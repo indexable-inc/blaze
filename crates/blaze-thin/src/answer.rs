@@ -67,13 +67,9 @@ pub struct Plain {
     why: Option<Vec<Report>>,
 }
 
-/// How this process shows an answer: the screen's options for its command, what stderr is,
-/// and how a program's size on disk is asked. Set once by the program ([`show_with`]) before
-/// it talks to the daemon; unset (a test, a library user), an answer is shown as a pipe is.
-///
-/// Interim: `talk::talk` makes the [`Plain`] and calls [`Plain::said`] with a `quiet` and a
-/// `color` alone, so what stderr is reaches it this way until `talk::Spoken` carries a
-/// [`Shown`] and passes it to [`Plain::shown`]; this static goes then.
+/// How a command shows its answer: the screen's options for it, what stderr is, and how a
+/// program's size on disk is asked. The program makes one before it talks to the daemon
+/// (`talk::Spoken::shown`).
 #[derive(Clone, Debug)]
 pub struct Shown {
     pub options: Options,
@@ -82,11 +78,20 @@ pub struct Shown {
     pub size: fn(&str) -> Option<u64>,
 }
 
-static SHOWN: std::sync::OnceLock<Shown> = std::sync::OnceLock::new();
-
-/// This process shows its answers as `shown` says; the first call's stands.
-pub fn show_with(shown: Shown) {
-    let _ = SHOWN.set(shown);
+impl Shown {
+    /// A pipe's: lines that stay, no escape but a colour asked for by name (`color`), no size
+    /// asked of any file. What a test speaks with.
+    pub fn pipe(command: blaze_screen::Command, color: bool) -> Shown {
+        Shown {
+            options: Options::of(command),
+            caps: Caps::PIPE,
+            terminal: Terminal {
+                caps: blaze_report::Caps { color, links: false, width: None },
+                ..Terminal::PIPE
+            },
+            size: |_| None,
+        }
+    }
 }
 
 impl Plain {
@@ -158,25 +163,12 @@ impl Plain {
         }
     }
 
-    /// What is written to stderr of this answer, the build over `took` after the command
-    /// began, as this process shows answers ([`show_with`]); a pipe's lines when it was not
-    /// said. `quiet` is the command's `-q`.
-    pub fn said(&self, quiet: bool, color: bool, took: Duration) -> String {
-        match SHOWN.get() {
-            Some(shown) => {
-                let options = Options { quiet, ..shown.options.clone() }; // clone: once a command
-                let size = placed(&self.artifacts).and_then(shown.size);
-                self.shown(options, shown.caps, &shown.terminal, took, size)
-            }
-            None => {
-                let options = Options { quiet, ..Options::of(blaze_screen::Command::Build) };
-                let terminal = Terminal {
-                    caps: blaze_report::Caps { color, links: false, width: None },
-                    ..Terminal::PIPE
-                };
-                self.shown(options, Caps::PIPE, &terminal, took, None)
-            }
-        }
+    /// What is written to stderr of this answer for a command that shows it as `shown` says,
+    /// `quiet` its `-q`, the build over `took` after the command began.
+    pub fn said(&self, shown: &Shown, quiet: bool, took: Duration) -> String {
+        let options = Options { quiet, ..shown.options.clone() }; // clone: once a command
+        let size = placed(&self.artifacts).and_then(shown.size);
+        self.shown(options, shown.caps, &shown.terminal, took, size)
     }
 
     /// The frame blaze-screen's core makes of the build's end and its why, as the bytes
@@ -354,12 +346,6 @@ impl Exec {
             cwd: cwd.to_owned(),
         }
     }
-
-    /// What is said of the program before it starts: nothing. Its command line is said
-    /// only under `-v`, which is the engine's; kept for `talk::talk`, which still asks.
-    pub fn running(&self, _color: bool) -> String {
-        String::new()
-    }
 }
 
 #[cfg(test)]
@@ -412,9 +398,9 @@ mod tests {
         let took = Duration::from_millis(10);
         let piped = plain.shown(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took, None);
         assert_eq!(piped, "blaze: ok built=0 cached=32 warnings=0 elapsed_ms=10\n");
-        // With nothing said of how this process shows answers, `said` is a pipe's.
-        assert_eq!(plain.said(false, false, took), piped);
-        assert_eq!(plain.said(true, false, took), "");
+        let pipe = Shown::pipe(Command::Build, false);
+        assert_eq!(plain.said(&pipe, false, took), piped);
+        assert_eq!(plain.said(&pipe, true, took), "");
         let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
         let build = plain.shown(Options::of(Command::Build), caps, &Terminal::PIPE, took, None);
         assert!(build.contains("up to date · 10ms"), "{build:?}");
@@ -444,8 +430,9 @@ mod tests {
         assert_eq!(plain.take(compiling(0)), Step::More);
         assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
         assert_eq!(plain.compiled.len(), 1);
-        assert!(plain.said(false, false, Duration::ZERO).starts_with("blaze: ok built=0 "));
-        assert_eq!(plain.said(true, false, Duration::ZERO), "");
+        let pipe = Shown::pipe(blaze_screen::Command::Run, false);
+        assert!(plain.said(&pipe, false, Duration::ZERO).starts_with("blaze: ok built=0 "));
+        assert_eq!(plain.said(&pipe, true, Duration::ZERO), "");
         assert!(matches!(Plain::of(true).take(compiling(0)), Step::HandOver(_)));
         assert!(matches!(Plain::new().take(compiling(IDS)), Step::HandOver(_)));
     }

@@ -878,7 +878,14 @@ fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
         let mut plain = Plain::of(reports);
         let steps: Vec<Step> = built_answer().into_iter().map(|it| plain.take(it)).collect();
         assert_eq!(steps, [Step::More, Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
-        let mut said = plain.said(thin.quiet, false, std::time::Duration::ZERO);
+        let shown = blaze_thin::answer::Shown::pipe(
+            match thin.command {
+                blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Run => blaze_screen::Command::Run,
+            },
+            false,
+        );
+        let said = plain.said(&shown, thin.quiet, std::time::Duration::ZERO);
 
         let mut api = FakeApi::answering(built_answer());
         let mut words = vec!["blaze"];
@@ -895,9 +902,6 @@ fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
                     &thin.program,
                     std::path::Path::new("/w"),
                 );
-                if !thin.quiet {
-                    said.push_str(&exec.running(false));
-                }
                 let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
                 assert_eq!(
                     (exec.program, exec.args, exec.env, exec.cwd),

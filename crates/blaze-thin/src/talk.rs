@@ -17,7 +17,7 @@ use std::{path::Path, time::Duration};
 use blaze_api::{Envelope, Executable, Request, Response};
 
 use crate::{
-    answer::{Exec, Plain, Step},
+    answer::{Exec, Plain, Shown, Step},
     handover,
     route::{Asked, Command},
 };
@@ -69,8 +69,8 @@ pub struct Spoken<'a> {
     pub asked: &'a Asked,
     /// The command's request, the CLI's own ([`crate::request::request`]).
     pub request: &'a Request,
-    /// Whether stderr is colored.
-    pub color: bool,
+    /// How the command shows its answer: what stderr is, as the program found it.
+    pub shown: &'a Shown,
     /// The directory the command runs in, which a `run`'s program is shown and started from.
     pub cwd: &'a Path,
     /// This process, which a `run` becomes its program as.
@@ -132,7 +132,9 @@ pub fn talk<L: Link>(
     if link.held() != 0 {
         return Ended::HandOver { request };
     }
-    let mut said = plain.said(asked.quiet, spoken.color, took());
+    // What the screen says of the answer (docs/terminal.md): nothing of the program's command
+    // line, which is said only under `-v`, the engine's.
+    let said = plain.said(spoken.shown, asked.quiet, took());
     if asked.command == Command::Build {
         return Ended::Said { said, exec: None };
     }
@@ -147,9 +149,6 @@ pub fn talk<L: Link>(
         Ok(Some(env)) => exec.env.extend(env),
         Ok(None) => {}
         Err(why) => return Ended::Engine(why),
-    }
-    if !asked.quiet {
-        said.push_str(&exec.running(spoken.color));
     }
     Ended::Said { said, exec: Some(exec) }
 }
@@ -397,10 +396,11 @@ mod tests {
     fn talked(typed: &[&str], answers: Vec<(u64, Response)>) -> (Ended, Scripted) {
         let asked = asked(typed);
         let mut link = Scripted::answering(answers);
+        let shown = Shown::pipe(blaze_screen::Command::Run, false);
         let spoken = Spoken {
             asked: &asked,
             request: &COMMAND,
-            color: false,
+            shown: &shown,
             cwd: Path::new("/w"),
             pid: 41,
         };
@@ -421,13 +421,17 @@ mod tests {
             assert_eq!(link.sent, [STATUS, BUILD, LAUNCH], "{typed:?}");
             let Ended::Said { said, exec: Some(exec) } = ended else { panic!("{typed:?}: {ended:?}") };
             assert_eq!(exec.program, Path::new("target/debug/foo"), "{typed:?}");
-            assert!(said.starts_with("link: /w/target/debug/foo (spliced)\n") || said.contains("Compiling foo"), "{said}");
+            // The screen's one line of the edit's build, to a pipe; nothing under `-q`.
+            match typed.contains(&"-q") {
+                true => assert_eq!(said, "", "{typed:?}"),
+                false => assert!(said.starts_with("blaze: ok built="), "{typed:?}: {said}"),
+            }
         }
         let (ended, link) = talked(&["build", "-q"], answers());
         assert_eq!((link.statuses, link.builds, link.launches), (1, 1, 0));
         assert_eq!(
             ended,
-            Ended::Said { said: "link: /w/target/debug/foo (spliced)\n".to_owned(), exec: None }
+            Ended::Said { said: String::new(), exec: None }
         );
     }
 
@@ -443,8 +447,9 @@ mod tests {
 
         let asked = asked(&["run", "-q"]);
         let mut link = Scripted::answering(status());
+        let shown = Shown::pipe(blaze_screen::Command::Run, false);
         let spoken =
-            Spoken { asked: &asked, request: &COMMAND, color: false, cwd: Path::new("/w"), pid: 41 };
+            Spoken { asked: &asked, request: &COMMAND, shown: &shown, cwd: Path::new("/w"), pid: 41 };
         let ended = talk(&mut link, &spoken, |_| Err("another build".to_owned()), || Duration::ZERO);
         assert_eq!(ended, Ended::Engine("another build".to_owned()));
         assert_eq!(link.sent, [STATUS]);

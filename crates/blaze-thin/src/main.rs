@@ -201,7 +201,7 @@ mod unix {
         let request = request::request(&asked, sent);
 
         // What an answer shows is the screen's (docs/terminal.md), as the engine shows it: what
-        // stderr is, said once before the daemon is talked to.
+        // stderr is, found before the daemon is talked to.
         let mut detected =
             blaze_report::terminal::detect(&config, var, terminal, width.map(|it| it as u16));
         detected.caps.color = color;
@@ -211,7 +211,7 @@ mod unix {
             }
             _ => blaze_screen::Caps::PIPE,
         };
-        blaze_thin::answer::show_with(blaze_thin::answer::Shown {
+        let shown = blaze_thin::answer::Shown {
             options: blaze_screen::Options {
                 cwd: place.cwd.to_str().map(str::to_owned),
                 home: blaze_core::home::user().ok().and_then(|it| it.into_os_string().into_string().ok()),
@@ -224,7 +224,7 @@ mod unix {
             caps,
             terminal: detected,
             size: blaze_thin::answer::on_disk,
-        });
+        };
 
         let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
         let engine = Engine::beside()?;
@@ -235,7 +235,7 @@ mod unix {
         let spoken = talk::Spoken {
             asked: &asked,
             request: &request,
-            color,
+            shown: &shown,
             cwd: &place.cwd,
             pid: std::process::id(),
         };
