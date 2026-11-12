@@ -69,8 +69,10 @@ mod pool;
 mod publish;
 mod pump;
 mod read;
+pub mod rebuild;
 pub mod remote;
 mod segment;
+pub mod sets;
 mod sync;
 mod table;
 #[cfg(all(test, not(blaze_check)))]
@@ -258,10 +260,13 @@ pub enum Kind {
     /// A pin ([`collect::Pin`]): a name, why, when and the keys the collector keeps for it
     /// whatever their last use (docs/gc.md, "The store's budget and collector").
     Pin,
+    /// A listing of an item set ([`sets`]): a leaf's item keys, or a root's leaves. The
+    /// collector keeps what a kept listing names, as it keeps a chunked output's chunks.
+    Set,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 10] = [
         Kind::Query,
         Kind::Code,
         Kind::Debug,
@@ -271,6 +276,7 @@ impl Kind {
         Kind::Machine,
         Kind::Derived,
         Kind::Pin,
+        Kind::Set,
     ];
 
     /// The kind's byte on disk and on the wire.
@@ -285,6 +291,7 @@ impl Kind {
             Kind::Machine => 6,
             Kind::Derived => 7,
             Kind::Pin => 8,
+            Kind::Set => 9,
         }
     }
 
@@ -299,6 +306,7 @@ impl Kind {
             6 => Some(Kind::Machine),
             7 => Some(Kind::Derived),
             8 => Some(Kind::Pin),
+            9 => Some(Kind::Set),
             _ => None,
         }
     }
@@ -314,6 +322,7 @@ impl Kind {
             Kind::Machine => "machine",
             Kind::Derived => "derived",
             Kind::Pin => "pin",
+            Kind::Set => "set",
         }
     }
 
@@ -1012,6 +1021,8 @@ pub struct Store {
     /// An index swap left the delta before it in `prev`, where a writer that loaded the view
     /// before the swap may still put; it is folded in once this grace has passed.
     migrating: Option<Grace>,
+    /// Its index tables built off its thread ([`rebuild`]).
+    rebuild: rebuild::Rebuild,
     /// What it unlinked, freed at task boundaries.
     limbo: Limbo,
     training: [Training; Kind::ALL.len()],
@@ -2353,6 +2364,7 @@ impl Store {
             index_mapping: false,
             flip: None,
             migrating: None,
+            rebuild: rebuild::Rebuild::new(),
             limbo: Limbo::new(),
             training: Default::default(),
             // alloc: empty, allocates nothing
@@ -6733,10 +6745,23 @@ impl Store {
         // A commit the collector asks for writes no index table: it stays as small as what
         // was copied on, and the next commit a build asks for writes the table.
         let small = std::mem::take(&mut self.collecting.small_commit);
-        let compact = !small
-            && !self.index_mapping
-            && self.migrating.is_none()
-            && own.delta.len() >= INDEX_AFTER;
+        let swaps = !small && !self.index_mapping && self.migrating.is_none();
+        // A table built off this thread ([`rebuild`]) is written by the first commit after it
+        // came back that may swap one in; a store with no worker builds it here when due.
+        let mut built = match swaps && self.rebuild.off_thread {
+            true => self.rebuild.ready_for(
+                own.packs.iter().map(|it| it.removed || it.retiring),
+                match own.head.index {
+                    Some(it) => 1 - it.slot,
+                    None => 0,
+                },
+            ),
+            false => None,
+        };
+        let compact = match self.rebuild.off_thread {
+            true => built.is_some(),
+            false => swaps && own.delta.len() >= INDEX_AFTER,
+        };
         // A pack retired with nothing copied on (every record of it dead or forgotten) is
         // still a head to write: the one that names it removed.
         let retiring = own.packs.iter().any(|it| it.retiring);
@@ -6798,18 +6823,37 @@ impl Store {
         };
         let mut index = None;
         if compact {
-            // alloc: once per index written (every `INDEX_AFTER` records); empty unless a slot is not whole
-            let mut bad = Vec::new();
-            let entries = self.index_entries(&mut bad);
-            for (_, what) in bad {
-                self.problems
-                    // alloc: a problem reported
-                    .push(format!(
-                        "a slot of {} left out of the next index: {what}",
-                        own.index_file()
-                    ));
-            }
-            let bytes = index::build_index(&entries);
+            // The table's bytes, how many records it holds, and (a table built off this
+            // thread) each pack's end when its build was taken.
+            let (bytes, count, marks) = match built.take() {
+                Some(built) => {
+                    for what in built.problems {
+                        self.problems
+                            // alloc: a problem reported
+                            .push(format!(
+                                "a slot of {} left out of the next index: {what}",
+                                own.index_file()
+                            ));
+                    }
+                    (built.bytes, built.count, Some(built.marks))
+                }
+                None => {
+                    // alloc: once per index written (every `INDEX_AFTER` records); empty unless a slot is not whole
+                    let mut bad = Vec::new();
+                    let entries = self.index_entries(&mut bad);
+                    for (_, what) in bad {
+                        self.problems
+                            // alloc: a problem reported
+                            .push(format!(
+                                "a slot of {} left out of the next index: {what}",
+                                own.index_file()
+                            ));
+                    }
+                    self.rebuild.counts.loop_rows += own.delta.len() as u64
+                        + own.index.as_ref().map_or(0, |it| it.table().count());
+                    (index::build_index(&entries), entries.len() as u64, None)
+                }
+            };
             let slot = match own.head.index {
                 Some(it) => 1 - it.slot,
                 None => 0,
@@ -6818,10 +6862,26 @@ impl Store {
                 slot,
                 len: bytes.len() as u64,
                 check: crc::crc32c(&bytes),
-                count: entries.len() as u64,
+                count,
             });
-            for pack in &mut head.packs {
-                pack.indexed = pack.committed;
+            match marks {
+                // Built here, of everything this commit writes.
+                None => {
+                    for pack in &mut head.packs {
+                        pack.indexed = pack.committed;
+                    }
+                }
+                // Built off this thread: it holds what each pack held under its end when the
+                // build was taken, and an open scans from there (`rebuild`'s invariant).
+                Some(marks) => {
+                    #[cfg(test)]
+                    let at_write = self.rebuild.plant_indexed_at_write;
+                    #[cfg(not(test))]
+                    let at_write = false;
+                    for (pack, &mark) in head.packs.iter_mut().zip(&marks) {
+                        pack.indexed = if at_write { pack.committed } else { mark.max(pack.indexed) };
+                    }
+                }
             }
             index = Some((slot, bytes));
         }

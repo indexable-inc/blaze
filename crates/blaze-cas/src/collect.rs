@@ -623,10 +623,10 @@ impl PeriodScan {
             // A file of its own goes cold as a record does: into a pack, compressed, and
             // its file is let go ([`Store::external_replaced`]). Machine code stays a file,
             // which its loader maps ([`Kind::Machine`]). A pin stays as it is: every scan
-            // reads it.
+            // reads it; so does a listing of an item set a scan follows ([`Kind::Set`]).
             Form::Raw | Form::Lz4 | Form::Warm | Form::External
                 if (loc.form != Form::External || loc.kind != Kind::Machine)
-                    && loc.kind != Kind::Pin
+                    && !matches!(loc.kind, Kind::Pin | Kind::Set)
                     && self.periods >= 2
                     && !read
                     && !before
@@ -648,7 +648,14 @@ impl PeriodScan {
 
 /// Whether a record at `place` may name other records of the store.
 fn names_others(place: Place) -> bool {
-    place.form() == Form::Chunked || place.kind() == Kind::Derived
+    place.form() == Form::Chunked || matches!(place.kind(), Kind::Derived | Kind::Set)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of `tests::sets`: the collector follows no listing of an item set
+    /// ([`Kind::Set`]) to what it names.
+    pub(crate) static SET_NOT_FOLLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Gives `each` every key the record of `key` names inside the store: a chunked value's
@@ -679,6 +686,24 @@ fn named_by(
             // alloc: a problem reported
             .map_err(|why| format!("the base of {:x} is not followed: it holds {why}", key.0))?;
         each(recipe.base);
+    }
+    // A listing of an item set names its leaves, or its items (`sets`): read whole, each
+    // time a scan follows it.
+    if found.place.kind() == Kind::Set {
+        #[cfg(test)]
+        if SET_NOT_FOLLOWED.with(|it| it.get()) {
+            return Ok(());
+        }
+        let (_, bytes) = look
+            .value(found, key, Use::Check)
+            // alloc: a problem reported
+            .map_err(|corrupt| format!("a listing's items are not followed: {corrupt}"))?;
+        let listing = crate::sets::decode(&bytes)
+            // alloc: a problem reported
+            .map_err(|why| format!("the listing {:x} is not followed: {why}", key.0))?;
+        for named in listing.named() {
+            each(named);
+        }
     }
     Ok(())
 }
@@ -945,7 +970,8 @@ impl CollectBatch {
             offset,
             key: header.key,
             span,
-            names_others: header.form == Form::Chunked || header.kind == Kind::Derived,
+            names_others: header.form == Form::Chunked
+                || matches!(header.kind, Kind::Derived | Kind::Set),
             external: (header.form == Form::External).then_some(header.content),
             file: match header.kind {
                 Kind::Output => Some(header.content),

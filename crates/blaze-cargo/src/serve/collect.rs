@@ -100,6 +100,69 @@ pub(crate) fn keep_as(name: &str, why: &str, keys: impl Iterator<Item = blaze_ca
     }
 }
 
+/// The front end's per-item entries in the store (AGENTS.md rule 65): the driver's side of
+/// `hir_def::nameres::frozen::entries::Entries`, the one `get` and `put` every records lane
+/// goes through. Each entry is a store record under its own key, found under any set
+/// ([`blaze_cas::sets`], the live form); what a set adds is a listing the collector follows,
+/// so a pin names a root a set, never a key an item.
+pub(crate) struct StoreEntries {
+    handle: &'static blaze_cas::Handle,
+    sets: std::sync::Arc<blaze_cas::sets::Sets>,
+}
+
+impl StoreEntries {
+    pub(crate) fn new(handle: &'static blaze_cas::Handle) -> std::sync::Arc<StoreEntries> {
+        // alloc: once a daemon
+        std::sync::Arc::new(StoreEntries { handle, sets: blaze_cas::sets::Sets::new() })
+    }
+
+    /// Lists the sets got or put since the last call (their leaves and roots put, only what
+    /// changed written): at a build's end, on a worker, before the roots are kept
+    /// ([`StoreEntries::keep`]).
+    pub(crate) fn list(&self) -> Result<blaze_cas::sets::Listed, String> {
+        let _span = tracing::info_span!(target: "blaze", "store sets list").entered();
+        self.sets.list(self.handle).map(|(_, listed)| listed)
+    }
+
+    /// The roots of `sets` are pin `name`'s from the next build's end on ([`keep`]): a key a
+    /// set. A set not listed yet ([`StoreEntries::list`]) is an error naming it, never
+    /// skipped.
+    pub(crate) fn keep(
+        &self,
+        name: &'static str,
+        sets: impl Iterator<Item = blaze_ids::ContentId>,
+    ) -> Result<(), String> {
+        // alloc: once a crate kept, a root a set
+        let mut roots = Vec::new();
+        for set in sets {
+            let root = self
+                .sets
+                .root(&set)
+                // alloc: error path
+                .ok_or_else(|| format!("the set {set:?} is kept as `{name}` before it was listed"))?;
+            roots.push(root);
+        }
+        keep(name, roots.into_iter());
+        Ok(())
+    }
+}
+
+impl hir_def::nameres::frozen::entries::Entries for StoreEntries {
+    // dyn: as `Entries::get`
+    fn get(
+        &self,
+        set: &blaze_ids::ContentId,
+        key: &blaze_ids::ContentId,
+        with: &mut dyn FnMut(&[u8]),
+    ) -> Result<bool, String> {
+        self.sets.get(self.handle, set, key, with)
+    }
+
+    fn put(&self, set: &blaze_ids::ContentId, key: blaze_ids::ContentId, bytes: &[u8]) -> Result<(), String> {
+        self.sets.put(self.handle, set, key, bytes)
+    }
+}
+
 /// From this share of the budget on, a build's end says so, in percent.
 pub const WARN_PERCENT: u64 = 85;
 /// A home near its budget says so at most this often, and one over it this often.
@@ -169,6 +232,8 @@ enum Back {
     /// A scan that reads the store's pins, asked for by a request, or `None` for one a
     /// panic lost.
     Pins(Option<blaze_cas::collect::PeriodScan>),
+    /// The store's next index table, built, or `None` for one a panic lost.
+    Index(Option<blaze_cas::rebuild::IndexBuild>),
 }
 
 /// What [`Collects::read_pins`] says of the store's pins.
@@ -227,6 +292,9 @@ pub struct Collects {
     /// A request waits for the store's pins: since when, and the wait's span
     /// (every-wait-says-what), open until they are read or the bound passes.
     pins_asked: Option<(Duration, tracing::Span)>,
+    /// The store's next index table is with a worker, being built
+    /// ([`blaze_cas::rebuild`]): the loop walks no row of it.
+    index_out: bool,
 }
 
 impl Collects {
@@ -253,6 +321,7 @@ impl Collects {
             over_bound: 0,
             pins_out: false,
             pins_asked: None,
+            index_out: false,
         }
     }
 
@@ -290,7 +359,12 @@ impl Collects {
     /// Whether the loop should turn again soon for it: a batch is out (it comes back over a
     /// channel no driver wakes for), or its core has a step due.
     pub(super) fn next_deadline(&self, now: Duration) -> Option<Duration> {
-        if self.collector.out() || self.other_out || self.pins_out || self.pins_asked.is_some() {
+        if self.collector.out()
+            || self.other_out
+            || self.pins_out
+            || self.pins_asked.is_some()
+            || self.index_out
+        {
             return Some(now + Duration::from_millis(1));
         }
         self.collector.next_deadline()
@@ -504,8 +578,33 @@ impl Collects {
         now: Duration,
         effects: &mut Vec<blaze_core::Effect>,
     ) {
+        // The store's index tables are built on a worker from here on, never in a commit on
+        // this loop.
+        store.index_off_thread();
         while let Ok(back) = self.recv.try_recv() {
             match back {
+                Back::Index(build) => {
+                    self.index_out = false;
+                    match build {
+                        Some(build) => {
+                            let _span = tracing::info_span!(
+                                target: "blaze",
+                                "store index put",
+                                records = build.records(),
+                                bytes = build.bytes(),
+                            )
+                            .entered();
+                            store.index_put(build, effects);
+                        }
+                        None => {
+                            tracing::error!(
+                                target: "blaze",
+                                "the build of the store's index table was lost to a panic: it is taken again"
+                            );
+                            store.index_lost();
+                        }
+                    }
+                }
                 Back::Batch(Some(batch)) => self.collector.back(batch),
                 Back::Batch(None) => {
                     tracing::error!(
@@ -535,6 +634,40 @@ impl Collects {
                     self.other_out = false;
                     tracing::warn!(target: "blaze", "the bytes of the daemon's state were not measured: {why}");
                 }
+            }
+        }
+        // The store's next index table, when one is due: handed to a worker, whatever the
+        // daemon is doing (a take is a count a pack; no build waits for the table).
+        if !self.index_out
+            && let Some(mut build) = store.index_take()
+        {
+            self.index_out = true;
+            // clone: a channel's sender, once an index table
+            let send = self.send.clone();
+            let work = move || {
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "store index build",
+                    rows = tracing::field::Empty,
+                    records = tracing::field::Empty,
+                    bytes = tracing::field::Empty,
+                )
+                .entered();
+                build.run();
+                span.record("rows", build.rows());
+                span.record("records", build.records());
+                span.record("bytes", build.bytes());
+                build
+            };
+            match self.run {
+                Compress::Inline => _ = send.send(Back::Index(Some(work()))),
+                Compress::Pool => blaze_graph::exec::shared().submit_as(
+                    None,
+                    Class::Background,
+                    work,
+                    // A panic fails this one job: the store hands the build out again.
+                    move |done| _ = send.send(Back::Index(done.ok())),
+                ),
             }
         }
         if !self.other_out && self.other_at.is_none_or(|at| now.saturating_sub(at) >= OTHER_EVERY) {

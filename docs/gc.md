@@ -470,7 +470,7 @@ collection, the bytes at each step, and what `blaze gc --dry-run` says is kept.
   record-level collection (a whole store goes by its TTL). Its limits: an index swap carries the
   flags of use over on a worker (`FlagCarry`, `store flags carry`), and until that is back the
   store forgets nothing; a store with no index table yet (under 65,536 records) forgets
-  nothing; the index table is still built on the loop by a build's commit; the period's scan
+  nothing; the index table is built on a worker (`blaze-cas/src/rebuild.rs`, 2026-11-12, not yet run; a daemon with no collector still builds it in a commit); the period's scan
   walks every row and reads every chunk list each period (on a worker); the daemon's own
   measurement (`harness/storegc.py`) has not been run.
 

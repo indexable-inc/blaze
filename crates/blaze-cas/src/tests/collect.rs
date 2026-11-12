@@ -122,6 +122,10 @@ struct Plants {
     /// The driver tells the collector no build is under way and none ever began, whatever
     /// is: a pack is sealed under a build.
     seal_in_build: bool,
+    /// No bug, a mode: the store's index tables are built off its thread
+    /// ([`crate::rebuild`]), a build handed out with a scan and back when the scan runs, or
+    /// at a step of the collector, so packs are retired and the power goes while one is out.
+    index_off_thread: bool,
 }
 
 struct World {
@@ -140,6 +144,8 @@ struct World {
     used: BTreeSet<u64>,
     used_before: BTreeSet<u64>,
     scan: Option<PeriodScan>,
+    /// The build of the next index table that is out (`Plants::index_off_thread`).
+    index: Option<crate::rebuild::IndexBuild>,
     batch: Option<CollectBatch>,
     /// What readers hold pinned: the key, the pin and the bytes it held when taken.
     held: Vec<(u64, Pinned, Vec<u8>)>,
@@ -165,6 +171,7 @@ impl World {
             used: BTreeSet::new(),
             used_before: BTreeSet::new(),
             scan: None,
+            index: None,
             batch: None,
             held: Vec::new(),
             seconds: 1_000_000,
@@ -175,6 +182,9 @@ impl World {
     fn plant(store: &mut Store, plants: Plants) {
         store.collecting.plant = plants.collect;
         store.plant_head_before_syncs = plants.head_before_syncs;
+        if plants.index_off_thread {
+            store.index_off_thread();
+        }
         crate::pool::RETIRE_PINNED.with(|it| it.set(plants.retire_pinned));
     }
 
@@ -244,6 +254,15 @@ impl World {
         drive(&mut self.sim, &mut self.store, effects);
     }
 
+    /// The index build out is run and handed back.
+    fn index_back(&mut self) {
+        let Some(mut build) = self.index.take() else { return };
+        build.run();
+        let mut effects = Vec::new();
+        self.store.index_put(build, &mut effects);
+        self.drive(&mut effects);
+    }
+
     fn put(&mut self, n: u64) -> Result<(), String> {
         let (kind, bytes) = value(n);
         let ticket = self
@@ -275,6 +294,11 @@ impl World {
         if let Some(mut carry) = self.store.carry_take() {
             carry.run();
             self.store.carry_put(carry);
+        }
+        // And the next index table is built, when none is out with a scan.
+        if self.index.is_none() {
+            self.index = self.store.index_take();
+            self.index_back();
         }
         self.collector.advance_clock(self.sim.now());
         self.collector.observe(self.facts());
@@ -335,6 +359,7 @@ impl World {
         self.held.clear();
         self.batch = None;
         self.scan = None;
+        self.index = None;
         self.build = None;
         self.used.clear();
         self.used_before.clear();
@@ -452,6 +477,11 @@ impl World {
                         self.scan = self.store.plan_take();
                     }
                 }
+                // A build of the next index table goes out with it, and comes back when the
+                // scan runs: what is put, collected and retired between races it.
+                if self.index.is_none() {
+                    self.index = self.store.index_take();
+                }
             }
             Op::Moves(steps) => {
                 for _ in 0..*steps {
@@ -466,7 +496,10 @@ impl World {
                 }
             }
             Op::CollectToRest => self.collect_to_rest()?,
-            Op::ScanRun => self.scan_run(),
+            Op::ScanRun => {
+                self.scan_run();
+                self.index_back();
+            }
             Op::Collect(steps) => {
                 for _ in 0..*steps {
                     if !self.collect_step()? {
@@ -608,10 +641,12 @@ fn the_collector_forgets_nothing_a_root_names() {
             max_latency: Duration::from_micros(tc.draw(gs::integers::<u64>().max_value(5000))),
             ..Faults::default()
         };
-        if let Err(why) = runs(&ops, seed, faults.clone(), Plants::default())
+        // Half the runs with the store's index tables built off its thread.
+        let plants = Plants { index_off_thread: tc.draw(gs::booleans()), ..Plants::default() };
+        if let Err(why) = runs(&ops, seed, faults.clone(), plants)
             && !injected(&why)
         {
-            panic!("seed {seed}, {faults:?}, {ops:?}: {why}");
+            panic!("seed {seed}, {faults:?}, {plants:?}, {ops:?}: {why}");
         }
     });
 }

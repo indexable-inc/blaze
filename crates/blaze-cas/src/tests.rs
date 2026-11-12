@@ -14,6 +14,8 @@ mod model_check;
 mod part;
 mod place_copy;
 mod place_whole;
+mod rebuild;
+mod sets;
 mod place_crash;
 mod place_made;
 mod place_race;
