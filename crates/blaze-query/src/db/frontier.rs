@@ -235,6 +235,14 @@ pub struct ChangedSetWork {
     /// reached past it, or past the walk's most unwinds ([`UNWOUND_MOST`]). 0 for an edit
     /// whose every level is narrow and whose rows verify.
     pub marked: u64,
+    /// Readers passed over because they are behind a seal ([`super::seal`]): a walk does not
+    /// enter a sealed group.
+    pub sealed_passed: u64,
+    /// Sealed groups it checked: those a write since the walk before may have reached.
+    pub groups_checked: u64,
+    /// Of them, groups whose seal broke: something their rows read from outside changed.
+    /// Their rows are among `marked`.
+    pub groups_broken: u64,
 }
 
 /// A bug planted in the walk or its feeds, for the simulation's controls: each is one
@@ -285,6 +293,18 @@ pub(crate) enum Plant {
     /// 2026-11-12: a request that changes nothing then verifies every row of the field's
     /// durability or below.
     EqualSetsWrite,
+    /// A write to an input of a sealed group neither opens the group nor has any group above
+    /// it checked ([`Storage::seal_wrote`] taken out): the seal survives the write, and its
+    /// rows are taken as unchanged.
+    SealSurvivesAWrite,
+    /// A write to an input of a group opens that group and leaves the groups that depend on
+    /// it sealed and unchecked: a dependent that read what the write changed answers its old
+    /// value.
+    SealedDependentsNeverSuspect,
+    /// The walk and its reach treat a row behind a seal as any other reader
+    /// ([`Plan::suspects`]'s `sealed` taken out): a walk enters the sealed groups above an
+    /// edit.
+    WalkEntersSealedGroups,
 }
 
 /// The storage's part of the changed set.
@@ -295,7 +315,7 @@ pub(crate) struct Frontier {
     /// Nodes whose summary gained a bit since the last view boundary ([`Frontier::grew`]).
     grew: SegQueue<u32>,
     /// Read by a walk, written at a view boundary (`&mut`).
-    reverse: Reverse,
+    pub(crate) reverse: Reverse,
     #[expect(clippy::disallowed_types, reason = "held to move the walks' vectors in and out, never across a call")]
     walked: blaze_core::lock::Lock<Walked>,
     /// The view the last walk ended in ([`Storage::view`]'s number), 0 before any: while it
@@ -313,7 +333,7 @@ pub(crate) struct Frontier {
     reached_before: blaze_core::lock::Lock<Vec<Box<Seen>>>,
     /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
-    plant: Plant,
+    pub(crate) plant: Plant,
 }
 
 impl Frontier {
@@ -416,6 +436,9 @@ impl Storage {
     /// An input field's node was written (with `&mut`: its setter).
     pub(crate) fn note_written(&mut self, node: u32) {
         self.frontier.walked.get_mut().written.push(node); // alloc: the writes since the last walk, a word each
+        // The seal groups: the field's own group opens, found from the field; the groups
+        // that depend on it are to be checked ([`super::seal`]).
+        self.seal_wrote(node);
     }
 
     /// The runs whose edges are not yet folded into the reverse index: what the next fold
@@ -436,6 +459,9 @@ impl Storage {
     /// stale readers are most of it, and it is made again from every row: at most the readers
     /// it frees.
     pub(crate) fn fold_reverse(&mut self) {
+        // A seal a reader broke is taken off first: its rows are ordinary rows again, and
+        // the index names them as readers before anything asks it ([`super::seal`]).
+        self.seal_finalize();
         if self.frontier.stored.is_empty() {
             return;
         }
@@ -460,6 +486,11 @@ impl Storage {
             if plant == Plant::KeepsOldEdges && stored.old != 0 {
                 continue;
             }
+            // A row behind a seal holds no reverse edges: its group's check answers for it,
+            // and they are made from its edges when its group opens.
+            if self.seals.unindex_if_sealed(stored.node) {
+                continue;
+            }
             self.copy_edges(stored.old, &mut old);
             self.copy_edges(stored.new, &mut new);
             if plant == Plant::DropsAnEdge {
@@ -472,10 +503,14 @@ impl Storage {
         if remade {
             reverse.clear();
             for node in 1..self.nodes_made() {
+                if self.seals.sealed_member(node) {
+                    continue;
+                }
                 let Some((header, _, _)) = row_of(self, node) else { continue };
                 self.copy_edges(header.edges.load(Ordering::Relaxed), &mut new);
                 reverse.stored(node, &[], &new, &mut seen);
             }
+            self.seals.unindexed_all();
         }
         // The lists hold as many readers as the packed tier: packed, a copy a reader, a
         // bounded number of times a reader however long the storage lives.
@@ -540,10 +575,8 @@ impl Storage {
         if self.frontier.grew.is_empty() || self.frontier.plant == Plant::LeavesReadersSummaries {
             return;
         }
-        let storage = &*self;
-        let frontier = &storage.frontier;
         let mut work: Vec<u32> = Vec::new(); // alloc: the nodes that gained an input, a word each
-        while let Some(node) = frontier.grew.pop() {
+        while let Some(node) = self.frontier.grew.pop() {
             work.push(node);
         }
         let span = tracing::info_span!(
@@ -556,6 +589,12 @@ impl Storage {
         let _entered = span.enter();
         let (mut edges, mut grown) = (0u64, 0u64);
         while let Some(node) = work.pop() {
+            // A sealed group that reads `node` from outside, or holds it, has rows the index
+            // does not name as readers: it is opened first (its rows indexed, a cost of its
+            // own size), so the gain reaches them as it reaches any reader.
+            self.seal_open_for_gain(node);
+            let storage = &*self;
+            let frontier = &storage.frontier;
             let summary = storage.summary_of(node);
             edges += frontier.reverse.readers(node, |reader| {
                 // Any bit more, one a reader of no input gains too: its readers lack it.
@@ -570,8 +609,60 @@ impl Storage {
         span.record("grown", grown);
     }
 
+    /// Adds the rows of `nodes` to the reverse index as readers of what their edges name:
+    /// what opening a sealed group does for its rows, at a cost of their edges
+    /// ([`super::seal`]). Returns the edges read.
+    pub(crate) fn index_rows(&mut self, nodes: &[u32]) -> u64 {
+        let mut reverse = std::mem::take(&mut self.frontier.reverse);
+        let mut seen = Seen::with_hasher(blaze_hash::FixedState);
+        let mut edges: Vec<u32> = Vec::new(); // alloc: scratch of one row's edges
+        let mut read = 0u64;
+        for &node in nodes {
+            let Some((header, _, _)) = row_of(self, node) else { continue };
+            self.copy_edges(header.edges.load(Ordering::Relaxed), &mut edges);
+            read += edges.len() as u64;
+            reverse.stored(node, &[], &edges, &mut seen);
+        }
+        self.frontier.reverse = reverse;
+        read
+    }
+
+    /// Makes the reverse index again from every row that is not behind a seal, and packs
+    /// it: what a seal pass does once the readers behind seals are most of the index, so a
+    /// sealed group's rows hold no reverse edges. Costs the edges of the rows outside seals.
+    /// Returns the readers held before and after.
+    pub(crate) fn shed_sealed_readers(&mut self) -> (u64, u64) {
+        self.fold_reverse();
+        let before = self.frontier.reverse.held();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "reverse edges shed sealed",
+            before,
+            after = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let mut reverse = std::mem::take(&mut self.frontier.reverse);
+        let mut seen = Seen::with_hasher(blaze_hash::FixedState);
+        let mut edges: Vec<u32> = Vec::new(); // alloc: scratch of one row's edges
+        reverse.clear();
+        for node in 1..self.nodes_made() {
+            if self.seals.sealed_member(node) {
+                continue;
+            }
+            let Some((header, _, _)) = row_of(self, node) else { continue };
+            self.copy_edges(header.edges.load(Ordering::Relaxed), &mut edges);
+            reverse.stored(node, &[], &edges, &mut seen);
+        }
+        reverse.pack();
+        let after = reverse.held();
+        self.frontier.reverse = reverse;
+        self.seals.unindexed_all();
+        span.record("after", after);
+        (before, after)
+    }
+
     /// The nodes of the edge span `span`, into `out` (emptied first).
-    fn copy_edges(&self, span: u64, out: &mut Vec<u32>) {
+    pub(crate) fn copy_edges(&self, span: u64, out: &mut Vec<u32>) {
         out.clear();
         let (start, len) = (span::start(span), span::len(span));
         out.extend((start..start + len).map(|at| self.edge(at))); // alloc: the fold's scratch, one row's edges
@@ -611,7 +702,7 @@ fn verified_in(storage: &Storage, node: u32) -> u32 {
 
 /// The header of the function row `node` names, with its ingredient and key; `None` for a
 /// field's node, a node with no key yet, or a row whose page is gone.
-fn row_of(storage: &Storage, node: u32) -> Option<(&Header, u32, Id)> {
+pub(crate) fn row_of(storage: &Storage, node: u32) -> Option<(&Header, u32, Id)> {
     let key = storage.key_of(node);
     if key == 0 {
         return None;
@@ -974,12 +1065,45 @@ fn walk(db: *const (), storage: &Storage) {
         if plant == Plant::ForgetsReadersOfWritten {
             changed.clear();
         }
-        plan.suspects(&frontier.reverse, &mut changed, &mut suspects, |reader| verified_in(storage, reader));
+        plan.suspects(
+            &frontier.reverse,
+            &mut changed,
+            &mut suspects,
+            |reader| verified_in(storage, reader),
+            |reader| plant != Plant::WalkEntersSealedGroups && storage.seals.sealed_member(reader),
+        );
         if suspects.is_empty() {
-            if frontier.changed.is_empty() || plant == Plant::StopsAtChangedReader {
-                break;
+            if !frontier.changed.is_empty() && plant != Plant::StopsAtChangedReader {
+                continue;
             }
-            continue;
+            // The rows are at rest. Each sealed group a write may have reached is checked
+            // now, once, by what its rows read from outside it ([`super::seal`]): a group
+            // that holds answers for all its rows; one whose seal broke has its rows set
+            // apart and named, as past a wide level, and their readers are asked in turn.
+            if storage.seals.unsettled() {
+                let (checked, broken) = {
+                    let apart = |node: u32| apart_now.contains(&node);
+                    super::seal::resolve_all(db, storage, &apart)
+                };
+                work.groups_checked += checked;
+                work.groups_broken += broken;
+                let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the rows of the groups that broke
+                storage.seals.broken_rows(storage, &mut rows);
+                for (node, word) in rows {
+                    changed.push((node, ASSUMED));
+                    found.push(node);
+                    if apart_now.insert(node) {
+                        unwound.push((node, word)); // alloc: as above
+                    }
+                    work.marked += 1;
+                }
+                if !changed.is_empty()
+                    || (!frontier.changed.is_empty() && plant != Plant::StopsAtChangedReader)
+                {
+                    continue;
+                }
+            }
+            break;
         }
         // A row set apart is not verified again: it is named, and its readers are asked.
         suspects.retain(|&node| {
@@ -1075,6 +1199,7 @@ fn walk(db: *const (), storage: &Storage) {
     work.visited = plan.visited;
     work.edges = plan.edges;
     work.seen_since = plan.seen_since;
+    work.sealed_passed = plan.sealed;
     work.changed = found.len() as u64;
     walking.record("untracked", work.untracked);
     walking.record("said", work.said);
@@ -1103,6 +1228,9 @@ fn walk(db: *const (), storage: &Storage) {
         marked = work.marked,
         reach = work.reach,
         reach_edges = work.reach_edges,
+        sealed_passed = work.sealed_passed,
+        groups_checked = work.groups_checked,
+        groups_broken = work.groups_broken,
         "edit work"
     );
 
@@ -1228,6 +1356,11 @@ impl Storage {
             }
             let mut behind = false;
             done.edges += frontier.reverse.readers(node, |reader| {
+                // A reader behind a seal is its group's to answer for: the group is checked
+                // against this node's stamp before a row of it is taken as unchanged.
+                if storage.seals.sealed_member(reader) {
+                    return;
+                }
                 // A reader never made, or emptied, has nothing to bring up to date.
                 let verified = verified_word(storage, reader);
                 behind |= verified & VIEW_MASK != 0 && verified & VIEW_MASK < since
@@ -1265,8 +1398,9 @@ impl Storage {
         drop(walked);
         // Nothing left: every node that changed since the last walk has been seen by every
         // reader, so every row holds in this view as after a walk that found no suspect, and
-        // this view is the floor ([`floor`]). The rows set apart stay apart.
-        if left == 0 {
+        // this view is the floor ([`floor`]). The rows set apart stay apart. Not while a sealed
+        // group waits for its check: its rows are not known to hold until it is checked.
+        if left == 0 && !storage.seals.unsettled() {
             frontier.floor.store(storage.view_bits(), Ordering::Release);
         }
         span.record("said", done.said);
@@ -1308,13 +1442,22 @@ fn verified_word(storage: &Storage, node: u32) -> u32 {
 fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut ChangedSetWork) {
     let frontier = &storage.frontier;
     let one_level = frontier.plant == Plant::ReachesOneLevel;
+    // A row behind a seal is not in the reach: its group's check answers for it, and a row
+    // that reads it is proved by the reach only where no group below it waits for its check
+    // ([`super::seal::Seals::reach_proves`]).
+    let sealed = |reader: u32| {
+        frontier.plant != Plant::WalkEntersSealedGroups && storage.seals.sealed_member(reader)
+    };
     // alloc: the walk's reach, 8 bytes a row it can reach
     let mut reached = Box::new(Seen::with_hasher(blaze_hash::FixedState));
     let mut next: Vec<u32> = Vec::new(); // alloc: as above
     let mut edges = 0u64;
     for &(node, since) in changed {
         edges += frontier.reverse.readers(node, |reader| {
-            if (since == ASSUMED || verified_in(storage, reader) < since) && reached.insert(reader) {
+            if !sealed(reader)
+                && (since == ASSUMED || verified_in(storage, reader) < since)
+                && reached.insert(reader)
+            {
                 next.push(reader); // alloc: as above
             }
         });
@@ -1334,7 +1477,7 @@ fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut
             break;
         }
         edges += frontier.reverse.readers(node, |reader| {
-            if reached.insert(reader) {
+            if !sealed(reader) && reached.insert(reader) {
                 next.push(reader); // alloc: as above
             }
         });
@@ -1419,6 +1562,7 @@ fn outside_reach(storage: &Storage, node: u32) -> bool {
     // `reach` publishes it.
     let reached = unsafe { &*reached };
     !reached.contains(&node)
+        && storage.seals.reach_proves(storage, node)
         && (frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node))
 }
 

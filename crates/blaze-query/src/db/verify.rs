@@ -125,6 +125,11 @@ fn walk(
                 mark(storage, header, word, row)
                     && header.changed.load(Ordering::Relaxed) <= verified
             } else {
+                // A row behind a seal not yet checked in this view: the claimed path checks
+                // its group once, where this walk would prove its rows one by one.
+                if storage.seals.suspect_of(dep).is_some() {
+                    return false;
+                }
                 if stack.len() - base > depth {
                     return false;
                 }

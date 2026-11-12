@@ -30,6 +30,7 @@ mod local;
 mod provenance;
 mod reverse;
 mod row;
+mod seal;
 mod slot;
 mod storage;
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub use provenance::{
     Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, SAMPLE_EVERY, SAMPLED_MOST,
     Taken, log_runs, name_rows, take_log_in,
 };
+pub use seal::{SealCensus, SealGroup, SealGroupCensus, SealKind, SealPass, SealState};
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, Unread, View};
 pub use value::Value;
@@ -74,7 +76,8 @@ pub mod plumbing {
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
-            input_set, input_singleton, input_written_since,
+            input_seal_group, input_set, input_singleton, input_singleton_seal_group,
+            input_written_since,
         },
         interned::{Interned, intern, intern_by, interned_arguments, interned_fields},
         owner_is,

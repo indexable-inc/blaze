@@ -17,7 +17,10 @@ use super::{
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
-    storage::{Durability, FIELD, Ids, Storage, Table, View, color, input_bits, node_key, or},
+    seal::SealGroup,
+    storage::{
+        Durability, FIELD, Ids, LOOSE, Storage, Table, View, color, input_bits, node_key, or,
+    },
 };
 
 /// One input struct. Its fields are numbered 0..FIELDS; each has its own stamp and node.
@@ -164,7 +167,8 @@ pub fn input_new<I: Input, const N: usize>(
     for (field, durability) in durability.into_iter().enumerate() {
         let node = first + field as u32;
         storage.set_key(node, node_key(index, id, field as u32));
-        storage.set_summary(node, input_bits(node));
+        // Of no seal group until its host says which ([`input_seal_group`]).
+        storage.set_summary(node, or(input_bits(node), LOOSE));
         storage.repaint(node, color(FIELD | u32::from(durability.0), view));
     }
     // SAFETY: the ID is fresh (`Ids::next` gives each once), so this task is the row's one
@@ -208,6 +212,37 @@ pub fn input_written_since<I: Input>(storage: &Storage, id: Id, since: View) -> 
     (0..I::FIELDS.max(1)).any(|field| storage.color_of(first + field) as u32 > stamp)
 }
 
+/// Says every field of input `id` is an input of seal group `group` ([`super::seal`]): a write
+/// of one opens that group and no other, found from the field with no walk of rows. For the
+/// host that makes the input, before a query reads it (a row that read it before stays as it
+/// was: of no group, verified row by row).
+///
+/// # Panics
+///
+/// When a field is already an input of another group, naming both: an input has one group
+/// for the storage's life.
+pub fn input_seal_group<I: Input>(storage: &mut Storage, id: Id, group: SealGroup) {
+    let first = row::<I>(storage, id).first.load(Ordering::Relaxed);
+    for field in 0..I::FIELDS.max(1) {
+        storage.seal_input(first + field, group, I::NAME);
+    }
+}
+
+/// [`input_seal_group`] for the singleton `I`, made or not: its absence is read as its field
+/// 0, which is the group's input too.
+pub fn input_singleton_seal_group<I: Input>(storage: &mut Storage, group: SealGroup) {
+    let (table, id) = reserved::<I>(storage);
+    let first = table
+        .pages
+        .row::<RowOf<I>>(id)
+        .expect("the reserved row's page")
+        .first
+        .load(Ordering::Relaxed);
+    for field in 0..I::FIELDS.max(1) {
+        storage.seal_input(first + field, group, I::NAME);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32 {
     row::<I>(storage, id).first.load(Ordering::Relaxed) + field
@@ -247,7 +282,8 @@ fn reserve<I: Input>(storage: &Storage, table: &InputTable<I>, index: u32) -> Id
     for field in 0..I::FIELDS.max(1) {
         let node = first + field;
         storage.set_key(node, node_key(index, id, field));
-        storage.set_summary(node, input_bits(node));
+        // Of no seal group until its host says which ([`input_seal_group`]).
+        storage.set_summary(node, or(input_bits(node), LOOSE));
         storage.repaint(node, color(FIELD | u32::from(Durability::HIGH.0), 0));
     }
     row.first.store(first, Ordering::Relaxed);

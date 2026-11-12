@@ -50,8 +50,8 @@ use super::{
         UNTRACKED, VALUE, VIEW_MASK, span,
     },
     storage::{
-        ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
-        node_key, or,
+        ALL, Durability, FIELD, LOOSE, Relocate, Restamp, Storage, Summary, Table, color,
+        key_parts, node_key, or,
     },
     verify,
 };
@@ -466,6 +466,18 @@ fn refresh<F: Function>(
                 return State::Assumed;
             }
             return State::OnStack(at);
+        }
+        // A row behind a seal a write may have reached: its group is checked once, here, and
+        // every row of it is proved by that check, or the seal is broken and the row is
+        // verified as any other is ([`super::seal`]).
+        if word & (RUNNING | PROVISIONAL) == 0
+            && node != 0
+            && word & VIEW_MASK != 0
+            && word & VIEW_MASK != view
+            && let Some(group) = storage.seals.suspect_of(node)
+            && super::seal::resolve(std::ptr::from_ref(db).cast::<()>(), storage, group, None)
+        {
+            continue;
         }
         if word & PROVISIONAL != 0 {
             let head = header.extra.load(Ordering::Relaxed) as u32;
@@ -1091,15 +1103,18 @@ fn store_edges(storage: &Storage, header: &Header, at: u32) {
 }
 
 /// Sets the summary of the run at `at` (node `node`): the OR of its edges' and its replayed
-/// reads', all bits when it made an untracked read.
-fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
+/// reads', all bits when it made an untracked read. Its seal group is worked out from the
+/// same edges ([`super::seal::Seals::derived`]); `made`: the row had run before.
+fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool, made: bool) {
     let summary = if untracked {
         ALL
     } else {
         local::with(|local| {
             let frame = &local.frames[at as usize];
             let start = frame.edges_start as usize;
-            or(frame.summary, storage.summary_of_edges(&local.edges[start..]))
+            let edges = &local.edges[start..];
+            let summary = or(frame.summary, storage.summary_of_edges(edges));
+            storage.seals.derived(storage, node, edges, summary, made)
         })
     };
     storage.set_summary(node, summary);
@@ -1169,7 +1184,7 @@ fn finish<F: Function>(
     // publishes, so a task waiting on this flight finds them never made.
     drop_orphans(storage, done.members, done.node);
     store_edges(storage, header, at);
-    summarize(storage, done.node, at, done.untracked);
+    summarize(storage, done.node, at, done.untracked, made_before);
     header.changed.store(changed, Ordering::Relaxed);
     header.meta.store(meta, Ordering::Relaxed);
     storage.paint(done.node, color(view, changed));
@@ -1332,7 +1347,8 @@ fn head_round<F: Function>(
         if reads.untracked != 0 {
             storage.frontier.untracked(done.node);
         }
-        storage.set_summary(done.node, reads.summary);
+        // A cycle's rows are of no seal group: what they read is no one group's to cover.
+        storage.set_summary(done.node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(meta, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -1441,7 +1457,8 @@ fn finalize(storage: &Storage, from: u32, head: u32, reads: Converged) -> u32 {
         if reads.untracked != 0 {
             storage.frontier.untracked(node);
         }
-        storage.set_summary(node, reads.summary);
+        // As its head: of no seal group.
+        storage.set_summary(node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(lowest | CYCLE | reads.untracked, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);

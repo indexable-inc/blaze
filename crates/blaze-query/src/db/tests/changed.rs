@@ -56,8 +56,8 @@ pub(super) enum FlowOp {
 
 #[derive(Clone, Debug)]
 pub(super) struct FlowNode {
-    op: FlowOp,
-    deps: Vec<Dep>,
+    pub(super) op: FlowOp,
+    pub(super) deps: Vec<Dep>,
 }
 
 struct Flow;
@@ -79,7 +79,7 @@ impl Spec for Flow {
 }
 
 /// The value of node `key` of the database's flow, its query reads made through `Q`.
-fn flowed<Q: Spec<Key = Node, Value = u64>>(db: &TestDb, key: Node) -> u64 {
+pub(super) fn flowed<Q: Spec<Key = Node, Value = u64>>(db: &TestDb, key: Node) -> u64 {
     let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
     let spec = db.flow.lock()[at].clone();
     let read = |dep: Dep| match dep {
@@ -153,7 +153,7 @@ fn fold(op: FlowOp, values: impl Iterator<Item = u64>) -> u64 {
 }
 
 /// The reference model: every node's value from scratch.
-fn evaluate(flow: &[FlowNode], inputs: &[u64], world: u64) -> Vec<u64> {
+pub(super) fn evaluate(flow: &[FlowNode], inputs: &[u64], world: u64) -> Vec<u64> {
     let mut values: Vec<u64> = Vec::with_capacity(flow.len());
     for spec in flow {
         let read = |dep: Dep| match dep {
@@ -366,7 +366,7 @@ fn the_changed_set_names_every_row_whose_value_differs_from_a_run_from_scratch(t
     }
 }
 
-fn sum(deps: &[Dep]) -> FlowNode {
+pub(super) fn sum(deps: &[Dep]) -> FlowNode {
     FlowNode { op: FlowOp::Sum, deps: deps.to_vec() }
 }
 

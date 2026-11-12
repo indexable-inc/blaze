@@ -358,6 +358,43 @@ to open, not the order right. F2's two blockers are as written in that section.
 (6) No new `blaze_cas::Kind`: pages are `Kind::Query` like the image; their keys are what a
 pin of "toolchain" or "bstd" names (`pages_key` of each crate's `Image::key`).
 
+**Found while reading for F2 (2026-11-12), which bounds what pages can save today.** After
+every crate graph change the name-resolution maintainer hands the impls maintainer a delta of
+each served crate made by walking every module's whole scope
+(`nameres::delta::served_delta`: `items.add(module.scope(db), ..)`), for every crate whose
+impls are not frozen too. With pages that is one `scope_memo` a module of every served crate,
+at the serve: the name tables make a lookup cheap, and this walk decodes every scope anyway.
+So the next record is the impls and traits of a crate by module (what `served_delta` reads),
+written beside the pages and handed over without a scope; until then expect `scope_memo` rows
+about equal to the served crates' modules.
+
+**F2 as it has to be built (not built; this lane's next piece).** Read from the code: both
+maintainers work at the write. `nameres::delta::unreached` gives a job to every crate with no
+state that no image serves, and `method_resolution::delta::state::prepare` gives every crate
+not served a state and a node; `crate_local_def_map` of a crate neither served nor published
+is `Unmaintained`. So "not resolved until asked" is a third state both maintainers know:
+
+- an input beside `DepImages`, the crates *awaited* (their records not asked for yet), with
+  the set closed upward once a change (a crate is blocked when it or a crate below it is
+  awaited): `unreached` is true for a blocked crate, `prepare` and the impls nodes pass over
+  one, and a reader of one is `Unmaintained` naming it, as today;
+- `blaze_lower::lower_writes` awaits every crate it makes, in the write that makes it
+  (`add_crates`), so that write resolves nothing; `deps::serve` takes from the set every crate
+  it was asked about, hit or miss, in its own write, where a miss and everything above it get
+  their first run (a crate with no state and no image is reached by any pass). A serve that
+  finds no key moved (`unit/deps.rs` `images` returning `None`) must still release;
+- a unit not ready (it waits on a build script's run) stays awaited, and so does everything
+  above it, until the serve after that run: today it is resolved twice, before the run and
+  after;
+- the count test, in blaze-lower beside `a_plan_lowered_again_is_found_whole_and_writes_nothing`:
+  a store filled by one database, a second database lowered over it, and `Counts::executed`
+  of the nameres and impls maintainers' queries for the crates with records: none; control:
+  the await left out.
+
+Files: `hir-def/src/nameres/delta.rs`, `hir-def/src/deps/serve.rs`,
+`hir-ty/src/method_resolution/delta/state.rs`, `blaze-lower/src/lib.rs` (`lower_writes`,
+`serve_deps`), `blaze-cargo/src/serve/unit/deps.rs` (`images`).
+
 **Checks** (hir-def `nameres::frozen::pages::tests`, blaze-cas `tests::part`):
 `a_crate_read_from_pages_answers_as_the_one_resolved` (the refinement: the whole def map and
 every name of every module, against the resolved crate) with its control
@@ -733,18 +770,66 @@ records are written if its key is new (the `store kept front end` task does this
 libraries today), its rows' kind is raised by one pass over its rows, and its heap values are
 let go. A request that arrives stops it.
 
-**The engine change this needs** (not built; it is the reason the two tests below are not
-written): three kinds for the whole database cannot say "only it". A write of kind `HIGH`
-makes every `HIGH` row verify again, so unsealing one crate today costs a walk over every
-sealed crate. The kind becomes a *seal group* a crate, ordered by the crate graph: a row keeps
-its crate's group (16 bits of `Header::meta`), the storage keeps a view a group
-(`closure_changed[g]`: the last view a leaf of `g` or of a group `g` depends on was written
-in), and a row verified at or after its group's view is current with one compare, as a
-durable row is now. A write to an input of crate `x` stamps `x`'s group and, only when
-`Seal(x)` is written, each group above it: a loop over crates, no rows. A row that reads a
-body below its own crate's interface records the body's group as well (a second word), so
-the compare stays exact. Then a sealed crate's rows need no edges (they verify by the group)
-and no place in the reverse index: the 108 and 106 MiB of step b1's second half.
+**The engine: seal groups** (written 2026-11-12 by lane sealgroups-1112 in
+`crates/blaze-query/src/db/seal.rs`, whose module text has the invariant and its argument; not
+yet compiled or run: the round runner's results decide). Three kinds for the whole database
+cannot say "only it", so a crate is a *seal group*:
+
+- *Which group.* The host makes a group a crate (`Storage::seal_group`, with the groups it
+  depends on, only ever added to) and gives each input its group (`plumbing::input_seal_group`):
+  one word a node, which is the index from a written input to its group. A row's group is
+  worked out from its edges as its run ends, beside its summary: the group among those it read
+  that depends on the others, none when no one of them does. One bit of the input summary
+  (`LOOSE`) is on every input of no group and every row no one group covers, and so on every
+  row that reads one at any depth: a row without it reads only its own group's inputs and
+  those of the groups below.
+- *When sealed.* The pass a host calls at a build's end (`Storage::seal_quiet_groups`, after the
+  answer and the settle) seals a library group at the first pass that finds rows of it, and a
+  local group at the pass that ends the second build in a row with no write to its inputs and
+  no broken seal (`SealKind`); the count is of passes, never a clock.
+- *One check a group.* A sealed group keeps what its rows read from outside it (its imports,
+  sorted by source group), the view it was sealed in, and the OR of its loose imports'
+  summaries. A write reads the field's word and opens that group and the groups declared to
+  open with it (`seal_group_opens_with`: a package's files and the crates made of them); one
+  loop over the groups makes suspect each held group that depends on it or reads the field
+  loosely. A suspect group is checked once, the first time a row of it is asked or by the walk:
+  imports behind another seal that holds are passed over a run at a time, the rest are brought
+  up to date and their stamps compared with the seal's view. Held: each row of it is proved by
+  one load. Not: the seal is broken, its rows are verified by their own edges, the walk names
+  them all as changed, and the next write opens the group. So a dependent stays sealed while
+  nothing it reads of the dependency changed; the engine compares the stamps of the rows read,
+  it defines no digest, and a host that has a dependent read a dependency through its
+  interface record gets cutoff-1112's digest as that one import.
+- *No reverse edges.* A walk never enters a sealed group (`Plan::suspects`, `reach`). Once
+  the readers behind seals are half the index, the pass makes the index again without them
+  (`shed_sealed_readers`); when a group opens they are made from its own rows.
+- *What an unseal costs.* The opened group's rows and their edges (to index them), on the
+  write's path, under the span `seal group open`; nothing of another group. A broken seal
+  costs the same at the next write, and its rows named to the hosts. A sealing costs the
+  group's rows not yet behind the seal and their edges, after the answer.
+- *The census* (`Storage::seal_census`, and in `durability_census`'s text): groups sealed,
+  rows behind seals, rows by group and state, checks, seals broken, groups opened.
+
+What is not built: the hosts' calls (no crate makes a group yet, so nothing is sealed in a
+real build); letting go of a sealed row's forward edges (a row without edges must run again
+when its group opens: right for a library, wrong for a local crate); the provider a sealed
+row's value is fetched through (records-1112b's functions, by value, where a let-go value is
+asked: `function::claimed`'s `Cause::Evicted` run); a precise walk into a broken seal (an
+index of that group made by the reader that broke it, where now every row of it is named).
+
+Memory a row behind a seal, as built: its header 32 bytes and its value's place, its node 32,
+its last run 8, its group word 4, its place in its group's list 4, its forward edges 4 each
+(about 12 a row on hello-world): about 130 bytes and the value. With the edges let go, 80.
+1.8 million library rows are then 140 MiB, three times the 48 MiB budget: the budget needs a
+sealed group's rows not to be rows at all (the group one leaf and a record read through the
+pool, a row made only for a key that is asked), which is records-1112b's half.
+
+Tests (`db/tests/sealed.rs`, each with its control): `an_edit_under_sealed_dependents_stays_in_its_group_at_two_sizes`,
+`a_write_to_a_sealed_groups_input_opens_that_group_and_no_other`,
+`an_interface_change_breaks_the_seals_of_the_dependents_that_read_it`,
+`an_equal_set_of_an_input_every_crate_reads_unseals_nothing`,
+`a_plan_that_adds_a_crate_unseals_nothing`, `a_local_group_is_sealed_after_two_quiet_builds`,
+and the refinement `a_sealed_database_answers_as_an_unsealed_one_under_random_writes`.
 
 **Where this meets the other lanes.** firstedit-1112 changes how a walk uses what changed
 (readers that saw the change are passed over); this lane changes which rows a walk can reach

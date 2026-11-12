@@ -22,6 +22,7 @@ use super::{
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
     provenance::{self, Cause, restamp_run},
     row::{Owners, Pages, VALUE, VIEW_MASK, span},
+    seal::Seals,
 };
 
 /// What a database is to the engine: its storage. `base_db::Db` implements it; the generated
@@ -116,6 +117,18 @@ pub(crate) fn key_parts(key: u64) -> (u32, Id, u32) {
 pub(crate) type Summary = [u64; 2];
 pub(crate) const ALL: Summary = [u64::MAX; 2];
 
+/// The summary bit no input field's own bits take ([`input_bits`]): set on an input field no
+/// seal group owns, on a row whose reads no one group covers, and so, by the summaries' own
+/// rule, on every row that reads one of them at any depth ([`super::seal`]). A row without it
+/// reads, transitively, only inputs of its seal group and of the groups that one depends on.
+pub(crate) const LOOSE: Summary = [0, 1 << 63];
+
+/// Whether `summary` has [`LOOSE`].
+#[inline(always)]
+pub(crate) fn loose(summary: Summary) -> bool {
+    summary[1] & LOOSE[1] != 0
+}
+
 /// A node of the dependency graph: what a walk reads of it (its color, summary and key) in one
 /// place, so a walk checks the node's index once and finds all of it in one cache line.
 #[repr(C, align(32))]
@@ -181,13 +194,14 @@ impl NodeRow {
 /// Views of written-field masks kept: a memo verified further back walks.
 const HISTORY: usize = 64;
 
-/// The two bits of input field node `node`: two multiplicative hashes by odd constants.
+/// The two bits of input field node `node`: two multiplicative hashes by odd constants. Never
+/// bit 127, which is [`LOOSE`]'s.
 #[inline]
 pub(crate) fn input_bits(node: u32) -> Summary {
     let node = u64::from(node);
     let mut bits = [0; 2];
     for k in [0x9e37_79b9_7f4a_7c15_u64, 0xc2b2_ae3d_27d4_eb4f] {
-        let bit = (node.wrapping_mul(k) >> 57) as u32;
+        let bit = ((node.wrapping_mul(k) >> 57) as u32).min(126);
         bits[(bit >> 6) as usize] |= 1 << (bit & 63);
     }
     bits
@@ -214,7 +228,7 @@ const INTERN_HEAP: usize = 1 << 35;
 /// Nodes and edges a storage may have; entries and captures one view's [`super::Reads`] may
 /// hold.
 #[cfg(target_pointer_width = "64")]
-const NODES: usize = 1 << 28;
+pub(crate) const NODES: usize = 1 << 28;
 #[cfg(target_pointer_width = "64")]
 const EDGES: usize = 1 << 32;
 #[cfg(target_pointer_width = "64")]
@@ -231,7 +245,7 @@ const HEAP: usize = 512 << 20;
 #[cfg(not(target_pointer_width = "64"))]
 const INTERN_HEAP: usize = 256 << 20;
 #[cfg(not(target_pointer_width = "64"))]
-const NODES: usize = 1 << 23;
+pub(crate) const NODES: usize = 1 << 23;
 #[cfg(not(target_pointer_width = "64"))]
 const EDGES: usize = 1 << 26;
 #[cfg(not(target_pointer_width = "64"))]
@@ -316,6 +330,8 @@ pub struct Storage {
     epochs: [u32; 2],
     /// The changed set's feeds, reverse index and walks ([`super::frontier`]).
     pub(crate) frontier: Frontier,
+    /// The seal groups: which group each node is of, and each group's state ([`super::seal`]).
+    pub(crate) seals: Seals,
     /// The database type of its first function table ([`Storage::check_db`]).
     #[expect(clippy::disallowed_types, reason = "held once per function table made, to check its database type")]
     db_type: blaze_core::lock::Lock<Option<TypeId>>,
@@ -383,6 +399,7 @@ impl Storage {
             passed_at: [0; Tag::COUNT],
             epochs: [view; 2],
             frontier: Frontier::new(),
+            seals: Seals::new(),
             db_type: blaze_core::lock::Lock::new("query.storage.db_type", None),
         }
     }
@@ -453,6 +470,11 @@ impl Storage {
     /// set's walk of this view says it is unchanged ([`super::frontier::unreached`]).
     #[inline]
     pub(crate) fn holds(&self, node: u32, row: &NodeRow, durability: u8, verified: u32) -> bool {
+        // A row behind a seal that holds: one check of its group stood for every row of it
+        // ([`super::seal`]).
+        if self.seals.proves(node) {
+            return true;
+        }
         if self.unchanged_since(durability, verified) || self.inputs_unchanged(row, verified) {
             return true;
         }
@@ -636,7 +658,8 @@ impl Storage {
                 name: "dependency nodes",
                 rows: nodes,
                 used: nodes,
-                row_bytes: (self.nodes.committed_bytes() + self.runs.committed_bytes()) as u64,
+                row_bytes: (self.nodes.committed_bytes() + self.runs.committed_bytes()) as u64
+                    + self.seals.bytes(),
                 value_bytes: 0,
             },
             MemoryUsage {
@@ -670,6 +693,9 @@ impl Storage {
     /// below is green by its summary.
     pub fn synthetic_write(&mut self, durability: Durability) {
         self.new_view(durability, ALL);
+        // No field names it: every sealed group whose rows read something no group covers
+        // (an untracked read is one) is checked before a row of it is taken as unchanged.
+        self.seal_wrote_all();
     }
 
     /// Opens the next view for a write of kind `durability` to the input fields whose
@@ -789,6 +815,7 @@ impl Storage {
         for epoch in &mut self.epochs {
             *epoch = restamp.apply(*epoch);
         }
+        self.seals.restamp(restamp);
         for node in 1..self.nodes_made() {
             let painted = self.color_of(node);
             let (verified, changed) = ((painted >> 32) as u32, painted as u32);

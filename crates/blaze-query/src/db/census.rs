@@ -13,6 +13,7 @@ use super::{
     function,
     ingredient::{self, Kind},
     row::{UNTRACKED, VIEW_MASK, span},
+    seal::SealCensus,
     storage::{FIELD, Storage, key_parts},
 };
 
@@ -57,6 +58,8 @@ pub struct Census {
     pub blockers: Vec<Blocker>,
     /// Functions with rows below `HIGH`, most rows first.
     pub held: Vec<Held>,
+    /// The rows by seal group and state ([`Storage::seal_census`]).
+    pub seals: SealCensus,
 }
 
 impl Storage {
@@ -143,6 +146,7 @@ impl Storage {
             })
             .collect();
         census.held.sort_by(|a, b| (b.rows, a.function).cmp(&(a.rows, b.function)));
+        census.seals = self.seal_census();
         census
     }
 }
@@ -173,6 +177,6 @@ impl std::fmt::Display for Census {
                 it.function, it.rows, it.inherited
             )?;
         }
-        Ok(())
+        write!(f, "{}", self.seals)
     }
 }

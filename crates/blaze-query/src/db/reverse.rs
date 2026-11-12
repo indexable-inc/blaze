@@ -266,6 +266,8 @@ pub(crate) struct Plan {
     pub(crate) visited: u64,
     /// Readers passed over: verified at or after the view their dependency changed in.
     pub(crate) seen_since: u64,
+    /// Readers passed over: rows behind a seal, which their group's one check answers for.
+    pub(crate) sealed: u64,
 }
 
 impl Plan {
@@ -277,6 +279,7 @@ impl Plan {
             edges: 0,
             visited: 0,
             seen_since: 0,
+            sealed: 0,
         }
     }
 
@@ -304,6 +307,11 @@ impl Plan {
     /// 2026-11-12).
     ///
     /// A node gathered at a stamp is not gathered again at that stamp or an earlier one.
+    ///
+    /// `sealed` says whether a reader is behind a seal ([`super::seal`]): such a reader is
+    /// never handed out, whatever its dependency's stamp. A walk does not enter a sealed
+    /// group; the group's check, of what its rows read from outside it, answers for all of
+    /// them, and a group whose check fails has its rows named by the driver.
     #[blaze::pure]
     pub(crate) fn suspects(
         &mut self,
@@ -311,6 +319,7 @@ impl Plan {
         changed: &mut Vec<ChangedIn>,
         suspects: &mut Vec<u32>,
         mut verified: impl FnMut(u32) -> u32,
+        mut sealed: impl FnMut(u32) -> bool,
     ) {
         // By node, then stamp: a node's latest stamp is the last of its run.
         changed.sort_unstable();
@@ -329,10 +338,14 @@ impl Plan {
                     new.insert(since); // alloc: a walk's set, the nodes it reaches
                 }
             }
-            let (asked, visited, seen_since) =
-                (&mut self.asked, &mut self.visited, &mut self.seen_since);
+            let (asked, visited, seen_since, behind_seal) =
+                (&mut self.asked, &mut self.visited, &mut self.seen_since, &mut self.sealed);
             self.edges += reverse.readers(node, |reader| {
                 if asked.contains(&reader) {
+                    return;
+                }
+                if sealed(reader) {
+                    *behind_seal += 1;
                     return;
                 }
                 if since != ASSUMED && verified(reader) >= since {
@@ -352,6 +365,21 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: a reader behind a seal is never handed out, whether its dependency has
+    /// a stamp or is taken as changed with none; the readers beside it are.
+    #[test]
+    fn a_plan_never_hands_out_a_reader_behind_a_seal() {
+        let mut reverse = Reverse::default();
+        for reader in [10, 20, 30] {
+            reverse.add(1, reader);
+        }
+        let mut plan = Plan::new();
+        let (mut changed, mut suspects) = (vec![(1, ASSUMED)], Vec::new());
+        plan.suspects(&reverse, &mut changed, &mut suspects, |_| 0, |reader| reader == 20);
+        assert_eq!(suspects, [10, 30]);
+        assert_eq!((plan.visited, plan.sealed, plan.edges), (2, 1, 3));
+    }
 
     fn readers(reverse: &Reverse, dep: u32) -> Vec<u32> {
         let mut out = Vec::new();
@@ -483,12 +511,12 @@ mod tests {
         }
         let mut plan = Plan::new();
         let (mut changed, mut suspects) = (vec![(2, ASSUMED), (1, ASSUMED), (2, ASSUMED)], Vec::new());
-        plan.suspects(&reverse, &mut changed, &mut suspects, |_| 0);
+        plan.suspects(&reverse, &mut changed, &mut suspects, |_| 0, |_| false);
         assert_eq!(suspects, [10, 20, 30]);
         assert!(changed.is_empty());
         suspects.clear();
         changed.extend([(20, ASSUMED), (1, ASSUMED)]);
-        plan.suspects(&reverse, &mut changed, &mut suspects, |_| 0);
+        plan.suspects(&reverse, &mut changed, &mut suspects, |_| 0, |_| false);
         assert_eq!(suspects, [40], "node 1's readers were gathered, row 20's are new");
         assert!(!plan.ask(40));
         assert_eq!((plan.visited, plan.edges), (4, 5));
@@ -511,19 +539,19 @@ mod tests {
         };
         let mut plan = Plan::new();
         let (mut changed, mut suspects) = (vec![(1, 5), (1, 3)], Vec::new());
-        plan.suspects(&reverse, &mut changed, &mut suspects, verified);
+        plan.suspects(&reverse, &mut changed, &mut suspects, verified, |_| false);
         assert_eq!(suspects, [10], "node 1 changed in view 5: only the reader of view 4 is behind");
         assert_eq!((plan.visited, plan.seen_since, plan.edges), (1, 2, 3));
         suspects.clear();
         changed.push((1, 5));
-        plan.suspects(&reverse, &mut changed, &mut suspects, verified);
+        plan.suspects(&reverse, &mut changed, &mut suspects, verified, |_| false);
         assert_eq!(suspects, [] as [u32; 0], "gathered at that stamp already");
         changed.push((1, 6));
-        plan.suspects(&reverse, &mut changed, &mut suspects, verified);
+        plan.suspects(&reverse, &mut changed, &mut suspects, verified, |_| false);
         assert_eq!(suspects, [20], "changed again in view 6: the reader of view 5 is behind now");
         suspects.clear();
         changed.push((1, ASSUMED));
-        plan.suspects(&reverse, &mut changed, &mut suspects, verified);
+        plan.suspects(&reverse, &mut changed, &mut suspects, verified, |_| false);
         assert_eq!(suspects, [30], "taken as changed with no stamp: every reader not yet asked");
     }
 }

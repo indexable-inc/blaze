@@ -85,18 +85,20 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
     let creator = function::running(storage)
         .unwrap_or_else(|| panic!("{} made outside a tracked function", T::NAME));
     let identity_hash = local::Local::identity_hash(&identity);
-    let (occurrence, durability, summary) = local::with(|local| {
+    let (occurrence, durability, summary, group) = local::with(|local| {
         let occurrence = local.occurrence(index, identity_hash).expect("a running query");
         let frame = local.recording(storage).expect("a running query");
         frame.unshareable = true;
         let (durability, untracked, start, replayed) =
             (frame.durability, frame.untracked, frame.edges_start as usize, frame.summary);
-        let summary = if untracked {
-            ALL
+        // The seal group of what the creator read so far: the fields' own, as their summary is.
+        let (summary, group) = if untracked {
+            (ALL, 0)
         } else {
-            or(replayed, storage.summary_of_edges(&local.edges[start..]))
+            let edges = &local.edges[start..];
+            storage.seals.derived_field(or(replayed, storage.summary_of_edges(edges)), edges)
         };
-        (occurrence, Durability::from_bits(durability), summary)
+        (occurrence, Durability::from_bits(durability), summary, group)
     });
     let hash = hash_of(&(creator, occurrence, identity_hash));
     let view = storage.view_bits();
@@ -122,7 +124,7 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
             for field in 0..T::TRACKED_FIELDS {
                 let node = row.first + field;
                 storage.set_key(node, node_key(index, id, field));
-                storage.set_summary(node, summary);
+                storage.set_summary(node, storage.seals.placed(storage, node, group, summary, false));
                 storage.repaint(node, color(FIELD | u32::from(durability.0), view));
             }
         }
@@ -132,7 +134,7 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
             let old = unsafe { &mut *row.fields.get() };
             for field in 0..T::TRACKED_FIELDS {
                 let node = row.first + field;
-                storage.set_summary(node, summary);
+                storage.set_summary(node, storage.seals.placed(storage, node, group, summary, true));
                 let was = Durability((((storage.color_of(node) >> 32) as u32) & !FIELD) as u8);
                 if was != durability || !T::equal_field(field, old, &new) {
                     storage.repaint(node, color(FIELD | u32::from(durability.0), view));
