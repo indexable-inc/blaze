@@ -36,11 +36,8 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
     if word & (RUNNING | PROVISIONAL) != 0 || meta & UNTRACKED != 0 || word & VIEW_MASK == 0 {
         return false;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
-        return mark(storage, header, word, storage.node(node));
-    }
     let row = storage.node(node);
-    if storage.inputs_unchanged(row, word & VIEW_MASK) {
+    if storage.holds(node, row, meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
         return mark(storage, header, word, row);
     }
     local::with(|local| {
@@ -86,7 +83,7 @@ fn walk(
             let header = unsafe { &*done.header };
             let row = storage.node(done.node);
             // The summary goes in before the mark publishes the row in this view.
-            row.grow_summary(done.summary);
+            storage.grow_summary(done.node, done.summary);
             if !mark(storage, header, done.word, row) {
                 return false;
             }
@@ -124,9 +121,7 @@ fn walk(
             }
             if word & VIEW_MASK == view {
                 header.changed.load(Ordering::Relaxed) <= verified
-            } else if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-                || storage.inputs_unchanged(row, word & VIEW_MASK)
-            {
+            } else if storage.holds(dep, row, meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
                 mark(storage, header, word, row)
                     && header.changed.load(Ordering::Relaxed) <= verified
             } else {

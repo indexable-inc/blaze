@@ -74,31 +74,69 @@ impl Spec for Flow {
 
     fn compute(db: &TestDb, key: Node) -> u64 {
         RAN_ON.lock().push((std::ptr::from_ref(db).addr(), std::thread::current().id()));
-        let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
-        let spec = db.flow.lock()[at].clone();
-        let read = |dep: Dep| match dep {
-            Dep::Input(input) => {
-                let cell = Cell(db.cells.lock()[input]);
-                cell.a(db)
-            }
-            Dep::Query(query) => *fetch::<Flow>(db, node(db, query)),
-        };
-        match spec.op {
-            FlowOp::Pick => {
-                let first = read(spec.deps[0]);
-                picked(first, spec.deps.len()).map_or(first, |at| mix(first, read(spec.deps[at])))
-            }
-            FlowOp::World => {
-                report_untracked_read(
-                    db,
-                    Untracked { what: "the simulation's world, which no tracked read stands for" },
-                );
-                let world = db.world.load(Ordering::Relaxed);
-                spec.deps.iter().fold(world, |acc, &dep| acc.wrapping_add(read(dep)))
-            }
-            op => fold(op, spec.deps.iter().map(|&dep| read(dep))),
-        }
+        flowed::<Flow>(db, key)
     }
+}
+
+/// The value of node `key` of the database's flow, its query reads made through `Q`.
+fn flowed<Q: Spec<Key = Node, Value = u64>>(db: &TestDb, key: Node) -> u64 {
+    let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
+    let spec = db.flow.lock()[at].clone();
+    let read = |dep: Dep| match dep {
+        Dep::Input(input) => {
+            let cell = Cell(db.cells.lock()[input]);
+            cell.a(db)
+        }
+        Dep::Query(query) => *fetch::<Q>(db, node(db, query)),
+    };
+    match spec.op {
+        FlowOp::Pick => {
+            let first = read(spec.deps[0]);
+            picked(first, spec.deps.len()).map_or(first, |at| mix(first, read(spec.deps[at])))
+        }
+        FlowOp::World => {
+            report_untracked_read(
+                db,
+                Untracked { what: "the simulation's world, which no tracked read stands for" },
+            );
+            let world = db.world.load(Ordering::Relaxed);
+            spec.deps.iter().fold(world, |acc, &dep| acc.wrapping_add(read(dep)))
+        }
+        op => fold(op, spec.deps.iter().map(|&dep| read(dep))),
+    }
+}
+
+/// The flow again as a query of its own, for the one test that counts its rows' work: the
+/// engine's counts are a process's, by query, and no other test runs this one
+/// ([`a_first_edit_after_a_build`], one at a time under [`BUILT`]).
+struct Built;
+
+impl Spec for Built {
+    type Key = Node;
+    type Value = u64;
+    const QUERY: &'static str = "Built";
+
+    fn cache() -> &'static Ingredient {
+        ingredient!(function::<Built>)
+    }
+
+    fn compute(db: &TestDb, key: Node) -> u64 {
+        flowed::<Built>(db, key)
+    }
+}
+
+/// Held by each run of [`a_first_edit_after_a_build`]: `Built`'s counts are one run's.
+static BUILT: Lock<()> = Lock::new("test.query.changed.built", ());
+
+/// `Built`'s rows proved unchanged without running since the last take.
+fn built_verified() -> u64 {
+    let mut verified = 0;
+    crate::db::take_counts(|name, counts| {
+        if name == "Built" {
+            verified += counts.verified;
+        }
+    });
+    verified
 }
 
 /// Which of a `Pick`'s `deps` reads its first's value `first` chooses, if it has more than one.
@@ -633,7 +671,7 @@ fn the_oracle_catches_a_walk_that_contains_every_unwind() {
 }
 
 /// What [`a_first_edit_after_a_build`] saw: the settle at the build's end, the first edit's
-/// walk, and the rows the edit's changed set named.
+/// walk, the rows the edit's changed set named and the rows the edit proved unchanged.
 #[derive(Debug, PartialEq, Eq)]
 struct FirstEdit {
     /// Nodes the settle at the build's end left to the edit's walk.
@@ -647,57 +685,79 @@ struct FirstEdit {
     edit: (u64, u64, u64),
     /// The rows named to a host that asks from the build's end.
     named: usize,
+    /// Rows the edit proved unchanged without running, in its walk and in the host's pull
+    /// of what it holds (the application's row, the library's top and the second package's).
+    verified: u64,
 }
 
-/// A build of `library` pairs of rows, an application row and a second package's row, then a
-/// first edit, as a host does them: row `2i` reads the library's configuration (input 0) and
-/// row `2i + 1` reads row `2i`; the application's row reads its source (input 1) and row 0;
-/// the last row reads the second package's configuration (input 2). The build makes every
-/// row, then the library's configuration is written (a build script's result applied after
-/// the rows that read it were made) and the build pulls every row again: each library row
-/// runs again and says it changed, with no walk. Then the second package's configuration is
-/// written and its row pulled, so the library's rows are of an earlier view than the
-/// build's last. At its end the host settles the changed set (off the answer's path). The edit writes the application's source and asks for the changed
-/// set since the build's end. Every answer is checked against a run from scratch.
+/// How many times the build writes the second package's configuration: more views than the
+/// written-field history holds, as a build's hundreds of writes are.
+const BUILD_WRITES: u64 = 70;
+
+/// A build of a library of `library` pairs of rows under one top row, an application row and
+/// a second package's row, then a first edit, as a host does them: row `2i` reads the
+/// library's configuration (input 0) and row `2i + 1` reads row `2i`; the top reads every row
+/// `2i + 1`; the application's row reads its source (input 1) and the top; the last row reads
+/// the second package's configuration (input 2). The build makes every row, then the
+/// library's configuration is written (a build script's result applied after the rows that
+/// read it were made) and the build pulls every row again: each library row runs again and
+/// says it changed, with no walk. Then the second package's configuration is written
+/// [`BUILD_WRITES`] times and its row pulled each time, so the library's rows were verified
+/// more views back than the written-field history holds. At its end the host settles the
+/// changed set (off the answer's path). The edit writes the application's source, asks for
+/// the changed set since the build's end and pulls the rows it holds. Every answer is checked
+/// against a run from scratch.
 fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
-    let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 1);
+    let _one = BUILT.lock();
+    let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 3);
     for at in 0..library {
         flow.push(sum(&[Dep::Input(0)]));
         flow.push(sum(&[Dep::Query(2 * at)]));
     }
-    flow.push(sum(&[Dep::Input(1), Dep::Query(0)]));
+    let top = flow.len();
+    flow.push(sum(&(0..library).map(|at| Dep::Query(2 * at + 1)).collect::<Vec<_>>()));
+    let application = flow.len();
+    flow.push(sum(&[Dep::Input(1), Dep::Query(top)]));
+    let second = flow.len();
     flow.push(sum(&[Dep::Input(2)]));
-    let (rows, application) = (flow.len(), 2 * library);
+    let rows = flow.len();
     let mut db = TestDb::new();
     db.storage_mut().plant_in_changed_set(plant);
     *db.flow.lock() = flow.clone();
     let mut inputs = vec![1u64, 10, 100];
     let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
-    let pull = |db: &TestDb, inputs: &[u64]| {
+    let pull = |db: &TestDb, inputs: &[u64], held: &[usize]| {
         let model = evaluate(&flow, inputs, 0);
-        for at in 0..rows {
-            assert_eq!(*fetch::<Flow>(db, node(db, at)), model[at], "row {at}");
+        for &at in held {
+            assert_eq!(*fetch::<Built>(db, node(db, at)), model[at], "row {at}");
         }
     };
+    let every: Vec<usize> = (0..rows).collect();
     // The build: every row made, the configuration applied, every row pulled again.
-    pull(&db, &inputs);
+    pull(&db, &inputs, &every);
     inputs[0] = 5;
     cells[0].set_a(&mut db, 5);
-    pull(&db, &inputs);
-    inputs[2] = 500;
-    cells[2].set_a(&mut db, 500);
-    assert_eq!(*fetch::<Flow>(&db, node(&db, rows - 1)), 500);
+    pull(&db, &inputs, &every);
+    for write in 1..=BUILD_WRITES {
+        inputs[2] = 100 + write;
+        cells[2].set_a(&mut db, 100 + write);
+        pull(&db, &inputs, &[second]);
+    }
     // Its end, after the answer: the host settles what the build's pulls left.
     let ended = db.storage_mut().settle_changed_set();
     let since = db.storage().view();
+    built_verified();
     // The first edit.
     inputs[1] = 11;
     cells[1].set_a(&mut db, 11);
-    let changed = changed_since::<Flow>(&db, since);
+    let changed = changed_since::<Built>(&db, since);
     let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
     let edit = db.storage().changed_set_work();
-    pull(&db, &inputs);
+    pull(&db, &inputs, &[application, top, second]);
+    let verified = built_verified();
+    // And every row answers as a run from scratch does.
+    pull(&db, &inputs, &every);
     if plant == Plant::None {
         assert_eq!(keys, [node(&db, application)], "the edit reaches the application's row");
     }
@@ -707,6 +767,7 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
         marked: edit.marked,
         edit: (edit.said, edit.edges, edit.visited),
         named: keys.len(),
+        verified,
     }
 }
 
@@ -714,13 +775,20 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
 /// reaches, not by the database's size. A build leaves every row it made again saying it
 /// changed; each reader of one was verified after it changed, so the settle at the build's
 /// end takes every one out of the next walk's start with a load a reader, running nothing,
-/// and the edit's walk starts from the edit's write alone: one reverse edge, one row asked,
-/// none set apart, one row named, the same in a database of 202 rows and one of 4,002.
+/// and its view becomes the floor. The edit's walk starts from the edit's write alone: one
+/// reverse edge, one row asked, none set apart, one row named; and the library's top, which
+/// the application's row reads and which was verified more views back than the written-field
+/// history holds, is proved from the floor with no look at what it read: two rows proved
+/// unchanged (it and the second package's), the same in a database of 203 rows and one of
+/// 4,003.
 #[test]
 fn the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes() {
     let small = a_first_edit_after_a_build(100, Plant::None);
     let large = a_first_edit_after_a_build(2000, Plant::None);
-    assert_eq!(small, FirstEdit { left: 0, asked: 1, marked: 0, edit: (0, 1, 1), named: 1 });
+    assert_eq!(
+        small,
+        FirstEdit { left: 0, asked: 1, marked: 0, edit: (0, 1, 1), named: 1, verified: 2 }
+    );
     assert_eq!(large, small, "the first edit's work grew with the database");
 }
 
@@ -735,4 +803,106 @@ fn the_oracle_catches_a_walk_that_asks_the_readers_that_saw_the_change() {
     assert!(small.left >= 200 && small.marked >= 200 && small.asked >= 200, "{small:?}");
     assert!(large.left >= 4000 && large.marked >= 4000 && large.asked >= 4000, "{large:?}");
     assert_ne!(small, large);
+}
+
+/// The second control of it: with no floor kept, the edit's walk is as small, but the
+/// library's top is proved by a walk of everything it read, every row of the library, and
+/// the oracle says so at both sizes.
+#[test]
+fn the_oracle_catches_an_edit_that_walks_what_the_build_verified() {
+    let small = a_first_edit_after_a_build(100, Plant::KeepsNoFloor);
+    let large = a_first_edit_after_a_build(2000, Plant::KeepsNoFloor);
+    assert_eq!((small.asked, small.marked, small.named), (1, 0, 1), "{small:?}");
+    assert!(small.verified >= 200, "{small:?}");
+    assert!(large.verified >= 4000, "{large:?}");
+}
+
+/// A row with 70 readers, each read by nothing, and one row that reads another input; the
+/// first input is written and the walk marks the wide level without verifying it; nothing
+/// pulls the marked rows; the other input is written and a second walk ends, whose view is
+/// the floor. Returns what a marked row answers then (the model says 7).
+fn a_marked_row_asked_after_a_later_walk(plant: Plant) -> u64 {
+    const WIDE: usize = 70;
+    let mut flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    flow.push(sum(&[Dep::Input(1)]));
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..=WIDE {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 1);
+    }
+    let since = db.storage().view();
+    cells[0].set_a(&mut db, 7);
+    _ = changed_since::<Flow>(&db, since);
+    assert_eq!(db.storage().changed_set_work().marked, WIDE as u64);
+    cells[1].set_a(&mut db, 3);
+    _ = changed_since::<Flow>(&db, since);
+    assert_eq!(*fetch::<Flow>(&db, node(&db, WIDE)), 3);
+    *fetch::<Flow>(&db, node(&db, 5))
+}
+
+/// The invariant: the floor never holds a row a walk set apart. A row marked by a walk and
+/// asked for only after a later walk ended is run then, and answers as the model does.
+#[test]
+fn a_row_set_apart_is_not_held_by_a_later_floor() {
+    assert_eq!(a_marked_row_asked_after_a_later_walk(Plant::None), 7);
+}
+
+/// The control of [`a_row_set_apart_is_not_held_by_a_later_floor`]: a floor that holds the
+/// rows set apart too gives the marked row's old value.
+#[test]
+fn the_oracle_catches_a_floor_under_a_row_set_apart() {
+    assert_eq!(a_marked_row_asked_after_a_later_walk(Plant::FloorsRowsSetApart), 1);
+}
+
+/// A row that picks what it reads by an input, under a reader: input 0 is 0, so row 0 reads
+/// input 1 (31) and is 31; row 1 reads row 0. Input 0 is written to 1: row 0 runs again,
+/// reads input 2 (0) and is 31 again, so its stamp does not move, and the walk ends without
+/// reaching row 1, which the host's pull then marks unchanged with no look at its edges.
+/// Input 2 is written to 5 and the host pulls row 1 before any walk. Returns what it answers
+/// (the model says 36).
+fn a_reader_asked_after_its_dependency_reads_another_input(plant: Plant) -> u64 {
+    let flow = vec![
+        FlowNode { op: FlowOp::Pick, deps: vec![Dep::Input(0), Dep::Input(1), Dep::Input(2)] },
+        sum(&[Dep::Query(0)]),
+    ];
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow.clone();
+    let mut inputs = vec![0u64, 31, 0];
+    let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    assert_eq!(*fetch::<Flow>(&db, node(&db, 1)), 31);
+    let since = db.storage().view();
+    inputs[0] = 1;
+    cells[0].set_a(&mut db, 1);
+    assert_eq!(changed_since::<Flow>(&db, since), Changed::Keys(Vec::new()), "row 0 is 31 again");
+    assert_eq!(*fetch::<Flow>(&db, node(&db, 1)), 31);
+    inputs[2] = 5;
+    cells[2].set_a(&mut db, 5);
+    assert_eq!(evaluate(&flow, &inputs, 0)[1], 36);
+    *fetch::<Flow>(&db, node(&db, 1))
+}
+
+/// The invariant: a row's input summary holds what its dependencies read now, at every
+/// write. A dependency that runs again, reads another input and gives an equal value moves
+/// no stamp; its reader, marked unchanged with no look at its edges, still learns of the new
+/// input ([`crate::db::Storage::complete_summaries`]), so a write of that input is not
+/// passed over by the reader's summary.
+#[test]
+fn a_reader_learns_what_its_dependency_reads_now() {
+    assert_eq!(a_reader_asked_after_its_dependency_reads_another_input(Plant::None), 36);
+}
+
+/// The control of [`a_reader_learns_what_its_dependency_reads_now`]: with the gain kept to
+/// the dependency, the reader's summary shares no bit with the write and it answers its old
+/// value (the engine before 2026-11-12).
+#[test]
+fn the_oracle_catches_a_reader_that_keeps_its_old_summary() {
+    assert_eq!(
+        a_reader_asked_after_its_dependency_reads_another_input(Plant::LeavesReadersSummaries),
+        31
+    );
 }

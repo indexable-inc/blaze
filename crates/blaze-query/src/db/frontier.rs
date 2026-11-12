@@ -253,6 +253,16 @@ pub(crate) enum Plant {
     /// ([`Plan::suspects`]'s test taken out): the first walk after a build asks the readers
     /// of every row the build made again.
     AsksReadersThatSawTheChange,
+    /// No floor is kept ([`floor`]): a row verified further back than the written-field
+    /// history holds is proved by its edges, whatever walk ended since.
+    KeepsNoFloor,
+    /// The floor holds a row set apart too ([`floored`]'s test taken out): a row a walk
+    /// marked and nothing pulled is taken as unchanged once a later walk ends.
+    FloorsRowsSetApart,
+    /// A node whose summary gains a bit keeps it to itself
+    /// ([`Storage::complete_summaries`] taken out): a reader marked unchanged with no look at
+    /// its edges does not learn what its dependency reads now.
+    LeavesReadersSummaries,
 }
 
 /// The storage's part of the changed set.
@@ -260,6 +270,8 @@ pub(crate) struct Frontier {
     stored: SegQueue<Stored>,
     changed: SegQueue<u32>,
     untracked: SegQueue<u32>,
+    /// Nodes whose summary gained a bit since the last view boundary ([`Frontier::grew`]).
+    grew: SegQueue<u32>,
     /// Read by a walk, written at a view boundary (`&mut`).
     reverse: Reverse,
     #[expect(clippy::disallowed_types, reason = "held to move the walks' vectors in and out, never across a call")]
@@ -267,6 +279,9 @@ pub(crate) struct Frontier {
     /// The view the last walk ended in ([`Storage::view`]'s number), 0 before any: while it
     /// is the storage's view, a row not verified in it is unchanged ([`clean`]).
     clean_at: AtomicU64,
+    /// The stamp of the view every row but those set apart or untracked is known to hold as
+    /// of ([`floor`]); 0 for none. Renumbered with the stamps ([`Storage::restamp`]).
+    pub(crate) floor: AtomicU32,
     /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
     plant: Plant,
@@ -279,9 +294,11 @@ impl Frontier {
             stored: SegQueue::new(),
             changed: SegQueue::new(),
             untracked: SegQueue::new(),
+            grew: SegQueue::new(),
             reverse: Reverse::default(),
             walked: blaze_core::lock::Lock::new("query.frontier.walked", Walked::default()),
             clean_at: AtomicU64::new(0),
+            floor: AtomicU32::new(0),
             unwound: AtomicU32::new(0),
             plant: Plant::None,
         }
@@ -309,6 +326,13 @@ impl Frontier {
     #[inline]
     pub(crate) fn changed_field(&self, node: u32) {
         self.changed.push(node);
+    }
+
+    /// `node`'s summary gained a bit while it may have readers: a row that ran again and
+    /// reads another input now, or one a walk proved through a dependency that does.
+    #[inline]
+    pub(crate) fn grew(&self, node: u32) {
+        self.grew.push(node); // alloc: a word a node whose cone gained an input, rare
     }
 
     /// The run of `node` made an untracked read.
@@ -441,6 +465,7 @@ impl Storage {
     /// settles, which only a view boundary does, after folding itself.
     pub fn pack_reverse(&mut self) {
         self.fold_reverse();
+        self.complete_summaries();
         if !self.frontier.reverse.worth_packing() {
             return;
         }
@@ -454,6 +479,57 @@ impl Storage {
         let _entered = pack.enter();
         self.frontier.reverse.pack();
         pack.record("after", self.frontier.reverse.bytes());
+    }
+
+    /// Completes the input summaries, with `&mut` and after a fold: each node whose summary
+    /// gained a bit since the last view boundary gives its bits to its readers, and they to
+    /// theirs, until no summary changes.
+    ///
+    /// The invariant: when a write's mask is tested against a row, the row's summary holds a
+    /// bit of every input field its stored edges reach, transitively. A row takes its
+    /// dependencies' summaries as it ends a run, and a walk of its edges adds theirs; but a
+    /// dependency that runs again, reads another input and gives an equal value (backdated)
+    /// moves no stamp, so no reader looks at it again, and a reader marked unchanged with no
+    /// look at its edges (by its durability, its summary or [`clean`]; from the floor,
+    /// [`floor`]) kept the summary of what the dependency read before. A write of the new
+    /// input then shared no bit with the reader's summary, and the reader was taken as
+    /// unchanged: a stale result. Here every such gain is passed up before the next write is
+    /// tested.
+    ///
+    /// Cost: the reverse edges of the nodes whose summary changes, each node at most once a
+    /// bit it gains (128); nothing when no run gained an input.
+    pub(crate) fn complete_summaries(&mut self) {
+        if self.frontier.grew.is_empty() || self.frontier.plant == Plant::LeavesReadersSummaries {
+            return;
+        }
+        let storage = &*self;
+        let frontier = &storage.frontier;
+        let mut work: Vec<u32> = Vec::new(); // alloc: the nodes that gained an input, a word each
+        while let Some(node) = frontier.grew.pop() {
+            work.push(node);
+        }
+        let span = tracing::info_span!(
+            target: "blaze",
+            "input summaries complete",
+            grew = work.len(),
+            edges = tracing::field::Empty,
+            grown = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let (mut edges, mut grown) = (0u64, 0u64);
+        while let Some(node) = work.pop() {
+            let summary = storage.summary_of(node);
+            edges += frontier.reverse.readers(node, |reader| {
+                // Any bit more, one a reader of no input gains too: its readers lack it.
+                let old = storage.node(reader).add_summary(summary);
+                if (summary[0] & !old[0]) | (summary[1] & !old[1]) != 0 {
+                    grown += 1;
+                    work.push(reader); // alloc: as above
+                }
+            });
+        }
+        span.record("edges", edges);
+        span.record("grown", grown);
     }
 
     /// The nodes of the edge span `span`, into `out` (emptied first).
@@ -980,6 +1056,38 @@ fn walk(db: *const (), storage: &Storage) {
     // Published last: from here a row not verified in this view is unchanged ([`clean`]).
     frontier.unwound.store(apart, Ordering::Release);
     frontier.clean_at.store(view, Ordering::Release);
+    // And from this view on, until the next walk ends: the floor ([`floor`]).
+    frontier.floor.store(storage.view_bits(), Ordering::Release);
+}
+
+/// The floor: the stamp of the view the last walk ended in (or a settle that left nothing,
+/// [`Storage::settle_changed_set`]); 0 for none.
+///
+/// The invariant: every row made by then, but those set apart ([`floored`]) and those whose
+/// last run made an untracked read, held in that view: it was verified in it, or a pull of it
+/// in it would have found it unchanged (the module's argument for a walk's end). So such a
+/// row verified in an earlier view is unchanged in a later one when no input it read was
+/// written after the floor: the tests of durability and of the input summary are made from
+/// the floor's view, not from the row's own ([`Storage::holds`]). Without it a row verified
+/// more views back than the written-field history holds is proved by a walk of everything it
+/// read: after a build of hundreds of writes, the first edit's 41 suspects walked 1,076,963
+/// rows (a hello-world, 2026-11-12), and the next edit's, their stamps fresh, 1,798.
+#[inline]
+pub(crate) fn floor(storage: &Storage) -> u32 {
+    if storage.frontier.plant == Plant::KeepsNoFloor {
+        return 0;
+    }
+    storage.frontier.floor.load(Ordering::Acquire)
+}
+
+/// Whether the floor holds the row of `node`: it is not set apart. (A row with an untracked
+/// read is never proved without running: its callers do not ask.)
+#[inline]
+pub(crate) fn floored(storage: &Storage, node: u32) -> bool {
+    let frontier = &storage.frontier;
+    frontier.plant == Plant::FloorsRowsSetApart
+        || frontier.unwound.load(Ordering::Acquire) == 0
+        || !set_apart(frontier, node)
 }
 
 /// The log with `found` (sorted, each node once) after the kept findings, as view `view`'s,
@@ -1019,8 +1127,8 @@ impl Storage {
     /// view and taken out of the next walk's start. A node with a reader that is behind, or
     /// with nothing to say when it changed, stays for the next walk, which verifies.
     ///
-    /// It runs no query and verifies no row: it claims nothing about the rows ([`clean`] is
-    /// a walk's to say), only that the next walk need not ask these nodes' readers.
+    /// It runs no query and verifies no row. When it leaves nothing, every row holds in this
+    /// view as after a walk with no suspect, and the view becomes the floor ([`floor`]).
     ///
     /// Why no changed row is missed: a row changes by running again for a read that changed
     /// after it was verified. A node taken out has no reader verified before its stamp, so
@@ -1088,6 +1196,12 @@ impl Storage {
         walked.written = written;
         walked.log = log;
         drop(walked);
+        // Nothing left: every node that changed since the last walk has been seen by every
+        // reader, so every row holds in this view as after a walk that found no suspect, and
+        // this view is the floor ([`floor`]). The rows set apart stay apart.
+        if left == 0 {
+            frontier.floor.store(storage.view_bits(), Ordering::Release);
+        }
         span.record("said", done.said);
         span.record("edges", done.edges);
         span.record("settled", done.settled);

@@ -655,9 +655,7 @@ fn claimed<F: Function>(
         run::<F>(db, storage, index, row, key, None, false);
         return None;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-        || storage.inputs_unchanged(storage.node(node), word & VIEW_MASK)
-    {
+    if storage.holds(node, storage.node(node), meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
             storage.record_run(node, Cause::Evicted);
             run::<F>(db, storage, index, row, key, None, true);
