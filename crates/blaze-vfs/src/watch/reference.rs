@@ -76,6 +76,10 @@ struct Batch {
     index: HashMap<Box<str>, usize, Global>,
     /// Stamps and listings in flight: it commits once none is and every slot is looked at.
     open: u32,
+    /// The slots read whose stamps are to be taken again, and those written in place across
+    /// their read (`super::VERIFIES`).
+    verify: Vec<usize>,
+    unsure: Vec<usize>,
     /// The subtree a rescan looks at, relative to the watched directory.
     rescan: Option<String>,
     /// The directory a [`Lost::Unnamed`] lists alone: its slots are what was in it.
@@ -100,6 +104,10 @@ impl Batch {
             slots,
             index: HashMap::new_in(Global),
             open: 1,
+            // alloc: none until a file is read.
+            verify: Vec::new(),
+            // alloc: none until a file is written while it is read.
+            unsure: Vec::new(),
             rescan,
             relist,
             gone: HashMap::new_in(Global),
@@ -202,6 +210,8 @@ enum Pending {
     Stamp(u64),
     Entries(u64, FileName),
     Read(u64, usize),
+    /// The stamps of a batch's read files, taken again (`super::VERIFIES`).
+    Verify(u64),
 }
 
 pub struct Watcher {
@@ -355,9 +365,17 @@ impl Watcher {
                 self.listed(vfs, number, &dir, entries, effects);
             }
             (Pending::Read(number, at), done) => {
-                if let Some(slot) = self.batch(number).and_then(|it| it.slots.get_mut(at)) {
+                if let Some(batch) = self.batch(number)
+                    && let Batch { slots, verify, .. } = batch
+                    && let Some(slot) = slots.get_mut(at)
+                {
                     slot.look = Some(match done {
-                        Done::Read(bytes) => Look::File(bytes),
+                        Done::Read(bytes) => {
+                            if super::VERIFIES {
+                                verify.push(at);
+                            }
+                            Look::File(bytes)
+                        }
                         Done::Failed(error) => {
                             // alloc: an error path.
                             out.push(Watched::Unreadable { path: slot.path.clone(), error });
@@ -366,6 +384,38 @@ impl Watcher {
                         done => unreachable!("a read of {} completed with {done:?}", slot.file),
                     });
                 }
+            }
+            (Pending::Verify(number), Done::Stamped(stamps)) => {
+                let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
+                batch.open -= 1;
+                let Batch { slots, verify, unsure, .. } = batch;
+                assert_eq!(stamps.len(), verify.len(), "a stamp per file read");
+                for (&at, now) in verify.iter().zip(&stamps) {
+                    let slot = &mut slots[at];
+                    let before = slot.stamp.expect("a read path is stamped");
+                    if *now == before {
+                        continue;
+                    }
+                    let same_file = !now.is_gone()
+                        && !now.is_unknown()
+                        && now.ino == before.ino
+                        && now.mode & S_IFMT == before.mode & S_IFMT;
+                    match same_file {
+                        true => unsure.push(at),
+                        false => slot.look = Some(Look::Unreadable),
+                    }
+                }
+                verify.clear();
+            }
+            (Pending::Verify(number), Done::Failed(error)) => {
+                let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
+                batch.open -= 1;
+                let Batch { slots, verify, .. } = batch;
+                for at in verify.drain(..) {
+                    slots[at].look = Some(Look::Unreadable);
+                }
+                // alloc: an error path.
+                out.push(Watched::Unreadable { path: String::new(), error });
             }
             (Pending::Stamp(number), Done::Failed(error)) => {
                 let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
@@ -835,6 +885,9 @@ impl Watcher {
             .front()
             .is_some_and(|it| it.open == 0 && it.slots.iter().all(|it| it.look.is_some()))
         {
+            if self.verify(effects) {
+                break;
+            }
             let batch = self.batches.pop_front().expect("a batch");
             self.first += 1;
             let scanned = batch.rescan.is_some() || batch.relist.is_some() || batch.caught_up;
@@ -855,6 +908,23 @@ impl Watcher {
             self.ours.clear();
         }
         vfs.flush(effects);
+    }
+
+    /// Asks for the stamps of the files the first batch read, once more (`super::VERIFIES`).
+    fn verify(&mut self, effects: &mut Vec<Effect>) -> bool {
+        let Some(batch) = self.batches.front_mut() else { return false };
+        if batch.verify.is_empty() {
+            return false;
+        }
+        // alloc: a stamp buffer per batch that read a file.
+        let mut names = Names::default();
+        for &at in &batch.verify {
+            names.push_checked(batch.slots[at].file.as_str());
+        }
+        batch.open += 1;
+        let tag = self.tag(Pending::Verify(self.first));
+        effects.push(Effect::Stamp { files: Arc::new(names), tag }); // alloc: as above
+        true
     }
 
     /// Commits what a batch saw; returns the files moved from a node the tree no longer has,
@@ -1063,6 +1133,11 @@ fn save(disk: &mut Disk, batch: &Batch) {
             Some(Look::Gone) => disk.remove_under(slot.file.as_str()),
             Some(Look::Same) => {}
             Some(Look::Dir | Look::File(_) | Look::Moved(_)) => disk.set(slot.file.as_str(), stamp),
+        }
+    }
+    for &at in &batch.unsure {
+        if matches!(batch.slots[at].look, Some(Look::File(_))) {
+            disk.set(batch.slots[at].file.as_str(), Stamp::UNKNOWN);
         }
     }
     if let Some(cursor) = batch.cursor {
