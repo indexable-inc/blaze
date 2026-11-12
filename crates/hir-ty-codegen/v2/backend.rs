@@ -84,6 +84,13 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             spec.backend
         )));
     }
+    if spec.slots && !stencil {
+        // alloc: an error
+        return Err(fail(format!(
+            "a unit for {:?} that calls through slot words: only stencil code is the launcher's",
+            spec.backend
+        )));
+    }
     let isa = isa(unit, unit_target(unit, spec)?)?;
     let pic = isa.flags().is_pic();
     if pic != (spec.toolchain.relocation == Relocation::Pic) {
@@ -1019,9 +1026,12 @@ fn emit_stencil(
     function: Box<Function>,
     refs: &Refs,
     counted: bool,
+    slots: bool,
 ) -> Result<Emitted, CodegenError> {
     let target = function.target;
-    emit_built(unit, function, refs, |func, named| stenciled(unit, target, func, named, counted))
+    emit_built(unit, function, refs, |func, named| {
+        stenciled(unit, target, func, named, counted, slots)
+    })
 }
 
 /// A prepared function's code, its IR made code by `backend` (given the stack slots of its
@@ -1276,6 +1286,7 @@ fn stenciled(
     func: ir::Function,
     named: &[ir::StackSlot],
     counted: bool,
+    slots: bool,
 ) -> Result<fragment::Code, CodegenError> {
     if unit.backend != Backend::Stencil {
         // alloc: an error
@@ -1289,6 +1300,8 @@ fn stenciled(
         ));
     };
     stencils.counts = counted;
+    // The launcher's code (`Spec::slots`): calls through slot words, addresses of thunks.
+    stencils.slots = slots;
     crate::with_context(func, |context| {
         let pairs = stencil_ir(&mut context.func);
         let func = &context.func;
@@ -1439,7 +1452,7 @@ impl<'db> Prepare for Backends<'db> {
                 if imports.is_some() {
                     return Err(failed(unit, "imports for a stencil unit: imports are LLVM's"));
                 }
-                emit_stencil(unit, function, refs, spec.counted)
+                emit_stencil(unit, function, refs, spec.counted, spec.slots)
             }
         }
     }

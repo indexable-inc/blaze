@@ -418,6 +418,7 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
             heap_to_stack: false,
             report: false,
             fuel: false,
+            slots: false,
         };
         blaze_codegen::kernel::template(&stored, &spec.settings(), &spec.toolchain.id)
     };

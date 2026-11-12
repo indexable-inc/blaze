@@ -25,6 +25,7 @@ pub const TARGETS: [Target; 4] = [
         probe_stack: true,
         probe_log2: 12,
         counts: true,
+        slots: false,
     },
     Target {
         arch: blaze_codegen::Arch::Aarch64,
@@ -35,6 +36,7 @@ pub const TARGETS: [Target; 4] = [
         probe_stack: true,
         probe_log2: 12,
         counts: true,
+        slots: false,
     },
     Target {
         arch: blaze_codegen::Arch::Aarch64,
@@ -45,6 +47,7 @@ pub const TARGETS: [Target; 4] = [
         probe_stack: true,
         probe_log2: 12,
         counts: true,
+        slots: false,
     },
     Target {
         arch: blaze_codegen::Arch::X86_64,
@@ -55,6 +58,7 @@ pub const TARGETS: [Target; 4] = [
         probe_stack: true,
         probe_log2: 12,
         counts: true,
+        slots: false,
     },
 ];
 

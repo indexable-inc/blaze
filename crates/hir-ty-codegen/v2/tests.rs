@@ -127,6 +127,7 @@ fn spec() -> Spec {
         proc_macro_bridge: false,
         report: false,
         fuel: false,
+        slots: false,
         heap_to_stack: false,
     }
 }
