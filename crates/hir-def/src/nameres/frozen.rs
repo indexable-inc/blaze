@@ -74,6 +74,8 @@ use crate::{
     visibility::Visibility,
 };
 
+pub mod pages;
+
 type R<T = ()> = Result<T, String>;
 
 /// What a [keyed](Name::keyed) name is written as before its name and context: a text no name
@@ -228,6 +230,12 @@ fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
 /// `DefMap` is frozen. Bytes that do not read stop the query with [`Unreadable`], failing the
 /// job that asked: never a panic of the daemon, and never a crate resolved instead.
 pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
+    // A crate given pages is read from them and from nothing else: its frozen bytes, when it
+    // was given those as well (the image's part, for the image's other readers), are not
+    // decoded. One path a crate, said by what it was given ([`pages::set`]).
+    if pages::is_paged(db, krate) {
+        return Some(pages::served(db, krate));
+    }
     let frozen = frozen_def_map(db, krate)?;
     if frozen.mode == Mode::Check {
         return None;
@@ -250,7 +258,7 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
 /// Whether [`served`] gives `krate`'s `DefMap` from the image, without decoding it: the name
 /// resolution maintainer never maintains such a crate.
 pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
-    frozen_def_map(db, krate).is_some_and(|it| it.mode != Mode::Check)
+    pages::is_paged(db, krate) || frozen_def_map(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
 
 /// Records a difference between the `DefMap` resolving found and the frozen one, in
@@ -2287,15 +2295,18 @@ pub struct Dec<'a> {
     db: &'a Db,
     r: Reader<'a>,
     krate: Crate,
-    closure: Vec<Crate>,
+    /// Owned by a reader of one whole buffer; borrowed from the crate's memo by a reader of
+    /// one segment of its pages ([`pages`]), which is made once a name looked up.
+    closure: std::borrow::Cow<'a, [Crate]>,
     /// The files of each crate of the closure by their path from its root, read when first
     /// needed.
     paths: HashMap<u32, (String, bool, base_db::SourceRootId), Global>,
-    files: Vec<FileId>,
+    /// As `closure`: read from the header, or the pages' files as their head read them.
+    files: std::borrow::Cow<'a, [FileId]>,
     calls: Vec<MacroCallId>,
     contexts: Vec<SyntaxContext>,
-    /// The modules of the crate being read, in its `DefMap`'s order.
-    own: Vec<ModuleId>,
+    /// The modules of the crate being read, in its `DefMap`'s order. As `closure`.
+    own: std::borrow::Cow<'a, [ModuleId]>,
     /// Reading the crate's own `DefMap`, whose modules are `own`.
     in_def_map: bool,
     modules: HashMap<u32, Vec<ModuleId>, Global>,
@@ -2307,16 +2318,16 @@ impl<'a> Dec<'a> {
             db,
             r: Reader::new(bytes),
             krate,
-            closure: closure(db, krate),
+            closure: std::borrow::Cow::Owned(closure(db, krate)),
             paths: HashMap::new_in(Global),
             // alloc: the decoded map's own storage, once per crate served
-            files: Vec::new(),
+            files: std::borrow::Cow::Owned(Vec::new()),
             // alloc: the decoded map's own storage, once per crate served
             calls: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
             contexts: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
-            own: Vec::new(),
+            own: std::borrow::Cow::Owned(Vec::new()),
             in_def_map: false,
             modules: HashMap::new_in(Global),
         }
@@ -2452,7 +2463,7 @@ impl Dec<'_> {
                     ));
                 }
                 self.checked(krate, root, &path, content)?;
-                self.files.push(root);
+                self.files.to_mut().push(root);
                 continue;
             }
             if !self.paths.contains_key(&owner) {
@@ -2479,7 +2490,7 @@ impl Dec<'_> {
                 continue;
             };
             self.checked(krate, found, &full, content)?;
-            self.files.push(found);
+            self.files.to_mut().push(found);
         }
         not_loaded.map_or(Ok(()), Err)
     }
@@ -3515,14 +3526,14 @@ impl Dec<'_> {
             None,
         );
         let mut def_map = DefMap::empty(db, krate, TArc::new(data), placeholder, None);
-        self.own.push(def_map.root);
+        self.own.to_mut().push(def_map.root);
         for (parent, name) in skeleton.iter().skip(1) {
             let parent = parent.ok_or("a module with no parent")? as usize;
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
             // clone: the decoded map's own storage, once per crate served
             let name = name.clone().ok_or("a module with no name")?;
             let module = super::facts::queries::child_module(db, krate, None, parent, name);
-            self.own.push(module);
+            self.own.to_mut().push(module);
         }
         let mut table = super::ModulesMap::new();
         for (index, (parent, _)) in skeleton.iter().enumerate() {
@@ -3686,7 +3697,7 @@ mod tests {
     use super::*;
     use crate::test_db::TestDB;
 
-    const FIXTURE: &str = r#"
+    pub(super) const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib
 #[macro_use]
 extern crate lib;
@@ -3739,7 +3750,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     /// The differences are recorded for the whole process: the tests that read them take turns.
     static TURN: Lock<()> = Lock::new("test.def.frozen.turn", ());
 
-    fn crate_named(db: &TestDB, name: &str) -> Crate {
+    pub(super) fn crate_named(db: &TestDB, name: &str) -> Crate {
         *base_db::all_crates(db)
             .iter()
             .find(|it| {

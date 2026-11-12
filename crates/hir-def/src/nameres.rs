@@ -315,6 +315,9 @@ struct HeldRecords<'db> {
 enum RecordsSlot {
     Held(blaze_query::db::Id),
     Published(blaze_query::db::Id),
+    /// The records of a crate read from pages (`frozen::pages`): its tail segment, decoded
+    /// when first asked for.
+    Paged(Crate),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -583,6 +586,11 @@ impl<'db> Modules<'db> {
         let Some(data) = self.table(db).get(&module) else {
             panic!("ModuleId not found in ModulesMap: {module:#?}")
         };
+        // A module of a crate read from pages: the one name, from the page it is on. This memo
+        // is the name's; nothing else of the scope is decoded.
+        if let ScopeSlot::Paged(paged) = data.scope {
+            return frozen::pages::name_now(db, paged, &name);
+        }
         data.scope(db).get(&name)
     }
 }
@@ -673,13 +681,16 @@ enum ScopeSlot {
     Fact(blaze_query::db::Id),
     /// The module's scope as the name resolution maintainer published it (`delta::ScopeInput`).
     Input(blaze_query::db::Id),
+    /// The module's scope in its crate's pages (a `frozen::pages::PagedScope`): a name is read
+    /// from the page it is on, the whole scope decoded only for a reader of all of it.
+    Paged(blaze_query::db::Id),
 }
 
 impl ScopeSlot {
     /// The `ModuleScope` of a handed-over or fact slot.
     fn handle(&self, db: &Db) -> Option<blaze_query::db::Id> {
         match self {
-            ScopeSlot::Building(_) | ScopeSlot::Input(_) => None,
+            ScopeSlot::Building(_) | ScopeSlot::Input(_) | ScopeSlot::Paged(_) => None,
             ScopeSlot::Collected(id) => Some(*id),
             ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
         }
@@ -1165,6 +1176,7 @@ impl DefMap {
                         <HeldRecords<'a> as blaze_query::db::FromId>::from_id(id).records(db)
                     }
                     RecordsSlot::Published(resolution) => delta::published_records(db, resolution),
+                    RecordsSlot::Paged(krate) => frozen::pages::records(db, krate),
                 };
                 Records {
                     names: &held.names,
@@ -1616,6 +1628,7 @@ impl ModuleData {
         match &self.scope {
             ScopeSlot::Building(building) => &building.scope,
             ScopeSlot::Input(input) => delta::input_scope(db, *input),
+            ScopeSlot::Paged(paged) => frozen::pages::scope(db, *paged),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).scope(db)
@@ -1628,6 +1641,7 @@ impl ModuleData {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get(name),
             ScopeSlot::Input(input) => delta::input_name(db, *input, *name),
+            ScopeSlot::Paged(paged) => frozen::pages::name(db, *paged, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 *<ModuleScope<'_> as blaze_query::db::FromId>::from_id(id).name(db, *name)
@@ -1643,6 +1657,7 @@ impl ModuleData {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get_legacy_macro(name),
             ScopeSlot::Input(input) => delta::input_legacy_macro(db, *input, *name),
+            ScopeSlot::Paged(paged) => frozen::pages::legacy_macro(db, *paged, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id)
@@ -1658,6 +1673,9 @@ impl ModuleData {
             ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
             ScopeSlot::Input(input) => {
                 (None, Some(delta::input_traits(db, *input).iter().copied()))
+            }
+            ScopeSlot::Paged(paged) => {
+                (None, Some(frozen::pages::traits(db, *paged).iter().copied()))
             }
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
                 None,
@@ -1679,6 +1697,7 @@ impl ModuleData {
         match &self.scope {
             ScopeSlot::Building(building) => &building.children,
             ScopeSlot::Input(input) => delta::input_children(db, *input),
+            ScopeSlot::Paged(paged) => frozen::pages::children(db, *paged),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
                 <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).children(db)
@@ -1689,7 +1708,10 @@ impl ModuleData {
     pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.children,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
+            ScopeSlot::Collected(_)
+            | ScopeSlot::Fact(_)
+            | ScopeSlot::Input(_)
+            | ScopeSlot::Paged(_) => {
                 panic!("the children of a collected module are read-only")
             }
         }
@@ -1699,7 +1721,10 @@ impl ModuleData {
     pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.scope,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Input(_) => {
+            ScopeSlot::Collected(_)
+            | ScopeSlot::Fact(_)
+            | ScopeSlot::Input(_)
+            | ScopeSlot::Paged(_) => {
                 panic!("the scope of a collected module is read-only")
             }
         }
