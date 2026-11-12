@@ -125,6 +125,22 @@ mod tests;
 
 pub use shared::{Reader, Shared};
 
+/// What a read of an included file gave, in a few words: its length and content, or its error.
+fn read_said(read: &Result<std::sync::Arc<[u8]>, crate::ReadError>) -> String {
+    match read {
+        // alloc: a moved file's event, at most [`MOVED_NAMED`] a reload
+        Ok(bytes) => format!(
+            "{} bytes, content {:?}",
+            bytes.len(),
+            IncludedFile::content_of(Ok(bytes.as_ref()))
+        ),
+        Err(error) => format!("unreadable: {error}"), // alloc: as above
+    }
+}
+
+/// The most moved files one [`Db::reload_included_files`] names in events.
+const MOVED_NAMED: usize = 16;
+
 impl Db {
     /// The database of a build: no crate, no source root, and its batches run as plane tasks
     /// of the process's pool. What the crates above need set before a query runs (proc-macro
@@ -294,6 +310,19 @@ impl Db {
         })
     }
 
+    /// The read of the file outside the VFS at `path` set to `bytes`, if any crate read it
+    /// ([`Files::included_file`]): for a file whose bytes are known before they are on disk
+    /// and that was read from disk before then (a file a build script's run left in
+    /// `OUT_DIR`, read by an `include!` resolved before the run). Unlike
+    /// [`Db::set_included_file`] it makes no read of a file nothing read. Whether a read
+    /// changed.
+    pub fn settle_included_file(&mut self, path: &AbsPath, bytes: std::sync::Arc<[u8]>) -> bool {
+        if self.files.find_included(path).is_none() {
+            return false;
+        }
+        self.set_included_file(path, bytes)
+    }
+
     /// Reads again each file outside the VFS that `include_bytes!` or `include_str!` read,
     /// through the one reader that read it first ([`Files::reload_included_file`]), and sets
     /// those whose read moved in one batch named by `trigger`: so exactly their readers run
@@ -326,6 +355,23 @@ impl Db {
             return moved;
         }
         moved.sort();
+        // Each file that moved is named with what was read of it and what is read now: a
+        // write that every reader of the file runs again for must say which file it was
+        // (rule 19). Bounded: the first [`MOVED_NAMED`] of them, the rest counted.
+        for path in moved.iter().take(MOVED_NAMED) {
+            let path: &AbsPath = path.as_path();
+            let on_disk = files.on_disk(path.as_ref());
+            let was = files.find_included(path).map(|it| read_said(it.read_field(db)));
+            let now = read_said(&IncludedFile::read_now(&on_disk));
+            tracing::info!(
+                target: "blaze",
+                path = %path,
+                on_disk = %on_disk.display(),
+                was = was.as_deref().unwrap_or("never read"),
+                now = %now,
+                "an included file outside the VFS moved on disk"
+            );
+        }
         // Read once more as each is set: one changed back since is not set, nor listed.
         self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path)));
         span.record("moved", moved.len() as u64);
