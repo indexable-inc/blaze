@@ -25,6 +25,8 @@ use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 mod drawn;
 /// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
 mod gpu;
+/// Content keys: a unit's key and record in another directory, under another home.
+mod portable;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
