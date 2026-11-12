@@ -47,7 +47,6 @@ pub(crate) fn warm(footprint: u64, limit: u64) -> u64 {
         false => 0,
     }
 }
-}
 
 /// Whether this stretch of idleness gave back yet.
 #[derive(Default)]
