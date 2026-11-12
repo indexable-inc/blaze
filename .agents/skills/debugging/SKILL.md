@@ -291,6 +291,54 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 - If the build never ends, `open` holds the spans every thread was inside at the last flush,
   and `blaze slow` reports a build whose daemon died.
 
+## A daemon that hangs, stalls or dies
+
+- **While it lives:** `blaze debug inspect` prints one line of JSON from a thread and socket
+  of the daemon's own, so it answers when every worker is busy and when the loop is stuck:
+  `{"pid":..,"turn":{"turned":0,..},"tasks":[{"kind":..,"state":"running","awaits":..,"for_ms":..}],
+  "memory":{"footprint":..,"ceiling":..,"limit":..,"admission":"near"},"longest":[{"on":"key
+  infer(..)","who":"blaze-work-3","kind":"span","for_ms":41000}],"threads":[..],"job_waits":"..",
+  "lock_waits":[..]}`. Read `longest` first, then `turn.turned` (0: the loop does not turn),
+  then `job_waits` for jobs parked on fibers (they are on no thread). `--record` also writes a
+  flight recording and names it in `recorded`.
+- **After it went:** the command it hung up on names `its flight recording`:
+  `<state>/flightrec/<pid>-<unix ms>.cbor`, written on a panic outside a job, at the memory
+  ceiling, and on a stall of a build, the loop or a stop. `blaze debug inspect --read FILE`
+  prints why, what the daemon said and every thread's open spans; `--trace OUT` writes the
+  recorder's last two minutes as a Chrome trace. A fatal signal leaves no recording: read
+  `blaze explain problems` and `blaze slow`, which take its rows from `flight-<pid>.map`.
+
+## Fixing the compiler without compiling the world again
+
+Everything stored is keyed by the code identity of what made it: `codegen` (every template),
+`front_end` (images, check outcomes, bodies, goals, expansions) and `record` (unit records, with
+the other two). Each is a hash of whole packages, worked out by blaze-engine's build script
+under cargo and under blaze alike, so a fix to one front-end file misses every image and record,
+and a cargo-built blaze has other identities than a blaze-built one of the same tree.
+
+- `blaze debug toolchain` prints one line of JSON with no daemon: `built` (this blaze's three),
+  `keyed` (what it keys by), `assumed`, and `as`, the value to give another blaze:
+  `{"as":"codegen=<hex>,front_end=<hex>,record=<hex>","assumed":false,"built":{...},"keyed":{...}}`.
+- `BLAZE_DEV_TOOLCHAIN_AS=<as>` in the environment of the rebuilt blaze (and so of the daemon
+  it starts) keys as that blaze did, part by part; a part left out keeps this blaze's own, so
+  what that part's code makes is made again. After a fix to the front end, assume `codegen`
+  alone: every template is reused, every image, check and record is made again, and nothing
+  stale is served. Assume a part whose code you changed only when you know which stored
+  values the change touched, and say so with the number.
+- It is loud and bounded: every build and check starts with one `warning:` naming what is
+  assumed; `--release`, `-r`, a `--profile` other than `dev` or `test`, `bench` and `--goal max`
+  are refused naming the argument; the store check (`BLAZE_VERIFY_STORE`) runs at a rate of at
+  least 0.05, so a stale template is an error naming the function. A command whose value
+  differs from its daemon's is refused naming both (`blaze stop`, then run it again).
+- Never quote a measurement from a build under it as a build's time: `blaze explain problems`
+  lists the warning.
+
+There is no `blaze debug evict` yet: the store never deletes or replaces a value (a second
+value under a key is a refusal), the daemon's database has no reverse edges, and unit records
+do not name the keys they were made from, so the dependents of an entry cannot be found.
+A stored value the fixed code would make otherwise is reached today only by leaving its part
+out of `BLAZE_DEV_TOOLCHAIN_AS`.
+
 ## Limits to keep in mind
 
 - A key's name is its `Debug` with each id the front end can name followed by its name
@@ -301,6 +349,11 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
   across daemons: compare by name, or through `key_parts` and `misses`.
 - The counts are process-wide (two overlapping builds share them); the run log is the front
   end's own.
+- The history holds 4 GiB. Past it the oldest builds go whole, never one that is running nor
+  the newest; each time a WARN event says the files, rows, bytes and builds
+  (`blaze explain problems`), and another says rows the rings wrote over before a flush read
+  them. A build with fewer rows than it should have and neither event is a bug in the history:
+  read `manifest.json`'s `builds` of each file before any other guess.
 - `admission` says memory only when the task was passed over for it; a wait behind another
   task's starvation hold reads as a thread.
 - The `queries` view joins `provenance` on a span's `function`. That is a display name, so the

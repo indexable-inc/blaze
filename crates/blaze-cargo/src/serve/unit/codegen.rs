@@ -1151,6 +1151,12 @@ pub(crate) fn generate<'db>(
     // compiled again and checked ([`Build::verify_store`]); a value that is none is the error.
     let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env)
         .map_err(|it| it.to_string())?;
+    // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) may be served what
+    // other code made: the check is on whatever the request asked, at the least rate.
+    let verify = match crate::serve::dev_toolchain::dev() {
+        Some(_) => verify.at_least(crate::serve::dev_toolchain::VERIFY_RATE),
+        None => verify,
+    };
     let backends = Backends::default();
     // The describes the walks before this one kept for this database and this front end's
     // configuration (docs/v2/plan/design/incremental-walk.md): the walk takes each one the

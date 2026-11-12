@@ -62,8 +62,17 @@ several readers.
 
     **The cap.** Past `history::CAP_BYTES` the history deletes its oldest builds whole, every
     table of a build at once, never one table of a build; files of no build (an idle daemon's
-    flushes) go one at a time. A build is as old as its newest flush; the newest flush's build is
-    kept.
+    flushes) go one at a time. A flush is named for the highest build of its rows, so while
+    builds run at once a file named for one holds another's rows: the unit that goes is every
+    build whose files chain together through the builds their rows are of (the manifest's
+    `builds` of each file), all at once. A unit is as old as its newest flush. Two are never
+    retired: the newest flush's, and any that holds a row of a build still running, so a long
+    build keeps every row however far past the cap it takes the history. What the cap retires
+    is never silent: each time, a WARN event says the files, rows, bytes and builds
+    (`blaze explain problems` lists it), and so does one for each flush in which the rings
+    wrote over rows before the history read them. Until 2026-11-11 the unit was the build a
+    file was named for and nothing was said: an 80-minute build that shorter builds ran beside
+    kept its last five minutes of `task` spans.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
@@ -1396,6 +1405,50 @@ on, the event fields' too), so a blaze rebuilt after a crash, the usual case whe
 being fixed, reads it; a check of the hash would refuse exactly those files, and the
 fingerprint already refuses every one this blaze would misread.
 
+### Flight recordings
+
+The daemon writes what the recorder holds to `<state>/flightrec/<pid>-<unix ms>.cbor`
+(`crates/blaze-cargo/src/serve/flightrec.rs`) when a thread no job's runner catches panics (the
+loop, an IO thread, the guard), when it is stopped at its memory ceiling (the last 5 s only),
+when a build, the loop or a stop stalls past the stall bound, and when `blaze debug inspect
+--record` asks. The file is a 16-byte mark, its format as a `u32`, then one record in
+deterministic CBOR: why it was written, what the daemon said, every thread's open spans
+(name, item, `awaits`, owner, how long) and the recorder's last two minutes as the Chrome
+trace `blaze debug profile` writes, taken again over half the window while it is past 64 MiB.
+A file of another format is refused naming both; the directory keeps the newest 16. A fatal
+signal writes none (its handler can only do what is async-signal-safe): its rows are in
+`flight-<pid>.map`, above. The client a request hung up on names the newest recording of
+the daemon's pid (`its flight recording ...: <path>`), and `blaze debug inspect --read FILE
+[--trace OUT]` prints one as a line of JSON and writes its trace out.
+
+## Asking a live daemon: `blaze debug inspect`
+
+`blaze debug inspect` prints one line of JSON saying what the daemon is doing now. It is
+answered by a thread of its own on a socket of its own (`<home>/v2.inspect.sock`,
+`crates/blaze-cargo/src/serve/inspect.rs`), never by the loop or a pool job, so it answers
+while every work thread is busy and while the loop is stuck. It starts no daemon. The fields:
+
+- `threads`: each thread inside a span, waiting ones first, longest first: `name`, `state`
+  (`waiting` when its innermost span awaits something), `awaits`, `for_ms`, `node` (the plane
+  node of the `task` span it is inside) and `open`, its spans outermost first;
+- `tasks`: the plane's tasks that have not ended, running first: `kind`, `name`, `state`
+  (`running` or `queued`), `for_ms`, `deps` (the unsettled tasks it waits on), and for one a
+  thread is inside, that `thread` and what it `awaits`; `tasks_unread` says when the loop held
+  the table;
+- `lock_waits`: the named-lock, signal and kernel waits in progress with each lock's `holder`;
+- `job_waits`: the scheduler's waits in one line (each parked job and the key, counter or job
+  it waits on, with the key's claimer), or why they were not read within a second;
+- `longest`: the waits of `threads` and `lock_waits`, longest first, at most 32;
+- `memory`: `footprint`, `ceiling`, `limit` (what admission decides by), `admission` (`under`,
+  `near` past 7/8 of the limit, `over`) and each subsystem's bytes;
+- `turn`: the loop's `turns` and how many it `turned` in the 60 ms before the answer (0 is a
+  loop that does not turn), and the pool's `workers`, `working`, `parked`, `jobs_ended`;
+- `recorded`: with `--record`, the flight recording written.
+
+A job parked on a fiber keeps its spans off every thread, so its wait is in `job_waits`, with
+no age, and not in `longest`; a queued task's reason (memory, a thread) is in its `admission`
+span once it starts.
+
 ## The live feed
 
 `blaze debug live` and the explorer's live stream each get a `live::Feed` of their own on the
@@ -1437,7 +1490,8 @@ When none of them has moved for the stall bound, 120 s unless `blaze serve --sta
 says otherwise, the daemon:
 
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
-   samples as a Chrome trace (ui.perfetto.dev opens it);
+   samples as a Chrome trace (ui.perfetto.dev opens it), and a flight recording
+   (`state/flightrec/<pid>-<time>.cbor`, above) with what every thread was inside;
 2. fails each running request with the error `blaze stalled: no job ended, no query
    completed, no task or step ended, no job's code or run of user code was running and no
    download got a byte for N s while M tasks ran (the stall bound is B s,

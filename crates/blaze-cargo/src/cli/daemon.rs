@@ -815,6 +815,9 @@ pub struct Died {
     /// What it said in its log of its memory ceiling ([`ceiling_said`]); `None` where it said
     /// nothing of one.
     pub memory: Option<CeilingSaid>,
+    /// The flight recording it wrote as it went down (`crate::serve::flightrec`: a panic, its
+    /// memory ceiling, a stall), the newest of its pid; `None` where it wrote none.
+    pub flightrec: Option<PathBuf>,
 }
 
 /// What a daemon said in its log of its memory ceiling ([`crate::serve::ceiling`]): the last
@@ -1033,6 +1036,14 @@ impl Died {
             Ok(None) => {}
             Err(why) => write!(f, "\nits crash record is unread: {why}")?,
         }
+        if let Some(recording) = &self.flightrec {
+            write!(
+                f,
+                "\nits flight recording (what every thread was inside and the recorder's last \
+                 minutes, `blaze debug inspect --read FILE`): {}",
+                recording.display()
+            )?;
+        }
         Ok(())
     }
 }
@@ -1136,6 +1147,7 @@ pub fn died() -> anyhow::Result<Died> {
             inside: Ok(None),
             crash: Ok(None),
             memory: None,
+            flightrec: None,
         });
     };
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
@@ -1163,7 +1175,10 @@ pub fn died() -> anyhow::Result<Died> {
             )
         }
     };
-    Ok(Died { log, ended: Some((pid, ended)), said, inside, crash, memory })
+    // Written before it ended, whether or not it is gone yet: a build's stall writes one and
+    // the daemon stops after.
+    let flightrec = crate::serve::flightrec::latest(&crate::serve::state()?, pid);
+    Ok(Died { log, ended: Some((pid, ended)), said, inside, crash, memory, flightrec })
 }
 
 /// The last [`TAIL_BYTES`] of the daemon's log.
@@ -1978,6 +1993,7 @@ mod refusals {
             inside: Ok(None),
             crash: Ok(None),
             memory,
+            flightrec: None,
         };
         let killed = died(Ended::Gone, Vec::new(), Some(said.clone()));
         assert_eq!(killed.at_ceiling(), Some(AtCeiling::Killed { kernel: Kernel::Jetsam, near: 45 * GIB }));
@@ -2035,8 +2051,16 @@ mod refusals {
             inside: Ok(None),
             crash: Ok(None),
             memory: None,
+            flightrec: Some(PathBuf::from("/b/v2/flightrec/7-1700000000000.cbor")),
         };
         let text = died.to_string();
+        assert!(
+            text.ends_with(
+                "\nits flight recording (what every thread was inside and the recorder's last minutes, \
+                 `blaze debug inspect --read FILE`): /b/v2/flightrec/7-1700000000000.cbor"
+            ),
+            "the hang-up names the recording the daemon wrote: {text}"
+        );
         assert!(
             text.starts_with(&format!(
                 "the daemon (`blaze serve`, pid 4242) was ended by signal {}, SIGABRT: process abort signal; \
@@ -2070,6 +2094,7 @@ mod refusals {
             inside: Ok(Some(inside)),
             crash: Ok(None),
             memory: None,
+            flightrec: None,
         }
         .to_string();
         assert!(
@@ -2092,6 +2117,7 @@ mod refusals {
             inside: Ok(None),
             crash: Ok(None),
             memory: None,
+            flightrec: None,
         }
         .to_string();
         assert!(

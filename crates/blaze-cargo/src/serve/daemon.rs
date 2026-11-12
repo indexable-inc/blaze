@@ -2240,6 +2240,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         Arc::clone(&self.pulse) // clone: a handle, once a daemon
     }
 
+    /// The table of the plane's tasks the loop publishes for the explorer: what `blaze debug
+    /// inspect`'s thread reads the queued and running tasks from, off the loop.
+    #[cfg(feature = "native")]
+    pub fn tasks(&self) -> Arc<blaze_explore::Tasks> {
+        self.observe.tasks()
+    }
+
     /// The loop's effects to the driver, those that end on their own counted in `ending`.
     fn submit(&mut self) {
         for effect in &self.effects {
@@ -2373,6 +2380,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             DownloadsNow(&blaze_fetch::downloads::Downloads::process().shown())
         );
         tracing::error!("{said}");
+        // What every thread was inside and the recorder's last minutes, where the client that
+        // this stall hangs up on finds it (`flightrec`): written here, by the loop, which is
+        // about to fail every request and stop.
+        _ = super::flightrec::record(
+            super::flightrec::Why::Stall,
+            &said,
+            super::flightrec::WINDOW,
+        );
         let file = under(&self.state, &format!("stalls/{now}.json"));
         // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });

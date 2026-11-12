@@ -1035,6 +1035,15 @@ impl Diagnostic {
             explanation: None,
         }
     }
+
+    /// A warning of the whole request, of no unit, span or code: `warning: {message}`.
+    pub fn warning(message: String) -> Diagnostic {
+        Diagnostic {
+            level: Level::Warning,
+            rendered: format!("warning: {message}\n"), // alloc: the report owns it, once per warning
+            ..Diagnostic::note(message)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

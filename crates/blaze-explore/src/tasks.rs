@@ -74,6 +74,12 @@ impl Tasks {
         self.table.lock()
     }
 
+    /// The table when no one holds it, never waiting: for a reader that must answer though the
+    /// loop that writes it is stuck (`blaze debug inspect`, answered off the loop).
+    pub fn try_lock(&self) -> Option<LockGuard<'_, Table>> {
+        self.table.try_lock()
+    }
+
     /// One reading of both clocks: the plane's `plane_ns` is the profile's `mono_ns`. The loop
     /// gives it as the daemon starts and at each look; until it does, a tick that has tasks to
     /// send fails, naming it.
@@ -131,7 +137,42 @@ fn outcome(node: &NodeState) -> (Option<&'static str>, Option<&str>) {
     }
 }
 
+/// A task that has not ended, as [`Table::live`] hands it out. Times are the plane's clock.
+pub struct Live<'a> {
+    /// [`task_id`].
+    pub id: u64,
+    pub kind: &'static str,
+    pub name: &'a str,
+    /// The task ids it waits on.
+    pub deps: &'a [u64],
+    /// When the plane first said it.
+    pub said_ns: u64,
+    /// When it began to run; `None` while it is queued.
+    pub running_ns: Option<u64>,
+}
+
 impl Table {
+    /// Each task that has not ended, in id order: the plane's queued and running tasks.
+    pub fn live(&self, mut each: impl FnMut(Live<'_>)) {
+        for (&id, row) in &self.rows {
+            if row.end_ns.is_none() {
+                each(Live {
+                    id,
+                    kind: row.kind,
+                    name: &row.name,
+                    deps: &row.deps,
+                    said_ns: row.said_ns,
+                    running_ns: row.running_ns,
+                });
+            }
+        }
+    }
+
+    /// The profile's clock less the plane's ([`Tasks::clock`]); `None` until the loop gave it.
+    pub fn offset(&self) -> Option<i64> {
+        self.offset
+    }
+
     /// Tasks past [`MOST_TASKS`] not kept, so far.
     pub fn refused(&self) -> u64 {
         self.refused
