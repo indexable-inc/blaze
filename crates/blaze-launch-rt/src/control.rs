@@ -14,7 +14,9 @@
 //! | arrives | the control thread |
 //! |---|---|
 //! | (start) | says `Hello` |
-//! | `Welcome { slots, store, statics }` | opens the records, declares the slots |
+//! | `Welcome { slots, entry }` | declares the slots, and gives the entry's address to the thread that waits to run the program |
+//! | `Record { id, bytes }` | hands the record to [`Records`], which keeps it for the message that names it |
+//! | `Statics { defs }` | has [`Records`] give each static its memory and its value |
 //! | a stub's need of a slot | says `Need` once a slot, however many threads wait in its stub |
 //! | `Edit { txn, binds, declare, together }` | declares, runs [`Driver::edit`], says `Applied` (and lets the stubs of the slots it bound go on) or `Failed` |
 //! | `Refused { slot, diagnostic }` | gives the diagnostic to the threads in that slot's stub, which stop the program with it |
@@ -52,8 +54,10 @@ pub enum ControlError {
     Socket { call: &'static str, why: String },
     /// The daemon's socket ended.
     Closed(String),
-    /// [`Records::open`] refused the store.
+    /// [`Records`] refused a record or a static's definition.
     Store(String),
+    /// A `Welcome` whose entry is no slot of the table.
+    Entry { entry: Slot, slots: u32 },
     /// A `Refused` for a slot no thread asked for.
     Unasked { slot: Slot },
     /// A message whose handling is not built yet.
@@ -69,7 +73,12 @@ impl core::fmt::Display for ControlError {
                 write!(f, "the daemon's socket: {call} failed: {why}")
             }
             ControlError::Closed(why) => write!(f, "the daemon's socket ended: {why}"),
-            ControlError::Store(why) => write!(f, "the store: {why}"),
+            ControlError::Store(why) => write!(f, "the daemon's records: {why}"),
+            ControlError::Entry { entry, slots } => write!(
+                f,
+                "the daemon named slot {} as the program's entry, and the table has {slots}",
+                entry.0
+            ),
             ControlError::Unasked { slot } => {
                 write!(f, "the daemon refused slot {}, which no thread asked for", slot.0)
             }
@@ -109,6 +118,9 @@ struct Control<'a> {
     lost: Option<ControlError>,
     /// One frame on its way out.
     out: Vec<u8>,
+    /// Where the program's main thread waits for the address of its entry (the entry's
+    /// thunk, once `Welcome` declared the slots), or for why none can come.
+    ready: Sender<Result<usize, String>>,
 }
 
 /// Runs the control thread's loop on this thread until [`Shared::stop`]: says `Hello` for
@@ -119,10 +131,19 @@ pub fn run(
     socket: UnixStream,
     program: ProgramId,
     records: &mut dyn Records,
+    ready: Sender<Result<usize, String>>,
 ) -> (Driver, Result<(), ControlError>) {
     let shared = driver.shared();
-    let mut control =
-        Control { driver, socket, records, needs: Vec::new(), said: 0, lost: None, out: Vec::new() };
+    let mut control = Control {
+        driver,
+        socket,
+        records,
+        needs: Vec::new(),
+        said: 0,
+        lost: None,
+        out: Vec::new(),
+        ready,
+    };
     let reader = match control.begin(program, &shared) {
         Ok(reader) => Some(reader),
         Err(why) => {
@@ -135,7 +156,7 @@ pub fn run(
         let event = match control.driver.ready() {
             Some(event) => event,
             None => {
-                if let Err(why) = control.driver.collect() {
+                if let Err(why) = control.driver.collect(&mut *control.records) {
                     control.lose(why.into());
                 }
                 control.driver.wait()
@@ -226,7 +247,11 @@ impl Control<'_> {
     /// No code can come any more, for `why`: keeps the first such failure and answers every
     /// stub that waits.
     fn lose(&mut self, why: ControlError) {
-        self.answer(&why.to_string());
+        let said = why.to_string();
+        self.answer(&said);
+        // A main thread still waiting for its entry is told too (one that has it ignores
+        // the queue from then on).
+        drop(self.ready.try_send(Err(said)));
         self.lost.get_or_insert(why);
     }
 
@@ -284,17 +309,35 @@ impl Control<'_> {
     fn tell(&mut self, item: &[u8]) -> Result<(), ControlError> {
         let (id, tell) = Tell::decode(item).map_err(ControlError::Wire)?;
         match tell {
-            Tell::Welcome { slots, store, statics } => {
-                self.records.open(store, statics).map_err(ControlError::Store)?;
+            Tell::Welcome { slots, entry } => {
                 self.driver.declare(slots)?;
+                let Some(thunk) = self.driver.thunk(entry) else {
+                    return Err(ControlError::Entry { entry, slots });
+                };
+                // The program's main thread waits for this; were it gone, the process is
+                // ending and there is no one to tell.
+                drop(self.ready.send(Ok(thunk)));
+            }
+            Tell::Record { id, bytes } => {
+                self.records.record(id, bytes).map_err(ControlError::Store)?;
+            }
+            Tell::Statics { defs } => {
+                // alloc: the definitions out of the frame, for the length of the message.
+                let defs: Vec<wire::StaticDef<'_>> = defs.iter().collect();
+                let place = self.driver.place();
+                let defined = self.records.statics(&defs, place);
+                self.records.release();
+                defined.map_err(ControlError::Store)?;
             }
             Tell::Edit { txn, binds, declare, together } => {
                 if declare > 0 {
                     self.driver.declare(declare)?;
                 }
                 // alloc: the edit's binds out of the frame, for the length of the edit.
-                let binds: Vec<wire::Bind> = binds.iter().collect();
-                match self.driver.edit(txn, &binds, together, &mut *self.records) {
+                let binds: Vec<wire::Bind<'_>> = binds.iter().collect();
+                let edited = self.driver.edit(txn, &binds, together, &mut *self.records);
+                self.records.release();
+                match edited {
                     Ok(committed) => {
                         self.wake();
                         self.ask(Some(id), &Ask::Applied { txn, epoch: committed.epoch })?;

@@ -15,9 +15,11 @@ doctest = false
 
 # On `std`, not bstd: blaze-launch's src/lib.rs says why and when that changes.
 [dependencies]
-blaze-launch = { path = "../blaze-launch" }
+blaze-launch.workspace = true
 # The one channel (rule standard-structures): what threads tell the control thread.
 crossbeam-channel.workspace = true
+# A record's id is the BLAKE3 hash of its bytes: checked when the daemon gives one.
+blake3.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

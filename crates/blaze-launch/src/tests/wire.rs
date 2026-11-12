@@ -7,7 +7,8 @@ use hegel::TestCase;
 use hegel::generators as gs;
 
 use crate::wire::{
-    Arch, Ask, Bind, LONGEST_FRAME, List, Os, ProgramId, RecordId, SCHEMA, Tell, WireError, split,
+    Arch, Ask, Bind, LONGEST_FRAME, List, Os, ProgramId, RecordId, SCHEMA, StaticDef, Tell,
+    WireError, split,
 };
 use crate::{CodeId, Slot, Thread, Tier, Txn};
 
@@ -21,11 +22,31 @@ enum Owned {
     Frames { txn: u64, held: Vec<Slot> },
     Ended { domain: u64, marks: Vec<u8>, needs: Option<String> },
     Restarting { txn: u64 },
-    Welcome { slots: u32, store: String, statics: u64 },
-    Edit { txn: u64, binds: Vec<Bind>, declare: u32, together: bool },
+    Welcome { slots: u32, entry: u32 },
+    Record { id: [u8; 32], bytes: Vec<u8> },
+    Statics { defs: Vec<(u32, [u8; 32])>, refs: Vec<u32> },
+    Edit { txn: u64, binds: Vec<OwnedBind>, refs: Vec<u32>, declare: u32, together: bool },
     Refused { slot: u32, diagnostic: String },
     Probe { txn: u64, slots: Vec<Slot> },
     Restart { txn: u64, why: String },
+}
+
+/// A bind without its refs: every bind of a drawn edit shares the edit's one list.
+#[derive(Clone, Copy, Debug)]
+struct OwnedBind {
+    slot: u32,
+    record: [u8; 32],
+    code: [u8; 32],
+    optimized: bool,
+    len: u64,
+    align: u32,
+}
+
+/// What a message borrows that is not in its [`Owned`] as it is: the lists of structs.
+#[derive(Default)]
+struct Lists<'a> {
+    binds: Vec<Bind<'a>>,
+    defs: Vec<StaticDef<'a>>,
 }
 
 enum Message<'a> {
@@ -34,7 +55,40 @@ enum Message<'a> {
 }
 
 impl Owned {
-    fn message(&self) -> Message<'_> {
+    /// The lists of structs `message` borrows.
+    fn lists(&self) -> Lists<'_> {
+        match self {
+            Owned::Edit { binds, refs, .. } => Lists {
+                binds: binds
+                    .iter()
+                    .map(|bind| Bind {
+                        slot: Slot(bind.slot),
+                        record: RecordId(bind.record),
+                        code: CodeId(bind.code),
+                        tier: if bind.optimized { Tier::Optimized } else { Tier::Zero },
+                        len: bind.len,
+                        align: bind.align,
+                        refs: List::of(refs),
+                    })
+                    .collect(),
+                defs: Vec::new(),
+            },
+            Owned::Statics { defs, refs } => Lists {
+                binds: Vec::new(),
+                defs: defs
+                    .iter()
+                    .map(|(number, record)| StaticDef {
+                        number: *number,
+                        record: RecordId(*record),
+                        refs: List::of(refs),
+                    })
+                    .collect(),
+            },
+            _ => Lists::default(),
+        }
+    }
+
+    fn message<'a>(&'a self, lists: &'a Lists<'a>) -> Message<'a> {
         match self {
             Owned::Hello { program, pid, arm, mac, page } => Message::Ask(Ask::Hello {
                 program: ProgramId(*program),
@@ -57,12 +111,18 @@ impl Owned {
                 Message::Ask(Ask::Ended { domain: *domain, marks, needs: needs.as_deref() })
             }
             Owned::Restarting { txn } => Message::Ask(Ask::Restarting { txn: Txn(*txn) }),
-            Owned::Welcome { slots, store, statics } => {
-                Message::Tell(Tell::Welcome { slots: *slots, store, statics: *statics })
+            Owned::Welcome { slots, entry } => {
+                Message::Tell(Tell::Welcome { slots: *slots, entry: Slot(*entry) })
             }
-            Owned::Edit { txn, binds, declare, together } => Message::Tell(Tell::Edit {
+            Owned::Record { id, bytes } => {
+                Message::Tell(Tell::Record { id: RecordId(*id), bytes })
+            }
+            Owned::Statics { .. } => {
+                Message::Tell(Tell::Statics { defs: List::of(&lists.defs) })
+            }
+            Owned::Edit { txn, declare, together, .. } => Message::Tell(Tell::Edit {
                 txn: Txn(*txn),
-                binds: List::of(binds),
+                binds: List::of(&lists.binds),
                 declare: *declare,
                 together: *together,
             }),
@@ -114,7 +174,7 @@ fn slots(tc: &TestCase) -> Vec<Slot> {
 }
 
 fn owned(tc: &TestCase) -> Owned {
-    match pick(tc, 11) {
+    match pick(tc, 13) {
         0 => Owned::Hello {
             program: id(tc),
             pid: number(tc),
@@ -132,19 +192,28 @@ fn owned(tc: &TestCase) -> Owned {
             needs: tc.draw(gs::booleans()).then(|| text(tc)),
         },
         6 => Owned::Restarting { txn: number(tc) },
-        7 => Owned::Welcome { slots: small(tc), store: text(tc), statics: number(tc) },
+        7 => Owned::Welcome { slots: small(tc), entry: small(tc) },
+        11 => Owned::Record {
+            id: id(tc),
+            bytes: (0..pick(tc, 300)).map(|at| at as u8).collect(),
+        },
+        12 => Owned::Statics {
+            defs: (0..pick(tc, 20)).map(|_| (small(tc), id(tc))).collect(),
+            refs: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
+        },
         8 => Owned::Edit {
             txn: number(tc),
             binds: (0..pick(tc, 20))
-                .map(|_| Bind {
-                    slot: Slot(small(tc)),
-                    record: RecordId(id(tc)),
-                    code: CodeId(id(tc)),
-                    tier: if tc.draw(gs::booleans()) { Tier::Zero } else { Tier::Optimized },
+                .map(|_| OwnedBind {
+                    slot: small(tc),
+                    record: id(tc),
+                    code: id(tc),
+                    optimized: tc.draw(gs::booleans()),
                     len: number(tc),
                     align: small(tc),
                 })
                 .collect(),
+            refs: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
             declare: small(tc),
             together: tc.draw(gs::booleans()),
         },
@@ -172,7 +241,8 @@ fn encoded(message: &Message<'_>, id: u64) -> Vec<u8> {
 fn every_message_is_deterministic_cbor_and_reads_back(tc: TestCase) {
     let owned = owned(&tc);
     let id = number(&tc);
-    let message = owned.message();
+    let lists = owned.lists();
+    let message = owned.message(&lists);
     let mut stream = encoded(&message, id);
     let one = stream.len();
     stream.extend_from_slice(&encoded(&message, id));
@@ -209,7 +279,7 @@ const NEED: [u8; 43] = [
     0xa2, //
     0x64, b's', b'l', b'o', b't', 0x03, //
     0x66, b't', b'h', b'r', b'e', b'a', b'd', 0x07, //
-    0x66, b's', b'c', b'h', b'e', b'm', b'a', 0x01,
+    0x66, b's', b'c', b'h', b'e', b'm', b'a', 0x02,
 ];
 
 #[test]
@@ -218,7 +288,7 @@ fn a_need_is_these_bytes() {
     let mut out = Vec::new();
     need.encode(1, &mut out).expect("encoded");
     assert_eq!(out, NEED);
-    assert_eq!(SCHEMA, 1, "the bytes above say schema 1");
+    assert_eq!(SCHEMA, 2, "the bytes above say schema 2");
     assert_eq!(Ask::decode(&NEED[4..]), Ok((1, need)));
 }
 
@@ -232,8 +302,8 @@ fn need_with(at: usize, with: &[u8]) -> Vec<u8> {
 #[test]
 fn what_is_not_a_message_of_this_schema_is_refused_by_name() {
     // Another schema, though the body is one this schema could read.
-    let other = need_with(38, &[0x02]);
-    assert_eq!(Ask::decode(&other), Err(WireError::Schema { said: 2 }));
+    let other = need_with(38, &[0x01]);
+    assert_eq!(Ask::decode(&other), Err(WireError::Schema { said: 1 }));
     // A variant this schema has not.
     let nope = need_with(12, b"Nope");
     assert_eq!(Ask::decode(&nope), Err(WireError::Variant { at: 11 }));
