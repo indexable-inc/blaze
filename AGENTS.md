@@ -93,20 +93,22 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     `compiler-correctness`.
 33. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-34. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
-    on AWS. Skill: `build-and-test`.
-35. **fan-out-write-only**: One tree, one VM, one run: lanes only write code and push it to their
-    branch; the main agent merges every lane's branch into the one integration tree on the one build
-    VM, builds it once, and runs every check that makes sense on that one binary, then hands each
-    failure back to the lane that owns the code. Skill: `build-and-test`.
-36. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
-    `build-and-test`.
+34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
+    one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
+    build at a time. Skill: `build-and-test`.
+35. **fan-out-write-only**: One tree, one VM, one run: lanes only write code, in the one integration
+    directory; the main agent commits it, builds the one tree once on the one build VM, and runs
+    every check that makes sense on that one binary, then hands each failure back to the lane that
+    owns the code. Skill: `build-and-test`.
+36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
+    everything is tested at once; a worktree is the exception, for two lanes that must change the
+    same file or a variant tree; never `git stash`. Skill: `build-and-test`.
 37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
 38. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-39. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
-    branch. Skill: `build-and-test`.
+39. **clean-up-lane**: When a lane is done, delete what it made: its state on the build VM, any
+    worktree, branch or exception machine. Skill: `build-and-test`.
 40. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
 41. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
