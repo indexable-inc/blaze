@@ -725,3 +725,86 @@ fn the_oracle_catches_a_cover_left_on_a_retired_directory() {
     super::COVER_STAYS_ON_THE_RETIRED.set(false);
     assert!(!vouched, "planted: the cover asks its retired directory alone");
 }
+
+/// A home directory with a config file and a noisy tree under it: `/home/cfg` asked of by
+/// name while `/home/noise/x` is written again and again. What the name's check says after
+/// the noise, after a write of the file itself, after a file made beside it, and after its
+/// directory is made again; and whether the table was quiet through the noise.
+fn names_in_a_noisy_home() -> [bool; 5] {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(9, Faults::default());
+    sim.change(&name("home/cfg"), b"a = 1");
+    sim.change(&name("home/noise/x"), b"0");
+    dirs.watch_name(path("/home/cfg"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    assert!(!dirs.unchanged_since(path("/home/cfg"), generation), "nothing is asked of whole");
+    for turn in 0..4u8 {
+        sim.change(&name("home/noise/x"), &[turn]);
+        round(&mut sim, &mut outside, &mut effects);
+    }
+    let after_noise = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    let quiet = dirs.quiet_since(generation);
+    sim.change(&name("home/cfg"), b"a = 2");
+    round(&mut sim, &mut outside, &mut effects);
+    let after_write = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    let generation = dirs.generation();
+    sim.change(&name("home/other"), b"1");
+    round(&mut sim, &mut outside, &mut effects);
+    let after_sibling = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    // A name asked of after a generation was read is not vouched for at it.
+    let before = dirs.generation();
+    dirs.watch_name(path("/home/deep/dir/file"));
+    round(&mut sim, &mut outside, &mut effects);
+    let unasked = dirs.name_unchanged_since(path("/home/deep/dir/file"), before);
+    [after_noise, quiet, after_write, after_sibling, unasked]
+}
+
+/// The invariant: a name asked of ([`Dirs::watch_name`]) is vouched for exactly while nothing
+/// heard since the generation named it, an entry beside it, or a directory above it; what is
+/// written elsewhere under its directory moves neither it nor [`Dirs::quiet_since`]. A
+/// generation read before the name was asked of is never vouched for.
+#[test]
+fn a_name_is_vouched_for_through_noise_under_its_directory() {
+    assert_eq!(names_in_a_noisy_home(), [true, true, false, false, false]);
+}
+
+/// The control: with no name ever vouched for, the oracle's first answer is false.
+#[test]
+fn the_oracle_catches_a_name_never_vouched_for() {
+    super::NAMES_HEAR_NOTHING_BESIDE.set(true);
+    let [after_noise, ..] = names_in_a_noisy_home();
+    super::NAMES_HEAR_NOTHING_BESIDE.set(false);
+    assert!(!after_noise, "planted: the name is looked at on the disk every time");
+}
+
+/// A directory asked of whole under one watched for its names keeps hearing its own changes
+/// through that one's watch, and nothing of its siblings'.
+#[test]
+fn a_whole_directory_under_a_names_directory_hears_its_own_changes() {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(3, Faults::default());
+    sim.change(&name("home/cfg"), b"a");
+    sim.change(&name("home/out/debug/a.o"), b"1");
+    sim.change(&name("home/noise/x"), b"0");
+    dirs.watch_name(path("/home/cfg"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    dirs.want(path("/home/out"));
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    assert!(dirs.unchanged_since(path("/home/out/debug/a.o"), generation));
+    sim.change(&name("home/noise/x"), b"1");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(dirs.unchanged_since(path("/home/out/debug/a.o"), generation), "a sibling's change");
+    assert!(dirs.quiet_since(generation));
+    sim.change(&name("home/out/debug/a.o"), b"2");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/home/out/debug/a.o"), generation));
+    assert!(!dirs.quiet_since(generation));
+}

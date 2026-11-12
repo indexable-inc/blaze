@@ -136,7 +136,7 @@ struct Vouched {
     /// One for each name the answer rests on ([`names`]): all must have heard nothing. `None`
     /// for a path with `..` in it, one whose links don't resolve, or one a name of
     /// which no watched directory covers: each of its checks looks at the disk.
-    covers: Option<Box<[Cover<'static>]>>,
+    names: Option<Box<[PathBuf]>>,
     sequence: AtomicU64,
     generation: AtomicU64,
     present: AtomicBool,
@@ -313,9 +313,9 @@ impl Files {
         let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
         let known = found.filter(|it| *it.path == *path.as_os_str());
         if let Some(known) = known
-            && let Some(covers) = &known.covers
+            && let Some(names) = &known.names
             && let Some((generation, answer)) = known.read()
-            && covers.iter().all(|cover| cover.unchanged_since(generation))
+            && names.iter().all(|name| self.dirs.name_unchanged_since(name, generation))
         {
             return Ok(answer);
         }
@@ -340,18 +340,17 @@ impl Files {
     fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
         // Every name the answer rests on has its directory wanted, and all are covered or the
         // answer is not vouched for.
-        let covers = names(path, answer).and_then(|names| {
+        // Every name the answer rests on is asked of by name ([`Dirs::watch_name`]): what
+        // is written elsewhere under its directory does not move it.
+        let names = names(path, answer).map(|names| {
             for name in &names {
-                if let Some(parent) = name.parent() {
-                    self.dirs.want(parent);
-                }
+                self.dirs.watch_name(name);
             }
-            // alloc: once per path, on its first miss
-            names.iter().map(|name| self.dirs.cover(name)).collect::<Option<Box<[_]>>>()
+            names.into_boxed_slice()
         });
         let at = self.vouched.intern(id, || Vouched {
             path: path.as_os_str().into(), // alloc: once per path, on its first miss
-            covers,
+            names,
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
@@ -420,7 +419,7 @@ impl Files {
         // being answered again without a walk.
         let kept = self.entries.lock().get(path).copied();
         if let Some((generation, entry)) = kept
-            && self.dirs.unchanged_since(path, generation)
+            && self.dirs.name_unchanged_since(path, generation)
             && !ENTRY_LOOKS_EVERY_TIME.get()
         {
             return Ok(entry);
@@ -429,7 +428,7 @@ impl Files {
         let plain = path.parent().is_some_and(|dir| {
             let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
             if canonical && kept.is_none() {
-                self.dirs.want(dir);
+                self.dirs.watch_name(path);
             }
             canonical
         });
@@ -917,7 +916,7 @@ mod tests {
         let roundabout = dir.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
-        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());
+        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).names.is_none());
         assert_eq!(dirs.len(), 1);
         _ = std::fs::remove_dir_all(&made);
     }
@@ -972,7 +971,7 @@ mod tests {
         let path = dir.join("sdks/named/lib/m");
         assert_eq!(files.file(&path).unwrap(), hash);
         let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
-        assert_eq!(vouched.covers.as_ref().map(|it| it.len()), Some(3));
+        assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
         let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
         assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
         _ = std::fs::remove_dir_all(&made);
@@ -1009,7 +1008,7 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let vouched = Vouched {
             path: OsStr::new("/nowhere/a").into(),
-            covers: dirs.cover(Path::new("/nowhere/a")).map(|it| vec![it].into()),
+            names: Some(vec![PathBuf::from("/nowhere/a")].into()),
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
