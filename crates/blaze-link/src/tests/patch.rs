@@ -669,8 +669,8 @@ const EDIT_CONSTANT: u64 = 16 * BLOCK as u64;
 /// `.eh_frame_hdr`, the symbol table). Among 20 functions each of those is shorter than a
 /// block and is written at its length; among 200 each is written by the blocks its changed
 /// entries are in. One block for all three, as this said until 2026-11-11, failed on every
-/// run (14,886 bytes against 3,982: 4,320 more of `.rela.dyn`, 1,440 of `.eh_frame_hdr`,
-/// 5,144 of the symbol table).
+/// run (14,886 bytes against 3,982, in three ranges that grew by 4,320, 1,440 and 5,144
+/// bytes; the first is `.rela.dyn`, 24 bytes a function, the others were not looked at).
 #[test]
 fn a_same_size_body_edit_writes_the_function_and_a_constant() {
     let (few, size) = body_edit_among(20);
