@@ -143,6 +143,8 @@ struct Scratch {
     names: HashSet<Name, Global>,
     defs: HashSet<ModuleDefId, Global>,
     woken: HashSet<ImplId, Global>,
+    /// The crates a delta reaches ([`reached`]).
+    reach: HashSet<Crate, Global>,
     /// The crates' work, from a pass's nodes ([`run_nodes`]) to its end ([`finish`]).
     jobs: Vec<Job>,
     slots: Vec<(Crate, DirectorySlot)>,
@@ -225,7 +227,62 @@ struct Shared<'a> {
     owner: &'a HashMap<ImplId, Crate, Global>,
     woken: &'a HashSet<ImplId, Global>,
     crates_changed: bool,
+    /// A name or a def changed in some crate.
     changed: bool,
+    /// The crates a changed name or def can reach: each crate with a delta and every crate
+    /// that depends on one, however far ([`reached`]).
+    reach: &'a HashSet<Crate, Global>,
+}
+
+impl Shared<'_> {
+    /// Whether a name or def `krate` can see changed: one changed, and `krate` has a delta
+    /// or depends on a crate that has. A crate resolves through itself and its dependencies
+    /// alone, so one no delta reaches reads what it read: its wild impls key as they did and
+    /// its modules' body parts are what they were, and its node reads neither. Until
+    /// 2026-11-11 a change in any crate had every crate read every module that ever held an
+    /// impl in a body (a one-expression edit of a hello-world's `main`: 27 crates, 945 body
+    /// parts asked, among them `core`'s 304 modules).
+    fn changed_for(&self, krate: Crate) -> bool {
+        self.changed && self.reach.contains(&krate)
+    }
+}
+
+/// The crates of `all` that a delta of `deltas` reaches: those with one, and those that
+/// depend on one, directly or through others. One pass over the graph with a memo: the crate
+/// graph has no cycles.
+fn reached(
+    db: &Db,
+    all: &[Crate],
+    deltas: &HashMap<Crate, usize, Global>,
+    out: &mut HashSet<Crate, Global>,
+) {
+    fn of(
+        db: &Db,
+        krate: Crate,
+        deltas: &HashMap<Crate, usize, Global>,
+        memo: &mut HashMap<Crate, bool, Global>,
+    ) -> bool {
+        if let Some(&known) = memo.get(&krate) {
+            return known;
+        }
+        let mut reached = deltas.contains_key(&krate);
+        for dep in &krate.data(db).dependencies {
+            // Every dependency is asked, so each is in the memo once.
+            reached |= of(db, dep.crate_id, deltas, memo);
+        }
+        memo.insert(krate, reached);
+        reached
+    }
+    out.clear();
+    if deltas.is_empty() {
+        return;
+    }
+    let mut memo = HashMap::new_in(Global); // alloc: once per pass with a delta, a flag a crate
+    for &krate in all {
+        if of(db, krate, deltas, &mut memo) {
+            out.insert(krate);
+        }
+    }
 }
 
 impl State {
@@ -299,8 +356,13 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
         scratch.woken.extend(state.by_def.readers(*def));
     }
     let changed = !scratch.names.is_empty() || !scratch.defs.is_empty();
+    reached(db, &crates[..], &scratch.deltas, &mut scratch.reach);
     if changed {
-        scratch.woken.extend(state.wild.iter().copied());
+        // A wild impl keys again only where a change can reach it ([`Shared::changed_for`]).
+        let (owner, reach) = (&state.owner, &scratch.reach);
+        scratch.woken.extend(
+            state.wild.iter().copied().filter(|imp| owner.get(imp).is_some_and(|it| reach.contains(it))),
+        );
     }
     drop(waking);
     let mut jobs = std::mem::take(&mut state.scratch.jobs);
@@ -356,6 +418,7 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
             woken: &state.scratch.woken,
             crates_changed: written.crates,
             changed,
+            reach: &state.scratch.reach,
         };
         let mut order = nodes.plan.lock().order().to_vec(); // alloc: once per pass, the nodes' order
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -871,7 +934,8 @@ fn work_crate(db: &Db, shared: &Shared<'_>, job: &mut Job) {
         }};
     }
     let Job { delta, fresh, crate_state, scratch, work, .. } = job;
-    let (fresh, crates_changed, changed) = (*fresh, shared.crates_changed, shared.changed);
+    let (fresh, crates_changed, changed) =
+        (*fresh, shared.crates_changed, shared.changed_for(krate));
     let delta = delta.map(|at| &shared.last.crates[at]);
     if let Some(delta) = delta {
         phase!("impls apply_impls", apply_impls(db, scratch, crate_state, delta, work));
@@ -1496,7 +1560,7 @@ impl WarmWhy {
             WarmWhy::Fresh
         } else if shared.crates_changed {
             WarmWhy::CratesChanged
-        } else if shared.changed {
+        } else if shared.changed_for(job.krate) {
             WarmWhy::Changed
         } else if job.delta.is_some() {
             WarmWhy::Delta
@@ -1623,7 +1687,7 @@ fn warm(db: &Db, shared: &Shared<'_>, job: &mut Job) {
                 .map(|&it| Warm::Impl(it)),
         );
     }
-    if shared.crates_changed || shared.changed {
+    if shared.crates_changed || shared.changed_for(krate) {
         // A trait the write removed leaves the wild ones in the work, before they are read again.
         let gone = |it: &TraitId| {
             delta.is_some_and(|delta| {
@@ -1661,7 +1725,7 @@ fn warm(db: &Db, shared: &Shared<'_>, job: &mut Job) {
     }
     db.run_all(Tag::Infer, keys.len(), |db, at| warm_one(db, &keys[at]));
     let sweep = job.fresh || shared.crates_changed;
-    if !(sweep || shared.changed || delta.is_some()) {
+    if !(sweep || shared.changed_for(krate) || delta.is_some()) {
         return;
     }
     let mut modules = std::mem::take(&mut job.scratch.body_modules);

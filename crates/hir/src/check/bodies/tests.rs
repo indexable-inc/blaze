@@ -1018,3 +1018,104 @@ fn a_kept_check_with_no_changed_set_is_an_error_and_never_a_whole_plan() {
         assert!(said.contains("after the storage's view"), "the engine's reason: {said}");
     }
 }
+
+/// [`workspace`]`(60)` over `libraries` library crates (their source root a library's, as
+/// the standard library's and a registry crate's are), each a file of functions; `base`
+/// depends on the first, each on the next.
+fn workspace_over_libraries(libraries: usize) -> Files {
+    let mut files = workspace(60);
+    for (header, _) in files.iter_mut() {
+        if *header == "/base.rs crate:base" {
+            *header = "/base.rs crate:base deps:lib0";
+        }
+    }
+    for at in 0..libraries {
+        let deps = if at + 1 < libraries { format!(" deps:lib{}", at + 1) } else { String::new() };
+        // Leaked: a fixture's header lives as long as the test's process.
+        let header: &'static str =
+            Box::leak(format!("/lib{at}.rs crate:lib{at}{deps} new_source_root:library").into_boxed_str());
+        let mut text = String::new();
+        for nth in 0..20 {
+            text.push_str(&format!("pub fn lib{at}_{nth}(x: u32) -> u32 {{ x }}\n"));
+        }
+        files.push((header, text));
+    }
+    files
+}
+
+/// The engine's walk after a warm body edit of `edited`, in a workspace over `libraries`
+/// library crates: fields written, rows verified, reverse edges followed, rows changed.
+fn walk_of_a_body_edit_over(libraries: usize) -> (u64, u64, u64, u64) {
+    let mut files = workspace_over_libraries(libraries);
+    let fixture = fixture::db(&render(&files));
+    let hot = fixture.file_at("/hot.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let first = kinds_of_every_crate(&db);
+    assert_eq!(mismatches(&first), 0, "{first:?}");
+    set(&mut files, "/hot.rs", HOT_EDITED);
+    db.set_file_text(hot, HOT_EDITED);
+    let walk = blaze_query::db::attach(&db, || blaze_query::db::plumbing::walk_changed_set(&db));
+    assert_eq!(kinds_of_every_crate(&db), from_scratch(&files), "over {libraries} libraries");
+    (walk.written, walk.visited, walk.edges, walk.changed)
+}
+
+/// The invariant: what a body edit of a workspace crate costs does not grow with its
+/// dependencies. Over 5 library crates and over 50 the engine's walk writes, verifies,
+/// follows and finds the same.
+#[test]
+fn a_body_edit_costs_the_same_over_five_libraries_and_fifty() {
+    let (few, many) = (walk_of_a_body_edit_over(5), walk_of_a_body_edit_over(50));
+    assert_eq!(few, many, "(written, verified, edges, changed) over 5 libraries and over 50");
+    assert!(few.1 <= 96, "the walk is the edit's size: {few:?}");
+}
+
+/// A workspace crate over a library crate (its source root a library's): `caller` reads the
+/// library's `callee`.
+fn over_a_library() -> Files {
+    vec![
+        ("/top.rs crate:top deps:lib", "pub fn caller() { let _: u32 = lib::callee(); }\n".to_owned()),
+        ("/lib.rs crate:lib new_source_root:library", "pub fn callee() -> u32 { 1 }\n".to_owned()),
+    ]
+}
+
+/// The invariant: an edit of a library's file (a path dependency's, a patched registry
+/// crate's, the standard library's own) reaches the workspace body that reads it, though a
+/// library's rows are durable and are not looked at after a write of a workspace file: a
+/// write of a library file is a write of its own kind. The diagnostics after it are a
+/// database's made from scratch.
+#[test]
+fn an_edit_of_a_librarys_file_reaches_the_workspace_body_that_reads_it() {
+    let mut files = over_a_library();
+    let fixture = fixture::db(&render(&files));
+    let lib = fixture.file_at("/lib.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let first = kinds_of_every_crate(&db);
+    assert_eq!(first, from_scratch(&files));
+    assert_eq!(mismatches(&first), 0, "{first:?}");
+    for (text, broken) in [("pub fn callee() -> bool { true }\n", 1), ("pub fn callee() -> u32 { 2 }\n", 0)] {
+        set(&mut files, "/lib.rs", text);
+        db.set_file_text(lib, text);
+        let kept = kinds_of_every_crate(&db);
+        assert_eq!(kept, from_scratch(&files), "after the library's file is `{text}`");
+        assert_eq!(mismatches(&kept), broken, "{kept:?}");
+    }
+}
+
+/// The control of [`an_edit_of_a_librarys_file_reaches_the_workspace_body_that_reads_it`]:
+/// with the engine following no reverse edge, the body that reads the library keeps its
+/// kept answer, and the build from scratch reports the mismatch it lost.
+#[test]
+fn the_oracle_catches_a_library_edit_that_reaches_no_reader() {
+    let mut files = over_a_library();
+    let fixture = fixture::db(&render(&files));
+    let lib = fixture.file_at("/lib.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    assert_eq!(kinds_of_every_crate(&db), from_scratch(&files));
+    blaze_query::db::Database::storage_mut(&mut db).plant_forgotten_readers_of_written();
+    let text = "pub fn callee() -> bool { true }\n";
+    set(&mut files, "/lib.rs", text);
+    db.set_file_text(lib, text);
+    let (kept, scratch) = (kinds_of_every_crate(&db), from_scratch(&files));
+    assert_ne!(kept, scratch);
+    assert!(mismatches(&kept) < mismatches(&scratch), "{kept:?} against {scratch:?}");
+}
