@@ -55,6 +55,7 @@ impl Clap for Command {
                 COMPILE_TIME_DEPS,
                 MANIFEST,
                 REFUSED,
+                GOAL,
             ],
             Command::Check => &[
                 GLOBAL,
@@ -75,6 +76,7 @@ impl Clap for Command {
                 COMPILE_TIME_DEPS,
                 MANIFEST,
                 REFUSED,
+                GOAL,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -91,10 +93,11 @@ impl Clap for Command {
                 MANIFEST,
                 REPORTS,
                 REFUSED,
+                GOAL,
             ],
             Command::Test => &[
                 GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS,
-                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
             ],
             Command::Bench => &[
                 GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING,
@@ -349,6 +352,14 @@ const TEST_ONLY: &[Flag] = &[
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
 const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 
+/// `--goal edit|max` is blaze's: what the build waits for before it answers
+/// ([`blaze_api::Goal`], docs/v2/plan/design/tiers.md). `edit` answers once every function has
+/// tier 0 code; `max` once every function has its optimized code. Without it the profile
+/// says: `dev` edits, `release` is `max` ([`blaze_api::Goal::of_profile`]). `check` takes it
+/// and compiles no program, so one command line serves all four.
+const GOAL: &[Flag] =
+    &[Flag { possible: blaze_api::Goal::NAMES, ..Flag::new("goal", None, Takes::Value, "GOAL") }];
+
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
@@ -379,6 +390,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "ub-seed"
                 | "ub-schedules"
                 | "refused"
+                | "goal"
                 | "baselines"
                 | "bless-baselines"
                 | "new-baseline"
@@ -466,8 +478,8 @@ pub enum DaemonVerb {
 pub struct Invocation {
     pub command: Option<Command>,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
-    /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*` and `--refused`,
-    /// nor `-C`.
+    /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*`, `--refused`
+    /// and `--goal`, nor `-C`.
     pub args: Vec<String>,
     /// `test`'s and `bench`'s `TESTNAME`.
     pub filter: Option<String>,
@@ -605,6 +617,8 @@ pub struct Flags {
     pub ub_schedules: Option<u32>,
     /// `--refused`: `None` without it, `Some(None)` for `all`, else `Some(Some(N))`.
     pub refused: Option<Option<u32>>,
+    /// `--goal`: `None` without it, for the profile's own goal.
+    pub goal: Option<blaze_api::Goal>,
     /// `--unit-graph` and `--timings`, by name, as given.
     pub reports: Vec<&'static str>,
     /// `check`'s `--fix`, and each `--lint` it is narrowed to.
@@ -670,6 +684,8 @@ impl Flags {
                 self.ub_schedules = value.and_then(|it| it.parse().ok());
             }
             "refused" => self.refused = value.map(|it| it.parse().ok()),
+            // `check_value` held it to the goals' names first.
+            "goal" => self.goal = value.and_then(blaze_api::Goal::named),
             "fix" => self.fix = true,
             "lint" => self.lints.extend(owned()),
             "replace" => self.replace.extend(owned()),

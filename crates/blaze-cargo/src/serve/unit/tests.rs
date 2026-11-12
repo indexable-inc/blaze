@@ -1154,19 +1154,22 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
     );
 }
 
-/// A build script's compile is one program under every goal, so `blaze check` and `blaze
+/// A build script's compile is one program under every kind of job, so `blaze check` and `blaze
 /// build` key its record alike and the second finds what the first stored; a library checked
-/// is not the library built, and keys the goal.
+/// is not the library built, and keys the kind.
 #[test]
 fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
-    use crate::serve::work::Goal;
-    let goals = [Goal::Check, Goal::Build, Goal::Test, Goal::Run];
+    use crate::serve::work::JobKind;
+    let kinds = [JobKind::Check, JobKind::Build, JobKind::Test, JobKind::Run];
     let script =
         unit("p", target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
-    let keyed: Vec<u8> = goals.iter().map(|goal| compile::keyed_goal(*goal, &script)).collect();
+    let keyed: Vec<u8> = kinds.iter().map(|kind| compile::keyed_kind(*kind, &script)).collect();
     assert!(keyed.iter().all(|it| *it == keyed[0]), "{keyed:?}");
     let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
-    assert_ne!(compile::keyed_goal(Goal::Check, &lib), compile::keyed_goal(Goal::Build, &lib));
+    assert_ne!(
+        compile::keyed_kind(JobKind::Check, &lib),
+        compile::keyed_kind(JobKind::Build, &lib)
+    );
 }
 
 const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n\
@@ -1324,17 +1327,17 @@ fn a_proc_macros_root_is_its_file_on_disk_and_its_def_map_has_its_macros() {
 /// compile, which is linked as under `cargo build` so that it can run.
 #[test]
 fn a_check_links_its_build_scripts_and_checks_the_rest() {
-    use crate::serve::work::Goal;
+    use crate::serve::work::JobKind;
     let script =
         unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Check, &[]);
     let bin = unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
-    assert!(!super::checks_only(Goal::Check, &script));
-    assert!(super::checks_only(Goal::Check, &lib));
-    assert!(super::checks_only(Goal::Check, &bin));
-    assert!(super::checks_only(Goal::Build, &lib));
-    assert!(!super::checks_only(Goal::Build, &script));
-    assert!(!super::checks_only(Goal::Build, &bin));
+    assert!(!super::checks_only(JobKind::Check, &script));
+    assert!(super::checks_only(JobKind::Check, &lib));
+    assert!(super::checks_only(JobKind::Check, &bin));
+    assert!(super::checks_only(JobKind::Build, &lib));
+    assert!(!super::checks_only(JobKind::Build, &script));
+    assert!(!super::checks_only(JobKind::Build, &bin));
 }
 
 /// `blaze check` links a proc macro a crate uses as its wasm32-wasip1 module, as `blaze build`
@@ -1342,17 +1345,17 @@ fn a_check_links_its_build_scripts_and_checks_the_rest() {
 /// crate record. A proc-macro crate checked for itself (a member, `Mode::Check`) is only checked.
 #[test]
 fn a_check_links_its_proc_macros_as_wasm_modules() {
-    use crate::serve::work::Goal;
+    use crate::serve::work::JobKind;
     let mut macros = target("m", "proc-macro", "/w/m/src/lib.rs");
     macros.crate_types = vec!["proc-macro".to_owned()];
     let mut used = unit(P, macros.clone(), Mode::Build, &[]);
     used.macro_wasm = true;
     let mut checked = unit(P, macros, Mode::Check, &[]);
     checked.macro_wasm = true;
-    assert!(!super::checks_only(Goal::Check, &used));
-    assert_eq!(super::phases(Goal::Check, &used), &crate::serve::work::Phase::BUILD);
-    assert!(!super::checks_only(Goal::Build, &used));
-    assert!(super::checks_only(Goal::Check, &checked));
+    assert!(!super::checks_only(JobKind::Check, &used));
+    assert_eq!(super::phases(JobKind::Check, &used), &crate::serve::work::Phase::BUILD);
+    assert!(!super::checks_only(JobKind::Build, &used));
+    assert!(super::checks_only(JobKind::Check, &checked));
 }
 
 /// A proc macro's `.wasm` output that holds a library's crate record (an `ar` archive) is
@@ -1622,7 +1625,8 @@ fn script_front_for(
         script_link_args: Vec::new(),
         linked_rustflag_libs: Vec::new(),
         makers: one_maker(),
-        goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
+        kind: compile::keyed_kind(crate::serve::work::JobKind::Build, script),
+        goal: compile::goal_byte(blaze_api::Goal::Edit),
         color: false,
         short: false,
         verified: false,
@@ -2338,7 +2342,8 @@ fn each_maker_of_a_record_moves_its_key() {
             script_link_args: Vec::new(),
             linked_rustflag_libs: Vec::new(),
             makers,
-            goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
             color: false,
             short: false,
             verified: false,
@@ -2367,6 +2372,50 @@ fn each_maker_of_a_record_moves_its_key() {
     }
 }
 
+/// Rule 21 for the build goal (docs/v2/plan/design/tiers.md): a unit's record holds the code
+/// of the tier its goal picked, and its unit and plan are the same under both goals, so the
+/// goal is in the record key: an `edit` build's record is never served to a `max` build, nor
+/// the other way, and a unit only checked (which compiles no code) is neither's.
+#[test]
+fn the_goal_moves_a_units_record_key() {
+    use blaze_api::Goal;
+    let key = |front: &mut MemFront, goal: u8| {
+        let identity = front.lowered.identity(0).unwrap();
+        let u = &front.units.graph.units[0];
+        compile::RecordInputs {
+            identity,
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[0],
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
+            makers: one_maker(),
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal,
+            color: false,
+            short: false,
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+            width: None,
+            refused: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let mut front = orphan_front(false);
+    let (edit, max) = (compile::goal_byte(Goal::Edit), compile::goal_byte(Goal::Max));
+    assert!(edit != 0 && max != 0 && edit != max, "0 is a unit only checked");
+    let at_edit = key(&mut front, edit);
+    assert_eq!(key(&mut front, edit), at_edit, "the same goal, the same key");
+    assert_ne!(key(&mut front, max), at_edit, "tier 0 code and optimized code under one key");
+    assert_ne!(key(&mut front, 0), at_edit);
+    assert_ne!(key(&mut front, 0), key(&mut front, max));
+}
+
 /// Rule 21 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
 /// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
 /// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
@@ -2386,7 +2435,8 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             script_link_args: Vec::new(),
             linked_rustflag_libs: Vec::new(),
             makers: one_maker(),
-            goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
             color: false,
             short: false,
             verified: false,

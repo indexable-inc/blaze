@@ -38,7 +38,7 @@ use super::{
     job::{DURABLE_WITHIN, ENDED_LOST, ENDED_ROWS, RECHECK},
     plane::{Inline, Runner},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut,
+        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
         Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
         applying_fallible,
     },
@@ -666,7 +666,7 @@ impl Steps for Fake {
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
         Ok(FrontEnd {
-            front: Arc::new(FakeFront { goal: job.goal }),
+            front: Arc::new(FakeFront { kind: job.kind }),
             writer,
             puts: Vec::new(),
             misses: Vec::new(),
@@ -692,7 +692,7 @@ impl Steps for Fake {
 }
 
 pub(super) struct FakeFront {
-    goal: Goal,
+    kind: JobKind,
 }
 
 /// A front end's inputs: the build scripts' runs applied to it, in the order applied, whether
@@ -1265,7 +1265,7 @@ impl Front<Fake> for FakeFront {
         FakeReader(_): FakeReader,
         selection: Selection<'_>,
     ) -> Result<Vec<String>, Failed> {
-        assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
+        assert_eq!(self.kind, JobKind::Check, "tests under the evaluator only check their units");
         let all = ["a::adds", "a::overflows", "b::reads"];
         Ok(all
             .iter()
@@ -1368,7 +1368,7 @@ impl Front<Fake> for FakeFront {
         no_deps: bool,
         private: bool,
     ) -> Result<Vec<Response>, Failed> {
-        assert_eq!(self.goal, Goal::Check, "the documentation only checks its units");
+        assert_eq!(self.kind, JobKind::Check, "the documentation only checks its units");
         writer.apply()?;
         let Some(inputs) = Arc::get_mut(&mut writer.inputs) else {
             return Err(ApiError::new("a task still reads the front end", None).into());
@@ -1544,6 +1544,7 @@ fn agent() -> Targets {
     Targets {
         packages: Vec::new(),
         profile: String::new(),
+        goal: None,
         target: None,
         features: Vec::new(),
         all_features: false,
@@ -2183,6 +2184,7 @@ fn an_agents_targets_are_the_views_invocation() {
     let targets = Targets {
         packages: vec!["app".into()],
         profile: "release".into(),
+        goal: None,
         target: None,
         features: vec!["x".into()],
         all_features: false,
@@ -4421,7 +4423,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let front = Arc::new(FakeFront { goal: Goal::Check });
+    let front = Arc::new(FakeFront { kind: JobKind::Check });
     let inputs = Arc::new(FakeInputs { runs: vec![4, 7], ..FakeInputs::default() });
     let reading =
         || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
@@ -4492,7 +4494,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
         Step::of(
             &cancelled,
             Does::Compile {
-                front: Arc::new(FakeFront { goal: Goal::Build }),
+                front: Arc::new(FakeFront { kind: JobKind::Build }),
                 back: Default::default(),
             },
         )

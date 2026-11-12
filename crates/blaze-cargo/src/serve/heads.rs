@@ -542,6 +542,7 @@ mod tests {
         let targets = blaze_api::Targets {
             packages: Vec::new(),
             profile: String::new(),
+            goal: None,
             target: None,
             features: Vec::new(),
             all_features: false,
@@ -576,6 +577,7 @@ mod tests {
         let targets = blaze_api::Targets {
             packages: Vec::new(),
             profile: String::new(),
+            goal: None,
             target: None,
             features: Vec::new(),
             all_features: false,
@@ -655,6 +657,7 @@ mod tests {
         let targets = blaze_api::Targets {
             packages: Vec::new(),
             profile: String::new(),
+            goal: None,
             target: None,
             features: Vec::new(),
             all_features: false,
@@ -689,6 +692,7 @@ mod tests {
         let targets = || blaze_api::Targets {
             packages: Vec::new(),
             profile: String::new(),
+            goal: None,
             target: None,
             features: Vec::new(),
             all_features: false,

@@ -314,6 +314,30 @@ fn refused_is_blazes_a_count_or_all() {
 }
 
 #[test]
+fn goal_is_blazes_edit_or_max_on_build_run_test_and_check() {
+    use blaze_api::Goal;
+    assert_eq!(cargo(&["build"]).flags.goal, None, "the profile's own goal");
+    let max = cargo(&["build", "--goal", "max", "--release"]);
+    assert_eq!(max.flags.goal, Some(Goal::Max));
+    assert_eq!(max.args, ["--release"], "cargo never sees `--goal`");
+    assert_eq!(cargo(&["run", "--goal=edit"]).flags.goal, Some(Goal::Edit));
+    assert_eq!(cargo(&["test", "--goal", "edit"]).flags.goal, Some(Goal::Edit));
+    assert_eq!(cargo(&["check", "--goal", "max"]).flags.goal, Some(Goal::Max));
+    assert_eq!(cargo(&["build", "--goal", "MAX"]).flags.goal, Some(Goal::Max));
+    for other in ["fast", "balanced", "release", "0"] {
+        let said = refused(&["build", "--goal", other]);
+        assert!(
+            said.starts_with(&format!("error: invalid value '{other}' for '--goal <GOAL>'")),
+            "{said}"
+        );
+        assert!(said.contains("edit") && said.contains("max"), "{said}");
+    }
+    assert!(parse(os(&["doc", "--goal", "max"])).is_err(), "doc compiles no program");
+    assert!(parse(os(&["build", "--goal"])).is_err());
+    assert!(parse(os(&["build", "--goal", "edit", "--goal", "max"])).is_err(), "one goal");
+}
+
+#[test]
 fn run_has_the_rest() {
     let asked = cargo(&["run", "--release", "a", "--verbose", "--", "b"]);
     assert_eq!(asked.args, ["--release"]);

@@ -145,6 +145,7 @@ impl TargetsConfig {
         Targets {
             packages: self.packages.clone(), // clone: once per check run, its request
             profile: self.profile.clone(),   // clone: once per check run, its request
+            goal: None,
             target: self.target.clone(),     // clone: once per check run, its request
             features: self.features.clone(), // clone: once per check run, its request
             all_features: self.all_features,

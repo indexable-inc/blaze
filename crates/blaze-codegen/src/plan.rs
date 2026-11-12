@@ -20,6 +20,10 @@
 //!   compiles each function once, at its level: the output never depends on timing.
 //! - A tiered run ([`Mode::Tiered`]) starts each function at opt-level 0 as stencils that
 //!   count, patchable: `blaze_stencil::tier` tiers it up by its counts, not the plan.
+//! - The build goal (docs/v2/plan/design/tiers.md) picks the tier of the profile's own code by
+//!   the level the policy is made at: [`OptLevel::tier_zero`] under `edit`,
+//!   [`OptLevel::optimized`] under `max`. The level is in every function's settings through
+//!   its backend, so `code(f, tier 0)` and `code(f, optimized)` are two store keys.
 
 use std::{cmp::Ordering, collections::BTreeMap, fmt};
 
@@ -53,6 +57,32 @@ impl OptLevel {
             OptLevel::O0 | OptLevel::O1 => Some(Backend::Stencil),
             OptLevel::O2 | OptLevel::S | OptLevel::Z => llvm.then_some(Backend::Llvm { opt: 2 }),
             OptLevel::O3 => llvm.then_some(Backend::Llvm { opt: 3 }),
+        }
+    }
+
+    /// Whether native code at the level is the optimized tier's: LLVM's, at 2, 3, `s` and `z`.
+    pub const fn is_optimized(self) -> bool {
+        !matches!(self, OptLevel::O0 | OptLevel::O1)
+    }
+
+    /// The level tier 0 code of a profile at this level is compiled at, what the `edit` goal
+    /// answers with: itself where that is stencils already (0 and 1), else 1, as a profile
+    /// that asks for stencils at every level is compiled ([`Profile::stencils`]). Overflow
+    /// checks, debug assertions and debug info are not the level's: they stay the profile's.
+    pub const fn tier_zero(self) -> OptLevel {
+        match self.is_optimized() {
+            true => OptLevel::O1,
+            false => self,
+        }
+    }
+
+    /// The level the optimized code of a profile at this level is compiled at, what the `max`
+    /// goal waits for: itself where that is LLVM's already (2, 3, `s`, `z`), else 3, LLVM at
+    /// full optimization, as `blaze_stencil::tier`'s last tier is.
+    pub const fn optimized(self) -> OptLevel {
+        match self.is_optimized() {
+            true => self,
+            false => OptLevel::O3,
         }
     }
 }
@@ -551,6 +581,68 @@ mod tests {
 
     /// AGENTS.md rule 10: native code is stencils or LLVM's at every level, origin and mode,
     /// the first tier of a live build's included.
+    /// The invariant: a function's tier is part of its store key (`keys-cover-every-input`,
+    /// docs/v2/plan/design/tiers.md). Tier 0 and the optimized tier of one profile differ in
+    /// the backend, which is in the settings ([`Spec::settings`]), which are in the instance's
+    /// key ([`crate::Instance::key`]): the same code and arguments at the two tiers are two
+    /// keys, at every level a profile can ask for, and the two tiers of every level are the
+    /// same two whichever goal a build first asked with.
+    #[test]
+    fn the_two_tiers_of_a_function_are_two_store_keys() {
+        use blaze_items::CodeHash;
+
+        use crate::Instance;
+        let key = |level: OptLevel| {
+            let choice = policy(level, Mode::Output).choose(&member(), None).unwrap();
+            let instance = Instance {
+                code: CodeHash(ContentId([7; 32])),
+                args: ContentId([9; 32]),
+                settings: choice.first.settings(),
+            };
+            (choice.first.backend, instance.key())
+        };
+        let levels =
+            [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::S, OptLevel::Z];
+        for level in levels {
+            let (zero, optimized) = (level.tier_zero(), level.optimized());
+            assert!(!zero.is_optimized() && optimized.is_optimized(), "{level:?}");
+            let (first, first_key) = key(zero);
+            let (last, last_key) = key(optimized);
+            assert_eq!(first, Backend::Stencil, "{level:?}: tier 0 is stencils");
+            assert!(
+                matches!(last, Backend::Llvm { opt: 2 | 3 }),
+                "{level:?}: the optimized tier is LLVM's, never {last:?}"
+            );
+            assert_ne!(first_key, last_key, "{level:?}: one key for two tiers");
+            // A tier's key is the tier's alone: asked for again, it is the same key.
+            assert_eq!(key(zero).1, first_key);
+            assert_eq!(key(optimized).1, last_key);
+            // A tier of a tier is itself: promotion asks for the key a `max` build makes.
+            assert_eq!((zero.tier_zero(), optimized.optimized()), (zero, optimized));
+        }
+        // A level that is a tier already is left as the profile gave it: a release build at
+        // `max` and a dev build at `edit` are compiled as before the goal.
+        assert_eq!(OptLevel::O0.tier_zero(), OptLevel::O0);
+        assert_eq!(OptLevel::O1.tier_zero(), OptLevel::O1);
+        for level in [OptLevel::O2, OptLevel::O3, OptLevel::S, OptLevel::Z] {
+            assert_eq!(level.optimized(), level);
+            assert_eq!(level.tier_zero(), OptLevel::O1);
+        }
+        assert_eq!(OptLevel::O0.optimized(), OptLevel::O3);
+        assert_eq!(OptLevel::O1.optimized(), OptLevel::O3);
+    }
+
+    /// `max` on a blaze with no LLVM is refused, naming the code and the level: never
+    /// answered with tier 0 code.
+    #[test]
+    fn the_optimized_tier_without_llvm_is_refused_by_name() {
+        let mut policy = policy(OptLevel::O0.optimized(), Mode::Output);
+        policy.toolchain.llvm = None;
+        let refused = policy.choose(&member(), None).unwrap_err();
+        assert_eq!(refused, PlanError::NoLlvm { origin: member(), level: OptLevel::O3 });
+        assert!(refused.to_string().contains("needs LLVM"), "{refused}");
+    }
+
     #[test]
     fn native_code_is_never_cranelifts() {
         let levels =

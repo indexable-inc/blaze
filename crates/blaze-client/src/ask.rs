@@ -51,6 +51,10 @@ pub struct Options {
     /// `None` for the command's own: `dev` of a build and a check, `test` of a test.
     #[serde(default)]
     pub profile: Option<String>,
+    /// What the request waits for, `"edit"` or `"max"` (`blaze_api::Goal`); `None` for the
+    /// profile's own (`dev` edits, `release` is `max`).
+    #[serde(default)]
+    pub goal: Option<blaze_api::Goal>,
     /// How many `-v`.
     #[serde(default)]
     pub verbose: u8,
@@ -92,6 +96,7 @@ impl Options {
             width: None,
             target: None,
             profile: None,
+            goal: None,
             verbose: 0,
             features: Vec::new(), // alloc: none
             packages: Vec::new(), // alloc: none
@@ -253,6 +258,7 @@ pub fn request(
         // clone: the request owns what it names, here and below.
         target: options.target.clone(),
         profile: options.profile.clone().unwrap_or_else(|| method.profile().to_owned()),
+        goal: options.goal,
         features: options.features.clone(),
         packages: options.packages.clone(),
         all_features: options.all_features,

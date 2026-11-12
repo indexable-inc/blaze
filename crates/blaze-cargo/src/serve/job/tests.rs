@@ -11,6 +11,7 @@ fn targets() -> Targets {
     Targets {
         packages: vec!["a".into(), "b".into()],
         profile: "release".into(),
+        goal: None,
         target: Some("wasm32-unknown-unknown".into()),
         features: vec!["x".into(), "y".into()],
         all_features: false,
@@ -74,7 +75,7 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
 #[test]
 fn work_is_placed_whole_when_any_link_was() {
     use crate::serve::work::Full;
-    let link = |how| ("/w/target/debug/app".to_owned(), how);
+    let link = |how| ("/w/target/debug/app".to_owned(), how, None);
     assert_eq!(link_kind(&[]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
@@ -173,7 +174,7 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
     let work =
         Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
     assert_eq!(command_of(&work), Command::Test);
-    assert_eq!(goal_of(&work), Goal::Check);
+    assert_eq!(kind_of(&work), JobKind::Check);
     let compiled = Work::Test {
         targets: targets(),
         filter: Vec::new(),
@@ -181,16 +182,16 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
         args: Vec::new(),
         ub: None,
     };
-    assert_eq!(goal_of(&compiled), Goal::Test);
+    assert_eq!(kind_of(&compiled), JobKind::Test);
 }
 
 #[test]
 fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
     let ahead = Work::Ahead { targets: targets(), filter: vec!["parse".into()] };
-    assert_eq!((command_of(&ahead), goal_of(&ahead)), (Command::Test, Goal::Test));
+    assert_eq!((command_of(&ahead), kind_of(&ahead)), (Command::Test, JobKind::Test));
     assert!(targets_of(&ahead).is_some());
     let edit = Work::Edit(Vec::new());
-    assert_eq!((command_of(&edit), goal_of(&edit)), (Command::Check, Goal::Check));
+    assert_eq!((command_of(&edit), kind_of(&edit)), (Command::Check, JobKind::Check));
     assert!(targets_of(&edit).is_none());
     assert!(reuses_plans(&edit) && reuses_plans(&ahead));
 }
