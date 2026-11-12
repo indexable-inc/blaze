@@ -510,10 +510,19 @@ fn is_plain(list: Option<view::AssocItemList<'_>>) -> bool {
     })
 }
 
-/// Whether `attr` is an attribute no crate resolves as a macro: one word, built in or
-/// `rustc_`'s, and not `cfg_attr`, which may write any attribute.
+/// Whether `attr` is an attribute no crate resolves as a macro: `cfg(..)`, or one word, built
+/// in or `rustc_`'s, and not `cfg_attr`, which may write any attribute.
+///
+/// `cfg(..)` and `cfg_attr(..)` are metas of their own kinds in the tree, a predicate and no
+/// path (`Meta::path` is `None` of both), so they are told by kind: asked for its path, a
+/// `#[cfg(..)]` was no attribute at all, and no `impl` with a cfg'd assoc item was plain.
 fn is_inert(attr: view::Attr<'_>) -> bool {
-    let Some(path) = attr.path() else { return false };
+    let path = match attr.meta() {
+        Some(view::Meta::CfgMeta(_)) => return true,
+        Some(view::Meta::CfgAttrMeta(_)) | None => return false,
+        Some(meta) => meta.path(),
+    };
+    let Some(path) = path else { return false };
     let word = path.syntax().text();
     word != "cfg_attr"
         && !word.is_empty()

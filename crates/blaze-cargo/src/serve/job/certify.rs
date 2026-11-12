@@ -6,20 +6,23 @@
 //! pinned view, a variable from the request's environment, a file or a listing outside the
 //! views through [`blaze_usercode::inputs::Disk`], an output's stamp and bytes through the
 //! loop's driver: [`Effect::Stat`], [`Effect::ReadAll`]). A hit says what the build said again
-//! and finishes with no job; a miss goes on into the job ([`Jobs::begin_job`]). A build that
-//! made nothing hands the machine what it read at its end ([`Jobs::certify_written`]) and the
+//! and finishes with no job; a miss goes on into the job ([`Jobs::begin_job`]). Every build
+//! of a checkout is heard as it speaks ([`Building`], [`Jobs::certify_heard`]); one that
+//! answered, having compiled or not, hands the machine what it read and what a build with
+//! nothing to do says ([`said::Saying`]) at its end ([`Jobs::certify_written`]) and the
 //! record is written.
 //!
 //! What this driver does not do yet, each named in certificate.md, "State": the shape is not
 //! relocated (the base holds the checkout's directory, an output's path is absolute, base 0);
-//! the one node is the view's root; a build that compiled writes none.
+//! the one node is the view's root.
 
-use std::{cell::RefCell, sync::Arc};
+use std::cell::RefCell;
 
 use blaze_record::Digest;
 
 use super::certificate::{self, Evidence, Read, Stamp};
 use super::request::{self, Ask, Next, Told, View};
+use super::said;
 use super::*;
 
 /// The most (checkout, shape) pairs evidence is held of; past it the oldest goes. Evidence is
@@ -107,8 +110,70 @@ struct Checking {
     span: tracing::Span,
 }
 
-/// A build that ended and may have left a certificate, as [`Jobs::keep_answer`] saw it: kept
-/// until the loop has the store in hand ([`Jobs::certify_written`]).
+/// A build of a checkout under way, heard as it speaks: at its end, what its request's
+/// certificate is written of ([`Ended`]). One a job, from its view's last open to its
+/// `Finish`.
+pub(super) struct Building {
+    pub(super) job: JobId,
+    root: u32,
+    shape: ContentId,
+    /// The view it reads (a root id of content, its own lock-file writes in it), its config
+    /// and its request.
+    inputs: Inputs,
+    saying: said::Saying,
+    /// [`blaze_vfs::outside::looks`] as read before it looked at anything.
+    looks: u64,
+    /// The variables its steps asked for by name ([`Building::steps_read`]); or why they are
+    /// not known.
+    named: Result<Vec<String>, String>,
+    /// The files and the listings its steps read by path outside the views; or why they are
+    /// not known.
+    read: Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String>,
+}
+
+impl Building {
+    /// What its steps read, as its writer says once every task of it ended.
+    pub(super) fn steps_read(
+        &mut self,
+        named: Result<Vec<String>, String>,
+        read: Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String>,
+    ) {
+        (self.named, self.read) = (named, read);
+    }
+
+    /// It ended, `passed` or not.
+    fn end(self, passed: bool) -> Ended {
+        let Building { root, shape, inputs, saying, looks, named, read, .. } = self;
+        // Its looks at the disk are taken whatever its outcome: the next build's are its own.
+        let files = blaze_vfs::outside::take_file_looks();
+        drop(blaze_vfs::outside::take_named_looks());
+        let looked_again = blaze_vfs::outside::looks() != looks;
+        if !passed {
+            // alloc: a reason, once a build
+            return Ended { root, shape, built: Err(request::Unwritten::Failed.to_string()) };
+        }
+        // A file it looked at on the disk that no watch vouched for is a read of its own, at
+        // the hash that look saw. A look of another kind is named by no record.
+        let looked = match (looked_again, files) {
+            (false, _) => Ok(Vec::new()), // alloc: none
+            (true, Some(files)) => Ok(files),
+            // alloc: a reason, once a build
+            (true, None) => Err(match blaze_vfs::outside::last_look() {
+                Some(path) => format!("a look at the disk outside every view that is of no one file, the last at {}", path.display()),
+                None => "a look at the disk outside every view that is of no one file".to_owned(),
+            }),
+        };
+        let built = match saying.end() {
+            Ok(said) => Ok(Walked { inputs, said, named, read, looked }),
+            // alloc: a reason, once a build
+            Err(what) => Err(format!("no request certificate is written: the build said {what}, which no build says with nothing to do")),
+        };
+        Ended { root, shape, built }
+    }
+}
+
+/// A build that ended, as its [`Building`] heard it: kept until the loop has the store in
+/// hand ([`Jobs::certify_written`]).
 pub(super) struct Ended {
     root: u32,
     shape: ContentId,
@@ -116,60 +181,41 @@ pub(super) struct Ended {
     built: Result<Walked, String>,
 }
 
-/// What a build that made nothing read and said.
+/// What a build that answered read and what a build of its request says with nothing to do.
 struct Walked {
-    /// The root of the view it read, its own writes in it: an id of content, never the
-    /// checkout's head.
-    view: ContentId,
-    config: Arc<BuildConfig>,
-    config_id: ContentId,
-    request: ContentId,
-    drawn: ContentId,
-    responses: Arc<[Response]>,
-    worked: Option<Worked>,
-    named: Result<Arc<[String]>, String>,
-    read: Result<(Arc<[std::path::PathBuf]>, Arc<[std::path::PathBuf]>), String>,
-    looked: Arc<[(std::path::PathBuf, Option<[u8; 32]>)]>,
-}
-
-impl Ended {
-    /// Of a build of checkout `root` and request shape `shape` whose walk ended as `last`.
-    pub(super) fn of(root: u32, shape: ContentId, last: &Last) -> Ended {
-        let built = match last {
-            Ok(answer) => Ok(Walked {
-                view: answer.inputs.view,
-                config: Arc::clone(&answer.inputs.config), // clone: a refcount
-                config_id: answer.inputs.config_id,
-                request: answer.inputs.request,
-                drawn: answer.inputs.drawn,
-                responses: Arc::clone(&answer.responses), // clone: a refcount
-                worked: answer.worked.clone(),            // clone: one `Work`, once a build
-                named: answer.named.clone(),              // clone: a refcount or a reason
-                read: answer.read.clone(),                // clone: refcounts or a reason
-                looked: Arc::clone(&answer.looked),       // clone: a refcount
-            }),
-            Err(why) => Err(why.to_string()), // alloc: a reason, once a build
-        };
-        Ended { root, shape, built }
-    }
+    inputs: Inputs,
+    /// [`said::Saying::end`].
+    said: Vec<Response>,
+    named: Result<Vec<String>, String>,
+    read: Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String>,
+    /// The files it looked at on the disk itself, each with what was there; or the look
+    /// that is of no file.
+    looked: Result<Vec<(std::path::PathBuf, Option<[u8; 32]>)>, String>,
 }
 
 /// What the jobs hold for the request machines.
 pub(super) struct Certify {
+    /// The blaze that serves: the hash of its own executable ([`tool_of`]), once it was asked
+    /// for.
+    tool: Option<[u8; 32]>,
     /// The searches of the certificates' read-lists, counted.
     tally: blaze_record::Tally,
     checking: Vec<Checking>,
     /// One a checkout and request shape, oldest first, at most [`MOST_EVIDENCE`].
     evidence: Vec<(u32, ContentId, Evidence)>,
+    /// One a job that builds a checkout now.
+    pub(super) building: Vec<Building>,
     pub(super) ended: Vec<Ended>,
 }
 
 impl Certify {
     pub(super) fn new() -> Certify {
         Certify {
+            tool: None,
             tally: blaze_record::Tally::default(),
             checking: Vec::new(), // alloc: none until a request is checked
             evidence: Vec::new(), // alloc: none until a request is checked
+            building: Vec::new(), // alloc: none until a checkout is built
             ended: Vec::new(),    // alloc: none until a build ends
         }
     }
@@ -194,13 +240,27 @@ fn evidence_of(
     &mut held[at].2
 }
 
+/// The blaze that serves, by content: the BLAKE3 hash of the executable running now
+/// ([`blaze_profile::identity::binary_hash`], the one home of it: what `builds.blaze` names
+/// each build's blaze by). Never its version: a blaze built again under the same version is
+/// another program, and what the old one answered is not its answer (rule 21). Hashed once
+/// a process (the daemon's history has it hashed before the first request); `held` keeps it
+/// for the loop. A blaze that cannot read itself certifies nothing and says so.
+fn tool_of(held: &mut Option<[u8; 32]>) -> Result<[u8; 32], String> {
+    if let Some(tool) = held {
+        return Ok(*tool);
+    }
+    let _hashing = tracing::info_span!(target: "blaze", "request certificate: the hash of this blaze's executable").entered();
+    let tool = blaze_profile::identity::binary_hash()
+        // alloc: an error, once
+        .map_err(|error| format!("the request certificate is of the blaze that serves it, by the hash of its executable, which could not be read: {error}"))?;
+    Ok(*held.insert(tool))
+}
+
 /// The base of the certificates of a request of plan shape `plan`, config `config` (less its
-/// environment) and request `request`, served by this blaze.
-fn base_of(plan: ContentId, config: ContentId, request: ContentId) -> ContentId {
-    let release = crate::release::get();
-    // alloc: the tool's identity, once a request
-    let tool = [release.version.as_bytes(), b"\0", release.line.as_bytes()].concat();
-    certificate::base(&certificate::Shape { plan, config, request }, &tool)
+/// environment) and request `request`, served by the blaze `tool` ([`tool_of`]).
+fn base_of(plan: ContentId, config: ContentId, request: ContentId, tool: &[u8; 32]) -> ContentId {
+    certificate::base(&certificate::Shape { plan, config, request }, tool)
 }
 
 /// The variables set in `env` that a build reads with no step asking for them by name.
@@ -258,7 +318,7 @@ fn outside_now(read: &Read) -> Digest {
 }
 
 /// Nanoseconds since the epoch now, by the clock files' change times are of.
-fn wall_ns() -> u64 {
+pub(super) fn wall_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -328,10 +388,20 @@ impl<S: Steps> Jobs<S> {
             self.refused = Some("its view is no checkout's: an agent's view has no certificate".to_owned());
             return Some((view, work, None));
         };
+        let tool = match tool_of(&mut self.certify.tool) {
+            Ok(tool) => tool,
+            // No fallback: a request this blaze cannot name itself for is not built unchecked.
+            Err(what) => {
+                drop(keying);
+                span.in_scope(|| tracing::error!(target: "blaze", job = %id, "{what}"));
+                w.said.push(Said::Finish(id, false, Some(ApiError::new(what, None)), None));
+                return None;
+            }
+        };
         let env = config.invocation.env;
         let traced = blaze_units::query::env_var(&env, crate::cli::client_rows::PROFILE)
             .is_some_and(|it| !it.is_empty());
-        let base = base_of(shape, bare, request);
+        let base = base_of(shape, bare, request, &tool);
         let machine = request::Request::new(base, traced, unasked_of(&env));
         drop(keying);
         let (now, drawn) = (opened.view.root, drawn_id(&work));
@@ -583,6 +653,49 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
+    /// Job `id` builds checkout `root`'s request of shape `shape` on `inputs` from now: what
+    /// it says and reads is its request's certificate at its end. A job whose view is opened
+    /// again (after a fetch, or with the lock file it wrote) is heard anew: a build of what
+    /// it left opens once.
+    pub(super) fn certify_building(&mut self, id: JobId, root: u32, shape: ContentId, inputs: Inputs) {
+        self.certify.building.retain(|it| it.job != id);
+        self.certify.building.push(Building {
+            job: id,
+            root,
+            shape,
+            inputs,
+            saying: said::Saying::new(),
+            looks: blaze_vfs::outside::looks(),
+            // alloc: a reason, once a build
+            named: Err("its steps were not asked which variables they read by name".to_owned()),
+            // alloc: as above
+            read: Err("its steps were not asked which paths they read".to_owned()),
+        });
+        // The path of each look at the disk is kept while a build is heard.
+        blaze_vfs::outside::name_looks(true);
+    }
+
+    /// What the daemon tells the session of a job, heard for the job's [`Building`]: each
+    /// response, and at its `Finish` the build handed over ([`Ended`]).
+    pub(super) fn certify_heard(&mut self, said: &Said) {
+        if self.certify.building.is_empty() {
+            return;
+        }
+        match said {
+            Said::Report(id, response) => {
+                if let Some(it) = self.certify.building.iter_mut().find(|it| it.job == *id) {
+                    it.saying.hear(response);
+                }
+            }
+            Said::Finish(id, ok, error, _) => {
+                let Some(at) = self.certify.building.iter().position(|it| it.job == *id) else { return };
+                let building = self.certify.building.swap_remove(at);
+                self.certify.ended.push(building.end(*ok && error.is_none()));
+                blaze_vfs::outside::name_looks(!self.certify.building.is_empty());
+            }
+        }
+    }
+
     /// Each build that ended since the last call ([`Ended`]) handed to a request machine, and
     /// its certificate written; or why none is, in a span and a warning. On the loop, with
     /// the store in hand.
@@ -616,7 +729,7 @@ impl<S: Steps> Jobs<S> {
         shape: ContentId,
         walked: Walked,
     ) -> Result<(), String> {
-        let env = &walked.config.invocation.env;
+        let env = &walked.inputs.config.invocation.env;
         let mut untraced = Vec::new(); // alloc: none unless a step was untraced
         // alloc: once a build, a digest a read
         let mut valued: Vec<(Read, Digest)> = Vec::new();
@@ -630,12 +743,17 @@ impl<S: Steps> Jobs<S> {
             // alloc: a reason, once a build
             Err(why) => untraced.push(format!("a step whose variable reads are not named ({why})")),
         }
-        // What the walk itself looked at outside the views, at the hash it saw.
-        for (path, hash) in walked.looked.iter() {
-            let Some(path) = path.to_str() else {
-                return Err(format!("no request certificate is written: {} is no UTF-8 path", path.display()));
-            };
-            valued.push((Read::Outside(path.to_owned()), outside_digest(Ok(*hash), path))); // alloc: a name
+        // What the build itself looked at outside the views, at the hash it saw.
+        match &walked.looked {
+            Ok(looked) => {
+                for (path, hash) in looked {
+                    let Some(path) = path.to_str() else {
+                        return Err(format!("no request certificate is written: {} is no UTF-8 path", path.display()));
+                    };
+                    valued.push((Read::Outside(path.to_owned()), outside_digest(Ok(*hash), path))); // alloc: a name
+                }
+            }
+            Err(why) => untraced.push(why.clone()), // clone: a reason, once a build
         }
         // What its steps' records read under its outputs: valued by a look now, at the
         // walk's end (certificate.md, "State": the records' own hashes are not handed over).
@@ -660,12 +778,14 @@ impl<S: Steps> Jobs<S> {
             // alloc: a reason, once a build
             Err(why) => untraced.push(format!("a step whose file reads are not named ({why})")),
         }
-        if walked.responses.iter().any(|it| matches!(it, Response::Diagnostic(_))) {
-            valued.push((Read::Drawn, Digest::Is(walked.drawn)));
+        if walked.said.iter().any(|it| matches!(it, Response::Diagnostic(_))) {
+            valued.push((Read::Drawn, Digest::Is(walked.inputs.drawn)));
         }
-        // The outputs of the shape's plan as they are placed: each by the key of its bytes.
-        // No stamp is handed over: when the placement's look was is not kept, so the first
-        // check hashes each once and its own looks vouch from then on.
+        // The outputs of the shape's plan as they are placed: each by the key of its bytes,
+        // with the stamp its placement's look took and when that look was asked for. The
+        // machine keeps the stamp only where it is steady (`RACY_NS` past the change): an
+        // output this build wrote is hashed once by a later check, one it found placed is a
+        // stat from the first check on.
         let mut outputs = Vec::new(); // alloc: once a build, an entry an output
         let Some(plan) = self.roots.plans[root as usize].iter().find(|it| it.shape == shape) else {
             return Err("no request certificate is written: the checkout keeps no plan of the request's shape to name its outputs by".to_owned());
@@ -673,10 +793,10 @@ impl<S: Steps> Jobs<S> {
         for path in plan.units.plans.iter().flat_map(|it| it.outputs.iter()) {
             let placed = self.paths.ids.get(path.as_str()).and_then(|id| self.paths.placed[*id as usize].as_ref());
             match placed {
-                Some(Placement { key, meta: Some(_), .. }) => outputs.push((
+                Some(Placement { key, meta: Some(meta), asked_ns, .. }) => outputs.push((
                     // clone: an output's own path, once a build
                     certificate::Output { base: ABSOLUTE, path: path.clone(), content: key.0 },
-                    None,
+                    Some((Stamp { len: meta.len, changed_ns: meta.modified_ns }, *asked_ns)),
                 )),
                 // A placement in flight: what the file holds is not known yet.
                 Some(_) => return Err(format!("no request certificate is written: the output {path} is still being placed")),
@@ -684,21 +804,10 @@ impl<S: Steps> Jobs<S> {
                 None => {}
             }
         }
-        let mut said: Vec<Response> = walked.responses.to_vec(); // alloc: once a build
-        if let Some(worked) = walked.worked {
-            // No build stands behind an answer said again: no id, no time of nodes.
-            said.push(Response::Work(Worked {
-                why: None,
-                build_id: None,
-                steps_us: Vec::new(), // alloc: none
-                critical_path_us: 0,
-                placed: blaze_api::PlacedBytes::default(),
-                ..worked
-            }));
-        }
-        let said = blaze_protocol::cbor::to_vec(&said)
+        let said = blaze_protocol::cbor::to_vec(&walked.said)
             .map_err(|error| format!("no request certificate is written: what the build said does not encode: {error}"))?;
-        let base = base_of(shape, walked.config_id, walked.request);
+        let tool = tool_of(&mut self.certify.tool).map_err(|why| format!("no request certificate is written: {why}"))?;
+        let base = base_of(shape, walked.inputs.config_id, walked.inputs.request, &tool);
         let mut machine = request::Request::building(base, unasked_of(env));
         let built = request::Built {
             nodes: vec![String::new()], // alloc: the one node, the view's root
@@ -725,9 +834,9 @@ impl<S: Steps> Jobs<S> {
                     for ask in &asks {
                         let digest = match ask {
                             // The view the build read, its own writes in it: an id of content.
-                            Ask::Read { read: Read::Node(path), view: View::Built } if path.is_empty() => Digest::Is(walked.view),
+                            Ask::Read { read: Read::Node(path), view: View::Built } if path.is_empty() => Digest::Is(walked.inputs.view),
                             Ask::Read { read: Read::Node(path), view: View::Built } => {
-                                w.vfs.reader().dir_id(walked.view, path).map_or(Digest::Nothing, Digest::Is)
+                                w.vfs.reader().dir_id(walked.inputs.view, path).map_or(Digest::Nothing, Digest::Is)
                             }
                             Ask::Read { read: Read::Env(name), .. } => env_digest(env, name),
                             other => return Err(format!("no request certificate is written: the machine asked for {other:?} at a build's end")),

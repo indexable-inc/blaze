@@ -43,6 +43,8 @@ mod kept;
 mod noop;
 #[blaze::sans_io]
 mod request;
+#[blaze::sans_io]
+mod said;
 mod slab;
 mod written;
 #[cfg(test)]
@@ -1327,6 +1329,9 @@ struct Placement {
     key: blaze_cas::Key,
     executable: bool,
     meta: Option<Meta>,
+    /// The file system's clock as the look `meta` is of was asked for: the look was no
+    /// earlier, so a stamp it is steady by ([`certificate::RACY_NS`]) is steady.
+    asked_ns: u64,
 }
 
 /// The directories `units`' outputs are in: under each of its build dirs and under `std`, where
@@ -4300,12 +4305,6 @@ impl<S: Steps> Jobs<S> {
         // stranger's change ([`noop::Answers`]). Until 2026-11-12 any job of the checkout
         // dropped its one answer, so `build`, `run`, `build` walked three times.
         if let (Some(at), Some(request)) = (root, request) {
-            for gone in self.roots.answers[at as usize].begin(&shape) {
-                // The view the answer just dropped was of is let go with it.
-                if let Some(view) = gone.view {
-                    w.vfs.close(view);
-                }
-            }
             let inputs = Inputs {
                 view: opened.view.root,
                 config_id: bare,
@@ -4313,13 +4312,9 @@ impl<S: Steps> Jobs<S> {
                 request,
                 drawn,
             };
-            self.record_answer(id, at, shape, key, inputs);
-            // A walk that may be kept holds its view's files, opened here in constant
-            // time: a later request on another root is read against them. A root the
-            // tree lacks holds none, and such a request walks.
-            if let Some(recorded) = self.recordings.iter_mut().find(|it| it.job == id) {
-                recorded.view = w.vfs.open(opened.view).ok();
-            }
+            // Heard from here to its end for its request's certificate, whatever it makes
+            // ([`Jobs::certify_building`]).
+            self.certify_building(id, at, shape, inputs);
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         // A build or a check takes what settling lost of its checkout's last build, to say it.
@@ -4609,6 +4604,7 @@ impl<S: Steps> Jobs<S> {
     /// its outputs are in is named canonically, as the watches are asked. The watches'
     /// generation and the count of looks at the disk are read here, before the job looks at
     /// anything. Else the checkout's answer says why none is kept ([`Unkept`]).
+    #[allow(dead_code)]
     fn record_answer(
         &mut self,
         id: JobId,
@@ -4677,6 +4673,7 @@ impl<S: Steps> Jobs<S> {
                     .map(|row| (row.build_id, row.kind.clone(), row.message.clone())),
             )
         });
+        self.certify_heard(said);
         if self.recordings.is_empty() {
             return;
         }
@@ -4817,9 +4814,6 @@ impl<S: Steps> Jobs<S> {
             files,
             worked,
         });
-        // What the build read and said, for its request's certificate: written at the loop's
-        // next step, with the store in hand ([`Jobs::certify_written`]).
-        self.certify.ended.push(certify::Ended::of(root, shape, &last));
         match &last {
             Ok(answer) => tracing::info_span!(
                 target: "blaze",
@@ -7749,7 +7743,7 @@ impl<S: Steps> Jobs<S> {
         match self.own_tag(Own::Record { job: id, path, key }) {
             Ok(tag) => {
                 self.begin_placing(id, path);
-                self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None });
+                self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None, asked_ns: certify::wall_ns() });
                 w.effects.push(Effect::Stat { file, tag });
             }
             Err(error) => self.placing_failed(id, path, error),
@@ -8105,6 +8099,12 @@ impl<S: Steps> Jobs<S> {
             for note in served.iter().filter_map(noted).chain(writer.goals_noted()) {
                 w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
+        }
+        // What the build's steps read, for its request's certificate ([`certify::Building`]):
+        // of every build that passed, one that compiled too.
+        if ok && let Some(building) = self.certify.building.iter_mut().find(|it| it.job == id) {
+            let _reads = tracing::info_span!(target: "blaze", "request certificate: what the build's steps read").entered();
+            building.steps_read(writer.env_named(), writer.read_outside());
         }
         // A build that may become its checkout's kept answer and made nothing so far says
         // which sources its keys held by code text alone: what the lane answers a comment

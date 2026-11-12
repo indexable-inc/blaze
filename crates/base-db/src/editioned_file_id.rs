@@ -17,8 +17,8 @@ pub struct EditionedFileId {
     field: span::EditionedFileId,
 }
 
-/// [`EditionedFileId::parse`]. Kept by its bytes, [`syntax::Parse::heap_bytes`] (its share of
-/// the tree, with the lazy bodies walked so far, and its errors), under [`blaze_mem::Tag::Parse`]'s budget;
+/// [`EditionedFileId::parse`]. Kept by its bytes, [`syntax::Parse::heap_bytes`] (the
+/// tree, with the lazy bodies walked so far, and its errors), under [`blaze_mem::Tag::Parse`]'s budget;
 /// the trees count against that tag.
 #[blaze_query::tracked(self_ty = EditionedFileId, lru, weigh = syntax::Parse::heap_bytes, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {

@@ -5,7 +5,7 @@ date: 2026-11-12
 ---
 # Request certificates
 
-Lanes certificate-1112, certificate2, certificate3. Code: `crates/blaze-cargo/src/serve/job/certificate.rs`
+Lanes certificate-1112, certificate2, certificate3, certificate4, certificate5. Code: `crates/blaze-cargo/src/serve/job/certificate.rs`
 (the record in `blaze-record`'s form, its codec, the local evidence) and
 `serve/job/request.rs` (the request machine: the check and the write), both sans-IO, with their tests. The owner, on a repeated `blaze run` of a hello-world
 being a whole walk (1,162 `job` and `task` spans, 1,195 `admission`, 160–700 ms; reth's no-op
@@ -144,46 +144,76 @@ first request after a restart, none while the watches vouch); end to end under 2
 the client's start. reth no-op: from 2.0–2.8 s to under 50 ms (about 30 groups, a few thousand
 output stats cold). First request after a restart: the same, plus the tree's restore.
 
-## State (2026-11-12, lane certificate4)
+## State (2026-11-12, lane certificate5)
 
-Wired, not yet compiled or run by anyone as of this writing: the driver `serve/job/certify.rs`.
-`Jobs::begin` checks a build or a check against its certificate before it is a job
-(`certify_begin`; outputs' stamps and bytes through the loop's driver, `Own::Certify`); a hit
-says `Answer.said` again and finishes with no job; a miss goes on into `begin_job`, its reason
-the span `request certificate: miss` and the build's `no-op answer: not given because`. A build
-that made nothing hands the machine `Built` at the loop's next step (`certify_written`).
-`Jobs::answer_again` is no longer called: the kept answers answer nothing.
+Wired; compiled by the main agent, no test run on the wiring as of this writing: the driver
+`serve/job/certify.rs`. `Jobs::begin` checks a build or a check against its certificate before
+it is a job (`certify_begin`; outputs' stamps and bytes through the loop's driver,
+`Own::Certify`); a hit says `Answer.said` again and finishes with no job; a miss goes on into
+`begin_job`, its reason the span `request certificate: miss` and the build's `no-op answer: not
+given because`. Every build of a checkout is heard from its view's last open to its `Finish`
+(`certify::Building`, `Jobs::certify_heard`), and one that answered, having compiled or not,
+hands the machine `Built` at the loop's next step (`certify_written`).
+
+Closed by certificate5:
+
+- **The tool is the binary.** The base's tool is the BLAKE3 of the running executable
+  (`blaze_profile::identity::binary_hash`, the one home: what `builds.blaze` names a build's
+  blaze by; hashed once a process, before the first request by the daemon's history). A blaze
+  that cannot read itself fails the request, by name. (`BuildConfig::blaze`, which the units'
+  keys read, is still the version: not this record's.)
+- **A build that compiled writes its certificate.** `said` is made by `serve/job/said.rs`
+  (sans-IO) from what any build that answered said: a package's line as `Fresh`, each artifact
+  fresh, nothing of fetches or progress, the `Work` of no work (every unit found; no count,
+  time, link or build id of the build that wrote it), in the plan's order (by package, by
+  unit), never the scheduler's. The invariant, tested with three planted bugs (`KeepsVerbs`,
+  `KeepsOrder`, `KeepsWork`): two builds of one request, whatever each compiled and in
+  whatever order, leave one `said` byte for byte; else the second would be refused as two
+  answers under one key. A hit therefore says a walk's words in the plan's order, where a
+  walk says them in its scheduler's.
+- **The placement's stamp is handed over at the write** (`Placement::asked_ns`: the clock
+  as its look was asked for, so no later than the look), under the racy rule: an output the
+  build found placed is a stat from the first check on; one it wrote within two seconds is
+  hashed once by a later check.
 
 What the wiring does not do yet (each a known gap, in the order to close them):
 
-1. **A build that compiled writes none.** `said` is what a build with nothing to do says, and
-   only such a build's words are recorded (`noop::Recording`, whose conditions gate the write
-   through `certify::Ended`). So: build, a walk that writes, then hits. Needed: `said` made from
-   a compiling build (its diagnostics as a replay says them, its `Work` as a no-op's), then
-   `Ended` from every build that passed, and `Recording`/`keep_answer` deleted.
-2. **A daemon's first request is not checked**: the config names where the standard library is
-   mounted, which that build's first task finds. It builds and (when it made nothing) writes.
-   Needed: the check run from `Jobs::prepare` once the library and the stale path
-   dependencies are read, or a base that does not hold the library's place.
-3. **Outside reads are valued at the walk's end**, through `Disk`, for the paths the steps'
-   records name (`Writer::read_outside`); the walk's own looks (`LastAnswer::looked`) carry
-   their own hashes. Needed: the records' hashes handed over a build (`serve/unit/reads.rs`
-   keeps paths for the process, no hash).
+1. **A daemon's first request is not checked**: the config names where the standard library
+   is mounted (`/rustc/<commit>/library`) and holds each mount by content id; `Jobs::library`
+   is set by that daemon's first task (`Does::Library`: a stat walk of the library's
+   directory, its fingerprint, compared with the mounts the VFS's heads restored). Needed:
+   the library a read of the certificate (its fingerprint, valued off the loop once a daemon's
+   life before the first check) with the base made of the restored mounts; or the walk done as
+   the daemon starts. Derived from the tool alone is not complete: `BLAZE_LIBRARY`-style
+   overrides and a checkout's `library/` change under one binary.
+2. **Outputs are hashed on the loop** where no stamp vouches (`Effect::ReadAll`, then the
+   hash, in the span `request certificate: hash an output no stamp vouches for`): every
+   output at a daemon's first check, and each output a build wrote less than two seconds
+   before its stamp was taken. Needed: a pool task, bounded, with a span.
+3. **Outside reads are valued at the build's end**, through `Disk`, for the paths the steps'
+   records name (`Writer::read_outside`, which names only paths under the build's directories
+   of outputs: a build script's read of a system header is in no list); the build's own looks
+   carry their hashes. A build in which a build script RAN (not found kept) says none of its
+   reads (`Writer::env_named`/`read_outside` are `Err`): `Untraced`, no certificate until the
+   next build. Needed: the runs' own recorded reads with their hashes
+   (`blaze-usercode/src/index.rs`, `inputs`), and a unit with none named `Untraced`.
 4. **Not relocated**: the base holds the checkout's directory (`Viewed::bare`, `shape`), an
    output's path is absolute (base 0), `said` is as said. One chain a checkout directory.
 5. **One node**, the view's root (`Read::Node("")`): any change in the checkout misses, and
-   the miss names the root. Package directories as "Package directories" below the check.
-6. **No stamp is handed over at the write** (when a placement was looked at is not kept): the
-   first check of a daemon's life hashes each output once, on the loop
-   (`request certificate: hash an output no stamp vouches for`, a span a file).
-7. `Unwritten` and every other reason no certificate is written are a span
+   the miss names the root.
+6. `Unwritten` and every other reason no certificate is written are a span
    (`request certificate: not written`, `why`) and a `warn` event; the client is not shown a
-   warning (the job has finished by then) and no profile counter is added.
-8. The tool's identity is the release's version and line (`certify::base_of`).
-9. **Delete** (nothing of it answers): `Jobs::answer_again`, `Jobs::edited`, `noop::Answers`,
-   `Shaped`, `MOST_SHAPES` and its assert, `noop::ask`, `NotReplayed`, `Moved`; then, with 1,
-   `Recording`, `Unkept`, `keep_answer`, `keep_last`, `record_answer`, their tests.
-10. The daemon-level restore test and the revision cases (not written).
+   warning (the job has finished by then) and no profile counter is added. A build whose
+   outputs are still being placed at its `Finish` writes none.
+7. **Delete** (nothing of it answers or feeds the write now; `Jobs::record_answer` is not
+   called, so no recording exists): `Jobs::answer_again`, `Jobs::edited`, `record_answer`,
+   `keep_answer`, `keep_last`, `Recorded`, `Jobs::recordings`, the made-nothing blocks at the
+   units' end and the job's answer, `Roots::answers`, `noop::Answers`, `Shaped`,
+   `MOST_SHAPES` and its assert, `noop::ask`, `NotReplayed`, `Moved`, `Recording`, `Walk`,
+   `Unkept`, `LastAnswer`, their tests; `noop::Inputs` moves to `certify.rs`.
+8. Under `-v` the notes of what the store served a build (`noted`) are diagnostics of one
+   build, kept in `said`: a second build of the same reads may be refused as two answers.
+9. The daemon-level simulation test and the revision cases (not written).
 
 An output's content is the store key of its bytes (`Placement.key`): `output_key(bytes)` for a
 file hashed whole, `linked_key(root)` for one blaze's linker made (the root of

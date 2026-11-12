@@ -153,16 +153,22 @@ impl<T> Parse<T> {
         self.tree.as_ref().unwrap().root()
     }
 
-    /// The heap this parse holds, in bytes, for a query that keeps parses by their bytes: its
-    /// share of the tree (the tree's arrays and the lazy parts walked so far, over the counts
-    /// of it, so the values sharing a tree count it once between them) and its errors. Not the
-    /// source text the tree indexes, which a file's text holds; a tree built by appending text
-    /// (a macro expansion) owns its text, [`Parse::source_bytes`].
+    /// The heap this parse holds, in bytes, for a query that keeps parses by their bytes: the
+    /// tree (its arrays and the lazy parts walked so far) and its errors. Not the source text
+    /// the tree indexes, which a file's text holds; a tree built by appending text (a macro
+    /// expansion) owns its text, [`Parse::source_bytes`].
+    ///
+    /// The whole tree, whoever else holds it: a weight is of the value alone. It was the tree
+    /// over its strong count, so that two values sharing a tree counted it once; but a count
+    /// is also taken by what is no weighed value (the body lowering's thread cache keeps a
+    /// file's own tree for a body anchored at the file's root, `hir_def::expr_store::body`),
+    /// and the table adds a value's weight when it is put and takes its weight off when it is
+    /// dropped: a tree put alone and dropped while that cache held it left half its bytes in
+    /// the count at every edit of its file, for good. Two values of one tree (a parse made
+    /// again while something else kept its tree alive) now count it twice, the same at put
+    /// and at drop.
     pub fn heap_bytes(&self) -> usize {
-        let tree = self.tree.as_ref().map_or(0, |tree| {
-            let flat = tree.flat();
-            flat.heap_size() / std::sync::Arc::strong_count(flat)
-        });
+        let tree = self.tree.as_ref().map_or(0, |tree| tree.flat().heap_size());
         let errors = self.errors.as_deref().map_or(0, |errors| {
             size_of_val(errors) + errors.iter().map(SyntaxError::heap_bytes).sum::<usize>()
         });
