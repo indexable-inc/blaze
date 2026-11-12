@@ -1239,36 +1239,40 @@ struct Placement {
     meta: Option<Meta>,
 }
 
-/// The directories `units`' outputs are in: under each of its build dirs, the first directory
-/// of each output's path (a profile's, or a target's), sorted, each once. These, not the build
-/// dirs themselves, which every build writes its record into (docs/gc.md). `None` when an
-/// output is under neither build dir or right in one: no such directory holds it.
-fn output_dirs(units: &Units) -> Option<Vec<std::path::PathBuf>> {
+/// The directories `units`' outputs are in: under each of its build dirs and under `std`, where
+/// the standard library's builds are placed ([`Setup::std`]: its units are units of the plan,
+/// and their outputs are placed and looked at as any other's), the first directory of each
+/// output's path (a profile's, a target's, or one build of the standard library), sorted, each
+/// once. These, not the build dirs themselves, which every build writes its record into
+/// (docs/gc.md). `Err` names the first output that is under none of them or right in one: no
+/// such directory holds it.
+fn output_dirs(units: &Units, std: &str) -> Result<Vec<std::path::PathBuf>, std::path::PathBuf> {
     let outputs = units.plans.iter().flat_map(|plan| plan.outputs.iter()).map(String::as_str);
-    output_dirs_of([units.target_dir.as_str(), units.build_dir.as_str()], outputs)
+    output_dirs_of(&[units.target_dir.as_str(), units.build_dir.as_str(), std], outputs)
 }
 
-/// [`output_dirs`] of `outputs`, each under one of the build dirs `roots`.
+/// [`output_dirs`] of `outputs`, each under one of `roots`.
 pub(super) fn output_dirs_of<'a>(
-    roots: [&str; 2],
+    roots: &[&str],
     outputs: impl Iterator<Item = &'a str>,
-) -> Option<Vec<std::path::PathBuf>> {
+) -> Result<Vec<std::path::PathBuf>, std::path::PathBuf> {
     use std::path::Path;
-    let roots = roots.map(Path::new);
     let mut dirs = Vec::new(); // alloc: once a build that asks for a replay, a directory or two
     for output in outputs {
         let output = Path::new(output);
-        let (root, rest) =
-            roots.iter().find_map(|root| output.strip_prefix(root).ok().map(|rest| (root, rest)))?;
-        let mut parts = rest.components();
-        let first = parts.next()?;
-        // Right in the build dir: only a watch of the build dir itself would hear of it.
-        parts.next()?;
-        dirs.push(root.join(first));
+        let dir = roots.iter().map(Path::new).find_map(|root| {
+            let mut parts = output.strip_prefix(root).ok()?.components();
+            let first = parts.next()?;
+            // Right in the root: only a watch of the root itself would hear of it.
+            parts.next()?;
+            Some(root.join(first))
+        });
+        // alloc: a reason, once a build whose answer is not kept
+        dirs.push(dir.ok_or_else(|| output.to_owned())?);
     }
     dirs.sort_unstable();
     dirs.dedup();
-    Some(dirs)
+    Ok(dirs)
 }
 
 /// The process's watches of directories outside every view ([`blaze_vfs::outside`]).
@@ -1343,6 +1347,7 @@ const LAYOUT: &str = "layout";
 /// answer of such a walk is kept.
 fn recorded_dirs(
     units: &Units,
+    std: &str,
 ) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), Unkept> {
     use std::path::Path;
     // A profile to use is read off the disk by each build (`unit::codegen::read_profile`),
@@ -1351,7 +1356,7 @@ fn recorded_dirs(
     if units.plans.iter().any(|plan| plan.rustflags.iter().any(profiled)) {
         return Err(Unkept::Uncounted("a `-C profile-use` profile"));
     }
-    let Some(mut dirs) = output_dirs(units) else { return Err(Unkept::Outputs) };
+    let mut dirs = output_dirs(units, std).map_err(Unkept::Outputs)?;
     // A watch hears nothing of a symlink above its directory being pointed elsewhere
     // ([`blaze_vfs::outside::unchanged_since`]): a directory named through one is not
     // vouched for. A resolve of each, once a build that walks.
@@ -1362,8 +1367,9 @@ fn recorded_dirs(
     )
     .entered();
     let canonical = |dir: &Path| std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
-    if !dirs.iter().all(|dir| canonical(dir.as_path())) {
-        return Err(Unkept::Outputs);
+    if let Some(dir) = dirs.iter().find(|dir| !canonical(dir.as_path())) {
+        // clone: a reason, once a build whose answer is not kept
+        return Err(Unkept::Outputs(dir.clone()));
     }
     let layout = Path::new(&units.target_dir).join(LAYOUT);
     let mut absent = Vec::new(); // alloc: once a build that walks, a path
@@ -3595,6 +3601,16 @@ impl<S: Steps> Jobs<S> {
         self.settling.len()
     }
 
+    /// The content key of the output placed at `path` whose file was as placed at the jobs'
+    /// last look ([`Placement`]); `None` for a path nothing is placed at, one whose placement
+    /// is in flight, or one whose file a look found changed. What a launch of the file there
+    /// may take the file for (`serve::unit::run::inproc::DevRuns::launch`).
+    pub fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        let id = *self.paths.ids.get(path)?;
+        let placed = self.paths.placed[id as usize].as_ref()?;
+        placed.meta.map(|_| placed.key.0.0)
+    }
+
     /// How many outputs answered jobs left being placed ([`Settling::placing`]): the loop is
     /// not between requests while any is, as while a job is under way.
     pub fn placing_after(&self) -> usize {
@@ -4158,7 +4174,7 @@ impl<S: Steps> Jobs<S> {
         let (generation, looks) = (blaze_vfs::outside::generation(), blaze_vfs::outside::looks());
         let found = match self.roots.plans.get(root as usize) {
             Some(Some(last)) if last.key == key && last.lock.is_none() => {
-                recorded_dirs(&last.units)
+                recorded_dirs(&last.units, &self.setup.std)
             }
             _ => Err(Unkept::Planned),
         };
@@ -5257,7 +5273,7 @@ impl<S: Steps> Jobs<S> {
         // ([`noop::LastAnswer::replayable`]). Once a directory a process.
         if prep.root.is_some()
             && self.jobs.get(key_of(id)).is_some_and(|job| request_id(&job.work).is_some())
-            && let Some(dirs) = output_dirs(&units)
+            && let Ok(dirs) = output_dirs(&units, &self.setup.std)
         {
             for dir in &dirs {
                 blaze_vfs::outside::want(dir);

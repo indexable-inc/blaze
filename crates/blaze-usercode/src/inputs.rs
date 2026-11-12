@@ -105,9 +105,11 @@ impl Stamp {
 /// was hashed. Append-only: a lookup takes no lock and writes nothing shared, a file is hashed
 /// outside any lock, and an edit adds an entry under its new stamp rather than changing one.
 ///
-/// Each canonical path's last answer is also kept with the watched directory covering it
-/// ([`blaze_vfs::Cover`]) and the generation read before it was looked at: while the watch
-/// has heard nothing under that directory since, the answer is returned with no syscall.
+/// Each path's last answer is also kept with the watched directories covering it
+/// ([`blaze_vfs::Cover`]: its own, and for a path named through symlinks each link's and the
+/// file's they end at, [`names`]) and the generation read before it was looked at: while the
+/// watches have heard nothing under those directories since, the answer is returned with no
+/// syscall.
 pub struct Files {
     stamped: Sharded<[u8; 32]>,
     vouched: Sharded<Vouched>,
@@ -118,9 +120,10 @@ pub struct Files {
 /// finds another writing skips), read with three loads and a compare.
 struct Vouched {
     path: Box<OsStr>,
-    /// `None` for a path that isn't canonical, or that no watched directory covers: each of
-    /// its checks looks at the disk.
-    cover: Option<Cover<'static>>,
+    /// One for each name the answer rests on ([`names`]): all must have heard nothing. `None`
+    /// for a path with `..` in it, one whose links don't resolve, or one a name of
+    /// which no watched directory covers: each of its checks looks at the disk.
+    covers: Option<Box<[Cover<'static>]>>,
     sequence: AtomicU64,
     generation: AtomicU64,
     present: AtomicBool,
@@ -175,19 +178,70 @@ fn mix(mut word: u64) -> u64 {
     word ^ (word >> 31)
 }
 
-/// Whether `path` names itself the way the watch hears it: absolute, with no symlink, `.` or
-/// `..` in it. A missing path is canonical when its parent is. Cold: on a miss only.
-fn canonical(path: &Path, answer: Option<[u8; 32]>) -> bool {
-    let same = |found: PathBuf| found.as_os_str() == path.as_os_str();
-    match answer {
-        Some(_) => std::fs::canonicalize(path).is_ok_and(same),
-        None => match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) => {
-                std::fs::canonicalize(parent).is_ok_and(|it| same(it.join(name)))
-            }
-            _ => false,
-        },
+/// The most symlinks one path is followed through, as the kernel's own bound is (`MAXSYMLINKS`
+/// is 32 on macOS, 40 on Linux): past it the path is not vouched for.
+const MOST_LINKS: usize = 40;
+
+/// Every name the answer about `path` rests on, each as the watch of its directory hears it
+/// (absolute, with no symlink above its last part): `path` itself when it is canonical; for a
+/// path named through symlinks (the macOS SDK's `MacOSX27.2.sdk` is a link to `MacOSX.sdk`, its
+/// `usr/lib/libm.tbd` one to `libSystem.tbd`), each link where it is and the file they end at.
+/// A link pointed elsewhere is a change in the link's own directory, and the file changed is
+/// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
+/// missing path's last part is the name that would be made. `None` for a path that is not
+/// absolute, has `..` in it, has more than [`MOST_LINKS`] links, or of which a part
+/// before the last is missing or unreadable. Cold: on a miss only.
+fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
+    use std::path::Component;
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir) {
+        return None;
     }
+    // alloc: cold, once per path on its first miss: the parts not yet resolved, last first
+    let mut left: Vec<std::ffi::OsString> = Vec::new();
+    for part in parts {
+        match part {
+            Component::Normal(name) => left.push(name.to_owned()),
+            _ => return None,
+        }
+    }
+    left.reverse();
+    let mut names = Vec::new(); // alloc: cold, as above
+    let mut at = PathBuf::from("/"); // alloc: cold, as above
+    // Bounded: each turn takes one part, and only a link, of which there are at most
+    // `MOST_LINKS`, adds any.
+    while let Some(part) = left.pop() {
+        if part == ".." {
+            // Of a link's target: `at` has no link in it, so its parent is the name's.
+            at.pop();
+            continue;
+        }
+        let name = at.join(&part);
+        match std::fs::symlink_metadata(&name) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if names.len() == MOST_LINKS {
+                    return None;
+                }
+                let target = std::fs::read_link(&name).ok()?;
+                names.push(name);
+                for part in target.components().rev() {
+                    match part {
+                        Component::RootDir => at = PathBuf::from("/"),
+                        Component::CurDir => {}
+                        Component::ParentDir => left.push("..".into()),
+                        Component::Normal(name) => left.push(name.to_owned()),
+                        Component::Prefix(_) => return None,
+                    }
+                }
+            }
+            Ok(_) => at = name,
+            // The name that would be made, for a path that is not there.
+            Err(error) if missing(&error) && left.is_empty() && answer.is_none() => at = name,
+            Err(_) => return None,
+        }
+    }
+    names.push(at);
+    Some(names)
 }
 
 impl Files {
@@ -238,9 +292,9 @@ impl Files {
         let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
         let known = found.filter(|it| *it.path == *path.as_os_str());
         if let Some(known) = known
-            && let Some(cover) = known.cover
+            && let Some(covers) = &known.covers
             && let Some((generation, answer)) = known.read()
-            && cover.unchanged_since(generation)
+            && covers.iter().all(|cover| cover.unchanged_since(generation))
         {
             return Ok(answer);
         }
@@ -263,18 +317,20 @@ impl Files {
     /// Keeps a first answer for `path`, with the directory to vouch for it if it is canonical:
     /// its parent is watched from the driver's next round.
     fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
-        let cover = match canonical(path, answer) {
-            true => {
-                if let Some(parent) = path.parent() {
+        // Every name the answer rests on has its directory wanted, and all are covered or the
+        // answer is not vouched for.
+        let covers = names(path, answer).and_then(|names| {
+            for name in &names {
+                if let Some(parent) = name.parent() {
                     self.dirs.want(parent);
                 }
-                self.dirs.cover(path)
             }
-            false => None,
-        };
+            // alloc: once per path, on its first miss
+            names.iter().map(|name| self.dirs.cover(name)).collect::<Option<Box<[_]>>>()
+        });
         let at = self.vouched.intern(id, || Vouched {
             path: path.as_os_str().into(), // alloc: once per path, on its first miss
-            cover,
+            covers,
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
@@ -804,8 +860,64 @@ mod tests {
         let roundabout = dir.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
-        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).cover.is_none());
+        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());
         assert_eq!(dirs.len(), 1);
+        _ = std::fs::remove_dir_all(&made);
+    }
+
+    /// A path named through symlinks rests on each link and on the file they end at: every
+    /// one's directory is wanted, so its answer is vouched for as a canonical path's is (the
+    /// macOS SDK's `MacOSX27.2.sdk/usr/lib/libm.tbd` is two links, and a link looks at it in
+    /// every build).
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_symlinks_rests_on_each_link_and_the_file_they_end_at() {
+        let made = std::env::temp_dir().join(format!("blaze-files-links-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&made);
+        let dir = {
+            std::fs::create_dir_all(&made).unwrap();
+            std::fs::canonicalize(&made).unwrap()
+        };
+        for sub in ["sdks/real/lib", "other"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("sdks/real/lib/system"), b"one").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("sdks/named")).unwrap();
+        std::os::unix::fs::symlink("system", dir.join("sdks/real/lib/m")).unwrap();
+        std::os::unix::fs::symlink("../sdks/named/lib", dir.join("other/lib")).unwrap();
+        let hash = Some(blaze_ids::b3::hash(b"one"));
+        assert_eq!(
+            names(&dir.join("sdks/named/lib/m"), hash),
+            Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/m"), dir.join("sdks/real/lib/system")])
+        );
+        assert_eq!(
+            names(&dir.join("other/lib/m"), hash),
+            Some(vec![
+                dir.join("other/lib"),
+                dir.join("sdks/named"),
+                dir.join("sdks/real/lib/m"),
+                dir.join("sdks/real/lib/system"),
+            ])
+        );
+        assert_eq!(names(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
+        assert_eq!(names(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "a part before the last is missing");
+        // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
+        // not resolved here.
+        assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
+        assert_eq!(names(&dir.join("sdks/named/../real/lib/system"), hash), None);
+        assert_eq!(names(Path::new("relative/a"), hash), None);
+        std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
+        assert_eq!(names(&dir.join("loop"), hash), None, "a link to itself ends at the bound");
+
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let files = Files::watched_by(dirs);
+        let path = dir.join("sdks/named/lib/m");
+        assert_eq!(files.file(&path).unwrap(), hash);
+        let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
+        assert_eq!(vouched.covers.as_ref().map(|it| it.len()), Some(3));
+        let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
+        assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
         _ = std::fs::remove_dir_all(&made);
     }
 
@@ -840,7 +952,7 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let vouched = Vouched {
             path: OsStr::new("/nowhere/a").into(),
-            cover: dirs.cover(Path::new("/nowhere/a")),
+            covers: dirs.cover(Path::new("/nowhere/a")).map(|it| vec![it].into()),
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),

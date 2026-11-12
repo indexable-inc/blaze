@@ -23,7 +23,10 @@
 //!
 //! 1. The daemon writes the executable's bytes, as the memory object holds them, to cargo's
 //!    path once per content key ([`host::Host::write_executable`]): not again while the key
-//!    is the same, never for a patch.
+//!    is the same, never for a patch, and not at all where the build placed that very file
+//!    there as its output and says so ([`host::Program::command_placed`]: `blaze run`'s
+//!    launch, which then writes nothing, so the build's placement and its outputs' watch see
+//!    no change).
 //! 2. It spawns that file through `blaze-core`'s `Effect::Spawn` in the run's sandbox, with
 //!    `BLAZE_INPROC` naming its host and a token ([`host::Program::command`]).
 //! 3. Before `main` and before any other code of the program, the program's runtime

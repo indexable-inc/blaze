@@ -121,8 +121,11 @@ a pull would never run. A verification that unwinds for any reason but the calle
 pending write, fuel, a wait that would close a cycle of tasks) is contained: the row's
 word is put back by the engine's guard, the walk logs it (`unwound`), names it as changed,
 goes on to its readers, never takes it as clean, and does not verify it again until
-something else brought it up to date. Watch `unwound` and the panic hook's output on edits
-that delete items.
+something else brought it up to date. A walk contains at most 8 of them (`UNWOUND_MOST`):
+from the row after the eighth it marks what it reaches and verifies nothing, as past a wide
+level, so an edit that deletes items costs at most 8 panics a walk (`fn main` replaced by
+another function in a hello-world was 83 before the bound, 2026-11-11). Watch `unwound` and
+the panic hook's output on edits that delete items.
 
 Proof (`dst-not-review`): crates/blaze-query/src/db/tests/changed.rs. Random programs
 (sums, cutoffs, reads chosen by a value, untracked reads) under random writes, pulls in

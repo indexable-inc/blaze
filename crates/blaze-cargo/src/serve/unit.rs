@@ -235,10 +235,15 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
-    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
+    fn launch(
+        &self,
+        program: &str,
+        pid: u32,
+        placed: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
         self.shared
             .dev_runs
-            .launch(program, pid)
+            .launch(program, pid, placed)
             .map_err(|what| ApiError::new(what, Some(program.to_owned())))
     }
 

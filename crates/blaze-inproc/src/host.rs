@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use blaze_core::{Command, Sandbox};
@@ -42,6 +42,10 @@ pub struct Executable<'a> {
 /// What [`Host::write_executable`] did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wrote {
+    /// The file at the path is the caller's: the build placed it there as its output of this
+    /// key and has looked at it since ([`Program::command_placed`]). Nothing is written, and
+    /// the host keeps no word of it: the build's placement is the one record of that file.
+    Placed,
     /// The file at the path is the one written for this key, unchanged since: nothing.
     Kept,
     /// A clone of the store's file: no bytes copied.
@@ -112,9 +116,37 @@ struct Waiting {
 /// entry; nothing is called with it held.
 type Table = Arc<Lock<HashMap<[u8; 16], Waiting>>>;
 
+/// A count of threads alive, one more while each [`Alive`] of it lives.
+#[derive(Clone, Default)]
+struct Threads(Arc<AtomicUsize>);
+
+/// One thread counted in a [`Threads`] from when it is about to be spawned until it ends
+/// (or could not be spawned), however it ends.
+struct Alive(Threads);
+
+impl Threads {
+    fn one_more(&self) -> Alive {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Alive(self.clone()) // clone: a count
+    }
+
+    fn alive(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct Host {
     address: String,
     waiting: Table,
+    /// The handshake threads alive: one a start hook connected and not yet started or
+    /// refused, each ended within [`HANDSHAKE`] of its hook's last frame.
+    handshakes: Threads,
     /// The executables written, by path: the key and the file as written.
     written: Lock<HashMap<PathBuf, ([u8; 32], Identity)>>,
     temporaries: AtomicU64,
@@ -127,13 +159,16 @@ impl Host {
         // alloc: once per host
         let waiting: Table = Arc::new(Lock::new("inproc.host.waiting", HashMap::new()));
         let table = Arc::clone(&waiting);
+        let handshakes = Threads::default();
+        let counted = handshakes.clone(); // clone: a count
         std::thread::Builder::new()
             .name("blaze-inproc host".to_owned())
-            .spawn(move || accept(&listener, &table))
+            .spawn(move || accept(&listener, &table, &counted))
             .map_err(|it| Error::new(format!("starting the host's thread: {it}")))?;
         Ok(Host {
             address,
             waiting,
+            handshakes,
             written: Lock::new("inproc.host.written", HashMap::new()),
             temporaries: AtomicU64::new(0),
         })
@@ -268,6 +303,19 @@ impl Host {
 
     fn table(&self) -> LockGuard<'_, HashMap<[u8; 16], Waiting>> {
         self.waiting.lock()
+    }
+
+    /// How many launches wait for their start hook to connect, each holding its grant's
+    /// objects: at most those started in the last [`START`], since each one's wait ends by
+    /// then and drops it ([`Pending::wait`]).
+    pub fn waiting(&self) -> usize {
+        self.table().len()
+    }
+
+    /// How many handshake threads are alive: one for each start hook connected whose
+    /// handshake has not ended. None once every launch attached or was refused.
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.alive()
     }
 }
 
@@ -491,6 +539,9 @@ pub struct Program {
     image: Lock<Image>,
     sessions: crossbeam_channel::Sender<Result<Session, Error>>,
     starts: Arc<Lock<Starts>>,
+    /// The threads alive that wait for a start hook ([`Program::command`]): one a process
+    /// started and not yet attached, each ended when its hook attached or within [`START`].
+    starting: Threads,
 }
 
 /// The executable of a [`Program`], as [`Executable`] names it, for any path.
@@ -535,6 +586,7 @@ impl Program {
             image: Lock::new("inproc.program.image", image),
             sessions,
             starts: Arc::new(Lock::new("inproc.program.starts", Starts::default())), // alloc: once per program
+            starting: Threads::default(),
         }
     }
 
@@ -569,6 +621,24 @@ impl Program {
         self.command_with(command, forks, Vec::new(), Vec::new(), Vec::new()) // alloc: none, empty
     }
 
+    /// As [`Program::command`], for a caller that knows what file is at the command's path:
+    /// `placed` is the content key of the output the build placed there and found unchanged
+    /// since, or `None` when it placed none. Where that is the key of this program's
+    /// executable as its memory is now, the file is the memory's file already and nothing is
+    /// written ([`Wrote::Placed`]): the build is the one writer of its outputs, and a second
+    /// write of the same bytes here would only make the build place it again (its file's time
+    /// moved) and its outputs' watch hear a change. Any other key, or none, and the host
+    /// writes the file as [`Program::command`] does. With what was done of the file.
+    pub fn command_placed(
+        &self,
+        command: Command,
+        forks: bool,
+        placed: Option<[u8; 32]>,
+    ) -> Result<(Command, Started, Wrote), Error> {
+        // alloc: none, empty
+        self.start(command, forks, Some(placed), Vec::new(), Vec::new(), Vec::new())
+    }
+
     /// As [`Program::command`], with dependency images mapped into the run: `maps` laid over
     /// the executable's reservation for fixed maps (`blaze_premap::map::Memory::maps`), and
     /// their open words written and bound before the program runs (`blaze_premap::start::plan`'s
@@ -582,7 +652,23 @@ impl Program {
         writes: Vec<ImageWrite>,
         lookups: Vec<ImageLookup<'_>>,
     ) -> Result<(Command, Started), Error> {
-        let (command, pending) = {
+        let (command, started, _) = self.start(command, forks, None, maps, writes, lookups)?;
+        Ok((command, started))
+    }
+
+    /// What [`Program::command_with`] and [`Program::command_placed`] do. `placed`: `None`
+    /// from a caller that says nothing of the file at the path, `Some` what the build placed
+    /// there.
+    fn start(
+        &self,
+        command: Command,
+        forks: bool,
+        placed: Option<Option<[u8; 32]>>,
+        maps: Vec<FixedMap<'_>>,
+        writes: Vec<ImageWrite>,
+        lookups: Vec<ImageLookup<'_>>,
+    ) -> Result<(Command, Started, Wrote), Error> {
+        let (command, pending, wrote) = {
             let memory = lock(&self.memory);
             // clone: once per launch, a key, a length and a store path
             let image = self.image.lock().clone();
@@ -592,7 +678,12 @@ impl Program {
                 len: image.len,
                 store: image.store.as_deref(),
             };
-            self.host.write_executable(&memory, &executable)?;
+            // Compared with `memory` locked, as the image is read: a link that commits into
+            // the memory changes both under that lock ([`Program::relaid`]).
+            let wrote = match placed {
+                Some(Some(key)) if key == image.key => Wrote::Placed,
+                _ => self.host.write_executable(&memory, &executable)?,
+            };
             let launch = Launch {
                 image: &memory,
                 maps,
@@ -606,7 +697,8 @@ impl Program {
                 sandbox: command.sandbox,
                 memory: command.memory,
             };
-            self.host.launch(&launch)?
+            let (command, pending) = self.host.launch(&launch)?;
+            (command, pending, wrote)
         };
         let started = {
             let mut starts = lock_starts(&self.starts);
@@ -618,9 +710,11 @@ impl Program {
         let memory = Arc::clone(&self.memory);
         let starts = Arc::clone(&self.starts);
         let sessions = self.sessions.clone();
+        let alive = self.starting.one_more();
         std::thread::Builder::new()
             .name("blaze-inproc start".to_owned())
             .spawn(move || {
+                let _alive = alive;
                 let session = pending.wait(START).and_then(|session| {
                     let mut starts = lock_starts(&starts);
                     match starts.starts.get(&started.0) {
@@ -658,7 +752,36 @@ impl Program {
             .map_err(|it| {
                 Error::new(format!("starting the thread that waits for a start hook: {it}"))
             })?;
-        Ok((command, started))
+        Ok((command, started, wrote))
+    }
+
+    /// Whether the start of `started` ended with its start hook never attached (the process
+    /// never ran, ended first, or its hook did not connect within [`START`]), forgetting it:
+    /// for a caller that is told of no exit of that process (`blaze run`'s program is its
+    /// CLI's process, which the daemon does not reap), so nothing of a start that failed is
+    /// kept for the program's life.
+    pub fn forget_ended(&self, started: Started) -> bool {
+        let mut starts = lock_starts(&self.starts);
+        match starts.starts.get(&started.0) {
+            Some(Start::Ended) => {
+                starts.starts.remove(&started.0);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many threads wait for a start hook of this program's processes: none once every
+    /// process started has attached or its wait ended.
+    pub fn starting(&self) -> usize {
+        self.starting.alive()
+    }
+
+    /// How many starts the program still holds word of: processes whose start hook has not
+    /// attached yet, attached ones not yet said exited, and failed ones not yet forgotten.
+    /// What a test of a caller reads to see that its launches leave nothing behind.
+    pub fn starts_held(&self) -> usize {
+        lock_starts(&self.starts).starts.len()
     }
 
     /// The process of `started` exited, and every child it forked too: its threads hold no
@@ -689,7 +812,7 @@ fn lock(memory: &Lock<CodeMemory>) -> LockGuard<'_, CodeMemory> {
     memory.lock()
 }
 
-fn accept(listener: &sys::Listener, waiting: &Table) {
+fn accept(listener: &sys::Listener, waiting: &Table, handshakes: &Threads) {
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(it) => it,
@@ -699,9 +822,13 @@ fn accept(listener: &sys::Listener, waiting: &Table) {
             }
         };
         let waiting = Arc::clone(waiting);
+        let alive = handshakes.one_more();
         let started = std::thread::Builder::new()
             .name("blaze-inproc handshake".to_owned())
-            .spawn(move || handshake(Channel::new(stream), peer, &waiting));
+            .spawn(move || {
+                let _alive = alive;
+                handshake(Channel::new(stream), peer, &waiting)
+            });
         if let Err(error) = started {
             eprintln!("blaze-inproc: starting a handshake thread: {error}");
         }

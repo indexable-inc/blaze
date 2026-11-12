@@ -22,6 +22,8 @@ macro_rules! logged {
         let line = format!($($arg)*);
         eprintln!("{line}");
         tracing::event!(target: "blaze", tracing::Level::$level, "{line}");
+        // The log is bounded (`serve/log.rs`): one `fstat` a line.
+        $crate::serve::log::check();
     }};
 }
 pub(crate) use logged;

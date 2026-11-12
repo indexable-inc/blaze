@@ -1099,10 +1099,10 @@ answered. It is said again only while every input of that walk is as it was:
 | The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
 | Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
 | Colors, width, `--refused`, `-v`, `--goal` | the request's own hash |
-| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
+| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk; a path named through symlinks (the macOS SDK's `libm.tbd`) is watched at each link and at the file they end at |
 | Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
 | A manifest above the checkout that is not there | looked at as the request is asked |
-| The outputs | each directory they are in has been watched since before the kept walk and heard nothing |
+| The outputs, the standard library's among them | each directory they are in (a profile's or a target's under the build directories, one build's under the daemon's `std` place) has been watched since before the kept walk and heard nothing; a `blaze run`'s launch writes none of them |
 | Layout profiles (`<target>/layout`) | watched when there, looked at when not |
 | Other jobs | none is under way |
 
@@ -1224,7 +1224,9 @@ never bytes of one layout read as another's. A new persisted file adds its row h
 | The profile history's manifest | `<home>/v2/profile/manifest.json` | the daemon's flushes and merges | `format` | read: formats from the oldest still read up to this one, rewritten as this one at the next commit; any other refused naming both | `a_manifest_reads_back_what_it_consumed_byte_for_byte` (`crates/blaze-profile/src/history/manifest.rs`) |
 | The flight recorder's mapped rings and the crash record | beside the profile history, `<home>/v2/profile` | every blaze process | a magic and a layout number | refused naming its file; its rows are not recovered | `a_mapping_of_another_layout_is_refused_naming_its_file` (`crates/blaze-profile/src/flight/postmortem.rs`), `a_record_of_another_layout_or_blaze_is_refused` (`crates/blaze-profile/src/crash.rs`) |
 | The collector's ledger | `<home>/v2/gc-ledger.json` | the daemon's collector | `format` | refused by name (the file and both formats) in the log and in status, then a new ledger is started | `a_file_of_the_previous_layout_is_refused_by_name` (`crates/blaze-gc/src/ledger.rs`) |
-| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash (records are zstd frames from version 4) | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| A flight recording | `<home>/v2/flightrec/<pid>-<ms>.cbor` | the daemon | a magic and a format number | format 1 (the CBOR as it is) is read; format 2 is the same CBOR as one zstd frame; any other is refused naming both formats | `a_file_of_format_1_reads_as_the_recording_it_is`, `a_file_of_another_format_is_refused_naming_both` (`crates/blaze-cargo/src/serve/flightrec.rs`) |
+| The daemon's log | `<home>/v2/serve.log`, and `serve.log.1` before it | the daemon's standard error | none: lines of text | read by every version; rotated at 8 MiB, the two kept to 16 MiB | `the_log_and_the_one_before_it_stay_within_the_cap` (`crates/blaze-cargo/src/serve/log.rs`) |
 | The daemon's lock | `<home>/v2/serve.lock` | the daemon | none: a pid and ` stopped` as text | read by every version | none yet |
 | The performance history's run rows | the build directory | `blaze perf record` | `format` in each row | refused naming the file, the run and both formats, with what to do (record it again) | none yet |
 | Build directories and fetched sources | `<home>/build`, `<home>/sources` | the daemon | none, on purpose: they keep their place across the daemon's formats | read | none: their contents are checked by content hash |

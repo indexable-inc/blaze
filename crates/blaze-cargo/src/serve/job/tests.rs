@@ -626,12 +626,18 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
 /// leaves the answer unkept.
 #[test]
 fn a_builds_outputs_are_vouched_for_by_the_directories_under_its_build_dirs() {
-    let dirs = |outputs: &[&'static str]| output_dirs_of(["/b", "/t"], outputs.iter().copied());
+    let dirs = |outputs: &[&'static str]| output_dirs_of(&["/b", "/t", "/std"], outputs.iter().copied());
     assert_eq!(
         dirs(&["/b/debug/deps/liba.rlib", "/b/debug/app", "/t/x86_64/debug/app", "/b/debug/b"]),
-        Some(vec!["/b/debug".into(), "/t/x86_64".into()])
+        Ok(vec!["/b/debug".into(), "/t/x86_64".into()])
     );
-    assert_eq!(dirs(&[]), Some(Vec::new()));
-    assert_eq!(dirs(&["/b/app"]), None, "an output right in the build dir");
-    assert_eq!(dirs(&["/elsewhere/debug/app"]), None, "an output under no build dir");
+    assert_eq!(dirs(&[]), Ok(Vec::new()));
+    // The standard library's units are units of the plan: one build of it is one directory.
+    assert_eq!(
+        dirs(&["/std/9c52/8d9a/build/core/1f/out/libcore-1f.rlib", "/b/debug/app"]),
+        Ok(vec!["/b/debug".into(), "/std/9c52".into()])
+    );
+    // The refusal names the output (errors-name-the-thing).
+    assert_eq!(dirs(&["/b/debug/a", "/b/app"]), Err("/b/app".into()), "an output right in the build dir");
+    assert_eq!(dirs(&["/elsewhere/debug/app"]), Err("/elsewhere/debug/app".into()), "an output under no build dir");
 }

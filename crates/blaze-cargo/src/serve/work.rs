@@ -688,9 +688,17 @@ pub trait Steps: Sized + Send + Sync + 'static {
     }
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
-    /// with, or `None` for a program that is no dev executable and runs its file.
-    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
-        let _ = (program, pid);
+    /// with, or `None` for a program that is no dev executable and runs its file. `placed`
+    /// is the content key of the output the jobs placed at `program` and found unchanged at
+    /// their last look ([`crate::serve::job::Jobs::placed_key`]): a launch of that very file
+    /// writes nothing.
+    fn launch(
+        &self,
+        program: &str,
+        pid: u32,
+        placed: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        let _ = (program, pid, placed);
         Ok(None)
     }
     /// On the loop, once at start: the queries of the daemon's database.

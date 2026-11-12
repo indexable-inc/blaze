@@ -1209,8 +1209,12 @@ fn builds_of(kept: &Kept) -> Option<[u64; 2]> {
 ///
 /// The invariant: no build loses a part of its rows. The unit that goes is a set of builds whose
 /// files chain together: files whose build ranges ([`builds_of`]) overlap are one unit, all
-/// retired at once, every table of them. A file of no build goes alone. Units go oldest first
-/// (a unit is as old as its newest file's flush), and two are never retired: the unit of the
+/// retired at once, every table of them. A file of no build goes alone, and before any build's:
+/// the files of no build (what a daemon wrote between builds, its own heartbeat mostly) go
+/// first, oldest first, and only then units of builds, oldest first (a unit is as old as its
+/// newest file's flush), so a daemon left idle never pushes a build's rows out while rows of
+/// no build are left to go (until 2026-11-11 age alone decided: a daemon idle for two days
+/// wrote its way through the cap and every build before it). Two are never retired: the unit of the
 /// newest flush, and any unit holding rows of a build in `running`, whose rows are still being
 /// written. Until 2026-11-11 the unit was the build a file was named for alone: a long build
 /// whose flushes also held a later, shorter build's rows had those files named for the later
@@ -1221,6 +1225,26 @@ fn past_cap<'a>(
     total: u64,
     cap: u64,
     running: &BTreeSet<u64>,
+) -> BTreeSet<usize> {
+    past_cap_in(kept, total, cap, running, Order::NoBuildFirst)
+}
+
+/// What [`past_cap`] retires first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// Files of no build, then builds: what the cap does.
+    NoBuildFirst,
+    /// Whatever is oldest, as until 2026-11-11: the planted bug of the order's test.
+    #[cfg(test)]
+    OldestFirst,
+}
+
+fn past_cap_in<'a>(
+    kept: impl Iterator<Item = &'a Kept> + Clone,
+    total: u64,
+    cap: u64,
+    running: &BTreeSet<u64>,
+    order_by: Order,
 ) -> BTreeSet<usize> {
     // alloc: empty unless past the cap
     let mut gone = BTreeSet::new();
@@ -1263,13 +1287,18 @@ fn past_cap<'a>(
             builds_of(kept).is_some_and(|[lo, hi]| running.range(lo..=hi).next().is_some());
     }
     // alloc: once a flush past the cap
-    let mut order: Vec<(u64, (u64, Option<usize>), u64, bool)> =
-        units.into_iter().map(|(key, (last, bytes, live))| (last, key, bytes, live)).collect();
+    // Sorted by whether it is a build's (those after the files of none), then by age.
+    let mut order: Vec<(bool, u64, (u64, Option<usize>), u64, bool)> = units
+        .into_iter()
+        .map(|(key, (last, bytes, live))| {
+            (order_by == Order::NoBuildFirst && key.1.is_none(), last, key, bytes, live)
+        })
+        .collect();
     order.sort_unstable();
     // alloc: once a flush past the cap
     let mut going = BTreeSet::new();
     let mut left = total;
-    for (last, key, bytes, live) in order {
+    for (_, last, key, bytes, live) in order {
         if left <= cap {
             break;
         }
@@ -3725,11 +3754,18 @@ impl<H: Host> Files<H> {
 
     /// Notes that build `build` started (`running`) or ended: while it runs, the cap retires
     /// no file that holds a row of it.
-    pub(crate) fn running(&mut self, build: u64, running: bool) {
+    /// Whether that changed what is noted: a second start of a build, or an end of one
+    /// never noted as started, does not.
+    pub(crate) fn running(&mut self, build: u64, running: bool) -> bool {
         match running {
             true => self.state.running.insert(build),
             false => self.state.running.remove(&build),
-        };
+        }
+    }
+
+    /// Whether any build is noted as running.
+    pub(crate) fn any_running(&self) -> bool {
+        !self.state.running.is_empty()
     }
 
     fn push(&mut self, job: Job) {
