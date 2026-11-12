@@ -1830,6 +1830,7 @@ mod folded;
 mod kept;
 mod later;
 mod masks;
+mod near;
 mod pieces;
 mod stop;
 mod walk;
