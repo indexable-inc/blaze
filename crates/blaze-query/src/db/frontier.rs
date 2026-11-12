@@ -199,6 +199,10 @@ pub struct ChangedSetWork {
     pub written: u64,
     /// Rows asked because their last run made an untracked read.
     pub untracked: u64,
+    /// Nodes that had said they changed before the walk began (runs of pulls since the walk
+    /// before, not backdated): the backlog the walk starts from beside what was written. A
+    /// build's pulls leave one per row it made again; an edit's walk should find none.
+    pub said: u64,
     /// Rows it verified.
     pub visited: u64,
     /// Reverse edges it followed.
@@ -716,6 +720,7 @@ fn walk(db: *const (), storage: &Storage) {
         view,
         written = taken.written.len(),
         untracked = tracing::field::Empty,
+        said = tracing::field::Empty,
         visited = tracing::field::Empty,
         edges = tracing::field::Empty,
         changed = tracing::field::Empty,
@@ -780,6 +785,7 @@ fn walk(db: *const (), storage: &Storage) {
             while let Some(node) = frontier.changed.pop() {
                 changed.push(node);
                 found.push(node);
+                work.said += u64::from(first);
             }
         }
         first = false;
@@ -888,6 +894,7 @@ fn walk(db: *const (), storage: &Storage) {
     work.edges = plan.edges;
     work.changed = found.len() as u64;
     walking.record("untracked", work.untracked);
+    walking.record("said", work.said);
     walking.record("visited", work.visited);
     walking.record("edges", work.edges);
     walking.record("changed", work.changed);
@@ -900,6 +907,7 @@ fn walk(db: *const (), storage: &Storage) {
         stage = super::edit_work::CHANGED_SET,
         written = work.written,
         untracked = work.untracked,
+        said = work.said,
         visited = work.visited,
         edges = work.edges,
         changed = work.changed,
