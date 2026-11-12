@@ -72,6 +72,13 @@ impl Idle {
         self.gave = true;
         true
     }
+
+    /// Whether this stretch of idleness gave back: until the daemon works again, what is
+    /// freed goes back as it is freed.
+    #[blaze::pure]
+    pub(crate) fn gave(&self) -> bool {
+        self.gave
+    }
 }
 
 #[cfg(test)]
