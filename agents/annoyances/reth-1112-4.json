@@ -16,5 +16,5 @@
  "class": "a fact learned by a build that the build's own outputs needed: outputs made before it are dropped instead of filed once it is known",
  "prevention": "none built. The fix: file such records after the answer, once the build's end knows the verdict (re-checking each call from either state, as `same_from_either_state` does for a crate that settles), or key the record by the verdict as a read so the next build's lookup finds it",
  "fix": "see prevention",
- "state": "open"
+ "state": "fixed 77c4d94579 (row reth-1112-11)"
 }

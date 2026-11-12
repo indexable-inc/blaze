@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-16",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "the Mac's disk",
+ "what": "The Mac's 7.1 TB volume had 138 MB free at 04:24 local: every command failed with ENOSPC until I deleted my own lane's target/debug (20 GiB). My lane's cargo target directory is 30 GiB and its fixture homes 1 GiB; the rest is not mine.",
+ "cost": "ten minutes; one fixture run lost",
+ "cause": "many worktrees each with a target directory",
+ "class": "a shared resource with no budget",
+ "prevention": "none built",
+ "fix": "a per-lane target budget, or one shared target directory for cargo-built lanes",
+ "state": "open"
+}
