@@ -2783,7 +2783,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// `reply` handed to the server to send. A request's `Done` ends its `request: read to
     /// reply` span ([`Daemon::arrive`]).
     fn reply(&mut self, reply: &Reply) {
+        self.server.at(self.driver.now());
         self.server.reply(reply, &mut self.effects);
+        while let Some(unsent) = self.server.take_overfull() {
+            // The client cannot be told on a connection it does not read: the log says why
+            // its request ended with a hangup, which it quotes.
+            tracing::error!(
+                target: "blaze",
+                conn = unsent.conn.0,
+                unsent_bytes = unsent.bytes,
+                "hung up on connection {}: {} bytes of replies waited behind a send its peer \
+                 took none of in 30 s{}",
+                unsent.conn.0,
+                unsent.bytes,
+                match unsent.last_request {
+                    // alloc: an error, once a connection hung up on
+                    Some(id) => format!("; the last of them answers its request {id}"),
+                    None => String::new(),
+                }
+            );
+        }
         if matches!(reply.response, blaze_api::Response::Done { .. })
             && let Some(at) = self.answering.iter().position(|(to, _)| *to == reply.to)
         {

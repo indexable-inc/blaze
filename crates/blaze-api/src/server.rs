@@ -32,7 +32,7 @@
 //! frames both ways, handed in ([`Server::send_local`]) and taken out ([`Server::take_local`])
 //! by the caller rather than received and sent through the driver.
 
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::SocketAddr, time::Duration};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
@@ -49,8 +49,19 @@ use crate::{
 
 /// The most bytes one receive asks for.
 const RECEIVE: usize = 64 << 10;
-/// The most bytes a connection's replies may queue behind the send in flight.
+/// The most bytes a connection's replies may queue behind a send its peer does not take: one
+/// in flight for [`STUCK`] with this much waiting is hung up on.
 const MOST_QUEUED: usize = 64 << 20;
+/// How long a send of at most [`MOST_SENT`] bytes may be in flight before its peer is one that
+/// does not read. A build's answers are queued as one burst, in one turn of the caller's loop,
+/// before any send of them can end: a unit with 18,834 errors (tempo-contracts under a lost
+/// impl table) queued more than [`MOST_QUEUED`] behind its first send and was hung up on with
+/// no word, its client reading all the while. So the bound is on a peer that takes nothing in
+/// this long, by the caller's clock ([`Server::at`]).
+const STUCK: Duration = Duration::from_secs(30);
+/// The most bytes one send carries: a peer that reads ends a send of this much well inside
+/// [`STUCK`], so a send that old is a peer that does not.
+const MOST_SENT: usize = 1 << 20;
 /// The most bytes an HTTP connection may hold, pipelined behind the request being answered,
 /// before the server stops reading it until that request is done.
 const MOST_HELD: usize = LONGEST_REQUEST as usize + (1 << 20);
@@ -109,6 +120,11 @@ pub struct Server {
     stopped: bool,
     /// What arrived, handed over at the end of the next [`Server::complete`].
     told: Vec<Arrived>,
+    /// The caller's clock, as it last said ([`Server::at`]).
+    now: Duration,
+    /// The connections hung up on for what waited behind a send their peer did not take, until
+    /// the caller takes them to say so ([`Server::take_overfull`]).
+    overfull: Vec<Unsent>,
     /// It takes this process's requests ([`Config::local`]).
     local: bool,
     /// The number of the next connection [`Server::open_local`] opens.
@@ -153,6 +169,45 @@ struct Listener {
     listening: Listening,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a connection is hung up on for what is queued behind its send
+    /// in flight, however long that send has been in flight.
+    static BOUND_IGNORES_THE_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn bound_ignores_the_clock() -> bool {
+    #[cfg(test)]
+    return BOUND_IGNORES_THE_CLOCK.get();
+    #[cfg(not(test))]
+    false
+}
+
+impl Connection {
+    /// The bytes queued that no send has taken.
+    fn waiting(&self) -> usize {
+        self.queue.len() - self.head
+    }
+
+    /// The bytes of the next send, at most [`MOST_SENT`] of what waits: the queue itself when
+    /// it is no longer than that (`spare`, empty, is then the queue's next room), else its
+    /// next stretch copied into `spare`.
+    fn next_send(&mut self, mut spare: Vec<u8>) -> Vec<u8> {
+        if self.head == 0 && self.queue.len() <= MOST_SENT {
+            return std::mem::replace(&mut self.queue, spare);
+        }
+        let end = (self.head + MOST_SENT).min(self.queue.len());
+        spare.clear();
+        spare.extend_from_slice(&self.queue[self.head..end]);
+        self.head = end;
+        if self.head == self.queue.len() {
+            self.queue.clear();
+            self.head = 0;
+        }
+        spare
+    }
+}
+
 /// What a tag of the server's was asked for.
 enum Pending {
     Listen(usize),
@@ -167,9 +222,14 @@ struct Connection {
     sending: Option<Tag>,
     /// How many bytes the send in flight carries, for [`Server::abandon`] to name.
     sending_bytes: usize,
-    /// Bytes waiting for the send in flight; empty while none is in flight, so a reply is
-    /// encoded where it is sent from.
+    /// When the send in flight was asked for, by the caller's clock.
+    sending_since: Duration,
+    /// Bytes waiting for the send in flight, from `head` on; empty while none is in flight, so
+    /// a reply is encoded where it is sent from.
     queue: Vec<u8>,
+    /// How much of `queue`, from its start, sends have taken: not 0 only while a queue longer
+    /// than [`MOST_SENT`] goes out a send at a time.
+    head: usize,
     /// Hang up once everything queued is sent; nothing more is read.
     closing: bool,
     /// The request the last reply queued on it answers, for [`Server::abandon`] to name.
@@ -188,7 +248,8 @@ pub struct Abandoned {
     pub unsent_bytes: usize,
 }
 
-/// A connection [`Server::abandon`] hung up on.
+/// A connection [`Server::abandon`] hung up on, or one hung up on for what waited behind a
+/// send its peer did not take ([`Server::take_overfull`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Unsent {
     pub conn: Conn,
@@ -249,6 +310,8 @@ impl Server {
             failed: None,
             stopped: false,
             told,
+            now: Duration::ZERO,
+            overfull: Vec::new(), // alloc: empty, allocates nothing
             local: config.local,
             next_local: 0,
             writer: cbor::Writer::new(),
@@ -321,7 +384,20 @@ impl Server {
     /// clock (the live feed) skips a tick then, so it never queues more than one tick's worth.
     /// A connection that is gone has nothing waiting.
     pub fn waiting(&self, conn: Conn) -> bool {
-        self.conns.get(&conn).is_some_and(|it| it.sending.is_some() || !it.queue.is_empty())
+        self.conns.get(&conn).is_some_and(|it| it.sending.is_some() || it.waiting() > 0)
+    }
+
+    /// The caller's clock now: what a send in flight is timed by. Said once a turn of the
+    /// caller's loop, before its replies.
+    pub fn at(&mut self, now: Duration) {
+        self.now = now;
+    }
+
+    /// A connection hung up on because more than the bound waited behind a send its peer did
+    /// not take, with what it was still owed: taken once, for the caller to say. `None` when
+    /// there is no other.
+    pub fn take_overfull(&mut self) -> Option<Unsent> {
+        self.overfull.pop()
     }
 
     /// Sends a reply; one to a connection that is gone is dropped.
@@ -402,6 +478,8 @@ impl Server {
             receiving: None,
             sending: None,
             sending_bytes: 0,
+            sending_since: Duration::ZERO,
+            head: 0,
             // alloc: none until a reply is queued; once per connection.
             queue: Vec::new(),
             closing: false,
@@ -466,7 +544,7 @@ impl Server {
         for conn in conns {
             let Some(it) = self.conns.get(&conn) else { continue };
             let in_flight = if it.sending.is_some() { it.sending_bytes } else { 0 };
-            let bytes = in_flight + it.queue.len();
+            let bytes = in_flight + it.waiting();
             abandoned.unsent_bytes += bytes;
             // alloc: once per connection a stop gives up on.
             abandoned.conns.push(Unsent { conn, bytes, last_request: it.last_request });
@@ -543,6 +621,8 @@ impl Server {
             receiving: None,
             sending: None,
             sending_bytes: 0,
+            sending_since: Duration::ZERO,
+            head: 0,
             queue,
             closing: false,
             last_request: None,
@@ -621,8 +701,8 @@ impl Server {
             return self.gone(conn, effects);
         };
         // The buffer sent is the queue's next, its room kept.
-        if !connection.queue.is_empty() {
-            let bytes = std::mem::replace(&mut connection.queue, spare);
+        if connection.waiting() > 0 {
+            let bytes = connection.next_send(spare);
             return self.send(conn, bytes, effects);
         }
         if connection.queue.capacity() == 0 {
@@ -787,20 +867,32 @@ impl Server {
     }
 
     /// Sends what is queued now when no send is in flight; else it waits for that send, and a
-    /// peer with too much waiting is hung up on.
+    /// peer that has not taken that send in [`STUCK`] with too much waiting is hung up on.
     fn flush(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
+        let now = self.now;
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         // A connection of this process's keeps its replies until they are taken.
         if connection.local {
             return;
         }
-        let waiting = connection.queue.len();
+        let waiting = connection.waiting();
         match connection.sending {
             None if waiting > 0 => {
-                let bytes = std::mem::take(&mut connection.queue);
+                // alloc: the next send's buffer, when the queue is longer than one send
+                let bytes = connection.next_send(Vec::new());
                 self.send(conn, bytes, effects);
             }
-            Some(_) if waiting > MOST_QUEUED => self.gone(conn, effects),
+            Some(_)
+                if waiting > MOST_QUEUED
+                    && (now.saturating_sub(connection.sending_since) >= STUCK
+                        || bound_ignores_the_clock()) =>
+            {
+                let bytes = connection.sending_bytes + waiting;
+                let last_request = connection.last_request;
+                // alloc: once per connection hung up on for its queue
+                self.overfull.push(Unsent { conn, bytes, last_request });
+                self.gone(conn, effects)
+            }
             _ => {}
         }
     }
@@ -810,6 +902,7 @@ impl Server {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         connection.sending = Some(tag);
         connection.sending_bytes = bytes.len();
+        connection.sending_since = self.now;
         self.pending.insert(tag, Pending::Send(conn));
         effects.push(Effect::Send { conn, bytes, tag });
     }

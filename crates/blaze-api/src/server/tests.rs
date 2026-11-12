@@ -412,20 +412,75 @@ fn one_send_is_in_flight_and_later_replies_are_concatenated_behind_it() {
     );
 }
 
-#[test]
-fn a_peer_that_lets_more_than_64_mib_queue_is_hung_up_on() {
-    let mut rig = Rig::new(config(true, false));
-    let conn = rig.accept(true, 1);
+/// Nine replies of 8 MiB each, queued behind the first's send.
+fn nine_big_replies(rig: &mut Rig, conn: Conn) {
     let big = Response::Error(ApiError::new("x".repeat(8 << 20), None));
     for id in 0..9 {
-        assert!(!rig.hung_up(conn), "hung up after {id} replies");
         rig.reply(conn, id, big.clone());
     }
+}
+
+/// The invariant: a peer is hung up on for what waits behind a send only when it took none of
+/// that send in 30 s of the caller's clock; a burst of replies longer than the bound, queued
+/// before a send of them could end, is sent whole to a peer that reads, a megabyte a send.
+/// tempo-contracts' 18,834 errors were one such burst, and its client was hung up on.
+#[test]
+fn a_burst_past_the_bound_is_sent_whole_to_a_peer_that_reads() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 1);
+    rig.server.at(Duration::from_secs(5));
+    nine_big_replies(&mut rig, conn);
+    assert!(!rig.hung_up(conn), "hung up on a peer given no time to read");
+    assert!(rig.server.take_overfull().is_none());
+    let mut sent = Vec::new();
+    let mut longest = 0;
+    loop {
+        let sends = rig.sends(conn);
+        let Some((tag, bytes)) = sends.into_iter().next() else { break };
+        longest = longest.max(bytes.len());
+        sent.extend(bytes);
+        rig.complete(tag, Done::Sent(Vec::new()));
+    }
+    assert!(longest <= 1 << 20, "a send carries at most a megabyte: {longest}");
+    let got = responses(&sent);
+    assert_eq!(got.len(), 9);
+    assert_eq!(got.iter().map(|it| it.id).collect::<Vec<_>>(), (0..9).collect::<Vec<_>>());
+    assert!(!rig.hung_up(conn));
+}
+
+#[test]
+fn a_peer_that_takes_nothing_for_30_s_with_more_than_64_mib_queued_is_hung_up_on() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 1);
+    rig.server.at(Duration::from_secs(5));
+    nine_big_replies(&mut rig, conn);
+    rig.server.at(Duration::from_secs(34));
+    rig.reply(conn, 9, Response::Done { ok: true });
+    assert!(!rig.hung_up(conn), "29 s is inside the bound");
+    rig.server.at(Duration::from_secs(35));
+    rig.reply(conn, 10, Response::Done { ok: true });
     assert!(rig.hung_up(conn));
+    let unsent = rig.server.take_overfull().expect("the connection hung up on is named");
+    assert_eq!((unsent.conn, unsent.last_request), (conn, Some(10)));
+    assert!(unsent.bytes > 64 << 20, "{}", unsent.bytes);
+    assert!(rig.server.take_overfull().is_none(), "named once");
     rig.hang_ups_done();
     assert_eq!(rig.arrived(), [Arrived::Gone { conn }]);
-    rig.reply(conn, 10, Response::Done { ok: true });
+    rig.reply(conn, 11, Response::Done { ok: true });
     assert_eq!(rig.sends(conn).len(), 1, "only the send in flight before");
+}
+
+/// The control of the invariant above: with the bound on what is queued alone, the burst is
+/// hung up on though its peer was given no time.
+#[test]
+fn the_oracle_catches_a_burst_hung_up_on_with_no_time_to_read() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 1);
+    rig.server.at(Duration::from_secs(5));
+    super::BOUND_IGNORES_THE_CLOCK.set(true);
+    nine_big_replies(&mut rig, conn);
+    super::BOUND_IGNORES_THE_CLOCK.set(false);
+    assert!(rig.hung_up(conn));
 }
 
 #[test]
