@@ -1494,8 +1494,9 @@ fn apply_bodies(
 
 /// The modules whose body parts `krate`'s work reads ([`apply_bodies`]), sorted, into
 /// `modules`: every module on a `sweep` or a change of which macros may write impls, else
-/// those of the defs, impls and bindings the delta touched, and every module whose bodies held
-/// an impl.
+/// those of the defs, impls and bindings the delta touched, those whose scope it set (a module
+/// macros wrote in this write, or one that gained a `const _` and no name), and every module
+/// whose bodies held an impl.
 fn bodies_to_read(
     db: &Db,
     crate_state: &CrateState,
@@ -1512,10 +1513,24 @@ fn bodies_to_read(
         modules.extend(delta.touched.iter().filter_map(|def| def.module(db)));
         modules.extend(delta.touched_impls.iter().map(|imp| imp.loc(db).container));
         modules.extend(delta.bindings.iter().map(|&(module, _)| module));
+        #[cfg(test)]
+        let planted = SET_SCOPES_ARE_NOT_READ.get();
+        #[cfg(not(test))]
+        let planted = false;
+        if !planted {
+            modules.extend(delta.scopes.iter().copied());
+        }
     }
     modules.extend(crate_state.bodies.keys().copied());
     modules.sort_unstable();
     modules.dedup();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: the bodies of a module are read again only where the write
+    /// touched a def or an impl or changed a binding, not where it set a scope.
+    pub(super) static SET_SCOPES_ARE_NOT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A key a crate's node reads before its work, across the database's workers: the work goes

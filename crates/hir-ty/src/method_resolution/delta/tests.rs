@@ -9,6 +9,7 @@
 
 mod batch;
 mod cost;
+mod given_macros;
 mod random;
 
 use std::fmt::Write as _;

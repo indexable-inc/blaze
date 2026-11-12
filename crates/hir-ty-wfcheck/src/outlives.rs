@@ -50,11 +50,44 @@ pub(crate) type Components<'db> = SmallVec<[Component<'db>; 4]>;
 
 const _: () = assert!(size_of::<Component<'static>>() <= 16);
 
+/// The outlives components of `ty`.
+///
+/// A closure outlives a region when what it captures does, and a coroutine when its captures
+/// and its resume type do (rustc's `push_outlives_components`): the parameters of the function
+/// that writes it are arguments of its type and none of its components. `impl<F: 'static>
+/// Builder for Ext<F>` given a closure that captures nothing needs nothing of its function's
+/// type parameters (reth-node-ethereum's `launch_add_ons`: E0310 of `PVB`, `EB` and `EVB`, the
+/// parameters of the impl with no `'static` bound).
 pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
     struct Find<'db>(Components<'db>);
     impl<'db> TypeVisitor<DbInterner<'db>> for Find<'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
+            #[cfg(test)]
+            if CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS.get() {
+                return self.visit_structurally(ty);
+            }
+            match ty.kind() {
+                TyKind::Closure(_, args) => args.as_closure().tupled_upvars_ty().visit_with(self),
+                TyKind::CoroutineClosure(_, args) => {
+                    args.as_coroutine_closure().tupled_upvars_ty().visit_with(self)
+                }
+                TyKind::Coroutine(_, args) => {
+                    let args = args.as_coroutine();
+                    args.tupled_upvars_ty().visit_with(self);
+                    args.resume_ty().visit_with(self)
+                }
+                _ => self.visit_structurally(ty),
+            }
+        }
+        fn visit_region(&mut self, region: Region<'db>) {
+            if !matches!(region.kind(), RegionKind::ReBound(..)) {
+                self.0.push(Component::Region(region));
+            }
+        }
+    }
+    impl<'db> Find<'db> {
+        fn visit_structurally(&mut self, ty: Ty<'db>) {
             match ty.kind() {
                 TyKind::Param(_) => self.0.push(Component::Param(ty)),
                 TyKind::Alias(_, _) if !ty.has_escaping_bound_vars() => {
@@ -64,15 +97,17 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
                 _ => ty.super_visit_with(self),
             }
         }
-        fn visit_region(&mut self, region: Region<'db>) {
-            if !matches!(region.kind(), RegionKind::ReBound(..)) {
-                self.0.push(Component::Region(region));
-            }
-        }
     }
     let mut find = Find(SmallVec::new());
     ty.visit_with(&mut find);
     find.0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a closure's and a coroutine's components are those of every
+    /// argument of its type, its function's parameters among them.
+    pub(crate) static CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The `impl Trait`s in `ty`, outermost first.
