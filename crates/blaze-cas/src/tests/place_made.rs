@@ -12,6 +12,12 @@
 //! The planted bugs ([`PlacePlant::MadeClonesUnflushed`],
 //! [`PlacePlant::MadeWaitsForWriteBack`]) put the route back that an edit's output took
 //! until then: a file of the store's written, then cloned to the path.
+//!
+//! An output that is its path's file with a patch over it ([`Store::place_patched`]) is the
+//! one clone a made place asks for: of the path's own file, never of a file of the store's.
+//! What that clone forces out is bounded by what the path's last place wrote, and is nothing
+//! once the write-back each place asks for as it ends has completed
+//! ([`PlacePlant::MadeNoWriteBack`] takes it out).
 
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -35,6 +41,10 @@ enum Op {
     /// the whole file of what the path held is let go of first ([`Store::unplace_made`]).
     /// Then `steps` completions are delivered (none: all of them).
     Place { image: u8, path: u8, steps: Option<u8> },
+    /// What path `path` holds brought to another file by a patch ([`Store::place_patched`]):
+    /// up to three runs of noise over it, its length moved by `grow` bytes less 100. Nothing
+    /// is asked of a path that holds no file.
+    Patch { seed: u64, path: u8, grow: u8, steps: Option<u8> },
     /// Everything in flight run to its end.
     Settle,
     /// The power goes; the store is opened again.
@@ -64,6 +74,8 @@ struct Asked {
     path: usize,
     value: usize,
     made: bool,
+    /// What a made place reports: the bytes it wrote there and the bytes it cloned.
+    reports: Option<(u64, u64)>,
 }
 
 struct World {
@@ -80,8 +92,15 @@ struct World {
     holds: [Option<Vec<u8>>; PATHS.len()],
     /// The value each path was last placed with.
     last: [Option<usize>; PATHS.len()],
-    /// Every value a place was ever asked of at each path.
-    ever: [Vec<usize>; PATHS.len()],
+    /// Every value a place was ever asked of at each path, a patch's with the bytes it was
+    /// a patch over.
+    ever: [Vec<(usize, Option<Vec<u8>>)>; PATHS.len()],
+    /// The bytes the last place that ended well at each path wrote into its file: what is
+    /// in memory alone until the file's write-back completes.
+    dirty: [u64; PATHS.len()],
+    /// The most the clones of patches may have forced out: what each patched path's last
+    /// place wrote, summed.
+    allowed: u64,
     asked: Vec<Asked>,
     /// Whether a cold place was asked since the store opened: until one is, the store has
     /// no file of its own to make, so every effect it asks for is a made place's.
@@ -131,6 +150,8 @@ impl World {
             holds: [None, None, None],
             last: [None; PATHS.len()],
             ever: [Vec::new(), Vec::new(), Vec::new()],
+            dirty: [0; PATHS.len()],
+            allowed: 0,
             asked: Vec::new(),
             cold: false,
         };
@@ -147,14 +168,18 @@ impl World {
     }
 
     /// What the store asks the driver for now, held to the rule while only made places were
-    /// asked since it opened: no clone, no write-back, and no write or rename that waits for
-    /// a sync.
+    /// asked since it opened: no clone but of a path's own file to a name beside it (a
+    /// patch's), no write-back but of a path's own file (asked as its place ends, waited for
+    /// by nothing), and no write or rename that waits for a sync.
     fn asks(&self) -> Result<(), String> {
         if self.cold {
             return Ok(());
         }
+        let own = |file: &FileName| PATHS.iter().any(|it| name(it) == *file);
         for effect in &self.effects {
             let what = match effect {
+                Effect::Clone { from, to, .. } if own(from) && !to.is_under(&name("store")) => continue,
+                Effect::WriteBack { file, .. } if own(file) => continue,
                 Effect::Clone { .. } => "a clone",
                 Effect::WriteBack { .. } => "a write-back",
                 Effect::Sync { .. } => "a sync",
@@ -208,7 +233,7 @@ impl World {
             let Some(at) = self.asked.iter().position(|it| it.tag == placed.tag) else {
                 return Err(format!("the store answered a place no one asked: {placed:?}"));
             };
-            let Asked { path: n, value, made, .. } = self.asked.swap_remove(at);
+            let Asked { path: n, value, made, reports, .. } = self.asked.swap_remove(at);
             let want = &self.values[value].bytes;
             match placed.result {
                 Ok(()) => {
@@ -223,16 +248,15 @@ impl World {
                             found.iter().zip(want).position(|(a, b)| a != b)
                         ));
                     }
-                    let runs = self.images.iter().find(|it| it.1 == value).map(|it| it.0.bytes());
-                    if made && Some(placed.bytes.copied) != runs
-                        || made && placed.bytes.cloned + placed.bytes.written != 0
-                    {
+                    let said = (placed.bytes.copied, placed.bytes.cloned);
+                    if made && (Some(said) != reports || placed.bytes.written != 0) {
                         return Err(format!(
-                            "{} was placed from its maker's runs of {runs:?} bytes and reported \
-                             as {:?}",
+                            "{} was placed from its maker's bytes, {reports:?} written and \
+                             cloned, and reported as {:?}",
                             PATHS[n], placed.bytes
                         ));
                     }
+                    self.dirty[n] = if made { placed.bytes.copied } else { 0 };
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
                     self.last[n] = Some(value);
@@ -294,10 +318,16 @@ impl World {
             let there = self.sim.exists(&path(n)).then(|| self.sim.contents(&path(n)));
             let allowed = match &there {
                 None => true,
-                Some(found) => self.ever[n].iter().any(|value| {
+                // A patch's file is a clone of its base with the patch written, none of it
+                // synced: what the power left of it holds, where a byte is not the value's,
+                // the base's byte or a zero, and is no longer than the longer of the two.
+                Some(found) => self.ever[n].iter().any(|(value, base)| {
                     let bytes = &self.values[*value].bytes;
-                    found.len() <= bytes.len()
-                        && found.iter().zip(bytes).all(|(it, want)| it == want || *it == 0)
+                    let base = base.as_deref().unwrap_or(&[]);
+                    found.len() <= bytes.len().max(base.len())
+                        && found.iter().enumerate().all(|(at, it)| {
+                            *it == 0 || bytes.get(at) == Some(it) || base.get(at) == Some(it)
+                        })
                 }),
             };
             if !allowed {
@@ -309,9 +339,11 @@ impl World {
             }
             self.last[n] = self.ever[n]
                 .iter()
-                .copied()
+                .map(|it| it.0)
                 .find(|value| Some(&self.values[*value].bytes) == there.as_ref());
             self.holds[n] = there;
+            // What the device holds is all there is: nothing of it is in memory alone.
+            self.dirty[n] = 0;
         }
         Ok(())
     }
@@ -365,8 +397,8 @@ impl World {
                     .ok_or_else(|| "the store has no value to place".to_owned())?;
                 let value = self.values.len();
                 self.values.push(Value { bytes, key: Some(key) });
-                self.asked.push(Asked { tag, path: n, value, made: false });
-                self.ever[n].push(value);
+                self.asked.push(Asked { tag, path: n, value, made: false, reports: None });
+                self.ever[n].push((value, None));
                 self.pump(steps)?;
             }
             Op::Place { image, path: n, steps } => {
@@ -384,9 +416,51 @@ impl World {
                 if let Some(before) = self.last[n].and_then(|it| self.values[it].key) {
                     store.unplace_made(&before, &mut self.effects);
                 }
+                let reports = Some((file.bytes(), 0));
                 let tag = store.place_made(path(n), file, &mut self.effects);
-                self.asked.push(Asked { tag, path: n, value, made: true });
-                self.ever[n].push(value);
+                self.asked.push(Asked { tag, path: n, value, made: true, reports });
+                self.ever[n].push((value, None));
+                self.pump(steps)?;
+            }
+            Op::Patch { seed, path: n, grow, steps } => {
+                let n = usize::from(n) % PATHS.len();
+                self.clear(n)?;
+                if self.asked.iter().any(|it| it.path == n) {
+                    return Ok(());
+                }
+                // clone: the model's copy of the file the patch is over.
+                let Some(base) = self.holds[n].clone() else { return Ok(()) };
+                let mut rng = Rng::new(seed);
+                let len = (base.len() as u64 + u64::from(grow)).saturating_sub(100).max(1);
+                let count = rng.below(4);
+                let room = len / count.max(1);
+                let runs: Vec<(u64, Vec<u8>)> = (0..count)
+                    .map(|k| {
+                        let at = k * room + rng.below(room / 2 + 1);
+                        let bytes = (1 + rng.below(2 * SECTOR as u64)).min(len - at).min((k + 1) * room - at);
+                        (at, noise(bytes.max(1) as usize, seed ^ (k + 7)))
+                    })
+                    .filter(|(at, bytes)| at + bytes.len() as u64 <= len)
+                    .collect();
+                // clone: the value the path is to hold, the base with the patch over it.
+                let mut bytes = base.clone();
+                bytes.resize(len as usize, 0);
+                for (at, run) in &runs {
+                    bytes[*at as usize..*at as usize + run.len()].copy_from_slice(run);
+                }
+                let file = Sparse { len, runs };
+                let wrote = file.bytes();
+                let store = self.store.as_mut().expect("the store is open");
+                if let Some(before) = self.last[n].and_then(|it| self.values[it].key) {
+                    store.unplace_made(&before, &mut self.effects);
+                }
+                self.allowed += self.dirty[n];
+                let tag = store.place_patched(path(n), file, &mut self.effects);
+                let value = self.values.len();
+                self.values.push(Value { bytes, key: None });
+                let reports = Some((wrote, len.saturating_sub(wrote)));
+                self.asked.push(Asked { tag, path: n, value, made: true, reports });
+                self.ever[n].push((value, Some(base)));
                 self.pump(steps)?;
             }
             Op::Settle => self.pump(None)?,
@@ -414,14 +488,15 @@ impl World {
 }
 
 /// Runs `case` with `plant` planted: the bytes its clones forced out of their sources
-/// ([`Sim::bytes_forced`]), or where the oracle failed.
+/// ([`Sim::bytes_forced`]) past what its patches' clones may have ([`World::allowed`]: what
+/// each patched path's last place wrote), or where the oracle failed.
 fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     let mut world = World::new(case, plant);
     for (n, op) in case.ops.iter().enumerate() {
         world.step(op).map_err(|why| format!("at op {n} ({op:?}): {why}"))?;
     }
     world.pump(None).map_err(|why| format!("at the end: {why}"))?;
-    Ok(world.sim.bytes_forced())
+    Ok(world.sim.bytes_forced().saturating_sub(world.allowed))
 }
 
 #[hegel::composite]
@@ -431,7 +506,13 @@ fn op(tc: &TestCase) -> Op {
         true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
         false => None,
     };
-    match tc.draw(gs::integers::<u8>().max_value(15)) {
+    match tc.draw(gs::integers::<u8>().max_value(21)) {
+        16.. => Op::Patch {
+            seed: tc.draw(gs::integers()),
+            path: byte(tc),
+            grow: byte(tc),
+            steps: steps(tc),
+        },
         0..3 => Op::Make {
             seed: tc.draw(gs::integers()),
             sectors: tc.draw(gs::integers::<u8>().max_value(60)),
@@ -458,15 +539,18 @@ fn case(tc: &TestCase) -> Case {
 
 /// The invariant: an output placed from its maker's bytes ([`Store::place_made`]), whatever
 /// the store's own whole files are doing beside it (written, sealed, their write-backs in
-/// flight or held for ever) and wherever the power goes, (1) asks the driver for no clone, no
-/// write-back and nothing that waits for a sync, so no clone of a file with data not written
-/// back is made for it and none of its bytes are forced out by one; (2) is answered once its
+/// flight or held for ever) and wherever the power goes, (1) asks the driver for nothing that
+/// waits for a sync, for no clone but a patch's ([`Store::place_patched`]) of its path's own
+/// file, and for no write-back but its path's own as it ends, so no clone of a file of the
+/// store's with data not written back is made for it, and a patch's clone forces out at most
+/// what its path's last place wrote; (2) is answered once its
 /// own effects have completed, with write-backs the disk never completes still held: its
 /// answer waits for no write-back; (3) ends with its path holding exactly its file, the runs
 /// over zeros at its length, and reports the runs' bytes as written there; (4) until it ends
 /// its path holds what it held or the new file whole, never a part; (5) after a crash its
 /// path holds nothing, a value once placed there whole, or what the power left of one (each
-/// byte the value's or a zero), never bytes of anything else; and the store opens.
+/// byte the value's, a zero or, for a patch, its base's), never bytes of anything else; and
+/// the store opens.
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back() {
@@ -476,8 +560,9 @@ fn a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back() {
             Err(why) => panic!("{case:?}: {why}"),
             Ok(0) => {}
             Ok(forced) => panic!(
-                "{case:?}: its clones forced {forced} bytes out of their sources: a file was \
-                 cloned from before its write-back completed"
+                "{case:?}: its clones forced {forced} bytes out of their sources past what its \
+                 patched paths' last places wrote: a file was cloned from before its write-back \
+                 completed"
             ),
         }
     });
@@ -587,5 +672,110 @@ fn runs_that_are_no_file_are_refused_naming_the_run() {
     let why = |n: usize| placed[n].result.clone().unwrap_err();
     assert!(why(0).contains("ends at 0x6e, past the file's length 0x64"), "{}", why(0));
     assert!(why(1).contains("the run at 0xa begins before 0x14"), "{}", why(1));
+    assert!(!sim.exists(&name("one/build/app")));
+}
+
+fn patch(seed: u64, path: u8) -> Op {
+    Op::Patch { seed, path, grow: 100, steps: None }
+}
+
+/// What a body edit's place writes once its image is at its path: the patch, whatever the
+/// file's length. An image of 16 MiB of which 1 MiB holds bytes, then two patches of two
+/// runs of 4 KiB each at each of two paths: 8 KiB written a patch a path, the file's blocks
+/// shared, nothing read, and nothing forced out, each place's write-back having completed
+/// before the next clone. The count is the same for an image four times as long. Before,
+/// each edit wrote the image's runs whole at each path.
+#[test]
+fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
+    const RUN: usize = 4 << 10;
+    let wrote_by = |len: u64| {
+        let mut sim = Sim::new(47, quiet());
+        let mut store = open(&mut sim, "store");
+        let runs: Vec<(u64, Vec<u8>)> =
+            (0..4u64).map(|n| (n * (len / 4), noise((len / 16) as usize, 300 + n))).collect();
+        let file = Sparse { len, runs };
+        let mut want = vec![0; len as usize];
+        for (at, bytes) in &file.runs {
+            want[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+        }
+        let paths = [name("one/build/deps/app"), name("one/build/app")];
+        let mut effects = Vec::new();
+        for to in &paths {
+            // clone: each path's writes own their runs.
+            store.place_made(to.clone(), file.clone(), &mut effects);
+        }
+        drive(&mut sim, &mut store, &mut effects);
+        assert!(store.placed().iter().all(|it| it.result == Ok(())));
+        let (wrote, read) = (sim.bytes_written(), sim.bytes_read());
+        for edit in 0..2u64 {
+            let patch = Sparse {
+                len,
+                runs: vec![(100 + edit, noise(RUN, 900 + edit)), (len / 2, noise(RUN, 950 + edit))],
+            };
+            for (at, bytes) in &patch.runs {
+                want[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+            }
+            for to in &paths {
+                // clone: each path's writes own their runs.
+                store.place_patched(to.clone(), patch.clone(), &mut effects);
+            }
+            drive(&mut sim, &mut store, &mut effects);
+            let placed = store.placed();
+            assert_eq!(placed.len(), 2, "{placed:?}");
+            for it in &placed {
+                assert_eq!(it.result, Ok(()));
+                let bytes =
+                    PlacedBytes { cloned: len - 2 * RUN as u64, written: 0, copied: 2 * RUN as u64 };
+                assert_eq!(it.bytes, bytes);
+            }
+            for to in &paths {
+                assert_eq!(sim.contents(to), want, "edit {edit}");
+            }
+        }
+        assert_eq!(sim.bytes_read(), read, "nothing is read");
+        assert_eq!(sim.bytes_forced(), 0, "each clone is of a file written back");
+        sim.bytes_written() - wrote
+    };
+    let (small, large) = (wrote_by(16 << 20), wrote_by(64 << 20));
+    assert_eq!(small, 2 * 2 * 2 * RUN as u64, "two edits, two paths, two runs of 4 KiB");
+    assert_eq!(small, large, "the patch's bytes, for a file of any length");
+}
+
+/// The planted-bug control: no write-back is begun as a made place ends, so the clone the
+/// path's next patch starts from forces out everything the place wrote (on a real disk it
+/// waits for it: the whole image, after a cold build).
+#[test]
+fn the_oracle_catches_a_patch_cloned_from_a_file_never_written_back() {
+    let ops = [make(1), place(0, 0), Op::Settle, patch(2, 0), Op::Settle, patch(3, 0)];
+    for seed in 0..8 {
+        let case = Case { seed, latency_us: 300, held: false, ops: ops.to_vec() }; // clone: a test's ops.
+        let run = |plant| {
+            let mut world = World::new(&case, plant);
+            for op in &case.ops {
+                world.step(op).unwrap_or_else(|why| panic!("seed {seed}, {op:?}: {why}"));
+            }
+            world.sim.bytes_forced()
+        };
+        assert_eq!(run(PlacePlant::None), 0, "seed {seed}: every clone is of a file written back");
+        let (file, _) = image_of(1, 40, 7, 3);
+        assert!(
+            run(PlacePlant::MadeNoWriteBack) >= file.bytes(),
+            "seed {seed}: the first patch's clone forces out the image's runs"
+        );
+    }
+}
+
+/// A patch of a path that holds no file is refused, naming the path: nothing is made there.
+#[test]
+fn a_patch_of_a_path_with_no_file_fails_naming_it() {
+    let mut sim = Sim::new(53, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut effects = Vec::new();
+    let patch = Sparse { len: 100, runs: vec![(10, vec![1; 20])] };
+    store.place_patched(name("one/build/app"), patch, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    let why = placed[0].result.clone().unwrap_err();
+    assert!(why.contains("cloning one/build/app"), "{why}");
     assert!(!sim.exists(&name("one/build/app")));
 }
