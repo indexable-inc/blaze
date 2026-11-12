@@ -11,6 +11,7 @@ mod archive;
 mod script;
 mod shared;
 mod strings;
+mod stub;
 #[cfg(test)]
 mod tests;
 
@@ -79,6 +80,10 @@ pub(super) fn read(
         };
     }
     match kind {
+        // blaze's own stub of a shared object of the target's C library.
+        NativeKind::Shared { .. } if bytes.starts_with(stub::STUB.as_bytes()) => {
+            stub::read(name, bytes).map(NativeFile::Shared)
+        }
         NativeKind::Shared { .. } => script::read(name, bytes).map(NativeFile::Shared),
         _ => Err(format!("{name}: neither an ELF file nor an archive, given as {}", taken(kind))), // alloc: error path
     }

@@ -1,0 +1,12 @@
+{
+ "id": "cross-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+ "where": "the lane rule (write only) and scripts/",
+ "what": "A new script must be Rust (tools/python-allowed.txt takes no new file) and a lane may not run cargo or blaze on the Mac, so a generator of checked-in data cannot be run by the lane that writes it; the data was produced with a Python prototype kept outside the tree.",
+ "cost": "two implementations of two generators; the Rust ones are unrun",
+ "cause": "the two rules were written for different cases and meet at data generators",
+ "workaround": "a prototype, and a how-to row (regenerate-shipped-symbol-lists) saying the Rust generator must be shown to write the same bytes",
+ "fix": "a lane may run `blaze run -p scripts --bin <name>` for a script that only reads and writes files, or the loop takes a script to run",
+ "state": "open"
+}

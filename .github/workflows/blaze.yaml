@@ -331,6 +331,48 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
+  # What blaze cross-builds is run (ledger row X1, docs/v2/plan/design/toolchain-c.md "Cross
+  # compilation"): the probe (harness/v2/cross/probe: hello, threads, a file, TCP loopback, a
+  # panic with a backtrace) is built for each Linux glibc triple with nothing of the machine (no
+  # cross gcc, no CC_*: `scripts --bin cross` builds under `env -i` with an empty PATH), the
+  # AArch64 one is run here and the x86-64 one under qemu-user with Debian's x86-64 glibc to load
+  # (libc6-amd64-cross and libgcc-s1-amd64-cross are what it runs against, not what it is built
+  # with). Not part of `ci` until it has been green on main: it needs no secret, and its runner
+  # label is a new one of the same pool as the job above.
+  cross-probe:
+    name: cross-built, run (linux x64 under qemu-user, linux arm64)
+    needs: changes
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: [ix, arm64, ix-cpu-64, blaze-cross-probe]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: qemu-user and an x86-64 glibc to run against
+        uses: ./.github/actions/apt
+        with:
+          packages: qemu-user-static libc6-amd64-cross libgcc-s1-amd64-cross
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: cross-probe
+      - run: blaze build --release --locked -p blaze-engine -p blaze-thin
+      - name: build the probe for each triple with nothing of the machine, and run it
+        run: |
+          mkdir -p "$RUNNER_TEMP/cross-bin"
+          cp target/release/blaze-thin "$RUNNER_TEMP/cross-bin/blaze"
+          cp target/release/blaze-engine "$RUNNER_TEMP/cross-bin/blaze-engine"
+          blaze run -q -p scripts --bin cross -- "$(cat <<JSON
+          {"command": "check",
+           "engine": {"kind": "v2", "blaze": "$RUNNER_TEMP/cross-bin/blaze"},
+           "out": "$RUNNER_TEMP/cross.json",
+           "triples": ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"],
+           "run": {"aarch64-unknown-linux-gnu": [],
+                   "x86_64-unknown-linux-gnu": ["qemu-x86_64-static", "-L", "/usr/x86_64-linux-gnu"]}}
+          JSON
+          )"
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+
   # The gate's build and unit tests, on ix (blaze-platform.yaml). On a push to main, the caches
   # for the train's runs and the next push's, and the snapshots the gate's runs fork.
   linux-arm64:

@@ -24,6 +24,33 @@ mod tests {
         assert!(pin.commit.bytes().all(|b| b.is_ascii_hexdigit()), "{pin:?}");
     }
 
+    /// A prefix with a link manifest answers every question the build script asks as data.
+    #[test]
+    fn a_manifest_answers_what_llvm_config_would_without_running_it() {
+        let json = r#"{"version": "23.1.4", "commit": "abc", "manifest": 1,
+            "targets_built": ["X86", "AArch64"], "libs": ["LLVMBlaze"],
+            "system_libs": ["-lrt", "-ldl", "-lm"],
+            "cflags": ["-I{prefix}/include", "-D_GNU_SOURCE"],
+            "cxxflags": ["-I{prefix}/include", "-std=c++17", "-fno-rtti"], "build_mode": "Release"}"#;
+        let prefix = std::path::Path::new("/p");
+        let ask = |msvc: bool, query: &[&str]| pin_answer(json, prefix, msvc, query).expect("a manifest");
+        assert_eq!(ask(false, &["--version"]), Ok("23.1.4".to_owned()));
+        assert_eq!(ask(false, &["--libnames", "--link-static"]), Ok("libLLVMBlaze.a".to_owned()));
+        assert_eq!(ask(true, &["--libnames", "--link-static"]), Ok("LLVMBlaze.lib".to_owned()));
+        assert!(ask(false, &["--libnames", "--link-shared"]).is_err());
+        assert_eq!(ask(false, &["--system-libs", "--link-static"]), Ok("-lrt -ldl -lm".to_owned()));
+        assert_eq!(ask(false, &["--cflags"]), Ok("-I/p/include -D_GNU_SOURCE".to_owned()));
+        assert_eq!(ask(false, &["--cxxflags"]), Ok("-I/p/include -std=c++17 -fno-rtti".to_owned()));
+        assert_eq!(ask(false, &["--build-mode"]), Ok("Release".to_owned()));
+        assert_eq!(ask(false, &["--targets-built"]), Ok("X86 AArch64".to_owned()));
+        assert!(ask(false, &["--libdir"]).unwrap().ends_with("lib"));
+        let error = ask(false, &["--ldflags"]).unwrap_err();
+        assert!(error.contains("--ldflags"), "{error}");
+        // A marker written before the manifest has none: its `llvm-config` is asked.
+        assert_eq!(pin_answer(r#"{"version": "23.1.4"}"#, prefix, false, &["--version"]), None);
+        assert_eq!(pin_list(r#"{"a": ["x\y"]}"#, "a").is_err(), true);
+    }
+
     #[test]
     fn reads_a_targets_sha256() {
         let sha = pin_sha256(LLVM_JSON, "x86_64-unknown-linux-gnu").unwrap().expect("a release");
