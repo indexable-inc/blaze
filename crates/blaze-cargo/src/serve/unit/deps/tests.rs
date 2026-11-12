@@ -103,7 +103,9 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
 /// The invariant: a per-item entry is found by its key alone, under any set, once the loop
 /// has put it; it is asked for once, in a list of its own that a take of the images' puts
 /// does not empty (a serve takes those and must lose no entry a query kept while it ran);
-/// other bytes under its key are an error naming the key.
+/// other bytes under its key are an error naming the key and how the two values differ. What a
+/// get does not see until the loop's put is what hir-def's `Memory::within_one_build` models
+/// for its tests of two items of one key.
 ///
 /// The control is the read before the put: the same key under the same set finds nothing.
 #[test]
@@ -121,7 +123,9 @@ fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
     assert_eq!(read(&images, 9, 1), None, "the control: nothing is kept yet");
     Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
     Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
-    assert!(Entries::put(&images, &key(9), key(1), b"another").unwrap_err().contains("two values"));
+    let twice = Entries::put(&images, &key(9), key(1), b"another").unwrap_err();
+    assert!(twice.contains("two values") && twice.contains("first differ at byte 0"), "{twice}");
+    assert!(twice.contains("is 9 bytes and the one given 7"), "{twice}");
     assert_eq!(read(&images, 9, 1), None, "asked, not yet put by the loop");
     assert!(images.take_puts().is_empty(), "an entry is no put of a flush");
     let puts = images.take_entries();
@@ -135,7 +139,8 @@ fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
     assert_eq!(read(&images, 8, 1).as_deref(), Some(&b"entry one"[..]), "under a set that moved");
     Entries::put(&images, &key(8), key(1), b"entry one").unwrap();
     assert!(images.take_entries().is_empty(), "held by the store: not asked for again");
-    assert!(Entries::put(&images, &key(8), key(1), b"changed").unwrap_err().contains("other bytes"));
+    let other = Entries::put(&images, &key(8), key(1), b"changed").unwrap_err();
+    assert!(other.contains("other bytes") && other.contains("first differ at byte 0"), "{other}");
 }
 
 #[test]
@@ -188,10 +193,17 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
 
 #[test]
 fn the_goal_note_names_every_count_that_kept_goals_out() {
-    let plain = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
+    // What its lookups came to is said as `blaze_record` says it (`Counts`' `Display`).
+    let plain = goal_store::Flushed {
+        written: 3,
+        kept: 5,
+        lookups: blaze_record::Counts { lookups: 9, hits: 5, lists: 7, reads: 12 },
+        ..goal_store::Flushed::default()
+    };
     assert_eq!(
         flushed(&plain).message,
-        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
+         9 lookups, 5 hit, 7 read-lists read, 12 reads valued"
     );
     let out = goal_store::Flushed {
         slots_full: 1,
@@ -204,6 +216,7 @@ fn the_goal_note_names_every_count_that_kept_goals_out() {
     assert_eq!(
         note.message,
         "the persistent goal cache, of the last build: 0 written, 0 kept, 1 with every slot full; \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued; \
          goals kept out by `impl_datum` (4), `crate_env` (2); 7 too long to keep"
     );
 }
@@ -216,6 +229,7 @@ fn the_goal_note_names_the_first_goal_of_a_full_chain() {
     let full = goal_store::Flushed {
         slots_full: 2,
         lookups_full: 3,
+        lookups: blaze_record::Counts { lookups: 3, hits: 0, lists: 33, reads: 33 },
         full: Some("goal ab, whose chain holds 4096 other shapes".to_owned()),
         ..goal_store::Flushed::default()
     };
@@ -223,7 +237,8 @@ fn the_goal_note_names_the_first_goal_of_a_full_chain() {
         flushed(&full).message,
         "the persistent goal cache, of the last build: 0 written, 0 kept, 2 with every slot full \
          (the first: goal ab, whose chain holds 4096 other shapes); \
-         3 lookups met a chain with every slot full"
+         3 lookups met a chain with every slot full; \
+         3 lookups, 0 hit, 33 read-lists read, 33 reads valued"
     );
 }
 
@@ -266,11 +281,21 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
     let alone = noted(Some(&Flushes { goals, items: None }), None).unwrap();
     assert_eq!(
         alone.message,
-        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued"
     );
+    let looked =
+        |lookups, hits, lists, reads| blaze_record::Counts { lookups, hits, lists, reads };
     let items = body_store::Flushed {
         written: 2,
         kept: 9,
+        // By step: inference, MIR, borrow check, constant.
+        lookups: [
+            looked(7, 6, 6, 40),
+            looked(7, 5, 6, 31),
+            looked(0, 0, 0, 0),
+            looked(5, 4, 4, 9),
+        ],
         refused: vec![("crate_env", 3)],
         no_identity: 4,
         ..body_store::Flushed::default()
@@ -286,7 +311,12 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
     assert_eq!(
         note.message,
         "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
-         the item store: 2 written, 9 kept, 0 with every slot full; steps kept out by reads of \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued; \
+         the item store: 2 written, 9 kept, 0 with every slot full; lookups by step: \
+         inference (7 lookups, 6 hit, 6 read-lists read, 40 reads valued), \
+         MIR (7 lookups, 5 hit, 6 read-lists read, 31 reads valued), \
+         borrow check (0 lookups, 0 hit, 0 read-lists read, 0 reads valued), \
+         constant (5 lookups, 4 hit, 4 read-lists read, 9 reads valued); steps kept out by reads of \
          `crate_env` (3); 4 of bodies with no identity; the item store, this build: inference 6 hit, \
          1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; borrow check 0 hit, 0 ran, 0 refused; \
          constant 4 hit, 1 ran, 0 refused"

@@ -180,6 +180,9 @@ struct Store {
     /// Lookups since the last flush that found their goal's chain at its bound:
     /// [`Flushed::lookups_full`].
     full_lookups: AtomicUsize,
+    /// What the lookups since the last flush came to, as `blaze_record` counted them:
+    /// [`Flushed::lookups`].
+    lookups: blaze_record::Tally,
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key): [`Installed::flush`] stops with it. The goal it met it on was
     /// solved instead, which gives the same answer, so the build's error comes at the flush.
@@ -282,7 +285,11 @@ impl Store {
     /// The driver's store as `blaze_record` reads and writes a goal's records: each under its
     /// own key.
     fn records(&self) -> slots::Records<'_, impl Fn(Kind, &ContentId) -> ContentId> {
-        slots::Records { images: &*self.images, at: |_: Kind, key: &ContentId| *key }
+        slots::Records {
+            images: &*self.images,
+            at: |_: Kind, key: &ContentId| *key,
+            tally: &self.lookups,
+        }
     }
 
     fn offer<'db>(
@@ -427,6 +434,10 @@ pub struct Flushed {
     /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
     /// the chain holds its shape where a placing looks.
     pub lookups_full: usize,
+    /// What the store's lookups since the last flush came to, as `blaze_record` counted them:
+    /// how many there were (each a goal the global table did not have), how many found an
+    /// answer, the shapes they read and the facts they valued, each a fact hashed again.
+    pub lookups: blaze_record::Counts,
     /// The first, in the order the flush writes, of those counted in `slots_full`: which it
     /// is, by its key, and the bound.
     pub full: Option<String>,
@@ -519,6 +530,7 @@ pub fn install(
         facts,
         pending: Pending::new(),
         full_lookups: AtomicUsize::new(0),
+        lookups: blaze_record::Tally::new(),
         error: Lock::new("ty.goal_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
@@ -594,6 +606,7 @@ impl Installed {
         let lookups_full = store.full_lookups.swap(0, Ordering::Relaxed);
         let mut flushed = Flushed {
             lookups_full,
+            lookups: store.lookups.take(),
             inexpressible,
             unhashable,
             too_long,

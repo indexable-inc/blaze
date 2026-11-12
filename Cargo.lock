@@ -567,6 +567,7 @@ dependencies = [
  "blaze-profile",
  "blaze-protocol",
  "blaze-query",
+ "blaze-record",
  "blaze-registry",
  "blaze-report",
  "blaze-screen",

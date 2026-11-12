@@ -8,7 +8,7 @@
 //! The invariant: equal keys are equal bytes. A key covers every input of its entry, so a
 //! `put` under a key the store has is the same bytes and may be dropped.
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use base_db::Db;
 use blaze_core::lock::Lock;
@@ -135,6 +135,41 @@ pub fn keep(db: &Db, family: &'static str, set: &ContentId, key: ContentId, byte
     entries.put(set, key, bytes).map_err(|why| format!("keeping {family} entry {key:?}: {why}"))
 }
 
+/// How many bytes of each value [`differ`] shows from the first that differs.
+const SHOWN: usize = 16;
+
+/// How two values under one key differ, for the refusal of the second (rules 19 and 21): their
+/// lengths, the first byte that differs, and [`SHOWN`] bytes of each from there. Every holder
+/// of entries says its refusal with this, so the next key that misses an input is read from
+/// the message: which value is longer, and how far in they part.
+pub fn differ(kept: &[u8], given: &[u8]) -> String {
+    let at = kept
+        .iter()
+        .zip(given)
+        .position(|(kept, given)| kept != given)
+        .unwrap_or(kept.len().min(given.len()));
+    let shown = |bytes: &[u8]| {
+        // alloc: error path
+        let mut text = String::new();
+        for byte in &bytes[at..bytes.len().min(at + SHOWN)] {
+            _ = write!(text, "{byte:02x}");
+        }
+        if text.is_empty() {
+            text.push_str("its end");
+        }
+        text
+    };
+    // alloc: error path
+    format!(
+        "the value kept is {} bytes and the one given {}, and they first differ at byte {at}, \
+         where the kept one has {} and the given one {}",
+        kept.len(),
+        given.len(),
+        shown(kept),
+        shown(given)
+    )
+}
+
 /// hir-expand's way to the entry store: it is below this crate and keeps a macro
 /// definition's tokens by the same [`entry`] and [`keep`] as every other family. An entry
 /// that does not read, or a store that refuses a put, is [`super::Unreadable`] naming the
@@ -178,6 +213,9 @@ impl hir_expand::declarative::stored::Kept for ForExpansion {
 pub struct Memory {
     held: Lock<HashMap<ContentId, Vec<u8>, Global>>,
     counts: Lock<Counts>,
+    /// Whether a get finds what was put ([`Memory::new`]) or nothing
+    /// ([`Memory::within_one_build`]).
+    finds: bool,
 }
 
 /// What was asked of a [`Memory`] since [`Memory::take`].
@@ -197,6 +235,21 @@ impl Memory {
         Arc::new(Memory {
             held: Lock::new("entries.memory.held", HashMap::new_in(Global)),
             counts: Lock::new("entries.memory.counts", Counts::default()),
+            finds: true,
+        })
+    }
+
+    /// Entries as the driver holds them while one build runs: a get finds nothing of what
+    /// that build put (its puts are written at its end), so two items of one key each make
+    /// their value and each put it, and the second put is checked against the first. A store
+    /// that serves a put back at once never sees that second put: it hands the first item's
+    /// value to the second item.
+    pub fn within_one_build() -> Arc<Memory> {
+        // alloc: a test's store
+        Arc::new(Memory {
+            held: Lock::new("entries.memory.held", HashMap::new_in(Global)),
+            counts: Lock::new("entries.memory.counts", Counts::default()),
+            finds: false,
         })
     }
 
@@ -210,7 +263,7 @@ impl Entries for Memory {
     // dyn: as `Entries::get`
     fn get(&self, _set: &ContentId, key: &ContentId, with: &mut dyn FnMut(&[u8])) -> R<bool> {
         // clone: a test's copy, so no lock is held while `with` runs
-        let found = self.held.lock().get(key).cloned();
+        let found = self.held.lock().get(key).filter(|_| self.finds).cloned();
         let mut counts = self.counts.lock();
         match found {
             Some(bytes) => {
@@ -232,7 +285,9 @@ impl Entries for Memory {
         match held.get(&key) {
             Some(was) if was.as_slice() == bytes => counts.again += 1,
             // alloc: error path
-            Some(_) => return Err(format!("two values under key {key:?} (rule 21)")),
+            Some(was) => {
+                return Err(format!("two values under key {key:?} (rule 21): {}", differ(was, bytes)));
+            }
             None => {
                 counts.made += 1;
                 // alloc: a test's copy

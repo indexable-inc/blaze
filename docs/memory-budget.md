@@ -252,7 +252,14 @@ As built (2026-11-05), where it differs from the above and why:
     (`kern_memorystatus.c`). A daemon run by a user gets `EPERM`, says so once in its log, and
     the watch below is its bound.
   - On Linux, `memory.max` of the daemon's own cgroup where one is delegated
-    (`blaze_core::cgroup`), `memory.high` at 15/16 of it.
+    (`blaze_core::cgroup`), and `memory.high` written as `max`: the kernel throttles the
+    daemon nowhere. It was 15/16 of the ceiling until 2026-11-12, when a cold build of tempo
+    sat 43 minutes between it (139.69 GiB) and the line where a lone task fails typed (31/32,
+    144.34 GiB): every allocating thread slowed, nothing reclaimable (anonymous memory, no
+    swap) and no exit, the slow death of section 1 made by blaze itself. The lines of a limit
+    are one module, `blaze_graph::lines` (release at 7/8, give back at 15/16, a lone task
+    fails at 31/32, the kernel kills at the limit), and it does not compile unless every line
+    where the kernel slows or ends the daemon has a typed exit at or below it.
   - Where neither applies, the daemon's watch thread (100 ms, the footprint
     `resident_by` reads) ends the daemon with exit status `MEMORY_CEILING` once its footprint
     passes the ceiling, after a postmortem naming the tags and the running tasks.
@@ -280,7 +287,14 @@ back. It keeps its allowance at what it holds until 10 s pass with no event
 `Plane::budget_now`, the one join), every admission decision reads that, and under a cap no
 task starts alone (waiting does make room there). A task is refused as too big only against the
 allowance, never the cap. The front ends are asked for a release at the first event of a run
-and once each 10 s of it after.
+and once each 10 s of it after. The stores' pools give back the pages no task pins a slice a
+loop turn (64 MiB, no sooner than 10 ms after the last) for the 10 s an event stands, as they
+do for the give-back ladder and for a footprint past its release line: one path
+(`blaze_graph::poolgive::Slices`, driven by `Jobs::sweep_pools`), so the loop always turns
+between two slices. Pools whose sweeps free nothing twice in a row are dry for 10 s: not
+swept, and no source for the ladder, which goes on to its next rung. Until 2026-11-12 each
+event swept both stores whole, in line (`evict_pool(u64::MAX)`): 68 such sweeps took 1,605 s
+of the loop's thread in one build, with turns of up to 542 s.
 
 **What the client is told.** A build held back for memory for more than a second (a task of it
 ready, a thread of its pool free, and no room: `Plane::waits_for_memory`) is told, as a note

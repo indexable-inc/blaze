@@ -2,7 +2,7 @@
 //! driver's store: both are `blaze_record`'s form (a base key, read-lists called **shapes** in
 //! a chain of slots under it, an answer under a shape's bytes and its facts' values), and this
 //! is what they share over it: the driver's store as `blaze_record` reads and writes it
-//! ([`Records`]), the name a shape has for a fact ([`fact_name`], [`fact_of`]), the placing of
+//! ([`Records`], with where its lookups are counted), the name a shape has for a fact ([`fact_name`], [`fact_of`]), the placing of
 //! one key's shapes by one flush ([`filing`]), the order a flush writes in ([`groups`]) and
 //! the words of an error ([`Refused`]).
 //!
@@ -25,11 +25,13 @@ use super::{FactObject, FactRef};
 
 /// The driver's store as `blaze_record` reads and writes a record's parts. `at` gives the key
 /// the store keeps a part under, from the part's own key: the goal store's is that key, the
-/// item store's is under its step, a shape and an answer apart.
+/// item store's is under its step, a shape and an answer apart. `tally` is where the lookups
+/// through it are counted: the goal store's one, the item store's of that step.
 pub(crate) struct Records<'a, At> {
     // dyn: the driver's store, as the stores that flush hold it
     pub(crate) images: &'a dyn ImageStore,
     pub(crate) at: At,
+    pub(crate) tally: &'a blaze_record::Tally,
 }
 
 impl<At: Fn(Kind, &ContentId) -> ContentId> blaze_record::Store for Records<'_, At> {
@@ -47,6 +49,10 @@ impl<At: Fn(Kind, &ContentId) -> ContentId> blaze_record::Store for Records<'_, 
 
     fn bytes(held: &ImageBuf) -> &[u8] {
         held.bytes()
+    }
+
+    fn tally(&self) -> &blaze_record::Tally {
+        self.tally
     }
 }
 

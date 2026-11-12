@@ -36,9 +36,13 @@
 
 pub(super) mod doing;
 pub(super) mod giving;
+#[blaze::sans_io]
 mod certificate;
+mod certify;
 mod kept;
 mod noop;
+#[blaze::sans_io]
+mod request;
 mod slab;
 mod written;
 #[cfg(test)]
@@ -3417,6 +3421,9 @@ enum Asked {
 enum Own {
     /// A lock file written for the job.
     Write { job: JobId, path: u32 },
+    /// A look at an output for the check of a request's certificate, before `job` is a job:
+    /// the `ask`th of the asks its machine has open ([`Jobs::certify_told`]).
+    Certify { job: JobId, ask: u32 },
     /// An executable's mode set, then its placement recorded.
     Mode { job: JobId, path: u32, key: blaze_cas::Key },
     /// A placed output's file looked at: placed again unless it is as it was placed.
@@ -3621,6 +3628,10 @@ pub struct Jobs<S: Steps> {
     /// shape's last build was, in words: taken by [`Jobs::begin`] and said in a span once
     /// the request has its build, so the build's own profile names why it walked.
     refused: Option<String>,
+    /// The request machines' driver: the checks under way before their requests are jobs,
+    /// what one machine knows beside the records, and the builds whose certificates are to
+    /// be written at the next step ([`certify`]).
+    certify: certify::Certify,
     /// A plan was made since the plan's database was last collected (`Jobs::expire`'s end):
     /// the values the plan before it held alone are let go of at the next turn.
     planned: bool,
@@ -3767,6 +3778,7 @@ impl<S: Steps> Jobs<S> {
             retired: Vec::new(), // alloc: none until a plan is replaced
             unheld: Vec::new(),  // alloc: none until a no-op answer goes
             refused: None,
+            certify: certify::Certify::new(),
             planned: false,
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
@@ -4007,6 +4019,9 @@ impl<S: Steps> Jobs<S> {
 
     /// Takes what the session asked since the last call.
     pub fn step(&mut self, w: &mut World<'_, S>) {
+        // The certificate of each build that ended since the last step, written before any
+        // request asked since is checked against it.
+        self.certify_written(w);
         // The views held for no-op answers that went since the last step.
         for view in self.unheld.drain(..) {
             w.vfs.close(view);
@@ -4016,7 +4031,10 @@ impl<S: Steps> Jobs<S> {
             for it in asked.drain(..) {
                 match it {
                     Asked::Start { id, view, work, idle } => self.begin(w, id, view, work, idle),
-                    Asked::Cancel(id) => self.cancel_job(w, id),
+                    Asked::Cancel(id) => {
+                        self.certify_cancel(w, id);
+                        self.cancel_job(w, id)
+                    }
                     Asked::Promote(id) => self.promote_job(w, id),
                 }
             }
@@ -4035,12 +4053,25 @@ impl<S: Steps> Jobs<S> {
         work: Work,
         idle: bool,
     ) {
-        // A build or a check of a checkout with nothing changed is answered here, as its last
-        // one was, before it is a job ([`Jobs::answer_again`]).
-        let walks = match self.answer_again(w, id, view.as_ref(), &work) {
-            Ok(()) => return,
-            Err(walks) => walks,
-        };
+        // A build or a check is checked against its certificate here, before it is a job
+        // ([`Jobs::certify_begin`]): answered, or waiting for looks at its outputs, it is
+        // none yet.
+        if let Some((view, work, walks)) = self.certify_begin(w, id, view, work, idle) {
+            self.begin_job(w, id, view, work, idle, walks);
+        }
+    }
+
+    /// Job `id` becomes a job: its request was not certified (`walks`: why, as the input
+    /// `blaze why` names, with the certificate's base), or is no build or check.
+    fn begin_job(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        view: Option<Opened>,
+        work: Work,
+        idle: bool,
+        walks: Option<(String, ContentId)>,
+    ) {
         let refused = self.refused.take();
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
@@ -4366,6 +4397,11 @@ impl<S: Steps> Jobs<S> {
     /// Else it walks: why, as the input `blaze why` names ([`noop::NotReplayed::input`]) with the
     /// id of the request's inputs; none for other work, and where the walk's own work says
     /// why.
+    ///
+    /// Not called since 2026-11-12: a request's first state is its certificate
+    /// ([`Jobs::certify_begin`]). To be deleted with the kept answers it asks
+    /// (certificate.md, "State").
+    #[allow(dead_code)]
     fn answer_again(
         &mut self,
         w: &mut World<'_, S>,
@@ -4781,6 +4817,9 @@ impl<S: Steps> Jobs<S> {
             files,
             worked,
         });
+        // What the build read and said, for its request's certificate: written at the loop's
+        // next step, with the store in hand ([`Jobs::certify_written`]).
+        self.certify.ended.push(certify::Ended::of(root, shape, &last));
         match &last {
             Ok(answer) => tracing::info_span!(
                 target: "blaze",
@@ -7826,6 +7865,7 @@ impl<S: Steps> Jobs<S> {
     /// An effect of the loop's own done.
     fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
         match own {
+            Own::Certify { job, ask } => self.certify_told(w, job, ask, done),
             Own::Record { job: id, path, key } => {
                 self.end_placing(id, path);
                 match (done, &mut self.paths.placed[path as usize]) {

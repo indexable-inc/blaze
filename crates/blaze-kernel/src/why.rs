@@ -22,7 +22,7 @@ use blaze_ids::ContentId;
 
 use blaze_record::{Slot, list_key};
 
-use crate::{Entry, Get, Identity, Seen, World};
+use crate::{Entry, Get, Identity, Kernel, Read, Seen, World};
 
 /// Why a lookup of a step the kernel computes found no entry.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -177,13 +177,17 @@ impl Miss {
 /// entry kept last (`last`, as the caller remembers it) that hashes differently in `world` now.
 /// Called on a miss only, by someone who wants the reason. A store or world that fails here is
 /// [`Missed::Failed`], never the miss's error.
+///
+/// `now` values a read: the world's, or for a step's value the kernel's lookup of that step.
 pub(crate) fn explain<W: World + ?Sized, G: Get + ?Sized>(
     store: &G,
+    kernel: &Kernel<W>,
     world: &W,
     identity: &Identity,
     last: Option<Key>,
+    now: &mut dyn FnMut(Read<'_>) -> Result<Seen, String>,
 ) -> Missed {
-    match explained(store, world, identity, last) {
+    match explained(store, kernel, world, identity, last, now) {
         Ok(missed) => missed,
         Err(why) => Missed::Failed(why),
     }
@@ -191,9 +195,11 @@ pub(crate) fn explain<W: World + ?Sized, G: Get + ?Sized>(
 
 fn explained<W: World + ?Sized, G: Get + ?Sized>(
     store: &G,
+    kernel: &Kernel<W>,
     world: &W,
     identity: &Identity,
     last: Option<Key>,
+    value: &mut dyn FnMut(Read<'_>) -> Result<Seen, String>,
 ) -> Result<Missed, String> {
     // alloc: an error
     let at = |key: Key, why: String| format!("the store at {:x}: {why}", key.0);
@@ -211,8 +217,7 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     let (mut first, mut changed) = (None, 0u32);
     for (read, was) in entry.reads() {
         // alloc: an error
-        let now =
-            world.hash(read).map_err(|error| format!("{}: {}", world.describe(read), error.why))?;
+        let now = value(read).map_err(|why| format!("{}: {why}", kernel.describe(world, read)))?;
         if now == was {
             continue;
         }
@@ -224,8 +229,8 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     let reads = u32::try_from(entry.reads().len()).unwrap_or(u32::MAX);
     Ok(match first {
         Some((read, was, now)) => Missed::Read {
-            read: world.describe(read),
-            names: world.names(read),
+            read: kernel.describe(world, read),
+            names: kernel.names(world, read),
             was,
             now,
             changed,

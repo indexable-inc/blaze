@@ -153,6 +153,9 @@ struct Store {
     /// Lookups since the last flush that found their base key's chain at its bound:
     /// [`Flushed::lookups_full`].
     full_lookups: AtomicUsize,
+    /// What each step's lookups since the last flush came to, as `blaze_record` counted them,
+    /// by [`Step`] as an index: [`Flushed::lookups`].
+    lookups: [blaze_record::Tally; Step::COUNT],
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key, a stored result that differs from running the step under
     /// [`Mode::Verify`]): [`Installed::flush`] stops with it.
@@ -298,6 +301,7 @@ impl Store {
                 blaze_record::Kind::List => record::shape_at(step, key),
                 blaze_record::Kind::Answer => record::answer_at(step, key),
             },
+            tally: &self.lookups[step as usize],
         }
     }
 
@@ -464,6 +468,12 @@ pub struct Flushed {
     /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
     /// the chain holds its shape where a placing looks.
     pub lookups_full: usize,
+    /// What each step's lookups of the store since the last flush came to, as `blaze_record`
+    /// counted them, by [`Step`] as an index: how many there were (a body with no identity
+    /// is not looked up), how many found an answer, the shapes they read and the facts they
+    /// valued, each a fact hashed again. [`Flushed::steps`]' hits are the answers that also
+    /// decoded.
+    pub lookups: [blaze_record::Counts; Step::COUNT],
     /// The first, in the order the flush writes, of those counted in `slots_full`: which it
     /// is, by its key, and the bound.
     pub full: Option<String>,
@@ -698,6 +708,7 @@ pub fn install(
         facts,
         pending: Pending::new(),
         full_lookups: AtomicUsize::new(0),
+        lookups: [const { blaze_record::Tally::new() }; Step::COUNT],
         error: Lock::new("ty.body_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
@@ -794,6 +805,7 @@ impl Installed {
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
         let mut flushed = Flushed {
             lookups_full: store.full_lookups.swap(0, Ordering::Relaxed),
+            lookups: std::array::from_fn(|step| store.lookups[step].take()),
             refused,
             scans,
             unhashable,

@@ -201,6 +201,12 @@ pub struct Served {
     /// The blaze the keys were made by: [`store`] makes each key again with it, to check the
     /// database did not move a crate's key between the serve and the store.
     pub build: ContentId,
+    /// What this serve's searches of the crates' read-filing slots came to, as `blaze_record`
+    /// counted them (`filed::search`): one lookup a crate fetched that has no image under
+    /// its key alone, a hit where a slot's reads have now the values an image is filed by,
+    /// the slots read, and a read valued for each slot whose set of reads was worked out
+    /// again. A crate found under its key alone is not among them.
+    pub lookups: blaze_record::Counts,
 }
 
 /// Why [`store`] wrote no image of a crate. Each is an input the key and the reads do not
@@ -393,20 +399,24 @@ fn serve_released(
     )]
     let found: Vec<std::sync::OnceLock<Fetched>> =
         order.iter().map(|_| std::sync::OnceLock::new()).collect();
+    // What the fetches' searches of the slots come to: counted from every thread of the
+    // store's, taken once they have all ended.
+    let lookups = blaze_record::Tally::new();
     {
         let db = &*db;
         images.for_each(order.len(), &|at| {
             let (krate, key) = order[at];
-            _ = found[at].set(fetch(db, krate, key, images));
+            _ = found[at].set(fetch(db, krate, key, images, &lookups));
         });
     }
+    let lookups = lookups.take();
     let mut hits: Vec<Crate> =
         // alloc: setup: once per serve
         keys.iter().filter(|(krate, key)| kept(krate, key)).map(|(&krate, _)| krate).collect();
     if order.is_empty() {
         hits.sort_unstable_by_key(|krate| keys[krate]);
         // alloc: none: an empty `Vec` holds no buffer
-        return Ok(Served { keys, hits, stale: Vec::new(), build });
+        return Ok(Served { keys, hits, stale: Vec::new(), build, lookups });
     }
     // clone: what was served before, once per serve that fetches a crate, to add to
     let mut served = (*before).clone();
@@ -488,7 +498,7 @@ fn serve_released(
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
     if !changed {
-        return Ok(Served { keys, hits, stale, build });
+        return Ok(Served { keys, hits, stale, build, lookups });
     }
     // What this serve changes of how each crate is read, named: a crate that gains an image
     // is read from it from here on, and one that loses its image is resolved again. Either
@@ -533,7 +543,7 @@ fn serve_released(
     if known {
         db.note_crates_changed();
     }
-    Ok(Served { keys, hits, stale, build })
+    Ok(Served { keys, hits, stale, build, lookups })
 }
 
 /// The frozen bytes a database was given, to add to.
@@ -553,10 +563,17 @@ enum Found {
 type Fetched = Result<Found, String>;
 
 /// The image of `krate`, whose key is `key`: under the key, or under the reads of one of its
-/// slots and their values now ([`filed::search`]); opened and its def map's files checked.
-// dyn: the driver's store, one call per crate per session
-fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetched {
-    let found = filed::search(db, krate, key, images, |at| {
+/// slots and their values now ([`filed::search`], which counts its search in `lookups`);
+/// opened and its def map's files checked.
+fn fetch(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+    lookups: &blaze_record::Tally,
+) -> Fetched {
+    let found = filed::search(db, krate, key, images, lookups, |at| {
         let bytes = images.get(&at).map_err(|why| {
             // alloc: error text
             format!("reading the image of crate {} (key {at:?}): {why}", krate.named(db))

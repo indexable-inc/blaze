@@ -1,314 +1,191 @@
-//! The certificate against a walk: a model checkout of `n` packages in a chain (package `i`
-//! depends on `i - 1`), each a directory of the view with one unit, one variable read, one
-//! probe outside the view and one output. The oracle is the walk: [`World::walk`] is what a
-//! fresh build of the world would write, and a certificate is given only when it is that.
-//!
-//! The invariant: a certificate is given only when a fresh walk would produce the same
-//! outputs and say the same; and it fails only for one of the six things that differ
-//! (certificate.md, "Why a certificate fails"), naming which.
-
-use std::collections::BTreeMap;
+//! The certificate's record: its parts' bytes, its keys and the local evidence beside it.
+//! The check and the write are tested against a model in `request/tests.rs`.
 
 use super::*;
 
-fn id(domain: &'static str, bytes: &[u8]) -> ContentId {
-    ContentId::of(domain, bytes)
+fn id(n: u8) -> ContentId {
+    ContentId::of("test certificate", &[n])
 }
 
-#[derive(Clone, Debug)]
-struct World {
-    /// Where the checkout is: in no key.
-    dir: String,
-    /// Each package's source, by content.
-    sources: Vec<u8>,
-    /// A file of the checkout no unit reads.
-    readme: u8,
-    /// The variable a build script reads, and one nothing reads.
-    made: Option<u8>,
-    shlvl: u8,
-    /// The path a build script looked for outside the view: there or not.
-    probe: Option<u8>,
-    /// The outputs in place, by path, each with its stamp.
-    placed: BTreeMap<String, Stamp>,
-    profile: &'static str,
-    blaze: &'static str,
-    traced: bool,
-}
-
-impl World {
-    fn new(n: usize) -> World {
-        World {
-            dir: "/home/a/checkout".to_owned(),
-            sources: vec![0; n],
-            readme: 0,
-            made: Some(1),
-            shlvl: 0,
-            probe: None,
-            placed: BTreeMap::new(),
-            profile: "dev",
-            blaze: "blaze 1",
-            traced: false,
-        }
-    }
-
-    fn group(&self, at: usize) -> ContentId {
-        id("test package directory", &[at as u8, self.sources[at]])
-    }
-
-    fn root(&self) -> ContentId {
-        let mut bytes = self.sources.clone();
-        bytes.push(self.readme);
-        id("test view root", &bytes)
-    }
-
-    fn shape(&self) -> ContentId {
-        let config = format!("build --profile {} --manifest-path {}/Cargo.toml", self.profile, self.dir);
-        id("test shape", relocated(&config, &self.dir).as_bytes())
-    }
-
-    fn stamp(&self, at: usize) -> Stamp {
-        // An output is a function of its package's source and every one before it.
-        let sum: u64 = self.sources[..=at].iter().map(|it| u64::from(*it)).sum();
-        Stamp { len: 100 + sum, changed_ns: 7 }
-    }
-
-    /// What a fresh walk of the world writes: its certificate, the outputs placed.
-    fn walk(&mut self) -> Certificate {
-        let n = self.sources.len();
-        self.placed = (0..n).map(|at| (format!("debug/p{at}"), self.stamp(at))).collect();
-        Certificate {
-            blaze: self.blaze.to_owned(),
-            shape: self.shape(),
-            config: id("test config", self.profile.as_bytes()),
-            request: id("test request", b""),
-            drawn: id("test drawn", b""),
-            diagnosed: false,
-            root: self.root(),
-            groups: (0..n)
-                .map(|at| Group {
-                    path: format!("p{at}"),
-                    id: Some(self.group(at)),
-                    readers: vec![at as u32],
-                })
-                .collect(),
-            env: vec![("MADE".to_owned(), self.made.map(|it| id("test env", &[it])))],
-            outside: vec![("/usr/include/probe.h".to_owned(), self.probe.map(|it| [it; 32]))],
-            outputs: (0..n)
-                .map(|at| Output {
-                    base: 0,
-                    path: format!("debug/p{at}"),
-                    content: id("test output", &self.stamp(at).len.to_le_bytes()),
-                    stamp: self.stamp(at),
-                })
-                .collect(),
-            units: (0..n).map(|at| id("test unit", &[at as u8, self.sources[at]])).collect(),
-            said: self.sources.clone(),
-        }
-    }
-
-    fn ask(&self, certificate: &Certificate) -> Result<(), Failed> {
-        let env = |name: &str| match name {
-            "MADE" => self.made.map(|it| id("test env", &[it])),
-            "SHLVL" => Some(id("test env", &[self.shlvl])),
-            _ => None,
-        };
-        let now = Now {
-            blaze: self.blaze,
-            shape: self.shape(),
-            config: id("test config", self.profile.as_bytes()),
-            request: id("test request", b""),
-            drawn: id("test drawn", b""),
-            root: self.root(),
-            env: &env,
-            traced: self.traced,
-        };
-        certificate.holds(&now, self)
-    }
-
-    /// The oracle: a certificate given is the one a fresh walk of this world writes, and the
-    /// outputs in place are that walk's.
-    fn given_rightly(&self, certificate: &Certificate) -> bool {
-        let mut fresh = self.clone();
-        let walked = fresh.walk();
-        walked == *certificate && fresh.placed == self.placed
-    }
-}
-
-impl Looks for World {
-    fn node(&self, path: &str) -> Option<ContentId> {
-        let at: usize = path.strip_prefix('p')?.parse().ok()?;
-        (at < self.sources.len()).then(|| self.group(at))
-    }
-
-    fn outside(&self, _: &str) -> Option<[u8; 32]> {
-        self.probe.map(|it| [it; 32])
-    }
-
-    fn output(&self, _: u8, path: &str) -> Option<Stamp> {
-        self.placed.get(path).copied()
-    }
-}
-
-/// Each way a world moves, with what the failure must name.
-fn moves() -> [(&'static str, fn(&mut World), fn(&Failed) -> bool, Plant); 5] {
-    [
-        (
-            "(1) a source's content",
-            |w| w.sources[1] += 1,
-            |f| matches!(f, Failed::Group { path, readers } if path == "p1" && readers == &[1]),
-            Plant::IgnoresGroups,
-        ),
-        (
-            "(2) a probe that became present",
-            |w| w.probe = Some(3),
-            |f| matches!(f, Failed::Outside { path, appeared: true } if path.ends_with("probe.h")),
-            Plant::IgnoresProbes,
-        ),
-        (
-            "(3) a variable a build script read",
-            |w| w.made = Some(2),
-            |f| matches!(f, Failed::Env(name) if name == "MADE"),
-            Plant::IgnoresEnv,
-        ),
-        (
-            "(4) the request's shape",
-            |w| w.profile = "release",
-            |f| matches!(f, Failed::Request(_)),
-            Plant::IgnoresRequest,
-        ),
-        (
-            "(6) an output deleted",
-            |w| _ = w.placed.remove("debug/p0"),
-            |f| matches!(f, Failed::Output { path, .. } if path == "debug/p0"),
-            Plant::IgnoresOutputs,
-        ),
+fn reads() -> Vec<(Read, Digest)> {
+    vec![
+        (Read::Outside("/usr/include/z.h".to_owned()), Digest::Nothing),
+        (Read::Env("CC".to_owned()), Digest::Is(id(1))),
+        (Read::Node("crates/a".to_owned()), Digest::Is(id(2))),
+        (Read::Drawn, Digest::Is(id(3))),
+        (Read::Listing("/opt/lib".to_owned()), Digest::Is(id(4))),
+        (Read::Node(String::new()), Digest::Is(id(9))),
     ]
 }
 
-/// The invariant: a certificate fails for each of the things that differ, naming it, and a
-/// check with that compare planted out gives it wrongly (the control), which the oracle says.
-#[test]
-fn a_certificate_fails_only_for_what_differs_and_names_it() {
-    for (what, change, names, plant) in moves() {
-        let mut world = World::new(3);
-        let certificate = world.walk();
-        assert_eq!(world.ask(&certificate), Ok(()), "{what}: a repeated request is answered");
-        assert!(world.given_rightly(&certificate));
-        change(&mut world);
-        let failed = world.ask(&certificate).expect_err(what);
-        assert!(names(&failed), "{what}: named {failed:?}");
-        assert!(!failed.input().is_empty());
-        // Control: the planted bug gives the certificate, and the oracle catches it.
-        PLANT.set(plant);
-        let given = world.ask(&certificate);
-        PLANT.set(Plant::None);
-        assert_eq!(given, Ok(()), "{what}: the planted check gives it");
-        assert!(!world.given_rightly(&certificate), "{what}: the oracle catches the planted bug");
+fn answer() -> Answer {
+    Answer {
+        outputs: vec![
+            Output { base: 1, path: "debug/b".to_owned(), content: id(5) },
+            Output { base: 0, path: "debug/a".to_owned(), content: id(6) },
+        ],
+        units: vec![id(7), id(8)],
+        said: b"said".to_vec(),
     }
 }
 
-/// (5): another blaze's certificate is not given, and its key is another.
-#[test]
-fn another_blaze_is_not_answered() {
-    let mut world = World::new(2);
-    let certificate = world.walk();
-    world.blaze = "blaze 2";
-    assert_eq!(world.ask(&certificate), Err(Failed::Blaze));
-    assert_ne!(
-        key(&world.shape(), &world.root(), "blaze 1"),
-        key(&world.shape(), &world.root(), "blaze 2")
-    );
+fn shape() -> Shape {
+    Shape { plan: id(20), config: id(21), request: id(22) }
 }
 
-/// Nothing else makes it fail: a restart (the certificate read back from its bytes), a file
-/// of the checkout no unit read, a variable no step read, another checkout's directory.
-/// Control for each: the same change to something that IS read fails (the test above).
+/// Rule 26: an answer's bytes read back are the answer, and encode to the same bytes.
 #[test]
-fn nothing_else_fails_a_certificate() {
-    let mut world = World::new(3);
-    let written = world.walk().encode();
-    // A restart: nothing in memory, the record's bytes alone.
-    let restored = Certificate::decode(&written).expect("its own layout");
-    assert_eq!(world.ask(&restored), Ok(()));
-    // A file no unit read: the root is another, every group is as it was.
-    world.readme += 1;
-    assert_ne!(world.root(), restored.root);
-    assert_eq!(world.ask(&restored), Ok(()));
-    assert!(world.given_rightly(&Certificate { root: world.root(), ..restored.clone() }));
-    // A variable that is another at every command.
-    world.shlvl += 1;
-    assert_eq!(world.ask(&restored), Ok(()));
-    // A second checkout of the same content, elsewhere: the same key, so it finds the
-    // record; its outputs are not placed yet, which is what the failure names, and no unit.
-    let mut second = World::new(3);
-    second.dir = "/tmp/other/place".to_owned();
-    assert_eq!(second.shape(), World::new(3).shape());
-    let first = World::new(3);
-    assert_eq!(
-        key(&second.shape(), &second.root(), second.blaze),
-        key(&first.shape(), &first.root(), first.blaze)
-    );
-    let found = second.ask(&restored).expect_err("no output placed yet");
-    assert!(matches!(found, Failed::Output { .. }));
-    assert_eq!(found.readers(), None);
-    // The slot is the checkout's own.
-    assert_ne!(slot(&second.shape(), &second.dir), slot(&first.shape(), &first.dir));
+fn an_answer_round_trips_with_identical_bytes() {
+    let certificate = Certificate::new(reads(), answer()).unwrap();
+    let bytes = certificate.answer().encode();
+    let back = Answer::decode(&bytes).unwrap();
+    assert_eq!(&back, certificate.answer());
+    assert_eq!(back.encode(), bytes);
+    assert_eq!(Answer::decode(&Answer::default().encode()).unwrap(), Answer::default());
 }
 
-/// The walk after an edit starts at the readers of the group that moved: it visits at most
-/// those and their dependents, at two graph sizes; a walk from the roots would visit all.
+/// Rule 26: an answer and a list of a layout before this one are refused by that layout's
+/// name, one of a layout not known by its number, other bytes as no certificate; none is
+/// read as an empty record.
 #[test]
-fn the_walk_after_an_edit_starts_at_the_readers() {
-    for n in [4_usize, 64] {
-        let mut world = World::new(n);
-        let certificate = world.walk();
-        let edited = n - 2;
-        world.sources[edited] += 1;
-        let failed = world.ask(&certificate).expect_err("an edit");
-        // Package `i + 1` depends on `i`.
-        let dependents = |unit: u32| if (unit as usize) + 1 < n { vec![unit + 1] } else { vec![] };
-        let visited = certificate.walk_from(&failed, &dependents).expect("a group names its readers");
-        assert_eq!(visited, vec![edited as u32, edited as u32 + 1], "{n} packages");
-        assert!(visited.len() < n);
+fn another_layout_is_refused_by_name() {
+    let bytes = Certificate::new(reads(), answer()).unwrap().answer().encode();
+    for (layout, _) in PREVIOUS {
+        let mut old = bytes.clone();
+        old[8..12].copy_from_slice(&layout.to_le_bytes());
+        match Answer::decode(&old) {
+            Err(why) => {
+                assert!(matches!(why, Undecoded::Previous(n, _) if n == *layout), "{why:?}");
+                assert!(why.to_string().contains(&format!("layout {layout} (")), "{why}");
+            }
+            Ok(read) => panic!("an answer of layout {layout} was read: {read:?}"),
+        }
+        let base = base(&shape(), b"blaze 1");
+        let mut list = Vec::new();
+        blaze_record::write_list(&mut list, &base, &head_of(*layout), [Read::Drawn.name()]);
+        let opened = ListRef::open(&list, &base).unwrap();
+        assert_eq!(reads_of(opened), Err(Undecoded::Previous(*layout, PREVIOUS[*layout as usize].1)));
     }
+    let mut later = bytes.clone();
+    later[8..12].copy_from_slice(&77_u32.to_le_bytes());
+    assert_eq!(Answer::decode(&later), Err(Undecoded::Unknown(77)));
+    assert_eq!(Answer::decode(b"not a certificate"), Err(Undecoded::NotOne));
+    assert_eq!(Answer::decode(b""), Err(Undecoded::NotOne));
 }
 
-/// Persisted state round-trips (rule 26): the same bytes again, a previous layout refused by
-/// its name, a cut record refused at its field, never read as an empty certificate.
+/// Every cut of an answer's bytes, and bytes past its end, are refused at a field.
 #[test]
-fn a_certificate_round_trips_and_refuses_other_layouts() {
-    let mut world = World::new(3);
-    world.probe = Some(9);
-    let certificate = world.walk();
-    let bytes = certificate.encode();
-    let read = Certificate::decode(&bytes).expect("its own layout");
-    assert_eq!(read, certificate);
-    assert_eq!(read.encode(), bytes);
-    let mut previous = bytes.clone();
-    previous[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&0_u32.to_le_bytes());
-    let refused = Certificate::decode(&previous).expect_err("layout 0");
-    assert!(matches!(refused, Undecoded::Previous(0, _)));
-    assert!(refused.to_string().contains("the draft of 2026-11-12"));
-    let mut unknown = bytes.clone();
-    unknown[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&99_u32.to_le_bytes());
-    assert_eq!(Certificate::decode(&unknown), Err(Undecoded::Unknown(99)));
-    assert_eq!(Certificate::decode(b"something else"), Err(Undecoded::NotOne));
-    for cut in MAGIC.len() + 4..bytes.len() {
-        assert!(
-            matches!(Certificate::decode(&bytes[..cut]), Err(Undecoded::Malformed(_))),
-            "cut at {cut}"
-        );
+fn every_cut_is_refused() {
+    let mut bytes = Certificate::new(reads(), answer()).unwrap().answer().encode();
+    for cut in 0..bytes.len() {
+        assert!(Answer::decode(&bytes[..cut]).is_err(), "a cut at {cut} was read");
     }
-    let mut longer = bytes;
-    longer.push(0);
-    assert_eq!(Certificate::decode(&longer), Err(Undecoded::Malformed("the end")));
+    bytes.push(0);
+    assert_eq!(Answer::decode(&bytes), Err(Undecoded::Malformed("the end")));
 }
 
+/// Rule 25: equal builds are equal bytes whatever order their steps read and placed in: the
+/// list names the reads sorted, each once, with no value; the outputs are sorted.
 #[test]
-fn the_checkout_directory_is_relocated_only_as_a_whole_path() {
-    assert_eq!(relocated("/a/b/Cargo.toml", "/a/b"), format!("{ROOT}/Cargo.toml"));
-    assert_eq!(relocated("--target-dir=/a/b/target", "/a/b"), format!("--target-dir={ROOT}/target"));
-    assert_eq!(relocated("/a/bc/x", "/a/b"), "/a/bc/x");
-    assert_eq!(relocated("/x/a/b/y", "/a/b"), "/x/a/b/y");
-    assert_eq!(relocated("/a/b", "/a/b"), ROOT);
+fn equal_builds_are_equal_bytes_in_any_order() {
+    let base = base(&shape(), b"blaze 1");
+    let one = Certificate::new(reads(), answer()).unwrap();
+    let mut turned = reads();
+    turned.reverse();
+    turned.push(turned[0].clone());
+    let mut placed = answer();
+    placed.outputs.reverse();
+    let two = Certificate::new(turned, placed).unwrap();
+    let list = one.list(&base);
+    assert_eq!(list, two.list(&base));
+    assert_eq!(one.answer_key(&list), two.answer_key(&list));
+    assert_eq!(one.answer().encode(), two.answer().encode());
+    let named = reads_of(ListRef::open(&list, &base).unwrap()).unwrap();
+    let mut sorted: Vec<Read> = reads().into_iter().map(|(read, _)| read).collect();
+    sorted.sort();
+    assert_eq!(named, sorted);
+    // A value is in the answer's key, not in the list.
+    let mut moved = reads();
+    moved[1].1 = Digest::Is(id(99));
+    let three = Certificate::new(moved, answer()).unwrap();
+    assert_eq!(three.list(&base), list);
+    assert_ne!(three.answer_key(&list), one.answer_key(&list));
+    let mut gone = reads();
+    gone[1].1 = Digest::Nothing;
+    let four = Certificate::new(gone, answer()).unwrap();
+    assert_ne!(four.answer_key(&list), one.answer_key(&list));
+}
+
+/// A read seen at two values has no one digest: that build has no certificate, by the
+/// read's name.
+#[test]
+fn a_read_at_two_values_is_refused_by_name() {
+    let mut twice = reads();
+    twice.push((Read::Env("CC".to_owned()), Digest::Nothing));
+    assert_eq!(Certificate::new(twice, answer()), Err(Read::Env("CC".to_owned())));
+}
+
+/// The base is the request's shape and the tool: each part of either gives another base.
+/// The tree's content is no parameter of it.
+#[test]
+fn the_base_is_the_shape_and_the_tool() {
+    let one = base(&shape(), b"blaze 1");
+    assert_eq!(one, base(&shape(), b"blaze 1"));
+    assert_ne!(one, base(&shape(), b"blaze 2"));
+    assert_ne!(one, base(&Shape { plan: id(0), ..shape() }, b"blaze 1"));
+    assert_ne!(one, base(&Shape { config: id(0), ..shape() }, b"blaze 1"));
+    assert_ne!(one, base(&Shape { request: id(0), ..shape() }, b"blaze 1"));
+}
+
+/// A read's name reads back as the read; other bytes are refused.
+#[test]
+fn a_read_round_trips_by_name() {
+    for (read, _) in reads() {
+        assert_eq!(Read::named(&read.name()), Ok(read));
+    }
+    assert!(Read::named(b"").is_err());
+    assert!(Read::named(b"\x09x").is_err());
+    assert!(Read::named(b"\x04x").is_err());
+    assert!(Read::named(b"\x00\xff").is_err());
+}
+
+/// Two checkouts of one content make one text of each path, and each gets its own back.
+#[test]
+fn the_checkout_is_relocated_and_put_back() {
+    let (a, b) = ("/home/a/checkout", "/srv/b");
+    let text = |root: &str| format!("{root}/target --cfg=x:{root} \"{root}/src\" PATH={root}/bin:/usr/bin {root}");
+    assert_eq!(relocated(&text(a), a), relocated(&text(b), b));
+    assert!(!relocated(&text(a), a).contains(a));
+    // A longer name that begins as the checkout's does is another directory.
+    assert_eq!(relocated("/home/a/checkout-other/x", a), "/home/a/checkout-other/x");
+    assert_eq!(relocated("in/home/a/checkout/x", a), "in/home/a/checkout/x");
+    let said = format!("{a}/target/debug/app");
+    assert_eq!(replaced(&relocated(&said, a), b), "/srv/b/target/debug/app");
+    assert_eq!(relocated("x", ""), "x");
+}
+
+/// A stamp vouches for the content hashed under it only when it was seen [`RACY_NS`] past
+/// its change time; a closer look keeps nothing and drops what was kept.
+#[test]
+fn a_stamp_seen_too_close_to_its_change_does_not_vouch() {
+    let mut evidence = Evidence::default();
+    let stamp = Stamp { len: 4, changed_ns: 10 * RACY_NS };
+    evidence.keep(0, "debug/a", stamp, id(1), stamp.changed_ns + RACY_NS - 1);
+    assert_eq!(evidence.vouched(0, "debug/a", stamp), None);
+    evidence.keep(0, "debug/a", stamp, id(1), stamp.changed_ns + RACY_NS);
+    assert_eq!(evidence.vouched(0, "debug/a", stamp), Some(id(1)));
+    assert_eq!(evidence.vouched(1, "debug/a", stamp), None);
+    assert_eq!(evidence.vouched(0, "debug/a", Stamp { len: 5, ..stamp }), None);
+    let later = Stamp { len: 4, changed_ns: 11 * RACY_NS };
+    evidence.keep(0, "debug/a", later, id(2), later.changed_ns);
+    assert_eq!(evidence.vouched(0, "debug/a", stamp), None);
+    assert_eq!(evidence.vouched(0, "debug/a", later), None);
+    // The bound: only the last answer's outputs stay.
+    evidence.keep(0, "debug/a", stamp, id(1), u64::MAX);
+    evidence.keep(1, "debug/b", stamp, id(1), u64::MAX);
+    evidence.only(&[Output { base: 1, path: "debug/b".to_owned(), content: id(1) }]);
+    assert_eq!(evidence.vouched(0, "debug/a", stamp), None);
+    assert_eq!(evidence.vouched(1, "debug/b", stamp), Some(id(1)));
+    evidence.forget(1, "debug/b");
+    assert_eq!(evidence.vouched(1, "debug/b", stamp), None);
 }

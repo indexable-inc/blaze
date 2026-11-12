@@ -4,7 +4,10 @@
 #![blaze::sans_io]
 
 use alloc::vec::Vec;
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use blaze_ids::ContentId;
 
@@ -35,6 +38,108 @@ pub trait Store {
     fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), Self::Error>;
 
     fn bytes(held: &Self::Held) -> &[u8];
+
+    /// Where the lookups through this store are counted ([`Tally`]): the store's one, or the
+    /// one of the kind of work this handle is for, where the store keeps its kinds apart.
+    /// Required: a store whose lookups nobody counts does not compile.
+    fn tally(&self) -> &Tally;
+}
+
+/// What the lookups through one store came to, counted where the form is searched ([`walk`],
+/// [`lookup`]) and nowhere else: how many lookups, how many found an answer, how many
+/// read-lists they read and how many reads were valued, each of which its caller hashed again.
+///
+/// A store owns one, or one for each kind of work it keeps apart, and gives it through
+/// [`Store::tally`]; its owner takes the counts where it reports ([`Tally::take`]). A placing
+/// ([`Filing`]) and a keeping ([`keep_answer`]) count nothing: neither is a lookup.
+///
+/// Time is not counted: this crate holds no clock. How long a lookup took is in the span its
+/// caller opens around it.
+///
+/// Alone on its cache lines: every thread that looks up through the store adds to it.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+pub struct Tally {
+    lookups: AtomicU64,
+    hits: AtomicU64,
+    lists: AtomicU64,
+    reads: AtomicU64,
+}
+
+impl Tally {
+    pub const fn new() -> Tally {
+        Tally {
+            lookups: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts `reads` reads valued: what a [`walk`]'s caller says of the reads its visitor
+    /// valued, each one it asked the value of, whether or not it got one. [`lookup`] says its
+    /// own.
+    pub fn valued(&self, reads: u64) {
+        if reads > 0 {
+            self.reads.fetch_add(reads, Ordering::Relaxed);
+        }
+    }
+
+    /// One walk, of `lists` read-lists, that found an answer when `hit`.
+    fn walked(&self, lists: u32, hit: bool) {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        if lists > 0 {
+            self.lists.fetch_add(u64::from(lists), Ordering::Relaxed);
+        }
+        if hit {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The counts since the last take, leaving zero. Each of the four is taken on its own: a
+    /// lookup that ends while they are taken can have its parts in this take and the next,
+    /// and the sum over takes is exact.
+    pub fn take(&self) -> Counts {
+        Counts {
+            lookups: self.lookups.swap(0, Ordering::Relaxed),
+            hits: self.hits.swap(0, Ordering::Relaxed),
+            lists: self.lists.swap(0, Ordering::Relaxed),
+            reads: self.reads.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+/// What a [`Tally`] counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Walks of a base's chain: every [`lookup`] and every [`walk`], one that stopped on an
+    /// error too.
+    pub lookups: u64,
+    /// Those that found an answer ([`Found::Hit`], [`Walked::Found`]).
+    pub hits: u64,
+    /// Read-lists read from the store and opened.
+    pub lists: u64,
+    /// Reads whose value now was asked for, each a hash made again by the caller: the ones
+    /// that had none ([`lookup`]'s `digest` giving `None`) too.
+    pub reads: u64,
+}
+
+impl Counts {
+    /// `more` added to these: the counts of two tallies, or of two takes of one.
+    pub fn add(&mut self, more: Counts) {
+        self.lookups += more.lookups;
+        self.hits += more.hits;
+        self.lists += more.lists;
+        self.reads += more.reads;
+    }
+}
+
+/// As a note says them: `7 lookups, 3 hit, 9 read-lists read, 21 reads valued`.
+impl fmt::Display for Counts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Counts { lookups, hits, lists, reads } = self;
+        write!(f, "{lookups} lookups, {hits} hit, {lists} read-lists read, {reads} reads valued")
+    }
 }
 
 /// The chain's shape: `width` slots a generation, at most `generations` of them.
@@ -150,12 +255,16 @@ enum Searched<T> {
 /// The answer of `base` under what its reads are now, if the store has one. `digest` is asked
 /// the digest a read has now, by the name its list has for it; `None` where it cannot be
 /// worked out now, which passes over that list.
+///
+/// Counted in the store's [`Tally`]: the lookup, the lists it read, each read `digest` was
+/// asked (the one it had no digest of too) and the hit.
 pub fn lookup<S: Store>(
     store: &S,
     bounds: Bounds,
     base: &ContentId,
     mut digest: impl FnMut(&[u8]) -> Option<Digest>,
 ) -> Result<Found<S::Held>, Error<S::Error>> {
+    let mut valued = 0_u64;
     let walked = walk::<S, (S::Held, ContentId), Error<S::Error>, _>(
         store,
         bounds,
@@ -163,6 +272,7 @@ pub fn lookup<S: Store>(
         |_at, bytes, list| {
             let mut key = AnswerKey::new(bytes);
             for read in list.reads() {
+                valued += 1;
                 let Some(now) = digest(read) else { return Ok(None) };
                 key.value(now);
             }
@@ -170,7 +280,10 @@ pub fn lookup<S: Store>(
             let answer = get(store, Kind::Answer, Doing::ReadingAnswer, &key)?;
             Ok(answer.map(|answer| (answer, key)))
         },
-    )?;
+    );
+    // Before the error goes on: the reads of a lookup that stopped were valued all the same.
+    store.tally().valued(valued);
+    let walked = walked?;
     Ok(match walked {
         Walked::Found { found: (answer, key), at } => Found::Hit { answer, key, at },
         Walked::Passed { lists, full } => Found::Miss { lists, full },
@@ -187,11 +300,17 @@ pub fn lookup<S: Store>(
 /// values the list (an [`AnswerKey`] of `bytes` keeps the answer's key this crate's), looks
 /// for the answer where it is, and gives `None` to pass over the list. Its error, `E`, ends
 /// the walk; the store's and the chain's errors are made into it.
+///
+/// Counted in the store's [`Tally`]: one lookup, the lists read (those read before an error
+/// too) and a hit when the visitor gave `Some`. The reads are the visitor's to value, so this
+/// counts none: the caller says how many its visitor asked the value of, with
+/// `store.tally().valued(n)` ([`Tally::valued`]), or the store's count of reads valued is
+/// short by them.
 pub fn walk<S, T, E, V>(
     store: &S,
     bounds: Bounds,
     base: &ContentId,
-    mut visit: V,
+    visit: V,
 ) -> Result<Walked<T>, E>
 where
     S: Store,
@@ -199,9 +318,27 @@ where
     V: FnMut(Slot, &[u8], ListRef<'_>) -> Result<Option<T>, E>,
 {
     let mut lists = 0;
-    match search(store, bounds, base, 0, &mut visit, &mut lists)? {
+    let walked = walk_chain(store, bounds, base, visit, &mut lists);
+    store.tally().walked(lists, matches!(walked, Ok(Walked::Found { .. })));
+    walked
+}
+
+/// [`walk`], uncounted: `lists` is how many read-lists it read, whatever it came to.
+fn walk_chain<S, T, E, V>(
+    store: &S,
+    bounds: Bounds,
+    base: &ContentId,
+    mut visit: V,
+    lists: &mut u32,
+) -> Result<Walked<T>, E>
+where
+    S: Store,
+    E: From<Error<S::Error>>,
+    V: FnMut(Slot, &[u8], ListRef<'_>) -> Result<Option<T>, E>,
+{
+    match search(store, bounds, base, 0, &mut visit, lists)? {
         Searched::Hit(found, at) => return Ok(Walked::Found { found, at }),
-        Searched::Ended => return Ok(Walked::Passed { lists, full: false }),
+        Searched::Ended => return Ok(Walked::Passed { lists: *lists, full: false }),
         Searched::Full => {}
     }
     let open = first_open(bounds.generations, |generation| {
@@ -215,12 +352,12 @@ where
         if generation == 0 || generation == bounds.generations {
             continue;
         }
-        let searched = search(store, bounds, base, generation, &mut visit, &mut lists)?;
+        let searched = search(store, bounds, base, generation, &mut visit, lists)?;
         if let Searched::Hit(found, at) = searched {
             return Ok(Walked::Found { found, at });
         }
     }
-    Ok(Walked::Passed { lists, full: open == bounds.generations })
+    Ok(Walked::Passed { lists: *lists, full: open == bounds.generations })
 }
 
 fn search<S, T, E, V>(

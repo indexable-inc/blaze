@@ -354,9 +354,16 @@ pub(super) fn only(step: Step, counts: StepCounts) -> [StepCounts; Step::COUNT] 
     steps
 }
 
-/// `flushed` but for its step counts, for a test that holds those apart.
+/// `flushed` but for what is counted by step (its step counts and its lookups' counts), for a
+/// test that holds those apart.
 pub(super) fn without_steps(flushed: Flushed) -> Flushed {
-    Flushed { steps: Default::default(), ..flushed }
+    without_lookups(Flushed { steps: Default::default(), ..flushed })
+}
+
+/// `flushed` but for what its lookups came to ([`Flushed::lookups`]), for a test that states
+/// the rest whole.
+pub(super) fn without_lookups(flushed: Flushed) -> Flushed {
+    Flushed { lookups: Default::default(), ..flushed }
 }
 
 fn ran() -> u32 {
@@ -389,6 +396,11 @@ fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>, Glob
     assert_eq!(flushed.written, BODIES.len(), "each body's inference is written: {flushed:?}");
     let ran = StepCounts { ran: BODIES.len() as u64, ..StepCounts::default() };
     assert_eq!(flushed.steps, only(Step::Infer, ran), "each body missed and ran");
+    // What `blaze_record` counted of those misses: a lookup a body, of an empty store, so no
+    // shape was read and no fact valued; and no other step was looked up.
+    let mut looked = [blaze_record::Counts::default(); Step::COUNT];
+    looked[Step::Infer as usize].lookups = BODIES.len() as u64;
+    assert_eq!(flushed.lookups, looked, "each body's lookup is counted, under its step");
     assert_eq!(memory.len(), 2 * BODIES.len(), "a shape and an answer each");
     assert_eq!(
         first.installed.flush().unwrap(),
@@ -511,6 +523,16 @@ fn a_stored_inference_is_read_in_a_fresh_database_without_inferring() {
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
     assert_eq!(fresh.installed.steps(), hits, "this build's counts, before the flush");
     let flushed = fresh.installed.flush().unwrap();
+    // What `blaze_record` counted of the hits: a lookup and a hit a body, each of at least its
+    // own shape, under inference alone.
+    let looked = flushed.lookups[Step::Infer as usize];
+    let bodies = BODIES.len() as u64;
+    assert_eq!((looked.lookups, looked.hits), (bodies, bodies), "{looked:?}");
+    assert!(looked.lists >= bodies, "a hit read the shape it was found by: {looked:?}");
+    let mut alone = [blaze_record::Counts::default(); Step::COUNT];
+    alone[Step::Infer as usize] = looked;
+    assert_eq!(flushed.lookups, alone, "no other step was looked up");
+    let flushed = without_lookups(flushed);
     assert_eq!(flushed, Flushed { steps: hits, ..Flushed::default() }, "a hit offers nothing");
     assert_eq!(
         fresh.installed.steps(),
@@ -578,7 +600,7 @@ fn a_refused_read_is_tallied_by_name_and_nothing_is_stored() {
     let memory = Arc::new(Memory::default());
     let refusing = session(db_of(FIXTURE), &memory, &defs, Some(read), Mode::Serve);
     let _ = InferenceResult::of(&refusing.db, function(&refusing.db, "seven"));
-    let flushed = refusing.installed.flush().unwrap();
+    let flushed = without_lookups(refusing.installed.flush().unwrap());
     let steps = only(Step::Infer, StepCounts { hits: 0, ran: 1, refused: 1 });
     assert_eq!(flushed, Flushed { refused: vec![(read, 1)], steps, ..Flushed::default() });
     assert_eq!(memory.len(), 0);
@@ -624,7 +646,7 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
     assert_eq!(ran(), BODIES.len() as u32, "every hit is inferred as well");
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
     assert_eq!(
-        same.installed.flush().unwrap(),
+        without_lookups(same.installed.flush().unwrap()),
         Flushed { steps: hits, ..Flushed::default() },
         "each stored result is the one inferred"
     );
@@ -709,7 +731,10 @@ fn only_a_passing_borrow_check_is_stored() {
     let seven = function(&verify.db, "seven");
     assert!(!lookup_passed(&verify.db, seven, CHECKER, || true), "under verify the check runs");
     let hit = only(Step::Borrowck, StepCounts { hits: 1, ..StepCounts::default() });
-    assert_eq!(verify.installed.flush().unwrap(), Flushed { steps: hit, ..Flushed::default() });
+    assert_eq!(
+        without_lookups(verify.installed.flush().unwrap()),
+        Flushed { steps: hit, ..Flushed::default() }
+    );
     assert!(!lookup_passed(&verify.db, seven, CHECKER, || false));
     let error = verify.installed.flush().expect_err("a stored pass whose check fails");
     assert!(error.contains(&format!("{seven:?}")) && error.contains("borrow check"), "{error}");

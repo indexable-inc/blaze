@@ -332,6 +332,14 @@ fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
 /// Nothing is taken out, so a place names one content for the process's life.
 static UNITS: Lock<Vec<Arc<Units>>> = Lock::new("codegen.frontend.units", Vec::new());
 
+/// [`UNITS`] by place, as a describe that runs reads it ([`Facing::front`]): a lock-free look.
+/// Written only under [`UNITS`]' lock, by the one [`give_units`] that gives a content its
+/// place, before that place is handed out, so a place a `Facing` holds is always here.
+/// Until 2026-11-12 the read took the lock: once per describe on every worker, which a cold
+/// build of tempo (bd63ea64fc, 5,597,946 describes) waited 1,559 s for in all.
+static UNITS_BY_PLACE: std::sync::LazyLock<blaze_hash::SharedMap<u32, Arc<Units>>> =
+    std::sync::LazyLock::new(blaze_hash::SharedMap::default);
+
 /// `units` among those given, by content: its place and the one held there.
 fn give_units(units: Units) -> (u32, Arc<Units>) {
     let mut given = UNITS.lock();
@@ -342,7 +350,10 @@ fn give_units(units: Units) -> (u32, Arc<Units>) {
     // alloc: once per content of units a process builds with, kept for its life
     let held = Arc::new(units);
     given.push(held.clone()); // clone: a reference count, once per content
-    (given.len() as u32 - 1, held)
+    let place = given.len() as u32 - 1;
+    // Under the lock, before the place leaves this call: a fresh place, so nothing is there.
+    _ = UNITS_BY_PLACE.pin().try_insert(place, held.clone()); // clone: a reference count, once per content
+    (place, held)
 }
 
 /// What describing an instance reads of a front end beside the database: the key of
@@ -373,7 +384,7 @@ impl Facing {
         };
         let units = match self.units {
             // clone: a reference count, once per describe that runs
-            Some(id) => Some(UNITS.lock().get(id as usize).cloned().ok_or_else(|| {
+            Some(id) => Some(UNITS_BY_PLACE.pin().get(&id).cloned().ok_or_else(|| {
                 // alloc: an error
                 format!("the units {id} of a describe's key were never given in this process")
             })?),

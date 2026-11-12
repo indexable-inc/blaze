@@ -11,7 +11,7 @@
 //! | family | key | value |
 //! |---|---|---|
 //! | `attr flags` | the kind of item, how its file is read, its `attrs`; the crate's cfg when the attributes name `cfg` | the flags |
-//! | `assoc items` | impl or trait, how its file is read, its `header`; the crate's cfg when the header names `cfg` | each item's kind, ast id and name |
+//! | `assoc items` | impl or trait, how its file is read, its `header`; the crate's cfg when the header names `cfg` | each item's kind, name and place among the assoc items written |
 //!
 //! Only what is a function of that key is kept:
 //!
@@ -23,16 +23,30 @@
 //!   and no attribute a crate could resolve as a macro), so no name is looked up to collect
 //!   it. Any other reads which macro a path names, which is a fact its key does not hold yet.
 //!
-//! The values name nothing of a database: an assoc item is its ast id in the file of its
-//! container, and the reader makes its id from the container it asked of.
+//! The values name nothing of a database and nothing of a file: an assoc item is its place
+//! among the assoc items written in its container (the third written, whatever a cfg leaves
+//! of them), and the reader makes its id from the container it asked of and the ast id its
+//! own file's index lists at that place (`FileIndex::assoc_items`). An ast id is of its file
+//! (its hash is of its parent's id, its index counts the file's other items of that hash), so
+//! two `impl`s written the same, in one file or in two, have one key and other ids: a value
+//! holding ids was two values under one key (layout 1; `agents/annoyances/assoc-key-1.json`).
+//! Read by an `impl` it was not made for, a value can name only that `impl`'s own items.
+//!
+//! The cfg part is the crate's whole cfg where the hashed text names `cfg`: coarser than the
+//! atoms the item's `cfg` predicates name (rule 65), which no row holds yet.
 //!
 //! The invariant: equal keys are equal bytes; an entry found is the answer the query makes.
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
+use std::fmt::Write as _;
+
 use hir_expand::{
     HirFileId, InFile, Intern, Lookup,
-    declarative::stored::{self, index::ItemSource},
+    declarative::stored::{
+        self,
+        index::{AssocItems, ItemSource},
+    },
     name::Name,
 };
 use intern::Symbol;
@@ -55,7 +69,8 @@ use crate::{
 mod tests;
 
 /// The layout of both families: part of their keys, and the first word of an assoc value.
-pub const LAYOUT: u32 = 1;
+/// 2: an assoc item by its place among those written, where layout 1 held its ast id.
+pub const LAYOUT: u32 = 2;
 
 /// The family of an item's attribute flags, as the entry store names it.
 pub const FLAGS: &str = "attr flags";
@@ -77,6 +92,9 @@ const TYPE: u8 = 2;
 /// Where an item is written and what it is made of: all a key takes.
 struct Place {
     file: EditionedFileId,
+    /// Its ast id in `file`: what the file's index lists its assoc items under and an error
+    /// names it by. Of the file, so never part of a key or a value.
+    ast: ErasedFileAstId,
     /// The set its entries are packed in: its file's.
     set: ContentId,
     /// How its file is read (`stored::read_as`).
@@ -96,9 +114,11 @@ fn place<N: AstIdNode>(
     let id = loc.ast_id();
     let HirFileId::FileId(file) = id.file_id else { return None };
     let krate = loc.krate(db);
-    let source = stored::index::of(db, file, krate).get(id.value.erase())?;
+    let ast = id.value.erase();
+    let source = stored::index::of(db, file, krate).get(ast)?;
     Some(Place {
         file,
+        ast,
         set: stored::file_set(db, file),
         read_as: stored::read_as(db, file),
         krate,
@@ -148,10 +168,13 @@ fn assoc_key(db: &Db, whose: u8, place: &Place, mixed: Option<&ContentId>) -> Co
 // A test's planted bug, `KEYED_BY_FILE`: with it on, a key also takes its file's set (its
 // content), as a key of a file or a crate would, and an edit anywhere in the file misses every
 // entry of it. `RAN`: how many times this thread ran a query's own work for an item that has
-// a place.
+// a place. `IDS_IN_VALUE`, the planted bug of layout 1: with it on, an assoc value holds each
+// item's ast id where it holds its place, so two `impl`s written the same are two values
+// under one key, and one reads the other's items.
 #[cfg(test)]
 thread_local! {
     pub(super) static KEYED_BY_FILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static IDS_IN_VALUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static RAN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -167,6 +190,14 @@ fn mixed(place: &Place) -> Option<&ContentId> {
 fn ran() {
     #[cfg(test)]
     RAN.set(RAN.get() + 1);
+}
+
+fn ids_in_value() -> bool {
+    #[cfg(test)]
+    if IDS_IN_VALUE.get() {
+        return true;
+    }
+    false
 }
 
 /// The place of an owner whose flags are of its own attributes alone, and its kind.
@@ -194,8 +225,50 @@ fn flags_place(db: &Db, owner: AttrDefId) -> Option<(u8, Place)> {
     })
 }
 
+/// Refuses the entry of `family` of the item at `place`, naming the item (rule 19): a key
+/// alone names nothing a person can find.
 fn refuse(db: &Db, place: &Place, family: &'static str, why: String) -> ! {
-    Unreadable::of(db, place.krate, family, why).throw()
+    let cfg = if family == FLAGS { place.source.attrs_cfg } else { place.source.header_cfg };
+    // alloc: error path
+    Unreadable::of(db, place.krate, family, format!("{}: {why}", says(db, place, cfg))).throw()
+}
+
+/// The item at `place` as a refusal names it: its first line, its file and line, which build
+/// of its crate asked, its ast id, and whether its key took the crate's cfg (`cfg`). An
+/// error's path: it reads the file's text and its ast ids.
+fn says(db: &Db, place: &Place, cfg: bool) -> String {
+    let file = place.file.file_id(db);
+    let text = db.file_text(file).text(db);
+    let node = HirFileId::FileId(place.file).ast_id_map(db).try_get_erased(place.ast);
+    let (line, first) = match node {
+        Some(node) => {
+            let range = node.text_range();
+            let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+            let line = text.get(..start).map_or(0, |it| it.matches('\n').count()) + 1;
+            // Its first line that is not an attribute or a comment.
+            let first = text
+                .get(start..end)
+                .unwrap_or("")
+                .lines()
+                .map(str::trim)
+                .find(|it| !it.is_empty() && !it.starts_with("//") && !it.starts_with('#'))
+                .unwrap_or("");
+            (line, first)
+        }
+        None => (0, ""),
+    };
+    // alloc: error path
+    let mut out = String::new();
+    _ = write!(out, "`{first}` at ");
+    match db.path_for_file(file) {
+        Some(path) => _ = write!(out, "{path}"),
+        None => _ = write!(out, "{file:?}, which has no path"),
+    }
+    _ = write!(out, ":{line} of ");
+    crate::span_names::write_crate_label(db, place.krate, &mut out);
+    let takes = if cfg { "takes" } else { "does not take" };
+    _ = write!(out, " (ast id {:?}; its key {takes} the crate's cfg)", place.ast);
+    out
 }
 
 /// `AttrFlags::query` of `owner`: its entry where one is kept, else what `make` (the query's
@@ -269,7 +342,10 @@ fn assoc(
     let Some(place) = place.filter(|it| it.source.plain) else { return make() };
     let key = assoc_key(db, whose, &place, mixed(&place));
     let file = place.file;
-    match entry(db, ASSOC, &place.set, key, |bytes| decode_assoc(db, file, container, bytes)) {
+    // The assoc items written in this one, by the ast ids they have in its own file.
+    let listed = stored::index::of(db, file, place.krate).assoc_items(place.ast);
+    let read = |bytes: &[u8]| decode_assoc(db, file, listed, container, bytes);
+    match entry(db, ASSOC, &place.set, key, read) {
         Ok(Some(items)) => {
             // alloc: empty; allocates nothing
             return (items, ThinVec::new(), DefDiagnostics::new(Vec::new()));
@@ -281,19 +357,33 @@ fn assoc(
     let made = make();
     // A plain impl's collection reports nothing and expands nothing but an item its cfg
     // leaves out (a diagnostic naming its module): that one is not kept, and is made again.
-    if made.1.is_empty()
-        && made.2.iter().next().is_none()
-        && let Some(bytes) = encode_assoc(db, file, &made.0)
-        && let Err(why) = keep(db, ASSOC, &place.set, key, &bytes)
-    {
-        refuse(db, &place, ASSOC, why)
+    if made.1.is_empty() && made.2.iter().next().is_none() {
+        match encode_assoc(db, file, listed, &made.0) {
+            Ok(Some(bytes)) => {
+                if let Err(why) = keep(db, ASSOC, &place.set, key, &bytes) {
+                    refuse(db, &place, ASSOC, why)
+                }
+            }
+            Ok(None) => {}
+            // alloc: error path
+            Err(why) => refuse(db, &place, ASSOC, format!("its value is not made: {why}")),
+        }
     }
     made
 }
 
-/// The assoc items as a value: `None` when one is not of `file` or has a name with a hygiene
-/// key, which no plain impl's has.
-fn encode_assoc(db: &Db, file: EditionedFileId, items: &[(Name, AssocItemId)]) -> Option<Vec<u8>> {
+/// The assoc items as a value: each by its kind, its place among the assoc items written in
+/// its `impl` or `trait` (`listed`, its file's index of them) and its name. No ast id: one is
+/// of its file, and this value is found by every `impl` written the same, wherever it is.
+/// `Ok(None)` when one is not of `file` or has a name with a hygiene key, which no plain
+/// impl's has; `Err` when one is not among `listed`, which is the index and the item's file
+/// disagreeing.
+fn encode_assoc(
+    db: &Db,
+    file: EditionedFileId,
+    listed: AssocItems<'_>,
+    items: &[(Name, AssocItemId)],
+) -> R<Option<Vec<u8>>> {
     // alloc: one impl's value, a few dozen bytes an item
     let mut out = Vec::new();
     out.extend_from_slice(&LAYOUT.to_le_bytes());
@@ -305,15 +395,31 @@ fn encode_assoc(db: &Db, file: EditionedFileId, items: &[(Name, AssocItemId)]) -
             AssocItemId::TypeAliasId(it) => (TYPE, it.lookup(db).id.map(|it| it.erase())),
         };
         if id.file_id != HirFileId::FileId(file) || name.key().is_some() {
-            return None;
+            return Ok(None);
         }
         let text = name.symbol().as_str();
+        let at = if ids_in_value() {
+            id.value.into_raw()
+        } else {
+            match listed.position(id.value) {
+                Some(at) => at as u32,
+                None => {
+                    // alloc: error path
+                    return Err(format!(
+                        "assoc item `{text}` ({:?}) is not one of the {} its file's index lists \
+                         for its `impl` or `trait`",
+                        id.value,
+                        listed.len()
+                    ));
+                }
+            }
+        };
         out.push(kind);
-        out.extend_from_slice(&id.value.into_raw().to_le_bytes());
+        out.extend_from_slice(&at.to_le_bytes());
         out.extend_from_slice(&(text.len() as u32).to_le_bytes());
         out.extend_from_slice(text.as_bytes());
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// What is left of a value being read.
@@ -335,9 +441,15 @@ impl<'a> In<'a> {
     }
 }
 
+/// The assoc items a value holds, as those of `container`: each one's id is the ast id
+/// `listed` (the container's own assoc items, of its own file's index) has at the place the
+/// value names, so a value names no node but the container's own. `Err` when the value names
+/// a place `listed` has none at, or an item of another kind than is written there: bytes
+/// under a key that does not cover them.
 fn decode_assoc(
     db: &Db,
     file: EditionedFileId,
+    listed: AssocItems<'_>,
     container: ItemContainerId,
     bytes: &[u8],
 ) -> R<Box<[(Name, AssocItemId)]>> {
@@ -353,9 +465,34 @@ fn decode_assoc(
     let file = HirFileId::FileId(file);
     for _ in 0..count {
         let kind = input.take(1)?[0];
-        let ast = ErasedFileAstId::from_raw(input.word()?);
+        let at = input.word()?;
         let len = input.word()? as usize;
         let text = std::str::from_utf8(input.take(len)?).map_err(|_| "a name that is not UTF-8")?;
+        let ast = if ids_in_value() {
+            ErasedFileAstId::from_raw(at)
+        } else {
+            listed.get(at as usize).ok_or_else(|| {
+                // alloc: error path
+                format!(
+                    "it names assoc item {at} (`{text}`), and the file's index lists {} written \
+                     in this `impl` or `trait`",
+                    listed.len()
+                )
+            })?
+        };
+        let written = match kind {
+            FN => ast.may_be::<syntax::ast::Fn>(),
+            CONST => ast.may_be::<syntax::ast::Const>(),
+            TYPE => ast.may_be::<syntax::ast::TypeAlias>(),
+            // alloc: error path
+            other => return Err(format!("an assoc item of kind {other}")),
+        };
+        if !written {
+            // alloc: error path
+            return Err(format!(
+                "it holds assoc item {at} (`{text}`) as kind {kind}, and {ast:?} is written there"
+            ));
+        }
         let name = Name::new_symbol_root(Symbol::intern(text));
         let item = match kind {
             FN => {

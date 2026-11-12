@@ -953,11 +953,21 @@ before its query (found: nothing parsed or collected; not found: the query runs 
 is kept; no per-crate encode pass). `attr flags`: H(kind, how the file is read, `attrs`, the
 crate's cfg only when `attrs_cfg`), every file-written item but a module. `assoc items`:
 H(impl or trait, how the file is read, `header`, the cfg only when `header_cfg`), only for a
-`plain` impl or trait; the value is each item's kind, ast id and name, and the reader interns
-the ids under the container it asked of. Checks: hir-expand `declarative::stored::index::tests`;
+`plain` impl or trait; the value is each item's kind, name and place among the assoc items
+written (layout 2, lane assoc-key, 2026-11-12, written and not compiled by the lane), and the
+reader interns, under the container it asked of, the ast id its own file's index lists at that
+place (`FileIndex::assoc_items`, index layout 2: a pair an assoc item after the rows). Layout 1
+held the ast id itself, which is of its file (an impl's id counts the file's impls of its self
+type and trait before it): two impls written the same, as `once_cell`'s in `unsync` and `sync`,
+were two values under one key, refused within a build and read as each other's from a kept
+store (`agents/annoyances/assoc-key-1.json`). The rule for every entry keyed by an item's text:
+its value holds nothing of a file or a database (no ast id, no crate, no interned id); what is of
+the file is in the file's index. Checks: hir-expand `declarative::stored::index::tests`;
 hir-def `nameres::frozen::entries::items::tests` (one impl of N edited: N-1 found and one
 collection; keyed by the file: all N miss; a body edit: no entry made again; two databases:
-equal bytes; a layout refused by name).
+equal bytes; a layout refused by name; two impls written the same read their own items, make
+one value within one build, and `the_oracle_catches_an_ast_id_in_an_assoc_value` plants layout 1's value; an entry is the
+same bytes wherever its item is written).
 
 Left, in order: resolution facts ((module, path) to macro definition, absent included) and the
 expansion key, so impls with macro calls, attribute macros or tool attributes, items a macro

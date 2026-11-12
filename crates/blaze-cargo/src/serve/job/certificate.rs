@@ -1,61 +1,72 @@
-//! The request certificate: the one record that says a request of a checkout is answered
-//! already, and by what (docs/v2/plan/design/certificate.md).
+//! The request certificate's record: what one build that answered read, and what it left
+//! (docs/v2/plan/design/certificate.md; end-state.md, "The shared page").
 //!
-//! A certificate is written once a build answered ([`Certificate`]) and holds everything that
-//! answer is a function of, each by content: the request (its shape, its config less the
-//! environment, what it says past those, how its client is drawn), the blaze that served it,
-//! the checkout's files as groups of the view's tree ([`Group`]: a directory's Merkle id or a
-//! file's id, with the units that read it), the variables its steps read with the hash of
-//! each value, the files outside every view its steps read with the hash of each (none: it
-//! was not there, a negative probe), the outputs with the stamp each was placed under, the
-//! units' record keys, and what the build said. It is a store record (`Kind::Query`), keyed
-//! by content alone ([`key`]), so a restarted daemon and a second checkout of the same
-//! content find it; the checkout's slot ([`slot`]) names the certificate its last build left,
-//! so a request whose content has no certificate still learns which input moved.
+//! It is filed in `blaze_record`'s one form, in the write-once store:
 //!
-//! The check ([`Certificate::holds`]) is one record read, the id compares and the looks: no
-//! plan, no view walk, no job. Where it fails it names the first input that moved and the
-//! units that read it ([`Failed`]): the walk that follows starts at those, never at the
-//! roots.
+//! - the **base key** ([`base`]) is an identity: the relocated request shape and the tool.
+//!   No root id and no content is in it; the tree's state enters as reads;
+//! - a **read-list** names what the build read ([`Read`]: a node of the checkout's view, a
+//!   variable, a file or a listing outside every view, how its client is drawn), sorted, with
+//!   no value ([`Certificate::list`]; its note is this layout's word);
+//! - the **answer** ([`Answer`]) is under the list's bytes and the digest each read had when
+//!   the build read it ([`Certificate::answer_key`]): the outputs each by the hash of its
+//!   bytes, the units' record keys, what a build with nothing to do says. Content only: no
+//!   stamp, no absolute path of the checkout ([`relocated`]), so equal builds are equal bytes
+//!   and a second put is the same put.
 //!
-//! The invariant: a certificate is given only when a fresh walk would produce the same
-//! outputs and say the same.
+//! What is local to one machine is beside the record, never in it ([`Evidence`]): the stamp
+//! each output was last seen to have with the content under it (remade by hashing the output
+//! once where missing), and the digests of the checkout's last build, which is how a miss
+//! names the reads that moved.
 //!
-//! A sans-IO core (rule 14): it reads no file, no clock, no watch and no store; the daemon
-//! hands it what is there now ([`Now`], [`Looks`]) and the record's bytes.
+//! The check and the write are the request machine's ([`super::request`]).
+//!
+//! The invariant: a certificate is given only when a fresh build would produce the same
+//! outputs and say the same bytes.
+//!
+//! A sans-IO core (rule 14): no file, clock, watch or store is read here.
 
-// Until `Jobs::begin` asks it and the settle writes it (certificate.md, "State"): the
-// record, its codec and its check are whole and tested here first.
+// Until `Jobs::begin` drives the request machine (certificate.md, "State").
 #![allow(dead_code)]
 
 use std::fmt;
 
 use blaze_ids::{ContentId, Hasher};
+use blaze_record::{AnswerKey, Digest, ListRef};
 
-/// The layout of a certificate's bytes ([`Certificate::encode`]). A change of any field's
-/// meaning or order takes the next number and a line in [`PREVIOUS`].
-pub(super) const LAYOUT: u32 = 1;
+/// The layout of a certificate's parts: the word in each read-list's note and at the head of
+/// each answer. A change of any field's meaning or order takes the next number and a line in
+/// [`PREVIOUS`].
+pub(super) const LAYOUT: u32 = 2;
 
-/// The first bytes of every certificate.
+/// The first bytes of a list's note and of every answer.
 const MAGIC: &[u8; 8] = b"blzcert\n";
 
-/// The layouts before [`LAYOUT`], each by name: a record of one is refused by that name
-/// ([`Undecoded::Previous`]), and the build walks and writes the record anew (rule 26).
-pub(super) const PREVIOUS: &[(u32, &str)] =
-    &[(0, "the draft of 2026-11-12, whose one group was the view's whole root")];
+/// The layouts before [`LAYOUT`], each by name: a part of one is refused by that name
+/// ([`Undecoded::Previous`]), and the build that follows files the record anew (rule 26).
+pub(super) const PREVIOUS: &[(u32, &str)] = &[
+    (0, "the draft of 2026-11-12, whose one group was the view's whole root"),
+    (1, "the record of 2026-11-12 keyed by the view's root, with its outputs' stamps in its bytes"),
+];
 
-/// The step a failed certificate is under in `blaze why`.
+/// The step a request that was not certified is under in `blaze why`.
 pub(super) const STEP: &str = "request certificate";
 
-/// What stands for the checkout's own directory in everything a certificate's key is made of
-/// ([`relocated`]): no absolute path of a checkout is in a key (store.md, "Content keys").
+/// What stands for the checkout's own directory in everything a certificate is made of
+/// ([`relocated`]): no absolute path of a checkout is in a key or a record.
 pub(super) const ROOT: &str = "\u{0}checkout";
+
+/// How long after an output's change time a look must be for its stamp to vouch for the
+/// content hashed under it: within this a second write can leave the same stamp (the
+/// coarsest change time of the file systems blaze places outputs on is two seconds, FAT's).
+/// Until then the output is hashed at each check; never trusted early.
+pub(super) const RACY_NS: u64 = 2_000_000_000;
 
 /// `text` with the checkout's directory `root` (absolute, no trailing `/`) replaced by
 /// [`ROOT`] wherever it is a whole path prefix: at the start of `text` or after a character
-/// no path holds in its middle of a word (`=`, `:`, a space, a quote), and followed by `/`
-/// or the end. What a request's config is made a shape of, so two checkouts of one content
-/// ask for one certificate.
+/// no path holds in its middle of a word (`=`, `:`, a space, a quote, a comma), and followed
+/// by `/`, one of those characters or the end. What a request's config is made a shape of and what a build said is
+/// kept as, so two checkouts of one content ask for one certificate ([`replaced`] undoes it).
 pub(super) fn relocated(text: &str, root: &str) -> String {
     let mut out = String::with_capacity(text.len()); // alloc: once a string of a request's config
     if root.is_empty() {
@@ -70,7 +81,7 @@ pub(super) fn relocated(text: &str, root: &str) -> String {
             Some(c) => matches!(c, '=' | ':' | ' ' | '"' | '\'' | ','),
         };
         let after = &rest[found + root.len()..];
-        let after_ok = after.is_empty() || after.starts_with('/');
+        let after_ok = after.is_empty() || after.starts_with(['/', ':', ' ', '"', '\'', ',']);
         out.push_str(&rest[..found]);
         if before_ok && after_ok {
             out.push_str(ROOT);
@@ -84,103 +95,137 @@ pub(super) fn relocated(text: &str, root: &str) -> String {
     out
 }
 
-/// The key of the certificate of a request of `shape` (its config as the plan reads it,
-/// relocated) on a checkout whose view's root is `root`, served by the blaze `blaze`: content
-/// alone.
-pub(super) fn key(shape: &ContentId, root: &ContentId, blaze: &str) -> ContentId {
+/// `text` as [`relocated`] left it, with the checkout at `root` put back: what a certificate
+/// said is said again with for the checkout that asks. [`ROOT`] holds a NUL, which no path
+/// and no rendered text holds, so every [`ROOT`] in `text` is one [`relocated`] wrote.
+pub(super) fn replaced(text: &str, root: &str) -> String {
+    text.replace(ROOT, root) // alloc: once a string said again
+}
+
+/// A request's identity, each part relocated: none holds the tree's content.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Shape {
+    /// Its config as the plan reads it.
+    pub(super) plan: ContentId,
+    /// Its config less its environment.
+    pub(super) config: ContentId,
+    /// What it says past its config (verbosity, the goal).
+    pub(super) request: ContentId,
+}
+
+/// The base key of the certificates of requests of `shape` served by `tool` (the blaze's own
+/// identity; the toolchain is in the shape's config, its mounts by content id). An identity:
+/// every checkout, of whatever content, asks under the one base its shape and tool give.
+pub(super) fn base(shape: &Shape, tool: &[u8]) -> ContentId {
     Hasher::new("blaze v2 serve request certificate")
-        .id(shape)
-        .id(root)
-        .part(blaze.as_bytes())
+        .id(&shape.plan)
+        .id(&shape.config)
+        .id(&shape.request)
+        .part(tool)
         .finish()
 }
 
-/// The key of the slot of the checkout at `dir` for requests of `shape`: the key of the
-/// certificate its last build of that shape left ([`key`]), 32 bytes. The one record of the
-/// lane keyed by where a checkout is: it is this machine's alone, never sent to a remote
-/// store, and what it names is content-keyed.
-pub(super) fn slot(shape: &ContentId, dir: &str) -> ContentId {
-    Hasher::new("blaze v2 serve request certificate slot").id(shape).part(dir.as_bytes()).finish()
+/// One thing a build read from outside itself, by its name: what a read-list holds. Its
+/// value is one digest, [`Digest::Nothing`] where nothing was there (a negative probe).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(super) enum Read {
+    /// A node of the checkout's view, from the view's root, `/`-separated (`""` the root): a
+    /// directory by its Merkle id (every file below it and every name that is not there: the
+    /// covering first check of a package, never the grain of what is redone) or one file by
+    /// its id. A path dependency outside the workspace is one too, by its mount's place.
+    Node(String),
+    /// A variable of the request's environment: one a step asked for by name, or one read
+    /// unasked that was set (the plan's variables, `BLAZE_*`).
+    Env(String),
+    /// A file outside every view, by its absolute path (a link: by where it points).
+    Outside(String),
+    /// A directory outside every view, by its listing.
+    Listing(String),
+    /// How the request's client is shown diagnostics: read only by a build that said one.
+    Drawn,
 }
 
-/// Files of the checkout a build read, as one node of the view's tree: a directory by its
-/// Merkle id (every file below it, and every name that is not there), or one file by its id.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) struct Group {
-    /// From the view's root, `/`-separated; `""` is the root itself. A directory outside the
-    /// view (a path dependency) is a group too, by its mount's place ([`relocated`] where it
-    /// is named from the checkout, absolute otherwise): its id is read from the tree's mount
-    /// when a watch vouches for it and from the disk when none does, the same id either way.
-    pub(super) path: String,
-    /// The node's id in the view the build read; none: nothing was there, and the build read
-    /// that (a negative probe inside the view).
-    pub(super) id: Option<ContentId>,
-    /// The units that read anything of it, each an index of [`Certificate::units`], sorted.
-    pub(super) readers: Vec<u32>,
+impl Read {
+    /// Its kind's number and its text: what its name is made of, and what orders reads.
+    pub(super) fn parts(&self) -> (u8, &str) {
+        match self {
+            Read::Node(path) => (0, path.as_str()),
+            Read::Env(name) => (1, name.as_str()),
+            Read::Outside(path) => (2, path.as_str()),
+            Read::Listing(path) => (3, path.as_str()),
+            Read::Drawn => (4, ""),
+        }
+    }
+
+    /// Its name in a read-list: its kind, then its text.
+    pub(super) fn name(&self) -> Vec<u8> {
+        let (kind, text) = self.parts();
+        let mut out = Vec::with_capacity(1 + text.len()); // alloc: a read's name, once a list written
+        out.push(kind);
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    /// The read `name` is of ([`Read::name`]), or why it is none.
+    pub(super) fn named(name: &[u8]) -> Result<Read, Undecoded> {
+        let (kind, text) = name.split_first().ok_or(Undecoded::Malformed("a read's kind"))?;
+        // alloc: a read's own string, once a list read
+        let text = std::str::from_utf8(text)
+            .map(str::to_owned)
+            .map_err(|_| Undecoded::Malformed("a read's name"))?;
+        Ok(match *kind {
+            0 => Read::Node(text),
+            1 => Read::Env(text),
+            2 => Read::Outside(text),
+            3 => Read::Listing(text),
+            4 if text.is_empty() => Read::Drawn,
+            _ => return Err(Undecoded::Malformed("a read's kind")),
+        })
+    }
 }
 
-/// An output of the build as it was placed.
+/// The input as `blaze why` names it.
+impl fmt::Display for Read {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Read::Node(path) if path.is_empty() => f.write_str("the checkout's files"),
+            Read::Node(path) | Read::Outside(path) => f.write_str(path),
+            Read::Env(name) => write!(f, "${name}"),
+            Read::Listing(path) => write!(f, "the names in {path}"),
+            Read::Drawn => f.write_str("how diagnostics are shown"),
+        }
+    }
+}
+
+/// An output of the build, by content.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Output {
-    /// Which of the daemon's bases `path` is under ([`Now::bases`] by index: the target
-    /// directory, the build directory, the standard library's builds).
+    /// Which of the daemon's bases `path` is under (the target directory, the build
+    /// directory, the standard library's builds), by index.
     pub(super) base: u8,
     /// From that base, `/`-separated.
     pub(super) path: String,
-    /// The store's key of its content.
+    /// The hash of the bytes placed there.
     pub(super) content: ContentId,
-    pub(super) stamp: Stamp,
 }
 
-/// What a look at a placed file says: its length and when it last changed. A file replaced
-/// by another of the same length at the same nanosecond passes for the placed one, as it
-/// does for the store's own placements (`Placement` in the daemon).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct Stamp {
-    pub(super) len: u64,
-    pub(super) changed_ns: u64,
-}
-
-/// One request's certificate.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) struct Certificate {
-    /// The blaze that served the build (its release's version).
-    pub(super) blaze: String,
-    /// The request's shape, relocated.
-    pub(super) shape: ContentId,
-    /// The request's config less its environment, relocated.
-    pub(super) config: ContentId,
-    /// What the request says past its config (verbosity, the goal).
-    pub(super) request: ContentId,
-    /// How the request's client is shown diagnostics.
-    pub(super) drawn: ContentId,
-    /// Whether what the build said holds a diagnostic: only then is `drawn` an input.
-    pub(super) diagnosed: bool,
-    /// The root of the view the build read.
-    pub(super) root: ContentId,
-    /// The checkout's files the build read, sorted by path, none under another.
-    pub(super) groups: Vec<Group>,
-    /// Each variable of the request's environment a step read, sorted by name, with the hash
-    /// of the value read (none: unset).
-    pub(super) env: Vec<(String, Option<ContentId>)>,
-    /// Each file outside every view a step read, sorted by path, with the hash of its
-    /// content (none: nothing was there, a negative probe). A link on the way to a directory
-    /// the build named is here too, by the hash of where it points.
-    pub(super) outside: Vec<(String, Option<[u8; 32]>)>,
+/// What a certified request is answered with: the value of the record.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(super) struct Answer {
     /// The outputs, sorted by base then path.
     pub(super) outputs: Vec<Output>,
     /// The units' record keys, in the plan's order: what `blaze why` reads of an answered
-    /// request, and what [`Group::readers`] index.
+    /// request.
     pub(super) units: Vec<ContentId>,
     /// What the build said, as a build with nothing to do says it, and its `Work`: the
-    /// daemon's encoding (deterministic CBOR), opaque here.
+    /// daemon's encoding (deterministic CBOR), every text of it [`relocated`]; opaque here.
     pub(super) said: Vec<u8>,
 }
 
 /// Why a certificate's bytes are not read.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Undecoded {
-    /// Not a certificate at all.
+    /// Not a certificate's part at all.
     NotOne,
     /// Of a layout before this one, by its number and name ([`PREVIOUS`]).
     Previous(u32, &'static str),
@@ -220,16 +265,6 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn put_opt(out: &mut Vec<u8>, id: Option<&[u8; 32]>) {
-    match id {
-        None => out.push(0),
-        Some(id) => {
-            out.push(1);
-            out.extend_from_slice(id);
-        }
-    }
-}
-
 /// A reader of a certificate's bytes: each take names its field for the refusal.
 struct Bytes<'a> {
     rest: &'a [u8],
@@ -254,13 +289,6 @@ impl<'a> Bytes<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    fn u64(&mut self, field: &'static str) -> Result<u64, Undecoded> {
-        let bytes = self.take(8, field)?;
-        let mut le = [0; 8];
-        le.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(le))
-    }
-
     /// A list's length, refused where the bytes left cannot hold that many items of at least
     /// `least` bytes each: no length read off a record reserves more than the record holds.
     fn len(&mut self, least: usize, field: &'static str) -> Result<usize, Undecoded> {
@@ -282,65 +310,48 @@ impl<'a> Bytes<'a> {
         std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| Undecoded::Malformed(field))
     }
 
-    fn id32(&mut self, field: &'static str) -> Result<[u8; 32], Undecoded> {
+    fn id(&mut self, field: &'static str) -> Result<ContentId, Undecoded> {
         let mut id = [0; 32];
         id.copy_from_slice(self.take(32, field)?);
-        Ok(id)
+        Ok(ContentId(id))
     }
 
-    fn id(&mut self, field: &'static str) -> Result<ContentId, Undecoded> {
-        self.id32(field).map(ContentId)
-    }
-
-    fn opt(&mut self, field: &'static str) -> Result<Option<[u8; 32]>, Undecoded> {
-        match self.u8(field)? {
-            0 => Ok(None),
-            1 => self.id32(field).map(Some),
-            _ => Err(Undecoded::Malformed(field)),
+    /// [`MAGIC`] and [`LAYOUT`], or which other layout the bytes are of.
+    fn head(&mut self) -> Result<(), Undecoded> {
+        if self.take(MAGIC.len(), "magic").map_err(|_| Undecoded::NotOne)? != MAGIC {
+            return Err(Undecoded::NotOne);
         }
+        let layout = self.u32("layout")?;
+        if layout != LAYOUT {
+            return Err(match PREVIOUS.iter().find(|(n, _)| *n == layout) {
+                Some((n, name)) => Undecoded::Previous(*n, name),
+                None => Undecoded::Unknown(layout),
+            });
+        }
+        Ok(())
     }
 }
 
-impl Certificate {
+/// The head of an answer and the whole of a list's note: [`MAGIC`], then `layout`.
+fn head_of(layout: u32) -> [u8; 12] {
+    let mut out = [0; 12];
+    out[..8].copy_from_slice(MAGIC);
+    out[8..].copy_from_slice(&layout.to_le_bytes());
+    out
+}
+
+impl Answer {
     /// Its bytes: [`MAGIC`], [`LAYOUT`], then each field in the struct's order, every number
     /// little-endian, every list and string under its length. One encoding a value: equal
-    /// certificates are equal bytes.
+    /// answers are equal bytes.
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256 + self.said.len()); // alloc: the record, once a build that answered
-        out.extend_from_slice(MAGIC);
-        put_u32(&mut out, LAYOUT);
-        put_bytes(&mut out, self.blaze.as_bytes());
-        for id in [&self.shape, &self.config, &self.request, &self.drawn] {
-            out.extend_from_slice(&id.0);
-        }
-        out.push(u8::from(self.diagnosed));
-        out.extend_from_slice(&self.root.0);
-        put_len(&mut out, self.groups.len());
-        for group in &self.groups {
-            put_bytes(&mut out, group.path.as_bytes());
-            put_opt(&mut out, group.id.as_ref().map(|it| &it.0));
-            put_len(&mut out, group.readers.len());
-            for reader in &group.readers {
-                put_u32(&mut out, *reader);
-            }
-        }
-        put_len(&mut out, self.env.len());
-        for (name, value) in &self.env {
-            put_bytes(&mut out, name.as_bytes());
-            put_opt(&mut out, value.as_ref().map(|it| &it.0));
-        }
-        put_len(&mut out, self.outside.len());
-        for (path, hash) in &self.outside {
-            put_bytes(&mut out, path.as_bytes());
-            put_opt(&mut out, hash.as_ref());
-        }
+        let mut out = Vec::with_capacity(64 + self.said.len()); // alloc: the record, once a build that answered
+        out.extend_from_slice(&head_of(LAYOUT));
         put_len(&mut out, self.outputs.len());
         for output in &self.outputs {
             out.push(output.base);
             put_bytes(&mut out, output.path.as_bytes());
             out.extend_from_slice(&output.content.0);
-            out.extend_from_slice(&output.stamp.len.to_le_bytes());
-            out.extend_from_slice(&output.stamp.changed_ns.to_le_bytes());
         }
         put_len(&mut out, self.units.len());
         for unit in &self.units {
@@ -350,61 +361,18 @@ impl Certificate {
         out
     }
 
-    /// The certificate `bytes` are, or why they are not read. A record of a layout before
-    /// this one is refused by its name; never read as an empty certificate.
-    pub(super) fn decode(bytes: &[u8]) -> Result<Certificate, Undecoded> {
+    /// The answer `bytes` are, or why they are not read. One of a layout before this one is
+    /// refused by its name; never read as an empty answer.
+    pub(super) fn decode(bytes: &[u8]) -> Result<Answer, Undecoded> {
         let mut bytes = Bytes { rest: bytes };
-        if bytes.take(MAGIC.len(), "magic").map_err(|_| Undecoded::NotOne)? != MAGIC {
-            return Err(Undecoded::NotOne);
-        }
-        let layout = bytes.u32("layout")?;
-        if layout != LAYOUT {
-            return Err(match PREVIOUS.iter().find(|(n, _)| *n == layout) {
-                Some((n, name)) => Undecoded::Previous(*n, name),
-                None => Undecoded::Unknown(layout),
-            });
-        }
-        let blaze = bytes.text("blaze")?;
-        let shape = bytes.id("shape")?;
-        let config = bytes.id("config")?;
-        let request = bytes.id("request")?;
-        let drawn = bytes.id("drawn")?;
-        let diagnosed = match bytes.u8("diagnosed")? {
-            0 => false,
-            1 => true,
-            _ => return Err(Undecoded::Malformed("diagnosed")),
-        };
-        let root = bytes.id("root")?;
-        let n = bytes.len(9, "groups")?;
-        let mut groups = Vec::with_capacity(n); // alloc: the certificate's own, once a record read
-        for _ in 0..n {
-            let path = bytes.text("group path")?;
-            let id = bytes.opt("group id")?.map(ContentId);
-            let m = bytes.len(4, "group readers")?;
-            let mut readers = Vec::with_capacity(m); // alloc: as above
-            for _ in 0..m {
-                readers.push(bytes.u32("group reader")?);
-            }
-            groups.push(Group { path, id, readers });
-        }
-        let n = bytes.len(5, "env")?;
-        let mut env = Vec::with_capacity(n); // alloc: as above
-        for _ in 0..n {
-            env.push((bytes.text("env name")?, bytes.opt("env value")?.map(ContentId)));
-        }
-        let n = bytes.len(5, "outside")?;
-        let mut outside = Vec::with_capacity(n); // alloc: as above
-        for _ in 0..n {
-            outside.push((bytes.text("outside path")?, bytes.opt("outside hash")?));
-        }
-        let n = bytes.len(53, "outputs")?;
-        let mut outputs = Vec::with_capacity(n); // alloc: as above
+        bytes.head()?;
+        let n = bytes.len(37, "outputs")?;
+        let mut outputs = Vec::with_capacity(n); // alloc: the answer's own, once a record read
         for _ in 0..n {
             let base = bytes.u8("output base")?;
             let path = bytes.text("output path")?;
             let content = bytes.id("output content")?;
-            let stamp = Stamp { len: bytes.u64("output len")?, changed_ns: bytes.u64("output changed")? };
-            outputs.push(Output { base, path, content, stamp });
+            outputs.push(Output { base, path, content });
         }
         let n = bytes.len(32, "units")?;
         let mut units = Vec::with_capacity(n); // alloc: as above
@@ -415,242 +383,169 @@ impl Certificate {
         if !bytes.rest.is_empty() {
             return Err(Undecoded::Malformed("the end"));
         }
-        let certificate = Certificate {
-            blaze,
-            shape,
-            config,
-            request,
-            drawn,
-            diagnosed,
-            root,
-            groups,
-            env,
-            outside,
-            outputs,
-            units,
-            said,
-        };
-        let units = certificate.units.len() as u64;
-        let in_range = |group: &Group| group.readers.iter().all(|it| u64::from(*it) < units);
-        if !certificate.groups.iter().all(in_range) {
-            return Err(Undecoded::Malformed("a group's reader is no unit of the certificate"));
-        }
-        Ok(certificate)
+        Ok(Answer { outputs, units, said })
     }
 }
 
-/// A request as the certificate's check is asked of it: what the daemon holds by value.
-pub(super) struct Now<'a> {
-    pub(super) blaze: &'a str,
-    pub(super) shape: ContentId,
-    pub(super) config: ContentId,
-    pub(super) request: ContentId,
-    pub(super) drawn: ContentId,
-    /// The root of the request's view, as of its checkout's watcher's flush for this request
-    /// (`serve::heads` holds the request until that flush is in).
-    pub(super) root: ContentId,
-    /// The hash of the variable of this name in the request's environment (none: unset).
-    pub(super) env: &'a dyn Fn(&str) -> Option<ContentId>,
-    /// The request asks for the build's trace (`BLAZE_PROFILE`): a walk is what it asks for,
-    /// so it is another request than any a certificate answers.
-    pub(super) traced: bool,
+/// The reads the read-list `list` names, in its order; or why it is no certificate's list.
+/// A list filed by a previous layout is refused by that layout's name.
+pub(super) fn reads_of(list: ListRef<'_>) -> Result<Vec<Read>, Undecoded> {
+    let mut note = Bytes { rest: list.note() };
+    note.head()?;
+    if !note.rest.is_empty() {
+        return Err(Undecoded::Malformed("the list's note"));
+    }
+    let mut reads = Vec::with_capacity(list.len()); // alloc: a list's reads, once a list read
+    for name in list.reads() {
+        reads.push(Read::named(name)?);
+    }
+    Ok(reads)
 }
 
-/// What is there now, as the check looks at it: the view's tree, and the disk outside it.
-pub(super) trait Looks {
-    /// The id of the node at `path` of the view asked (`blaze_vfs::reader::Pinned::dir_id`
-    /// for a directory, the file's id for a file); none: nothing there.
-    fn node(&self, path: &str) -> Option<ContentId>;
-    /// The hash of the file at `path`, outside every view; none: nothing there.
-    fn outside(&self, path: &str) -> Option<[u8; 32]>;
-    /// The stamp of the file at `path` under base `base`; none: nothing there.
-    fn output(&self, base: u8, path: &str) -> Option<Stamp>;
-}
-
-/// Why a certificate is not given: the first input that is not as the build read it. These
-/// six and no other (certificate.md, "Why a certificate fails"): not a restart, not another
-/// request's walk, not the build's own writes, not a variable no step read.
+/// One build that answered: what it read, each with the digest it read it at, and what it
+/// left.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) enum Failed {
-    /// Served by another blaze or toolchain.
-    Blaze,
-    /// The request itself is another: its shape, its config, what it says past them.
-    Request(&'static str),
-    /// Its client is shown diagnostics another way, and the build said some.
-    Drawing,
-    /// Files of the checkout: the group at this path, and the units that read it (indices
-    /// of [`Certificate::units`]): where the walk starts.
-    Group { path: String, readers: Vec<u32> },
-    /// A variable a step read.
-    Env(String),
-    /// A file outside every view a step read; `appeared`: it was not there (a probe).
-    Outside { path: String, appeared: bool },
-    /// An output is gone or is another file: it is placed again from the store, no unit
-    /// walked.
-    Output { base: u8, path: String },
-}
-
-impl Failed {
-    /// The input `blaze why` names.
-    pub(super) fn input(&self) -> String {
-        match self {
-            Failed::Blaze => "the blaze that serves it".to_owned(), // alloc: a reason, once
-            Failed::Request(what) => (*what).to_owned(),                 // alloc: as above
-            Failed::Drawing => "how diagnostics are shown".to_owned(),   // alloc: as above
-            Failed::Group { path, .. } if path.is_empty() => "the checkout's files".to_owned(), // alloc: as above
-            Failed::Group { path, .. } => path.clone(), // clone: a reason, once
-            Failed::Env(name) => format!("${name}"),
-            Failed::Outside { path, .. } => path.clone(), // clone: a reason, once
-            Failed::Output { path, .. } => path.clone(),  // clone: a reason, once
-        }
-    }
-
-    /// The units the walk that follows starts at (indices of [`Certificate::units`]); none:
-    /// the failure names no unit, and the walk starts at every unit that reads the request
-    /// (a config change) or at none (an output placed again).
-    pub(super) fn readers(&self) -> Option<&[u32]> {
-        match self {
-            Failed::Group { readers, .. } => Some(readers),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for Failed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Failed::Blaze => f.write_str("the certificate is another blaze's"),
-            Failed::Request(what) => write!(f, "{what} is another than the certificate's"),
-            Failed::Drawing => f.write_str("its diagnostics were drawn for another client"),
-            Failed::Group { path, readers } => {
-                let path = if path.is_empty() { "the checkout" } else { path.as_str() };
-                write!(f, "{path} changed, which {} unit(s) read", readers.len())
-            }
-            Failed::Env(name) => write!(f, "the variable {name} changed, which a step read"),
-            Failed::Outside { path, appeared: true } => {
-                write!(f, "{path} is there now, which a step looked for and did not find")
-            }
-            Failed::Outside { path, appeared: false } => write!(f, "{path} changed, which a step read"),
-            Failed::Output { path, .. } => write!(f, "the output {path} is gone or is another file"),
-        }
-    }
-}
-
-/// A bug planted in the check, for a test's control: with it the check gives a certificate
-/// it must not, and the test's oracle says so. Never planted outside a test.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Plant {
-    None,
-    IgnoresGroups,
-    IgnoresProbes,
-    IgnoresEnv,
-    IgnoresOutputs,
-    IgnoresRequest,
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(super) static PLANT: std::cell::Cell<Plant> = const { std::cell::Cell::new(Plant::None) };
-}
-
-#[cfg(test)]
-fn planted(plant: Plant) -> bool {
-    PLANT.get() == plant
-}
-
-#[cfg(not(test))]
-fn planted(plant: Plant) -> bool {
-    let _ = plant;
-    false
+pub(super) struct Certificate {
+    /// Sorted, each read once.
+    reads: Vec<(Read, Digest)>,
+    answer: Answer,
 }
 
 impl Certificate {
-    /// Whether `now` is answered by this: every input of the build is as it read it. The
-    /// first that is not is the reason, with the units that read it. Compares before looks,
-    /// the view's tree before the disk: a hit costs the compares, one look a file outside the
-    /// views and one an output.
-    pub(super) fn holds(&self, now: &Now<'_>, looks: &impl Looks) -> Result<(), Failed> {
-        if self.blaze != now.blaze {
-            return Err(Failed::Blaze);
-        }
-        if !planted(Plant::IgnoresRequest) {
-            if self.shape != now.shape {
-                return Err(Failed::Request("the request's command, arguments or plan variables"));
-            }
-            if self.config != now.config {
-                return Err(Failed::Request("the request's configuration"));
-            }
-            if now.traced {
-                return Err(Failed::Request("the request asks for the build's trace, which a walk makes; that"));
-            }
-            if self.request != now.request {
-                return Err(Failed::Request("what the request asks past its configuration"));
-            }
-            if self.diagnosed && self.drawn != now.drawn {
-                return Err(Failed::Drawing);
+    /// The certificate of a build that read `reads` and left `answer`: the reads sorted, each
+    /// once, and the outputs sorted, so equal builds are equal bytes whatever order their
+    /// steps ran in. `Err`: a read the build saw with two values (it moved under the build),
+    /// which no one digest stands for: that build has no certificate.
+    pub(super) fn new(mut reads: Vec<(Read, Digest)>, mut answer: Answer) -> Result<Certificate, Read> {
+        reads.sort_by(|a, b| a.0.cmp(&b.0));
+        for pair in reads.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1 {
+                return Err(pair[1].0.clone()); // clone: a refusal's name, once
             }
         }
-        // One compare when nothing of the checkout moved; else a node a group, O(groups),
-        // never a file each.
-        if self.root != now.root && !planted(Plant::IgnoresGroups) {
-            for group in &self.groups {
-                if looks.node(&group.path) != group.id {
-                    return Err(Failed::Group {
-                        path: group.path.clone(),       // clone: a reason, once
-                        readers: group.readers.clone(), // clone: where the walk starts, once
-                    });
-                }
-            }
-        }
-        if !planted(Plant::IgnoresEnv) {
-            for (name, value) in &self.env {
-                if (now.env)(name) != *value {
-                    return Err(Failed::Env(name.clone())); // clone: a reason, once
-                }
-            }
-        }
-        for (path, hash) in &self.outside {
-            if hash.is_none() && planted(Plant::IgnoresProbes) {
-                continue;
-            }
-            if looks.outside(path) != *hash {
-                // clone: a reason, once
-                return Err(Failed::Outside { path: path.clone(), appeared: hash.is_none() });
-            }
-        }
-        if !planted(Plant::IgnoresOutputs) {
-            for output in &self.outputs {
-                if looks.output(output.base, &output.path) != Some(output.stamp) {
-                    // clone: a reason, once
-                    return Err(Failed::Output { base: output.base, path: output.path.clone() });
-                }
-            }
-        }
-        Ok(())
+        reads.dedup_by(|a, b| a.0 == b.0);
+        answer.outputs.sort_by(|a, b| (a.base, &a.path).cmp(&(b.base, &b.path)));
+        Ok(Certificate { reads, answer })
     }
 
-    /// Every unit the walk after `failed` visits at most: the readers of the group that
-    /// moved and, through `dependents` (a unit's direct dependents, by index), everything
-    /// that depends on one. Sorted, each once. None where the failure names no unit.
-    pub(super) fn walk_from(
-        &self,
-        failed: &Failed,
-        dependents: &dyn Fn(u32) -> Vec<u32>,
-    ) -> Option<Vec<u32>> {
-        let mut seen = vec![false; self.units.len()]; // alloc: once a failed certificate
-        let mut todo: Vec<u32> = failed.readers()?.to_vec(); // alloc: as above
-        let mut out = Vec::new(); // alloc: as above
-        // Bounded: each unit is pushed to `out` once, so at most `units` turns do work.
-        while let Some(unit) = todo.pop() {
-            let Some(slot) = seen.get_mut(unit as usize) else { continue };
-            if std::mem::replace(slot, true) {
-                continue;
-            }
-            out.push(unit);
-            todo.extend(dependents(unit));
+    pub(super) fn reads(&self) -> &[(Read, Digest)] {
+        &self.reads
+    }
+
+    pub(super) fn answer(&self) -> &Answer {
+        &self.answer
+    }
+
+    /// Its read-list under `base`: the note is this layout's word, the reads their names.
+    pub(super) fn list(&self, base: &ContentId) -> Vec<u8> {
+        let mut out = Vec::new(); // alloc: the list, once a build that answered
+        blaze_record::write_list(
+            &mut out,
+            base,
+            &head_of(LAYOUT),
+            self.reads.iter().map(|(read, _)| read.name()),
+        );
+        out
+    }
+
+    /// The key its answer is under: `list` (its own, [`Certificate::list`]) and the digest
+    /// each read had.
+    pub(super) fn answer_key(&self, list: &[u8]) -> ContentId {
+        let mut key = AnswerKey::new(list);
+        for (_, digest) in &self.reads {
+            key.value(*digest);
         }
-        out.sort_unstable();
-        Some(out)
+        key.finish()
+    }
+}
+
+/// What a look at a placed file says: its length and when it last changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Stamp {
+    pub(super) len: u64,
+    pub(super) changed_ns: u64,
+}
+
+/// An output's stamp with the content hashed under it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Vouched {
+    base: u8,
+    path: String,
+    stamp: Stamp,
+    content: ContentId,
+}
+
+/// What one machine knows beside the records of one checkout and request shape: never
+/// stored, never a condition for an answer. Without it a check hashes each output once and a
+/// miss cannot name what moved; nothing else differs.
+///
+/// Bounded: `stamps` holds the outputs of one answer (the last given or written), `last` the
+/// reads of one build.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Evidence {
+    /// The reads of the last build or hit of this checkout and shape, each with its digest
+    /// then: what a miss is compared with to name the reads that moved.
+    pub(super) last: Option<Vec<(Read, Digest)>>,
+    /// Sorted by base then path.
+    stamps: Vec<Vouched>,
+}
+
+impl Evidence {
+    fn at(&self, base: u8, path: &str) -> Result<usize, usize> {
+        self.stamps.binary_search_by(|it| (it.base, it.path.as_str()).cmp(&(base, path)))
+    }
+
+    /// The content the output at `path` under `base` holds, where its stamp `now` is the one
+    /// that content was hashed under.
+    pub(super) fn vouched(&self, base: u8, path: &str, now: Stamp) -> Option<ContentId> {
+        let at = self.at(base, path).ok()?;
+        (self.stamps[at].stamp == now).then_some(self.stamps[at].content)
+    }
+
+    /// Keeps that the output at `path` under `base` held `content` under `stamp`, seen at
+    /// `looked_ns` (the file system's clock): only where the look is [`RACY_NS`] past the
+    /// stamp's change time, since within it another write can leave the same stamp. What was
+    /// kept of the path before goes either way.
+    pub(super) fn keep(&mut self, base: u8, path: &str, stamp: Stamp, content: ContentId, looked_ns: u64) {
+        let steady = stamp.changed_ns.checked_add(RACY_NS).is_some_and(|it| it <= looked_ns);
+        match (self.at(base, path), steady) {
+            (Ok(at), true) => {
+                self.stamps[at].stamp = stamp;
+                self.stamps[at].content = content;
+            }
+            (Ok(at), false) => {
+                self.stamps.remove(at);
+            }
+            (Err(at), true) => {
+                // alloc: one entry an output of the shape's last answer
+                self.stamps.insert(at, Vouched { base, path: path.to_owned(), stamp, content });
+            }
+            (Err(_), false) => {}
+        }
+    }
+
+    /// Forgets what was kept of the output at `path` under `base`.
+    pub(super) fn forget(&mut self, base: u8, path: &str) {
+        if let Ok(at) = self.at(base, path) {
+            self.stamps.remove(at);
+        }
+    }
+
+    /// Keeps only the stamps of `outputs` (sorted by base then path, as an [`Answer`]'s are):
+    /// the bound.
+    pub(super) fn only(&mut self, outputs: &[Output]) {
+        self.stamps.retain(|it| {
+            outputs
+                .binary_search_by(|out| (out.base, out.path.as_str()).cmp(&(it.base, it.path.as_str())))
+                .is_ok()
+        });
+    }
+
+    /// As [`Evidence::keep`] with no regard for [`RACY_NS`]: the planted bug of the racy
+    /// stamp's control. For tests.
+    #[cfg(test)]
+    pub(super) fn keep_racy(&mut self, base: u8, path: &str, stamp: Stamp, content: ContentId) {
+        self.keep(base, path, stamp, content, u64::MAX);
     }
 }
 

@@ -114,6 +114,25 @@ impl Stopped {
     }
 }
 
+/// What the kernel's lookups came to, as `blaze_record` counts them ([`Looking`]'s tally):
+/// how many chains of read-lists were walked, how many found an entry, the read-lists read and
+/// the reads valued. An entry with no reads is found by its key before any chain is walked,
+/// and is not among them.
+///
+/// One for the process, not one a kernel: [`Looking`] and [`Keeping`] are made where a lookup
+/// or a keep is, from a store the kernel is handed each call, and neither the store
+/// (`blaze_cas`'s) nor the handles outlive the call to own a count. It belongs with whatever
+/// comes to own the kernel's store for a build; until then a process with two kernels counts
+/// both here.
+static LOOKUPS: blaze_record::Tally = blaze_record::Tally::new();
+
+/// What the kernel's lookups of this process came to since the last call, as `blaze_record`
+/// counts them (lookups, hits, read-lists read, reads valued), taken: for the driver that
+/// reports a build's.
+pub fn take_lookups() -> blaze_record::Counts {
+    LOOKUPS.take()
+}
+
 /// The store a lookup reads an identity's read-lists through.
 pub(crate) struct Looking<'s, G: ?Sized>(pub &'s G);
 
@@ -131,6 +150,10 @@ impl<'s, G: Get + ?Sized> blaze_record::Store for Looking<'s, G> {
 
     fn bytes<'h>(held: &'h &'s [u8]) -> &'h [u8] {
         held
+    }
+
+    fn tally(&self) -> &blaze_record::Tally {
+        &LOOKUPS
     }
 }
 
@@ -182,5 +205,11 @@ impl<'c, P: Put + ?Sized> blaze_record::Store for Keeping<'c, '_, P> {
 
     fn bytes<'h>(held: &'h Ref<'c, [u8]>) -> &'h [u8] {
         held
+    }
+
+    /// A keep walks no chain (a placing and a keeping count nothing): the kernel's one all
+    /// the same, so a lookup that came to go through this handle would be counted.
+    fn tally(&self) -> &blaze_record::Tally {
+        &LOOKUPS
     }
 }

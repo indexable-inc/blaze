@@ -5,8 +5,9 @@ date: 2026-11-12
 ---
 # Request certificates
 
-Lane certificate-1112. Code: `crates/blaze-cargo/src/serve/job/certificate.rs` (the record, its
-codec, the check; sans-IO) and its tests. The owner, on a repeated `blaze run` of a hello-world
+Lanes certificate-1112, certificate2, certificate3. Code: `crates/blaze-cargo/src/serve/job/certificate.rs`
+(the record in `blaze-record`'s form, its codec, the local evidence) and
+`serve/job/request.rs` (the request machine: the check and the write), both sans-IO, with their tests. The owner, on a repeated `blaze run` of a hello-world
 being a whole walk (1,162 `job` and `task` spans, 1,195 `admission`, 160–700 ms; reth's no-op
 2.0–2.8 s): "is our architecture jank? what does the competitor do". makepad Relax answers a
 hello-world no-op in 52 ms with nothing held between runs: one certificate for the whole program
@@ -18,95 +19,84 @@ miss path.
 
 ## What a certificate holds
 
-One per request shape and content (`Certificate`):
+It is filed in `blaze-record`'s one form (end-state.md, shared page 2): base key → read-lists →
+answer.
 
-| field | what | compared by |
+| part | what | where |
 |---|---|---|
-| `blaze` | the blaze that served it (release version; the toolchain is in `config`: the library and std mounts are by content id) | equality |
-| `shape`, `config`, `request`, `drawn` | the request: its config as the plan reads it; its config less the environment; what it says past those; how its client is drawn (an input only when the build said a diagnostic). The checkout's own directory is replaced by a marker first (`relocated`), so no absolute checkout path is in a key | equality |
-| `root` | the view's root id, read AFTER the build's own writes into the view (lock files: `Job::built_root`) | one compare; equal ends the file check |
-| `groups` | the checkout's files the build read, as nodes of the VFS tree: a directory by its Merkle id (`Pinned::dir_id(root, path)`: every file below and every absent name: a new `build.rs`, a module file, a member's `Cargo.toml` change it), or one file by its id (`Cargo.toml`, `Cargo.lock`, `.cargo/config.toml` at the root); `None` for a node read as absent. Each with `readers`: the units that read it. Which: one a package root directory of the plan (less nothing: the tree already leaves out what the watcher ignores, `target/` and `.git/`: to be confirmed by the runner, see State), plus the workspace root's files. A path dependency outside the workspace (bstd) is a group like any other: id from its mount in the tree when its watch vouches, from a direct read of the directory when none does (span `request certificate: a directory read, no watch vouches`, with the path) | `O(groups)` id compares, only when `root` differs; never a stat a file |
-| `env` | each variable a step read (`read_by_plan`, the walk set, `BLAZE_*`, and each name a build script, proc macro or `env!` asked for) with the hash of its value, `None` unset | per name; a variable nothing read is in no certificate |
-| `outside` | each file outside every view a step read (a header, the C compiler) with its content hash; `None`: looked for and absent (a negative probe). A link on the way to a directory the build named is an entry by where it points | one look each |
-| (listings) | a directory outside the views a build script listed (blake3's, ring's, zstd-sys's globs): an `outside` entry by the hash of its listing (direct names, which are directories); a listing through a link records the link as a probe and the resolved directory's listing. In memory the watches' generation vouches for these (lane reth-1112's rules 1–4); the record holds the content, so a restart re-reads each once | one listing each, cold only |
-| `outputs` | each output: base (target dir, build dir, std's builds), path under it, store key, and the stamp (length, change time) it was placed under | one stat each |
-| `units` | the units' record keys in plan order: what `blaze why` reads of an answered request and what `readers` index | not compared |
-| `said` | what a build with nothing to do says (diagnostics, units, artifacts) and its `Work`, deterministic CBOR | replayed |
+| base | `base(Shape, tool)`: the request's shape (its config as the plan reads it, its config less the environment, what it says past those; each relocated: the checkout's directory is a marker, `relocated`) and the blaze that serves it. An identity: no root id, no content | the key the lists are under |
+| read-list | the names of what the build read, sorted, each once, no value (`Read`): `Node(path)` a node of the checkout's view (a package root's directory by its Merkle id: every file below and every absent name; or one file: `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`); `Env(name)` each variable a step asked for, and each variable read unasked (plan variables, `BLAZE_*`) that was set; `Outside(path)` a file outside every view; `Listing(path)` a directory outside by its listing; `Drawn` how the client is drawn, only of a build that said a diagnostic. The note is the layout's word | `list_key(base, slot)`; past the chain's bound the oldest list is no longer searched |
+| answer | `Answer`: the outputs (base, path, the hash of the bytes), the units' record keys in plan order, what a build with nothing to do says (`said`, every text relocated). Content only: equal builds are equal bytes | under the list's bytes and the digest each read had when the build read it (nothing there is a digest) |
+| evidence | local, never stored, never a condition (`Evidence`, one a checkout and shape): each output's stamp with the content hashed under it (kept only when seen 2 s past its change time; else hashed at each check), and the reads and digests of the checkout's last build, which is how a miss names what moved | the daemon's memory; lost at a restart, remade by one hash an output |
 
 ## Where it lives
 
-A store record, `Kind::Query`, domain `serve request certificate`:
-`key(shape, root, blaze)`: content alone, so a restarted daemon finds it, and a second checkout
-of the same content finds it too (its outputs are not placed: the failure names an output and no
-unit; they are placed from the store by their keys, no unit walked). Beside it one slot a
-checkout and shape, domain `serve request certificate slot`, `slot(shape, dir)` → the 32 bytes
-of the key of the certificate that checkout's last build left: how a request whose content has
-no certificate (an edit) still finds the last one and learns which group moved. The slot is the
-one record keyed by a directory: local to the machine, never sent to a remote store.
-`noop::LastAnswer` becomes a cache of the decoded record with the watches' word beside it (a hit
-in memory skips the looks at `outside` and `outputs` while the watches vouch); it is never the
-only copy.
+In the store (`Kind::Query`), write-once, as above. A restarted daemon and a second checkout of
+the same content compute the same base, value the same reads and find the same answer; the
+second checkout's outputs are not there, so it misses on an output and they are placed from the
+store. Nothing is keyed by a directory and nothing moves.
 
 ## The check
 
-`Certificate::holds(now, looks)`: one record read, the compares above, the looks. Done by the
-daemon's loop in `Jobs::begin` before anything else (today's `answer_again`), after the
-checkout's watcher's flush for this request is in (`serve::heads` already holds a request for
-it), so the root compared is never older than a write made before the request was sent. On a hit:
-no `job`, `task` or `admission` span, no plan, no view opened in the database.
+The request machine (`request::Request`), stepped by the daemon's loop before any plan, view walk
+or job, after the checkout's watcher's flush for this request is in:
 
-The thin client does NOT check without the daemon. It could map a file holding "root id R at
-watcher cursor C", but a write the watcher has not delivered is exactly what that file cannot
-vouch for, and only the daemon can flush its watcher. So: one small request, answered by the loop
-with the certificate's `said` and the program's path; the client then execs. If a later
-measurement shows the round trip matters (it is a Unix-socket request: expected well under a
-millisecond), the daemon can answer "root R as of cursor C, flushed for you" and the client do the
-compares; not built now. Correctness first.
+1. the read-lists under the base (`blaze_record::walk`; at most 11);
+2. each read they name valued now: asks the driver answers (a pinned node's id, a variable's
+   hash, an outside file's or listing's digest). A list that does not name a variable read
+   unasked that is set now is passed over (it was unset at that list's build);
+3. the answer under the first list's bytes and those digests;
+4. each output: its stamp; where the evidence does not vouch for the content under that stamp:
+   stat, hash, stat again;
+5. `Hit(answer)`: `said` is said again, no `job`, `task` or `admission` span; or `Miss(why)`.
 
-## Why a certificate fails (the invariant)
+Every wait is a named state (`Request::waiting`) and ends, after `MOST_IDLE` steps with nothing
+told, in `Stopped::Stalled`.
 
-**A certificate is given only when a fresh walk would produce the same outputs and say the
-same.** And it stops holding ONLY when one of these differs, naming which (`Failed`):
+The thin client does NOT check without the daemon: only the daemon can flush its watcher. One
+small request, answered by the loop; the client then execs.
 
-1. a recorded input's content: a source, a manifest, a file a build script or proc macro read, an
-   `include!`d file (`Failed::Group`, `Failed::Outside`);
-2. a probe that flipped: absent → present (a `build.rs`, a module file, a member's manifest: in a
-   group's directory id; outside the views: `Failed::Outside { appeared: true }`), or present →
-   gone;
-3. the value of a variable the build read (`Failed::Env`);
-4. the request shape: profile, target, features, packages, arguments (`Failed::Request`; a
-   request for a trace is such a request);
-5. the toolchain or blaze's identity (`Failed::Blaze`, or `config` for the toolchain);
-6. an output it promised: deleted or changed (`Failed::Output`).
+## Why a request misses (the invariant)
 
-Nothing else: not a restart (the record is read back), not another request's walk (its outputs
-are other paths; no "alone" condition), not the build's own writes (the root is taken after the
-lock files), not a link in a path (recorded as a probe with the resolved directory's id), not a
-file outside the workspace (a group, above), not a variable nothing read, not the order of equal
-values (every list is sorted before it is encoded).
+**A hit is given only when a fresh build would say the same bytes and leave the same outputs.**
+A request misses only for (`request::Why`):
 
-The one hard case: a step blaze could not trace (a build script run outside the sandbox with no
-record of its reads). Its inputs cannot be claimed, so that build writes NO certificate and says
-so once per build, naming the unit (a warning diagnostic, and the span `request certificate: not
-written, an untraced step`), and the count of such units is a column of the build's profile row.
-Never a silent walk forever (rule 3). The fix is tracing that step.
+1. `Unfiled`: no build of this shape by this blaze answered yet (the request's shape, the
+   toolchain or blaze's identity is another: another base);
+2. `Moved(reads)`: a recorded read's digest differs: a source, a manifest, a file a step read, a
+   probe that flipped (absent → present or back), a variable's value, a variable read unasked
+   set since. The reads named are those that differ from this checkout's last build;
+3. `Unnamed`: as 2, where this daemon holds no build of the checkout to compare with (a restart,
+   then a change): nothing is named and the engine's walk asks its own records;
+4. `Output`: an output is gone, holds other bytes or is being written: placed again from the
+   store, no read moved;
+5. `Traced`: the request asks for the build's trace.
+
+Nothing else: not a restart, not another request, not the build's own writes (the nodes are
+valued in the view the build read with its own writes in it, `View::Built`; a file saved under
+the build by anyone else is not in that view, so the next request misses), not a file touched
+and left as it was, not a variable or file nothing read, not the order steps ran in.
+
+Not written (`request::Unwritten`), each said by name, never silent: a failed build; an untraced
+step (the units named, one warning a build, a profile count); a read seen at two values; two
+answers under one key (the build read something its list does not name: rule 21); the chain at
+its bound.
 
 ## Granularity (rule 65)
 
-A certificate is per request: it is the quick first check that nothing moved, which rule 65
-allows; it is no entry's key. When it fails on a group it hands the walk that group's `readers`:
-the walk starts at those units and goes on to their dependents only (`Certificate::walk_from`),
-each of which then asks its own per-item records. Units visited ≤ readers + their dependents;
-tested at two graph sizes. A failure that names no unit (an output gone) walks none and places.
+A certificate is per request: the covering first check that nothing moved; it is no entry's key.
+On a miss the machine hands the engine the reads that moved, by name; the one walk is the
+engine's (shared page 5), and each unit asks its own per-item records. There is no walk over an
+old plan.
 
 ## When it is written
 
-At the end of every build that answered (passed), by the after-answer settle, never delaying the
-answer: the settle derives `said` as a no-op build says it (from the units' records: the same
-rendering the walk uses when it finds every record), stamps the outputs it placed, and puts the
-record and the slot in the settle's own store batch. Not only after a build that made nothing: a
-build that compiled writes the certificate of the state it left, so the very next request is
-answered. Not written: a failed build; an untraced step (above).
+At the end of every build that answered, from a build that compiled too: the driver hands the
+machine `Built` (the nodes read; every other read with the digest the build read it at: outside
+files from the traced steps' own recorded hashes, never from a look at the build's end; the
+outputs with the placement record's stamps; the units' keys; `said` as a no-op build says it),
+the machine values the nodes in `View::Built`, places the list (`Filing::place`) and keeps the
+answer (`keep_answer`).
 
 ## `run` and `test`
 
@@ -120,11 +110,11 @@ results by test are another record, lane test-results; not this one.)
 
 - `noop::Answers`, `MOST_SHAPES`, `Shaped`: go. The store holds the certificates; the bound is the
   store's.
-- `noop::LastAnswer`, `Recording`, `Walk`, `Unkept`: become the in-memory cache entry of a
-  `Certificate` plus the watch generation; `Unkept::{Planned, Made, Said, Looked, Outputs}` go
+- `noop::LastAnswer`, `Recording`, `Walk`, `Unkept`: go; what one machine knows beside the record is
+  `certificate::Evidence`, never a condition for an answer; `Unkept::{Planned, Made, Said, Looked, Outputs}` go
   (they are restrictions of the exception, not reasons a certificate fails); `Unkept::Failed` and
   the untraced case stay.
-- `NotReplayed`, `Moved`: replaced by `certificate::Failed` (six reasons).
+- `NotReplayed`, `Moved`: replaced by `request::Why`.
 - Kept: the comment-only-edit lane (`code_unmoved`, `StillFile`, `FileEdit`) as a refinement of
   reason 1 (a group moved, but every changed file's code text is as it was: the certificate is
   rewritten under the new root, no unit walked); and the simulation model and oracle in
@@ -134,13 +124,17 @@ results by test are another record, lane test-results; not this one.)
 
 ## Tests and controls
 
-In `certificate/tests.rs` (written): each of reasons 1–4 and 6 fails and names the thing, with a
-planted check that gives it and the oracle catching it; reason 5; restart from bytes; an unread
-file and an unread variable do not fail it; a second checkout has the same key and fails only on
-outputs; the walk after an edit visits readers and dependents at 4 and 64 units; round trip with
-identical bytes, layout 0 refused by name, every cut refused at a field. To write with the
-wiring: the cases listed above in `noop/tests.rs`, and the revision cases
-`a_repeated_run_executes_no_job` and `a_no_op_after_a_restart_executes_no_job` (max jobs 0).
+`request/tests.rs`: a model world (files in two package directories and at the root, three
+variables, two outside files, one output; a write-once store) and a Hegel property over edits,
+variables, probes, outputs changed by hand, waits, restarts and saves under a build, in a seeded
+order of the driver's answers: every hit equals a fresh build, and nothing read changed since a
+recorded build ⇒ hit. Planted bugs the oracle catches: a variable left out, a negative probe
+left out, the root taken at the build's end, outputs not looked at, a racy stamp trusted, an
+unasked variable set since. Also: the named misses, an untraced step, a list of the previous
+layout refused by name, the stall bound. `certificate/tests.rs`: the codec and its layouts,
+sorted lists, the base, relocation, racy stamps. To write with the wiring: the daemon-level
+restore case and the revision cases `a_repeated_run_executes_no_job` and
+`a_no_op_after_a_restart_executes_no_job` (max jobs 0).
 
 ## Expected numbers (not measured: guesses to be checked)
 
@@ -150,93 +144,49 @@ first request after a restart, none while the watches vouch); end to end under 2
 the client's start. reth no-op: from 2.0–2.8 s to under 50 ms (about 30 groups, a few thousand
 output stats cold). First request after a restart: the same, plus the tree's restore.
 
-## State (2026-11-12, lane certificate2, paused for `end-state.md`)
+## State (2026-11-12, lane certificate4)
 
-In the tree, not compiled by anyone yet: `serve/job/certificate.rs` and `certificate/tests.rs`
-(record, codec, keys, `relocated`, `holds`, `walk_from`; `cargo test -p blaze-cargo
-certificate::`), `mod certificate;` in `serve/job.rs` (the module is `#![allow(dead_code)]`), the
-`request-certificates` row and Domains line in `caches.md`, the annoyance row. Nothing else: no
-hunk of `job.rs` or `noop.rs` asks or writes a certificate. The wiring is paused (rule 66): the
-request loop is being redesigned around the certificate as its own sans-IO state machine.
+Wired, not yet compiled or run by anyone as of this writing: the driver `serve/job/certify.rs`.
+`Jobs::begin` checks a build or a check against its certificate before it is a job
+(`certify_begin`; outputs' stamps and bytes through the loop's driver, `Own::Certify`); a hit
+says `Answer.said` again and finishes with no job; a miss goes on into `begin_job`, its reason
+the span `request certificate: miss` and the build's `no-op answer: not given because`. A build
+that made nothing hands the machine `Built` at the loop's next step (`certify_written`).
+`Jobs::answer_again` is no longer called: the kept answers answer nothing.
 
-What reading the daemon showed, which the design above does not yet say and the end state must:
+What the wiring does not do yet (each a known gap, in the order to close them):
 
-1. **The store is write-once.** `Store::put` of other bytes under a kept key is a `Mismatch`
-   (`blaze-cas/src/lib.rs`, `put_in`). So neither `key(shape, root, blaze)` nor `slot(shape,
-   dir)` can be one record as written above: a certificate's bytes are not a function of its
-   key (the values of variables read, outside files' hashes, outputs' stamps and `said` are in
-   the bytes and not the key), and a slot is a pointer that moves. The tree's idiom for this is
-   a bounded chain (`blaze-usercode/src/index.rs`, `slot(run, n)`): `key(shape, root, blaze, n)`,
-   the reader checks each until one holds, the writer puts at the first free `n`. Stamps in the
-   record make the chain grow by one each time outputs are placed again for the same content (A,
-   B, A, B). The clean split: the record holds content only (an output by the hash of its
-   bytes; then equal builds are equal bytes and a put is idempotent, and the chain has one entry
-   an environment); stamps are local evidence beside it (memory, or the daemon's image), made
-   again by hashing an output once when missing. Whether `Placement.key`'s store value is the
-   placed file's bytes (a patched image may not be) is not read.
-2. **`said` names the checkout.** `Response::Built`'s artifacts are absolute paths, so a
-   certificate found by a second checkout would say the first one's paths. Either `said` is
-   relocated as the shape is (a CBOR transcode of every text), or a certificate whose `said`
-   holds the directory is kept under `key(slot(shape, dir), root, blaze)` (local) and only one
-   without it under the shared key; the reader asks local then shared.
-3. **Where each part is known.** `Jobs::keep_answer` has no `World` (it is called from
-   `Jobs::heard`): no store, no VFS. The parts: the responses said (`Recording`, whole at
-   `heard`'s `Finish`); the view's root after lock files (`Recording`'s `inputs.view`, recorded
-   again by `open` after `open_locked`); the variables read (`writer.env_named()`, asked in the
-   lowering's end, about `job.rs:8100`, only of a build that made nothing so far); the whole list
-   of outside reads (`writer.read_outside()`, same place: paths only, `(files, listed)`, no
-   hashes; `Recording::vouch_reads` cuts it to those under output directories, so the whole list
-   must be taken before); outputs and stamps (`Paths::placed[..].meta`, set by `Done::Stat`,
-   memory only, empty after a restart); the plan (`Roots::plans[root]`, by shape:
-   `units.packages[..].manifest_path`, `units.plans[..].outputs`); a `World` with the store and
-   the VFS at `Jobs::step` and in `wind_up_timed` (where `recorded.walked` is set). Hashes of
-   outside files taken at the build's end are not what the build read if a file changed during
-   it: the traced runs' own recorded hashes (`serve/unit/reads.rs`) are the right source.
-4. **Variables read unasked.** `read_unasked(name)` (plan variables, `BLAZE_*`, the walk set) is
-   a predicate, not a list: a certificate's `env` must hold every such variable set at the build,
-   and the check must fail on one set now that the record does not name (it was unset).
-5. **Looks.** `Looks::node`: `w.vfs.reader().pin()`, `dir_id(root, path)` else `file(root,
-   path)`'s id. `Looks::outside`: `blaze_usercode::inputs::Disk` (`file`, `dir` for a listing),
-   as `Watched::same_file` does. `Looks::output`: the driver's `Meta` (`len`, `modified_ns`); a
-   direct `std::fs` look from the loop is IO outside the driver and is not seen by the
-   simulation.
-6. **The relocated shape** (item 1 below) was written and taken out again at the pause, since
-   nothing reads it: in `Jobs::viewed`, clone the config, `relocated` over `invocation.root`,
-   `cwd`, each arg, each variable's value, each `files` path and each mount's `at`, sort the
-   mounts again (where the checkout is must not order them), then `bare` and `shape_of` from the
-   clone; `planned` and the plan's `key` stay as they are.
-7. A path dependency outside the workspace (bstd) needs its mount's directory id from
-   `Mounts`; how to read it is not looked up. Answered by lane records-restart2, by reading the code, not by a
-   run: `Pinned::dir_id` is the node's own Merkle id, so it covers every entry the tree holds
-   under the directory and leaves nothing out itself. What a checkout's view holds is decided
-   by `serve/heads.rs` `excluded(rel)`: a `target/` at the checkout's ROOT and every `.git`
-   at any depth are out of the view, so neither moves any directory's id. A `target/` that
-   is not at the root (a member package's own `crates/x/target/`, a `--target-dir` elsewhere
-   in the checkout) IS in the tree and moves the id of every directory above it; so does a
-   nested package's edit move its enclosing package's id. blaze's default build directory is
-   outside the checkout. So a group by a package root's `dir_id` is exact for a workspace
-   whose only in-checkout build directory is the root's `target/`; for the rest the group
-   needs the skipped sub-paths, as `blaze_lower::found::dir_key(mounts, dir, skipped)` does
-   (the id with what the load skips left out: one node when nothing is skipped under the
-   directory, a listing along the paths to what is). A mount's directory id: `Mounts::locate`
-   gives `(root, path under it)`, then `Tree::dir(root, path)`. To confirm by a run: build,
-   touch a file under a member's own `target/`, and compare the member directory's `dir_id`.
+1. **A build that compiled writes none.** `said` is what a build with nothing to do says, and
+   only such a build's words are recorded (`noop::Recording`, whose conditions gate the write
+   through `certify::Ended`). So: build, a walk that writes, then hits. Needed: `said` made from
+   a compiling build (its diagnostics as a replay says them, its `Work` as a no-op's), then
+   `Ended` from every build that passed, and `Recording`/`keep_answer` deleted.
+2. **A daemon's first request is not checked**: the config names where the standard library is
+   mounted, which that build's first task finds. It builds and (when it made nothing) writes.
+   Needed: the check run from `Jobs::prepare` once the library and the stale path
+   dependencies are read, or a base that does not hold the library's place.
+3. **Outside reads are valued at the walk's end**, through `Disk`, for the paths the steps'
+   records name (`Writer::read_outside`); the walk's own looks (`LastAnswer::looked`) carry
+   their own hashes. Needed: the records' hashes handed over a build (`serve/unit/reads.rs`
+   keeps paths for the process, no hash).
+4. **Not relocated**: the base holds the checkout's directory (`Viewed::bare`, `shape`), an
+   output's path is absolute (base 0), `said` is as said. One chain a checkout directory.
+5. **One node**, the view's root (`Read::Node("")`): any change in the checkout misses, and
+   the miss names the root. Package directories as "Package directories" below the check.
+6. **No stamp is handed over at the write** (when a placement was looked at is not kept): the
+   first check of a daemon's life hashes each output once, on the loop
+   (`request certificate: hash an output no stamp vouches for`, a span a file).
+7. `Unwritten` and every other reason no certificate is written are a span
+   (`request certificate: not written`, `why`) and a `warn` event; the client is not shown a
+   warning (the job has finished by then) and no profile counter is added.
+8. The tool's identity is the release's version and line (`certify::base_of`).
+9. **Delete** (nothing of it answers): `Jobs::answer_again`, `Jobs::edited`, `noop::Answers`,
+   `Shaped`, `MOST_SHAPES` and its assert, `noop::ask`, `NotReplayed`, `Moved`; then, with 1,
+   `Recording`, `Unkept`, `keep_answer`, `keep_last`, `record_answer`, their tests.
+10. The daemon-level restore test and the revision cases (not written).
 
-The work, for whoever the end-state spec assigns it to:
-
-1. The relocated shape (6).
-2. The check before any job: record chain read, `holds`, the unasked-variable check (4), `said`
-   said again.
-3. The record written after every build that answered, from a build that compiled too: needs
-   `said` as a no-op build says it, which today only a build that made nothing records.
-4. An untraced step: no certificate, one warning a build naming the unit, a profile count.
-5. On `Failed::Group` the walk starts at `walk_from`; outputs placed from the store for a second
-   checkout (`Group::readers` and `Certificate::units` need the unit of each package and the
-   units' record keys: not looked up).
-6. Deleting what it replaces (`noop::Answers`, `Shaped`, `MOST_SHAPES`, `Unkept::{Planned, Made,
-   Said, Looked, Outputs}`, `NotReplayed`, `Moved`); the simulation cases and the revision cases
-   listed under "Tests and controls".
-
-To measure once wired: repeated `blaze build` and `blaze run` on hello-world, the bstd
-hello-world and the smoke projects, in milliseconds, with the counts of `job`, `task` and
-`admission` spans (0 on a hit); the same after a daemon restart; reth's no-op row.
+An output's content is the store key of its bytes (`Placement.key`): `output_key(bytes)` for a
+file hashed whole, `linked_key(root)` for one blaze's linker made (the root of
+`blaze_link::digest`), both functions of the bytes; the driver answers `Ask::Content` in the
+form the record names (`Request::wanted`). The view a walk read (`Inputs::view`) is a root id
+of content, as its last `open` had it after its lock-file writes: never the head at its end.

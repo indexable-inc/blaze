@@ -14,6 +14,10 @@
 //! keeps the answer ([`keep_answer`]). A caller whose answer is not one record, or whose reads
 //! are valued a list at a time, searches the same lists itself with [`walk`].
 //!
+//! Every lookup is counted, here and only here ([`Tally`], which a [`Store`] must give): how
+//! many there were, how many hit, how many read-lists they read and how many reads were
+//! valued. A store's owner takes the counts ([`Counts`]) where it reports.
+//!
 //! The crate owns the key derivations (two domains, both in [`keys`]), the list's encoding and
 //! layout word, and the chain. It does no IO and holds no clock: the store is a [`Store`] its
 //! caller hands in.
@@ -63,8 +67,8 @@ mod list;
 mod tests;
 
 pub use chain::{
-    Bounds, Doing, Error, Filing, Found, Kept, Kind, Placed, Store, Walked, keep_answer, lookup,
-    walk,
+    Bounds, Counts, Doing, Error, Filing, Found, Kept, Kind, Placed, Store, Tally, Walked,
+    keep_answer, lookup, walk,
 };
 pub use keys::{AnswerKey, Digest, Slot, list_key};
 pub use list::{LAYOUT, ListError, ListRef, Reads, empty_list, write_list, write_list_with};

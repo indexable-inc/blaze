@@ -169,7 +169,7 @@ reading taken after a rung's gives before the next is asked (at most 2 s is wait
 | rung | what | made again by |
 |---|---|---|
 | 1 allocator | pages the allocators freed and hold (`raw::memory::purge`) | nothing |
-| 2 pool | the stores' pool pages no task pins (`Store::evict_pool`) | a read |
+| 2 pool | the stores' pool pages no task pins (`Store::evict_pool`), a slice of 64 MiB a loop turn until the give is covered or two sweeps in a row free nothing (`blaze_graph::poolgive::Slices`) | a read |
 | 3 caches | what codegen keeps between builds (its kept walks), only while no task that may walk a program runs (`Plane::walks_in_flight`, a count the plane owns: a walk in flight keeps its own table, so a give then frees nothing and loses its result) | the next walk, which describes again |
 | 4 values | a front end's values kept by bytes, least recently verified first; a running build's MIR and inference nothing still to compile reads | the engine, from their memos |
 | 5 front end | one checkout's kept front end, whole | lowering anew: minutes |
@@ -233,8 +233,10 @@ its memory: a small wait costs a purge and the next build lowers into the kept f
 values go on a worker and a build asked meanwhile waits and lowers into the front end; the
 control is a driver that gives with no plan, which drops the front end for the same wait.
 
-**The last rung, and the ceiling.** The planner is told the limit's line, a sixteenth
-under the limit, since nothing gates an allocation: the daemon holds a limit (`--memory-gb`,
+**The last rung, and the ceiling.** The planner is told the limit's give-back line, a
+sixteenth under the limit (`blaze_graph::lines`, the one home of a limit's lines and of what
+the kernel is told: no `memory.high`, so nothing slows the daemon under its typed failure),
+since nothing gates an allocation: the daemon holds a limit (`--memory-gb`,
 or what the machine's ledger allows) by making tasks wait and by giving back, never by
 growing to it. After a kept front end comes one more rung, `running tasks`: the readers of
 the builds under way are stopped (`Writer::stop_for_memory`,

@@ -42,6 +42,38 @@ fn main() {}
 }
 
 #[test]
+fn an_enum_in_a_module_of_each_of_two_identical_expansions_in_one_body_sees_its_generics() {
+    // Our own: tempo's zone-node (`crates/zones/node/src/role.rs`), two `tokio::select!` of the
+    // same arms in one function. Each expands to a block declaring `mod __tokio_select_util`
+    // whose enum `Out<_0, _1> { _0(_0), _1(_1), Disabled }` a macro called in the module makes;
+    // the two expansions have the same text, so each node of one has a twin of the same kind
+    // and range in the other, and the first `Out`'s `_0` was looked up in the second's module:
+    // "cannot find type `_0` in this scope".
+    let fixture = r#"//- minicore: sized
+//- /main.rs crate:main edition:2021
+#[macro_export]
+macro_rules! declare_output_enum {
+    ($($name:ident)*) => {
+        pub(super) enum Out<$($name),*> { $($name($name),)* Disabled }
+    };
+}
+macro_rules! select {
+    () => {{
+        mod util {
+            $crate::declare_output_enum!(_0 _1);
+        }
+    }};
+}
+fn main() {
+    let _first = select!();
+    let _second = select!();
+}
+"#;
+    let messages = checked(fixture).messages();
+    assert!(!messages.iter().any(|it| it.starts_with("E0425")), "{messages:?}");
+}
+
+#[test]
 fn a_derive_and_a_macros_impl_in_a_file_of_two_crates_see_self_and_their_generics() {
     // Our own: blaze-mem's derives and llvm-sys's build script, at the root and in an inline
     // `mod`, whose module the walk out of the expansion comes to in the file.

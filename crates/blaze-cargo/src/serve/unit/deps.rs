@@ -56,9 +56,11 @@ impl Kept {
     /// What a later [`serve`] of the same front end served, added: a crate's latest key holds,
     /// and a crate keyed again is a hit or stale only as that serve found it.
     fn add(&mut self, more: Served) {
-        let Served { keys, hits, stale, build } = more;
+        let Served { keys, hits, stale, build, lookups } = more;
         // Every serve of one front end is by one blaze: what `store` makes the keys again with.
         self.served.build = build;
+        // Over the front end's life here; a build's are the session's, which `store` says.
+        self.served.lookups.add(lookups);
         self.served.hits.retain(|it| !keys.contains_key(it));
         self.served.stale.retain(|it| !keys.contains_key(it));
         self.served.keys.extend(keys);
@@ -151,8 +153,10 @@ pub(crate) fn serve(
     let flags = imaged(job, units.iter().map(|&unit| unit as usize), &session.keyed)?;
     let asked: Vec<(Crate, cache::Inputs<'_>)> =
         flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags))).collect(); // alloc: once per serve
-    cache::serve(lowered.served_db(), &asked, &*session.images, checks)
-        .map_err(|why| ApiError::new(why, None))?;
+    let served = cache::serve(lowered.served_db(), &asked, &*session.images, checks);
+    // Taken whether or not the serve stopped: what it searched before an error was searched.
+    session.lookups.checks.add(std::mem::take(&mut checks.lookups));
+    served.map_err(|why| ApiError::new(why, None))?;
     let db = lowered.db();
     let consts = (0..job.graph.len())
         .filter_map(|unit| job.crates.krate(unit))
@@ -342,7 +346,9 @@ pub(crate) fn images(
     session.walked.note(at, build, crates.iter().chain(keys.keys()));
     // Written: what was walked stands again only once [`serve`] is done and stamps its view.
     session.walked.at = None;
-    let Served { keys, hits, stale, build } = served;
+    let Served { keys, hits, stale, build, lookups } = served;
+    // What this serve's searches of the store came to, for the build's count ([`store`]).
+    session.lookups.images.add(lookups);
     let of_moved = |krate: &Crate| moved.binary_search(krate).is_ok();
     // alloc: once per serve that moved a key, one entry per crate whose key moved
     Ok(Some(Served {
@@ -350,6 +356,7 @@ pub(crate) fn images(
         hits: hits.into_iter().filter(of_moved).collect(),
         stale: stale.into_iter().filter(of_moved).collect(),
         build,
+        lookups,
     }))
 }
 
@@ -420,6 +427,36 @@ pub(crate) struct Session {
     /// [`serve`] that served them left: a later serve of those crates at the same view (no
     /// write came between, so each key is the one `keyed` holds) walks nothing.
     walked: Walked,
+    /// What the serves' searches of the store came to since the last [`store`], which takes
+    /// and says them with the flushes' ([`record_lookups`]).
+    lookups: Lookups,
+}
+
+/// [`Session::lookups`]: `blaze_record`'s counts of the searches of the read-filing slots, by
+/// what was searched for.
+#[derive(Default)]
+struct Lookups {
+    /// The dependency crates' images ([`Served::lookups`]).
+    images: blaze_record::Counts,
+    /// Their check outcomes and checked bodies ([`cache::Served::lookups`]).
+    checks: blaze_record::Counts,
+}
+
+/// What each step of the item store is called in a note and an event, by `body_store::Step`
+/// as an index.
+const ITEM_STEPS: [&str; body_store::Step::COUNT] =
+    ["inference", "MIR", "borrow check", "constant"];
+
+/// Says what the lookups through one store kept in `blaze_record`'s form came to, as one kept
+/// event `record lookups` in the profile: the `store` (`goals`, `items`, `dep images`,
+/// `dep checks`), its `step` where the store keeps its steps apart (an [`ITEM_STEPS`] name,
+/// else empty), then `lookups`, `hits`, `lists` (read-lists read) and `reads` (reads valued,
+/// each a hash made again), always in that order. Said when nothing was looked up too: a
+/// store that was asked nothing says zero, so a count that is missing is a build that did
+/// not get here.
+fn record_lookups(store: &'static str, step: &'static str, counts: blaze_record::Counts) {
+    let blaze_record::Counts { lookups, hits, lists, reads } = counts;
+    tracing::info!(target: "blaze", store, step, lookups, hits, lists, reads, "record lookups");
 }
 
 /// [`Session::walked`]: the crates keyed at one view of one database by one `build`, each of
@@ -597,6 +634,7 @@ pub(crate) fn session(
         env: read,
         keyed: HashMap::new_in(Global),
         walked: Walked::new(),
+        lookups: Lookups::default(),
     })
 }
 
@@ -871,6 +909,18 @@ pub(crate) fn store(
             "item store flushed"
         );
     }
+    // What the lookups through each store came to, in the profile (`record lookups`): the
+    // two stores' since their last flush, and the serves' since the last store. A build
+    // whose front end is not stored leaves its counts to the next that is.
+    record_lookups("goals", "", goals.lookups);
+    if let Some(items) = &items {
+        for (step, counts) in ITEM_STEPS.into_iter().zip(items.lookups) {
+            record_lookups("items", step, counts);
+        }
+    }
+    let serves = std::mem::take(&mut session.lookups);
+    record_lookups("dep images", "", serves.images);
+    record_lookups("dep checks", "", serves.checks);
     if let Some(stored) = &stored {
         for krate in &stored.written {
             session.refused.remove(krate);
@@ -935,9 +985,7 @@ pub(crate) fn noted(
     }
     if let Some(steps) = steps {
         message.push_str("; the item store, this build:");
-        for (at, (counts, step)) in
-            steps.iter().zip(["inference", "MIR", "borrow check", "constant"]).enumerate()
-        {
+        for (at, (counts, step)) in steps.iter().zip(ITEM_STEPS).enumerate() {
             let body_store::StepCounts { hits, ran, refused } = counts;
             let sep = if at == 0 { "" } else { ";" };
             message.push_str(&format!("{sep} {step} {hits} hit, {ran} ran, {refused} refused")); // alloc: under `-v`, once per build
@@ -987,6 +1035,7 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         kept,
         slots_full,
         lookups_full,
+        lookups,
         full,
         refused,
         unhashable,
@@ -1004,6 +1053,11 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         "the item store: {written} written, {kept} kept, {slots_full} with every slot full"
     ));
     full_chain(*lookups_full, full.as_deref(), message);
+    // What the lookups since the last flush came to, step by step, as `blaze_record` counted
+    // them: the event `record lookups` has the same.
+    let by: Vec<String> =
+        ITEM_STEPS.iter().zip(lookups).map(|(step, counts)| format!("{step} ({counts})")).collect(); // alloc: as above
+    message.push_str(&format!("; lookups by step: {}", by.join(", "))); // alloc: as above
     if !scans.is_empty() {
         // Who read a whole scope (a listing, not a lookup of a name): each is a read no finer
         // than a module, so the rows that do it are named.
@@ -1041,6 +1095,7 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         kept,
         slots_full,
         lookups_full,
+        lookups,
         full,
         inexpressible,
         unhashable,
@@ -1054,6 +1109,9 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         "the persistent goal cache, of the last build: {written} written, {kept} kept, {slots_full} with every slot full"
     );
     full_chain(*lookups_full, full.as_deref(), &mut message);
+    // What the lookups since the last flush came to, as `blaze_record` counted them: the
+    // event `record lookups` has the same.
+    message.push_str(&format!("; {lookups}")); // alloc: as above
     if !inexpressible.is_empty() {
         let by: Vec<String> =
             inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above
@@ -1235,7 +1293,8 @@ impl Images {
 impl Images {
     /// Asks the loop, in `into`, to keep `value` under `key` as a query's record: nothing when the store
     /// or an earlier ask of this flush holds these bytes under it, and an error naming the
-    /// key when either holds other bytes (two values under one key: the key misses an input).
+    /// key when either holds other bytes (two values under one key: the key misses an input),
+    /// saying how the two differ (`entries::differ`).
     /// The bytes are copied only when the put is new.
     fn ask(
         &self,
@@ -1243,10 +1302,15 @@ impl Images {
         key: ContentId,
         value: std::borrow::Cow<'_, [u8]>,
     ) -> Result<(), String> {
+        use hir_def::nameres::frozen::entries::differ;
         let guard = blaze_cas::enter();
         match self.store.get(&guard, &Key(key)) {
             Ok(Some(entry)) if entry.bytes[..] == *value => return Ok(()),
-            Ok(Some(_)) => return Err(format!("the store holds other bytes under {key:?}")), // alloc: error path
+            Ok(Some(entry)) => {
+                let differ = differ(&entry.bytes[..], &value);
+                // alloc: error path
+                return Err(format!("the store holds other bytes under {key:?}: {differ}"));
+            }
             Ok(None) => {}
             Err(corrupt) => return Err(corrupt.to_string()),
         }
@@ -1254,7 +1318,11 @@ impl Images {
         let Puts { list, at } = &mut *puts;
         match at.get(&key).copied() {
             Some(asked) if list[asked].bytes[..] == *value => {}
-            Some(_) => return Err(format!("two values were made under {key:?}")), // alloc: error path
+            Some(asked) => {
+                let differ = differ(&list[asked].bytes[..], &value);
+                // alloc: error path
+                return Err(format!("two values were made under {key:?} in this build: {differ}"));
+            }
             None => {
                 at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
                 // alloc: the put's bytes, until the loop writes them

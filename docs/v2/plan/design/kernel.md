@@ -71,7 +71,7 @@ read's name in a list is its kind (`u16`, big-endian) then its key's bytes.
 |---|---|---|
 | entry with no reads | `whole::key(identity)` = `AnswerKey(empty_list(id))` | the bare value |
 | read-list in slot `n` | `blaze_record::list_key(id, generation 0, n)` | `blaze_record::write_list`: the base, no note, each read's name (no hashes) |
-| entry with reads | `AnswerKey(the read-list's bytes, each read's digest)` | magic, step, the read-list's length, the read-list, each read's digest (gone, or its hash), the value at a 16-byte boundary |
+| entry with reads | `AnswerKey(the read-list's bytes, each read's digest)` | magic (layout 3; a layout-2 entry is refused by name), step, the read-list's length, the read-list, each read's digest (gone, or its hash), the hash of the value's bytes, the value at a 16-byte boundary |
 
 - **Lookup** probes the entry with no reads first (one probe: a step whose identity is its
   whole content costs nothing more). Otherwise it walks the identity's read-lists from slot 0
@@ -204,25 +204,63 @@ Three things recur, and each is one piece of work for all five, not five:
   `Kernel::keep::<S>(store, input, trace, value)` beside `Kernel::find`. It is the door for
   what the kernel cannot run (a process); for what it can run, it is an interim that keeps
   point 1 above open, and is listed as such per step.
+  **Built**: `Trace::new`, `Trace::read` (`reads.rs`; one read with two hashes is `TwoSeen`),
+  `Kernel::keep`, and `Kernel::find` for any `Step` (`lib.rs`). `Kernel<W>` is now of one
+  world type. Tests (`tests.rs`): `a_step_kept_with_a_trace_made_elsewhere_is_found_while_its_reads_hold`,
+  `two_values_under_one_identity_and_trace_made_elsewhere_are_refused`,
+  `a_trace_made_elsewhere_keeps_the_entry_a_run_keeps`.
 - **Nesting.** `Reads` does not nest: `Reads::new` is the kernel's, a `compute` holds no
   kernel and no store, so a step cannot ask for another step's value. A front-end step's reads
   are found while it runs, through other steps (inference asks for signatures, which ask for
   name resolution). Needed: `Reads::step::<S>(input) -> value`, which looks the child up or
   runs it with reads of its own and records one read in the parent.
+  **Built**: `Reads::step`, trait `Ask` (an input's stable bytes), `Kernel::register_ask`,
+  the engine in `nest.rs` (a cycle is `KernelError::Cycle` naming its identities; no
+  fixpoint; depth bounded by `MOST_NESTED`). Tests: `exhaustive/nested.rs`
+  (`a_cycle_is_refused_naming_its_identities`, `a_stale_list_that_asks_back_is_a_miss_not_a_cycle`).
 - **Early cutoff.** That one read is the shared page's `Record` read: kind "a step's value",
   key the child's identity, seen the hash of the child's value bytes. A child recomputed to
   the same bytes then leaves the parent a hit. Verifying it at lookup needs the child's value
   hash now, so the kernel, not the `World`, answers reads of that kind, and a step must be
   runnable from its read's key: an input that decodes from stable bytes, and a registry entry
   holding the erased `compute`. Today `Step::Input` is any type and the identity is one-way.
+  **Built**: kind `ReadKind::STEP`, key the child's step number and input bytes (not its code:
+  the registry gives the code now), seen `content_of` the value. A read-list holds names, not
+  the hashes an entry saw, so a lookup values every step read its lists name; a child that
+  cannot be valued then makes the list not hold. **Built** (cost): one walk, in which a child
+  is looked up through the store the walk reads and remembered for the request
+  (`nest::Looker`, `Engine::lookup`); only a child that must be run is run after the walk,
+  and the lists then walked once more. The entry keeps its value's hash (layout 3,
+  `Entry::value_hash`), so a hit of a child with reads hashes and copies nothing. A hit's
+  cost per shape is pinned in `tests/cost.rs` (probes, gets, reads valued): no reads 1, 1, 0;
+  R reads 2, 2, R; each child with reads 3 gets and its reads, once a request however many
+  parents name it; a child with no reads 1 get and one hash of its bare value. Still paid:
+  the answer's probe before its get at the top (the borrow of the store), `Entry::read`
+  deriving the entry's key again (one hash of its list and digests), and a read shared by
+  two lists of one identity valued once a list. Not built: stopping at the first changed
+  read (the record form holds names only). Test:
+  `every_nested_sequence_in_scope_gives_what_a_fresh_run_gives` (20,736 sequences, counts early
+  cutoffs), controls `a_parent_that_records_its_childs_reads_but_one_is_caught`,
+  `a_cutoff_by_the_childs_identity_alone_is_caught`.
 - **A session.** With nesting, one build asks for a child once per parent. What this process
   verified (identity → value hash, under one pinned world) is a table of the lookup's own,
   dropped at will without changing an answer. The kernel has none; `World` is not pinned.
+  **Built**: `Session` (`nest.rs`), `Kernel::get_in`/`find_in`, required `World::pin`; a
+  world not at the session's pin, before or after a request, is `KernelError::Moved` (after:
+  the rows are dropped and the answer is not given). `Kernel::get` is a session of one
+  request. In a session a value found at the top before is one get, and a child is verified
+  once over all requests (`tests/cost.rs`). Test: the nested exhaustive check runs every
+  sequence in one session with a drop at every place (28,561 sequences), control
+  `a_session_that_outlives_its_pin_is_caught`.
 - **Negative reads.** Present for a key: `Seen::Gone` (`Digest::Nothing`), never equal to a
   hash. Absence over a set (no impl for a type, no such name in a scope) is a read of the set
   under its own kind, whose hash covers the set. Lacking: a read that cannot be valued now is
   an error of the whole lookup (`KernelError::World`), where the hir-ty stores pass over that
   list; a front-end world needs that as an outcome of `World::hash`, not an error.
+  **Built**: `WorldError::not_now` (an outcome of `World::hash`, documented on `World` with
+  the other three and with absence over a set): a lookup passes over the list that names
+  the read and goes on; a run that asks for it fails and keeps nothing. Test:
+  `a_read_that_cannot_be_valued_now_passes_over_its_list`.
 - **A covering digest.** No new rule in the lookup: a cover is a step. Its reads are only
   covering reads (a crate's digest, a directory's Merkle id), its value is the manifest of its
   members' entry keys, and a member is fetched by key (`Entry::read` checks it is that

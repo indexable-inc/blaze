@@ -13,6 +13,13 @@
 //! file itself (its inner attributes). An item in a body has no row: it is keyed under the
 //! body it is in.
 //!
+//! After the rows, a pair an assoc item: the ast id of its `impl` or `trait`, then its own,
+//! in the order written ([`FileIndex::assoc_items`]). An ast id is of its file (its hash is of
+//! its parent's id and its index counts the file's other items of that hash), so it is kept
+//! here, under the file's content, and in no entry keyed by an item's text: such an entry
+//! names an assoc item by where it is written in its `impl`, and its reader asks this which
+//! id that is in its own file.
+//!
 //! The hashes are of text and of nothing a parse decides (a lazy node or a parsed one, where
 //! the item is in its file), so an outline and a full parse of one text make the same bytes.
 //!
@@ -32,8 +39,9 @@ use crate::HirFileId;
 type R<T = ()> = Result<T, String>;
 
 /// The layout of a file's index: part of its key and its second word. It changes with the
-/// header, a row, which nodes have rows, or what any of the three hashes covers.
-pub const LAYOUT: u32 = 1;
+/// header, a row, which nodes have rows, what any of the three hashes covers, or the pairs.
+/// 2: the pairs of assoc items after the rows, and their count in the header.
+pub const LAYOUT: u32 = 2;
 
 /// The family of a file's index, as the entry store names it.
 pub const FAMILY: &str = "file index";
@@ -45,10 +53,12 @@ const BODY_DOMAIN: &str = "blaze v2 item body";
 
 /// What an index starts with.
 const MAGIC: [u8; 8] = *b"blzfidx\0";
-/// Bytes before the rows: the magic, the layout, the count of rows.
-const HEAD: usize = 16;
+/// Bytes before the rows: the magic, the layout, the count of rows, the count of pairs.
+const HEAD: usize = 20;
 /// Bytes of a row: the ast id, whether it has a body, and the three hashes.
 const ROW: usize = 56;
+/// Bytes of a pair: the ast id of an `impl` or a `trait`, then of one assoc item written in it.
+const PAIR: usize = 8;
 
 /// In a header's feed, where a body was cut: no piece is this long.
 const CUT: u32 = u32::MAX;
@@ -95,7 +105,7 @@ pub struct FileIndex {
 impl FileIndex {
     /// How many rows there are.
     pub fn len(&self) -> usize {
-        (self.bytes.len() - HEAD) / ROW
+        u32_at(&self.bytes, 12) as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -144,6 +154,60 @@ impl FileIndex {
             let (id, source) = self.row(at);
             (ErasedFileAstId::from_raw(id), source)
         })
+    }
+
+    /// The assoc items written in the `impl` or `trait` whose ast id is `owner`, in the order
+    /// written, a macro call at assoc position among them: none for any other id. A binary
+    /// search of the pairs.
+    pub fn assoc_items(&self, owner: ErasedFileAstId) -> AssocItems<'_> {
+        let want = owner.into_raw();
+        let pairs = &self.bytes[HEAD + self.len() * ROW..];
+        let count = pairs.len() / PAIR;
+        // The first pair whose owner is not below `want`. The bound: the range halves each turn.
+        let (mut low, mut high) = (0, count);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if u32_at(pairs, mid * PAIR) < want {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        // The bound: the pairs of one owner, which are together.
+        let mut end = low;
+        while end < count && u32_at(pairs, end * PAIR) == want {
+            end += 1;
+        }
+        AssocItems { pairs: &pairs[low * PAIR..end * PAIR] }
+    }
+}
+
+/// The assoc items written in one `impl` or `trait`, in the order written
+/// ([`FileIndex::assoc_items`]): the ast id each has in the index's file.
+#[derive(Clone, Copy, Debug)]
+pub struct AssocItems<'a> {
+    pairs: &'a [u8],
+}
+
+impl AssocItems<'_> {
+    /// How many are written, whatever a cfg leaves of them.
+    pub fn len(&self) -> usize {
+        self.pairs.len() / PAIR
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// The ast id of the `at`th written, from 0.
+    pub fn get(&self, at: usize) -> Option<ErasedFileAstId> {
+        (at < self.len()).then(|| ErasedFileAstId::from_raw(u32_at(self.pairs, at * PAIR + 4)))
+    }
+
+    /// Which one written has the ast id `id`, from 0: a scan of one `impl`'s items.
+    pub fn position(&self, id: ErasedFileAstId) -> Option<usize> {
+        let want = id.into_raw();
+        (0..self.len()).find(|&at| u32_at(self.pairs, at * PAIR + 4) == want)
     }
 }
 
@@ -200,16 +264,22 @@ pub fn source(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> O
 /// The index of the file whose tree is `root` and whose ast ids are `map`, as its entry's
 /// bytes.
 pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
-    let mut rows = rows(root, map);
+    // alloc: one file's pairs, while its index is made
+    let mut assoc = Vec::new();
+    let mut rows = rows(root, map, &mut assoc);
     rows.sort_unstable_by_key(|&(id, _)| id);
     if let Some(pair) = rows.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         panic!("file index: two items of one file with ast id {:#x}", pair[0].0);
     }
+    // By owner, the order written kept within one: the sort is stable.
+    // alloc: the sort's buffer, once per index made
+    assoc.sort_by_key(|pair| pair[0]);
     // alloc: one file's index, kept as the query's value
-    let mut out = Vec::with_capacity(HEAD + rows.len() * ROW);
+    let mut out = Vec::with_capacity(HEAD + rows.len() * ROW + assoc.len() * PAIR);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&LAYOUT.to_le_bytes());
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(assoc.len() as u32).to_le_bytes());
     for (id, source) in rows {
         out.extend_from_slice(&id.to_le_bytes());
         let flags = if source.body.is_some() { HAS_BODY } else { 0 }
@@ -220,6 +290,10 @@ pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
         out.extend_from_slice(&source.attrs.to_le_bytes());
         out.extend_from_slice(&source.header.to_le_bytes());
         out.extend_from_slice(&source.body.unwrap_or(0).to_le_bytes());
+    }
+    for [owner, item] in assoc {
+        out.extend_from_slice(&owner.to_le_bytes());
+        out.extend_from_slice(&item.to_le_bytes());
     }
     out
 }
@@ -236,10 +310,14 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
         // alloc: error path
         return Err(format!("file index layout {layout}, and this reads layout {LAYOUT}"));
     }
-    let count = u32_at(bytes, 12) as usize;
-    if bytes.len() != HEAD + count * ROW {
+    let (count, pairs) = (u32_at(bytes, 12) as usize, u32_at(bytes, 16) as usize);
+    let size = HEAD as u64 + count as u64 * ROW as u64 + pairs as u64 * PAIR as u64;
+    if bytes.len() as u64 != size {
         // alloc: error path
-        return Err(format!("a file index of {count} rows in {} bytes", bytes.len()));
+        return Err(format!(
+            "a file index of {count} rows in {} bytes, with {pairs} assoc items listed",
+            bytes.len()
+        ));
     }
     // alloc: the query's value, one file's index
     let index = FileIndex { bytes: bytes.into() };
@@ -253,11 +331,28 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
         }
         last = Some(id);
     }
+    let listed = &index.bytes[HEAD + count * ROW..];
+    let mut last = 0;
+    for at in 0..pairs {
+        let owner = u32_at(listed, at * PAIR);
+        if owner < last {
+            // alloc: error path
+            return Err(format!(
+                "a file index whose assoc pair {at} (of {owner:#x}) is out of order"
+            ));
+        }
+        last = owner;
+    }
     Ok(index)
 }
 
-/// Every row of the file, in the file's order: the file itself first.
-fn rows(root: view::Node<'_>, map: &AstIdMap) -> Vec<(u32, ItemSource)> {
+/// Every row of the file, in the file's order: the file itself first. Into `assoc`, a pair
+/// an assoc item (its `impl` or `trait`, then itself), in the file's order.
+fn rows(
+    root: view::Node<'_>,
+    map: &AstIdMap,
+    assoc: &mut Vec<[u32; 2]>,
+) -> Vec<(u32, ItemSource)> {
     // alloc: one file's rows, while its index is made
     let mut out = Vec::new();
     let mut attrs = Feed::new(ATTRS_DOMAIN);
@@ -276,18 +371,24 @@ fn rows(root: view::Node<'_>, map: &AstIdMap) -> Vec<(u32, ItemSource)> {
     out.push((ROOT_ERASED_FILE_AST_ID.into_raw(), file));
     if let Some(file) = view::SourceFile::cast(root) {
         for item in file.items() {
-            item_rows(item, map, &mut out);
+            item_rows(item, map, &mut out, assoc);
         }
     }
     out
 }
 
-fn item_rows(item: view::Item<'_>, map: &AstIdMap, out: &mut Vec<(u32, ItemSource)>) {
-    out.push((map.ast_id_of_view::<ast::Item>(item).erase().into_raw(), item_source(item)));
+fn item_rows(
+    item: view::Item<'_>,
+    map: &AstIdMap,
+    out: &mut Vec<(u32, ItemSource)>,
+    assoc: &mut Vec<[u32; 2]>,
+) {
+    let id = map.ast_id_of_view::<ast::Item>(item).erase().into_raw();
+    out.push((id, item_source(item)));
     match item {
         view::Item::Module(it) => {
             for child in it.item_list().into_iter().flat_map(|list| list.items()) {
-                item_rows(child, map, out);
+                item_rows(child, map, out, assoc);
             }
         }
         view::Item::ExternBlock(it) => {
@@ -298,11 +399,11 @@ fn item_rows(item: view::Item<'_>, map: &AstIdMap, out: &mut Vec<(u32, ItemSourc
                     view::ExternItem::Static(it) => view::Item::Static(it),
                     view::ExternItem::TypeAlias(it) => view::Item::TypeAlias(it),
                 };
-                item_rows(child, map, out);
+                item_rows(child, map, out, assoc);
             }
         }
-        view::Item::Impl(it) => assoc_rows(it.assoc_item_list(), map, out),
-        view::Item::Trait(it) => assoc_rows(it.assoc_item_list(), map, out),
+        view::Item::Impl(it) => assoc_rows(id, it.assoc_item_list(), map, out, assoc),
+        view::Item::Trait(it) => assoc_rows(id, it.assoc_item_list(), map, out, assoc),
         view::Item::Enum(it) => {
             for variant in it.variant_list().into_iter().flat_map(|list| list.variants()) {
                 let id = map.ast_id_of_view::<ast::Variant>(variant).erase().into_raw();
@@ -314,13 +415,19 @@ fn item_rows(item: view::Item<'_>, map: &AstIdMap, out: &mut Vec<(u32, ItemSourc
     }
 }
 
+/// The rows of the assoc items of `list`, and the pair of each with `owner`, the `impl` or
+/// `trait` the list is of.
 fn assoc_rows(
+    owner: u32,
     list: Option<view::AssocItemList<'_>>,
     map: &AstIdMap,
     out: &mut Vec<(u32, ItemSource)>,
+    assoc: &mut Vec<[u32; 2]>,
 ) {
     for child in list.into_iter().flat_map(|list| list.assoc_items()) {
-        item_rows(assoc_as_item(child), map, out);
+        let child = assoc_as_item(child);
+        assoc.push([owner, map.ast_id_of_view::<ast::Item>(child).erase().into_raw()]);
+        item_rows(child, map, out, assoc);
     }
 }
 
@@ -532,7 +639,8 @@ mod tests {
             SourceFile::parse(text, Edition::Edition2021)
         };
         let map = AstIdMap::from_view(parse.root());
-        rows(parse.root(), &map)
+        // alloc: a test's list
+        rows(parse.root(), &map, &mut Vec::new())
     }
 
     fn index_of(text: &str, outline: bool) -> Vec<u8> {
@@ -653,5 +761,53 @@ mod tests {
         // The control: bytes cut short are refused too, by their size.
         let whole = index_of(&text("1", "", ""), false);
         assert!(decode(&whole[..whole.len() - 1]).expect_err("cut").contains("rows in"));
+    }
+
+    /// The index lists each `impl`'s and `trait`'s assoc items in the order written, by the
+    /// ast id each has in this file: an entry keyed by an `impl`'s text names
+    /// an assoc item by its place in that order, and reads its id here. Two `impl`s written
+    /// the same in one file have each its own ids, which is why no such entry holds one.
+    #[test]
+    fn an_index_lists_the_assoc_items_of_each_impl_in_the_order_written() {
+        let twin =
+            "impl S {\n    fn f() {}\n    const C: u8 = 1;\n    m!();\n    type T = u8;\n}\n";
+        // alloc: a test's text
+        let text = format!(
+            "mod a {{\nstruct S;\n{twin}}}\nmod b {{\nstruct S;\n{twin}}}\n\
+             trait Tr {{ fn g(); }}\n"
+        );
+        for outline in [false, true] {
+            let rows = rows_of(&text, outline);
+            let index = decode(&index_of(&text, outline)).expect("the index this wrote");
+            // Rows: 0 the file, 1 `a`, 2 `S`, 3 the impl, 4..=7 its items, 8 `b`, 9 `S`,
+            // 10 the impl, 11..=14 its items, 15 `Tr`, 16 `g`.
+            assert_eq!(rows.len(), 17, "{rows:?}");
+            let listed = |owner: usize| {
+                let items = index.assoc_items(ErasedFileAstId::from_raw(rows[owner].0));
+                // alloc: a test's list
+                let listed: Vec<u32> =
+                    (0..items.len()).map(|at| items.get(at).expect("within").into_raw()).collect();
+                listed
+            };
+            let ids = |from: usize, to: usize| {
+                // alloc: a test's list
+                let ids: Vec<u32> = rows[from..=to].iter().map(|row| row.0).collect();
+                ids
+            };
+            assert_eq!(listed(3), ids(4, 7));
+            assert_eq!(listed(10), ids(11, 14));
+            assert_eq!(listed(15), ids(16, 16));
+            // The two impls are written the same (one header) and have other ids, as their
+            // items do: the cause an entry of theirs must hold no id.
+            assert_eq!(rows[3].1.header, rows[10].1.header);
+            assert_ne!(rows[3].0, rows[10].0);
+            assert!(listed(3).iter().all(|id| !listed(10).contains(id)));
+            // An item that is no impl or trait lists none; past the last is none.
+            assert!(index.assoc_items(ErasedFileAstId::from_raw(rows[2].0)).is_empty());
+            let items = index.assoc_items(ErasedFileAstId::from_raw(rows[3].0));
+            assert_eq!(items.get(4), None);
+            assert_eq!(items.position(ErasedFileAstId::from_raw(rows[6].0)), Some(2));
+            assert_eq!(items.position(ErasedFileAstId::from_raw(rows[11].0)), None);
+        }
     }
 }

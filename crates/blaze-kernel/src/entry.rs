@@ -13,12 +13,14 @@
 //!   identity and never filed, and that entry's bytes are its bare value.
 //! - **Entry bytes** (with reads): magic, step `u16`, `0u16`, the read-list's length `u32`,
 //!   the read-list as it is filed, each read's digest in the list's order (`u8` 0 gone / 1 a
-//!   hash, then the hash), the value's `u64` length, zeros to a 16-byte boundary, the value.
-//!   An entry so says by itself which key it is of ([`Entry::read`]).
+//!   hash, then the hash), the hash of the value's bytes (32 bytes), the value's `u64` length,
+//!   zeros to a 16-byte boundary, the value. An entry so says by itself which key it is of
+//!   ([`Entry::read`]), and what a read of its value sees ([`Entry::value_hash`]) without its
+//!   value being hashed again: a parent's lookup reads 32 bytes of each child it names.
 
 use std::ops::Range;
 
-use blaze_cas::Key;
+use blaze_cas::{Key, content_of};
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_ids::ContentId;
 use blaze_record::{AnswerKey, Bounds, Digest, ListError, ListRef, empty_list, write_list};
@@ -26,8 +28,9 @@ use blaze_record::{AnswerKey, Bounds, Digest, ListError, ListRef, empty_list, wr
 use crate::{Identity, MOST_SHAPES, Read, ReadKind, Seen, Trace};
 
 /// `blaze kernel e`, then the layout's number: 1 kept its reads' names and hashes together
-/// under a key of the kernel's own; 2 keeps the read-list `blaze_record` files.
-const ENTRY_MAGIC: [u8; 16] = *b"blaze kernel e 2";
+/// under a key of the kernel's own; 2 keeps the read-list `blaze_record` files; 3 keeps the
+/// hash of its value's bytes too.
+const ENTRY_MAGIC: [u8; 16] = *b"blaze kernel e 3";
 const ENTRY_MAGIC_FAMILY: &[u8] = b"blaze kernel e ";
 
 /// The chain of an identity's read-lists: one generation of [`MOST_SHAPES`] slots, searched
@@ -90,6 +93,8 @@ pub mod whole {
 pub(crate) struct Encoded {
     pub key: Key,
     pub bytes: Vec<u8>,
+    /// The hash of its value's bytes, made once here and kept in the entry.
+    pub hash: ContentId,
     list: Range<usize>,
 }
 
@@ -109,7 +114,7 @@ pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Encode
     let id = identity.id();
     let list_len = empty_list(&id).len() + names;
     // alloc: the entry, kept in the store: one allocation of its exact size
-    let mut out = Vec::with_capacity(LIST_AT + list_len + digests + 8 + 15 + value.len());
+    let mut out = Vec::with_capacity(LIST_AT + list_len + digests + 32 + 8 + 15 + value.len());
     out.put_bytes(&ENTRY_MAGIC);
     out.put_u16(identity.step.0);
     out.put_u16(0);
@@ -126,11 +131,13 @@ pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Encode
             }
         }
     }
+    let hash = content_of(value);
+    out.put_bytes(&hash.0);
     out.put_u64(value.len() as u64);
     out.pad_to(16);
     out.put_bytes(value);
     let key = entry_key(&out[list.clone()], trace.seen());
-    Encoded { key, bytes: out, list }
+    Encoded { key, bytes: out, hash, list }
 }
 
 fn hash_len(seen: Seen) -> usize {
@@ -146,6 +153,9 @@ pub struct Entry<'s> {
     pub key: Key,
     pub identity: Identity,
     pub value: &'s [u8],
+    /// The hash of its value's bytes as the entry keeps it; none for an entry with no reads,
+    /// whose bytes are its bare value.
+    hash: Option<ContentId>,
     /// Its read-list and the digests of the list's reads; none for an entry with no reads.
     reads: Option<(ListRef<'s>, Reader<'s>)>,
 }
@@ -153,7 +163,23 @@ pub struct Entry<'s> {
 impl<'s> Entry<'s> {
     /// The entry with no reads of `identity`: its bytes are its value.
     pub fn whole(bytes: &'s [u8], identity: Identity) -> Entry<'s> {
-        Entry { key: whole::key(&identity), identity, value: bytes, reads: None }
+        Entry { key: whole::key(&identity), identity, value: bytes, hash: None, reads: None }
+    }
+
+    /// The hash of its value's bytes: what a read of this step's value sees. An entry with
+    /// reads keeps it, so nothing is hashed here; an entry with no reads is its bare value
+    /// (one probe, no header), which is hashed.
+    pub fn value_hash(&self) -> ContentId {
+        match self.hash {
+            Some(hash) => hash,
+            None => content_of(self.value),
+        }
+    }
+
+    /// The hash the entry keeps of its value, where it keeps one: for a check that the value
+    /// under it still hashes to it.
+    pub(crate) fn kept_hash(&self) -> Option<ContentId> {
+        self.hash
     }
 
     /// The entry under `key`. It is refused when it is of another identity than `identity`, or
@@ -200,6 +226,7 @@ impl<'s> Entry<'s> {
             // alloc: an error
             return Err("its reads name another key than the one it is filed under".to_owned());
         }
+        let hash = ContentId(*input.array::<32>()?);
         // alloc: an error
         let len =
             usize::try_from(input.u64()?).map_err(|_| "a value longer than memory".to_owned())?;
@@ -210,7 +237,7 @@ impl<'s> Entry<'s> {
         }
         let value = input.take(len)?;
         input.finish()?;
-        Ok(Entry { key, identity: *identity, value, reads: Some((list, digests)) })
+        Ok(Entry { key, identity: *identity, value, hash: Some(hash), reads: Some((list, digests)) })
     }
 
     /// The reads it recorded, sorted by kind and key, with the hash each saw.

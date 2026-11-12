@@ -1302,7 +1302,9 @@ fn reads_of_the_previous_layout_are_refused_by_name() {
     let mut list = Vec::new();
     reads::write_list(&mut list, key, &was);
     memory.put(reads::slot(key, 0), list).unwrap();
-    let why = find_by_reads(&db, lib, key, &memory, |_| Ok(None::<ContentId>)).unwrap_err();
+    let lookups = blaze_record::Tally::new();
+    let why =
+        find_by_reads(&db, lib, key, &memory, &lookups, |_| Ok(None::<ContentId>)).unwrap_err();
     assert!(
         why.contains("lib") && why.contains("slot 0") && why.contains("reads of another version"),
         "{why}"
@@ -1504,7 +1506,21 @@ fn contents(memory: &Memory) -> Vec<(ContentId, Vec<u8>)> {
 
 /// What `find_by_reads` finds in `memory`: the filed key, when a value is kept under it.
 fn found_in(db: &TestDB, lib: Crate, key: ContentId, memory: &Memory) -> Option<ContentId> {
-    find_by_reads(db, lib, key, memory, |at| Ok(memory.get(&at)?.map(|_| at))).unwrap()
+    searched_in(db, lib, key, memory).0
+}
+
+/// [`found_in`], with what the search of the key's slots came to as `blaze_record` counted it.
+fn searched_in(
+    db: &TestDB,
+    lib: Crate,
+    key: ContentId,
+    memory: &Memory,
+) -> (Option<ContentId>, blaze_record::Counts) {
+    let lookups = blaze_record::Tally::new();
+    let found =
+        find_by_reads(db, lib, key, memory, &lookups, |at| Ok(memory.get(&at)?.map(|_| at)))
+            .unwrap();
+    (found, lookups.take())
 }
 
 /// A process variable a body's `env!` reads, not a signature's, files a value made from the
@@ -1532,9 +1548,12 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
     assert_ne!(filed, key);
     assert!(memory.images.lock().contains_key(&reads::slot(key, 0)));
     memory.put(filed, b"a check".to_vec()).unwrap();
-    assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
+    // Each search is one lookup that read the one slot filed and valued its one set of reads;
+    // it is a hit while the value those reads name is kept.
+    let counted = |hits| blaze_record::Counts { lookups: 1, hits, lists: 1, reads: 1 };
+    assert_eq!(searched_in(&db, lib, key, &memory), (Some(filed), counted(1)));
     set(&mut db, "2");
-    assert_eq!(found_in(&db, lib, key, &memory), None);
+    assert_eq!(searched_in(&db, lib, key, &memory), (None, counted(0)));
     set(&mut db, "1");
     assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
 }

@@ -577,19 +577,34 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     let facts = Arc::new(TestFacts::new(knob, true));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
     assert_eq!(looked_up(&db, krate), None, "nothing stored yet");
+    // What the lookups since the last flush came to (`Flushed::lookups`): each `looked_up`
+    // is one, the goal's one shape names one fact, and an offer and a flush are none.
+    let counted =
+        |lookups, hits, lists, reads| blaze_record::Counts { lookups, hits, lists, reads };
 
     assert_eq!(offered(&db, knob), 1);
     assert_eq!(memory.len(), 0, "an offer writes nothing until the flush");
     let flushed = installed.flush().unwrap();
-    assert_eq!(flushed, Flushed { written: 1, ..Flushed::default() });
+    // The miss above: no shape to read yet.
+    let want = Flushed { written: 1, lookups: counted(1, 0, 0, 0), ..Flushed::default() };
+    assert_eq!(flushed, want);
     assert_eq!(memory.len(), 2, "a shape and an answer");
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
-    assert_eq!(installed.flush().unwrap(), Flushed::default(), "a flush writes each offer once");
+    // The hit: one shape read, its one fact valued.
+    assert_eq!(
+        installed.flush().unwrap(),
+        Flushed { lookups: counted(1, 1, 1, 1), ..Flushed::default() },
+        "a flush writes each offer once"
+    );
 
     knob.set_value(&mut db).to(2);
     assert_eq!(looked_up(&db, krate), None, "a fact it read hashes otherwise");
     assert_eq!(offered(&db, knob), 2);
-    assert_eq!(installed.flush().unwrap(), Flushed { written: 1, ..Flushed::default() });
+    // That miss read the shape and valued its fact, and found no answer under the value.
+    assert_eq!(
+        installed.flush().unwrap(),
+        Flushed { written: 1, lookups: counted(1, 0, 1, 1), ..Flushed::default() }
+    );
     assert_eq!(memory.len(), 3, "the same shape, a second answer");
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
     knob.set_value(&mut db).to(1);
@@ -599,7 +614,11 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     assert_eq!(looked_up(&db, krate), None, "no store installed");
     let other = install(&db, memory.clone(), facts, OTHER_BUILD).unwrap();
     assert_eq!(looked_up(&db, krate), None, "another solver version");
-    assert_eq!(other.flush().unwrap(), Flushed::default());
+    // Another version is another key: its lookup finds no shape to read.
+    assert_eq!(
+        other.flush().unwrap(),
+        Flushed { lookups: counted(1, 0, 0, 0), ..Flushed::default() }
+    );
 }
 
 /// A second answer under the same facts is the goal's refusal, named in what the flush did; it

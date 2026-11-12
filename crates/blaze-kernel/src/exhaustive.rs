@@ -29,6 +29,8 @@ use blaze_store_check::Setting;
 
 use super::*;
 
+mod nested;
+
 /// How many facts the world has (K).
 const FACTS: usize = 3;
 /// How many steps a sequence has (N).
@@ -62,6 +64,15 @@ impl World for Facts {
             (FACT, &[at]) if usize::from(at) < FACTS => Ok(seen(at, self.facts[usize::from(at)])),
             _ => Err(WorldError::new(read, "the exhaustive world has no such read")),
         }
+    }
+
+    fn pin(&self) -> Pin {
+        let mut bytes = [0_u8; 2 * FACTS];
+        for (at, fact) in self.facts.iter().enumerate() {
+            bytes[2 * at] = fact.is_some() as u8;
+            bytes[2 * at + 1] = fact.unwrap_or(0);
+        }
+        Pin(ContentId::of("blaze v2 kernel exhaustive pin 1", &bytes))
     }
 }
 
@@ -236,6 +247,8 @@ impl Put for Undoable {
 enum Did {
     Set(u8, Option<u8>),
     Get(u8),
+    /// The session dropped what it verified (`nested`).
+    Drop,
 }
 
 /// What the oracle refused, with the sequence that led to it.
@@ -256,7 +269,7 @@ struct Explored {
 }
 
 struct Exploring {
-    kernel: Kernel,
+    kernel: Kernel<Facts>,
     store: Undoable,
     world: Facts,
     path: Vec<Did>,

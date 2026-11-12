@@ -58,6 +58,10 @@ pub use crate::deps::{
     },
 };
 pub use crate::nameres::frozen::Mode;
+/// `blaze_record`, the form what is filed by a crate's reads is kept in: for a caller of
+/// [`find_by_reads`], which counts the searches in a [`record::Tally`] it owns and reports
+/// ([`record::Counts`]).
+pub use blaze_record as record;
 pub use crate::nameres::frozen::pages::{PageSource, Paged, is_paged};
 
 /// An image a database was given: the buffer, which [`serve`] opened and checked against the

@@ -2255,7 +2255,7 @@ impl AttrFlags {
 
     /// [`AttrFlags::is_cfg_enabled_for`] of an owner as the view every attribute owner is:
     /// one instance for every kind of owner.
-    pub(crate) fn is_cfg_enabled_in(
+    pub fn is_cfg_enabled_in(
         owner: ast::AnyHasAttrs<'_>,
         cfg_options: &CfgOptions,
     ) -> Result<(), CfgExpr> {

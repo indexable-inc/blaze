@@ -15,9 +15,9 @@ use blaze_ids::ContentId;
 use blaze_rng::SplitMix64;
 
 use crate::{
-    AnswerKey, Bounds, Digest, Error, Filing, Found, Kept, Kind, LAYOUT, ListError, ListRef,
-    Placed, Slot, Store, Walked, chain::first_open_for_tests, empty_list, keep_answer, list_key,
-    lookup, walk, write_list, write_list_with,
+    AnswerKey, Bounds, Counts, Digest, Error, Filing, Found, Kept, Kind, LAYOUT, ListError,
+    ListRef, Placed, Slot, Store, Tally, Walked, chain::first_open_for_tests, empty_list,
+    keep_answer, list_key, lookup, walk, write_list, write_list_with,
 };
 
 /// The things the work can read: each absent, or one of [`READS`] values.
@@ -35,6 +35,7 @@ struct Memory {
     /// Every put that landed, in order.
     log: RefCell<Vec<(Kind, ContentId, Vec<u8>)>>,
     clashes: Cell<u32>,
+    tally: Tally,
 }
 
 impl Store for Memory {
@@ -63,6 +64,10 @@ impl Store for Memory {
 
     fn bytes(held: &Vec<u8>) -> &[u8] {
         held
+    }
+
+    fn tally(&self) -> &Tally {
+        &self.tally
     }
 }
 
@@ -475,6 +480,7 @@ fn a_walk_shows_the_lists_a_lookup_searches_and_ends_where_its_visitor_says() {
 #[derive(Default)]
 struct Buffered {
     puts: RefCell<Vec<(ContentId, Vec<u8>)>>,
+    tally: Tally,
 }
 
 impl Store for Buffered {
@@ -493,6 +499,84 @@ impl Store for Buffered {
     fn bytes(held: &Vec<u8>) -> &[u8] {
         held
     }
+
+    fn tally(&self) -> &Tally {
+        &self.tally
+    }
+}
+
+/// The invariant: a store's tally counts each lookup through it once, with the read-lists it
+/// read, every read it asked the value of (the one that had none too) and whether it hit; a
+/// walk counts the same but the reads, which are its caller's to say; a placing and a keeping
+/// count nothing; and a take leaves zero. The control: the walk whose caller says no reads
+/// counts none, so the reads counted are the ones said.
+#[test]
+fn a_tally_counts_lookups_hits_lists_and_reads_valued() {
+    let base = base_key(2);
+    let store = Memory::default();
+    // A miss with no read-list: nothing is filed under the base yet.
+    let miss = lookup(&store, ROOMY, &base, |_| Some(Digest::Nothing)).unwrap();
+    assert_eq!(miss, Found::Miss { lists: 0, full: false });
+    assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 0, lists: 0, reads: 0 });
+    assert_eq!(store.tally.take(), Counts::default(), "a take leaves zero");
+
+    // Two lists of three reads each, and an answer under the second.
+    let list = |reads: [u8; 3]| {
+        let mut list = Vec::new();
+        write_list(&mut list, &base, b"", reads.map(name));
+        list
+    };
+    let (one, two) = (list([0, 1, 2]), list([3, 4, 5]));
+    let slot = |n| Slot { generation: 0, n };
+    let mut filing = Filing::new(base, ROOMY);
+    assert_eq!(filing.place(&store, &one), Ok(Placed::Written(slot(0))));
+    assert_eq!(filing.place(&store, &two), Ok(Placed::Written(slot(1))));
+    let mut key = AnswerKey::new(&two);
+    for _ in 0..3 {
+        key.value(digest(Some(9)));
+    }
+    let key = key.finish();
+    assert_eq!(keep_answer(&store, key, b"answer"), Ok(Kept::Written));
+    assert_eq!(store.tally.take(), Counts::default(), "a placing and a keeping are no lookup");
+
+    // The second read of the first list has no value now: two reads asked, and the list is
+    // passed over. The three of the second list are valued, and its answer is the hit.
+    let now = |name: &[u8]| (name[1] != 1).then(|| digest(Some(9)));
+    let hit = lookup(&store, ROOMY, &base, now).unwrap();
+    assert_eq!(hit, Found::Hit { answer: b"answer".to_vec(), key, at: slot(1) });
+    assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 1, lists: 2, reads: 5 });
+
+    // The same two lookups as one count, as a store that reports once a build has them.
+    let both = Memory::default();
+    lookup(&both, ROOMY, &base, now).unwrap();
+    for bytes in [&one, &two] {
+        assert!(matches!(Filing::new(base, ROOMY).place(&both, bytes), Ok(Placed::Written(_))));
+    }
+    assert_eq!(keep_answer(&both, key, b"answer"), Ok(Kept::Written));
+    lookup(&both, ROOMY, &base, now).unwrap();
+    let counted = both.tally.take();
+    assert_eq!(counted, Counts { lookups: 2, hits: 1, lists: 2, reads: 5 });
+    assert_eq!(format!("{counted}"), "2 lookups, 1 hit, 2 read-lists read, 5 reads valued");
+    let mut sum = counted;
+    sum.add(Counts { lookups: 1, hits: 1, lists: 1, reads: 3 });
+    assert_eq!(sum, Counts { lookups: 3, hits: 2, lists: 3, reads: 8 });
+
+    // A walk counts the lookup, its lists and its hit; the reads are what its caller says.
+    let visit = |_: Slot, bytes: &[u8], list: ListRef<'_>| {
+        Ok::<Option<usize>, Error<&'static str>>((bytes == two.as_slice()).then_some(list.len()))
+    };
+    assert_eq!(walk(&store, ROOMY, &base, visit), Ok(Walked::Found { found: 3, at: slot(1) }));
+    assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 1, lists: 2, reads: 0 });
+    assert_eq!(walk(&store, ROOMY, &base, visit), Ok(Walked::Found { found: 3, at: slot(1) }));
+    store.tally().valued(6);
+    assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 1, lists: 2, reads: 6 });
+
+    // A walk its visitor stops with an error is a lookup all the same, of the list it read.
+    let stopped = walk(&store, ROOMY, &base, |_, _: &[u8], _| {
+        Err::<Option<()>, Error<&'static str>>(Error::TwoAnswers { key })
+    });
+    assert_eq!(stopped, Err(Error::TwoAnswers { key }));
+    assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 0, lists: 1, reads: 0 });
 }
 
 /// The invariant: two lists of one base placed by one filing take two slots, though the store

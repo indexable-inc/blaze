@@ -30,6 +30,9 @@ mod artifact;
 mod checks;
 mod codegen;
 mod compile;
+/// The store's keys of an output's bytes, for the request certificate's look at an output
+/// (`serve::job::certify`).
+pub(super) use compile::{linked_key, output_key};
 mod configs;
 mod deps;
 mod doc;

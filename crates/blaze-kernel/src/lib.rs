@@ -40,11 +40,12 @@ use std::fmt;
 use blaze_cas::{Key, Kind, content_of};
 use blaze_ids::{ContentId, Hasher};
 use blaze_record::{AnswerKey, Doing, Filing, Placed, Slot, Walked, keep_answer, list_key, walk};
-use blaze_store_check::{Hit, Recompute, RecordedRead, Setting, VerifyError};
+use blaze_store_check::{Setting, VerifyError};
 
 mod entry;
 #[cfg(test)]
 mod exhaustive;
+mod nest;
 mod reads;
 mod store;
 #[cfg(test)]
@@ -52,8 +53,10 @@ mod tests;
 pub mod why;
 
 pub use crate::entry::{Entry, EntryReads, whole};
-pub use crate::reads::{Reads, Trace};
-pub use crate::store::{Get, Put, Reading, Writing};
+pub use crate::nest::{MOST_NESTED, Session};
+use crate::nest::{Door, Engine, How, Lent, LentMut, Need, Now, Runner, Valued};
+pub use crate::reads::{Reads, Trace, TwoSeen};
+pub use crate::store::{Get, Put, Reading, Writing, take_lookups};
 use crate::store::{Keeping, Looking, Stopped};
 pub use crate::why::{Miss, Missed, Part, PartKind};
 
@@ -123,6 +126,13 @@ pub fn identity<S: Step>(code: CodeId, input: &S::Input) -> Identity {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ReadKind(pub u16);
 
+impl ReadKind {
+    /// A step's value: the one kind the kernel answers itself, never a [`World`]. Its key is
+    /// the step's number (`u16`, big-endian) and the input's stable bytes ([`Ask::key`]); what
+    /// it saw is the hash of the value's bytes. [`Reads::step`] records it.
+    pub const STEP: ReadKind = ReadKind(0xffff);
+}
+
 /// One read: its kind and the canonical bytes of its key (content IDs and item keys; no dense
 /// id, no absolute path). It is narrow: the layout of `Foo`, not `Foo`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -156,12 +166,26 @@ pub struct WorldError {
     pub kind: ReadKind,
     pub key: Vec<u8>,
     pub why: String,
+    /// The read only cannot be valued now ([`WorldError::not_now`]): to a lookup that is an
+    /// outcome, not a failure.
+    pub not_now: bool,
 }
 
 impl WorldError {
+    /// The read failed: a lookup that asks for it fails, and so does a run.
     pub fn new(read: Read<'_>, why: impl Into<String>) -> WorldError {
         // alloc: an error
-        WorldError { kind: read.kind, key: read.key.to_vec(), why: why.into() }
+        WorldError { kind: read.kind, key: read.key.to_vec(), why: why.into(), not_now: false }
+    }
+
+    /// The read cannot be valued now: what it names is not there to hash in the world as it
+    /// is (a file of a crate not loaded, a name in a scope that no longer exists). A lookup
+    /// passes over the read-list that names it, since an entry whose run made that read cannot
+    /// be the one valid now, and goes on to the identity's other lists; nothing fails. A run
+    /// that asks for it fails as with any other error: a run asks only for what it needs.
+    pub fn not_now(read: Read<'_>, why: impl Into<String>) -> WorldError {
+        // alloc: an error
+        WorldError { kind: read.kind, key: read.key.to_vec(), why: why.into(), not_now: true }
     }
 
     pub fn read(&self) -> Read<'_> {
@@ -175,19 +199,35 @@ impl fmt::Display for WorldError {
     }
 }
 
+/// What a [`World`] is pinned at ([`World::pin`]): equal pins, equal hashes of every read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pin(pub ContentId);
+
 /// The outside world, as hashes. The crate that wires a step implements it, over the front
 /// end's facts, the file system, and the rest.
 ///
 /// `hash` must give the [`Seen`] that [`Fact::get`] gives for the same read. Lookup trusts it,
 /// and a sampled check (lane verify) finds out when the two disagree.
+///
+/// What `hash` comes to, for a read: a hash ([`Seen::Is`]); nothing under that key
+/// ([`Seen::Gone`], which equals no hash, so an entry that saw nothing there holds only while
+/// nothing is there); that it cannot be valued now ([`WorldError::not_now`]: a lookup passes
+/// over the list, a run fails); or a failure ([`WorldError::new`]). Absence over a set (no impl
+/// for a type, no such name in a scope) is none of these: it is a read of the set, under a
+/// kind of its own, whose hash covers the set's members.
 pub trait World {
     fn hash(&self, read: Read<'_>) -> Result<Seen, WorldError>;
+
+    /// What the world is pinned at now: while two calls give the same pin, every read hashes
+    /// the same at both. A world that can change says so here (a revision's digest, a
+    /// snapshot's id); it is asked at the start and the end of every request, so it is a value
+    /// the world holds, not one it works out. What a [`Session`] verified holds for one pin.
+    fn pin(&self) -> Pin;
 
     /// The read as an error or a check names it, e.g. "layout of `core::option::Option<u8>`".
     /// Rendered only for an error or a sampled check, never on a hit's path.
     fn describe(&self, read: Read<'_>) -> String {
-        // alloc: an error's or a check's text
-        format!("read {} of {}", read.kind.0, hex(read.key))
+        plain(read)
     }
 
     /// The item the read is of, by path (the type whose layout it is, the callee whose
@@ -232,9 +272,10 @@ pub trait Step: 'static {
     fn label(input: &Self::Input) -> String;
 }
 
-/// A step the kernel computes. A step whose value is computed elsewhere (codegen's batched
-/// templates) is a [`Step`] only, kept through [`Kernel::find_whole`], [`Kernel::keep_whole`]
-/// or [`whole::key`].
+/// A step the kernel computes. A step whose value is computed elsewhere is a [`Step`] only:
+/// with no reads (codegen's batched templates) it is kept through [`Kernel::find_whole`],
+/// [`Kernel::keep_whole`] or [`whole::key`]; with reads made elsewhere, through
+/// [`Kernel::keep`] and found by [`Kernel::find`].
 #[blaze::pure]
 pub trait Compute: Step {
     type World: World + ?Sized;
@@ -244,6 +285,22 @@ pub trait Compute: Step {
     -> Result<Vec<u8>, StepError>;
 }
 
+/// A step another step may ask for ([`Reads::step`]): its input has stable bytes, so a read of
+/// its value can be keyed by them and the kernel can run it from that key at a later lookup
+/// ([`Kernel::register_ask`]).
+///
+/// `input(key(i))` must be `i`: the kernel computes the step from the input its key decodes
+/// to, and from no other.
+#[blaze::pure]
+pub trait Ask: Compute<Input: Sized> {
+    /// Appends the input's stable bytes: content IDs and item keys, never a dense id or a
+    /// path in the checkout.
+    fn key(input: &Self::Input, out: &mut Vec<u8>);
+
+    /// The input `key` wrote; bytes that are none are refused, naming why.
+    fn input(key: &[u8]) -> Result<Self::Input, String>;
+}
+
 /// Why a step's run made no value.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StepError {
@@ -251,6 +308,15 @@ pub enum StepError {
     World(WorldError),
     /// The step refused its input, naming why.
     Refused(String),
+    /// A step it asked for was refused (`?` on [`Reads::step`]).
+    Asked(Box<KernelError>),
+}
+
+/// One value on a cycle: its step and its identity's ID.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Link {
+    pub step: &'static str,
+    pub identity: ContentId,
 }
 
 impl From<WorldError> for StepError {
@@ -322,6 +388,48 @@ pub enum KernelError {
     Compute { of: Of, why: String },
     /// A sampled hit computed again to other reads or other bytes.
     Verify(VerifyError),
+    /// The world is not at the pin the request's session is of: it moved between two requests
+    /// of one session, or while one ran. Nothing is answered from the session's rows, and
+    /// whoever holds the session makes a new one for the world as it is now.
+    Moved { pinned: Pin, now: Pin },
+    /// A step asked for a value that was being computed for it: `cycle` is the values on the
+    /// way, from the one asked for again (`of`) to the one that asked. The kernel has no
+    /// fixpoint: steps that need each other are one step over their whole cycle.
+    Cycle { of: Of, cycle: Vec<Link> },
+    /// Steps nest deeper than [`MOST_NESTED`].
+    TooDeep { of: Of },
+    /// A step this one asked for was refused, so nothing was kept.
+    Child { of: Of, child: Box<KernelError> },
+    /// A read of a step's value names a step that is not registered to be asked for
+    /// ([`Kernel::register_ask`]): `name` is the step registered under the number, if any.
+    Unasked { step: StepId, name: Option<&'static str> },
+    /// A read of a step's value whose key is no input of its step.
+    Input { step: &'static str, key: String, why: String },
+}
+
+impl KernelError {
+    /// Whether it says only that a step's value cannot be had now. During a lookup that makes
+    /// the read-list that named the step not hold (`nest`'s doc says why); during a run it is
+    /// the run's error.
+    pub(crate) fn unvaluable(&self) -> bool {
+        match self {
+            KernelError::Cycle { .. }
+            | KernelError::TooDeep { .. }
+            | KernelError::Compute { .. }
+            | KernelError::World { .. }
+            | KernelError::Unasked { .. }
+            | KernelError::Input { .. } => true,
+            KernelError::Child { child, .. } => child.unvaluable(),
+            KernelError::Unregistered { .. }
+            | KernelError::Twice { .. }
+            | KernelError::Store { .. }
+            | KernelError::Unsteady { .. }
+            | KernelError::Conflict { .. }
+            | KernelError::TooManyShapes { .. }
+            | KernelError::Verify(_)
+            | KernelError::Moved { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for KernelError {
@@ -364,39 +472,94 @@ impl fmt::Display for KernelError {
             ),
             KernelError::Compute { of, why } => write!(f, "{of}: {why}"),
             KernelError::Verify(error) => error.fmt(f),
+            KernelError::Moved { pinned, now } => write!(
+                f,
+                "the world moved under a session: the session is of the world pinned at {:x}, and the world is at {:x} now, so nothing was answered; make a new session for the world as it is",
+                pinned.0, now.0
+            ),
+            KernelError::Cycle { of, cycle } => {
+                write!(f, "{of} is asked for while it is computed: a cycle of steps, ")?;
+                for link in cycle {
+                    write!(f, "{} (identity {:x}) asks for ", link.step, link.identity)?;
+                }
+                write!(
+                    f,
+                    "the first again; the kernel has no fixpoint, so steps that need each other are one step over their whole cycle"
+                )
+            }
+            KernelError::TooDeep { of } => write!(
+                f,
+                "{of}: {MOST_NESTED} steps are asking for one another's values on the way to it, the most that may nest"
+            ),
+            KernelError::Child { of, child } => {
+                write!(f, "{of}: a step it asked for was refused, so nothing was kept: {child}")
+            }
+            KernelError::Unasked { step, name: Some(name) } => write!(
+                f,
+                "step `{name}` (step {}) is asked for by another step, and is not registered to be (Kernel::register_ask)",
+                step.0
+            ),
+            KernelError::Unasked { step, name: None } => write!(
+                f,
+                "a read of a step's value names step {}, and the kernel has no such step",
+                step.0
+            ),
+            KernelError::Input { step, key, why } => {
+                write!(f, "a read of the value of {step} is keyed by {key}, no input of it: {why}")
+            }
         }
     }
 }
 
 impl std::error::Error for KernelError {}
 
-#[derive(Clone, Copy, Debug)]
-struct Registered {
+struct Registered<W: ?Sized> {
     name: &'static str,
     code: CodeId,
     type_id: TypeId,
+    /// Its lookup, run and keep behind its input's bytes, when other steps may ask for it.
+    asked: Option<Runner<W>>,
 }
 
-/// The registry of steps, each with its code. It is built at setup and shared (`&Kernel`)
-/// after that.
-pub struct Kernel {
-    steps: blaze_hash::HashMap<StepId, Registered, Global>,
+/// The registry of steps, each with its code, over the one world `W` its steps read. It is
+/// built at setup and shared (`&Kernel<W>`) after that.
+///
+/// One kernel is of one world type: a step that asks for another step's value runs it in the
+/// world it reads itself, and a lookup values a stored read in that world, so which world a
+/// step is of is checked where it is registered and used, by the compiler.
+pub struct Kernel<W: ?Sized> {
+    steps: blaze_hash::HashMap<StepId, Registered<W>, Global>,
 }
 
-impl Default for Kernel {
-    fn default() -> Kernel {
+impl<W: World + ?Sized> Default for Kernel<W> {
+    fn default() -> Kernel<W> {
         Kernel::new()
     }
 }
 
-impl Kernel {
-    pub fn new() -> Kernel {
+impl<W: World + ?Sized> Kernel<W> {
+    pub fn new() -> Kernel<W> {
         // alloc: the registry, once a process, a few entries
         Kernel { steps: blaze_hash::HashMap::new_in(Global) }
     }
 
     /// Registers `S` with its code. A second step of one number or one name is refused.
     pub fn register<S: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
+        self.enter::<S>(code, None)
+    }
+
+    /// Registers `S` with its code as a step other steps may ask for ([`Reads::step`]): the
+    /// registry keeps how to look it up, run it and keep it from the bytes of its input, which
+    /// is how a read of its value is answered at a later lookup.
+    pub fn register_ask<S: Ask<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
+        self.enter::<S>(code, Some(Runner::of::<S>()))
+    }
+
+    fn enter<S: Step>(
+        &mut self,
+        code: CodeId,
+        asked: Option<Runner<W>>,
+    ) -> Result<(), KernelError> {
         if let Some(had) = self.steps.get(&S::ID) {
             return Err(KernelError::Twice { first: (S::ID, had.name), second: (S::ID, S::NAME) });
         }
@@ -404,8 +567,53 @@ impl Kernel {
             return Err(KernelError::Twice { first: (*step, had.name), second: (S::ID, S::NAME) });
         }
         // alloc: the registry, once a step
-        self.steps.insert(S::ID, Registered { name: S::NAME, code, type_id: TypeId::of::<S>() });
+        let registered = Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked };
+        // alloc: the registry, once a step
+        self.steps.insert(S::ID, registered);
         Ok(())
+    }
+
+    /// How the step numbered `step` is asked for.
+    pub(crate) fn runner(&self, step: StepId) -> Result<Runner<W>, KernelError> {
+        match self.steps.get(&step) {
+            Some(Registered { asked: Some(runner), .. }) => Ok(*runner),
+            Some(it) => Err(KernelError::Unasked { step, name: Some(it.name) }),
+            None => Err(KernelError::Unasked { step, name: None }),
+        }
+    }
+
+    /// The step and the input a read of a step's value names, where the kernel has the step.
+    fn asked_of<'r>(&self, read: Read<'r>) -> Option<(&Registered<W>, &'r [u8])> {
+        let (step, input) = read.key.split_first_chunk::<2>()?;
+        Some((self.steps.get(&StepId(u16::from_be_bytes(*step)))?, input))
+    }
+
+    /// A read as an error or a check names it: a step's value by the step and its input, any
+    /// other read as the world names it. Never on a hit's path.
+    pub fn describe(&self, world: &W, read: Read<'_>) -> String {
+        if read.kind != ReadKind::STEP {
+            return world.describe(read);
+        }
+        match self.asked_of(read) {
+            // alloc: an error's or a check's text
+            Some((Registered { name, asked: Some(runner), .. }, input)) => {
+                format!("the value of {name} of `{}`", (runner.label)(input))
+            }
+            // alloc: an error's or a check's text
+            Some((it, input)) => format!("the value of {} of input {}", it.name, hex(input)),
+            // alloc: an error's or a check's text
+            None => format!("the value of a step the kernel does not have, keyed {}", hex(read.key)),
+        }
+    }
+
+    /// The item a read is of, for a reason's chain to follow: the input of the step whose
+    /// value it is, as that step labels it; any other read as the world says.
+    pub fn names(&self, world: &W, read: Read<'_>) -> Option<String> {
+        if read.kind != ReadKind::STEP {
+            return world.names(read);
+        }
+        let (registered, input) = self.asked_of(read)?;
+        Some((registered.asked?.label)(input))
     }
 
     /// The code `S` was registered with.
@@ -425,23 +633,64 @@ impl Kernel {
 
     /// The entry of `input`, else `S` computed now and kept. A hit that `verify` samples is
     /// computed again with fresh reads, and its reads and bytes must equal the entry's.
-    pub fn get<'s, S: Compute, P: Put + ?Sized>(
+    ///
+    /// A session of this one request: a child asked for by many parents under it is still
+    /// verified once, and a world that moved while it ran is [`KernelError::Moved`].
+    pub fn get<'s, S: Compute<World = W>, P: Put + ?Sized>(
         &self,
         store: &'s mut P,
-        world: &S::World,
+        world: &W,
+        input: &S::Input,
+        verify: &Setting,
+    ) -> Result<Got<'s>, KernelError> {
+        self.get_at::<S, P>(&mut Session::new(world), store, world, input, verify)
+    }
+
+    /// [`Kernel::get`] in `session`: what the session verified under its pin is not looked up
+    /// again (a child of many requests' parents is verified once; a value the session found
+    /// at the top before is one get, with no probe and no list read), and what this request
+    /// verifies is the session's after it. `store` is the one store the session is of. A world
+    /// that is not at the session's pin, before or after, is [`KernelError::Moved`].
+    pub fn get_in<'s, S: Compute<World = W>, P: Put + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &'s mut P,
+        world: &W,
+        input: &S::Input,
+        verify: &Setting,
+    ) -> Result<Got<'s>, KernelError> {
+        session.enter(world)?;
+        self.get_at::<S, P>(session, store, world, input, verify)
+    }
+
+    /// A get in a session whose pin is the world's at the start.
+    fn get_at<'s, S: Compute<World = W>, P: Put + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &'s mut P,
+        world: &W,
         input: &S::Input,
         verify: &Setting,
     ) -> Result<Got<'s>, KernelError> {
         let identity = self.identity::<S>(input)?;
-        if let Some(key) = find_key::<S, P>(&*store, world, input, &identity)? {
-            let store: &'s P = store;
-            let entry = read_entry::<S, P>(store, key, input, &identity)?;
-            check::<S>(verify, world, input, &entry)?;
-            return Ok(Got::Hit(entry));
+        let valued = {
+            let mut lent = LentMut(&mut *store);
+            let mut engine =
+                Engine::new(self, world, Door::Keep(&mut lent), verify, session.table());
+            engine.value::<S>(input, &identity, Need::Key)
+        };
+        // Before the answer, or the request's own error: a world that moved gives neither.
+        session.leave(world)?;
+        match valued? {
+            Some(Valued { key, how: How::Computed { value, reads }, .. }) => {
+                Ok(Got::Computed { key, value, reads })
+            }
+            Some(Valued { key, how: How::Hit { .. }, .. }) => {
+                let store: &'s P = store;
+                Ok(Got::Hit(read_entry::<S, P>(store, key, input, &identity)?))
+            }
+            None => unreachable!("a get keeps, and what keeps finds a value or makes it"),
         }
-        let (value, trace) = run::<S>(world, input, &identity)?;
-        let key = keep::<S, P>(store, world, input, &identity, &trace, &value)?;
-        Ok(Got::Computed { key, value, reads: trace })
     }
 
     /// Why the store has no entry of `input` whose reads all hash the same now, against `last`:
@@ -449,28 +698,89 @@ impl Kernel {
     /// remembered as [`Miss::kept`]), none when it saw none. For a lookup that found nothing;
     /// worked out by reading the store and the world again, so only when it is wanted, and it
     /// writes nothing.
-    pub fn why<S: Compute, G: Get + ?Sized>(
+    pub fn why<S: Step, G: Get + ?Sized>(
         &self,
         store: &G,
-        world: &S::World,
+        world: &W,
         input: &S::Input,
         last: Option<Key>,
     ) -> Result<Missed, KernelError> {
-        Ok(why::explain(store, world, &self.identity::<S>(input)?, last))
+        let identity = self.identity::<S>(input)?;
+        let (lent, off) = (Lent(store), Setting::OFF);
+        let mut session = Session::new(world);
+        let mut engine = Engine::new(self, world, Door::Look(&lent), &off, session.table());
+        let mut now = |read: Read<'_>| engine.now(read);
+        Ok(why::explain(store, self, world, &identity, last, &mut now))
     }
 
-    /// The entry of `input` whose reads all hash the same now, if the store has one.
-    pub fn find<'s, S: Compute, G: Get + ?Sized>(
+    /// The entry of `input` whose reads all hash the same now, if the store has one: of a step
+    /// the kernel computed, or of one kept with a trace made elsewhere ([`Kernel::keep`]).
+    pub fn find<'s, S: Step, G: Get + ?Sized>(
         &self,
         store: &'s G,
-        world: &S::World,
+        world: &W,
+        input: &S::Input,
+    ) -> Result<Option<Entry<'s>>, KernelError> {
+        self.find_at::<S, G>(&mut Session::new(world), store, world, input)
+    }
+
+    /// [`Kernel::find`] in `session`, as [`Kernel::get_in`] is of [`Kernel::get`].
+    pub fn find_in<'s, S: Step, G: Get + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &'s G,
+        world: &W,
+        input: &S::Input,
+    ) -> Result<Option<Entry<'s>>, KernelError> {
+        session.enter(world)?;
+        self.find_at::<S, G>(session, store, world, input)
+    }
+
+    fn find_at<'s, S: Step, G: Get + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &'s G,
+        world: &W,
         input: &S::Input,
     ) -> Result<Option<Entry<'s>>, KernelError> {
         let identity = self.identity::<S>(input)?;
-        match find_key::<S, G>(store, world, input, &identity)? {
+        let found = {
+            let (lent, off) = (Lent(store), Setting::OFF);
+            let mut engine = Engine::new(self, world, Door::Look(&lent), &off, session.table());
+            engine.found::<S>(input, &identity)
+        };
+        session.leave(world)?;
+        match found? {
             Some(key) => Ok(Some(read_entry::<S, G>(store, key, input, &identity)?)),
             None => Ok(None),
         }
+    }
+
+    /// Keeps `value` as the entry of `input` with `trace`: the reads its run made where the
+    /// kernel could not run it (a process: a build script's traced reads), each with the hash
+    /// it saw. [`Kernel::find`] then takes the entry by the rule of every entry: only when
+    /// every read of `trace` hashes the same now. Other bytes under the same identity and
+    /// reads are a [`KernelError::Conflict`] naming the identity and the reads, and the first
+    /// value stays, as for an entry the kernel computed.
+    ///
+    /// For a step the kernel could run itself this is an interim, listed as such per step
+    /// (docs/v2/plan/design/kernel.md, "The kernel as the home", (b)): a trace made elsewhere
+    /// is complete only as far as whoever made it is, where a step run through [`Reads`]
+    /// cannot leave a read out. No world is at hand here, so an error names a read by its
+    /// kind and key.
+    pub fn keep<S: Step, P: Put + ?Sized>(
+        &self,
+        store: &mut P,
+        input: &S::Input,
+        trace: &Trace,
+        value: &[u8],
+    ) -> Result<Key, KernelError> {
+        let identity = self.identity::<S>(input)?;
+        let reads = || -> Vec<String> {
+            // alloc: an error
+            trace.iter().map(|(read, seen)| said(plain(read), seen)).collect()
+        };
+        Ok(keep::<S, P>(store, input, &identity, trace, value, reads)?.key)
     }
 
     /// The entry with no reads of a step computed elsewhere, if the store has one.
@@ -513,8 +823,8 @@ enum Stop {
     /// The slot `at` holds a read-list one of whose reads is named by `len` bytes: no kernel
     /// read's name.
     Name { at: Slot, len: usize },
-    World { read: String, why: String },
-    Store { key: Key, why: String },
+    /// Valuing a read, or reading the answer, failed: the lookup's error as it is.
+    Kernel(KernelError),
 }
 
 impl From<blaze_record::Error<Stopped>> for Stop {
@@ -549,37 +859,44 @@ fn chain_error(of: Of, id: &ContentId, error: blaze_record::Error<Stopped>) -> K
     }
 }
 
-/// The key of the entry of `identity` whose reads all hash the same now: the entry with no
-/// reads, else the first read-list in the identity's chain whose reads' hashes now name an
-/// entry the store has.
-fn find_key<S: Compute, G: Get + ?Sized>(
+/// The entry of `identity` whose reads all hash the same now: the entry with no reads, else
+/// the first read-list in the identity's chain whose reads' hashes now name an entry the store
+/// has. `now` values a read: a list with a read that cannot be valued does not hold, and one
+/// with a step's value that must be run first is passed over (`Engine::lookup`). `answer` is
+/// asked for the entry under a key, none where the store has nothing there: it probes or reads
+/// as its caller needs (`nest::Need`), so a lookup reads the store no more than its caller uses.
+fn find_key<S: Step, G: Get + ?Sized, T>(
     store: &G,
-    world: &S::World,
     input: &S::Input,
     identity: &Identity,
-) -> Result<Option<Key>, KernelError> {
+    now: &mut dyn FnMut(Read<'_>) -> Result<Now, KernelError>,
+    answer: &mut dyn FnMut(Key) -> Result<Option<T>, KernelError>,
+) -> Result<Option<T>, KernelError> {
     let id = identity.id();
     let failed =
         |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
-    let whole = whole::key(identity);
-    if store.has(&whole).map_err(|why| failed(whole, why))? {
-        return Ok(Some(whole));
+    if let Some(found) = answer(whole::key(identity))? {
+        return Ok(Some(found));
     }
-    let walked = walk::<_, Key, Stop, _>(&Looking(store), entry::BOUNDS, &id, |at, bytes, list| {
+    let walked = walk::<_, T, Stop, _>(&Looking(store), entry::BOUNDS, &id, |at, bytes, list| {
         let mut key = AnswerKey::new(bytes);
+        let mut holds = true;
         for name in list.reads() {
             let read = entry::named(name).ok_or(Stop::Name { at, len: name.len() })?;
-            let seen = world
-                .hash(read)
-                .map_err(|error| Stop::World { read: world.describe(read), why: error.why })?;
-            key.value(entry::digest(seen));
+            // The walk leaves the reads to its visitor: each one asked the value of is said.
+            blaze_record::Store::tally(&Looking(store)).valued(1);
+            match now(read).map_err(Stop::Kernel)? {
+                Now::Seen(seen) => {
+                    key.value(entry::digest(seen));
+                }
+                Now::Pending => holds = false,
+                Now::Not => return Ok(None),
+            }
         }
-        let key = Key(key.finish());
-        match store.has(&key) {
-            Ok(true) => Ok(Some(key)),
-            Ok(false) => Ok(None),
-            Err(why) => Err(Stop::Store { key, why }),
+        if !holds {
+            return Ok(None);
         }
+        answer(Key(key.finish())).map_err(Stop::Kernel)
     });
     match walked {
         Ok(Walked::Found { found, .. }) => Ok(Some(found)),
@@ -596,10 +913,7 @@ fn find_key<S: Compute, G: Get + ?Sized>(
                 at.n
             ),
         )),
-        Err(Stop::World { read, why }) => {
-            Err(KernelError::World { of: of::<S>(input, identity), read, why })
-        }
-        Err(Stop::Store { key, why }) => Err(failed(key, why)),
+        Err(Stop::Kernel(error)) => Err(error),
     }
 }
 
@@ -618,49 +932,11 @@ fn read_entry<'s, S: Step, G: Get + ?Sized>(
     Entry::read(bytes, key, identity).map_err(failed)
 }
 
-/// `S` of `input` with fresh reads: its value and its reads, sorted, each once.
-fn run<S: Compute>(
-    world: &S::World,
-    input: &S::Input,
-    identity: &Identity,
-) -> Result<(Vec<u8>, Trace), KernelError> {
-    let mut ctx = Reads::new(world);
-    let computed = S::compute(&mut ctx, input);
-    let trace = ctx.finish().map_err(|it| ended::<S>(world, input, identity, it))?;
-    match computed {
-        Ok(value) => Ok((value, trace)),
-        Err(StepError::World(error)) => Err(KernelError::World {
-            of: of::<S>(input, identity),
-            read: world.describe(error.read()),
-            why: error.why,
-        }),
-        Err(StepError::Refused(why)) => {
-            Err(KernelError::Compute { of: of::<S>(input, identity), why })
-        }
-    }
-}
-
-fn ended<S: Compute>(
-    world: &S::World,
-    input: &S::Input,
-    identity: &Identity,
-    ended: reads::Unfinished,
-) -> KernelError {
-    match ended {
-        reads::Unfinished::Failed(error) => KernelError::World {
-            of: of::<S>(input, identity),
-            read: world.describe(error.read()),
-            why: error.why,
-        },
-        reads::Unfinished::Unsteady { name, first, then } => KernelError::Unsteady {
-            of: of::<S>(input, identity),
-            read: world.describe(
-                entry::named(&name).expect("a name written by `Reads` starts with its kind"),
-            ),
-            first,
-            then,
-        },
-    }
+/// An entry kept: its key, and the hash of its value's bytes where the entry keeps it (one
+/// with reads), made once while the entry was written.
+pub(crate) struct Kept {
+    pub key: Key,
+    pub hash: Option<ContentId>,
 }
 
 /// Keeps `value` as the entry of `identity` and `trace`, then makes sure the trace's read-list
@@ -670,30 +946,28 @@ fn ended<S: Compute>(
 /// `store` must read its own puts at once (blaze-cas does, through every writer): a slot taken
 /// by another list is found by its get, and a slot taken between the get and the put (another
 /// writer, a [`blaze_cas::Mismatch`]) is read again and passed over for the next slot.
-fn keep<S: Compute, P: Put + ?Sized>(
+///
+/// `reads` names the trace's reads for a conflict's error, asked only then.
+fn keep<S: Step, P: Put + ?Sized>(
     store: &mut P,
-    world: &S::World,
     input: &S::Input,
     identity: &Identity,
     trace: &Trace,
     value: &[u8],
-) -> Result<Key, KernelError> {
+    reads: impl Fn() -> Vec<String>,
+) -> Result<Kept, KernelError> {
     let store = RefCell::new(store);
-    let reads = || -> Vec<String> {
-        // alloc: an error
-        trace.iter().map(|(read, seen)| described(world, read, seen)).collect()
-    };
     if trace.is_empty() {
         let key = whole::key(identity);
-        keep_entry::<S, P>(&store, input, identity, key, value, reads)?;
-        return Ok(key);
+        keep_entry::<S, P>(&store, input, identity, key, value, &reads)?;
+        return Ok(Kept { key, hash: None });
     }
     let entry = entry::encode(identity, trace, value);
-    keep_entry::<S, P>(&store, input, identity, entry.key, &entry.bytes, reads)?;
+    keep_entry::<S, P>(&store, input, identity, entry.key, &entry.bytes, &reads)?;
     let id = identity.id();
     let records = Keeping { store: &store, answers: S::KIND };
     match Filing::new(id, entry::BOUNDS).place(&records, entry.list()) {
-        Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(entry.key),
+        Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(Kept { key: entry.key, hash: Some(entry.hash) }),
         Ok(Placed::Full) => Err(KernelError::TooManyShapes { of: of::<S>(input, identity) }),
         Err(error) => Err(chain_error(of::<S>(input, identity), &id, error)),
     }
@@ -742,85 +1016,19 @@ fn keep_entry<S: Step, P: Put + ?Sized>(
     }
 }
 
-fn described<W: World + ?Sized>(world: &W, read: Read<'_>, seen: Seen) -> String {
+/// A read by its name and what it saw, as an error or a check gives it.
+fn said(read: String, seen: Seen) -> String {
     match seen {
-        Seen::Is(hash) => format!("{} = {hash:x}", world.describe(read)), // alloc: an error's or a check's text
-        Seen::Gone => format!("{} (gone)", world.describe(read)), // alloc: an error's or a check's text
+        Seen::Is(hash) => format!("{read} = {hash:x}"), // alloc: an error's or a check's text
+        Seen::Gone => format!("{read} (gone)"), // alloc: an error's or a check's text
     }
 }
 
-/// Checks a hit when `verify` samples it: `S` is run again with fresh reads, and it must make
-/// the entry's reads and bytes.
-fn check<S: Compute>(
-    verify: &Setting,
-    world: &S::World,
-    input: &S::Input,
-    entry: &Entry<'_>,
-) -> Result<(), KernelError> {
-    let identity = entry.identity.id();
-    if !verify.sampled(&identity) {
-        return Ok(());
-    }
-    let label = S::label(input);
-    // alloc: a sampled check's text
-    let names: Vec<String> =
-        entry.reads().map(|(read, seen)| described(world, read, seen)).collect();
-    // alloc: a sampled check's reads
-    let reads: Vec<RecordedRead<'_>> = names
-        .iter()
-        .zip(entry.reads())
-        .map(|(what, (_, seen))| RecordedRead { what, hash: seen.hash() })
-        .collect();
-    let hit = Hit { function: &label, identity, reads: &reads, stored: entry.value };
-    blaze_store_check::check(verify, &hit, &Again::<S> { world, input, entry })
-        .map_err(KernelError::Verify)?;
-    Ok(())
-}
-
-/// A hit's value computed again, for lane verify's check.
-struct Again<'a, S: Compute> {
-    world: &'a S::World,
-    input: &'a S::Input,
-    entry: &'a Entry<'a>,
-}
-
-impl<S: Compute> Recompute for Again<'_, S> {
-    fn recompute(&self, _: &Hit<'_>) -> Result<Vec<u8>, String> {
-        let (value, trace) =
-            // alloc: an error
-            run::<S>(self.world, self.input, &self.entry.identity).map_err(|it| it.to_string())?;
-        let mut stored = self.entry.reads();
-        for (n, (read, seen)) in trace.iter().enumerate() {
-            match stored.next() {
-                Some(was) if was == (read, seen) => {}
-                Some((was, was_seen)) => {
-                    // alloc: an error
-                    return Err(format!(
-                        "computed again, read {n} is {}, where the entry recorded {}",
-                        described(self.world, read, seen),
-                        described(self.world, was, was_seen)
-                    ));
-                }
-                None => {
-                    // alloc: an error
-                    return Err(format!(
-                        "computed again, it made {} reads, where the entry recorded {}",
-                        trace.len(),
-                        self.entry.reads().len()
-                    ));
-                }
-            }
-        }
-        if stored.next().is_some() {
-            // alloc: an error
-            return Err(format!(
-                "computed again, it made {} reads, where the entry recorded {}",
-                trace.len(),
-                self.entry.reads().len()
-            ));
-        }
-        Ok(value)
-    }
+/// A read by its kind and key alone: what a world that does not name it gives, and what the
+/// kernel gives where it has no world.
+fn plain(read: Read<'_>) -> String {
+    // alloc: an error's or a check's text
+    format!("read {} of {}", read.kind.0, hex(read.key))
 }
 
 /// `bytes` in hex, at most 32 of them.

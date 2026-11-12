@@ -165,24 +165,33 @@ pub fn file_by_reads(
 
 /// The driver's store as `blaze_record` reads and writes a crate key's read-lists: each under
 /// its own key. What is filed by reads is looked for by the caller, under a key it is given.
-// dyn: the driver's store, as `find_by_reads` and `file_by_reads` are handed it
-struct Slots<'a>(&'a dyn ImageStore);
+/// `lookups` is where the searches through it are counted: its caller's, which reports them
+/// ([`super::Served::lookups`]).
+struct Slots<'a> {
+    // dyn: the driver's store, as `find_by_reads` and `file_by_reads` are handed it
+    store: &'a dyn ImageStore,
+    lookups: &'a blaze_record::Tally,
+}
 
 impl blaze_record::Store for Slots<'_> {
     type Held = ImageBuf;
     type Error = String;
 
     fn get(&self, _: blaze_record::Kind, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        self.0.get(key)
+        self.store.get(key)
     }
 
     fn put(&self, _: blaze_record::Kind, key: ContentId, bytes: &[u8]) -> Result<(), String> {
         // alloc: the slot's bytes, once per crate kept
-        self.0.put(key, bytes.to_vec())
+        self.store.put(key, bytes.to_vec())
     }
 
     fn bytes(held: &ImageBuf) -> &[u8] {
         held.bytes()
+    }
+
+    fn tally(&self) -> &blaze_record::Tally {
+        self.lookups
     }
 }
 
@@ -201,15 +210,20 @@ impl From<blaze_record::Error<String>> for Stopped {
 /// The first of `key`, then the filed key of each slot of `key` with its reads' values now, for
 /// which `found` gives `Some`: as [`super::serve`] looks for an image. `None` when none does. A
 /// slot that does not decode is an error naming the crate.
+///
+/// `lookups` counts the search of the slots (`blaze_record::walk`), for the caller to report:
+/// a value found under `key` alone is found before any slot is read and is no lookup there,
+/// and a slot's reads are one read of its list, valued as one hash.
 pub fn find_by_reads<T>(
     db: &Db,
     krate: Crate,
     key: ContentId,
     // dyn: the driver's store, one call per crate per session
     store: &dyn ImageStore,
+    lookups: &blaze_record::Tally,
     found: impl FnMut(ContentId) -> Result<Option<T>, String>,
 ) -> Result<Option<T>, String> {
-    Ok(search(db, krate, key, store, found)?.ok())
+    Ok(search(db, krate, key, store, lookups, found)?.ok())
 }
 
 /// [`find_by_reads`], and when nothing is found whether a slot of `key` holds reads: `Err(true)`
@@ -218,12 +232,18 @@ pub fn find_by_reads<T>(
 /// with the values found in the expansion log under `key` (`Files::expansions_are_read`), in
 /// place of what was served under `key` before: none when the value is under `key` alone or
 /// not found, so a value no longer served leaves no reads behind.
+///
+/// `lookups` counts the search of the slots (`blaze_record::walk`): a value found under `key`
+/// alone, the crate that read nothing, is found before any slot is read and is no lookup
+/// there. A slot's reads are one read of its list, valued as one hash ([`reads::write_list`]),
+/// so a read valued here is a whole set of names worked out again.
 pub(super) fn search<T>(
     db: &Db,
     krate: Crate,
     key: ContentId,
     // dyn: the driver's store, one call per crate per session
     store: &dyn ImageStore,
+    lookups: &blaze_record::Tally,
     mut found: impl FnMut(ContentId) -> Result<Option<T>, String>,
 ) -> Result<Result<T, bool>, String> {
     let served = |expansions: Vec<ExpansionRead>| {
@@ -238,7 +258,7 @@ pub(super) fn search<T>(
         return Ok(Ok(it));
     }
     let name = || krate.named(db);
-    let slots = Slots(store);
+    let slots = Slots { store, lookups };
     let visit = |at: blaze_record::Slot,
                  list: &[u8],
                  opened: blaze_record::ListRef<'_>|
@@ -252,6 +272,8 @@ pub(super) fn search<T>(
         })?;
         // alloc: a few names and hashes, once per slot read that holds expansions
         let mut expansions = Vec::new();
+        // The walk leaves the reads to its visitor: asked for here, whether or not they come.
+        lookups.valued(opened.len() as u64);
         let values = reads
             .values_now(db, krate, store, |shape, values| {
                 expansions.push(ExpansionRead::Traced { shape: shape.into(), values });
@@ -313,7 +335,13 @@ fn keep_reads(
     store: &dyn ImageStore,
 ) -> Result<Option<Refused>, String> {
     use blaze_record::Placed;
-    match blaze_record::Filing::new(key, reads::BOUNDS).place(&Slots(store), list) {
+    // A placing is no lookup, so it has nothing to count and nobody to report to: checked,
+    // so a placing that came to count something is seen here and not let go.
+    let placing = blaze_record::Tally::new();
+    let slots = Slots { store, lookups: &placing };
+    let placed = blaze_record::Filing::new(key, reads::BOUNDS).place(&slots, list);
+    debug_assert_eq!(placing.take(), blaze_record::Counts::default(), "a placing was counted");
+    match placed {
         Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(None),
         // The chain's bound: counted and named by the driver as this refusal of the crate.
         Ok(Placed::Full) => {

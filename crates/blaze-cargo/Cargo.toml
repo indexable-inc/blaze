@@ -122,6 +122,7 @@ blaze-cas.workspace = true
 blaze-gc.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-record.workspace = true
 blaze-kernel.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
