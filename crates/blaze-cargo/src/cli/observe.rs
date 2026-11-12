@@ -46,7 +46,8 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
                            | blaze debug locks [--build N] [--top N] [--json] \
                            | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS] \
-                           | blaze debug toolchain";
+                           | blaze debug toolchain \
+                           | blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
@@ -138,6 +139,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        Some("inspect") => inspect(words.collect()),
         Some("toolchain") => match words.next() {
             None => toolchain(),
             Some(word) => Err(Refusal::Usage(format!(
@@ -150,6 +152,93 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
+}
+
+/// `blaze debug inspect [--record]`: what the live daemon is doing, as one line of JSON
+/// (`crate::serve::inspect::Inspected`: each thread's spans and what it waits on, the plane's
+/// queued and running tasks, the lock and scheduler waits, memory, the longest waits first),
+/// asked of the daemon's inspect thread on its own socket, so it answers while every work
+/// thread is busy and while the loop is stuck. It starts no daemon. `--record` also has the
+/// daemon write a flight recording and names it (`recorded`).
+///
+/// `blaze debug inspect --read FILE [--trace OUT]`: a flight recording as one line of JSON
+/// (why it was written, what the daemon said, every thread's open spans), with its trace's
+/// length in place of the trace; `--trace OUT` writes the trace, a Chrome trace
+/// ui.perfetto.dev opens, to `OUT`. No daemon.
+fn inspect(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str =
+        "blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
+    let (mut record, mut read, mut trace) = (false, None, None);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let file = |words: &mut std::vec::IntoIter<String>| {
+            words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes a file")))
+        };
+        match word.as_str() {
+            "--record" => record = true,
+            "--read" => read = Some(file(&mut words)?),
+            "--trace" => trace = Some(file(&mut words)?),
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    match (read, trace, record) {
+        (Some(file), trace, false) => read_recording(Path::new(&file), trace.as_deref()),
+        (Some(_), _, true) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--record` asks a daemon, `--read` reads a file")))
+        }
+        (None, Some(_), _) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--trace` is of the recording `--read` names")))
+        }
+        (None, None, record) => inspect_daemon(record),
+    }
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn inspect_daemon(record: bool) -> Result<(), Refusal> {
+    use crate::serve::inspect::{self, Answer, Asked};
+    let daemon = blaze_api::client::socket().map_err(|why| Refusal::Failed(why.to_string()))?;
+    let asked = Asked { record, schema: inspect::SCHEMA };
+    match inspect::ask(&inspect::socket_of(&daemon), asked).map_err(Refusal::Failed)? {
+        Answer::Inspected(inspected) => {
+            let text = serde_json::to_string(&inspected).map_err(|error| {
+                Refusal::Failed(format!("`blaze debug inspect`'s answer as JSON: {error}"))
+            })?;
+            println!("{text}");
+            Ok(())
+        }
+        Answer::Refused(why) => Err(Refusal::Failed(why)),
+    }
+}
+
+#[cfg(not(all(unix, feature = "native")))]
+fn inspect_daemon(_record: bool) -> Result<(), Refusal> {
+    Err(Refusal::Failed(
+        "`blaze debug inspect` asks a daemon over a Unix socket, and this blaze has none (it is \
+         not a Unix build with the `native` feature)"
+            .to_owned(),
+    ))
+}
+
+/// The flight recording `file` as one line of JSON, its trace's length in place of its bytes;
+/// the trace written to `trace` when given.
+fn read_recording(file: &Path, trace: Option<&str>) -> Result<(), Refusal> {
+    use crate::serve::flightrec::Recording;
+    let failed = |what: String| Refusal::Failed(format!("{}: {what}", file.display()));
+    let bytes = std::fs::read(file).map_err(|error| failed(format!("reading it: {error}")))?;
+    let mut recording = Recording::decode(&bytes).map_err(|refused| failed(refused.to_string()))?;
+    let bytes = std::mem::take(&mut recording.trace);
+    let Ok(Value::Object(mut said)) = serde_json::to_value(&recording) else {
+        return Err(failed("its recording is no JSON object".to_owned()));
+    };
+    said.remove("trace");
+    said.insert("trace_bytes".to_owned(), Value::from(bytes.len()));
+    if let Some(out) = trace {
+        std::fs::write(out, &bytes)
+            .map_err(|error| failed(format!("writing its trace to {out}: {error}")))?;
+        said.insert("trace_written".to_owned(), Value::String(out.to_owned()));
+    }
+    println!("{}", Value::Object(said));
+    Ok(())
 }
 
 /// `blaze debug toolchain`: the three code identities this blaze keys what it stores by, as

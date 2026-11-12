@@ -291,6 +291,23 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 - If the build never ends, `open` holds the spans every thread was inside at the last flush,
   and `blaze slow` reports a build whose daemon died.
 
+## A daemon that hangs, stalls or dies
+
+- **While it lives:** `blaze debug inspect` prints one line of JSON from a thread and socket
+  of the daemon's own, so it answers when every worker is busy and when the loop is stuck:
+  `{"pid":..,"turn":{"turned":0,..},"tasks":[{"kind":..,"state":"running","awaits":..,"for_ms":..}],
+  "memory":{"footprint":..,"ceiling":..,"limit":..,"admission":"near"},"longest":[{"on":"key
+  infer(..)","who":"blaze-work-3","kind":"span","for_ms":41000}],"threads":[..],"job_waits":"..",
+  "lock_waits":[..]}`. Read `longest` first, then `turn.turned` (0: the loop does not turn),
+  then `job_waits` for jobs parked on fibers (they are on no thread). `--record` also writes a
+  flight recording and names it in `recorded`.
+- **After it went:** the command it hung up on names `its flight recording`:
+  `<state>/flightrec/<pid>-<unix ms>.cbor`, written on a panic outside a job, at the memory
+  ceiling, and on a stall of a build, the loop or a stop. `blaze debug inspect --read FILE`
+  prints why, what the daemon said and every thread's open spans; `--trace OUT` writes the
+  recorder's last two minutes as a Chrome trace. A fatal signal leaves no recording: read
+  `blaze explain problems` and `blaze slow`, which take its rows from `flight-<pid>.map`.
+
 ## Fixing the compiler without compiling the world again
 
 Everything stored is keyed by the code identity of what made it: `codegen` (every template),
