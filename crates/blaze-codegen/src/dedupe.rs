@@ -292,9 +292,114 @@ pub fn dedupe(
     dedupe_keeping(functions, statics, mergeable, None)
 }
 
+/// Each function key a function names, where [`names_any`] looks: its relocations, its data's
+/// and its unwind routine. A key may come more than once.
+fn named_keys(function: &CompiledFunction, mut each: impl FnMut(InstanceKey)) {
+    let mut target = |it: &Target| {
+        if let Target::Function(key) | Target::Direct(key) = it {
+            each(*key);
+        }
+    };
+    function.relocs.targets().iter().for_each(&mut target);
+    for datum in &function.data {
+        datum.relocs.targets().iter().for_each(&mut target);
+    }
+    if let Some(
+        Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. },
+    ) = &function.unwind
+    {
+        target(it);
+    }
+}
+
+/// The key `key` was merged into at last, following `kept` through every later round: each
+/// step goes to a lesser key, so the walk ends.
+fn resolved(key: InstanceKey, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> InstanceKey {
+    let mut at = key;
+    while let Some(next) = kept.get(&at) {
+        at = *next;
+    }
+    at
+}
+
+/// The end of a list in [`dedupe_keeping`]'s arrays of positions.
+const NONE: u32 = u32::MAX;
+
+/// Who names each function, by position: a list per function of the positions naming it,
+/// linked through one arena so that a merge hands the list of the function merged away to the
+/// one kept in a step.
+struct Callers {
+    head: Vec<u32>,
+    tail: Vec<u32>,
+    /// Each link: the position naming, and the next link.
+    links: Vec<(u32, u32)>,
+}
+
+impl Callers {
+    fn new(count: usize) -> Callers {
+        // alloc: per dedupe, two slots a function
+        Callers { head: vec![NONE; count], tail: vec![NONE; count], links: Vec::new() }
+    }
+
+    fn push(&mut self, named: u32, by: u32) {
+        let link = self.links.len() as u32;
+        self.links.push((by, NONE));
+        match self.tail[named as usize] {
+            NONE => self.head[named as usize] = link,
+            last => self.links[last as usize].1 = link,
+        }
+        self.tail[named as usize] = link;
+    }
+
+    /// Appends who names `from` to `out`, and hands them to `to`: once renamed they name it.
+    fn hand_over(&mut self, from: u32, to: u32, out: &mut Vec<u32>) {
+        let first = std::mem::replace(&mut self.head[from as usize], NONE);
+        let last = std::mem::replace(&mut self.tail[from as usize], NONE);
+        let mut at = first;
+        while at != NONE {
+            out.push(self.links[at as usize].0);
+            at = self.links[at as usize].1;
+        }
+        if first == NONE {
+            return;
+        }
+        match self.tail[to as usize] {
+            NONE => self.head[to as usize] = first,
+            end => self.links[end as usize].1 = first,
+        }
+        self.tail[to as usize] = last;
+    }
+}
+
+/// `functions` sorted by key as `sort_by_key` sorts them (stable: by key, then position), each
+/// moved once to its place rather than swapped about by the sort: a function is a few hundred
+/// bytes, its key and position a few dozen.
+fn sort_by_key(functions: &mut Vec<CompiledFunction>) {
+    if functions.is_sorted_by_key(|it| it.key) {
+        return;
+    }
+    // alloc: per sort, each function's key and position
+    let mut order: Vec<(InstanceKey, u32)> =
+        functions.iter().enumerate().map(|(at, it)| (it.key, at as u32)).collect();
+    order.sort_unstable();
+    // alloc: per sort, each function once, to be moved to its place
+    let mut slots: Vec<Option<CompiledFunction>> =
+        std::mem::take(functions).into_iter().map(Some).collect();
+    functions.extend(order.iter().map(|(_, at)| slots[*at as usize].take().expect("each once")));
+}
+
 /// [`dedupe`], which also gives `originals`, when asked, each function and static it changes
 /// or takes out as it was given ([`Originals`]): a copy of each renamed one, made before its
 /// first rename, and each merged one itself.
+///
+/// Each round looks only at what the round before changed: after a round every group of equal
+/// code IDs has one member left, so a new group holds at least one function whose ID changed
+/// (renamed last round); and only the callers of a function merged away are renamed, found by
+/// an index of who names whom. A round costs what it merges and renames, not the whole build
+/// (a chain of `n` links once took `n` passes over every function). The answer is the same as
+/// a pass over every function a round gives (`tests::reference`): the same groups merge in the
+/// same rounds, the functions renamed are renamed in the build's order, and the first
+/// [`DedupeError`] of a round is the same one.
 pub fn dedupe_keeping(
     functions: &mut Vec<CompiledFunction>,
     statics: &mut [Static],
@@ -302,16 +407,50 @@ pub fn dedupe_keeping(
     mut originals: Option<&mut Originals>,
 ) -> Result<(Deduped, Vec<usize>), DedupeError> {
     let candidate = |it: &CompiledFunction| candidate(it, mergeable(&it.key));
+    let count = functions.len();
+    assert!(count < NONE as usize, "a build of fewer than 2^32 - 1 functions");
     // The keys whose original is kept already: a function renamed in two rounds is copied
     // before the first.
     let mut copied: blaze_hash::HashSet<InstanceKey, Global> = blaze_hash::HashSet::new_in(Global);
-    // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
-    // Unordered: only grouped, and each group is sorted on its own.
-    let mut ids: HashMap<InstanceKey, ContentId, Global> = HashMap::new_in(Global);
-    for function in functions.iter().filter(|it| candidate(it)) {
-        ids.insert(function.key, code_id(function));
+    // Each key's position, its first in `functions`: what stands for the key below. A key
+    // twice in a build (never, from codegen) has its other positions by `same_key`.
+    let mut at_of: HashMap<InstanceKey, u32, Global> = HashMap::with_capacity_in(count, Global);
+    // alloc: per dedupe, one slot a function
+    let mut same_key: Vec<u32> = vec![NONE; count];
+    // Each candidate key's code ID, at its position: hashed once, and again only when a round
+    // renames it.
+    // alloc: per dedupe, one slot a function
+    let mut ids: Vec<Option<ContentId>> = vec![None; count];
+    // The positions whose code ID is new since the last round: every candidate in the first.
+    // alloc: per dedupe, the candidates, then each round's renamed
+    let mut fresh: Vec<u32> = Vec::new();
+    let mut candidates = 0;
+    for (at, function) in functions.iter().enumerate() {
+        let at = at as u32;
+        let first = *at_of.entry(function.key).or_insert(at);
+        if first != at {
+            let mut last = first;
+            while same_key[last as usize] != NONE {
+                last = same_key[last as usize];
+            }
+            same_key[last as usize] = at;
+        }
+        if candidate(function) {
+            if ids[first as usize].is_none() {
+                candidates += 1;
+                fresh.push(first);
+            }
+            ids[first as usize] = Some(code_id(function));
+        }
     }
-    let candidates = ids.len();
+    let mut callers = Callers::new(count);
+    for (at, function) in functions.iter().enumerate() {
+        named_keys(function, |key| {
+            if let Some(named) = at_of.get(&key) {
+                callers.push(*named, at as u32);
+            }
+        });
+    }
     let span = tracing::info_span!(
         target: "blaze",
         "codegen dedupe",
@@ -322,96 +461,175 @@ pub fn dedupe_keeping(
         bytes = tracing::field::Empty,
     );
     let _entered = span.enter();
-    // Unordered: `merged` is sorted as it is made.
+    // The one candidate holding each code ID once a round has merged its group: the member a
+    // later round's group of that ID starts from.
+    let mut holder: HashMap<ContentId, u32, Global> =
+        HashMap::with_capacity_in(candidates, Global);
+    // alloc: per dedupe, one flag a function
+    let mut gone = vec![false; count];
+    // Each function merged away with the one it was merged into in its round; [`resolved`]
+    // follows later rounds. Unordered: `merged` is sorted as it is made.
     let mut kept: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
     let (mut rounds, mut bytes) = (0u32, 0u64);
     let mut last = None;
-    loop {
+    // alloc: per dedupe, reused by every round: its groups' members and who it may rename
+    let mut members: Vec<(ContentId, InstanceKey, u32)> = Vec::new();
+    let mut renaming: Vec<u32> = Vec::new();
+    let result = loop {
         rounds += 1;
         if rounds as usize > candidates + 1 {
             let none = InstanceKey(ContentId::default());
             let merging = last.unwrap_or((none, none));
-            return Err(DedupeError::NoFixpoint { rounds: rounds - 1, candidates, merging });
+            break Err(DedupeError::NoFixpoint { rounds: rounds - 1, candidates, merging });
         }
-        // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
-        let mut groups: HashMap<ContentId, Vec<InstanceKey>, Global> = HashMap::new_in(Global);
-        for (key, id) in &ids {
-            groups.entry(*id).or_default().push(*key);
-        }
-        let mut more: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
-        for mut keys in groups.into_values().filter(|it| it.len() > 1) {
-            keys.sort();
-            let first = keys[0];
-            more.extend(keys[1..].iter().map(|key| (*key, first)));
-        }
-        if more.is_empty() {
-            break;
-        }
-        last = more.iter().min().map(|(from, to)| (*from, *to));
-        match originals.as_deref_mut() {
-            None => functions.retain(|it| {
-                let gone = more.contains_key(&it.key);
-                bytes += if gone { it.code.len() as u64 } else { 0 };
-                !gone
-            }),
-            Some(originals) => {
-                // alloc: per round that merges, the functions it keeps
-                let mut stay = Vec::with_capacity(functions.len());
-                for it in std::mem::take(functions) {
-                    if !more.contains_key(&it.key) {
-                        stay.push(it);
-                        continue;
-                    }
-                    bytes += it.code.len() as u64;
-                    // Renamed in a round before: its original is kept already.
-                    if copied.insert(it.key) {
-                        originals.functions.push(it);
-                    }
-                }
-                *functions = stay;
+        // The round's groups, sorted by code ID and then key: each ID that changed, with the
+        // one holding it (whose own ID did not change, or it would not hold it any more).
+        members.clear();
+        for at in fresh.drain(..) {
+            let Some(id) = ids[at as usize] else { continue };
+            members.push((id, functions[at as usize].key, at));
+            if let Some(held) = holder.get(&id) {
+                members.push((id, functions[*held as usize].key, *held));
             }
         }
-        for key in more.keys() {
-            ids.remove(key);
+        members.sort_unstable();
+        members.dedup();
+        let mut more: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
+        // Each merge of the round by position: the one merged away and the one kept.
+        // alloc: per round, its merges
+        let mut merges: Vec<(u32, u32)> = Vec::new();
+        for group in members.chunk_by(|a, b| a.0 == b.0) {
+            let (id, first, first_at) = group[0];
+            holder.insert(id, first_at);
+            for (_, key, at) in &group[1..] {
+                more.insert(*key, first);
+                merges.push((*at, first_at));
+            }
         }
-        for to in kept.values_mut() {
-            *to = renamed(to, &more);
+        if more.is_empty() {
+            break Ok(());
+        }
+        last = more.iter().min().map(|(from, to)| (*from, *to));
+        renaming.clear();
+        for (from, to) in merges {
+            let mut at = from;
+            while at != NONE {
+                gone[at as usize] = true;
+                bytes += functions[at as usize].code.len() as u64;
+                at = same_key[at as usize];
+            }
+            ids[from as usize] = None;
+            callers.hand_over(from, to, &mut renaming);
         }
         kept.extend(more.iter().map(|(from, to)| (*from, *to)));
-        for function in functions.iter_mut() {
+        // In the build's order, as a pass over every function renames them.
+        renaming.sort_unstable();
+        renaming.dedup();
+        let mut failed = None;
+        for at in &renaming {
+            if gone[*at as usize] {
+                continue;
+            }
+            let function = &mut functions[*at as usize];
             let before = match originals.is_some() && !copied.contains(&function.key) {
                 // clone: a function as it was given, when this round may rename it and its
                 // original is kept; dropped when the round leaves it as it is
                 true if names_any(function, &more) => Some(function.clone()),
                 _ => None,
             };
-            let changed = rename(function, &more)?;
+            let changed = match rename(function, &more) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            };
             if let (true, Some(before), Some(originals)) = (changed, before, originals.as_deref_mut())
             {
                 copied.insert(before.key);
                 originals.functions.push(before);
             }
-            if changed && ids.contains_key(&function.key) {
-                ids.insert(function.key, code_id(function));
+            let first = at_of[&function.key];
+            if changed && let Some(old) = ids[first as usize] {
+                if holder.get(&old) == Some(&first) {
+                    holder.remove(&old);
+                }
+                ids[first as usize] = Some(code_id(function));
+                fresh.push(first);
             }
         }
+        if let Some(error) = failed {
+            break Err(error);
+        }
+        // A key is renamed twice in a round only when it is twice in the build.
+        fresh.sort_unstable();
+        fresh.dedup();
+    };
+    // The functions merged away leave `functions`, and those left are put in key order, the
+    // order a stable sort gives: by key, then by position.
+    // alloc: per dedupe, the order of those left
+    let mut order: Vec<(InstanceKey, u32)> = Vec::with_capacity(count);
+    // alloc: per dedupe, each function once, to be moved to its place
+    let mut slots: Vec<Option<CompiledFunction>> = Vec::with_capacity(count);
+    for (at, it) in std::mem::take(functions).into_iter().enumerate() {
+        if !gone[at] {
+            order.push((it.key, at as u32));
+            slots.push(Some(it));
+            continue;
+        }
+        slots.push(None);
+        // Renamed in a round before it was merged: its original is kept already.
+        if let Some(originals) = originals.as_deref_mut()
+            && copied.insert(it.key)
+        {
+            originals.functions.push(it);
+        }
     }
+    // Those left go back by key, the order a stable sort gives (by key, then position), once
+    // every rename is done; in their own order when one fails, as a pass a round left them.
+    let mut place = |functions: &mut Vec<CompiledFunction>, by_key: bool| {
+        if by_key {
+            order.sort_unstable();
+        }
+        functions.reserve_exact(order.len());
+        functions
+            .extend(order.iter().map(|(_, at)| slots[*at as usize].take().expect("each once")));
+    };
+    if let Err(error) = result {
+        place(functions, false);
+        return Err(error);
+    }
+    // Each merged key named by the one its last round kept, as the rounds renamed them.
+    let kept: HashMap<InstanceKey, InstanceKey, Global> = {
+        let mut resolved_kept = HashMap::with_capacity_in(kept.len(), Global);
+        for from in kept.keys() {
+            resolved_kept.insert(*from, resolved(*from, &kept));
+        }
+        resolved_kept
+    };
     let mut renamed_statics = Vec::new(); // alloc: per build, the few statics that name a merged function
     for (at, value) in statics.iter_mut().enumerate() {
         // clone: a static as it was given, when its original is kept and it may be renamed
         let before = (originals.is_some() && static_names_any(value, &kept)).then(|| value.clone());
-        if rename_static(value, &kept)? {
+        let renamed = match rename_static(value, &kept) {
+            Ok(renamed) => renamed,
+            Err(error) => {
+                place(functions, false);
+                return Err(error);
+            }
+        };
+        if renamed {
             renamed_statics.push(at);
             if let (Some(before), Some(originals)) = (before, originals.as_deref_mut()) {
                 originals.statics.push(before);
             }
         }
     }
+    place(functions, true);
     if let Some(originals) = originals {
-        originals.functions.sort_by_key(|it| it.key);
+        sort_by_key(&mut originals.functions);
         originals.statics.sort_by_key(|it| (it.item, it.instance));
     }
-    functions.sort_by_key(|it| it.key);
     span.record("folded", kept.len()).record("rounds", rounds).record("bytes", bytes);
     // alloc: the build's answer, sorted once as it is made
     Ok((Deduped { merged: kept.into_iter().collect(), rounds, bytes }, renamed_statics))
@@ -782,5 +1000,302 @@ mod tests {
         assert_eq!(deduped.rounds, 32);
         assert_eq!(deduped.bytes, 1 + 30 * 6);
         assert_eq!(functions.len(), 31);
+    }
+
+
+    /// The dedupe this module had before rounds looked only at what changed: a pass over every
+    /// function a round. Kept to check the worklist against, on random builds.
+    fn reference(
+        functions: &mut Vec<CompiledFunction>,
+        statics: &mut [Static],
+        mergeable: impl Fn(&InstanceKey) -> bool,
+        mut originals: Option<&mut Originals>,
+    ) -> Result<(Deduped, Vec<usize>), DedupeError> {
+        let candidate = |it: &CompiledFunction| candidate(it, mergeable(&it.key));
+        // The keys whose original is kept already: a function renamed in two rounds is copied
+        // before the first.
+        let mut copied: blaze_hash::HashSet<InstanceKey, Global> = blaze_hash::HashSet::new_in(Global);
+        // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
+        // Unordered: only grouped, and each group is sorted on its own.
+        let mut ids: HashMap<InstanceKey, ContentId, Global> = HashMap::new_in(Global);
+        for function in functions.iter().filter(|it| candidate(it)) {
+            ids.insert(function.key, code_id(function));
+        }
+        let candidates = ids.len();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "codegen dedupe",
+            functions = functions.len(),
+            candidates,
+            folded = tracing::field::Empty,
+            rounds = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        // Unordered: `merged` is sorted as it is made.
+        let mut kept: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
+        let (mut rounds, mut bytes) = (0u32, 0u64);
+        let mut last = None;
+        loop {
+            rounds += 1;
+            if rounds as usize > candidates + 1 {
+                let none = InstanceKey(ContentId::default());
+                let merging = last.unwrap_or((none, none));
+                return Err(DedupeError::NoFixpoint { rounds: rounds - 1, candidates, merging });
+            }
+            // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
+            let mut groups: HashMap<ContentId, Vec<InstanceKey>, Global> = HashMap::new_in(Global);
+            for (key, id) in &ids {
+                groups.entry(*id).or_default().push(*key);
+            }
+            let mut more: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
+            for mut keys in groups.into_values().filter(|it| it.len() > 1) {
+                keys.sort();
+                let first = keys[0];
+                more.extend(keys[1..].iter().map(|key| (*key, first)));
+            }
+            if more.is_empty() {
+                break;
+            }
+            last = more.iter().min().map(|(from, to)| (*from, *to));
+            match originals.as_deref_mut() {
+                None => functions.retain(|it| {
+                    let gone = more.contains_key(&it.key);
+                    bytes += if gone { it.code.len() as u64 } else { 0 };
+                    !gone
+                }),
+                Some(originals) => {
+                    // alloc: per round that merges, the functions it keeps
+                    let mut stay = Vec::with_capacity(functions.len());
+                    for it in std::mem::take(functions) {
+                        if !more.contains_key(&it.key) {
+                            stay.push(it);
+                            continue;
+                        }
+                        bytes += it.code.len() as u64;
+                        // Renamed in a round before: its original is kept already.
+                        if copied.insert(it.key) {
+                            originals.functions.push(it);
+                        }
+                    }
+                    *functions = stay;
+                }
+            }
+            for key in more.keys() {
+                ids.remove(key);
+            }
+            for to in kept.values_mut() {
+                *to = renamed(to, &more);
+            }
+            kept.extend(more.iter().map(|(from, to)| (*from, *to)));
+            for function in functions.iter_mut() {
+                let before = match originals.is_some() && !copied.contains(&function.key) {
+                    // clone: a function as it was given, when this round may rename it and its
+                    // original is kept; dropped when the round leaves it as it is
+                    true if names_any(function, &more) => Some(function.clone()),
+                    _ => None,
+                };
+                let changed = rename(function, &more)?;
+                if let (true, Some(before), Some(originals)) = (changed, before, originals.as_deref_mut())
+                {
+                    copied.insert(before.key);
+                    originals.functions.push(before);
+                }
+                if changed && ids.contains_key(&function.key) {
+                    ids.insert(function.key, code_id(function));
+                }
+            }
+        }
+        let mut renamed_statics = Vec::new(); // alloc: per build, the few statics that name a merged function
+        for (at, value) in statics.iter_mut().enumerate() {
+            // clone: a static as it was given, when its original is kept and it may be renamed
+            let before = (originals.is_some() && static_names_any(value, &kept)).then(|| value.clone());
+            if rename_static(value, &kept)? {
+                renamed_statics.push(at);
+                if let (Some(before), Some(originals)) = (before, originals.as_deref_mut()) {
+                    originals.statics.push(before);
+                }
+            }
+        }
+        if let Some(originals) = originals {
+            originals.functions.sort_by_key(|it| it.key);
+            originals.statics.sort_by_key(|it| (it.item, it.instance));
+        }
+        functions.sort_by_key(|it| it.key);
+        span.record("folded", kept.len()).record("rounds", rounds).record("bytes", bytes);
+        // alloc: the build's answer, sorted once as it is made
+        Ok((Deduped { merged: kept.into_iter().collect(), rounds, bytes }, renamed_statics))
+    }
+
+    /// A random build: functions of few codes calling each other (directly, through their
+    /// address, from a vtable and as a personality), some not mergeable, some covered, and
+    /// statics pointing at them.
+    fn random_build(seed: u64) -> (Vec<CompiledFunction>, Vec<Static>, u8) {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below.max(1)
+        };
+        let count = 2 + next(60) as u8;
+        let codes = 1 + next(5) as u8;
+        let mut functions = Vec::new();
+        for n in 1..=count {
+            let calls: Vec<u8> = (0..next(4)).map(|_| 1 + next(count as u64) as u8).collect();
+            let mut it = function(n, next(codes as u64) as u8, &calls);
+            if next(4) == 0 {
+                let callee = 1 + next(count as u64) as u8;
+                let target = match next(2) {
+                    0 => Target::Function(key(callee)),
+                    _ => Target::Direct(key(callee)),
+                };
+                let table = Data::new(8, vec![0; 8], vec![abs64(0, target)].into());
+                // A datum naming the one before it, as a vtable's holder does.
+                if next(2) == 0 {
+                    let outer =
+                        Data::new(8, vec![1; 8], vec![abs64(0, Target::Data(table.id))].into());
+                    it.data.push(table);
+                    it.data.push(outer);
+                } else {
+                    it.data.push(table);
+                }
+            }
+            if next(6) == 0 {
+                it.unwind = Some(Unwind::Dwarf {
+                    code_align: 1,
+                    data_align: -8,
+                    return_address: 16,
+                    cie: Vec::new(),
+                    fde: Vec::new(),
+                    personality: Some(Target::Direct(key(1 + next(count as u64) as u8))),
+                    lsda: None,
+                });
+            }
+            if next(12) == 0 {
+                it.coverage =
+                    Some(crate::Covered { counters: 1, flags: 0, guards: 0, pcs: vec![(0, 1)] });
+            }
+            functions.push(it);
+        }
+        // A datum naming a later one now and then: refused, by both alike.
+        // Two of them, so which is refused first is checked too.
+        // Both name one callee, so they are refused in one round.
+        let callee = 1 + next(count as u64) as u8;
+        for _ in 0..2 {
+            if next(3) == 0 {
+                let at = next(count as u64) as usize;
+                let inner =
+                    Data::new(8, vec![3; 8], vec![abs64(0, Target::Direct(key(callee)))].into());
+                let outer =
+                    Data::new(8, vec![4; 8], vec![abs64(0, Target::Data(inner.id))].into());
+                functions[at].data = vec![outer, inner];
+            }
+        }
+        let statics = (0..next(4) as u8)
+            .map(|n| {
+                let callee = 1 + next(count as u64) as u8;
+                crate::Static {
+                    init: crate::Init::Bytes {
+                        bytes: vec![0; 8],
+                        relocs: vec![abs64(0, Target::Function(key(callee)))].into(),
+                    },
+                    data: Vec::new(),
+                    ..holder(200 + n)
+                }
+            })
+            .collect();
+        // A key twice now and then, which codegen never makes: both agree on it all the same.
+        if next(15) == 0 {
+            let mut twice = functions[next(count as u64) as usize].clone();
+            if next(2) == 0 {
+                twice.code = vec![next(codes as u64) as u8];
+            }
+            functions.push(twice);
+        }
+        // Shuffled, so the build's order is not the keys'.
+        let len = functions.len();
+        let step = [1usize, 7, 11, 13][next(4) as usize];
+        let functions = if len % step == 0 {
+            functions
+        } else {
+            (0..len).map(|at| functions[at * step % len].clone()).collect()
+        };
+        let pinned = 1 + next(count as u64) as u8;
+        (functions, statics, pinned)
+    }
+
+    /// A function kept in one round for two merged away, with callers of each, and merged in
+    /// turn in the next: the callers it took over from both are renamed again.
+    #[test]
+    fn callers_taken_over_twice_follow_a_later_merge() {
+        let make = || {
+            vec![
+                function(1, 0x77, &[11]),
+                function(2, 0x77, &[10]),
+                function(3, 0x77, &[10]),
+                function(4, 0x77, &[10]),
+                function(5, 0xcc, &[3]),
+                function(6, 0xcd, &[4]),
+                function(10, 0x90, &[]),
+                function(11, 0x90, &[]),
+            ]
+        };
+        let (mut ours, mut theirs) = (make(), make());
+        let got = run(&mut ours, |_| true);
+        let want = reference(&mut theirs, &mut [], |_| true, None).unwrap().0;
+        assert_eq!(got, want);
+        assert_eq!(ours, theirs);
+        assert_eq!(got.merged.get(&key(2)), Some(&key(1)));
+        for function in &ours {
+            assert!(!names_any(function, &got.merged.iter().map(|(a, b)| (*a, *b)).collect()));
+        }
+    }
+
+    /// The worklist gives what a pass over every function a round gave, on thousands of random
+    /// builds: the same merges, rounds and bytes, functions, statics, originals and errors.
+    #[test]
+    fn the_worklist_agrees_with_a_pass_over_every_function() {
+        let (mut merged_some, mut refused) = (0, 0);
+        for seed in 0..3000u64 {
+            let (functions, statics, pinned) = random_build(seed);
+            let mergeable = |it: &InstanceKey| *it != key(pinned);
+            for keeping in [false, true] {
+                let (mut ours, mut our_statics, mut our_originals) =
+                    (functions.clone(), statics.clone(), Originals::default());
+                let (mut theirs, mut their_statics, mut their_originals) =
+                    (functions.clone(), statics.clone(), Originals::default());
+                let got = dedupe_keeping(
+                    &mut ours,
+                    &mut our_statics,
+                    mergeable,
+                    keeping.then_some(&mut our_originals),
+                );
+                let want = reference(
+                    &mut theirs,
+                    &mut their_statics,
+                    mergeable,
+                    keeping.then_some(&mut their_originals),
+                );
+                match &want {
+                    Ok((deduped, _)) => merged_some += usize::from(!deduped.merged.is_empty()),
+                    Err(_) => refused += 1,
+                }
+                assert_eq!(got, want, "seed {seed}, keeping {keeping}");
+                assert_eq!(ours, theirs, "seed {seed}, keeping {keeping}");
+                if let Ok((deduped, _)) = &got {
+                    let merged: HashMap<InstanceKey, InstanceKey, Global> =
+                        deduped.merged.iter().map(|(a, b)| (*a, *b)).collect();
+                    assert!(ours.iter().all(|it| !names_any(it, &merged)), "seed {seed}");
+                }
+                if want.is_ok() {
+                    assert_eq!(our_statics, their_statics, "seed {seed}");
+                    assert_eq!(our_originals.functions, their_originals.functions, "seed {seed}");
+                    assert_eq!(our_originals.statics, their_originals.statics, "seed {seed}");
+                }
+            }
+        }
+        assert!(merged_some > 1000, "the random builds merge: {merged_some}");
+        assert!(refused > 100, "and some are refused: {refused}");
     }
 }
