@@ -259,6 +259,15 @@ const PLUMBING: &[&str] = &[
     // The global allocator's shims, as blaze names them (`__blaze_global_alloc`, `_zeroed`,
     // `_realloc`): every Rust allocation of a blaze-built daemon passes through one.
     "blaze_engine::__blaze_global",
+    // The same shims as rustc's own mangling names them in a binary the system linker made
+    // (`__rustc::__rust_alloc`, `_zeroed`, `_realloc`), and C's entry points, which blaze
+    // exports on Linux (`malloc.rs`): their caller is the site.
+    "__rustc::",
+    "malloc",
+    "calloc",
+    "realloc",
+    "posix_memalign",
+    "aligned_alloc",
     "_Unwind_",
     "__rust_",
     "__rdl_",
@@ -318,6 +327,15 @@ mod tests {
         ];
         assert_eq!(site(stack.into_iter()), Some("hir_ty_mir::lower::body"));
         assert_eq!(site(["__rust_alloc", "alloc::alloc::alloc"].into_iter()), None);
+        // A binary cargo built: rustc's own names for the shims, and the counting allocator's
+        // `GlobalAlloc` impl as a trait path.
+        let cargo_built = [
+            "<blaze_graph::arena::Counting<blaze_engine::heaps::Heaps> as core::alloc::global::GlobalAlloc>::realloc",
+            "__rustc::__rust_realloc",
+            "<blaze_query::db::reverse::Reverse>::add",
+        ];
+        assert_eq!(site(cargo_built.into_iter()), Some("<blaze_query::db::reverse::Reverse>::add"));
+        assert_eq!(site(["malloc", "llvm::SmallVectorBase::grow_pod"].into_iter()), Some("llvm::SmallVectorBase::grow_pod"));
     }
 
     /// A sample put is read back whole, once, and a ring written past a reader's place loses
