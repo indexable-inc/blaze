@@ -59,6 +59,7 @@ real! {
     a_comment_edit_remakes_nothing
     a_dependency_edit_reaches_only_what_uses_it
     a_feature_flip_follows_the_cfg
+    a_panic_under_the_launcher_names_its_frames
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole
     a_signature_change_remakes_the_callers

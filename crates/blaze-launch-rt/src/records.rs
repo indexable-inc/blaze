@@ -81,7 +81,16 @@ pub struct Loaded {
     bodies: BTreeMap<u64, Body>,
     /// One datum's or static's bytes on their way into the data mapping.
     scratch: Vec<u8>,
+    /// Where the program's backtraces find the names of placed code (`symbols`): made when
+    /// the first body is placed, which is when the code mapping's address is first told.
+    symbols: Names,
 }
+
+#[cfg(target_os = "linux")]
+type Names = Option<crate::symbols::Symbols>;
+/// Not built on macOS: its standard library asks dyld's image list (`symbols`).
+#[cfg(not(target_os = "linux"))]
+type Names = ();
 
 // SAFETY: the raw pointers in `statics` are to `tls::Var`s this value leaked: plain data
 // that lives as long as the process and is never written again, so they may be read from
@@ -113,6 +122,7 @@ impl Loaded {
             thread_locals: 0,
             bodies: BTreeMap::new(),
             scratch: Vec::new(), // alloc: as above
+            symbols: Names::default(),
         })
     }
 
@@ -272,6 +282,10 @@ fn own(name: &str) -> Option<u64> {
         // The program's threads are started through the launcher, which tells the core of
         // each before it runs (`threads`).
         "pthread_create" => Some(crate::threads::create as *const () as u64),
+        // The images of the process, with the launcher's code as one more: where the
+        // program's backtraces find the names of its own functions (`symbols`).
+        #[cfg(target_os = "linux")]
+        "dl_iterate_phdr" => Some(crate::symbols::iterate as *const () as u64),
         _ => None,
     }
 }
@@ -373,7 +387,7 @@ impl Records for Loaded {
         at: Place,
         into: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let Loaded { held, data, placed, statics, externs, bodies, scratch, .. } = self;
+        let Loaded { held, data, placed, statics, externs, bodies, scratch, symbols, .. } = self;
         let record = Loaded::held(held, &bind.record)?;
         let pool = place::pool(&record, KEPT).map_err(|why| format!("`{}`: {why}", record.name))?;
         if pool.len != bind.len {
@@ -405,6 +419,17 @@ impl Records for Loaded {
                 Some((address, fde))
             }
         };
+        // Named before it is placed: a backtrace can only ask once a thread is in it.
+        #[cfg(target_os = "linux")]
+        {
+            let symbols = match symbols {
+                Some(symbols) => symbols,
+                none => none.insert(crate::symbols::Symbols::new(at.words as usize, crate::drive::REACH as usize)?),
+            };
+            symbols.add(at.at - at.words, bind.len, record.name)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let () = *symbols;
         let body = Body { len: bind.len, name: record.name.into(), frame, registered: false };
         bodies.insert(at.at, body);
         Ok(())
