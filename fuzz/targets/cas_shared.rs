@@ -496,7 +496,7 @@ pub(crate) fn sim() -> Sim {
 }
 
 pub(crate) fn config() -> Config {
-    Config { dir: FileName::new(DIR).expect("the store's directory"), layers: Vec::new(), tags: 0 }
+    Config { dir: FileName::new(DIR).expect("the store's directory"), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: blaze_cas::Loader::Pumped }
 }
 
 /// Runs what the store asked for, handing it each completion, until nothing is in flight.

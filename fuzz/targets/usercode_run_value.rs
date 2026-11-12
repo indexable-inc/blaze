@@ -50,6 +50,7 @@ fn seeds() -> Vec<Vec<u8>> {
         path: path.into(),
         executable,
         bytes: bytes.map(<[u8]>::to_vec),
+        link: None,
     };
     [
         Value {

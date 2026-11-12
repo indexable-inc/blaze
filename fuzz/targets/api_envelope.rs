@@ -209,6 +209,7 @@ fn targets(cargo: bool) -> Targets {
         }),
         target: Some("x86_64-unknown-linux-gnu".to_owned()),
         profile: "dev".to_owned(),
+        goal: cargo.then_some(blaze_api::Goal::Max),
         features: vec!["std".to_owned()],
         packages: vec!["blaze".to_owned()],
         all_features: false,
@@ -237,6 +238,7 @@ fn unit_of() -> UnitOf {
         doctest: false,
         package_id: "path+file:///w#a@0.1.0".to_owned(),
         manifest_path: "/w/Cargo.toml".to_owned(),
+        primary: true,
     }
 }
 
@@ -401,6 +403,22 @@ fn seeds() -> Vec<Vec<u8>> {
             critical_path_us: u64::MAX,
             steps_us: vec![(blaze_api::NodeKind::Codegen, u64::MAX)],
             placed: blaze_api::PlacedBytes { cloned: u64::MAX, written: 1, copied: 0 },
+            why: Some(vec![blaze_api::Report::text("a body changed", Some("a".to_owned()))]),
+            tiers: Some(blaze_api::Tiers {
+                goal: blaze_api::Goal::Edit,
+                optimized: 38,
+                functions: u64::MAX,
+            }),
+            storage: Some(blaze_api::Storage {
+                store_bytes: u64::MAX,
+                store_delta_bytes: i64::MIN,
+                held_bytes: 1 << 30,
+                budget_bytes: 1 << 31,
+                collectable_bytes: 0,
+                volume_free_bytes: 1,
+                over_budget: true,
+                warning: Some("the store is at 90% of its budget".to_owned()),
+            }),
         }),
         Response::TestResult(TestResult {
             name: "tests::a".to_owned(),
@@ -472,6 +490,7 @@ fn seeds() -> Vec<Vec<u8>> {
             builds: Vec::new(),
             downloads: Vec::new(),
             settings: Vec::new(),
+            placed_by: Some("by cloning: its file system shares blocks".to_owned()),
         }),
         Response::Status(Status {
             pid: 1,
@@ -492,6 +511,7 @@ fn seeds() -> Vec<Vec<u8>> {
             builds: Vec::new(),
             downloads: Vec::new(),
             settings: vec![blaze_api::Setting { name: "BLAZE_CORES".to_owned(), value: None }],
+            placed_by: None,
         }),
         Response::Explored { link: "https://ix.dev/explore#x".to_owned() },
         Response::Profiled { trace: b"{}".to_vec() },
