@@ -743,6 +743,47 @@ mod tests {
         });
     }
 
+    /// The page walk names a tag's blocks where they are: blocks made for a tag show in its
+    /// pages as committed and used bytes of at least their sizes, and once they are freed and
+    /// the thread collected, the tag's used bytes fall by them. On a tag no other test of this
+    /// binary allocates for, on one thread. The cause, by removing it: a walk that read
+    /// another field for `used` (mimalloc 2's `mi_heap_area_t` has no `full_block_size`)
+    /// fails the first bound.
+    #[test]
+    fn the_page_walk_counts_a_tags_live_blocks_and_sees_them_go() {
+        const BLOCK: usize = 1 << 10;
+        const BLOCKS: usize = 4 << 10; // 4 MiB
+        let of = |tag: Tag| {
+            let mut all = [blaze_mem::tag::HeapPages::default(); Tag::COUNT + 1];
+            pages(&mut all);
+            all[tag.index()]
+        };
+        std::thread::spawn(move || {
+            let before = of(Tag::Fuzz);
+            let blocks: Vec<Sent> = (0..BLOCKS)
+                .map(|_| {
+                    // SAFETY: a valid layout; each block is freed below, once, with it.
+                    let block = unsafe { Heaps.alloc_for(Tag::Fuzz, layout(BLOCK), false) };
+                    assert!(!block.is_null());
+                    Sent(block, ptr::null_mut())
+                })
+                .collect();
+            let held = of(Tag::Fuzz);
+            let made = (BLOCK * BLOCKS) as u64;
+            assert!(held.used >= before.used + made, "{before:?} then {held:?}");
+            assert!(held.committed >= held.used && held.pages > before.pages, "{held:?}");
+            for block in blocks {
+                // SAFETY: a live block made above with this layout, freed once.
+                unsafe { Heaps.dealloc(block.0, layout(BLOCK)) };
+            }
+            give_back_here(blaze_mem::tag::heap_give_backs());
+            let after = of(Tag::Fuzz);
+            assert!(after.used + made <= held.used, "{held:?} then {after:?}");
+        })
+        .join()
+        .expect("the walking thread");
+    }
+
     /// [`PURGE_DELAY`] is the option `purge_at_once` means: it reads mimalloc's default for
     /// `purge_delay`, which neither neighbour in `mi_option_e` has (`eager_commit_delay` is 1
     /// and `use_numa_nodes` 0). No test of this binary sets it, since those above measure what

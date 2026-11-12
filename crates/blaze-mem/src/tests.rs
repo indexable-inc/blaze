@@ -1322,6 +1322,42 @@ fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
     .expect("the task's thread");
 }
 
+/// An idle daemon's ask reaches each thread once: a thread that kept frames warm gives them
+/// back as it next settles ([`frame::settle_spare`], what a pool worker does as it parks) and
+/// not again until asked again, and what it warms after is kept until the next ask. On threads
+/// of their own; the ask is the process's, so each thread is held only to what it does after an
+/// ask it saw. The cause, tested by removing it: without the ask, `settle_spare` trims nothing
+/// and the shelf stays warm (the first assertion after `warm`).
+#[test]
+fn a_thread_gives_its_warm_frames_back_once_an_idle_daemon_asked() {
+    fn warm() -> usize {
+        frame::task(Tag::Codegen, |frame| {
+            for _ in 0..64 {
+                frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+            }
+        });
+        frame::spare_bytes()
+    }
+    thread::spawn(|| {
+        // Whatever was asked before this thread began is answered with nothing warm.
+        frame::settle_spare();
+        assert!(warm() > 0, "a task leaves its thread's shelf warm");
+        // Another test's ask may land between any two lines here: settle until this thread
+        // has answered every ask so far, then warm again and see no trim without an ask.
+        while frame::settle_spare() {}
+        let kept = warm();
+        assert!(kept > 0);
+        if !frame::settle_spare() {
+            assert_eq!(frame::spare_bytes(), kept, "nobody asked: the shelf stays warm");
+        }
+        frame::ask_spare_trim();
+        assert!(frame::settle_spare(), "an ask this thread has not answered");
+        assert_eq!(frame::spare_bytes(), 0, "the asked thread keeps nothing warm");
+    })
+    .join()
+    .expect("the thread");
+}
+
 /// A task of a build-shaped run: scratch of a drawn size (a few KB, a few MB or tens of MB),
 /// read back, with up to `depth` tasks inside it that run while it still holds its own.
 /// Returns the most one task of it asked for.
