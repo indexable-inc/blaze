@@ -403,6 +403,38 @@ fn the_oracle_catches_a_stale_store_entry() {
     assert!(!found.is_empty(), "the oracle found nothing in a build that took `shown` of before the edit from the store");
 }
 
+/// The key `name`'s kernel entry has in a clean build of each revision of `case`, the last
+/// revision built first: each in a database of its own, so a key two revisions share is
+/// shared by what the key is made of, not by anything one build left for the next. Run
+/// alone, it is one process.
+fn keys_of(case: &str, name: &str) -> Vec<blaze_cas::Key> {
+    let test = Test::read(&spec::cases(), case);
+    let mut keys: Vec<blaze_cas::Key> = (0..test.revisions.len())
+        .rev()
+        .map(|index| {
+            let text = text_at(&test, index);
+            let (mut db, file) = database(&fixture(&text));
+            db.set_file_text(file, &text);
+            let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
+            let (instance, _) = built.debug_names.iter().find(|(_, it)| it == name).unwrap_or_else(|| panic!("no `{name}` is built"));
+            built.kernel.iter().find(|entry| entry.instance == *instance).expect("its kernel entry").key
+        })
+        .collect();
+    keys.reverse();
+    keys
+}
+
+/// What the oracle's first finding is of: whether `shapes`, which coerces `&B` to
+/// `&dyn Shape`, has one key before and after `B` overrides the provided `sides`.
+#[test]
+#[ignore = "a diagnosis: prints the keys"]
+fn the_keys_of_the_coercion_site_before_and_after_the_override() {
+    let keys = keys_of("an_override_beside_a_required_method_changes_the_vtable", "app::shapes");
+    eprintln!("app::shapes: {keys:?}; the same: {}", keys[0] == keys[1]);
+    let keys = keys_of("an_impl_overriding_a_provided_method_changes_its_vtable", "app::all");
+    eprintln!("app::all (the case that passes): {keys:?}; the same: {}", keys[0] == keys[1]);
+}
+
 macro_rules! sim {
     ($($name:ident)*) => {
         $(
