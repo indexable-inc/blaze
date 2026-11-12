@@ -1124,7 +1124,7 @@ pub fn invocation(
         // clone: cargo's own invocation, owned by the config, once per job
         return Invocation {
             command,
-            args: cargo.args.clone(),   // clone: once per job
+            args: undrawn(&cargo.args), // alloc: once per job
             root: cargo.root.clone(),   // clone: once per job
             cwd: cargo.cwd.clone(),     // clone: once per job
             env: cargo.env.clone(),     // clone: once per job
@@ -1183,12 +1183,50 @@ fn said_once(said: &mut HashSet<ContentId, Global>, diagnostic: &blaze_api::Diag
         ))
 }
 
+/// The flags of cargo's command line that say only how its client is shown the build, each
+/// with a value: no input of the plan or of anything built. The daemon reads how diagnostics
+/// are drawn from the request itself ([`short`], [`blaze_api::Cargo::color`]).
+const DRAWN_FLAGS: [&str; 2] = ["--message-format", "--color"];
+
+/// cargo's `args` without [`DRAWN_FLAGS`] and their values, as a view's config holds them
+/// ([`invocation`]): the config is what the checkout's plan is keyed by ([`Viewed::key`]) and
+/// what its units are loaded from, so a build asked for with `--message-format short` or
+/// `--color always` plans what one without them does, from the same plan. What follows `--`
+/// is the program's or the test binary's, and is kept as it is.
+pub(crate) fn undrawn(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len()); // alloc: the config's own arguments, once per job
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg.clone()); // clone: the config's own, once per job
+            kept.extend(args.cloned());
+            break;
+        }
+        if DRAWN_FLAGS.contains(&arg.as_str()) {
+            // Its value is the next word.
+            args.next();
+            continue;
+        }
+        let valued = DRAWN_FLAGS
+            .iter()
+            .any(|flag| arg.strip_prefix(flag).is_some_and(|rest| rest.starts_with('=')));
+        if !valued {
+            kept.push(arg.clone()); // clone: the config's own, once per job
+        }
+    }
+    kept
+}
+
 /// Whether cargo's `args` ask for diagnostics a line each (`--message-format=short` or
-/// `json-diagnostic-short`), read as cargo reads each `--message-format`.
+/// `json-diagnostic-short`), read as cargo reads each `--message-format`. Of the request's
+/// own arguments: a view's config holds none of them ([`undrawn`]).
 fn short(args: &[String]) -> Result<bool, String> {
     let mut values = Vec::new(); // alloc: none unless a `--message-format` is given
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
         if let Some(value) = arg.strip_prefix("--message-format=") {
             values.push(value.to_owned()); // alloc: once per `--message-format`, once per job
         } else if arg == "--message-format" {
@@ -1318,10 +1356,44 @@ fn request_id(work: &Work) -> Option<ContentId> {
         Work::Check(targets) => ("check", targets),
         _ => return None,
     };
+    // How its client is shown diagnostics is no part of it ([`drawn_id`]).
+    // clone: the request's targets less how they are drawn, once a build or check
+    let mut undrawn_targets = targets.clone();
+    if let Some(cargo) = &mut undrawn_targets.cargo {
+        (cargo.color, cargo.width, cargo.refused) = (false, None, None);
+        cargo.args = undrawn(&cargo.args);
+    }
     // alloc: the request's encoding, once a build or check
-    let encoded = blaze_protocol::cbor::to_vec(targets)
+    let encoded = blaze_protocol::cbor::to_vec(&undrawn_targets)
         .expect("a request's targets are plain data, which CBOR encodes");
     Some(Hasher::new("blaze v2 serve no-op request").part(word.as_bytes()).part(&encoded).finish())
+}
+
+/// The hash of how `work`'s client is shown diagnostics ([`Inputs::drawn`]): whether in
+/// colour, their width, how many refused functions are named, and each word of its command
+/// line that says only that ([`DRAWN_FLAGS`]: `--message-format`, `--color`).
+fn drawn_id(work: &Work) -> ContentId {
+    let mut hasher = Hasher::new("blaze v2 serve no-op drawn");
+    let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) else {
+        return hasher.finish();
+    };
+    hasher.update(&[u8::from(cargo.color)]);
+    hasher.update(&cargo.width.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
+    hasher.update(&cargo.refused.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
+    let kept = undrawn(&cargo.args);
+    let mut kept = kept.iter().peekable();
+    for arg in &cargo.args {
+        // The words `undrawn` left out, in order: every word it kept is met in order too.
+        match kept.peek() {
+            Some(next) if *next == arg => {
+                kept.next();
+            }
+            _ => {
+                hasher.part(arg.as_bytes());
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// The hash of a view's config, by its encoding ([`Inputs::config_id`]).
@@ -3920,7 +3992,7 @@ impl<S: Steps> Jobs<S> {
         };
         let Viewed { root_dir, root, config, encoded, key } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
-        let request = request_id(&job.work);
+        let (request, drawn) = (request_id(&job.work), drawn_id(&job.work));
         // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
         // anything else of each build or check, and refuses one whose outputs may be shipped.
         if request.is_some()
@@ -3951,6 +4023,7 @@ impl<S: Steps> Jobs<S> {
                     config_id: config_id(&encoded),
                     config: Arc::clone(&config), // clone: a refcount, once per view
                     request,
+                    drawn,
                 };
                 self.record_answer(id, at, key, inputs);
                 // A walk that may be kept holds its view's files, opened here in constant
@@ -4039,6 +4112,7 @@ impl<S: Steps> Jobs<S> {
             config_id: config_id(&encoded),
             config: Arc::new(config), // alloc: once a request, kept with a walk's recording
             request,
+            drawn: drawn_id(work),
         };
         drop(keying);
         // The files that differ from the kept answer's view, where the root is another.
@@ -5379,7 +5453,13 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, true, None);
             return;
         }
-        let short = match short(&prep.config.invocation.args) {
+        let asked_args = self
+            .jobs
+            .get(key_of(id))
+            .and_then(|job| targets_of(&job.work))
+            .and_then(|it| it.cargo.as_ref())
+            .map_or(&[][..], |cargo| cargo.args.as_slice());
+        let short = match short(asked_args) {
             Ok(short) => short,
             Err(why) => {
                 self.end(

@@ -15,9 +15,14 @@
 //! - **The request**: its command, arguments, directory, whole environment and the config
 //!   files outside the view by their bytes, the mounts (each source and path dependency
 //!   outside the view by its root), the toolchain, where the daemon builds, and the blaze
-//!   that serves it ([`Inputs::config`]); and what the request says past those (whether its
-//!   diagnostics are colored, their width, how many refused functions it names, `-v`, the
+//!   that serves it ([`Inputs::config`]); and what the request says past those (`-v`, the
 //!   build goal: [`Inputs::request`]).
+//! - **How the request's client is shown diagnostics** (in colour or not, their width, a line
+//!   each, how many refused functions are named: [`Inputs::drawn`]): no input of anything
+//!   built, and of an answer only its diagnostics are drawn with it. An answer that holds no
+//!   diagnostic is said again to a client shown them another way; one that holds any is not
+//!   ([`Moved::Drawing`]), and the walk draws them for that client from the units' records
+//!   (`serve::unit::drawn`), making nothing.
 //! - **Paths outside every view** (a build script's traced reads and the directories it
 //!   listed, an `include!`d file, the toolchain's files, the C compiler's): the watches of
 //!   [`blaze_vfs::outside`] heard nothing since the walk began ([`Vouches::quiet_since`]), and
@@ -100,9 +105,13 @@ pub(super) struct Inputs {
     pub(super) config: Arc<BuildConfig>,
     /// The hash of `config`'s encoding.
     pub(super) config_id: ContentId,
-    /// The hash of the request's work and its whole `Targets`: what `config` does not hold of
-    /// it (colors, width, the refused functions named, verbosity).
+    /// The hash of the request's work and its `Targets`, less how its client is shown
+    /// diagnostics: what `config` does not hold of it (verbosity, the build goal).
     pub(super) request: ContentId,
+    /// The hash of how the request's client is shown diagnostics: in colour or not, their
+    /// width, a line each or whole, how many refused functions are named. Of an answer, only
+    /// its diagnostics are a function of it.
+    pub(super) drawn: ContentId,
 }
 
 impl Inputs {
@@ -112,6 +121,7 @@ impl Inputs {
             .id(&self.view)
             .id(&self.config_id)
             .id(&self.request)
+            .id(&self.drawn)
             .finish()
     }
 
@@ -120,7 +130,12 @@ impl Inputs {
         if self.files_moved(now) {
             return Some(Moved::Files);
         }
-        self.moved_past_files(now)
+        self.moved_past_files(now).or(self.drawn_moved(now).then_some(Moved::Drawing))
+    }
+
+    /// Whether `now`'s client is shown diagnostics another way than this one's.
+    fn drawn_moved(&self, now: &Inputs) -> bool {
+        self.drawn != now.drawn && !planted(Plant::IgnoresRequest)
     }
 
     /// Whether `now`'s view is another root than this one's.
@@ -128,7 +143,7 @@ impl Inputs {
         self.view != now.view && !planted(Plant::IgnoresFiles)
     }
 
-    /// [`Inputs::moved`] of everything but the view.
+    /// [`Inputs::moved`] of everything but the view and how diagnostics are drawn.
     fn moved_past_files(&self, now: &Inputs) -> Option<Moved> {
         if self.config_id != now.config_id && !planted(Plant::IgnoresConfig) {
             return Some(config_moved(&self.config, &now.config));
@@ -213,9 +228,12 @@ pub(super) enum Moved {
     Blaze,
     /// Where the daemon places builds, sources or the standard library's builds.
     Places,
-    /// What the request says past its config: colors, width, refused functions, verbosity,
-    /// the build goal.
+    /// What the request says past its config: verbosity, the build goal.
     Rendering,
+    /// How the request's client is shown diagnostics (colour, width, a line each, how many
+    /// refused functions are named), where the kept answer holds diagnostics, which were
+    /// drawn for another.
+    Drawing,
 }
 
 impl fmt::Display for Moved {
@@ -233,8 +251,11 @@ impl fmt::Display for Moved {
             Moved::Toolchain => f.write_str("the toolchain"),
             Moved::Blaze => f.write_str("the version of blaze"),
             Moved::Places => f.write_str("where the daemon places builds and sources"),
-            Moved::Rendering => f.write_str(
-                "what the request says past its command line (colors, width, `--refused`, `-v`, `--goal`)",
+            Moved::Rendering => {
+                f.write_str("what the request says past its command line (`-v`, `--goal`)")
+            }
+            Moved::Drawing => f.write_str(
+                "how the last build's diagnostics were drawn (colors, width, `--message-format`, `--refused`)",
             ),
         }
     }
@@ -423,7 +444,8 @@ pub(super) enum Plant {
     IgnoresFiles,
     /// Says an answer of another config again (a variable, a flag, a feature, the profile).
     IgnoresConfig,
-    /// Says an answer of another rendering again (colors, width).
+    /// Says an answer of another request again, and one whose diagnostics were drawn for
+    /// another client (colors, width).
     IgnoresRequest,
     /// Says an answer again while another job may be writing the outputs.
     IgnoresOthers,
@@ -618,6 +640,12 @@ impl LastAnswer {
         }
         if let Some(moved) = self.inputs.moved_past_files(asked.inputs) {
             return Err(NotReplayed::Moved(moved));
+        }
+        // Only a diagnostic is drawn for its client: an answer with none is every client's.
+        if self.inputs.drawn_moved(asked.inputs)
+            && self.responses.iter().any(|it| matches!(it, Response::Diagnostic(_)))
+        {
+            return Err(NotReplayed::Moved(Moved::Drawing));
         }
         if !asked.alone && !planted(Plant::IgnoresOthers) {
             return Err(NotReplayed::NotAlone);

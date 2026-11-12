@@ -1,0 +1,52 @@
+about = "The same sources built for a client shown diagnostics another way (a terminal of another width, in colour, a line each) make no unit again, and each build's warning is drawn for its own client from the record the first build kept."
+drivers = ["real"]
+
+# Why the real driver: the property is of the daemon's whole path from a request to a unit's
+# record and back (the request's width and colour, the plan's key, the record's key, the
+# replay), which no core holds alone; `serve::unit::tests::drawn` holds the record's key, its
+# encoding and its drawing in process.
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+says = ["unused variable: `unused_at_the_far_end`"]
+
+[[revision]]
+steps = []
+action = "run"
+env = { __CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS = "80" }
+prints = "2 4\n"
+says = ["unused variable: `unused_at_the_far_end`", "..."]
+redone = []
+max_units = 0
+link = "none"
+
+[[revision]]
+steps = []
+action = "run"
+env = { __CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS = "200" }
+prints = "2 4\n"
+says = ["let first = 1; let second = 2; let third = 3; let fourth = 4; let fifth = 5; let sixth = 6; let seventh = 7; let eighth = 8; let unused_at_the_far_end = 9;"]
+redone = []
+max_units = 0
+link = "none"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["--color", "always"]
+prints = "2 4\n"
+says = ["\u001b["]
+redone = []
+max_units = 0
+link = "none"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["--message-format", "json-diagnostic-short"]
+prints = "2 4\n"
+says = ["src/main.rs:2:"]
+redone = []
+max_units = 0
+link = "none"

@@ -695,7 +695,7 @@ impl TestRun {
         store: &mut Store,
         out: &mut Vec<Response>,
     ) {
-        let color = self.job.input.color;
+        let color = super::compile::drawing(&self.job).color;
         let refused = |what: String| Response::Diagnostic(super::say::refused(what, None, color));
         // clone: a reference count, once per batch of results
         let job = self.job.clone();
@@ -823,7 +823,7 @@ impl Runs<Real> for TestRun {
                 Some(at) => format!("the tests of `{at}` can't run: {}", refused.what),
                 None => refused.what,
             };
-            out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+            out.push(Response::Diagnostic(super::say::refused(what, None, super::compile::drawing(&self.job).color)));
         }
         if self.job.input.verbose > 0 {
             for suite in &self.suites {
@@ -843,7 +843,7 @@ impl Runs<Real> for TestRun {
                     Level::Note,
                     said,
                     None,
-                    self.job.input.color,
+                    super::compile::drawing(&self.job).color,
                 )));
             }
         }
@@ -857,7 +857,7 @@ impl Runs<Real> for TestRun {
             let Some(selector) = suite.selector.as_mut() else {
                 self.ok = false;
                 let what = UnitError::NoSelector { binary: suite.name.clone() }.to_string();
-                out.push(Response::Diagnostic(super::say::refused(what, None, job.input.color)));
+                out.push(Response::Diagnostic(super::say::refused(what, None, super::compile::drawing(&job).color)));
                 continue;
             };
             for (n, test) in tests.iter().enumerate() {
@@ -910,7 +910,7 @@ impl Runs<Real> for TestRun {
                                 test.name, suite.name
                             ),
                             None,
-                            job.input.color,
+                            super::compile::drawing(&job).color,
                         )));
                     }
                 }
@@ -938,7 +938,7 @@ impl Runs<Real> for TestRun {
                 out.push(Response::Diagnostic(super::say::refused(
                     what,
                     None,
-                    self.job.input.color,
+                    super::compile::drawing(&self.job).color,
                 )));
                 return self.end();
             }
@@ -955,7 +955,7 @@ impl Runs<Real> for TestRun {
                 out.push(Response::Diagnostic(super::say::refused(
                     what,
                     None,
-                    self.job.input.color,
+                    super::compile::drawing(&self.job).color,
                 )));
                 return self.end();
             }
