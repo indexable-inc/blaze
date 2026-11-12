@@ -94,6 +94,13 @@ pub(super) fn glibc(arch: Arch, soname: &str, release: Glibc) -> Result<Arc<[u8]
     stub_of(list, soname, release)
 }
 
+/// Writes the held symbol's line, if one is held.
+fn flush(held: &mut Option<(&str, &str, &str)>, out: &mut String) {
+    if let Some((name, kind, version)) = held.take() {
+        let _ = writeln!(out, "{kind} GLIBC_{version} {name}");
+    }
+}
+
 fn stub_of(list: &str, soname: &str, release: Glibc) -> Result<Arc<[u8]>, String> {
     let mut lines = list.lines().filter(|it| !it.starts_with('#'));
     let releases = lines
@@ -122,11 +129,6 @@ fn stub_of(list: &str, soname: &str, release: Glibc) -> Result<Arc<[u8]>, String
     // The newest version of the name being read that the library has at `release`: lines of
     // one name are together.
     let mut held: Option<(&str, &str, &str)> = None;
-    let mut flush = |held: &mut Option<(&str, &str, &str)>, out: &mut String| {
-        if let Some((name, kind, version)) = held.take() {
-            let _ = writeln!(out, "{kind} GLIBC_{version} {name}");
-        }
-    };
     for line in lines {
         if let Some(library) = line.strip_prefix("library ") {
             flush(&mut held, &mut out);
@@ -457,11 +459,12 @@ pub(super) fn start(arch: Arch, executable: bool, release: Glibc) -> Result<Arc<
     // alloc: once per process and kind of image, the start object's few names
     let mut undefined: Vec<(&'static str, object::write::SymbolId)> = Vec::new();
     let mut defined: Vec<(&'static str, object::write::SymbolId)> = Vec::new();
-    let codes: &[&Code] = match executable {
-        true => &[&fini, &init, &start],
-        false => &[&fini],
+    // alloc: once per process and kind of image
+    let codes: Vec<&Code> = match executable {
+        true => vec![&fini, &init, &start],
+        false => vec![&fini],
     };
-    for code in codes {
+    for code in &codes {
         let at = object.append_section_data(text, code.code, 16);
         let symbol = object.add_symbol(Symbol {
             name: code.name.as_bytes().to_vec(),
@@ -479,8 +482,8 @@ pub(super) fn start(arch: Arch, executable: bool, release: Glibc) -> Result<Arc<
         let (plain, at_form, jump, plain_at, at_form_at): (&[u8], &[u8], elf::RelocationType, u64, u64) =
             match arch
         {
-            Arch::X86_64 => (&X86_STAT, &X86_STATAT, elf::R_X86_64_PLT32, 12, 18),
-            _ => (&A64_STAT, &A64_STATAT, elf::R_AARCH64_JUMP26, 12, 20),
+            Arch::X86_64 => (&X86_STAT[..], &X86_STATAT[..], elf::R_X86_64_PLT32, 12, 18),
+            _ => (&A64_STAT[..], &A64_STATAT[..], elf::R_AARCH64_JUMP26, 12, 20),
         };
         let addend = if arch == Arch::X86_64 { -4 } else { 0 };
         let stats = object.add_section(Vec::new(), b".text.stat".to_vec(), object::SectionKind::Text);
@@ -522,7 +525,7 @@ pub(super) fn start(arch: Arch, executable: bool, release: Glibc) -> Result<Arc<
         }
     }
     let mut at = 0;
-    for code in codes {
+    for code in &codes {
         let base = at;
         at += (code.code.len() as u64).next_multiple_of(16);
         for field in code.fields {

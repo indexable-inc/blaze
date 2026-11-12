@@ -811,9 +811,11 @@ impl Target {
     fn ships(self, output: &Output, libs: &[CrateLibs<'_>]) -> Result<(), String> {
         let named: fn(Target, &str) -> bool = match self {
             Target::LinuxX86_64 | Target::LinuxAarch64 => {
-                |target, name| name != "ld" && target.glibc_soname(name).is_some()
+                |target: Target, name: &str| name != "ld" && target.glibc_soname(name).is_some()
             }
-            Target::MacOs => |_, name| matches!(name, "System" | "c" | "m" | "pthread" | "dl"),
+            Target::MacOs => {
+                |_: Target, name: &str| matches!(name, "System" | "c" | "m" | "pthread" | "dl")
+            }
             // alloc: error path
             _ => return Err(format!("blaze ships no C library for {}", self.triple())),
         };
