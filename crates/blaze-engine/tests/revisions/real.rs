@@ -426,6 +426,7 @@ impl Real {
                 let file = fs::File::options().write(true).open(self.dir.join(path)).unwrap_or_else(|error| panic!("touch {path}: {error}"));
                 file.set_modified(SystemTime::now()).unwrap();
             }
+            Step::Wait(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
             Step::Project(name) => self.enter(Some(name)),
             Step::Do(action) => {
                 // The revision's own arguments: a request that differs in them is another

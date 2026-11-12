@@ -99,6 +99,9 @@ pub enum Step {
     Beside(String),
     /// A file's modification time moved, its bytes as they were.
     Touch(String),
+    /// Nothing is asked of the daemon for this many milliseconds: what it does with a save
+    /// of its own accord (a build ahead, `serve::ahead`) has the time to end.
+    Wait(u64),
     /// A command whose outcome only has to be success: `build`, `run`, `check`, `test`.
     Do(Action),
     /// From here on the commands run in another checkout, of this name, beside the first:
@@ -195,6 +198,7 @@ impl Step {
             Step::Stop => "stop".to_owned(),
             Step::Kill => "kill".to_owned(),
             Step::Touch(path) => format!("touch {path}"),
+            Step::Wait(ms) => format!("wait {ms} ms"),
             Step::Do(action) => action.word().to_owned(),
             Step::Project(name) => format!("project {name}"),
         }
@@ -245,6 +249,11 @@ fn step(word: &str, at: &str) -> Step {
         "kill" => Step::Kill,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some(("wait", ms)) => Step::Wait(
+                ms.strip_suffix(" ms")
+                    .and_then(|it| it.parse().ok())
+                    .unwrap_or_else(|| panic!("{at}: `wait N ms`, not `{word}`")),
+            ),
             Some(("cancel", after)) => Step::Cancel(
                 after
                     .strip_prefix("build after ")
@@ -269,7 +278,7 @@ fn step(word: &str, at: &str) -> Step {
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `edit twice`, \
-                     `stop`, `kill`, `touch PATH`, `project NAME`, `beside NAME`, `cancel build after N ms`, `check`, \
+                     `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `cancel build after N ms`, `check`, \
                      `build`, `run`, `test`"
                 )
             })),
