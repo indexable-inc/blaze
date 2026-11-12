@@ -789,6 +789,10 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            // `blaze gc ...` is `blaze cache gc ...`.
+            Some("gc") => {
+                return Ok(Asked::Cache(std::iter::once("gc".into()).chain(words).collect()));
+            }
             Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
             Some("fmt") => return Ok(Asked::Fmt(words.collect())),
             Some("new") => return Ok(Asked::New { init: false, words: words.collect() }),

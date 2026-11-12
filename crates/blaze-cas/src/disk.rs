@@ -280,12 +280,15 @@ pub(crate) struct Loc {
 
 const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x04";
 const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
-const PACK_REF: usize = 32;
+/// A pack in a head of format 6: format 5's and when it was last used.
+const PACK_REF: usize = 40;
+/// A pack in a head of formats 4 and 5.
+const PACK_REF_5: usize = 32;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
 const UNIT_REF: usize = 32;
 const HEAD_CHECK: usize = 4;
-const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 32);
+const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 40 && PACK_REF_5 == 32);
 
 /// The index table a head names: which of the two slots, its length and its CRC-32C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -312,6 +315,11 @@ pub(crate) struct PackRef {
     /// Its live records were all copied on and the file is gone, or going: it is not mapped.
     /// It keeps its place in the list, which is the number index slots name.
     pub removed: bool,
+    /// When a record of it was last read, or it was last appended to with a new value, in
+    /// seconds since the Unix epoch on its store's clock ([`crate::Store::clock`]): what the
+    /// collector orders packs by (format 6). 0 for not known: a head of format 5 has none,
+    /// and the store that opens it stamps each pack with its clock.
+    pub used: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,6 +358,13 @@ pub(crate) struct Head {
 
 impl Head {
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_as(crate::FORMAT)
+    }
+
+    /// Its bytes as a store of `format` writes them: this one's, or (a test's, of a store an
+    /// older blaze left) format 4's and 5's, whose packs carry no time of use.
+    pub(crate) fn encode_as(&self, format: u32) -> Vec<u8> {
+        debug_assert!(format == crate::FORMAT || cfg!(test), "a head is written in this format");
         let mut out = Vec::with_capacity(
             HEAD_FIXED
                 + self.packs.len() * PACK_REF
@@ -359,7 +374,7 @@ impl Head {
                 + HEAD_CHECK,
         );
         out.put_bytes(&HEAD_MAGIC);
-        out.put_u32(crate::FORMAT);
+        out.put_u32(format);
         out.put_u32(0);
         out.put_u64(self.generation);
         let index = self.index.unwrap_or(IndexRef { slot: u8::MAX, len: 0, check: 0, count: 0 });
@@ -380,6 +395,9 @@ impl Head {
             out.put_u64(pack.committed);
             out.put_u64(pack.indexed);
             out.put_u64(pack.dead);
+            if format >= 6 {
+                out.put_u64(pack.used);
+            }
         }
         for dictionary in &self.dictionaries {
             out.put_u8(dictionary.kind.code());
@@ -432,8 +450,9 @@ impl Head {
         let dictionaries = u32_at(body, 60) as usize;
         let externals = u32_at(body, 64) as usize;
         let units = u32_at(body, 68) as usize;
+        let pack_ref = if format >= 6 { PACK_REF } else { PACK_REF_5 };
         let want = packs
-            .checked_mul(PACK_REF)
+            .checked_mul(pack_ref)
             .zip(dictionaries.checked_mul(DICTIONARY_REF))
             .zip(externals.checked_mul(EXTERNAL_REF))
             .zip(units.checked_mul(UNIT_REF))
@@ -456,7 +475,8 @@ impl Head {
             }
             let unit = read.u32()?;
             let (committed, indexed, dead) = (read.u64()?, read.u64()?, read.u64()?);
-            head.packs.push(PackRef { unit, committed, indexed, dead, removed });
+            let used = if format >= 6 { read.u64()? } else { 0 };
+            head.packs.push(PackRef { unit, committed, indexed, dead, removed, used });
         }
         for _ in 0..dictionaries {
             let kind = Kind::from_code(read.u8()?).ok_or("a dictionary of no kind")?;

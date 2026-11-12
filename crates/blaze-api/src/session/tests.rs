@@ -697,7 +697,7 @@ fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
         (4, Request::Flush, "a read of the profile history"),
-        (5, Request::Gc { dry_run: true }, "blaze cache gc"),
+        (5, Request::Gc { dry_run: true, unkept: false }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);
         assert_eq!(error_at(&refused).as_deref(), Some(named), "{refused:?}");
@@ -850,6 +850,7 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
 fn worked() -> Response {
     Response::Work(crate::Worked {
         why: None,
+        storage: None,
         reran: 3,
         misses: 0,
         green: 9,

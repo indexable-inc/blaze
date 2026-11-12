@@ -39,6 +39,7 @@
 mod checks;
 pub mod chunk;
 mod cold;
+pub mod collect;
 mod copy;
 pub mod derived;
 use blaze_ids::crc32c as crc;
@@ -85,7 +86,7 @@ use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
-use blaze_ids::{ContentId, Hasher, radix};
+use blaze_ids::{ContentId, Hasher};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
 use serde::{Deserialize, Serialize};
@@ -122,7 +123,10 @@ use crate::table::{Held, Table};
 /// remove ([`disk::EXTERNAL_REMOVED`]: a hot value's file of its own, let go once a settle
 /// moved the value cold into a pack); a head and an index of format 4 are read as they are,
 /// and what is written next is of format 5, which a blaze of format 4 refuses by name.
-pub(crate) const FORMAT: u32 = 5;
+/// Format 6 added when each pack was last used to the head ([`disk::PackRef::used`]: what the
+/// collector orders packs by, [`collect`]); a head of format 4 or 5 is read with none, and the
+/// next head written is of format 6.
+pub(crate) const FORMAT: u32 = 6;
 
 /// The oldest format read ([`FORMAT`]).
 pub(crate) const FORMAT_READ: u32 = 4;
@@ -246,10 +250,13 @@ pub enum Kind {
     /// clone ([`Store::place`]). How its file is checked is how it is made: never taken from
     /// an earlier run, always the base's bytes with the ranges written.
     Derived,
+    /// A pin ([`collect::Pin`]): a name, why, when and the keys the collector keeps for it
+    /// whatever their last use (docs/gc.md, "The store's budget and collector").
+    Pin,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::Query,
         Kind::Code,
         Kind::Debug,
@@ -258,6 +265,7 @@ impl Kind {
         Kind::Image,
         Kind::Machine,
         Kind::Derived,
+        Kind::Pin,
     ];
 
     /// The kind's byte on disk and on the wire.
@@ -271,6 +279,7 @@ impl Kind {
             Kind::Image => 5,
             Kind::Machine => 6,
             Kind::Derived => 7,
+            Kind::Pin => 8,
         }
     }
 
@@ -284,6 +293,7 @@ impl Kind {
             5 => Some(Kind::Image),
             6 => Some(Kind::Machine),
             7 => Some(Kind::Derived),
+            8 => Some(Kind::Pin),
             _ => None,
         }
     }
@@ -298,6 +308,7 @@ impl Kind {
             Kind::Image => "image",
             Kind::Machine => "machine",
             Kind::Derived => "derived",
+            Kind::Pin => "pin",
         }
     }
 
@@ -992,6 +1003,12 @@ pub struct Store {
     /// What the last period's end ([`Store::end_period`]) planned and no
     /// [`Store::settle_step`] has made yet.
     moves: Option<Moves>,
+    /// What its collector keeps: the mark of the last scan, the pins, the counts ([`collect`]).
+    collecting: collect::Collecting,
+    /// The unit of the packs records moved cold are written to, once one was: apart from the
+    /// packs new values go to, so a pack of what nothing reads ages as a whole and the
+    /// collector retires it without copying ([`Store::cold_unit`]).
+    cold_unit: Option<Unit>,
     /// The encodings of each schema whose values it keeps in columns.
     columns: Arc<Encodings>,
     /// The other writers of its directory's shared one ([`Store::open_shared`]).
@@ -1893,7 +1910,13 @@ impl Tier {
                 .packs
                 .iter()
                 // clone: the published view owns its names and mappings; once per pack a view
-                .map(|it| PackView { file: it.file.clone(), base: it.base, usable: it.usable })
+                .map(|it| PackView {
+                    file: it.file.clone(),
+                    base: it.base,
+                    usable: it.usable,
+                    gone: it.removed || it.retiring,
+                    used: Arc::clone(&it.used), // clone: a count per pack, once per view
+                })
                 // alloc: the view's packs, exactly sized; once per view
                 .collect(),
             externals: self
@@ -1938,6 +1961,13 @@ struct Pack {
     removed: bool,
     /// Its live records are copied on; the next head names it removed.
     retiring: bool,
+    /// A batch of the collector is out for it ([`Store::collect_take`]): nothing is appended
+    /// to it, so what the batch scanned is all it holds when it is sealed.
+    closing: bool,
+    /// When a record of it was last read or a new value appended to it, in seconds on the
+    /// store's clock ([`Store::clock`]); 0 until the clock is first told. Readers write it
+    /// (a second at most once), the head keeps it.
+    used: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Pack {
@@ -2240,6 +2270,8 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
+            collecting: collect::Collecting::new(),
+            cold_unit: None,
             moves: None,
             commit_deferred: false,
             columns,
@@ -2546,6 +2578,9 @@ impl Store {
             return;
         }
         if self.commit.is_some() {
+            if self.collecting.commit_ours {
+                self.collecting.flush_waited();
+            }
             self.flush_wanted = true;
         } else {
             self.start_commit(effects);
@@ -2642,18 +2677,17 @@ impl Store {
     }
 
     /// The moves the period ending now asks for, in the order they are made.
+    /// It is the scan a worker runs for the daemon ([`collect::PeriodScan`]), run here: one
+    /// walk of the rows, which also marks what the collector keeps.
     fn plan_moves(&mut self) -> Moves {
-        let (mut demote, mut promote, named) = self.tier_moves();
-        for (content, external) in &mut self.tiers[0].externals {
-            external.keys = named.get(content).copied().unwrap_or(0);
+        // With no driver to run it on a worker, the carry of an index swap's flags runs here.
+        if let Some(mut carry) = self.carry_take() {
+            carry.run();
+            self.carry_put(carry);
         }
-        radix::sort_by_key(&mut demote, |(_, loc, _)| {
-            (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
-        });
-        radix::sort_by_key(&mut promote, |(_, loc, _)| {
-            radix::pack_64(u64::from(loc.pack), loc.offset)
-        });
-        Moves { demote, demoted: 0, promote, promoted: 0 }
+        let mut scan = self.scan_new(false);
+        scan.run();
+        self.keep_scan(scan)
     }
 
     /// The period of reading ended: this period's flags are the period before's.
@@ -2718,8 +2752,8 @@ impl Store {
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
             *spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
-                Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
-                None => self.replace(key, loc, Form::Raw, 0, content, &bytes),
+                Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored, false),
+                None => self.replace(key, loc, Form::Raw, 0, content, &bytes, false),
             }
             settled.promoted += 1;
         }
@@ -2933,7 +2967,7 @@ impl Store {
                         (Form::Zstd, ..) => NO_DICTIONARY,
                         _ => 0,
                     };
-                    self.replace(key, loc, form, named, content, &payload);
+                    self.replace(key, loc, form, named, content, &payload, true);
                     if loc.form == Form::External {
                         self.external_replaced(&content);
                     }
@@ -3048,74 +3082,6 @@ impl Store {
         }
     }
 
-    /// The own tier's records in its packs to move cold and to move hot, as of the period
-    /// ending now. A record still in a segment is new, and stays.
-    #[expect(clippy::type_complexity, reason = "the two lists of moves and the count of each whole file's keys, taken apart by its one caller")]
-    fn tier_moves(
-        &self,
-    ) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>, ByHash<ContentId, u32, Global>) {
-        let own = &self.tiers[0];
-        // alloc: once a settle (idle, never on the way of a get or a put); empty unless a slot is not whole
-        let mut bad = Vec::new();
-        let rows = self.look().rows(0, &mut bad);
-        // alloc: once a settle (idle), the records it moves, sorted after
-        let (mut demote, mut promote) = (Vec::new(), Vec::new());
-        // By kind code: whether a short record of the kind is listed: to be moved colder once
-        // the kind has a dictionary and, before, to be sampled while its training wants
-        // samples (after a reopen, the only way its records already kept are). Every kind's
-        // is: most records of a hot kind are short too (a function's code, a small query
-        // result: 23 of hello-world's 26 MiB of them), and a dictionary takes four fifths of
-        // each.
-        let short_listed: [bool; Kind::ALL.len()] = std::array::from_fn(|code| {
-            Kind::from_code(code as u8).is_some_and(|kind| {
-                self.dictionary_of(kind).is_some() || self.training[code].wants_samples()
-            })
-        });
-        // alloc: once a settle (idle), a count for each whole file a record names: a few
-        let mut named: ByHash<ContentId, u32, Global> = ByHash::new_in(Global);
-        for (key, found) in rows {
-            if found.place.form() == Form::External
-                && let Ok((header, _)) = self.look().record(found, &key)
-            {
-                *named.entry(header.content).or_insert(0) += 1;
-            }
-            let Place::Pack(loc) = found.place else { continue };
-            let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
-            // A short record goes colder only as `short_listed` says. One of a cold kind never
-            // comes back hot (its kind is read rarely, by its nature); one of a hot kind does,
-            // as a long one does.
-            let short = loc.raw < DEMOTE_FROM;
-            if pack.removed || pack.retiring || (short && !short_listed[loc.kind.code() as usize]) {
-                continue;
-            }
-            let flag = |flag| found.at.get(flag);
-            let (read, before) = (flag(Flag::Read), flag(Flag::ReadBefore));
-            match loc.form {
-                // A file of its own goes cold as a record does: into a pack, compressed, and
-                // its file is let go ([`Store::external_replaced`]). Machine code stays a file,
-                // which its loader maps ([`Kind::Machine`]).
-                Form::Raw | Form::Lz4 | Form::Warm | Form::External
-                    if (loc.form != Form::External || loc.kind != Kind::Machine)
-                        && self.periods >= 2
-                        && !read
-                        && !before
-                        && !flag(Flag::New)
-                        && !flag(Flag::NewBefore)
-                        && !flag(Flag::Tried) =>
-                {
-                    demote.push((key, loc, found.at.row()));
-                }
-                Form::Zstd | Form::Warm | Form::ColdColumns
-                    if read && before && (!short || !loc.kind.cold()) =>
-                {
-                    promote.push((key, loc, found.at.row()));
-                }
-                _ => {}
-            }
-        }
-        (demote, promote, named)
-    }
-
     /// Sets a flag of an own record by its row: rows hold while the store swaps no table, as
     /// within a settle.
     fn set_flag(&self, row: Row, flag: Flag) {
@@ -3150,8 +3116,16 @@ impl Store {
         dictionary: u32,
         content: ContentId,
         payload: &[u8],
+        colder: bool,
     ) {
-        let unit = Unit(self.tiers[0].packs[old.pack as usize].unit);
+        // Moved colder, it goes to the cold packs; moved back hot out of one, to the packs
+        // new values share.
+        let was = Unit(self.tiers[0].packs[old.pack as usize].unit);
+        let unit = match colder {
+            true => self.cold_unit(),
+            false if Some(was) == self.cold_unit => Unit::SHARED,
+            false => was,
+        };
         let header = RecordHeader {
             kind: old.kind,
             form,
@@ -3387,6 +3361,9 @@ impl Store {
             "{to} is in the store: values are placed outside it"
         );
         self.tidy();
+        // What a path holds the collector keeps until the path holds another value
+        // ([`Store::unplace`]): the next output there may be made of this one.
+        self.collecting.placed(*key);
         enum Plan {
             Clone(FileName, u64, ContentId),
             File(ContentId, u64),
@@ -3928,6 +3905,8 @@ impl Store {
     /// ([`Kind::Derived`]), `now`'s whole file is made of a clone of this one first.
     pub fn unplace(&mut self, key: &Key, now: &Key, effects: &mut Vec<Effect>) {
         self.tidy();
+        // The path holds `now`'s value: `key` is no longer kept for it.
+        self.collecting.unplaced(key);
         let look = self.look();
         // The whole file each is placed from, if one is kept of it; else its content alone.
         let file_of = |key: &Key| match whole_of(look, key) {
@@ -5579,7 +5558,7 @@ impl Store {
         let own = &mut self.tiers[0];
         // A retiring pack takes no more: the next head names it removed.
         if let Some(at) =
-            own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed && !it.retiring)
+            own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed && !it.retiring && !it.closing)
         {
             let pack = &own.packs[at];
             if pack.end == PACK_HEADER || pack.end + span <= PACK_MOST {
@@ -5604,13 +5583,21 @@ impl Store {
             dead: 0,
             removed: false,
             retiring: false,
+            closing: false,
+            // alloc: once per pack made
+            used: Arc::new(std::sync::atomic::AtomicU64::new(self.shared.tick())),
         });
-        own.packs.len() - 1
+        self.tiers[0].packs.len() - 1
     }
 
     fn append_record(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) -> Loc {
         let span = header.span();
         let at = self.writable_pack(unit, span);
+        // A pack new values are appended to is in use; a cold pack is used when it is read.
+        if Some(unit) != self.cold_unit {
+            let tick = self.shared.tick();
+            self.tiers[0].packs[at].used.store(tick, std::sync::atomic::Ordering::Relaxed);
+        }
         let pack = &mut self.tiers[0].packs[at];
         let offset = pack.end;
         pack.memory.extend_from_slice(&header.encode());
@@ -6038,6 +6025,17 @@ impl Store {
         }
         // alloc: once per index swap (every `INDEX_AFTER` records), the delta readers are handed
         let old = std::mem::replace(&mut own.delta, Arc::new(fresh));
+        // The new table's rows are numbered afresh, so its flags of use start clear. What the
+        // old tables knew of each record is carried over by key, off this thread
+        // ([`collect::FlagCarry`]); until it is, the flags say nothing (`periods` is 0), and
+        // nothing is moved cold or forgotten by them.
+        self.collecting.carry(collect::FlagCarry::new(
+            // clone: counts, once per index swap
+            own.index.clone(),
+            Arc::clone(&old),
+            Arc::clone(&index),
+            self.periods,
+        ));
         own.index = Some(index);
         let writers = self.drains.len() > 1;
         if writers {
@@ -6326,9 +6324,17 @@ impl Store {
             // alloc: once per commit, the files its head lists as removed, held in the `Commit`
             own.externals.iter().filter(|(_, it)| it.dropped).map(|(it, _)| *it).collect();
         dropped.sort_unstable();
-        let compact =
-            !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
-        if packs.is_empty() && externals.is_empty() && !compact && dropped.is_empty() {
+        // A commit the collector asks for writes no index table: it stays as small as what
+        // was copied on, and the next commit a build asks for writes the table.
+        let small = std::mem::take(&mut self.collecting.small_commit);
+        let compact = !small
+            && !self.index_mapping
+            && self.migrating.is_none()
+            && own.delta.len() >= INDEX_AFTER;
+        // A pack retired with nothing copied on (every record of it dead or forgotten) is
+        // still a head to write: the one that names it removed.
+        let retiring = own.packs.iter().any(|it| it.retiring);
+        if packs.is_empty() && externals.is_empty() && !compact && dropped.is_empty() && !retiring {
             // Nothing to write and no commit in flight: every record drained is in what a
             // commit wrote already, and a put that wrote none (it lost its key to another
             // writer's put of the same bytes, or panicked before it wrote) has nothing to make
@@ -6370,6 +6376,7 @@ impl Store {
                     indexed: it.indexed,
                     dead: it.dead,
                     removed: it.removed || it.retiring,
+                    used: it.used.load(std::sync::atomic::Ordering::Relaxed),
                 })
                 // alloc: once per commit, the head it writes
                 .collect(),
@@ -6444,6 +6451,7 @@ impl Store {
             (slot, batch.id)
         });
         let written = packs.len();
+        self.collecting.commit_begun(small);
         self.commit = Some(Commit {
             packs,
             checks,
@@ -6465,7 +6473,9 @@ impl Store {
         }
         // Every append failed to begin with nothing else asked: no completion will come to
         // move the commit, so it is tried again (or the store stopped) from here.
-        if self.commit.as_ref().is_some_and(|it| it.steps == 0 && it.failed.is_some()) {
+        // And a commit with nothing to write before its head (a pack retired with nothing
+        // copied on, a whole file dropped) writes its head now.
+        if self.commit.as_ref().is_some_and(|it| it.steps == 0) {
             _ = self.commit_moves(effects);
         }
     }
@@ -6511,6 +6521,8 @@ impl Store {
                 for (_, key, loc) in index.table().iter() {
                     match loc {
                         Ok(_) if taken.contains(&key) => {}
+                        // A key the collector forgot: the pack it was in is retired.
+                        Ok(loc) if own.packs.get(loc.pack as usize).is_some_and(|it| it.removed || it.retiring) => {}
                         Ok(loc) => out.push((key, loc)),
                         Err(what) => bad.push((key, what)),
                     }
@@ -6987,6 +6999,9 @@ impl Store {
                 dead: it.dead,
                 removed: it.removed,
                 retiring: false,
+                closing: false,
+                // alloc: once per pack, at opening
+                used: Arc::new(std::sync::atomic::AtomicU64::new(it.used)),
             })
             // alloc: opening, once per tier
             .collect();
@@ -7186,6 +7201,10 @@ impl Store {
                 let tier = &mut self.tiers[at];
                 tier.opened = true;
                 tier.before = None;
+                if at == 0 {
+                    // The cold packs' unit an earlier run made, if one did.
+                    self.cold_unit = self.tiers[0].unit_of.get(&collect::cold_unit_id()).copied();
+                }
                 self.publish_view();
                 if self.is_peer(at) {
                     self.peer_settled(at);

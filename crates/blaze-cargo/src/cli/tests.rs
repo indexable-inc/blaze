@@ -689,6 +689,7 @@ fn plain_answer() -> Vec<Response> {
     };
     let worked = Response::Work(blaze_api::Worked {
         why: None,
+        storage: None,
         tiers: Some(blaze_api::Tiers::of(blaze_api::Goal::Edit).with(38, 100)),
         link: blaze_api::LinkKind::Patched,
         found: 1,

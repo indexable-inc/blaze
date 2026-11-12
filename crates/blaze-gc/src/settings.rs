@@ -3,7 +3,7 @@
 //! of free space ([`crate::pace::Levels`]), and whether the daemon collects on its own:
 //!
 //! ```json
-//! { "comfortable_percent": 15, "comfortable_gib": 30, "floor_percent": 10, "floor_gib": 20, "share_percent": 50, "auto": true }
+//! { "comfortable_percent": 15, "comfortable_gib": 30, "floor_percent": 10, "floor_gib": 20, "share_percent": 25, "budget_gib": 64, "auto": true }
 //! ```
 //!
 //! `"auto": false` turns the daemon's paced collector off (`blaze cache gc` still runs when
@@ -36,6 +36,16 @@ struct Settings {
     floor_gib: Option<u64>,
     #[serde(default)]
     share_percent: Option<u8>,
+    /// The absolute budget, in GiB, or (`budget_mib`, for a small disk or a test) in MiB;
+    /// only one of the two.
+    #[serde(default)]
+    budget_gib: Option<u64>,
+    #[serde(default)]
+    budget_mib: Option<u64>,
+    /// How long a pack of the daemon's store goes unused before records are forgotten out
+    /// of it, in seconds (an hour unless set).
+    #[serde(default)]
+    store_grace_s: Option<u64>,
     #[serde(default)]
     auto: Option<bool>,
 }
@@ -46,6 +56,8 @@ pub struct GcSettings {
     pub levels: Levels,
     /// Whether the daemon collects on its own, paced; `true` unless set.
     pub auto: bool,
+    /// The grace of the daemon's store, in seconds, when the file sets it.
+    pub store_grace_s: Option<u64>,
 }
 
 impl GcSettings {
@@ -55,7 +67,7 @@ impl GcSettings {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(GcSettings { levels, auto: true });
+                return Ok(GcSettings { levels, auto: true, store_grace_s: None });
             }
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         };
@@ -84,6 +96,20 @@ impl GcSettings {
         if let Some(it) = set.floor_gib {
             levels.floor_bytes = it.saturating_mul(GIB);
         }
+        match (set.budget_gib, set.budget_mib) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "{}: budget_gib and budget_mib are both set; set one",
+                    path.display()
+                ));
+            }
+            (Some(0), _) | (_, Some(0)) => {
+                return Err(format!("{}: the budget is 0", path.display()));
+            }
+            (Some(it), None) => levels.budget_bytes = it.saturating_mul(GIB),
+            (None, Some(it)) => levels.budget_bytes = it.saturating_mul(1 << 20),
+            (None, None) => {}
+        }
         if levels.floor_percent > levels.comfortable_percent {
             return Err(format!(
                 "{}: floor_percent {} is above comfortable_percent {}",
@@ -100,7 +126,11 @@ impl GcSettings {
                 levels.comfortable_bytes / GIB
             ));
         }
-        Ok(GcSettings { levels, auto: set.auto.unwrap_or(true) })
+        Ok(GcSettings {
+            levels,
+            auto: set.auto.unwrap_or(true),
+            store_grace_s: set.store_grace_s,
+        })
     }
 }
 
@@ -133,5 +163,11 @@ mod tests {
         assert!(read(r#"{"autos": false}"#).is_err());
         assert!(!read(r#"{"auto": false}"#).unwrap().auto);
         assert!(read("{}").unwrap().auto);
+        let defaults = read("{}").unwrap().levels;
+        assert_eq!((defaults.budget_bytes, defaults.share_percent), crate::pace::BUDGET);
+        assert_eq!(read(r#"{"budget_gib": 128}"#).unwrap().levels.budget_bytes, 128 << 30);
+        assert_eq!(read(r#"{"budget_mib": 512}"#).unwrap().levels.budget_bytes, 512 << 20);
+        assert!(read(r#"{"budget_gib": 0}"#).unwrap_err().contains("the budget is 0"));
+        assert!(read(r#"{"budget_gib": 1, "budget_mib": 1}"#).unwrap_err().contains("set one"));
     }
 }

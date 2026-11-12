@@ -267,6 +267,23 @@ impl fmt::Debug for Word {
 
 // --- Planted bugs ------------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// A planted bug for the collector's simulation (`tests/collect.rs`), on the test's own
+    /// thread: a retired file's pages are given back while readers pin them.
+    pub(crate) static RETIRE_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the planted bug of [`RETIRE_PINNED`] is on: never outside a test.
+#[inline]
+fn retire_pinned_planted() -> bool {
+    #[cfg(test)]
+    let planted = RETIRE_PINNED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let planted = false;
+    planted
+}
+
 /// A safeguard of the pool's removed, for the DST's controls (the design's section 7, bugs 1 to
 /// 6, 8 and 9, and a tenth found by the DST itself): each is caught by the oracle within its case budget, or the oracle is too weak. Only a
 /// test's pool plants one ([`Pool::planted`] is `false` in every build of blaze).
@@ -1080,7 +1097,7 @@ impl Windows {
             match seen.state() {
                 State::Unloaded | State::Corrupt => {}
                 State::Abandoned => abandoned = true,
-                State::Loaded if seen.pins() == 0 => {
+                State::Loaded if seen.pins() == 0 || retire_pinned_planted() => {
                     let next = Word::evicting(seen.next_version());
                     match pool.word(page).compare_exchange(seen.0, next.0, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => {

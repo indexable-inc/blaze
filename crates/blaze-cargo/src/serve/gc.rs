@@ -271,10 +271,36 @@ impl Gc {
     /// ([`Gc::take_answers`]); one asked while a run of the other kind is asked waits for the
     /// next.
     pub fn ask(&mut self, to: RequestRef, dry_run: bool) {
+        // `gc.json` as it is now: `blaze gc --budget` writes it and then asks. One that
+        // does not read keeps the levels the daemon has, and says so.
+        if let Some(root) = self.collector.config().areas.first() {
+            let levels = self.collector.config().levels;
+            match blaze_gc::settings::GcSettings::read(Path::new(root), levels) {
+                Ok(settings) => self.collector.set_levels(settings.levels),
+                Err(why) => {
+                    tracing::error!(target: "blaze", "the collector keeps the levels it has: {why}");
+                }
+            }
+        }
         if !self.askers.iter().any(|(_, asked)| *asked != dry_run) {
             self.collector.ask(dry_run);
         }
         self.askers.push((to, dry_run));
+    }
+
+    /// The daemon's word that its state (its store, its image, its journal) holds `bytes`
+    /// under the root: they count against the home's budget with the build dirs the scans
+    /// list ([`Collector::holds`]).
+    pub fn holds(&mut self, bytes: u64) {
+        self.collector.holds(0, bytes);
+    }
+
+    /// What the home holds against its budget: the bytes held, the budget, the volume's free
+    /// bytes and its comfortable level of them. `None` until the root's volume was measured.
+    pub fn budget(&self) -> Option<(u64, u64, u64, u64)> {
+        let (held, budget, volume) = self.collector.budget_of(0)?;
+        let comfortable = self.collector.config().levels.comfortable(&volume);
+        Some((held, budget, volume.free_bytes, comfortable))
     }
 
     /// The answers of the asked runs that recorded, for the daemon to send.

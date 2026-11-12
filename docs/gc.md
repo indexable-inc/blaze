@@ -1,6 +1,6 @@
 ---
 status: current
-summary: What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed.
+summary: What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
 ---
 # Collecting what blaze keeps on disk
 
@@ -12,9 +12,8 @@ crates/blaze-cargo, never the executable's bytes), shared by every daemon of the
 (`<machine>/std/<makers>`). The collector, `crates/blaze-gc`, removes what is no
 longer used of the first and the last, so a machine that builds many checkouts does not fill its
 disk. The daemon's state (its store, image and journal) is counted against the home's budget and
-its store is collected record by record, by the design in
-[The store's budget and collector](#the-stores-budget-and-collector) (designed 2026-11-12, lane
-storegc-1112; until it is built the store only grows and nothing of `<root>/v2` is listed).
+its store is collected record by record
+([The store's budget and collector](#the-stores-budget-and-collector)).
 
 It is automatic: nobody needs `blaze clean` or `blaze cache gc` to keep a disk from filling.
 The daemon measures each area's volume and collects more, and sooner, the closer free space
@@ -76,9 +75,9 @@ areas are collected all the same. Pressure, in permille:
 
 - 0 at the comfortable level, max(15%, 30 GiB) free, and full (1000) at the floor, max(10%,
   20 GiB) free, linear between;
-- also from blaze's share: blaze's own bytes on a volume past 80% of half the volume raise it,
-  full at half; what is to be freed for the share is what is past that 80%, so it is never 0
-  while the share holds pressure on;
+- also from blaze's budget: blaze's own bytes on a volume past 80% of its budget (a quarter of
+  the volume, and no more than 64 GiB) raise it, full at the budget; what is to be freed for it
+  is what is past that 80%, so it is never 0 while the budget holds pressure on;
 - with a band of 5% of the gap between the levels either side: it comes on at 5% pressure and
   goes off only once free space is 5% past comfortable, so free space hovering at a level does
   not switch it on and off. Free space's pressure runs below 0 past comfortable; blaze's share
@@ -170,7 +169,7 @@ The levels are set in `<root>/gc.json`, one JSON object whose fields are all opt
 unknown fields are refused, naming them (`crates/blaze-gc/src/settings.rs`):
 
 ```json
-{ "comfortable_percent": 15, "comfortable_gib": 30, "floor_percent": 10, "floor_gib": 20, "share_percent": 50, "auto": true }
+{ "comfortable_percent": 15, "comfortable_gib": 30, "floor_percent": 10, "floor_gib": 20, "share_percent": 25, "budget_gib": 64, "auto": true }
 ```
 
 `"auto": false` turns the daemon's own collection off, saying so as it starts (a build out of
@@ -367,109 +366,120 @@ and begun afresh, never silently.
 
 ## The store's budget and collector
 
-Designed 2026-11-12 (lane storegc-1112), not built: each paragraph is what the code is to do.
+Built 2026-11-12 (lane storegc-1112): the core is `crates/blaze-cas/src/collect.rs`, its
+driver `crates/blaze-cargo/src/serve/collect.rs`, its simulation
+`crates/blaze-cas/src/tests/collect.rs`. What is not built is under [Not done yet](#not-done-yet).
 
-**Budget.** One number per area (a home, `<root>`; the machine's directory), the tightest of
-three, each set in that area's `gc.json`: an absolute size (`budget_gib`, 64), a share of the
-volume (`share_percent`, 25; it was 50), and what leaves the floor free (held + free − floor,
-the `floor_*` levels above). The absolute size is what a person reads and raises; the share
-keeps a small CI disk from being filled; the floor is what makes room when other things fill
-the disk. Held is every byte under the area: build dirs, trash, and `v2` (the store's packs,
-checks, index and whole files, the image, the journal, the rest as `other`). The pacer's share
-pressure is this budget's: 0 at 80% of it, full at 100%.
+**Budget.** One number for a home (`<root>`), the tightest of three, each set in its
+`gc.json`:
 
-**Collectable.** A record of the store whose last use is older than the grace, least recently
-used first. Use is kept per pack, as the period a record of it was last read or written (a
-stamp in the head, head format 6; a head of format 5 is read with every pack stamped at the
-open), and per record in the flags the cold tier keeps (`Read`, `ReadBefore`, `New`,
-`NewBefore`), which every hit sets, `has` included. Never collected, the roots: (1) a record
-with one of those four flags set: a period ends only between requests, so every key a running
-or queued build found or put is flagged until it ends, and two periods after; (2) a record a
-pin names; (3) what a kept record names inside the store (a chunked output's chunks, a derived
-value's base, a compressed record's dictionary); (4) a record whose pages a reader pins
-(`Pinned`, a kept front end's images): its key may go, its pack's pages and file stay until the
-pin does; (5) the key last placed at each path of a leased build dir (`Jobs.paths.placed`),
-which a patch is based on. A launched program holds nothing of the store: its files are clones
-and its code is copied.
+| Bound | Setting | Default |
+|---|---|---|
+| an absolute size | `budget_gib` (or `budget_mib`), `blaze gc --budget <size>` | 64 GiB |
+| a share of the volume | `share_percent` | 25% |
+| what leaves the floor free (held + free − floor) | `floor_percent`, `floor_gib` | max(10%, 20 GiB) free |
 
-**Kept set.** A pin is a record of the store (`Kind::Pin`: a name, why, when, the keys). The
-daemon writes two unasked: `toolchain` (the std records it copies in from the shared std store,
-whose own directory its lease keeps) and `bstd`. `blaze gc --kept` lists each pin, its bytes
-and why, then what else is rooted and by what. `blaze clean` is this project's build dir and the
-records only its members made; `blaze clean --unkept` everything but the kept set and the roots;
-`blaze clean --everything` stops the daemon and trashes the home's state whole.
+The defaults are one row of code, `blaze_gc::pace::BUDGET`; the rule is
+`Levels::budget`. Held is the build dirs the collector lists and what the daemon says its
+state holds (`Collector::holds`: the store as its head names it, and every other file under
+`<root>/v2`, measured on a worker once a minute), so the collector of build dirs and the
+store's work against one number. Pressure is 0 under four fifths of the budget and full at it.
 
-**Forgetting a key.** By generations, not tombstones: the store's tables stay append-only. The
-least recently used pack is retired as a settle retires a half-dead one: its rooted records are
-copied on into the pack being written, and the head that makes the copies durable names the
-pack removed. A key that points into a pack its view names removed finds nothing, in memory
-and after a reopen, and the next index table leaves it out. So forgetting N cold records costs
-one unlink, copying costs what is kept, and the one commit point is the head, which is already
-crash-tested. A tombstone per key would need a second durable structure and a compaction to get
-the bytes back. A reader that found the record first reads it: the pack's pages are retired
-only after a view without it is published, its grace has passed and no pin holds them (the
-pool's `pack_removed`), and the file is unlinked then, not at the head.
+**Collectable.** A record of the store that no root keeps, in a pack not used for the grace
+(an hour; `store_grace_s` in `gc.json`). Use is kept two ways. Per pack: when a record of it was last read, or a new value
+appended to it, in seconds (`PackRef::used`, in the head since store format 6; a head of
+format 4 or 5 is read with none and its packs are stamped by the store's clock as it opens).
+Per record: the four flags the cold tier keeps (`Read`, `ReadBefore`, `New`, `NewBefore`),
+which a read sets, and `has`, and a put of a value the store already has. What moves cold is
+written to packs of its own (`Store::cold_unit`), so a pack of what nothing reads ages as a
+whole and is retired without a copy. The roots, never forgotten: (1) a record with one of the
+four flags; (2) a record a pin names; (3) what a record that stays names inside the store (a
+chunked output's chunks, a derived value's base): what only a forgettable record names goes
+with it in the same seal, never before; (4) the key placed at a path until the path holds
+another (`Store::place`, `unplace`); (5) a record the index table does not hold yet (the delta
+holds the newest 65,536); (6) a dictionary a pack is retired around is written again first. A
+pack is sealed only while no build is under way, queued, stored or placed, and only as scanned
+since the last one began, so a build never finds a key and then misses it. A reader that pinned
+a record's pages (`Pinned`, a kept front end's images) keeps reading them: the pool gives a
+retired pack's pages back only after a view without it is published, its grace has passed and
+no pin holds them.
 
-**Crash safety.** The copies and their checks are behind a barrier before the head; the head is
-one whole write; files are removed after it is durable, and an open removes those a head names
-removed. A crash before the head leaves the old store (the copies are cut off as an unnamed
-tail); after it, the new. No head names a record whose bytes are in a pack it names removed.
+**Kept set.** A pin is a record of the store (`Kind::Pin`: a name, why, when, its keys; the
+newest of a name is the name's, one with no keys lets it go; `collect::Pin`). The daemon
+writes two unasked at a build's end: `toolchain` (the standard library's unit records, their
+slots and outputs, as builds find them in the store) and `bstd` (the same of bstd's units).
+`blaze gc --dry-run` (or `--kept`) prints each pin with its keys, bytes and why, and what else
+is kept and by what, and removes nothing. `blaze clean` is this project's build dir, as before;
+`blaze clean --unkept` asks the daemon's store to forget every record no root keeps, whatever
+the budget and the grace.
 
-**Pacing.** The collector core (`blaze_cas::collect`, sans-IO, on the daemon's clock) only
-plans; reading, hashing and compressing run on a worker through a `Reader`, as the cold tier's
-batches do, in the pacer's class (`Background` below half pressure, `Normal` above). The
-period-end walk goes the same way (a worker scans the rows and rotates the flags; the loop takes
-the plan back), so its cost on the loop no longer grows with the store. On the loop a step
-hands a batch out or copies at most 256 KiB into the store's segment: 1 ms is its bound, each a
-span (`store gc plan`, `scan`, `copy`, `retire`, `unlink`) and a counter of steps past it. While
-a request is open the collector starts no commit: its copies ride the build's own commits; idle,
-it commits at most 1 MiB at a time, the one wait a request can meet (the rest of that commit).
-A slice's bytes and gap scale with pressure as above. When everything left is rooted and the
-area is still over, it stops, removes nothing, and reports `OverBudget` with the largest
-keepers and what keeps each.
+**Forgetting a key.** By retiring its pack, never by a tombstone: the tables stay
+append-only. The collector takes one pack (`Store::collect_take`; nothing is appended to it
+from then on), a worker reads it and judges each record (`CollectBatch::work`), the store
+copies the kept ones on a few at a time (`collect_copy`), and the seal (`collect_seal`) names
+the pack retired: a slot of the index table that points into a retired pack finds nothing
+(`TierView::gone`), at once in memory and after any reopen, and the next index table leaves it
+out. A record the delta holds is never forgotten, so no spot ever points into a retired pack.
+A pack more than three quarters kept is passed by; one that is half dead bytes is rewritten
+whatever the budget (this replaces the settle step's rewrite on the loop).
 
-**Other formats.** A store whose head is of a format this binary does not read is renamed to
-`v2/store.format-<n>` at start (today the daemon's start fails on it), and an image of another
-layout is named as stale; each is trashed once nothing wrote it or leased it for a day.
+**Crash safety.** The copies and their checks are behind a barrier before the head; the head
+is one whole write and names the pack removed; the file is removed after it is durable, and an
+open removes those a head names removed. A crash before the head leaves the old store (the
+copies are a tail no head names); after it, the new one.
 
-**What a person sees.** Every build's end carries the data (`store_bytes`,
-`store_delta_bytes`, `held_bytes`, `budget_bytes`, `collectable_bytes`, the volume's free
-bytes). A line is printed only at 85% of the budget or more, or when the volume is below its
-comfortable level, at most once in 6 hours for a home (once an hour when over), naming
-`blaze gc --budget <size>` and `blaze clean --unkept`. No prompt, during a build or after it:
-keys typed ahead for the next command would answer it, `blaze run` has handed the terminal to
-the program, an agent on a pty would hang or answer by accident, and nothing waits on the
-answer since the collector is already at work. At 100% the build proceeds and the line says
-what is kept; a build fails only when a write fails for want of space, with `NoSpace` naming
-the volume, the budget and both commands.
+**Pacing.** `Collector` is a core on the daemon's clock: it owns no file and no thread. The
+loop gives it the facts each turn (held, budget, whether a build is under way, builds begun,
+the time) and takes one step: a batch handed to a worker (`store gc read`: `Background` under
+half pressure, `Normal` from it), or a bounded piece of work on the store (`store gc step`:
+at most 256 KiB copied, a pack sealed, a commit asked for). The bound of a step is 1 ms; a
+step past it is counted and said. Under half pressure it steps only while no build runs; from
+half on it also copies while one does, and seals between builds. The gap between two packs
+goes from 60 s at no pressure to 50 ms at full. While a build is under way the collector
+begins no commit: what it copied rides the build's own. Between builds it commits after every
+256 KiB copied, with no index table in that commit, so a request that arrives meanwhile waits
+at most for the rest of one such commit (counted, `Counts::flush_waits`). The period-end walk
+of the store's rows, which plans the cold tier and marks the roots, runs on a worker
+(`PeriodScan`, `store period scan`); the loop hands it out and takes its plan back, so its
+cost on the loop no longer grows with the store. When every pack was looked at and the home is
+still at its budget, the collector says `OverBudget`, removes nothing in use, and looks again
+after ten minutes.
+
+**What a person sees.** Every build's end carries `Worked::storage` (`store_bytes`,
+`store_delta_bytes`, `held_bytes`, `budget_bytes`, `collectable_bytes`, `volume_free_bytes`,
+`over_budget`). Its `warning` is a line only when the home holds 85% of its budget or more,
+or its volume is under its comfortable level, at most once in six hours (once an hour when
+over), naming `blaze gc --budget <size>` and `blaze clean --unkept` (`serve::collect::Warner`).
+There is no prompt, during a build or after it: keys typed ahead for the next command would
+answer it, `blaze run` has handed the terminal to the program, an agent on a terminal would
+hang or answer by accident, and nothing waits on the answer since the collector is already at
+work. At the budget the build proceeds and the line says what is kept; a build fails only
+when a write fails for want of space, as [above](#pacing-how-hard-it-works).
+
+**Measured by** `harness/storegc.py` (one JSON value): a home filled by several generated
+programs, the budget set to a share of what it holds, body edits before, during and after the
+collection, the bytes at each step, and what `blaze gc --dry-run` says is kept.
 
 ## Not done yet
 
-- Eviction inside a store (`crates/blaze-cas` units and packs, least recently used): it needs the
-  store to drop keys from its tables before their packs go. Not built, so nothing in a store is
-  ever forgotten; what is built (2026-11-12, lane disk2-1111) is that it no longer keeps what it
-  holds raw: between requests the daemon ends the store's reading periods and moves what went
-  unread for two of them cold (`crates/blaze-cargo/src/serve/settle.rs`: zstd with a dictionary
-  per kind, on a worker; a value in a file of its own goes into a pack and its file is removed;
-  a pack left half dead is rewritten, the one its unit appends to as well). Hello-world's store
-  after a cold build and ten edits went from 184.3 MB to 33.9 MB (ix arm64, xfs), with the body
-  edit's median unchanged (79.3 ms before, 76.9 ms after, n=4 each). The design for forgetting:
-  packs as the unit of eviction, as a log-structured cache evicts regions: the oldest pack is
-  retired with only its records read in the last two periods (and every pinned key's) copied on,
-  the rest forgotten by a head that no longer lists them; a store of another format or of makers
-  no installed blaze has is a directory the collector trashes whole. What it cost before
-  (measured 2026-11-11, lane disk-1111): the daemon's store (`<root>/v2/store`) only grew. Hello-world's after a cold build and five edits is 174 MB:
-  six whole files of front-end records (`Query`, kept as files of their own: 85.7 MB, the
-  largest 51.6 MB), one whole `Derived` file (21.1 MB) and a pack of 93 MB (`Query` 43.5 MB in
-  13,304 records, `Code` 26.3 MB in 12,207 of which 6.5 MB repeat another record's content,
-  `Derived` recipes 21.7 MB in 20, about 1.1 MB an edit, `Debug` 1.3 MB). Nothing in it is
-  compressed (the cold tier has not settled anything yet): zstd -3 takes the pack to 18.3 MB
-  and the largest file to 5.7 MB. Every record's key covers the code of what made it, so a
+- The store's collector (above), what is designed and not built: a store whose head is of a
+  format this binary does not read is still refused at the daemon's start, not moved aside as
+  `v2/store.format-<n>` and trashed after a day; a stale image is replaced by the next, never
+  collected on its own; `blaze clean --everything`; `blaze clean` does not forget the
+  project's own records (records carry no project); the machine's shared std stores have no
+  record-level collection (a whole store goes by its TTL). Its limits: an index swap carries the
+  flags of use over on a worker (`FlagCarry`, `store flags carry`), and until that is back the
+  store forgets nothing; a store with no index table yet (under 65,536 records) forgets
+  nothing; the index table is still built on the loop by a build's commit; the period's scan
+  walks every row and reads every chunk list each period (on a worker); the daemon's own
+  measurement (`harness/storegc.py`) has not been run.
+
+- Records an older blaze made (every record's key covers the code of what made it, so a
   rebuilt blaze reads none of an older one's: a home used by rebuilt compilers for a day held
-  2.2 GB, 85 whole files of 54 MB each among them, none of which any installed blaze could
-  read. The design that fits: the store's directory named for the makers' identity
-  (`v2/store-<makers>`, as `std/<makers>` is), so a store no installed blaze reads is a
-  directory the collector already knows how to lease, age out and trash whole.
+  2.2 GB of them, measured 2026-11-11, lane disk-1111) are not known as such: they go cold
+  unread and are forgotten a pack at a time when the home nears its budget, not at once. The
+  design that would drop them whole: the store's directory named for the makers' identity
+  (`v2/store-<makers>`, as `std/<makers>` is).
 - A build out of space is recognised by the OS error's code in its error's text (`(os error
   28)`); one whose error lost that text is not held. The code does not travel through the API's
   error type, so the volume is found from the error's place (`ApiError::at`), and an error

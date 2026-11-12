@@ -811,6 +811,10 @@ pub struct Collector {
     /// What the lap saw, by path; and blaze's bytes in each area from it.
     seen: HashMap<String, Seen, Global>,
     area_bytes: Vec<u64>,
+    /// What its driver says blaze holds in each area that no scan lists: the daemon's state
+    /// ([`Collector::holds`]). Counted in blaze's bytes on the volume, so the budget is the
+    /// home's, never taken or freed by this collector.
+    held_bytes: Vec<u64>,
     /// Where the next slice's scan goes on from; whether a lap is under way, why it began, what
     /// it freed so far, and when the last one ended.
     cursor: Option<String>,
@@ -957,6 +961,7 @@ impl Collector {
             paced: 0,
             seen: HashMap::new_in(Global),
             area_bytes: vec![0; areas], // alloc: once per collector, one an area
+            held_bytes: vec![0; areas], // alloc: once per collector, one an area
             cursor: None,
             lap_open: false,
             lap_trigger: Trigger::Period,
@@ -1548,14 +1553,37 @@ impl Collector {
         self.volumes.iter().position(|it| it.is_some_and(|it| it.id == id)).unwrap_or(usize::MAX)
     }
 
-    /// blaze's bytes on the volume `id`: every area on it, as the lap saw them.
+    /// blaze's bytes on the volume `id`: every area on it, as the lap saw them, and what
+    /// the driver says each holds besides ([`Collector::holds`]).
     fn volume_bytes(&self, id: u64) -> u64 {
         self.volumes
             .iter()
-            .zip(&self.area_bytes)
+            .zip(self.area_bytes.iter().zip(&self.held_bytes))
             .filter(|(it, _)| it.is_some_and(|it| it.id == id))
-            .map(|(_, bytes)| *bytes)
+            .map(|(_, (bytes, held))| bytes.saturating_add(*held))
             .sum()
+    }
+
+    /// The levels read again (`gc.json` changed: `blaze gc --budget`).
+    pub fn set_levels(&mut self, levels: Levels) {
+        self.config.levels = levels;
+    }
+
+    /// The driver's word that blaze holds `bytes` in area `area` that no scan lists (the
+    /// daemon's store, image and journal): they count against the budget with what the scans
+    /// list, and this collector neither lists nor removes them.
+    pub fn holds(&mut self, area: usize, bytes: u64) {
+        if let Some(held) = self.held_bytes.get_mut(area) {
+            *held = bytes;
+        }
+    }
+
+    /// What area `area` holds against its budget, and the budget: what its scans listed and
+    /// what its driver says it holds besides; `None` until its volume was measured.
+    pub fn budget_of(&self, area: usize) -> Option<(u64, u64, Volume)> {
+        let volume = (*self.volumes.get(area)?)?;
+        let held = self.volume_bytes(volume.id);
+        Some((held, self.config.levels.budget(&volume, held), volume))
     }
 
     /// Each volume as it stands: free space, the levels, blaze's bytes and what is to be freed.

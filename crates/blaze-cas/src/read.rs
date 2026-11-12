@@ -78,6 +78,10 @@ pub(crate) struct Shared {
     /// passed its grace, a table of pins among it ([`Shared::pins_let_go`]).
     bound: Lock<()>,
     unpinned: Signal,
+    /// The store's clock as it was last told ([`crate::Store::clock`]), in seconds: what a
+    /// read stamps its pack with. `std`'s atomic under the model checker too: a hint, read
+    /// and written with no ordering.
+    tick: std::sync::atomic::AtomicU64,
 }
 
 /// A read found the pool's pinned bytes at their bound through every wait for the store to
@@ -110,6 +114,7 @@ impl Shared {
             side,
             bound: Lock::new("store.pool.pinned", ()),
             unpinned: Signal::new("store.pool.unpinned"),
+            tick: std::sync::atomic::AtomicU64::new(0),
             // alloc: once per store opened, the view readers load
             view: AtomicPtr::new(Box::into_raw(Box::new(view))),
             // alloc: once per store opened, the table of values made whole
@@ -120,6 +125,15 @@ impl Shared {
             // alloc: empty, allocates nothing until a whole file is written
             unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
         }
+    }
+
+    /// The store's clock, in seconds; 0 until it is told.
+    pub(crate) fn tick(&self) -> u64 {
+        self.tick.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_tick(&self, seconds: u64) {
+        self.tick.store(seconds, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The store began to write the whole file `id`: no base until its write-back completes.
@@ -303,6 +317,21 @@ pub(crate) struct PackView {
     pub(crate) base: Option<u64>,
     /// How much of it is committed, and so a reader's to read through the pool.
     pub(crate) usable: u64,
+    /// Its records are no key's any more: the pack was retired ([`crate::collect`]), its
+    /// rooted records copied on, and the head names it removed or the next one will. A slot
+    /// of the index table that points into it finds nothing.
+    pub(crate) gone: bool,
+    /// When a record of it was last read, in seconds on the store's clock: the pack's own
+    /// word, which a read writes at most once a second ([`Look::was_read`]).
+    pub(crate) used: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TierView {
+    /// Whether `loc` is in a pack that was retired: its key finds nothing in this tier.
+    #[inline]
+    pub(crate) fn gone(&self, loc: Loc) -> bool {
+        self.packs.get(loc.pack as usize).is_some_and(|it| it.gone)
+    }
 }
 
 impl PackView {
@@ -693,6 +722,8 @@ impl<'a> Look<'a> {
             }
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
+                // A key the collector forgot: its pack was retired without it.
+                Some((_, Ok(loc))) if tier.gone(loc) => {}
                 Some((slot, Ok(loc))) => {
                     return Some(Ok(Found {
                         view,
@@ -722,12 +753,21 @@ impl<'a> Look<'a> {
         let view = self.view();
         for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
-                if let Some((_, spot)) = table.get(self.held, key) {
+                if let Some((row, spot)) = table.get(self.held, key) {
+                    // A put of a value the store has is a use of it, as a read is: the
+                    // collector keeps what a build was told is kept.
+                    self.was_read(Found {
+                        view,
+                        tier: at,
+                        place: spot.place,
+                        at: At::Spot(table, row, spot),
+                    });
                     return Some((spot.content, spot.ticket));
                 }
             }
             let Some(index) = &tier.index else { continue };
             match index.table().get(key) {
+                Some((_, Ok(loc))) if tier.gone(loc) => {}
                 Some((slot, Ok(loc))) => {
                     let found = Found {
                         view,
@@ -735,6 +775,7 @@ impl<'a> Look<'a> {
                         place: Place::Pack(loc),
                         at: At::Slot(index, slot),
                     };
+                    self.was_read(found);
                     return self
                         .record(found, key)
                         .ok()
@@ -775,6 +816,7 @@ impl<'a> Look<'a> {
                 for (slot, key, loc) in index.table().iter() {
                     match loc {
                         Ok(_) if shadow.contains(&key) => {}
+                        Ok(loc) if it.gone(loc) => {}
                         Ok(loc) => out.push((
                             key,
                             Found {
@@ -1143,9 +1185,19 @@ impl<'a> Look<'a> {
         Ok((header, bytes))
     }
 
+    /// A hit of the own tier: its record's flag of use, and its pack's time of use, each
+    /// written only when it changes, so reading a record again writes no shared line.
     fn was_read(self, found: Found<'a>) {
         if found.tier == 0 {
             found.at.set(Flag::Read);
+            if let Place::Pack(loc) = found.place
+                && let Some(pack) = found.view.tiers[0].packs.get(loc.pack as usize)
+            {
+                let (tick, relaxed) = (self.shared.tick(), std::sync::atomic::Ordering::Relaxed);
+                if pack.used.load(relaxed) != tick {
+                    pack.used.store(tick, relaxed);
+                }
+            }
         }
     }
 
@@ -1220,8 +1272,17 @@ impl<'a> Look<'a> {
         )))
     }
 
+    /// A hit counts as a read: what a build found it may read or place later, so the
+    /// collector keeps it as it keeps what was read (docs/gc.md, the roots).
     pub(crate) fn has(self, key: &Key) -> bool {
-        self.find(key).is_some()
+        match self.find(key) {
+            Some(Ok(found)) => {
+                self.was_read(found);
+                true
+            }
+            Some(Err(_)) => true,
+            None => false,
+        }
     }
 
     /// The value of `key`, verified as [`Look::get`] verifies it, held past the task: the bytes

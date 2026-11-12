@@ -103,8 +103,10 @@ use serde::{Deserialize, Serialize};
 /// with the in-browser compiler they fed. 49: [`Worked::why`], the build's own summary in its
 /// `Work` when the daemon has it by then, so its client makes one round trip. 50:
 /// [`Targets::goal`] and [`Worked::tiers`], the build goal ([`Goal`]) and how much of the code
-/// a build linked is optimized.
-pub const SCHEMA: u32 = 50;
+/// a build linked is optimized. 51: [`Worked::storage`] ([`Storage`]: what the daemon's store
+/// and its home hold against their budget, on every build's end) and `unkept` of
+/// [`Request::Gc`].
+pub const SCHEMA: u32 = 51;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -414,12 +416,15 @@ pub enum Request {
         top: u32,
         since: HotSince,
     },
-    /// `blaze cache gc` while the daemon holds the collector's areas: one run of the daemon's
-    /// collector to its end (`dry_run` plans and removes nothing), answered with
-    /// [`Response::Collected`] as it records. Answered by the daemon's loop, which holds the
-    /// collector.
+    /// `blaze gc` while the daemon holds the collector's areas: one run of the daemon's
+    /// collector to its end (`dry_run` plans and removes nothing), and one lap of its store's
+    /// collector (docs/gc.md, "The store's budget and collector"), answered with
+    /// [`Response::Collected`] as they end. `unkept` (`blaze clean --unkept`): the store's lap
+    /// forgets every record no pin and no root keeps, whatever the budget and its pack's age.
+    /// Answered by the daemon's loop, which holds the collectors.
     Gc {
         dry_run: bool,
+        unkept: bool,
     },
     /// `blaze why [ITEM]`: what the last build that ended in this daemon's life computed again
     /// instead of reusing, grouped by step and reason, each group with its first items (every
@@ -1270,6 +1275,36 @@ pub struct Worked {
     /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
     /// asked for compiles a program.
     pub tiers: Option<Tiers>,
+    /// What the daemon's store and its home hold against their budget as the build ends.
+    /// `None` from a daemon that collects nothing (a test's, or one that is not `blaze
+    /// serve`'s).
+    pub storage: Option<Storage>,
+}
+
+/// What blaze holds on disk as a build ends, against its budget (docs/gc.md, "The store's
+/// budget and collector"): data on every build, for whoever renders it. Bytes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Storage {
+    /// The daemon's store, and how much it grew or shrank since the build before ended.
+    pub store_bytes: u64,
+    pub store_delta_bytes: i64,
+    /// Everything the home holds (its build dirs, its store, its image), and its budget: the
+    /// tightest of an absolute size, a share of the volume and what leaves the volume's floor
+    /// free. The share used is `held_bytes / budget_bytes`. A budget of 0: not measured yet.
+    pub held_bytes: u64,
+    pub budget_bytes: u64,
+    /// What the store's collector could give back: dead bytes, and records no root keeps.
+    pub collectable_bytes: u64,
+    /// The volume's free space.
+    pub volume_free_bytes: u64,
+    /// The collector looked at everything and what is held is still at the budget or past
+    /// it: what is left is in use or kept.
+    pub over_budget: bool,
+    /// One line to print, when the daemon's policy says this build should say something
+    /// (held at 85% of the budget or more, or the volume low; at most once in six hours, once
+    /// an hour when over): it names the command that raises the budget and the one that
+    /// frees space. `None`: nothing to say.
+    pub warning: Option<String>,
 }
 
 /// What a build left unchecked ([`Response::Unchecked`]): said once a unit failed and any

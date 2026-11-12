@@ -245,6 +245,7 @@ fn the_finished_line_says_the_goal_and_how_much_is_optimized() {
     let worked = |tiers| {
         Response::Work(blaze_api::Worked {
             why: None,
+            storage: None,
             tiers,
             link: blaze_api::LinkKind::Patched,
             found: 0,
@@ -280,6 +281,7 @@ fn the_finished_line_says_the_goal_and_how_much_is_optimized() {
 fn what_a_request_did_is_one_json_line_of_blazes() {
     let worked = blaze_api::Worked {
         why: None,
+        storage: None,
         tiers: None,
         link: blaze_api::LinkKind::Patched,
         found: 3,
@@ -333,6 +335,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
     use blaze_api::{ServedCrate, ServedPart};
     let worked = blaze_api::Worked {
         why: None,
+        storage: None,
         tiers: None,
         link: blaze_api::LinkKind::Placed,
         found: 0,

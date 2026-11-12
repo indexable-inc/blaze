@@ -57,7 +57,7 @@ use blaze_manifest::{Config, Context, Workspace, metadata::root_manifest};
 
 use super::say;
 
-const USAGE_TEXT: &str = "blaze clean [--dry-run] [--force] [--manifest-path PATH] [--target-dir DIR] | blaze clean --list | blaze clean --all [--dry-run]";
+const USAGE_TEXT: &str = "blaze clean [--dry-run] [--force] [--manifest-path PATH] [--target-dir DIR] | blaze clean --list | blaze clean --all [--dry-run] | blaze clean --unkept [--dry-run]";
 
 /// What `blaze clean` is asked.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -118,6 +118,12 @@ fn parse(words: Vec<OsString>) -> Result<Asked, String> {
 
 /// `blaze clean`, with the words after it.
 pub fn main(words: Vec<OsString>, color: bool) -> i32 {
+    // `blaze clean --unkept`: the daemon's store forgets every record no pin and no root
+    // keeps, whatever its budget (docs/gc.md); the daemon does it, asked as `blaze gc` asks.
+    if words.first().is_some_and(|it| it == "--unkept") {
+        let asked: Vec<OsString> = std::iter::once("gc".into()).chain(words).collect();
+        return super::cache::main(&asked, color);
+    }
     let refused = |what: &str, code: i32| {
         eprint!("{}", say::error(what, color));
         code

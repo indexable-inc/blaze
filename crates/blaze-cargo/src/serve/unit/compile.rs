@@ -1739,6 +1739,21 @@ fn kept(job: &Job, unit: usize) -> Result<Option<Kept>, ApiError> {
     Ok(None)
 }
 
+/// The record of a standard library unit, and of bstd, with the slot of what it read and
+/// every output it names, handed to the store's collector to pin: the toolchain's own records
+/// and bstd's are kept whatever their last use (docs/gc.md, "The store's budget and
+/// collector"; [`crate::serve::collect::keep`]).
+fn pin_kept(job: &Job, unit: usize, at: &reads::Found, record: &Record) {
+    let Ok(it) = job.unit(unit) else { return };
+    let name = match (it.is_std, it.target.name == "bstd") {
+        (true, _) => crate::serve::collect::TOOLCHAIN,
+        (false, true) => crate::serve::collect::BSTD,
+        (false, false) => return,
+    };
+    let outputs = record.outputs.iter().map(|(_, output, _)| *output);
+    crate::serve::collect::keep(name, at.slot.iter().copied().chain(outputs).chain([at.key]));
+}
+
 /// [`kept`] under the base key `base`, one of the unit's ([`record_keys`]).
 fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiError> {
     let guard = blaze_cas::enter();
@@ -1761,9 +1776,10 @@ fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiErro
             pkg,
         )
     };
-    if let Some((_, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? {
-        let record = blaze_protocol::cbor::from_slice(&entry.bytes[body..])
+    if let Some((at, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? {
+        let record: Record = blaze_protocol::cbor::from_slice(&entry.bytes[body..])
             .map_err(|error| undecoded("the daemon's store", error.to_string()))?;
+        pin_kept(job, unit, &at, &record);
         let profiles = recorded_in(job, unit, base, entry.bytes)?;
         // alloc: none
         return Ok(Some(Kept { record, puts: Vec::new(), profiles }));
@@ -1776,6 +1792,7 @@ fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiErro
     let Some((at, entry, body)) = filed_in(job, std, true, &guard, base)? else { return Ok(None) };
     let record: Record = blaze_protocol::cbor::from_slice(&entry.bytes[body..])
         .map_err(|error| undecoded(&in_std(), error.to_string()))?;
+    pin_kept(job, unit, &at, &record);
     let profiles = recorded_in(job, unit, base, entry.bytes)?;
     let mut puts = Vec::with_capacity(record.outputs.len() + 2); // alloc: once per std unit found shared
     let copied = at.slot.iter().chain(record.outputs.iter().map(|(_, output, _)| output));

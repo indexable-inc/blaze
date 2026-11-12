@@ -313,6 +313,7 @@ const COMMANDS: &[&str] = &[
     "lock",
     "clean",
     "cache",
+    "gc",
     "fmt",
     "new",
     "init",
@@ -356,7 +357,6 @@ const ALIASES: &[(&str, &str, &str)] = &[
     ("start", "blaze serve", "though any command starts the daemon when none runs"),
     ("clippy", "blaze check", "it runs every lint, clippy's too"),
     ("fix", "blaze check --fix", "it makes the machine-applicable suggestions"),
-    ("gc", "blaze cache gc", "it collects what blaze keeps on disk"),
 ];
 
 /// The command `name` (the words typed, as `args::parse` hands them: `daemon stop`) most

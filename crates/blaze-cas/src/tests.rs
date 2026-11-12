@@ -9,6 +9,7 @@ use super::*;
 use crate::read::Found;
 
 mod block_checks;
+mod collect;
 mod model_check;
 mod place_crash;
 mod place_made;
@@ -1795,7 +1796,8 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     flush_holding(&mut sim, &mut store, &mut held, batch_map);
     assert_eq!(store.pending.len(), 1, "the batch's moves are held back");
     let pack = &store.tiers[0].packs[0];
-    assert!(store.tiers[0].packs.len() == 2 && store.tiers[0].dictionaries.is_empty());
+    // Pack 0 and the pack the puts went on into; what moved cold is in a cold pack of its own.
+    assert!(store.tiers[0].packs.len() >= 2 && store.tiers[0].dictionaries.is_empty());
     assert!(pack.usable == pack.committed, "pack 0 is read as far as it is committed");
     assert!(pack.dead * 2 >= pack.committed - PACK_HEADER, "pack 0 is half dead");
     assert!(
@@ -1975,7 +1977,7 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     store.put(key(1), Kind::Code, &[1]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    assert_eq!((FORMAT_READ, FORMAT), (4, 5));
+    assert_eq!((FORMAT_READ, FORMAT), (4, 6));
     let head = name("store/head");
     let mut bytes = sim.contents(&head);
     assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
@@ -1987,13 +1989,21 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     assert!(!store.ready());
     let broken = store.broken().unwrap();
     assert_eq!(broken.file, head);
-    assert!(broken.what.contains("store format 3, not 5"), "{broken}");
+    assert!(broken.what.contains("store format 3, not 6"), "{broken}");
 }
 
-/// Format 5 added a head's whole files to remove. A store of format 4 (its head and its
-/// index table) is read as it is, and the next head written over it is of format 5.
+/// Format 5 added a head's whole files to remove, format 6 each pack's time of use. A store
+/// of format 4 or 5 (its head and its index table) is read as it is, its packs' times of use
+/// not known until the store's clock is told, and the next head written over it is of this
+/// format.
 #[test]
-fn a_store_of_format_4_is_read_and_goes_on_as_format_5() {
+fn a_store_of_format_4_or_5_is_read_and_goes_on_as_this_format() {
+    for format in [4u32, 5] {
+        a_store_of_an_older_format_is_read_and_goes_on(format);
+    }
+}
+
+fn a_store_of_an_older_format_is_read_and_goes_on(format: u32) {
     let mut sim = Sim::new(8, quiet());
     let mut store = open(&mut sim, "store");
     let count = INDEX_AFTER as u64 + 4;
@@ -2008,23 +2018,31 @@ fn a_store_of_format_4_is_read_and_goes_on_as_format_5() {
     let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
     let mut table = sim.contents(&index);
     assert_eq!(table[8..12], FORMAT.to_le_bytes());
-    table[8..12].copy_from_slice(&4u32.to_le_bytes());
+    table[8..12].copy_from_slice(&format.to_le_bytes());
     sim.change(&index, &table);
     let mut written = Head::decode(&sim.contents(&head)).unwrap();
     written.index.as_mut().unwrap().check = crc::crc32c(&table);
-    let mut bytes = written.encode();
-    bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
-    let body = bytes.len() - 4;
-    let check = crc::crc32c(&bytes[..body]);
-    bytes[body..].copy_from_slice(&check.to_le_bytes());
+    // As that blaze wrote it: no time of use a pack.
+    let bytes = written.encode_as(format);
+    assert_eq!(bytes[8..12], format.to_le_bytes());
+    assert!(bytes.len() < written.encode().len(), "a head of format {format} is shorter");
     sim.change(&head, &bytes);
     let mut store = open(&mut sim, "store");
+    assert!(
+        store.collect_candidates().iter().all(|it| it.used == 0),
+        "a head of format {format} says of no pack when it was used"
+    );
+    store.clock(1_000);
+    assert!(
+        store.collect_candidates().iter().all(|it| it.used == 1_000),
+        "the store's clock stamps the packs whose use is not known"
+    );
     for n in 0..count {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n}");
     }
     store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
     flush(&mut sim, &mut store);
-    assert_eq!(sim.contents(&head)[8..12], 5u32.to_le_bytes(), "the next head is of format 5");
+    assert_eq!(sim.contents(&head)[8..12], FORMAT.to_le_bytes(), "the next head is of this format");
     drop(store);
     let store = open(&mut sim, "store");
     for n in 0..=count {
@@ -3109,8 +3127,15 @@ fn a_head_round_trips_and_refuses_any_change() {
         generation: 7,
         index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, check: 0xdead_beef, count: 3 }),
         packs: vec![
-            PackRef { unit: 0, committed: 4096, indexed: 16, dead: 0, removed: true },
-            PackRef { unit: 2, committed: 3 * 4096, indexed: 4096, dead: 112, removed: false },
+            PackRef { unit: 0, committed: 4096, indexed: 16, dead: 0, removed: true, used: 0 },
+            PackRef {
+                unit: 2,
+                committed: 3 * 4096,
+                indexed: 4096,
+                dead: 112,
+                removed: false,
+                used: 1_762_900_000,
+            },
         ],
         dictionaries: vec![DictionaryRef { kind: Kind::Run, pack: 1, offset: 16 }],
         externals: vec![ExternalRef { content: content_of(b"y"), len: 9 }],

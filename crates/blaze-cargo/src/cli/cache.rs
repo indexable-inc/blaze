@@ -1,7 +1,13 @@
-//! `blaze cache gc [--dry-run]`: one run of the collector of what blaze keeps on disk
-//! (docs/gc.md), here in the CLI, to its end: what went and why, what stayed and why.
-//! `--dry-run` plans and removes nothing. `blaze cache gc --last` prints the daemon's last runs
-//! from its ledger.
+//! `blaze gc [--dry-run]` (also `blaze cache gc`): one run of the collector of what blaze
+//! keeps on disk (docs/gc.md), here in the CLI, to its end: what went and why, what stayed and
+//! why. `--dry-run` (or `--kept`) plans and removes nothing: it prints what is held, what is
+//! kept and why. `blaze gc --last` prints the daemon's last runs from its ledger. `blaze gc
+//! --budget <size>` (`64G`, `512M`) sets the home's absolute budget in `<root>/gc.json` and
+//! prints what is held against it. `--unkept` is `blaze clean --unkept`: the daemon's store
+//! forgets every record no pin and no root keeps.
+//!
+//! The daemon's store is collected by the daemon alone, which holds it: with none running,
+//! the build dirs are collected here and the store is said to be left.
 //!
 //! The CLI knows no daemon's live heads, so it keeps more than the daemon would: every build
 //! dir whose checkout still exists counts as a head's. Everything else holds as in the daemon:
@@ -19,7 +25,7 @@ use blaze_gc::{Collector, Config, Inventory};
 
 use super::say;
 
-const USAGE_TEXT: &str = "blaze cache gc [--dry-run] | blaze cache gc --last";
+const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaze gc --budget <size> (64G, 512M) | blaze clean --unkept";
 
 /// `blaze cache`, with the words after it.
 pub fn main(words: &[OsString], color: bool) -> i32 {
@@ -28,13 +34,18 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
         code
     };
     let words: Option<Vec<&str>> = words.iter().map(|it| it.to_str()).collect();
-    let (dry_run, last) = match words.as_deref() {
-        Some(["gc"]) => (false, false),
-        Some(["gc", "--dry-run" | "-n"]) => (true, false),
-        Some(["gc", "--last"]) => (false, true),
+    let done = match words.as_deref() {
+        Some(["gc"]) => collect(false, false),
+        Some(["gc", "--dry-run" | "-n" | "--kept"]) => collect(true, false),
+        Some(["gc", "--unkept"]) => collect(false, true),
+        Some(["gc", "--unkept", "--dry-run" | "-n"]) => collect(true, true),
+        Some(["gc", "--last"]) => last_runs(),
+        Some(["gc", "--budget", size]) => budget(size).and_then(|mut said| {
+            said.push_str(&collect(true, false)?);
+            Ok(said)
+        }),
         _ => return refused(USAGE_TEXT, Exit::Usage.code()),
     };
-    let done = if last { last_runs() } else { collect(dry_run) };
     match done {
         Ok(out) => {
             print!("{out}");
@@ -58,7 +69,64 @@ fn areas() -> Result<Vec<String>, String> {
     Ok(areas)
 }
 
-fn collect(dry_run: bool) -> Result<String, String> {
+/// `size` as bytes: a whole number of `G` (or `GiB`) or `M` (or `MiB`); `None` for anything
+/// else, and for none.
+fn budget_size(size: &str) -> Option<(u64, &'static str)> {
+    let (digits, unit) = size.split_at(size.find(|it: char| !it.is_ascii_digit())?);
+    let count: u64 = digits.parse().ok().filter(|&it| it > 0)?;
+    match unit {
+        "G" | "GiB" | "g" => Some((count, "budget_gib")),
+        "M" | "MiB" | "m" => Some((count, "budget_mib")),
+        _ => None,
+    }
+}
+
+/// `blaze gc --budget <size>`: the home's absolute budget written into `<root>/gc.json`, its
+/// other fields kept; the file is read back as the daemon reads it before this says it is
+/// set, and the daemon reads it again as it is next asked (the report that follows asks).
+fn budget(size: &str) -> Result<String, String> {
+    let Some((count, field)) = budget_size(size) else {
+        return Err(format!(
+            "`{size}` is no size: a whole number of G or M, as in `blaze gc --budget 128G`"
+        ));
+    };
+    let areas = areas()?;
+    let root = Path::new(&areas[0]);
+    let path = root.join(blaze_gc::settings::SETTINGS);
+    let mut set = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Object(set)) => set,
+            Ok(_) => return Err(format!("{} is not one JSON object", path.display())),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    set.remove("budget_gib");
+    set.remove("budget_mib");
+    set.insert(field.to_owned(), serde_json::Value::from(count));
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(set))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let temp = root.join(format!(".gc.json.{}.tmp", std::process::id()));
+    std::fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    std::fs::write(&temp, format!("{text}\n"))
+        .and_then(|()| std::fs::rename(&temp, &path))
+        .map_err(|error| format!("writing {}: {error}", path.display()))?;
+    let levels =
+        blaze_gc::settings::GcSettings::read(root, blaze_gc::pace::Levels::default())?.levels;
+    Ok(format!(
+        "the budget of {} is {} (and at most {}% of its volume, and what leaves its floor free): written to {}\n",
+        root.display(),
+        blaze_gc::plan::size_text(levels.budget_bytes),
+        levels.share_percent,
+        path.display(),
+    ))
+}
+
+/// What is said of the store when no daemon holds the home: only its daemon collects it.
+const STORE_LEFT: &str = "the daemon's store is left as it is: only the daemon that holds it collects it, and none is running (any build starts one; then `blaze gc` again)\n";
+
+fn collect(dry_run: bool, unkept: bool) -> Result<String, String> {
     let areas = areas()?;
     let mut out = String::new();
     // Held to the end of the run: an area another collector holds is given as `""`, left alone.
@@ -85,7 +153,10 @@ fn collect(dry_run: bool) -> Result<String, String> {
     }
     if locks.is_empty() {
         // A daemon collects them all: its collector runs this, with its live heads.
-        return asked_of_daemon(dry_run, out);
+        return asked_of_daemon(dry_run, unkept, out);
+    }
+    if unkept {
+        return Err(format!("{out}{STORE_LEFT}"));
     }
     // Every checkout a build dir names that exists: the heads, as the CLI can know them.
     let clock = blaze_gc::plan::Clock::default();
@@ -109,16 +180,17 @@ fn collect(dry_run: bool) -> Result<String, String> {
     let report = blaze_gc::fs::run_now(&mut collector, dry_run, &held)?;
     drop(locks);
     out.push_str(&report.details());
+    out.push_str(STORE_LEFT);
     Ok(out)
 }
 
 /// The run asked of the running daemon, which holds every area's collector lock: its report as
 /// it prints, after `out` (which names the holders). No daemon answering, the holder is another
 /// `blaze cache gc` or a daemon that runs no collector, and that is the error.
-fn asked_of_daemon(dry_run: bool, mut out: String) -> Result<String, String> {
+fn asked_of_daemon(dry_run: bool, unkept: bool, mut out: String) -> Result<String, String> {
     let mut report = None;
     let asked = super::observe::ask(
-        blaze_api::Request::Gc { dry_run },
+        blaze_api::Request::Gc { dry_run, unkept },
         super::daemon::Start::Never,
         |response| {
             if let blaze_api::ResponseRef::Collected { report: it } = response {

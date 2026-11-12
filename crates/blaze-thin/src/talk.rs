@@ -363,6 +363,7 @@ mod tests {
         };
         let worked = Worked {
             why: None,
+            storage: None,
             link: LinkKind::Patched,
             found: 0,
             green: 4,

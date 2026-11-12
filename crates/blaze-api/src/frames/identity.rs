@@ -312,7 +312,7 @@ impl Gen {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
-            28 => Request::Gc { dry_run: self.yes() },
+            28 => Request::Gc { dry_run: self.yes(), unkept: self.yes() },
             29 => Request::Rebuilt {
                 all: self.yes(),
                 cwd: self.maybe_text(),
@@ -588,6 +588,16 @@ impl Gen {
                     goal: g.goal(),
                     optimized: g.wide(),
                     functions: g.wide(),
+                }),
+                storage: self.maybe(|g| crate::Storage {
+                    store_bytes: g.wide(),
+                    store_delta_bytes: g.wide() as i64,
+                    held_bytes: g.wide(),
+                    budget_bytes: g.wide(),
+                    collectable_bytes: g.wide(),
+                    volume_free_bytes: g.wide(),
+                    over_budget: g.yes(),
+                    warning: g.maybe_text(),
                 }),
             }),
             8 => Response::TestResult(TestResult {
