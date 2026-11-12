@@ -621,7 +621,11 @@ impl Image {
         if let Some(given) = change.given {
             new.given = given;
         }
-        if new.wants_compaction() {
+        // O(image), so it has a span of its own that says which list it is run for: a stage
+        // that compacts every link is a link that costs the image and not the change.
+        if let Some((list, garbage, live)) = new.compaction_of() {
+            let _span =
+                tracing::info_span!(target: "blaze", "link compact", list, garbage, live).entered();
             new.compact();
         }
         self.arena.reset();

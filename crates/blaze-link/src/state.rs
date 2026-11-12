@@ -1047,14 +1047,24 @@ impl State {
 
     /// Whether the list arenas are mostly garbage: then [`State::compact`] pays for itself.
     pub fn wants_compaction(&self) -> bool {
+        self.compaction_of().is_some()
+    }
+
+    /// The first list arena that is mostly garbage, with its garbage and what it holds
+    /// live: what [`State::compact`] is run for, which its span says.
+    pub fn compaction_of(&self) -> Option<(&'static str, usize, usize)> {
         let over = |garbage: usize, live: usize| garbage > live + (1 << 16);
-        over(self.fixups.garbage(), self.fixups.live())
-            || over(self.syms.garbage(), self.syms.live())
-            || over(self.wasm_names.garbage(), self.wasm_names.live())
-            || over(self.ref_items.garbage(), self.ref_items.live())
-            || over(self.rebase.garbage(), self.rebase.live())
-            || over(self.binds.garbage(), self.binds.live())
-            || over(self.lines.garbage(), self.lines.live())
+        [
+            ("fixups", self.fixups.garbage(), self.fixups.live()),
+            ("syms", self.syms.garbage(), self.syms.live()),
+            ("wasm_names", self.wasm_names.garbage(), self.wasm_names.live()),
+            ("ref_items", self.ref_items.garbage(), self.ref_items.live()),
+            ("rebase", self.rebase.garbage(), self.rebase.live()),
+            ("binds", self.binds.garbage(), self.binds.live()),
+            ("lines", self.lines.garbage(), self.lines.live()),
+        ]
+        .into_iter()
+        .find(|it| over(it.1, it.2))
     }
 
     /// Copies every live list into fresh arenas and rebuilds the referrer lists, dropping
