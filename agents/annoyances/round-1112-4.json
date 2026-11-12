@@ -1,0 +1,18 @@
+{
+ "id": "round-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "where": "blaze-vm: /tmp during the round`s test runs",
+ "what": "The revision tests (/tmp/brv-<pid>-<n>) and blaze-engine`s repro tests (/tmp/blaze-repro-<pid>-<n>) keep their homes in /tmp, a tmpfs of 373,581 inodes on the VM. Two test streams (the round`s tree and main) plus the homes of runs that were stopped (a killed test removes nothing) used every inode: `df -i /tmp` 100%, 29 GiB held as shared memory, and every real-driver revision test then failed with `getting it from .../library failed: No space left on device (os error 28)`, which read as a regression of the merged tree until one case was run alone.",
+ "cost": "the revision suite`s first results on both trees are void (about 25 minutes of two test streams), 29 GiB of the VM`s memory held while lane reth waited for memory, and a wrong first reading (all real-driver cases failing here, not on base)",
+ "whys": [
+  "test homes are under /tmp, which is memory on this VM",
+  "a stopped or failed test leaves its home (kept on purpose for a failure`s log; a kill keeps all)",
+  "nothing bounds or reports /tmp`s inodes, and ENOSPC from an inode limit says `No space left` with 100 GiB free",
+  "the runner stacked two suites"
+ ],
+ "class": "test state on a tmpfs that nobody empties",
+ "prevention": "the revision and repro harnesses take their root from one variable (BLAZE_TEST_TMP, default as now) so a runner puts it on the root disk under its own directory and removes it per run; the runner checks `df -i` and `free -g` before a unit; the copy`s error names the directory it wrote to",
+ "workaround": "rm -rf /tmp/brv-* /tmp/blaze-repro-* between runs (only when no test runs)",
+ "state": "open"
+}
