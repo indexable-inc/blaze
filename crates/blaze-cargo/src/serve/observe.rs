@@ -341,8 +341,9 @@ pub struct Ended {
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
 /// a reader's ask for a flush.
 enum ToHistory {
-    /// Its row with outcome running and no end, written at once: the row a build has if its
-    /// daemon dies before it ends ([`history::writes`]).
+    /// Its row with outcome running and no end: the row a build has if its daemon dies
+    /// before it ends ([`history::writes`]). Written by the next flush made, which for a
+    /// build still running comes [`STARTED_FLUSH_AFTER`] after its start ([`Held`]).
     Started(BuildRow),
     /// Its misses explained and told at once (`blaze why` is answered from them), and its
     /// rows kept by the thread ([`Noted`]), given to no flush: the build's answer may still be
@@ -372,7 +373,7 @@ enum ToHistory {
     /// to the explorer's thread that waits for it ([`explorer_flush`]).
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
-    /// written at once. Its request was answered as this was sent ([`Observe::client_rows`]):
+    /// written by the next flush made ([`Held`]). Its request was answered as this was sent ([`Observe::client_rows`]):
     /// no client waits for a write, and one that fails is the history's failure, said in
     /// `blaze status` as any flush's is.
     Client(history::ClientRows),
