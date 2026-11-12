@@ -1,0 +1,11 @@
+{
+ "id": "rev-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: memory",
+ "what": "While four test daemons ran, one build paused with `daemon at 0.1 of 95 GiB (machine 95.0 GiB, 95.1 held by 5 other daemons: pid .. of brv-..-1/h 78.2 ..)`: a daemon serving a two-function crate was counted as holding 78 GiB.",
+ "cost": "none measured; a paused build in a timing-sensitive case",
+ "cause": "not looked into: the store pool's reservation counted as held, or a real footprint under `BLAZE_VERIFY_STORE=1`",
+ "workaround": "none",
+ "state": "open: for the daemon-memory lane"
+}

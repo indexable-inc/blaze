@@ -1,0 +1,11 @@
+{
+ "id": "edit3-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "the Mac: other lanes' builds while measuring",
+ "what": "Another lane's cargo build ran on the Mac for about half an hour of this lane's measurements (load average 20 to 55 on 18 cores): `/usr/bin/true` went from 1.9 to 4.5 ms and every row about doubled, Relax's too. `/tmp/blaze-inst`, which the brief named as the baseline binaries, was replaced by another build at 23:18.",
+ "cost": "two measurement runs thrown away, and a build of the base for the before rows",
+ "cause": "the Mac is shared by lanes that build and lanes that time",
+ "workaround": "check `/usr/bin/true`'s median before each run and report the load average with the rows; build the base into this lane's own install directory",
+ "state": "open"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-11",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "blaze-query: the reader shed of lane records-1111 (2b173f8632)",
+ "what": "Applied on top of this lane's branch and measured: live heap 1,470 to 1,372 MiB (the parse holder 166 to 63), resident 4,095 to 4,069 MB, and a comment edit and run 20.0 ms to 34.7 (p25 25.4, p75 47.0; base 22.7 to 23.4 over three runs).",
+ "cost": "one build and one run; the commit was left off this branch",
+ "cause": "not looked into; the pack that sheds runs 103 to 116 ms after an answer (restore.md), which back-to-back edits would meet",
+ "workaround": "none",
+ "state": "open: for whoever lands records-1111's shed: the comment-edit row has to be measured back to back"
+}

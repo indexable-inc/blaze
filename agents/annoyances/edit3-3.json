@@ -1,0 +1,11 @@
+{
+ "id": "edit3-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "APFS: writing into a clone just made",
+ "what": "On APFS the first `pwrite` into a file cloned a moment ago takes 3.5 ms whatever its size (4 KiB or 2.6 MB), and renaming that file over another takes 3.6 ms; a clone made 300 ms earlier takes 0.3 to 1 ms for the write and 0.3 ms for the rename, and a new sparse file 0.3 and 0.3 (python, 15 to 30 turns each, quiet disk). `F_FULLFSYNC` of any other file meanwhile makes them 10 and 7.5 ms. So an edit's place by clone, write, rename has a floor near 7 ms a file on a quiet disk.",
+ "cost": "about 6 ms of every edit's answer on macOS (`the job's answer waits for what it still does: its outputs, being placed` 8.1 ms after this lane)",
+ "cause": "my guess, unverified: the clone's transaction is still open when the write comes; the check is the same timing with the clone made earlier, which is fast",
+ "workaround": "none",
+ "state": "open: make the next edit's clone as the last place ends (off the answer's path), so an edit's place is its writes and one rename; needs the store to hold a staged clone per path, checked against the path's file as it is used"
+}

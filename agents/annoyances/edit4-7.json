@@ -1,0 +1,11 @@
+{
+ "id": "edit4-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-codegen: the refinement of a patched walk",
+ "what": "`driver::tests::kept::a_walk_over_kept_describes_builds_what_a_fresh_walk_builds` failed in 4 of 20 runs: the driver asked only the patching build's front end whether it closes dyn facts, so a walk kept against closed facts was patched once an edit removed the program's one call through a `dyn`, and the build kept a removed function and its caller's direct call to it.",
+ "cost": "a real stale-code bug on the edit path sat behind a test known to fail",
+ "cause": "`Frontend::closes` was read of the build, not kept with the walk",
+ "workaround": "none",
+ "state": "fixed on edit4-1111 for that case (`Walked::closes`; the case pinned, with its control); the test still fails, 1 run of 30 where it was 4 of 20: see edit4-10"
+}

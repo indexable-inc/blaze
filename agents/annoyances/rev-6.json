@@ -1,0 +1,11 @@
+{
+ "id": "rev-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: rustflags",
+ "what": "A `--cfg` in `.cargo/config.toml`'s `build.rustflags` re-keys the standard library: changing it rebuilt 147 units (`names core`, `link core` ..), about 5 s, where cargo applies rustflags to no prebuilt std. So compiletest's way of flipping a revision tests no reuse at all under blaze.",
+ "cost": "the corpus importer was redesigned to set the cfg from a build script",
+ "cause": "rustflags reach every unit, std's too",
+ "workaround": "a generated `build.rs` that prints `cargo::rustc-cfg` from a file",
+ "state": "open: is std meant to see the workspace's rustflags?"
+}

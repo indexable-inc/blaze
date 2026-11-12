@@ -1,0 +1,11 @@
+{
+ "id": "records-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "the measuring binaries from a cargo build",
+ "what": "`target/release/blaze` is blaze-engine's second binary, not the thin client (`blaze-thin`). A bin directory made of `blaze` and `blaze-engine` copied from `target/release` runs the cold build with one daemon and every edit with another: the client sees a daemon of another binary, stops it and starts its own, and the script then fails on the first daemon's pid.",
+ "cost": "three measurement runs, about 25 minutes",
+ "cause": "two binaries named blaze in one directory; the measuring script's header does not say which is which",
+ "workaround": "copy `target/release/blaze-thin` as `blaze`",
+ "state": "open: the script should check that `blaze` is the thin client"
+}

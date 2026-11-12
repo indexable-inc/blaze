@@ -1,0 +1,11 @@
+{
+ "id": "A3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: restart",
+ "what": "After a daemon restart the first request that sees a changed file never returns; the log holds about 40,000 caught panics (`module … of an item is not in its crate's def map`).",
+ "cost": "hours: I blamed two lanes' changes for it, because every bisect restarted the daemon to swap binaries",
+ "cause": "restored state refers to modules the current front end lacks; each verification panics and is retried",
+ "workaround": "none; do not restart between an edit and a measurement",
+ "state": "a lane is fixing it (edit-correct-1111)"
+}

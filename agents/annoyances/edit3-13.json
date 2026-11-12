@@ -1,0 +1,11 @@
+{
+ "id": "edit3-13",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "cargo: one CARGO_TARGET_DIR for two worktrees, again (disk-11)",
+ "what": "To time the base beside this lane's build, the base commit was built from a second worktree into this lane's target directory (the brief allows one). Cargo names a workspace member's artifacts by its path inside the workspace, so the base's replaced this lane's, and since the base's sources were checked out later than this lane's were edited, the next build of this lane took the base's artifacts as fresh: it failed in blaze-cargo (`cannot find type Waker in crate blaze_core`). The lane's own helper printed `cargo exit 101` and returned 0, so the `&&` after it installed what was in `release/`: the base's binaries, as this lane's. One comparison then read base against base (118.9 and 115.4 ms) before the daemon's own span names gave it away (`a plane task's end (read every 1 ms)`).",
+ "cost": "a ten-minute rebuild, one comparison run thrown away, and nearly a wrong before-and-after",
+ "cause": "disk-11's cause, met again though its row was read first: the row says what happened, not what to do; and a helper script that reports a failed build as text with exit status 0",
+ "workaround": "touch every source the lane changed before rebuilding; compare the installed binaries' hashes with the base's before measuring; make the helper exit with cargo's status",
+ "state": "open: `guard-the-cause` wants the measuring binaries built by a command that names its worktree and refuses a target directory another worktree built into"
+}

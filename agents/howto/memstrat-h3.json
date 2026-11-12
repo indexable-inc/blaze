@@ -1,0 +1,9 @@
+{
+ "id": "memstrat-h3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "task": "Measure Relax",
+ "do": "Run `relax run --quiet <package>` from inside the package's directory, and check the exit status and the program's output of every run: from any other directory it prints `no Cargo.toml in ...`, exits 1 in 10 ms and still reports about 37 MB resident. `--verbose` prints each phase with its time; MAKEPAD_RUN_MEM_REPORT=1 the heap by subsystem (it raises the run's memory itself).",
+ "why": "The first Relax figure in this lane's brief (37.8 MB resident, 23.9 MB footprint, warm) was of such a failed run; a real warm run of hello-world is 87 MB resident, 50 MB footprint.",
+ "state": "current"
+}

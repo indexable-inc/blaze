@@ -1,0 +1,9 @@
+{
+ "id": "H2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Time blaze against anything",
+ "do": "Run every command of a measurement under one fixed environment (`env -i` with the same variables each time, including BLAZE_DUCKDB if any command uses `debug sql`), with BLAZE_HOME on a path with no symlink in it (/private/tmp, not /tmp, on macOS), edit files in place, check each run's output and exit status and count the bad ones, report medians with n, and name the commit and binary measured.",
+ "why": "A variable that differs between two requests (CARGO_TARGET_DIR, LLVM_SYS_231_PREFIX) makes the daemon rebuild; a home under a symlink turned the no-op lane off; an unchecked exit status produced a number that had to be retracted (A-rows of 2026-11-11).",
+ "state": "current"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "rev-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: tests under cargo",
+ "what": "hir-ty-codegen's unit tests did not compile on all-1111: `wasm.rs`'s test module called `iconst`, `iadd` and 28 more without `InstBuilder` in scope and `FunctionBuilder::finalize` without its argument (32 errors). No unit test of the crate could build, the edit fuzzer (`v2/edits.rs`) among them.",
+ "cost": "twenty minutes; and the fuzzer that holds incremental builds to clean ones was not running for anyone",
+ "cause": "a test module written by a lane that could not build it; nothing compiles test targets before a merge",
+ "workaround": "fixed here in three lines (the import, the two `finalize` arguments)",
+ "state": "fixed on revisions-1111; open: the gate should compile every test target (`cargo test --no-run`) of the crates a merge touches"
+}

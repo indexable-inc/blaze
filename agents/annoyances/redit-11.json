@@ -1,0 +1,11 @@
+{
+ "id": "redit-11",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: an idle daemon and the kernel's pressure figures",
+ "what": "With one idle blaze daemon and nothing else running, `/proc/pressure/io` said `full avg10=98.95` and `/proc/stat`'s iowait grew by 99% of all CPU time, while the disk wrote 8 requests in 5 s and no task was in state D: the daemon's threads wait in io_uring, which the kernel counts as waiting on I/O.",
+ "cost": "ten minutes looking for a disk fault that was not there",
+ "cause": "io_uring waits are accounted as iowait",
+ "workaround": "read `/proc/diskstats`, not the pressure file, when a daemon is alive",
+ "state": "open"
+}

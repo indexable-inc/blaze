@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "serve/job/noop/tests.rs",
+ "what": "The no-op lane's model had the colour of the request among what a build's outputs are made from (`made_from`), so the model itself said a build in another colour makes its outputs again: the test agreed with the bug this lane removes.",
+ "cost": "found only by reading the model while changing the lane",
+ "cause": "the model was written from what the code did",
+ "workaround": "none needed",
+ "state": "fixed on diagkey-1111: colour is in the model's warning alone, and an answer with no diagnostic is said again to any client"
+}
