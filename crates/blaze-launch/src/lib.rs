@@ -21,9 +21,14 @@
 //! simulation (`tests/sim.rs`) whose oracle states the invariants and whose controls plant a
 //! bug each.
 //!
-//! It is built on bstd (docs/v2/plan/design/std.md), not on Rust's `std`: `no_std`, its tables
-//! in the allocator its maker hands it ([`Launch::new`]), a message encoded into the caller's
-//! buffer. `alloc` is linked for `Vec<T, A>` alone, as bstd links it.
+//! It is `no_std` on `core` and `alloc` alone: its tables are in the allocator its maker hands
+//! it ([`Launch::new`], a [`Kept`]), a message is encoded into the caller's buffer. It is not
+//! on bstd (docs/v2/plan/design/std.md) yet, and that is a decision, not an oversight: bstd
+//! uses syntax only blaze accepts, and while cargo with the pinned nightly builds and tests
+//! blaze in the dev loop (AGENTS.md, `blaze-builds-blaze`, as of 2026-11-11) a crate that
+//! must be verified now cannot depend on it. When the rule returns to blaze-only, [`Kept`]
+//! becomes `bstd::mem::Kept` (one allocator a subsystem tag) and nothing else here changes:
+//! every table already names its allocator.
 
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
@@ -45,6 +50,13 @@ mod tests;
 use core::fmt;
 
 pub use launch::{Bind, Committed, Config, Edit, Launch, Placed, Target, Write};
+
+/// The allocator of the core's tables, which live as long as the process: the global heap
+/// until this crate is on bstd (the crate's documentation says when), then `bstd::mem::Kept`.
+pub type Kept = alloc::alloc::Global;
+
+/// The one [`Kept`].
+pub const KEPT: Kept = alloc::alloc::Global;
 
 /// A function's slot: its index in the table. A slot is a path and an ABI, so a function
 /// whose signature changes gets another (launcher.md, section 4).

@@ -580,3 +580,198 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The words of `typed` (after the program's name) as the thin `blaze` reads them.
+fn thin_asked(typed: &[&str]) -> blaze_thin::route::Asked {
+    let words: Vec<OsString> = typed.iter().map(OsString::from).collect();
+    match blaze_thin::route::words(&words) {
+        blaze_thin::route::Route::Cargo(asked) => asked,
+        other => panic!("{typed:?} is not the thin blaze's: {other:?}"),
+    }
+}
+
+/// The invariant: for every command line the thin `blaze` sends itself (blaze-thin's
+/// `route`), its request is this CLI's, byte for byte in the API's deterministic CBOR, and it
+/// runs the program with the arguments this CLI's parser gives it. So the daemon builds one
+/// thing whichever sent it, and the engine can go on with an answer the thin `blaze` began
+/// (`resume`, which refuses any other request).
+#[test]
+fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
+    let env = vec![("HOME".to_owned(), "/u".to_owned()), ("PATH".to_owned(), "/usr/bin".to_owned())];
+    let files = vec![("/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())];
+    let table: &[&[&str]] = &[
+        &["build"],
+        &["b"],
+        &["build", "-q"],
+        &["build", "--quiet", "-r"],
+        &["build", "--release"],
+        &["run"],
+        &["r", "-q"],
+        &["run", "-q", "a", "--", "b"],
+        &["run", "--release", "--", "--x", "--", "y"],
+        &["run", "-r", "-q", "-"],
+    ];
+    let frame = |it: &Request| blaze_api::frames::encode(&blaze_api::Envelope::new(2, it)).unwrap();
+    for typed in table {
+        let thin = thin_asked(typed);
+        let asked = invocation(typed.iter().map(OsString::from).collect());
+        for (color, width) in [(false, None), (true, Some(100))] {
+            let cargo =
+                place::cargo(&asked, &place(), env.clone(), files.clone(), color, width).unwrap();
+            let cli = request(&asked, cargo).unwrap();
+            let sent = blaze_thin::request::Sent {
+                cwd: "/w".to_owned(),
+                root: "/w".to_owned(),
+                env: env.clone(),
+                files: files.clone(),
+                color,
+                width,
+            };
+            let thin_request = blaze_thin::request::request(&thin, sent);
+            assert_eq!(frame(&thin_request), frame(&cli), "{typed:?}");
+        }
+        assert_eq!(thin.program, asked.program, "{typed:?}");
+        assert_eq!(thin.quiet, asked.flags.quiet, "{typed:?}");
+        assert_eq!(thin.command.name(), asked.command().name(), "{typed:?}");
+    }
+}
+
+/// The control of the test above: a request that differs in one word is other bytes, so the
+/// equality there is of the whole request.
+#[test]
+fn a_request_of_other_words_is_other_bytes() {
+    let frame = |it: &Request| blaze_api::frames::encode(&blaze_api::Envelope::new(2, it)).unwrap();
+    let quiet = request_of(&invocation(os(&["build", "-q"]).collect()));
+    let long = request_of(&invocation(os(&["build", "--quiet"]).collect()));
+    assert_ne!(frame(&quiet), frame(&long));
+}
+
+/// Every setting the daemon keeps for its life is read from a variable the thin `blaze`
+/// leaves to the engine (blaze-thin's `route::refuses`): the engine's check that the daemon
+/// keeps what the command sets is never skipped for a command that sets one.
+#[test]
+fn every_setting_the_daemon_keeps_is_a_variable_the_thin_blaze_leaves_to_the_engine() {
+    for name in crate::serve::settings::STARTED_WITH {
+        assert!(blaze_thin::route::refuses(name), "{name}");
+    }
+    for name in [client_rows::PROFILE, client_rows::LAUNCHED, blaze_core::cores::VAR, "BLAZE_STATS", "BLAZE_UI"] {
+        assert!(blaze_thin::route::refuses(name), "{name}");
+    }
+}
+
+/// A line of cargo's with its time taken out: `Finished ... in <time>` and what follows it.
+fn untimed(said: &str) -> String {
+    let lines = said.lines().map(|line| match line.split_once(" target(s) in ") {
+        Some((before, after)) => {
+            let rest = after.split_once('s').map_or("", |(_, rest)| rest);
+            format!("{before} target(s) in <time>{rest}")
+        }
+        None => line.to_owned(),
+    });
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// A build's answer with nothing to do: every unit fresh, the outputs, the work, the `Done`.
+fn plain_answer() -> Vec<Response> {
+    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let fresh = Response::Unit(UnitStarted {
+        package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        name: "foo".to_owned(),
+        version: "0.1.0".to_owned(),
+        source: Some("(/w/foo)".to_owned()),
+        verb: Verb::Fresh,
+        package: 0,
+    });
+    let built = Response::Built {
+        members: 1,
+        artifacts: vec![foo],
+        profile: "`dev` profile [unoptimized + debuginfo]".to_owned(),
+    };
+    let worked = Response::Work(blaze_api::Worked {
+        why: None,
+        tiers: Some(blaze_api::Tiers::of(blaze_api::Goal::Edit).with(38, 100)),
+        link: blaze_api::LinkKind::Patched,
+        found: 1,
+        green: 4,
+        links: vec![blaze_api::Linked {
+            how: blaze_api::LinkHow::Unchanged,
+            path: "/w/target/debug/foo".to_owned(),
+        }],
+        reran: 0,
+        misses: 0,
+        served: Vec::new(),
+        build_id: None,
+        compiled: 0,
+        critical_path_us: 0,
+        steps_us: Vec::new(),
+        placed: blaze_api::PlacedBytes::default(),
+    });
+    vec![fresh, built, worked, Response::Done { ok: true }]
+}
+
+/// The invariant: what the thin `blaze` prints of an answer it takes as plain
+/// (blaze-thin's `answer`) is what this CLI prints of the same responses, and the program it
+/// runs is the one this CLI runs, from the same directory with the same arguments and
+/// variables. Anything it does not take as plain it hands to this CLI, so the two never print
+/// one answer two ways.
+#[test]
+fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
+    use blaze_thin::answer::{Exec, Plain, Step};
+    let table: &[&[&str]] =
+        &[&["build"], &["build", "-q"], &["run"], &["run", "-q"], &["run", "a", "--", "b=1"]];
+    for typed in table {
+        let thin = thin_asked(typed);
+        let mut plain = Plain::new();
+        let steps: Vec<Step> = plain_answer().into_iter().map(|it| plain.take(it)).collect();
+        assert_eq!(steps, [Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
+        let mut said = plain.said(thin.quiet, false, std::time::Duration::ZERO);
+
+        let mut api = FakeApi::answering(plain_answer());
+        let mut words = vec!["blaze"];
+        words.extend(typed.iter());
+        let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
+        assert_eq!(out, "", "{typed:?}");
+        match thin.command {
+            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Run => {
+                let program = plain.program().expect("the one bin runs");
+                let exec = Exec::of(
+                    program.executable.as_deref().unwrap(),
+                    &program.env,
+                    &thin.program,
+                    std::path::Path::new("/w"),
+                );
+                if !thin.quiet {
+                    said.push_str(&exec.running(false));
+                }
+                let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
+                assert_eq!(
+                    (exec.program, exec.args, exec.env, exec.cwd),
+                    (cli.program, cli.args, cli.env, cli.cwd),
+                    "{typed:?}"
+                );
+            }
+        }
+        assert_eq!(untimed(&said), untimed(&err), "{typed:?}");
+    }
+}
+
+/// The control of the test above, and the other half of the thin `blaze`'s rule: each response
+/// this CLI's printer says more of than `Finished` is one the thin `blaze` does not take, so
+/// it is this CLI that prints it.
+#[test]
+fn what_this_clis_printer_says_more_of_the_thin_blaze_hands_over() {
+    use blaze_thin::answer::{Plain, Step};
+    let handed = |response: Response| matches!(Plain::new().take(response), Step::HandOver(_));
+    assert!(handed(foo_compiling()));
+    assert!(handed(Response::Done { ok: false }));
+    assert!(handed(Response::Error(blaze_api::ApiError::new("no", None))));
+    assert!(handed(Response::Diagnostic(blaze_api::Diagnostic::note("said".to_owned()))));
+    let mut recomputed = plain_answer();
+    let Response::Work(worked) = &mut recomputed[2] else { panic!("the work is third") };
+    worked.misses = 1;
+    let mut plain = Plain::new();
+    let steps: Vec<bool> =
+        recomputed.into_iter().map(|it| matches!(plain.take(it), Step::HandOver(_))).collect();
+    assert_eq!(steps[..3], [false, false, true]);
+}

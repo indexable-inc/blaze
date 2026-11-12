@@ -240,45 +240,9 @@ pub fn env(
     Ok(env)
 }
 
-/// Whether what cargo writes to stderr is colored: `--color` (the last one), else
-/// `CARGO_TERM_COLOR`, else `auto`, which is anstream's choice for a stream that is a
-/// `terminal` or not (`NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR`, `TERM`, `CI`).
-pub fn color(
-    flag: Option<&str>,
-    var: impl Fn(&str) -> Option<String>,
-    terminal: bool,
-) -> Result<bool, String> {
-    let when = match flag {
-        Some(flag) => Some(flag.to_owned()),
-        None => var("CARGO_TERM_COLOR"),
-    };
-    match when.as_deref() {
-        Some("always") => Ok(true),
-        Some("never") => Ok(false),
-        Some("auto") | None => Ok(auto(&var, terminal)),
-        // cargo's `ColorChoice::from_str`, of `--color` (which clap took in any case) or
-        // `term.color`.
-        Some(other) => {
-            Err(format!("argument for --color must be auto, always, or never, but found `{other}`"))
-        }
-    }
-}
-
-/// anstream's `AutoStream::choice`.
-fn auto(var: &impl Fn(&str) -> Option<String>, terminal: bool) -> bool {
-    let clicolor = var("CLICOLOR").map(|it| it != "0");
-    if var("NO_COLOR").is_some_and(|it| !it.is_empty()) {
-        return false;
-    }
-    if var("CLICOLOR_FORCE").is_some_and(|it| it != "0") {
-        return true;
-    }
-    if clicolor == Some(false) {
-        return false;
-    }
-    let term = cfg!(windows) || var("TERM").is_some_and(|it| it != "dumb");
-    terminal && (term || clicolor == Some(true) || var("CI").is_some())
-}
+// Whether what cargo writes to stderr is colored (`--color`, `CARGO_TERM_COLOR`, anstream's
+// choice): blaze-thin's, which the thin `blaze` sends its request with, so one rule colors both.
+pub use blaze_thin::request::color;
 
 /// The columns diagnostics are rendered in: cargo's `Shell::err_width().diagnostic_terminal_width()`.
 /// cargo's own test override `__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS` first, then the width of

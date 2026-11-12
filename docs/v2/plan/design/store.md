@@ -204,6 +204,37 @@ find each other's results (`crates/blaze-usercode/src/roots.rs`).
   completions, flush it and lend it to jobs (`JobInput`) and to `Expansions`, and puts to say
   which store they go to.
 
+## Cold start as a fetch: the standard library (F4)
+
+2026-11-11. A machine that has never built std spends its first build on it (10 to 12 s for
+hello-world); every input of that work is public and the same on every machine of one blaze.
+
+- **What it is keyed by.** One std is `(record makers, StdKey::placement)`: the library's
+  root, the triple, the profile's settings, std's features, the rustflags, where its code runs
+  (`crates/blaze-units/src/query.rs`). The crates asked are not in it, so a program's build and
+  its tests' build name the same one.
+- **What is fetched.** For each std crate: its dependency image (def map, lang items,
+  signatures), whose key has no path in it and is already one `blaze_global::Rule::image`
+  accepts for `Origin::Toolchain`; its checked bodies and constants; and each unit's record with
+  its tier-0 code (`Kind::Machine` and the unit record in the shared std store).
+- **What exists.** `blaze_global`: the rule for what is public, Ed25519 records under pinned
+  keys, the client as a `blaze_cas::Remote` (a fetched value enters the store only after its
+  signature and content hash), and `bundle`: one signed manifest of every key a cold build of a
+  lock file's crates.io dependencies computes, fetched in parallel. A dependency image's
+  store can read through to it (`hir_def::deps::ReadThrough`).
+- **What is missing.** (1) A bundle of a std: `BundleId` from the makers and the placement,
+  its manifest listing the keys above, made by the builders for each target and profile blaze
+  ships. (2) A unit record's key hashes its whole `UnitPlan` (`RecordInputs::key`,
+  `crates/blaze-cargo/src/serve/unit/compile.rs`), whose `outputs` and `OUT_DIR` are absolute
+  paths under this machine's `<machine>/std/<makers>/<placement>`: two machines with other home
+  directories make other keys. The std directory has to be written as a root in the key, as
+  build scripts' roots are (Portable keys, above), before any std record is another machine's.
+  (3) The ask: the `std library` task fetches the bundle when the shared std store has no record
+  of the placement, before the plan's units are posted, and says a miss by name (no bundle
+  for this target, a signature refused) with what will be compiled instead. (4) F2 of
+  [restore.md](restore.md): a fetched image is only worth its bytes if no crate is resolved
+  before the store is asked.
+
 ## Issues this lane takes in
 
 - **#1439**: the store keys every value by a hash of all of blaze's sources, so any release

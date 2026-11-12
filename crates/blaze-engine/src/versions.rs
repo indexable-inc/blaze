@@ -264,19 +264,19 @@ pub(crate) fn why_this_one(given: bool) -> String {
         .and_then(|it| pin::root_manifest(&it));
     let manifest = match found {
         Ok(Some(manifest)) => manifest,
-        Ok(None) => return format!("{this}, as no workspace is here to pin one"),
+        Ok(None) => return blaze_thin::pin::says_no_workspace(&this),
         Err(why) => return format!("{this}: {why}"),
     };
     let shown = manifest.display();
     if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) {
-        return format!("{this}, as {shown} pins it");
+        return blaze_thin::pin::says_pinned(&this, &manifest);
     }
     let ignore = pin::ignores(given, &manifest);
     match pin::pinned(&manifest) {
         Ok(Some(wanted)) => {
             let pinned = pin::pinned_text(&wanted);
             match pin::choose(ours, &manifest, &wanted, ignore) {
-                Ok(pin::Choice::Pinned) => format!("{this}, as {shown} pins it"),
+                Ok(pin::Choice::Pinned) => blaze_thin::pin::says_pinned(&this, &manifest),
                 Ok(pin::Choice::Ignored) => format!(
                     "{this}, as `{}` says, in place of {pinned}, which {shown} pins",
                     pin::IGNORE_PIN
@@ -291,10 +291,7 @@ pub(crate) fn why_this_one(given: bool) -> String {
                 Err(why) => format!("{this}: {why}"),
             }
         }
-        Ok(None) => format!(
-            "{this}, as {shown} pins none (`[workspace.metadata.blaze] version`, which \
-             `blaze pin` writes)"
-        ),
+        Ok(None) => blaze_thin::pin::says_pins_none(&this, &manifest),
         Err(why) => format!("{this}: {why}"),
     }
 }
