@@ -511,3 +511,98 @@ So, replacing "one primitive" and "one validity mechanism" above:
 5. **The number that decides how far it goes:** the cost of verifying front-end entries by hash at
    item grain on reth (reads per entry, entries per edit, nanoseconds per re-hash through the
    pool). It is why the kernel stopped at MIR; it is measured before the front end is moved.
+
+## The bar: within 10% of the floor (2026-11-12; the owner's direction, with an outside review)
+
+The owner's bar: every part of the design is within 10% of the theoretical best in time, memory
+and disk, and nothing is designed that cannot be. This section says what that means, where the
+design above misses it, and what replaces those parts. It overrides "Speed comes only from
+covering digests" in the section before it.
+
+### The floor
+
+An oracle knows exactly which results changed. It redoes those and the direct readers of each
+changed value (a reader must rerun to learn whether its own value changed; no design avoids
+that), plus the I/O nobody can avoid. The bar is **bookkeeping ≤ max(10% of that work, a few
+milliseconds)**: process start, a socket round trip and a patch are a fixed cost under which a
+percentage means nothing. The compiler's own throughput (type checking, LLVM) has no theoretical
+best; it is compared with the best existing tools and is not part of this bar. Reported with
+every edit measurement: results changed, direct readers rerun, everything else touched, and the
+ratio of the last to the first two.
+
+| Operation | Floor | The design before this section | Off by (reviewer's estimates) |
+|---|---|---|---|
+| No-op, warm | one check | certificate hit | within |
+| Comment edit | reparse one file; outputs whose lines moved | every entry of the crate and its dependents re-verified | 100x and more |
+| Leaf body edit | the function, its code, a patch | every entry of the crate re-verified, 5-10 µs each | 10-50x |
+| Signature edit, 33 dependents | the readers of the signature | 100-300 thousand entries re-verified | 3-30x |
+| Restart, nothing changed | journal replay (macOS); a stat sweep (Linux, no design avoids it) | a stat sweep | 10x on macOS |
+| Restart, then an edit | the pages of what is affected | the edit's cost plus 0.2-0.6 GB faulted in | 100x |
+| Idle memory | the watcher and an index root | nothing held | within |
+| Disk | the results | two records an entry, 170-290 B of store overhead each, names spelled out | 20-60% over; more than 100% for small values |
+
+Why: a crate's cover held its dependencies' **content** digests, so any byte breaks the crate's
+cover and every dependent's; and re-verifying one entry by hashing its list and valuing each read
+costs microseconds where a dirty mark costs tens of nanoseconds.
+
+### What replaces it
+
+1. **One reverse-index proof, stated and checked.** The kernel's session is carried from one
+   pinned world to the next: the change set is the exact difference of the two pins, the
+   kernel keeps postings (a read → the session entries whose list names it), and an entry
+   verified under the old pin stays verified unless the repair reaches it. This is the old
+   engine's `frontier` argument, and three of its holes shipped; it is allowed here only under
+   five invariants, each with a planted-bug control in the exhaustive check, and proved once
+   (an induction on height):
+   - **I1, every session entry is indexed.** Postings are written in the same transition that
+     admits an entry to the session: a keep, a hit on an entry another process or an earlier
+     daemon kept, or an admission through a cover. Never "at the next boundary".
+   - **I2, the seed is complete.** The difference is a total match over the kinds of read:
+     paths including absences (postings are by path, not content), variables by name (the pin
+     holds the environment), outside-tree nodes (in a pinned tree, or always dirty), the step
+     registry's digest (a change drops the session), flags. A read with no exact difference
+     (a fact valued by the old engine; an untraced unit) makes its entries always dirty.
+   - **I3, repair in height order with cutoff.** A parent is repaired after every dirty child,
+     comparing each child's repaired value hash (Jane Street's Incremental). Without cutoff
+     the cost is the whole closure.
+   - **I4, valued at the pin.** Every digest was valued against the old pin, and no request
+     reads the session during a repair.
+   - **I5, covers post.** An entry admitted through a cover has a posting from the cover to
+     it; nothing is "behind a cover and not indexed".
+   The one thing still trusted is that a pin's root matches the disk (stamps and the watcher,
+   overflow included): the single timing proof, named, with its own tests.
+2. **The kernel's lookup is the recompute step, not the edit path.** A repair recomputes
+   through a kernel lookup first (so another process's entry, a branch switch back, or an
+   earlier daemon's work is a hit). Verifying traces stay the only proof across processes,
+   machines and restarts.
+3. **Covers read interface digests, and only seed.** A crate's cover holds its own content
+   digest and its dependencies' **interface** digests. Covers admit entries to a session on a
+   cold start or in another checkout; they are not consulted on the edit path.
+4. **Postings and the current table are records.** Per checkout: identity → answer key and
+   height (24-40 B an entry), and the postings, read through the pool. Idle memory stays at
+   nothing held; a restart followed by an edit pages in only what the edit touches. A missing
+   posting is rebuilt loudly, never on the edit path.
+5. **A hit in a session costs nanoseconds.** No list bytes are hashed again for an entry the
+   session holds.
+6. **Read-lists under 10% of the store.** Names interned to a number, sorted and delta-coded
+   (1-3 B a read); the list inline in the entry when the identity has one list; one record an
+   entry, not two.
+7. **Comment edits.** Spans relative to their item and line tables as a placed record, so a
+   comment changes one file's parse and the line tables, nothing that reads items.
+
+### What no design reaches, said plainly
+
+Direct readers rerun. Recompiling every instantiation of an edited generic is floor work (reth's
+54 units remade under 33 dependents may be mostly that: not measured). A restart on Linux is a
+stat of every file. What macOS's protected programs read cannot be traced, so those units are
+never carried. "Small when idle" and "the first edit after idle is instant" trade through page-ins;
+a reverse index trades memory or disk for time. Where two measures trade, the choice is the point
+on the frontier stated above (index on disk, nothing held idle), not 10% on both.
+
+### Measured first
+
+On reth, on a named commit, from the old engine (which already backdates): for the body edit
+under 33 dependents and for one signature edit, rows verified, rows run, rows whose value changed,
+and the readers of changed rows. If the changed set is close to everything in the 34 crates, the
+index buys little and items 3 and 5 alone are the design; otherwise the order of building is
+1, 5, 4, 6, 3, 7.
