@@ -3,6 +3,7 @@
 #
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
 #   gh workflow run focused.yaml --ref <branch> -f harnesses='["unreached.py"]' -f macos=true
+#   gh workflow run focused.yaml --ref <branch> -f harnesses='["v2/windows.py"]' -f linux-arm64=false -f windows=true
 #
 # A name is a label of `ci.py list '{}'`, or its start up to a space (harness/focused.py). Each
 # supported platform builds blaze with the released blaze and runs the named harnesses that run there;
@@ -27,7 +28,7 @@ on:
         type: boolean
         default: false
       windows:
-        description: requires a released Windows blaze for bootstrap (currently unavailable)
+        description: Windows x64; requires a released Windows blaze for bootstrap (currently unavailable, and never replaced by cargo)
         type: boolean
         default: false
 

@@ -3,7 +3,8 @@
 # docs/harness.md ("CI").
 #
 #   every harness of harness/ci.py's full tier, on Linux AArch64 (ix), macOS arm64 and
-#       Windows x86-64, each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (AArch64, macOS) and the larger ones (AArch64); and the ripgrep
+#       Windows x86-64 (including v2/windows.py's path, MSVC linker, incremental and daemon
+#       regressions), each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (AArch64, macOS) and the larger ones (AArch64); and the ripgrep
 #       bench (not blocking). No Linux x86-64 until ix has x86-64 capacity. nix-live.yaml (the flake's builds, the demo and live edits on macOS)
 #       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,
 #       and in the train's run it held main's next train that long
@@ -65,6 +66,9 @@ jobs:
 
   windows:
     name: windows x64
+    # blaze-platform fails loudly before the harness while release.yaml has no Windows blaze to
+    # bootstrap this build. That prerequisite is not replaced with cargo; once the release exists,
+    # harness/ci.py's Windows-only part runs v2/windows.py here on every train.
     uses: ./.github/workflows/blaze-platform.yaml
     with:
       platform: windows-x64
