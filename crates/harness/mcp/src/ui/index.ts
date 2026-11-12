@@ -5,8 +5,9 @@ import { askProps, planAsk, type AskOptions } from './ask.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
 import { currentTask, inTask, taskCall, taskCount, type Task } from '../tasks.ts';
-import { req } from '../daemon.ts';
 import { tellAgent } from '../tell.ts';
+import { abortable } from '../cancel.ts';
+import type { Docs } from '../docs.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
@@ -56,7 +57,7 @@ function treeOf(t: Task, shown: Shown): UiTree {
   return new UiTree({
     emit: () => update(t, shown),
     fail: (what, error) => {
-      t.logs.push(`[ui] ${what} failed: ${(uiError(error) ?? (error instanceof Error ? `${error.name}: ${error.message}` : String(error))).replace(/\n\s+at repl-cell\.js:.*/, '')}`);
+      t.log(`[ui] ${what} failed: ${(uiError(error) ?? (error instanceof Error ? `${error.name}: ${error.message}` : String(error))).replace(/\n\s+at repl-cell\.js:.*/, '')}`);
       t.touch();
     },
     enter: (fn) => inTask(t, fn),
@@ -85,8 +86,7 @@ export async function dispatch(id: string, handler: string, value: unknown): Pro
     for (const tree of [shown.main, ...shown.asks.map(ask => ask.tree)]) {
       if (tree && await tree.dispatch(handler, value)) return undefined;
     }
-    t.logs.push(`[ui] ${handler} did nothing: no element of this cell's UI has that handler now (it re-rendered without it)`);
-    t.touch();
+    t.log(`[ui] ${handler} did nothing: no element of this cell's UI has that handler now (it re-rendered without it)`);
     return undefined;
   }
   return `ui event ${handler} for cell ${id}: its UI is not live (the cell was replaced, or ${MAX_LIVE} newer UIs unmounted it)`;
@@ -106,12 +106,6 @@ export function show(t: Task, component: unknown, props: Record<string, unknown>
   }
   return tree;
 }
-
-/**
- * Say `text` to this kernel's own agent as a message in its chat (the daemon's `prompt`, as agents.send types one): how an
- * answer given after the agent stopped waiting reaches it, and wakes it. With no session (a kernel run by hand) or no daemon
- * it is only in the cell's logs.
- */
 
 /**
  * `ask(text, {options, default, detail, allowText, block})` (ask.ts): the question goes below what the calling cell shows, drawn
@@ -144,26 +138,28 @@ export function ask(text: string, options?: AskOptions): Promise<string> {
       waiting = false;
       resolve(said);
       // The tool call gave up waiting on the cell: nothing reads its result, so the answer goes to the agent's chat.
-      if (t.returned) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said}`);
+      if (t.returned) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said}`, { urgent: true });
       return;
     }
     // It did not wait: the cell went ahead with the default; an answer that differs is the person changing it.
-    if (said !== preset) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said} (you went ahead with ${JSON.stringify(preset)}; change it)`);
+    if (said !== preset) tellAgent(t, `Answer to ${JSON.stringify(text)}: ${said} (you went ahead with ${JSON.stringify(preset)}; change it)`, { urgent: true });
   };
   shown.asks.push(prompt);
   try { tree.mount(askComponent, { ...elementGlobals(), ...askProps(plan), answer }); }
   catch (error) { shown.asks.splice(shown.asks.indexOf(prompt), 1); update(t, shown); return Promise.reject(error); }
   if (!plan.block) return Promise.resolve(preset!);
+  // Stopping the cell ends its wait for the answer (cancel.ts); the question is then withdrawn below.
+  const answered = abortable(promise);
   // A cell that stops with an error (its timeout) while it waits withdraws the question: nothing would hear the answer.
   void t.done.then(() => {
-    if (!waiting || t.status !== 'error') return;
+    if (!waiting || t.status === 'done') return;
     prompt.withdraw('the cell stopped');
     tree.unmount();
     const at = shown.asks.indexOf(prompt);
     if (at >= 0) shown.asks.splice(at, 1);
     update(t, shown);
   });
-  return promise;
+  return answered;
 }
 
 /** What React users reach for, and the Svelte way to say it: calling one throws this instead of a ReferenceError. */
@@ -245,3 +241,31 @@ export function uiError(error: unknown): string | undefined {
   const message = error.message.replace(/\$\$free\./g, '').replace(/\$\.get\(([\w$]+)\)/g, '$1');
   return `${error.name}: ${message}${place ? ` (${place.at})` : ''}${hint ? `: ${hint}` : ''}${place ? `\n    at repl-cell.js:${place.line}:${place.column}` : ''}`;
 }
+
+/** The UI names a cell's TypeScript uses, as the type checker sees them (typecheck.ts); the elements themselves are markup's. */
+export type UiGlobals = {
+  render(component: unknown, props?: Record<string, unknown>): { unmount(): void };
+  ask(text: string, options?: AskOptions): Promise<string>;
+  svelte(strings: TemplateStringsArray): (...args: never[]) => unknown;
+  interval(fn: () => unknown, ms: number): () => void;
+};
+export const UI_TYPED = ['render', 'ask', 'svelte', 'interval'] as const satisfies readonly (keyof UiGlobals)[];
+
+export const uiDocs: Docs = {
+  render: {
+    area: 'ui',
+    for: "show, chart, compare, visualize; a small interactive tool",
+    sig: "render(svelte`<markup>`, props?): { unmount() }",
+    about: "Draw a Svelte 5 component under the cell, live for the person; or write the whole cell as markup (it starts with <script> or a tag). What it renders is for the person and never comes back to you: return the facts you need. await skill('ui') first for the elements, runes and rules.",
+    example: "render(svelte`<Table {rows} />`, { rows })",
+    throws: "TypeError when it is not given a component; the markup's own error at the cell's line.",
+  },
+  ask: {
+    area: 'ui',
+    for: "ask the person a question; confirm; choose",
+    sig: "ask(text, { options?: (string | { label, detail? })[], default?, detail?, allowText?, block? = true }): Promise<string>",
+    about: "Ask the person a question under the cell and get the label picked or the words typed. An answer that comes after the tool call replied reaches you as a message. Stopping the cell withdraws the question.",
+    example: "await ask('Deploy to production?', { options: ['Deploy', 'Cancel'], default: 'Cancel' })",
+    throws: "RangeError past 16 questions in one cell; Error when the question is withdrawn unanswered (the cell stopped).",
+  },
+};
