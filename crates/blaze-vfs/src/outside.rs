@@ -214,10 +214,30 @@ pub struct Cover<'d> {
 
 impl<'d> Cover<'d> {
     /// [`Dirs::unchanged_since`] of every path under this directory.
+    ///
+    /// A directory wanted above this one later takes its watch over (the driver ends this
+    /// one's, which then never vouches again): the directory asked is then that one, and so
+    /// on up. Until 2026-11-12 a cover kept with an answer stayed on the retired directory,
+    /// so every file of glibc's `lib` (wanted first, then its package's directory for its
+    /// `etc`) was looked at on the disk in every build for the daemon's life.
     pub fn unchanged_since(self, generation: u64) -> bool {
-        self.dirs.hot.settled.load(Ordering::Acquire)
-            && self.entry.since.load(Ordering::Acquire) <= generation
-            && self.entry.changed.load(Ordering::Acquire) <= generation
+        if !self.dirs.hot.settled.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut entry = self.entry;
+        // Bounded: each directory above is a shorter path.
+        loop {
+            if entry.since.load(Ordering::Acquire) <= generation
+                && entry.changed.load(Ordering::Acquire) <= generation
+            {
+                return true;
+            }
+            match entry.subsumed_by.load(Ordering::Acquire) {
+                0 => return false,
+                _ if COVER_STAYS_ON_THE_RETIRED.get() => return false,
+                by => entry = self.dirs.dir(by - 1).entry,
+            }
+        }
     }
 
     pub fn dir(self) -> Dir<'d> {
@@ -960,6 +980,14 @@ impl<'d> Outside<'d> {
         }
         FileName::new(rest)
     }
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a cover asks only the directory it was found
+    /// with, though a directory above took its watch over, as until 2026-11-12. Never set
+    /// outside a test.
+    #[doc(hidden)]
+    pub static COVER_STAYS_ON_THE_RETIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {

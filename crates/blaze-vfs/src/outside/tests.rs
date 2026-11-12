@@ -685,3 +685,43 @@ fn the_oracle_catches_an_empty_wake_taken_as_a_change() {
     super::EMPTY_WAKE_IS_A_CHANGE.set(false);
     assert!(!vouched, "planted: an empty wake stops the directory vouching");
 }
+
+/// A cover of `/sdk/lib/b.h` found while `/sdk/lib` was the watched directory, then `/sdk`
+/// wanted and `/sdk/lib`'s watch retired. Whether the cover vouches once `/sdk` is confirmed
+/// and a round is in, and whether it still hears a change.
+fn a_cover_after_its_directory_retired() -> (bool, bool) {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(6, Faults::default());
+    sim.change(&name("sdk/lib/b.h"), b"int b;");
+    dirs.want(path("/sdk/lib"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    let cover = dirs.cover(path("/sdk/lib/b.h")).expect("under /sdk/lib");
+    dirs.want(path("/sdk"));
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    assert_eq!(dirs.dir(0).since(), UNCONFIRMED, "the first watch is retired");
+    let generation = dirs.generation();
+    let vouched = cover.unchanged_since(generation);
+    sim.change(&name("sdk/lib/b.h"), b"int c;");
+    round(&mut sim, &mut outside, &mut effects);
+    (vouched, !cover.unchanged_since(generation))
+}
+
+/// The invariant: a cover kept with an answer vouches as its path does
+/// ([`Dirs::unchanged_since`]) for the table's life, a directory wanted above its own later
+/// included: it answers by the directory that took the watch over, and hears what that hears.
+#[test]
+fn a_cover_follows_the_directory_that_took_its_watch_over() {
+    assert_eq!(a_cover_after_its_directory_retired(), (true, true));
+}
+
+/// The control: a cover that stays on its retired directory never vouches again.
+#[test]
+fn the_oracle_catches_a_cover_left_on_a_retired_directory() {
+    super::COVER_STAYS_ON_THE_RETIRED.set(true);
+    let (vouched, _) = a_cover_after_its_directory_retired();
+    super::COVER_STAYS_ON_THE_RETIRED.set(false);
+    assert!(!vouched, "planted: the cover asks its retired directory alone");
+}
