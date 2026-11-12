@@ -106,6 +106,11 @@ class Report:
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:
+        # A script that checked nothing has not passed (agents.json A39, vacuous success): an
+        # empty selection, a corpus that was not found or a loop over no case ends here with no
+        # outcome, which is an error of the harness and exit status 1, never a silent 0.
+        if not self.outcomes:
+            self.add("checked nothing", "error", f"{self.script} ended with no outcome: nothing it was asked to check ran")
         counts = Counter(o.verdict for o in self.outcomes)
         result = dict(script=self.script, engine=asdict(self.engine), host=host(), commit=commit(),
                       started=self.started, ended=now(), outcomes=[asdict(o) for o in self.outcomes],

@@ -1133,12 +1133,31 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
         }
         Command::Test | Command::Bench if in_daemon(asked) => {
             let (out, mut err) = printer.streams();
-            let passed = test::reached(&results, speaking, out, &mut err)?;
-            Ok(Then::Exit(if passed && ok { 0 } else { Exit::Failed.code() }))
+            let passed = test::reached(&results, speaking, &mut *out, &mut err)?;
+            let code = if passed && ok { 0 } else { Exit::Failed.code() };
+            // The daemon ran them: the names it sent are the tests this run knows exist.
+            let names = || test::Names {
+                names: results.iter().map(|it| it.name.clone()).collect(), // clone: a refusal's help, once
+                unlisted: Vec::new(),                                      // alloc: none
+            };
+            let code = test::conclude(
+                &test::Selection::of(asked),
+                &test::tally_of(&results),
+                code,
+                ok,
+                started.elapsed(),
+                names,
+                speaking,
+                &mut *out,
+                &mut err,
+            )?;
+            Ok(Then::Exit(code))
         }
         Command::Test | Command::Bench => {
             // The test executables write for themselves from here.
             printer.clear()?;
+            let began = Instant::now();
+            let mut tally = blaze_screen::Tally::default();
             let code = test::run(
                 asked,
                 &artifacts,
@@ -1147,6 +1166,20 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                 speaking,
                 &mut printer.err(),
                 programs,
+                &mut tally,
+            )?;
+            // A run of none is refused here, and the run's counts are its last line.
+            let (out, mut err) = printer.streams();
+            let code = test::conclude(
+                &test::Selection::of(asked),
+                &tally,
+                code,
+                ok,
+                began.elapsed(),
+                || test::names_of(&artifacts, programs),
+                speaking,
+                &mut *out,
+                &mut err,
             )?;
             Ok(Then::Exit(if ok { code } else { code.max(Exit::Failed.code()) }))
         }

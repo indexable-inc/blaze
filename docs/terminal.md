@@ -18,7 +18,7 @@ and no escape byte.
 | an edit | `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0` |
 | a larger build | `✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why`, and `hint: 2 warnings have a fix: blaze check --fix` when some do |
 | a failure | the diagnostics, then `✗ run failed in 0.14s · 1 error in hello (bin) · blaze explain hello` |
-| tests | each failure as it happens (name, executable, its last 40 lines of output), then `✗ 1 failed · 7 passed · 1 ignored · 3 binaries · 31.8s` and `rerun: blaze test -p calc --lib` |
+| tests | each failure as it happens (name, executable, its last 40 lines of output), then `✗ 8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered · 3 binaries · 31.8s` (how many of the tests selected ran comes first and is always said; `filtered` is what the filter left out) and `rerun: blaze test -p calc --lib`; a run that ran none is refused, naming its filter ([cargo.md](cargo.md#a-run-that-ran-no-test-is-refused)) |
 
 While a build runs (ripgrep from an empty store, 80 by 24; `tests/golden/` in blaze-screen has
 every size):
@@ -153,7 +153,12 @@ blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=15 unit="hello (bin)" nex
 or `failed` line always (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
 have a fix), `key=value` with a value quoted when it is not one word. No start
 line: it says nothing its reader did not type. stdout is the program's and the JSON messages',
-unchanged. Test executables write libtest's own output.
+unchanged. Test executables write libtest's own output, and the run ends with its counts
+(`blaze_screen::tests_line`), so a pass says how many tests it is a pass of:
+
+```text
+blaze: tests ok selected=9 ran=8 passed=8 failed=0 ignored=1 measured=0 filtered_out=0 unreached=0 binaries=3 unbuilt=0 elapsed_ms=31800
+```
 
 ## How it is built
 

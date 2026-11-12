@@ -16,7 +16,9 @@
 //! Off a terminal, or with libtest's own output asked for ([`PLAIN_ARGS`]), none of this
 //! runs: [`wanted`] says no and `cli::drive` runs the executables after the build, each
 //! writing for itself. The exit code is cargo's either way: 0, the code of the first failing
-//! executable in cargo's order under `--fail-fast`, else 101 when anything failed.
+//! executable in cargo's order under `--fail-fast`, else 101 when anything failed; and
+//! blaze's own for a run that ran no test, which is refused (`test::refusal`,
+//! `Exit::NoTests`): the runner counts what each executable said it ran ([`Run::Counted`]).
 //!
 //! [`Response::TestReady`]: blaze_api::Response::TestReady
 
@@ -35,7 +37,7 @@ use blaze_api::{Artifact, ArtifactKind, Request, ResponseRef, TargetKind};
 use blaze_core::exit::Exit;
 use blaze_core::lock::Lock;
 use blaze_hash::HashSet;
-use blaze_screen::{BinaryEnd, Caps, Event, Test, Verdict};
+use blaze_screen::{BinaryEnd, Caps, Event, Tally, Test, Verdict};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
 use super::{
@@ -47,13 +49,9 @@ use super::{
     run::Exec,
     say,
     show::{Msg, Sink},
-    test::{self, Kind},
+    test::{self, DRAIN, Kind, Programs as _},
 };
 
-/// How long a test executable's output is read after its process exited. Whatever it wrote
-/// is in the pipe by then, so only a process it started and left running, which inherited its
-/// stdout or stderr, holds the pipe open past this; the runner then stops reading and says so.
-const DRAIN: Duration = Duration::from_secs(2);
 /// libtest's arguments that change what it prints, which the screen can't read: with any of
 /// them the executables write for themselves.
 const PLAIN_ARGS: [&str; 9] = [
@@ -87,6 +85,8 @@ pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
 enum Run {
     /// A test executable is linked and placed.
     Ready(Artifact),
+    /// One's suite ended: libtest's counts of it, sent before its [`Run::Drained`].
+    Counted { binary: u32, counts: Tally },
     /// One's stdout and stderr closed: all it printed is in its [`Captured`].
     Drained { binary: u32 },
     /// One's process exited, and is not yet reaped (the runner reaps it): its output is read
@@ -209,6 +209,8 @@ struct Binary {
     /// libtest's JSON is read from it; otherwise it is one test, its exit status the verdict.
     json: bool,
     began: Option<Instant>,
+    /// What its suites said they ran, summed ([`Run::Counted`]); `None` until one ended.
+    counts: Option<Tally>,
 }
 
 /// One running.
@@ -267,6 +269,10 @@ struct Runner {
     color: bool,
     /// How long an executable's output is read after it exited: [`DRAIN`].
     drain: Duration,
+    /// What the command selects, for the rule on a run of none.
+    selection: test::Selection,
+    /// What the executables that ended ran, summed.
+    tally: Tally,
 }
 
 impl Runner {
@@ -288,6 +294,7 @@ impl Runner {
             to_runner,
             spec_flag,
             color,
+            test::Selection::of(asked),
         )
     }
 
@@ -310,6 +317,7 @@ impl Runner {
         to_runner: Sender<Run>,
         spec_flag: bool,
         color: bool,
+        selection: test::Selection,
     ) -> Runner {
         let slots = cores.split(blaze_core::cores::NESTED).get();
         Runner {
@@ -329,6 +337,8 @@ impl Runner {
             build: None,
             color,
             drain: DRAIN,
+            selection,
+            tally: Tally::default(),
         }
     }
 
@@ -344,7 +354,7 @@ impl Runner {
     fn run(mut self, gets: &Receiver<Run>) -> i32 {
         loop {
             if self.build.is_some() && self.queued.is_empty() && self.running.is_empty() {
-                return self.code();
+                return self.finish();
             }
             // The first exited executable whose output is still open: its drain's deadline.
             let deadline = self
@@ -382,6 +392,11 @@ impl Runner {
             };
             match run {
                 Run::Ready(artifact) => self.ready(artifact),
+                Run::Counted { binary, counts } => {
+                    if let Some(it) = self.binaries.get_mut(binary as usize) {
+                        it.counts.get_or_insert_with(Tally::default).add(&counts);
+                    }
+                }
                 Run::Drained { binary } => self.ended(binary, false),
                 Run::Exited { binary, waited } => self.exited(binary, waited),
                 Run::BuildOver { ok, artifacts } => {
@@ -395,6 +410,40 @@ impl Runner {
             }
             self.start();
         }
+    }
+
+    /// The command's exit code once every executable ended: [`Runner::code`], or for a run in
+    /// which nothing failed and no test ran, the refusal said and [`Exit::NoTests`]
+    /// (`test::refusal`).
+    fn finish(&mut self) -> i32 {
+        let code = self.code();
+        if code != 0 {
+            return code;
+        }
+        let Some(refused) = test::refusal(&self.selection, &self.tally, || self.names()) else {
+            return code;
+        };
+        self.say(Test::Refused { what: refused.what, help: refused.help });
+        Exit::NoTests.code()
+    }
+
+    /// The tests of every libtest executable the run started, each asked for its list: a
+    /// refusal's help names the nearest.
+    fn names(&self) -> test::Names {
+        let mut names = test::Names::default();
+        for it in self.binaries.iter().filter(|it| it.json) {
+            let executable =
+                PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
+            let root = std::path::Path::new(&it.artifact.manifest_path)
+                .parent()
+                .map_or_else(PathBuf::new, std::path::Path::to_owned);
+            let exec = Exec::of(&it.artifact, executable, test::LIST.map(OsString::from), root);
+            match test::Spawned.names(&exec) {
+                Ok(listed) => names.names.extend(listed),
+                Err(why) => names.unlisted.push(format!("{}: {why}", exec.shown())), // alloc: a refusal's help, once
+            }
+        }
+        names
     }
 
     /// 0, the first failing executable's code in cargo's order (fail-fast), or 101.
@@ -446,7 +495,7 @@ impl Runner {
         let binary = self.binaries.len() as u32;
         self.say(Test::Queued { binary, label: label.clone(), rerun: format!("blaze test {rerun}") }); // alloc: once a test executable
         let json = artifact.harness && !doc;
-        self.binaries.push(Binary { artifact, order, label, json, began: None });
+        self.binaries.push(Binary { artifact, order, label, json, began: None, counts: None });
         if self.stopping {
             self.say(Test::Ended { binary, end: BinaryEnd::Stopped, output: String::new() });
             return;
@@ -628,6 +677,8 @@ impl Runner {
             }
         };
         let ok = ended.success();
+        let counts = test::counted(self.binaries[binary as usize].counts.take(), ok, json);
+        self.tally.add(&counts);
         if !json {
             let verdict = if ok { Verdict::Passed } else { Verdict::Failed };
             // clone: the box and the binary's end both show it
@@ -718,6 +769,10 @@ fn read(
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
+            // A suite's end: its counts are the runner's, for the rule on a run of none.
+            if json && let Some(counts) = test::counts_of(&line) {
+                let _ = to_runner.send(Run::Counted { binary, counts });
+            }
             match json.then(|| said(binary, &line)).flatten() {
                 Some(event) => {
                     let _ = to_screen.send(Msg::Event(Event::Test(event)));
@@ -744,8 +799,8 @@ fn read(
     let _ = to_runner.send(Run::Drained { binary });
 }
 
-/// One line of libtest's JSON as the view's event: a suite's start, a test's start, end or
-/// "running for over 60 seconds". Anything else is `None`.
+/// One line of libtest's JSON as the view's event: a suite's start, a test's start or end, and
+/// a suite's end as how many tests its filter left out. Anything else is `None`.
 fn said(binary: u32, line: &str) -> Option<Test> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let kind = value.get("type")?.as_str()?;
@@ -755,6 +810,10 @@ fn said(binary: u32, line: &str) -> Option<Test> {
         ("suite", "started") => {
             let tests = value.get("test_count").and_then(serde_json::Value::as_u64).unwrap_or(0);
             Some(Test::Total { binary, tests: u32::try_from(tests).unwrap_or(u32::MAX) })
+        }
+        ("suite", "ok" | "failed") => {
+            let tests = value.get("filtered_out")?.as_u64()?;
+            Some(Test::Filtered { binary, tests: u32::try_from(tests).unwrap_or(u32::MAX) })
         }
         ("test", "started") => Some(Test::TestStarted { binary, name: name()? }),
         ("test", "ok" | "failed" | "ignored") => {
@@ -817,7 +876,17 @@ mod tests {
         let cores =
             blaze_core::cores::Cores::resolve(blaze_core::cores::Setting::Exactly(one), one);
         let mut runner =
-            Runner::of(Vec::new(), true, cores, true, to_screen, to_runner.clone(), true, false);
+            Runner::of(
+                Vec::new(),
+                true,
+                cores,
+                true,
+                to_screen,
+                to_runner.clone(),
+                true,
+                false,
+                crate::cli::test::Selection::default(),
+            );
         runner.drain = Duration::from_millis(300);
         to_runner.send(Run::BuildOver { ok: true, artifacts: vec![artifact] }).unwrap();
         let (done, finished) = crossbeam_channel::bounded(1);
@@ -860,5 +929,85 @@ mod tests {
         assert_eq!(took_ms, Some(250));
         assert!(said(3, r#"{ "type": "suite", "event": "ok", "passed": 2 }"#).is_none());
         assert!(said(3, "running 2 tests").is_none());
+        // A suite's end, whole: how many tests its filter left out.
+        let ended = said(
+            3,
+            r#"{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 5, "exec_time": 0.1 }"#,
+        );
+        assert!(matches!(ended, Some(Test::Filtered { binary: 3, tests: 5 })), "{ended:?}");
+    }
+
+    /// One libtest executable, stood in for by a shell script that says what libtest's JSON
+    /// says of a suite whose filter left out all 7 of its tests, and exits 0: the runner's
+    /// exit code and the screen's events for `selection`.
+    #[cfg(unix)]
+    fn a_run_of_none(selection: crate::cli::test::Selection) -> (i32, Vec<Event>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut artifact =
+            crate::cli::run::tests::artifact("calc", "lib", "calc", true, Some("deps/calc-0"));
+        artifact.manifest_path = dir.path().join("Cargo.toml").to_string_lossy().into_owned();
+        let suite = r#"echo '{ "type": "suite", "event": "started", "test_count": 0 }'; echo '{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 7, "exec_time": 0.0 }'"#;
+        artifact.runner = ["/bin/sh", "-c", suite].map(str::to_owned).to_vec();
+        let (to_screen, screen_gets) = unbounded::<Msg>();
+        let (to_runner, runner_gets) = unbounded::<Run>();
+        let one = std::num::NonZero::<usize>::MIN;
+        let cores =
+            blaze_core::cores::Cores::resolve(blaze_core::cores::Setting::Exactly(one), one);
+        let runner = Runner::of(
+            vec!["nope".into()],
+            false,
+            cores,
+            true,
+            to_screen,
+            to_runner.clone(),
+            true,
+            false,
+            selection,
+        );
+        to_runner.send(Run::BuildOver { ok: true, artifacts: vec![artifact] }).unwrap();
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || done.send(runner.run(&runner_gets)));
+        let code = finished.recv_timeout(Duration::from_secs(20)).expect("the runner ends within 20 s");
+        let events = screen_gets
+            .try_iter()
+            .filter_map(|msg| match msg {
+                Msg::Event(event) => Some(event),
+                Msg::Draw | Msg::Sync(_) => None,
+            })
+            .collect();
+        (code, events)
+    }
+
+    /// On a terminal too, a run whose filter matched no test is refused (agents.json A39): the
+    /// runner counts what each executable's suite said it ran, exits with blaze's code for a
+    /// run of none, and tells the screen, which says it and makes the summary a failure. The
+    /// control: `--no-tests pass` is exit 0 with no refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_of_none_under_the_screen_is_refused() {
+        let selection = crate::cli::test::Selection {
+            typed: "blaze test nope".to_owned(),
+            filters: vec!["nope".to_owned()],
+            ..crate::cli::test::Selection::default()
+        };
+        let (code, events) = a_run_of_none(selection.clone());
+        assert_eq!(code, blaze_core::exit::Exit::NoTests.code(), "{events:#?}");
+        assert!(
+            events.iter().any(|it| matches!(it, Event::Test(Test::Filtered { tests: 7, .. }))),
+            "{events:#?}"
+        );
+        let refused = events.iter().find_map(|it| match it {
+            Event::Test(Test::Refused { what, help }) => Some((what.as_str(), help.len())),
+            _ => None,
+        });
+        assert_eq!(
+            refused,
+            Some(("no test ran: `blaze test nope` matched none of the 7 tests in 1 test executable", 1)),
+            "{events:#?}"
+        );
+
+        let (code, events) = a_run_of_none(crate::cli::test::Selection { pass: true, ..selection });
+        assert_eq!(code, 0, "{events:#?}");
+        assert!(!events.iter().any(|it| matches!(it, Event::Test(Test::Refused { .. }))), "{events:#?}");
     }
 }

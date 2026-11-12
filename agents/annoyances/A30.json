@@ -7,5 +7,6 @@
  "cost": "every blaze number I reported before 18:40 PST was 2 to 10 times too slow on the no-op rows",
  "cause": "a path through a symlink is not vouched for; nothing reports that the lane is off",
  "workaround": "use `/private/tmp/…`",
- "state": "open: say so once per daemon, or resolve the path"
+ "state": "open: say so once per daemon, or resolve the path",
+ "class": "vacuous success (A39), neighbour: a measurement of something other than the thing named (a lane disabled silently)"
 }

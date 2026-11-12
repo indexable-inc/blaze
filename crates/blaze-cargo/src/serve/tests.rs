@@ -4786,6 +4786,33 @@ fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
 }
 
+/// The invariant: while a daemon holds a state, anyone who asks the state's lock who holds it
+/// is told that one does, and its pid, without a socket and without waiting; and is told none
+/// does before any daemon ran there and after it let go. (agents.json A37: `stop` said no
+/// daemon ran while one did; the socket's path follows `XDG_RUNTIME_DIR`, the state's does
+/// not.)
+#[cfg(unix)]
+#[test]
+fn the_states_lock_says_whether_a_daemon_runs_and_which() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "no daemon ever ran here");
+    assert!(!state.path().join("serve.lock").exists(), "asking creates nothing");
+    let held = super::hold(state.path(), None).unwrap();
+    let lock = state.path().join("serve.lock");
+    assert_eq!(
+        super::holder(state.path()).unwrap(),
+        super::Holder::Daemon { pid: Some(std::process::id()), lock: lock.clone() }
+    );
+    // Asking does not take the daemon's place, nor leave a lock behind: asked twice, and a
+    // daemon that starts after still waits for the one that holds the state.
+    assert!(matches!(super::holder(state.path()).unwrap(), super::Holder::Daemon { .. }));
+    drop(held);
+    assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "let go of as the daemon ends");
+    // And asking left the lock free: a daemon starts on the state at once.
+    let again = super::hold(state.path(), None).unwrap();
+    assert!(matches!(again.1, super::Before::Ended(pid) if pid == std::process::id()));
+}
+
 #[test]
 #[cfg(feature = "native")]
 fn serve_takes_activated_alone_and_names_it_among_its_flags() {

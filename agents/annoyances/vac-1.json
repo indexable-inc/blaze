@@ -1,0 +1,21 @@
+{
+ "id": "vac-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "where": "tools/agents/rules.ts --write, run by an agent as `bun ... | tail -1`",
+ "what": "The generator failed to parse, the commit went out with stale AGENTS.md and skills, and nobody saw it: only the last line of its output was read, and on success it printed nothing, so an error's last line and success looked alike.",
+ "cost": "a commit with stale generated files (the brief names it; this lane did not see it happen)",
+ "cause": "a generator that is silent on success",
+ "whys": [
+  "why wrong: generated files did not match their source",
+  "why possible: the generator failed and its old output stayed",
+  "why not caught: its exit status was not read, and its last line was",
+  "why easy: on success it prints nothing, so there is no line whose absence shows",
+  "property: a generator's success is silence"
+ ],
+ "class": "vacuous success (A39): success said by the absence of output",
+ "prevention": "rules.ts `--write` and `--check` end with a line saying what was done (`wrote AGENTS.md and 10 skills from 64 rules`), so the last line is that or an error; `docs check` prints how many docs hold and refuses none; `library.py check` (new) says the digest it held; integrate.py's `generated()` rows hold each of the three to its exit status and that line; the gate already ran rules.ts --check, docs check, ledger, invariants and diff_rules checks (83f6882263). Run by this lane: `bun tools/agents/rules.ts --write` and `--check`, both exit 0, AGENTS.md changed. Open: ledger, invariants and diff_rules still print nothing on success; nostd.rs's and tools/cpus.py's check modes are called by no workflow.",
+ "workaround": "read the exit status",
+ "fix": "see prevention",
+ "state": "prevention written on vacuous-1112 (83f6882263); rules.ts run, the Rust not compiled"
+}

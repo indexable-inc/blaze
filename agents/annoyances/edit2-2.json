@@ -7,5 +7,6 @@
  "cost": "one baseline run (five minutes) and ten minutes finding why the daemon restarted",
  "cause": "two binaries of one name, and a script that takes a directory",
  "workaround": "copy `blaze-thin` as `blaze` beside `blaze-engine` into a directory of its own (`/root/install.sh`, gone with the VM)",
- "state": "open: the measuring script should take the two paths, or check `blaze --version` says thin"
+ "state": "open: the measuring script should take the two paths, or check `blaze --version` says thin",
+ "class": "vacuous success (A39), neighbour: a measurement of another program than the one named; ran.py's proof (text only the measured program prints) is the guard"
 }

@@ -133,6 +133,11 @@ jobs:
       # The list of tests that may fail holds together and is as its recorder writes it, and the
       # comparison and the recording do what they say on made-up results.
       - run: uv run --frozen python harness/failures.py selftest
+      # A row or a test run counts only with proof that it ran (harness/v2/ran.py): each rule
+      # beside the planted bug it refuses, and the count of checks the self-test expects of itself.
+      - run: uv run --frozen python harness/v2/ran.py selftest
+      # library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
+      - run: uv run --frozen python harness/library.py check '{}'
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
@@ -560,9 +565,26 @@ jobs:
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}
+          TIER: ${{ needs.changes.outputs.tier }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
           ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
+          # What this tier was expected to run, each of which has to have succeeded: the absence
+          # of a failure is not a pass (agents.json A39), and a job this tier runs that was
+          # skipped is a gate that tested nothing. `none` (a change of no code) runs the first
+          # four; any other tier the Linux tests and the workspace check too; `warm` macOS too.
+          case "$TIER" in
+            none) expected='["changes","scripts","workflows","lean"]' ;;
+            gate) expected='["changes","scripts","workflows","lean","linux-arm64","linux-6-8","workspace-check"]' ;;
+            warm) expected='["changes","scripts","workflows","lean","linux-arm64","linux-6-8","workspace-check","macos"]' ;;
+            *) echo "::error::the tier is '$TIER', none of none, gate and warm: what this run was to test is not known"; exit 1 ;;
+          esac
+          missed=$(echo "$NEEDS" | jq -r --argjson expected "$expected" '$expected - [to_entries[] | select(.value.result == "success") | .key] | join(", ")')
+          if [ -n "$missed" ]; then
+            echo "::error::tier $TIER expected these jobs to run and succeed, and they did not: $missed"
+            exit 1
+          fi
+          echo "tier $TIER: each of $expected ran and succeeded"
       # The budget smoke's guards ran and held (harness/v2/guards.py, `held`): a tier that builds
       # blaze has the smoke's result, with an outcome that passed for every bound of every step
       # of both fixtures and for the sandbox's probe. A job that was skipped passes the step

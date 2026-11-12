@@ -7,5 +7,6 @@
  "cost": "twenty minutes; and the fuzzer that holds incremental builds to clean ones was not running for anyone",
  "cause": "a test module written by a lane that could not build it; nothing compiles test targets before a merge",
  "workaround": "fixed here in three lines (the import, the two `finalize` arguments)",
- "state": "fixed on revisions-1111; open: the gate should compile every test target (`cargo test --no-run`) of the crates a merge touches"
+ "state": "fixed on revisions-1111; open: the gate should compile every test target (`cargo test --no-run`) of the crates a merge touches",
+ "class": "vacuous success (A39), neighbour: tests or lints that never compiled or never ran, counted as held"
 }

@@ -4,16 +4,28 @@
 //! built and the failure that held it back; `--fail-fast` stops at the first that fails, as
 //! cargo does; `--no-run` lists them. And blaze's
 //! `--reached` (an extension, opt-in): the daemon's [`TestResult`]s in libtest's format.
+//!
+//! A run that ran no test is refused (`useful-not-parity`; cargo and libtest end 0 with
+//! `test result: ok. 0 passed`): every path counts what ran into one [`Tally`], [`refusal`]
+//! is the one rule over it, and [`conclude`] says the run's end with the counts, so a pass
+//! always says how many tests it is a pass of. A test executable's stdout comes through this
+//! process ([`Spawned::run`]), which is how the counts are known off a terminal; on one the
+//! runner reads libtest's JSON (`cli::live`).
 
 use std::{
     ffi::OsString,
     fmt::Write as _,
-    io::{self, Write},
+    io::{self, IsTerminal as _, Read as _, Write},
     path::{Path, PathBuf},
+    process::Stdio,
+    thread,
+    time::{Duration, Instant},
 };
 
 use blaze_api::{Artifact, ArtifactKind, TargetKind, TestOutcome, TestResult, Unbuilt};
 use blaze_core::exit::Exit;
+use blaze_screen::Tally;
+use crossbeam_channel::RecvTimeoutError;
 
 use super::{
     args::{Command, Invocation},
@@ -21,9 +33,28 @@ use super::{
     say,
 };
 
+/// How long a test executable's output is read after its process exited. Whatever it wrote
+/// is in the pipe by then, so only a process it started and left running, which inherited its
+/// stdout or stderr, holds the pipe open past this; the reader then stops waiting and says so.
+pub const DRAIN: Duration = Duration::from_secs(2);
+
+/// How a test executable ended, and what it said it ran.
+#[derive(Clone, Copy)]
+pub struct Ran {
+    pub ended: say::Ended,
+    /// The sum of the result lines it printed ([`counts_of`]); `None` when it printed none.
+    pub counts: Option<Tally>,
+}
+
 /// What runs a test executable: the process itself, or the tests' fake.
 pub trait Programs {
-    fn run(&mut self, exec: &Exec) -> io::Result<say::Ended>;
+    /// Runs `exec` to its end, its stdout written through to this process's and read for
+    /// libtest's result lines. `harness`: it is libtest's, which colours by whether its
+    /// stdout is a terminal.
+    fn run(&mut self, exec: &Exec, harness: bool) -> io::Result<Ran>;
+
+    /// The tests `exec` (a test executable run with [`LIST`]) lists, for a refusal's help.
+    fn names(&mut self, exec: &Exec) -> io::Result<Vec<String>>;
 
     /// Readies `exec` to start `artifact`'s program, asking the daemon whether it runs on its
     /// code memory ([`super::run::launch`]); the tests' fake asks no daemon.
@@ -35,12 +66,110 @@ pub trait Programs {
     fn started(&mut self, artifact: &Artifact, exec: &Exec) -> Result<Exec, String>;
 }
 
-/// Runs each program on the terminal, its output inherited.
+/// Runs each program as a process of its own: its stdin and stderr this process's, its stdout
+/// through this process, which counts what it says it ran.
 pub struct Spawned;
 
 impl Programs for Spawned {
-    fn run(&mut self, exec: &Exec) -> io::Result<say::Ended> {
-        exec.command().status().map(say::Ended::of)
+    /// The executable's stdout is a pipe to this process, which writes each chunk on at once
+    /// and reads it for result lines; its stdin and stderr are this process's own. Its exit is
+    /// waited for apart from its output, which is read for at most [`DRAIN`] after it.
+    fn run(&mut self, exec: &Exec, harness: bool) -> io::Result<Ran> {
+        let mut command = exec.command();
+        let told = exec.args.iter().any(|it| it.to_string_lossy().starts_with("--color"));
+        if harness && !told && io::stdout().is_terminal() {
+            command.arg("--color=always");
+        }
+        command.stdout(Stdio::piped());
+        let mut out = own_stdout()?;
+        let mut child = command.spawn()?;
+        let Some(mut from) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let what = format!("{}: its stdout was asked for as a pipe and none came", exec.shown());
+            return Err(io::Error::other(what));
+        };
+        let (counted, counts) = crossbeam_channel::unbounded::<io::Result<Tally>>();
+        let reader = thread::Builder::new().name("blaze test output".into()).spawn(move || {
+            let mut scan = Scan::default();
+            let mut found = |tally: Tally| {
+                let _ = counted.send(Ok(tally));
+            };
+            let mut chunk = [0; 8192];
+            loop {
+                match from.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(error) = out.write_all(&chunk[..n]) {
+                            let _ = counted.send(Err(error));
+                            return;
+                        }
+                        scan.feed(&chunk[..n], &mut found);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        let _ = counted.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            scan.end(&mut found);
+        });
+        if let Err(error) = reader {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let status = {
+            let _waiting = tracing::info_span!(
+                target: "blaze",
+                "test.wait_exit",
+                program = %exec.program.display(),
+            )
+            .entered();
+            child.wait()?
+        };
+        let _draining = tracing::info_span!(
+            target: "blaze",
+            "test.read_output",
+            program = %exec.program.display(),
+        )
+        .entered();
+        let deadline = Instant::now() + DRAIN;
+        let mut sum = None;
+        loop {
+            match counts.recv_deadline(deadline) {
+                Ok(Ok(tally)) => sum.get_or_insert_with(Tally::default).add(&tally),
+                Ok(Err(error)) => return Err(error),
+                // The reader ended: all the executable wrote was written on.
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    let what = format!(
+                        "{} exited, but a process it started still holds its stdout open; what that \
+                         process prints from now on is still written, and is not read for test results",
+                        exec.shown()
+                    );
+                    io::stderr().write_all(say::warning(&what, false).as_bytes())?;
+                    break;
+                }
+            }
+        }
+        Ok(Ran { ended: say::Ended::of(status), counts: sum })
+    }
+
+    fn names(&mut self, exec: &Exec) -> io::Result<Vec<String>> {
+        let _listing = tracing::info_span!(
+            target: "blaze",
+            "test.list",
+            program = %exec.program.display(),
+        )
+        .entered();
+        let output = exec.command().stdin(Stdio::null()).output()?;
+        if !output.status.success() {
+            let what = format!("{} ended with {}", exec.shown(), say::ended(say::Ended::of(output.status)));
+            return Err(io::Error::other(what));
+        }
+        Ok(listed(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn launch(&mut self, artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
@@ -57,6 +186,22 @@ impl Programs for Spawned {
             true => super::run::through_trampoline(artifact, exec),
             false => super::run::launch(artifact, &mut exec).map(|()| exec),
         }
+    }
+}
+
+/// This process's stdout as a test executable had it when it inherited it: the descriptor
+/// itself, unbuffered, and not std's handle, which the command's thread holds locked while the
+/// command runs (`cli::command`), so another thread's write through it would never return.
+fn own_stdout() -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        io::stdout().as_fd().try_clone_to_owned().map(std::fs::File::from)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle as _;
+        io::stdout().as_handle().try_clone_to_owned().map(std::fs::File::from)
     }
 }
 
@@ -225,7 +370,9 @@ pub fn run(
     speaking: Speaking<'_>,
     err: &mut dyn Write, // dyn: the CLI's output writer, a few writes per test executable run.
     programs: &mut impl Programs,
+    tally: &mut Tally,
 ) -> io::Result<i32> {
+    tally.unbuilt = tally.unbuilt.saturating_add(u32::try_from(unbuilt.len()).unwrap_or(u32::MAX));
     let bench = asked.command() == Command::Bench;
     let unit_kind = if bench { Kind::Bench } else { Kind::Test };
     let (tests, docs) = executables(artifacts);
@@ -246,7 +393,7 @@ pub fn run(
         let shown = exec.shown_at(speaking.verbose);
         speaking.running(err, "Running", test, unit_kind, &shown)?;
         if let Some(failure) =
-            ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs)?
+            ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs, tally)?
         {
             failed.push(failure);
             if asked.flags.fail_fast {
@@ -262,9 +409,18 @@ pub fn run(
             if speaking.verbose > 0 {
                 speaking.status(err, "Running", &shown)?;
             }
-            if let Some(failure) =
-                ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs)?
-            {
+            if let Some(failure) = ran(
+                doc,
+                Kind::Doctest,
+                &exec,
+                &shown,
+                asked,
+                spec_flag,
+                speaking,
+                err,
+                programs,
+                tally,
+            )? {
                 failed.push(failure);
                 if asked.flags.fail_fast {
                     return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
@@ -340,8 +496,11 @@ fn ran(
     speaking: Speaking<'_>,
     err: &mut dyn Write, // dyn: the CLI's output writer, a few writes per test executable run.
     programs: &mut impl Programs,
+    tally: &mut Tally,
 ) -> io::Result<Option<Failed>> {
     let rerun = rerun(artifact, kind, spec_flag);
+    // One that never started is a failure of the run, counted as one.
+    let never_ran = Tally { binaries: 1, failed: 1, ..Tally::default() };
     let what = format!("{}, to rerun pass `{rerun}`", kind.failed());
     let never = |error: String| {
         caused(
@@ -360,16 +519,20 @@ fn ran(
         Ok(it) => it,
         Err(error) => {
             err.write_all(never(error).as_bytes())?;
+            tally.add(&never_ran);
             return Ok(Some(Failed { rerun, code: None }));
         }
     };
-    let ended = match programs.run(&started) {
-        Ok(ended) => ended,
+    let libtest = artifact.harness && kind != Kind::Doctest;
+    let Ran { ended, counts } = match programs.run(&started, libtest) {
+        Ok(ran) => ran,
         Err(error) => {
             err.write_all(never(error.to_string()).as_bytes())?;
+            tally.add(&never_ran);
             return Ok(Some(Failed { rerun, code: None }));
         }
     };
+    tally.add(&counted(counts, matches!(ended, say::Ended::Code(0)), libtest));
     let code = match ended {
         say::Ended::Code(0) => return Ok(None),
         say::Ended::Code(code) => Some(code),
@@ -392,6 +555,370 @@ fn ran(
         err.write_all(said.as_bytes())?;
     }
     Ok(Some(Failed { rerun, code }))
+}
+
+/// One executable's counts in the run's tally. With result lines, their sum; one that ended
+/// badly with no failing test among them is itself a failure. Without any: libtest's harness
+/// always prints one when it runs tests, so a harness executable that printed none ran none
+/// (`--list`, `--help`), and any other executable is one test whose exit status is its verdict.
+pub fn counted(counts: Option<Tally>, ok: bool, libtest: bool) -> Tally {
+    let mut one = match counts {
+        Some(counts) => counts,
+        None if libtest => Tally::default(),
+        None => Tally { passed: u32::from(ok), ..Tally::default() },
+    };
+    one.binaries = 1;
+    if !ok && one.failed == 0 {
+        one.failed = 1;
+    }
+    one
+}
+
+/// libtest's count of a suite that ended, from the line it says it in: the pretty and terse
+/// formats' `test result: ok. 7 passed; 1 failed; 1 ignored; 0 measured; 2 filtered out; ...`
+/// (the `ok` coloured or not) and the JSON format's `{ "type": "suite", "event": "ok", ... }`.
+/// `None` for any other line, and for a result line without every count.
+pub fn counts_of(line: &str) -> Option<Tally> {
+    let line = line.trim();
+    if line.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        if value.get("type")?.as_str()? != "suite"
+            || !matches!(value.get("event")?.as_str()?, "ok" | "failed")
+        {
+            return None;
+        }
+        let count = |name: &str| {
+            let count = value.get(name)?.as_u64()?;
+            Some(u32::try_from(count).unwrap_or(u32::MAX))
+        };
+        return Some(Tally {
+            passed: count("passed")?,
+            failed: count("failed")?,
+            ignored: count("ignored")?,
+            measured: count("measured")?,
+            filtered_out: count("filtered_out")?,
+            ..Tally::default()
+        });
+    }
+    let rest = line.strip_prefix("test result: ")?;
+    // The number just before `label`.
+    let count = |label: &str| {
+        let before = &rest[..rest.find(label)?];
+        let digits = before.bytes().rev().take_while(u8::is_ascii_digit).count();
+        before[before.len() - digits..].parse::<u32>().ok()
+    };
+    Some(Tally {
+        passed: count(" passed;")?,
+        failed: count(" failed;")?,
+        ignored: count(" ignored;")?,
+        measured: count(" measured;")?,
+        filtered_out: count(" filtered out")?,
+        ..Tally::default()
+    })
+}
+
+/// The longest line read whole: a result line is far shorter, and a longer line is none.
+const LINE: usize = 4096;
+
+/// Finds the result lines ([`counts_of`]) in a test executable's stdout as it comes, in
+/// chunks that end anywhere.
+#[derive(Default)]
+pub struct Scan {
+    line: Vec<u8>,
+    /// The line under way is past [`LINE`]: it is no result line, and is not kept.
+    long: bool,
+}
+
+impl Scan {
+    pub fn feed(&mut self, bytes: &[u8], found: &mut impl FnMut(Tally)) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.end(found);
+            } else if self.line.len() < LINE {
+                self.line.push(byte); // alloc: one line's bytes, at most `LINE`, reused
+            } else {
+                self.long = true;
+            }
+        }
+    }
+
+    /// The line under way ends: at a newline, and at the end of the output.
+    pub fn end(&mut self, found: &mut impl FnMut(Tally)) {
+        if !self.long
+            && let Ok(line) = std::str::from_utf8(&self.line)
+            && let Some(tally) = counts_of(line)
+        {
+            found(tally);
+        }
+        self.line.clear();
+        self.long = false;
+    }
+}
+
+/// What a test executable is run with to list its tests, one a line as `name: test`.
+pub const LIST: [&str; 3] = ["--list", "--format", "terse"];
+
+/// The names in libtest's terse listing: each `name: test` and `name: benchmark` line.
+pub fn listed(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|it| it.strip_suffix(": test").or_else(|| it.strip_suffix(": benchmark")))
+        .map(str::to_owned)
+        .collect() // alloc: on a refusal's path, once
+}
+
+/// The tests that exist, for a refusal's help: the names listed, and for each executable
+/// whose listing failed, why.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Names {
+    pub names: Vec<String>,
+    pub unlisted: Vec<String>,
+}
+
+/// The tests of every libtest executable among `artifacts`, each asked for its list.
+pub fn names_of(artifacts: &[Artifact], programs: &mut impl Programs) -> Names {
+    let (tests, _) = executables(artifacts);
+    let mut names = Names::default();
+    for test in tests.into_iter().filter(|it| it.harness) {
+        let executable = PathBuf::from(test.executable.as_deref().unwrap_or(&test.path));
+        let exec = Exec::of(test, executable, LIST.map(OsString::from), package_root(test));
+        let listed = programs
+            .started(test, &exec)
+            .and_then(|exec| programs.names(&exec).map_err(|error| error.to_string()));
+        match listed {
+            Ok(listed) => names.names.extend(listed),
+            Err(why) => names.unlisted.push(format!("{}: {why}", exec.shown())), // alloc: as above
+        }
+    }
+    names
+}
+
+/// libtest's options that take a value as their next word: that word is no name filter.
+const VALUED: [&str; 7] =
+    ["--skip", "--test-threads", "--format", "--color", "--logfile", "--shuffle-seed", "-Z"];
+
+/// What a `test` or `bench` command line selects, as far as the rule for a run of none
+/// ([`refusal`]) reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// The command as typed, for the refusal to name: `blaze test -p calc adds -- --exact`.
+    pub typed: String,
+    /// The name filters: `TESTNAME`, and each bare word after `--`.
+    pub filters: Vec<String>,
+    /// Nothing is meant to run: `--no-run`, libtest's `--list` and `--help`.
+    pub lists: bool,
+    /// `--no-tests pass`: a run of none is a pass.
+    pub pass: bool,
+    /// `--reached`: a test the edit did not reach is selected and does not run.
+    pub reached: bool,
+}
+
+impl Selection {
+    pub fn of(asked: &Invocation) -> Selection {
+        let mut typed = format!("blaze {}", asked.command().name()); // alloc: once a command
+        for word in &asked.args {
+            typed.push(' ');
+            typed.push_str(word);
+        }
+        if !asked.program.is_empty() {
+            typed.push_str(" --");
+        }
+        let mut filters: Vec<String> = asked.filter.iter().cloned().collect(); // alloc: as above
+        let mut lists = asked.flags.no_run;
+        let mut words = asked.program.iter().map(|it| it.to_string_lossy());
+        while let Some(word) = words.next() {
+            typed.push(' ');
+            typed.push_str(&word);
+            if VALUED.contains(&&*word) {
+                if let Some(value) = words.next() {
+                    typed.push(' ');
+                    typed.push_str(&value);
+                }
+                continue;
+            }
+            lists |= matches!(&*word, "--list" | "-h" | "--help");
+            if !word.starts_with('-') {
+                filters.push(word.into_owned()); // alloc: as above
+            }
+        }
+        Selection {
+            typed,
+            filters,
+            lists,
+            pass: asked.flags.no_tests_pass,
+            reached: asked.flags.reached,
+        }
+    }
+}
+
+/// Why a run in which nothing failed is refused: what it selected and ran none of, then the
+/// lines of help under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub what: String,
+    pub help: Vec<String>,
+}
+
+/// The few words a refusal is said by where a line has room for no more: the `why=` of the
+/// `blaze: tests` line and of the JSON summary.
+pub const NO_TEST_RAN: &str = "no test ran";
+
+/// How many of the tests that exist a refusal names as nearest its filter.
+const NEAREST: usize = 3;
+
+/// The rule for a run of none (`useful-not-parity`, where cargo and libtest end 0): a `test`
+/// or `bench` that built, in which nothing failed, and that ran no test is refused, naming
+/// what it selected and the nearest tests that exist. Not refused: a command that is meant to
+/// run nothing ([`Selection::lists`]), `--no-tests pass`, and under `--reached` a run whose
+/// tests were all selected and unreached, which is that flag's answer. `names` is asked only
+/// when the run is refused.
+pub fn refusal(selection: &Selection, tally: &Tally, names: impl FnOnce() -> Names) -> Option<Refusal> {
+    if selection.lists || selection.pass {
+        return None;
+    }
+    if tally.ran() > 0 || tally.failed > 0 || tally.unbuilt > 0 {
+        return None;
+    }
+    if selection.reached && tally.unreached > 0 {
+        return None;
+    }
+    let typed = &selection.typed;
+    let executables = match tally.binaries {
+        1 => "1 test executable".to_owned(), // alloc: a refusal's text, once
+        n => format!("{n} test executables"),
+    };
+    let mut help = Vec::new(); // alloc: as above
+    let what = if tally.ignored > 0 {
+        help.push(
+            "`-- --ignored` runs the ignored ones, `-- --include-ignored` them and the rest".to_owned(),
+        );
+        format!(
+            "{NO_TEST_RAN}: every one of the {} `{typed}` selected is ignored (`#[ignore]`)",
+            tally.ignored
+        )
+    } else if tally.filtered_out > 0 {
+        let names = names();
+        let near = nearest(&selection.filters, &names.names);
+        if !near.is_empty() {
+            help.push(format!("the nearest that exist: {}", near.join(", ")));
+        } else if !names.names.is_empty() {
+            help.push(format!(
+                "none of the {} that exist is near it; `blaze test -- --list` lists them",
+                names.names.len()
+            ));
+        }
+        for unlisted in names.unlisted {
+            help.push(format!("could not be listed: {unlisted}"));
+        }
+        format!(
+            "{NO_TEST_RAN}: `{typed}` matched none of the {} tests in {executables}",
+            tally.filtered_out
+        )
+    } else if tally.binaries == 0 {
+        format!("{NO_TEST_RAN}: `{typed}` selected no test executable")
+    } else {
+        let hold = if tally.binaries == 1 { "holds" } else { "hold" };
+        format!("{NO_TEST_RAN}: `{typed}` selected {executables}, which {hold} no test")
+    };
+    help.push("a run of no test is refused; `--no-tests pass` allows one, as cargo does".to_owned());
+    Some(Refusal { what, help })
+}
+
+/// The tests nearest any of `filters`, nearest first, at most [`NEAREST`]: by rustc's edit
+/// distance (`stdx::edit_distance`, the tree's one "did you mean") between a filter and a
+/// test's whole path or its last segment, within a third of the filter's length.
+fn nearest<'a>(filters: &[String], names: &'a [String]) -> Vec<&'a str> {
+    let mut scored: Vec<(usize, &str)> = Vec::new(); // alloc: on a refusal's path, once
+    for name in names {
+        let last = name.rsplit("::").next().unwrap_or(name);
+        let score = filters
+            .iter()
+            .filter_map(|filter| {
+                let limit = (filter.chars().count() / 3).max(1);
+                let whole = stdx::edit_distance::edit_distance_with_substrings(filter, name, limit);
+                let tail = stdx::edit_distance::edit_distance_with_substrings(filter, last, limit);
+                whole.into_iter().chain(tail).min()
+            })
+            .min();
+        if let Some(score) = score {
+            scored.push((score, name.as_str()));
+        }
+    }
+    scored.sort_unstable();
+    scored.dedup();
+    scored.into_iter().take(NEAREST).map(|(_, name)| name).collect()
+}
+
+/// The counts of the results the daemon sent (`--reached`, `--ub`): one executable for each
+/// index it numbered.
+pub fn tally_of(results: &[TestResult]) -> Tally {
+    let mut tally = Tally::default();
+    let mut executables: Vec<u32> = results.iter().map(|it| it.executable).collect(); // alloc: once a request
+    executables.sort_unstable();
+    executables.dedup();
+    tally.binaries = u32::try_from(executables.len()).unwrap_or(u32::MAX);
+    for result in results {
+        match result.outcome {
+            TestOutcome::Passed => tally.passed += 1,
+            TestOutcome::Failed => tally.failed += 1,
+            TestOutcome::Ignored => tally.ignored += 1,
+            TestOutcome::Unreached => tally.unreached += 1,
+        }
+    }
+    tally
+}
+
+/// The end of a `test` or `bench` whose tests ran with exit code `code` (`built`: the build
+/// before them passed): the rule for a run of none ([`refusal`]), then the run's counts, as
+/// one `blaze: tests` line on stderr (`blaze_screen::tests_line`; not under `-q`, which says
+/// errors only) and with a JSON `--message-format` one `blaze-test-summary` line on stdout.
+/// The command's exit code: `code`, or [`Exit::NoTests`] for a run refused. A command that is
+/// meant to run nothing ([`Selection::lists`]) says nothing here.
+#[expect(clippy::too_many_arguments, reason = "the run's end, and everything it is said from and to")]
+pub fn conclude(
+    selection: &Selection,
+    tally: &Tally,
+    code: i32,
+    built: bool,
+    took: Duration,
+    names: impl FnOnce() -> Names,
+    speaking: Speaking<'_>,
+    out: &mut dyn Write, // dyn: the CLI's output writers, written once a run
+    err: &mut dyn Write,
+) -> io::Result<i32> {
+    if selection.lists {
+        return Ok(code);
+    }
+    let refused = match code == 0 && built {
+        true => refusal(selection, tally, names),
+        false => None,
+    };
+    let mut said = String::new(); // alloc: the run's last lines, once
+    let code = match &refused {
+        Some(refused) => {
+            say::error_into(&mut said, &refused.what, speaking.color);
+            for help in &refused.help {
+                say::note_into(&mut said, help, speaking.color);
+            }
+            Exit::NoTests.code()
+        }
+        None => code,
+    };
+    let ok = code == 0 && built;
+    let why = refused.is_some().then_some(NO_TEST_RAN);
+    let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    if !speaking.quiet {
+        said.push_str(&blaze_screen::tests_line(tally, ok, why, took_ms));
+        said.push('\n');
+    }
+    err.write_all(said.as_bytes())?;
+    if speaking.json {
+        said.clear();
+        super::json::test_summary(&mut said, tally, ok, why, took_ms);
+        said.push('\n');
+        out.write_all(said.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(code)
 }
 
 /// The most test executables one request's results index: the daemon's indexes are dense from

@@ -7,5 +7,6 @@
  "cost": "one measurement thrown away and run again",
  "cause": "one VM for building and measuring, and nothing that refuses to measure while a build runs",
  "workaround": "waited for `pgrep cargo` to be empty before each measurement",
- "state": "open: the measuring script could refuse when the machine is busy"
+ "state": "open: the measuring script could refuse when the machine is busy",
+ "class": "vacuous success (A39), neighbour: a measurement of another program than the one named; ran.py's proof (text only the measured program prints) is the guard"
 }

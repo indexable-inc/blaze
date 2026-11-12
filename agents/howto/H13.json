@@ -1,0 +1,9 @@
+{
+ "id": "H13",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "task": "Time a command, or count a test run, in a harness script",
+ "do": "Go through harness/v2/ran.py: `ran.series(label, Command(args, cwd, env), Proof(stdout=<text only the measured program prints>), n, warm)` for a row, `ran.tests(stdout, exit, Tests(at_least=N, named=(...)))` for a test run; from a shell, `python3 -I harness/v2/ran.py '<json>'`. Print `row.text`: it is a number only when every run had its exit status and its proof, else `INVALID: why`.",
+ "why": "A39: a row timed a wrapper that failed before blaze ran, and a filter that matched no test was reported as a pass.",
+ "state": "current"
+}

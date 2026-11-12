@@ -194,6 +194,13 @@ pub enum Test {
     Ended { binary: u32, end: BinaryEnd, output: String },
     /// A test executable never built: behind which unit, and why that one failed.
     Unbuilt { unit: String, behind: String, why: String },
+    /// A test executable's suite ended: how many of its tests the filter left out, libtest's
+    /// count. The summary says their sum, so a filter that left out everything shows.
+    Filtered { binary: u32, tests: u32 },
+    /// The run is refused though no test failed: it ran none (`cli::test::refusal`). `what`
+    /// names the selection that matched nothing; each of `help` is a line under it (the
+    /// nearest tests that exist, the flag that allows a run of none).
+    Refused { what: String, help: Vec<String> },
     /// Every executable ended: the summary is due.
     Over,
 }

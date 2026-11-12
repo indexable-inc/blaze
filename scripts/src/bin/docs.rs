@@ -3,7 +3,8 @@
 //! byte (docs/v2/plan/design/scripts.md, "Ports and their parity"): the same commands, text
 //! printed, exit status and bytes written.
 //!
-//!     blaze run -q -p scripts --bin docs -- check      fail naming each problem (CI)
+//!     blaze run -q -p scripts --bin docs -- check      fail naming each problem (CI); else print
+//!                                                      how many docs hold
 //!     blaze run -q -p scripts --bin docs -- write      regenerate docs/README.md, the index, from
 //!                                                      the front matter, and take the files that
 //!                                                      are gone out of tools/python-allowed.txt
@@ -25,6 +26,11 @@
 //! still to come. A `record` was true on its date and is never brought up to date: only the files
 //! it links have to exist. A `superseded` doc names what replaced it and is left out of the
 //! index. Outside docs/, every doc under docs/ that code or another document names exists.
+//!
+//! A table of a `current` doc has no two rows with one key (`duplicate_rows`): the key is a row's
+//! first two cells in a table of three columns or more, its first cell in a narrower one. Two rows
+//! with one key are two answers to one question, and one of them is stale (agents.json A38: two
+//! rows for the gate's workflow stood one after the other and disagreed).
 //!
 //! No new Python: tools/python-allowed.txt lists every `.py` file in the tree, a path a line.
 //! `check` fails for a `.py` file that is not listed and for a line whose file is gone; `write`
@@ -342,6 +348,102 @@ fn parse_front(p: &Patterns, path: &str, text: &str, errors: &mut Vec<String>) -
 }
 
 /// A path relative to the root, with `/` between its parts.
+/// The cells of one row of a table, trimmed: split at each `|` that is not escaped (`\|`) and
+/// not inside a code span, without the empty cell before a leading `|` or after a trailing one.
+fn cells(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut cell = String::new();
+    // The length of the run of backticks that opened the code span the scan is inside; 0 outside.
+    let mut open = 0;
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if c == '\\' && chars.get(at + 1) == Some(&'|') {
+            cell.push('|');
+            at += 2;
+        } else if c == '`' {
+            let run = chars[at..].iter().take_while(|it| **it == '`').count();
+            if open == 0 {
+                open = run;
+            } else if open == run {
+                open = 0;
+            }
+            cell.extend(&chars[at..at + run]);
+            at += run;
+        } else if c == '|' && open == 0 {
+            out.push(cell.trim().to_owned());
+            cell.clear();
+            at += 1;
+        } else {
+            cell.push(c);
+            at += 1;
+        }
+    }
+    out.push(cell.trim().to_owned());
+    if line.starts_with('|') {
+        out.remove(0);
+    }
+    if line.ends_with('|') && !line.ends_with("\\|") {
+        out.pop();
+    }
+    out
+}
+
+/// Whether `line` is a table's delimiter row: cells of dashes, each with or without a colon at
+/// either end (`|---|:--:|`).
+fn delimits(line: &str) -> bool {
+    let cells = cells(line);
+    line.contains('|')
+        && !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|c| c == '-')
+        })
+}
+
+/// How many of a row's first cells are its key: two in a table of three columns or more (the
+/// thing and its case, as `workflow | event | what runs`), one in a narrower table.
+const fn key_cells(columns: usize) -> usize {
+    if columns >= 3 { 2 } else { 1 }
+}
+
+/// Each table of `body` (a doc's text without fenced code) with two rows whose key cells are
+/// equal, named by the table's header and the key. A row whose key cells are all empty goes on
+/// from the row above it and is no key.
+fn duplicate_rows(path: &str, body: &str) -> Vec<String> {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut errors = Vec::new();
+    let mut at = 0;
+    while at + 1 < lines.len() {
+        if !(lines[at].contains('|') && delimits(lines[at + 1])) {
+            at += 1;
+            continue;
+        }
+        let head = cells(lines[at]);
+        let key = key_cells(head.len());
+        let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut row = at + 2;
+        while row < lines.len() && lines[row].contains('|') && !lines[row].trim().is_empty() {
+            let mut first = cells(lines[row]);
+            first.truncate(key);
+            if first.iter().any(|it| !it.is_empty()) && !seen.insert(first.clone()) {
+                errors.push(format!(
+                    "{path}: the table headed `{}` has two rows whose first {} `{}`: one key, two rows, and a \
+                     reader cannot tell which is true; merge them, or tell them apart in those cells",
+                    head.join(" | "),
+                    if key == 1 { "cell is" } else { "cells are" },
+                    first.join("` | `"),
+                ));
+            }
+            row += 1;
+        }
+        at = row;
+    }
+    errors
+}
+
 fn rel(root: &Path, full: &Path) -> String {
     let parts: Vec<String> = full
         .strip_prefix(root)
@@ -572,6 +674,11 @@ fn allowed_now(root: &Path) -> Vec<String> {
 
 fn check(root: &Path, p: &Patterns) -> Vec<String> {
     let (docs, mut errors) = load(root, p);
+    // A check of no doc holds nothing (agents.json A39, vacuous success): the wrong root, or a
+    // tree without docs/, is a failure and never an empty list of problems.
+    if docs.is_empty() {
+        errors.push(format!("{}: no doc was found under docs/: nothing was checked", root.display()));
+    }
     errors.extend(python_problems(&python_files(root), &allowed_now(root)));
     let mut settings: BTreeSet<String> = BTreeSet::new();
     for path in tracked(root) {
@@ -613,6 +720,7 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
         if status != "current" {
             continue;
         }
+        errors.extend(duplicate_rows(&doc.path, &doc.body));
         for span in spans(&doc.body) {
             let token = p.line_suffix.replace(span.trim(), "");
             let named = token.trim_end_matches('/');
@@ -785,6 +893,15 @@ fn selftest(p: &Patterns) {
             == ["d.md:4: front matter line is not `key: value`: 'bad'", "d.md: a plan doc needs `date: YYYY-MM-DD`"],
         "a bad line and a missing date are refused, naming the doc",
     );
+    // A table's key (agents.json A38).
+    let gate = "| workflow | event | what |\n|---|---|---|\n| `blaze.yaml` (`gate`) | pull request | every test |\n";
+    expect(duplicate_rows("d.md", gate).is_empty(), "a table whose rows have their own keys holds");
+    let twice = format!("{gate}| `blaze.yaml` (`gate`) | pull request | only the tests reached |\n");
+    let found = duplicate_rows("d.md", &twice);
+    expect(
+        found.len() == 1 && found[0].starts_with("d.md: the table headed `workflow | event | what` has two rows whose first cells are ``blaze.yaml` (`gate`)` | `pull request`"),
+        "two rows of a table with one key are refused, naming the table and the key",
+    );
     println!("docs.py selftest: ok");
 }
 
@@ -823,7 +940,11 @@ fn main() {
             let kept = allowed_after(&python_files(root), &allowed_now(root));
             write_file(&root.join("tools").join("python-allowed.txt"), &kept);
         }
-        ["check"] => end(check(root, &p)),
+        ["check"] => {
+            end(check(root, &p));
+            // Said on success, with the count: the last line is this or an error, never nothing.
+            println!("{SAYS}: {} docs hold", load(root, &p).0.len());
+        }
         _ => fail(SAYS, "one subcommand: check, write, selftest, or python with its input"),
     }
 }
@@ -837,5 +958,63 @@ mod tests {
     #[test]
     fn the_patterns_compile() {
         let _ = Patterns::new();
+    }
+
+    /// The script's own cases run under `blaze test` and `cargo test` too: one that fails ends
+    /// the test process with status 1, which fails the run.
+    #[test]
+    fn the_selftest_holds() {
+        selftest(&Patterns::new());
+    }
+
+    #[test]
+    fn a_rows_cells_split_at_bars_outside_code_and_escapes() {
+        assert_eq!(cells("| a | `b | c` | d \\| e |  |"), ["a", "`b | c`", "d | e", ""]);
+        assert_eq!(cells("a | ``b ` | c`` | d"), ["a", "``b ` | c``", "d"]);
+        assert_eq!(cells("|"), Vec::<String>::new());
+        assert!(delimits("|---|:--:|--:|") && delimits("--- | ---"));
+        assert!(!delimits("| a | b |") && !delimits("---") && !delimits("| - | x |"));
+    }
+
+    /// The instance (agents.json A38): docs/harness.md's workflow table held two rows for
+    /// `blaze.yaml` (`gate`) on a pull request, one after the other, that disagreed. The rule
+    /// refuses the second, naming the table and the key.
+    #[test]
+    fn two_rows_of_a_table_with_one_key_are_refused() {
+        let table = "| workflow | event | what runs |\n\
+                     |---|---|---|\n\
+                     | `blaze.yaml` (`gate`) | pull request | `blaze test --workspace`, every test |\n\
+                     | `blaze.yaml` (`gate`) | pull request | `blaze test`, only the tests the change reached |\n\
+                     | `blaze.yaml` (`gate`) | merge queue | the same |\n";
+        let found = duplicate_rows("docs/harness.md", table);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(
+                "docs/harness.md: the table headed `workflow | event | what runs` has two rows whose first \
+                 cells are ``blaze.yaml` (`gate`)` | `pull request`: one key, two rows"
+            ),
+            "{found:?}"
+        );
+    }
+
+    /// The control: what must not be refused, so the rule cannot pass by refusing nothing or
+    /// fail by refusing everything. The same first cell with another second cell is another
+    /// key in a table of three columns; a table of two columns is keyed by its first cell; a
+    /// row with empty key cells goes on from the row above; two tables do not share keys; and
+    /// text with bars that is no table is not read as one.
+    #[test]
+    fn rows_that_differ_in_their_key_and_text_that_is_no_table_hold() {
+        let wide = "| a | b | c |\n|---|---|---|\n| x | 1 | p |\n| x | 2 | p |\n|  |  | more of it |\n|  |  | and more |\n";
+        assert_eq!(duplicate_rows("d.md", wide), Vec::<String>::new());
+        let narrow = "| setting | meaning |\n|---|---|\n| `A` | one |\n| `B` | one |\n";
+        assert_eq!(duplicate_rows("d.md", narrow), Vec::<String>::new());
+        let again = format!("{narrow}| `A` | another |\n");
+        let found = duplicate_rows("d.md", &again);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("has two rows whose first cell is ``A``"), "{found:?}");
+        let two = format!("{narrow}\ntext between\n\n{narrow}");
+        assert_eq!(duplicate_rows("d.md", &two), Vec::<String>::new());
+        let prose = "a | b\na | b\n\n`x | y` and `x | y`\n";
+        assert_eq!(duplicate_rows("d.md", prose), Vec::<String>::new());
     }
 }

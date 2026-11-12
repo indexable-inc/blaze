@@ -1,0 +1,12 @@
+{
+ "id": "vac-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "where": "`uv run --frozen pyright` (blaze.yaml's scripts job) on this tree",
+ "what": "The gate's pyright step exits 1 with 36 errors, one site each in harness/v2/budgets.py, debug_side.py, nostd.py and std_uses.py, files this lane did not change (they are as on origin/main); harness/v2/integrate.py had 12 more before it was ported. harness/v2 is checked strict as a directory, so a script added there without types turns the step red.",
+ "cost": "ten minutes telling its errors from mine",
+ "cause": "not looked into",
+ "workaround": "ran pyright on the files changed",
+ "fix": "fix the four sites; land harness scripts through the gate",
+ "state": "open"
+}

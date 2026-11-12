@@ -27,8 +27,13 @@ before the next claim builds on it. Never turn a prior about how such systems us
 release builds are LLVM-bound, a daemon restart loses state, this error usually means that) or a
 label on a status line (a task kind named `codegen` is not LLVM) into a sentence in the indicative.
 A number has its source and its tree (`measure-the-exact-tree`); a why has its rows
-(`ask-the-profile-first`); a works has its command and exit status. When the evidence is lost or the
-tool could not run, say that, not the conclusion you expected.
+(`ask-the-profile-first`); a works has its command and exit status. A pass counts only with proof
+that the check ran: the count of tests that ran (not `test result: ok`, which a filter that matched
+nothing prints with `0 passed`), the exit status and the output the measured program itself prints,
+a generator's last line saying what it wrote; the absence of a failure is evidence of nothing, and a
+check, a row or a gate step that can succeed having run nothing is a bug to fix where it is found
+(`blaze test` refuses a run of no test; a harness row goes through harness/v2/ran.py). When the
+evidence is lost or the tool could not run, say that, not the conclusion you expected.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

@@ -5,7 +5,7 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"build": false, "record": false, "reached": false, "args": ["<test argument>", ...], "max_mb": 0}
+    {"build": false, "record": false, "reached": false, "args": ["<test argument>", ...], "max_mb": 0, "at_least": 1}
 
 Runs `blaze test --release --locked --no-fail-fast --workspace` from the root: every package of
 the workspace with its default features (blaze tests blaze, AGENTS.md rule blaze-builds-blaze),
@@ -34,6 +34,11 @@ workspace is keyed by its features, by whether it is of a package named, `CARGO_
 and by the keys of the crates it is built on), and the tests job takes those from the store the
 build job hands it (.github/workflows/blaze-platform.yaml). Only the crates built with
 `cfg(test)` are then compiled again.
+
+`at_least` is the fewest tests the run has to have run (1 without it; the gate may say more): a
+run that ran fewer fails whatever its exit status and whatever the list says, since a run of no
+test has no failing test either (agents.json A39, vacuous success). With `args` that select
+tests, say how many they select.
 
 `max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
 and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
@@ -252,6 +257,8 @@ class Config:
     args: list = dataclasses.field(default_factory=list)
     # The most memory and swap the machine may have in use at once, in MB; 0 is no bound.
     max_mb: int = 0
+    # The fewest tests the run has to have run: a run of fewer is a failure, never a pass.
+    at_least: int = 1
 
 
 def config(argv: list[str]) -> Config:
@@ -275,6 +282,8 @@ def config(argv: list[str]) -> Config:
             sys.exit(f"unittests.py: `{key}` is a {hints[key].__name__}, not {json.dumps(item)}")
     if not all(isinstance(it, str) for it in value.get("args", [])):
         sys.exit("unittests.py: `args` is a list of strings")
+    if value.get("at_least", 1) < 1:
+        sys.exit("unittests.py: `at_least` is 1 or more: a run that may run no test checks nothing")
     return Config(**value)
 
 
@@ -315,10 +324,12 @@ def main():
     context = failures.Context("release", failures.this_os())
     asked = failures.workspace_packages()
     logged = failures.Path(log)
+    # What the run was expected to run, held before anything reads its failures: a run of no
+    # test, or of fewer than asked for, has none to hold to the list.
+    if len(seen) < cfg.at_least:
+        print(f"::error::{' '.join(command)} (exit status {status}) ran {len(seen)} tests, fewer than the {cfg.at_least} expected (`at_least`): the build failed, or its arguments select nothing")
+        sys.exit(1)
     if cfg.record:
-        if not seen:
-            print(f"::error::{' '.join(command)} (exit status {status}) ran no test: nothing to record; the build, most likely")
-            sys.exit(1)
         print(f"\n{len(seen)} tests, {len(failed)} failed; harness/known-failures.toml written from them:", flush=True)
         try:
             for line in failures.record([logged], context, asked, " ".join(command)):

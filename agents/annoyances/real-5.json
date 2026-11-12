@@ -7,5 +7,6 @@
  "cost": "a detour in four fixes",
  "cause": "landed by lanes that could not build or run them",
  "workaround": "fixed each where met",
- "state": "fixed where met; unrun tests landing is open"
+ "state": "fixed where met; unrun tests landing is open",
+ "class": "vacuous success (A39), neighbour: tests or lints that never compiled or never ran, counted as held"
 }

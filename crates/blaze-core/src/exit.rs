@@ -57,6 +57,11 @@ exits! {
     /// The CLI refused its command line and did nothing: clap's code for a command line it
     /// refuses.
     Usage = 1, "USAGE", "its command line was refused";
+    /// `blaze test` or `blaze bench` built what it was asked and ran no test: its selection (a
+    /// name filter, `--skip`, a package with no tests) matched nothing, and no `--no-tests pass`
+    /// said that is meant. The number is cargo-nextest's for the same end (`NO_TESTS_RUN`), so a
+    /// script tells "nothing ran" from "a test failed" (101) by the code alone.
+    NoTests = 4, "NO_TESTS", "its test run ran no test";
     /// The daemon's stop made no progress for its bound (`serve::stop`): it ends without its
     /// image, having written what it was inside.
     StopStalled = 75, "STOP_STALLED", "its stop made no progress for the stall bound, and it ended without its image";
