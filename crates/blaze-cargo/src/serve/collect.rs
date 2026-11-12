@@ -34,6 +34,11 @@ use super::settle::Compress;
 pub(super) const STEP_BOUND: Duration = Duration::from_millis(1);
 /// How often the bytes of the daemon's state outside the store are measured.
 const OTHER_EVERY: Duration = Duration::from_secs(60);
+/// A request that needs the store's pins waits this long for the scan that reads them
+/// ([`Collects::read_pins`]) before it is refused, naming the wait: the scan is a walk of
+/// the store's rows on a worker, begun as it is asked, and waits only for the store to be at
+/// rest (no commit or index swap in flight).
+pub(super) const PINS_BOUND: Duration = Duration::from_secs(30);
 /// A lap asked for (`blaze gc`) that has not ended by then is answered as it stands: builds
 /// that follow one another leave it no turn to seal a pack in.
 const ASKED_BOUND: Duration = Duration::from_secs(120);
@@ -43,17 +48,55 @@ const ASKED_BOUND: Duration = Duration::from_secs(120);
 pub(crate) const TOOLCHAIN: &str = "toolchain";
 pub(crate) const BSTD: &str = "bstd";
 
+/// Every store key the front-end records of a crate are kept under, from the key its image
+/// is filed under: `hir_def::deps::front_keys` (the image and hir-def's record kinds), then
+/// each record kind of a crate above hir-def keyed over the same key (hir-ty's frozen impl
+/// tables). The one function the `toolchain` and `bstd` pins and a pack's export take a
+/// crate's front end from: a lane that adds a record kind above hir-def adds its key here.
+pub(crate) fn front_keys(filed: blaze_ids::ContentId) -> impl Iterator<Item = blaze_cas::Key> {
+    hir_def::deps::front_keys(filed)
+        .chain([hir_ty::method_resolution::frozen::key(filed)])
+        .map(blaze_cas::Key)
+}
+
+/// The store keys of the read-filing records of the crate whose own key is `key`
+/// (`hir_def::deps::filing_keys`): what a crate with reads is found through.
+pub(crate) fn filing_keys(key: blaze_ids::ContentId) -> impl Iterator<Item = blaze_cas::Key> {
+    hir_def::deps::filing_keys(key).map(blaze_cas::Key)
+}
+
 /// The keys builds found that a pin keeps, until the daemon's loop takes them
 /// ([`Collects::pin`]). The process's one queue: only `blaze serve`'s daemon has a collector
 /// that drains it, and it is the process's one daemon with a store on disk.
-static KEPT: crossbeam_queue::SegQueue<(&'static str, blaze_cas::Key)> =
-    crossbeam_queue::SegQueue::new();
+static KEPT: crossbeam_queue::SegQueue<Kept> = crossbeam_queue::SegQueue::new();
+
+/// Keys queued for a pin: its name, why it is kept, and the keys.
+struct Kept {
+    name: std::sync::Arc<str>,
+    why: std::sync::Arc<str>,
+    keys: Vec<blaze_cas::Key>,
+}
 
 /// `keys` are pin `name`'s from the next build's end on: called by a build's task as it
-/// finds a standard library unit's record, or bstd's, in the store.
+/// finds a standard library unit's record, or bstd's, in the store. `name` is one of
+/// [`TOOLCHAIN`] and [`BSTD`]; any other name is [`keep_as`]'s.
 pub(crate) fn keep(name: &'static str, keys: impl Iterator<Item = blaze_cas::Key>) {
-    for key in keys {
-        KEPT.push((name, key));
+    let why = match name {
+        TOOLCHAIN => "the standard library's records, which every build of this toolchain reads",
+        BSTD => "bstd's records, which blaze's own crates are built on",
+        _ => "kept by name",
+    };
+    keep_as(name, why, keys);
+}
+
+/// `keys` are added to the pin `name` (any name: a build kept as a name, a package's
+/// closure) at the next build's end, `why` said with it. Adding keys the pin already names
+/// writes nothing.
+pub(crate) fn keep_as(name: &str, why: &str, keys: impl Iterator<Item = blaze_cas::Key>) {
+    // alloc: once per call, what is queued for the daemon's loop
+    let keys: Vec<blaze_cas::Key> = keys.collect();
+    if !keys.is_empty() {
+        KEPT.push(Kept { name: name.into(), why: why.into(), keys });
     }
 }
 
@@ -123,6 +166,20 @@ enum Back {
     Batch(Option<CollectBatch>),
     /// The bytes of the daemon's state outside the store, or why they were not measured.
     Other(Result<u64, String>),
+    /// A scan that reads the store's pins, asked for by a request, or `None` for one a
+    /// panic lost.
+    Pins(Option<blaze_cas::collect::PeriodScan>),
+}
+
+/// What [`Collects::read_pins`] says of the store's pins.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PinsRead {
+    /// They are read: [`Store::pins`] is whole and [`Store::pin_add`] writes.
+    Ready,
+    /// The scan that reads them is under way: ask again next turn.
+    Reading,
+    /// It did not come back within [`PINS_BOUND`]: why, for the request's error.
+    Failed(String),
 }
 
 /// The home's bytes against its budget, as last worked out.
@@ -165,6 +222,11 @@ pub struct Collects {
     /// Steps on the loop, and those past [`STEP_BOUND`].
     steps: u64,
     over_bound: u64,
+    /// A scan of the pins a request asked for is with a worker.
+    pins_out: bool,
+    /// A request waits for the store's pins: since when, and the wait's span
+    /// (every-wait-says-what), open until they are read or the bound passes.
+    pins_asked: Option<(Duration, tracing::Span)>,
 }
 
 impl Collects {
@@ -189,6 +251,8 @@ impl Collects {
             asked: None,
             steps: 0,
             over_bound: 0,
+            pins_out: false,
+            pins_asked: None,
         }
     }
 
@@ -198,36 +262,22 @@ impl Collects {
     /// key is new.
     pub(super) fn build_ended(&mut self, store: &mut Store) {
         self.builds += 1;
-        let mut found: Vec<(&'static str, blaze_cas::Key)> = Vec::new(); // alloc: once a build's end, what it found to pin
-        while let Some(it) = KEPT.pop() {
-            found.push(it);
+        // Each name's keys, in the order of the names (rule deterministic-output).
+        // alloc: once a build's end, what it found to pin
+        let mut found: std::collections::BTreeMap<std::sync::Arc<str>, (std::sync::Arc<str>, Vec<blaze_cas::Key>)> =
+            std::collections::BTreeMap::new();
+        while let Some(Kept { name, why, mut keys }) = KEPT.pop() {
+            found.entry(name).or_insert_with(|| (why, Vec::new())).1.append(&mut keys);
         }
-        for (name, why) in [
-            (TOOLCHAIN, "the standard library's records, which every build of this toolchain reads"),
-            (BSTD, "bstd's records, which blaze's own crates are built on"),
-        ] {
-            // alloc: once a build's end that found something to pin
-            let mut keys: Vec<blaze_cas::Key> =
-                store.pins().find(|pin| pin.name == name).map_or_else(Vec::new, |pin| pin.keys.clone());
-            let had = keys.len();
-            keys.extend(found.iter().filter(|(it, _)| *it == name).map(|(_, key)| *key));
-            keys.sort_unstable();
-            keys.dedup();
-            if keys.len() == had {
-                continue;
-            }
-            // No scan has read the store's pins since it opened: a pin written now would
-            // leave out the keys of the one an earlier run wrote. The keys wait for the
-            // next build's end.
-            if store.usage().scans == 0 {
-                for key in keys {
-                    KEPT.push((name, key));
+        for (name, (why, keys)) in found {
+            match store.pin_add(&name, &why, blaze_gc::record::now_ns(), &keys) {
+                Ok(blaze_cas::collect::PinAdded::Written(_) | blaze_cas::collect::PinAdded::Unchanged) => {}
+                // No scan has read the store's pins since it opened: the keys wait for the
+                // next build's end.
+                Ok(blaze_cas::collect::PinAdded::NotRead) => KEPT.push(Kept { name, why, keys }),
+                Err(mismatch) => {
+                    tracing::error!(target: "blaze", "the pin `{name}` was not written: {mismatch:?}");
                 }
-                continue;
-            }
-            let when = blaze_gc::record::now_ns();
-            if let Err(mismatch) = store.pin(name, why, when, &keys) {
-                tracing::error!(target: "blaze", "the pin `{name}` was not written: {mismatch:?}");
             }
         }
     }
@@ -240,10 +290,73 @@ impl Collects {
     /// Whether the loop should turn again soon for it: a batch is out (it comes back over a
     /// channel no driver wakes for), or its core has a step due.
     pub(super) fn next_deadline(&self, now: Duration) -> Option<Duration> {
-        if self.collector.out() || self.other_out {
+        if self.collector.out() || self.other_out || self.pins_out || self.pins_asked.is_some() {
             return Some(now + Duration::from_millis(1));
         }
         self.collector.next_deadline()
+    }
+
+    /// The store's pins, for a request that needs them now (an import, an export, a status of
+    /// the store), whether or not any build has ended: read already, or being read by a scan
+    /// this call begins on a worker when none is out. The daemon reads its pins otherwise
+    /// only at a period's end, which the first comes after the first build; a daemon that is
+    /// never asked scans nothing as it starts. Call it each turn until it answers
+    /// [`PinsRead::Ready`]; the wait has a span (`store pins read, asked for`) and a bound
+    /// ([`PINS_BOUND`]), past which it answers [`PinsRead::Failed`] naming what it waited on.
+    pub(crate) fn read_pins(&mut self, store: &mut Store, now: Duration) -> PinsRead {
+        if store.pins_read() {
+            self.pins_asked = None;
+            return PinsRead::Ready;
+        }
+        let since = self
+            .pins_asked
+            .get_or_insert_with(|| {
+                // No parent: it ends on a later turn, under whatever request is current then.
+                let span = tracing::info_span!(target: "blaze", parent: None, "store pins read, asked for");
+                (now, span)
+            })
+            .0;
+        let waited = now.saturating_sub(since);
+        if waited > PINS_BOUND {
+            self.pins_asked = None;
+            // alloc: an error, once
+            return PinsRead::Failed(format!(
+                "the store's pins were not read in {} s: the scan that reads them {}",
+                waited.as_secs(),
+                match self.pins_out {
+                    true => "is still with its worker",
+                    false => "could not be taken (the store has a commit, an index swap or another scan in flight)",
+                }
+            ));
+        }
+        if !self.pins_out
+            && let Some(mut scan) = store.pins_take()
+        {
+            self.pins_out = true;
+            // clone: a channel's sender, once a scan
+            let send = self.send.clone();
+            let work = move || {
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "store pins scan",
+                    records = tracing::field::Empty,
+                )
+                .entered();
+                scan.run();
+                span.record("records", scan.records());
+                scan
+            };
+            match self.run {
+                Compress::Inline => _ = send.send(Back::Pins(Some(work()))),
+                Compress::Pool => blaze_graph::exec::shared().submit_as(
+                    None,
+                    Class::Normal,
+                    work,
+                    move |done| _ = send.send(Back::Pins(done.ok())),
+                ),
+            }
+        }
+        PinsRead::Reading
     }
 
     /// `blaze gc` asked for a lap now (`unkept`: `blaze clean --unkept`, every record no
@@ -400,6 +513,19 @@ impl Collects {
                         "a batch of the store's collector was lost to a panic while its pack was read: the pack is passed by for this lap"
                     );
                     self.collector.lost(store);
+                }
+                Back::Pins(scan) => {
+                    self.pins_out = false;
+                    match scan {
+                        Some(scan) => store.pins_put(scan),
+                        None => {
+                            tracing::error!(
+                                target: "blaze",
+                                "the scan that reads the store's pins was lost to a panic: it is asked again"
+                            );
+                            store.plan_lost();
+                        }
+                    }
                 }
                 Back::Other(Ok(bytes)) => {
                     self.other_out = false;
@@ -629,6 +755,18 @@ mod tests {
     /// A store on the simulation with `count` short records put and committed, enough of
     /// them that its index table holds them (only a record the index holds can be forgotten).
     fn filled(sim: &mut blaze_core::sim::Sim, count: u64) -> Store {
+        let mut store = opened(sim);
+        let mut effects = Vec::new();
+        for n in 0..count {
+            store.put(key(n), blaze_cas::Kind::Code, &n.to_le_bytes().repeat(8)).unwrap();
+        }
+        store.flush(&mut effects);
+        driven(sim, &mut store, &mut effects);
+        store
+    }
+
+    /// The store of `home/v2/store` on the simulation, opened.
+    fn opened(sim: &mut blaze_core::sim::Sim) -> Store {
         let name = |it: &str| blaze_core::FileName::new(it).unwrap();
         let config = blaze_cas::Config {
             dir: name("home/v2/store"),
@@ -639,11 +777,6 @@ mod tests {
         };
         let mut effects = Vec::new();
         let mut store = Store::open(config, &mut effects);
-        driven(sim, &mut store, &mut effects);
-        for n in 0..count {
-            store.put(key(n), blaze_cas::Kind::Code, &n.to_le_bytes().repeat(8)).unwrap();
-        }
-        store.flush(&mut effects);
         driven(sim, &mut store, &mut effects);
         store
     }
@@ -747,6 +880,52 @@ mod tests {
         let (there, forgotten) = found_then_collected(false);
         assert!(forgotten > 1000, "the control's collection forgot {forgotten} records: it did not run");
         assert!(there.iter().any(|it| !*it), "the control kept every record with no pin: it tests nothing");
+    }
+
+    /// A store an earlier daemon left with a pin, opened by a fresh daemon that has built
+    /// nothing; then turns of the collector's driver. `asks`: a request that needs the pins
+    /// asks for them each turn ([`Collects::read_pins`]). How it ended, and whether the
+    /// store's pins were read by then.
+    fn pins_of_a_fresh_daemon(asks: bool) -> (PinsRead, bool) {
+        use blaze_core::Driver as _;
+        let mut sim = blaze_core::sim::Sim::new(41, blaze_core::sim::Faults::default());
+        let mut store = filled(&mut sim, 300);
+        periods(&mut sim, &mut store, 1);
+        store.pin_add("imported", "a pack an earlier daemon imported", 7, &[key(1), key(2)]).unwrap();
+        periods(&mut sim, &mut store, 1);
+        drop(store);
+        let mut store = opened(&mut sim);
+        assert!(!store.pins_read() && store.pins().count() == 0, "a store just opened has read no pin");
+        let gone = std::env::temp_dir().join(format!("blaze-collect-none-{}", std::process::id()));
+        let mut collects = Collects::new(&gone, Compress::Inline, Pace::default());
+        let start = sim.now();
+        let mut said = PinsRead::Reading;
+        // Turns of a daemon no build is asked of, for longer than the bound.
+        while sim.now().saturating_sub(start) < PINS_BOUND * 2 {
+            if asks {
+                said = collects.read_pins(&mut store, sim.now());
+                if said != PinsRead::Reading {
+                    break;
+                }
+            }
+            let mut effects = Vec::new();
+            collects.turn(&mut store, None, true, sim.now(), &mut effects);
+            driven(&mut sim, &mut store, &mut effects);
+            sim.advance(Duration::from_millis(50));
+        }
+        (said, store.pins_read() && store.pins().any(|pin| pin.name == "imported" && pin.keys.len() == 2))
+    }
+
+    /// The invariant: a request that needs the store's pins gets them from a daemon that has
+    /// built nothing, by the scan it starts itself, well within its bound. The control is the
+    /// daemon as it was (the pins read only by the scan of a period's end, which follows a
+    /// build): with no build they are never read, so a request waiting on them runs out its
+    /// bound.
+    #[test]
+    fn a_request_that_needs_the_pins_reads_them_from_a_daemon_that_has_built_nothing() {
+        assert_eq!(pins_of_a_fresh_daemon(true), (PinsRead::Ready, true));
+        let (_, read) = pins_of_a_fresh_daemon(false);
+        assert!(!read, "the control read the pins with no build and no ask: it tests nothing");
     }
 
     #[test]

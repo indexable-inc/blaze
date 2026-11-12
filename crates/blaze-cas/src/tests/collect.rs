@@ -974,3 +974,35 @@ fn a_key_a_reader_keeps_is_not_forgotten_while_it_is_kept() {
     assert!(world.store.usage().counts.records_forgotten > 0, "the run still collects");
     drop(keep);
 }
+
+/// [`Store::pin_add`] grows a pin and knows the rule of when a pin may be written: not
+/// before a scan has read the pins an earlier run wrote, nothing when no key is new, and the
+/// name's keys kept when more are added.
+#[test]
+fn a_pin_is_grown_only_once_the_stores_pins_are_read_and_only_by_new_keys() {
+    use crate::collect::PinAdded;
+    let mut sim = Sim::new(7, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..6 {
+        store.put(key(n), Kind::Code, &text(n, 500)).unwrap();
+    }
+    assert!(!store.pins_read());
+    assert_eq!(store.pin_add("closure", "a build kept by name", 10, &[key(1)]), Ok(PinAdded::NotRead));
+    assert!(store.end_period());
+    assert!(store.pins_read());
+    assert!(matches!(store.pin_add("closure", "a build kept by name", 10, &[key(1)]), Ok(PinAdded::Written(_))));
+    assert_eq!(store.pin_add("closure", "a build kept by name", 11, &[key(1)]), Ok(PinAdded::Unchanged));
+    assert!(matches!(store.pin_add("closure", "a build kept by name", 12, &[key(2), key(1)]), Ok(PinAdded::Written(_))));
+    let pin = store.pins().find(|pin| pin.name == "closure").unwrap();
+    let mut want = vec![key(1), key(2)];
+    want.sort_unstable();
+    assert_eq!((pin.keys.clone(), pin.when), (want, 12));
+    // Across a reopen the earlier pin is read before anything is added to it.
+    flush(&mut sim, &mut store);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    assert_eq!(store.pin_add("closure", "a build kept by name", 13, &[key(3)]), Ok(PinAdded::NotRead));
+    assert!(store.end_period());
+    assert!(matches!(store.pin_add("closure", "a build kept by name", 13, &[key(3)]), Ok(PinAdded::Written(_))));
+    assert_eq!(store.pins().find(|pin| pin.name == "closure").unwrap().keys.len(), 3);
+}

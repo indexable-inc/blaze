@@ -1021,6 +1021,18 @@ pub struct Candidate {
     pub used: u64,
 }
 
+/// What [`Store::pin_add`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinAdded {
+    /// The pin was written with the keys added; durable with the ticket.
+    Written(Ticket),
+    /// Every key was the pin's already: nothing written.
+    Unchanged,
+    /// The store's pins are not read yet (no scan since it opened): nothing written; ask
+    /// again after the next period's end.
+    NotRead,
+}
+
 /// What a seal did, or why it did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sealed {
@@ -1055,6 +1067,41 @@ impl Store {
         // The mark made before does not hold the keys it names.
         self.collecting.mark = None;
         Ok(ticket)
+    }
+
+    /// Adds `keys` to the pin `name`: the name's keys as they are and `keys`, written as its
+    /// new pin when a key is new ([`Store::pin`]), `why` said with it. The one way to grow a
+    /// pin, so no writer has to know its rule: until a scan has read the store's pins since
+    /// it opened ([`Usage::scans`]) nothing is written and the answer is
+    /// [`PinAdded::NotRead`], since a pin written then would leave out the keys of the one
+    /// an earlier run wrote; the caller asks again later.
+    pub fn pin_add(
+        &mut self,
+        name: &str,
+        why: &str,
+        when: u64,
+        keys: &[Key],
+    ) -> Result<PinAdded, Mismatch> {
+        if self.collecting.generations == 0 {
+            return Ok(PinAdded::NotRead);
+        }
+        // alloc: once per pin grown, its keys
+        let mut all: Vec<Key> =
+            self.pins().find(|pin| pin.name == name).map_or_else(Vec::new, |pin| pin.keys.clone());
+        let had = all.len();
+        all.extend_from_slice(keys);
+        all.sort_unstable();
+        all.dedup();
+        if all.len() == had {
+            return Ok(PinAdded::Unchanged);
+        }
+        self.pin(name, why, when, &all).map(PinAdded::Written)
+    }
+
+    /// Whether a scan has read the store's pins since it opened: [`Store::pins`] is whole,
+    /// and [`Store::pin_add`] writes.
+    pub fn pins_read(&self) -> bool {
+        self.collecting.generations > 0
     }
 
     /// Each name's pin, in the order of their names: as the last period's scan found them
@@ -1199,6 +1246,34 @@ impl Store {
     /// [`Store::carry_back`] of a carry that ran.
     pub fn carry_put(&mut self, carry: FlagCarry) {
         self.carry_back(Some(carry));
+    }
+
+    /// A scan that reads the store's pins and marks its roots without ending a period of
+    /// reading: for a request that needs the pins before any build has ended (an import, an
+    /// export, a status of the store), run on any thread ([`PeriodScan::run`]) and handed
+    /// back to [`Store::pins_put`]. `None` while one cannot be taken (a scan is out, or a
+    /// commit, an index swap or its carry is in flight): ask again.
+    pub fn pins_take(&mut self) -> Option<PeriodScan> {
+        assert!(self.tiers[0].opened, "the pins asked of a store that is not open");
+        self.tidy();
+        if !self.at_rest() || self.collecting.scan_out || self.carrying() {
+            return None;
+        }
+        self.collecting.scan_out = true;
+        Some(self.scan_new(false))
+    }
+
+    /// Takes back a scan [`Store::pins_take`] gave: the pins are read ([`Store::pins_read`])
+    /// and the roots marked. No period ended and no move is planned by it.
+    pub fn pins_put(&mut self, scan: PeriodScan) {
+        self.tidy();
+        self.collecting.scan_out = false;
+        assert!(scan.done, "a scan of the pins handed back before it ran");
+        if self.broken.is_some() {
+            return;
+        }
+        // Its plan of moves is of no period's end: let go.
+        _ = self.keep_scan(scan);
     }
 
     /// A scan was lost with its worker: the store keeps the plan and the mark it had, and a
