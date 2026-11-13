@@ -97,6 +97,23 @@
 // `// alloc:` line until the effects stop owning their bytes. Tests are built on `std` (the
 // harness, `eprintln!`).
 #![cfg_attr(not(test), no_std)]
+// Decision D29 (docs/v2/plan/design/fallible-bstd.md): non-test code holds no panic path and no
+// infallible growth of alloc's. `warn` while the port is in progress; `deny` once the list is
+// empty.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
 #![deny(unsafe_code)]
 // A field marked `#[blaze::policy]` (a cost or a guarantee its maker decides) is never chosen
 // by a `Default` or a `new()` that takes nothing (std.md, "The second rule").

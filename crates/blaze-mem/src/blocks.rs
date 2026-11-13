@@ -839,13 +839,6 @@ impl Kept {
     }
 }
 
-// SAFETY: a block is handed out by one `take_raw` and given back once, by `deallocate`, `grow`
-// or `shrink`, to the class its layout picks, which is the class it came from: `class_of` is
-// a function of the layout, and any size the contract lets a caller name for a block (from
-// what was asked up to the block's length, which `allocate` returns) picks the same class.
-// Blocks of one class are disjoint and live as long as the process (a class is never
-// unreserved), so a block stays valid until given back, and any `Kept` (a copy) may give back
-// what another took. Zero-size layouts are a dangling, aligned pointer, never given back.
 impl crate::Named for Kept {
     /// The tag its blocks are counted to.
     #[inline]
@@ -854,6 +847,13 @@ impl crate::Named for Kept {
     }
 }
 
+// SAFETY: a block is handed out by one `take_raw` and given back once, by `deallocate`, `grow`
+// or `shrink`, to the class its layout picks, which is the class it came from: `class_of` is
+// a function of the layout, and any size the contract lets a caller name for a block (from
+// what was asked up to the block's length, which `allocate` returns) picks the same class.
+// Blocks of one class are disjoint and live as long as the process (a class is never
+// unreserved), so a block stays valid until given back, and any `Kept` (a copy) may give back
+// what another took. Zero-size layouts are a dangling, aligned pointer, never given back.
 unsafe impl std::alloc::Allocator for Kept {
     fn allocate(
         &self,

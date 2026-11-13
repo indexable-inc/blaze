@@ -33,7 +33,7 @@ pub use blaze_mem::{
     AppendVec, ArenaLocal, Block, Built, ByteLen, Cache, Column, FormatError, Frame,
     FromUtf8Error, HUGE_PAGE, Handle, InsertError, InsideChar, Kept, Marker, MemError, Named,
     Offset, OutOfMemory, Overflow, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
-    TooSmall, Vec, format_in, format_into, page_size,
+    TooSmall, Vec, format_in, format_into, heap, page_size,
 };
 pub use blaze_mem::Arena as RequestArena;
 

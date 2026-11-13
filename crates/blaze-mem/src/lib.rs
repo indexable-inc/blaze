@@ -41,6 +41,23 @@
 //! allocator that turn a committed address into a typed place; every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
+// Decision D29 (docs/v2/plan/design/fallible-bstd.md): non-test code holds no panic path and no
+// infallible growth of alloc's. `warn` while the port is in progress; `deny` once the list is
+// empty.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
 #![feature(allocator_api, allocator_ext)]
 // `memory.grow` on wasm64 (`os.rs`), whose intrinsics are not stable there yet.
 #![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
@@ -54,6 +71,7 @@ pub mod column;
 mod error;
 pub mod frame;
 pub mod handle;
+pub mod heap;
 pub mod huge;
 mod os;
 pub mod pool;

@@ -419,11 +419,6 @@ impl<'a> ArenaLocal<'a> {
     }
 }
 
-// SAFETY: blocks come from the local's own block or from blocks and regions the arena hands
-// out once each, disjoint and committed. Each stays valid until the arena resets or drops, both
-// of which take `&mut Arena` or ownership, impossible while this local (which borrows the arena
-// for `'a`) is alive. `deallocate` and `shrink` move only this local's cursor, and only over the
-// top block; nothing here unwinds.
 impl crate::Named for ArenaLocal<'_> {
     /// Its arena's tag.
     #[inline]
@@ -432,6 +427,11 @@ impl crate::Named for ArenaLocal<'_> {
     }
 }
 
+// SAFETY: blocks come from the local's own block or from blocks and regions the arena hands
+// out once each, disjoint and committed. Each stays valid until the arena resets or drops, both
+// of which take `&mut Arena` or ownership, impossible while this local (which borrows the arena
+// for `'a`) is alive. `deallocate` and `shrink` move only this local's cursor, and only over the
+// top block; nothing here unwinds.
 unsafe impl Allocator for ArenaLocal<'_> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {

@@ -970,12 +970,6 @@ impl Drop for Frame {
     }
 }
 
-// SAFETY: blocks are disjoint ranges of the frame's chunks and spans, handed out once each and
-// committed before they are returned. A block stays valid until it is deallocated or the frame
-// is reset, rolled back or dropped, each of which takes `&mut Frame` (or ownership), which no
-// live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
-// `deallocate` and `shrink` only move the cursor back over the top block, never touching
-// another. A cancel by the cap unwinds before any of the frame's state changes.
 impl Named for Frame {
     /// The name [`Frame::named`] gave it, else its tag's.
     #[inline]
@@ -987,6 +981,12 @@ impl Named for Frame {
     }
 }
 
+// SAFETY: blocks are disjoint ranges of the frame's chunks and spans, handed out once each and
+// committed before they are returned. A block stays valid until it is deallocated or the frame
+// is reset, rolled back or dropped, each of which takes `&mut Frame` (or ownership), which no
+// live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
+// `deallocate` and `shrink` only move the cursor back over the top block, never touching
+// another. A cancel by the cap unwinds before any of the frame's state changes.
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {

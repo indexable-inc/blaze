@@ -163,6 +163,16 @@ impl<A: Allocator> String<A> {
     }
 }
 
+impl String<std::alloc::Global> {
+    /// The same bytes as std's `String`, for an interface that takes one. Its own growth is
+    /// `alloc`'s: infallible, and banned in blaze-mem and bstd.
+    pub fn into_std(self) -> std::string::String {
+        // SAFETY: `bytes` is UTF-8 (the field's invariant), in the global allocator std's
+        // `String` frees from.
+        unsafe { std::string::String::from_utf8_unchecked(self.bytes.into_std()) }
+    }
+}
+
 impl<A: Allocator + Named> String<A> {
     /// An empty string in `alloc` with room for `capacity` bytes.
     #[inline]

@@ -123,6 +123,20 @@ impl Named for std::alloc::Global {
     }
 }
 
+impl<A: Named + ?Sized> Named for std::rc::Rc<A> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
+impl<A: Named + ?Sized> Named for std::sync::Arc<A> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
 /// Stops with `error`: what an infallible allocation does when memory cannot be had.
 #[cold]
 #[inline(never)]
