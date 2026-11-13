@@ -252,6 +252,8 @@ pub fn request(
         command: method.name().to_owned(),
         refused: Some(REFUSED_SHOWN),
         verbose: options.verbose,
+        // An agent's build takes what its sources give, as packs.json says.
+        prebuilt: true,
     };
     let targets = Targets {
         cargo: Some(cargo),

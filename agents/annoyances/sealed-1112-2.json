@@ -1,0 +1,19 @@
+{
+ "id": "sealed-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sealed-1112",
+ "where": "/root/loop.sh on blaze-vm: a lane cannot compile before it pushes",
+ "what": "The queue builds origin/int-1112 only, so the first compile of a change is after it is pushed to the branch every lane builds from. To keep the branch compiling this lane made a clone at /root/wt/sealed-1112/src with its own target directory, sent its working diff there (git diff piped to git apply) and ran cargo check and cargo test there, outside the queue: about 60 to 90 s a check on 128 cores, and it loads the machine other lanes time on.",
+ "cost": "a second target directory (dev profile) and unqueued CPU; once, a git stash in that private clone to run a test on its base, which the rule forbids for shared worktrees",
+ "cause": "loop.sh takes a branch, not a diff",
+ "workaround": "the clone and /tmp/sealed-tools/check.sh on the Mac",
+ "fix": "loop.sh takes an optional diff on stdin, applies it to a detached checkout, runs cargo check or the named tests in the shared warm target, and resets",
+ "whys": [
+  "the queue was written for one writer of the branch",
+  "lanes write in one checkout but verify only after pushing",
+  "a push is the only way to hand the VM a tree"
+ ],
+ "class": "shared branch whose first compile is after the push",
+ "prevention": "a check step in the queue that takes a diff, so no lane pushes what it has not compiled",
+ "state": "open"
+}

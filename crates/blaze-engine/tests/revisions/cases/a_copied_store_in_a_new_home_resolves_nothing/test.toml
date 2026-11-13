@@ -1,0 +1,22 @@
+about = "The same sources in another directory, under another home that starts with a copy of the first home's store: the front-end half of `the_same_sources_in_another_directory_under_another_home`. The new daemon has no image, no VFS and no front end of its own; it reads the files once into its tree, makes each crate's key from the plan and those content IDs, finds every crate's front-end records in the copied store (a found record's key and bytes say nothing of where the checkout, the home or the machine's directories are) and so makes no item tree, expands no macro and resolves no crate, the project's own and the standard library's alike. Expected once the lane's pieces are in (the runner's measured numbers replace these): written about 250, executed under 2,000. The planted control (the checkout's path put back into the plan key, so the record is not found) comes with the found record and is not written yet."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "42\n"
+
+[[revision]]
+steps = ["run", "home elsewhere", "project moved", "edit"]
+action = "run"
+prints = "42\n"
+redone = []
+max_units = 0
+max_records = 0
+max_executed = 2000
+max_written = 400
+max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_local_def_map = 0 }
+
+[revision.known]
+max_executed = "a new home resolves the project's crate from source, and a unit's record is found only by an identity that needs its crate resolved (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", steps 5 and 7; pieces E and F)"
+max_written = "a new database is written every file of every package of the plan (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
+max_ran = "a workspace crate has no records: `eligible` refuses a local crate (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"

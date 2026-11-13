@@ -25,9 +25,9 @@ use blaze_hash::FixedHasher;
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_mem::{Tag, frame};
 use blaze_query::{Cancelled, Cx};
-use blaze_vfs::outside::{Cover, Dirs};
+use blaze_vfs::outside::{Cover, Dirs, LookKind, Looks};
 
-use crate::trace::{DIRECTORY, Entry, Inputs, Names, listing, os_bytes};
+use crate::trace::{DIRECTORY, Entry, Inputs, Names, entry_digest, listing, os_bytes};
 
 /// What a traced path that is neither a file nor a directory hashes as.
 pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
@@ -90,6 +90,18 @@ impl Stamp {
         }
     }
 
+    /// Whether a write could still land under this stamp, `now_ns` being the wall clock: the
+    /// file last changed less than [`RACY_NS`] ago, or after now (another machine's clock, a
+    /// clock set back). A kernel stamps a write with a clock that ticks every few
+    /// milliseconds (a second on some file systems), so a file hashed in the tick it was
+    /// written in and written again in that tick, to the same length, has the stamp it was
+    /// hashed under and other bytes. Git's index has the same hole and the same answer
+    /// ("racy git"): such a stamp stands for nothing yet, and the file is hashed again at its
+    /// next check, until its last change is old enough that no write can share its tick.
+    fn racy(&self, now_ns: i128) -> bool {
+        self.modified.max(self.changed).saturating_add(RACY_NS) > now_ns
+    }
+
     fn bytes(&self) -> [u8; 56] {
         let mut out = [0; 56];
         out[..8].copy_from_slice(&self.len.to_le_bytes());
@@ -99,6 +111,19 @@ impl Stamp {
         out[48..].copy_from_slice(&self.device.to_le_bytes());
         out
     }
+}
+
+/// How long after a file's last change its stamp is not taken for its content
+/// ([`Stamp::racy`]): above the coarsest tick a file system blaze reads stamps a write with
+/// (FAT's two seconds).
+const RACY_NS: i128 = 2_000_000_000;
+
+/// The wall clock in nanoseconds since the epoch, the clock a kernel stamps a file with; the
+/// least value when it cannot be read, under which every stamp is racy and none is kept.
+fn wall_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i128::MIN, |it| i128::try_from(it.as_nanos()).unwrap_or(i128::MAX))
 }
 
 /// The hashes of the machine's files, each under its path and what `stat` said of it when it
@@ -113,7 +138,49 @@ impl Stamp {
 pub struct Files {
     stamped: Sharded<[u8; 32]>,
     vouched: Sharded<Vouched>,
+    /// What [`Files::entry`] last said of a path whose directory has no link in its name,
+    /// with the generation read before it looked: vouched for while the watches heard
+    /// nothing under a directory at or above it since.
+    entries: blaze_core::lock::Lock<
+        blaze_hash::HashMap<PathBuf, (u64, Entry), std::alloc::Global>,
+    >,
+    /// What [`Inputs::names`] last listed of a directory (each name and whether it is a
+    /// directory), with the generation read before it listed.
+    listings: blaze_core::lock::Lock<blaze_hash::HashMap<PathBuf, Listed, std::alloc::Global>>,
     dirs: &'static Dirs,
+    /// The wall clock a stamp is judged racy against ([`Stamp::racy`]): [`wall_ns`], or a
+    /// test's own ([`Files::with_clock`]), so a file just written is not racy to a test that
+    /// says its clock is past the racy window.
+    clock: fn() -> i128,
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a path missing a part before its last has no
+    /// names ([`names`]), so it is looked at every time, as until 2026-11-12. Never set
+    /// outside a test.
+    #[doc(hidden)]
+    pub static MISSING_PARENT_IS_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A directory's listing as kept: the generation read before it was listed, and each name
+/// with whether it is a directory.
+type Listed = (u64, std::sync::Arc<[(OsString, bool)]>);
+
+/// The name a listing's watch is asked of: one no entry of a directory has (a NUL in it).
+const LISTING: &str = "\0the listing";
+
+thread_local! {
+    /// A planted bug, for a test's control: a directory is listed off the disk on every ask,
+    /// as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static LISTING_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: [`Files::entry`] looks at the disk on every ask,
+    /// as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static ENTRY_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
@@ -123,7 +190,7 @@ struct Vouched {
     /// One for each name the answer rests on ([`names`]): all must have heard nothing. `None`
     /// for a path with `..` in it, one whose links don't resolve, or one a name of
     /// which no watched directory covers: each of its checks looks at the disk.
-    covers: Option<Box<[Cover<'static>]>>,
+    names: Option<Box<[PathBuf]>>,
     sequence: AtomicU64,
     generation: AtomicU64,
     present: AtomicBool,
@@ -180,7 +247,7 @@ fn mix(mut word: u64) -> u64 {
 
 /// The most symlinks one path is followed through, as the kernel's own bound is (`MAXSYMLINKS`
 /// is 32 on macOS, 40 on Linux): past it the path is not vouched for.
-const MOST_LINKS: usize = 40;
+pub(crate) const MOST_LINKS: usize = 40;
 
 /// Every name the answer about `path` rests on, each as the watch of its directory hears it
 /// (absolute, with no symlink above its last part): `path` itself when it is canonical; for a
@@ -188,9 +255,9 @@ const MOST_LINKS: usize = 40;
 /// `usr/lib/libm.tbd` one to `libSystem.tbd`), each link where it is and the file they end at.
 /// A link pointed elsewhere is a change in the link's own directory, and the file changed is
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
-/// missing path's last part is the name that would be made. `None` for a path that is not
-/// absolute, has `..` in it, has more than [`MOST_LINKS`] links, or of which a part
-/// before the last is missing or unreadable. Cold: on a miss only.
+/// missing path's name is the first part of it that is not there: the name that would be made.
+/// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
+/// links, or of which a part before the last is unreadable. Cold: on a miss only.
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
     let mut parts = path.components();
@@ -235,7 +302,16 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                 }
             }
             Ok(_) => at = name,
-            // The name that would be made, for a path that is not there.
+            // The name that would be made, for a path that is not there: its last part, or
+            // the first part of it that is missing (nothing below a name that is not there
+            // is, until that name is made, which its directory hears). Until 2026-11-12 a
+            // path missing a part before its last was never vouched for: a tool that asks of
+            // `src/lib.rs`, `src/main.rs` and `src/bin` in each package of a workspace, some
+            // with no `src`, was looked at on the disk for each, in every build.
+            Err(error) if missing(&error) && answer.is_none() && !MISSING_PARENT_IS_UNVOUCHED.get() => {
+                at = name;
+                break;
+            }
             Err(error) if missing(&error) && left.is_empty() && answer.is_none() => at = name,
             Err(_) => return None,
         }
@@ -251,7 +327,26 @@ impl Files {
 
     /// A table whose answers are vouched for by `dirs`' watches.
     pub fn watched_by(dirs: &'static Dirs) -> Files {
-        Files { stamped: Sharded::new(), vouched: Sharded::new(), dirs }
+        Files {
+            stamped: Sharded::new(),
+            vouched: Sharded::new(),
+            entries: blaze_core::lock::Lock::new(
+                "usercode.inputs.entries",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+            listings: blaze_core::lock::Lock::new(
+                "usercode.inputs.listings",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+            dirs,
+            clock: wall_ns,
+        }
+    }
+
+    /// The same table judging stamps against `clock` in place of the wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_clock(self, clock: fn() -> i128) -> Files {
+        Files { clock, ..self }
     }
 
     /// The one table of the process.
@@ -287,23 +382,25 @@ impl Files {
             .finish()
     }
 
-    fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+    /// What `path` hashes as, links followed. When no watch vouches for the answer kept the
+    /// disk is looked at, and the look is pushed to `looks` with what it said; a file that
+    /// can't be read pushes nothing.
+    fn file(&self, path: &Path, looks: &Looks) -> Result<Option<[u8; 32]>, Unreadable> {
         let id = Files::path_id(path);
         let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
         let known = found.filter(|it| *it.path == *path.as_os_str());
         if let Some(known) = known
-            && let Some(covers) = &known.covers
+            && let Some(names) = &known.names
             && let Some((generation, answer)) = known.read()
-            && covers.iter().all(|cover| cover.unchanged_since(generation))
+            && names.iter().all(|name| self.dirs.name_unchanged_since(name, generation))
         {
             return Ok(answer);
         }
         let generation = self.dirs.generation();
         // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
-        // counted, so a stretch of checks that looked at nothing can be told
-        // (`blaze_vfs::outside::looks`).
-        blaze_vfs::outside::looked(path);
+        // the look kept by the build it was made for, with what it said.
         let (answer, settled) = self.look(path)?;
+        looks.push(path, LookKind::File, answer);
         if settled {
             match (known, found) {
                 (Some(known), _) => known.write(generation, answer),
@@ -319,18 +416,17 @@ impl Files {
     fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
         // Every name the answer rests on has its directory wanted, and all are covered or the
         // answer is not vouched for.
-        let covers = names(path, answer).and_then(|names| {
+        // Every name the answer rests on is asked of by name ([`Dirs::watch_name`]): what
+        // is written elsewhere under its directory does not move it.
+        let names = names(path, answer).map(|names| {
             for name in &names {
-                if let Some(parent) = name.parent() {
-                    self.dirs.want(parent);
-                }
+                self.dirs.watch_name(name);
             }
-            // alloc: once per path, on its first miss
-            names.iter().map(|name| self.dirs.cover(name)).collect::<Option<Box<[_]>>>()
+            names.into_boxed_slice()
         });
         let at = self.vouched.intern(id, || Vouched {
             path: path.as_os_str().into(), // alloc: once per path, on its first miss
-            covers,
+            names,
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
@@ -371,7 +467,8 @@ impl Files {
         // A file changed while it was read is hashed again at its next check.
         let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
         let settled = after == Some(stamp);
-        if settled {
+        // Kept only under a stamp no later write can share ([`Stamp::racy`]).
+        if settled && !stamp.racy((self.clock)()) {
             self.stamped.intern(key, || hash);
         }
         Ok((Some(hash), settled))
@@ -381,7 +478,7 @@ impl Files {
     /// blaze-cargo's fetch reads a tree into one: a link is its target, `/`-separated; a file
     /// is executable when any of its execute bits is set. A file's content ID is kept under
     /// what `stat` says of it, as its hash is.
-    fn entry(&self, path: &Path) -> Result<Entry, Unreadable> {
+    fn entry(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
         // alloc: error path
@@ -390,8 +487,51 @@ impl Files {
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
-        // Looked at on the disk every time: no watch vouches for an entry.
-        blaze_vfs::outside::looked(path);
+        // The invariant: the disk is looked at only while no watch vouches for the answer
+        // kept. An entry is the path itself, a link not followed, so its answer rests on the
+        // names of its directory alone: kept when that directory's name has no link in it
+        // (it is its own canonical name, the form a watch is asked in), with the generation
+        // read before the look. Until 2026-11-12 every ask looked: a link's native inputs
+        // (glibc's `crt*.o` and `lib*.so`, ten each a build) kept every build on NixOS from
+        // being answered again without a walk.
+        let kept = self.entries.lock().get(path).copied();
+        if let Some((generation, entry)) = kept
+            && self.dirs.name_unchanged_since(path, generation)
+            && !ENTRY_LOOKS_EVERY_TIME.get()
+        {
+            return Ok(entry);
+        }
+        let generation = self.dirs.generation();
+        let plain = path.parent().is_some_and(|dir| {
+            let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+            if canonical && kept.is_none() {
+                self.dirs.watch_name(path);
+            }
+            canonical
+        });
+        let entry = self.entry_now(path, looks)?;
+        if plain {
+            // alloc: once per path asked of, its name as the key of what was said of it
+            self.entries.lock().insert(path.to_path_buf(), (generation, entry));
+        }
+        Ok(entry)
+    }
+
+    /// [`Files::entry`] of the disk now: a look, pushed to `looks` with what it said
+    /// ([`entry_digest`]); a path that can't be read as an entry pushes nothing.
+    fn entry_now(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
+        let entry = self.entry_on_disk(path)?;
+        looks.push(path, LookKind::Entry, entry_digest(&entry));
+        Ok(entry)
+    }
+
+    /// What the disk says `path` itself is, a link not followed.
+    fn entry_on_disk(&self, path: &Path) -> Result<Entry, Unreadable> {
+        // alloc: error path
+        let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
+        // alloc: error path
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
@@ -440,7 +580,10 @@ impl Files {
         read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
         let id = hasher.finish();
         // A file changed while it was read is hashed again at its next check.
-        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp) {
+        // And kept only under a stamp no later write can share ([`Stamp::racy`]).
+        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp)
+            && !stamp.racy((self.clock)())
+        {
             self.stamped.intern(key, || id.0);
         }
         Ok(Entry::File(id, mode))
@@ -453,44 +596,83 @@ impl Default for Files {
     }
 }
 
-/// An environment, sorted by name, each name once (the first, as `getenv` finds it).
+/// An environment, sorted by name, each name once (the first, as `getenv` finds it), and
+/// what a walk of it sees: all of it ([`Env::new`]), or, for a run that is lent its
+/// environment, the variables its sandbox shows a walk ([`Env::lent`]).
 #[derive(PartialEq, Eq, Default, Debug)]
-pub struct Env(Vec<(OsString, OsString)>);
+pub struct Env {
+    vars: Vec<(OsString, OsString)>,
+    /// What a walk sees of `vars`, in their order, when that is not all of them.
+    walk: Option<Vec<(OsString, OsString)>>,
+}
 
 impl Env {
     pub fn new(mut vars: Vec<(OsString, OsString)>) -> Env {
         vars.sort_by(|a, b| a.0.cmp(&b.0));
         vars.dedup_by(|later, first| later.0 == first.0);
-        Env(vars)
+        Env { vars, walk: None }
+    }
+
+    /// The environment of a run that is lent it ([`crate::confine::GIVEN`]): a read by name
+    /// finds any variable of `vars`, and a walk sees those `sees` says alone (the walk set,
+    /// [`crate::confine::walk_sees`], and for the launcher the given names as well). So what
+    /// a run that read them all is keyed by is the walk's variables, never the whole of the
+    /// environment the build was started in.
+    pub fn lent(vars: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool) -> Env {
+        let mut env = Env::new(vars);
+        // clone: once per run prepared or checked, the variables its walk sees
+        let walk = env.vars.iter().filter(|(name, _)| sees(name)).cloned().collect(); // alloc: as above
+        env.walk = Some(walk);
+        env
     }
 
     pub fn get(&self, name: &OsStr) -> Option<&OsStr> {
-        let at = self.0.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
-        Some(&self.0[at].1)
+        let at = self.vars.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
+        Some(&self.vars[at].1)
     }
 
+    /// What a walk of the environment sees: sorted by name, each name once.
     pub fn vars(&self) -> &[(OsString, OsString)] {
-        &self.0
+        self.walk.as_deref().unwrap_or(&self.vars)
     }
 }
 
 /// The machine's files and an environment, as one check sees them: what [`Files`] it hashes
-/// with and what [`Env`] it answers from, both shared.
+/// with and what [`Env`] it answers from, both shared, and the looks of the build the check
+/// is made for ([`Looks::none`] for a check no build keeps the looks of).
+///
+/// The invariant: each look at the disk this makes is pushed to `looks` with the answer it
+/// gave, and asking the same of an unchanged disk gives that answer again: a file's is what
+/// [`Inputs::file`] returns, a listing's what [`Inputs::dir`] returns, an entry's
+/// [`entry_digest`] of what [`Inputs::entry`] returns.
 #[derive(Clone, Copy)]
 pub struct Now<'a> {
     pub files: &'a Files,
     pub env: &'a Env,
+    pub looks: &'a Looks,
 }
 
-/// The machine's files as they are, through [`Files::shared`], and an environment of its own.
+/// The machine's files as they are, through [`Files::shared`], an environment of its own, and
+/// the looks of the build it reads for.
 pub struct Disk {
     files: &'static Files,
     env: Env,
+    looks: Looks,
 }
 
 impl Disk {
-    pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
-        Disk { files: Files::shared(), env: Env::new(env) }
+    /// `looks` is the list of the build this reads for: each look at the disk is pushed there.
+    pub fn new(env: Vec<(OsString, OsString)>, looks: &Looks) -> Disk {
+        // clone: an Arc, the build's list
+        Disk { files: Files::shared(), env: Env::new(env), looks: looks.clone() }
+    }
+
+    /// The files with the environment of a run that is lent it ([`Env::lent`], whose `sees`
+    /// this takes): what a build script's run is assembled and checked against. `looks` as
+    /// [`Disk::new`]'s.
+    pub fn lent(env: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool, looks: &Looks) -> Disk {
+        // clone: an Arc, the build's list
+        Disk { files: Files::shared(), env: Env::lent(env, sees), looks: looks.clone() }
     }
 
     /// The same files with another environment.
@@ -499,7 +681,7 @@ impl Disk {
     }
 
     pub fn now(&self) -> Now<'_> {
-        Now { files: self.files, env: &self.env }
+        Now { files: self.files, env: &self.env, looks: &self.looks }
     }
 }
 
@@ -537,7 +719,7 @@ impl Inputs for Now<'_> {
     type Error = Unreadable;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
-        self.files.file(path)
+        self.files.file(path, self.looks)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -551,31 +733,71 @@ impl Inputs for Now<'_> {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        // Listed on the disk every time: no watch vouches for a listing.
-        blaze_vfs::outside::looked(path);
+        // The invariant: the disk is listed only while no watch vouches for the listing kept.
+        // A listing is the names directly in the directory and whether each is a directory:
+        // it moves only with a change that names an entry of it, the directory itself or
+        // one above it, which is what the watches keep of a name in it
+        // ([`Dirs::watch_name`], asked here of a name no entry has). Kept for a directory
+        // whose own name has no link in it and that lists no link (what a link leads to is
+        // not in its directory). Until 2026-11-12 every ask listed: a build script that
+        // globs its sources (ring's `crypto/**`, zstd-sys's `zstd/lib/*`) kept every build
+        // of anything above it from being answered again without a walk.
+        let asked = path.join(LISTING);
+        let kept = self.files.listings.lock().get(path).cloned(); // clone: an `Arc`
+        if let Some((generation, names)) = &kept
+            && self.files.dirs.name_unchanged_since(&asked, *generation)
+            && !LISTING_LOOKS_EVERY_TIME.get()
+        {
+            for (name, dir) in names.iter() {
+                out.push(name, *dir);
+            }
+            out.sort();
+            return Ok(true);
+        }
+        let generation = self.files.dirs.generation();
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
-            Err(error) if missing(&error) => return Ok(false),
+            Err(error) if missing(&error) => {
+                self.looks.push(path, LookKind::Listing, None);
+                return Ok(false);
+            }
             Err(error) => return Err(unreadable(error)),
         };
+        // alloc: the listing kept, once a directory listed off the disk
+        let mut listed: Vec<(OsString, bool)> = Vec::new();
+        let mut links = false;
         for entry in entries {
             let entry = entry.map_err(unreadable)?;
             // The listing says what each entry is, without a `stat`; a link is what it leads
             // to, as the program that opens it sees, which only a `stat` of it says.
             let kind = entry.file_type().map_err(unreadable)?;
+            links |= kind.is_symlink();
             let dir = match kind.is_symlink() {
                 true => std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir()),
                 false => kind.is_dir(),
             };
             // alloc: std's listing owns each name: a walk of the disk allocates what `read_dir` does.
-            out.push(&entry.file_name(), dir);
+            let name = entry.file_name();
+            out.push(&name, dir);
+            listed.push((name, dir));
         }
         out.sort();
+        // The look, once the whole listing was read: what [`Inputs::dir`] says of these names.
+        if self.looks.keeps() {
+            self.looks.push(path, LookKind::Listing, Some(listing(listed.iter().map(|it| it.0.as_os_str()))));
+        }
+        if !links && std::fs::canonicalize(path).is_ok_and(|it| it == path) {
+            if kept.is_none() {
+                self.files.dirs.watch_name(&asked);
+            }
+            // alloc: once a directory listed off the disk, its path as the key
+            self.files.listings.lock().insert(path.to_path_buf(), (generation, listed.into()));
+        }
         Ok(true)
     }
 
     fn entry(&mut self, path: &Path) -> Result<Entry, Unreadable> {
-        self.files.entry(path)
+        self.files.entry(path, self.looks)
     }
 
     fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
@@ -762,13 +984,51 @@ impl Inputs for ViewInputs<'_, '_> {
 mod tests {
     use super::*;
 
+    /// The invariant: a stamp stands for a file's content only once no write can share it. A
+    /// file changed within [`RACY_NS`] of now, or stamped after now, is racy; an older one is
+    /// not; with no clock every stamp is. The control is the rule this replaced (any settled
+    /// stamp is kept): the rewrite below has the stamp of the bytes before it.
+    #[test]
+    fn a_stamp_a_later_write_can_share_is_not_kept() {
+        let at = |modified: i128, changed: i128| Stamp { len: 4, modified, changed, inode: 7, device: 1 };
+        let now = 1_700_000_000_000_000_000i128;
+        assert!(at(now, now).racy(now), "written this tick");
+        assert!(at(now - RACY_NS + 1, now - 10 * RACY_NS).racy(now), "modified a moment ago");
+        assert!(at(now - 10 * RACY_NS, now - 1).racy(now), "its inode changed a moment ago");
+        assert!(at(now + 5, now + 5).racy(now), "stamped after now");
+        assert!(!at(now - RACY_NS, now - RACY_NS).racy(now), "old enough");
+        assert!(at(0, 0).racy(i128::MIN), "no clock: nothing is kept");
+        // Two writes of one length in one tick: equal stamps, other bytes. Kept by the stamp
+        // alone, the first hash would answer for the second.
+        let (first, second) = (at(now, now), at(now, now));
+        assert_eq!(first, second);
+        assert!(first.racy(now) && second.racy(now));
+    }
+
+    /// A file just written is hashed from the disk each time it is looked at, so a rewrite of
+    /// the same length under the same stamp is seen; nothing was kept for it to hide behind.
+    #[test]
+    fn a_file_rewritten_at_once_to_the_same_length_is_seen() {
+        let dir = std::env::temp_dir().join(format!("blaze-usercode-racy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input");
+        let files = Files::new();
+        std::fs::write(&path, b"aaaa").unwrap();
+        let (first, _) = files.look(&path).unwrap();
+        std::fs::write(&path, b"bbbb").unwrap();
+        let (second, _) = files.look(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second, "the second write's bytes are what is hashed");
+    }
+
     #[test]
     fn the_disk_hashes_files_lists_directories_and_refuses_nothing_quietly() {
         let dir = std::env::temp_dir().join(format!("blaze-disk-test-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a"), b"one").unwrap();
-        let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())]);
+        let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())], &Looks::none());
         assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(disk.file(&dir.join("sub")).unwrap(), Some(DIRECTORY));
         assert_eq!(disk.file(&dir.join("none")).unwrap(), None);
@@ -811,6 +1071,25 @@ mod tests {
         assert_eq!(env.get(OsStr::new("C")), None);
     }
 
+    /// The invariant: a lent environment answers a read by name from all of it and a walk
+    /// from the walk's variables alone, in order. The control: the same variables not lent
+    /// show a walk every one.
+    #[test]
+    fn a_lent_environment_is_read_whole_by_name_and_walked_in_part() {
+        let vars = || -> Vec<(OsString, OsString)> {
+            vec![("TERM".into(), "x".into()), ("PATH".into(), "/bin".into()), ("CC".into(), "cc".into())]
+        };
+        let lent = Env::lent(vars(), |name| name != "TERM");
+        assert_eq!(lent.get(OsStr::new("TERM")), Some(OsStr::new("x")));
+        let walked: Vec<&OsStr> = lent.vars().iter().map(|it| it.0.as_os_str()).collect();
+        assert_eq!(walked, [OsStr::new("CC"), OsStr::new("PATH")]);
+        let mut disk = Disk::lent(vars(), |name| name != "TERM", &Looks::none());
+        assert_eq!(disk.env(OsStr::new("TERM")), Some(OsStr::new("x")));
+        assert_eq!(disk.env_all().len(), 2);
+        // The control.
+        assert_eq!(Env::new(vars()).vars().len(), 3);
+    }
+
     #[test]
     fn every_check_shares_one_table_and_an_edit_is_a_new_entry() {
         let dir = std::env::temp_dir().join(format!("blaze-files-test-{}", std::process::id()));
@@ -818,13 +1097,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a");
         std::fs::write(&path, b"one").unwrap();
-        let files = Files::new();
+        // A clock past the racy window of the writes here, so each hash is kept under its
+        // stamp ([`Stamp::racy`], which `a_stamp_a_later_write_can_share_is_not_kept` tests).
+        let files = Files::new().with_clock(|| wall_ns() + 10 * RACY_NS);
         let (one, two) = (Env::new(vec![("X".into(), "1".into())]), Env::default());
         let hashes: Vec<_> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)
                 .map(|n| {
                     let (files, env, path) = (&files, if n % 2 == 0 { &one } else { &two }, &path);
-                    scope.spawn(move || Now { files, env }.file(path).unwrap())
+                    scope.spawn(move || Now { files, env, looks: &Looks::none() }.file(path).unwrap())
                 })
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
@@ -832,11 +1113,74 @@ mod tests {
         assert!(hashes.iter().all(|it| *it == Some(blaze_ids::b3::hash(b"one"))));
         assert_eq!(files.stamped.len(), 1);
         std::fs::write(&path, b"two, longer").unwrap();
-        let mut now = Now { files: &files, env: &one };
+        let mut now = Now { files: &files, env: &one, looks: &Looks::none() };
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(files.stamped.len(), 2);
         assert_eq!(now.env(OsStr::new("X")), Some(OsStr::new("1")));
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The invariant: each look at the disk is pushed once to the build's [`Looks`], with its
+    /// kind and the answer the ask returned (an entry's through [`entry_digest`]), and the
+    /// same ask of the unchanged disk, through [`Looks::none`] as the daemon's later check
+    /// makes it, gives that answer again. No driver runs here, so no watch vouches and every
+    /// ask looks. The control: a handle that keeps nothing ([`Looks::none`]) holds no look.
+    #[test]
+    fn each_look_is_pushed_once_with_the_answer_a_second_ask_gives() {
+        let made = std::env::temp_dir().join(format!("blaze-files-looks-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&made);
+        std::fs::create_dir_all(made.join("sub")).unwrap();
+        let dir = std::fs::canonicalize(&made).unwrap();
+        let (file, gone) = (dir.join("a"), dir.join("gone"));
+        std::fs::write(&file, b"one").unwrap();
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let files = Files::watched_by(dirs);
+        let (env, looks, none) = (Env::default(), Looks::new(), Looks::none());
+        let mut now = Now { files: &files, env: &env, looks: &looks };
+        let mut again = Now { files: &files, env: &env, looks: &none };
+        let mut expect: Vec<(PathBuf, LookKind, Option<[u8; 32]>)> = Vec::new();
+
+        for path in [&file, &gone, &dir] {
+            let answer = now.file(path).unwrap();
+            assert_eq!(again.file(path).unwrap(), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::File, answer));
+        }
+        assert_eq!(expect[0].2, Some(blaze_ids::b3::hash(b"one")));
+        assert_eq!(expect[1].2, None);
+        assert_eq!(looks.len(), 3);
+
+        for path in [&file, &gone, &dir] {
+            let answer = entry_digest(&now.entry(path).unwrap());
+            assert_eq!(entry_digest(&again.entry(path).unwrap()), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::Entry, answer));
+        }
+        assert_eq!(expect[4].2, None, "an entry that is not there says nothing");
+        assert!(expect[3].2.is_some() && expect[5].2.is_some() && expect[3].2 != expect[5].2);
+        assert_eq!(looks.len(), 6);
+
+        for path in [&dir, &gone] {
+            let answer = now.dir(path).unwrap();
+            assert_eq!(again.dir(path).unwrap(), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::Listing, answer));
+        }
+        assert_eq!(expect[6].2, Some(listing([OsStr::new("a"), OsStr::new("sub")])));
+        assert_eq!(expect[7].2, None);
+
+        expect.sort();
+        let kept: Vec<_> = looks.all().into_iter().map(|it| (it.path, it.kind, it.answer)).collect();
+        assert_eq!(kept, expect, "one look per ask, of its kind, with its answer");
+        assert!(none.is_empty() && !none.keeps());
+        assert!(Looks::twice(&looks.all()).next().is_none());
+
+        // A second ask that says something else is a second look of the path, which
+        // [`Looks::twice`] names.
+        std::fs::write(&file, b"two, longer").unwrap();
+        assert_eq!(now.file(&file).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
+        let all = looks.all();
+        let twice: Vec<_> = Looks::twice(&all).collect();
+        assert_eq!(twice.len(), 1);
+        assert_eq!((twice[0].0.path.as_path(), twice[0].0.kind), (file.as_path(), LookKind::File));
+        _ = std::fs::remove_dir_all(&made);
     }
 
     #[test]
@@ -849,7 +1193,7 @@ mod tests {
         std::fs::write(&path, b"one").unwrap();
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
-        let mut now = Now { files: &files, env: &Env::default() };
+        let mut now = Now { files: &files, env: &Env::default(), looks: &Looks::none() };
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs.dir(0).path(), dir.as_path());
@@ -860,7 +1204,7 @@ mod tests {
         let roundabout = dir.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
-        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());
+        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).names.is_none());
         assert_eq!(dirs.len(), 1);
         _ = std::fs::remove_dir_all(&made);
     }
@@ -901,7 +1245,12 @@ mod tests {
         );
         assert_eq!(names(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
         assert_eq!(names(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
-        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "a part before the last is missing");
+        // The invariant: a path missing a part before its last rests on that part's name.
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), Some(vec![dir.join("sdks/gone")]));
+        // The control: as until 2026-11-12, such a path is vouched for by nothing.
+        MISSING_PARENT_IS_UNVOUCHED.set(true);
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "planted");
+        MISSING_PARENT_IS_UNVOUCHED.set(false);
         // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
         // not resolved here.
         assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
@@ -913,9 +1262,9 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
         let path = dir.join("sdks/named/lib/m");
-        assert_eq!(files.file(&path).unwrap(), hash);
+        assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
         let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
-        assert_eq!(vouched.covers.as_ref().map(|it| it.len()), Some(3));
+        assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
         let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
         assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
         _ = std::fs::remove_dir_all(&made);
@@ -934,14 +1283,14 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
         let hash = Some(blaze_ids::b3::hash(b"one"));
-        assert_eq!(files.file(&path).unwrap(), hash);
+        assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
         let warm =
-            blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
+            blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path, &Looks::none()).unwrap());
         assert_eq!(warm, hash);
         let missing = path.with_file_name("gone");
-        assert_eq!(files.file(&missing).unwrap(), None);
+        assert_eq!(files.file(&missing, &Looks::none()).unwrap(), None);
         let warm = blaze_alloc_count::assert_at_most(0, "a warm missing file", || {
-            files.file(&missing).unwrap()
+            files.file(&missing, &Looks::none()).unwrap()
         });
         assert_eq!(warm, None);
         _ = std::fs::remove_dir_all(&made);
@@ -952,7 +1301,7 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let vouched = Vouched {
             path: OsStr::new("/nowhere/a").into(),
-            covers: dirs.cover(Path::new("/nowhere/a")).map(|it| vec![it].into()),
+            names: Some(vec![PathBuf::from("/nowhere/a")].into()),
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
@@ -1004,7 +1353,7 @@ mod tests {
         fn execute(cx: &mut Cx<'_>, package: &bool) -> Result<Both, Cancelled> {
             let kept = cx.tree("", *package)?.expect("the root is a directory");
             let (env, hashes) = (Env::new(Vec::new()), Hashes::default());
-            let now = Now { files: Files::shared(), env: &env };
+            let now = Now { files: Files::shared(), env: &env, looks: &Looks::none() };
             let mut inputs = ViewInputs { cx, root: Path::new("/v"), now, hashes: &hashes };
             let walked = match crate::trace::walk(&mut inputs, Path::new("/v"), *package) {
                 Ok(it) => it.expect("the root is a directory"),
@@ -1054,7 +1403,7 @@ mod tests {
                 std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        let mut disk = Disk::new(Vec::new());
+        let mut disk = Disk::new(Vec::new(), &Looks::none());
         for package in [false, true] {
             let (kept, walked) = db.pin().get::<ViewTree>(view, &package).expect("not cancelled");
             assert_eq!(walked, kept, "package {package}: the view walked and its own hash");

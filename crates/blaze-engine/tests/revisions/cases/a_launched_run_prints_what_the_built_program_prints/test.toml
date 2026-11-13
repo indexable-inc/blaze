@@ -1,0 +1,26 @@
+about = "A launched run is the program `blaze build` makes (the refinement): `blaze run` makes the start and each other function at its first call, and what the program prints on standard output and standard error and the status it exits with are those of the file `blaze build` makes, run with the same arguments, and are what the case states: cold, after a body edit, and under a second home whose store is a copy of the first's (the layer another machine fetched), where every function bound from a record is bound under a key that holds what that home calls the files. The program's own output is the oracle, never another compiler's; the oracle's control is `the_refinement_oracle_catches_a_run_that_is_not_the_built_programs` in main.rs, and the planted bugs of the launched path are blaze-codegen's `Planted::WeakByKey` and blaze-launch-host's `Plant::StaleSlot`."
+drivers = ["real"]
+
+# Cold: the launched run walks nothing.
+[[revision]]
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+spans = { "codegen walk" = 0 }
+
+# A body edit.
+[[revision]]
+action = "run"
+prints = "hi 1, hi 2, hi 3\n"
+status = 3
+as_built = true
+
+# Another home over a copy of the first one's store.
+[[revision]]
+steps = ["home second"]
+action = "run"
+prints = "hi 1, hi 2, hi 3\n"
+status = 3
+as_built = true
+spans = { "codegen walk" = 0 }

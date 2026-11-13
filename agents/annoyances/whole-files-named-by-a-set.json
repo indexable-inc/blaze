@@ -1,0 +1,14 @@
+{
+ "id": "whole-files-named-by-a-set",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of handoff-7 sections 1, 2 and 4 in blaze-cas, int-1112",
+ "where": "crates/blaze-cas/src/collect.rs Collecting::placed; src/lib.rs Store::unplace; src/peers.rs; src/whole.rs",
+ "what": "A hello-world home kept seven whole files of one program (112 MB) and copied std's records into every home: the store knew a placed key as a member of a set (one unplace drops it whatever other path still holds it), had no durable record of which path names which whole file, and read only its own directory's tiers, so std could not be read in place.",
+ "cost": "760 MB a home against the competitor's 75; the 78 MB pack of std copied a home",
+ "cause": "names of a shared resource kept as a set, not counted, and kept only in memory; layers modelled as single store directories, not as a shared directory of writers",
+ "class": "a shared resource's lifetime decided by a set membership instead of a count of its holders, with no durable record of the holders",
+ "prevention": "whole::Names counts every path and pin that names a whole file, lists them durably before any removal, and its simulation crashes at every step with the planted set bug as its control; Config::layers names shared directories read like a shared store's other writers",
+ "workaround": "blaze gc",
+ "fix": "peers.rs reads Config::layers as shared directories (a_home_store_reads_a_layer_in_place_and_never_writes_it); census.rs (Store::census); whole.rs and tests/whole.rs (no_named_whole_file_is_removed_and_no_unnamed_one_outlives_the_next_place, control the_oracle_catches_a_file_removed_while_a_second_place_names_it); the place routes' use of whole::Names is /tmp/plan/3c-next.md",
+ "state": "written, not yet built; the place routes not yet driving whole::Names"
+}

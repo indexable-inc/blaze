@@ -1,0 +1,22 @@
+about = "Early cutoff between crates (docs/v2/plan/design/store.md): in the chain `a <- b <- c <- app`, a body edit of a plain function of `a` that keeps its lines makes that one function again and two units, `a`'s library and the program that links it; the libraries `b` and `c` over it are keyed by `a`'s interface, which the edit leaves as it was, so their records are found. A signature edit of the same function then makes it and its caller in `b` again (the caller's text is as it was), and no function of `c`. The control is `a_body_edit_below_with_libraries_keyed_by_code`."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "10 10\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "22 10\n"
+redone = ["a::base"]
+max_units = 2
+max_records = 2
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "22 10\n"
+redone = ["a::base", "b::mid"]
+reused = ["c::top", "c::top_beside", "b::mid_beside", "a::beside"]

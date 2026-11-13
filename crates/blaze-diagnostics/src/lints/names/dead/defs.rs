@@ -3,29 +3,52 @@
 //! free and foreign items of each module in the order `check_mod_deathness` visits them, each
 //! definition's parent (`local_parent`), and the owners in `hir_crate_items` order.
 //!
-//! One walk of the crate's syntax numbers every definition with a dense `u32`; the rest of the
-//! pass indexes columns and bitsets by it. A definition's children are one CSR list, its name the
-//! interned `Name` its signature has, and what each impl is of is resolved once here.
+//! The crate is numbered from what name resolution already made, not from its syntax: each
+//! module's items in the order its item tree has them ([`ItemTree::top_level_items`], a macro
+//! call's or an attribute macro's expansion's tree in place of the call), each mapped to its id
+//! by its scope ([`ItemScope::items_by_ast`]); an ADT's variants and fields, its derives', a
+//! trait's or an impl's items as their own queries list them; and the items written in a body
+//! as [`item_tree::body_items`] lists them, each after the definition whose body holds it. A
+//! dense `u32` per definition; the rest of the pass indexes columns and bitsets by it. A
+//! definition's children are one CSR list, its name the interned `Name` its signature has, and
+//! what each impl is of is resolved once here. Where a definition is written is asked only
+//! where a finding or a level is made ([`Defs::node`]).
 //!
 //! Follows `compiler/rustc_middle/src/hir/map.rs` (`ItemCollector`),
 //! `compiler/rustc_middle/src/hir/mod.rs` (`hir_crate_items`, `hir_module_items`) and
 //! `compiler/rustc_builtin_macros/src/deriving/` (where a derive puts its impl)
 //! (MIT or Apache-2.0).
 
+#[cfg(test)]
+pub(super) mod reference;
+
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{bits::BitSet, radix};
-use hir::{HirFileId, InFile, ModuleSourceView, Name};
+use either::Either;
+use hir::{HirFileId, InFile, Name};
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
-    StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
+    AdtId, AssocItemId, BlockId, BuiltinDeriveImplId, ConstId, DefWithBodyId, EnumVariantId,
+    ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId, HasModule, ImplId, Lookup as _,
+    MacroId, ModuleDefId, ModuleId, StaticId, TraitId, TypeAliasId, UseId, VariantId,
+    builtin_derive::BuiltinDeriveImplTrait,
+    expr_store::{Body, ExpressionStore, StoreVisitor},
+    hir::{ClosureKind, CoroutineSource, Expr, ExprId, PatId, type_ref::TypeRefId},
+    item_scope::{ItemOfAst, ItemScope, ItemsByAst},
+    item_tree::{self, ItemKind, ItemTree, ModItemId},
+    nameres::{ModuleOrigin, block_def_map},
+    signatures::{
+        ConstSignature, FunctionSignature, ImplSignature, StaticFlags, StaticSignature, TraitFlags,
+        TraitSignature, VariantFields,
+    },
+    src::HasChildSourceView as _,
 };
-use hir_expand::builtin::BuiltinDeriveExpander;
+use hir_expand::{ErasedAstId, MacroCallId, builtin::BuiltinDeriveExpander};
 use intern::sym;
 use smallvec::SmallVec;
 use std::alloc::Global;
 use syntax::{
-    SyntaxKind, SyntaxNodePtr, T,
-    view::{self as ast, AstNode as _, HasModuleItem as _},
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _},
 };
 
 use crate::cx::Cx;
@@ -36,7 +59,7 @@ pub(super) type DefIdx = u32;
 /// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.
 pub(super) type DefSet = BitSet<DefIdx>;
 
-/// What a definition is, by the front end's ids. A `use` has none and is its node.
+/// What a definition is, by the front end's ids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Id {
     Fn(FunctionId),
@@ -52,7 +75,7 @@ pub(super) enum Id {
     Derive(BuiltinDeriveImplId),
     /// The method of that impl, for the traits that have one.
     DeriveMethod(BuiltinDeriveImplId),
-    Use(InFile<SyntaxNodePtr>),
+    Use(UseId),
 }
 
 /// rustc's `DefKind`, as far as the pass tells them apart.
@@ -113,13 +136,19 @@ impl Kind {
     }
 }
 
+/// A closure, a coroutine, a `const` block or an anonymous constant (rustc's definitions of
+/// their own that items in them have as their parent), by the expression store it is in (a
+/// body's, a signature's, a variant's fields') and its expression: the key both the numbering
+/// and the walk of the store name it by, with no position in it.
+pub(super) type Anon = (ExpressionStoreOwnerId, ExprId);
+
 /// rustc's `local_parent` of a definition, as far as liveness asks: the module, a definition,
-/// or a closure or anonymous constant (by its node), which is live once it is visited.
+/// or a closure or anonymous constant, which is live once it is visited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Parent {
     Module,
     Def(DefIdx),
-    Anon(InFile<SyntaxNodePtr>),
+    Anon(Anon),
 }
 
 /// One definition: no heap data of its own (its children are a range of [`Defs`]'s list).
@@ -127,8 +156,6 @@ pub(super) enum Parent {
 pub(super) struct Def {
     pub(super) id: Id,
     pub(super) kind: Kind,
-    /// Its node; none for what a builtin derive makes.
-    pub(super) node: Option<InFile<SyntaxNodePtr>>,
     /// rustc's `opt_item_name`: none for an impl or a `use`; a positional field's is its index.
     pub(super) name: Option<Name>,
     pub(super) parent: Parent,
@@ -196,10 +223,27 @@ pub(super) struct Defs {
     pub(super) trivial_derives: HashMap<DefIdx, &'static str, Global>,
 }
 
+/// Where a numbering puts the impls a builtin derive makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Order {
+    /// After their ADT, as rustc's `ItemCollector` meets them.
+    Written,
+    /// After the last item of their module: a planted bug of the numbering, which its test
+    /// against the syntax walk catches.
+    #[cfg(test)]
+    DerivesLast,
+}
+
 impl Defs {
     pub(super) fn of(cx: &Cx<'_, '_>) -> Defs {
+        Defs::numbered(cx, Order::Written)
+    }
+
+    pub(super) fn numbered(cx: &Cx<'_, '_>, order: Order) -> Defs {
+        let db = cx.db;
         let mut walk = Walk {
             cx,
+            krate: cx.krate.base(),
             defs: Vec::new(), // alloc: setup, the crate's tables, once per crate
             ids: HashMap::new_in(Global),
             edges: Vec::new(),          // alloc: setup, once per crate
@@ -213,28 +257,35 @@ impl Defs {
             scopes: HashSet::new_in(Global),
             unported: false,
             trivial_derives: HashMap::new_in(Global),
+            block_now: None,
+            order,
+            later: Vec::new(), // alloc: empty unless a test plants a reorder
         };
         let module_ids = crate::checks::modules(cx);
         walk.modules.reserve_exact(module_ids.len());
         for &module in &module_ids {
             walk.modules.push(ModuleItems::default());
-            let source = module.definition_source_view(cx.db);
-            let file = source.file_id;
-            let root = cx.vsema.parse_or_expand(file);
-            let items = match source.value {
-                ModuleSourceView::SourceFile(it) => {
-                    ast::SourceFile::cast(ast::to_node(ast::ptr(it.syntax()), root))
-                        .map(|it| it.items())
+            let id: ModuleId = module.into();
+            let data = id.def_map(db).module(db, id);
+            let scope = Scope::of(db, data.scope(db));
+            match data.origin {
+                ModuleOrigin::CrateRoot { definition } | ModuleOrigin::File { definition, .. } => {
+                    let file: HirFileId = definition.into();
+                    let tree = item_tree::file_item_tree(db, file, walk.krate);
+                    walk.tree(&scope, tree, file, tree.top_level_items(), Container::Module, Parent::Module);
                 }
-                ModuleSourceView::Module(it) => {
-                    ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
-                        .and_then(|it| it.item_list())
-                        .map(|it| it.items())
+                ModuleOrigin::Inline { definition_tree_id, definition } => {
+                    let file = definition_tree_id.file_id();
+                    let tree = item_tree::file_item_tree(db, file, walk.krate);
+                    let Some(item) = find(tree, tree.top_level_items(), definition.erase()) else {
+                        panic!("{id:?}: its tree of {file:?} has no `mod` item {definition:?}")
+                    };
+                    walk.tree(&scope, tree, file, tree.nested_items(item), Container::Module, Parent::Module);
                 }
-                ModuleSourceView::BlockExpr(_) => continue,
-            };
-            for item in items.into_iter().flatten() {
-                walk.item(InFile::new(file, item), Container::Module, Parent::Module);
+                ModuleOrigin::BlockExpr { .. } => continue,
+            }
+            for (adt, parent) in std::mem::take(&mut walk.later) {
+                walk.derived(adt, parent);
             }
         }
         let (child_at, child_list) = csr(walk.defs.len(), &walk.edges);
@@ -294,6 +345,33 @@ impl Defs {
         impls
     }
 
+    /// Where `def` is written: its item's, variant's or field's node; none for what a builtin
+    /// derive makes. Asked only where a finding or a level is made: the numbering holds no
+    /// position.
+    pub(super) fn node(&self, cx: &Cx<'_, '_>, def: DefIdx) -> Option<InFile<SyntaxNodePtr>> {
+        let db = cx.db;
+        let erased = |ast: ErasedAstId| InFile::new(ast.file_id, ast.to_ptr(db));
+        Some(match self[def].id {
+            Id::Fn(it) => erased(it.lookup(db).id.erase()),
+            Id::Const(it) => erased(it.lookup(db).id.erase()),
+            Id::Static(it) => erased(it.lookup(db).id.erase()),
+            Id::Adt(AdtId::StructId(it)) => erased(it.lookup(db).id.erase()),
+            Id::Adt(AdtId::UnionId(it)) => erased(it.lookup(db).id.erase()),
+            Id::Adt(AdtId::EnumId(it)) => erased(it.lookup(db).id.erase()),
+            Id::Variant(it) => erased(it.lookup(db).id.erase()),
+            Id::Trait(it) => erased(it.lookup(db).id.erase()),
+            Id::Alias(it) => erased(it.lookup(db).id.erase()),
+            Id::Impl(it) => erased(it.lookup(db).id.erase()),
+            Id::Use(it) => erased(it.lookup(db).id.erase()),
+            Id::Field(FieldId { parent, local_id }) => {
+                let source = parent.child_source_view(db, local_id);
+                let node = source.value?.either(|it| it.syntax(), |it| it.syntax());
+                InFile::new(source.file_id, ast::ptr(node))
+            }
+            Id::Derive(_) | Id::DeriveMethod(_) => return None,
+        })
+    }
+
     pub(super) fn get(&self, id: Id) -> Option<DefIdx> {
         self.ids.get(&id).copied()
     }
@@ -350,6 +428,67 @@ fn csr(len: usize, edges: &[(DefIdx, DefIdx)]) -> (Vec<u32>, Vec<DefIdx>) {
     radix::Csr::build(len, edges.iter().copied()).into_parts()
 }
 
+/// The item of `tree` among `items` (and the items of the inline modules and extern blocks
+/// among them) whose ast id is `ast`.
+fn find(tree: &ItemTree, items: &[ModItemId], ast: span::ErasedFileAstId) -> Option<ModItemId> {
+    items.iter().copied().find_map(|item| {
+        if item.ast_id(tree).erase() == ast {
+            return Some(item);
+        }
+        find(tree, tree.nested_items(item), ast)
+    })
+}
+
+/// What one scope (a module's, or a block's) made of the items of its trees, by the ast id of
+/// each item: its ids, and the macro calls it expanded in place of items. Built once per scope
+/// the numbering reads.
+struct Scope {
+    by_ast: ItemsByAst,
+    /// The macro calls written as items.
+    calls: HashMap<ErasedAstId, MacroCallId, Global>,
+    /// The attribute macros of items: the item is its expansion.
+    attrs: HashMap<ErasedAstId, MacroCallId, Global>,
+    /// The derives of each ADT that are expanded (not builtin), in the order they are written.
+    derives: HashMap<ErasedAstId, SmallVec<[MacroCallId; 2]>, Global>,
+}
+
+impl Scope {
+    fn of(db: &base_db::Db, scope: &ItemScope) -> Scope {
+        let mut calls = HashMap::new_in(Global); // alloc: setup, once per scope numbered
+        for (call, &id) in scope.iter_macro_invoc() {
+            calls.insert(call.erase(), id);
+        }
+        let mut attrs = HashMap::new_in(Global); // alloc: setup, once per scope numbered
+        for (item, id) in scope.attr_macro_invocs() {
+            attrs.insert(item.erase(), id);
+        }
+        let mut derives = HashMap::new_in(Global); // alloc: setup, once per scope numbered
+        for (adt, invocs) in scope.derive_macro_invocs() {
+            // (the attribute's index among the item's, the derive's among the attribute's)
+            let mut written: SmallVec<[(u32, u32, MacroCallId); 2]> = SmallVec::new();
+            for (attr, _, ids) in invocs {
+                for (at, id) in ids.iter().enumerate() {
+                    if let Some(Either::Left(call)) = *id {
+                        written.push((attr.item_tree_index(), at as u32, call));
+                    }
+                }
+            }
+            if written.is_empty() {
+                continue;
+            }
+            written.sort_unstable_by_key(|&(attr, at, _)| (attr, at));
+            derives.insert(adt.erase(), written.into_iter().map(|(_, _, call)| call).collect());
+        }
+        Scope { by_ast: scope.items_by_ast(db), calls, attrs, derives }
+    }
+
+    /// The scope of the block `block`: its def map's root module's.
+    fn of_block(db: &base_db::Db, block: BlockId) -> Scope {
+        let map = block_def_map(db, block);
+        Scope::of(db, map.module(db, map.root_module_id()).scope(db))
+    }
+}
+
 /// What an item is an item of.
 #[derive(Clone, Copy)]
 enum Container {
@@ -361,6 +500,7 @@ enum Container {
 
 struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
+    krate: base_db::Crate,
     defs: Vec<Def>,
     ids: HashMap<Id, DefIdx, Global>,
     /// (owner, child), in the order the children are met.
@@ -376,127 +516,63 @@ struct Walk<'c, 'a, 'db> {
     scopes: HashSet<hir_def::ModuleId, Global>,
     unported: bool,
     trivial_derives: HashMap<DefIdx, &'static str, Global>,
+    /// The block whose items are being defined, while a body's are: the tree an item of it
+    /// is in ([`Walk::tree_of`]).
+    block_now: Option<BlockId>,
+    order: Order,
+    /// The ADTs whose builtin derives [`Order::DerivesLast`] defines after their module.
+    later: Vec<(AdtId, Parent)>,
 }
 
 impl<'db> Walk<'_, '_, 'db> {
-    fn item(&mut self, item: InFile<ast::Item<'db>>, container: Container, parent: Parent) {
-        if !self.cx.cfg_enabled(item.value.syntax()) {
-            return;
-        }
-        if let ast::Item::MacroCall(call) = item.value {
-            if let Some(expansion) = self.expand(item.with_value(call)) {
-                self.expansion(expansion, container, parent);
-            }
-            return;
-        }
-        if self.cx.vsema.is_attr_macro_call(item) {
-            if let Some(expansion) = self.cx.vsema.expand_attr_macro(item.value) {
-                self.expansion(expansion.value, container, parent);
-            }
-            return;
-        }
-        if let ast::Item::MacroDef(it) = item.value
-            && ast::HasVisibility::visibility(&it).is_some()
-        {
-            self.unported = true;
-        }
-        let file = item.file_id;
-        let def = self.define(item, container, parent);
-        let (list_container, list_kind) = match (&item.value, def) {
-            (ast::Item::Module(_) | ast::Item::MacroRules(_) | ast::Item::MacroDef(_), _)
-            | (ast::Item::Trait(_) | ast::Item::Impl(_), None) => return,
-            (ast::Item::Trait(_), Some(def)) => {
-                (Some(Container::Trait(def)), SyntaxKind::ASSOC_ITEM_LIST)
-            }
-            (ast::Item::Impl(_), Some(def)) => {
-                (Some(Container::Impl(def)), SyntaxKind::ASSOC_ITEM_LIST)
-            }
-            (ast::Item::ExternBlock(_), _) => {
-                (Some(Container::Extern), SyntaxKind::EXTERN_ITEM_LIST)
-            }
-            _ => (None, SyntaxKind::ASSOC_ITEM_LIST),
-        };
-        let inner = match def {
-            Some(def) => Parent::Def(def),
-            None => parent,
-        };
-        for child in item.value.syntax().children() {
-            match list_container {
-                Some(container) if child.kind() == list_kind => {
-                    let item_parent = match container {
-                        Container::Extern => parent,
-                        _ => inner,
-                    };
-                    for it in child.children() {
-                        if let Some(item) = ast::Item::cast(it) {
-                            self.item(InFile::new(file, item), container, item_parent);
-                        }
+    /// The items `items` of `tree` (of `file`), in order, each in `scope`.
+    fn tree(
+        &mut self,
+        scope: &Scope,
+        tree: &ItemTree,
+        file: HirFileId,
+        items: &[ModItemId],
+        container: Container,
+        parent: Parent,
+    ) {
+        for &item in items {
+            let ast = InFile::new(file, item.ast_id(tree).erase());
+            match tree.kind(item) {
+                ItemKind::MacroCall => {
+                    if let Some(&call) = scope.calls.get(&ast) {
+                        self.expansion(scope, call, container, parent);
                     }
                 }
-                _ => self.node(file, child, inner),
-            }
-        }
-    }
-
-    /// What a macro call or an attribute macro of an item expands to, in place of it.
-    fn expansion(&mut self, root: InFile<ast::Node<'db>>, container: Container, parent: Parent) {
-        for child in root.value.children() {
-            if is_item(child)
-                && let Some(item) = ast::Item::cast(child)
-            {
-                self.item(root.with_value(item), container, parent);
-            }
-        }
-    }
-
-    /// `node`, inside the item whose nested items have `parent`: dispatched on its kind, so that
-    /// a node that is no item, macro call or anonymous definition costs its children's walk.
-    fn node(&mut self, file: HirFileId, node: ast::Node<'db>, parent: Parent) {
-        let kind = node.kind();
-        if ast::AnyHasAttrs::can_cast(kind) && !self.cx.cfg_enabled(node) {
-            return;
-        }
-        if is_item(node) {
-            if kind == SyntaxKind::ASM_EXPR {
-                self.global_asm(node);
-            } else if let Some(item) = ast::Item::cast(node) {
-                self.item(InFile::new(file, item), Container::Module, parent);
-            }
-            return;
-        }
-        if kind == SyntaxKind::MACRO_CALL {
-            let Some(call) = ast::MacroCall::cast(node) else { return };
-            let Some(expansion) = self.expand(InFile::new(file, call)) else { return };
-            match expansion.value.kind() {
-                SyntaxKind::MACRO_ITEMS | SyntaxKind::MACRO_STMTS => {
-                    for child in expansion.value.children() {
-                        self.node(expansion.file_id, child, parent);
+                // A module's items are its own; a `macro_rules!` and an `extern crate` define
+                // nothing the pass lints.
+                ItemKind::Mod | ItemKind::MacroRules | ItemKind::ExternCrate => {}
+                // A `cfg`'d-out block has no id.
+                ItemKind::ExternBlock => {
+                    if scope.by_ast.def_of_ast(ast).is_some() {
+                        self.tree(scope, tree, file, tree.nested_items(item), Container::Extern, parent);
                     }
                 }
-                _ => self.node(expansion.file_id, expansion.value, parent),
+                _ => self.item(scope, ast, container, parent),
             }
+        }
+    }
+
+    /// The items of the expansion of `call`, in place of it.
+    fn expansion(&mut self, scope: &Scope, call: MacroCallId, container: Container, parent: Parent) {
+        let file = HirFileId::from(call);
+        let tree = item_tree::file_item_tree(self.cx.db, file, self.krate);
+        self.tree(scope, tree, file, tree.top_level_items(), container, parent);
+    }
+
+    /// The item `ast` of `scope` (no macro call, which is its expansion): its expansion when an
+    /// attribute macro is on it, else its definition, if the collector made one.
+    fn item(&mut self, scope: &Scope, ast: ErasedAstId, container: Container, parent: Parent) {
+        if let Some(&call) = scope.attrs.get(&ast) {
+            self.expansion(scope, call, container, parent);
             return;
         }
-        let parent = match is_anon(node) {
-            true => Parent::Anon(anon_key(file, node)),
-            false => parent,
-        };
-        for child in node.children() {
-            stdx::ensure_sufficient_stack(|| self.node(file, child, parent));
-        }
-    }
-
-    fn global_asm(&mut self, node: ast::Node<'_>) {
-        let names = node
-            .descendants()
-            .any(|it| matches!(it.kind(), SyntaxKind::ASM_SYM | SyntaxKind::ASM_CONST));
-        self.unported |= names;
-    }
-
-    fn expand(&self, call: InFile<ast::MacroCall<'db>>) -> Option<InFile<ast::Node<'db>>> {
-        let id = self.cx.vsema.to_def(call.value)?;
-        let file: HirFileId = id.into();
-        Some(InFile::new(file, self.cx.vsema.parse_or_expand(file)))
+        let Some(of) = scope.by_ast.def_of_ast(ast) else { return };
+        self.define(scope, ast, of, container, parent);
     }
 
     fn push(&mut self, def: Def) -> DefIdx {
@@ -508,82 +584,89 @@ impl<'db> Walk<'_, '_, 'db> {
         index
     }
 
-    /// Records `item` as a definition with its variants, fields and derives.
+    /// Records the item `of` (written at `ast`) as a definition with its variants, fields and
+    /// derives, then what is in it: a trait's or an impl's items, the items of its bodies.
     fn define(
         &mut self,
-        item: InFile<ast::Item<'db>>,
+        scope: &Scope,
+        ast: ErasedAstId,
+        of: ItemOfAst,
         container: Container,
         parent: Parent,
-    ) -> Option<DefIdx> {
-        let cx = self.cx;
-        let db = cx.db;
-        let node = Some(item.map(|it| ast::ptr(it.syntax())));
+    ) {
+        let db = self.cx.db;
         let assoc = matches!(container, Container::Trait(_) | Container::Impl(_));
         let foreign = matches!(container, Container::Extern);
         let parent = match container {
             Container::Trait(it) | Container::Impl(it) => Parent::Def(it),
             Container::Module | Container::Extern => parent,
         };
-        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign };
-        let (def, adt) = match item.value {
-            ast::Item::Fn(it) => {
-                let function = cx.vsema.to_def(it)?;
-                let id = FunctionId::try_from(function).ok()?;
+        let def = |id, kind, name| Def { id, kind, name, parent, foreign };
+        let (def, adt) = match of {
+            ItemOfAst::Def(ModuleDefId::FunctionId(id)) => {
+                let function = hir::Function::from(id);
                 let kind = match assoc {
                     true => Kind::AssocFn { method: function.has_self_param(db) },
                     false => Kind::Fn,
                 };
                 (def(Id::Fn(id), kind, Some(function.name(db))), None)
             }
-            ast::Item::Const(it) => {
-                let konst = cx.vsema.to_def(it)?;
+            ItemOfAst::Def(ModuleDefId::ConstId(id)) => {
                 let kind = if assoc { Kind::AssocConst } else { Kind::Const };
-                let name = konst.name(db).unwrap_or_else(|| Name::new_symbol_root(sym::underscore));
-                (def(Id::Const(ConstId::from(konst)), kind, Some(name)), None)
+                let name = hir::Const::from(id)
+                    .name(db)
+                    .unwrap_or_else(|| Name::new_symbol_root(sym::underscore));
+                (def(Id::Const(id), kind, Some(name)), None)
             }
-            ast::Item::Static(it) => {
-                let it = cx.vsema.to_def(it)?;
-                (def(Id::Static(StaticId::from(it)), Kind::Static, Some(it.name(db))), None)
+            ItemOfAst::Def(ModuleDefId::StaticId(id)) => {
+                (def(Id::Static(id), Kind::Static, Some(hir::Static::from(id).name(db))), None)
             }
-            ast::Item::Struct(it) => {
-                let it = cx.vsema.to_def(it)?;
-                let id = AdtId::StructId(it.into());
-                (def(Id::Adt(id), Kind::Struct, Some(it.name(db))), Some(id))
+            ItemOfAst::Def(ModuleDefId::AdtId(id)) => {
+                let (kind, name) = match id {
+                    AdtId::StructId(it) => (Kind::Struct, hir::Struct::from(it).name(db)),
+                    AdtId::UnionId(it) => (Kind::Union, hir::Union::from(it).name(db)),
+                    AdtId::EnumId(it) => (Kind::Enum, hir::Enum::from(it).name(db)),
+                };
+                (def(Id::Adt(id), kind, Some(name)), Some(id))
             }
-            ast::Item::Union(it) => {
-                let it = cx.vsema.to_def(it)?;
-                let id = AdtId::UnionId(it.into());
-                (def(Id::Adt(id), Kind::Union, Some(it.name(db))), Some(id))
+            ItemOfAst::Def(ModuleDefId::TraitId(id)) => {
+                let kind = match TraitSignature::of(db, id).flags.contains(TraitFlags::ALIAS) {
+                    true => Kind::TraitAlias,
+                    false => Kind::Trait,
+                };
+                (def(Id::Trait(id), kind, Some(hir::Trait::from(id).name(db))), None)
             }
-            ast::Item::Enum(it) => {
-                let it = cx.vsema.to_def(it)?;
-                let id = AdtId::EnumId(it.into());
-                (def(Id::Adt(id), Kind::Enum, Some(it.name(db))), Some(id))
-            }
-            ast::Item::Trait(it) => {
-                let kind = if it.eq_token().is_some() { Kind::TraitAlias } else { Kind::Trait };
-                let it = cx.vsema.to_def(it)?;
-                (def(Id::Trait(TraitId::from(it)), kind, Some(it.name(db))), None)
-            }
-            ast::Item::TypeAlias(it) => {
-                let it = cx.vsema.to_def(it)?;
+            ItemOfAst::Def(ModuleDefId::TypeAliasId(id)) => {
                 let kind = match (assoc, foreign) {
                     (true, _) => Kind::AssocTy,
                     (_, true) => Kind::ForeignTy,
                     _ => Kind::TyAlias,
                 };
-                (def(Id::Alias(TypeAliasId::from(it)), kind, Some(it.name(db))), None)
+                (def(Id::Alias(id), kind, Some(hir::TypeAlias::from(id).name(db))), None)
             }
-            ast::Item::Impl(it) => {
-                let id = ImplId::try_from(cx.vsema.to_def(it)?).ok()?;
-                (def(Id::Impl(id), Kind::Impl { of_trait: it.trait_().is_some() }, None), None)
+            ItemOfAst::Impl(id) => {
+                let of_trait = ImplSignature::of(db, id).target_trait.is_some();
+                (def(Id::Impl(id), Kind::Impl { of_trait }, None), None)
             }
-            ast::Item::Use(_) => {
-                let ptr = item.map(|it| ast::ptr(it.syntax()));
-                (def(Id::Use(ptr), Kind::Use, None), None)
+            ItemOfAst::Use(id) => (def(Id::Use(id), Kind::Use, None), None),
+            ItemOfAst::Def(ModuleDefId::MacroId(MacroId::Macro2Id(_))) => {
+                // A `pub macro` makes its module's items reachable, which is not ported.
+                let node = self.cx.syntax_view(InFile::new(ast.file_id, ast.to_ptr(db)));
+                if ast::MacroDef::cast(node.value)
+                    .is_some_and(|it| ast::HasVisibility::visibility(&it).is_some())
+                {
+                    self.unported = true;
+                }
+                return;
             }
-            _ => return None,
+            // An extern block in a body (one of a module's is walked from its tree).
+            ItemOfAst::ExternBlock(_) => {
+                self.extern_in_block(scope, ast, parent);
+                return;
+            }
+            ItemOfAst::Def(_) | ItemOfAst::ExternCrate(_) => return,
         };
+        let id = def.id;
         let index = self.push(def);
         match container {
             Container::Trait(owner) => {
@@ -604,48 +687,214 @@ impl<'db> Walk<'_, '_, 'db> {
             }
         }
         if let Some(adt) = adt {
-            self.fields_and_variants(item, index);
-            self.derived(adt, parent);
-            self.expanded_derives(item, parent);
+            self.fields_and_variants(adt, index);
+            match self.order {
+                Order::Written => self.derived(adt, parent),
+                #[cfg(test)]
+                Order::DerivesLast => self.later.push((adt, parent)),
+            }
+            self.expanded_derives(scope, ast, parent);
         }
-        Some(index)
+        self.inside(index, id, foreign);
     }
 
-    /// The items the derives of `item` expand to, after it, where they are expanded (a build;
-    /// the front end records the builtin ones of a check instead, [`Walk::derived`]): free items
-    /// of its module. The impls of `Clone`'s and `Debug`'s are [`Defs::trivial_derives`].
-    fn expanded_derives(&mut self, item: InFile<ast::Item<'db>>, parent: Parent) {
-        let cx = self.cx;
-        let db = cx.db;
-        let Some(owner) = ast::AnyHasAttrs::cast(item.value.syntax()) else { return };
-        let cfg = cx.krate.cfg(db);
-        for (meta, _) in hir_expand::attrs::cfg_attrs_view(ast::attrs_including_inner(&owner), cfg)
-        {
-            let is_derive = matches!(meta, ast::Meta::TokenTreeMeta(it)
-                if it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "derive"));
-            if !is_derive {
+    /// The items of an extern block written in a body, as foreign items of the enclosing module
+    /// with the block's parent: found in the tree its ast id is of.
+    fn extern_in_block(&mut self, scope: &Scope, ast: ErasedAstId, parent: Parent) {
+        let (tree, file) = self.tree_of(ast.file_id);
+        let Some(item) = find(tree, tree.top_level_items(), ast.value) else {
+            panic!("extern block {ast:?}: its tree of {file:?} has no such item")
+        };
+        self.tree(scope, tree, file, tree.nested_items(item), Container::Extern, parent);
+    }
+
+    /// The tree of the items of `file` in the block being walked: the block's own when `file`
+    /// is the block's, else the macro expansion's ([`Walk::block_now`]).
+    fn tree_of(&self, file: HirFileId) -> (&'db ItemTree, HirFileId) {
+        let db = self.cx.db;
+        match self.block_now {
+            Some(block) if block.ast_id(db).file_id == file => {
+                (item_tree::block_item_tree(db, block, self.krate), file)
+            }
+            _ => (item_tree::file_item_tree(db, file, self.krate), file),
+        }
+    }
+
+    /// What is in the definition `def` (of `id`): the items written in each expression store it
+    /// owns, in rustc's order ([`stores`]: its signature's anonymous constants, its fields',
+    /// its body or an enum's discriminants), then a trait's or an impl's items, each followed by
+    /// what is in it. A foreign function or static has no body.
+    fn inside(&mut self, def: DefIdx, id: Id, foreign: bool) {
+        let db = self.cx.db;
+        stores(db, id, |owner| match owner {
+            ExpressionStoreOwnerId::Body(_) if foreign => {}
+            ExpressionStoreOwnerId::Body(body) => self.body(body, def),
+            ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => {
+                self.store_items(owner, def)
+            }
+        });
+        match id {
+            Id::Trait(it) => {
+                for &(_, item) in it.trait_items(db).items.iter() {
+                    self.assoc(item, Container::Trait(def));
+                }
+            }
+            Id::Impl(it) => {
+                for &(_, item) in it.impl_items(db).items.iter() {
+                    self.assoc(item, Container::Impl(def));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// An associated item of a trait or an impl, then what is in it.
+    fn assoc(&mut self, item: AssocItemId, container: Container) {
+        let db = self.cx.db;
+        let (Container::Trait(owner) | Container::Impl(owner)) = container else {
+            unreachable!("an associated item is a trait's or an impl's")
+        };
+        let parent = Parent::Def(owner);
+        let (id, kind, name) = match item {
+            AssocItemId::FunctionId(it) => {
+                let function = hir::Function::from(it);
+                (Id::Fn(it), Kind::AssocFn { method: function.has_self_param(db) }, function.name(db))
+            }
+            AssocItemId::ConstId(it) => {
+                let name = hir::Const::from(it)
+                    .name(db)
+                    .unwrap_or_else(|| Name::new_symbol_root(sym::underscore));
+                (Id::Const(it), Kind::AssocConst, name)
+            }
+            AssocItemId::TypeAliasId(it) => {
+                (Id::Alias(it), Kind::AssocTy, hir::TypeAlias::from(it).name(db))
+            }
+        };
+        let index = self.push(Def { id, kind, name: Some(name), parent, foreign: false });
+        self.edges.push((owner, index));
+        match container {
+            Container::Trait(_) => self.trait_items.push(index),
+            _ => self.impl_items.push(index),
+        }
+        self.inside(index, id, false);
+    }
+
+    /// The items written in the body of `owner` (the definition `def`), in source order, each
+    /// a free item of the enclosing module whose parent is the closure or anonymous constant
+    /// around it, else `def`; each followed by what is in it.
+    fn body(&mut self, owner: DefWithBodyId, def: DefIdx) {
+        let db = self.cx.db;
+        let items = item_tree::body_items(db, owner);
+        if items.is_empty() {
+            return;
+        }
+        let body = Body::of(db, owner);
+        let discriminant = matches!(owner, DefWithBodyId::VariantId(_));
+        let anons = anons(&body.store, std::iter::once(body.root_expr()), discriminant);
+        // alloc: setup, the scopes of the body's blocks, once per body holding items
+        let mut scopes: HashMap<BlockId, Scope, Global> = HashMap::new_in(Global);
+        for item in items {
+            if !scopes.contains_key(&item.block) {
+                scopes.insert(item.block, Scope::of_block(db, item.block));
+            }
+        }
+        let outer = self.block_now;
+        for item in items {
+            let Some(&anon) = anons.get(&item.block) else {
+                panic!(
+                    "{owner:?}: block {:?} of item {:?} is in no expression of the body's store",
+                    item.block, item.item
+                )
+            };
+            let parent = match anon {
+                Some(expr) => Parent::Anon((ExpressionStoreOwnerId::Body(owner), expr)),
+                None => Parent::Def(def),
+            };
+            let scope = scopes.get(&item.block).expect("a scope was made for each block above");
+            self.block_now = Some(item.block);
+            if scope.by_ast.def_of_ast(item.item).is_none() && !scope.attrs.contains_key(&item.item) {
+                self.global_asm(item.item);
                 continue;
             }
-            let Some(derived) = cx.vsema.expand_derive_macro(meta) else { continue };
-            for root in derived.into_iter().flatten() {
-                let file = cx.vsema.hir_file_for(root.value);
-                let Some(call) = file.macro_file() else { continue };
-                let trivial = match call.loc(db).def.kind {
-                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Clone) => {
-                        Some("Clone")
-                    }
-                    hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Debug) => {
-                        Some("Debug")
-                    }
-                    _ => None,
-                };
-                let first = self.defs.len();
-                self.expansion(InFile::new(file, root.value), Container::Module, parent);
-                let Some(name) = trivial else { continue };
-                for at in first..self.defs.len() {
-                    if self.defs[at].kind == (Kind::Impl { of_trait: true }) {
-                        self.trivial_derives.insert(at as DefIdx, name);
-                    }
+            self.item(scope, item.item, Container::Module, parent);
+        }
+        self.block_now = outer;
+    }
+
+    /// The items written in the anonymous constants of the store of `owner` (a signature's or
+    /// a variant's fields', where every expression root is one), block by block as the store
+    /// lowered them, each a free item of the enclosing module whose parent is the closure or
+    /// anonymous constant innermost around it; each followed by what is in it. A block nested
+    /// in another's statement has its items after the outer block's (rustc interleaves them).
+    fn store_items(&mut self, owner: ExpressionStoreOwnerId, def: DefIdx) {
+        let db = self.cx.db;
+        let store = ExpressionStore::of(db, owner);
+        let mut blocks = store.blocks(db).map(|(block, _)| block).peekable();
+        if blocks.peek().is_none() {
+            return;
+        }
+        let anons = anons(store, store.expr_roots(), true);
+        let outer = self.block_now;
+        for block in blocks {
+            let Some(&anon) = anons.get(&block) else {
+                panic!("{owner:?}: block {block:?} is in no expression of the store")
+            };
+            let parent = match anon {
+                Some(expr) => Parent::Anon((owner, expr)),
+                None => Parent::Def(def),
+            };
+            let tree = item_tree::block_item_tree(db, block, self.krate);
+            let scope = Scope::of_block(db, block);
+            self.block_now = Some(block);
+            let file = block.ast_id(db).file_id;
+            self.tree(&scope, tree, file, tree.top_level_items(), Container::Module, parent);
+        }
+        self.block_now = outer;
+    }
+
+    /// A `global_asm!` naming an item in a `sym` or `const` operand, written in a body: what is
+    /// live is then not known ([`Defs::unported`]). Any other item with no id (a `mod`, a
+    /// `macro_rules!`, an `asm!` expression) is nothing here.
+    fn global_asm(&mut self, ast: ErasedAstId) {
+        let db = self.cx.db;
+        let ptr = ast.to_ptr(db);
+        if ptr.kind() != SyntaxKind::ASM_EXPR {
+            return;
+        }
+        let node = self.cx.syntax_view(InFile::new(ast.file_id, ptr)).value;
+        let item = matches!(
+            node.parent().map(|it| it.kind()),
+            Some(SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::MACRO_ITEMS)
+        );
+        self.unported |= item
+            && node
+                .descendants()
+                .any(|it| matches!(it.kind(), SyntaxKind::ASM_SYM | SyntaxKind::ASM_CONST));
+    }
+
+    /// The items the expanded derives of the ADT at `ast` make, after it, where they are
+    /// expanded (a build; the front end records the builtin ones of a check instead,
+    /// [`Walk::derived`]): free items of its module. The impls of `Clone`'s and `Debug`'s are
+    /// [`Defs::trivial_derives`].
+    fn expanded_derives(&mut self, scope: &Scope, ast: ErasedAstId, parent: Parent) {
+        let db = self.cx.db;
+        let Some(calls) = scope.derives.get(&ast) else { return };
+        for &call in calls {
+            let trivial = match call.loc(db).def.kind {
+                hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Clone) => {
+                    Some("Clone")
+                }
+                hir_expand::MacroDefKind::BuiltInDerive(_, BuiltinDeriveExpander::Debug) => {
+                    Some("Debug")
+                }
+                _ => None,
+            };
+            let first = self.defs.len();
+            self.expansion(scope, call, Container::Module, parent);
+            let Some(name) = trivial else { continue };
+            for at in first..self.defs.len() {
+                if self.defs[at].kind == (Kind::Impl { of_trait: true }) {
+                    self.trivial_derives.insert(at as DefIdx, name);
                 }
             }
         }
@@ -655,74 +904,42 @@ impl<'db> Walk<'_, '_, 'db> {
         self.modules.last_mut().expect("items are walked within a module")
     }
 
-    fn fields_and_variants(&mut self, item: InFile<ast::Item<'db>>, adt: DefIdx) {
-        let fields = match item.value {
-            ast::Item::Struct(it) => it.field_list(),
-            ast::Item::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList),
-            ast::Item::Enum(it) => {
-                let db = self.cx.db;
-                for variant in it.variant_list().into_iter().flat_map(|it| it.variants()) {
-                    if !self.cx.cfg_enabled(variant.syntax()) {
-                        continue;
-                    }
-                    let Some(id) = self.cx.vsema.to_def(variant) else { continue };
+    /// An ADT's variants, each with its fields, or its fields, in order (those `cfg`'d out
+    /// have no id).
+    fn fields_and_variants(&mut self, adt: AdtId, def: DefIdx) {
+        let db = self.cx.db;
+        match adt {
+            AdtId::StructId(it) => self.fields(VariantId::StructId(it), def),
+            AdtId::UnionId(it) => self.fields(VariantId::UnionId(it), def),
+            AdtId::EnumId(it) => {
+                for &(variant, _) in it.enum_variants(db).variants.values() {
                     let index = self.push(Def {
-                        id: Id::Variant(id.into()),
+                        id: Id::Variant(variant),
                         kind: Kind::Variant,
-                        node: Some(item.with_value(ast::ptr(variant.syntax()))),
-                        name: Some(id.name(db)),
-                        parent: Parent::Def(adt),
+                        name: Some(hir::EnumVariant::from(variant).name(db)),
+                        parent: Parent::Def(def),
                         foreign: false,
                     });
-                    self.edges.push((adt, index));
-                    self.fields(item.file_id, variant.field_list(), index);
-                }
-                return;
-            }
-            _ => return,
-        };
-        self.fields(item.file_id, fields, adt);
-    }
-
-    fn fields(&mut self, file: HirFileId, list: Option<ast::FieldList<'db>>, owner: DefIdx) {
-        match list {
-            Some(ast::FieldList::RecordFieldList(it)) => {
-                for field in it.fields() {
-                    if self.cx.cfg_enabled(field.syntax()) {
-                        let def = self.cx.vsema.to_def(field);
-                        self.field(file, field.syntax(), def, owner);
-                    }
+                    self.edges.push((def, index));
+                    self.fields(VariantId::EnumVariantId(variant), index);
                 }
             }
-            Some(ast::FieldList::TupleFieldList(it)) => {
-                for field in it.fields() {
-                    if self.cx.cfg_enabled(field.syntax()) {
-                        let def = self.cx.vsema.to_def(field);
-                        self.field(file, field.syntax(), def, owner);
-                    }
-                }
-            }
-            None => {}
         }
     }
 
-    fn field(
-        &mut self,
-        file: HirFileId,
-        node: ast::Node<'_>,
-        field: Option<hir::Field>,
-        owner: DefIdx,
-    ) {
-        let Some(field) = field else { return };
-        let index = self.push(Def {
-            id: Id::Field(FieldId::from(field)),
-            kind: Kind::Field,
-            node: Some(InFile::new(file, ast::ptr(node))),
-            name: Some(field.name(self.cx.db)),
-            parent: Parent::Def(owner),
-            foreign: false,
-        });
-        self.edges.push((owner, index));
+    fn fields(&mut self, variant: VariantId, owner: DefIdx) {
+        let db = self.cx.db;
+        for (local_id, field) in VariantFields::of(db, variant).fields().iter() {
+            let index = self.push(Def {
+                id: Id::Field(FieldId { parent: variant, local_id }),
+                kind: Kind::Field,
+                // clone: an interned name, a count bump
+                name: Some(field.name.clone()),
+                parent: Parent::Def(owner),
+                foreign: false,
+            });
+            self.edges.push((owner, index));
+        }
     }
 
     /// The impls the builtin derives of `adt` make, after it, and their methods.
@@ -745,7 +962,6 @@ impl<'db> Walk<'_, '_, 'db> {
             let index = self.push(Def {
                 id: Id::Derive(derive),
                 kind: Kind::Impl { of_trait: true },
-                node: None,
                 name: None,
                 parent,
                 foreign: false,
@@ -758,7 +974,6 @@ impl<'db> Walk<'_, '_, 'db> {
                     kind: Kind::AssocFn {
                         method: !matches!(trait_, BuiltinDeriveImplTrait::Default),
                     },
-                    node: None,
                     name: Some(Name::new_symbol_root(method.name())),
                     parent: Parent::Def(index),
                     foreign: false,
@@ -770,59 +985,115 @@ impl<'db> Walk<'_, '_, 'db> {
     }
 }
 
-/// Whether `node` is an item of HIR's: an item, an associated item or an item of an `extern`
-/// block, not a macro call (which is what it expands to); a `global_asm!` is one.
-fn is_item(node: ast::Node<'_>) -> bool {
-    match node.kind() {
-        SyntaxKind::MACRO_CALL => false,
-        SyntaxKind::ASM_EXPR => matches!(
-            node.parent().map(|it| it.kind()),
-            Some(SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::MACRO_ITEMS)
-        ),
-        kind => ast::Item::can_cast(kind),
+/// Of each block of `store` under the expressions `roots`, the closure, coroutine, `const`
+/// block or anonymous constant innermost around it, if any: what the items in the block have
+/// as their parent. The same expressions the walk of the store (`mark::body::Walk::anon`)
+/// marks visited; each root is one itself when `anon_roots` (a variant's discriminant, every
+/// root of a signature's or of fields' store).
+fn anons(
+    store: &ExpressionStore,
+    roots: impl Iterator<Item = ExprId>,
+    anon_roots: bool,
+) -> HashMap<BlockId, Option<ExprId>, Global> {
+    struct Anons<'s> {
+        store: &'s ExpressionStore,
+        at: Option<ExprId>,
+        blocks: HashMap<BlockId, Option<ExprId>, Global>,
     }
-}
-
-/// Whether `node` is a definition of its own in rustc's HIR that items in it have as their
-/// parent: a closure, an `async` or `gen` block (a coroutine), a `const` block, or an
-/// anonymous constant (an array's length, a const argument, a discriminant).
-pub(super) fn is_anon(node: ast::Node<'_>) -> bool {
-    match node.kind() {
-        SyntaxKind::CLOSURE_EXPR => true,
-        SyntaxKind::BLOCK_EXPR => node
-            .children_with_tokens()
-            .any(|it| matches!(it.kind(), T![const] | T![async] | T![gen])),
-        kind if !ast::Expr::can_cast(kind) => false,
-        _ => match node.parent() {
-            Some(parent) => match parent.kind() {
-                SyntaxKind::CONST_ARG | SyntaxKind::VARIANT => true,
-                SyntaxKind::ARRAY_EXPR => {
-                    let has_semi =
-                        parent.children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
-                    has_semi
-                        && parent.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1)
-                            == Some(node)
+    impl Anons<'_> {
+        fn within(&mut self, anon: ExprId, walk: impl FnOnce(&mut Self)) {
+            let outer = self.at.replace(anon);
+            walk(self);
+            self.at = outer;
+        }
+    }
+    impl StoreVisitor for Anons<'_> {
+        fn on_expr(&mut self, expr: ExprId) {
+            let store = self.store;
+            match store.expr(expr) {
+                Expr::Closure { closure_kind, .. }
+                    if !matches!(
+                        closure_kind,
+                        ClosureKind::Coroutine { source: CoroutineSource::Fn, .. }
+                    ) =>
+                {
+                    self.within(expr, |this| store.visit_expr_children(expr, &mut *this));
+                    return;
                 }
-                _ => false,
-            },
-            None => false,
-        },
+                Expr::Const(inner) => {
+                    self.within(expr, |this| this.on_expr(inner));
+                    return;
+                }
+                Expr::Block { id: Some(block), .. } => {
+                    self.blocks.insert(block, self.at);
+                }
+                _ => {}
+            }
+            stdx::ensure_sufficient_stack(|| store.visit_expr_children(expr, &mut *self));
+        }
+
+        fn on_anon_const_expr(&mut self, expr: ExprId) {
+            self.within(expr, |this| this.on_expr(expr));
+        }
+
+        fn on_pat(&mut self, pat: PatId) {
+            let store = self.store;
+            store.visit_pat_children(pat, &mut *self);
+        }
+
+        fn on_type(&mut self, ty: TypeRefId) {
+            let store = self.store;
+            store.visit_type_ref_children(ty, &mut *self);
+        }
     }
+    // alloc: setup, one entry per block of a store holding items, once per such store
+    let mut anons = Anons { store, at: None, blocks: HashMap::new_in(Global) };
+    for root in roots {
+        anons.at = anon_roots.then_some(root);
+        anons.on_expr(root);
+    }
+    anons.blocks
 }
 
-/// What a closure or an anonymous constant is known by: its node inside any parentheses, which
-/// is the node the front end maps the expression back to.
-pub(super) fn anon_key<'t>(file: HirFileId, node: ast::Node<'t>) -> InFile<SyntaxNodePtr> {
-    let inner = |node: ast::Node<'t>| {
-        (node.kind() == SyntaxKind::PAREN_EXPR)
-            .then(|| node.children().find(|it| ast::Expr::can_cast(it.kind())))
-            .flatten()
+/// Each expression store the definition `id` owns, in rustc's `intravisit` order: its signature,
+/// then a struct's or a union's fields, each variant's fields and then its discriminant, or the
+/// body a function, a constant or a static has written. A `use`, a variant and a field own
+/// none (a variant's are its enum's). The one list both the numbering ([`Walk::inside`]) and
+/// the walk (`mark::Mark::visit`) go by.
+pub(super) fn stores(db: &base_db::Db, id: Id, mut f: impl FnMut(ExpressionStoreOwnerId)) {
+    let (def, body) = match id {
+        Id::Fn(it) => (GenericDefId::FunctionId(it), {
+            FunctionSignature::of(db, it).has_body().then_some(DefWithBodyId::FunctionId(it))
+        }),
+        Id::Const(it) => (GenericDefId::ConstId(it), {
+            ConstSignature::of(db, it).has_body().then_some(DefWithBodyId::ConstId(it))
+        }),
+        Id::Static(it) => (GenericDefId::StaticId(it), {
+            let written = StaticSignature::of(db, it).flags.contains(StaticFlags::HAS_BODY);
+            written.then_some(DefWithBodyId::StaticId(it))
+        }),
+        Id::Adt(it) => (GenericDefId::AdtId(it), None),
+        Id::Trait(it) => (GenericDefId::TraitId(it), None),
+        Id::Alias(it) => (GenericDefId::TypeAliasId(it), None),
+        Id::Impl(it) => (GenericDefId::ImplId(it), None),
+        Id::Variant(_) | Id::Field(_) | Id::Derive(_) | Id::DeriveMethod(_) | Id::Use(_) => return,
     };
-    let mut ptr = ast::ptr(node);
-    let mut next = inner(node);
-    while let Some(node) = next {
-        ptr = ast::ptr(node);
-        next = inner(node);
+    f(ExpressionStoreOwnerId::Signature(def));
+    match id {
+        Id::Adt(AdtId::StructId(it)) => f(ExpressionStoreOwnerId::VariantFields(it.into())),
+        Id::Adt(AdtId::UnionId(it)) => f(ExpressionStoreOwnerId::VariantFields(it.into())),
+        Id::Adt(AdtId::EnumId(it)) => {
+            let variants = it.enum_variants(db);
+            for &(variant, _) in variants.variants.values() {
+                f(ExpressionStoreOwnerId::VariantFields(VariantId::EnumVariantId(variant)));
+                if variants.has_explicit_discriminant(variant) {
+                    f(ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(variant)));
+                }
+            }
+        }
+        _ => {}
     }
-    InFile::new(file, ptr)
+    if let Some(body) = body {
+        f(ExpressionStoreOwnerId::Body(body));
+    }
 }

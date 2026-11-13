@@ -22,8 +22,10 @@
 //! one whose output, read variables or given strings still hold a root once ported ([`left`],
 //! a literal the macro made of `CARGO_MANIFEST_DIR`) is kept here alone.
 //!
-//! Not kept: an expansion that asked the database about a span (its text, file or line),
-//! since the key does not say what it was told; one whose output has an anchor or a context
+//! Not kept: an expansion that asked the database about a span (its text, file, line or
+//! join with another), since the key does not say what it was told (where the answer is a
+//! function of the calling crate's sources by position, what it read is still known, and
+//! the unit and image made from it are kept: `blaze-macro-eval`'s `Asked::by_position`); one whose output has an anchor or a context
 //! its input has not, which the next call could not be given back; one that read what can't
 //! be traced (the clock, randomness); and one that failed. `BLAZE_PROC_MACRO_CACHE=check`
 //! expands every call it finds kept anyway, and an output other than the kept one is an error
@@ -204,6 +206,9 @@ struct Seen<'a> {
     call: &'a Env,
     made: Option<inputs::Env>,
     /// What file, directory and listing reads are asked through: no variable is read there.
+    /// Their looks at the disk are kept by no build ([`base_db::Looks::none`]): an
+    /// expansion's lookup is shared by every job, and what it read is in the reads of the
+    /// unit's record, which each build that uses the unit takes.
     none: inputs::Env,
 }
 
@@ -228,15 +233,15 @@ impl Inputs for Seen<'_> {
         &mut self,
         path: &std::path::Path,
     ) -> Result<blaze_usercode::trace::Entry, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.entry(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.entry(path)
     }
 
     fn file(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.file(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.file(path)
     }
 
     fn dir(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.dir(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.dir(path)
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
@@ -256,7 +261,7 @@ impl Inputs for Seen<'_> {
         path: &std::path::Path,
         out: &mut blaze_usercode::trace::Names<'_>,
     ) -> Result<bool, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.names(path, out)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.names(path, out)
     }
 }
 

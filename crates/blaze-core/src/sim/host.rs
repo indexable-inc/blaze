@@ -216,6 +216,15 @@ impl Sim {
         self.host.wall
     }
 
+    /// The wall clock now: the seed's start plus the virtual clock (half of it under the
+    /// [`Plant::WallLags`] control). One home for [`Effect::Now`] and [`Sim::wall_ns`].
+    pub(super) fn wall_now(&self) -> Duration {
+        match self.planted(Plant::WallLags) {
+            true => self.host.wall + self.now / 2,
+            false => self.host.wall + self.now,
+        }
+    }
+
     /// The simulation from now on has the bug `plant`, for a control.
     #[cfg(test)]
     pub(super) fn plant(&mut self, plant: Plant) {
@@ -265,10 +274,7 @@ impl Sim {
                 self.tell(tag, done, Of::Op);
             }
             Effect::Now { tag } => {
-                let done = Done::Wall(match self.planted(Plant::WallLags) {
-                    true => self.host.wall + self.now / 2,
-                    false => self.host.wall + self.now,
-                });
+                let done = Done::Wall(self.wall_now());
                 self.tell(tag, done, Of::Op);
             }
             Effect::Random { len, tag } => {

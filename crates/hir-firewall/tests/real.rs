@@ -306,6 +306,7 @@ fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
         )
     })?;
     let mut ran = Ran { out_dir: out_dir.clone(), ..Ran::default() };
+    let mut env = Vec::new();
     for line in String::from_utf8_lossy(&output).lines() {
         let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))
         else {
@@ -318,12 +319,16 @@ fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
                 let (name, value) = value
                     .split_once('=')
                     .ok_or_else(|| format!("{}: `{line}` sets no variable", output_at.display()))?;
-                ran.env.push((name.to_owned(), value.to_owned()));
+                env.push((name.to_owned(), value.to_owned()));
             }
             _ => {}
         }
     }
-    ran.files = read_tree(Path::new(&out_dir), &|_: &str| true, &[])?;
+    ran.env = env.into();
+    ran.files = read_tree(Path::new(&out_dir), &|_: &str| true, &[])?
+        .into_iter()
+        .map(|(path, bytes)| (path, bytes.into()))
+        .collect();
     Ok(ran)
 }
 
@@ -337,8 +342,9 @@ fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home)?;
+    let sealed = blaze_lower::unsealed(&units);
     let lower =
-        Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None };
+        Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None, sealed: &sealed };
     let mut lowered = blaze_lower::lower_into(Db::logged(), lower)
         .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {

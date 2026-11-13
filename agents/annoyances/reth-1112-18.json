@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-18",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "tempo's cold build: codegen of tempo-node-launcher (hir-ty-pure's walk)",
+ "what": "tempo's cold build (7,909 units) stopped at 7,841: one task, `compile (Codegen) tempo-node-launcher`, granted 64 MiB, peaked at 34.4 GiB over 444 s on one worker while the daemon grew 2 GiB every 30 s to 128 GiB resident (4.2 M MIR bodies held). The allocation stacks of `monomorphization::monomorphized` all run through `hir_ty_pure::walk::summary -> summarize -> Walk::call/function/walk -> summary`; single describes of the launcher's generic entry points took 57 to 106 s.",
+ "cost": "tempo has no successful cold build; a 251 GiB machine was at 46 GiB available with other lanes' tests beside it",
+ "cause": "the purity walk summarizes the callee tree of a top crate on one query stack, monomorphizing as it goes, and keeps the bodies",
+ "class": "an unbounded walk admitted as a 64 MiB task (admission grants are 20 to 100 times under real peaks)",
+ "prevention": "lane monowalk-1112 has it; evidence in /root/wt/reth-1112/log/tempo-evidence on blaze-vm. Not built by me",
+ "fix": "monowalk-1112's",
+ "state": "open: handed over with rows"
+}

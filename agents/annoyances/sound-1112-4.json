@@ -1,0 +1,17 @@
+{
+ "id": "sound-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "blaze: a request made again of unchanged sources after another request (build, test, check, run, release, a feature, a width, a message format)",
+ "what": "The oracle's fixed alternation (oracle::alternating_requests_of_unchanged_sources_are_no_ops, tree a35c6a040e, blaze-vm, load 70 to 90; workspace app + up + vendor/made with a build script) : build, test, build, test, check, run, check, run --release, run, run --release, run --features loud, run, run --features loud, run at width 80, run with json-diagnostic-short, run, the same again. Engine memos executed by a request already made of the same sources: build after test 624,371 (1 unit made again), test after build 635,307 (1 unit), run after check 624,453, dev run after release 618,478, run without the feature after with it 624,382, run at width 80 624,336, run with the short format 624,308; verified 1.9 to 2.8 million each; 7 to 24 s each on the loaded VM. A request repeated at once is 0. The bound the oracle states is 2000.",
+ "cost": "every switch of command, profile, feature set, width or message format pays a whole lowering",
+ "cause": "not measured here beyond the counts; by reading (an Explore pass over serve/job.rs): the kept front end is one slot a checkout (Roots.fronts, let go when the plan's units differ), the last plan is one slot keyed by the whole encoded request (Roots.plans, job.rs:3981 and 4067), and the no-op lane's answer is one slot that any walk drops (Roots.answers, job.rs:4024)",
+ "whys": [
+  "a result is kept as the last one of its checkout",
+  "its key is the whole request, not what it was computed from"
+ ],
+ "class": "a single slot keyed by the whole request",
+ "prevention": "the oracle draws alternations and bounds a request made again (generate.rs: max_units 0, max_executed 2000); the slots become stores keyed by what they were computed from",
+ "workaround": "none",
+ "state": "open: Roots.fronts is lane sealed-1112's; Roots.plans, Roots.answers, Roots.sized and ahead's Checkout.last have no owner yet"
+}

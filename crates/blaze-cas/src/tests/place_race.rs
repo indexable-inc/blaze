@@ -16,7 +16,7 @@ enum Shape {
     Output,
     /// A hot value past [`EXTERNAL_FROM`]: cloned from its file of its own.
     External,
-    /// A short value: written ([`Effect::Write`], already atomic in every driver).
+    /// A short value: its bytes written under a staged name and renamed onto the path.
     Written,
 }
 

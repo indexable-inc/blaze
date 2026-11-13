@@ -1,0 +1,14 @@
+{
+ "id": "front-carry-codes-private",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), the blaze-solo lane (no-daemon end state, piece 1), int-1112",
+ "where": "crates/blaze-cargo/src/serve/front_carry.rs:60 EXISTS_DOMAIN, :66-77 CODE and code(), :80-88 kernel(); crates/blaze-vfs/src/view.rs:28-33 TAG_NAME and SIGNATURE (pub(crate))",
+ "what": "A second driver of the front end's kernel (blaze-solo) must give the same step codes, registrations, EXISTS value domain and cache-tag rule as the daemon's carry so the two share entries, but all of them are private to blaze-cargo or blaze-vfs, so blaze-solo copies them.",
+ "cost": "four copies that must stay byte-equal to their originals by hand; a drift makes every entry of one driver a miss for the other, silently",
+ "cause": "the identity of the front end's steps (their code ids, the registry order, the value of an EXISTS read) is decided in one driver's file, not in the crate that defines the steps",
+ "class": "a key's inputs defined at one consumer instead of beside what it keys, so a second consumer copies them",
+ "prevention": "move CODE/code(), kernel() and EXISTS_DOMAIN into blaze-front-items (beside steps::reads) and TAG_NAME/SIGNATURE to pub in blaze-vfs; both drivers take them from there and the copies are banned",
+ "workaround": "blaze-solo copies them: src/bin/solo.rs codes(), src/run.rs kernel(), src/world.rs EXISTS_DOMAIN, src/sweep.rs TAG_NAME/SIGNATURE, each comment naming its original",
+ "fix": "not yet",
+ "state": "open"
+}

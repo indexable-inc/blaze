@@ -208,9 +208,11 @@ fn find<'t>(cx: &Cx<'_, 't>) -> Option<Vec<Found>> {
             .min_by_key(|range| range.start());
         let last = written.iter().map(|&(_, range)| range).max_by_key(|range| range.end());
         let (insert, fix) = match (later, last) {
-            (Some(next), _) => before(text, in_text(next.start()), word),
-            (None, Some(last)) => after(text, in_text(last.start()), in_text(last.end()), word),
-            (None, None) => before(text, in_text(signature), word),
+            (Some(next), _) => before(text, in_text(next.start()), whole.end(), word),
+            (None, Some(last)) => {
+                after(text, in_text(last.start()), in_text(last.end()), whole.end(), word)
+            }
+            (None, None) => before(text, in_text(signature), whole.end(), word),
         };
         let label = format!("mark it `#[blaze::{word}]`");
         found.push(Found { lint, name: name_range, message, notes, insert, fix, label });
@@ -224,23 +226,43 @@ fn line_before(text: &str, at: TextSize) -> &str {
     &text[text[..at].rfind('\n').map_or(0, |it| it + 1)..at]
 }
 
+/// The indentation of the line `at` starts, or `None` when something is written before it on
+/// its line.
+///
+/// `text` is a body's anchor alone when the function is linted by its body (`Cx::text`): it
+/// starts at the function, so a signature or attribute with nothing above it is at offset 0
+/// and the text does not have its line's indentation. It is then read from the line of the
+/// function's closing brace (`end`), which is at the function's own indentation in formatted
+/// code; a function written on one line has none to read. Without this the fix wrote
+/// `    #[blaze::nopanic]\npub fn len(..)` in every `impl` (bstd, 2026-11-12).
+// when `hir_def::expr_store::body::BodySyntax` says its anchor's column: read it here.
+fn indent_of(text: &str, at: TextSize, end: TextSize) -> Option<&str> {
+    if usize::from(at) != 0 {
+        let lead = line_before(text, at);
+        return lead.trim().is_empty().then_some(lead);
+    }
+    let last = line_before(text, end);
+    let brace = last.trim_start();
+    (brace == "}" && usize::from(end) > last.len()).then(|| &last[..last.len() - brace.len()])
+}
+
 /// The edit that writes `#[blaze::<word>]` before what starts at `at`: on a line of its own at
-/// that line's indentation when `at` starts its line, before it on its line otherwise.
-fn before(text: &str, at: TextSize, word: &str) -> (TextSize, String) {
-    let lead = line_before(text, at);
-    match lead.trim().is_empty() {
-        true => (at, format!("#[blaze::{word}]\n{lead}")), // alloc: the fix's text
-        false => (at, format!("#[blaze::{word}] ")),       // alloc: the fix's text
+/// that line's indentation when `at` starts its line, before it on its line otherwise. `end`
+/// is where the function ends.
+fn before(text: &str, at: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
+    match indent_of(text, at, end) {
+        Some(indent) => (at, format!("#[blaze::{word}]\n{indent}")), // alloc: the fix's text
+        None => (at, format!("#[blaze::{word}] ")),                  // alloc: the fix's text
     }
 }
 
-/// The edit that writes `#[blaze::<word>]` after the attribute from `start` to `end`: on the
-/// next line at its indentation when the attribute starts its line, after it otherwise.
-fn after(text: &str, start: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
-    let lead = line_before(text, start);
-    match lead.trim().is_empty() {
-        true => (end, format!("\n{lead}#[blaze::{word}]")), // alloc: the fix's text
-        false => (end, format!(" #[blaze::{word}]")),       // alloc: the fix's text
+/// The edit that writes `#[blaze::<word>]` after the attribute from `start` to `after`: on the
+/// next line at its indentation when the attribute starts its line, after it otherwise. `end`
+/// is where the function ends.
+fn after(text: &str, start: TextSize, after: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
+    match indent_of(text, start, end) {
+        Some(indent) => (after, format!("\n{indent}#[blaze::{word}]")), // alloc: the fix's text
+        None => (after, format!(" #[blaze::{word}]")),                  // alloc: the fix's text
     }
 }
 
@@ -341,4 +363,49 @@ fn is_bstd_cx(db: &Db, adt: hir::Adt) -> bool {
         && module.name(db).is_some_and(|it| it.as_str() == "cx")
         && module.parent(db).is_some_and(|it| it.is_crate_root(db))
         && (facts::crate_is(db, krate, "bstd") || facts::crate_is(db, krate, "blaze_std"))
+}
+
+#[cfg(test)]
+mod tests {
+    use syntax::TextSize;
+
+    use super::{after, before};
+
+    fn at(offset: usize) -> TextSize {
+        TextSize::new(offset as u32)
+    }
+
+    /// A method linted by its body is the whole text: its first line's indentation is not
+    /// in it, and is its closing brace's.
+    #[test]
+    fn a_mark_at_the_start_of_a_body_s_anchor_takes_the_closing_brace_s_indentation() {
+        let method = "pub fn len(&self) -> usize {\n        self.0\n    }";
+        let end = at(method.len());
+        assert_eq!(before(method, at(0), end, "nopanic"), (at(0), "#[blaze::nopanic]\n    ".to_owned()));
+        let marked = "#[blaze::pure]\n    pub fn len(&self) -> usize {\n        self.0\n    }";
+        let end = at(marked.len());
+        assert_eq!(
+            after(marked, at(0), at(14), end, "noalloc"),
+            (at(14), "\n    #[blaze::noalloc]".to_owned())
+        );
+        // On one line there is no brace line to read: the mark goes on the line.
+        let one = "fn id(x: u8) -> u8 { x }";
+        assert_eq!(before(one, at(0), at(one.len()), "pure"), (at(0), "#[blaze::pure] ".to_owned()));
+    }
+
+    /// With the function's own line in the text (a doc comment above it, or a file's text)
+    /// the indentation is that line's, as before.
+    #[test]
+    fn a_mark_inside_the_text_takes_its_line_s_indentation() {
+        let text = "/// Doc.\n    pub fn f() {\n    }";
+        assert_eq!(
+            before(text, at(13), at(text.len()), "pure"),
+            (at(13), "#[blaze::pure]\n    ".to_owned())
+        );
+        let inline = "    #[inline] pub fn f() {\n    }";
+        assert_eq!(
+            before(inline, at(14), at(inline.len()), "pure"),
+            (at(14), "#[blaze::pure] ".to_owned())
+        );
+    }
 }

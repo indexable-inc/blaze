@@ -218,9 +218,12 @@ pub struct Profiling {
     /// `blaze-history` thread writes, and the explorer and `blaze debug sql` read.
     pub dir: PathBuf,
     pub duckdb: Option<PathBuf>,
-    /// The number of the daemon's first build: past every build the history names, so a build
-    /// stays one id across the daemon's restarts ([`History::next_build`]). Never 0.
-    pub first_build: u32,
+    /// The number of the daemon's first build, once the history's thread opened it: past
+    /// every build the history names, so a build stays one id across the daemon's restarts
+    /// ([`History::next_build`]), never 0; or the history's error. Taken by
+    /// [`Observe::numbering`]; `None` once taken (and in a test's profiling, which numbers
+    /// from 1).
+    pub opened: Option<Receiver<Result<u32, String>>>,
     ended: Sender<ToHistory>,
     failed: Receiver<String>,
     /// What the history's thread tells the loop of `blaze why`'s ledger: its restore, and each
@@ -229,6 +232,50 @@ pub struct Profiling {
     /// What the history's thread is doing, for a `blaze why` that waited too long to name.
     doing: Arc<Doing>,
 }
+
+/// How long the daemon's first build waits for the profile history to open before it fails,
+/// naming the history and its thread (rule 18): the open syncs twice and replays what the last
+/// daemon left, at most a few hundred milliseconds when measured.
+pub const OPEN_WAIT: Duration = Duration::from_secs(120);
+
+/// Why the daemon's builds cannot be numbered: the profile history at `dir` did not open.
+/// The daemon stops on it (`daemon::Failed::History`), as its start did when it waited for
+/// the open: a build numbered past no history could take the id of a build it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unopened {
+    pub dir: PathBuf,
+    pub why: Unopen,
+}
+
+/// What [`Unopened`] says of the open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unopen {
+    /// The history's own error.
+    Failed(String),
+    /// Its thread ended without a word.
+    Gone,
+    /// No word in [`OPEN_WAIT`].
+    Waited(Duration),
+}
+
+impl std::fmt::Display for Unopened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dir = self.dir.display();
+        match &self.why {
+            Unopen::Failed(why) => write!(f, "the profile history at {dir} did not open: {why}"),
+            Unopen::Gone => write!(
+                f,
+                "the profile history at {dir} did not open: its thread (`blaze-history`) ended before it opened it"
+            ),
+            Unopen::Waited(waited) => write!(
+                f,
+                "the profile history at {dir} did not open in {waited:?} (serve/observe.rs OPEN_WAIT): its thread (`blaze-history`) never answered"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unopened {}
 
 /// How long a `blaze why` waits for the builds that ended before it was asked to be explained,
 /// on the loop's clock, before it fails naming the build and what the history's thread is
@@ -341,8 +388,9 @@ pub struct Ended {
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
 /// a reader's ask for a flush.
 enum ToHistory {
-    /// Its row with outcome running and no end, written at once: the row a build has if its
-    /// daemon dies before it ends ([`history::writes`]).
+    /// Its row with outcome running and no end: the row a build has if its daemon dies
+    /// before it ends ([`history::writes`]). Written by the next flush made, which for a
+    /// build still running comes [`STARTED_FLUSH_AFTER`] after its start ([`Held`]).
     Started(BuildRow),
     /// Its misses explained and told at once (`blaze why` is answered from them), and its
     /// rows kept by the thread ([`Noted`]), given to no flush: the build's answer may still be
@@ -372,10 +420,17 @@ enum ToHistory {
     /// to the explorer's thread that waits for it ([`explorer_flush`]).
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
-    /// written at once. Its request was answered as this was sent ([`Observe::client_rows`]):
+    /// written by the next flush made ([`Held`]). Its request was answered as this was sent ([`Observe::client_rows`]):
     /// no client waits for a write, and one that fails is the history's failure, said in
     /// `blaze status` as any flush's is.
     Client(history::ClientRows),
+    /// A solo answer the loop took from its kept rows ([`Observe::solo_rows`]), numbered as a
+    /// build of its own: its row and its client's spans, written by the next flush made.
+    Solo(history::Solo, history::ClientRows),
+    /// A message whose taking panics, saying this: the planted fault of the supervised
+    /// thread's test.
+    #[cfg(test)]
+    Planted(String),
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -389,6 +444,9 @@ pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 struct Finished {
     ended: Ended,
     query_counts: Vec<QueryCountRow>,
+    /// Its writes of crate slots by who writes that kind (`base_db::take_given`, taken with
+    /// the counts): what the account attributes its `CrateSlot` writes by.
+    slots: blaze_profile::account::Slots,
 }
 
 /// A build that ended, explained, whose rows wait on the history's thread for its answer
@@ -411,6 +469,8 @@ struct Noted {
     keyed: Vec<KeyedMiss>,
     misses: Vec<blaze_profile::facts::MissRow>,
     test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// The build's account ([`account_of`]): its `accounts` row.
+    account: blaze_profile::account::AccountRow,
     /// `profile rows wait for the build's answer`, open from its end to its answer.
     _waits: tracing::Span,
 }
@@ -427,8 +487,10 @@ impl Noted {
             keyed,
             misses,
             test_runs,
+            account,
             _waits,
         } = self;
+        history.accounted([account]);
         history.linked(links);
         history.crate_graph(crate_deps);
         history.query_counted(query_counts);
@@ -440,21 +502,106 @@ impl Noted {
     }
 }
 
+/// The account of the build of `row` ([`blaze_profile::account`]): what the engine counted
+/// (`counts`), each step it computed again with where `blaze why`'s chain of reasons ends
+/// (`rebuilt`), and what the history has dropped so far (`dropped`). Made for every build that
+/// ends, on the history's thread, from the rows the build already gave: nothing a build has
+/// to remember to say.
+fn account_of(
+    row: &BuildRow,
+    counts: &[QueryCountRow],
+    rebuilt: &[blaze_api::Rebuild],
+    links: usize,
+    slots: blaze_profile::account::Slots,
+    dropped: u64,
+) -> blaze_profile::account::Account {
+    use blaze_api::Reason;
+    use blaze_profile::account::{Account, End, Origin, Seen, Step};
+    // alloc: once a build, a step a thing it computed again
+    let steps: Vec<Step> = rebuilt
+        .iter()
+        .map(|it| Step {
+            step: it.step.clone(), // clone: the account's copy, once a step
+            ends: it
+                .ends
+                .iter()
+                .map(|end| match end {
+                    Reason::InputChanged { file, input, .. } => End::Changed {
+                        origin: match *file {
+                            true => Origin::of_file(input, &row.workspace),
+                            false => Origin::Input,
+                        },
+                        input: input.clone(), // clone: as above
+                    },
+                    Reason::FirstTime => End::First,
+                    Reason::Evicted { .. } => End::Evicted,
+                    Reason::PreviousFailed { .. } => End::Left,
+                    Reason::Forced { .. } => End::Forced,
+                    Reason::KeyUnstable { .. } => End::Unstable,
+                    Reason::Unexplained { .. } => End::Unexplained,
+                })
+                .collect(),
+        })
+        .collect();
+    let seen = Seen { links: links as u64, slots, history_dropped: dropped };
+    Account::of(row.build_id, counts, &steps, seen)
+}
+
+/// Says `account` where the profile and a person see it: one `build account` event with its
+/// numbers (in `events`, as `edit work` is), and a WARN for each alarm and each sum that does
+/// not hold, which `blaze explain problems`, `blaze slow` and `blaze why` list first.
+fn say_account(account: &blaze_profile::account::Account) {
+    let row = &account.row;
+    let build = row.build_id;
+    tracing::info!(
+        target: "blaze",
+        build,
+        written = row.written,
+        executed = row.executed,
+        verified = row.verified,
+        steps = row.steps,
+        changes = row.changes,
+        unexplained = row.by_unexplained + row.by_unstable + row.ran_uncaused,
+        unbalanced = row.unbalanced,
+        history_dropped = row.history_dropped,
+        "build account: {}",
+        account.line()
+    );
+    for sum in &account.unbalanced {
+        tracing::warn!(
+            target: "blaze",
+            build,
+            total = sum.total,
+            by_cause = sum.by_cause,
+            "build {build}'s account does not add up, which is a bug in blaze: {} are {} and their causes count {}",
+            sum.what,
+            sum.total,
+            sum.by_cause
+        );
+    }
+    for alarm in account.alarms() {
+        tracing::warn!(target: "blaze", build, alarm = alarm.name(), "{}", alarm.text(build));
+    }
+}
+
 /// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
 /// cause, each untracked read by name. Taken with its database: by the task that stores the
 /// build's kept front end, after its answer ([`super::work::Steps::kept_run_log`]), or on the
 /// loop as the build ends when its front end is not kept ([`super::work::Writer::run_log`]);
 /// sorted by the engine, so the rows are the same each time.
 pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
-    let blaze_query::db::Taken { rows, dropped } = taken;
+    let blaze_query::db::Taken { rows, dropped, sampled } = taken;
     if dropped > 0 {
         // Never silent (rule 3): the counts in `query_counts` still hold every run.
         tracing::warn!(
             target: "blaze",
             build,
             dropped,
-            "the query engine's run log kept its first {} runs; the rest of build {build}'s are in `query_counts` alone",
+            sampled,
+            "the query engine's run log kept build {build}'s first {} runs whole and one in {} of the next {sampled} as a sample (`provenance.weight`); {} more are in `query_counts` alone",
             blaze_query::db::LOG_MOST,
+            blaze_query::db::SAMPLE_EVERY,
+            dropped - sampled,
         );
     }
     // alloc: once a build, a row a memo that ran again
@@ -463,7 +610,7 @@ pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<
 
 fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceRow {
     use blaze_query::db::{Cause, Logged};
-    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind } = run;
+    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind, weight } = run;
     let (outcome, cause, what) = match why {
         Logged::Ran(cause) => {
             let name = match cause {
@@ -487,6 +634,7 @@ fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceR
         cause_key: read,
         cause_kind: read_kind,
         what,
+        weight,
     }
 }
 
@@ -515,12 +663,17 @@ fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyedMiss> {
     misses.iter().map(keyed).collect()
 }
 
-/// What the query engine counted since the last take, as `build`'s `query_counts` rows. Taken
-/// on the loop as the build ends, so the next build's runs are its own.
-fn query_counts(build: u64) -> Vec<QueryCountRow> {
+/// What the query engine counted since the last take, as `build`'s `query_counts` rows: the
+/// front end's, by ingredient, and the daemon's own database's (`plan`, `std units`, the
+/// load's queries, by `Query::NAME`). Taken on the loop as the build ends, so the next build's
+/// runs are its own.
+fn query_counts(build: u64, plan: Option<&blaze_query::Database>) -> Vec<QueryCountRow> {
     // alloc: once a build, a row a query function that did anything
     let mut rows = Vec::new();
     blaze_query::db::take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
+    if let Some(plan) = plan {
+        plan.take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
+    }
     rows
 }
 
@@ -544,7 +697,22 @@ fn query_count_row(
         ran_changed,
         ran_untracked,
         ran_cycle,
+        validity,
     } = counts;
+    let blaze_query::db::Validity {
+        proved_seal,
+        proved_durability,
+        proved_summary,
+        proved_floor_durability,
+        proved_floor_summary,
+        proved_walk_end,
+        proved_reach,
+        proved_first,
+        edge_walked,
+        edge_gave_up,
+        edge_claimed,
+        edges_compared,
+    } = validity;
     QueryCountRow {
         build_id,
         query,
@@ -562,6 +730,20 @@ fn query_count_row(
         ran_changed,
         ran_untracked,
         ran_cycle,
+        validity: blaze_profile::facts::Validity {
+            proved_seal,
+            proved_durability,
+            proved_summary,
+            proved_floor_durability,
+            proved_floor_summary,
+            proved_walk_end,
+            proved_reach,
+            proved_first,
+            edge_walked,
+            edge_gave_up,
+            edge_claimed,
+            edges_compared,
+        },
     }
 }
 
@@ -577,9 +759,58 @@ impl Keeper {
     }
 }
 
-/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on,
-/// writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]); a history that does not
-/// open is the error, which fails `blaze serve`.
+/// The bytes the home's own store at `store` holds as the daemon starts, before it is opened:
+/// the length of every file under it (its packs, index table and whole files, as
+/// `blaze_cas::collect::Usage::bytes` counts them, with what is not yet committed). A store not
+/// made yet holds nothing; any other error names the file and fails the start. A layer read
+/// behind the store is another writer's directory, outside it, so it is not counted.
+fn home_store_bytes(store: &Path) -> Result<u64, String> {
+    let _span = tracing::info_span!(target: "blaze", "profile cap: measure the home's store", dir = %store.display()).entered();
+    let mut sum = 0u64;
+    // alloc: once a daemon's start, the directories still to list
+    let mut dirs = vec![store.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                // alloc: an error, once a daemon
+                return Err(format!("listing {} to size the profile's cap: {error}", dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                // alloc: an error, once a daemon
+                format!("listing {} to size the profile's cap: {error}", dir.display())
+            })?;
+            // A file the store removes as it is listed (it is not open yet: only a peer's
+            // collector) holds nothing.
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    // alloc: an error, once a daemon
+                    return Err(format!(
+                        "reading {} to size the profile's cap: {error}",
+                        entry.path().display()
+                    ));
+                }
+            };
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                sum = sum.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(sum)
+}
+
+/// Starts the thread `blaze-history`, which opens the history in `state` and keeps it from
+/// then on, writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]). Returns once
+/// the thread is spawned, never waiting for the open (its syncs, its replay of what the last
+/// daemon left): the first build waits for it ([`Observe::numbering`]), and a history that
+/// does not open stops the daemon there, named ([`Unopened`]).
 pub fn keep_history(
     state: &Path,
     duckdb: Option<PathBuf>,
@@ -595,11 +826,15 @@ pub fn keep_history(
         Err(std::env::VarError::NotUnicode(_)) => Some("(not UTF-8)"),
     };
     blaze_profile::sampler::sample_between_builds(blaze_profile::sampler::detail_of(detail)?);
+    // Unset, the cap follows what the home's own store holds as the daemon starts
+    // ([`history::cap_for`]); a layer read behind it is another writer's and not counted.
     let cap = match std::env::var(history::CAP_VAR) {
-        Ok(value) => history::cap_of(Some(&value))?,
-        Err(std::env::VarError::NotPresent) => history::cap_of(None)?,
+        Ok(value) => history::cap_of(Some(&value), 0)?,
+        Err(std::env::VarError::NotPresent) => {
+            history::cap_of(None, home_store_bytes(&state.join("store"))?)?
+        }
         Err(std::env::VarError::NotUnicode(value)) => {
-            history::cap_of(Some(&value.to_string_lossy()))?
+            history::cap_of(Some(&value.to_string_lossy()), 0)?
         }
     };
     let owner = claim(&dir).map_err(|it| it.to_string())?;
@@ -647,25 +882,51 @@ pub fn keep_history(
                     _ = told_to.send(Told::Restored { torn: said.torn, dropped: why.dropped() });
                     keep(history, &mut why, &rows, &failed_to, &told_to, &now);
                 }
-                Err(error) => _ = opened_to.send(Err(error.to_string())), // alloc: error path, once a daemon
+                Err(error) => {
+                    // alloc: error path, once a daemon
+                    let why = error.to_string();
+                    // Said by the loop at once, and the first build fails on it.
+                    _ = failed_to.send(why.clone()); // clone: error path, once a daemon
+                    _ = opened_to.send(Err(why));
+                }
             }
         })
         .map_err(|error| {
             format!("starting the profile history's thread (`blaze-history`): {error}")
         })?; // alloc: error path
-    let first_build =
-        match opened.recv() {
-            Ok(Ok(first)) => first,
-            Ok(Err(why)) => return Err(why),
-            Err(_) => return Err(
-                "the profile history's thread (`blaze-history`) ended before it opened the history"
-                    .to_owned(),
-            ), // alloc: error path
-        };
     // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
     // ([`provenance_rows`]); one that keeps none counts alone.
     blaze_query::db::log_runs(true);
-    Ok((Profiling { dir, duckdb, first_build, ended, failed, told, doing }, Keeper(thread)))
+    Ok((Profiling { dir, duckdb, opened: Some(opened), ended, failed, told, doing }, Keeper(thread)))
+}
+
+/// The number of the daemon's first build, as the history's thread at `dir` tells it on
+/// `opened`, waited for at most [`OPEN_WAIT`] under a span naming the wait.
+fn first_number(dir: &Path, opened: &Receiver<Result<u32, String>>) -> Result<u32, Unopened> {
+    let _waiting = tracing::info_span!(target: "blaze", "the first build waits for the profile history to open", dir = %dir.display()).entered();
+    // alloc: an error path, once a daemon
+    let unopened = |why| Unopened { dir: dir.to_path_buf(), why };
+    match opened.recv_timeout(OPEN_WAIT) {
+        Ok(Ok(first)) => Ok(first.max(1)),
+        Ok(Err(why)) => Err(unopened(Unopen::Failed(why))),
+        Err(RecvTimeoutError::Disconnected) => Err(unopened(Unopen::Gone)),
+        Err(RecvTimeoutError::Timeout) => Err(unopened(Unopen::Waited(OPEN_WAIT))),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the open's control: [`Observe::numbering`] waits for the open
+    /// itself, as the start did when it waited in `keep_history`.
+    static WAITS_AT_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each client's rows given to the history ([`Observe::client_rows`],
+    /// [`Observe::program_rows`]), as the history's thread would take them: its build, its
+    /// client times and its `spans` rows as encoded. What a test reads of a table only the
+    /// history's thread writes, kept whether the daemon keeps a history or not.
+    pub(crate) static CLIENT_ROWS: std::cell::RefCell<Vec<(u64, Option<(i64, i64)>, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Each solo answer given to the history ([`Observe::solo_rows`]), with the build it was
+    /// numbered: kept whether the daemon keeps a history or not, as [`CLIENT_ROWS`] is.
+    pub(crate) static SOLO_ROWS: std::cell::RefCell<Vec<(u64, blaze_certify::kept::Kept)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
 }
 
 /// A history another process writes: build ids are numbered from what a history holds, so a
@@ -792,6 +1053,14 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
 /// never as it ends: [`Noted`]), which writes its row and gives its spans
 /// its commit. A flush that fails is logged and told to the daemon, for `blaze daemon status`;
 /// the next one goes on.
+///
+/// Supervised (rule panics-fail-one-job, `blaze_profile::supervise::Supervisor`): a panic in a
+/// turn of it (outside a flush and outside a build's explaining, which contain their own) is
+/// caught, said once to the daemon (`blaze daemon status`, the `history:` line) and in the
+/// log, and the thread goes on with the next message; what it held across turns
+/// ([`Keeping`]) is kept. Past the supervisor's bound of panics in a minute it ends, saying so.
+/// Until 2026-11-12 such a panic ended the thread for the daemon's life and every later
+/// build's rows were dropped with nothing said (annoyances envkeys-1112-2, reth-1112-14).
 fn keep(
     mut history: History,
     why: &mut File,
@@ -800,40 +1069,121 @@ fn keep(
     told: &Sender<Told>,
     doing: &Doing,
 ) {
-    let mut flushed_at = Instant::now();
-    // When the history last wrote, or was last asked to by anything but the timer: a quiet
-    // history's timer writes only every `history::IDLE_EVERY`.
-    let mut written_at = Instant::now();
-    // The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
-    let mut noted: Vec<Noted> = Vec::new(); // alloc: none until a build ends
+    let began = Instant::now();
+    let mut keeping = Keeping {
+        flushed_at: began,
+        written_at: began,
+        noted: Vec::new(), // alloc: none until a build ends
+        held: Held::default(),
+        unwritten: Vec::new(), // alloc: none until a build ends
+    };
+    let mut supervisor = blaze_profile::supervise::Supervisor::default();
+    // What the history has dropped that the daemon was told of ([`tell_dropped`]).
+    let mut dropped_told = 0;
+    // Bounded (rule 18): each turn of this loop is a clean end or a panic, and the supervisor
+    // ends it past its bound of panics.
+    loop {
+        let turns = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keep_turns(&mut history, why, rows, failed, told, doing, &mut keeping, &mut dropped_told)
+        }));
+        let Err(panic) = turns else { return };
+        let what = blaze_profile::supervise::panic_text(&*panic);
+        let verdict = supervisor.panicked(began.elapsed(), &doing.said(), &what);
+        let (say, ends) = match verdict {
+            blaze_profile::supervise::Verdict::Restart { say } => (say, false),
+            blaze_profile::supervise::Verdict::GiveUp { say } => (Some(say), true),
+        };
+        if let Some(say) = say {
+            tracing::error!("{say}");
+            _ = failed.send(say);
+        }
+        if ends {
+            return;
+        }
+    }
+}
+
+/// What the `blaze-history` thread holds from one turn to the next: kept outside its turns, so
+/// a turn that panics loses its own message and nothing a turn before it took ([`keep`]).
+struct Keeping {
+    flushed_at: Instant,
+    /// When the history last wrote, or was last asked to by anything but the timer: a quiet
+    /// history's timer writes only every `history::IDLE_EVERY`.
+    written_at: Instant,
+    /// The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
+    noted: Vec<Noted>,
+    /// The flushes no reader waits for, held while builds come ([`Held`]).
+    held: Held,
+    /// The records of builds explained and not yet appended to `blaze why`'s ledger, oldest
+    /// first: written with the next flush made ([`File::write_all`]), never as a build ends.
+    unwritten: Vec<(u64, Vec<u8>)>,
+}
+
+/// Tells the daemon what the history has dropped since it opened, by table, each time that
+/// grew ([`History::dropped`]): the `history:` line of `blaze daemon status`.
+fn tell_dropped(history: &History, told: &mut u64, failed: &Sender<String>) {
+    let dropped = history.dropped();
+    if dropped.total() == *told {
+        return;
+    }
+    *told = dropped.total();
+    if let Some(line) = dropped.line() {
+        // alloc: error path, rows the history could not write
+        _ = failed.send(format!(
+            "the profile history has dropped {} rows it read and could not write, since the daemon began ({line}): totals over those tables are short by them",
+            dropped.total()
+        ));
+    }
+}
+
+/// The turns of the `blaze-history` thread, until the daemon hangs up (its last flush made)
+/// or one panics ([`keep`]).
+#[expect(clippy::too_many_arguments, reason = "the history thread's state, each its own")]
+fn keep_turns(
+    history: &mut History,
+    why: &mut File,
+    rows: &Receiver<ToHistory>,
+    failed: &Sender<String>,
+    told: &Sender<Told>,
+    doing: &Doing,
+    keeping: &mut Keeping,
+    dropped_told: &mut u64,
+) {
+    let Keeping { flushed_at, written_at, noted, held, unwritten } = keeping;
     loop {
         doing.set(Step::Waiting, 0);
         let due = history::EVERY.saturating_sub(flushed_at.elapsed());
+        let due = held.due_in(Instant::now()).map_or(due, |it| it.min(due));
         let next = crossbeam_channel::select! {
             recv(rows) -> it => it.map_err(|_| RecvTimeoutError::Disconnected),
             recv(history.full()) -> _ => {
                 doing.set(Step::FlushingFull, 0);
-                if let Err(error) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| history.flush(None)) {
+                if let Err(error) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| history.flush_contained(None)) {
                     tracing::error!("{error}");
                     _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
                 }
-                tell_failed(&mut history, failed);
-                flushed_at = Instant::now();
-                written_at = flushed_at;
+                tell_failed(history, failed);
+                tell_dropped(history, dropped_told, failed);
+                *flushed_at = Instant::now();
+                *written_at = *flushed_at;
+                held.flushed();
                 continue;
             }
             default(due) => Err(RecvTimeoutError::Timeout),
         };
+        // The timer's turn, or a held flush's: either flushes now.
+        let timed = matches!(next, Err(RecvTimeoutError::Timeout));
         // The timer, with no build running, none whose row or answer waits, and a write
         // within the last minute: nothing a flush now would write but the daemon's own
         // heartbeat, a file a table for a few hundred rows. Held for the next flush anything
         // asks for, at most `history::IDLE_EVERY`.
-        if matches!(next, Err(RecvTimeoutError::Timeout))
+        if timed
+            && !held.owes()
             && noted.is_empty()
             && history.quiet()
             && written_at.elapsed() < history::IDLE_EVERY
         {
-            flushed_at = Instant::now();
+            *flushed_at = Instant::now();
             continue;
         }
         // In a task of the profile's tag, so what a flush reads and keeps (the rings' rows,
@@ -854,15 +1204,27 @@ fn keep(
             let mut next = Some(next);
             // Bounded: `MOST_BATCH` turns at most.
             while let Some(taken) = next.take() {
-                take(taken, &mut history, why, &mut noted, failed, told, doing, &mut batch);
+                take(taken, history, why, noted, unwritten, failed, told, doing, &mut batch);
                 batch.taken += 1;
                 if batch.last || batch.taken == MOST_BATCH {
                     break;
                 }
                 next = rows.try_recv().ok().map(Ok);
             }
-            let Some(build) = batch.flush else { return (Ok(()), batch.last) };
-            let flushed = history.flush(build);
+            // A flush no reader waits for, asked by a build's start, its answer or what
+            // follows it, is held while builds come ([`Held`]): it is made by the timer's turn
+            // that finds it due, or with the next flush a reader or the thread's end asks.
+            let waited_for = !batch.asked.is_empty() || !batch.asked_for.is_empty() || batch.last;
+            let now = Instant::now();
+            // Past its bound, what is held is flushed with this batch whatever it asks.
+            let overdue = held.due_in(now).is_some_and(|it| it.is_zero());
+            if !(timed || waited_for || overdue) {
+                held.note(batch.started, batch.flush, now);
+                return (Ok(()), false);
+            }
+            let Some(build) = held.take(batch.flush) else { return (Ok(()), batch.last) };
+            write_why(why, unwritten, failed);
+            let flushed = history.flush_contained(build);
             let seq = || match &flushed {
                 Ok(it) => Ok(it.seq),
                 // alloc: error path, a flush that failed
@@ -876,17 +1238,28 @@ fn keep(
             }
             (flushed.map(drop), batch.last)
         });
-        flushed_at = Instant::now();
-        written_at = flushed_at;
+        *flushed_at = Instant::now();
+        *written_at = *flushed_at;
         if let Err(error) = flushed {
             tracing::error!("{error}");
             _ = failed.send(error.to_string()); // alloc: error path, a flush that failed
         }
-        tell_failed(&mut history, failed);
+        tell_failed(history, failed);
+        tell_dropped(history, dropped_told, failed);
         if last {
             return;
         }
     }
+}
+
+/// The records of the builds explained since `blaze why`'s ledger was last written, appended
+/// together ([`File::write_all`]); a failure is logged and told to the daemon, as a flush's.
+fn write_why(why: &mut File, unwritten: &mut Vec<(u64, Vec<u8>)>, failed: &Sender<String>) {
+    if let Err(error) = why.write_all(unwritten) {
+        tracing::error!("{error}");
+        _ = failed.send(error);
+    }
+    unwritten.clear();
 }
 
 /// The most messages of the loop's that one flush of the history's thread covers ([`keep`]).
@@ -906,6 +1279,95 @@ struct Batch {
     taken: u32,
     /// The daemon hung up: this flush is the thread's last.
     last: bool,
+    /// A build started ([`ToHistory::Started`]): its row waits for a flush, and asks for none
+    /// of its own at once ([`Held`]).
+    started: bool,
+}
+
+/// How long after a build starts its row is flushed if nothing flushed it sooner: a build
+/// still running by then is one a daemon that dies leaves a row of (`history::writes`). An
+/// edit's build ends well inside it, and its own flush, after its answer, writes the row.
+/// Until 2026-11-11 a build's start flushed at once: several files written and synced on the
+/// disk the build's outputs go to, begun as the build began and still under way as they were
+/// placed (measured on APFS, hello world's body edit: the flush 104 to 174 ms from the
+/// build's first task, its outputs' placement 24 to 63 ms beside it against 6 ms alone).
+const STARTED_FLUSH_AFTER: Duration = Duration::from_millis(500);
+
+/// How long the history's thread waits, after the last build's start or answer, before it
+/// makes a flush no reader waits for: the next edit's build, tens of milliseconds behind the
+/// last one's answer in an edit loop, then shares the disk with no flush of the last one's
+/// profile. A flush held is made at the latest [`history::EVERY`] after it was first owed.
+const FLUSH_QUIET: Duration = Duration::from_millis(300);
+
+/// The flushes of the history that no reader waits for, held back while builds come: a
+/// build's start, its answer, its run log and its client's rows each ask for one, and each is
+/// seconds of writes and syncs at worst on the disk builds place their outputs on. A flush a
+/// reader asks for (`blaze why`, `blaze debug sql`), the timer's and the thread's last are
+/// made at once and take what is held with them, so no reader sees the wait.
+///
+/// The bound (rule 18): a flush owed is made [`FLUSH_QUIET`] after the last message that asked
+/// for one or said a build started, and no later than [`history::EVERY`] after it was first
+/// owed; a started build's row no later than [`STARTED_FLUSH_AFTER`] after its start.
+#[derive(Default)]
+struct Held {
+    /// The flush owed, as [`Batch::flush`] has it, and since when.
+    owed: Option<(Option<u64>, Instant)>,
+    /// When the builds have been quiet long enough for it.
+    quiet_at: Option<Instant>,
+    /// When a started build's row is flushed for itself.
+    started_at: Option<Instant>,
+}
+
+impl Held {
+    /// A batch that no reader waits for was taken at `now`: `started` when a build started
+    /// in it, `flush` what it asked to be flushed.
+    fn note(&mut self, started: bool, flush: Option<Option<u64>>, now: Instant) {
+        if started && self.started_at.is_none() {
+            self.started_at = Some(now + STARTED_FLUSH_AFTER);
+        }
+        if let Some(build) = flush {
+            let (owed, since) = self.owed.unwrap_or((None, now));
+            self.owed = Some((owed.max(build), since));
+        }
+        if self.owed.is_some() && (started || flush.is_some()) {
+            self.quiet_at = Some(now + FLUSH_QUIET);
+        }
+    }
+
+    /// Whether a flush is held.
+    fn owes(&self) -> bool {
+        self.owed.is_some() || self.started_at.is_some()
+    }
+
+    /// How long from `now` until what is held is due; `None` with nothing held.
+    fn due_in(&self, now: Instant) -> Option<Duration> {
+        let owed = self.owed.map(|(_, since)| {
+            let latest = since + history::EVERY;
+            self.quiet_at.map_or(latest, |quiet| quiet.min(latest))
+        });
+        let at = match (owed, self.started_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        at.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// The flush to make now, of what is held and what the turn asks (`flush`), and nothing
+    /// held after it; `None` when neither asks for one.
+    fn take(&mut self, flush: Option<Option<u64>>) -> Option<Option<u64>> {
+        let owed = self.owed.take().map(|it| it.0);
+        let started = self.started_at.take().is_some();
+        self.quiet_at = None;
+        match (owed, flush) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b).or(started.then_some(None)),
+        }
+    }
+
+    /// A flush was made that wrote every row given: nothing is held.
+    fn flushed(&mut self) {
+        *self = Held::default();
+    }
 }
 
 impl Batch {
@@ -924,6 +1386,7 @@ fn take(
     history: &mut History,
     why: &mut File,
     noted: &mut Vec<Noted>,
+    unwritten: &mut Vec<(u64, Vec<u8>)>,
     failed: &Sender<String>,
     told: &Sender<Told>,
     doing: &Doing,
@@ -943,7 +1406,9 @@ fn take(
         Ok(ToHistory::Started(row)) => {
             doing.set(Step::Flushing, row.build_id);
             history.build_started(row);
-            batch.flush(None);
+            // No flush of its own at once: the build's outputs are about to be placed on the
+            // disk a flush writes and syncs ([`Held`], [`STARTED_FLUSH_AFTER`]).
+            batch.started = true;
         }
         Ok(ToHistory::Ran(rows)) => {
             doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
@@ -951,6 +1416,8 @@ fn take(
             batch.flush(None);
         }
         Ok(ToHistory::Errored(rows)) => history.errored(rows),
+        #[cfg(test)]
+        Ok(ToHistory::Planted(what)) => panic!("{what}"),
         Ok(ToHistory::Client(rows)) => {
             let build = rows.build;
             doing.set(Step::Flushing, build);
@@ -962,26 +1429,72 @@ fn take(
                 }
             }
         }
+        Ok(ToHistory::Solo(solo, rows)) => {
+            let build = solo.build;
+            doing.set(Step::Flushing, build);
+            match history.solo_build(solo, &rows) {
+                Ok(()) => batch.flush(Some(build)),
+                Err(error) => {
+                    tracing::error!("{error}");
+                    _ = failed.send(error.to_string()); // alloc: error path
+                }
+            }
+        }
         Ok(ToHistory::Ended(Finished {
             ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
             query_counts,
+            slots,
         })) => {
             let build = row.build_id;
             let ended_well = matches!(row.outcome, history::Outcome::Ok);
             // Before the ledger takes the misses: their keys' parts, which it drops.
             let keyed = key_parts(build, &misses);
             doing.set(Step::Explaining, build);
-            let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
+            // A panic while explaining fails this build's explanation alone (rule
+            // panics-fail-one-job): the build is still told explained, with the one reason
+            // that it could not be, so the loop's count of builds explained stays whole and
+            // no later `blaze why` waits for an answer that never comes.
+            let explained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                why.explain(build, ended_well, misses)
+            }));
+            let (rebuilt, misses, record) = match explained {
+                Ok(explained) => explained,
+                Err(panic) => {
+                    let what = blaze_profile::supervise::panic_text(&*panic);
+                    // alloc: error path
+                    let said = format!(
+                        "explaining build {build}'s misses panicked ({what}): its steps are not explained, its `misses` rows are not written, and a later build compared with it may be explained short"
+                    );
+                    tracing::error!("{said}");
+                    _ = failed.send(said.clone()); // clone: error path
+                    // alloc: error path
+                    let unexplained = blaze_api::Rebuild {
+                        ends: vec![blaze_api::Reason::Unexplained { what: said.clone() }], // clone: error path
+                        item: format!("build {build}"),
+                        step: "blaze why".to_owned(),
+                        cause: blaze_api::RebuildCause::Failed { why: said },
+                    };
+                    (vec![unexplained], Vec::new(), Vec::new()) // alloc: error path
+                }
+            };
+            // The build's account, from the same reasons its `blaze why` answer gives.
+            let account = account_of(
+                &row,
+                &query_counts,
+                &rebuilt,
+                links.len(),
+                slots,
+                history.dropped().total(),
+            );
+            say_account(&account);
             // clone: the answer's copy of whose build it is, once a build
             let answer = Answer::new(build, row.workspace.clone(), row.command.clone(), rebuilt);
             // Sent before the record is durable: an answer may name a build whose record a
             // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
             _ = told.send(Told::Explained { answer, dropped: why.dropped() });
-            doing.set(Step::Appending, build);
-            if let Err(error) = why.write(build, &record) {
-                tracing::error!("{error}");
-                _ = failed.send(error);
-            }
+            // Its record is appended with the next flush made (`keep`, [`write_why`]): the
+            // append is synced, on the disk the build's outputs are being placed on now.
+            unwritten.push((build, record)); // alloc: once a build
             if row.commit.is_none() {
                 row.commit = commit_of(Path::new(&row.workspace));
             }
@@ -1008,6 +1521,7 @@ fn take(
                 keyed,
                 misses,
                 test_runs,
+                account: account.row,
                 _waits: waits,
             });
         }
@@ -1027,6 +1541,7 @@ fn take(
         }
         Err(RecvTimeoutError::Disconnected) => {
             doing.set(Step::Closing, 0);
+            write_why(why, unwritten, failed);
             if let Err(error) = why.close() {
                 tracing::error!("{error}");
                 _ = failed.send(error);
@@ -1239,10 +1754,21 @@ impl Observe {
         self.tasks.clock(super::plane::ns(now), blaze_profile::clock::mono_ns());
     }
 
-    /// The number of the daemon's first build ([`Profiling::first_build`]); a daemon that
-    /// keeps no history numbers from 1, as 0 is no build.
-    pub fn first_build(&self) -> u32 {
-        self.profiling.as_ref().map_or(1, |it| it.first_build)
+    /// How the plane numbers the daemon's builds: from the history's first number
+    /// ([`Profiling::opened`]), asked at the plane's first open and not before, so the start
+    /// waits for no open of the history; a daemon that keeps no history numbers from 1, as 0
+    /// is no build. Asked once a daemon: a second ask numbers from 1.
+    pub fn numbering(&mut self) -> super::plane::Numbered {
+        let Some((dir, opened)) =
+            self.profiling.as_mut().and_then(|it| Some((it.dir.clone(), it.opened.take()?))) // clone: a path, once a daemon
+        else {
+            return super::plane::Numbered::From(1);
+        };
+        #[cfg(test)]
+        if WAITS_AT_START.get() {
+            return super::plane::Numbered::From(first_number(&dir, &opened).unwrap_or(1));
+        }
+        super::plane::Numbered::Later(Box::new(move || first_number(&dir, &opened))) // alloc: once a daemon
     }
 
     /// The history's last error.
@@ -1288,7 +1814,9 @@ impl Observe {
 
     /// A build that ended, for the history to write with what the query engine counted by
     /// now; dropped by a daemon that keeps none, which takes no counts.
-    pub fn ended(&mut self, mut ended: Ended) {
+    /// `plan`: the daemon's one database, whose counts since the last build's end are this
+    /// build's rows too.
+    pub fn ended(&mut self, mut ended: Ended, plan: Option<&blaze_query::Database>) {
         let build = ended.row.build_id;
         let Some(profiling) = &self.profiling else {
             let _span =
@@ -1308,8 +1836,12 @@ impl Observe {
             self.answers.add(answer, dropped);
             return;
         };
-        let query_counts = query_counts(build);
-        let sent = profiling.ended.send(ToHistory::Ended(Finished { ended, query_counts }));
+        let query_counts = query_counts(build, plan);
+        // alloc: once a build, a kind of crate slot it wrote
+        let mut given: Vec<(&'static str, u64)> = Vec::new();
+        base_db::take_given(|kind, writes| given.push((kind, writes)));
+        let slots = blaze_profile::account::Slots::of(given);
+        let sent = profiling.ended.send(ToHistory::Ended(Finished { ended, query_counts, slots }));
         // Counted whether or not it reached the history's thread: one that never did is never
         // explained, and `blaze why` says so rather than answer with an older build's reasons
         // (rule 3).
@@ -1346,14 +1878,77 @@ impl Observe {
     /// ([`Observe::history_error`]), not the client's. A daemon that keeps no history answers
     /// the same and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
     pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
+        // clone: a test's record of the rows, once a client
+        #[cfg(test)]
+        CLIENT_ROWS.with_borrow_mut(|it| it.push((rows.build, rows.times, rows.spans.clone())));
         let Some(profiling) = &self.profiling else {
             return out.push(Reply { to, response: Response::Done { ok: true } });
         };
         if profiling.ended.send(ToHistory::Client(rows)).is_err() {
             let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
-            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS_AT.to_owned()))); // alloc: error path
         }
         out.push(Reply { to, response: Response::Done { ok: true } });
+    }
+
+    /// Whether the loop takes the solo answers' kept rows ([`Observe::solo_rows`]): a daemon
+    /// that keeps a history does; one that keeps none leaves them for the next daemon that
+    /// does, rather than take rows it would drop. A test's daemon, which keeps none, takes them
+    /// into [`SOLO_ROWS`].
+    pub fn takes_solo_rows(&self) -> bool {
+        self.profiling.is_some() || cfg!(test)
+    }
+
+    /// A solo answer's kept rows, taken by the loop and numbered `build`: its spans made its
+    /// process's rows as a client's are, and its row and spans handed to the history's thread.
+    /// Spans that do not encode, or a thread that is gone, are said at error naming the build
+    /// and the process: the file is already taken, so the record is lost, loudly.
+    pub fn solo_rows(&mut self, build: u64, kept: blaze_certify::kept::Kept) {
+        let spans = match crate::cli::client_rows::spans_of(build, kept.pid, Vec::new(), &kept.timed) {
+            Ok(spans) => spans,
+            Err(why) => {
+                return tracing::error!(target: "blaze", "the solo answer of process {} (build {build}) is not kept: {why}", kept.pid);
+            }
+        };
+        let pid = kept.pid;
+        // clone: a test's record of what was taken, once a solo answer
+        #[cfg(test)]
+        SOLO_ROWS.with_borrow_mut(|it| it.push((build, kept.clone())));
+        let Some(profiling) = &self.profiling else { return };
+        let blaze_certify::kept::Kept { started_ns, ended_ns, certified, slot, workspace, command, .. } = kept;
+        let solo = history::Solo { build, started_ns, ended_ns, workspace, command, slot, certified_by: certified };
+        let rows = history::ClientRows { build, times: None, spans, ..history::ClientRows::default() };
+        if profiling.ended.send(ToHistory::Solo(solo, rows)).is_err() {
+            tracing::error!(target: "blaze", "the profile history's thread (`blaze-history`) is gone: the solo answer of process {pid} (build {build}) is not kept");
+        }
+    }
+
+    /// A launched program's two spans (`program: exec to Hello`, `program: Hello to exit`),
+    /// made by the launch host once its process ended: written as `blaze client` rows of its
+    /// process under the build that ran it, with no client times (the client's own rows set
+    /// those). A span that does not encode is said at error, naming the build and process.
+    pub fn program_rows(&mut self, ran: crate::serve::unit::run::launch::ProgramSpans) {
+        #[cfg(not(test))]
+        let Some(profiling) = &self.profiling else { return };
+        let spans = match crate::cli::client_rows::spans_of(ran.build, ran.pid, Vec::new(), &ran.timed) {
+            Ok(spans) => spans,
+            Err(why) => {
+                return tracing::error!(target: "blaze", "the program spans of build {} (process {}) are not kept: {why}", ran.build, ran.pid);
+            }
+        };
+        // A test's record of the rows is kept with no history too: the rows are made first.
+        #[cfg(test)]
+        let Some(profiling) = ({
+            // clone: a test's record of the rows, once a program
+            CLIENT_ROWS.with_borrow_mut(|it| it.push((ran.build, None, spans.clone())));
+            &self.profiling
+        }) else {
+            return;
+        };
+        let rows = history::ClientRows { build: ran.build, times: None, spans, ..history::ClientRows::default() };
+        if profiling.ended.send(ToHistory::Client(rows)).is_err() {
+            tracing::error!(target: "blaze", "the profile history's thread (`blaze-history`) is gone: the program spans of build {} are not kept", ran.build);
+        }
     }
 
     /// `blaze why`: what the last build computed again and why, in groups (each listing
@@ -1638,7 +2233,7 @@ impl Observe {
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
 /// What a client's profile rows are named as in an error.
-const CLIENT_ROWS: &str = "a client's profile rows";
+const CLIENT_ROWS_AT: &str = "a client's profile rows";
 
 /// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
 /// C: the explorer serves through Flecs and blaze-http's HTTP/3 on ring) says to the explorer.
@@ -1769,7 +2364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A ring of the test's own: the process's is a sampler's wherever one runs.
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
-        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let history = History::open(dir.path(), history::CAP_MOST, &UNSAMPLED).unwrap();
         let counts = blaze_query::db::Counts {
             executed: 6384,
             verified: 1,
@@ -1785,6 +2380,20 @@ mod tests {
             ran_changed: 11,
             ran_untracked: 12,
             ran_cycle: 13,
+            validity: blaze_query::db::Validity {
+                proved_seal: 14,
+                proved_durability: 15,
+                proved_summary: 16,
+                proved_floor_durability: 17,
+                proved_floor_summary: 18,
+                proved_walk_end: 19,
+                proved_reach: 20,
+                proved_first: 21,
+                edge_walked: 22,
+                edge_gave_up: 23,
+                edge_claimed: 24,
+                edges_compared: 25,
+            },
         };
         let row = query_count_row(71, "mir_body_query", counts);
         assert_eq!(
@@ -1805,6 +2414,38 @@ mod tests {
                 row.ran_cycle
             ],
             [6384, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
+        let blaze_profile::facts::Validity {
+            proved_seal,
+            proved_durability,
+            proved_summary,
+            proved_floor_durability,
+            proved_floor_summary,
+            proved_walk_end,
+            proved_reach,
+            proved_first,
+            edge_walked,
+            edge_gave_up,
+            edge_claimed,
+            edges_compared,
+        } = row.validity;
+        assert_eq!(
+            [
+                proved_seal,
+                proved_durability,
+                proved_summary,
+                proved_floor_durability,
+                proved_floor_summary,
+                proved_walk_end,
+                proved_reach,
+                proved_first,
+                edge_walked,
+                edge_gave_up,
+                edge_claimed,
+                edges_compared,
+            ],
+            [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+            "each count of the validity census under its own name"
         );
         let ended = Ended {
             row: BuildRow {
@@ -1832,7 +2473,7 @@ mod tests {
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
-        to.send(ToHistory::Ended(Finished { ended, query_counts: vec![row] })).unwrap();
+        to.send(ToHistory::Ended(Finished { ended, query_counts: vec![row], slots: Default::default() })).unwrap();
         drop(to);
         let (mut why, _) = File::restore(dir.path());
         let (told_to, told) = crossbeam_channel::unbounded();
@@ -1896,13 +2537,13 @@ mod tests {
         let keeper = std::thread::Builder::new()
             .name("blaze-history-test".to_owned())
             .spawn(move || {
-                let history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
                 let (mut why, _) = File::restore(&at);
                 keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
             })
             .unwrap();
         let bound = Duration::from_secs(60);
-        let ended = Finished { ended: ended_row(71), query_counts: Vec::new() };
+        let ended = Finished { ended: ended_row(71), query_counts: Vec::new(), slots: Default::default() };
         sent.send(ToHistory::Ended(ended)).unwrap();
         sent.send(ToHistory::Flush(to(1, 1))).unwrap();
         assert!(matches!(
@@ -1922,6 +2563,140 @@ mod tests {
         assert_eq!(failed.try_recv().ok(), None);
     }
 
+    /// The invariant: a panic in a turn of the history's thread ends nothing. It is told to
+    /// the daemon, saying what panicked and that the thread goes on, and the build that ends
+    /// after it is explained, accounted and written as any other. Its control is
+    /// `the_oracle_catches_a_history_thread_that_ends_at_its_first_panic`.
+    #[test]
+    fn a_planted_panic_in_the_history_thread_is_told_and_the_next_build_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let at = dir.path().to_path_buf();
+        let keeper = std::thread::Builder::new()
+            .name("blaze-history-test".to_owned())
+            .spawn(move || {
+                let history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
+                let (mut why, _) = File::restore(&at);
+                keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
+            })
+            .unwrap();
+        let bound = Duration::from_secs(60);
+        sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new(), slots: Default::default() }))
+            .unwrap();
+        sent.send(ToHistory::Answered(72)).unwrap();
+        sent.send(ToHistory::Flush(to(1, 1))).unwrap();
+        assert_eq!(written_after_a_panic(&told, 72, bound), None);
+        assert!(matches!(told.recv_timeout(bound), Ok(Told::Flushed { seq: Ok(_), .. })));
+        let said = failed.recv_timeout(bound).unwrap();
+        assert!(
+            said.contains("panicked") && said.contains("byte array offset overflow") && said.contains("the thread goes on"),
+            "{said}"
+        );
+        let files: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|it| it.starts_with("72-"))
+            .collect();
+        assert!(files.iter().any(|it| it.ends_with(".builds.parquet")), "{files:?}");
+        assert!(files.iter().any(|it| it.ends_with(".accounts.parquet")), "{files:?}");
+        drop(sent);
+        keeper.join().unwrap();
+    }
+
+    /// The oracle of the supervised thread's test: why the history's thread did not go on
+    /// after a panic (the build that ended after it was never told explained), or `None`.
+    fn written_after_a_panic(told: &Receiver<Told>, build: u64, bound: Duration) -> Option<String> {
+        match told.recv_timeout(bound) {
+            Ok(Told::Explained { answer, .. }) if answer.build == build => None,
+            Ok(_) => Some(format!("build {build} was not the next thing told")),
+            Err(error) => Some(format!("build {build} was never explained: {error}")),
+        }
+    }
+
+    /// The control: the thread as it was until 2026-11-12, its turns run with no supervisor,
+    /// ends at the planted panic, and the build after it is never explained.
+    #[test]
+    fn the_oracle_catches_a_history_thread_that_ends_at_its_first_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, _failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let at = dir.path().to_path_buf();
+        let keeper = std::thread::Builder::new()
+            .name("blaze-history-test".to_owned())
+            .spawn(move || {
+                let mut history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
+                let (mut why, _) = File::restore(&at);
+                let now = Instant::now();
+                let mut keeping = Keeping {
+                    flushed_at: now,
+                    written_at: now,
+                    noted: Vec::new(),
+                    held: Held::default(),
+                    unwritten: Vec::new(),
+                };
+                let doing = Doing::default();
+                keep_turns(&mut history, &mut why, &rows, &failed_to, &told_to, &doing, &mut keeping, &mut 0)
+            })
+            .unwrap();
+        sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new(), slots: Default::default() }))
+            .unwrap();
+        assert!(keeper.join().is_err(), "the unsupervised thread ends by its panic");
+        let caught = written_after_a_panic(&told, 72, Duration::from_secs(60));
+        assert!(caught.is_some_and(|it| it.contains("never explained")));
+    }
+
+    /// The invariant of [`Held`]: a flush no reader waits for is due [`FLUSH_QUIET`] after the
+    /// last build's start or answer, never later than [`history::EVERY`] after it was first
+    /// owed, and a started build's row [`STARTED_FLUSH_AFTER`] after its start at the latest;
+    /// nothing is due while nothing is held; and a flush made takes all that is held, the
+    /// highest build with it. The control: the history as it was until 2026-11-11 flushed at
+    /// each start and answer, which is `due_in` of zero at each, and none is.
+    #[test]
+    fn a_flush_no_reader_waits_for_is_held_while_builds_come() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut held = Held::default();
+        assert_eq!(held.due_in(t0), None);
+        assert!(!held.owes());
+        // A build starts: its row alone is due after `STARTED_FLUSH_AFTER`, not now.
+        held.note(true, None, at(0));
+        assert_eq!(held.due_in(at(0)), Some(STARTED_FLUSH_AFTER));
+        // It is answered 40 ms later: the flush is owed, due once the builds are quiet.
+        held.note(false, Some(Some(7)), at(40));
+        assert_eq!(held.due_in(at(40)), Some(FLUSH_QUIET));
+        // The next edit's build starts 60 ms later and is answered: the quiet begins again.
+        held.note(true, None, at(100));
+        assert_eq!(held.due_in(at(100)), Some(FLUSH_QUIET));
+        held.note(false, Some(Some(8)), at(140));
+        assert_eq!(held.due_in(at(140)), Some(FLUSH_QUIET));
+        assert_eq!(held.due_in(at(140) + FLUSH_QUIET), Some(Duration::ZERO));
+        // Builds that keep coming do not hold it past `EVERY` from when it was first owed.
+        let mut ms = 140;
+        while Duration::from_millis(ms) < history::EVERY {
+            ms += 100;
+            held.note(true, Some(Some(9)), at(ms));
+        }
+        let first_owed = at(40);
+        let due = held.due_in(at(ms)).expect("a flush is held");
+        assert!(at(ms) + due <= first_owed + history::EVERY, "{due:?}");
+        // The flush made takes all of it, the highest build's rows merged.
+        assert_eq!(held.take(Some(None)), Some(Some(9)));
+        assert_eq!(held.due_in(at(ms)), None);
+        assert_eq!(held.take(None), None);
+        // A start alone, then the timer's turn: its row is flushed, of no build's end.
+        held.note(true, None, at(0));
+        assert!(held.owes());
+        assert_eq!(held.take(None), Some(None));
+        assert!(!held.owes());
+    }
+
     /// The planted bug: the history as it was until 2026-11-11, a build's row in a file as
     /// the build ended, before its answer. The oracle names the file.
     #[test]
@@ -1938,7 +2713,7 @@ mod tests {
     fn a_readers_flush_is_written_then_told_with_its_number() {
         let dir = tempfile::tempdir().unwrap();
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
-        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let history = History::open(dir.path(), history::CAP_MOST, &UNSAMPLED).unwrap();
         let (sent, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
         sent.send(ToHistory::Flush(to(4, 9))).unwrap();
@@ -2026,7 +2801,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
-            first_build: 1,
+            opened: None,
             ended,
             failed,
             told,
@@ -2041,12 +2816,12 @@ mod tests {
                 dropped: None,
             })
             .unwrap();
-        observe.ended(ended_row(1));
+        observe.ended(ended_row(1), None);
         observe.rebuilt(to(1, 1), Some("/w".to_owned()), None, false, at, &mut out);
         assert!(out.is_empty(), "build 1 is not explained yet: {out:?}");
         assert_eq!(observe.wait(at), Some(WHY_WAIT), "the loop wakes by the deadline");
         // A build that ends after it was asked is not waited for.
-        observe.ended(ended_row(2));
+        observe.ended(ended_row(2), None);
         told_to.send(explained(1)).unwrap();
         observe.tick(at, |_| false, &mut out);
         match &out[..] {
@@ -2137,7 +2912,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
-            first_build: 1,
+            opened: None,
             ended,
             failed,
             told,
@@ -2146,21 +2921,21 @@ mod tests {
         let mut observe = Observe::new(Some(profiling));
         let mut out = Vec::new();
         let at = Duration::from_secs(5);
-        observe.ended(ended_row(1));
+        observe.ended(ended_row(1), None);
         told_to.send(explained(1)).unwrap();
         observe.tick(at, |_| false, &mut out);
         assert!(out.is_empty(), "{out:?}");
 
         // The thread ends; the loop has not seen it yet. Build 2's send fails.
         drop(rows);
-        observe.ended(ended_row(2));
+        observe.ended(ended_row(2), None);
         assert!(observe.history_error().is_some_and(|it| it.contains("no build is written")));
         observe.rebuilt(to(1, 1), None, None, false, at, &mut out);
         assert!(out.is_empty(), "held for build 2, not answered with build 1: {out:?}");
         drop(told_to);
         observe.tick(at, |_| false, &mut out);
         // Seen gone: build 3 ends after, and one asked then fails at once.
-        observe.ended(ended_row(3));
+        observe.ended(ended_row(3), None);
         observe.rebuilt(to(1, 2), None, None, false, at, &mut out);
         match &out[..] {
             [
@@ -2199,7 +2974,76 @@ mod tests {
             .collect();
         assert_eq!(refused, [Some("blaze explore"), Some("a read of the profile history")]);
         assert_eq!(out.last().map(|it| &it.response), Some(&Response::Done { ok: false }));
-        assert_eq!(observe.first_build(), 1);
+        assert!(matches!(observe.numbering(), super::super::plane::Numbered::From(1)));
+    }
+
+    /// An observer of a history whose thread tells its open on `opened`, at `dir`.
+    fn opening(dir: &Path, opened: Receiver<Result<u32, String>>) -> Observe {
+        let (ended, _rows) = crossbeam_channel::unbounded();
+        let (_failed_to, failed) = crossbeam_channel::unbounded();
+        let (_told_to, told) = crossbeam_channel::unbounded();
+        Observe::new(Some(Profiling {
+            dir: dir.to_path_buf(),
+            duckdb: None,
+            opened: Some(opened),
+            ended,
+            failed,
+            told,
+            doing: Arc::new(Doing::default()),
+        }))
+    }
+
+    /// The invariant: the daemon's start waits for no open of its history: `numbering` returns
+    /// while the open is held (the history's word not yet sent, the test's gate), its number is
+    /// asked only by the plane's first open, which waits for the gate and is answered the
+    /// history's number; a history that fails, or whose thread ends without a word, is a typed
+    /// error naming the history's directory, never a panic. Control: the planted
+    /// `WAITS_AT_START` (the start waiting for the open, as before) does not return while the
+    /// gate is shut, and the oracle sees it.
+    #[test]
+    fn keeping_a_history_does_not_wait_for_its_open() {
+        use super::super::plane::Numbered;
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("profile");
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let Numbered::Later(number) = opening(&at, opened).numbering() else {
+            panic!("a history being opened numbers later")
+        };
+        let (answer_to, answer) = crossbeam_channel::bounded(1);
+        let first_open = std::thread::spawn(move || answer_to.send(number()).unwrap());
+        assert!(answer.recv_timeout(Duration::from_millis(50)).is_err(), "the first open waits for the gate");
+        gate.send(Ok(7)).unwrap();
+        assert_eq!(answer.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(7));
+        first_open.join().unwrap();
+
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let mut observe = opening(&at, opened);
+        let Numbered::Later(number) = observe.numbering() else { panic!("numbered later") };
+        assert!(matches!(observe.numbering(), Numbered::From(1)), "asked once a daemon");
+        gate.send(Err("the history's file is torn".to_owned())).unwrap();
+        let failed = number().unwrap_err();
+        assert_eq!(failed, Unopened { dir: at.clone(), why: Unopen::Failed("the history's file is torn".to_owned()) });
+        assert!(failed.to_string().contains(&at.display().to_string()), "{failed}");
+
+        let (gate, opened) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        let Numbered::Later(number) = opening(&at, opened).numbering() else { panic!("numbered later") };
+        drop(gate);
+        assert_eq!(number(), Err(Unopened { dir: at.clone(), why: Unopen::Gone }));
+
+        // The control: the planted start waits for the open, and does not return while the
+        // gate is shut.
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let (said_to, said) = crossbeam_channel::bounded(1);
+        let planted_at = at.clone();
+        let planted = std::thread::spawn(move || {
+            WAITS_AT_START.set(true);
+            let numbered = opening(&planted_at, opened).numbering();
+            said_to.send(matches!(numbered, Numbered::From(9))).unwrap();
+        });
+        assert!(said.recv_timeout(Duration::from_millis(50)).is_err(), "the control: the planted start waits");
+        gate.send(Ok(9)).unwrap();
+        assert!(said.recv_timeout(Duration::from_secs(10)).unwrap());
+        planted.join().unwrap();
     }
 
     #[test]

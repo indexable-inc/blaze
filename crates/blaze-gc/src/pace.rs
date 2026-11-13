@@ -28,18 +28,27 @@ pub struct Volume {
     pub free_bytes: u64,
 }
 
-/// Where pressure starts and where it is full, and blaze's share of a volume. The defaults:
-/// comfortable at max(15%, 30 GiB) free, the floor at max(10%, 20 GiB), blaze's own bytes at
-/// most half the volume. Overridable in `<root>/gc.json` ([`crate::settings`]).
+/// The defaults of the budget, the one place they are written: an absolute size, and a share
+/// of the volume in percent. The third bound, what leaves the floor free, is the floor's own
+/// levels ([`Levels::budget`]).
+pub const BUDGET: (u64, u8) = (64 * GIB, 25);
+
+/// Where pressure starts and where it is full, and blaze's budget on a volume. The defaults:
+/// comfortable at max(15%, 30 GiB) free, the floor at max(10%, 20 GiB), and a budget for
+/// blaze's own bytes of 64 GiB or a quarter of the volume, whichever is less ([`BUDGET`]).
+/// Overridable in `<root>/gc.json` ([`crate::settings`]).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Levels {
     pub comfortable_percent: u8,
     pub comfortable_bytes: u64,
     pub floor_percent: u8,
     pub floor_bytes: u64,
-    /// blaze's own bytes on a volume (every object the collector lists there) past this share
-    /// of it are pressure as well.
+    /// blaze's own bytes on a volume (every object the collector lists there, and what its
+    /// driver says the daemon's state holds) past this share of it are pressure as well.
     pub share_percent: u8,
+    /// And past this many bytes, whatever the volume's size: the budget a person reads and
+    /// raises (`blaze gc --budget`).
+    pub budget_bytes: u64,
     /// Collection starts once pressure reaches this, and stops once free space is this far
     /// (permille of the band between floor and comfortable) above the comfortable level: a band
     /// either side, so free space hovering at a level does not switch it on and off.
@@ -53,7 +62,8 @@ impl Default for Levels {
             comfortable_bytes: 30 * GIB,
             floor_percent: 10,
             floor_bytes: 20 * GIB,
-            share_percent: 50,
+            share_percent: BUDGET.1,
+            budget_bytes: BUDGET.0,
             hysteresis_permille: 50,
         }
     }
@@ -75,9 +85,19 @@ impl Levels {
             .min(comfortable.saturating_sub(1))
     }
 
-    /// The bytes blaze may hold on `volume`.
+    /// The bytes blaze may hold on `volume`: its share of it, and no more than the absolute
+    /// budget.
     pub fn share(&self, volume: &Volume) -> u64 {
-        percent(volume.total_bytes, self.share_percent)
+        percent(volume.total_bytes, self.share_percent).min(self.budget_bytes)
+    }
+
+    /// The budget of an area that holds `held` bytes on `volume`: the tightest of the
+    /// absolute size, the share of the volume, and what leaves the floor free (what is held
+    /// and what is free, less the floor). Never 0: a volume at its floor still has a budget of
+    /// a byte, which what is held is far past.
+    pub fn budget(&self, volume: &Volume, held: u64) -> u64 {
+        let room = held.saturating_add(volume.free_bytes).saturating_sub(self.floor(volume));
+        self.share(volume).min(room).max(1)
     }
 
     /// Pressure from free space, signed: 0 at comfortable, [`FULL`] at the floor, negative

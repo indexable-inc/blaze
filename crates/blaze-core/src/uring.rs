@@ -83,6 +83,9 @@ use crate::{
 /// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
 const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
+/// `fsync_flags` of an `IORING_OP_FSYNC`: the file's data and what a read of it needs (its
+/// length), as `fdatasync` ([`crate::Effect::Barrier`]).
+const IORING_FSYNC_DATASYNC: u32 = 1;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -1201,10 +1204,10 @@ struct Watching {
     journal: Option<FileName>,
 }
 
-/// A file opened for reading and appending, kept open: under its name in [`Uring::names`]
-/// while `named`, and kept while any request in flight uses it (its open among them). Opened
-/// through the ring into its slot of the table, by which every request on it names it; until
-/// `open`, they wait.
+/// A file opened for reading and appending (for a sync alone, reading: `read_only`), kept
+/// open: under its name in [`Uring::names`] while `named`, and kept while any request in
+/// flight uses it (its open among them). Opened through the ring into its slot of the table,
+/// by which every request on it names it; until `open`, they wait.
 struct Kept {
     fixed: Fixed,
     users: u32,
@@ -1217,6 +1220,31 @@ struct Kept {
     positional: bool,
     /// A positional file opened `O_DIRECT`, around the page cache.
     direct: bool,
+    /// Opened `O_RDONLY`: kept by a sync or a barrier of a name no request kept
+    /// ([`Wants::Flush`]), of a file that is there. A sync needs no write access, and a file
+    /// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+    /// Cleared where its open found the file missing and made it, as an append's open does
+    /// (`O_RDWR | O_APPEND | O_CREAT`).
+    ///
+    /// The invariant: nothing is written through a kept file while it is `read_only`.
+    /// Upheld by [`Uring::file`], the one way a request reaches a kept file by name: one that
+    /// writes ([`Wants::Append`]) and finds the name kept read-only lets that file go (its
+    /// requests in flight keep it until they end) and keeps the name opened to append; reads
+    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`])
+    /// and is never read-only.
+    read_only: bool,
+}
+
+/// What a request asks of the file kept under its name ([`Uring::file`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wants {
+    /// Reads of a file already kept: never made.
+    Read,
+    /// Appends: opened to read and append, made with its directories where missing.
+    Append,
+    /// A sync or a barrier ([`crate::Effect::Sync`], [`crate::Effect::Barrier`]): opened
+    /// read-only where it is there; made, as for an append, only where it is missing.
+    Flush,
 }
 
 /// The bits of a `user_data` that are its link.
@@ -1277,7 +1305,7 @@ impl Offload {
         let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false) }); // alloc: setup, once per driver.
+        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
@@ -1662,6 +1690,18 @@ struct Wake {
     /// Set by the ring's thread before it waits in the kernel, cleared by it after, and by
     /// the first sender that wakes it.
     parked: AtomicBool,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]) with no completion of the
+    /// ring's own: set before `parked` is swapped, read by the ring's thread after it set
+    /// `parked`, so, both sequentially consistent, either the thread reads it before it sleeps
+    /// or the waker finds `parked` and writes the eventfd.
+    asked: AtomicBool,
+}
+
+impl crate::Wake for Wake {
+    fn wake(&self) {
+        self.asked.store(true, Ordering::SeqCst);
+        wake_ring(self);
+    }
 }
 
 /// Tells the ring's wait that work off the ring has sent its completion: a write of the
@@ -1861,15 +1901,22 @@ impl Uring {
         forget(&mut self.positional, &mut self.kept, name);
     }
 
-    /// The file kept under `name`, its open through the ring started where none is; `make`
-    /// makes it if missing, with its directories. Requests on it wait for the open
-    /// ([`Uring::prepared`]); where the driver's half of the table is full, the files kept
-    /// are let go (each request in flight holds its own until it ends) to make room.
-    fn file(&mut self, name: &FileName, make: bool) -> io::Result<Handle<Kept>> {
+    /// The file kept under `name` for what a request `wants`, its open through the ring
+    /// started where none is: an append's makes it if missing, with its directories; a
+    /// sync's opens it read-only, and makes it only where its open finds it missing.
+    /// Requests on it wait for the open ([`Uring::prepared`]); where the driver's half of the
+    /// table is full, the files kept are let go (each request in flight holds its own until
+    /// it ends) to make room.
+    fn file(&mut self, name: &FileName, wants: Wants) -> io::Result<Handle<Kept>> {
+        let make = wants != Wants::Read;
         if let Some(&file) = self.names.get(name) {
             let kept = self.kept.get_mut(file).expect("named files are kept");
-            kept.make |= make && !kept.open;
-            return Ok(file);
+            // `Kept::read_only`'s invariant: a write never goes through a read-only file.
+            if !(wants == Wants::Append && kept.read_only) {
+                kept.make |= make && !kept.open;
+                return Ok(file);
+            }
+            forget(&mut self.names, &mut self.kept, name);
         }
         let fixed = Fixed::unopened(&self.table);
         // Held by its open until it ends.
@@ -1881,6 +1928,7 @@ impl Uring {
             make,
             positional: false,
             direct: false,
+            read_only: wants != Wants::Append,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
@@ -1913,6 +1961,7 @@ impl Uring {
             make: false,
             positional: true,
             direct,
+            read_only: false,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
@@ -2023,6 +2072,8 @@ impl Uring {
             // of 162 MB is a second of this thread, and was in no span.
             let (op, file) = match &effect {
                 Effect::WriteBack { file, .. } => ("write back", file.as_str()),
+                Effect::Prewarm { file, .. } => ("prewarm", file.as_str()),
+                Effect::CopyData { from, .. } => ("copy the data of", from.as_str()),
                 Effect::List { dir, .. } => ("list", dir.as_str()),
                 Effect::Private { dir, .. } => ("make private", dir.as_str()),
                 _ => ("carry out", ""),
@@ -2420,6 +2471,13 @@ impl Driver for Uring {
                 // On a thread of its own (`sync_file_range`, waited for there): the ring's
                 // submitter never waits for a device, and the asker waits for nothing.
                 back @ Effect::WriteBack { .. } => self.off_ring(back).map(|()| None),
+                // `mincore` of a mapping and a read-ahead call a run: on a thread of its own,
+                // as a write-back is.
+                warm @ Effect::Prewarm { .. } => self.off_ring(warm).map(|()| None),
+                // `lseek` and `copy_file_range` an extent: on a thread of its own, as the
+                // `FICLONE` of a clone is (`uring/files.rs`), since a copy of tens of MB of
+                // data is milliseconds the submitter must not wait in.
+                copy @ Effect::CopyData { .. } => self.off_ring(copy).map(|()| None),
                 // A directory's `fsync`, waited for on a thread of its own as a list is.
                 names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
@@ -2497,7 +2555,7 @@ impl Driver for Uring {
                 // alone. Its buffer is the file's size, once it is open (a missing file's,
                 // empty).
                 Effect::ReadAll { file, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
                         hot.flags |= ops::WHOLE;
@@ -2507,7 +2565,7 @@ impl Driver for Uring {
                     false => self.load(tag, &file, 0, None).map(|()| None),
                 },
                 Effect::Read { file, at, len, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let hot = Hot::new(tag, Kind::Read, file.to_bits());
                         // alloc: the read's result, handed to its asker.
@@ -2525,18 +2583,26 @@ impl Driver for Uring {
                     .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false)
                     .map(|()| None),
                 // An empty one too, so it answers once the file it makes is there.
-                Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
+                Effect::Append { file, bytes, .. } => self.file(&file, Wants::Append).map(|file| {
                     let file = self.hold(file);
                     self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
                     None
                 }),
-                Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
+                Effect::Sync { file, .. } => self.file(&file, Wants::Flush).map(|file| {
                     let file = self.hold(file);
                     self.start(
                         Hot::new(tag, Kind::Sync, file.to_bits()),
                         ops::NO_BYTES,
                         Cold::EMPTY,
                     );
+                    None
+                }),
+                // The same request with `IORING_FSYNC_DATASYNC`: Linux's cheapest ordering.
+                Effect::Barrier { file, .. } => self.file(&file, Wants::Flush).map(|file| {
+                    let file = self.hold(file);
+                    let mut hot = Hot::new(tag, Kind::Sync, file.to_bits());
+                    hot.flags |= ops::DATA;
+                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
                 // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
@@ -2639,7 +2705,10 @@ impl Driver for Uring {
                 // below, and the kernel is not entered to wait.
                 self.offload.wake.parked.store(true, Ordering::SeqCst);
                 self.take_offloaded();
-                if !self.ready.is_empty() {
+                // A waker's ask ends the poll with what there is, which may be nothing: what
+                // it woke the loop for is in a queue of the caller's own.
+                let asked = self.offload.wake.asked.swap(false, Ordering::SeqCst);
+                if !self.ready.is_empty() || asked {
                     self.offload.wake.parked.store(false, Ordering::SeqCst);
                     out.append(&mut self.ready);
                     break;
@@ -2683,6 +2752,15 @@ impl Driver for Uring {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        // clone: a handle to the ring's wake, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
     }
 }
 
@@ -4030,6 +4108,28 @@ mod tests {
     /// Each request in flight, by its handle.
     fn requests(driver: &Uring) -> Vec<Id> {
         driver.ops.iter().map(|(id, _)| id).collect()
+    }
+
+    /// The invariant: a sync and a barrier of a file sealed read-only succeed through the
+    /// ring and through the threads driver, and of a missing file make it
+    /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control); on the ring a file a
+    /// sync kept read-only (`Kept::read_only`) is let go by the append after it, which writes
+    /// through a descriptor of its own.
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+        let root = dir("uring-sync-sealed");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut driver, &root);
+        let plain = FileName::new("sealed/plain").unwrap();
+        let kept = driver.names.get(&plain).copied().expect("the append's file is named");
+        assert!(!driver.kept.get(kept).expect("kept").read_only, "the append's file is kept");
+        drop(driver);
+        let threads = dir("uring-sync-sealed-threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(threads).unwrap();
     }
 
     /// A completion that comes after its request ended, once the request's slot holds another

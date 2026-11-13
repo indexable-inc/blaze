@@ -103,6 +103,9 @@ pub(crate) fn told_to_stop(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Start {
     IfMissing,
+    /// As [`Start::IfMissing`], for a request that said `--no-prebuilt`: a home's first daemon
+    /// started for it installs no sealed layer from a pack ([`super::store::first_use`]).
+    IfMissingNoPrebuilt,
     Never,
 }
 
@@ -229,6 +232,9 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     if let Some(refused) = refused {
         say_start(&socket, &refused)?;
     }
+    // Lane packs-1112: a home with no store yet and an `install` base in its settings gets
+    // the configured packs before its first daemon starts (`super::store::first_use`).
+    super::store::first_use(start != Start::IfMissingNoPrebuilt).map_err(anyhow::Error::msg)?;
     use anyhow::Context as _;
     let (log, ready, mut child) = started()?;
     let pid = child.id();
@@ -253,11 +259,25 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
             crate::raw::process::ended_within(pid, ENDING)
                 .context("waiting for the daemon that closed its pipe to end")?;
             let status = child.try_wait().context("asking how the daemon it started ended")?;
-            Err(match status.and_then(reaped) {
-                Some(ended) => DaemonError::Exited { socket, log, pid, phase, ended },
-                None => DaemonError::Closed { socket, log, pid, phase, inside },
+            match status.and_then(reaped) {
+                // Another command started a daemon of this home at the same time, and that one
+                // took the state and listens (`serve::Served`): this command is its client.
+                Some(Reaped::Code(code)) if code == blaze_core::exit::Exit::Served.code() => {
+                    let client = Client::unix(&socket)
+                        .map_err(|error| DaemonError::Connect { socket: socket.clone(), error })?;
+                    match this_build(client, &socket)? {
+                        Some(client) => Ok(Some(client)),
+                        None => anyhow::bail!(
+                            "the daemon another command started at {} at the same time as this one's (pid {pid}) \
+                             was another build of blaze, and was stopped: run this command again to start this \
+                             build's",
+                            socket.display()
+                        ),
+                    }
+                }
+                Some(ended) => Err(DaemonError::Exited { socket, log, pid, phase, ended }.into()),
+                None => Err(DaemonError::Closed { socket, log, pid, phase, inside }.into()),
             }
-            .into())
         }
         Heard::Nothing { phase, inside } => {
             Err(DaemonError::NotListening { socket, log, pid, phase, inside }.into())
@@ -272,10 +292,10 @@ fn say_started(log: &Path, pid: u32) {
     match tail(log) {
         Ok(bytes) => {
             for said in start_said(&String::from_utf8_lossy(&bytes), pid) {
-                eprintln!("blaze: the daemon it started (pid {pid}) {said}");
+                blaze_report::errln!("blaze: the daemon it started (pid {pid}) {said}");
             }
         }
-        Err(error) => eprintln!(
+        Err(error) => blaze_report::errln!(
             "blaze: how the daemon it started (pid {pid}) started is unread: {}: {error}",
             log.display()
         ),
@@ -415,7 +435,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
             named(&ours)
         );
     }
-    eprintln!(
+    blaze_report::errln!(
         "blaze: the daemon at {} (pid {pid}) is another build of blaze ({}), not this one ({}): stopping it and \
          starting this one",
         socket.display(),
@@ -476,13 +496,13 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
                 blaze_api::units::main_file(&place).display()
             );
         }
-        Installed::Elsewhere(theirs) => eprintln!(
+        Installed::Elsewhere(theirs) => blaze_report::errln!(
             "blaze: starting the daemon for {}: the installed units serve {} (`blaze daemon install` with this \
              environment serves this one)",
             socket.display(),
             theirs.display()
         ),
-        Installed::No => eprintln!(
+        Installed::No => blaze_report::errln!(
             "blaze: starting the daemon (no socket activation is installed: `blaze daemon install` has the system \
              start it on demand)"
         ),
@@ -625,13 +645,11 @@ fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
     }
 }
 
-/// Whether a launchd or systemd unit serves `socket`. Units live under `HOME`: without one,
-/// none is installed.
+/// Whether a launchd or systemd unit serves `socket`. Units live under the user's home
+/// ([`blaze_core::home::user`]): without one, none is installed.
 #[cfg(all(unix, feature = "native"))]
 fn activation(socket: &Path) -> anyhow::Result<Installed> {
-    if blaze_api::activation::Manager::here().is_none()
-        || std::env::var_os("HOME").is_none_or(|it| it.is_empty())
-    {
+    if blaze_api::activation::Manager::here().is_none() || blaze_core::home::user().is_err() {
         return Ok(Installed::No);
     }
     Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)
@@ -677,8 +695,8 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
         Err(error) => Some(error),
     };
     match &refused {
-        Some(refused) => eprintln!("blaze: starting the daemon ({refused})"),
-        None => eprintln!("blaze: starting the daemon"),
+        Some(refused) => blaze_report::errln!("blaze: starting the daemon ({refused})"),
+        None => blaze_report::errln!("blaze: starting the daemon"),
     }
     let (log, mut child) = started()?;
     let pid = child.id();
@@ -1277,11 +1295,77 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
     Ok((log, child?))
 }
 
+/// What a command that found nothing listening at `socket` may say: nothing more (`Ok`: no
+/// daemon is running) only when no daemon holds blaze's state either. One that does is named,
+/// and is the error: "no daemon is running" is never said while one runs (agents.json A37;
+/// the class: two answers to "which daemon", the socket's and the state's).
+pub fn absent(holder: &crate::serve::Holder, socket: &Path) -> Result<(), String> {
+    let crate::serve::Holder::Daemon { pid, lock } = holder else { return Ok(()) };
+    let who = match pid {
+        Some(pid) => format!("pid {pid}"), // alloc: an error's text, once
+        None => "its pid not yet written".to_owned(),
+    };
+    Err(format!(
+        "a daemon is running ({who}: it holds blaze's state, {}) and nothing listens at {}, the socket this \
+         command uses: it was started with another XDG_RUNTIME_DIR, where its socket is, or its socket's file \
+         was removed. This command told it nothing; run it with the daemon's XDG_RUNTIME_DIR, or end that \
+         process",
+        lock.display(),
+        socket.display()
+    ))
+}
+
+/// [`absent`], of this blaze's state and socket. Where the state has no lock (not Unix) there
+/// is no second answer to ask for.
+#[cfg(feature = "native")]
+fn none_runs() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let holder = crate::serve::holder(&crate::serve::state()?)?;
+        absent(&holder, &crate::serve::socket()?).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// A failed call to the daemon at this blaze's socket, as an error that names the daemon: one
+/// of another API schema ([`ClientError::Schema`]) is another build of blaze, running, named
+/// by its schema and by the pid its state's lock holds, with what stops it.
+#[cfg(feature = "native")]
+fn of_daemon(error: ClientError) -> anyhow::Error {
+    let ClientError::Schema { theirs } = error else { return error.into() };
+    let socket = match crate::serve::socket() {
+        Ok(socket) => socket,
+        Err(error) => return error,
+    };
+    #[cfg(unix)]
+    let holder = crate::serve::state().and_then(|state| crate::serve::holder(&state));
+    #[cfg(not(unix))]
+    let holder: anyhow::Result<crate::serve::Holder> = Ok(crate::serve::Holder::None);
+    anyhow::Error::msg(other_schema(theirs, holder.ok().as_ref(), &socket))
+}
+
+/// What is said of a running daemon that speaks API schema `theirs`, not this blaze's.
+pub fn other_schema(theirs: u32, holder: Option<&crate::serve::Holder>, socket: &Path) -> String {
+    let who = match holder {
+        Some(crate::serve::Holder::Daemon { pid: Some(pid), .. }) => format!("pid {pid}"), // alloc: an error's text, once
+        _ => "its pid is the first word of `serve.lock` in blaze's state".to_owned(),
+    };
+    format!(
+        "a daemon is running at {} ({who}) and speaks API schema {theirs}, this blaze {}: it is another build \
+         of blaze, which this one can ask nothing and can't tell to stop. That build's own `blaze stop` stops \
+         it; so does ending that process",
+        socket.display(),
+        blaze_api::SCHEMA
+    )
+}
+
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
 pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
@@ -1291,7 +1375,8 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
             // alloc: error path, the daemon's errors, said once it is done.
             said.push(error.what.to_owned());
         }
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
@@ -1351,6 +1436,8 @@ pub fn status(
         false => None,
     };
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         match &place {
             Some(place) => out.write_all(status_json(place, None)?.as_bytes())?,
             None => writeln!(out, "no daemon is running")?,
@@ -1364,7 +1451,8 @@ pub fn status(
         // alloc: error path, the daemon's errors, said once it is done.
         ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
@@ -1568,6 +1656,9 @@ pub fn status_lines(status: &Status) -> String {
     if let Some(why) = &status.history {
         lines.push_str(&format!("history: {why}\n"));
     }
+    if let Some(how) = &status.placed_by {
+        lines.push_str(&format!("placing: {how}\n"));
+    }
     // The settings it was started with that are set: what a client setting other values is
     // refused over ([`crate::serve::settings`]).
     let set: Vec<String> = status
@@ -1592,11 +1683,8 @@ pub fn status_lines(status: &Status) -> String {
         lines.push_str(&format!("builds: {}\n", status.builds.len()));
     }
     for build in &status.builds {
-        let mut board = blaze_ui::board::Board::new(&build.what, blaze_ui::test_view::Paint::Plain);
-        board.take(build.now.clone()); // clone: the status is borrowed, and read once
-        let mut compact = String::new(); // alloc: a line a build
-        // A fresh board's first line is always due.
-        board.line(&mut compact);
+        // alloc: a line a build
+        let compact = blaze_screen::progress_fields(&build.now, build.now.at_ms);
         lines.push_str(&format!("  #{} {}: {compact}\n", build.id, build.what));
         for span in &build.spans {
             lines.push_str(&format!("    {span}\n"));
@@ -2069,8 +2157,9 @@ mod refusals {
             )),
             "{text}"
         );
+        // The log's last line and the reading come before the recording, which ends the text.
         assert!(
-            text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside"),
+            text.contains("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside\nits flight recording"),
             "{text}"
         );
         let inside = blaze_profile::reading::Reading {

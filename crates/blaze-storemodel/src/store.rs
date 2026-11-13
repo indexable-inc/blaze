@@ -11,13 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use blaze_cas::{Config, Key, Kind, Mismatch, Reader, Store, Ticket, Writer, content_of};
+use blaze_cas::{Config, Key, Kind, Mismatch, PlaceBy, Reader, Store, Ticket, Writer, content_of};
 use blaze_core::{Effect, FileName, lock::Lock};
 use blaze_ids::{ContentId, Hasher};
 
 use crate::actors::{Actors, Next, Resume, Turn};
 use crate::explore::{Bounds, Chooser, Failure, Memo};
-use crate::fs::{CrashFs, Disk, Persist, digest};
+use crate::fs::{Clones, CrashFs, Disk, Persist, digest};
 use crate::properties;
 
 /// What is waited on before what a build left is kept for reuse across a crash: by what
@@ -36,11 +36,34 @@ pub enum Wait {
 #[derive(Clone, Copy, Debug)]
 pub struct Model {
     pub persist: Persist,
+    /// Whether the file system shares blocks: what the clone a store's open tries ends in.
+    pub clones: Clones,
     /// IO failures the explorer may inject in one execution.
     pub failures: u32,
     /// Whether effects in flight complete in any order, or in the order asked.
     pub reorder_io: bool,
     pub wait: Wait,
+}
+
+impl Model {
+    /// An empty disk of the model's file system.
+    pub fn empty(&self) -> CrashFs {
+        CrashFs::new(self.persist, self.clones)
+    }
+
+    /// A fresh process on `disk`, on the model's file system.
+    pub fn on(&self, disk: &Disk) -> CrashFs {
+        CrashFs::from_disk(self.persist, self.clones, disk)
+    }
+
+    /// How a store on the model's file system places outputs: what its open has to decide,
+    /// whatever an earlier open's crash left in its directory.
+    pub fn place_by(&self) -> PlaceBy {
+        match self.clones {
+            Clones::Made => PlaceBy::Clone,
+            Clones::Refused => PlaceBy::Copy,
+        }
+    }
 }
 
 /// What a kernel get ended in, for the restore's checks.
@@ -264,7 +287,7 @@ pub fn fresh(
     model: &Model,
     bounds: &Bounds,
 ) -> Result<BTreeMap<Key, (Kind, Vec<u8>)>, Failure> {
-    let mut fs = CrashFs::new(model.persist);
+    let mut fs = model.empty();
     let mut store = open(&mut fs, bounds, "a fresh build's open")?;
     for (key, (kind, bytes)) in &ledger.accepted {
         if let Err(mismatch) = store.put(*key, *kind, bytes) {
@@ -312,7 +335,7 @@ pub fn restore(
     bounds: &Bounds,
     extra: Extra<'_>,
 ) -> Result<(), Failure> {
-    let mut fs = CrashFs::from_disk(model.persist, disk);
+    let mut fs = model.on(disk);
     let mut store = open(&mut fs, bounds, "the restore's open")?;
     if let Some(broken) = store.broken() {
         return Err(Failure::new(
@@ -326,6 +349,17 @@ pub fn restore(
         return Err(Failure::new(
             properties::EVERY_WAIT_ENDS,
             "the restore's IO ended and it is not ready",
+        ));
+    }
+    if store.place_by() != Some(model.place_by()) {
+        return Err(Failure::new(
+            properties::RESTORE_EQUALS_FRESH,
+            format!(
+                "the restore places outputs by {:?}, where a fresh store on its file system (clones {:?}) places by {:?}",
+                store.place_by(),
+                model.clones,
+                model.place_by()
+            ),
         ));
     }
     let held = contents(&store, "the restore")?;
@@ -391,7 +425,7 @@ pub fn restore(
     let fresh = fresh(ledger, model, bounds)?;
     compare(&contents(&store, "the restore, built again")?, &fresh, "the restore, built again")?;
     drop(store);
-    let mut again = CrashFs::from_disk(model.persist, &fs.synced_disk());
+    let mut again = model.on(&fs.synced_disk());
     let store = open(&mut again, bounds, "the restore's restart")?;
     if let Some(broken) = store.broken() {
         return Err(Failure::new(
@@ -455,7 +489,7 @@ impl<'a> Run<'a> {
         memo: &'a mut Memo,
         extra: Extra<'a>,
     ) -> Result<Run<'a>, Failure> {
-        let mut fs = CrashFs::new(model.persist);
+        let mut fs = model.empty();
         let store = open(&mut fs, bounds, "the first open")?;
         if let Some(broken) = store.broken() {
             return Err(Failure::new(
@@ -639,7 +673,10 @@ impl<'a> Run<'a> {
         let ledger = self.ledger.lock();
         let survive = must_survive(&self.store, &ledger);
         let mut hasher = Hasher::new("blaze storemodel expectation 1");
-        hasher.update(format!("{:?} {:?} {:?}", self.model.persist, *ledger, survive).as_bytes());
+        hasher.update(
+            format!("{:?} {:?} {:?} {:?}", self.model.persist, self.model.clones, *ledger, survive)
+                .as_bytes(),
+        );
         let expected = hasher.finish();
         let states = self
             .fs
@@ -819,7 +856,7 @@ pub fn damaged(
     model: &Model,
     bounds: &Bounds,
 ) -> Result<(), Failure> {
-    let mut fs = CrashFs::from_disk(model.persist, disk);
+    let mut fs = model.on(disk);
     let store = open(&mut fs, bounds, "the open of a damaged disk")?;
     if store.broken().is_some() {
         return Ok(());
@@ -849,5 +886,132 @@ pub fn damaged(
                 lost.join(", ")
             ),
         )),
+    }
+}
+
+/// The open's scenario: a store that stopped cleanly on `disk`, holding what `ledger` and
+/// `survive` say, is opened again, its open's IO completing in every order the model allows
+/// (and failing, within the failure budget), with a crash after every step. An open reads, and
+/// writes one thing: the files of the clone it tries to decide how it places
+/// (`blaze_cas::PlaceBy`), so a crash in it leaves those behind. After each crash the store
+/// holds every property a restore holds ([`restore`]), and an open on what the crash left ends
+/// with the names a clean open ends with: what the try left is removed, never kept or tripped
+/// over. `left` collects the names crashes left that the stopped store did not have, so a test
+/// can say the search saw them.
+pub fn run_open(
+    disk: &Disk,
+    ledger: &Ledger,
+    survive: &BTreeSet<Key>,
+    model: &Model,
+    bounds: &Bounds,
+    chooser: &mut Chooser,
+    memo: &mut Memo,
+    left: &Lock<BTreeSet<String>>,
+) -> Result<(), Failure> {
+    let clean = {
+        let mut fs = model.on(disk);
+        open(&mut fs, bounds, "a clean open")?;
+        fs.names()
+    };
+    let mut fs = model.on(disk);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config(), &mut effects);
+    fs.submit(&mut effects);
+    let mut failures_left = model.failures;
+    loop {
+        let states = fs
+            .crash_states(bounds.crash_states)
+            .map_err(|it| Failure::new(properties::EXPLORED, it.to_string()))?;
+        for state in states {
+            left.lock().extend(state.disk.keys().filter(|it| !disk.contains_key(*it)).cloned());
+            let mut id = Hasher::new("blaze storemodel open crash check 1");
+            id.id(&digest(&state.disk));
+            if !memo.first(id.finish()) {
+                continue;
+            }
+            let how = match state.how.is_empty() {
+                true => "everything pending kept".to_owned(),
+                false => state.how.clone(),
+            };
+            let crash = format!("after step {}: {how}", chooser.steps());
+            restore(&state.disk, ledger, survive, model, bounds, &no_extra)
+                .map_err(|it| it.at_crash(crash.clone()))?;
+            let mut after = model.on(&state.disk);
+            open(&mut after, bounds, "the open after a crash in an open")
+                .map_err(|it| it.at_crash(crash.clone()))?;
+            let names = after.names();
+            if names != clean {
+                let kept: Vec<&String> = names.difference(&clean).collect();
+                let lacks: Vec<&String> = clean.difference(&names).collect();
+                return Err(Failure::new(
+                    properties::RESTORE_EQUALS_FRESH,
+                    format!(
+                        "the open after a crash in an open ends with other files than a clean open: it keeps {kept:?} and lacks {lacks:?}"
+                    ),
+                )
+                .at_crash(crash));
+            }
+        }
+        let flying = fs.in_flight();
+        if flying.is_empty() {
+            break;
+        }
+        let width = if model.reorder_io { flying.len() } else { 1 };
+        let mut options: Vec<String> = Vec::new();
+        let mut actions: Vec<Action> = Vec::new();
+        for (at, effect) in flying.iter().enumerate().take(width) {
+            options.push(format!("io: {effect}"));
+            actions.push(Action::Complete(at));
+            if failures_left > 0 {
+                options.push(format!("io: fail {effect}"));
+                actions.push(Action::Fail(at));
+            }
+        }
+        // Distinct names, so a schedule replays by them.
+        let mut seen = BTreeMap::<String, usize>::new();
+        for option in &mut options {
+            let n = seen.entry(option.clone()).or_insert(0);
+            *n += 1;
+            if *n > 1 {
+                option.push_str(&format!(" #{n}"));
+            }
+        }
+        let completion = match actions.swap_remove(chooser.pick(&options)?) {
+            Action::Fail(at) => {
+                failures_left -= 1;
+                fs.fail(at)
+            }
+            Action::Complete(at) => fs.complete(at),
+            Action::Resume(..) | Action::Flush(_) | Action::Answer(_) => {
+                unreachable!("an open has no actor: its steps are its IO's")
+            }
+        };
+        if store.owns(completion.tag) {
+            store.complete(completion, &mut effects);
+        }
+        fs.submit(&mut effects);
+    }
+    // The open ended: with nothing failed it is open, and placing as its file system says.
+    let failed = failures_left < model.failures;
+    match store.broken() {
+        Some(_) if failed => Ok(()),
+        Some(broken) => Err(Failure::new(
+            properties::RESTORE_EQUALS_FRESH,
+            format!("a store that stopped cleanly does not open again: {broken}"),
+        )),
+        None if !store.ready() => Err(Failure::new(
+            properties::EVERY_WAIT_ENDS,
+            "the open's IO ended, and the store is neither ready nor stopped",
+        )),
+        None if store.place_by() != Some(model.place_by()) => Err(Failure::new(
+            properties::RESTORE_EQUALS_FRESH,
+            format!(
+                "the store places outputs by {:?}, where its file system (clones {:?}) makes it place by {:?}",
+                store.place_by(),
+                model.clones,
+                model.place_by()
+            ),
+        )),
+        None => Ok(()),
     }
 }

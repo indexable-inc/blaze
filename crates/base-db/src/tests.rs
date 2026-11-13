@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, Looks, VfsPath};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgOptions};
@@ -24,6 +24,7 @@ use crate::{
     target::{Arch, TargetData},
 };
 
+mod durable_roots;
 mod memo_properties;
 
 #[global_allocator]
@@ -1053,7 +1054,7 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
     assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
     assert_ne!(missing_content, dir_content, "a different error is a different input");
-    assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
+    assert!(db.files().included_is_read(&db, &missing, &Looks::none()), "the same error is what was read");
 }
 
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
@@ -1456,13 +1457,13 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
 
     // An edit on disk, read again: the reader runs again and reads the new text.
     std::fs::write(&m, "pub fn f() { 1 }").unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's edit")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's edit"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
     assert_eq!(disk_module_runs(), runs + 2);
 
     // Gone from disk: no module file, never the old text.
     std::fs::remove_file(&m).unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's removal")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's removal"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), None);
     assert_eq!(disk_module_runs(), runs + 3);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1588,14 +1589,23 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
         let mut rng = Rng::new(seed);
         let mut text = source.to_owned();
         let start = reparsed();
+        // An edit that gives the text the file has writes nothing, so nothing is parsed.
+        let mut changed = 0;
         for step in 0..80 {
-            text = random_edit(&mut rng, &text);
+            let edited = random_edit(&mut rng, &text);
+            changed += usize::from(edited != text);
+            text = edited;
             db.set_file_text(file, &text);
             let parse = id.parse(&db);
             assert_eq!(parse.root().text(), text, "step {step}");
             assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
         }
-        assert_eq!(reparsed() - start, 80, "seed {seed}: every edit after a kept parse reparses");
+        assert!(changed >= 70, "seed {seed}: {changed} of 80 edits changed the text");
+        assert_eq!(
+            reparsed() - start,
+            changed,
+            "seed {seed}: every edit after a kept parse that changes the text reparses, and no other"
+        );
     }
 }
 

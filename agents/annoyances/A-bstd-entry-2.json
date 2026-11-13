@@ -1,0 +1,12 @@
+{
+ "id": "A-bstd-entry-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+ "where": "base-db `crate_attrs` (crates/base-db/src/crate_attrs.rs:204)",
+ "what": "A crate attribute handed to `BuiltCrateData::crate_attrs` without `#![` and `]` around it panics the lowering (\"is not given with \\\"#![\\\" and \\\"]\\\" around it\"); the field's doc says so, the module's top doc reads as if the text is wrapped for you.",
+ "cost": "one build round",
+ "cause": "an invariant of a string field checked by a panic at use",
+ "workaround": "`BlazeEdition::crate_attr` returns the whole `#![..]`",
+ "fix": "a `CrateAttr` type whose constructor wraps or refuses",
+ "state": "open"
+}

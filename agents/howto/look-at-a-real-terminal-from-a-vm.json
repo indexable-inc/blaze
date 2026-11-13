@@ -1,0 +1,9 @@
+{
+ "id": "look-at-a-real-terminal-from-a-vm",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "task": "Look at what blaze draws on a real terminal from an ix VM",
+ "do": "Run it in a detached tmux pane of the size wanted (tmux new-session -d -x 80 -y 24), capture the pane as text every 0.4 s (tmux capture-pane -p), and at the end capture with history (-S -300): the history shows what the screen left behind, which the visible pane does not.",
+ "why": "Every visible frame looked right while tmux's history held a copy of the region per frame (annoyance termui-1): only the history capture showed it.",
+ "state": "current"
+}

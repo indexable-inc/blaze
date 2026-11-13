@@ -1,0 +1,12 @@
+{
+ "id": "launch3-14",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "the Mac, measuring",
+ "what": "Every Mac measurement of this lane ran at a load average of 17 to 100 (other lanes' daemons, builds and revision tests): the same series gave a body edit then run of 57, 98, 104 and 148 ms at the median, with single runs of 7 to 15 s. The medians of blaze under the launcher, blaze today and Relax overlap there.",
+ "cost": "four series that cannot rank the three ways; the comparison between the launcher and today's path rests on the VM, and Relax was never measured on a quiet machine",
+ "cause": "one machine for every lane's builds and for the measurements a claim rests on",
+ "workaround": "interleaved rounds (one of each way a round), and the quiet VM for the blaze-against-blaze rows",
+ "state": "open",
+ "fix": ""
+}

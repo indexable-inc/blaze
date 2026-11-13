@@ -1,0 +1,14 @@
+{
+ "id": "no-noop-without-a-daemon",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of task B of plan 10, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job/certify.rs (slot_begin, slot_step, slot_told), serve/job/slot.rs, crates/blaze-vfs/src/lib.rs Vfs::column, serve/idle.rs exit_due",
+ "what": "`blaze run` with nothing changed had to start or reach a daemon to learn that nothing changed, and the daemon then held its memory forever: versus.py's no-daemon no-op and idle-memory rows lost to makepad's Relax. Writing the slot a client checks alone also showed that a checkout's watcher column vouches for no root: `Disk::root` is set only by replay and tests, and the head's root is not what the column's stamps vouch for after a conflict (watch.rs `apply`, the `Watched::Conflict` arm: the disk's stamp saved, the head kept), a moved file looked at again (`again` in `apply`), or a commit to the head by anyone but the watcher.",
+ "cost": "a daemon start (hundreds of ms) on every no-op run without one, and an idle daemon's footprint kept after the edit loop ends",
+ "cause": "the only proof that nothing changed (the request certificate's check) lived inside the daemon, over state only the daemon held",
+ "class": "a verdict whose evidence is held only in a long-lived process, so every asker must keep that process alive",
+ "prevention": "every verdict a client may want without the daemon is written as a self-contained, keyed, stamped record (the slot) the client can rehearse alone; the daemon exits when idle because nothing it holds is needed to answer a no-op",
+ "workaround": "keep the daemon running",
+ "fix": "in progress: blaze-certify slot+solo (task A); daemon-side slot writer (tested against a model with the client's check as oracle), start-file placer (crash-tested on blaze_core::sim), exit_due (task B, this row); the column's root is open (see /tmp/plan/10-B2-next.md); client check and driver hooks (H1-H9).",
+ "state": "open"
+}

@@ -3,13 +3,20 @@
 //!
 //! - The first request on a checkout imports it: a [`Watcher`] of its directory scans it into
 //!   the head named by its path and keeps the head current. What a build writes and what is no
-//!   source is not taken in: a `target/` at the root (cargo's, or a `--target-dir` named
-//!   there; blaze's own build directories are under blaze's root, never in the checkout) and
-//!   every `.git`.
-//! - A request on a checkout waits until the watcher has seen every change made before it:
-//!   the daemon asks the driver to flush the checkout's watch ([`Effect::Flush`]) and holds the
-//!   request until the flush is told and the watcher has committed everything it was told
-//!   before it. Only then does the session see it. Nothing is written into the checkout for
+//!   source is not taken in: the watcher leaves out the root's `target/`, every `.git` and
+//!   every directory a `CACHEDIR.TAG` marks, at any depth (`blaze_vfs::watch::view`); a file
+//!   over `blaze_vfs::MOST_FILE_BYTES` is named and left out.
+//! - The request that starts a checkout's watch asks no flush: it waits for the watcher's own
+//!   look (its start sweeps the column, [`Watcher::start`]), and is handed on once that look
+//!   has committed. Sound because the look's every stamp is asked after the request arrived
+//!   (the watch starts inside [`Heads::arrive`]) and the watch is asked before the look in the
+//!   same effects: a change made before the request is seen by the look, one made after the
+//!   watch began is told by it. A request that arrives while that look runs flushes as below.
+//! - A request on a checkout already watched waits until the watcher has seen every change
+//!   made before it: the daemon asks the driver to flush the checkout's watch
+//!   ([`Effect::Flush`]) and holds the request until the flush is told and the watcher has
+//!   committed everything it was told before it. Only then does the session see it. Nothing
+//!   is written into the checkout for
 //!   it: FSEvents' flush writes its cookie in a directory of its own outside the checkout,
 //!   io_uring's drains the watch's queue, and IOCP's marks where the volume's USN journal ends
 //!   as the flush is asked and is told once the watch's reads of the journal have told every
@@ -70,13 +77,37 @@ struct Held {
 struct Checkout {
     head: String,
     watcher: Watcher,
-    /// Its directory under the driver's root, then `/`: what its files' paths start with.
-    below: String,
     /// The tag of its watcher's watch, which a flush names.
     watch: Tag,
     /// Flushes asked of its watch, by number: whether each has been told. Dropped once told
-    /// and no held request waits for it ([`Heads::sweep`]).
+    /// and no held request waits for it ([`Heads::sweep`]). The wait of the request that
+    /// started the watch is one told as it is made: no flush is asked for it, the watcher's
+    /// own look stands for it.
     flushes: HashMap<u64, bool, Global>,
+    /// The number of the wait that stands for the watcher's own look, for the plant.
+    #[cfg(test)]
+    first: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plant {
+    None,
+    /// The request that starts a watch is handed on before the watcher's look commits.
+    PassesBeforeTheLook,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the first look's control (`serve::tests::first_look`).
+    static PLANT: std::cell::Cell<Plant> = const { std::cell::Cell::new(Plant::None) };
+}
+
+/// Plants [`Plant::PassesBeforeTheLook`] on this thread, or takes it away: for the
+/// simulation's control.
+#[cfg(test)]
+pub(super) fn plant_passes_before_the_look(on: bool) {
+    PLANT.set(if on { Plant::PassesBeforeTheLook } else { Plant::None });
 }
 
 pub struct Heads {
@@ -163,21 +194,6 @@ pub fn runs_user_code(request: &Request) -> bool {
     )
 }
 
-/// Whether the file at `rel` of a checkout is out of its view: a `target/` at the root, which
-/// cargo or a `--target-dir` there writes (blaze's default build directory is never in the
-/// checkout), and every `.git`.
-pub fn excluded(rel: &str) -> bool {
-    rel.strip_prefix("target").is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        || (rel.contains(".git") && rel.split('/').any(|part| part == ".git"))
-}
-
-impl Checkout {
-    /// Whether `file` is in the view: outside the checkout, or not [`excluded`].
-    fn keeps(&self, file: &FileName) -> bool {
-        file.as_str().strip_prefix(self.below.as_str()).is_none_or(|rel| !excluded(rel))
-    }
-}
-
 impl Heads {
     /// Flushes take the tags `tags..tags + 2^32`; watchers take ranges of `2^32` from
     /// `watchers` on, up to `watchers_end`; `outside` its own ([`Outside::owns`]).
@@ -232,10 +248,16 @@ impl Heads {
     pub fn arrive(
         &mut self,
         vfs: &Vfs,
+        wall_ns: u64,
         arrived: Arrived,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Out>,
     ) {
+        // Each name a watcher saved no stamp of (taken within the racy window of its change)
+        // and now steady is looked at again, before the request is held behind the watchers.
+        for checkout in self.checkouts.iter_mut().flatten() {
+            checkout.watcher.steady(vfs, wall_ns, effects);
+        }
         let (from, request) = match arrived {
             Arrived::Gone { conn } => {
                 self.held.retain(|held| held.from.conn != conn);
@@ -268,9 +290,13 @@ impl Heads {
             return;
         }
         let mut waits = Vec::with_capacity(heads.len());
+        let mut first_looks = 0usize;
         for head in heads {
-            match self.flush(vfs, head, effects) {
-                Ok(wait) => waits.push(wait),
+            match self.flush(vfs, head, wall_ns, effects) {
+                Ok((slot, number, first)) => {
+                    first_looks += usize::from(first);
+                    waits.push((slot, number));
+                }
                 Err(error) => {
                     answer(out, from, Some(error), false);
                     return;
@@ -284,58 +310,88 @@ impl Heads {
             target: "blaze",
             "the request waits for the watches to hear every change made before it",
             checkouts = waits.len(),
+            first_looks,
             outside,
         );
         self.held.push(Held { from, request, waits, outside, _waiting });
         self.release(out);
     }
 
-    /// A flush of `head`'s checkout's watch, its watcher started first if it has none: the
-    /// checkout's slot and the flush's number. Nothing is written into the checkout.
+    /// A wait on `head`'s checkout's watch: the checkout's slot, the wait's number, and whether
+    /// it started the watch. A checkout watched already is flushed; one not watched yet is
+    /// watched, and its wait is the watcher's own look, told as it is made, with no flush.
+    /// Nothing is written into the checkout.
     fn flush(
         &mut self,
         vfs: &Vfs,
         head: &str,
+        wall_ns: u64,
         effects: &mut Vec<Effect>,
-    ) -> Result<(u32, u64), ApiError> {
-        let slot = match self.slots.get(head) {
-            Some(&slot) => slot,
-            None => self.watch(vfs, head, effects)?,
+    ) -> Result<(u32, u64, bool), ApiError> {
+        let (slot, first) = match self.slots.get(head) {
+            Some(&slot) => (slot, false),
+            None => (self.watch(vfs, head, wall_ns, effects)?, true),
         };
         let checkout =
             self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
         let number = self.next_flush;
         self.next_flush += 1;
+        if first {
+            #[cfg(test)]
+            {
+                checkout.first = number;
+            }
+            checkout.flushes.insert(number, true);
+            return Ok((slot, number, true));
+        }
         let tag = Tag(self.tags + number % (1 << 32));
         self.flushing.insert(tag, (slot, number));
         effects.push(Effect::Flush { watch: checkout.watch, tag });
         checkout.flushes.insert(number, false);
-        Ok((slot, number))
+        Ok((slot, number, false))
     }
 
     /// Starts watching `head`'s checkout in a new slot.
-    fn watch(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {
+    fn watch(
+        &mut self,
+        vfs: &Vfs,
+        head: &str,
+        wall_ns: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<u32, ApiError> {
         let path = head.trim_end_matches('/');
         let Some(dir) = FileName::new(path.trim_start_matches('/')) else {
             return Err(ApiError::new(
-                format!("the head `{head}` names no directory a checkout can be in"),
+                blaze_report::say!("the head ", blaze_report::say::Code(head), " names no directory a checkout can be in").flat(),
                 Some(head.to_owned()),
             ));
         };
         let slot = u32::try_from(self.checkouts.len()).expect("under 2^32 checkouts");
         let tags = self.watchers + u64::from(slot) * WATCHER_TAGS;
         assert!(tags < self.watcher_end, "the daemon has watched every checkout its tags allow");
-        let mut watcher = Watcher::new(head, dir.clone(), tags);
+        let mut watcher = Watcher::new(head, dir, tags).map_err(|error| {
+            ApiError::new(
+                blaze_report::say!(
+                    "watching the checkout ",
+                    blaze_report::say::Code(head),
+                    ": its looks in flight can't be reserved: ",
+                    blaze_report::say::Words(&error.to_string())
+                )
+                .flat(),
+                Some(head.to_owned()),
+            )
+        })?;
         // The journal is asked before any flush of it, in the same effects: a flush names a
         // watch in flight.
-        watcher.start(vfs, effects);
+        watcher.start(vfs, wall_ns, effects);
         let checkout = Checkout {
             head: head.to_owned(),
             watcher,
-            below: format!("{dir}/"),
             // The tag of the watcher's journal: its first ([`Watcher::new`]).
             watch: Tag(tags),
             flushes: HashMap::new_in(Global),
+            #[cfg(test)]
+            first: u64::MAX,
         };
         self.checkouts.push(Some(Box::new(checkout)));
         self.slots.insert(head.to_owned(), slot);
@@ -346,6 +402,7 @@ impl Heads {
     pub fn complete(
         &mut self,
         vfs: &mut Vfs,
+        wall_ns: u64,
         completion: Completion,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Out>,
@@ -355,7 +412,7 @@ impl Heads {
         } else if self.outside.owns(completion.tag) {
             self.outside.complete(completion, effects);
         } else {
-            self.watched(vfs, completion, effects, out);
+            self.watched(vfs, wall_ns, completion, effects, out);
         }
         self.release(out);
     }
@@ -391,6 +448,7 @@ impl Heads {
     fn watched(
         &mut self,
         vfs: &mut Vfs,
+        wall_ns: u64,
         completion: Completion,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Out>,
@@ -400,22 +458,7 @@ impl Heads {
         else {
             return;
         };
-        let done = match completion.done {
-            Done::Journaled(mut batch) => {
-                // A lost subtree under `target/` or `.git` is not rescanned, nor is an excluded
-                // directory listed into.
-                batch.files.retain(|it| checkout.keeps(it));
-                batch.lost.retain(|(it, _)| checkout.keeps(it));
-                Done::Journaled(batch)
-            }
-            Done::Entries(mut entries) => {
-                entries.retain(|(it, _)| checkout.keeps(it));
-                Done::Entries(entries)
-            }
-            done => done,
-        };
-        let watched =
-            checkout.watcher.complete(vfs, Completion { tag: completion.tag, done }, effects);
+        let watched = checkout.watcher.complete(vfs, completion, wall_ns, effects);
         let head = &checkout.head;
         let mut ended = None;
         for it in watched {
@@ -424,6 +467,11 @@ impl Heads {
                     out.push(Out::Moved { head: head.clone(), root: commit.root })
                 }
                 Watched::Lost { .. } | Watched::Scanned => {}
+                Watched::TooLarge { path, size, most } => {
+                    crate::serve::said::logged!(WARN,
+                        "blaze serve: {head}/{path} is {size} bytes, over the {most} one file of a head may hold; it is left out of the head"
+                    );
+                }
                 Watched::Conflict { path } => {
                     crate::serve::said::logged!(WARN,
                         "blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's"
@@ -436,6 +484,11 @@ impl Heads {
                     ended.get_or_insert_with(|| {
                         format!("{head}/{path} changed and can't be read: {error}")
                     });
+                }
+                Watched::Refused(error) => {
+                    ended = Some(format!(
+                        "the disk's changes to the checkout {head} do not apply to its head, so its watch stopped and the next one reads every file again: {error}"
+                    ));
                 }
                 Watched::Ended(error) => {
                     ended.get_or_insert_with(|| match error {
@@ -475,6 +528,10 @@ impl Heads {
         let (checkouts, flushed) = (&self.checkouts, self.outside.flushed());
         let caught_up = |(slot, number): &(u32, u64)| {
             checkouts.get(*slot as usize).and_then(Option::as_deref).is_some_and(|it| {
+                #[cfg(test)]
+                if PLANT.get() == Plant::PassesBeforeTheLook && it.first == *number {
+                    return true;
+                }
                 it.watcher.idle() && it.flushes.get(number).is_some_and(|told| *told)
             })
         };
@@ -523,18 +580,9 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn the_build_dir_and_git_are_out_of_the_view() {
-        assert!(excluded("target"));
-        assert!(excluded("target/debug/foo"));
-        assert!(excluded(".git/HEAD"));
-        assert!(excluded("vendor/x/.git/config"));
-        assert!(!excluded("src/target.rs"));
-        assert!(!excluded("targets/a.rs"));
-        assert!(!excluded("crates/target/src/lib.rs"));
-        assert!(!excluded(".cargo/config.toml"));
-        assert!(!excluded("src/.gitignore.rs"));
-    }
+    /// The wall clock the tests' driver reads: a real epoch's, long after every stamp they
+    /// answer with (`mtime_ns: 1`), so none of those is racy.
+    const NOW_NS: u64 = 1_700_000_000_000_000_000;
 
     #[test]
     fn what_waits_is_what_reads_a_checkout() {
@@ -601,11 +649,11 @@ mod tests {
                 .collect()
         };
 
-        heads.arrive(&vfs, build(1), &mut effects, &mut out);
+        heads.arrive(&vfs, NOW_NS, build(1), &mut effects, &mut out);
         assert_eq!(passed(&mut out), [1], "nothing is watched: the round is in at once");
 
         dirs.want(std::path::Path::new("/usr/include"));
-        heads.arrive(&vfs, build(2), &mut effects, &mut out);
+        heads.arrive(&vfs, NOW_NS, build(2), &mut effects, &mut out);
         assert_eq!(passed(&mut out), [2], "a watch not yet confirmed has nothing to flush");
         let stat = effects
             .iter()
@@ -617,13 +665,14 @@ mod tests {
         let meta = blaze_core::Meta { len: 0, dir: true, modified_ns: 0 };
         heads.complete(
             &mut vfs,
+            NOW_NS,
             Completion { tag: stat, done: Done::Stat(Some(meta)) },
             &mut effects,
             &mut out,
         );
         effects.clear();
 
-        heads.arrive(&vfs, build(3), &mut effects, &mut out);
+        heads.arrive(&vfs, NOW_NS, build(3), &mut effects, &mut out);
         let flush = effects
             .iter()
             .find_map(|it| match it {
@@ -635,6 +684,7 @@ mod tests {
         assert_eq!(heads.waiting(), 1);
         heads.arrive(
             &vfs,
+            NOW_NS,
             Arrived::Request { from: from(4), request: Request::Status },
             &mut effects,
             &mut out,
@@ -643,6 +693,7 @@ mod tests {
 
         heads.complete(
             &mut vfs,
+            NOW_NS,
             Completion { tag: flush, done: Done::Flushed },
             &mut effects,
             &mut out,
@@ -726,14 +777,14 @@ mod tests {
         let mut effects = Vec::new();
         let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
         let numbers: Vec<u64> =
-            (0..40).map(|_| heads.flush(&vfs, "/w", &mut effects).unwrap().1).collect();
+            (0..40).map(|_| heads.flush(&vfs, "/w", NOW_NS, &mut effects).unwrap().1).collect();
         assert_eq!(numbers, (0..40).collect::<Vec<_>>());
         let watch = heads.checkouts[0].as_deref().unwrap().watch;
         let flushes = effects
             .iter()
             .filter(|it| matches!(it, Effect::Flush { watch: at, .. } if *at == watch))
             .count();
-        assert_eq!(flushes, 40);
+        assert_eq!(flushes, 39, "the first wait is the watcher's own look, no flush");
         assert!(
             !effects.iter().any(|it| matches!(it, Effect::Write { .. } | Effect::Remove { .. })),
             "a flush writes nothing into the checkout: {effects:?}"
@@ -744,5 +795,88 @@ mod tests {
         }
         heads.sweep();
         assert_eq!(heads.checkouts[0].as_deref().unwrap().flushes.len(), 13);
+    }
+
+    /// The invariant: the request that starts a checkout's watch asks no flush and is handed on
+    /// only once the watcher's own look (its start's sweep) has committed; a request that
+    /// arrives while that look runs asks one flush and waits for it. Control: a first request
+    /// handed on before the look commits.
+    #[test]
+    fn the_request_that_starts_a_watch_waits_for_its_look_and_asks_no_flush() {
+        for planted in [false, true] {
+            plant_passes_before_the_look(planted);
+            let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
+            let mut vfs = Vfs::recover(FileName::new("journal").unwrap(), 1 << 50, &[]).0;
+            let (mut effects, mut out) = (Vec::new(), Vec::new());
+            let open = |id| Arrived::Request {
+                from: RequestRef { conn: Conn(1), id },
+                request: Request::Open { view: ViewRef::Head("/w".to_owned()) },
+            };
+            let passed = |out: &mut Vec<Out>| -> Vec<u64> {
+                out.drain(..)
+                    .filter_map(|it| match it {
+                        Out::Pass(Arrived::Request { from, .. }) => Some(from.id),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let flushes = |effects: &[Effect]| {
+                effects.iter().filter(|it| matches!(it, Effect::Flush { .. })).count()
+            };
+
+            heads.arrive(&vfs, NOW_NS, open(1), &mut effects, &mut out);
+            assert_eq!(flushes(&effects), 0, "the first request asks no flush: {effects:?}");
+            let early = passed(&mut out);
+            if planted {
+                assert_eq!(early, [1], "the control hands it on before the look");
+                plant_passes_before_the_look(false);
+                continue;
+            }
+            assert!(early.is_empty(), "handed on before the watcher looked: {early:?}");
+            heads.arrive(&vfs, NOW_NS, open(2), &mut effects, &mut out);
+            assert_eq!(flushes(&effects), 1, "a request while the look runs asks one flush");
+            assert!(passed(&mut out).is_empty());
+
+            // The watcher's look answered as an empty directory; the journal stays open.
+            let mut first = Vec::new();
+            let mut flush = None;
+            for _ in 0..100 {
+                let asked: Vec<Effect> = effects.drain(..).collect();
+                let mut answered = false;
+                for effect in asked {
+                    let (tag, done) = match effect {
+                        Effect::Stamp { files, tag } => {
+                            let mode = blaze_core::S_IFDIR;
+                            let dir = blaze_core::Stamp { ino: 2, size: 0, mtime_ns: 1, ctime_ns: 1, mode };
+                            (tag, Done::Stamped(files.iter().map(|_| dir).collect()))
+                        }
+                        Effect::Entries { tag, .. } => (tag, Done::Entries(Vec::new())),
+                        Effect::ReadAll { tag, .. } => (tag, Done::Read(Vec::new())),
+                        Effect::Flush { tag, .. } => {
+                            flush = Some(tag);
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    answered = true;
+                    assert!(heads.owns(tag), "{tag:?}");
+                    heads.complete(&mut vfs, NOW_NS, Completion { tag, done }, &mut effects, &mut out);
+                    let now = passed(&mut out);
+                    if !now.is_empty() {
+                        let checkout = heads.checkouts[0].as_deref().unwrap();
+                        assert!(checkout.watcher.idle(), "handed on with the look in flight");
+                    }
+                    first.extend(now);
+                }
+                if !answered {
+                    break;
+                }
+            }
+            assert_eq!(first, [1], "the first request goes on once the look commits, alone");
+            let flush = flush.expect("the second request's flush");
+            heads.complete(&mut vfs, NOW_NS, Completion { tag: flush, done: Done::Flushed }, &mut effects, &mut out);
+            assert_eq!(passed(&mut out), [2]);
+            assert_eq!(heads.waiting(), 0);
+        }
     }
 }

@@ -24,8 +24,13 @@ use crate::{
     tree::{self, Entry, Kind},
 };
 
+/// Windows a test's store reserves in its pool: its few packs, where a store reserves 4 TiB of
+/// address space. A property test leaks a handle (and so the pool) a case, so the whole
+/// reservation each case would run the process out of address space within a few dozen cases.
+const WINDOWS: u32 = 16;
+
 fn store(dir: &Path) -> (Driven, &'static Handle) {
-    let mut driven = Driven::open(dir).unwrap();
+    let mut driven = Driven::open_reserving(dir, blaze_cas::Loader::Pumped, WINDOWS).unwrap();
     let handle = Box::leak(Box::new(driven.handle()));
     (driven, handle)
 }

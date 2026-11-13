@@ -119,7 +119,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Capabilities
         // Kept by the list itself, or with `#[expect(..)]` on the function.
         | Lint::UndeclaredEffect
-        | Lint::UnneededEffect
+        | Lint::UnfulfilledEffect
         | Lint::NegativeEffect
         | Lint::Packable
         | Lint::SoaCandidate
@@ -134,6 +134,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ProcMacroAttribute
         | Lint::ProcMacroFnLike
         | Lint::BuildScriptAmbient
+        // About the package: allowed in the workspace's lint table or at the crate root.
+        | Lint::NotLatestEdition
         // Kept with `#[expect(..)]` on the function: what a function reaches is its choice.
         | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:

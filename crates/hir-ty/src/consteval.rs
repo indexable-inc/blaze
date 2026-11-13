@@ -660,6 +660,26 @@ pub fn const_eval_query<'db>(
     value
 }
 
+/// `run`, the evaluation of `def`, a constant with no generic arguments, through the item
+/// store's constant step ([`crate::body_store::konst`]): its value from its own entry when the
+/// store has it, else `run`, offered with what it read. Call it inside a query.
+///
+/// [`const_eval_query`] does not go through it, and [`deps`] (a constant under its crate's
+/// check key) is its one store. The one condition that turns it on: runtime MIR being a step
+/// of the item store. Until then `run` reads the constant's own runtime MIR
+/// (`monomorphized_runtime_mir_body_query`), which no fact stands for, so every offer is
+/// refused and a constant would pay a lookup, a capture and a classification for an entry it
+/// can never have (docs/v2/plan/design/caches.md, the `item-store` and `dep-consts` rows).
+/// Then `const_eval_query` calls this for `subst.is_empty()` and `deps` is deleted. Public for
+/// hir-ty-mir's `tests::consteval::items`, which hold what the step does once it can hit.
+pub fn stored_constant<'db>(
+    db: &'db Db,
+    def: ConstId,
+    run: impl FnOnce() -> Result<StoredAllocation, ConstEvalError<'db>>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    crate::body_store::constant(db, def, run)
+}
+
 fn const_eval_cycle_result<'db>(
     _: &'db Db,
     _: blaze_query::db::Id,

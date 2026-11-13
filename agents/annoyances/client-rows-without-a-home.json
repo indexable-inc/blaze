@@ -1,0 +1,14 @@
+{
+ "id": "client-rows-without-a-home",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), spans-2 executor then solo-rows executor, int-1112",
+ "where": "crates/blaze-thin/src/main.rs (solo answer, handover), crates/blaze-cargo/src/cli.rs sent_client_rows, cli/client_rows.rs, crates/blaze-certify/src/kept.rs, crates/blaze-cargo/src/serve/daemon.rs (look_for_solo_rows, solo_taken), serve/observe.rs (solo_rows), blaze-profile history.rs (solo_build)",
+ "what": "Three ways a command ends dropped or split its client spans: a solo answer (no daemon asked) timed `client: exec to main` and `client: solo check` and threw them away; a handover to the engine lost the thin's spans (Held carried only the request and the answer); the engine sent its rows on a second connection after closing the build's. A profile could not split a warm run, and the engine's run paid a second connect.",
+ "cost": "no profile of the fastest path at all; one extra connection per engine command",
+ "cause": "each new way to answer a command (solo, handover) was added as a route to an answer, and where its record goes was left for later",
+ "class": "a new exit path of a command with no owner for its record",
+ "prevention": "every way a command ends names where its spans go in the same change: the thin's `Rows` enum (told to the daemon, or kept as a file) is the one exit, and `client_rows::send` takes the command's own connection so it cannot open another",
+ "workaround": "none",
+ "fix": "The record, its layout (now `blaze solo rows2`, with workspace and command), the span codec and the take moved to blaze-certify `kept` (one home; blaze-thin keeps only `keep`, the writer). The take is a sans-IO machine over the daemon's driver effects (stat, list, read, remove), its record given only after its removal so nothing is taken twice; a `.part` is never read, and one past PART_GONE_AFTER_NS (60 s) whose pid is gone (raw::process::alive, kill(pid, 0)) is removed. The daemon looks at its first turn and each second idle; each record is numbered by the plane (Plane::number_unplanned, /tmp/plan/handoff-solo-rows.md) and written by History::solo_build with builds.solo_slot and solo_certified_by. Tests: blaze-certify kept::tests, blaze-thin kept::tests, history a_solo_answer_is_one_build_row..., serve tests/solo_rows.rs, each with a planted control.",
+ "state": "open until Plane::number_unplanned lands (handoff-solo-rows) and the build compiles; S3 (a solo run's program spans) not done"
+}

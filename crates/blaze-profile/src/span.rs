@@ -975,6 +975,8 @@ span_kinds! {
             "the span open on the thread that gave a `job` span's job to the pool, as `span_id` numbers it in the same process: what the job stands on when no job gave it (the daemon's loop on no fiber), which the critical path crosses into; null when the giver was inside no span, and for any other span";
         GrantedBytes = "granted_bytes" (U64): u64,
             "the memory the plane granted a daemon `task` as it started: its predicted peak (`blaze_graph::admission`), what its memory admission held it to; against `peak_bytes`, how far off the forecast was; null for any other span";
+        ForecastBasis = "forecast_basis" (Utf8): Name,
+            "where a daemon `task`'s or `admission`'s forecast (its `granted_bytes`) came from (`blaze_graph::forecast::Basis`): `own record` (its learn key's last runs), `size x kind's measured rate`, `kind's measured peak`, `unseen kind's default`, or `given` (not forecast); against `peak_bytes`, which part of the model was off; null for any other span and in files of a blaze before it";
         Passed = "passed" (U64): u64,
             "the times a daemon `task` was passed over for memory before it started: another task started while its granted bytes did not fit (0: memory never held it back); null for any other span";
         Node = "node" (U64): u64,
@@ -1034,12 +1036,13 @@ span_kinds! {
         /// One run of a daemon plane task on a thread (`blaze_cargo::serve::plane`): `kind` its
         /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
         /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
-        /// times it was passed over for memory before it started, `krate` and `unit` the unit
+        /// times it was passed over for memory before it started, `basis` where its forecast came
+        /// from (`blaze_graph::forecast::Basis`), `krate` and `unit` the unit
         /// it is a phase of as the unit phase spans name it (none for a task of no unit); as
         /// it ends, `peak` the most it held, and `heap_allocated` and `heap_freed` what it
         /// allocated and freed of the global heap in all. The unit phase and query spans of its
         /// work are under it.
-        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed, krate: Option<Name> => Crate, unit: Option<Name> => Unit }
+        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed, basis: Name => ForecastBasis, krate: Option<Name> => Crate, unit: Option<Name> => Unit }
             => TaskEnded { peak: Option<u64> => PeakBytes, heap_allocated: Option<u64> => HeapAllocated, heap_freed: Option<u64> => HeapFreed }
         /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
         /// step its node became ready to the step it started, `kind` its task kind as its
@@ -1047,10 +1050,10 @@ span_kinds! {
         /// queues the task), so it is [`detached`]: on no thread's stack, under no span. As
         /// it ends, `waited_for` what held it back (memory when another task with memory
         /// started while it did not fit, else a thread of its pool, or nothing when it started
-        /// in the step it became ready), `passed` and `granted` as its `task` span's. One
+        /// in the step it became ready), `passed`, `granted` and `basis` as its `task` span's. One
         /// that never started (its request cancelled, it settled from the memo) ends unsaid.
         Admission = "admission" { kind: Name => Function, node: u64 => Node }
-            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes }
+            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes, basis: Name => ForecastBasis }
     }
 }
 

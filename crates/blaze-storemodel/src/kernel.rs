@@ -15,15 +15,15 @@ use std::sync::Arc;
 use blaze_cas::{Guard, Key, Kind, Mismatch, Reader, Store, Ticket, Writer};
 use blaze_ids::ContentId;
 use blaze_kernel::{
-    CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Put, Read, ReadKind, Reading, Reads,
-    Seen, Step, StepError, StepId, Subject, World, WorldError,
+    CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Pin, Put, Read, ReadKind, Reading,
+    Reads, Seen, Step, StepError, StepId, Subject, World, WorldError,
 };
 use blaze_store_check::Setting;
 use blaze_core::lock::Lock;
 
 use crate::actors::{Resume, Turn};
 use crate::explore::{Bounds, Chooser, Failure, Memo};
-use crate::fs::{CrashFs, Disk};
+use crate::fs::Disk;
 use crate::properties;
 use crate::store::{Ledger, Model, Outcome, Run, Wait, keep, open, short};
 
@@ -47,6 +47,11 @@ impl World for Dials {
             }
             _ => Err(WorldError::new(read, "the model's world has no such read")),
         }
+    }
+
+    fn pin(&self) -> Pin {
+        let [a, b, c, d] = self.facts;
+        Pin(ContentId::of("blaze storemodel pin 1", &[self.dial, a, b, c, d]))
     }
 }
 
@@ -178,7 +183,7 @@ pub struct KernelScenario {
 const CODE_DOMAIN: &str = "blaze storemodel code 1";
 
 /// The kernel every model uses: both steps registered.
-pub fn kernel() -> Kernel {
+pub fn kernel() -> Kernel<Dials> {
     let mut kernel = Kernel::new();
     kernel
         .register::<Dialed>(CodeId(ContentId::of(CODE_DOMAIN, b"dialed")))
@@ -244,7 +249,7 @@ fn outcome(got: Result<Got<'_>, KernelError>) -> Result<Outcome, String> {
 /// A kernel get's outcome; an error other than a conflict, rendered.
 fn get<P: Put + ?Sized>(
     which: Which,
-    kernel: &Kernel,
+    kernel: &Kernel<Dials>,
     store: &mut P,
     world: &Dials,
     input: u8,
@@ -258,7 +263,7 @@ fn get<P: Put + ?Sized>(
 /// A kernel lookup's value; an error, rendered.
 fn find<G: Get + ?Sized>(
     which: Which,
-    kernel: &Kernel,
+    kernel: &Kernel<Dials>,
     store: &G,
     world: &Dials,
     input: u8,
@@ -291,7 +296,7 @@ fn asks(
     asker: Asker,
     which: Which,
     wait: Wait,
-    kernel: &Kernel,
+    kernel: &Kernel<Dials>,
     world: &Dials,
     mut writer: Writer,
     reader: &Reader,
@@ -382,7 +387,7 @@ fn asks(
 /// restore gives what it gives on an empty store.
 fn check(
     scenario: &KernelScenario,
-    kernel: &Kernel,
+    kernel: &Kernel<Dials>,
     model: &Model,
     store: &Store,
     disk: &Disk,
@@ -425,9 +430,9 @@ fn check(
         }
     }
     // The kernel run again on the restore, and on an empty store.
-    let mut fs = CrashFs::from_disk(model.persist, disk);
+    let mut fs = model.on(disk);
     let mut again = open(&mut fs, bounds, "the restore, for the kernel")?;
-    let mut fs = CrashFs::new(model.persist);
+    let mut fs = model.empty();
     let mut fresh = open(&mut fs, bounds, "a fresh store, for the kernel")?;
     let mut values: BTreeMap<&str, (Outcome, Outcome)> = BTreeMap::new();
     for asker in scenario.askers.iter().filter(|it| !it.finds) {

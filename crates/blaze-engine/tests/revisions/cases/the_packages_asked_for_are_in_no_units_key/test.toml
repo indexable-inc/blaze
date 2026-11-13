@@ -1,0 +1,35 @@
+about = "Which packages a request asks for is in no unit's key: after `-p a`, a build of `-p b` makes b's own program and finds every unit the two share (the library `up`, the vendored `made`, its build script and that script's run); a build of both then makes nothing, and neither does going back to `-p a`."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "a"]
+prints = "53\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "b"]
+prints = "54\n"
+max_units = 1
+max_records = 1
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "build"
+args = ["-p", "a", "-p", "b"]
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "a"]
+prints = "53\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0

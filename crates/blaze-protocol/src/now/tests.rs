@@ -385,6 +385,24 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
             span: span.clone(),
             path: vec!["codegen".into(), "copy_prop".into()],
         }],
+        running: vec![Running {
+            task: task.clone(),
+            for_ms: 270_000,
+            thread: Some("blaze-worker-3".into()),
+            span: Some(span.clone()),
+            path: vec!["codegen".into(), "copy_prop".into()],
+        }],
+        recent: 12,
+        failures: vec![task.clone()],
+        expanding: Expansion {
+            threads: 4,
+            busy: vec![Busy {
+                thread: "blaze-expand-1".into(),
+                task: None,
+                span: span.clone(),
+                path: Vec::new(),
+            }],
+        },
         blockers: vec![Blocker {
             task: task.clone(),
             running: true,

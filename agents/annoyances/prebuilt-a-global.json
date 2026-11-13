@@ -1,0 +1,14 @@
+{
+ "id": "prebuilt-a-global",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 7 task A3, int-1112",
+ "where": "crates/blaze-cargo/src/serve/packs.rs (the process OnceLock of the daemon's packs), crates/blaze-cargo/src/serve/unit/compile.rs `names`, scripts/src/bin/seal.rs",
+ "what": "The per-run `--no-prebuilt` could not be built or tested where it belongs: the daemon's packs were one process global (`packs()`, a OnceLock) that `names` asked of directly, and `Packs::fetch` wrote through the process-global store handle, so a request had no way to say 'no source for me' and a test had no way to give its own packs without a cfg(test) back door. Separately, seal refused any release that ships more than one tree, so bstd could not be sealed at all.",
+ "cost": "the switch stayed unbuilt one round (handoff-7A section 2); seal stopped at one pin",
+ "cause": "a setting that varies per request (whether records built elsewhere are taken) was read from process state at the use site instead of carried as a value in the job's input; seal sealed every tree in one home, where an export cannot select one tree's records",
+ "class": "per-request policy read from a process global at the point of use",
+ "prevention": "the request's typed field (`Cargo::prebuilt`, schema 54) becomes the job input's `packs: Option<Arc<Packs>>`, None when the request says no; Packs carries its store handle; seal seals each tree in its own home on the layers of the trees before it",
+ "workaround": "none",
+ "fix": "JobInput::packs from `packs::of_request`; `names` asks only `job.input.packs`. Test with_no_prebuilt_a_source_that_has_the_key_is_never_asked (control: the packs given whatever the switch says find the key and load the source).",
+ "state": "fixed, not yet built"
+}

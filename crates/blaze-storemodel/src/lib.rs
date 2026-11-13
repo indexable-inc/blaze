@@ -8,8 +8,9 @@
 //! system ([`fs::CrashFs`]) and a scheduler of actor threads ([`actors`]) are all it takes.
 //!
 //! - [`fs`]: what a crash keeps, as ALICE models it (Pillai et al., OSDI 2014): a prefix of
-//!   each file's unsynced changes, the last perhaps torn, and the directory entries a
-//!   [`fs::Persist`] model allows.
+//!   each file's unsynced changes, the last perhaps torn, the directory entries a
+//!   [`fs::Persist`] model allows, what a barrier orders, and whether a clone is made or
+//!   refused ([`fs::Clones`]: a store's open tries one, so every scenario runs on both).
 //! - [`explore`]: stateless depth-first search over the choices, bounded, with a seeded random
 //!   mode, shrinking, and a report naming the schedule and the crash point.
 //! - [`store`]: the controller every scenario runs on, the checks of a restore, and the

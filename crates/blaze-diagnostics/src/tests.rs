@@ -8,6 +8,7 @@ mod emit;
 mod items;
 mod stabilized;
 pub(crate) mod lints;
+mod passes_named;
 
 use std::collections::HashMap;
 
@@ -155,7 +156,77 @@ fn checked_as(
     expand_derives: bool,
     appended: Option<&'static str>,
 ) -> Checked {
+    if !expand_derives && appended.is_none() {
+        // clone: the fixture and its options, kept for the by-piece check's refinement
+        CHECKED.lock().push((fixture.to_owned(), prefix.to_owned(), options.clone()));
+    }
     checked_from(fixture::db(fixture), fixture, prefix, options, expand_derives, appended)
+}
+
+/// Each fixture a test checked through [`checked_as`] with neither derives expanded nor a
+/// module appended, with its prefix and options, in the order checked: what
+/// `pieces::tests::the_pieces_check_equals_the_whole_check` checks again by piece, beside its
+/// own fixtures, after every edit kind.
+pub(crate) static CHECKED: blaze_core::lock::Lock<Vec<(String, String, Options)>> =
+    blaze_core::lock::Lock::new("test.diagnostics.checked", Vec::new());
+
+/// A fixture's database as [`checked_with`] makes it, nothing checked yet, with the names of
+/// its files and its first file: what a test edits and checks again ([`check_all`]).
+pub(crate) fn fixture_db(
+    fixture: &str,
+    prefix: &str,
+) -> (base_db::Db, HashMap<FileId, String>, FileId) {
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let sysroot = fx.sysroot_files().to_vec();
+    let db = fx.into_db();
+    let first = files[0].file_id(&db);
+    let (names, _) = names_of(&db, fixture, prefix, &files, sysroot);
+    (db, names, first)
+}
+
+/// The diagnostics of every workspace crate of `db`, checked as [`checked_with`] checks them,
+/// `options` as given.
+pub(crate) fn check_all(
+    db: &base_db::Db,
+    names: &HashMap<FileId, String>,
+    options: &Options,
+) -> Vec<Diag> {
+    blaze_query::db::attach(db, || {
+        hir::check::workspace_crates(db)
+            .into_iter()
+            .flat_map(|krate| crate::check::check_crate(db, krate, Files::new(names, ""), options))
+            .collect()
+    })
+}
+
+/// The names of a fixture's files: each as the fixture names it, with `prefix` before it, and
+/// minicore's and the proc macros' crate's as compiletest names them; and minicore's file, if
+/// the fixture has it.
+fn names_of(
+    db: &base_db::Db,
+    fixture: &str,
+    prefix: &str,
+    files: &[base_db::EditionedFileId],
+    sysroot: Vec<FileId>,
+) -> (HashMap<FileId, String>, Option<FileId>) {
+    let mut names: HashMap<FileId, String> = files
+        .iter()
+        .zip(paths(fixture))
+        .map(|(file, path)| (file.file_id(db), format!("{prefix}{path}")))
+        .collect();
+    let (has_core, has_proc_macros) = sysroot_of(fixture);
+    let mut sysroot = sysroot.into_iter();
+    let core = has_core.then(|| sysroot.next().expect("a fixture with minicore has its file"));
+    if let Some(core) = core {
+        names.insert(core, CORE_NAME.to_owned());
+    }
+    if has_proc_macros {
+        let proc_macros =
+            sysroot.next().expect("a fixture with proc macros has their crate's file");
+        names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
+    }
+    (names, core)
 }
 
 fn checked_from(
@@ -187,30 +258,8 @@ fn checked_from(
         let root = files[0].file_id(&db);
         db.set_appended_root_module(root, Some(module), blaze_query::db::Durability::LOW);
     }
-    let mut names: HashMap<FileId, String> = files
-        .iter()
-        .zip(paths(fixture))
-        .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
-        .collect();
-    let (has_core, has_proc_macros) = sysroot_of(fixture);
-    let mut sysroot = sysroot.into_iter();
-    let core = has_core.then(|| sysroot.next().expect("a fixture with minicore has its file"));
-    if let Some(core) = core {
-        names.insert(core, CORE_NAME.to_owned());
-    }
-    if has_proc_macros {
-        let proc_macros =
-            sysroot.next().expect("a fixture with proc macros has their crate's file");
-        names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
-    }
-    let diags = blaze_query::db::attach(&db, || {
-        hir::check::workspace_crates(&db)
-            .into_iter()
-            .flat_map(|krate| {
-                crate::check::check_crate(&db, krate, Files::new(&names, ""), options)
-            })
-            .collect()
-    });
+    let (names, core) = names_of(&db, fixture, prefix, &files, sysroot);
+    let diags = check_all(&db, &names, options);
     Checked { db, names, core, diags }
 }
 

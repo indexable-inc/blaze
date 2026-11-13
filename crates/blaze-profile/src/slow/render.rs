@@ -33,6 +33,7 @@ pub fn text(report: &Report, top: usize) -> String {
     }
     panics_text(&b.panics, top, &mut out);
     problems_text(&report.problems, b.id, top, &mut out);
+    account_text(report.account.as_ref(), b.id, &mut out);
     // alloc: a line
     let links: Vec<String> =
         sum.path_by_link.iter().map(|it| format!("{} {}", it.name, s(it.ns))).collect();
@@ -109,6 +110,35 @@ pub fn text(report: &Report, top: usize) -> String {
         b.id
     );
     out
+}
+
+/// The build's account: what it saw change and what it did, by cause, in a line, then each
+/// warning the account names; said when the history holds none, never left out.
+pub fn account_text(account: Option<&super::Accounted>, build: u64, out: &mut String) {
+    let Some(account) = account else {
+        _ = writeln!(
+            out,
+            "  account: the history holds none for build {build} (written by a blaze before the `accounts` table, or the history's writer lost the build's end: `blaze daemon status`)"
+        );
+        return;
+    };
+    _ = writeln!(out, "  account: {}", account.line);
+    let ratio = |it: Option<f64>| it.map_or("-".to_owned(), |it| format!("{it:.1}")); // alloc: a cell
+    _ = writeln!(
+        out,
+        "    rows per input written {}, steps per changed input {}, unexplained {}{}",
+        ratio(account.rows_per_write),
+        ratio(account.steps_per_change),
+        account.unexplained,
+        match account.history_dropped {
+            0 => String::new(),
+            // alloc: a cell
+            rows => format!("; the history has dropped {rows} rows since its daemon began (`blaze daemon status`)"),
+        },
+    );
+    for it in &account.warnings {
+        _ = writeln!(out, "    warning ({}): {}", it.name, it.says);
+    }
 }
 
 /// What blaze itself said was wrong in the build, the first `top`, before anything the profile

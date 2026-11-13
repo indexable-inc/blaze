@@ -1,0 +1,14 @@
+{
+ "id": "stall-loud-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane stall-loud",
+ "where": "crates/blaze-core/src/cgroup.rs (HIGH_SIXTEENTHS), crates/blaze-cargo/src/serve/job/giving.rs (LINE, FAIL_LINE)",
+ "what": "The daemon set its own cgroup's memory.high at 15/16 of its ceiling while the only typed exit (a lone task fails) was at 31/32. A cold build of tempo sat 43 minutes between the two (139.69 and 144.34 of 149 GiB), every allocating thread throttled by the kernel and nothing able to fail, until systemd killed it.",
+ "cost": "a 43 minute stall and a killed daemon; a lane to find it",
+ "cause": "three constants for the lines of one limit lived in three files of two crates, each with a comment about the others, and nothing compared them",
+ "class": "a line that slows with no typed exit at or below it (rules 3 and 18); one concept in several homes (rule 30)",
+ "prevention": "crates/blaze-graph/src/lines.rs defines every line of a limit and what the kernel is told, and a const assertion over a range of limits refuses to compile an order where the kernel slows or ends the daemon below its typed failure; the control plants the old 15/16",
+ "workaround": "none",
+ "fix": "memory.high is written as max; cgroup::hold_own takes what lines.rs derives",
+ "state": "fixed, not yet compiled or run by this lane (write-only)"
+}

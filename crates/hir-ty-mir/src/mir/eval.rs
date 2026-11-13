@@ -3963,7 +3963,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         {
             // alloc: error path
             return Err(MirEvalError::NotSupported(format!(
-                "{} (of `{ty:?}`), computed from a `TypeId` and read by {}: its type has a raw                  pointer, a `dyn` or a union that may hold a `TypeId`, where the id of the                  evaluation that made it cannot be found and given this one's",
+                "{} (of `{ty:?}`), computed from a `TypeId` and read by {}: its type has a raw \
+                 pointer, a `dyn` or a union that may hold a `TypeId`, where the id of the \
+                 evaluation that made it cannot be found and given this one's",
                 whose(),
                 evaluated(self.db, self.owner)
             )));
@@ -5068,7 +5070,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let Some(ty) = source.type_id_ty(id) else {
             not_supported!(
-                "a `TypeId` in a constant read by another evaluation, which the evaluation that                  made the constant did not make (its bytes are {id:#x})"
+                "a `TypeId` in a constant read by another evaluation, which the evaluation that \
+                 made the constant did not make (its bytes are {id:#x})"
             );
         };
         let own = self.type_id(ty);

@@ -67,8 +67,12 @@ impl ArgType {
     }
 }
 
+/// The last build: the last row of `builds`, never the greatest id a span has. What a build
+/// does after its answer (storing what it left) is recorded under the id after its own, which
+/// is no build: with that as the default, `blaze explain edit_work` after any build said
+/// `build 4 counted no work in any stage` and `writes` said `0 rows` (2026-11-12).
 const BUILD: Arg =
-    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM spans)") };
+    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM builds)") };
 /// A build for a view over its wall time: by default the last to end, as one still running has
 /// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
@@ -140,6 +144,7 @@ pub const VIEWS: &[View] = &[
     const { view("memory_held", &[BUILD, LIMIT]) },
     const { view("memory_held_now", &[LIMIT]) },
     const { view("memory_sites", &[BUILD, LIMIT]) },
+    const { view("memory_give_backs", &[BUILD, LIMIT]) },
     const { view("admission_waits", &[BUILD, LIMIT]) },
     const { view("busiest_threads", &[BUILD, LIMIT]) },
     const { view("longest_gaps", &[BUILD, LIMIT]) },
@@ -164,12 +169,16 @@ pub const VIEWS: &[View] = &[
     const { view("wait_owner", &[BUILD, LONG_MS, LIMIT]) },
     const { view("waits_by_reason", &[BUILD, LIMIT]) },
     const { view("counts_by_cause", &[BUILD, MANY]) },
+    const { view("validity", &[BUILD]) },
     const { view("writes", &[BUILD, MANY]) },
     const { view("scripts", &[BUILD, MANY]) },
     const { view("pool", &[ENDED_BUILD]) },
     const { view("kept", &[ENDED_BUILD, MANY]) },
     const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
+    const { view("unit_reads", &[BUILD, MANY]) },
     const { view("edit_work", &[BUILD, MANY]) },
+    const { view("account", &[ENDED_BUILD]) },
+    const { view("unaccounted", &[LIMIT]) },
 ];
 
 /// The view named `name`.
@@ -655,7 +664,7 @@ mod tests {
         let view = find("slowest_queries").unwrap();
         let sql = render(view, &args(json!({}))).unwrap();
         assert!(
-            sql.contains("build_id = (SELECT max(build_id) FROM spans)"),
+            sql.contains("build_id = (SELECT max(build_id) FROM builds)"),
             "a missing argument takes its default: {sql}"
         );
         assert!(sql.ends_with("LIMIT 20"), "{sql}");

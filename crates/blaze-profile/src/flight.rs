@@ -381,15 +381,18 @@ impl ReadTable {
         READER_SYM | epoch << 24
     }
 
-    fn sym_of(&mut self, text: std::sync::Arc<str>) -> Sym {
-        if let Some(&id) = self.current.ids.get(&text) {
+    /// The sym of `text`, copied into the table only where it holds none: a name read back
+    /// from a ring is borrowed from the readers' definitions until here
+    /// ([`names::Streams::resolve_str`]).
+    fn sym_of(&mut self, text: &str) -> Sym {
+        if let Some(&id) = self.current.ids.get(text) {
             return id;
         }
         if self.current.names.len() >= READER_GENERATION {
             self.previous = std::mem::take(&mut self.current);
             self.epoch = (self.epoch + 1) % READER_EPOCHS;
         }
-        self.current.add_arc(Self::base(self.epoch), text)
+        self.current.add(Self::base(self.epoch), text)
     }
 
     fn get(&self, sym: Sym) -> Option<&std::sync::Arc<str>> {
@@ -434,6 +437,25 @@ fn reader() -> ReaderGuard {
     let mut guard = lock(&READER);
     guard.get_or_insert_with(|| Reader { streams: names::Streams::default(), table: ReadTable::default() });
     ReaderGuard(guard)
+}
+
+/// The bytes of the heap the readers hold of the rings' names ([`names::Streams::held_bytes`]):
+/// each ring's definitions of its last [`names::RETAIN`] generations, one text buffer a
+/// generation. What an idle daemon's planner lists as the names it can give back
+/// ([`trim_names`]); 0 before anything was read.
+pub fn names_held() -> u64 {
+    lock(&READER).as_ref().map_or(0, |it| it.streams.held_bytes())
+}
+
+/// Lets go of the readers' names no read can need again ([`names::Streams::trim`]): every
+/// generation but the newest of each ring whose thread ended, and the spare room of the rest.
+/// The bytes [`names_held`] fell by.
+pub fn trim_names() -> u64 {
+    let mut reader = lock(&READER);
+    let Some(reader) = reader.as_mut() else { return 0 };
+    reader.streams.trim(|ring| {
+        by_number(usize::from(ring)).is_none_or(|it| !it.live.load(Ordering::Acquire))
+    })
 }
 
 /// The live rings, as the readers' [`names::Source`].
@@ -586,7 +608,7 @@ pub(crate) fn token_text(token: Token) -> Option<std::sync::Arc<str>> {
 /// A sym of this process for `text`, from the readers' table: what a name read back from a
 /// table is given ([`span::Value::of_text`]).
 pub fn read_sym(text: &str) -> Sym {
-    reader().table.sym_of(text.into())
+    reader().table.sym_of(text)
 }
 
 /// The key the hot sketches keep `token` under ([`names::hot_key`]).
@@ -689,7 +711,7 @@ impl Namer for LiveNamer<'_> {
             return word;
         }
         let Reader { streams, table } = &mut *self.0;
-        match streams.resolve(ring, at, word, &mut Rings) {
+        match streams.resolve_str(ring, at, word, &mut Rings) {
             Some(text) => table.sym_of(text),
             None => 0,
         }
@@ -786,17 +808,28 @@ pub enum Plot {
     Named,
     /// Bytes the process's footprint holds past the live heap and blaze-mem's resident
     /// committed memory: what the allocators keep freed and resident, the bytes a purge can
-    /// give back. mimalloc's own committed count is no measure of it, since a purge never
-    /// lowers that count (`mi_os_decommit_ex` on a release build). Sampled by the daemon with
-    /// [`Plot::Footprint`].
+    /// give back, and the stacks ([`Plot::StackBytes`] says how much of it the fibers' are).
+    /// mimalloc's own committed count is no measure of it: it counts arenas committed whole
+    /// and never touched. Sampled by the daemon with [`Plot::Footprint`].
     AllocatorKeptBytes,
     /// Bytes purges gave back so far, each one's footprint before less its footprint after
     /// once every worker gave back its heaps (`blaze_cargo::raw::memory::purged_bytes`).
     AllocatorPurgedBytes,
+    /// Bytes of footprint an idle daemon holds past its idle budget while its planner's last
+    /// look found nothing more it may give (`serve::idle::BUDGET`, outcome `FloorOver`); 0
+    /// otherwise. What should read 0 a minute into an idle daemon.
+    IdleOverBytes,
+    /// Bytes the live fibers' stacks hold, each to the deepest page it switched out from
+    /// (`blaze_graph::sched::stack::resident`): the part of [`Plot::AllocatorKeptBytes`] that
+    /// is stacks, not an allocator's pages. Sampled with the memory's breakdown.
+    StackBytes,
+    /// Threads the process runs now (Linux `/proc/self/stat`, macOS `proc_pidinfo`): each holds
+    /// a stack and its own heaps' pages. Sampled with the memory's breakdown.
+    Threads,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 32] = [
+    pub const ALL: [Plot; 35] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -829,6 +862,9 @@ impl Plot {
         Plot::Named,
         Plot::AllocatorKeptBytes,
         Plot::AllocatorPurgedBytes,
+        Plot::IdleOverBytes,
+        Plot::StackBytes,
+        Plot::Threads,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -865,6 +901,9 @@ impl Plot {
             Plot::Named => "named",
             Plot::AllocatorKeptBytes => "allocator kept bytes",
             Plot::AllocatorPurgedBytes => "allocator purged bytes",
+            Plot::IdleOverBytes => "idle over bytes",
+            Plot::StackBytes => "stack bytes",
+            Plot::Threads => "threads",
         }
     }
 
@@ -4180,10 +4219,17 @@ pub struct Read {
 /// `decode`'s blocks on an idle hello-world daemon's heap).
 const READ_KEPT: usize = 1 << 14;
 
-/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most.
+/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most once a read used under a
+/// quarter of the room it had: a read that filled its room is one of a busy stretch, whose
+/// next read fills it again. Until 2026-11-12 every read's room was cut back, so each flush
+/// of a cold build grew it again from [`READ_KEPT`] by doubling: on tempo's, `decode` and
+/// this function were 6.2 GiB of the `profile` tag's 135.31 GiB of heap churn, in blocks of
+/// 60 MB and 3.3 MB (`alloc_samples`; int-1112 d45e70ddc). An idle daemon's first small read
+/// after a burst still lets the room go, which is what the cut is for.
 fn let_go<T>(rows: &mut Vec<T>) {
+    let used = rows.len();
     rows.clear();
-    if rows.capacity() > READ_KEPT {
+    if rows.capacity() > READ_KEPT && used < rows.capacity() / 4 {
         rows.shrink_to(READ_KEPT);
     }
 }

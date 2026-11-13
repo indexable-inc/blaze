@@ -7,7 +7,10 @@ use blaze_live::patch::ask::{
 };
 use crossbeam_queue::SegQueue;
 
-use super::{ARENA, CELLS_PER_FUNCTION, Patch, answer, dev_run};
+use super::{
+    ARENA, CELLS_PER_FUNCTION, NotPlaced, PLANT, Patch, Plant, Unheld, answer, dev_file_key, dev_run,
+    placed_file, unheld_launch, write_file,
+};
 
 const PID: u32 = 41;
 
@@ -117,4 +120,124 @@ fn a_bad_ask_and_other_kinds_are_refused_naming_them() {
     assert!(premap.contains("0x0200"), "{premap}");
     let other = answered(&ask(Kind(0x03ff), &[]), &patch).0.unwrap_err();
     assert!(other.contains("0x03ff"), "{other}");
+}
+
+/// A code memory of `pages` pages of this host's and one page of arena; `None` on a platform
+/// blaze has no code memory on (nothing there adopts a file).
+fn memory_of(pages: u64) -> Option<blaze_inproc::CodeMemory> {
+    blaze_inproc::Format::host()?;
+    let probe = blaze_inproc::CodeMemory::new("adopt-probe", 1, 1).unwrap();
+    let page = probe.page();
+    drop(probe);
+    Some(blaze_inproc::CodeMemory::new("adopt", pages * page, page).unwrap())
+}
+
+/// A file of nine pages of `page` bytes and 100 bytes more: headers, a hole of
+/// zeros as an image's patch room is, code, another hole, and a last chunk cut short that is
+/// not zeros. Its bytes depend on `seed`.
+fn a_file(page: usize, seed: u8) -> Vec<u8> {
+    let mut bytes = vec![0u8; 9 * page + 100];
+    let mut fill = |from: usize, to: usize| {
+        for (n, it) in bytes[from..to].iter_mut().enumerate() {
+            *it = (n as u8).wrapping_mul(31).wrapping_add(seed) | 1;
+        }
+    };
+    fill(0, 200); // headers, in a page otherwise zeros
+    fill(3 * page, 5 * page); // two pages of code
+    fill(5 * page + page / 2, 5 * page + page / 2 + 1); // one byte that is not zero
+    fill(9 * page, 9 * page + 100); // the cut chunk at the end
+    bytes
+}
+
+/// The bytes of `bytes`' chunks of `page` that hold a byte that is not zero.
+fn not_zero(bytes: &[u8], page: usize) -> u64 {
+    bytes.chunks(page).filter(|it| it.iter().any(|b| *b != 0)).map(|it| it.len() as u64).sum()
+}
+
+/// What a launch does at a path this daemon holds no program at.
+/// The invariant: a dev executable is made its memory only from the output placed there (its
+/// key); with nothing placed it is refused, never run from its file; a file that is no dev
+/// executable runs as linked.
+#[test]
+fn a_launch_with_nothing_held_adopts_only_a_placed_dev_executable() {
+    let key = [7u8; 32];
+    assert_eq!(unheld_launch(true, Some(key)), Unheld::Adopt(blaze_cas::Key(blaze_ids::ContentId(key))));
+    assert_eq!(unheld_launch(true, None), Unheld::Refused, "nothing placed: the unheld error, never its file");
+    assert_eq!(unheld_launch(false, Some(key)), Unheld::File);
+    assert_eq!(unheld_launch(false, None), Unheld::File);
+}
+
+/// The placed file laid into a new code memory, as a launch after a start does
+/// (`DevRuns::launch`'s `Unheld::Adopt`: `placed_file`, then `adopted`'s `write_file`).
+/// The invariant: the memory's first `len` bytes are the placed file's, byte for byte, and
+/// past them zeros; the bytes written are the file's chunks of a page that are not all zeros,
+/// so a hole takes no page. Control: `Plant::WritesEveryPage` writes the holes too, and the
+/// count says so.
+#[test]
+fn an_adopted_memory_is_the_placed_file_and_takes_no_page_for_a_hole() {
+    let Some(mut memory) = memory_of(12) else { return };
+    let page = memory.page() as usize;
+    let file = a_file(page, 3);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app");
+    std::fs::write(&path, &file).unwrap();
+    let path = path.to_str().unwrap();
+
+    let bytes = placed_file(path, dev_file_key(&file)).unwrap();
+    assert_eq!(bytes, file, "the bytes given are the file's");
+    let written = write_file(&mut memory, &bytes).unwrap();
+    let held = memory.bytes(blaze_inproc::CodeRange { offset: 0, len: 12 * page as u64 }).unwrap();
+    assert_eq!(&held[..file.len()], &file[..], "the memory's code is the file's, byte for byte");
+    assert!(held[file.len()..].iter().all(|it| *it == 0), "and zeros past it");
+    let want = not_zero(&file, page);
+    assert_eq!(written, want, "only the pages that are not zeros are written");
+    assert!(want < file.len() as u64, "the file has holes, or the count proves nothing");
+
+    // The control: a writer that writes every chunk lays the same bytes and fails the count.
+    let Some(mut every) = memory_of(12) else { return };
+    PLANT.set(Some(Plant::WritesEveryPage));
+    let planted = write_file(&mut every, &bytes);
+    PLANT.set(None);
+    assert_ne!(planted.unwrap(), want, "the oracle catches a hole written");
+}
+
+/// A file written at the placed path after its build placed it.
+/// The invariant: its bytes are not given for the memory: the refusal names the path, the
+/// placed key and the key of the file there now, and an unreadable path names the path.
+/// Control: `Plant::TrustsThePlacedKey` (the hash check removed) gives the stranger's bytes,
+/// which a memory made from them runs, and the oracle (the memory is the placed file) fails.
+#[test]
+fn a_file_changed_since_it_was_placed_is_refused_naming_it_and_both_keys() {
+    let page = 4096;
+    let placed = a_file(page, 3);
+    let stranger = a_file(page, 4);
+    assert_ne!(placed, stranger);
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("app");
+    std::fs::write(&at, &stranger).unwrap();
+    let path = at.to_str().unwrap();
+    let key = dev_file_key(&placed);
+
+    let refused = placed_file(path, key).unwrap_err();
+    let found = dev_file_key(&stranger);
+    assert_eq!(refused, NotPlaced::Changed { path: path.to_owned(), placed: key, found });
+    let said = refused.to_string();
+    assert!(said.contains(path), "{said}");
+    assert!(said.contains(&format!("{:x}", key.0)) && said.contains(&format!("{:x}", found.0)), "{said}");
+
+    let gone = dir.path().join("gone");
+    let unread = placed_file(gone.to_str().unwrap(), key).unwrap_err();
+    assert!(matches!(&unread, NotPlaced::Unread { path, .. } if path == gone.to_str().unwrap()), "{unread}");
+
+    // The control: with the check removed the stranger's bytes are what a memory is made of.
+    PLANT.set(Some(Plant::TrustsThePlacedKey));
+    let trusted = placed_file(path, key);
+    PLANT.set(None);
+    let trusted = trusted.unwrap();
+    assert_eq!(trusted, stranger);
+    if let Some(mut memory) = memory_of(12) {
+        write_file(&mut memory, &trusted).unwrap();
+        let held = memory.bytes(blaze_inproc::CodeRange { offset: 0, len: placed.len() as u64 }).unwrap();
+        assert_ne!(held, &placed[..], "the oracle catches the stranger's bytes laid in as code");
+    }
 }

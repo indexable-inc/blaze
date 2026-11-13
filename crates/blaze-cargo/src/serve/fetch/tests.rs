@@ -48,13 +48,19 @@ impl Http for Fake {
     }
 }
 
+/// Windows a test's store reserves in its pool: its few packs, where a store reserves 4 TiB of
+/// address space, which a leaked handle keeps reserved until the process ends.
+const WINDOWS: u32 = 16;
+
 /// A fetcher over `fake` keeping `.crate` files in a store of its own: the tests serve the
 /// same tarballs, and one test's kept `.crate` must not answer another's fetch. The store's
 /// handle is leaked (blaze-fetch takes a `'static` one, as the daemon's is); its directory is
-/// removed when the fetcher drops.
+/// removed when the fetcher drops. Its pool reserves [`WINDOWS`] windows, not a store's 4 TiB:
+/// every test leaks one.
 fn fetcher(fake: &Arc<Fake>) -> Kept {
     let dir = tempfile::tempdir().unwrap();
-    let driven = Box::leak(Box::new(blaze_cas::Driven::open(dir.path()).unwrap()));
+    let driven = blaze_cas::Driven::open_reserving(dir.path(), blaze_cas::Loader::Pumped, WINDOWS);
+    let driven = Box::leak(Box::new(driven.unwrap()));
     let store = Box::leak(Box::new(driven.handle()));
     let fetcher = Fetcher::with_http(fake.clone(), dir.path().join("scratch"))
         .retrying(Retry { retries: 3, quiet: true, fixed_sleep_ms: Some(0) })
@@ -360,13 +366,23 @@ fn entries_that_leave_the_package_are_refused_by_name() {
         assert!(error.what.contains(named), "{named}: {}", error.what);
         assert_eq!(error.at.as_deref(), Some(SERDE));
     };
-    refused(Entry::File("../x", b"", 0o644), "\"../x\"");
-    refused(Entry::File("/x", b"", 0o644), "\"/x\"");
-    refused(Entry::File("serde-1.0.218/x", b"", 0o644), "\"serde-1.0.218/x\"");
-    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "\"serde-1.0.219/../x\"");
-    refused(Entry::File("serde-1.0.219/./x", b"", 0o644), "\"serde-1.0.219/./x\"");
-    refused(Entry::File("serde-1.0.219//x", b"", 0o644), "\"serde-1.0.219//x\"");
+    // Each name is held to blaze-fetch's one set of name rules (`blaze_fetch::unpack::Names`),
+    // which names the entry as the archive spells it.
+    refused(Entry::File("../x", b"", 0o644), "`../x` has a `..` in it");
+    refused(Entry::File("/x", b"", 0o644), "`/x` is absolute");
+    refused(Entry::File("serde-1.0.218/x", b"", 0o644), "`serde-1.0.218/x` is not under `serde-1.0.219`");
+    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "`serde-1.0.219/../x` has a `..` in it");
     refused(Entry::Link("serde-1.0.219/etc", "../../etc"), "\"serde-1.0.219/etc\"");
+    // A `.` or an empty part stays inside the package: the name is the file it lands on, as
+    // cargo unpacks it, and the same rules take it on disk.
+    for spelled in ["serde-1.0.219/./x", "serde-1.0.219//x"] {
+        let source = fetch_crate(&[
+            Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644),
+            Entry::File(spelled, b"x", 0o644),
+        ])
+        .unwrap();
+        assert!(source.files.iter().any(|it| it.path == "x"), "{spelled}: {:?}", source.files);
+    }
 }
 
 #[test]
@@ -376,14 +392,18 @@ fn a_path_twice_is_refused() {
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\" twice"), "{}", error.what);
+    assert!(error.what.contains("`src/lib.rs` is in the archive twice"), "{}", error.what);
 
     let error = fetch_crate(&[
         Entry::File("serde-1.0.219/src", b"a", 0o644),
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\""), "{}", error.what);
+    assert!(
+        error.what.contains("`src` is in the archive as a directory and as a file"),
+        "{}",
+        error.what
+    );
 }
 
 fn index_fetch() -> Fetch {
@@ -544,8 +564,15 @@ fn a_git_tree_is_its_commit_with_modes() {
     let fake = Fake::new(Vec::new());
     let source = fetcher(&fake).fetch(&fetch).unwrap();
     assert_eq!(source.under, "");
+    // The tree comes with the repository blaze-registry keeps of a checkout (`.git/...`, its
+    // commit, trees and an index), so a build script that asks git for its commit is answered:
+    // HEAD names the locked commit, detached.
+    let (repository, tree): (Vec<SourceFile>, Vec<SourceFile>) =
+        source.files.into_iter().partition(|it| it.path.starts_with(".git/"));
+    let head = repository.iter().find(|it| it.path == ".git/HEAD").expect("the kept repository's HEAD");
+    assert_eq!(&*head.bytes, format!("{commit}\n").as_bytes());
     assert_eq!(
-        source.files,
+        tree,
         vec![
             file(".cargo-ok", b"", Mode::Regular),
             file("Cargo.toml", b"[package]\nname = \"g\"\n", Mode::Regular),

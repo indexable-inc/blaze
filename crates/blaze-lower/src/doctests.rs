@@ -25,7 +25,7 @@ use intern::Symbol;
 use span::Edition;
 use triomphe::Arc;
 
-use super::{Appended, Db, LowerError, Lowered};
+use super::{Appended, Db, LowerError, Lowered, RootOf};
 
 /// One program of a library's doctests: an example's, or the runner's.
 pub struct DoctestProgram<'a> {
@@ -49,7 +49,9 @@ pub struct DoctestProgram<'a> {
 /// The crates [`Lowered::doctests`] made for one `Doctest` unit, kept so a later call writes
 /// the same files and crates again rather than making new ones.
 pub(crate) struct OfUnit {
-    unit: usize,
+    /// The unit of the plan the front end is at; `usize::MAX` while that plan has no
+    /// `Doctest` unit of their crate ([`Lowered::relower`]).
+    pub(crate) unit: usize,
     made: Vec<Made>,
 }
 
@@ -136,11 +138,8 @@ impl Lowered {
                 self.doctests.len() - 1
             }
         };
-        // Each example's source root is its own, after the packages' and every one an example
-        // of any unit has.
-        let taken =
-            self.doctests.iter().flat_map(|it| it.made.iter().map(|made| made.root.0)).max();
-        let mut next = taken.map_or(self.crates.sets as u32 + 1, |it| it + 1);
+        // Each example's source root is its own: the front end's next ([`Graph::root`]), so a
+        // package a later plan names takes none of them.
         let mut was = std::mem::take(&mut self.doctests[at].made);
         // alloc: once per doctest unit written, its programs' crates
         let mut made = Vec::with_capacity(programs.len());
@@ -165,8 +164,7 @@ impl Lowered {
                             what.clone(),
                         )
                     })?;
-                    next += 1;
-                    (file, SourceRootId(next - 1))
+                    (file, SourceRootId(self.graph.root(RootOf::Example) as u32))
                 }
             };
             match program.appended {
@@ -216,6 +214,9 @@ impl Lowered {
                 manifest_kind: kind,
                 crate_types: kind.default_crate_types(),
                 proc_macro_cwd: base.proc_macro_cwd.clone(),
+                // An example crate is never sealed, whatever its library's pin: its root
+                // file is in a local root, written again by each build.
+                sealed: None,
             };
             // A test example's has `test` too.
             let cfg = match program.test {

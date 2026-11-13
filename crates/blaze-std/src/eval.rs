@@ -69,7 +69,7 @@
 //!
 //! # Memory
 //!
-//! [`Eval::memo`] keeps its entries in two generations, each a map ([`Map`]) and its values in
+//! [`Eval::memo`] keeps its entries in two generations, each a map ([`HashMap`]) and its values in
 //! an arena of [`Mem`] of half the byte limit. A new entry goes to the young one; when that
 //! holds half the entry limit, or its arena is full, the old generation's entries are dropped
 //! whole, its arena is reset, and the two swap. So no entry is freed piecemeal (an arena is a
@@ -102,7 +102,7 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     id::{ContentHasher, ContentId},
-    map::Map,
+    map::HashMap,
     mem::{Arena, Mem},
     sync::{LocalLock, LocalShared},
 };
@@ -125,12 +125,20 @@ pub struct Point {
 
 impl Point {
     /// The point of the memo point `f`.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn of<F: MemoPoint>(f: &F) -> Point {
         let _ = f;
         Point::of_type::<F>()
     }
 
     /// The point of the memo point whose item type is `F`: a constant of each instance.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn of_type<F: MemoPoint>() -> Point {
         // A constant of each instance of `F`: its value is in the code identity of whatever
         // names it, so a point's own identity covers the points it calls.
@@ -139,11 +147,19 @@ impl Point {
     }
 
     /// Its code identity.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn code(&self) -> ContentId {
         self.code
     }
 
     /// The function's path with its generic arguments, as an error names it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn path(&self) -> &'static str {
         self.path
     }
@@ -155,6 +171,10 @@ impl Point {
 }
 
 impl PartialEq for Point {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn eq(&self, other: &Point) -> bool {
         self.code == other.code
     }
@@ -163,6 +183,10 @@ impl PartialEq for Point {
 impl Eq for Point {}
 
 impl core::hash::Hash for Point {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.code.hash(state);
     }
@@ -198,6 +222,10 @@ impl Key {
     }
 
     /// The content ID it is.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn id(&self) -> ContentId {
         self.0
     }
@@ -246,6 +274,9 @@ pub trait EvalKey {
     fn write_key(&self, into: &mut KeyWriter);
 
     /// `items` one after another, without their count. `u8` writes them as one run of bytes.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn write_keys(items: &[Self], into: &mut KeyWriter)
     where
         Self: Sized,
@@ -305,6 +336,10 @@ impl EvalKey for char {
 }
 
 impl EvalKey for () {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn write_key(&self, _: &mut KeyWriter) {}
 }
 
@@ -325,6 +360,9 @@ impl<T: EvalKey> EvalKey for [T] {
 
 /// An array: its elements; its length is its type's.
 impl<T: EvalKey, const N: usize> EvalKey for [T; N] {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn write_key(&self, into: &mut KeyWriter) {
         T::write_keys(self, into);
     }
@@ -332,6 +370,10 @@ impl<T: EvalKey, const N: usize> EvalKey for [T; N] {
 
 /// A reference is what it refers to: never its address.
 impl<T: EvalKey + ?Sized> EvalKey for &T {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn write_key(&self, into: &mut KeyWriter) {
         (**self).write_key(into);
     }
@@ -401,6 +443,10 @@ pub struct At {
 
 impl At {
     /// The call itself.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn called(&self) -> Called {
         Called { point: self.point, key: self.key }
     }
@@ -438,6 +484,10 @@ pub trait Handler {
     fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>);
 
     /// What an error calls it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn name(&self) -> &'static str {
         "a handler"
     }
@@ -521,6 +571,10 @@ enum Provider<'a> {
 
 impl<'a> Eval<'a> {
     /// Calls the body: with it a marked call costs a plain call. No key is made.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn direct() -> Eval<'static> {
         Eval { provider: Provider::Direct }
     }
@@ -542,6 +596,9 @@ impl<'a> Eval<'a> {
     }
 
     /// Hands every call to `handler`.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn handler(handler: &'a dyn Handler) -> Eval<'a> {
         Eval { provider: Provider::Handler(handler) }
     }
@@ -767,7 +824,7 @@ where
         let this = self.key.map(|key| Called { point: self.point, key });
         let parent = match self.cx.plant() {
             Plant::NestedUnderGrandparent => self.parent,
-            _ => this,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => this,
         };
         let mut running = Running { eval: self.top, cx: self.cx, parent };
         self.out = Some((self.f)(&mut Nested { door: &mut running }, args));
@@ -835,7 +892,7 @@ struct Generations {
 
 struct Generation {
     /// `None` only inside [`Generation::empty`], between dropping the map and making the next.
-    entries: Option<Map<Called, Kept, Alloc>>,
+    entries: Option<HashMap<Called, Kept, Alloc>>,
     alloc: Alloc,
 }
 
@@ -843,7 +900,7 @@ impl Generation {
     fn new(arena: Arena) -> Generation {
         // alloc: once per generation of an evaluator, the owner of its arena's frame.
         let alloc = LocalShared::new(arena.into_frame());
-        Generation { entries: Some(Map::new_in(LocalShared::clone(&alloc))), alloc }
+        Generation { entries: Some(HashMap::new_in(LocalShared::clone(&alloc))), alloc }
     }
 
     fn get(&self, slot: &Called) -> Option<&Kept> {
@@ -868,7 +925,7 @@ impl Generation {
                  which were dropped",
             )
             .reset();
-        self.entries = Some(Map::new_in(LocalShared::clone(&self.alloc)));
+        self.entries = Some(HashMap::new_in(LocalShared::clone(&self.alloc)));
         dropped
     }
 
@@ -906,7 +963,7 @@ impl Memo {
         let plant = cx.plant();
         let point = match plant {
             Plant::MemoSharesPoints => Point::none(),
-            _ => call.point(),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => call.point(),
         };
         let slot = Called { point, key: call.key() };
         {
@@ -971,7 +1028,7 @@ impl Memo {
 /// reads it once the work is done; [`Provenance`] writes it.
 pub struct Graph<'m> {
     arena: &'m Arena,
-    edges: LocalLock<Map<Called, Vec<Called, &'m Frame>, &'m Frame>>,
+    edges: LocalLock<HashMap<Called, Vec<Called, &'m Frame>, &'m Frame>>,
     /// The calls the program made itself, in the order it first made them.
     roots: LocalLock<Vec<Called, &'m Frame>>,
     /// The first call that could not be recorded: the arena had no room.
@@ -980,10 +1037,12 @@ pub struct Graph<'m> {
 
 impl<'m> Graph<'m> {
     /// An empty graph in `arena`.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn new_in(arena: &'m Arena) -> Graph<'m> {
         Graph {
             arena,
-            edges: LocalLock::new(Map::new_in(arena.alloc())),
+            edges: LocalLock::new(HashMap::new_in(arena.alloc())),
             roots: LocalLock::new(Vec::new_in(arena.alloc())),
             failed: LocalLock::new(None),
         }
@@ -993,6 +1052,8 @@ impl<'m> Graph<'m> {
     /// order it first made them: `None` when no such call was recorded. An error when the
     /// arena ran out while recording: the graph is then not whole, and says so rather than
     /// answer with what it has.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn inputs_of<T>(
         &self,
         point: Point,
@@ -1005,6 +1066,8 @@ impl<'m> Graph<'m> {
     }
 
     /// The calls the program made itself, read by `read`, in the order it first made them.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn roots<T>(&self, read: impl FnOnce(&[Called]) -> T) -> Result<T, Stopped> {
         self.whole()?;
         let roots = self.roots.borrow();
@@ -1012,10 +1075,14 @@ impl<'m> Graph<'m> {
     }
 
     /// How many distinct calls were recorded.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn len(&self) -> usize {
         self.edges.borrow().len()
     }
 
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1097,6 +1164,9 @@ pub struct Provenance<'a, 'm> {
 }
 
 impl<'a, 'm> Provenance<'a, 'm> {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn new(inner: &'a Eval<'a>, graph: &'a Graph<'m>) -> Provenance<'a, 'm> {
         Provenance { inner, graph }
     }
@@ -1108,6 +1178,9 @@ impl Handler for Provenance<'_, '_> {
         next.through(cx, self.inner);
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn name(&self) -> &'static str {
         "the provenance handler"
     }

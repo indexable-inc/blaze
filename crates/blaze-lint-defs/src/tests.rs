@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 116);
+    assert_eq!(blaze_lints().len(), 117);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -73,6 +73,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::proc_macro_derive", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::proc_macro_attribute", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+        ("blaze::not_latest_edition", ready::EDITION_SHIPS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
         ("blaze::lossy_as", false),
@@ -95,7 +96,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     }
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
-    // `#[blaze::may(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
+    // `#[blaze::expect(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
@@ -104,6 +105,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::pure",
         "blaze::capabilities",
         "blaze::undeclared_effect",
+        "blaze::unfulfilled_effect",
         "blaze::program_lifetime",
         "blaze::unreachable",
     ];
@@ -195,6 +197,7 @@ fn the_proc_macro_lints_are_a_group_of_the_edition_lints() {
         level("blaze::build_script_ambient"),
         ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS)
     );
+    assert_eq!(level("blaze::not_latest_edition"), ready::level(ready::EDITION_SHIPS));
     assert_eq!(ready::level(true), Level::Warn);
     assert_eq!(ready::level(false), Level::Allow);
 }
@@ -267,8 +270,9 @@ fn counts_are_rustcs() {
     // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
     assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
     // With `no_mangle_generic_items` (an error since 1.99) and
-    // `dependency_on_unit_never_type_fallback` (the never type's stabilization, 1.100).
-    assert_eq!(removed().len(), 68);
+    // `dependency_on_unit_never_type_fallback` (the never type's stabilization, 1.100), and
+    // blaze's own `blaze::unneeded_effect`.
+    assert_eq!(removed().len(), 69);
 }
 
 #[test]
@@ -343,6 +347,9 @@ fn future_incompatible() {
 fn renamed_and_removed() {
     assert_eq!(named("bare_trait_object"), Named::Renamed("bare_trait_objects"));
     assert_eq!(named("raw_pointer_derive"), Named::Removed("using derive with raw pointers is ok"));
+    // Deleted, not renamed: no alias stands for it.
+    assert!(matches!(named("blaze::unneeded_effect"), Named::Removed(_)));
+    assert!(lint("blaze::unneeded_effect").is_none());
     assert_eq!(named("broken_intra_doc_links"), Named::Ignored);
     assert_eq!(named("no_such_lint"), Named::Unknown);
     assert!(matches!(named("nonstandard_style"), Named::Group(_)));

@@ -291,7 +291,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 None => "a value of the body".to_owned(), // alloc: error path
             };
             not_supported!(
-                "checking the `ensures` of `{path}` at run time: the clause `{text}` moves out                  of {what}, which is still used after the clause: read it by reference (`match                  &r {{ .. }}`, a `ref` binding, a method that takes `&self`)"
+                "checking the `ensures` of `{path}` at run time: the clause `{text}` moves out \
+                 of {what}, which is still used after the clause: read it by reference (`match \
+                 &r {{ .. }}`, a `ref` binding, a method that takes `&self`)"
             );
         }
         Ok(())

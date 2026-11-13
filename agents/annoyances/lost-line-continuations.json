@@ -1,0 +1,14 @@
+{
+ "id": "lost-line-continuations",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs:3456-3464 and 4853, serve/job/giving.rs:1085, crates/hir-ty-lean/src/driver.rs:475 and 484, crates/blaze-launch-rt/src/drive.rs (fixed), crates/blaze-cas/src/pool.rs (fixed), crates/blaze-link/src/native.rs (fixed), hir-ty-mir (fixed)",
+ "what": "String literals in messages hold a run of 14 or more spaces: the `\\` at a line's end and the newline were deleted and the next line's indentation kept, so the message prints with a gap and a test that asserts its text fails. Each was already so in the commit that first added it (six commits by six lanes, 2026-11-10 to 11-12): no mass edit did it.",
+ "cost": "about ten messages printed wrong; one contracts test red; a lane's time to rule out a mass edit",
+ "cause": "not traced; the shape (the space before the `\\` plus the next line's indent, exactly) is what a non-raw Python string does to `\\`-newline, as when an agent applies an edit with `python3 - <<'EOF' ... s.replace(\"\"\"old\"\"\", \"\"\"new\"\"\")`",
+ "class": "source text passed through a layer that interprets escapes before it reaches the file",
+ "prevention": "edit Rust source with the Edit tool or a raw string (r\"\"\"..\"\"\"), never a non-raw Python string or an unquoted heredoc; a blaze lint that refuses a run of 8 or more spaces between two word or punctuation characters on one line of a non-raw string literal (pattern for string tokens: crates/blaze-lints/src/blaze/error_debug.rs:367), with a reasoned allow for the eight usage tables that align on purpose",
+ "workaround": "find them: python3 -I <scratchpad>/scan.py 8 . crates fuzz harness scripts tools, or git grep -nE '[a-zA-Z.,:;)`(]  {14,}[a-zA-Z&(`{]' (which also matches aligned tables)",
+ "fix": "the sites named fixed above; the lint is not written; job.rs, giving.rs and hir-ty-lean's driver.rs still gapped",
+ "state": "open"
+}

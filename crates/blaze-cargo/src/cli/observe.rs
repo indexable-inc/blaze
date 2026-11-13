@@ -53,12 +53,13 @@ const EXPLAIN_USAGE: &str =
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
 
 /// The parts of `blaze explain memory`, each a view of `sql/examples.sql`, with its heading.
-const MEMORY_PARTS: [(&str, &str, &str); 5] = [
+const MEMORY_PARTS: [(&str, &str, &str); 6] = [
     ("timeline", "memory_timeline", "the memory, minute by minute"),
     ("peak_tasks", "memory_peak_tasks", "the tasks that held the most at once"),
     ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
     ("held", "memory_held", "what the global heap held at the footprint's peak, by call site"),
     ("sites", "memory_sites", "what churns the global heap, by call site"),
+    ("give_backs", "memory_give_backs", "what was given back because memory was short"),
 ];
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--unexplained] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
@@ -97,9 +98,9 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
             color,
         );
     };
-    println!("{link}");
+    blaze_report::outln!("{link}");
     if !print && let Err(why) = open(&link) {
-        eprint!(
+        blaze_report::err!(
             "{}",
             say::warning(&format!("the link was not opened ({why}): open it in a browser"), color)
         );
@@ -204,7 +205,7 @@ fn inspect_daemon(record: bool) -> Result<(), Refusal> {
             let text = serde_json::to_string(&inspected).map_err(|error| {
                 Refusal::Failed(format!("`blaze debug inspect`'s answer as JSON: {error}"))
             })?;
-            println!("{text}");
+            blaze_report::outln!("{text}");
             Ok(())
         }
         Answer::Refused(why) => Err(Refusal::Failed(why)),
@@ -238,7 +239,7 @@ fn read_recording(file: &Path, trace: Option<&str>) -> Result<(), Refusal> {
             .map_err(|error| failed(format!("writing its trace to {out}: {error}")))?;
         said.insert("trace_written".to_owned(), Value::String(out.to_owned()));
     }
-    println!("{}", Value::Object(said));
+    blaze_report::outln!("{}", Value::Object(said));
     Ok(())
 }
 
@@ -266,7 +267,7 @@ fn toolchain() -> Result<(), Refusal> {
     out.insert("assumed".to_owned(), Value::Bool(dev.is_some()));
     out.insert("built".to_owned(), codes(built));
     out.insert("keyed".to_owned(), codes(keyed));
-    println!("{}", Value::Object(out));
+    blaze_report::outln!("{}", Value::Object(out));
     Ok(())
 }
 
@@ -304,7 +305,7 @@ fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
             "the daemon answered `blaze debug hot` with no answer".to_owned(),
         ));
     }
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 
@@ -442,7 +443,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
                 value.map_err(|error| format!("`blaze why`'s problems as JSON: {error}"))?;
             answer.insert(key.to_owned(), value);
         }
-        println!("{answer}");
+        blaze_report::outln!("{answer}");
         return Ok(());
     }
     let mut text = String::new();
@@ -464,7 +465,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         true => blaze_ui::why::unexplained(&mut text, &rebuilt),
         false => blaze_ui::why::lines(&mut text, &rebuilt),
     }
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 
@@ -714,7 +715,7 @@ impl From<String> for Refusal {
 }
 
 fn refused(what: &str, code: i32, color: bool) -> i32 {
-    eprint!("{}", say::error(what, color));
+    blaze_report::err!("{}", say::error(what, color));
     code
 }
 
@@ -740,21 +741,6 @@ pub(super) fn ask(
         true => Ok(()),
         false => Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),
     }
-}
-
-/// `request` handed to the daemon that is running, its answer not waited for: for a command
-/// about to become another program (`run`'s client rows). The daemon takes a request as it
-/// reads it, whether or not its connection is still there when it answers. No daemon running
-/// is an error, as [`ask`]'s.
-pub(super) fn tell(request: Request) -> Result<(), String> {
-    let mut client = match daemon::connect(Start::Never) {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned());
-        }
-        Err(error) => return Err(format!("{error:#}")),
-    };
-    client.send(request).map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// [`ask`], where no daemon running (under [`Start::Never`]) is not an error: whether one
@@ -823,7 +809,7 @@ fn profile(words: Vec<OsString>) -> Result<(), Refusal> {
         .map_or(0, |it| it.as_secs());
     let path = state.join(format!("profile-{now}.json"));
     std::fs::write(&path, trace).map_err(|error| format!("writing {}: {error}", path.display()))?;
-    println!("{}", path.display());
+    blaze_report::outln!("{}", path.display());
     Ok(())
 }
 
@@ -1166,7 +1152,7 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
                      says so)"
                 );
                 match json {
-                    true => eprintln!("note: {note}"),
+                    true => blaze_report::errln!("note: {note}"),
                     false => _ = writeln!(out, "{note}\n"),
                 }
                 with

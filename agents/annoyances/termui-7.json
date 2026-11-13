@@ -1,0 +1,13 @@
+{
+ "id": "termui-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "`blaze check` of blaze-screen",
+ "what": "The crate's `// alloc:` comments, its `#![blaze::sans_io]` and `std_use` were never held to their lints: blaze building blaze needs more memory than the lane's 128 GB VM (A25), so `blaze check` was not run on the tree; cargo checks none of them.",
+ "cost": "unknown until it is run",
+ "cause": "no VM of 256 GB in this lane",
+ "workaround": "cargo with the pinned nightly, as blaze-builds-blaze says",
+ "fix": "the main agent's one `blaze check` of the tip",
+ "state": "open",
+ "class": "vacuous success (A39), neighbour: tests or lints that never compiled or never ran, counted as held"
+}

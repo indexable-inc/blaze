@@ -1,0 +1,21 @@
+{
+ "id": "records-bodies3-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-bodies3",
+ "where": "hir-def nameres.rs (DefMap, DefMapPair, crate_local_def_map) and blaze-item-hash reads.rs Rule::Names",
+ "what": "The design for name reads as facts listed five kinds of read (a name, the traits in scope, a whole scope, a module's children, a handle) and called every other row of name resolution a handle. Reading DefMap's fields showed it is not one: it holds the prelude module, the extern prelude (in DefMapPair's untracked half), the #[macro_use] prelude and the root's flags (no_std, edition, registered tools), and crate_shadows_primitive_type is a bool over every scope of the crate. Recorded as handles, a changed `extern crate` or #![no_std] would have served stale answers. Also: the rows of ScopeInput and of a paged scope are private to their files and a struct's fields share one ingredient, so the asked signature name_read(db, read) could not tell `scope` from `children`.",
+ "cost": "about a quarter of a small context spent finding it; a sixth variant and a ninth fact kind (0x1808 CRATE_NAMES) not in the plan",
+ "whys": [
+  "the request for name_read listed 21 row names and asked which are handles, without their values",
+  "RULES names a row by its debug name and file only: what a row's value holds is in no table",
+  "Rule::Names covered every key by the identity, so nobody had to know what each row's value was",
+  "the old identity hashed results (what each path resolved to), so inputs were never enumerated",
+  "no test changes a crate-level name input (extern prelude, prelude, no_std) under stored steps"
+ ],
+ "cause": "a rule that covers reads wholesale hides what each read is of; the move to facts needs the per-row values, which were never written down",
+ "class": "a key that lists reads by name without saying what value each read reveals",
+ "prevention": "name_read is the one place that says what each row of name resolution reveals, and Names::Facts refuses a row it does not answer for (listed by the flush); the refinement test under random edits (list f) must include edits of `extern crate`, #![no_std], a #[macro_use] and a shadowed primitive",
+ "workaround": "none",
+ "fix": "NameRead::Crate with values::crate_names (written, uncompiled); exported_derives, fn_proc_macro_mapping and derive_helpers_in_scope are left out of it and not yet shown unread by body steps",
+ "state": "open"
+}

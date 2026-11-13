@@ -21,7 +21,7 @@ use hir_ty::{
 };
 use rustc_type_ir::inherent::IntoKind;
 
-use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate};
+use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate, with_toolchain};
 use crate::{
     Abs, Effects,
     models::{Applied, Leaf, Model, Transfer, apply_leaf, check_resolved, crate_models, model_of},
@@ -358,7 +358,7 @@ fn a_platform_entry_must_resolve_on_its_platform() {
         "//- /std.rs crate:std deps:alloc",
         "//- /std.rs crate:std deps:alloc cfg:target_family=windows",
     );
-    let db = fixture::db(&format!("{windows}{SCRIPT}")).into_db();
+    let db = fixture::db(&with_toolchain(&windows, SCRIPT)).into_db();
     blaze_query::db::attach(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let missing = check_resolved(&db, std);

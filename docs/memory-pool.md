@@ -136,9 +136,10 @@ features below directly, with no probe and no path for an older kernel:
   committed heap is about 200 MiB of page tables at 4 KiB). A collapse that fails (no
   contiguous memory) leaves the arena as it was, which is correct, and its span names it.
 - **`memory.events` for the hard ceiling.** The 100 ms footprint watch stays the bound on
-  macOS. On Linux the cgroup's `memory.high` (15/16 of the ceiling) already makes the kernel
-  reclaim past that line, and `memory.max` is the kill. The watch is kept as the line in the
-  log that names the daemon's tags before a kill, and an inotify watch on `memory.events`
+  macOS. On Linux `memory.max` is the kill and no `memory.high` is set (a throttle under the
+  line where a task fails typed is a band with no exit: `blaze_graph::lines`). The watch is
+  kept as the line in the log that names the daemon's tags before a kill, and an inotify
+  watch on `memory.events`
   (`high` and `max` counts) wakes it as soon as the kernel acts, not on the next tick.
 
 On macOS, the equivalents are the dispatch memory pressure source (built), `madvise(MADV_FREE_REUSABLE)`

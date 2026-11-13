@@ -1,0 +1,17 @@
+{
+ "id": "round-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "where": "the round`s test run: environment for the soundness oracle",
+ "what": "The oracle`s variables (HEGEL_TEST_CASES=1000000, BLAZE_ORACLE_MINUTES) were set for every test executable of the round, so every Hegel property test in every crate drew a million cases; base-db`s and blaze-cas`s property tests ran past a minute each and the run had to be stopped and started again.",
+ "cost": "about 15 minutes of the round on a loaded VM, and six test results thrown away",
+ "whys": [
+  "one environment for the whole run",
+  "HEGEL_TEST_CASES is read by every Hegel test, not only the oracle",
+  "only BLAZE_ORACLE_MINUTES bounds the oracle; nothing bounds the others"
+ ],
+ "class": "a variable meant for one test reaching all of them",
+ "prevention": "the oracle reads its own case count (BLAZE_ORACLE_CASES exists: have the minutes bound imply it), so no run needs HEGEL_TEST_CASES set globally; a round`s runner sets a test`s variables for that executable alone (run_tests.py env_for)",
+ "workaround": "per-executable environment",
+ "state": "open"
+}

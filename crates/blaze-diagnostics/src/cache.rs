@@ -569,6 +569,12 @@ pub struct Served {
     /// What each crate asked was looked up under: its base key ([`bodies_key`]) and its outcome's
     /// key, so asking it again under the same is no lookup.
     asked: HashMap<Crate, (ContentId, Option<ContentId>), Global>,
+    /// What the searches of the crates' read-filing slots came to, as `blaze_record` counted
+    /// them (`hir_def::deps::find_by_reads`), added by every [`serve`] until the driver takes
+    /// them to report: one lookup a crate fetched whose bodies part is not under its base key
+    /// alone, a hit where a slot's reads have now the values a part is filed by, the slots
+    /// read, and a read valued for each slot whose set of reads was worked out again.
+    pub lookups: hir_def::deps::record::Counts,
 }
 
 impl Served {
@@ -724,13 +730,17 @@ pub fn serve(
         }
         // alloc: setup: one slot per crate, once per serve
         let found: Vec<OnceLock<Fetched>> = asked.iter().map(|_| OnceLock::new()).collect();
+        // Counted from every thread of the store's, and added once the layer's fetches have
+        // all ended: before any of them is looked at, so a layer that stops on one is counted.
+        let lookups = hir_def::deps::record::Tally::new();
         {
             let db = &*db;
             store.for_each(asked.len(), &|at| {
                 let (krate, base) = asked[at];
-                _ = found[at].set(fetch(db, krate, base, &images[&krate].1, store));
+                _ = found[at].set(fetch(db, krate, base, &images[&krate].1, store, &lookups));
             });
         }
+        served.lookups.add(lookups.take());
         for (&(krate, base), found) in asked.iter().zip(found) {
             let found = found.into_inner().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
@@ -768,14 +778,16 @@ fn forget(served: &mut Served, krate: Crate) -> bool {
 }
 
 /// The bodies part of `krate` filed by `base` and its bodies' reads as they are now, and the
-/// outcome under the check key it is filed by, each opened.
-// dyn: the driver's store, one call per crate per session
+/// outcome under the check key it is filed by, each opened. The search of the slots of `base`
+/// is counted in `lookups`.
 fn fetch(
     db: &Db,
     krate: Crate,
     base: ContentId,
     inputs: &Inputs<'_>,
+    // dyn: the driver's store, one call per crate per session
     store: &dyn ImageStore,
+    lookups: &hir_def::deps::record::Tally,
 ) -> Fetched {
     let get = |key: ContentId, what: &str| {
         store
@@ -785,7 +797,7 @@ fn fetch(
                 format!("reading the {what} of crate {} (key {key:?}): {why}", krate.named(db))
             })
     };
-    let found = hir_def::deps::find_by_reads(db, krate, base, store, |at| {
+    let found = hir_def::deps::find_by_reads(db, krate, base, store, lookups, |at| {
         let Some(bytes) = get(at, "checked bodies")? else { return Ok(None) };
         match hir_ty::check_cache::open(bytes.bytes()) {
             Ok(()) => Ok(Some((at, bytes))),

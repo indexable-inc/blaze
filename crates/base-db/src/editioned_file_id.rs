@@ -1,14 +1,14 @@
 //! Defines [`EditionedFileId`], an interned wrapper around [`span::EditionedFileId`] that
 //! is interned (so queries can take it) and stores only the underlying `span::EditionedFileId`.
 
-use std::{hash::Hash, sync::Arc};
+use std::hash::Hash;
 
 use crate::FileId;
 use blaze_ids::ContentId;
 use span::{Edition, Extensions};
 use syntax::{SyntaxError, ast};
 
-use crate::{Db, trees::Trees};
+use crate::Db;
 
 #[blaze_query::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime))]
 #[derive(PartialOrd, Ord)]
@@ -17,8 +17,8 @@ pub struct EditionedFileId {
     field: span::EditionedFileId,
 }
 
-/// [`EditionedFileId::parse`]. Kept by its bytes, [`syntax::Parse::heap_bytes`] (its share of
-/// the tree, with the lazy bodies walked so far, and its errors), under [`blaze_mem::Tag::Parse`]'s budget;
+/// [`EditionedFileId::parse`]. Kept by its bytes, [`syntax::Parse::heap_bytes`] (the
+/// tree, with the lazy bodies walked so far, and its errors), under [`blaze_mem::Tag::Parse`]'s budget;
 /// the trees count against that tag.
 #[blaze_query::tracked(self_ty = EditionedFileId, lru, weigh = syntax::Parse::heap_bytes, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
@@ -37,26 +37,7 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     }
     let _p = span.entered();
     let input = db.file_text(file_id);
-    let stored = db.trees().map(|it| &**it);
-    let parse = input.reparse_field(db).parse(input.text(db), edition, extensions, outline, stored);
-    parse.unwrap_or_else(|error| {
-        let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
-        let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
-        panic!(
-            "{error}, read for {file_id:?} at {path:?}: delete the daemon's image to store it again"
-        )
-    })
-}
-
-/// What a database reads its files' parses from besides parsing: the stored trees ([`Trees`]).
-pub(crate) struct Parses {
-    pub(crate) trees: Option<Arc<Trees>>,
-}
-
-impl Parses {
-    pub(crate) fn new(trees: Option<Arc<Trees>>) -> Parses {
-        Parses { trees }
-    }
+    input.reparse_field(db).parse(input.text(db), edition, extensions, outline)
 }
 
 #[blaze_query::tracked]
@@ -88,9 +69,7 @@ impl EditionedFileId {
     /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
     /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
     /// After an edit it is made from the file's last parse, when one is kept (see
-    /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse. A
-    /// library file whose outline the daemon's image stores is read from it in place
-    /// ([`Trees`]): the tree a parse makes, with the bodies walked before it was stored.
+    /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse.
     #[inline]
     pub fn parse(self, db: &Db) -> &syntax::Parse<ast::SourceFile> {
         parse_(db, self)

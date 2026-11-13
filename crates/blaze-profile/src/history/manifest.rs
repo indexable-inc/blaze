@@ -66,6 +66,7 @@ use parquet::file::{
     metadata::{ParquetMetaData, ParquetMetaDataReader},
     statistics::Statistics,
 };
+use blaze_report::{say, say::Code};
 use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 
@@ -413,9 +414,14 @@ impl fmt::Display for ManifestError {
                 f,
                 "it lists `{file}` under the table {table}, which is no file of that table blaze lists"
             ),
-            ManifestError::Missing { file } => write!(
-                f,
-                "it lists `{file}`, which is not in the directory: something other than the history deleted it, and its rows are gone (delete the directory to start a history afresh)"
+            // alloc: an error's text
+            ManifestError::Missing { file } => f.write_str(
+                &say!(
+                    "it lists ",
+                    Code(file),
+                    ", which is not in the directory: something other than the history deleted it, and its rows are gone (delete the directory to start a history afresh)"
+                )
+                .flat(),
             ),
             ManifestError::Locked => write!(
                 f,

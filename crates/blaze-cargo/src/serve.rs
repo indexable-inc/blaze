@@ -11,23 +11,38 @@
 //!   ([`daemon::Started`]); an image that is damaged, or does not match its journal, stops the
 //!   start naming it ([`daemon::StartError`]), and one found corrupt while running stops the
 //!   daemon ([`daemon::Failed`]).
-//! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
+//! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first;
+//!   started with `BLAZE_DAEMON_EXIT_UNHELD`, also once no connection held it for its grace
+//!   ([`unheld`]), ending with `Exit::Unheld`.
 //! - It keeps the profile history in `<state>/profile` on the thread `blaze-history`, samples
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+#[blaze::sans_io]
+mod ahead;
 mod breakdown;
 pub mod ceiling;
 mod daemon;
 pub mod dev_toolchain;
 mod fetch;
 mod fetch_url;
+#[blaze::sans_io]
+pub(crate) mod front_carry;
 pub(crate) mod flightrec;
+mod collect;
 mod gc;
+// Lane packs-1112: packs read on a miss, and the endpoint peers read this store through.
+pub(crate) mod packs;
 mod heads;
 #[blaze::sans_io]
 mod idle;
 mod image;
+// Track 6, T2: the daemon's local facts (tool, placed outputs, carries) as VFS marks.
+#[blaze::sans_io]
+mod local;
+// Track 7, task A: the sealed layer, installed once a machine and read in place by every home.
+#[blaze::sans_io]
+pub(crate) mod sealed;
 #[cfg(all(unix, feature = "native"))]
 pub(crate) mod inspect;
 mod job;
@@ -49,7 +64,9 @@ pub mod observe;
 #[cfg(not(feature = "native"))]
 pub(crate) mod once;
 mod plane;
+mod settle;
 mod pulse;
+mod rooted;
 pub(crate) mod said;
 pub mod settings;
 pub(crate) mod signals;
@@ -58,6 +75,9 @@ mod still;
 mod stop;
 #[cfg(test)]
 mod tests;
+// A daemon that exits once no connection holds it (`BLAZE_DAEMON_EXIT_UNHELD`).
+#[blaze::sans_io]
+mod unheld;
 mod unit;
 pub mod why;
 mod work;
@@ -140,8 +160,8 @@ pub fn sources() -> anyhow::Result<PathBuf> {
 /// [`builds`] and [`sources`] are under; `blaze status --json` names it as `home`.
 pub fn root() -> anyhow::Result<PathBuf> {
     blaze_manifest::home::process_root()
-        .map_err(anyhow::Error::msg)?
-        .context("no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps its state and build directories")
+        .map_err(anyhow::Error::msg)
+        .context("finding where blaze keeps its state and build directories")
 }
 
 /// Where every daemon of this machine, whatever its `BLAZE_HOME`, keeps what they share:
@@ -195,11 +215,9 @@ fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
 fn user_shared() -> anyhow::Result<PathBuf> {
     let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
         Some(caches) => PathBuf::from(caches).join("blaze"),
-        None => {
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-            PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
-                .join(".cache/blaze")
-        }
+        None => blaze_core::home::user()
+            .context("no XDG_CACHE_HOME says where this machine's daemons share the standard library")?
+            .join(".cache/blaze"),
     };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
@@ -374,30 +392,19 @@ pub fn record_makers() -> Result<RecordMakers, String> {
     })
 }
 
-/// Which blaze `exe` is, the hash of its bytes, with the file it hashed ([`executable`]), as
-/// one open file was both: one that changed while it was read is an error. What a client
-/// compares with the daemon's to know it speaks to the same blaze; no stored value is keyed by
-/// it ([`RecordMakers`]).
+/// Which blaze `exe` (this process's own executable) is: the hash of its bytes, known by its
+/// stamp ([`local::tool_hash`], `<state>/tool`: read whole once a build of blaze, never at a
+/// start after), with the file it names ([`executable`]). What a client compares with the
+/// daemon's to know it speaks to the same blaze; no stored value is keyed by it
+/// ([`RecordMakers`]).
 pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(exe)
+    let file = std::fs::File::open(exe)
         .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
-    let before = executable(exe, &file)?;
-    let mut hasher = blaze_ids::Hasher::new("blaze v2 build id 1");
-    let mut chunk = vec![0u8; 1 << 20]; // alloc: one buffer, once per start
-    loop {
-        let read = file
-            .read(&mut chunk)
-            .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&chunk[..read]);
-    }
-    if executable(exe, &file)? != before {
-        bail!("blaze itself, {}, changed while it was read for its build id", exe.display());
-    }
-    Ok(blaze_api::Build { id: hasher.finish(), exe: before })
+    let running = blaze_profile::identity::running()
+        .with_context(|| format!("finding the running file of blaze itself, {}", exe.display()))?;
+    let hash = local::tool_hash(&state()?.join("tool"), &running).map_err(anyhow::Error::msg)?;
+    let id = blaze_ids::Hasher::new("blaze v2 build id 2").part(&hash).finish();
+    Ok(blaze_api::Build { id, exe: executable(exe, &file)? })
 }
 
 /// The open file `file` of `exe` as a [`blaze_api::Executable`]: what changes when its bytes do.
@@ -755,9 +762,47 @@ impl std::fmt::Display for Before {
 /// What a daemon adds to its pid in `serve.lock` once its stop wrote its image.
 const STOPPED: &str = "stopped";
 
+/// A daemon started while another held its state found that one listening at its socket: two
+/// commands found nothing listening at once and each started a daemon, and the other won. This
+/// one starts none over it and ends with [`blaze_core::exit::Exit::Served`]; the command that
+/// started it connects to the one listening (`cli::daemon::connect`).
+#[derive(Debug)]
+pub struct Served {
+    /// The pid the lock's file names, as the daemon that holds it wrote.
+    pub pid: String,
+    pub socket: PathBuf,
+}
+
+impl std::fmt::Display for Served {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the daemon that holds this state (pid {}) listens at {}: this one, started at the same time, starts \
+             none over it, and its command connects to that one",
+            self.pid,
+            self.socket.display()
+        )
+    }
+}
+
+impl std::error::Error for Served {}
+
+/// How often a daemon waiting for the one before it on its state asks whether that one listens
+/// at its socket ([`hold`]): a start that lost a race waits this long at most after the winner
+/// listens before it ends.
+const LISTENS_EVERY: Duration = Duration::from_millis(50);
+
+/// The daemon's hold of its state ([`Held::lock`]). When another holds it, this one waits for it
+/// to end (one that writes its image as it stops) and, every [`LISTENS_EVERY`], asks whether a
+/// daemon listens at `socket`: one does when two commands started a daemon at once and the
+/// other's took the state first, and this one then ends ([`Served`]) rather than wait for a
+/// daemon that serves for as long as it is used. A daemon that stops lets go of its socket's
+/// name first (`Daemon::stop`), so one still writing its image never answers. `socket` is
+/// `None` for one socket-activated, whose manager starts one daemon alone.
 #[cfg(unix)]
 fn hold(
     state: &Path,
+    socket: Option<&Path>,
     ready: Option<&Ready>,
 ) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
     use std::{
@@ -801,19 +846,40 @@ fn hold(
                 .name("blaze-serve-lock".to_owned()) // alloc: once a start that waits
                 .spawn(move || drop(locked.send(stdx::file_lock::Locked::lock(file))))
                 .with_context(|| format!("starting the thread that waits on {}", lock.display()))?;
-            match word.recv_timeout(BEFORE_ENDS) {
-                Ok(Ok(file)) => file,
-                Ok(Err(error)) => {
-                    bail!("locking the daemon's state at {}: {error}", lock.display())
+            let deadline = std::time::Instant::now() + BEFORE_ENDS;
+            let _waits = tracing::info_span!(
+                target: "blaze",
+                "daemon start: wait for the daemon that holds its state to end, or to be found listening",
+                awaits = %lock.display(),
+                holder = pid.as_str(),
+            )
+            .entered();
+            // Bounded: each turn waits at most `LISTENS_EVERY`, and the turn past `deadline`
+            // ends in `StillRuns`.
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match word.recv_timeout(left.min(LISTENS_EVERY)) {
+                    Ok(Ok(file)) => break file,
+                    Ok(Err(error)) => {
+                        bail!("locking the daemon's state at {}: {error}", lock.display())
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        bail!(
+                            "the thread waiting on the daemon's lock {} ended without a word",
+                            lock.display()
+                        )
+                    }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // A connect that is taken is a daemon listening: the one that holds the state,
+                // as no other binds this home's socket. It is closed at once.
+                if let Some(socket) = socket
+                    && std::os::unix::net::UnixStream::connect(socket).is_ok()
+                {
+                    return Err(Served { pid, socket: socket.to_owned() }.into());
+                }
+                if left.is_zero() {
                     return Err(StillRuns { pid, lock }.into());
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    bail!(
-                        "the thread waiting on the daemon's lock {} ended without a word",
-                        lock.display()
-                    )
                 }
             }
         }
@@ -828,6 +894,50 @@ fn hold(
         .and_then(|()| write!(file, "{}", std::process::id()))
         .with_context(|| format!("writing this daemon's pid to its lock {}", lock.display()))?;
     Ok((file, before))
+}
+
+/// Who holds blaze's state now ([`holder`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// No process holds the state's lock: no daemon runs on this state.
+    None,
+    /// A daemon holds it: the pid it wrote in `lock`, when it has written one.
+    Daemon { pid: Option<u32>, lock: PathBuf },
+}
+
+/// Who holds `state` now, asked of its lock (`serve.lock`, [`hold`]) and never of a socket: the
+/// one answer to "is a daemon running on this state", whatever socket that daemon listens at
+/// and whatever build of blaze it is. The socket's path follows `XDG_RUNTIME_DIR`
+/// ([`blaze_api::client::home`]) and the state's does not ([`state`]), so a command whose
+/// environment differs from the daemon's finds no socket while the daemon runs (agents.json
+/// A37: `stop` said no daemon ran while one held the state); the lock is held for the daemon's
+/// life by the kernel, and says so to anyone. It takes the lock shared for an instant when no
+/// one holds it, creates nothing and never waits.
+#[cfg(unix)]
+pub fn holder(state: &Path) -> anyhow::Result<Holder> {
+    use std::io::Read as _;
+    let lock = state.join("serve.lock");
+    let file = match std::fs::File::open(&lock) {
+        Ok(file) => file,
+        // No daemon ever ran on this state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Holder::None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening the daemon's lock {}", lock.display()));
+        }
+    };
+    let tried = stdx::file_lock::Locked::try_lock_shared(file)
+        .with_context(|| format!("asking who holds the daemon's lock {}", lock.display()))?;
+    match tried {
+        // Taken, so no daemon holds it; let go as it drops, here.
+        Ok(_free) => Ok(Holder::None),
+        Err(mut file) => {
+            let mut written = String::new(); // alloc: once a command that found no socket
+            file.read_to_string(&mut written)
+                .with_context(|| format!("reading the pid in the daemon's lock {}", lock.display()))?;
+            let pid = written.split_whitespace().next().and_then(|it| it.parse().ok());
+            Ok(Holder::Daemon { pid, lock })
+        }
+    }
 }
 
 /// The pipe of `blaze serve --ready-fd N` ([`Phase`]), and the thread that says on it, every
@@ -954,17 +1064,26 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
 /// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
 #[cfg(feature = "native")]
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    use blaze_core::exit::Exit;
+    // Every `Exit` is below 128 ([`blaze_core::exit`]'s test), so it is a byte.
+    let code = |exit: Exit| ExitCode::from(exit.code() as u8);
     match serve(args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(exit)) => code(exit),
         Err(error) => {
             eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+            match error.downcast_ref::<Served>() {
+                Some(_) => code(Exit::Served),
+                None => ExitCode::FAILURE,
+            }
         }
     }
 }
 
 #[cfg(feature = "native")]
-fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
+/// `Some` of the exit status a stop of its own ends with ([`blaze_core::exit::Exit::Unheld`]);
+/// `None` for one it was told.
+fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Option<blaze_core::exit::Exit>> {
     let args = parse(args)?;
     // First, before any thread starts: taking the passed socket reads and clears the
     // environment.
@@ -1015,12 +1134,14 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         crate::release::watch_updates().context("starting the daemon's update check thread")?;
     let ran = listen(&mut running.daemon, ready);
     let marked = match ran {
-        Ok(()) => running.stopped(),
+        Ok(_) => running.stopped(),
         Err(_) => Ok(()),
     };
     // The daemon is gone, and with it the history's sender: its thread's last flush ends it.
     running.end()?;
-    ran.and(marked)
+    let exit = ran?;
+    marked?;
+    Ok(exit)
 }
 
 /// Where the engine takes its requests, and the bound of its stall watchdog.
@@ -1071,7 +1192,12 @@ pub(crate) fn engine(
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
     #[cfg(unix)]
-    let (lock, before) = hold(&state, ready)?;
+    let (lock, before) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: wait for the daemon before it").entered();
+        // A socket-activated daemon's manager starts it alone: no start races it.
+        let racing = serving.socket.as_deref().filter(|_| serving.activated.is_none());
+        hold(&state, racing, ready)?
+    };
     #[cfg(not(unix))]
     let (_, before) = (ready, Before::None);
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
@@ -1122,12 +1248,24 @@ pub(crate) fn engine(
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
-    let (profiling, keeper) =
-        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
+    // Which blaze this is, for clients to compare: no stored value is keyed by it. Before the
+    // history's thread starts: it seeds the process's hash of its own executable
+    // (`local::tool_hash`), which the history's identity and crash record then read, not hash.
+    let build = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: which blaze this is").entered();
+        build_of(&paths.launcher)?
+    };
+    // Returns once its thread is spawned: the history opens there, and the first build waits
+    // for its number (`Observe::numbering`), never the start.
+    let (profiling, keeper) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: start the profile history").entered();
+        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?
+    };
     // Fixed for the daemon's life before any job: a build's tasks only read it.
+    let toolchain_span = tracing::info_span!(target: "blaze", "daemon start: find the toolchain").entered();
     let sysroot = crate::toolchain::sysroot().with_context(|| {
         // alloc: once, on the error that stops the daemon from starting
-        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir());
+        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir().ok());
         let at =
             at.map_or_else(|| "on this machine".to_owned(), |it| format!("at {}", it.display()));
         format!(
@@ -1136,12 +1274,12 @@ pub(crate) fn engine(
         )
     })?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
-    // Which blaze this is, for clients to compare: no stored value is keyed by it.
-    let build = build_of(&paths.launcher)?;
+    drop(toolchain_span);
     // Keyed by what makes std's records and outputs ([`RecordMakers`]), never the executable's
     // bytes: the shared store holds std units' records and outputs alone, and each std key's
     // outputs are files at fixed paths under it, so two blazes share it only when every byte
     // either writes there is made by the same code from the same inputs (AGENTS.md rule 25).
+    let lease_span = tracing::info_span!(target: "blaze", "daemon start: lease the shared store").entered();
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
     let std = machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| {
@@ -1157,6 +1295,7 @@ pub(crate) fn engine(
     {
         tracing::warn!(target: "blaze", dir = %std.display(), "the shared store's record did not read and was written afresh: {why}");
     }
+    drop(lease_span);
     let host = crate::toolchain::host()
         .context("blaze has no target triple for this machine's architecture and system")?
         .to_owned();
@@ -1167,7 +1306,10 @@ pub(crate) fn engine(
     let sources = sources()?;
     // A daemon that stopped mid-write left a package's half-written directory, which nothing
     // reads: removed before any fetch writes beside it.
-    let swept = fetch::sweep_parts(&sources).map_err(|why| anyhow::anyhow!(why))?;
+    let swept = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: remove half-written packages").entered();
+        fetch::sweep_parts(&sources).map_err(|why| anyhow::anyhow!(why))?
+    };
     if let Some(first) = swept.first() {
         tracing::info!(target: "blaze", removed = swept.len(), first = %first.display(), "half-written fetched packages removed");
     }
@@ -1180,6 +1322,7 @@ pub(crate) fn engine(
     // budget. A ledger that cannot be joined stops the start, naming it.
     #[cfg(all(unix, feature = "native"))]
     let (machine, budget) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: join the machine's memory ledger").entered();
         let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
         let joined = machine::Machine::join(told_machine, told, &crate::version(), &build, &root()?)
             .context("joining the machine's memory ledger")?;
@@ -1192,7 +1335,22 @@ pub(crate) fn engine(
         blaze_graph::arena::machine_budget(1 << 30, told)
             .context("the memory the daemon's tasks may hold")?,
     );
+    // Read once: a daemon that exits once no connection holds it ([`unheld`]). The one-shot
+    // build listens on nothing and is held by its own command, so there it is said, by name,
+    // to do nothing.
+    let unheld = match std::env::var(unheld::VAR) {
+        Ok(text) => unheld::told(Some(&text)).map_err(anyhow::Error::msg)?,
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => anyhow::bail!("the daemon's ${}: {error}", unheld::VAR),
+    };
+    if unheld.is_some() && paths.socket.is_none() {
+        eprintln!(
+            "blaze: {} is set and does nothing here: the one-shot build listens on no socket, and ends with its command",
+            unheld::VAR
+        );
+    }
     let options = Options {
+        unheld: unheld.filter(|_| paths.socket.is_some()),
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,
@@ -1230,7 +1388,9 @@ pub(crate) fn engine(
             Err(std::env::VarError::NotPresent) => daemon::Without::default(),
             Err(error) => anyhow::bail!("the daemon's ${}: {error}", daemon::RESTORE_WITHOUT),
         },
+        premises: daemon::Premises::of_this_process().map_err(anyhow::Error::msg)?,
     };
+    let samplers_span = tracing::info_span!(target: "blaze", "daemon start: start the samplers").entered();
     // A sampler that can't be made is no other path: every dump and history says it is off.
     if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {
         tracing::warn!("{why}");
@@ -1242,6 +1402,7 @@ pub(crate) fn engine(
         tracing::warn!("{why}");
         eprintln!("blaze serve: {why}");
     }
+    drop(samplers_span);
     signals::catch();
     signals::record_ends();
     // After `record_ends`, which leaves a signal something handles alone: the crash record's
@@ -1266,11 +1427,19 @@ pub(crate) fn engine(
              watchdog would not see query runs as progress"
         );
     }
-    let steps = Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?);
+    let steps = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: make the steps").entered();
+        Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?)
+    };
     let scratch = paths.state.join("spawn");
-    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
-    let driver = blaze_core::native(std::path::Path::new("/"), threads)
-        .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    let driver = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: make the driver").entered();
+        blaze_core::native(std::path::Path::new("/"), threads)
+            .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?
+    };
+    // A plane task's end ends the loop's wait in this driver, where it has a waker.
+    let wake = blaze_core::Driver::waker(&driver);
+    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads, wake));
     let driver = driver
         .confined(confine)
         .scratch(&scratch)
@@ -1343,6 +1512,17 @@ pub(crate) fn start(
     }
 }
 
+/// The variable that has the daemon build a save before it is asked for (`1` or `on`), in the
+/// daemon's own environment (docs/v2/plan/design/on-save.md). Opt-in while a build's account
+/// (`blaze why`, the revision tests' `redone`) is of the request's own job alone: a save
+/// built ahead leaves the request after it nothing to make.
+pub(crate) const BUILD_AHEAD: &str = "BLAZE_AHEAD";
+
+/// Whether [`BUILD_AHEAD`] is on for this daemon.
+fn build_ahead() -> bool {
+    matches!(std::env::var(BUILD_AHEAD).as_deref(), Ok("1" | "on"))
+}
+
 fn begin(
     driver: blaze_core::Native,
     options: Options,
@@ -1357,6 +1537,7 @@ fn begin(
     #[cfg(all(unix, feature = "native"))]
     let shared = options.machine.as_ref().map(|it| it.said().to_owned()); // alloc: the start's line
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
+    daemon.build_ahead(build_ahead());
     say(ready, Phase::Setup);
     // Each start says the limit it runs under, so a run's log shows it was told one (B5).
     if let Some(limit) = limit {
@@ -1367,11 +1548,9 @@ fn begin(
         eprintln!("{who}: {shared}");
     }
     let started = daemon.started();
-    if started.cold == Some(daemon::Cold::Interned) {
-        bail!("{who}: the daemon image's symbols: {}", daemon::Cold::Interned);
-    }
-    if let Some(restored) = &started.restored {
-        eprintln!("{who}: restored the daemon image {restored}");
+    if let Some(mapped) = &started.mapped {
+        // The words harness/incremental.py reads: the VFS and the history came from it.
+        blaze_report::errln!("{who}: restored the daemon image {mapped}");
     }
     // What a client that started it quotes (`cli::daemon::start_said`): why the warm state is
     // gone, and how the daemon before it ended.
@@ -1394,6 +1573,12 @@ fn begin(
         .map_err(|why| anyhow::anyhow!(why))?;
     if settings.auto {
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
+        daemon.settle(settle::Settles::new(settle::Compress::Pool));
+        let mut pace = blaze_cas::collect::Pace::default();
+        if let Some(seconds) = settings.store_grace_s {
+            pace.grace = std::time::Duration::from_secs(seconds);
+        }
+        daemon.collect_store(collect::Collects::new(&state()?, settle::Compress::Pool, pace));
     } else {
         eprintln!(
             "{who}: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",
@@ -1408,7 +1593,7 @@ fn begin(
 fn listen(
     daemon: &mut Daemon<blaze_core::Native, unit::Real>,
     ready: Option<Ready>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<blaze_core::exit::Exit>> {
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.
     let turning = daemon.turn();
@@ -1449,7 +1634,7 @@ fn listen(
             told = true;
             let pid = std::process::id();
             let by = signals::stopped_by().unwrap_or_default();
-            eprintln!(
+            blaze_report::errln!(
                 "blaze serve: pid {pid} asked to stop by {by}: writing the image first; a stop in which nothing moves \
                  for {} s, or a second signal, ends it with what it is inside written here",
                 daemon.stall_bound().as_secs()
@@ -1470,9 +1655,20 @@ fn listen(
     guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),
+        None if daemon.ended_unheld() => {
+            let exit = blaze_core::exit::Exit::Unheld;
+            blaze_report::errln!(
+                "blaze serve: pid {} stopped: no client or launcher connection was open for its grace of {} s \
+                 ({}); it ends with exit status {exit}",
+                std::process::id(),
+                daemon.unheld_grace().unwrap_or_default().as_secs(),
+                unheld::VAR,
+            );
+            Ok(Some(exit))
+        }
         None => {
             eprintln!("blaze serve: pid {} stopped", std::process::id());
-            Ok(())
+            Ok(None)
         }
     }
 }

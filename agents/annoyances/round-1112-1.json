@@ -1,0 +1,17 @@
+{
+ "id": "round-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "where": "the round: a lane resolving a merge conflict from files the runner hands it",
+ "what": "Lane termui wrote its four resolved files against the snapshot of int-1112 the runner saved when the conflict was first seen; five more branches were merged before the resolution came back, and copying the resolved files over dropped three of their changes (home::record in blaze-thin main.rs, UnitOf.primary in print/tests.rs, two decision rows). One build failed on it.",
+ "cost": "one failed build of the whole tree (about 1 minute) and a merge-fix commit; the dropped decisions.json rows would not have failed any build",
+ "whys": [
+  "the resolved file replaced the tree`s file whole",
+  "the lane had only a snapshot, because lanes do not run git",
+  "the runner went on merging while the lane wrote"
+ ],
+ "class": "a whole-file resolution written against a tree that moved",
+ "prevention": "apply a lane`s resolution as a three-way merge against the snapshot it was written from (git merge-file with the snapshot as base), never by copying the file; or merge nothing else until the resolution is in",
+ "workaround": "git diff <snapshot commit> <tip> -- <the resolved files> | git apply --3way",
+ "state": "open: harness/v2/integrate.py has no step for a lane-written resolution"
+}

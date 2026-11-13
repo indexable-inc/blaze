@@ -1,0 +1,18 @@
+{
+ "id": "storegc-1112-3",
+ "where": "crates/blaze-cas/src/lib.rs `start_commit`, `finish_commit`",
+ "what": "A commit with nothing to write before its head (a pack retired with every record of it dead or forgotten, so no copy and no dictionary to move) was begun with zero steps and never wrote its head: no completion came to move it, so the store stayed in a commit for good and every later flush queued behind it. The existing retire always copied something, so it never showed; the collector's simulation hung on it (`waiting for Store`).",
+ "cost": "three test rounds on the VM to find",
+ "cause": "`start_commit` moved a commit with no steps on only when it had failed",
+ "workaround": "none",
+ "fix": "a commit with no steps writes its head at once (done, lane storegc-1112)",
+ "whys": [
+  "the head write is triggered by the last step's completion",
+  "a commit with no step has no completion"
+ ],
+ "class": "state-machine-with-no-event-to-advance",
+ "prevention": "the collector's simulation ends with the store at rest; a commit in flight with no effect pending is an assertion in `start_commit`",
+ "state": "fixed in the working tree of int-1112 (not committed by this lane: write-only rule)",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane storegc-1112"
+}

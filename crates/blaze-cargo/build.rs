@@ -28,18 +28,75 @@ fn linux_interpose() {
     }
     let out =
         PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libblaze_sandbox_interpose.so");
+    println!("cargo:rerun-if-env-changed=CC");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-    let status = std::process::Command::new(&cc)
-        .args(["-shared", "-fPIC", "-O2", "-Wall"])
-        .arg("-o")
-        .arg(&out)
-        .arg(source)
-        // After the source: under `--as-needed` a library named before the object it serves is
-        // dropped.
-        .arg("-ldl")
+    // The library is carried in the executable and loaded into every process of a traced run,
+    // wherever blaze is installed: it must name no directory of this build. A nix shell's
+    // compiler wrapper writes a RUNPATH of its own choosing (2026-11-12: its first entry was
+    // this `OUT_DIR`, so every sandboxed process's loader looked for `libdl.so.2` and
+    // `libc.so.6` there first: a traced read of one machine's build directory in every run,
+    // and a pure script's proof refused for it); it is told to write none (below: by which
+    // name it hears that). With no RUNPATH the library may need only what every process has loaded already, which
+    // is the C library: so it is linked without `libdl` where the C library has `dlsym` and
+    // `dladdr` itself (glibc 2.34 and later, musl), which `-z defs` proves at link time, and
+    // with `libdl` only where that link fails (an older glibc, whose loader finds `libdl.so.2`
+    // in its default directories).
+    // Measured on the NixOS VM, 2026-11-12 (gcc 16.2 under nixpkgs' wrapper): the wrapper's
+    // linker writes the directory of every `.so` path among its arguments that exists, and the
+    // output of `-o` is one of them once a build before this one has made it: so the first
+    // build of a target directory wrote no build directory and every rebuild of the C file
+    // wrote `OUT_DIR`. The output is removed before each link. The wrapper reads its switch
+    // under the name salted with the target (`NIX_DONT_SET_RPATH_aarch64_unknown_linux_gnu`;
+    // the unsalted name and `_FOR_TARGET` changed nothing there), so all three are set.
+    let salted = format!(
+        "NIX_DONT_SET_RPATH_{}",
+        std::env::var("TARGET").unwrap_or_else(|_| panic!("cargo sets TARGET for a build script")).replace(['-', '.'], "_")
+    );
+    let link = |libdl: bool| {
+        match std::fs::remove_file(&out) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("removing {} before linking it again: {error}", out.display()),
+        }
+        let mut command = std::process::Command::new(&cc);
+        command
+            .env("NIX_DONT_SET_RPATH", "1")
+            .env("NIX_DONT_SET_RPATH_FOR_TARGET", "1")
+            .env(&salted, "1")
+            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wl,-z,defs"])
+            .arg("-o")
+            .arg(&out)
+            .arg(source);
+        if libdl {
+            // After the source: under `--as-needed` a library named before the object it
+            // serves is dropped.
+            command.arg("-ldl");
+        }
+        command
+    };
+    let alone = link(false)
+        .stderr(std::process::Stdio::null())
         .status()
         .unwrap_or_else(|error| panic!("{cc} did not run to build {source}: {error}"));
-    assert!(status.success(), "{cc} could not build {source}");
+    if !alone.success() {
+        let status = link(true)
+            .status()
+            .unwrap_or_else(|error| panic!("{cc} did not run to build {source}: {error}"));
+        assert!(status.success(), "{cc} could not build {source}");
+    }
+    // The guard: no path of this build in the library's bytes (a RUNPATH or RPATH entry, a
+    // file name), whatever the compiler's wrapper did.
+    let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("reading {}: {error}", out.display()));
+    for name in ["OUT_DIR", "CARGO_MANIFEST_DIR"] {
+        let dir = std::env::var(name).unwrap_or_else(|_| panic!("cargo sets {name} for a build script"));
+        let held = !dir.is_empty() && bytes.windows(dir.len()).any(|it| it == dir.as_bytes());
+        assert!(
+            !held,
+            "{} holds {dir} ({name}): the sandbox's interposer is loaded into every traced process and must \
+             name no directory of the build that made it (a RUNPATH the compiler wrote? `readelf -d` shows it)",
+            out.display()
+        );
+    }
 }
 
 /// On macOS, the library every process of a sandbox loads (`src/sandbox/macos_interpose.c`),

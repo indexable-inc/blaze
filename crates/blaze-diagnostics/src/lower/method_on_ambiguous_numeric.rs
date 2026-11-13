@@ -21,7 +21,7 @@ use syntax::{
 
 use crate::{
     cx::Cx,
-    lower::unresolved_method_call::{NoMatch, all_traits},
+    lower::unresolved_method_call::NoMatch,
     model::{Applicability, Diag},
 };
 
@@ -87,8 +87,8 @@ fn a_numeric_type_or_a_trait_has<'db>(
         found.is_some()
     });
     on_a_numeric_type
-        || all_traits(cx).into_iter().any(|it| {
-            it.items(cx.db).into_iter().any(|item| {
+        || cx.traits().with_item(name).any(|it| {
+            it.items_iter(cx.db).any(|item| {
                 matches!(item, hir::AssocItem::Function(_) | hir::AssocItem::Const(_))
                     && named(item)
             })

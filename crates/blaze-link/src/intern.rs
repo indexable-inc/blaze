@@ -579,6 +579,9 @@ mod tests {
                 Effect::Remove { .. } => Done::Removed,
                 Effect::Truncate { .. } => Done::Truncated,
                 Effect::Clone { .. } => Done::Cloned,
+                // The sibling of a clone on a volume that shares no blocks: this disk keeps no
+                // bytes, so none were copied.
+                Effect::CopyData { .. } => Done::Copied { bytes: 0 },
                 Effect::WriteAt { .. } | Effect::Write { .. } => Done::Written,
                 Effect::Sync { .. } => Done::Synced,
                 Effect::Mode { .. } => Done::Moded,

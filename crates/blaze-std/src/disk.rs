@@ -77,6 +77,8 @@ impl NameChange {
 }
 
 /// The directory `name` is in: everything before its last `/`, or the root's empty name.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn dir_of(name: &FileName) -> &str {
     match name.as_str().rsplit_once('/') {
         Some((dir, _)) => dir,
@@ -106,6 +108,7 @@ pub(crate) struct Disk {
 }
 
 impl Disk {
+    #[blaze::nonblocking]
     pub(crate) fn new(seed: u64) -> Disk {
         Disk {
             counts: DiskCounts::default(),
@@ -123,11 +126,16 @@ impl Disk {
         }
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn counts(&self) -> DiskCounts {
         self.counts
     }
 
     /// A caller waited for the device: a flush or a name sync it did not return before.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn waited(&mut self) {
         self.counts.device_waits += 1;
     }
@@ -186,6 +194,14 @@ impl Disk {
                 // clone: the ledger's name of the file, a refcount.
                 self.flushing.push((*tag, file.clone(), covered));
             }
+            // A barrier writes out what a flush writes out and makes nothing durable by
+            // itself: the simulation orders it before what is written after.
+            Effect::Barrier { file, tag } => {
+                self.counts.writebacks += 1;
+                let covered = self.dirty_of(file);
+                // clone: the ledger's name of the file, a refcount.
+                self.flushing.push((*tag, file.clone(), covered));
+            }
             // A write-back cleans what a flush cleans (a clone after it forces nothing out)
             // and makes nothing durable: the simulation still tears the file at a crash.
             Effect::WriteBack { file, tag } => {
@@ -225,11 +241,18 @@ impl Disk {
                 self.made(sim, *tag, to);
             }
             Effect::Link { to, tag, .. } => self.made(sim, *tag, to),
-            _ => {}
+            // A copy of the data reads the source's pages where they are, written back or
+            // not: it forces nothing out, as a clone does.
+            Effect::CopyData { to, tag, .. } => self.made(sim, *tag, to),
+            // A prewarm asks the page cache to read ahead and is not waited for: no byte is
+            // written, read for a caller or flushed, and no name changes.
+            Effect::Prewarm { .. } => {}
+            Effect::ReadInto { .. } | Effect::WriteFrom { .. } | Effect::ReadLink { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
         }
     }
 
     /// `completion` was polled, for its waiter or for none.
+    #[blaze::nonblocking]
     pub(crate) fn completed(&mut self, completion: &Completion) {
         let tag = completion.tag;
         if let Some(at) = self.naming.iter().position(|(it, _)| *it == tag) {
@@ -241,7 +264,7 @@ impl Disk {
         }
         if let Some(at) = self.flushing.iter().position(|(it, _, _)| *it == tag) {
             let (_, file, covered) = self.flushing.swap_remove(at);
-            if matches!(completion.done, Done::Synced | Done::WrittenBack) {
+            if matches!(completion.done, Done::Synced | Done::Ordered | Done::WrittenBack) {
                 if let Some((_, dirty)) = self.dirty.iter_mut().find(|(it, _)| *it == file) {
                     // What was written after the flush was asked is still unflushed.
                     *dirty = dirty.saturating_sub(covered);
@@ -259,6 +282,7 @@ impl Disk {
 
     /// The names of the directory `dir` synced: every change in it, and every change before
     /// the last of those, is durable.
+    #[blaze::nonblocking]
     pub(crate) fn sync_names(&mut self, dir: &str) {
         self.counts.name_syncs += 1;
         if let Some(last) = self.names.iter().rposition(|change| dir_of(change.name()) == dir) {

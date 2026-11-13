@@ -563,11 +563,10 @@ fn config_path(options: &impl CliOptions) -> Result<Option<PathBuf>, Error> {
     }
 }
 
-/// `dirs::home_dir`: `$HOME` when set and not empty.
+/// `dirs::home_dir`, as blaze answers it ([`blaze_core::home::user`]): `$HOME` when set and not
+/// empty, else the system's record of the user. A user with no home has no configuration in it.
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
+    blaze_core::home::user().ok()
 }
 
 /// `dirs::config_dir`: `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` (if absolute)

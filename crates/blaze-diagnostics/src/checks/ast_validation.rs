@@ -33,11 +33,7 @@ mod items;
 mod pats;
 mod types;
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "OnceCell: a memo of one check, dropped with it, not global state"
-)]
-use std::{cell::OnceCell, ops::ControlFlow};
+use std::ops::ControlFlow;
 
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};
@@ -47,6 +43,7 @@ use syntax::{
 };
 
 use crate::{
+    checks::features::Features,
     cx::{Cx, item_range_view as item_range},
     lints::syntax::{Pass, Tree, Walk, source_fact},
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
@@ -55,15 +52,10 @@ use crate::{
 
 /// One pass over the nodes [`Walk`] holds: each node costs a `kind` read and a `match` on it;
 /// only the kinds a check looks at are cast, and nothing is allocated unless an error fires.
-#[expect(
-    clippy::disallowed_types,
-    reason = "OnceCell: a memo of one check, dropped with it, not global state"
-)]
-pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Found> {
-    let features = OnceCell::new();
+pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, features: &Features) -> Vec<Found> {
     let mut out = Out::default();
     for tree in &walk.trees {
-        let v = V { cx, walk, tree, features: &features };
+        let v = V { cx, walk, tree, features };
         for &node in &tree.nodes {
             v.visit(node, &mut out);
         }
@@ -91,16 +83,14 @@ impl Out {
 }
 
 /// The validator at one tree of the walk.
-#[expect(
-    clippy::disallowed_types,
-    reason = "OnceCell: a memo of one check, dropped with it, not global state"
-)]
 struct V<'v, 'a, 'db> {
     cx: &'v Cx<'a, 'db>,
     walk: &'v Walk<'db>,
     tree: &'v Tree<'db>,
-    /// The crate's `#![feature]`s, read the first time a check asks.
-    features: &'v OnceCell<Vec<String>>,
+    /// What the crate's `#![feature]`s enable, as the feature gates read them: the check's
+    /// (`features::configured`), or of a piece's probe the crate's settings
+    /// (`checks::settings::crate_settings`).
+    features: &'v Features,
 }
 
 impl<'db> V<'_, '_, 'db> {
@@ -169,29 +159,9 @@ impl<'db> V<'_, '_, 'db> {
         ctxt.edition(self.cx.db)
     }
 
-    /// The crate's language and library features, as its `#![feature(..)]`s enable them.
+    /// rustc's `Features::enabled`: whether the crate's `#![feature(..)]`s enable `name`.
     fn feature(&self, name: &str) -> bool {
-        let features = self.features.get_or_init(|| {
-            // alloc: setup, the crate's `#![feature]`s, once per check when a check asks
-            let mut features = Vec::new();
-            for meta in crate::checks::crate_attrs(self.cx) {
-                let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
-                let is_feature = meta
-                    .path()
-                    .and_then(|it| it.as_single_name_ref())
-                    .is_some_and(|it| it.text() == "feature");
-                let Some(tt) = meta.token_tree().filter(|_| is_feature) else { continue };
-                for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token)
-                {
-                    if token.kind() == SyntaxKind::IDENT {
-                        // alloc: as above
-                        features.push(unraw(token.text()).to_owned());
-                    }
-                }
-            }
-            features
-        });
-        features.iter().any(|it| it == name)
+        self.features.enabled(name)
     }
 
     /// The `target_arch` of the crate's target.

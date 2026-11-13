@@ -40,17 +40,26 @@
 //!   rewrite loads the image and the old file whole over it: every record of the old file is
 //!   of a node the image has or one the file makes, because an image is written only while no
 //!   node of the file's base was dropped since the file was last rewritten (`settled`).
+//! - **Stamps and marks**: a `SEEN` record follows the head record of each batch the watcher
+//!   committed, with the stamps it saved ([`crate::disk::encode_seen`]), and a `MARK` record
+//!   holds one local fact by name; a rewrite holds one `SEEN` per disk (its overlay over the
+//!   image it was opened from) and every mark, after the head records. A `SEEN` is after the
+//!   head it vouches for, so a prefix that has it has the head: a stamp never names bytes the
+//!   recovered head lacks. An image is written only while the file is quiet (everything
+//!   recorded is durable), so the column it holds vouches only for heads the file has. A file
+//!   of the layout before these records loads as it did: its stamps are the image's alone.
 
 use std::sync::Arc;
 
-use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_core::{Completion, Cursor, Done, Effect, FileName, Stamp, Tag};
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use std::alloc::Global;
 
 use crate::{
-    FILE_DOMAIN, Mode, Recovered, Ticket,
+    FILE_DOMAIN, MOST_RECORD_BYTES, Mode, RecordTooLarge, Recovered, Ticket,
+    disk::{Disk, Disks, Marks, encode_mark, encode_seen, put_entry},
     image::Bytes,
     tree::{DIR_MODE, NodeId, Tree, check},
 };
@@ -69,6 +78,10 @@ const SEQUENCE: u8 = 5;
 /// The image the file starts from: the hash of its tree and its node count. Only first.
 const BASE: u8 = 6;
 const BASE_PAYLOAD: usize = 32 + 8;
+/// The stamps one watcher batch saved, or a disk's overlay in a rewrite: [`Disks::replay`].
+const SEEN: u8 = 7;
+/// One local fact by name, or its removal (empty bytes): [`Marks::replay`].
+const MARK: u8 = 8;
 
 /// Sequence numbers are below this: one more per head move from 0 never reaches it, so a
 /// record at or above it is forged, and the next number never overflows.
@@ -192,17 +205,38 @@ impl Journal {
     /// The journal whose file holds `bytes`, and the tree and heads it holds. A file that
     /// starts from an image loads only the records that name no node of it (none past the
     /// first that does), and is rewritten as what loaded.
-    pub(crate) fn recover(file: FileName, tags: u64, bytes: &[u8]) -> Loaded {
-        Journal::load(file, tags, bytes, None)
+    pub(crate) fn recover(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
+        Journal::load(file, tags, bytes, None, disks, marks)
     }
 
     /// The journal whose file holds `bytes`, loaded over `image`: the file's records after its
     /// base record, each node of the image found where it is.
-    pub(crate) fn restore(file: FileName, tags: u64, bytes: &[u8], image: FromImage) -> Loaded {
-        Journal::load(file, tags, bytes, Some(image))
+    /// `disks` is the image's column (or empty): the file's `SEEN` records apply over it.
+    pub(crate) fn restore(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        image: FromImage,
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
+        Journal::load(file, tags, bytes, Some(image), disks, marks)
     }
 
-    fn load(file: FileName, tags: u64, bytes: &[u8], image: Option<FromImage>) -> Loaded {
+    fn load(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        image: Option<FromImage>,
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
         let mut found = Recovered::default();
         let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> =
             HashMap::new_in(Global);
@@ -222,13 +256,25 @@ impl Journal {
             lost_base = from.is_none();
         }
         while let Some(one) = record(&bytes[valid..]) {
-            if load(&mut tree, &one, &mut moves, &mut sequence).is_none() {
+            let loaded = match one.kind {
+                SEEN => disks.replay(one.payload).map(|()| found.seen += 1),
+                MARK => marks.replay(one.payload).map(|()| found.marks += 1),
+                _ => load(&mut tree, &one, &mut moves, &mut sequence),
+            };
+            if loaded.is_none() {
                 break;
             }
             found.records += 1;
             valid += one.len;
         }
         found.skipped = bytes.len() - valid;
+        if lost_base {
+            // The column holds only what changed since the image it lost: no disk holds all of
+            // its head, so each is looked at whole once (what it lacks is not seen, so read).
+            for disk in disks.by_head.values_mut() {
+                disk.root = None;
+            }
+        }
         let mut journal = Journal {
             file,
             tags,
@@ -290,30 +336,57 @@ impl Journal {
     }
 
     /// Records that `head` moved to `root`; the ticket is in what [`Journal::complete`] returns
-    /// once that is durable.
-    pub(crate) fn record_head(&mut self, tree: &Tree, head: &str, root: NodeId) -> Ticket {
+    /// once that is durable. A record over [`MOST_RECORD_BYTES`] (a directory of that many
+    /// bytes of entries, a head of that long a name) is refused, naming it: the head is not
+    /// recorded as moved, and the records of the nodes under it framed before stay, naming
+    /// nodes no head has.
+    pub(crate) fn record_head(
+        &mut self,
+        tree: &Tree,
+        head: &str,
+        root: NodeId,
+    ) -> Result<Ticket, RecordTooLarge> {
         self.written.grow(tree.len());
-        write_node(tree, &mut self.written, &mut self.stack, &mut self.open.bytes, root);
-        self.sequence = next(self.sequence);
+        write_node(tree, &mut self.written, &mut self.stack, &mut self.open.bytes, root)?;
+        let sequence = next(self.sequence);
+        head_record(&mut self.open.bytes, sequence, Some(&tree.id(root)), head)?;
+        self.sequence = sequence;
         match self.heads.get_mut(head) {
             Some(sequence) => *sequence = self.sequence,
             None => {
                 self.heads.insert(head.into(), self.sequence);
             }
         }
-        head_record(&mut self.open.bytes, self.sequence, Some(&tree.id(root)), head);
-        self.ticket()
+        Ok(self.ticket())
     }
 
     /// Records that `head` is gone.
     pub(crate) fn record_removal(&mut self, head: &str) -> Ticket {
         self.sequence = next(self.sequence);
         self.heads.remove(head);
-        head_record(&mut self.open.bytes, self.sequence, None, head);
+        head_record(&mut self.open.bytes, self.sequence, None, head)
+            .expect("a removal is smaller than the head record that named its head, which fit");
         self.ticket()
     }
 
-    fn ticket(&mut self) -> Ticket {
+    /// Records the stamps a watcher batch saved: `count` entries ([`put_entry`]'s) of `head`'s
+    /// `disk` as it is now, made after the batch's head record, so after it in the file
+    /// ([`frame_seen`]: as many records as they take). Made durable with the records around it
+    /// and given no ticket of its own.
+    pub(crate) fn record_seen(&mut self, head: &str, disk: &Disk, count: u32, entries: &[u8]) {
+        let most = MOST_RECORD_BYTES as usize;
+        frame_seen(&mut self.open.bytes, head, disk, count, entries, most);
+    }
+
+    /// Records that `name`'s mark is `bytes` (empty: it has none); the ticket is in what
+    /// [`Journal::complete`] returns once that is durable.
+    pub(crate) fn record_mark(&mut self, name: &str, bytes: &[u8]) -> Ticket {
+        frame(&mut self.open.bytes, MARK, |out| encode_mark(out, name, bytes))
+            .expect("a mark's name and bytes are each at most MARK_MOST (`Vfs::mark`)");
+        self.ticket()
+    }
+
+    pub(crate) fn ticket(&mut self) -> Ticket {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
         self.open.tickets.push(ticket);
@@ -332,9 +405,15 @@ impl Journal {
 
     /// Whether an image of the tree written now can become the file's base: no image is on
     /// its way to being one, and the file names only nodes the tree has or the file makes, so
-    /// it loads whole over that image if the rewrite naming it never happens.
+    /// it loads whole over that image if the rewrite naming it never happens. The file is quiet
+    /// too (everything recorded is durable, nothing in flight): the image's column then vouches
+    /// only for heads the file has, whether or not the rewrite naming the image happens.
     pub(crate) fn can_stage(&self) -> bool {
-        self.next.is_none() && self.switching.is_none() && self.settled
+        let quiet = matches!(self.flight, Flight::Idle)
+            && self.open.bytes.is_empty()
+            && self.open.tickets.is_empty()
+            && self.cut.is_none();
+        quiet && self.next.is_none() && self.switching.is_none() && self.settled
     }
 
     /// The image the file starts from, which an image written now records.
@@ -367,6 +446,8 @@ impl Journal {
         &mut self,
         tree: &Tree,
         heads: &HashMap<Box<str>, NodeId, Global>,
+        disks: &Disks,
+        marks: &Marks,
         effects: &mut Vec<Effect>,
     ) {
         if !matches!(self.flight, Flight::Idle) {
@@ -386,7 +467,8 @@ impl Journal {
                     frame(&mut bytes, BASE, |out| {
                         out.put_bytes(&base.name.0);
                         out.put_u64(base.nodes);
-                    });
+                    })
+                    .expect("a base record is 40 bytes");
                     // clone: one bit per node, once per rewrite.
                     let mut written = base.of.clone();
                     written.grow(tree.len());
@@ -399,14 +481,38 @@ impl Journal {
             // alloc: once per rewrite, the heads by name.
             let mut names: Vec<&Box<str>> = heads.keys().collect();
             names.sort_unstable();
+            // Every record here was framed once already, when it was first recorded
+            // (`record_head`, `record_mark`), so each fits again.
             for name in &names {
-                write_node(tree, &mut self.written, &mut self.stack, &mut bytes, heads[*name]);
+                write_node(tree, &mut self.written, &mut self.stack, &mut bytes, heads[*name])
+                    .expect("a head's nodes were framed when the head was recorded");
             }
             for name in &names {
                 let sequence = self.heads[&***name];
-                head_record(&mut bytes, sequence, Some(&tree.id(heads[*name])), name);
+                head_record(&mut bytes, sequence, Some(&tree.id(heads[*name])), name)
+                    .expect("a head's record was framed when the head was recorded");
             }
-            frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence));
+            // After the heads they vouch for: each disk's overlay, heads in name order.
+            // alloc: once per rewrite, the disks by head and one record's payload, reused.
+            let mut watched: Vec<&Box<str>> = disks.by_head.keys().collect();
+            watched.sort_unstable();
+            let mut entries = Vec::new();
+            for head in watched {
+                let disk = &disks.by_head[head];
+                let overlay = disk.overlay();
+                entries.clear();
+                for (name, stamp) in &overlay {
+                    put_entry(&mut entries, name, *stamp);
+                }
+                let count = u32::try_from(overlay.len()).expect("under 2^32 names");
+                frame_seen(&mut bytes, head, disk, count, &entries, MOST_RECORD_BYTES as usize);
+            }
+            for (name, value) in marks.all() {
+                frame(&mut bytes, MARK, |out| encode_mark(out, name, value))
+                    .expect("a mark's record was framed when the mark was set");
+            }
+            frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence))
+                .expect("a sequence record is 8 bytes");
             // What was recorded and not appended is in the rewrite: the heads as they are now.
             let tickets = std::mem::take(&mut self.open).tickets;
             self.rewriting = bytes.len() as u64;
@@ -445,6 +551,8 @@ impl Journal {
         &mut self,
         tree: &Tree,
         heads: &HashMap<Box<str>, NodeId, Global>,
+        disks: &Disks,
+        marks: &Marks,
         completion: Completion,
         effects: &mut Vec<Effect>,
     ) -> Vec<Ticket> {
@@ -497,7 +605,7 @@ impl Journal {
                 unreachable!("the journal has nothing in flight as tag +{offset} for {done:?}")
             }
         }
-        self.flush(tree, heads, effects);
+        self.flush(tree, heads, disks, marks, effects);
         durable
     }
 
@@ -522,6 +630,40 @@ impl Journal {
         }
         self.compact |= lost || (self.dirty && self.appended >= self.rewritten);
     }
+
+    /// The node count of the image `name` when it is durable: the file starts from it, a
+    /// rewrite to it is in flight, or the next starts from it. Never of an image only staged,
+    /// whose file may not be whole.
+    pub(crate) fn durable_image(&self, name: &ContentId) -> Option<u64> {
+        let images = [&self.base, &self.switching, &self.next];
+        images.into_iter().flatten().find(|it| it.name == *name).map(|it| it.nodes)
+    }
+
+    /// Follows a settle onto the durable image `name` ([`crate::Vfs::settle`]): each node's
+    /// new number, and every node of the image (the tree's first ones, as many as the image
+    /// holds) in that image's set and in what the file has, so [`write_node`]'s claim holds:
+    /// no record reads the image's bytes. Where the image is the next one the file starts
+    /// from and not yet the file's base, the rewrite to it ([`Journal::durable`] asked for it)
+    /// comes before any append, so no record made now is appended to a file not starting
+    /// from it.
+    pub(crate) fn onto_image(
+        &mut self,
+        name: &ContentId,
+        renumbered: &[Option<NodeId>],
+        len: usize,
+    ) {
+        self.written = self::renumbered(&self.written, renumbered, len).0;
+        let all = [&mut self.base, &mut self.switching, &mut self.staged, &mut self.next];
+        for base in all.into_iter().flatten() {
+            base.of = self::renumbered(&base.of, renumbered, len).0;
+        }
+        let images = [&mut self.base, &mut self.switching, &mut self.next];
+        let image = images.into_iter().flatten().find(|it| it.name == *name);
+        let image = image.expect("a settle onto an image the journal holds durable");
+        let nodes = NodeId(u32::try_from(image.nodes).expect("an image of under 2^32 nodes"));
+        image.of.insert_range(NodeId(0)..nodes);
+        self.written.insert_range(NodeId(0)..nodes);
+    }
 }
 
 /// The sequence number after `sequence`, which is below [`SEQUENCES`].
@@ -532,14 +674,16 @@ fn next(sequence: u64) -> u64 {
 }
 
 /// Records `node` and everything under it not recorded yet, children first, so a record only
-/// names nodes recorded before it. Each record is framed in place in `out`.
+/// names nodes recorded before it. Each record is framed in place in `out`. A directory whose
+/// record is over [`MOST_RECORD_BYTES`] is refused by its content ID and count of entries,
+/// and stays unrecorded; what was framed under it before stays, recorded.
 fn write_node(
     tree: &Tree,
     written: &mut Written,
     stack: &mut Vec<(NodeId, bool)>,
     out: &mut Vec<u8>,
     node: NodeId,
-) {
+) -> Result<(), RecordTooLarge> {
     stack.clear();
     stack.push((node, false));
     while let Some((node, children_done)) = stack.pop() {
@@ -562,27 +706,88 @@ fn write_node(
             continue;
         } else {
             let entries = tree.entries(node).expect("a directory");
-            frame(out, DIR, |out| {
+            let framed = frame(out, DIR, |out| {
                 for (name, child, mode) in entries.iter() {
                     out.put_bytes_u32(tree.name_str(name).as_bytes());
                     out.put_u32(tree.code(child, mode));
                     out.put_bytes(&tree.id(child).0);
                 }
             });
+            if let Err(len) = framed {
+                let count = entries.iter().count();
+                return Err(RecordTooLarge {
+                    // alloc: the error's name of what it is about
+                    what: format!("the directory {} of {count} entries", tree.id(node)),
+                    len,
+                });
+            }
         }
         written.insert(node);
     }
+    Ok(())
 }
 
-fn head_record(out: &mut Vec<u8>, sequence: u64, root: Option<&ContentId>, head: &str) {
+fn head_record(
+    out: &mut Vec<u8>,
+    sequence: u64,
+    root: Option<&ContentId>,
+    head: &str,
+) -> Result<(), RecordTooLarge> {
     let kind = if root.is_some() { HEAD } else { REMOVE };
-    frame(out, kind, |out| {
+    let framed = frame(out, kind, |out| {
         out.put_u64(sequence);
         if let Some(root) = root {
             out.put_bytes(&root.0);
         }
         out.put_bytes(head.as_bytes());
     });
+    // alloc: the error's name of what it is about
+    framed.map_err(|len| RecordTooLarge {
+        what: blaze_report::say!("the head ", blaze_report::say::Code(head)).flat(),
+        len,
+    })
+}
+
+/// Frames the `SEEN` records of `count` entries ([`put_entry`]'s, in the order applied) of
+/// `head`'s `disk`: one record when they fit in `most` bytes of payload, else as many as they
+/// take, split between entries. Each but the last carries no root, so a cut of the journal
+/// between them leaves a column that vouches for none; the last carries the disk's.
+/// Replayed in order they leave the column as one record would. Each record holds at least one
+/// entry, and an entry is a path the system gave and its stamp, far under `most`.
+fn frame_seen(
+    out: &mut Vec<u8>,
+    head: &str,
+    disk: &Disk,
+    count: u32,
+    entries: &[u8],
+    most: usize,
+) {
+    // `head str_u32 | dir str_u32 | cursor | root flag + 32 B | count u32`.
+    let fixed = 4 + head.len() + 4 + disk.dir.as_str().len() + Cursor::BYTES + 33 + 4;
+    let entry_len = |at: &[u8]| {
+        let name = u32::from_le_bytes(at[..4].try_into().expect("four bytes")) as usize;
+        4 + name + Stamp::BYTES
+    };
+    let (mut rest, mut left) = (entries, count);
+    loop {
+        let (mut taken, mut n) = (0, 0u32);
+        while n < left {
+            let len = entry_len(&rest[taken..]);
+            if n > 0 && fixed + taken + len > most {
+                break;
+            }
+            taken += len;
+            n += 1;
+        }
+        let last = n == left;
+        let root = if last { disk.root } else { None };
+        frame(out, SEEN, |out| encode_seen(out, head, disk, root, n, &rest[..taken]))
+            .expect("a SEEN record of entries that fit, or of one path and its stamp");
+        if last {
+            return;
+        }
+        (rest, left) = (&rest[taken..], left - n);
+    }
 }
 
 fn checksum(kind: u8, payload: &[u8]) -> [u8; CHECKSUM] {
@@ -591,16 +796,23 @@ fn checksum(kind: u8, payload: &[u8]) -> [u8; CHECKSUM] {
 }
 
 /// Appends one record whose payload `payload` writes, in place: the length is filled in after.
-fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) {
+/// A payload over [`MOST_RECORD_BYTES`] is refused with its length, and nothing of the record
+/// is left in `out`.
+fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) -> Result<(), u64> {
     let start = out.len();
     out.put_bytes(&MAGIC);
     out.put_u32(0);
     out.put_u8(kind);
     payload(out);
-    let len = u32::try_from(out.len() - start - HEADER).expect("a record under 4 GiB");
+    let Ok(len) = u32::try_from(out.len() - start - HEADER) else {
+        let len = (out.len() - start - HEADER) as u64;
+        out.truncate(start);
+        return Err(len);
+    };
     out.patch_u32(start + MAGIC.len(), len);
     let sum = checksum(kind, &out[start + HEADER..]);
     out.put_bytes(&sum);
+    Ok(())
 }
 
 /// Appends the record of a file whose content ID is `id`: its checksum is over the ID, so
@@ -609,7 +821,9 @@ fn frame_file(out: &mut Vec<u8>, id: &ContentId, bytes: &[u8]) {
     debug_assert_eq!(*id, ContentId::of(FILE_DOMAIN, bytes), "a file record's ID");
     out.reserve(HEADER + bytes.len() + CHECKSUM);
     out.put_bytes(&MAGIC);
-    out.put_u32(u32::try_from(bytes.len()).expect("a record under 4 GiB"));
+    // The tree refuses a file over `MOST_FILE_BYTES` when it is staged (`OpError::TooLarge`)
+    // and the watcher before it reads one, so every file the tree holds fits.
+    out.put_u32(u32::try_from(bytes.len()).expect("a file the tree took is at most MOST_FILE_BYTES"));
     out.put_u8(FILE);
     out.put_bytes(bytes);
     out.put_bytes(&checksum(FILE, &id.0));
@@ -621,7 +835,8 @@ pub(crate) fn framed(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match kind {
         FILE => frame_file(&mut out, &ContentId::of(FILE_DOMAIN, payload), payload),
-        _ => frame(&mut out, kind, |out| out.extend_from_slice(payload)),
+        _ => frame(&mut out, kind, |out| out.extend_from_slice(payload))
+            .expect("a forged record fits"),
     }
     out
 }
@@ -631,6 +846,9 @@ pub(crate) const KINDS: (u8, u8, u8, u8, u8) = (FILE, DIR, HEAD, REMOVE, SEQUENC
 
 #[cfg(test)]
 pub(crate) const BASE_KIND: u8 = BASE;
+
+#[cfg(test)]
+pub(crate) const STAMP_KINDS: (u8, u8) = (SEEN, MARK);
 
 /// The image a journal's file starts from, if its first record is a base record: the hash of
 /// the image's tree and its node count.
@@ -744,4 +962,69 @@ fn load(
 /// [`SEQUENCES`], so a head moved after recovery is numbered.
 fn sequence_at(read: &mut Reader<'_>) -> Option<u64> {
     read.u64().ok().filter(|&at| at < SEQUENCES - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The payloads of the records framed in `bytes`, in order.
+    fn payloads(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            out.push(&bytes[at + HEADER..at + HEADER + len]);
+            at += HEADER + len + CHECKSUM;
+        }
+        out
+    }
+
+    /// The names and stamps `disks` holds for `main`, with its root.
+    fn column(disks: &Disks) -> (Option<ContentId>, Vec<(String, Stamp)>) {
+        let disk = disks.get("main").expect("the disk replayed");
+        let mut names = Vec::new();
+        disk.under_saved("w", |name, stamp| names.push((name.to_owned(), stamp)));
+        (disk.root, names)
+    }
+
+    /// The invariant: `SEEN` entries too many for one record are split between entries into
+    /// records that each fit, which replayed in order leave the column one record leaves, and
+    /// every cut between them leaves a column that vouches for no root. Control: the split
+    /// records under the whole bound are one record, the same column.
+    #[test]
+    fn a_seen_record_split_to_fit_replays_as_the_whole_one() {
+        let mut disks = Disks::default();
+        let disk = disks.of("main", &FileName::new("w").unwrap());
+        disk.root = Some(ContentId([7; 32]));
+        let mut entries = Vec::new();
+        for n in 0..50u64 {
+            let mode = blaze_core::S_IFREG;
+            let stamp = Stamp { ino: n + 1, size: n, mtime_ns: n, ctime_ns: n, mode };
+            put_entry(&mut entries, &format!("w/file-{n}"), stamp);
+        }
+        let disk = &disks.by_head["main"];
+        let (mut whole, mut split) = (Vec::new(), Vec::new());
+        frame_seen(&mut whole, "main", disk, 50, &entries, MOST_RECORD_BYTES as usize);
+        // Room for the fixed part and about three entries a record.
+        let most = 4 + 4 + 4 + 1 + Cursor::BYTES + 33 + 4 + 150;
+        frame_seen(&mut split, "main", disk, 50, &entries, most);
+        let (whole, split) = (payloads(&whole), payloads(&split));
+        assert_eq!(whole.len(), 1);
+        assert!(split.len() > 10, "{} records", split.len());
+        let replayed = |records: &[&[u8]]| {
+            let mut disks = Disks::default();
+            for it in records {
+                disks.replay(it).expect("a record that replays");
+            }
+            column(&disks)
+        };
+        let want = replayed(&whole);
+        assert_eq!(want.0, Some(ContentId([7; 32])));
+        assert_eq!(want.1.len(), 50);
+        assert_eq!(replayed(&split), want);
+        for cut in 1..split.len() {
+            assert_eq!(replayed(&split[..cut]).0, None, "a cut after {cut} records vouches for none");
+        }
+    }
 }

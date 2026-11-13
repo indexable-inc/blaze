@@ -1,65 +1,80 @@
-//! How entries and shapes are keyed and laid out in the store.
+//! How entries are keyed and laid out in the store. The form is `blaze_record`'s (base key →
+//! read-lists → answer), which owns the key derivations, the read-list's layout and the chain;
+//! this file is what the kernel puts in it.
 //!
-//! - **Entry key**: `H("blaze v2 kernel entry 1", identity, count, each (kind, key, seen))`.
-//!   With no reads it is [`whole::key`], and that entry's bytes are its bare value.
-//! - **Entry bytes** (with reads): magic, step `u16`, `0u16`, count `u32`, the identity's
-//!   ID, then each read (kind `u16`, seen `u8` 0 gone / 1 hash, the hash, key `u32` length and
-//!   bytes), then the value's `u64` length, zeros to a 16-byte boundary, and the value.
-//! - **Shape slot `n`**: `H("blaze v2 kernel shape slot 1", identity, n)`. Its bytes are
-//!   magic, the identity's ID, count `u32`, then each read's kind `u16` and key (`u32` length
-//!   and bytes), with no hashes.
+//! - **Base key**: the identity's ID ([`Identity::id`]).
+//! - **A read's name**: its kind (`u16`, big-endian, so that names order as kind then key),
+//!   then its key's bytes ([`named`]).
+//! - **Read-list**: `blaze_record::write_list` of the base, no note, and the names of one
+//!   run's reads, sorted, each once. It is filed in the base's chain ([`BOUNDS`]).
+//! - **Entry key**: `blaze_record::AnswerKey` of the read-list's bytes and each read's digest
+//!   (a read that saw nothing is `Digest::Nothing`). With no reads it is [`whole::key`]: the
+//!   answer of the list with no reads (`blaze_record::empty_list`), which is known from the
+//!   identity and never filed, and that entry's bytes are its bare value.
+//! - **Entry bytes** (with reads): magic, step `u16`, `0u16`, the read-list's length `u32`,
+//!   the read-list as it is filed, each read's digest in the list's order (`u8` 0 gone / 1 a
+//!   hash, then the hash), the hash of the value's bytes (32 bytes), the value's `u64` length,
+//!   zeros to a 16-byte boundary, the value. An entry so says by itself which key it is of
+//!   ([`Entry::read`]), and what a read of its value sees ([`Entry::value_hash`]) without its
+//!   value being hashed again: a parent's lookup reads 32 bytes of each child it names.
 
-use blaze_cas::Key;
+use std::ops::Range;
+
+use blaze_cas::{Key, content_of};
 use blaze_format::cursor::{Put as _, Reader};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
+use blaze_record::{AnswerKey, Bounds, Digest, ListError, ListRef, empty_list, write_list};
 
-use crate::{Identity, Read, ReadKind, Seen, Trace};
+use crate::{Identity, MOST_SHAPES, Read, ReadKind, Seen, Trace};
 
-const ENTRY_KEY: &str = "blaze v2 kernel entry 1";
-const SLOT_KEY: &str = "blaze v2 kernel shape slot 1";
-const ENTRY_MAGIC: [u8; 16] = *b"blaze kernel e 1";
-const SHAPE_MAGIC: [u8; 16] = *b"blaze kernel s 1";
+/// `blaze kernel e`, then the layout's number: 1 kept its reads' names and hashes together
+/// under a key of the kernel's own; 2 keeps the read-list `blaze_record` files; 3 keeps the
+/// hash of its value's bytes too.
+const ENTRY_MAGIC: [u8; 16] = *b"blaze kernel e 3";
+const ENTRY_MAGIC_FAMILY: &[u8] = b"blaze kernel e ";
 
-/// An entry's key, made read by read.
-pub struct EntryKey(Hasher);
+/// The chain of an identity's read-lists: one generation of [`MOST_SHAPES`] slots, searched
+/// whole from slot 0 and full at its bound ([`crate::KernelError::TooManyShapes`]), as the
+/// kernel's chain of shape slots was. A generational bound (a full chain stops searching its
+/// oldest lists and is never a refusal) is a change of what a lookup finds: its own step.
+pub(crate) const BOUNDS: Bounds = Bounds::new(MOST_SHAPES, 1);
 
-impl EntryKey {
-    pub fn new(identity: &ContentId, reads: usize) -> EntryKey {
-        let mut hasher = Hasher::new(ENTRY_KEY);
-        hasher.id(identity).update(&(reads as u64).to_le_bytes());
-        EntryKey(hasher)
-    }
+/// Appends the first part of a read's name: its kind. The key's bytes follow.
+pub(crate) fn name_kind(kind: ReadKind, out: &mut Vec<u8>) {
+    // alloc: the caller's buffer of one run's names
+    out.extend_from_slice(&kind.0.to_be_bytes());
+}
 
-    pub fn read(&mut self, read: Read<'_>, seen: Seen) {
-        self.0.update(&read.kind.0.to_le_bytes()).part(read.key);
-        match seen {
-            Seen::Gone => self.0.update(&[0]),
-            Seen::Is(hash) => self.0.update(&[1]).id(&hash),
-        };
-    }
+/// The read `name` is of; `None` for bytes too short to hold a kind.
+pub(crate) fn named(name: &[u8]) -> Option<Read<'_>> {
+    let (kind, key) = name.split_first_chunk::<2>()?;
+    Some(Read { kind: ReadKind(u16::from_be_bytes(*kind)), key })
+}
 
-    pub fn finish(&self) -> Key {
-        Key(self.0.finish())
+/// What a read saw, as its entry's key takes it.
+pub(crate) fn digest(seen: Seen) -> Digest {
+    match seen {
+        Seen::Gone => Digest::Nothing,
+        Seen::Is(hash) => Digest::Is(hash),
     }
 }
 
-/// The key of the entry of `identity` (its [`Identity::id`]) whose reads saw `reads`.
-pub fn entry_key<'a>(
-    identity: &ContentId,
-    reads: impl ExactSizeIterator<Item = (Read<'a>, Seen)>,
-) -> Key {
-    let mut key = EntryKey::new(identity, reads.len());
-    for (read, seen) in reads {
-        key.read(read, seen);
+/// The key of the entry whose read-list is `list` and whose reads saw `seen`, in the list's
+/// order.
+pub(crate) fn entry_key(list: &[u8], seen: impl Iterator<Item = Seen>) -> Key {
+    let mut key = AnswerKey::new(list);
+    for seen in seen {
+        key.value(digest(seen));
     }
-    key.finish()
+    Key(key.finish())
 }
 
-/// The key of slot `n` of `identity`'s chain of shapes.
-pub fn shape_slot(identity: &ContentId, n: u32) -> Key {
-    let mut hasher = Hasher::new(SLOT_KEY);
-    hasher.id(identity).update(&n.to_le_bytes());
-    Key(hasher.finish())
+/// The read-list of `trace` under the identity whose ID is `identity`.
+#[cfg(test)]
+pub(crate) fn list(identity: &ContentId, trace: &Trace) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_list(&mut out, identity, &[], trace.names());
+    out
 }
 
 /// A step whose identity is its whole content: one probe, and the value is kept as it is.
@@ -70,27 +85,44 @@ pub mod whole {
 
     /// The key of `identity`'s entry with no reads.
     pub fn key(identity: &Identity) -> Key {
-        super::entry_key(&identity.id(), std::iter::empty())
+        super::entry_key(&super::empty_list(&identity.id()), std::iter::empty())
     }
 }
 
 /// An entry with reads, as the store keeps it.
-pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Vec<u8> {
-    if trace.is_empty() {
-        // alloc: the value, kept in the store
-        return value.to_vec();
+pub(crate) struct Encoded {
+    pub key: Key,
+    pub bytes: Vec<u8>,
+    /// The hash of its value's bytes, made once here and kept in the entry.
+    pub hash: ContentId,
+    list: Range<usize>,
+}
+
+impl Encoded {
+    /// Its read-list, as it is filed in the identity's chain.
+    pub fn list(&self) -> &[u8] {
+        &self.bytes[self.list.clone()]
     }
-    let reads: usize =
-        trace.iter().map(|(read, seen)| 2 + 1 + hash_len(seen) + 4 + read.key.len()).sum();
+}
+
+const LIST_AT: usize = 16 + 2 + 2 + 4;
+
+/// The entry of `identity` whose run made `trace` (which has reads) and `value`.
+pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Encoded {
+    let names: usize = trace.names().map(|name| 4 + name.len()).sum();
+    let digests: usize = trace.seen().map(|seen| 1 + hash_len(seen)).sum();
+    let id = identity.id();
+    let list_len = empty_list(&id).len() + names;
     // alloc: the entry, kept in the store: one allocation of its exact size
-    let mut out = Vec::with_capacity(16 + 8 + 32 + reads + 8 + 15 + value.len());
+    let mut out = Vec::with_capacity(LIST_AT + list_len + digests + 32 + 8 + 15 + value.len());
     out.put_bytes(&ENTRY_MAGIC);
     out.put_u16(identity.step.0);
     out.put_u16(0);
-    out.put_u32(u32::try_from(trace.len()).expect("fewer than 2^32 reads in one run"));
-    out.put_bytes(&identity.id().0);
-    for (read, seen) in trace.iter() {
-        out.put_u16(read.kind.0);
+    out.put_u32(u32::try_from(list_len).expect("a read-list shorter than 2^32 bytes"));
+    write_list(&mut out, &id, &[], trace.names());
+    let list = LIST_AT..out.len();
+    assert_eq!(list.len(), list_len, "a read-list is its head and each name with its length");
+    for seen in trace.seen() {
         match seen {
             Seen::Gone => out.put_u8(0),
             Seen::Is(hash) => {
@@ -98,12 +130,14 @@ pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Vec<u8
                 out.put_bytes(&hash.0);
             }
         }
-        out.put_bytes_u32(read.key);
     }
+    let hash = content_of(value);
+    out.put_bytes(&hash.0);
     out.put_u64(value.len() as u64);
     out.pad_to(16);
     out.put_bytes(value);
-    out
+    let key = entry_key(&out[list.clone()], trace.seen());
+    Encoded { key, bytes: out, hash, list }
 }
 
 fn hash_len(seen: Seen) -> usize {
@@ -113,41 +147,39 @@ fn hash_len(seen: Seen) -> usize {
     }
 }
 
-/// The shape of `trace`: its reads' names, without their hashes.
-pub(crate) fn encode_shape(identity: &ContentId, trace: &Trace) -> Vec<u8> {
-    let reads: usize = trace.iter().map(|(read, _)| 2 + 4 + read.key.len()).sum();
-    // alloc: the shape, kept in the store: one allocation of its exact size
-    let mut out = Vec::with_capacity(16 + 32 + 4 + reads);
-    out.put_bytes(&SHAPE_MAGIC);
-    out.put_bytes(&identity.0);
-    out.put_u32(u32::try_from(trace.len()).expect("fewer than 2^32 reads in one run"));
-    for (read, _) in trace.iter() {
-        out.put_u16(read.kind.0);
-        out.put_bytes_u32(read.key);
-    }
-    out
-}
-
 /// An entry as the store holds it, read in place.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry<'s> {
     pub key: Key,
     pub identity: Identity,
     pub value: &'s [u8],
-    reads: Reader<'s>,
-    count: usize,
+    /// The hash of its value's bytes as the entry keeps it; none for an entry with no reads,
+    /// whose bytes are its bare value.
+    hash: Option<ContentId>,
+    /// Its read-list and the digests of the list's reads; none for an entry with no reads.
+    reads: Option<(ListRef<'s>, Reader<'s>)>,
 }
 
 impl<'s> Entry<'s> {
     /// The entry with no reads of `identity`: its bytes are its value.
     pub fn whole(bytes: &'s [u8], identity: Identity) -> Entry<'s> {
-        Entry {
-            key: whole::key(&identity),
-            identity,
-            value: bytes,
-            reads: Reader::new(&[]),
-            count: 0,
+        Entry { key: whole::key(&identity), identity, value: bytes, hash: None, reads: None }
+    }
+
+    /// The hash of its value's bytes: what a read of this step's value sees. An entry with
+    /// reads keeps it, so nothing is hashed here; an entry with no reads is its bare value
+    /// (one probe, no header), which is hashed.
+    pub fn value_hash(&self) -> ContentId {
+        match self.hash {
+            Some(hash) => hash,
+            None => content_of(self.value),
         }
+    }
+
+    /// The hash the entry keeps of its value, where it keeps one: for a check that the value
+    /// under it still hashes to it.
+    pub(crate) fn kept_hash(&self) -> Option<ContentId> {
+        self.hash
     }
 
     /// The entry under `key`. It is refused when it is of another identity than `identity`, or
@@ -157,32 +189,44 @@ impl<'s> Entry<'s> {
             return Ok(Entry::whole(bytes, *identity));
         }
         let mut input = Reader::new(bytes);
-        if *input.array::<16>()? != ENTRY_MAGIC {
-            // alloc: an error
-            return Err("its value is no kernel entry".to_owned());
+        let magic = input.array::<16>()?;
+        if *magic != ENTRY_MAGIC {
+            return Err(not_this_layout(magic));
         }
         let step = input.u16()?;
         input.u16()?;
-        let count = input.u32()? as usize;
-        let id = ContentId(*input.array::<32>()?);
-        if step != identity.step.0 || id != identity.id() {
+        let list_len = input.u32()? as usize;
+        let list_bytes = input.take(list_len)?;
+        let id = identity.id();
+        let list = match ListRef::open(list_bytes, &id) {
+            Ok(list) if step == identity.step.0 => list,
+            Ok(_) | Err(ListError::OtherBase) => {
+                // alloc: an error
+                return Err(format!(
+                    "its entry is of step {step} and another identity, not of step {} and identity {id:x}: it is filed under another key",
+                    identity.step.0
+                ));
+            }
             // alloc: an error
-            return Err(format!(
-                "its entry is of step {step} and identity {id:x}, not of step {} and identity {:x}: it is filed under another key",
-                identity.step.0,
-                identity.id()
-            ));
+            Err(why) => return Err(format!("its entry's reads are {why}")),
+        };
+        let digests = input;
+        let mut keyed = AnswerKey::new(list_bytes);
+        for name in list.reads() {
+            if named(name).is_none() {
+                // alloc: an error
+                return Err(format!(
+                    "a read named by {} bytes, too few to hold its kind",
+                    name.len()
+                ));
+            }
+            keyed.value(digest(next_seen(&mut input)?));
         }
-        let reads = input;
-        let mut keyed = EntryKey::new(&id, count);
-        for _ in 0..count {
-            let (read, seen) = next_read(&mut input)?;
-            keyed.read(read, seen);
-        }
-        if keyed.finish() != key {
+        if Key(keyed.finish()) != key {
             // alloc: an error
             return Err("its reads name another key than the one it is filed under".to_owned());
         }
+        let hash = ContentId(*input.array::<32>()?);
         // alloc: an error
         let len =
             usize::try_from(input.u64()?).map_err(|_| "a value longer than memory".to_owned())?;
@@ -193,119 +237,64 @@ impl<'s> Entry<'s> {
         }
         let value = input.take(len)?;
         input.finish()?;
-        Ok(Entry { key, identity: *identity, value, reads, count })
+        Ok(Entry { key, identity: *identity, value, hash: Some(hash), reads: Some((list, digests)) })
     }
 
     /// The reads it recorded, sorted by kind and key, with the hash each saw.
     pub fn reads(&self) -> EntryReads<'s> {
-        EntryReads { input: self.reads, left: self.count }
+        match self.reads {
+            Some((list, digests)) => EntryReads { names: Some(list.reads()), digests },
+            None => EntryReads { names: None, digests: Reader::new(&[]) },
+        }
     }
 }
 
-fn next_read<'s>(input: &mut Reader<'s>) -> Result<(Read<'s>, Seen), String> {
-    let kind = ReadKind(input.u16()?);
-    let seen = match input.u8()? {
-        0 => Seen::Gone,
-        1 => Seen::Is(ContentId(*input.array::<32>()?)),
+/// Why bytes whose magic is `magic` are no entry this blaze reads: an entry of another layout
+/// is named as one (kept by another blaze under a key this one never looks under), never read
+/// as this layout.
+fn not_this_layout(magic: &[u8; 16]) -> String {
+    let (family, number) = magic.split_at(ENTRY_MAGIC_FAMILY.len());
+    match family == ENTRY_MAGIC_FAMILY && number[0].is_ascii_digit() {
         // alloc: an error
-        tag => {
-            return Err(format!("a read seen as {tag}, which is neither 0 (gone) nor 1 (a hash)"));
-        }
-    };
-    let key = input.bytes_u32()?;
-    Ok((Read { kind, key }, seen))
+        true => format!(
+            "its value is a kernel entry of layout {}, where this blaze reads layout {}",
+            number[0] as char,
+            ENTRY_MAGIC[ENTRY_MAGIC_FAMILY.len()] as char
+        ),
+        // alloc: an error
+        false => "its value is no kernel entry".to_owned(),
+    }
+}
+
+fn next_seen(input: &mut Reader<'_>) -> Result<Seen, String> {
+    match input.u8()? {
+        0 => Ok(Seen::Gone),
+        1 => Ok(Seen::Is(ContentId(*input.array::<32>()?))),
+        // alloc: an error
+        tag => Err(format!("a read seen as {tag}, which is neither 0 (gone) nor 1 (a hash)")),
+    }
 }
 
 /// An entry's reads, checked when the entry was read ([`Entry::read`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EntryReads<'s> {
-    input: Reader<'s>,
-    left: usize,
+    names: Option<blaze_record::Reads<'s>>,
+    digests: Reader<'s>,
 }
 
 impl<'s> Iterator for EntryReads<'s> {
     type Item = (Read<'s>, Seen);
 
     fn next(&mut self) -> Option<(Read<'s>, Seen)> {
-        self.left = self.left.checked_sub(1)?;
-        Some(next_read(&mut self.input).expect("an entry's reads, checked by `Entry::read`"))
+        let checked = "an entry's reads, checked by `Entry::read`";
+        let name = self.names.as_mut()?.next()?;
+        Some((named(name).expect(checked), next_seen(&mut self.digests).expect(checked)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
+        let left = self.names.as_ref().map_or(0, ExactSizeIterator::len);
+        (left, Some(left))
     }
 }
 
 impl ExactSizeIterator for EntryReads<'_> {}
-
-/// The names of the reads some entry of an identity recorded, kept in a slot of its chain.
-#[derive(Clone, Copy, Debug)]
-pub struct Shape<'s> {
-    reads: Reader<'s>,
-    count: usize,
-}
-
-impl<'s> Shape<'s> {
-    /// The shape of the identity whose ID is `identity`, checked whole.
-    pub fn read(bytes: &'s [u8], identity: &ContentId) -> Result<Shape<'s>, String> {
-        let mut input = Reader::new(bytes);
-        if *input.array::<16>()? != SHAPE_MAGIC {
-            // alloc: an error
-            return Err("its value is no kernel shape".to_owned());
-        }
-        let id = ContentId(*input.array::<32>()?);
-        if id != *identity {
-            // alloc: an error
-            return Err(format!(
-                "its shape is of identity {id:x}, not {identity:x}: it is filed under another key"
-            ));
-        }
-        let count = input.u32()? as usize;
-        let reads = input;
-        for _ in 0..count {
-            next_name(&mut input)?;
-        }
-        input.finish()?;
-        Ok(Shape { reads, count })
-    }
-
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    pub fn reads(&self) -> ShapeReads<'s> {
-        ShapeReads { input: self.reads, left: self.count }
-    }
-}
-
-fn next_name<'s>(input: &mut Reader<'s>) -> Result<Read<'s>, String> {
-    let kind = ReadKind(input.u16()?);
-    let key = input.bytes_u32()?;
-    Ok(Read { kind, key })
-}
-
-/// A shape's reads, checked when the shape was read ([`Shape::read`]).
-#[derive(Clone, Copy, Debug)]
-pub struct ShapeReads<'s> {
-    input: Reader<'s>,
-    left: usize,
-}
-
-impl<'s> Iterator for ShapeReads<'s> {
-    type Item = Read<'s>;
-
-    fn next(&mut self) -> Option<Read<'s>> {
-        self.left = self.left.checked_sub(1)?;
-        Some(next_name(&mut self.input).expect("a shape's reads, checked by `Shape::read`"))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
-    }
-}
-
-impl ExactSizeIterator for ShapeReads<'_> {}

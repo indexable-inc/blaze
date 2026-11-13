@@ -11,6 +11,10 @@
 //! - Keys that are hashes already (a content ID, a store key, a fingerprint): [`ByHash`] and
 //!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing, in
 //!   a named allocator as above.
+//! - A table whose iteration reaches an output, or whose entries are named by position:
+//!   [`IndexMap`] and [`IndexSet`] ([`order`]), which iterate in insertion order whatever the
+//!   hasher, the capacity or the process: dense entries and a table of `u32` indices, in a
+//!   named allocator as above. They replace the `indexmap` crate in blaze's own code.
 //! - A map or set shared between threads: [`SharedMap`] and [`SharedSet`] (and [`SharedByHash`]
 //!   for keys that are hashes), papaya's lock-free tables on the same hashers. A read takes no
 //!   lock and writes no shared memory, and nothing is held across a call, so no thread waits on
@@ -31,12 +35,14 @@
 //!   is no cheaper than SipHash, as the fixed seed's lead is LLVM folding it into the code
 //!   (`interning_cost` in hir-ty, 2026-11-03). So the hottest of these tables (hir-ty's
 //!   interned kinds, the watcher's names) are [`adaptive`]: the fixed hash until a lookup walks
-//!   a run no honest set of keys makes, then SipHash under a key drawn then, for good.
+//!   a run no honest set of keys makes, then SipHash under a key drawn then, for good. A
+//!   single-owner table of such keys is a [`KeyedMap`] or [`KeyedSet`]: it has no `new_in`,
+//!   only [`Map::with_hasher_in`] with the key, so it cannot be made without one.
 //! - Hashes that are persisted or compared across runs are BLAKE3, never these: a content ID
 //!   is `blaze_ids::Hasher`, and a value's `Hash` is fed to it through [`Blake3Hasher`]. This
 //!   crate depends on nothing of blaze's, so every crate can use it.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![cfg_attr(test, feature(hashmap_internals))]
 #![cfg_attr(
     test,
@@ -51,6 +57,9 @@ use std::hash::{BuildHasher, Hasher};
 pub mod adaptive;
 mod blake3;
 mod key;
+pub mod order;
+#[cfg(test)]
+mod order_tests;
 mod sip;
 pub mod table;
 #[cfg(test)]
@@ -59,6 +68,7 @@ mod tests;
 pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
+pub use order::{OrderMap, OrderSet};
 pub use table::{Map, Set};
 
 /// The entry and iterator types of [`HashMap`] and [`ByHash`]: hashbrown's
@@ -73,6 +83,24 @@ pub type HashMap<K, V, A> = Map<K, V, FixedState, A>;
 
 /// A set of ordinary keys in the allocator `A`, which every use names, as for [`HashMap`].
 pub type HashSet<K, A> = Set<K, FixedState, A>;
+
+/// A map of ordinary keys that iterates in insertion order, in the allocator `A`, which every
+/// use names: `IndexMap::new_in(frame)`, `IndexMap::with_capacity_in(n, frame)`.
+pub type IndexMap<K, V, A> = OrderMap<K, V, FixedState, A>;
+
+/// A set of ordinary keys that iterates in insertion order, in the allocator `A`.
+pub type IndexSet<K, A> = OrderSet<K, FixedState, A>;
+
+/// A map of keys an attacker may pick (names and paths from outside, a request's headers), in
+/// the allocator `A`: SipHash-1-3 under a [`SipKey`] its maker hands in
+/// (`KeyedMap::with_hasher_in(key, alloc)`, the key from [`SipKey::random`] or from a
+/// capability that gives randomness). [`SipKey`] has no `Default`, so there is no `new_in`: a
+/// keyed table cannot be made without its key. With the fixed seed of [`HashMap`], whoever
+/// picks the keys can pick ones that share a hash, and each insert then walks them all.
+pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
+
+/// A set of keys an attacker may pick, as [`KeyedMap`].
+pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
 /// A map of ordinary keys shared between threads, made by `SharedMap::default()`. Like the
 /// other shared tables it names no allocator: papaya takes none, and a shared table is

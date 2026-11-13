@@ -341,13 +341,6 @@ impl Store {
         self.codes.lock().all[code as usize]
     }
 
-    /// Every code's schema and producer, indexed by code: for a pass over many memos, which
-    /// would otherwise take the codes' lock once a memo.
-    pub(crate) fn codes(&self) -> Vec<(SchemaHash, ContentId)> {
-        // clone: once per image write, a list of every schema and producer.
-        self.codes.lock().all.clone()
-    }
-
     /// Above every memo ID handed out so far.
     pub(crate) fn end(&self) -> u32 {
         self.ids.end()
@@ -516,30 +509,6 @@ impl Store {
         let edges = self.edges.copy(EdgeRecord::as_bytes(edges), align_of::<EdgeRecord>());
         let task = blaze_reclaim::enter();
         let value = self.take_shared(&task, shared, fingerprint, value);
-        self.add(key, fingerprint, code, edges, value)
-    }
-
-    /// A memo of the image: its edges and value stay in the mapping.
-    ///
-    /// # Safety
-    ///
-    /// `edges` and the value's bytes are in a mapping kept, unchanged, as long as the store
-    /// lives ([`Span::mapped`]).
-    pub(crate) unsafe fn make_mapped(
-        &self,
-        key: QueryKey,
-        fingerprint: Fingerprint,
-        code: u32,
-        edges: &[EdgeRecord],
-        value: Option<(&[u8], ContentId)>,
-    ) -> MemoId {
-        // SAFETY: the caller's contract.
-        let edges = unsafe { Span::mapped(EdgeRecord::as_bytes(edges)) };
-        let value = value.map_or(0, |(bytes, id)| {
-            // SAFETY: as above.
-            let span = unsafe { Span::mapped(bytes) };
-            self.frees(|frees| self.put_value(frees, span, false, id, false))
-        });
         self.add(key, fingerprint, code, edges, value)
     }
 
@@ -998,7 +967,7 @@ impl Store {
     /// with `&mut`, no task reads the store.
     pub(crate) fn reclaim(&mut self, held: impl Fn(MemoId) -> bool) {
         let dying = std::mem::take(self.dying.get_mut());
-        // alloc: once a `&mut` reclaim (settle, or a driver's full free).
+        // alloc: once a `&mut` reclaim (`Database::reclaim`, a driver's full free).
         let pinned: Vec<MemoId> = self.pins.get_mut().keys().copied().collect();
         let mut keep = Dying::default();
         let all = dying

@@ -452,7 +452,8 @@ impl Files {
         }
 
         for &(id, root, _) in &plan.added {
-            self.set_file_source_root_in(writer, db, id, root, Durability::MEDIUM);
+            let durability = crate::files::root_durability(writer, root);
+            self.set_file_source_root_in(writer, db, id, root, durability);
         }
         let mut roots: Vec<SourceRootId, &Frame> =
             Vec::with_capacity_in(plan.added.len() + plan.removed.len(), frame);
@@ -516,9 +517,10 @@ impl Files {
             gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
             // The root's set, taken out of its input to be edited where it is: no reader holds
             // it by then (they read it by reference), so `make_mut` copies nothing.
+            let root_kind = crate::files::root_durability(writer, root);
             let spare = writer.spare_root();
             let mut source_root =
-                input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(spare);
+                input.set_source_root_field(db).with_durability(root_kind).to(spare);
             let index = writer
                 .root_contents
                 .get_mut(&root)
@@ -572,7 +574,7 @@ impl Files {
                 }
                 writer.note_path(path, *id);
             }
-            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(source_root);
+            input.set_source_root_field(db).with_durability(root_kind).to(source_root);
             if !changed.contains(&root) {
                 changed.push(root);
             }

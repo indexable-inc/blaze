@@ -36,7 +36,9 @@ below is [ci-runner.md](v2/plan.md)'s second slice; "R2" alone is Cloudflare's o
 
 Andrew wants CI and local testing to be "uber fast", and wants other people to benefit from the
 cache. [AGENTS.md](../AGENTS.md) makes blaze's own store "the one cache", locally and in the
-shared remote CI fills, and rules out sccache. This file is the design of that shared remote:
+shared remote CI fills, and rules out sccache. ("Packs", the last section, is what is built for prebuilt std and bstd, for
+any crate, from a bucket, a directory or a peer; it uses BLAKE3 and no gateway, and says why.)
+This file is the design of that shared remote:
 how CI on main fills it, how CI on every branch and any user reads it, and how nobody else can
 put code in it. It builds on [cache.md](cache.md) (the store and today's remote), on
 [ci-runner.md](v2/plan.md) (test results keyed by content) and on [cargo.md](cargo.md) (the
@@ -1214,3 +1216,263 @@ first rule would expire what a head names.
   Needs per-function determinism, which the golden check gives.
 - **Windows and macOS**: CI on main runs Linux x64 and arm64 and macOS arm64 (`train.yaml`,
   **read**). Each target is its own set of heads; is macOS arm64 filled from the start?
+
+## Packs: record sets fetched by content, from any source (2026-11-12)
+
+Lane packs-1112. Built, not yet compiled or run: `crates/blaze-pack` (the sans-IO cores and
+their simulations), `crates/blaze-cargo/src/serve/packs.rs` with `packs/stored.rs`,
+`packs/daemon.rs` and `packs/endpoint.rs` (the drivers), `crates/blaze-cargo/src/cli/store.rs`
+(the commands), the miss hook in `serve/unit/compile.rs` (`names`, `filed_under`, `found`,
+`pack_keys`). What is not built is
+listed at the end. Nothing is uploaded anywhere by any of it.
+
+This section replaces the one that stood here, and differs from the rest of this document in
+three places, on purpose:
+
+- **BLAKE3, not SHA-256.** The store that exists (`blaze-cas`) names every value by BLAKE3
+  (`content_of`), and a pack's record hash *is* that content hash: a record checked on arrival
+  is checked by the same hash again as the store keeps it, and nothing is hashed twice in two
+  algorithms. The SHA-256 argument above was the Worker's native digest; a pack needs no
+  Worker.
+- **No gateway is needed.** A pack is three kinds of static file, so a bucket, a directory on
+  a share, or a daemon on the next desk serve it alike. The gateway design stays the plan for
+  private tenants and metering; it is not on the path of "std prebuilt, fetched at install".
+- **Per-record hashes, not a tree over a whole object.** The section before this one built a
+  two-level chunk tree (`blaze-fetch/src/verified.rs`). A pack's unit of use is the record:
+  the store keeps and checks records, a miss asks for one record, and most are a few
+  kilobytes. So the manifest lists each record's BLAKE3 and a reader checks a record as its
+  range arrives, from any source, in any order. A tree inside a record (Bao) would only let
+  part of one long record be checked alone; a record is at most 1 GiB (the store's own bound
+  on a value that travels), which bounds what a reader holds before a check. `verified.rs`
+  stays for objects with no record structure (a toolchain tarball); nothing here uses it.
+
+**What a pack is.** A set of store records of any kinds (unit records, their slots and
+outputs, describe records, front-end pages: a pack does not know kinds apart) under one
+manifest. The manifest is deterministic CBOR, one array:
+`["blaze pack manifest", 1, coding, pin, scope, [[key, kind, len, blake3], ...]]`, records
+sorted by key, each key once; a reader refuses any other order, so a selection has one
+encoding and two exports of it are the same bytes. The body is the records' bytes in that
+order; a record's offset is the sum of the lengths before it, computed and never stated, so
+no stated offset can point outside the body. **The pack's name is the BLAKE3 of the
+manifest's bytes.** Bounds, checked before anything is allocated: manifest 128 MiB, 2^20
+records, record 1 GiB, body 1 TiB. A manifest of another layout or body coding is refused by
+its number; bytes that are not a manifest are refused as that.
+
+Files, the same under a directory, a base URL and a release bucket (`blaze_pack::layout`):
+
+    <base>/v1/<scope>/<pin>.head     which pack the pin of a scope is (the one mutable name)
+    <base>/v1/<pack>.manifest
+    <base>/v1/<pack>.body
+
+`pin` is the name the importing store pins the records under (the store's own pin form,
+`blaze_cas::collect::Pin`: `toolchain`, `bstd`, any name). `scope` is this blaze's version
+and the host triple: a label to find a pack by, never part of a key (a pack of another scope
+is records no build asks for: a miss, never a wrong hit). Both are held to 1 to 96 of
+`a-z 0-9 . _ -` not starting with `.` or `-`; a pack's own name is 64 hex digits. No name
+read from a file or a request can leave its directory.
+
+**Is the pack closed under what a build needs?** By selection, not by proof. `export --pin`
+writes exactly the keys the pin holds (for `toolchain` and `bstd`: each unit's record, its
+slot and every output it names, as `serve::collect::keep` gathers them) and refuses a pin
+that names a record the store lacks. `export --all` writes every record that may travel:
+everything this home's builds used. A record a build needs that a pack lacks is a miss and
+is made locally; that is slower, never wrong.
+
+**Trust: what a hash proves and what it does not.** A hash proves bytes are the named ones.
+It does not prove a record is an honest build of what its key was hashed from; a wrong record
+under a real key is code in your program. So the rule is one sentence: **a key is mapped to
+bytes only by a saying of someone the user trusts, and bytes are taken only when they hash to
+what that saying names.** The sayings:
+
+| saying | who | checked by |
+|---|---|---|
+| a head (`<pin>.head`: pin, scope, pack, lengths) | signed with Ed25519 by a key in `packs.json`'s `trusted` (a release: the release key) | `blaze_pack::Head::vouched` |
+| the same head, unsigned | the user, by naming a directory to `blaze store import --unsigned` (never an address) | the flag |
+| a statement (key, kind, length, content hash) | a listed peer, signed with that peer's key | `blaze_pack::peer::Statement::vouched` |
+
+Nothing else maps a key to bytes: not an address, not presence on the network, not a
+manifest that merely hashes to its name. So an **untrusted** party (a mirror, a man in the
+middle, a machine on the network) can do two things: withhold (a miss: built locally) and
+send wrong bytes (caught by the record's hash; the source is named; nothing of it is kept).
+It cannot make the client link anything. A **trusted** signer that is dishonest can; that is
+what listing its key means, and the mitigations are not built (a sampled rebuild that
+compares, `BLAZE_VERIFY_STORE`; two independent signers that must agree). An old head played
+again names an old pack whose records are still true, so there is no turn to check. Machine
+code a loader maps (`Kind::Machine`) is taken only under a signature, never on `--unsigned`;
+a pin record and the daemon's image never travel. Signatures are `blaze_global::sign`'s
+Ed25519 (one home for it), over a domain of the pack's own.
+
+**Open decision for the owner: key distribution.** The check is built; which keys a blaze
+trusts out of the box is not decided, and until it is nothing is trusted by default (an empty
+`trusted`: every signed pack is refused naming its signer). The choices: (a) the release
+public key compiled into blaze, as `blaze_global::sign::PINNED` was meant to be (rotation is
+a release; simplest; a stolen release key needs a release to revoke); (b) a key list fetched
+under an offline root key compiled in (this document's "Trust and signing": rotation without
+a release, one more object and a turn number to get right); (c) nothing compiled in, the
+installer writes the key into `packs.json` (the installer's own integrity is then the root).
+Recommended: (a) now, (b) when there is more than one signer. Peers' keys are always the
+user's to list.
+
+**Commands** (`cli/store.rs`, `serve/packs/stored.rs`):
+`blaze store export [--all] [--raw] --pin <name> --out <dir> [--sign-key <file>]`;
+`blaze store import <dir or base URL> [--pin <name>]... [--unsigned] [--trust <key>]...`;
+`blaze store install [--from <base>]`. With a daemon on the home (the normal case) the
+command is asked of it (`blaze_api::Request::Store`, schema 53) and run on a thread of the
+daemon over its own store: reads and puts through the store's handle, and what only the
+store's owner can do (write a pin, read a pin's keys, list keys, flush) asked of the loop and
+done on its next turn, before the collector's step (`serve/packs/daemon.rs`). With none it
+runs in the CLI over the store it opens. One implementation, over one trait
+(`stored::Records`).
+
+An import checks every record against the manifest before it is put (`blaze_pack::Import`:
+the only way to a record the store is given is through the check), leaves a record already
+there as it is, refuses a key the store holds with other bytes, and can be run again after a
+crash or a cut transfer. **The pin is written before the first record** (the store's own pin
+form, `Store::pin_add`, merged with what the name held; in the daemon, the first put waits
+for the loop's answer that the pin is in the store, and a daemon that has built nothing has
+its pins read on demand for it, `Collects::read_pins`): no commit ever holds a record of the pack without its
+pin, so no collection at any time from the import on can take one. A pin whose import then
+fails names keys the store lacks, which keeps nothing.
+
+**No record that holds a directory of the exporting machine travels.** The export searches
+each record's bytes with the one searcher of a root left in bytes (`Places::tied`, which is
+`Roots::embedded`, over this home's build, shared std and sources directories:
+`packs::home_places`). Under `--all` such a record is left out, counted and said in the
+command's line (a unit whose code holds a `file!()` path is kept tied on purpose, under a key
+no other machine asks); a pin that keeps one is refused naming the key.
+
+**The body is compressed for transfer**, span by span (`blaze_pack::spans`: 4 MiB spans,
+each a zstd frame, an index of the frames' lengths beside them; `--raw` keeps it as it is).
+Checked first: the store compresses its cold records, but a record is read out of it
+uncompressed and that is what a pack's body holds, so this is the bytes' one compression,
+not a second. The frames and their index are under no hash of their own and need none: what
+comes out is checked record by record against the manifest. What an index could do is ask
+for memory, so a span is at most 16 MiB and a frame is decompressed to at most what its span
+holds. The pack's name (the manifest's hash) does not depend on the compression; the frames'
+bytes are the same for one zstd version and level.
+
+**Fetch on miss** (`serve/packs.rs`). Settings are `<root>/packs.json` (`sources`, `pins`,
+`trusted`, `key_file`, `peers`, `serve`, `install`); absent, nothing happens. Where a unit's
+record is missed and before the unit is built (`unit::compile::names`), the lookup is run
+again with each key it misses (the slot, the record, each output the record names) asked of
+the sources. A static source is asked by the manifests of its configured pins, loaded once
+and held in memory; the first miss one of its packs answers **installs that pack whole**
+(read in order a span at a time, every record checked before it is put), because a pack is
+what its publisher selected to travel together and reading it record by record would fetch
+a span a record. A peer is asked by key: once a build, every unit's record keys and first
+slots in batches of 64 (`GET /v1/has/<key>,<key>,...`), so what a peer lacks costs no request
+of its own, then singly for what the lookup still misses; `blaze_pack::Fetch` decides which
+peer is asked and what is kept. The wait is the span `pack fetch on miss`, each read a span
+`pack read` naming the object and its bound in bytes; every HTTP answer is held to a bound
+the request states (`HyperHttp::get_bounded`: 1 KiB for a head, the head's stated length for
+a manifest, its own length for a range, the format's most for statements), and to the HTTP
+client's deadline. Only that build task waits.
+
+Is building after a source failed a fallback (AGENTS.md rule 3)? **No**, and the line is
+drawn here: a record no source has is a miss, the defined answer of a cache; a source that
+cannot be reached is said once, as an error in the daemon's log and as a warning in the
+output of the build that ends next (`packs::take_notices`), paused for 60 s, and the unit is
+built, with the error shown, not hidden. What would be a fallback, and is not done: taking
+the record from elsewhere unchecked, or trying the failed source again and again. A record
+that arrives and does not hash to what its manifest or statement names is a **hard error
+naming the source and the key**: the lookup fails and so does the build. So are two trusted
+sayings that differ on one key.
+
+**Peers, no server** (`blaze_pack::peer`, `serve/packs/endpoint.rs`). A daemon serves its
+store read-only over HTTP only when `packs.json` has `serve`: the one address to bind and
+`readers`, the public keys that may read. The endpoint is a state machine on the daemon's
+own driver (`Listen`, `Recv`, `Send`, `Hangup` and a `Timer` per connection, under tags of
+its own; no thread, no kernel wait of its own), so it runs under the simulation as the
+daemon does; at most 64 connections, 10 s each, an 8 KiB head, 4 MiB of a record an answer.
+**Who may read is said by key, not by address**: every request carries its caller's public
+key and that key's signature of the request's path, and one that is not signed by a listed
+reader is answered 403 before the store is read. (Changed from allow rules by address in
+this lane's first round: the driver's accept names no caller's address, an address can be
+borrowed where a key cannot, and with keys a loopback port is closed to the machine's other
+users with no special case.) Refused as the daemon starts: an every-interface address, and
+no reader. It serves by key (`/v1/has/...`: the signed statements; `/v1/record/<key>` by
+ranges), because a store is not a pack. **Discovery is a configured list** (`peers`: address
+and key), not mDNS: a peer is trusted by its key, which must be listed anyway, so mDNS would
+save typing an address at the price of a multicast listener, a platform daemon (Bonjour,
+Avahi) and a part that cannot run under simulation. Plain HTTP carries no secret and cannot
+be forged (signed statements, signed requests, hashed bytes), but is not private: where that
+matters, bind a tunnel's address. `key_file` holds the machine's own Ed25519 secret, which
+signs what it states and what it asks.
+
+**The installer.** `blaze store install` imports the configured pins (`toolchain`, `bstd`)
+for this blaze's scope from `install` in `packs.json`, signed heads only; with no base set it
+says so and does nothing. It also runs by itself on a home's first use: as a command is
+about to start a daemon on a home that has no store yet (`cli::store::first_use`, from
+`cli::daemon::connect`), when `install` is set. No address is compiled in. A base that is set
+and cannot be read fails that first command, naming it.
+
+**What a release publishes, today.** The two selections the install needs, "the standard
+library for this toolchain and target" and "bstd", are made on the builder by the home, not
+by a query: a fresh home builds a probe project (hello-world for `toolchain`; the bstd
+hello-world for `bstd`) and `blaze store export --all --pin <name> --out <dir> --sign-key
+<file>` writes everything that home's builds used: unit records, their outputs, describe
+records and front-end records alike, since `--all` takes every record that may travel. That
+is one command per pin and the directory to upload; the upload, the bucket and the release
+key are the owner's, and nothing here does it.
+
+Exporting the store's own `toolchain` and `bstd` pins (`--pin` without `--all`) carries what
+builds queue through `serve::collect::keep`: each unit's record, slot and outputs
+(`unit::compile::pin_kept`), and for each std or bstd crate whose image a build found or
+wrote, the image, its def-map pages and its impl tables (`unit/deps.rs` `store`; read by lane
+records-1112d, 2026-11-12, not run). All are `Kind::Query` content keys with no path, in the
+daemon's own store. A crate with reads (`env!`, a proc macro's file reads) is found through
+a read-filing record under its base key: the pin names all sixteen slot keys of each such
+crate, filled or not (storegc, written 2026-11-12, not compiled), and an export skips and
+counts a key the pin names that the store has no record of. Not under the pins: describe
+records, checked bodies and outcomes, constants, goals; and registry dependencies are under
+neither pin. So `--all` from a fresh builder home is the selection to publish until those
+kinds are pinned too.
+
+**Tests** (none run yet). `blaze-pack` `src/tests.rs`, each invariant with a planted-bug
+control, 200 seeds: one selection, one encoding; a flipped byte names its record (control:
+unchecked puts, seen by the model's oracle); a truncated body, then a re-import; a crash at
+every step; import then collect-everything then 0 missing (control: no pin); path-escaping
+names and oversized lengths; two sources, one lying; failing and stalling sources; misses;
+heads and statements under trusted and untrusted keys; an endpoint that answers only
+requests a listed key signed; batched statements; the span index and its bounds.
+`blaze-cargo` `serve/packs/tests.rs`: the same through real stores on disk (round trip,
+identical bytes twice, a flipped byte in a raw and in a compressed body, a signed head) and,
+on the simulation with the real collector, import then collect-everything (control: no pin).
+`blaze-engine` revision case `an_exported_pack_imported_into_an_empty_home_makes_no_unit`
+(step `packed NAME`): `max_units = 0`. Not tested: the endpoint's state machine and the
+daemon-side command runner against a driver (their decisions are the cores', tested there).
+
+**Not built.** A selection by package closure or by one named build without a home of its
+own (when it is built, a crate's front-end keys come from `serve::collect::front_keys` and
+`filing_keys`, the functions the pins are made from, so a record kind a records lane adds
+travels with no change here) (needs `serve::collect::keep` to take any pin name and every unit, storegc's; then
+`export --pin`: `serve::collect::keep_as` now takes any name, nothing calls it for a whole
+build yet); describe records, checked bodies and outcomes, constants and goals under the
+`toolchain` and `bstd` pins (storegc's pin-on-use block in `unit/deps.rs`); a simulation of the endpoint and of the daemon-side runner on
+the daemon's driver; the daemon-side runner's waits for the loop are channel waits with a
+deadline and a span, not `blaze_core::wait`'s; a source's notice goes to the build that ends
+next, which with two builds at once may not be the one that met it; first use on Windows;
+a kept-set setting; mDNS and TLS between peers (out until the owner asks).
+
+**What stops a pack from being used on another machine today** (measured 2026-11-12, hello-world,
+ix arm64: a first run in an empty home 13.1 s; with another home's whole store copied in, built
+by the same binary, 13.0 s: nothing was reused). The key parts that carry a machine or project
+path, from a read of the code on `origin/main` and `origin/newproj-1111`:
+
+| Part | Where | State |
+|---|---|---|
+| A std unit's outputs, `OUT_DIR` and plan environment under `<machine>/std/<makers>/<placement>` | `crates/blaze-units/src/load/units.rs` (`rebase`), `crates/blaze-cargo/src/serve.rs` (`machine`) | open: key on the virtual `/@blaze-std-out`, rebase when outputs are written |
+| The same `OUT_DIR` in `Crate::content`, so in every crate identity above a std crate with a build script | `crates/base-db/src/input.rs` | open, same fix |
+| `run_env`: `CARGO=<blaze's path>` and the library path under the machine directory, for every unit | `crates/blaze-cargo/src/serve/unit/compile.rs`, `unit/artifact.rs` | open: out of the key for units that run nothing, or written against roots |
+| `proc_macro_cwd` of std members: the asking workspace's root | `crates/blaze-lower/src/crates.rs`, `crates/hir-def/src/deps/key.rs` | fixed on `origin/newproj-1111` (4e433c727b) |
+| The diagnostics' width, colour and short form in unit keys | `compile.rs` (`RecordInputs::key`) | open (lane diagkey-1111, agents.json A34) |
+| `RUSTFLAGS` text in `StdKey` and `UnitPlan` (may hold `-L` paths) | `crates/blaze-units/src/query.rs` | open; correct to key on, paths in it need roots |
+| A workspace member's package id, source path, `CARGO_MANIFEST_DIR`, outputs under `<root>/build/<id>`, registry sources under `<home>/sources` (bstd is such a member) | `crates/blaze-units/src/load/plan/*` | open: workspace members have no root rewriting; dependency images refuse local crates |
+| A linked output's record names its output and native-input paths (values, not key parts) | `compile.rs` (`linked_key`) | open: an importer rebases them |
+
+`Code`, `Debug`, dependency images, check outcomes and the library copy are keyed with no path
+(`hir-ty-identity`'s code id, `hir-def/src/deps/key.rs`'s markers, the virtual
+`/rustc/<commit>/library`). The store already reads read-only layers behind its own directory
+(`blaze_cas::Config::layers`); the daemon configures none. An imported pack is best kept as a
+layer: read in place, verified on every read, removed as one directory.
+

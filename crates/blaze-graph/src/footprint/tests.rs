@@ -12,12 +12,22 @@
 //! once (the guard's thread waits for it); the plane's lands a drawn lag of ticks after its ask,
 //! as the daemon's purger thread's does, with readings before it not marked purged. A task that
 //! ends or gives way in the lag frees bytes the purge may not reach (a worker that already gave
-//! back keeps them), so the driver asks again rather than read it as purged.
+//! back keeps them), so the driver asks again rather than read it as purged while the plane
+//! holds work back, and otherwise lets the purge go with a plain reading, as the daemon's
+//! plane does (`blaze-cargo`'s `Plane::poll`: a purge nothing waits for is not chased).
+//!
+//! After every step of the plane the oracle checks liveness (the invariant of
+//! `Plane::pick`): no state has a task ready and none running. Whatever the readings say,
+//! whether a purge landed, was delayed or was let go, a ready task with nothing running
+//! started in that step.
 //!
 //! After every act the oracle checks:
 //! - the footprint is at most the ceiling;
 //! - growth within a task's grant always fits, unless that task runs alone and alone passes
-//!   the ceiling (admission let in nothing the ceiling has no room for);
+//!   the ceiling (admission let in nothing the ceiling has no room for), or it was started
+//!   with nothing running though it did not fit beside the footprint ([`Job::past`]: the
+//!   liveness rule's start, which may meet what the allocator keeps): that one's growth goes
+//!   to the gate, which purges for it;
 //! - the gate refuses growth (wait, give way or fail) only when a purge could not help: the
 //!   allocator keeps nothing, or the driver purged for it since what it keeps last grew;
 //! - a task fails only with [`TooBig`], only when it runs alone and alone passes the ceiling.
@@ -26,12 +36,14 @@
 //! (bounded-progress).
 //!
 //! Four plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! A task the gate gives way tells the plane what it needed (`PlaneInput::Yielded`'s `needs`),
+//! which it is forecast when it starts again.
 //! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
 //! its plan.
 
 use std::fmt;
 
-use blaze_protocol::events::NodeKind;
+use blaze_protocol::events::{NodeKind, NodeState};
 use blaze_rng::SplitMix64;
 use hegel::{TestCase, generators as gs};
 
@@ -69,12 +81,16 @@ enum Plant {
     /// A driver that never purges: it ignores [`Plane::purge_due`], and the gate is told a
     /// purge was always tried.
     NoPurge,
-    /// The daemon before 2026-11-09: a plane's purge read as purged as it is asked, with what
-    /// the workers keep still in the footprint.
-    EarlyPurged,
-    /// A plane's purge read as purged when it lands though a task freed bytes in its lag, which
-    /// the purge left kept.
-    LandsDespiteFrees,
+    /// The plane before 2026-11-12: a task that does not fit beside the footprint starts
+    /// alone only on a fresh reading that keeps nothing or came after a purge
+    /// (`Plane::alone_needs_purge`). With nothing running and such a reading owed by the
+    /// driver, a ready task waits: the liveness oracle's control.
+    AloneNeedsPurge,
+    /// A driver that tells the plane nothing of what a task given way at the gate needed
+    /// (`needs` 0): it comes back on the grant it outgrew, re-grows to the same gate and gives
+    /// way again while the task it gave way to waits on it, so neither ends (bounded progress,
+    /// [`MOST_TICKS`]).
+    ForgetsNeeds,
 }
 
 // --- The plan ------------------------------------------------------------------------------
@@ -209,10 +225,16 @@ struct Job {
     step: u64,
     /// Waits at the gate.
     waiting: bool,
+    /// What it asked to hold as it last waited at the gate: what it needs, told the plane if
+    /// it gives way ([`PlaneInput::Yielded`]'s `needs`).
+    asks: u64,
     /// The driver purged for its growth since what the allocator keeps last grew.
     tried: bool,
     /// When it started, against the others: the newest gives way.
     stamp: u64,
+    /// It was started with nothing running though its grant did not fit beside the footprint
+    /// (the liveness rule's start): its growth within its grant may need the gate's purge.
+    past: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +278,10 @@ impl<'p> Sim<'p> {
             from: "the simulated daemon's ceiling".to_owned(), // alloc: the budget, once a case
             kept_back: 0,
         };
-        let plane =
+        let mut plane =
             Plane::new(PlaneConfig { io: 1, work: plan.work, budget: Some(budget), starve_after: 8 })
                 .map_err(harness)?;
+        plane.alone_needs_purge = plant == Plant::AloneNeedsPurge;
         let mut sim = Sim {
             plan,
             plant,
@@ -323,6 +346,8 @@ impl<'p> Sim<'p> {
                         return Err(harness(format_args!("the plane ran {id} and admitted nothing")));
                     };
                     self.stamps += 1;
+                    let past = self.jobs.is_empty()
+                        && self.footprint() + admitted.granted > self.plan.ceiling;
                     self.jobs.push(Job {
                         task,
                         id,
@@ -330,8 +355,10 @@ impl<'p> Sim<'p> {
                         holds: 0,
                         step: 0,
                         waiting: false,
+                        asks: 0,
                         tried: false,
                         stamp: self.stamps,
+                        past,
                     });
                 }
                 PlaneOutput::Finished { ok, .. } => self.finished = Some(ok),
@@ -341,7 +368,31 @@ impl<'p> Sim<'p> {
                 PlaneOutput::Said { .. } => {}
             }
         }
-        Ok(())
+        self.live()
+    }
+
+    /// The liveness oracle, after every step of the plane: with nothing running, no task is
+    /// left ready. Every task of a plan is ready from the step that adds it (none has a
+    /// dependency), so one the plane says is ready while no job runs was held back with
+    /// nothing whose end could let it in.
+    fn live(&self) -> Result<(), Broke> {
+        if !self.jobs.is_empty() {
+            return Ok(());
+        }
+        let ready = |at: &usize| self.plane.state(NodeId(*at as u32)) == Some(&NodeState::Ready);
+        match (0..self.plan.tasks.len()).find(ready) {
+            None => Ok(()),
+            Some(at) => Err(oracle(format_args!(
+                "task {at} (grant {}) is ready, nothing runs and the plane started nothing: {} charged of {}, footprint {} ({} kept, {} stuck), a purge on its way: {}",
+                self.plan.tasks[at].grant,
+                self.plane.charged(),
+                self.plan.ceiling,
+                self.footprint(),
+                self.kept,
+                self.stuck,
+                self.purging.is_some(),
+            ))),
+        }
     }
 
     /// The driver measures: each running task's realized bytes, then the footprint; under
@@ -377,26 +428,27 @@ impl<'p> Sim<'p> {
         self.purge_due = false;
         let lands = self.clock + self.plan.purge_lag * TICK_NS;
         self.purging = Some(Purging { lands, kept: self.kept, freed: false });
-        if self.plant == Plant::EarlyPurged {
-            return self.read_after(true);
-        }
         Ok(())
     }
 
     /// A plane's purge whose time came lands: what the allocator kept at its ask is given back
-    /// and the plane reads it purged; or, a task having freed bytes since, it is asked again.
+    /// and the plane reads it purged. Or, a task having freed bytes since: it is asked again
+    /// while the plane holds work back, and otherwise let go with a plain reading, as the
+    /// daemon's plane does. No start may hang on the reading that then never comes.
     fn land_purge(&mut self) -> Result<(), Broke> {
         let Some(purging) = self.purging else { return Ok(()) };
         if self.clock < purging.lands {
             return Ok(());
         }
         self.kept -= purging.kept.min(self.kept);
-        if purging.freed && self.plant != Plant::LandsDespiteFrees {
-            self.purging = None;
+        self.purging = None;
+        if !purging.freed {
+            return self.read_after(true);
+        }
+        if self.plane.held_back() {
             return self.ask_purge();
         }
-        self.purging = None;
-        self.read_after(true)
+        self.read()
     }
 
     /// `bytes` freed: a part sticks, the rest the allocator keeps; no purge tried since.
@@ -434,8 +486,7 @@ impl<'p> Sim<'p> {
     /// lag passed lands, and one running task acts.
     fn tick(&mut self, tick: u64, rng: &mut SplitMix64) -> Result<(), Broke> {
         self.clock += TICK_NS;
-        // As the daemon's plane does: an ask while one is on its way is dropped, since the
-        // plane asks no other until a reading after a purge.
+        // As the daemon's plane does: an ask while one is on its way is taken as that one.
         let due = std::mem::take(&mut self.purge_due);
         if due && self.plant != Plant::NoPurge && self.purging.is_none() {
             self.ask_purge()?;
@@ -481,7 +532,7 @@ impl<'p> Sim<'p> {
             job.waiting = false;
             return Ok(());
         }
-        if within && !self.alone_passes(level) {
+        if within && !self.alone_passes(level) && !job.past {
             return Err(oracle(format_args!(
                 "{} grew within its grant of {} to {level} beside a footprint of {footprint}, past the ceiling {}: admission let in more than fits ({} running, {} kept, {} stuck)",
                 job.id,
@@ -537,6 +588,7 @@ impl<'p> Sim<'p> {
             }
             Step::Wait => {
                 self.jobs[j].waiting = true;
+                self.jobs[j].asks = level;
                 Ok(())
             }
             Step::GiveWay(id) => {
@@ -546,9 +598,17 @@ impl<'p> Sim<'p> {
                 if !(at == j || self.jobs[at].waiting) {
                     return Err(oracle(format_args!("the gate gave way to {id}, which waits not")));
                 }
+                // What it needs: what it asks now, or asked as it waited. The plane forecasts
+                // its next start by it; told nothing, it came back on the grant it outgrew,
+                // re-grew to this gate and gave way again, for good.
+                let needs = match self.plant {
+                    Plant::ForgetsNeeds => 0,
+                    _ if at == j => level,
+                    _ => self.jobs[at].asks.max(self.jobs[at].holds),
+                };
                 let gone = self.jobs.swap_remove(at);
                 self.free(gone.holds);
-                self.step(PlaneInput::Yielded { at_ns: self.clock, id })
+                self.step(PlaneInput::Yielded { at_ns: self.clock, id, needs })
             }
             Step::Fail(too_big) => {
                 if too_big.id != job.id || !self.alone_passes(level) {
@@ -600,8 +660,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 // --- The tests ------------------------------------------------------------------------------
 
 /// The invariant: whatever the peaks, the grants and what the allocator keeps, the footprint
-/// never passes the ceiling; growth within a grant never needs the gate; a task fails only
-/// when it alone passes the ceiling, with [`TooBig`]; every other task is built.
+/// never passes the ceiling; growth within a grant never needs the gate, but for a task
+/// started with nothing running; a task fails only when it alone passes the ceiling, with
+/// [`TooBig`]; every other task is built; and, after every step of the plane, whatever the
+/// readings and whether purges land, lag or are let go, no task is ready while none runs.
 #[hegel::test(test_cases = 300)]
 fn footprint_stays_under_the_ceiling_unless_one_task_alone_exceeds_it(tc: TestCase) {
     let plan = plan(&mut Drawn(&tc));
@@ -640,14 +702,18 @@ fn the_oracle_catches_a_gate_that_never_purges() {
     control(Plant::NoPurge);
 }
 
+/// The liveness oracle's control: the rule before 2026-11-12 (a task that fits only alone
+/// waits for a reading after a purge) leaves a task ready with nothing running.
 #[test]
-fn the_oracle_catches_a_purge_read_before_it_lands() {
-    control(Plant::EarlyPurged);
+fn the_oracle_catches_a_task_alone_that_waits_for_a_purged_reading() {
+    control(Plant::AloneNeedsPurge);
 }
 
+/// The progress oracle's control: a task given way that comes back asking what it outgrew
+/// gives way again for good.
 #[test]
-fn the_oracle_catches_a_purge_read_purged_though_a_task_freed_in_its_lag() {
-    control(Plant::LandsDespiteFrees);
+fn the_oracle_catches_a_give_way_that_forgets_what_the_task_needed() {
+    control(Plant::ForgetsNeeds);
 }
 
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
@@ -679,6 +745,29 @@ fn a_grant_counts_until_a_reading_holds_its_bytes() {
     assert_eq!(charge.charged(80), 180);
 }
 
+/// The invariant: a task that grew far past its grant is charged what it holds from the look
+/// that saw it (its grant is raised to it at once, before any reading holds its bytes), so
+/// what no longer fits beside it waits; the reading that holds its bytes then counts them
+/// once, not twice. The cold build of tempo, 2026-11-12: a lowering granted 0.06 GiB held
+/// 7.27 (here in tenths of a GiB: 1 granted, 70 held, 100 held besides).
+#[test]
+fn a_task_far_past_its_grant_is_charged_from_the_look_that_saw_it() {
+    let mut charge = Charge::<u32>::new();
+    charge.read(100, 0, false);
+    charge.started(1, 1);
+    assert_eq!(charge.charged(1), 101);
+    // The look, every 10 ms: its account reached 70.
+    let raise = charge.realized(1, 70);
+    assert_eq!(raise, 69, "its grant is raised to what it holds");
+    assert_eq!(charge.charged(1 + raise), 170, "charged at once: nothing that needs that room starts");
+    // The reading that holds its bytes counts them once.
+    charge.read(170, 0, false);
+    assert_eq!(charge.charged(70), 170);
+    // It ends having held 70 on a grant of 1: graded over, by 69.
+    charge.ended(1, Some(70));
+    assert_eq!(charge.grades(), Grades { over: 1, over_bytes: 69, ..Grades::default() });
+}
+
 /// A task that ended stays charged for what it grew since the reading, until the next.
 #[test]
 fn an_ended_task_stays_charged_until_the_next_reading() {
@@ -701,28 +790,30 @@ fn held_alone_charges_the_grants_or_the_live_bytes() {
     charge.held(70);
     charge.started(1, 50);
     assert_eq!(charge.charged(50), 70);
-    assert!(charge.alone_ok());
     assert!(!charge.ask_purge(0));
 }
 
-/// A purge is asked once until a reading after a purge, at most every [`PURGE_EVERY_NS`], and a
-/// task starts alone only after that reading: a reading the driver took before it purged is not
-/// one.
+/// A purge is asked at most every [`PURGE_EVERY_NS`] while the allocator may keep what one
+/// gives back, whether or not the driver answered the last ask (it may let a purge go), and
+/// not for a reading taken after a purge until a task ends.
 #[test]
-fn a_purge_is_asked_once_a_purge_and_lets_a_task_start_alone() {
+fn a_purge_is_asked_at_most_every_bound_answered_or_not() {
     let mut charge = Charge::<u32>::new();
     charge.read(100, 60, false);
-    assert!(!charge.alone_ok());
     assert!(charge.ask_purge(0));
     assert!(!charge.ask_purge(1));
+    // The driver let that purge go: a plain reading. Asked again once the bound passed.
     charge.read(100, 60, false);
-    assert!(!charge.alone_ok());
-    assert!(!charge.ask_purge(PURGE_EVERY_NS));
-    charge.read(80, 40, true);
-    assert!(charge.alone_ok());
     assert!(!charge.ask_purge(PURGE_EVERY_NS - 1));
     assert!(charge.ask_purge(PURGE_EVERY_NS));
-    assert_eq!(charge.grades().purges, 2);
+    // A reading after a purge: what it still keeps no purge gives back, so none is asked,
+    charge.read(80, 40, true);
+    assert!(!charge.ask_purge(2 * PURGE_EVERY_NS));
+    // until a task ends, whose freed bytes the allocator may keep.
+    charge.started(1, 10);
+    charge.ended(1, Some(5));
+    assert!(charge.ask_purge(2 * PURGE_EVERY_NS));
+    assert_eq!(charge.grades().purges, 3);
 }
 
 /// The gate purges before it refuses, fails only a task alone, and names it.

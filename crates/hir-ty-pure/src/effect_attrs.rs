@@ -1,5 +1,5 @@
 //! `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and the effect a
-//! `#[blaze::may(..)]` without `diverge` asks for, `terminates`
+//! `#[blaze::expect(..)]` without `diverge` asks for, `terminates`
 //! (docs/v2/plan/design/effects.md), and the crate-wide effects of `#![blaze::capabilities]`
 //! ([`AMBIENT`], [`UNSAFE`], [`GLOBAL_ALLOC`], docs/v2/plan/design/std.md) with the trust a
 //! crate has for them ([`crate_trust`]): their [`EffectDef`]s, and the rules and tables the walk
@@ -22,7 +22,7 @@ use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin, TrustedCrate};
 use blaze_hash::HashMap;
 use hir_def::{
     AdtId, AttrDefId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleDefId, ModuleId,
-    attrs::{AttrFlags, EffectWord, MayWord, PureAttr},
+    attrs::{AttrFlags, EffectWord, ExpectWord, PureAttr},
     nameres::{ModuleData, crate_def_map},
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
@@ -51,7 +51,7 @@ use crate::effects::{EffectDef, EffectSet, Rule, effect_index};
 /// overflow checks included), no foreign call whose ABI may unwind, nothing the walk can't see.
 pub const NOPANIC: EffectDef = EffectDef {
     name: "nopanic",
-    word: Some(MayWord::Panic),
+    word: Some(ExpectWord::Panic),
     refuses: EffectSet::of(&[Rule::Panic, Rule::Overflow, Rule::ForeignUnwind, Rule::Unchecked]),
     attr: nopanic_attr,
     says,
@@ -71,7 +71,7 @@ pub const NOPANIC_NO_OVERFLOW_CHECKS: EffectDef = EffectDef {
 /// names (`Vec::new_in(frame)`) is allowed.
 pub const NOALLOC: EffectDef = EffectDef {
     name: "noalloc",
-    word: Some(MayWord::Alloc),
+    word: Some(ExpectWord::Alloc),
     refuses: EffectSet::of(&[Rule::Alloc, Rule::ForeignUnknown, Rule::Unchecked]),
     attr: noalloc_attr,
     says,
@@ -84,7 +84,7 @@ pub const NOALLOC: EffectDef = EffectDef {
 /// condvars, channels, sleeps, joins; the blocking syscalls of [`FOREIGN`]), transitively.
 pub const NONBLOCKING: EffectDef = EffectDef {
     name: "nonblocking",
-    word: Some(MayWord::Block),
+    word: Some(ExpectWord::Block),
     refuses: EffectSet::of(&[Rule::Block, Rule::ForeignUnknown, Rule::Unchecked]),
     attr: nonblocking_attr,
     says,
@@ -148,7 +148,7 @@ pub const GLOBAL_ALLOC: EffectDef = EffectDef {
 };
 
 /// No attribute of its own: a crate's listing trusts for a crate-wide effect, and `terminates`
-/// is spelled only by `#[blaze::may(..)]`.
+/// is spelled only by `#[blaze::expect(..)]`.
 fn no_attr(_: &Db, _: AttrDefId) -> Option<PureAttr> {
     None
 }
@@ -228,7 +228,7 @@ pub fn trusted_entry(db: &Db, krate: Crate) -> Option<&TrustedCrate> {
     krate.workspace_data(db).trusted.iter().find(|it| &*it.name == name)
 }
 
-/// What a `#[blaze::may(..)]` without `diverge` asks for: the function returns or panics, and
+/// What a `#[blaze::expect(..)]` without `diverge` asks for: the function returns or panics, and
 /// never runs for ever. No loop not known to end (`crate::loops`), no recursion (an instance
 /// that can call itself again, through any calls), no call through a function pointer or a
 /// `dyn` (which may reach the caller again), nothing the walk can't see, transitively. A wait
@@ -237,7 +237,7 @@ pub fn trusted_entry(db: &Db, krate: Crate) -> Option<&TrustedCrate> {
 /// is spelled only by what a function may do, `diverge`.
 pub const TERMINATES: EffectDef = EffectDef {
     name: "terminates",
-    word: Some(MayWord::Diverge),
+    word: Some(ExpectWord::Diverge),
     refuses: EffectSet::of(&[
         Rule::Loop,
         Rule::Recursion,
@@ -247,19 +247,19 @@ pub const TERMINATES: EffectDef = EffectDef {
     ]),
     attr: no_attr,
     says,
-    fix: "a function that may not `diverge`, and everything it calls, has only loops known to end (a counted `while i < n`) and no recursion: write it so, list `diverge`, or mark a callee proven to end by hand `#[blaze::may(.., trusted = \"why\")]` without `diverge`",
+    fix: "a function that may not `diverge`, and everything it calls, has only loops known to end (a counted `while i < n`) and no recursion: write it so, list `diverge`, or mark a callee proven to end by hand `#[blaze::expect(.., trusted = \"why\")]` without `diverge`",
     through_never: true,
     crate_wide: false,
 };
 
-/// The effect a `#[blaze::may(..)]` that leaves `word` out asks for, in a crate built with
+/// The effect a `#[blaze::expect(..)]` that leaves `word` out asks for, in a crate built with
 /// `overflow_checks` (which only `panic` reads: [`nopanic_for`]).
-pub const fn of_word(word: MayWord, overflow_checks: bool) -> &'static EffectDef {
+pub const fn of_word(word: ExpectWord, overflow_checks: bool) -> &'static EffectDef {
     match word {
-        MayWord::Panic => nopanic_for(overflow_checks),
-        MayWord::Alloc => &NOALLOC,
-        MayWord::Block => &NONBLOCKING,
-        MayWord::Diverge => &TERMINATES,
+        ExpectWord::Panic => nopanic_for(overflow_checks),
+        ExpectWord::Alloc => &NOALLOC,
+        ExpectWord::Block => &NONBLOCKING,
+        ExpectWord::Diverge => &TERMINATES,
     }
 }
 
@@ -730,7 +730,13 @@ pub fn crate_rows(db: &Db, krate: Crate) -> CrateRows {
             At::Methods(ty, names) => {
                 if let Some(ModuleDefId::AdtId(adt)) = item(db, root, ty, true) {
                     let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-                    for &imp in InherentImpls::for_crate(db, krate).for_self_ty(&self_ty) {
+                    // The type's inherent impls alone, not the crate's whole table.
+                    let impls = InherentImpls::in_crate_for_self_ty(
+                        db,
+                        krate,
+                        hir_ty::method_resolution::SelfTyKey(self_ty),
+                    );
+                    for &imp in impls {
                         for (method, assoc) in imp.impl_items(db).items.iter() {
                             if let hir_def::AssocItemId::FunctionId(func) = *assoc
                                 && names.contains(&method.symbol().as_str())

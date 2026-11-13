@@ -4,7 +4,7 @@
 //! built from.
 
 use super::rustc;
-pub(super) use super::rustc::{ALIASES, GROUPS, IGNORED, INTERNAL_GROUP, REMOVED};
+pub(super) use super::rustc::{ALIASES, GROUPS, IGNORED, INTERNAL_GROUP};
 
 /// The groups of blaze's own lints, after rustc's: `blaze::hot`, the lints of hot code
 /// (blaze-lints' `blaze::HOT`, which its tests hold to this); `blaze::general`, the lints on
@@ -75,7 +75,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unreachable",
             "blaze::todo",
             "blaze::undeclared_effect",
-            "blaze::unneeded_effect",
+            "blaze::unfulfilled_effect",
             "blaze::negative_effect",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
@@ -107,6 +107,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::proc_macro_attribute",
             "blaze::proc_macro_fn_like",
             "blaze::build_script_ambient",
+            "blaze::not_latest_edition",
             "blaze::std_use",
             "blaze::lossy_as",
             "blaze::implicit_overflow",
@@ -195,3 +196,23 @@ pub(super) const RENAMED: &[(&str, &str)] = &{
 };
 
 const BLAZE_RENAMED: &[(&str, &str)] = &[("blaze::std_hashmap", "blaze::default_hasher")];
+
+/// `register_removed`: the name and why. blaze's own, deleted with no alias (AGENTS.md rule 30),
+/// then rustc's.
+pub(super) const REMOVED: &[(&str, &str)] = &{
+    let mut out = [("", ""); BLAZE_REMOVED.len() + rustc::REMOVED.len()];
+    let mut at = 0;
+    while at < out.len() {
+        out[at] = match at < BLAZE_REMOVED.len() {
+            true => BLAZE_REMOVED[at],
+            false => rustc::REMOVED[at - BLAZE_REMOVED.len()],
+        };
+        at += 1;
+    }
+    out
+};
+
+const BLAZE_REMOVED: &[(&str, &str)] = &[(
+    "blaze::unneeded_effect",
+    "a word of a function's own list it is proved not to have is `blaze::unfulfilled_effect`, deny: `#[blaze::expect(..)]` is exact",
+)];

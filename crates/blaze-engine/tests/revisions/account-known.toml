@@ -1,0 +1,15 @@
+# The known failures of the revision harness's standing expectation (`check.rs`, the check
+# `account`): every revision's build has an account that names no alarm (blaze-profile's
+# `account`: no work without a recorded cause, every sum held, work in proportion to the
+# change; docs/profiling.md, "`accounts`"). A `[[known]]` row is one revision of one case that
+# fails it today: `test`, `revision`, `alarms` (the alarms its account names, as
+# `accounts.alarms` joins them) and `cause`. A listed revision passes with exactly those alarms;
+# with others it fails; with none it fails until its row is taken out. The list only shrinks.
+#
+# Written by a run of the real driver with `BLAZE_REVISIONS_ACCOUNT_RECORD=<file>`, which
+# appends the rows the run would list (keeping the cause of a row that is here); each cause is
+# then looked into and written in a line.
+#
+# Not yet recorded: no run has measured the cases since the check was written (2026-11-12,
+# lane telemetry-1112), so the first run fails for each revision whose account alarms and
+# lists it in its record file.

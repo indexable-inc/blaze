@@ -1631,6 +1631,33 @@ fn the_sweep_takes_a_page_read_once_and_passes_over_one_read_again() {
     world.check().unwrap_or_else(|broke| panic!("{broke}"));
 }
 
+/// The invariant ([`Sweep::lap`]): one lap visits at most the open pages, gives back no page
+/// read again since it was loaded, and a second lap with no read between gives that page back;
+/// a page read once goes on the first lap.
+#[test]
+fn a_lap_keeps_what_was_read_again_and_the_next_lap_gives_it_back() {
+    let plan = quiet_plan();
+    let mut world = World::new(&plan, Plant::None).unwrap_or_else(|broke| panic!("{broke}"));
+    let page = world.files[0].window.first_page();
+    let open = world.windows.open_pages();
+    let state = |world: &World| world.pool.word_now(page).state();
+
+    read_once(&mut world, &plan);
+    let once = world.sweep.lap(&world.pool, &world.windows);
+    assert!(once.visited <= open, "a lap visits each open page at most once: {once:?} of {open}");
+    assert!(once.freed >= PAGE && state(&world) == State::Unloaded, "read once, it goes: {once:?}");
+
+    read_once(&mut world, &plan);
+    read_once(&mut world, &plan);
+    let first = world.sweep.lap(&world.pool, &world.windows);
+    assert!(first.visited <= open, "a lap visits each open page at most once: {first:?} of {open}");
+    assert_eq!((first.freed, state(&world)), (0, State::Loaded), "read again since its load, it stays");
+    let second = world.sweep.lap(&world.pool, &world.windows);
+    assert!(second.freed >= PAGE && state(&world) == State::Unloaded, "not read since the lap before, it goes: {second:?}");
+    assert_eq!(world.sweep.lap(&world.pool, &world.windows).freed, 0, "nothing loaded, nothing given");
+    world.check().unwrap_or_else(|broke| panic!("{broke}"));
+}
+
 /// The loader's thread end to end on a real file system: a file's records pinned through it,
 /// loaded by its driver's reads and checked, every page given back by the kernel (the real
 /// `Region::evict`), and pinned again, loading again.

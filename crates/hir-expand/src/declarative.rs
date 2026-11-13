@@ -19,6 +19,8 @@ use crate::{
     tt,
 };
 
+pub mod stored;
+
 /// Old-style `macro_rules` or the new macros 2.0
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeclarativeMacroExpander {
@@ -99,15 +101,38 @@ impl AstId<ast::Macro> {
     /// Fetches (and compiles) the expander of this decl macro.
     #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
     pub fn decl_macro_expander(self, db: &Db, def_crate: Crate) -> DeclarativeMacroExpander {
+        let id = self;
+        // A definition written in a file, of a database that keeps definitions: found by what
+        // it is (`stored`), with no syntax made when its file is as it was, and with its
+        // tokens not made again when the file changed around it; made below and kept when it
+        // is not found.
+        let kept = match id.file_id {
+            HirFileId::FileId(file) => stored::of(db).map(|kept| {
+                (kept, file, stored::def_hash(db, id, def_crate))
+            }),
+            HirFileId::MacroFile(_) => None,
+        };
+        if let Some((kept, file, hash)) = kept
+            && let Some(def) = stored::find(db, kept, file, id.value.erase(), def_crate, hash)
+        {
+            return def.compile(def_crate.data(db).edition);
+        }
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-            let id = self;
             let map = id.file_id.span_map(db);
+            // What is kept of the definition, written as its trees are made.
+            let mut written = kept.map(|(_, file, _)| {
+                stored::Writer::new(stored::Place::of(db, file, id.value.erase()))
+            });
+            let read_cfg = std::cell::Cell::new(false);
 
             let transparency = |node: view::AnyHasAttrs<'_>| {
                 let mut cfg_options = None;
                 expand_cfg_attr_view(
                     node.attrs(),
-                    || cfg_options.get_or_insert_with(|| def_crate.cfg_options(db)),
+                    || {
+                        read_cfg.set(true);
+                        cfg_options.get_or_insert_with(|| def_crate.cfg_options(db))
+                    },
                     |attr, _| {
                         if let view::Meta::KeyValueMeta(attr) = attr
                             && attr.path().is1("rustc_macro_transparency")
@@ -155,12 +180,20 @@ impl AstId<ast::Macro> {
                                 DocCommentDesugarMode::Mbe,
                                 frame,
                             );
+                            if let Some(written) = &mut written {
+                                written.rules(Some(&tt));
+                            }
 
                             mbe::DeclarativeMacro::parse_macro_rules(&tt, ctx_edition)
                         }
-                        None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
-                            "expected a token tree".into(),
-                        )),
+                        None => {
+                            if let Some(written) = &mut written {
+                                written.rules(None::<&tt::TopSubtree>);
+                            }
+                            mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
+                                "expected a token tree".into(),
+                            ))
+                        }
                     },
                     transparency(view::AnyHasAttrs::new(macro_rules))
                         .unwrap_or(Transparency::SemiOpaque),
@@ -186,16 +219,33 @@ impl AstId<ast::Macro> {
                                 DocCommentDesugarMode::Mbe,
                                 frame,
                             );
+                            if let Some(written) = &mut written {
+                                written.macro2(args.as_ref(), &body);
+                            }
 
                             mbe::DeclarativeMacro::parse_macro2(args.as_ref(), &body, ctx_edition)
                         }
-                        None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
-                            "expected a token tree".into(),
-                        )),
+                        None => {
+                            if let Some(written) = &mut written {
+                                written.macro_without_body();
+                            }
+                            mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
+                                "expected a token tree".into(),
+                            ))
+                        }
                     },
                     transparency(view::AnyHasAttrs::new(macro_def)).unwrap_or(Transparency::Opaque),
                 ),
             };
+            if let (Some((kept, file, hash)), Some(mut written)) = (kept, written) {
+                written.transparency(transparency);
+                // The transparency read the crate's cfg (a `cfg_attr` on the definition), which
+                // the tokens' key does not cover: such a definition is made from its source.
+                if read_cfg.get() {
+                    written.disown();
+                }
+                stored::keep(db, kept, file, id.value.erase(), def_crate, hash, written);
+            }
             DeclarativeMacroExpander { mac, transparency, edition }
         })
     }

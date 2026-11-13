@@ -250,6 +250,21 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                     }
                 }
 
+                /// Says every field of this input is an input of seal group `group`
+                /// (`blaze_query::db::seal`): a write of one opens that group and no other.
+                /// Given another group later, the input is removed from the first and added
+                /// to the second.
+                pub fn seal_group<#database>(self, db: &mut #database, group: #db::SealGroup)
+                where
+                    #database: ?::core::marker::Sized + #db::Database,
+                {
+                    #plumbing::input_seal_group::<#config>(
+                        #db::Database::storage_mut(db),
+                        self.0,
+                        group,
+                    );
+                }
+
                 #methods
             }
 

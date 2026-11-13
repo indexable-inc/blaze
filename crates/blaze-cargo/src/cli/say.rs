@@ -4,7 +4,7 @@
 //! name, a command line as cargo quotes it. Every function here is pure; the caller writes the
 //! text to the stream cargo writes it to.
 
-use std::{fmt::Write as _, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use blaze_api::{TargetKind, UnitTarget, UnitTargetRef};
 
@@ -187,39 +187,6 @@ pub fn target_named_into<'a>(out: &mut String, target: impl Into<Named<'a>>) {
     out.push('"');
 }
 
-/// Whether a unit compiled with `--test` is named a test of its target: it is no test or bench
-/// target (cargo's `mode.is_rustc_test() && !(target.is_test() || target.is_bench())`).
-fn test_of(target: Named<'_>, test: bool) -> bool {
-    test && !matches!(target.kind, TargetKind::Test | TargetKind::Bench)
-}
-
-/// A unit as cargo's `descriptive_pkg_name` names it: `` `foo` (lib) ``, `` `foo` (lib test) ``
-/// for one compiled with `--test` that is no test or bench target.
-pub fn unit_named<'a>(package: &str, target: impl Into<Named<'a>>, test: bool) -> String {
-    let target = target.into();
-    let mut out = String::with_capacity(package.len() + target.name.len() + 20);
-    unit_named_into(&mut out, package, target, test);
-    out
-}
-
-/// [`unit_named`] into `out`.
-pub fn unit_named_into<'a>(
-    out: &mut String,
-    package: &str,
-    target: impl Into<Named<'a>>,
-    test: bool,
-) {
-    let target = target.into();
-    out.push('`');
-    out.push_str(package);
-    out.push_str("` (");
-    target_named_into(out, target);
-    if test_of(target, test) {
-        out.push_str(" test");
-    }
-    out.push(')');
-}
-
 /// The package name in cargo's package id: `path+file:///w/foo#0.1.0` is `foo`,
 /// `registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0` is `serde`.
 pub fn package_name(package_id: &str) -> &str {
@@ -235,135 +202,6 @@ pub fn package_name(package_id: &str) -> &str {
 pub fn package_version(package_id: &str) -> &str {
     let fragment = package_id.split_once('#').map_or("", |(_, it)| it);
     fragment.split_once('@').map_or(fragment, |(_, version)| version)
-}
-
-/// What a unit's warnings came to, once it ended (`JobQueue::report_warning_count`).
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Warned {
-    pub total: u32,
-    pub duplicates: u32,
-    /// The warnings with a machine-applicable suggestion; `None` once the unit has an error,
-    /// which takes the `blaze check --fix` hint away.
-    pub fixable: Option<u32>,
-}
-
-/// `` `foo` (lib) generated 2 warnings (1 duplicate) (run `blaze check --fix --lib -p foo` to
-/// apply 1 suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one
-/// without (`JobQueue::report_warning_count`). The hint is for a local unit that is no build
-/// script, and always names the package (cargo since "fix(check): ... always using -p"). It
-/// names blaze's own command, which makes the suggestions blaze gave, never `cargo fix`, which
-/// would run rustc for its own (useful-not-parity).
-pub fn generated<'a>(
-    package: &str,
-    target: impl Into<Named<'a>>,
-    test: bool,
-    local: bool,
-    warned: Warned,
-) -> Option<String> {
-    let target = target.into();
-    let mut out = String::with_capacity(package.len() * 2 + target.name.len() + 96);
-    generated_into(&mut out, package, target, test, local, warned).then_some(out)
-}
-
-/// [`generated`] into `out`; false, with nothing written, for a unit without warnings.
-pub fn generated_into<'a>(
-    out: &mut String,
-    package: &str,
-    target: impl Into<Named<'a>>,
-    test: bool,
-    local: bool,
-    warned: Warned,
-) -> bool {
-    if warned.total == 0 {
-        return false;
-    }
-    let target = target.into();
-    unit_named_into(out, package, target, test);
-    // Writing to a String cannot fail.
-    let _ = match warned.total {
-        1 => write!(out, " generated 1 warning"),
-        n => write!(out, " generated {n} warnings"),
-    };
-    let _ = match warned.duplicates {
-        0 => Ok(()),
-        1 => write!(out, " (1 duplicate)"),
-        n => write!(out, " ({n} duplicates)"),
-    };
-    if let Some(fixable @ 1..) = warned.fixable
-        && local
-        && target.kind != TargetKind::CustomBuild
-    {
-        out.push_str(" (run `blaze check --fix --");
-        target_named_into(out, target);
-        out.push_str(" -p ");
-        out.push_str(package);
-        if test_of(target, test) {
-            out.push_str(" --tests");
-        }
-        let _ = match fixable {
-            1 => write!(out, "` to apply 1 suggestion)"),
-            n => write!(out, "` to apply {n} suggestions)"),
-        };
-    }
-    true
-}
-
-/// `` could not compile `foo` (lib) due to 1 previous error; 1 warning emitted ``: what follows
-/// `error:` for a unit that failed (`core/compiler/mod.rs`, `rustc`).
-pub fn could_not_compile<'a>(
-    package: &str,
-    target: impl Into<Named<'a>>,
-    test: bool,
-    errors: u32,
-    warnings: u32,
-) -> String {
-    let target = target.into();
-    let mut out = String::with_capacity(package.len() + target.name.len() + 80);
-    could_not_compile_into(&mut out, package, target, test, errors, warnings);
-    out
-}
-
-/// [`could_not_compile`] into `out`.
-pub fn could_not_compile_into<'a>(
-    out: &mut String,
-    package: &str,
-    target: impl Into<Named<'a>>,
-    test: bool,
-    errors: u32,
-    warnings: u32,
-) {
-    out.push_str("could not compile ");
-    unit_named_into(out, package, target, test);
-    previous_into(out, errors, warnings);
-}
-
-/// `` could not compile `foo` (lib doctest) due to 1 previous error ``: a library's doc tests
-/// that failed to build, named as its doc tests and not as the library, whose unit built.
-pub fn doctests_could_not_compile_into(
-    out: &mut String,
-    package: &str,
-    errors: u32,
-    warnings: u32,
-) {
-    out.push_str("could not compile `");
-    out.push_str(package);
-    out.push_str("` (lib doctest)");
-    previous_into(out, errors, warnings);
-}
-
-/// `` due to 1 previous error; 1 warning emitted ``, what ends a "could not compile".
-fn previous_into(out: &mut String, errors: u32, warnings: u32) {
-    // Writing to a String cannot fail.
-    let _ = match errors {
-        0 => Ok(()),
-        1 => write!(out, " due to 1 previous error"),
-        n => write!(out, " due to {n} previous errors"),
-    };
-    let _ = match warnings {
-        0 => Ok(()),
-        1 => write!(out, "; 1 warning emitted"),
-        n => write!(out, "; {n} warnings emitted"),
-    };
 }
 
 /// `arg` as cargo-util's `ProcessBuilder` shows it, quoted as `shell-escape` quotes it.

@@ -1,0 +1,10 @@
+{
+  "what": "rustc's own tests, the corpus `compiletest` runs under blaze (docs/compiletest.md): the Rust project's source archive of blaze's nightly, held to its sha256 before anything is unpacked, and of it only `paths`. Untrusted data: compiled by blaze, run only in blaze's sandbox.",
+  "repo": "https://github.com/rust-lang/rust",
+  "commit": "16d1ffac17ad8b739e32483ac2e65fe7e1804977",
+  "nightly": "nightly-2026-10-27",
+  "archive": "https://static.rust-lang.org/dist/2026-10-27/rustc-nightly-src.tar.xz",
+  "sha256": "4cdc3dc3d550b244732477839fc336d45a89c6132c32d27d68305e2202936713",
+  "prefix": "rustc-nightly-src",
+  "paths": ["tests/ui", "tests/incremental", "tests/crashes", "tests/auxiliary"]
+}

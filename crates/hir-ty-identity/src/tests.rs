@@ -935,3 +935,54 @@ pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
     assert_ne!(small.0, wide.0, "debug identity covers the nested `impl Trait`'s type");
     assert_ne!(small.2, wide.2, "CodeId covers the nested `impl Trait`'s type");
 }
+
+/// A `kernel` whose `root` calls one generic function, `leaf`, with `instances` different type
+/// arguments (`u8`, `(u8,)`, `((u8,),)`, ...): two bodies whatever `instances` is.
+fn ladder(instances: usize) -> Db {
+    let mut ty = String::from("u8");
+    let mut calls = String::new();
+    for _ in 0..instances {
+        calls.push_str(&format!("    n = leaf::<{ty}>(n);\n"));
+        ty = format!("({ty},)");
+    }
+    program(
+        "/src/lib.rs",
+        &format!(
+            "fn leaf<T>(x: u32) -> u32 {{\n    x\n}}\n\n\
+             pub fn root(mut n: u32) -> u32 {{\n{calls}    n\n}}\n"
+        ),
+    )
+}
+
+/// How many MIR values the database holds once the CodeId of the step rooted at `root` of
+/// [`ladder`] is made: each instance it runs summarized from its body.
+fn held_after_the_step(instances: usize, keeps_bodies: bool) -> usize {
+    use blaze_query::db::Database as _;
+    let db = ladder(instances);
+    let made = || _ = step(&db, "root");
+    match keeps_bodies {
+        true => crate::walk::plant::keeping_bodies(made),
+        false => made(),
+    }
+    db.storage().values_of(blaze_query::db::plumbing::Tag::Mir)
+}
+
+/// The invariant: a step's walk keeps each instance's part and callees, never the body it read
+/// them from: the CodeId of a step running 8 instances of one generic and of one running 64
+/// leave the same number of MIR values held.
+#[test]
+fn the_step_walk_holds_no_body_an_instance() {
+    let (few, many) = (held_after_the_step(8, false), held_after_the_step(64, false));
+    assert_eq!(few, many, "MIR values held after a step of 8 instances and of 64");
+}
+
+/// The planted bug: each instance's summary reads its body from the memo that keeps one an
+/// instance, as it did until 2026-11-13: 56 more instances hold at least 56 more bodies.
+#[test]
+fn the_oracle_catches_a_step_walk_that_keeps_each_instances_body() {
+    let (few, many) = (held_after_the_step(8, true), held_after_the_step(64, true));
+    assert!(
+        many >= few + 56,
+        "the memoized walk held {few} MIR values for 8 instances and {many} for 64"
+    );
+}

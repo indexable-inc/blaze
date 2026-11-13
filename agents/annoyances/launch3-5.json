@@ -1,0 +1,12 @@
+{
+ "id": "launch3-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-launch-host::program, the classifier",
+ "what": "A body edit of `fn main` changes the code hash of two functions: `main` and the C `main` shim the front end makes around it. \"One changed body applies live\" read it as two and restarted the program on every edit of `main`.",
+ "cost": "the first live edit of a real program restarted instead",
+ "cause": "the shim's code hash follows `fn main`'s body (it need not: it calls `lang_start` with `main`'s address)",
+ "workaround": "the entry's identity is not counted",
+ "state": "open: the shim's code hash should not move with `main`'s body",
+ "fix": "open: the shim's code hash should not move with `main`'s body"
+}

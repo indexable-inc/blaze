@@ -1,0 +1,14 @@
+{
+ "id": "borrowck-verdict-outside-query",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 4b task B, int-1112",
+ "where": "crates/hir-ty-borrowck/src/lib.rs borrowck, kept; crates/hir-ty-borrowck/src/gate.rs checked",
+ "what": "A stored borrow-check verdict was looked at only by the gate (`gate::stored_passed`), so every other asker of the `borrowck` query (the diagnostics, hir/diagnostics.rs) ran the check again on a body the daemon had served; and a pass with an `unused_mut` lint was offered as a verdict, whose bytes cannot hold the lint.",
+ "cost": "every served body's borrow check ran again whenever diagnostics were asked; a served verdict would have dropped a lint",
+ "cause": "the stored answer lived beside the query instead of being the query's own answer",
+ "class": "a cached answer consulted at one caller instead of at the query every caller asks",
+ "prevention": "the query is the one place that looks at its stored answer; an answer is kept only when it equals what the query returns from it",
+ "workaround": "none",
+ "fix": "`borrowck` answers from `lookup_passed` itself; `kept` keeps only a pass with nothing to say; `stored_passed` deleted. Test kept_tests::a_kept_verdict_stands_for_a_result_with_nothing_to_say, control the_oracle_catches_a_verdict_kept_with_a_lint (KEEP_LOUD).",
+ "state": "fixed, not yet built"
+}

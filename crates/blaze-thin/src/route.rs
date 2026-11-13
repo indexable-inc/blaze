@@ -10,7 +10,8 @@
 //!
 //! The environment routes too ([`env`]): a variable that changes what the engine's launcher
 //! or its CLI does before the request (which blaze runs, the daemon's settings, the profile,
-//! the core budget) is the engine's to read.
+//! the core budget) is the engine's to read. The one daemon setting a typed command keeps
+//! ([`CHECKED_HERE`]) is checked here against the daemon's ([`drifted`]) instead.
 
 use std::ffi::{OsStr, OsString};
 
@@ -160,9 +161,46 @@ pub fn words(words: &[OsString]) -> Route {
 /// The one variable of blaze's own that the thin `blaze` reads itself: where blaze's home is.
 const HOME: &str = "BLAZE_HOME";
 
+/// The daemon settings (blaze-cargo's `serve::settings::STARTED_WITH`) a typed command keeps
+/// on the thin `blaze`'s path. Each only says how a daemon is started, and the thin starts
+/// none: where no daemon answers it hands the command to the engine, which inherits this
+/// process's environment and starts the daemon with the setting, as it does any. Where a
+/// daemon answers, the thin holds the setting to the daemon's own ([`drifted`], against
+/// `Status::settings`) and leaves a difference to the engine, which refuses it naming both
+/// (`DaemonError::Drifted`), so a command that sets one is never answered by a daemon started
+/// with another. `BLAZE_DAEMON_EXIT_UNHELD` (blaze-cargo's `serve::unheld`): a test of the typed
+/// path sets it on every command, so that a test killed before it could stop its daemon
+/// leaves none, and the typed path stays what it tests.
+pub const CHECKED_HERE: &[&str] = &["BLAZE_DAEMON_EXIT_UNHELD"];
+
+/// Why the daemon that answered (`theirs`, its `Status::settings`) is not the one this command
+/// asks for: the first of [`CHECKED_HERE`] that `ours` (this process's environment) sets to
+/// another value than the daemon's, or that the daemon does not say. `None` where every one
+/// `ours` sets is the daemon's too; one `ours` leaves unset is the daemon's to choose, as the
+/// engine's client has it (`serve::settings::drift`).
+pub fn drifted(ours: impl Fn(&str) -> Option<String>, theirs: &[blaze_api::Setting]) -> Option<String> {
+    CHECKED_HERE.iter().find_map(|name| {
+        let asked = ours(name)?;
+        let their = theirs.iter().find(|it| it.name == *name).and_then(|it| it.value.as_deref());
+        // alloc: the reason the engine runs the command, once
+        (their != Some(asked.as_str())).then(|| match their {
+            Some(their) => {
+                use blaze_report::say::{Code, Words};
+                blaze_report::say!(Words(name), ": the daemon has ", Code(their), ", this command ", Code(&asked))
+                    .flat()
+            }
+            None => {
+                use blaze_report::say::{Code, Words};
+                blaze_report::say!(Words(name), ": the daemon has it unset, this command ", Code(&asked)).flat()
+            }
+        })
+    })
+}
+
 /// The first of `names` (the environment's variables) that makes the command the engine's:
-/// every `BLAZE_*` but `BLAZE_HOME` (the pin a launcher ran this blaze under, the daemon's
-/// settings, the core budget, the profile and the statistics a command asks for), `IX_PROF`
+/// every `BLAZE_*` but `BLAZE_HOME` and [`CHECKED_HERE`] (the pin a launcher ran this blaze
+/// under, the daemon's other settings, the core budget, the profile and the statistics a
+/// command asks for), `IX_PROF`
 /// (the sampler) and cargo's override of the terminal's width, each read by the engine before
 /// it sends its request. blaze-cargo's tests hold every setting the daemon keeps to a name
 /// this refuses.
@@ -183,7 +221,7 @@ pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
 
 /// Whether the variable `name` makes a command the engine's ([`env`]).
 pub fn refuses(name: &str) -> bool {
-    (name.starts_with("BLAZE_") && name != HOME)
+    (name.starts_with("BLAZE_") && name != HOME && !CHECKED_HERE.contains(&name))
         || name == "IX_PROF"
         || name == "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"
 }
@@ -262,5 +300,42 @@ mod tests {
         {
             assert_eq!(names(&["PATH", name]), Some(Why::Env(name.to_owned())), "{name}");
         }
+    }
+
+    /// The exemption held: with only `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD` of blaze's own
+    /// set, a typed command stays the thin's; with any other `BLAZE_*` beside them it is the
+    /// engine's, named by that variable.
+    #[test]
+    fn a_daemon_exit_setting_keeps_a_typed_command_and_any_other_blaze_variable_does_not() {
+        let names = |names: &[&str]| env(os(names).into_iter());
+        assert_eq!(names(&["PATH", "BLAZE_HOME", "BLAZE_DAEMON_EXIT_UNHELD"]), None);
+        assert_eq!(names(&["BLAZE_DAEMON_EXIT_UNHELD"]), None);
+        for other in ["BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_LOCK", "BLAZE_VERIFY_STORE", "BLAZE_DAEMON_EXIT", "BLAZE_X"] {
+            assert_eq!(
+                names(&["BLAZE_HOME", "BLAZE_DAEMON_EXIT_UNHELD", other]),
+                Some(Why::Env(other.to_owned())),
+                "{other}"
+            );
+        }
+    }
+
+    /// A daemon setting kept on the typed path is held to the daemon's: the same value, or one
+    /// the command leaves unset, is no reason; another value, or one the daemon does not have,
+    /// is, naming the variable and both values.
+    #[test]
+    fn a_kept_setting_the_daemon_does_not_share_sends_the_command_to_the_engine() {
+        let setting = |value: Option<&str>| blaze_api::Setting {
+            name: "BLAZE_DAEMON_EXIT_UNHELD".to_owned(),
+            value: value.map(str::to_owned),
+        };
+        let ours = |value: Option<&'static str>| move |name: &str| (name == "BLAZE_DAEMON_EXIT_UNHELD").then_some(value).flatten().map(str::to_owned);
+        assert_eq!(drifted(ours(Some("on")), &[setting(Some("on"))]), None);
+        assert_eq!(drifted(ours(None), &[setting(Some("on"))]), None);
+        assert_eq!(drifted(ours(None), &[]), None);
+        let other = drifted(ours(Some("on")), &[setting(Some("5"))]).unwrap();
+        assert!(other.contains("BLAZE_DAEMON_EXIT_UNHELD") && other.contains("`5`") && other.contains("`on`"), "{other}");
+        let unset = drifted(ours(Some("on")), &[setting(None)]).unwrap();
+        assert!(unset.contains("unset"), "{unset}");
+        assert!(drifted(ours(Some("on")), &[]).is_some());
     }
 }

@@ -41,6 +41,8 @@ disabled-strategies = ["quick-install"]
 
 [dependencies]
 blaze-core.workspace = true
+# The one writer of the command's stdout and stderr (`blaze_report::out`).
+blaze-report.workspace = true
 # blaze's cargo: the client, the daemon, the sandbox launcher, the release this is.
 blaze-cargo.workspace = true
 # The thin `blaze` (docs/client.md) reads the launcher's kept pin lookup and says `--version`'s
@@ -50,7 +52,7 @@ anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
-# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on the huge pages `blaze-mem` chose (`huge.rs`).
+# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on base pages (`huge.rs`).
 libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 blaze-mem.workspace = true
 # Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.
@@ -100,6 +102,8 @@ intern.workspace = true
 blaze-codegen-code.workspace = true
 
 [dev-dependencies]
+# tests/revisions/oracle.rs: the drawn sequences of the real driver's oracle.
+hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 # tests/malloc.rs: an LLVM context made and disposed of in a task, through LLVM's C API.
 llvm-sys.workspace = true

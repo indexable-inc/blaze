@@ -96,10 +96,6 @@ name = "hir_store_source_map"
 path = "targets/hir_store_source_map.rs"
 
 [[bin]]
-name = "intern_table"
-path = "targets/intern_table.rs"
-
-[[bin]]
 name = "link_coff_archive"
 path = "targets/link_coff_archive.rs"
 
@@ -241,8 +237,6 @@ blaze-usercode.workspace = true
 blaze-vfs.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-# `intern::fuzz`, a table section restored into a fresh table and the writer of one, which `intern_table` runs.
-intern = { workspace = true, features = ["fuzz"] }
 # The object-file targets build their seeds with `object::write`.
 object = { workspace = true, features = ["write"] }
 # `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone.

@@ -1,0 +1,12 @@
+{
+ "id": "launch3-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-launch-host's driver in blaze-cargo; hir-ty-codegen's `LinkInputs`",
+ "what": "`LinkInputs { base: None, tables: [] }` means two things: every table (none, when a build names none) and \"the same snapshot as `serial`, nothing changed\". A second link of one build gave the second, the launcher's driver read the first and wiped the program's span tables; the next first call stopped the program with `the build gave no span table of that anchor`.",
+ "cost": "one debugging round on the VM (two builds, three runs), found only because a project was deleted and made again at the same path",
+ "cause": "one field carries two cases; the doc on `LinkInputs` says only the first",
+ "workaround": "the driver asks `work.whole` and compares `serial` with the one it holds (serve/unit/run/launch.rs)",
+ "state": "open: give `LinkInputs` an enum (Same, Changed, Whole)",
+ "fix": "open: give `LinkInputs` an enum (Same, Changed, Whole)"
+}

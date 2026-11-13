@@ -20,9 +20,19 @@
     library.py digest '{}'
         writes library/DIGEST, the digest blaze knows the library by (the store's key of the
         standard library; `toolchain/library.rs` computes the same): after any change to library/.
-    library.py archive '{"out": "<dir>"}'
-        writes <dir>/library-<digest>.tar.xz, the asset of a release a blaze without a checkout
-        downloads the library from once, checking its files against the digest.
+    library.py check '{}'
+        fails when library/DIGEST is not the digest of library/ as it is: a change to library/
+        without `digest` after it (the gate runs this; agents.json H7).
+    library.py archive '{"out": "<dir>", "tree": "library"}'
+        writes <dir>/<tree>-<digest>.tar.xz, the asset of a release a blaze without a checkout
+        downloads that shipped tree from once, checking its files against the digest
+        (toolchain/library.rs `place`), and prints `digest=<digest>` and `archive=<path>`
+        (lines a workflow appends to $GITHUB_OUTPUT). `tree` is `library` (library/ as it is,
+        its DIGEST checked) or `bstd`: crates/blaze-std, the crates of this repository it
+        depends on by path (and the [patch] crates its graph uses), each manifest without its
+        dev-dependencies, tests, benches or examples, under a workspace manifest of just them
+        and a Cargo.lock of just their graph, at the paths they have here, with a DIGEST; the
+        release build is told that digest as BLAZE_BSTD_DIGEST (crates/blaze-new's BSTD_DIGEST).
 
 A snapshot is a commit of nothing but library/ as a nightly's rust-src has it (none of blaze's
 own files), made the same way from the same rust-src and parent wherever it is made. Each one's
@@ -62,6 +72,7 @@ class Empty:
 @dataclass(frozen=True)
 class Archive:
     out: str
+    tree: str = "library"
 
 
 def typed(cls, text):
@@ -387,12 +398,13 @@ def do_digest(args):
     print(f"library/DIGEST: {write_digest()}")
 
 
-def do_archive(args):
-    digest = open(DIGEST).read().strip()
-    if digest_of(LIBRARY) != digest:
-        sys.exit("library.py: library/DIGEST is not library/'s digest: `library.py digest '{}'` writes it")
-    os.makedirs(args.out, exist_ok=True)
-    out = os.path.join(args.out, f"library-{digest}.tar.xz")
+def archive_tree(root, name, out_dir):
+    """<out_dir>/<name>-<digest>.tar.xz of the tree at `root` (whose DIGEST says `digest`), its one
+    top directory `name`, every entry owned by root with mtime 0, so the same tree is the same
+    bytes wherever it is made."""
+    digest = open(os.path.join(root, "DIGEST")).read().strip()
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"{name}-{digest}.tar.xz")
 
     def tidy(info):
         info.uid = info.gid = 0
@@ -405,19 +417,291 @@ def do_archive(args):
         return info
 
     with tarfile.open(out + ".part", "w:xz", preset=9) as tar:
-        for dir, subdirs, names in os.walk(LIBRARY):
+        for dir, subdirs, names in os.walk(root):
             subdirs.sort()
-            rel = os.path.relpath(dir, ROOT).replace(os.sep, "/")
+            rel = os.path.relpath(dir, root).replace(os.sep, "/")
+            rel = name if rel == "." else f"{name}/{rel}"
             tar.add(dir, arcname=rel, recursive=False, filter=tidy)
-            for name in sorted(names + [d for d in subdirs if os.path.islink(os.path.join(dir, d))]):
-                tar.add(os.path.join(dir, name), arcname=f"{rel}/{name}", recursive=False, filter=tidy)
+            for entry in sorted(names + [d for d in subdirs if os.path.islink(os.path.join(dir, d))]):
+                tar.add(os.path.join(dir, entry), arcname=f"{rel}/{entry}", recursive=False, filter=tidy)
     os.replace(out + ".part", out)
-    print(out)
+    return digest, out
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else toml_string(key)
+
+
+def toml_string(text):
+    # JSON's escapes are TOML's basic string's; DEL is the one control character JSON leaves raw.
+    return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def toml_value(value, where):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(it, where) for it in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_value(v, f'{where}.{k}')}" for k, v in value.items()) + " }"
+    sys.exit(f"library.py: {where} is a {type(value).__name__}, which the staged bstd's manifests do not write")
+
+
+def table_like(value):
+    return isinstance(value, dict) and any(isinstance(v, dict) or (isinstance(v, list) and v and all(isinstance(i, dict) for i in v))
+                                           for v in value.values())
+
+
+def toml_text(doc):
+    """`doc` (what tomllib reads) as TOML: each table's plain keys, then its tables, a table of
+    plain values inline once inside a section."""
+    lines = []
+
+    def section(table, path):
+        plain = [(k, v) for k, v in table.items()
+                 if not (isinstance(v, dict) and (not path or table_like(v)))
+                 and not (isinstance(v, list) and v and all(isinstance(i, dict) for i in v))]
+        if path and (plain or not table):
+            lines.append(f"\n[{'.'.join(toml_key(p) for p in path)}]")
+        for k, v in plain:
+            lines.append(f"{toml_key(k)} = {toml_value(v, '.'.join(path + [k]))}")
+        for k, v in table.items():
+            if isinstance(v, dict) and (not path or table_like(v)):
+                section(v, path + [k])
+            elif isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
+                for item in v:
+                    lines.append(f"\n[[{'.'.join(toml_key(p) for p in path + [k])}]]")
+                    for ik, iv in item.items():
+                        lines.append(f"{toml_key(ik)} = {toml_value(iv, '.'.join(path + [k, ik]))}")
+
+    section(doc, [])
+    return "\n".join(lines).lstrip("\n") + "\n"
+
+
+def tracked(rel):
+    """The files git tracks under `rel` (relative to ROOT), relative to ROOT."""
+    listed = out("ls-files", "-z", "--", rel)
+    return sorted(it for it in listed.split("\0") if it)
+
+
+def dep_tables(manifest):
+    """Each dependency table of a manifest a build of its library reads: `dependencies` and
+    `build-dependencies`, top-level and per target."""
+    tables = [manifest.get("dependencies", {}), manifest.get("build-dependencies", {})]
+    for target in manifest.get("target", {}).values():
+        tables += [target.get("dependencies", {}), target.get("build-dependencies", {})]
+    return tables
+
+
+def stage_bstd(into):
+    """The bstd tree (see the module's `archive`) staged at `into`; returns its directory."""
+    root_manifest = tomllib.load(open(os.path.join(ROOT, "Cargo.toml"), "rb"))
+    workspace = root_manifest["workspace"]
+    shared = workspace.get("dependencies", {})
+    excluded = [os.path.normpath(it) for it in workspace.get("exclude", [])]
+    patched = {name: os.path.normpath(spec["path"])
+               for table in root_manifest.get("patch", {}).values()
+               for name, spec in table.items() if isinstance(spec, dict) and "path" in spec}
+
+    # The crates bstd's library may reach by path (and every [patch] crate, with what it names
+    # by path), each with the names of the packages its library and build script read.
+    members, outside, used_shared, reads, unread = {}, {}, {}, {}, {}
+    todo = ["crates/blaze-std", *patched.values()]
+    while todo:
+        rel = todo.pop()
+        if rel in members or rel in outside:
+            continue
+        path = os.path.join(ROOT, rel, "Cargo.toml")
+        if not os.path.isfile(path):
+            sys.exit(f"library.py: bstd's graph names {rel}, which has no Cargo.toml")
+        manifest = tomllib.load(open(path, "rb"))
+        is_member = not any(rel == it or rel.startswith(it + "/") for it in excluded)
+        (members if is_member else outside)[rel] = manifest
+        names = set()
+        for table in dep_tables(manifest):
+            for key, spec in table.items():
+                spec = spec if isinstance(spec, dict) else {"version": spec}
+                if spec.get("workspace"):
+                    if not is_member:
+                        # An error only if the graph reaches it (below).
+                        unread[manifest["package"]["name"]] = f"{rel} is outside the workspace and names `{key}.workspace`"
+                        continue
+                    used_shared.setdefault(rel, set()).add(key)
+                    spec = {**(shared[key] if isinstance(shared[key], dict) else {"version": shared[key]}), **spec}
+                    if "path" in spec:
+                        todo.append(os.path.normpath(spec["path"]))
+                elif "path" in spec:
+                    todo.append(os.path.normpath(os.path.join(rel, spec["path"])))
+                names.add(spec.get("package", key))
+        reads[manifest["package"]["name"]] = names
+    by_name = {m["package"]["name"]: rel for rel, m in {**members, **outside}.items()}
+
+    # The lock's graph from those crates: each one's lock entry keeps the dependencies its
+    # library reads; every other package keeps its own.
+    text = open(os.path.join(ROOT, "Cargo.lock"), "rb").read()
+    lock = tomllib.loads(text.decode())
+    packages = lock["package"]
+
+    def key_of(pkg):
+        return (pkg["name"], pkg["version"], pkg.get("source"))
+
+    def resolve(spec, where):
+        parts = spec.split(" ")
+        found = [p for p in packages if p["name"] == parts[0]
+                 and (len(parts) < 2 or p["version"] == parts[1])
+                 and (len(parts) < 3 or p.get("source") == parts[2].strip("()"))]
+        if len(found) != 1:
+            sys.exit(f"library.py: Cargo.lock's {where} names `{spec}`, which is {len(found)} of its packages")
+        return found[0]
+
+    kept, todo = {}, [p for p in packages if p.get("source") is None and p["name"] == "blaze-std"]
+    while todo:
+        pkg = todo.pop()
+        if key_of(pkg) in kept:
+            continue
+        deps = pkg.get("dependencies", [])
+        if pkg.get("source") is None and pkg["name"] in reads:
+            deps = [d for d in deps if d.split(" ")[0] in reads[pkg["name"]]]
+        kept[key_of(pkg)] = (pkg, [resolve(d, pkg["name"]) for d in deps])
+        todo += kept[key_of(pkg)][1]
+    # Only what the lock reaches from blaze-std: a crate of the walk it does not reach (an
+    # optional dependency nothing turns on, a [patch] of a package outside the graph) is none
+    # of bstd's tree.
+    reached = {pkg["name"] for pkg, _ in kept.values() if pkg.get("source") is None}
+    if "blaze-std" not in reached:
+        sys.exit("library.py: Cargo.lock has no package blaze-std")
+    for name in sorted(reached):
+        if name in unread:
+            sys.exit(f"library.py: bstd's graph has {name}: {unread[name]}")
+        if name not in by_name:
+            sys.exit(f"library.py: Cargo.lock's bstd graph has the path package {name}, which neither bstd's crates nor a [patch] name by path")
+    path_dirs = sorted({by_name[name] for name in reached})
+
+    # The files, at the paths they have here.
+    tree = os.path.join(into, "bstd")
+    for rel in path_dirs:
+        for file in tracked(rel):
+            inside = os.path.relpath(file, rel).replace(os.sep, "/")
+            if rel in members and inside.split("/")[0] in ("tests", "benches", "examples"):
+                continue
+            src, dst = os.path.join(ROOT, file), os.path.join(tree, file)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.islink(src):
+                os.symlink(os.readlink(src), dst)
+            else:
+                shutil.copy2(src, dst)
+
+    # Each member's manifest as its library is built: no dev-dependencies, tests, benches or
+    # examples.
+    for rel in path_dirs:
+        if rel not in members:
+            continue
+        manifest = dict(members[rel])
+        for drop in ("dev-dependencies", "test", "bench", "example"):
+            manifest.pop(drop, None)
+        if "target" in manifest:
+            manifest["target"] = {cfg: {k: v for k, v in t.items() if k != "dev-dependencies"}
+                                  for cfg, t in manifest["target"].items()}
+        manifest["package"] = {**manifest["package"], "autotests": False, "autobenches": False, "autoexamples": False}
+        open(os.path.join(tree, rel, "Cargo.toml"), "w").write(toml_text(manifest))
+
+    names = {pkg["name"] for pkg, _ in kept.values()}
+    ws = {"members": [rel for rel in path_dirs if rel in members],
+          "exclude": [rel for rel in path_dirs if rel not in members]}
+    if not ws["exclude"]:
+        del ws["exclude"]
+    if "resolver" in workspace:
+        ws["resolver"] = workspace["resolver"]
+    if "package" in workspace:
+        ws["package"] = workspace["package"]
+    used = set().union(*(used_shared.get(rel, set()) for rel in path_dirs))
+    ws["dependencies"] = {k: v for k, v in shared.items() if k in used}
+    if "lints" in workspace:
+        ws["lints"] = workspace["lints"]
+    top = {"workspace": ws}
+    if "profile" in root_manifest:
+        top["profile"] = {name_: {k: ({p: v2 for p, v2 in v.items() if p == "*" or p in names} if k == "package" else v)
+                                  for k, v in profile.items()}
+                          for name_, profile in root_manifest["profile"].items()}
+    patches = {}
+    for registry, table in root_manifest.get("patch", {}).items():
+        kept_patches = {k: v for k, v in table.items() if k in reached}
+        if kept_patches:
+            patches[registry] = kept_patches
+    if patches:
+        top["patch"] = patches
+    open(os.path.join(tree, "Cargo.toml"), "w").write(toml_text(top))
+
+    # The lock of just that graph, in the lock's own order, as cargo writes one: a dependency
+    # says its version only when the graph has two of its name, and its source only when two
+    # of that version.
+    graph = [kept[key_of(p)] for p in packages if key_of(p) in kept]
+    count = {}
+    for pkg, _ in graph:
+        count[pkg["name"]] = count.get(pkg["name"], 0) + 1
+        count[(pkg["name"], pkg["version"])] = count.get((pkg["name"], pkg["version"]), 0) + 1
+    lines = ["# This file is automatically @generated by Cargo.", "# It is not intended for manual editing.",
+             f"version = {lock['version']}"]
+    for pkg, deps in graph:
+        lines += ["", "[[package]]", f"name = {toml_string(pkg['name'])}", f"version = {toml_string(pkg['version'])}"]
+        if pkg.get("source"):
+            lines.append(f"source = {toml_string(pkg['source'])}")
+        if pkg.get("checksum"):
+            lines.append(f"checksum = {toml_string(pkg['checksum'])}")
+        if deps:
+            lines.append("dependencies = [")
+            for dep in sorted(deps, key=key_of_sortable):
+                said = dep["name"]
+                if count[dep["name"]] > 1:
+                    said += f" {dep['version']}"
+                    if count[(dep["name"], dep["version"])] > 1:
+                        said += f" ({dep['source']})"
+                lines.append(f" {toml_string(said)},")
+            lines.append("]")
+    open(os.path.join(tree, "Cargo.lock"), "w").write("\n".join(lines) + "\n")
+    return tree
+
+
+def key_of_sortable(pkg):
+    return (pkg["name"], pkg["version"], pkg.get("source") or "")
+
+
+def do_archive(args):
+    if args.tree == "library":
+        digest = open(DIGEST).read().strip()
+        if digest_of(LIBRARY) != digest:
+            sys.exit("library.py: library/DIGEST is not library/'s digest: `library.py digest '{}'` writes it")
+        digest, out_path = archive_tree(LIBRARY, "library", args.out)
+    elif args.tree == "bstd":
+        with tempfile.TemporaryDirectory(prefix="blaze-bstd-") as staging:
+            tree = stage_bstd(staging)
+            open(os.path.join(tree, "DIGEST"), "w").write(digest_of(tree) + "\n")
+            digest, out_path = archive_tree(tree, "bstd", args.out)
+    else:
+        sys.exit(f"library.py: `tree` is `{args.tree}`: the shipped trees are `library` and `bstd`")
+    print(f"digest={digest}")
+    print(f"archive={out_path}")
+
+
+def do_check(args):
+    kept = open(DIGEST).read().strip() if os.path.isfile(DIGEST) else None
+    now = digest_of(LIBRARY)
+    if kept != now:
+        sys.exit(f"library.py: library/DIGEST is stale: it says {kept}, and library/ is {now}: "
+                 "run `uv run --frozen python harness/library.py digest '{}'` and commit it")
+    # Said, so that a reader of the last line sees that the check ran and what it held.
+    print(f"library.py: library/DIGEST is the digest of library/ ({now})")
 
 
 def main():
     commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "snapshot": (Empty, do_snapshot),
-                "digest": (Empty, do_digest),
+                "digest": (Empty, do_digest), "check": (Empty, do_check),
                 "archive": (Archive, do_archive)}
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in commands:
         sys.exit(f"usage: library.py {{{'|'.join(commands)}}} '<json>'\n\n{__doc__}")

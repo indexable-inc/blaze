@@ -78,6 +78,9 @@ pub const SYMBOLS: &[Symbol] = &[
     public(c"os_unfair_lock_unlock", "its unlock"),
     public(c"clonefile", "`Effect::Clone` by path: a copy-on-write clone on APFS"),
     public(c"fclonefileat", "`Effect::Clone` from an open file to a name beneath a directory"),
+    public(c"lseek", "`Effect::CopyData` and `Effect::Prewarm`: `SEEK_DATA` (4) and `SEEK_HOLE` (3) find the data extents"),
+    public(c"pread", "`Effect::CopyData`: one extent read into the driver's one bounded buffer"),
+    public(c"pwrite", "`Effect::CopyData`: that buffer written at the same offset of the new file"),
     public(
         c"fcopyfile",
         "`copy_to` between open files (`COPYFILE_DATA`); never where a clone was asked for",

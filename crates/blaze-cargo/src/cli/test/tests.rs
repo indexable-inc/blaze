@@ -1,6 +1,8 @@
 use std::{ffi::OsString, io, path::Path};
 
 use blaze_api::{Artifact, ArtifactKind, TestOutcome, TestResult, Unbuilt};
+use blaze_core::exit::Exit;
+use blaze_screen::Tally;
 
 use super::*;
 use crate::cli::{
@@ -9,18 +11,32 @@ use crate::cli::{
     say::Ended,
 };
 
-/// Ends each executable as `ends` says by its file name, and the rest with 0.
+/// Ends each executable as `ends` says by its file name, and the rest with 0. Each says it
+/// ran one test, which its exit status is the verdict of, unless `counts` is what every one
+/// says it ran; `names` is what each lists.
 #[derive(Default)]
 pub(crate) struct Fake {
     pub ends: Vec<(&'static str, Ended)>,
     pub ran: Vec<Exec>,
+    pub counts: Option<Tally>,
+    pub names: Vec<&'static str>,
+    pub listed: Vec<Exec>,
 }
 
 impl Programs for Fake {
-    fn run(&mut self, exec: &Exec) -> io::Result<Ended> {
+    fn run(&mut self, exec: &Exec, _harness: bool) -> io::Result<Ran> {
         self.ran.push(exec.clone());
         let name = exec.program.file_name().unwrap().to_str().unwrap().to_owned();
-        Ok(self.ends.iter().find(|(it, _)| *it == name).map_or(Ended::Code(0), |(_, ended)| *ended))
+        let ended =
+            self.ends.iter().find(|(it, _)| *it == name).map_or(Ended::Code(0), |(_, ended)| *ended);
+        let ok = ended.success();
+        let one = Tally { passed: u32::from(ok), failed: u32::from(!ok), ..Tally::default() };
+        Ok(Ran { ended, counts: Some(self.counts.unwrap_or(one)) })
+    }
+
+    fn names(&mut self, exec: &Exec) -> io::Result<Vec<String>> {
+        self.listed.push(exec.clone());
+        Ok(self.names.iter().map(|it| (*it).to_owned()).collect())
     }
 
     /// No daemon: every program runs its file.
@@ -60,8 +76,30 @@ fn speaking() -> Speaking<'static> {
 
 fn tested(asked: &Invocation, fake: &mut Fake, speaking: Speaking<'_>) -> (i32, String) {
     let mut err = Vec::new();
-    let code = run(asked, &built(), &[], 1, speaking, &mut err, fake).unwrap();
+    let code = run(asked, &built(), &[], 1, speaking, &mut err, fake, &mut Tally::default()).unwrap();
     (code, String::from_utf8(err).unwrap())
+}
+
+/// A whole run as the command does it: the executables, then the run's end ([`conclude`]).
+/// The exit code, the run's counts, stdout and stderr.
+fn concluded(asked: &Invocation, fake: &mut Fake, speaking: Speaking<'_>) -> (i32, Tally, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut tally = Tally::default();
+    let built = built();
+    let code = run(asked, &built, &[], 1, speaking, &mut err, fake, &mut tally).unwrap();
+    let code = conclude(
+        &Selection::of(asked),
+        &tally,
+        code,
+        true,
+        std::time::Duration::from_millis(12),
+        || names_of(&built, fake),
+        speaking,
+        &mut out,
+        &mut err,
+    )
+    .unwrap();
+    (code, tally, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
 }
 
 #[test]
@@ -81,6 +119,7 @@ fn rerun_names_the_package_as_cargos_needs_spec_flag_does() {
         speaking(),
         &mut err,
         &mut fake,
+        &mut Tally::default(),
     )
     .unwrap();
     assert_eq!(code, 101);
@@ -200,9 +239,19 @@ fn the_end_lists_each_test_that_never_built_and_what_held_it_back() {
     ];
     let mut fake = Fake { ends: vec![("x-4567", Ended::Code(101))], ..Fake::default() };
     let mut err = Vec::new();
-    let code =
-        run(&asked(Command::Test, &[]), &built(), &unbuilt, 1, speaking(), &mut err, &mut fake)
-            .unwrap();
+    let mut tally = Tally::default();
+    let code = run(
+        &asked(Command::Test, &[]),
+        &built(),
+        &unbuilt,
+        1,
+        speaking(),
+        &mut err,
+        &mut fake,
+        &mut tally,
+    )
+    .unwrap();
+    assert_eq!((tally.unbuilt, tally.binaries, tally.passed, tally.failed), (2, 4, 3, 1));
     let err = String::from_utf8(err).unwrap();
     assert_eq!(code, 101);
     assert_eq!(fake.ran.len(), 4, "{err}");
@@ -224,6 +273,7 @@ fn the_end_lists_each_test_that_never_built_and_what_held_it_back() {
         speaking(),
         &mut err,
         &mut Fake::default(),
+        &mut Tally::default(),
     )
     .unwrap();
     let err = String::from_utf8(err).unwrap();
@@ -255,6 +305,7 @@ fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
         speaking(),
         &mut err,
         &mut Fake::default(),
+        &mut Tally::default(),
     )
     .unwrap();
     assert_eq!(code, 0);
@@ -262,8 +313,17 @@ fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
 
     let mut err = Vec::new();
     let verbose = Speaking { verbose: 1, ..speaking() };
-    run(&asked(Command::Test, &[]), &[doc], &[], 1, verbose, &mut err, &mut Fake::default())
-        .unwrap();
+    run(
+        &asked(Command::Test, &[]),
+        &[doc],
+        &[],
+        1,
+        verbose,
+        &mut err,
+        &mut Fake::default(),
+        &mut Tally::default(),
+    )
+    .unwrap();
     assert_eq!(
         String::from_utf8(err).unwrap(),
         "   Doc-tests my-lib\n     Running `/w/target/debug/deps/my_lib-doctests`\n"
@@ -478,4 +538,335 @@ fn reached_results_of_executables_interleaved_by_their_first_and_in_the_order_th
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert!(reached(&[], speaking(), &mut out, &mut err).unwrap());
     assert!(out.is_empty() && err.is_empty());
+}
+
+/// libtest's result line in each form it has: pretty and terse (the `ok` coloured or not), a
+/// failed suite, a bench's, the JSON format's, and blaze's own of `--reached`.
+#[test]
+fn libtests_result_line_is_read_in_every_format() {
+    let seven = Tally { passed: 7, failed: 1, ignored: 2, filtered_out: 30, ..Tally::default() };
+    for line in [
+        "test result: FAILED. 7 passed; 1 failed; 2 ignored; 0 measured; 30 filtered out; finished in 0.31s",
+        "test result: \x1b[31mFAILED\x1b[0m. 7 passed; 1 failed; 2 ignored; 0 measured; 30 filtered out; finished in 0.31s",
+        "  test result: FAILED. 7 passed; 1 failed; 2 ignored; 0 measured; 30 filtered out; 4 unreached; finished in 0.31s\r",
+        r#"{ "type": "suite", "event": "failed", "passed": 7, "failed": 1, "ignored": 2, "measured": 0, "filtered_out": 30, "exec_time": 0.31 }"#,
+    ] {
+        assert_eq!(counts_of(line), Some(seven), "{line}");
+    }
+    assert_eq!(
+        counts_of("test result: ok. 0 passed; 0 failed; 0 ignored; 3 measured; 0 filtered out; finished in 2.10s"),
+        Some(Tally { measured: 3, ..Tally::default() })
+    );
+    for line in [
+        "running 7 tests",
+        "test a::b ... ok",
+        "test result: ok.",
+        "test result: ok. 7 passed; 1 failed",
+        "the test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        r#"{ "type": "suite", "event": "started", "test_count": 7 }"#,
+        r#"{ "type": "test", "event": "ok", "name": "a" }"#,
+        r#"{ "type": "suite", "event": "ok", "passed": 7 }"#,
+        "{ not json",
+    ] {
+        assert_eq!(counts_of(line), None, "{line}");
+    }
+}
+
+/// The result lines are found whatever chunks the output comes in, the last line with or
+/// without its newline; a line too long to be one is none, and does not hide the next.
+#[test]
+fn the_scan_finds_result_lines_across_any_chunks() {
+    let line = "test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 5 filtered out; finished in 0.00s";
+    let long = "x".repeat(3 * LINE);
+    let text = format!("running 4 tests\n{long}\n{line}\ntest a ... ok\n{long}{line}\n\n{line}");
+    for size in [1, 2, 7, 64, 4096, text.len()] {
+        let mut scan = Scan::default();
+        let mut found = Vec::new();
+        for chunk in text.as_bytes().chunks(size) {
+            scan.feed(chunk, &mut |tally| found.push(tally));
+        }
+        scan.end(&mut |tally| found.push(tally));
+        let one = Tally { passed: 3, ignored: 1, filtered_out: 5, ..Tally::default() };
+        assert_eq!(found, [one, one], "in chunks of {size}: the line after a long line's start is part of it");
+    }
+}
+
+/// What each executable's counts are in the run's: its result lines' sum; a failure of its own
+/// when it ended badly with no failing test; none for a libtest executable that printed no
+/// result line; one test by its exit status for any other executable.
+#[test]
+fn an_executables_counts_in_the_runs() {
+    let said = Tally { passed: 2, filtered_out: 9, ..Tally::default() };
+    assert_eq!(counted(Some(said), true, true), Tally { binaries: 1, ..said });
+    assert_eq!(counted(Some(said), false, true), Tally { binaries: 1, failed: 1, ..said });
+    assert_eq!(counted(None, true, true), Tally { binaries: 1, ..Tally::default() });
+    assert_eq!(counted(None, false, true), Tally { binaries: 1, failed: 1, ..Tally::default() });
+    assert_eq!(counted(None, true, false), Tally { binaries: 1, passed: 1, ..Tally::default() });
+    assert_eq!(counted(None, false, false), Tally { binaries: 1, failed: 1, ..Tally::default() });
+}
+
+#[test]
+fn the_selection_reads_the_filters_and_what_runs_nothing() {
+    let it = Selection::of(&asked(
+        Command::Test,
+        &["-p", "foo", "adds", "--", "--skip", "slow", "--exact", "wrong", "--test-threads", "2"],
+    ));
+    assert_eq!(it.typed, "blaze test -p foo adds -- --skip slow --exact wrong --test-threads 2");
+    assert_eq!(it.filters, ["adds", "wrong"], "a value of libtest's is no filter");
+    assert!(!it.lists && !it.pass && !it.reached);
+    assert!(Selection::of(&asked(Command::Test, &["--no-run"])).lists);
+    assert!(Selection::of(&asked(Command::Test, &["--", "--list"])).lists);
+    assert!(Selection::of(&asked(Command::Bench, &["--", "--help"])).lists);
+    assert!(Selection::of(&asked(Command::Test, &["--no-tests", "pass"])).pass);
+    assert!(!Selection::of(&asked(Command::Test, &["--no-tests=fail"])).pass);
+    assert!(Selection::of(&asked(Command::Bench, &["--no-tests=pass"])).pass);
+    assert!(Selection::of(&asked(Command::Test, &["--reached"])).reached);
+}
+
+/// What a command's exit code may be for a run's counts: 0 only when a test ran, or the
+/// command said a run of none is meant.
+fn a_pass_is_of_something(selection: &Selection, tally: &Tally, code: i32) -> bool {
+    code != 0
+        || tally.ran() > 0
+        || selection.lists
+        || selection.pass
+        || (selection.reached && tally.unreached > 0)
+}
+
+/// Every selection and every small tally: each count 0, 1 or 3.
+fn every_run() -> Vec<(Selection, Tally)> {
+    let mut runs = Vec::new();
+    let selections = [
+        Selection { typed: "blaze test".into(), ..Selection::default() },
+        Selection { typed: "blaze test nope".into(), filters: vec!["nope".into()], ..Selection::default() },
+        Selection { typed: "blaze test --no-run".into(), lists: true, ..Selection::default() },
+        Selection { typed: "blaze test".into(), pass: true, ..Selection::default() },
+        Selection { typed: "blaze test".into(), reached: true, ..Selection::default() },
+    ];
+    let counts = [0, 1, 3];
+    for selection in &selections {
+        for binaries in counts {
+            for passed in counts {
+                for failed in counts {
+                    for ignored in counts {
+                        for filtered_out in counts {
+                            for unreached in counts {
+                                for unbuilt in [0, 1] {
+                                    let tally = Tally {
+                                        binaries,
+                                        passed,
+                                        failed,
+                                        ignored,
+                                        measured: 0,
+                                        filtered_out,
+                                        unreached,
+                                        unbuilt,
+                                    };
+                                    runs.push((selection.clone(), tally));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    runs
+}
+
+/// The invariant: a `test` or `bench` that exits 0 ran at least one test, unless its command
+/// line says a run of none is meant (`--no-run`, `--list`, `--no-tests pass`, or `--reached`
+/// with tests selected and unreached). Checked for every selection and small tally, through
+/// [`conclude`], with the exit code the executables gave: cargo's (0 unless one failed or
+/// never built).
+#[test]
+fn a_run_that_exits_0_ran_a_test_or_was_told_none_is_fine() {
+    for (selection, tally) in every_run() {
+        let cargos = if tally.failed > 0 || tally.unbuilt > 0 { 101 } else { 0 };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = conclude(
+            &selection,
+            &tally,
+            cargos,
+            true,
+            std::time::Duration::ZERO,
+            Names::default,
+            speaking(),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(a_pass_is_of_something(&selection, &tally, code), "{selection:?} {tally:?}: {code}\n{err}");
+        // A run that failed keeps its code; only a pass of nothing becomes a refusal.
+        assert!(code == cargos || (cargos == 0 && code == Exit::NoTests.code()), "{selection:?} {tally:?}");
+        // And every run that says anything says its counts, with the verdict the code has.
+        if !selection.lists {
+            let word = if code == 0 { "ok" } else { "failed" };
+            let line = format!("blaze: tests {word} selected={} ran={} ", tally.selected(), tally.ran());
+            assert!(err.contains(&line), "{selection:?} {tally:?}: {err}");
+            assert_eq!(err.contains("error: no test ran"), code == Exit::NoTests.code(), "{err}");
+        }
+    }
+}
+
+/// The planted bug: cargo's and libtest's rule, 0 whenever nothing failed. The oracle of the
+/// test above refuses it, on the run this whole rule exists for: a filter that matched none.
+#[test]
+fn the_oracle_catches_a_run_of_none_that_exits_0() {
+    let caught: Vec<(Selection, Tally)> = every_run()
+        .into_iter()
+        .filter(|(selection, tally)| {
+            let cargos = if tally.failed > 0 || tally.unbuilt > 0 { 101 } else { 0 };
+            !a_pass_is_of_something(selection, tally, cargos)
+        })
+        .collect();
+    let filtered = Tally { binaries: 3, filtered_out: 3, ..Tally::default() };
+    assert!(
+        caught.iter().any(|(selection, tally)| selection.filters == ["nope"] && *tally == filtered),
+        "the oracle passes `blaze test nope` with every test filtered out and exit 0"
+    );
+    assert!(caught.iter().all(|(_, tally)| tally.ran() == 0));
+}
+
+/// The instance (agents.json A39): a name filter that matches no test. Every executable says
+/// `0 passed; 5 filtered out` and exits 0, which cargo reports as a pass. blaze refuses it
+/// with a code of its own, names the filter and the nearest tests that exist, and its last
+/// line and its JSON say that nothing ran.
+#[test]
+fn a_filter_that_matches_no_test_is_refused_naming_it_and_the_nearest_tests() {
+    let nothing = Tally { filtered_out: 5, ..Tally::default() };
+    let mut fake = Fake {
+        counts: Some(nothing),
+        names: vec!["tests::adds_wrong", "tests::subtracts", "parse::reads_a_number"],
+        ..Fake::default()
+    };
+    let asked = asked(Command::Test, &["adds_wrng"]);
+    let (code, tally, out, err) = concluded(&asked, &mut fake, speaking());
+    assert_eq!(code, Exit::NoTests.code());
+    assert_eq!(code, 4, "the number scripts read; nextest's for the same end");
+    assert_eq!((tally.selected(), tally.ran(), tally.filtered_out, tally.binaries), (0, 0, 20, 4));
+    assert_eq!(out, "");
+    assert!(
+        err.ends_with(
+            "error: no test ran: `blaze test adds_wrng` matched none of the 20 tests in 4 test executables\n\
+             note: the nearest that exist: tests::adds_wrong\n\
+             note: a run of no test is refused; `--no-tests pass` allows one, as cargo does\n\
+             blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 \
+             unreached=0 binaries=4 unbuilt=0 elapsed_ms=12 why=\"no test ran\"\n"
+        ),
+        "{err}"
+    );
+    // Each libtest executable was asked for its list, as the daemon would start it.
+    assert_eq!(fake.listed.len(), 3, "the three test executables, not the doc tests");
+    assert_eq!(fake.listed[0].args, LIST.map(OsString::from));
+
+    // The control, and what depends on cargo's behaviour: `--no-tests pass` is exit 0, and
+    // the line still says that nothing ran.
+    let mut fake = Fake { counts: Some(nothing), ..Fake::default() };
+    let allowed = self::asked(Command::Test, &["adds_wrng", "--no-tests", "pass"]);
+    let (code, _, _, err) = concluded(&allowed, &mut fake, speaking());
+    assert_eq!(code, 0);
+    assert!(err.ends_with("blaze: tests ok selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 unreached=0 binaries=4 unbuilt=0 elapsed_ms=12\n"), "{err}");
+    assert!(fake.listed.is_empty(), "nothing is listed for a run that is not refused");
+
+    // With a JSON `--message-format`, the same on stdout as one line of fields.
+    let mut fake = Fake { counts: Some(nothing), ..Fake::default() };
+    let (code, _, out, _) = concluded(&asked, &mut fake, Speaking { json: true, ..speaking() });
+    assert_eq!(code, 4);
+    assert_eq!(
+        out,
+        "{\"reason\":\"blaze-test-summary\",\"ok\":false,\"selected\":0,\"ran\":0,\"passed\":0,\"failed\":0,\
+         \"ignored\":0,\"measured\":0,\"filtered_out\":20,\"unreached\":0,\"binaries\":4,\"unbuilt\":0,\
+         \"elapsed_ms\":12,\"why\":\"no test ran\"}\n"
+    );
+}
+
+/// A run that ran tests ends as before, and its last line says how many: the filter that
+/// matched in one executable of four is a pass of that one.
+#[test]
+fn a_run_that_ran_tests_says_how_many() {
+    let mut fake = Fake::default();
+    let (code, tally, out, err) = concluded(&asked(Command::Test, &[]), &mut fake, speaking());
+    assert_eq!((code, out.as_str()), (0, ""));
+    assert_eq!((tally.selected(), tally.ran(), tally.binaries), (4, 4, 4));
+    assert!(err.ends_with("   Doc-tests foo\nblaze: tests ok selected=4 ran=4 passed=4 failed=0 ignored=0 measured=0 filtered_out=0 unreached=0 binaries=4 unbuilt=0 elapsed_ms=12\n"), "{err}");
+
+    // `-q` says errors only: no line for a pass, the refusal for a run of none.
+    let quiet = Speaking { quiet: true, ..speaking() };
+    let (code, _, _, err) = concluded(&asked(Command::Test, &["-q"]), &mut Fake::default(), quiet);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let mut fake = Fake { counts: Some(Tally { filtered_out: 2, ..Tally::default() }), ..Fake::default() };
+    let (code, _, _, err) = concluded(&asked(Command::Test, &["-q", "nope"]), &mut fake, quiet);
+    assert_eq!(code, 4);
+    assert!(err.starts_with("error: no test ran: `blaze test -q nope` matched none of the 8 tests"), "{err}");
+    assert!(!err.contains("blaze: tests"), "{err}");
+
+    // `--no-run` runs nothing on purpose and says nothing here.
+    let (code, tally, out, err) =
+        concluded(&asked(Command::Test, &["--no-run"]), &mut Fake::default(), speaking());
+    assert_eq!((code, tally.ran(), out.as_str()), (0, 0, ""));
+    assert!(!err.contains("blaze: tests") && !err.contains("no test ran"), "{err}");
+}
+
+/// What the refusal says for each way a run comes to nothing.
+#[test]
+fn the_refusal_names_why_nothing_ran() {
+    let typed = |words: &[&str]| Selection::of(&asked(Command::Test, words));
+    let no_names = Names::default;
+    let ignored = Tally { binaries: 1, ignored: 3, filtered_out: 9, ..Tally::default() };
+    let said = refusal(&typed(&["slow"]), &ignored, no_names).unwrap();
+    assert_eq!(said.what, "no test ran: every one of the 3 `blaze test slow` selected is ignored (`#[ignore]`)");
+    assert!(said.help[0].contains("--ignored"), "{said:?}");
+
+    let empty = Tally { binaries: 1, ..Tally::default() };
+    let said = refusal(&typed(&["-p", "foo"]), &empty, no_names).unwrap();
+    assert_eq!(said.what, "no test ran: `blaze test -p foo` selected 1 test executable, which holds no test");
+
+    let said = refusal(&typed(&["--doc"]), &Tally::default(), no_names).unwrap();
+    assert_eq!(said.what, "no test ran: `blaze test --doc` selected no test executable");
+
+    // No test near the filter: how many exist, and how to list them; and a listing that failed.
+    let filtered = Tally { binaries: 2, filtered_out: 40, ..Tally::default() };
+    let names = || Names {
+        names: vec!["a::b".to_owned(), "c::d".to_owned()],
+        unlisted: vec!["`/w/x --list`: exit status: 1".to_owned()],
+    };
+    let said = refusal(&typed(&["zzzzzzzz"]), &filtered, names).unwrap();
+    assert_eq!(
+        said.help,
+        [
+            "none of the 2 that exist is near it; `blaze test -- --list` lists them",
+            "could not be listed: `/w/x --list`: exit status: 1",
+            "a run of no test is refused; `--no-tests pass` allows one, as cargo does",
+        ]
+    );
+
+    // `--reached`: tests selected and none reached is that flag's answer; none selected is not.
+    let unreached = Tally { binaries: 1, unreached: 4, ..Tally::default() };
+    assert_eq!(refusal(&typed(&["--reached"]), &unreached, no_names), None);
+    assert!(refusal(&typed(&["--reached", "nope"]), &Tally::default(), no_names).is_some());
+    assert!(refusal(&typed(&[]), &unreached, no_names).is_some(), "only under `--reached`");
+}
+
+#[test]
+fn the_daemons_results_are_counted_by_outcome_and_executable() {
+    let results = [
+        result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, ""),
+        result("/w/target/debug/deps/foo-0123abcd", "b", TestOutcome::Failed, ""),
+        result("/w/target/debug/deps/foo-0123abcd", "c", TestOutcome::Unreached, ""),
+        result("/w/target/debug/deps/x-4567", "d", TestOutcome::Ignored, ""),
+    ];
+    assert_eq!(
+        tally_of(&results),
+        Tally { binaries: 2, passed: 1, failed: 1, ignored: 1, unreached: 1, ..Tally::default() }
+    );
+    assert_eq!(tally_of(&[]), Tally::default());
+}
+
+/// A libtest name listing, as `--list --format terse` prints it.
+#[test]
+fn the_names_of_a_terse_listing() {
+    let text = "tests::adds: test\ntests::fast: benchmark\n\n2 tests, 1 benchmarks\nsrc/lib.rs - add (line 3): test\n";
+    assert_eq!(listed(text), ["tests::adds", "tests::fast", "src/lib.rs - add (line 3)"]);
 }

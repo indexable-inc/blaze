@@ -472,7 +472,8 @@ pub fn proved(
     }
     if clause == Clause::Requires {
         return Err(not(
-            "a `requires` is proved where the function is called, and v0 lowers no call site's              obligation"
+            "a `requires` is proved where the function is called, and v0 lowers no call site's \
+             obligation"
                 .to_owned(),
         ));
     }
@@ -481,7 +482,8 @@ pub fn proved(
     match check(db, func, &proof, &config) {
         Ok(proved) => Ok(proved.key),
         Err(LeanError::NoProof { path, .. }) => Err(not(format!(
-            "there is no proof file {}: Lean checks the proof a person or an agent wrote and              searches for none itself",
+            "there is no proof file {}: Lean checks the proof a person or an agent wrote and \
+             searches for none itself",
             path.display()
         ))),
         Err(err) => Err(not(err.to_string())),

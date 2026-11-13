@@ -1,6 +1,7 @@
-//! Values filed by what a crate read, as an image is ([`super::serve`]): the names it read in
-//! the first free of the slots under a key ([`reads::slot`]), and the value under the key,
-//! those names and the values they had ([`reads::image_key`]). An image is filed so, and so are
+//! Values filed by what a crate read, as an image is ([`super::serve`]), in `blaze_record`'s
+//! form: the names it read as a read-list in the first free of the slots under a key
+//! ([`reads::slot`]), and the value under that list's bytes and the values the names had
+//! ([`reads::image_key`]). An image is filed so, and so are
 //! values made from a crate's bodies (`blaze_diagnostics::cache`, `hir_ty::check_cache`), whose
 //! reads ([`checked_reads`]) are the expansions of its bodies besides those its image covers.
 
@@ -11,7 +12,8 @@ use hir_expand::MacroCallId;
 use crate::{
     deps::{
         mode,
-        reads::{self, READS_DOMAIN, Reads, SLOTS},
+        image::ImageBuf,
+        reads::{self, READS_DOMAIN, Reads},
         serve::{ImageStore, Refused},
         signatures,
     },
@@ -152,25 +154,76 @@ pub fn file_by_reads(
     if reads.is_empty() {
         return Ok(Ok(key));
     }
-    let record = reads.encode();
-    if let Some(why) = keep_reads(db, krate, key, &record, store)? {
+    // alloc: the slot's bytes, once per crate kept
+    let mut list = Vec::new();
+    reads::write_list(&mut list, key, &reads.encode());
+    if let Some(why) = keep_reads(db, krate, key, &list, store)? {
         return Ok(Err(why));
     }
-    Ok(Ok(reads::image_key(key, &record, reads.values_then(db, krate))))
+    Ok(Ok(reads::image_key(&list, reads.values_then(db, krate))))
+}
+
+/// The driver's store as `blaze_record` reads and writes a crate key's read-lists: each under
+/// its own key. What is filed by reads is looked for by the caller, under a key it is given.
+/// `lookups` is where the searches through it are counted: its caller's, which reports them
+/// ([`super::Served::lookups`]).
+struct Slots<'a> {
+    // dyn: the driver's store, as `find_by_reads` and `file_by_reads` are handed it
+    store: &'a dyn ImageStore,
+    lookups: &'a blaze_record::Tally,
+}
+
+impl blaze_record::Store for Slots<'_> {
+    type Held = ImageBuf;
+    type Error = String;
+
+    fn get(&self, _: blaze_record::Kind, key: &ContentId) -> Result<Option<ImageBuf>, String> {
+        self.store.get(key)
+    }
+
+    fn put(&self, _: blaze_record::Kind, key: ContentId, bytes: &[u8]) -> Result<(), String> {
+        // alloc: the slot's bytes, once per crate kept
+        self.store.put(key, bytes.to_vec())
+    }
+
+    fn bytes(held: &ImageBuf) -> &[u8] {
+        held.bytes()
+    }
+
+    fn tally(&self) -> &blaze_record::Tally {
+        self.lookups
+    }
+}
+
+/// Why a search of a crate key's slots stopped: the chain's error, or what the search said.
+enum Stopped {
+    Chain(blaze_record::Error<String>),
+    Said(String),
+}
+
+impl From<blaze_record::Error<String>> for Stopped {
+    fn from(error: blaze_record::Error<String>) -> Stopped {
+        Stopped::Chain(error)
+    }
 }
 
 /// The first of `key`, then the filed key of each slot of `key` with its reads' values now, for
 /// which `found` gives `Some`: as [`super::serve`] looks for an image. `None` when none does. A
 /// slot that does not decode is an error naming the crate.
+///
+/// `lookups` counts the search of the slots (`blaze_record::walk`), for the caller to report:
+/// a value found under `key` alone is found before any slot is read and is no lookup there,
+/// and a slot's reads are one read of its list, valued as one hash.
 pub fn find_by_reads<T>(
     db: &Db,
     krate: Crate,
     key: ContentId,
     // dyn: the driver's store, one call per crate per session
     store: &dyn ImageStore,
+    lookups: &blaze_record::Tally,
     found: impl FnMut(ContentId) -> Result<Option<T>, String>,
 ) -> Result<Option<T>, String> {
-    Ok(search(db, krate, key, store, found)?.ok())
+    Ok(search(db, krate, key, store, lookups, found)?.ok())
 }
 
 /// [`find_by_reads`], and when nothing is found whether a slot of `key` holds reads: `Err(true)`
@@ -179,95 +232,122 @@ pub fn find_by_reads<T>(
 /// with the values found in the expansion log under `key` (`Files::expansions_are_read`), in
 /// place of what was served under `key` before: none when the value is under `key` alone or
 /// not found, so a value no longer served leaves no reads behind.
+///
+/// `lookups` counts the search of the slots (`blaze_record::walk`): a value found under `key`
+/// alone, the crate that read nothing, is found before any slot is read and is no lookup
+/// there. A slot's reads are one read of its list, valued as one hash ([`reads::write_list`]),
+/// so a read valued here is a whole set of names worked out again.
 pub(super) fn search<T>(
     db: &Db,
     krate: Crate,
     key: ContentId,
     // dyn: the driver's store, one call per crate per session
     store: &dyn ImageStore,
+    lookups: &blaze_record::Tally,
     mut found: impl FnMut(ContentId) -> Result<Option<T>, String>,
 ) -> Result<Result<T, bool>, String> {
     let served = |expansions: Vec<ExpansionRead>| {
         db.files().expansions_are_read(krate, ReadBy::Served(key), expansions);
     };
+    // The files outside the VFS a value was found by, as the crate's reads of them in place
+    // of the resolution that never runs (`Files::included_by`); none when it is under `key`
+    // alone or not found.
+    db.files().included_are_served(krate, Vec::new());
     if let Some(it) = found(key)? {
         served(Vec::new());
         return Ok(Ok(it));
     }
     let name = || krate.named(db);
-    let mut kept = false;
-    for n in 0..SLOTS {
-        let at = reads::slot(key, n);
-        let record = store.get(&at).map_err(|why| {
+    let slots = Slots { store, lookups };
+    let visit = |at: blaze_record::Slot,
+                 list: &[u8],
+                 opened: blaze_record::ListRef<'_>|
+     -> Result<Option<T>, Stopped> {
+        let n = at.n;
+        let reads = reads::listed(opened).and_then(Reads::decode);
+        let reads = reads.map_err(|why| {
             // alloc: error text
-            format!("reading the reads of crate {} (key {at:?}): {why}", name())
-        })?;
-        let Some(record) = record else { break };
-        let reads = Reads::decode(record.bytes()).map_err(|why| {
-            // alloc: error text
-            format!("the reads of crate {} in slot {n} of key {key:?}: {why}", name())
+            let why = format!("the reads of crate {} in slot {n} of key {key:?}: {why}", name());
+            Stopped::Said(why)
         })?;
         // alloc: a few names and hashes, once per slot read that holds expansions
         let mut expansions = Vec::new();
+        // The walk leaves the reads to its visitor: asked for here, whether or not they come.
+        lookups.valued(opened.len() as u64);
         let values = reads
             .values_now(db, krate, store, |shape, values| {
                 expansions.push(ExpansionRead::Traced { shape: shape.into(), values });
             })
             .map_err(|why| {
                 // alloc: error text
-                format!("the values of the reads of crate {} in slot {n}: {why}", name())
+                let why = format!("the values of the reads of crate {} in slot {n}: {why}", name());
+                Stopped::Said(why)
             })?;
-        if let Some(it) = found(reads::image_key(key, record.bytes(), values))? {
-            // The value stands in for resolving what read the variables and ran the
-            // expansions, which now never run: both logs have them as if they had, for what
-            // is keyed by them.
-            for name in reads.names().0 {
-                db.files().env_is_read(krate, name);
-            }
-            let closure = krate.transitive_deps(db);
-            for &at in reads.primary() {
-                if let Some(&by) = closure.get(at as usize) {
-                    db.files().env_is_read(by, base_db::PRIMARY_PACKAGE);
-                }
-            }
-            served(expansions);
-            return Ok(Ok(it));
+        let Some(it) = found(reads::image_key(list, values)).map_err(Stopped::Said)? else {
+            return Ok(None);
+        };
+        // The value stands in for resolving what read the variables and ran the
+        // expansions, which now never run: both logs have them as if they had, for what
+        // is keyed by them.
+        let files = reads.files_now(db).map_err(|why| {
+            // alloc: error text
+            let why = format!("the files of the reads of crate {} in slot {n}: {why}", name());
+            Stopped::Said(why)
+        })?;
+        db.files().included_are_served(krate, files);
+        for name in reads.names().0 {
+            db.files().env_is_read(krate, name);
         }
-        kept = true;
+        let closure = krate.transitive_deps(db);
+        for &at in reads.primary() {
+            if let Some(&by) = closure.get(at as usize) {
+                db.files().env_is_read(by, base_db::PRIMARY_PACKAGE);
+            }
+        }
+        served(expansions);
+        Ok(Some(it))
+    };
+    let walked = blaze_record::walk(&slots, reads::BOUNDS, &key, visit);
+    match walked {
+        Ok(blaze_record::Walked::Found { found, at: _ }) => Ok(Ok(found)),
+        // Whether a slot holds reads: something they read changed.
+        Ok(blaze_record::Walked::Passed { lists, full: _ }) => {
+            served(Vec::new());
+            Ok(Err(lists > 0))
+        }
+        Err(Stopped::Said(why)) => Err(why),
+        Err(Stopped::Chain(why)) => {
+            // alloc: error text
+            Err(format!("the reads of crate {} (key {key:?}): {why}", name()))
+        }
     }
-    served(Vec::new());
-    Ok(Err(kept))
 }
 
-/// Keeps `record`, the reads of `krate`, in the first slot of `key` that holds it or is free.
-/// Two writers that keep other reads in one slot at once each see the other's and move on.
+/// Keeps `list`, the read-list of the reads of `krate` ([`reads::write_list`]), in the first
+/// slot of `key` that holds it or is free. Two writers that keep other reads in one slot at
+/// once each see the other's and move on.
 fn keep_reads(
     db: &Db,
     krate: Crate,
     key: ContentId,
-    record: &[u8],
+    list: &[u8],
     // dyn: the driver's store, one call per crate kept
     store: &dyn ImageStore,
 ) -> Result<Option<Refused>, String> {
-    let error = |what: &str, why: String| {
-        // alloc: error text
-        format!("{what} the reads of crate {} (key {key:?}): {why}", krate.named(db))
-    };
-    for n in 0..SLOTS {
-        let at = reads::slot(key, n);
-        match store.get(&at).map_err(|why| error("reading", why))? {
-            Some(kept) if kept.bytes() == record => return Ok(None),
-            Some(_) => continue,
-            // alloc: the slot's bytes, once per crate kept
-            None => match store.put(at, record.to_vec()) {
-                Ok(()) => return Ok(None),
-                Err(why) => match store.get(&at).map_err(|why| error("reading", why))? {
-                    Some(kept) if kept.bytes() == record => return Ok(None),
-                    Some(_) => continue,
-                    None => return Err(error("keeping", why)),
-                },
-            },
+    use blaze_record::Placed;
+    // A placing is no lookup, so it has nothing to count and nobody to report to: checked,
+    // so a placing that came to count something is seen here and not let go.
+    let placing = blaze_record::Tally::new();
+    let slots = Slots { store, lookups: &placing };
+    let placed = blaze_record::Filing::new(key, reads::BOUNDS).place(&slots, list);
+    debug_assert_eq!(placing.take(), blaze_record::Counts::default(), "a placing was counted");
+    match placed {
+        Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(None),
+        // The chain's bound: counted and named by the driver as this refusal of the crate.
+        Ok(Placed::Full) => {
+            Ok(Some(Refused::Reads { why: "every slot of its key holds other reads" }))
         }
+        // alloc: error text
+        Err(why) => Err(format!("the reads of crate {} (key {key:?}): {why}", krate.named(db))),
     }
-    Ok(Some(Refused::Reads { why: "every slot of its key holds other reads" }))
 }

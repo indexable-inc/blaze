@@ -53,6 +53,14 @@ struct Function {
     /// One of its type arguments names a workspace type, closure or item
     /// ([`Described::over_editable`]); read only when it is not editable.
     over_editable: bool,
+    /// Its signature, as a byte: what its callers' code is compiled against, so in their code
+    /// and in its own [`Described::abi`]. 0 unless a test says, and then in no hash.
+    signature: u8,
+    /// The types its signature names, behind a reference or not: each one's layout is in
+    /// its [`Described::abi`] and, unless it also reads it, in no code.
+    names_layouts: Vec<u32>,
+    /// The types whose layout its body reads: each one's layout is in its code.
+    reads_layouts: Vec<u32>,
 }
 
 struct Program {
@@ -87,6 +95,13 @@ struct Program {
     /// What stands in for the front end's query engine, for the walk over kept describes
     /// (`tests/kept.rs`).
     engine: Engine,
+    /// The describes this front end keeps as records and reads back (`tests/recorded.rs`):
+    /// `None`, it keeps none ([`Frontend::record_key`]'s default).
+    shelf: Option<std::sync::Arc<recorded::Shelf>>,
+    /// The version of each type's layout, 0 unless set: what a function whose signature
+    /// names the type hands its callers ([`Described::abi`]) and one whose body reads it
+    /// compiles against.
+    layouts: HashMap<u32, u8>,
 }
 
 /// The front end's query engine, as [`Frontend::redescribe`] needs it: a revision an edit, the
@@ -178,6 +193,8 @@ impl Default for Program {
             limits: HashMap::default(),
             dyn_sites: HashMap::default(),
             engine: Engine::default(),
+            shelf: None,
+            layouts: HashMap::default(),
         }
     }
 }
@@ -192,7 +209,19 @@ impl Program {
         if function.code_of.is_none() {
             for callee in &function.calls {
                 code.update(&callee.to_le_bytes());
+                // A callee by its interface: its signature, where a test gave it one.
+                match self.functions.get(callee).map(|it| it.signature) {
+                    Some(signature) if signature != 0 => code.update(&[0xA5, signature]),
+                    _ => &mut code,
+                };
             }
+        }
+        if function.signature != 0 {
+            code.update(&[0x5A, function.signature]);
+        }
+        for layout in &function.reads_layouts {
+            code.update(&layout.to_le_bytes())
+                .update(&[0xC3, self.layouts.get(layout).copied().unwrap_or(0)]);
         }
         CodeHash(code.finish())
     }
@@ -269,8 +298,22 @@ impl Program {
             crates: self.crates.clone(),
             limits: self.limits.clone(),
             dyn_sites: self.dyn_sites.clone(),
+            layouts: self.layouts.clone(),
             ..Program::default()
         }
+    }
+
+    /// What callers of `id` assume of it: its signature and the version of each layout its
+    /// signature names, never its body or what it calls.
+    fn abi(&self, id: u32) -> ContentId {
+        let function = &self.functions[&id];
+        let mut abi = Hasher::new("blaze v2 test abi 1");
+        abi.update(&[function.signature]);
+        for layout in &function.names_layouts {
+            abi.update(&layout.to_le_bytes())
+                .update(&[self.layouts.get(layout).copied().unwrap_or(0)]);
+        }
+        abi.finish()
     }
 
     fn function(&mut self, id: u32, body: u8, calls: &[u32]) -> &mut Function {
@@ -289,6 +332,9 @@ impl Program {
             anchors: None,
             foreign: false,
             over_editable: false,
+            signature: 0,
+            names_layouts: Vec::new(),
+            reads_layouts: Vec::new(),
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -363,6 +409,9 @@ impl Frontend for Program {
                 "blaze v2 test identity 1",
                 &function.identity_of.unwrap_or(*id).to_le_bytes(),
             ),
+            // What its callers assume of it: its own signature byte and each layout its
+            // signature names, by the layout's version.
+            abi: self.abi(*id),
             bound: Ok(code.0),
             item: item(*id),
             code,
@@ -445,6 +494,30 @@ impl Frontend for Program {
 
     fn spell(&self, id: &u32) -> String {
         format!("f{id}")
+    }
+
+    fn record_key(&self, id: &u32, requester: &Origin) -> Option<blaze_cas::Key> {
+        self.shelf.as_ref()?.key(self, *id, requester)
+    }
+
+    fn from_record(
+        &self,
+        _: &u32,
+        _: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<u32, u32>, String> {
+        let shelf = self.shelf.as_ref().ok_or("a record given to a front end with no shelf")?;
+        shelf.read(bytes)
+    }
+
+    fn to_record(
+        &self,
+        id: &u32,
+        requester: &Origin,
+        described: &Described<u32, u32>,
+    ) -> Option<Vec<u8>> {
+        let shelf = self.shelf.as_ref()?;
+        Some(shelf.write(self.record_key(id, requester)?, described))
     }
 
     /// The kept describe holds when it was made at or after the last change of what a
@@ -1830,7 +1903,11 @@ mod folded;
 mod kept;
 mod later;
 mod masks;
+mod near;
+mod abis;
 mod pieces;
+mod recorded;
+mod start;
 mod stop;
 mod walk;
 
@@ -1920,6 +1997,154 @@ fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() 
         "{errors:?}"
     );
     assert_eq!(salted.emitted.load(Ordering::Relaxed), 0, "nothing landed is compiled again");
+}
+
+/// How many of [`Counting`]'s prepared functions are alive, and the most that were at once.
+#[derive(Default)]
+struct Alive {
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// One prepared function counted alive in its [`Alive`] until it is dropped.
+struct AliveOne(std::sync::Arc<Alive>);
+
+impl AliveOne {
+    fn new(alive: &std::sync::Arc<Alive>) -> AliveOne {
+        let now = alive.now.fetch_add(1, Ordering::SeqCst) + 1;
+        alive.most.fetch_max(now, Ordering::SeqCst);
+        // clone: a reference count, so the function's drop counts it in the backend's tally
+        AliveOne(alive.clone())
+    }
+}
+
+impl Drop for AliveOne {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// [`Machine`]'s prepared function, counted alive while it is held.
+struct Counted {
+    prepared: Prepared,
+    _alive: AliveOne,
+}
+
+/// [`Machine`] whose prepared functions count themselves alive ([`Alive`]): what a build holds
+/// of IR at once.
+#[derive(Default)]
+struct Counting {
+    machine: Machine,
+    alive: std::sync::Arc<Alive>,
+}
+
+impl Prepare for Counting {
+    type Frontend = Program;
+    type Prepared = Counted;
+    type Export = Exported;
+
+    fn prepare(
+        &self,
+        program: &Program,
+        unit: &Unit,
+        spec: &Spec,
+        id: &u32,
+        refs: &crate::template::Refs,
+    ) -> Result<(Shape, Counted), CodegenError> {
+        let (shape, prepared) = self.machine.prepare(program, unit, spec, id, refs)?;
+        Ok((shape, Counted { prepared, _alive: AliveOne::new(&self.alive) }))
+    }
+
+    fn summarize(
+        &self,
+        unit: &Unit,
+        spec: &Spec,
+        counted: &mut Counted,
+        refs: &crate::template::Refs,
+    ) -> Result<(Summary, Exported), CodegenError> {
+        self.machine.summarize(unit, spec, &mut counted.prepared, refs)
+    }
+
+    fn emit(
+        &self,
+        unit: &Unit,
+        spec: &Spec,
+        counted: Counted,
+        refs: &crate::template::Refs,
+        imports: Option<(&Imports, &[Import<'_, Exported>])>,
+    ) -> Result<Emitted, CodegenError> {
+        let Counted { prepared, _alive } = counted;
+        self.machine.emit(unit, spec, prepared, refs, imports)
+    }
+
+    fn masked(&self, unit: &Unit, counted: &Counted, refs: &crate::template::Refs) -> Option<Masked> {
+        self.machine.masked(unit, &counted.prepared, refs)
+    }
+
+    fn merge(
+        &self,
+        group: &Group,
+        _: Vec<(&Unit, &Spec, Counted, &crate::template::Refs)>,
+    ) -> Result<fold::Merged, CodegenError> {
+        Err(error(group.key(), item(0), "nothing folds here"))
+    }
+
+    fn compile_static(
+        &self,
+        program: &Program,
+        spec: &Spec,
+        id: &u32,
+        refs: &crate::template::Refs,
+    ) -> Result<Static, CodegenError> {
+        self.machine.compile_static(program, spec, id, refs)
+    }
+}
+
+/// The most prepared functions a cold folding build held at once, of `main` and the
+/// `candidates - 1` functions it calls, each of its own body: every one a fold candidate, none
+/// in a group, so each the store misses is compiled after all are masked. `keeps` plants
+/// [`plant::KEEPS_MADE`].
+fn most_held(candidates: u32, keeps: bool) -> usize {
+    let mut program = Program::default();
+    let calls: Vec<u32> = (2..candidates + 1).collect();
+    program.function(1, 0x11, &calls).symbol = Some("main".to_owned());
+    for &id in &calls {
+        program.function(id, 0x80 + (id - 2) as u8, &[]);
+    }
+    let counting = Counting::default();
+    plant::KEEPS_MADE.set(keeps);
+    let built = Build::new(&counting, &program, &folding_policy(), &Memo::new())
+        .run(&[(1, member())], &Store::default());
+    plant::KEEPS_MADE.set(false);
+    let built = built.unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(built.stats.instances, candidates as usize);
+    assert_eq!(counting.alive.now.load(Ordering::SeqCst), 0, "IR outlived its build");
+    counting.alive.most.load(Ordering::SeqCst)
+}
+
+/// The invariant: the most `B::Prepared` alive at once in a dev build that folds (a counting
+/// backend, [`Counting`]) is at most the pool's width (its workers and the calling thread,
+/// which helps while it waits), for 8 and for 64 fold candidates: a candidate's IR is let go
+/// as it is masked, and prepared again where it is compiled, so `dev_of` holds no IR of a
+/// function it is not compiling.
+///
+/// Control: [`plant::KEEPS_MADE`] keeps each candidate's IR until `dev_of` ends, as the map
+/// of prepared functions did: the most held grows with the candidates, to every one of them.
+#[test]
+fn dev_holds_no_ir_of_a_function_it_is_not_compiling() {
+    let width = blaze_graph::par::threads() + 1;
+    for candidates in [8, 64] {
+        let most = most_held(candidates, false);
+        assert!(
+            (1..=width).contains(&most),
+            "{most} prepared functions held at once of {candidates} candidates, on {width} threads"
+        );
+        let kept = most_held(candidates, true);
+        assert!(
+            kept >= candidates as usize,
+            "the control: with each candidate's IR kept, {kept} held at once of {candidates}"
+        );
+    }
 }
 
 /// A chain of `count` functions from 1, each calling the next, all of `body` and `drop_glue`.

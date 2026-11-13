@@ -1,0 +1,45 @@
+== 5000 ms
+ ▶ test (build script)  run build script    1.0s  ← 25 wait on it
+ ▶ core                 store               0.3s  ← 145 wait on it
+ building  ━━━━────────────────────  35/182 · 2 running · 5.0s
+== 10000 ms
+ ▶ calc  codegen    2.1s  ← 2 wait on it
+ ◦ paused: daemon at 7.6 of 81.5 GiB, waiting on 1 task: calc 0.1.0 lib (host)
+ building  ━━━━━━━━━━━━━━━━━━━━━━──  173/182 · 1 running · 10.0s
+== 14000 ms
+ ▶ calc  codegen    6.1s  ← 2 wait on it
+ ◦ 2 ready, all 30 cores busy
+ ◦ paused: daemon at 8.9 of 81.5 GiB, waiting on 1 task: calc 0.1.0 lib (host)
+ building  ━━━━━━━━━━━━━━━━━━━━━━──  173/182 · 1 running · 14.0s
+== 19000 ms
+ ▶ calc  codegen   11.1s  ← 2 wait on it
+ ◦ paused: daemon at 9.6 of 81.5 GiB, waiting on 1 task: calc 0.1.0 lib (host)
+ building  173/182 · 1 running · 19.0s ⚠ nothing finished for 10.9s
+== 23000 ms
+ ◦ paused: daemon at 89.4 of 81.5 GiB, waiting on 1 task: calc 0.1.0 test it (host)
+ testing  ━━━━━━━━━━━━━━━━━━━━━━━━  1/1 · 1 passed · 23.0s
+== 28000 ms
+✗ tests::adds_wrong  calc lib · <1ms
+  adding 2 and 2
+
+  thread 'tests::adds_wrong' (130627) panicked at src/lib.rs:8:59:
+  assertion `left == right` failed: sums are off
+    left: 4
+   right: 5
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+✓ built 33 units, 7 cached in 26.8s ·  · tier 0 · 29% optimized
+ ▶ calc lib        4/6 · 1 failed  tests::slow_one 2.2s  tests::slow_two 2.2s
+ ▶ calc it         1/2  slow_outside 1.1s
+ testing  ━━━━━━━━━━━━━━━━────────  6/9 · 4 passed · 1 failed · 1 ignored · 28.0s
+== end
+✗ tests::adds_wrong  calc lib · <1ms
+  adding 2 and 2
+
+  thread 'tests::adds_wrong' (130627) panicked at src/lib.rs:8:59:
+  assertion `left == right` failed: sums are off
+    left: 4
+   right: 5
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+✓ built 33 units, 7 cached in 26.8s ·  · tier 0 · 29% optimized
+✗ 8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered · 3 binaries · 31.8s (26.8s of it the build)
+  rerun: blaze test -p calc --lib

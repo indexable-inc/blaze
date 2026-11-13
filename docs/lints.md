@@ -16,10 +16,11 @@ The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `packable`, `pod_serializ
 `soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
 allowed unless a workspace or crate turns it on (`pedantic_perf = "warn"`; `vecreport`, which
 the release build reports, only by its flags). `checkfree`,
-`nopanic`, `noalloc`, `nonblocking` and `undeclared_effect` are in `blaze::general` but `deny` by
-default, and fire only where the code asks: on functions marked with their attribute
-(`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...), and for `undeclared_effect` where a
-`#[blaze::may(..)]` or `#![blaze::effects]` reaches the function.
+`nopanic`, `noalloc`, `nonblocking`, `undeclared_effect` and `unfulfilled_effect` are in
+`blaze::general` but `deny` by default, and fire only where the code asks: on functions marked
+with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...), for `undeclared_effect`
+where a `#[blaze::expect(..)]` or `#![blaze::effects]` reaches the function, and for
+`unfulfilled_effect` on a function's own `#[blaze::expect(..)]`.
 
 The group `blaze::edition` flags what the blaze edition removes
 ([the plan](v2/plan/design/edition.md)). Its lints here are those of code blaze cannot analyse:
@@ -38,6 +39,7 @@ table to the levels the lints have:
 | `blaze::proc_macro_attribute` | `allow` | reflection over the item and a generic function | the same switch |
 | `blaze::proc_macro_fn_like` | `warn` | a `const fn` or a `const` block; a macro that parses a foreign syntax may stay | now: `const fn` is Rust's |
 | `blaze::build_script_ambient` | `allow` | a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock`) | `CAPABILITIES_FOR_BUILD_SCRIPTS` is `true`: [blaze's standard library](v2/plan/design/std.md) is in the tree and a build script is handed its capabilities |
+| `blaze::not_latest_edition` | `allow` | `edition = "blaze-2026.11"` in the package's manifest | `EDITION_SHIPS` is `true`: bstd ships with blaze, so a package of [the edition](v2/plan/design/std.md#the-blaze-edition-opting-in) builds wherever blaze runs |
 | `blaze::std_use` | `allow` | what [bstd](v2/plan/design/std.md) has in place of each item of Rust's `std`, by [its table](#std_use) | never by default: a crate asks with `#![blaze::capabilities]`, and a workspace with a line of its `lints-when-ready` table, which holds once `BSTD_IN_TREE` is `true` |
 
 `edition = "warn"` (or `#![warn(blaze::edition)]`) turns the whole group on whatever the
@@ -62,8 +64,8 @@ The group also holds what the edition removes or respells (`async_fn`, `global_s
 `could_be_ref32`). None of these has a switch: each is allowed unless a workspace or crate
 turns it, or the group, on. Of them only `mut_ref` and the four `unmarked_*` lints have a fix.
 The three `unmarked_*` effect lints still write the old spellings (`#[blaze::nopanic]`, ..),
-which [`negative_effect`](#undeclared_effect-unneeded_effect-negative_effect) then asks to
-respell as `#[blaze::may(..)]`; they are to be ported to write the list.
+which [`negative_effect`](#undeclared_effect-unfulfilled_effect-negative_effect) then asks to
+respell as `#[blaze::expect(..)]`; they are to be ported to write the list.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
@@ -378,6 +380,36 @@ relative links.
 (`struct NodeId(u32)`): one allocation, nodes next to each other, freed at once.
 
 **Allowing it.** `#[expect(blaze::boxed_recursive_node, reason = "..")]` on the type.
+
+## `not_latest_edition`
+
+A package of the workspace that has not opted into the latest blaze edition
+([std.md](v2/plan/design/std.md#the-blaze-edition-opting-in)): one on a Rust edition, or, once
+there is more than one, on an older blaze edition. One rule covers both.
+
+```
+warning: package `app` is on Rust edition 2024, not the latest blaze edition `blaze-2026.11`, under which `main` takes what it may touch (`fn main(cx: &Cx, io: Io)`) and `std` is bstd, blaze's capability-based standard library: set `edition = "blaze-2026.11"` in its Cargo.toml
+```
+
+**Once per package.** The finding is about the package, has no place in a source file, and is
+said by the package's library, or by a binary or an example of a package with no library. A
+test, a bench, a build script and a proc-macro crate never say it. It is stored with the
+crate's other diagnostics and drawn as they are: in `--message-format json` it is a
+`compiler-message` whose code is `blaze::not_latest_edition`.
+
+**Never for code that is not yours.** A dependency, a registry or git crate, vendored code
+outside the workspace and the standard library are not linted.
+
+**Default.** `allow` until `EDITION_SHIPS` (a package of the edition names bstd by path
+until blaze ships it, which only a checkout of blaze can do); `warn` from then on.
+
+**Allowing or denying it.** `not_latest_edition = "allow"` (or `"deny"`, for a CI that holds
+a workspace to the edition) under `[workspace.metadata.blaze.lints]`,
+`#![allow(blaze::not_latest_edition)]` at the crate root, or `-A`/`-D
+blaze::not_latest_edition` in `RUSTFLAGS`. blaze's own workspace allows it while cargo
+builds blaze (decision D25).
+
+**No fix.** `blaze fix --edition` is planned.
 
 ## `build_script_ambient`
 
@@ -1002,7 +1034,7 @@ method of an impl of a trait so marked, that may, through any call:
   `poll`, `accept`, `connect`).
 
 Each also refuses what it can't see: a function pointer the function takes, a call through a
-`dyn` it takes whose method has no `#[blaze::may(..)]` leaving the word out (taking the `dyn`,
+`dyn` it takes whose method has no `#[blaze::expect(..)]` leaving the word out (taking the `dyn`,
 storing it or handing it on is fine; the finding names the method called), and (`noalloc`,
 `nonblocking`) a foreign function or `asm!` it knows nothing of. The
 finding says the shortest call chain to what does it, each step with its file and line. They
@@ -1020,37 +1052,50 @@ proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::nopanic, reason = "..")]` on the function.
 
-These three are the old spellings of `#[blaze::may(..)]`, next.
+These three are the old spellings of `#[blaze::expect(..)]`, next.
 
-## `undeclared_effect`, `unneeded_effect`, `negative_effect`
+## `undeclared_effect`, `unfulfilled_effect`, `negative_effect`
 
-`#[blaze::may(panic, alloc, block, diverge)]` (a blaze extension, opt-in; it changes
-diagnostics, never code) lists what a function, and everything it calls, may do: panic or
-abort, call the global allocator, block the thread, not return. A word the list leaves out is
-an effect the function does not have. The design, the rules and the tables are in
-[v2/plan/design/effects.md](v2/plan/design/effects.md).
+`#[blaze::expect(panic, alloc, block, diverge)]` (a blaze extension, opt-in; it changes
+diagnostics, never code) lists what a function, and everything it calls, is expected to do:
+panic or abort, call the global allocator, block the thread, not return. A word the list leaves
+out is an effect the function does not have; a word a function's own list has is an effect it
+has, as Rust's `#[expect(lint)]` is fulfilled or reported. The design, the rules and the tables
+are in [v2/plan/design/effects.md](v2/plan/design/effects.md).
 
 **What they catch.**
 
 - `undeclared_effect` (`deny`): a function with an effect its allowance leaves out. The
   allowance is the function's own list; else the list of the trait's method it implements (or
-  of the trait); else the `#![blaze::may(..)]` of the nearest module around it; else nothing
-  at all in a crate with `#![blaze::effects]`. The first written holds alone: a function's own
-  list replaces a module's default, it is not added to it. A function none of these reach is
-  not looked at, so a crate that declares nothing is unaffected. The finding says each effect
-  with its witness: the shortest call chain to what has it, each step with its file and line,
-  or for `diverge` the line of a loop not known to end, or the chain of a recursion and which
-  function is called again. Also: an impl's method whose list has a word its trait's method
-  does not allow (an impl may declare fewer effects, never more), a function with both a list
-  and an old spelling, and a list that is not words separated by commas.
-- `unneeded_effect` (`warn`): a word of a private function's list for an effect the function
-  is proved not to have. Not on a function with a visibility written, a trait's method or an
-  impl's method of one: a public signature may reserve the right, and a trait method's list is
-  the bound of its impls. `panic` is found only where the crate is checked with overflow
-  checks, so the shorter list holds in dev and in release.
+  of the trait); else the `#![blaze::expect(..)]` of the nearest module around it; else
+  nothing at all in a crate with `#![blaze::effects]`. The first written holds alone: a
+  function's own list replaces a module's default, it is not added to it. A function none of
+  these reach is not looked at, so a crate that declares nothing is unaffected. The finding
+  says each effect with its witness: the shortest call chain to what has it, each step with its
+  file and line, or for `diverge` the line of a loop not known to end, or the chain of a
+  recursion and which function is called again. Also: an impl's method whose list has a word
+  its trait's method does not allow (an impl may declare fewer effects, never more), a function
+  with both a list and an old spelling, a list that is not words separated by commas, and the
+  deleted spelling `#[blaze::may(..)]` (or `#![blaze::may(..)]`), wherever it is written, whose
+  fix respells it `blaze::expect`.
+- `unfulfilled_effect` (`deny`): a word of a function's own list for an effect the function is
+  proved not to have, on every function with a body that writes its list, private and public
+  alike, an impl's method that writes its own included. The finding names the function, the
+  word and why it is known not to hold ("no call or operation in it allocates from the global
+  heap, through every call it makes"); the fix takes the word off. `panic` is found only where
+  the crate is checked with overflow checks, so the shorter list holds in dev and in release.
+  Where exactness has nothing to prove, a list is a bound and never reported: a trait method's
+  list bounds its impls (a default body among them); a list a function inherits from its trait
+  or a module's default and did not write cannot be exact for every function under it; a
+  `trusted` list is taken at its word; and a word over code the check can't see (a `dyn` call
+  with no list, a body that does not lower) is neither proved nor refuted.
 - `negative_effect` (`warn`): `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`
   on a function under a module's default or `#![blaze::effects]`. The old spellings still mean
-  what they meant, everywhere; where effects are declared, the function says what it may do.
+  what they meant, everywhere; where effects are declared, the function says what it is
+  expected to do.
+
+`unneeded_effect`, the advice this was before lists were exact (private functions only), is
+deleted: naming it is `renamed_and_removed_lints`.
 
 `diverge` in short: a counted `while i < n { ..; i += 1; }` is known to end (with the crate's
 overflow checks, any positive step and `<=` too); every other loop (`for`, `while let`,
@@ -1059,19 +1104,22 @@ list need the word, until `decreases` clauses exist. What the check can't see (a
 foreign function, a function pointer or unlisted `dyn` parameter) may do anything, so it needs
 every word.
 
-**Why it matters.** A signature that lists what can happen is complete: a reader, and a caller
-on a pool thread, in a signal handler or under a deadline, knows what the call can do without
-reading its body, and the list keeps holding as the code changes, in every crate it reaches.
+**Why it matters.** A signature that lists what can happen is complete and true: a reader, and
+a caller on a pool thread, in a signal handler or under a deadline, knows what the call can do
+without reading its body, the list keeps holding as the code changes, in every crate it
+reaches, and a word in it is never stale.
 
 **How to fix it.** `blaze check --fix` writes each list: the missing words added
-(`undeclared_effect`; under `#![blaze::effects]` that is a `#[blaze::may(..)]` with exactly the
-inferred effects on every function that needs one), the unneeded word taken off
-(`unneeded_effect`), the old spellings rewritten to the list they stand for
-(`negative_effect`: `nopanic` and `nonblocking` on a function that allocates and may not return
-become `#[blaze::may(alloc, diverge)]`). Or handle the effect so the function no longer has it
-(`get` or `checked_*`, the task's frame, the scheduler's wait, a counted loop), or mark a
-callee proven by hand `#[blaze::may(.., trusted = "why")]`: its list is then taken at its word,
-and the reason is kept in the proof.
+(`undeclared_effect`; under `#![blaze::effects]` that is a `#[blaze::expect(..)]` with exactly
+the inferred effects on every function that needs one), the unfulfilled words taken off
+(`unfulfilled_effect`; a callee that stops having an effect makes each caller's word for it
+unfulfilled, and this fix carries the change up the callers), the old spellings rewritten to the
+list they stand for (`negative_effect`: `nopanic` and `nonblocking` on a function that
+allocates and may not return become `#[blaze::expect(alloc, diverge)]`), and `blaze::may`
+respelled. Or handle the effect so the function no longer has it (`get` or `checked_*`, the
+task's frame, the scheduler's wait, a counted loop), or mark a callee proven by hand
+`#[blaze::expect(.., trusted = "why")]`: its list is then taken at its word, and the reason is
+kept in the proof.
 
 **Allowing it.** `#[expect(blaze::undeclared_effect, reason = "..")]` (likewise the others) on
 the function.
@@ -1654,7 +1702,7 @@ which lints report the row in this one's place where they are on:
 | `std::sync::{Condvar, Barrier}` | ambient authority | `Signal` of `bstd::sync`, or a scope's `join(cx)` | no |  |
 | `std::sync::{Once, OnceState}` | ambient authority | `Once<T>` of `bstd::sync`, a value to own and pass, never in a `static` | no |  |
 | `std::hash::{RandomState, DefaultHasher}` | ambient authority | `bstd::hash::FixedState`, the one fixed seed; under keys an attacker picks, `SipKey` from an `Rng` | no | `blaze::default_hasher` |
-| `std::collections::{HashMap, HashSet}` | ambient authority | `bstd::map::Map` and `bstd::set::Set`, made with `new_in(alloc)` | no | `blaze::default_hasher`, `blaze::implicit_allocator` |
+| `std::collections::{HashMap, HashSet}` | ambient authority | `bstd::map::HashMap` and `bstd::set::HashSet`, made with `new_in(alloc)` | no | `blaze::default_hasher`, `blaze::implicit_allocator` |
 | `std::random`'s functions | ambient authority | take an `Rng` (`rng.next_u64()`, `rng.fill(..)`), which is seeded in a simulation | no |  |
 | `std::sync::{Arc}` | renamed | `bstd::sync::Shared` | yes |  |
 | `std::rc::{Rc}` | renamed | `bstd::sync::LocalShared` | yes |  |

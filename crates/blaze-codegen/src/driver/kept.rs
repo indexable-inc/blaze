@@ -59,15 +59,11 @@ pub struct Kept<I, S> {
     /// Each program's last `Built` by row ([`Lists`]), by the [`program`] its walk is kept
     /// under: taken by the build that patches it, as its walk is.
     lists: Lock<std::collections::HashMap<u64, Lists>>,
-    /// Made in place of one let go when memory was short ([`Kept::after_let_go`]): what its
-    /// first walks say of why they took nothing kept ([`Fresh::LetGo`]).
-    let_go: bool,
 }
 
 impl<I: Eq + Hash, S> Default for Kept<I, S> {
     fn default() -> Self {
         Kept {
-            let_go: false,
             rounds: std::array::from_fn(|_| SharedMap::default()),
             // alloc: none until a walk is kept
             walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
@@ -82,21 +78,6 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
     /// Nothing kept: what the first walk over a database begins with.
     pub fn new() -> Self {
         Kept::default()
-    }
-
-    /// Nothing kept, in place of what was let go when memory was short: a walk that finds it
-    /// empty says so, not that the daemon started.
-    pub fn after_let_go() -> Self {
-        Kept { let_go: true, ..Kept::default() }
-    }
-
-    /// Why a walk that finds nothing kept here took nothing: what was kept was let go, or
-    /// nothing was kept yet.
-    pub(super) fn empty_because(&self) -> Fresh {
-        match self.let_go {
-            true => Fresh::LetGo,
-            false => Fresh::Restart,
-        }
     }
 
     /// How many describes are kept, over every round.
@@ -204,6 +185,9 @@ pub struct Walk {
     pub described: usize,
     /// Kept describes the front end said still hold: each cost its answer, never a describe.
     pub verified: usize,
+    /// Describes read from the store's records ([`super::records`]): each cost a lookup and
+    /// its record's decode, never a describe. Over every round.
+    pub found: usize,
     /// The functions of the walk's result.
     pub reached: usize,
     /// The functions of this program's last build that are not in this one's
@@ -281,6 +265,7 @@ pub struct Work {
 pub(super) struct Counts {
     pub(super) described: AtomicUsize,
     pub(super) verified: AtomicUsize,
+    pub(super) found: AtomicUsize,
 }
 
 impl Counts {
@@ -290,6 +275,14 @@ impl Counts {
 
     pub(super) fn verified(&self) {
         self.verified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn found(&self) {
+        self.found.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn found_so_far(&self) -> usize {
+        self.found.load(Ordering::Relaxed)
     }
 
     pub(super) fn get(&self) -> (usize, usize) {

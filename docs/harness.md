@@ -332,6 +332,7 @@ own to test here: its remote is the read-through tier of `crates/blaze-cas/src/r
 | `keys.py '{"cases": [...], "shard": {"index": K, "count": N}}'` | Whether the store ever hands a build code compiled from something else. One case per thing code depends on besides its file's text: each builds `harness/keys` in an empty home, leaves the home only its store (`storelib.forget`), changes that thing (in place, or in a copy at another path) and builds again; both programs have to do what a fresh build does (`rebuild.py`). `cases` picks those whose names contain one of its strings, `shard` every Nth of those runs (each case in place and elsewhere) from the Kth (CI's `keys-1..3`) |
 | `storetracked.py` | A daemon on a store holding the checkout's code (with nothing else of the home), and one in another home with a copy of that store on a copy of the checkout elsewhere, build it right, and every edit after: a generic body, closures moved, a static, an `#[inline]` function, an `impl Trait`'s closure, all taken back ([#105](https://github.com/indexable-inc/blaze/issues/105), [#216](https://github.com/indexable-inc/blaze/issues/216)) |
 | `storerevisions.py` | A fresh daemon on a checkout edited before it started, and on the undo of that edit from a store holding only the edited revision, gets nothing stale: each case changes one thing a function's code depends on besides its own text (a callee's body or signature, an inline helper, a rebound import, a module constant, a field, a layout, a constant table), and both builds have to print what a cold build of the same tree prints. The acceptance test of v2's keys by every input ([#1336](https://github.com/indexable-inc/blaze/issues/1336), [#1291](https://github.com/indexable-inc/blaze/issues/1291), [#1439](https://github.com/indexable-inc/blaze/issues/1439)); it asserts no reuse and prints the `blaze-work` counts. From astral-experiments/blaze#66-#78. `uv run` |
+| `cargo test -p blaze-storemodel` (in `unittests.py` as `blaze test --workspace`) | The model checker of the store and kernel protocol (`crates/blaze-storemodel`, [storemodel.md](v2/plan/design/storemodel.md)): the real `blaze-cas` and `blaze-kernel` state machines through every schedule of a few actors, a crash after every IO step on a file system that models what a crash keeps, on one that shares blocks and one that refuses clones. No script and no `ci.py` line of its own: it runs only where the workspace's unit tests run, so a change to `crates/blaze-cas`, `crates/blaze-kernel`, `crates/blaze-record` or `blaze_core::Effect` runs it by name before it lands. A run is good only when each test prints its `N executions, M crash states checked` line with both above 0: on 2026-11-12 ten of its tests had failed at their first step since the store's open began to ask an effect the model had no rule for, and nothing ran them |
 
 ### Timing
 
@@ -502,6 +503,10 @@ Each number is held to one table, `guards.BOUNDS`, which the script reads and
 | `answer_delay_ms` | ms | 100 | 100 | 100 | from the end of the build's last `task` span to the end of its `request: read to reply` span | a build's answer held 4 s for a disk sync of derived data |
 | `turn_uncovered_ms` | ms | 50 | 50 | 50 | the most time one `loop turn` span has that no child span of it covers | the daemon's loop thread spent 0.8 to 1.1 s in one turn with no span |
 | `uncovered_ms` | ms | 100 | 100 | 100 | the view `uncovered_time` of the build: wall time inside no span | time the profile cannot name (every-wait-says-what, slow-is-p0-traced) |
+| `unexplained` | pieces | 0 | 0 | 0 | `accounts`: steps with no recorded reason or an unstable key, and rows no cause counts | `blaze why` had no recorded reason for steps in 9 of 53 builds of the soundness oracle (2026-11-12) |
+| `unbalanced` | sums | 0 | 0 | 0 | `accounts.unbalanced`: sums of the account that do not hold | a run path that counts a run under no cause |
+| `alarms` | alarms | 0 | 0 | 0 | `accounts.alarms`: how many alarms the account names (work without a change, needless writes, work out of proportion to the change, an unkept unit, an unattributed write) | a no-op that wrote 53 inputs, and 46 units remade by every build of reth, each found by hand (2026-11-12) |
+| `history_dropped` | rows | 0 | 0 | 0 | `accounts.history_dropped`: rows the profile history could not write since its daemon began | a history whose thread ended on a panic and dropped every later build's rows unsaid (2026-11-12) |
 
 The times are for the gate's machine class (16 cores, a blaze the tree built, which runs slower
 than a release) and loose on purpose; they tighten as the numbers fall, by editing the table.
@@ -567,10 +572,14 @@ A case is `crates/blaze-engine/tests/revisions/cases/<name>/`: `base/` (the proj
     known = { "real: max_executed" = "why it fails today" }
 
 Steps: `edit`, `edit by rename` (written beside and renamed over), `edit by truncate then write`,
-`stop` (`blaze stop`), `kill` (`kill -9` of the daemon), `touch PATH`, and `check`, `build`, `run`,
-`test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
-this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_executed`,
-`max_verified`, `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
+`stop` (`blaze stop`), `kill` (`kill -9` of the daemon), `touch PATH`, `project NAME` (from here
+on the commands run in a second checkout beside the first, served by the same daemon; the
+revision's overlay is that project's files whole; the real driver only), and `check`, `build`,
+`run`, `test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
+this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_records` (units whose record
+missed, compiled or not), `max_executed`,
+`max_verified`, `max_written` (the engine's input writes: 0 for a request that changes nothing),
+`max_unkept` (units made whose record was not kept, so the next build makes them again), `max_ran` (a table from a text to the most runs of the queries whose name holds it, summed: `{ item_tree = 0 }`; the real driver reads `blaze explain counts_by_cause`), `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
 `spliced`, `unchanged`, `full`, `none`), `bytes` (the linked bytes equal a clean build's), `env`
 (variables of every command from that revision on), `args`, `remove`. A key the harness does
 not know is refused. `known` lists checks that fail today, each with its cause (`"real: check"`
@@ -608,7 +617,24 @@ shared by both):
   the simulated driver is the primary one. It is for what only a kernel shows (the watcher's event order, `kill -9`, a program
   really run, a splice of a real image) and as the cross-check of the simulated driver.
 
+      cargo +nightly-<date> build --release -p blaze-thin
       RUST_TEST_THREADS=6 cargo +nightly-<date> test --release -p blaze-engine --test revisions --no-fail-fast
+
+Every real case runs through the thin `blaze` (crates/blaze-thin) with the engine beside it, as
+an install lays them out, and `cargo test -p blaze-engine` does not build another package's
+binary: build `blaze-thin` first (it lands beside `blaze-engine` in the target directory), or
+name one with `BLAZE_REVISIONS_THIN`, as `BLAZE_REVISIONS_BLAZE` names the engine. Missing, every
+real case fails naming the path. The two are hard-linked per test into
+`CARGO_TARGET_TMPDIR/revisions-bin/<root>` (`replace engine` changes that test's engine alone),
+so both must be files on that filesystem.
+
+A case is of the thin `blaze`'s own path when a revision states `daemon_after`, `starts`,
+`at_once` or `run the file` (spec.rs `Test::as_typed`). Its `build`, `run`, `check` and `test`
+run with no `--message-format` and no `BLAZE_*` but `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD`
+(any other sends the command to the engine, blaze-thin's `route::env`; the second is on every
+command of the real driver, so a killed test leaves no daemon), so a daemon such a command starts runs without
+`BLAZE_VERIFY_STORE=1` and `BLAZE_LOCK=write`: what such a case loses is the store's read-back
+check. The driver's own reads (`why`, `explain`, `stop`, `store`) keep the whole environment.
 
 `BLAZE_REVISIONS_REPORT=<file>` appends one JSON line a revision; each row is also printed
 (`revisions: real <case> rev2 run ok units=1 executed=..`).
@@ -634,6 +660,65 @@ The report groups failures by cause. It is not in the gate. On 2026-11-11 (all-1
 6b5b794d0d): 180 files with revisions, 120 run, 53 pass, 67 fail (61 of them one refusal of the
 splice when a cfg swaps a function for its twin), 60 not run (25 have one revision, 35 use a
 directive or flag the importer has no place for); about 30 minutes.
+
+## The oracle
+
+One property over the revision tests' two drivers: after any sequence of edits, saves, builds,
+restarts and kills, what an incremental build gives is what a clean build of the same sources
+gives, the work is bounded by what the step changed, and nothing panicked, was contained or was
+recomputed for no recorded reason. The sequences are drawn, not listed
+(`crates/blaze-engine/tests/revisions/generate.rs`): Hegel draws a workspace (the package `app`,
+a `#![no_std]` library with a struct, a trait with a provided method and two impls, a call
+through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
+`main.rs`; and, each drawn, `up` with a generic `app` instantiates, `mid`, a library built over
+`up` whose text never changes while `up`'s bodies, lines, a signature and a method it selects do
+(early cutoff between crates: a record of `mid` found across an edit below it), `vendor/made` with a build
+script that reads two files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
+macro `mac`) and one to five turns. A turn is up to two edits (a body, a signature, a layout, a
+trait impl, an override, the only `dyn` call, an item added or removed, a rename, a `cfg`, a
+feature, the build script, its input, its `cfg` file, the proc macro, a comment, an indent,
+lines moved; a value set again is a no-op and an earlier one a take-back), how they are saved (in
+place, by rename, truncate then write, twice), and an event before or after the save (`blaze
+stop`, `kill -9`, a build interrupted some milliseconds in, the same sources built in a second
+checkout by the same daemon, a build of its own, a terminal of another width). The generator
+makes each sequence a revision test, so both drivers run it as they run a case, and it states
+what each build must print (the model computes it) and what it may make again (nothing for a
+turn that changes nothing or only comments and layout; the one function for a body).
+
+    cargo +nightly-<date> test --release -p hir-ty-codegen --lib -- edits::revisions::any_turn_sequence
+    BLAZE_ORACLE_CASES=200 cargo +nightly-<date> test --release -p blaze-engine --test revisions -- --ignored oracle::any_turn_sequence --nocapture
+
+- **Simulated** (`any_turn_sequence_builds_as_clean` in `v2/edits/revisions.rs`): the library
+  alone, 40 sequences in about 45 s in the suite, `HEGEL_TEST_CASES=<n>` for more. A stop or a
+  kill is a new database and memo over the kept store; a second checkout is a second database
+  over the same store; an interrupted build is a build whose records are dropped. Its control
+  plants a stale store entry (`the_oracle_catches_a_stale_store_entry`).
+  `BLAZE_REVISIONS_STORE_CHECK=off` lets a stale hit through so the oracle lists what came of it.
+- **Real** (`oracle.rs`, ignored tests: minutes of builds a sequence): the whole workspace under
+  a real daemon. `BLAZE_ORACLE_CASES`, `BLAZE_ORACLE_TURNS`, `BLAZE_ORACLE_SEED`,
+  `BLAZE_ORACLE_MINUTES` (both drivers: no sequence starts after that long; give it with a large
+  case count), `BLAZE_ORACLE_REPLAY="parts made; scriptcfg; body=1 kill"` with the test `oracle::replay`
+  (a sequence written by hand, `generate::parse`), `BLAZE_ORACLE_ENV=NAME=VALUE,..` (variables of
+  every command of the sequence: the driver clears its own environment);
+  `BLAZE_ORACLE_SKIP=<names>` leaves out edit kinds (`body`, `scriptcfg`..), events (`kill`,
+  `cancel`..) and parts (`mac-part`..) with a known failure while the rest run;
+  `BLAZE_ORACLE_CLEAN=when-wrong` builds a revision from nothing only when its incremental build
+  failed a check (the model's `prints` still catches a stale program). `each_kind_once_builds_as_clean`
+  is the smoke run; `the_oracle_catches_a_build_of_the_sources_before` the control.
+
+What needs the real daemon, and why: the build script and the proc macro (they run sandboxed
+processes and wasm, which the simulated pipeline has no seam for), features and the manifest
+(cargo's resolution is the daemon's lowering), the watcher's view of a save, `kill -9`, an
+interrupted request, two checkouts in one process, diagnostics replayed for another terminal,
+and the program run. A crash that tears unsynced writes is neither driver's: the real kernel
+does not tear on `kill -9`, and the simulation has no daemon. The store's and the image's own
+simulation tests hold that below the daemon (`blaze-query/src/tests/restore.rs`,
+`blaze-cargo/src/serve/tests.rs`).
+
+A failure prints the sequence, Hegel shrinks it, and each failing sequence is written as a case
+directory under `BLAZE_ORACLE_OUT` (the last written is the smallest). To keep it: move the
+directory into `cases/` under a name that says the property, list it in `sim!` or `real!`, and
+give the failing check a `known` row naming its cause until it is fixed.
 
 ## Adding a test
 
@@ -832,14 +917,24 @@ What stays on GitHub's hosted runners, and why:
 - Windows, which ix does not serve.
 - The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.
 
-How far blaze cross-compiles today: `--target` takes one foreign triple; std is built from
-`library/` for it, Cranelift and LLVM emit for it, and blaze-link writes ELF and Mach-O itself,
-signing Mach-O ad hoc (no `codesign`). What a cross build still borrows from the host: a C cross
-compiler as `CC_<triple>` (crt objects, libc, build scripts' `cc`), read when the daemon starts;
-the pinned LLVM's build script runs the target archive's own `llvm-config` (qemu-user for
-x86-64, impossible for a Mach-O one on Linux); and `build_release.py` builds only for the host.
-For `aarch64-apple-darwin` on Linux it also needs a macOS SDK at `SDKROOT`, a darwin clang as
-`CC_aarch64_apple_darwin` and `otool`, none of which CI has, so no darwin cross job runs.
+How far blaze cross-compiles today (ledger row X1; the design is
+[toolchain-c.md](v2/plan/design/toolchain-c.md#cross-compilation)): `--target` takes one foreign
+triple; std is built from `library/` for it, Cranelift and LLVM emit for it, and blaze-link
+writes ELF and Mach-O itself, signing Mach-O ad hoc (no `codesign`). A program of Rust alone
+borrows nothing from the host: for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
+`aarch64-apple-darwin` blaze-link takes glibc's symbols (release 2.28), libgcc_s's, a start
+object and libSystem's symbol list from its own binary, and runs no program and reads no file of
+the machine. Measured on an AArch64 Linux VM at 079690a95a (2026-11-12) under `env -i` with a
+PATH of one empty directory and no `CC*`, `SDKROOT`, `LIBRARY_PATH` or `NIX_LDFLAGS`: the probe
+(`harness/v2/cross/probe`) built for all three; the AArch64 one ran and passed its five checks,
+the x86-64 one passed them under qemu-user 11.1.2 against glibc 2.44 (270 ms); a second build
+from an empty home on the same machine gave the same bytes for each. Not measured: the darwin
+binary run on a Mac, and a build from a second host. What still borrows from the host: a link
+that names anything blaze does not ship (a `-sys` crate's archive, a system library, a
+framework, a sanitizer) takes the machine's C toolchain as `CC_<triple>` for all of it, and for
+darwin the SDK at `SDKROOT`; build scripts' `cc`; the pinned LLVM's build script, which runs
+the target archive's own `llvm-config` until the archives are rebuilt with their link manifest;
+and `build_release.py` builds only for the host. The musl triples are not linked.
 
 ### Named harnesses, and the projects downstream
 

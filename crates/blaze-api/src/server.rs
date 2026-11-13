@@ -294,6 +294,14 @@ impl Server {
         tag.0.wrapping_sub(self.tags) < TAGS
     }
 
+    /// How many connections are open now, counted at the socket: one from its accept until the
+    /// driver says it ended (a receive of nothing, as a peer the kernel closed for, a `kill -9`
+    /// among them, gives) or the server hangs up on it. What a daemon that exits once nothing
+    /// holds it decides on (`serve::unheld` in blaze-cargo).
+    pub fn connections(&self) -> usize {
+        self.conns.len()
+    }
+
     /// Why a listener failed, naming its address: the daemon must stop or say so, as a
     /// listener that failed is never listened on again.
     pub fn failed(&self) -> Option<&str> {

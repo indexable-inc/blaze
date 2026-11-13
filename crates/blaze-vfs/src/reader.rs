@@ -67,6 +67,11 @@ impl Reader {
         Some(names.into_iter())
     }
 
+    /// [`Pinned::dir_id`] under a pin of its own.
+    pub fn dir_id(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        self.pin().dir_id(root, path)
+    }
+
     /// Pins this thread to read the tree as it is now, in place, as many times as wanted.
     /// Hold it only while reading: a collection's old nodes are freed once the task it is in
     /// ends.
@@ -91,7 +96,7 @@ impl Pinned<'_> {
         if shape.is_dir() {
             return Ok(None);
         }
-        Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(shape)? }))
+        Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(node)? }))
     }
 
     /// [`Pinned::file`], its bytes held past the pin: the tree's own, with one count taken. A
@@ -108,7 +113,7 @@ impl Pinned<'_> {
         if shape.is_dir() {
             return Ok(None);
         }
-        Ok(Some((*table.id(node), mode, table.bytes(shape)?)))
+        Ok(Some((*table.id(node), mode, table.bytes(node)?)))
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
@@ -127,6 +132,18 @@ impl Pinned<'_> {
         let entries = table.entries(shape);
         let names = self.snapshot.names();
         Some((0..entries.len()).map(move |at| (names.str(entries.names[at]), entries.is_dir(at))))
+    }
+
+    /// The content ID of the directory at `path` under `root` (`""`: `root` itself, when the
+    /// tree has it): the hash of its entries, so of every file below it, read from the node
+    /// with no entry listed and no file's bytes touched. `None` for none, a file, or a root
+    /// the tree does not have. What a key of "this package's files" is made from after a
+    /// restart, when the tree is restored and nothing was read (restore.md, "Restart reads
+    /// records (d)", A).
+    pub fn dir_id(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        let (node, _) = self.walk(root, path)?;
+        let table = self.snapshot.table();
+        table.shape(node).is_dir().then(|| *table.id(node))
     }
 
     /// The node `path` names under the directory `root`, and its mode, as the tree's `entry`.

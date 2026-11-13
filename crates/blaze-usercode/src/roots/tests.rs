@@ -11,10 +11,10 @@ use crate::{
 
 fn checkout(home: &str) -> RootMap {
     RootMap::default()
-        .with(Role::Package, Path::new(&format!("{home}/ws/p")))
-        .with(Role::OutDir, Path::new(&format!("{home}/ws/target/debug/build/p-1/out")))
-        .with(Role::Target, Path::new(&format!("{home}/ws/target")))
-        .with(Role::Workspace, Path::new(&format!("{home}/ws")))
+        .with(Role::Package, Path::new(&format!("{home}/ws/p")), &Looks::none())
+        .with(Role::OutDir, Path::new(&format!("{home}/ws/target/debug/build/p-1/out")), &Looks::none())
+        .with(Role::Target, Path::new(&format!("{home}/ws/target")), &Looks::none())
+        .with(Role::Workspace, Path::new(&format!("{home}/ws")), &Looks::none())
 }
 
 /// A checkout's files and environment, as a run there sees them.
@@ -160,7 +160,7 @@ fn a_changed_file_under_a_root_changes_the_key() {
 #[test]
 fn a_root_of_another_role_or_a_missing_one_gives_another_key() {
     let a = checkout("/home/a");
-    let fewer = RootMap::default().with(Role::Package, Path::new("/home/a/ws/p"));
+    let fewer = RootMap::default().with(Role::Package, Path::new("/home/a/ws/p"), &Looks::none());
     assert_ne!(key("/home/a", &a), key("/home/a", &fewer));
     // A path under no root stays absolute: two checkouts' differ.
     let none = RootMap::default();
@@ -251,8 +251,8 @@ fn a_path_is_written_against_the_nearest_root_by_whole_names() {
 #[test]
 fn a_root_that_is_not_absolute_or_is_the_file_systems_names_none() {
     let map = RootMap::default()
-        .with(Role::Package, Path::new("ws/p"))
-        .with(Role::Workspace, Path::new("/"));
+        .with(Role::Package, Path::new("ws/p"), &Looks::none())
+        .with(Role::Workspace, Path::new("/"), &Looks::none());
     assert!(map.view().is_empty());
 }
 
@@ -312,14 +312,14 @@ fn kept_store(run: &RunKey, traced: &Traced) -> BTreeMap<Key, Vec<u8>> {
 #[test]
 fn another_layout_of_the_roots_misses() {
     let inside = checkout("/home/a");
-    let elsewhere = checkout("/srv/b").with(Role::Target, Path::new("/cache/target"));
+    let elsewhere = checkout("/srv/b").with(Role::Target, Path::new("/cache/target"), &Looks::none());
     assert_ne!(key("/home/a", &inside), key("/srv/b", &elsewhere));
     let one = RootMap::default()
-        .with(Role::Package, Path::new("/home/a/ws"))
-        .with(Role::Workspace, Path::new("/home/a/ws"));
+        .with(Role::Package, Path::new("/home/a/ws"), &Looks::none())
+        .with(Role::Workspace, Path::new("/home/a/ws"), &Looks::none());
     let two = RootMap::default()
-        .with(Role::Package, Path::new("/srv/b/ws/p"))
-        .with(Role::Workspace, Path::new("/srv/b/ws"));
+        .with(Role::Package, Path::new("/srv/b/ws/p"), &Looks::none())
+        .with(Role::Workspace, Path::new("/srv/b/ws"), &Looks::none());
     let given = |map: &RootMap| {
         let mut given = Given::new(RunKind::BuildScript);
         given.roots(&map.view());
@@ -327,8 +327,8 @@ fn another_layout_of_the_roots_misses() {
     };
     assert_ne!(given(&one), given(&two));
     let same = RootMap::default()
-        .with(Role::Package, Path::new("/srv/c/ws"))
-        .with(Role::Workspace, Path::new("/srv/c/ws"));
+        .with(Role::Package, Path::new("/srv/c/ws"), &Looks::none())
+        .with(Role::Workspace, Path::new("/srv/c/ws"), &Looks::none());
     assert_eq!(given(&one), given(&same));
 }
 
@@ -336,7 +336,7 @@ fn another_layout_of_the_roots_misses() {
 /// `%`-escaped, UTF-16) is still found embedded, and only a root as it is is ported.
 #[test]
 fn a_root_in_another_spelling_is_embedded() {
-    let map = RootMap::default().with(Role::Workspace, Path::new("/tmp/blaze roots/ws"));
+    let map = RootMap::default().with(Role::Workspace, Path::new("/tmp/blaze roots/ws"), &Looks::none());
     let roots = map.view();
     for spelled in [
         &b"x /private/tmp/blaze roots/ws/a.rs"[..],
@@ -374,7 +374,7 @@ fn a_root_in_another_spelling_is_embedded() {
 /// it is in is kept against where the root is.
 #[test]
 fn a_root_inside_a_longer_path_is_not_ported() {
-    let map = RootMap::default().with(Role::Package, Path::new("/src"));
+    let map = RootMap::default().with(Role::Package, Path::new("/src"), &Looks::none());
     let roots = map.view();
     assert_eq!(&*roots.ported(b"/usr/src/linux"), b"/usr/src/linux");
     assert_eq!(&*roots.ported(b"-I/src/include:/src"), b"-I/src/include:\0p");
@@ -402,7 +402,7 @@ fn a_run_that_wrote_files_is_kept_against_its_roots_until_verified() {
         files: vec![crate::run::OutFile {
             path: "5f3a-foo.o".into(),
             executable: false,
-            bytes: Some(b"\x7fELF".to_vec()),
+            bytes: Some(b"\x7fELF".to_vec().into()),
             link: None,
         }],
     };
@@ -444,7 +444,7 @@ fn reading(paths: &[&str]) -> Traced {
 /// write it back as `vendor/home/b/ws/lib`. It stays as it is and marks its root.
 #[test]
 fn a_root_after_a_name_is_kept_against_where_it_is() {
-    let map = RootMap::default().with(Role::Workspace, Path::new("/src"));
+    let map = RootMap::default().with(Role::Workspace, Path::new("/src"), &Looks::none());
     let roots = map.view();
     assert_eq!(&*roots.ported(b"vendor/src/lib"), b"vendor/src/lib");
     let (kept, stored) = roots.kept(&reading(&[]), &printed(b"vendor/src/lib\n")).unwrap();
@@ -458,9 +458,9 @@ fn a_root_after_a_name_is_kept_against_where_it_is() {
 #[test]
 fn a_path_between_roots_of_two_tops_is_kept_against_them() {
     let apart = RootMap::default()
-        .with(Role::Package, Path::new("/home/a/ws/p"))
-        .with(Role::Workspace, Path::new("/home/a/ws"))
-        .with(Role::Target, Path::new("/cache/a/target"));
+        .with(Role::Package, Path::new("/home/a/ws/p"), &Looks::none())
+        .with(Role::Workspace, Path::new("/home/a/ws"), &Looks::none())
+        .with(Role::Target, Path::new("/cache/a/target"), &Looks::none());
     let (_, embedded) = apart
         .view()
         .stored(&printed(b"cargo:rustc-env=T=../../../../cache/a/target/debug\n"))
@@ -483,11 +483,11 @@ fn a_path_between_roots_of_two_tops_is_kept_against_them() {
 #[test]
 fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
     let map = RootMap::default()
-        .with(Role::Package, Path::new("/b/sources/git/checkouts/dep-1/abc"))
-        .with(Role::OutDir, Path::new("/h/ws/target/debug/build/dep-1/out"))
-        .with(Role::Target, Path::new("/h/ws/target"))
-        .with(Role::Workspace, Path::new("/h/ws"))
-        .with(Role::Tools, Path::new("/nix/store/x-blaze/bin"))
+        .with(Role::Package, Path::new("/b/sources/git/checkouts/dep-1/abc"), &Looks::none())
+        .with(Role::OutDir, Path::new("/h/ws/target/debug/build/dep-1/out"), &Looks::none())
+        .with(Role::Target, Path::new("/h/ws/target"), &Looks::none())
+        .with(Role::Workspace, Path::new("/h/ws"), &Looks::none())
+        .with(Role::Tools, Path::new("/nix/store/x-blaze/bin"), &Looks::none())
         .with_sources(Path::new("/b/sources"));
     let roots = map.view();
     let (kept, _) = roots
@@ -692,10 +692,10 @@ fn another_checkout_verifies_a_run_before_it_is_given_it() {
 /// workspace and tools the same, the target directory outside the workspace in both.
 fn sharing(target: &str, tools: &str) -> RootMap {
     RootMap::default()
-        .with(Role::Package, Path::new("/h/ws/p"))
-        .with(Role::Workspace, Path::new("/h/ws"))
-        .with(Role::Target, Path::new(target))
-        .with(Role::Tools, Path::new(tools))
+        .with(Role::Package, Path::new("/h/ws/p"), &Looks::none())
+        .with(Role::Workspace, Path::new("/h/ws"), &Looks::none())
+        .with(Role::Target, Path::new(target), &Looks::none())
+        .with(Role::Tools, Path::new(tools), &Looks::none())
 }
 
 /// C1 (round 4): two checkouts that agree say nothing of a root that is the same in both. A
@@ -819,7 +819,7 @@ fn a_written_file_that_embeds_a_root_is_kept_here_alone() {
         files: vec![crate::run::OutFile {
             path: "flags".into(),
             executable: false,
-            bytes: Some(b"-B/opt/tools/bin".to_vec()),
+            bytes: Some(b"-B/opt/tools/bin".to_vec().into()),
             link: None,
         }],
     };
@@ -848,7 +848,7 @@ fn the_written_file_scan_finds_every_spelling_embedded_does() {
         files: vec![crate::run::OutFile {
             path: "f".into(),
             executable: false,
-            bytes: Some(bytes),
+            bytes: Some(bytes.into()),
             link: None,
         }],
     };
@@ -956,10 +956,10 @@ fn a_root_left_in_a_given_string_is_kept_against_where_it_is() {
 fn a_package_that_is_its_workspace_marks_nothing() {
     let at = |home: &str| {
         RootMap::default()
-            .with(Role::Package, Path::new(&format!("{home}/p")))
-            .with(Role::Workspace, Path::new(&format!("{home}/p")))
-            .with(Role::Target, Path::new(&format!("{home}/p/target")))
-            .with(Role::OutDir, Path::new(&format!("{home}/p/target/debug/build/p-1/out")))
+            .with(Role::Package, Path::new(&format!("{home}/p")), &Looks::none())
+            .with(Role::Workspace, Path::new(&format!("{home}/p")), &Looks::none())
+            .with(Role::Target, Path::new(&format!("{home}/p/target")), &Looks::none())
+            .with(Role::OutDir, Path::new(&format!("{home}/p/target/debug/build/p-1/out")), &Looks::none())
     };
     let a = at("/home/a");
     let roots = a.view();
@@ -988,7 +988,7 @@ fn a_root_relinked_since_its_map_was_made_is_kept_against_where_it_is() {
     std::fs::create_dir_all(dir.join("one")).unwrap();
     std::fs::create_dir_all(dir.join("two")).unwrap();
     std::os::unix::fs::symlink(dir.join("one"), dir.join("ws")).unwrap();
-    let map = RootMap::default().with(Role::Workspace, &dir.join("ws"));
+    let map = RootMap::default().with(Role::Workspace, &dir.join("ws"), &Looks::none());
     let (kept, _) = map.view().kept(&reading(&[]), &printed(b"")).unwrap();
     assert!(!kept.relinked && kept.shared.is_some());
     std::fs::remove_file(dir.join("ws")).unwrap();
@@ -1022,15 +1022,15 @@ fn a_kept_link_into_the_package_is_the_other_checkouts_package_where_it_is_reuse
     assert_eq!(stored.files[0].link.as_deref(), Some("\0p/vendor/gmp"));
     assert!(left.is_empty(), "{left:?}");
     let there = RootMap::default()
-        .with(Role::Package, Path::new("/g/other/p"))
-        .with(Role::Workspace, Path::new("/g/other"))
-        .with(Role::Target, Path::new("/tb/target"))
-        .with(Role::Tools, Path::new("/opt/tools"));
+        .with(Role::Package, Path::new("/g/other/p"), &Looks::none())
+        .with(Role::Workspace, Path::new("/g/other"), &Looks::none())
+        .with(Role::Target, Path::new("/tb/target"), &Looks::none())
+        .with(Role::Tools, Path::new("/opt/tools"), &Looks::none());
     let restored = there.view().restored(stored.clone()).unwrap();
     assert_eq!(restored.files[0].link.as_deref(), Some("/g/other/p/vendor/gmp"));
     assert_eq!(here.view().restored(stored).unwrap(), wrote("/h/ws/p/vendor/gmp"));
     // No root starts it: this checkout's path, kept here alone.
-    let unrooted = RootMap::default().with(Role::Target, Path::new("/ta/target"));
+    let unrooted = RootMap::default().with(Role::Target, Path::new("/ta/target"), &Looks::none());
     let (stored, left) = unrooted.view().stored(&wrote("/h/ws/p/vendor/gmp")).unwrap();
     assert_eq!(stored.files[0].link.as_deref(), Some("/h/ws/p/vendor/gmp"));
     assert!(left.contains(Role::Target), "{left:?}");

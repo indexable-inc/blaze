@@ -306,9 +306,18 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
         let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
         assert!(message.contains("neither recorded nor left out"), "{message}");
     }
-    // The bodies the part has are still served.
+    // No body of the part is served beside it: the part's item table names `/dep.rs` by the
+    // content it was made from (`served_items`, through hir-def's `frozen` reader), and the
+    // file here has `unwritten` added, so the table refuses the crate whole, naming the file,
+    // where this test once read `area` from it. A body the part has is served over the same
+    // files in `a_left_out_body_is_listed_with_why_and_not_served` and the tests above.
     let area = DefWithBodyId::FunctionId(function(&db, dep, "area"));
-    assert!(served_inference(&db, area).is_some());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(served_inference(&db, area))
+    }))
+    .unwrap_err();
+    let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
+    assert!(message.contains("/dep.rs") && message.contains("the image was made from"), "{message}");
 }
 
 /// A body the writer left out is listed with why, and reads as not served, not as an error.
@@ -346,4 +355,141 @@ fn finding_a_record_allocates_nothing() {
             assert!(part::open_body(body).unwrap().passed());
         }
     });
+}
+
+/// What the port tests name an item by: its crate's name and its own, as a describe record
+/// names it by its item key (`blaze_items`, which hir-ty does not see).
+fn port_name(krate: &str, function: &str) -> port::Name {
+    ContentId::of("blaze v2 test ported item 1", format!("{krate}::{function}").as_bytes()).0
+}
+
+/// The functions the port tests' values name, by crate.
+const PORTED: [(&str, &str); 3] = [("dep", "area"), ("dep", "sum"), ("other", "o1")];
+
+/// The buffer of the port tests' values written in `db`: the generic arguments
+/// `[fn area, fn sum, fn o1]`, function items of two crates, and `area` as an id of its own.
+/// With the buffer, where each was written.
+fn ported(db: &Db) -> (Vec<u8>, u32, u32) {
+    use crate::next_solver::{GenericArg, GenericArgs, Ty};
+    use hir_def::CallableDefId;
+
+    let interner = DbInterner::new_no_crate(db);
+    let item = |(krate, name): (&str, &str)| {
+        let func = function(db, crate_named(db, krate), name);
+        let def = CallableDefId::FunctionId(func).into();
+        GenericArg::from(Ty::new_fn_def(interner, def, GenericArgs::default()))
+    };
+    let args = GenericArgs::new_from_slice(&PORTED.map(item));
+    let mut writer = port::Writer::new(db, interner);
+    let args = writer.args(args);
+    let area = writer.function(function(db, crate_named(db, "dep"), "area"));
+    let bytes = writer
+        .finish(&mut |item| {
+            let port::Item::Function(func) = item else {
+                return Err(format!("{item:?} is no function"));
+            };
+            let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+            let (krate, _) = (PORTED.iter())
+                .find(|(krate, of)| *of == name && function(db, crate_named(db, krate), of) == func)
+                .ok_or_else(|| format!("`{name}` is none of the test's functions"))?;
+            Ok(port_name(krate, &name))
+        })
+        .unwrap();
+    (bytes, args, area)
+}
+
+/// The invariant: values ported in one database are the same bytes in another database of the
+/// same sources whose ids differ (no id of a database is in them), and read back there as
+/// that database's own values.
+#[test]
+fn ported_values_are_the_same_bytes_in_two_databases_and_read_back() {
+    let first = db_of(FIXTURE);
+    let (second, dep) = second();
+    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_u32();
+    assert_ne!(bits(&first, crate_named(&first, "dep")), bits(&second, dep), "the ids differ");
+
+    let (bytes, args, area) = ported(&first);
+    let (again, args_again, area_again) = ported(&second);
+    assert_eq!((args, area), (args_again, area_again), "written in one order");
+    assert_eq!(bytes, again, "an id of a database is in the bytes");
+
+    // Read in the second database, which never wrote them.
+    let (second, dep) = self::second();
+    let interner = DbInterner::new_no_crate(&second);
+    let aligned = Aligned::copy_from(&bytes);
+    let mut reader = port::Reader::open(&second, interner, &aligned, &mut |name| {
+        (PORTED.iter())
+            .find(|(krate, function)| port_name(krate, function) == *name)
+            .map(|(krate, name)| {
+                port::Item::Function(function(&second, crate_named(&second, krate), name))
+            })
+    })
+    .unwrap();
+    assert_eq!(reader.function(area).unwrap(), function(&second, dep, "area"));
+    let read = reader.args(args).unwrap();
+    // The same values written again from what was read are the same bytes: they are the
+    // second database's own.
+    let mut writer = port::Writer::new(&second, interner);
+    assert_eq!(writer.args(read), args);
+    let rewritten = writer.finish(&mut |item| match item {
+        port::Item::Function(func) => (PORTED.iter())
+            .find(|(krate, name)| function(&second, crate_named(&second, krate), name) == func)
+            .map(|(krate, name)| port_name(krate, name))
+            .ok_or_else(|| format!("{func:?} is none of the test's functions")),
+        other => Err(format!("{other:?} is no function")),
+    });
+    assert!(rewritten.is_ok(), "{rewritten:?}");
+}
+
+/// The control: a reader that has no item for a name refuses the buffer, and so does one
+/// that names another kind of item; neither panics.
+#[test]
+fn a_ported_buffer_naming_an_unknown_item_is_refused() {
+    let db = db_of(FIXTURE);
+    let (bytes, _, _) = ported(&db);
+    let aligned = Aligned::copy_from(&bytes);
+    let interner = DbInterner::new_no_crate(&db);
+    let unknown = port::Reader::open(&db, interner, &aligned, &mut |_| None);
+    assert!(unknown.is_err_and(|why| why.contains("has none of")));
+    let mut cut = bytes.clone();
+    cut.truncate(bytes.len() / 2);
+    let cut = Aligned::copy_from(&cut);
+    assert!(port::Reader::open(&db, interner, &cut, &mut |_| None).is_err());
+}
+
+/// What `served_inference` bounds a record's nodes by is kept in the record, so a served body
+/// is read without lowering it: the counts a part keeps of each body are those of the body's
+/// store in the database that reads it. (That no `Body::of` row runs on a served read is the
+/// build's to count: `query_counts` of a dependent whose dependency is served.)
+#[test]
+fn a_record_keeps_the_node_counts_of_its_bodys_store() {
+    let bytes = written();
+    let (db, dep) = second();
+    let aligned = Aligned::copy_from(&bytes);
+    let part = part::open(&aligned).unwrap();
+    let mut read = 0;
+    for def in crate_body_owners(&db, dep) {
+        let Some(body) = body_key(&db, def).and_then(|key| part.find(&key)) else { continue };
+        let kept = part::open_body(body).unwrap().nodes();
+        let own = Nodes::of(Body::of(&db, def));
+        assert_eq!((kept.exprs, kept.pats), (own.exprs, own.pats), "{def:?}");
+        read += 1;
+    }
+    assert!(read >= 10, "the fixture's bodies are in the part: {read}");
+}
+
+/// The control: a record whose counts are another body's is refused by the read they bound
+/// (a node past them), so the counts are what the read rests on.
+#[test]
+fn the_oracle_catches_node_counts_that_are_not_the_bodys() {
+    let bytes = written();
+    let (db, dep) = second();
+    let aligned = Aligned::copy_from(&bytes);
+    let part = part::open(&aligned).unwrap();
+    let items = part.items(&db, dep).unwrap();
+    let def = DefWithBodyId::FunctionId(function(&db, dep, "area"));
+    let body = part::open_body(part.find(&body_key(&db, def).unwrap()).unwrap()).unwrap();
+    assert!(body.inference(&db, dep, &items, body.nodes()).is_ok());
+    let none = Nodes { exprs: 0, pats: 0 };
+    assert!(body.inference(&db, dep, &items, none).is_err(), "no node is below a count of 0");
 }

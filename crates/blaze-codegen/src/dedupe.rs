@@ -19,7 +19,7 @@
 //! different functions can compare equal (since identical functions can be deduplicated
 //! within a codegen unit)".
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -107,13 +107,13 @@ impl DedupeError {
     }
 }
 
-fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> InstanceKey {
+fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> InstanceKey {
     kept.get(key).copied().unwrap_or(*key)
 }
 
 fn rename_target(
     target: &Target,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
     data: &HashMap<ContentId, ContentId, Global>,
 ) -> Target {
     match target {
@@ -128,7 +128,7 @@ fn rename_target(
 
 fn rename_relocs(
     relocs: &Relocs,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
     data: &HashMap<ContentId, ContentId, Global>,
 ) -> Relocs {
     relocs.map(|target| rename_target(target, kept, data))
@@ -136,7 +136,7 @@ fn rename_relocs(
 
 fn rename_unwind(
     unwind: Unwind,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
     data: &HashMap<ContentId, ContentId, Global>,
 ) -> Unwind {
     let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
@@ -160,12 +160,12 @@ fn rename_unwind(
 }
 
 /// Whether `target` is a function of `kept`.
-fn names(target: &Target, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
+fn names(target: &Target, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
     matches!(target, Target::Function(key) | Target::Direct(key) if kept.contains_key(key))
 }
 
 /// Whether `relocs` name a function of `kept`.
-fn names_kept(relocs: &Relocs, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
+fn names_kept(relocs: &Relocs, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
     relocs.targets().iter().any(|target| names(target, kept))
 }
 
@@ -177,7 +177,7 @@ fn names_kept(relocs: &Relocs, kept: &HashMap<InstanceKey, InstanceKey, Global>)
 /// [`DedupeError::DataOrder`]. The answer is each changed datum's old ID with its new one.
 fn rename_data(
     data: &mut [Data],
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
     owner: DataOwner,
 ) -> Result<HashMap<ContentId, ContentId, Global>, DedupeError> {
     let mut ids: HashMap<ContentId, ContentId, Global> = HashMap::new_in(Global);
@@ -210,7 +210,7 @@ fn rename_data(
 
 /// Whether `function` names a function of `kept`: in its code, its data or its unwind
 /// routine. What [`rename`] changes it for.
-fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
+fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
     let routine_named = match &function.unwind {
         Some(
             Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. },
@@ -223,7 +223,7 @@ fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKe
 }
 
 /// Whether `value` names a function of `kept`: what [`rename_static`] changes it for.
-fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, Global>) -> bool {
+fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
     matches!(&value.init, Init::Bytes { relocs, .. } if names_kept(relocs, kept))
         || value.data.iter().any(|it| names_kept(&it.relocs, kept))
 }
@@ -232,7 +232,7 @@ fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, Glo
 /// it as it is, and says so, when it names nothing of `kept`.
 pub(crate) fn rename(
     function: &mut CompiledFunction,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
 ) -> Result<bool, DedupeError> {
     if !names_any(function, kept) {
         return Ok(false);
@@ -247,7 +247,7 @@ pub(crate) fn rename(
 /// whether anything changed, which changes its digest.
 pub(crate) fn rename_static(
     value: &mut Static,
-    kept: &HashMap<InstanceKey, InstanceKey, Global>,
+    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
 ) -> Result<bool, DedupeError> {
     if !static_names_any(value, kept) {
         return Ok(false);
@@ -294,20 +294,37 @@ pub fn dedupe(
 
 /// [`dedupe`], which also gives `originals`, when asked, each function and static it changes
 /// or takes out as it was given ([`Originals`]): a copy of each renamed one, made before its
-/// first rename, and each merged one itself.
+/// first rename, and each merged one itself. Its tables (which keys are copied, each code ID,
+/// what is merged into what) are the task's frame's, let go as it returns: a key a candidate,
+/// they were the largest churn of the global heap in a build (66 GiB on tempo); the answer
+/// is the caller's, in the global heap.
 pub fn dedupe_keeping(
     functions: &mut Vec<CompiledFunction>,
     statics: &mut [Static],
     mergeable: impl Fn(&InstanceKey) -> bool,
+    originals: Option<&mut Originals>,
+) -> Result<(Deduped, Vec<usize>), DedupeError> {
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        dedupe_in(functions, statics, mergeable, originals, frame)
+    })
+}
+
+/// [`dedupe_keeping`] with its tables in `frame`.
+fn dedupe_in(
+    functions: &mut Vec<CompiledFunction>,
+    statics: &mut [Static],
+    mergeable: impl Fn(&InstanceKey) -> bool,
     mut originals: Option<&mut Originals>,
+    frame: &blaze_mem::Frame,
 ) -> Result<(Deduped, Vec<usize>), DedupeError> {
     let candidate = |it: &CompiledFunction| candidate(it, mergeable(&it.key));
     // The keys whose original is kept already: a function renamed in two rounds is copied
     // before the first.
-    let mut copied: blaze_hash::HashSet<InstanceKey, Global> = blaze_hash::HashSet::new_in(Global);
+    let mut copied: blaze_hash::HashSet<InstanceKey, &blaze_mem::Frame> =
+        blaze_hash::HashSet::new_in(frame);
     // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
     // Unordered: only grouped, and each group is sorted on its own.
-    let mut ids: HashMap<InstanceKey, ContentId, Global> = HashMap::new_in(Global);
+    let mut ids: HashMap<InstanceKey, ContentId, &blaze_mem::Frame> = HashMap::new_in(frame);
     for function in functions.iter().filter(|it| candidate(it)) {
         ids.insert(function.key, code_id(function));
     }
@@ -323,7 +340,7 @@ pub fn dedupe_keeping(
     );
     let _entered = span.enter();
     // Unordered: `merged` is sorted as it is made.
-    let mut kept: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
+    let mut kept: HashMap<InstanceKey, InstanceKey, &blaze_mem::Frame> = HashMap::new_in(frame);
     let (mut rounds, mut bytes) = (0u32, 0u64);
     let mut last = None;
     loop {

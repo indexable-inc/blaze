@@ -16,6 +16,7 @@
 //! `message` are rustc's.
 
 mod calls;
+pub mod comptime;
 mod qualifs;
 mod stability;
 
@@ -659,14 +660,12 @@ impl<'a, 'db> Checker<'a, 'db> {
 
     /// Whether `span` is of something written in the source, not of what lowering made. Asked
     /// last, of what would be reported: a body with nothing to report is checked without
-    /// building its source map.
+    /// building its source map. An expression's is the store's fact
+    /// ([`ExpressionStore::is_synthesized`]); only a pattern's reads the map.
     fn written(&self, span: MirSpan) -> bool {
-        let source_map = || self.source_map();
         match span {
-            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
-                source_map().expr_syntax(expr).is_ok()
-            }
-            MirSpan::PatId(pat) => source_map().pat_syntax(pat).is_ok(),
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => !self.store.is_synthesized(expr),
+            MirSpan::PatId(pat) => self.source_map().pat_syntax(pat).is_ok(),
             MirSpan::BindingId(_) | MirSpan::SelfParam => true,
             MirSpan::Unknown | MirSpan::Inlined(_) => false,
         }
@@ -680,16 +679,11 @@ impl<'a, 'db> Checker<'a, 'db> {
 }
 
 /// Whether `func` is written with `#[rustc_do_not_const_check]`, whose body rustc does not
-/// check: core's `panic!` makes such a `const fn` in the body it is written in.
+/// check: core's `panic!` makes such a `const fn` in the body it is written in. Read from the
+/// item's attributes (`cfg_attr` expanded), not the file's live parse, so an edit of a body
+/// elsewhere in the file does not run `const_check` again.
 fn not_const_checked(db: &Db, func: FunctionId) -> bool {
-    use hir_def::src::HasSource;
-    use syntax::view::HasAttrs;
-    let source = func.lookup(db).ast_ptr(db);
-    source
-        .value
-        .to_view(source.file_id.root(db))
-        .attrs()
-        .any(|attr| attr.simple_name() == Some("rustc_do_not_const_check"))
+    hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_do_not_const_check")
 }
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a
@@ -699,12 +693,12 @@ fn not_const_checked(db: &Db, func: FunctionId) -> bool {
 /// otherwise callable only when it is declared `const`, as the nightly declares the others const
 /// eval runs (`atomic_load` and the rest of the atomics, `transmute`, ..).
 ///
-/// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
-/// check reports only what rustc reports.
+/// Where a comptime function may be called is not this check's: a `const fn` may not call one
+/// outside a `const { .. }` block, which [`comptime::comptime_calls`] reports, of every function.
 fn is_const_callable(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).is_const()
         || of_a_trait(db, func)
-        || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
+        || comptime::is_comptime(db, func)
 }
 
 /// How rustc's message names the function called: `function`, `method` or `associated

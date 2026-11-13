@@ -56,6 +56,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Check => &[
                 GLOBAL,
@@ -78,6 +79,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -95,14 +97,16 @@ impl Clap for Command {
                 REPORTS,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Test => &[
-                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS,
-                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
+                JOBS, KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                PREBUILT,
             ],
             Command::Bench => &[
-                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING,
-                PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, NO_TESTS, FEATURES, JOBS,
+                KEEP_GOING, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
                 GLOBAL,
@@ -349,6 +353,15 @@ const TEST_ONLY: &[Flag] = &[
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
 
+/// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
+/// `fail` (the default) refuses it, naming the selection that matched nothing
+/// ([`super::test::refusal`]); `pass` is cargo's and libtest's behaviour, exit 0. The name and
+/// the values are cargo-nextest's.
+const NO_TESTS: &[Flag] = &[Flag {
+    possible: &["fail", "pass"],
+    ..Flag::new("no-tests", None, Takes::Value, "fail|pass")
+}];
+
 /// `--refused N|all` is blaze's: how many of the functions blaze could not compile a build's
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
 const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
@@ -360,6 +373,12 @@ const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 /// and compiles no program, so one command line serves all four.
 const GOAL: &[Flag] =
     &[Flag { possible: blaze_api::Goal::NAMES, ..Flag::new("goal", None, Takes::Value, "GOAL") }];
+
+/// `--no-prebuilt` is blaze's: this request takes no record from a pack source (packs.json's
+/// `remote`, an R2 bucket) and builds what the home's store and the machine's layer miss from
+/// source, the per-request form of packs.json's `"prebuilt": false`
+/// ([`blaze_api::Cargo::prebuilt`]).
+const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
 
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
@@ -402,6 +421,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
+                | "no-tests"
                 | "refused"
                 | "goal"
                 | "baselines"
@@ -410,6 +430,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "fix"
                 | "lint"
                 | "replace"
+                | "no-prebuilt"
         )
     )
 }
@@ -632,6 +653,9 @@ pub struct Flags {
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
     pub reached: bool,
+    /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
+    /// Without it such a run is refused ([`super::test::refusal`]).
+    pub no_tests_pass: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
     pub ub_seed: Option<u64>,
@@ -651,6 +675,8 @@ pub struct Flags {
     pub baselines: Option<String>,
     pub bless_baselines: bool,
     pub new_baselines: Vec<String>,
+    /// `--no-prebuilt`: no record of this request comes from a pack source.
+    pub no_prebuilt: bool,
     /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
     /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
     /// (`Asked::lint_levels` of blaze-units).
@@ -697,6 +723,8 @@ impl Flags {
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
             "reached" => self.reached = true,
+            // `check_value` held it to `fail` and `pass` first.
+            "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),
             // `check_value` parsed them first.
@@ -716,6 +744,7 @@ impl Flags {
             "replace" => self.replace.extend(owned()),
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
+            "no-prebuilt" => self.no_prebuilt = true,
             "new-baseline" => {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));
@@ -824,6 +853,14 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            // `blaze store verify` is the same command's (`cli::cache`).
+            Some("store") => {
+                return Ok(Asked::Cache(std::iter::once("store".into()).chain(words).collect()));
+            }
+            // `blaze gc ...` is `blaze cache gc ...`.
+            Some("gc") => {
+                return Ok(Asked::Cache(std::iter::once("gc".into()).chain(words).collect()));
+            }
             Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
             Some("fmt") => return Ok(Asked::Fmt(words.collect())),
             Some("new") => return Ok(Asked::New { init: false, words: words.collect() }),

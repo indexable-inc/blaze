@@ -1,0 +1,14 @@
+{
+ "id": "front-items-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane front-items",
+ "where": "crates/hir-expand/src/inert_attr_macro.rs, crates/hir-ty/src/method_resolution.rs, crates/blaze-front-items/src/builtin.rs",
+ "what": "The list of built-in attribute names now has three homes: hir-expand's INERT_ATTRIBUTES (tied to intern's declared symbols), hir-ty's own INERT_ATTRIBUTES string list, and blaze-front-items' NAMES. The bottom step of the new front end needs the names and sits under hir-expand, so it could not read the table and I copied it.",
+ "cost": "a third copy; one test (`the_built_in_names_are_the_old_front_ends`) holds it equal to hir-expand's",
+ "cause": "the table lives in a crate above the code that needs it, and its rows carry interned symbols a bottom crate cannot name",
+ "class": "one concept in several homes (rule 30)",
+ "prevention": "move the names to the bottom crate (blaze-front-items::builtin) and build hir-expand's table and hir-ty's list from it; ban the copies",
+ "workaround": "the equality test",
+ "fix": "2026-11-12, lane front-items2: the table is `syntax::builtin_attrs` (rows, templates, `find`, `is_built_in`); hir-expand builds its declared symbols from the same rows through `syntax::builtin_attributes!`; blaze-front-items' copy is deleted; hir-ty's list is a chosen subset, held to the table by its test",
+ "state": "fixed"
+}

@@ -863,10 +863,6 @@ impl Frame {
         }
     }
 
-    pub(crate) fn set_tag(&self, tag: Tag) {
-        self.tag.set(tag);
-    }
-
     /// Whether `[ptr, ptr + size)` ends at the cursor, in the current block: the most recent
     /// allocation.
     #[inline]

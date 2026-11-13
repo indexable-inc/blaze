@@ -8,8 +8,9 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, CrateLibs, Located, Target, caseless, fhs, listing, loader, locate_with,
-    output_with, parse_version, reactor_with, rpaths, top_level_string,
+    Ask, Cache, CrateLibs, Located, RunsOn, Target, caseless, fhs, listing, loader,
+    locate_any, locate_with, machine_facts, output_with, parse_version, reactor_with, rpaths,
+    top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
@@ -61,6 +62,33 @@ impl Ask for Answers {
     fn said(&self, program: &Path, args: &[String]) -> Result<String, String> {
         let mut answers = self.run(program, &[args.to_vec()]);
         answers.pop().unwrap()
+    }
+
+    fn loader(&self) -> Result<Option<String>, LinkError> {
+        Ok(self.vars.iter().find(|it| it.0 == "blaze's own loader").map(|it| it.1.clone()))
+    }
+}
+
+/// A machine that must not be asked: every question fails the test.
+struct Never;
+
+impl Ask for Never {
+    fn var(&self, name: &str) -> Result<Option<String>, LinkError> {
+        // The one variable a link of Rust alone reads: the macOS deployment target.
+        assert_eq!(name, "MACOSX_DEPLOYMENT_TARGET", "a link of Rust alone read {name}");
+        Ok(None)
+    }
+
+    fn run(&self, program: &Path, runs: &[Vec<String>]) -> Vec<Result<String, String>> {
+        panic!("a link of Rust alone ran {} {runs:?}", program.display())
+    }
+
+    fn said(&self, program: &Path, args: &[String]) -> Result<String, String> {
+        panic!("a link of Rust alone ran {} {args:?}", program.display())
+    }
+
+    fn loader(&self) -> Result<Option<String>, LinkError> {
+        panic!("a link for another machine read this one's loader")
     }
 }
 
@@ -208,19 +236,158 @@ fn verbatim(name: &str) -> NativeLib {
     NativeLib { name: name.to_owned(), kind: NativeLibKind::Dylib, verbatim: true }
 }
 
+/// An executable linked with the machine's C toolchain: [`output_with`]'s output, saying the
+/// machine's interpreter and SDK ([`machine_facts`]), as [`locate_any`] makes it for a link
+/// that names something blaze does not ship.
 fn executable(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, LinkError> {
-    output_with(cache, answers, triple, None, Debug::None, true)
+    let mut output = output_with(answers, triple, None, Debug::None, true, RunsOn::Elsewhere)?;
+    machine_facts(cache, answers, &mut output)?;
+    Ok(output)
 }
 
 fn shared(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, LinkError> {
-    output_with(
-        cache,
+    let mut output = output_with(
         answers,
         triple,
         Some(("libdemo.so".to_owned(), vec!["demo".to_owned()])),
         Debug::Lines,
         false,
+        RunsOn::Elsewhere,
+    )?;
+    machine_facts(cache, answers, &mut output)?;
+    Ok(output)
+}
+
+/// The libraries Rust's std, `libc` and `unwind` crates ask for on a glibc target.
+fn std_glibc() -> Vec<NativeLib> {
+    ["gcc_s", "util", "rt", "pthread", "m", "dl", "c"].map(dylib).to_vec()
+}
+
+/// The control of the test below is its `Never`: a `locate_any` that asked the machine for a
+/// link of Rust alone panics there.
+#[test]
+fn a_link_of_rust_alone_asks_the_machine_nothing_and_takes_only_what_blaze_ships() {
+    for (triple, interpreter) in [
+        ("x86_64-unknown-linux-gnu", Some("/lib64/ld-linux-x86-64.so.2")),
+        ("aarch64-unknown-linux-gnu", Some("/lib/ld-linux-aarch64.so.1")),
+        ("aarch64-apple-darwin", None),
+    ] {
+        let libs = match interpreter {
+            Some(_) => std_glibc(),
+            None => ["System", "c", "m"].map(dylib).to_vec(),
+        };
+        let cache = Cache::new();
+        let mut output =
+            output_with(&Never, triple, None, Debug::None, true, RunsOn::Elsewhere).unwrap();
+        assert_eq!(output.interpreter.as_deref(), interpreter, "{triple}");
+        let located = locate_any(
+            &cache,
+            &Never,
+            &mut output,
+            &program(&libs),
+            &[PathBuf::from("/a/link/directory")],
+            Path::new("/no-blaze-toolchain"),
+        )
+        .unwrap();
+        assert!(!located.is_empty());
+        for it in &located {
+            assert!(it.bytes.is_some(), "{triple}: {} is read off the machine", it.name);
+            assert!(it.name.starts_with(&format!("blaze:{triple}/")), "{}", it.name);
+        }
+        let names: Vec<&str> =
+            located.iter().map(|it| it.name.rsplit('/').next().unwrap()).collect();
+        match interpreter {
+            Some(_) => {
+                assert_eq!(names[0], "start.o");
+                assert_eq!(located[0].kind, NativeKind::Object);
+                assert_eq!(
+                    names[1..8],
+                    [
+                        "libgcc_s.so.1",
+                        "libutil.so.1",
+                        "librt.so.1",
+                        "libpthread.so.0",
+                        "libm.so.6",
+                        "libdl.so.2",
+                        "libc.so.6"
+                    ]
+                );
+                assert!(names[8].starts_with("ld-linux-") && names.len() == 9, "{names:?}");
+                assert_eq!(output.platform, None);
+            }
+            None => {
+                assert_eq!(names, ["libSystem.tbd"]);
+                assert_eq!(output.platform.unwrap().sdk, super::shipped::MACOS_SDK);
+            }
+        }
+        // The same link again takes the same bytes, kept.
+        let again = locate_any(
+            &cache,
+            &Never,
+            &mut output,
+            &program(&libs),
+            &[],
+            Path::new("/no-blaze-toolchain"),
+        )
+        .unwrap();
+        assert_eq!(located, again);
+    }
+    assert_eq!(super::Glibc::DEFAULT, super::Glibc(2, 28));
+}
+
+#[test]
+fn a_build_for_this_machine_is_interpreted_by_the_loader_blaze_runs_under() {
+    let answers = Answers::new().var("blaze's own loader", "/nix/store/x-glibc/lib/ld.so");
+    let here = output_with(&answers, "x86_64-unknown-linux-gnu", None, Debug::None, true, RunsOn::Here);
+    assert_eq!(here.unwrap().interpreter.as_deref(), Some("/nix/store/x-glibc/lib/ld.so"));
+    // A blaze with no loader of its own (statically linked) names the ABI's.
+    let none = Answers::new();
+    let here = output_with(&none, "x86_64-unknown-linux-gnu", None, Debug::None, true, RunsOn::Here);
+    assert_eq!(here.unwrap().interpreter.as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
+    assert_eq!(answers.asked() + none.asked(), 0);
+}
+
+#[test]
+fn a_link_that_names_what_blaze_does_not_ship_takes_the_machines_toolchain_and_says_why() {
+    // No C toolchain answers: the error names the library that made the link the machine's.
+    let mut libs = std_glibc();
+    libs.push(dylib("ssl"));
+    let mut output = output_with(
+        &Answers::new(),
+        "x86_64-unknown-linux-gnu",
+        None,
+        Debug::None,
+        true,
+        RunsOn::Elsewhere,
     )
+    .unwrap();
+    let error = locate_any(
+        &Cache::new(),
+        &Answers::new(),
+        &mut output,
+        &program(&libs),
+        &[],
+        Path::new("/no-blaze-toolchain"),
+    )
+    .unwrap_err();
+    assert!(
+        error.what.contains("the native library `ssl`")
+            && error.what.contains("the machine's C toolchain for x86_64-unknown-linux-gnu"),
+        "{}",
+        error.what
+    );
+    for lib in [static_lib("c", false), verbatim("libc.so.6")] {
+        let output = output_with(
+            &Answers::new(),
+            "aarch64-unknown-linux-gnu",
+            None,
+            Debug::None,
+            true,
+            RunsOn::Elsewhere,
+        )
+        .unwrap();
+        assert!(Target::LinuxAarch64.ships(&output, &program(&[lib])).is_err());
+    }
 }
 
 /// `libs` as one crate's whose compile searches no directory of its own: each searched in the

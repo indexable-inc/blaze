@@ -421,7 +421,7 @@ pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in
 /// the user's home.
 pub(crate) fn versions() -> Option<PathBuf> {
-    Some(blaze_manifest::user_config::home()?.join("versions"))
+    Some(blaze_manifest::user_config::home().ok()?.join("versions"))
 }
 
 /// The `blaze` of `version` where [`versions`] keeps it.
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn the_thin_blaze_finds_blazes_home_where_the_launcher_does() {
         assert_eq!(
-            blaze_thin::pin::home(|name| std::env::var_os(name)),
+            blaze_thin::pin::home(|name| std::env::var_os(name), blaze_core::home::record),
             blaze_manifest::user_config::home()
         );
     }

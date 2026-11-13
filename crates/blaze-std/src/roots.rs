@@ -29,32 +29,46 @@ pub struct Roots {
 }
 
 impl Roots {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
         Roots { anchors, allowed: Allowed::Any, plant }
     }
 
     /// The empty set: trusts no one. Not authority, so anyone may make it.
+    #[blaze::nonblocking]
     pub fn none() -> Roots {
         // alloc: once per empty set, its count.
         Roots { anchors: Arc::from(Vec::new()), allowed: Allowed::nothing(), plant: Plant::None }
     }
 
     /// Only the authorities of `names` this trusts already: never one more.
+    #[blaze::nonblocking]
     pub fn only(&self, names: &[Authority]) -> Roots {
         Roots { anchors: Arc::clone(&self.anchors), allowed: self.allowed.only(names, self.plant), plant: self.plant }
     }
 
     /// Whether `name` is trusted.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn trusts(&self, name: &Authority) -> bool {
         self.each().any(|anchor| &anchor.name == name)
     }
 
     /// Each anchor trusted, in the host's order.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = &Anchor> {
         self.anchors.iter().filter(|anchor| self.allowed.allows(&anchor.name))
     }
 
     /// Whether it trusts no one.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.each().next().is_none()
     }

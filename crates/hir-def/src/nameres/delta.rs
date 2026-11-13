@@ -46,7 +46,7 @@ use std::alloc::Global;
 #[cfg(test)]
 pub(in crate::nameres) use self::publish::Slices;
 pub(in crate::nameres) use self::publish::{
-    log_row_module, input_children, input_legacy_macro, input_name, input_scope, input_traits, published,
+    log_row_module, name_read, input_children, input_legacy_macro, input_name, input_scope, input_traits, published,
     published_module, published_modules, published_records,
 };
 pub(in crate::nameres) use self::state::State;
@@ -72,6 +72,31 @@ const NAME: &str = "nameres";
 
 inventory::submit! {
     base_db::Maintainer { order: 100, name: NAME, reads: read_step, apply: apply_step }
+}
+
+/// Whether the impls of a crate are read from records of their own, by whoever keeps them (the
+/// impls maintainer's crate registers its `frozen::served`): name resolution then hands no
+/// delta of that crate when its def map is served ([`served_delta`] walks every scope of the
+/// crate to make one, which nothing would read). Reads inputs alone: an apply asks it too.
+pub struct ImplsServed(pub fn(&Db, Crate) -> bool);
+
+inventory::collect!(ImplsServed);
+
+/// Whether name resolution maintains `krate` now: it holds the crate's state and no frozen
+/// image serves its def map (a crate served in the write that is still to drop its state is
+/// not). What `crate::deps::serve` leaves out of its fetch for a crate it asked before, so a
+/// crate an edit took the image of is maintained by deltas from then on and never pays a
+/// cold run for being served again.
+pub fn maintained(db: &mut Db, krate: Crate) -> bool {
+    !frozen::is_served(&*db, krate)
+        && db.with_state::<State, _>(|_, state| state.crates.contains_key(&krate))
+}
+
+/// Whether a served crate owes the impls maintainer its decoded map's items after `written`:
+/// the crate graph reached it, and no [`ImplsServed`] says its impls are records.
+fn owes_served_delta(db: &Db, written: &Written<'_>, krate: Crate) -> bool {
+    written.crate_graph_reaches(krate)
+        && !inventory::iter::<ImplsServed>().any(|it| (it.0)(db, krate))
 }
 
 /// What the last write changed of each maintained crate's resolution, in dependency order:
@@ -101,6 +126,12 @@ pub struct CrateDelta {
     /// headers and signatures may differ with no binding changed.
     pub touched: Vec<ModuleDefId>,
     pub touched_impls: Vec<ImplId>,
+    /// The modules whose scope the write set: a module made (one a macro wrote once its crate
+    /// was given its procedural macros, with no round-0 log changed) and one whose scope
+    /// changed in any list. A body that may hold an impl (a `const`, named or not, a function,
+    /// a static) can come or go with no name bound anew, so neither `bindings` nor `touched`
+    /// lists it.
+    pub scopes: Vec<ModuleId>,
 }
 
 /// The maintainer's reads, two steps per layer of the crate graph (each crate one past its
@@ -202,8 +233,11 @@ pub(super) fn forgets_included() -> bool {
 /// The invariant: a crate with no job is one whose job would read no log again, wake no
 /// group, run no region and publish nothing ([`read_crate`] and [`finish_crate`] with an
 /// empty delta put its state back and hand [`LastWrite`] nothing). That holds when
-/// - the write changed no crate graph, cfg or env, no file set and no source root (any of
-///   those walks every crate's round-0 tree), and gave this crate no proc macros;
+/// - the write changed no crate graph, cfg or env (any of those walks every crate's round-0
+///   tree), did not add this crate to the graph ([`Written::crates_added`]: a crate added is
+///   run, and no crate that was there depends on it, so it reaches none of them), and gave
+///   this crate no proc macros;
+/// - the write changed no file set or source root this crate can read ([`files_reach`]);
 /// - no crate it depends on, directly or through others, is reached by the write: a crate
 ///   reads names only of crates it depends on, so nothing an earlier crate's job changed is
 ///   a key it read, and its root's log, which alone reads other crates' roots, is as it was;
@@ -213,10 +247,8 @@ pub(super) fn forgets_included() -> bool {
 /// A crate reached is noted ([`state::Pass::reached`]) whether or not its job then changes
 /// anything, so every crate above a written one has its job, as before.
 fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> bool {
-    if written.crates
-        || !written.added.is_empty()
-        || !written.removed.is_empty()
-        || !written.roots.is_empty()
+    if written.crate_graph_reaches(krate)
+        || files_reach(db, krate, written)
         || written.proc_macros.binary_search(&krate).is_ok()
     {
         return false;
@@ -234,6 +266,43 @@ fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> boo
         (false, Some(cs)) => !cs.reads_written(written),
         _ => false,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a file set or a source root changed by the write reaches no
+    /// crate but through the files it names, so a crate whose own source root gained a file
+    /// (a `mod` probe that now hits) has no job.
+    pub(in crate::nameres) static ROOTS_REACH_NO_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a file set or a source root `written` changed (a file added to one or taken from
+/// it) may change what `krate`'s round-0 tree reads: a `mod` probe that now hits or no longer
+/// does.
+///
+/// The invariant: a module's file is probed in the source root of the file that declares it,
+/// from the crate's root file down, so a crate reads the file set of its root file's source
+/// root and no other's. A library crate (its root is a library's: the standard library's, a
+/// registry or git package's, each package its own root) is therefore reached only when that
+/// root is among `written.roots`: a plan lowered into the front end beside another's (a
+/// `cfg(test)` twin's alias in its package's root, a dev-dependency's new root) leaves every
+/// library crate of the other roots without a job. A local crate is taken as reached by any
+/// such change: a workspace's packages may nest, and what its `include!`s probed outside its
+/// root is not kept by root. A change that names no root (none does today) reaches every
+/// crate.
+fn files_reach(db: &Db, krate: Crate, written: &Written<'_>) -> bool {
+    if written.added.is_empty() && written.removed.is_empty() && written.roots.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    if ROOTS_REACH_NO_CRATE.get() {
+        return false;
+    }
+    if written.roots.is_empty() {
+        return true;
+    }
+    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    written.roots.binary_search(&root).is_ok() || !db.source_root(root).source_root_ref(db).is_library
 }
 
 /// The maintainer's apply: each crate of the step's layer publishes what its job ran, in
@@ -370,7 +439,7 @@ impl CrateRun {
 fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     if run.served {
         // Read here, not in the apply: the decoded map is a query the apply may not run.
-        if written.crates {
+        if owes_served_delta(db, written, run.krate) {
             run.served_delta = Some(served_delta(db, run.krate));
         }
         return;
@@ -386,7 +455,7 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
     let root = queries::crate_root(db, krate);
     let (cold, mut cs) = match run.old.take() {
-        Some(it) if !written.crates && it.root == root => (false, it),
+        Some(it) if !written.crate_graph_reaches(krate) && it.root == root => (false, it),
         old => (true, CrateState::cold(root, old)),
     };
     let work = &mut run.work;
@@ -456,7 +525,7 @@ fn finish_crate(
         if old.is_some() {
             publish::enter(db, krate, None);
         }
-        if written.crates {
+        if owes_served_delta(&*db, written, krate) {
             let delta = run_served.unwrap_or_else(|| {
                 panic!("nameres delta: crate {krate:?}'s served delta was not read")
             });
@@ -802,6 +871,8 @@ struct Scoped {
     old_items: Items,
     /// The groups whose items the impls maintainer is handed, now.
     emit: Vec<ModuleId>,
+    /// The modules whose scope this step set ([`CrateDelta::scopes`]).
+    scopes: Vec<ModuleId>,
     changed: Vec<Changed>,
     /// The region in group order and what its run read, when one ran.
     ran: Option<(Vec<ModuleId>, Vec<Read>)>,
@@ -834,6 +905,7 @@ fn publish_scopes(
     let proc_macro = attrs.proc_macro;
     let root = cs.root;
     let mut old_items = Items::default();
+    let mut scopes = Vec::new(); // alloc: the modules whose scope the write set, once per write that sets one
     let mut changed = Vec::new(); // alloc: empty, allocates nothing without a run
     let mut order = Vec::new(); // alloc: as above
     let mut ran_reads = None;
@@ -870,8 +942,11 @@ fn publish_scopes(
                 scope.censor_non_proc_macros(krate);
             }
             let mut slot = cs.inputs.get(&module).copied();
-            work.slices +=
-                u64::from(publish::set_scope(db, krate, &mut slot, module, scope, children));
+            let set = publish::set_scope(db, krate, &mut slot, module, scope, children);
+            work.slices += u64::from(set);
+            if set {
+                scopes.push(module);
+            }
             let input = slot.expect("nameres delta: `set_scope` makes the input");
             cs.inputs.insert(module, input);
             if !censored {
@@ -936,7 +1011,9 @@ fn publish_scopes(
     let mut emit: Vec<ModuleId> = order;
     for (group, places) in &delta.direct {
         if !region.contains(group) {
-            apply_direct(db, &cs, *group, places, &mut old_items, &mut work);
+            if apply_direct(db, &cs, *group, places, &mut old_items, &mut work) {
+                scopes.push(*group);
+            }
             emit.push(*group);
         }
     }
@@ -951,6 +1028,7 @@ fn publish_scopes(
         proc_macro,
         old_items,
         emit,
+        scopes,
         changed,
         ran: ran_reads,
         rows_changed,
@@ -1056,7 +1134,7 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
 /// of it for the impls maintainer.
 fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta {
     let Scoped {
-        krate, mut cs, delta, cold, old_items, emit, changed, mut work, assembled, ..
+        krate, mut cs, delta, cold, old_items, emit, scopes, changed, mut work, assembled, ..
     } = scoped;
     carry_maintaining();
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
@@ -1070,6 +1148,7 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
     let mut crate_delta =
         touched_only(db, krate, &cs, &delta).unwrap_or_else(|| empty_delta(krate));
     crate_delta.fresh = cold;
+    crate_delta.scopes = scopes;
     let mut new_items = Items::default();
     for group in &emit {
         let pos = cs.group_pos.get(group).expect("nameres delta: every group has a position");
@@ -1090,7 +1169,8 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
 
 /// Puts a group's name-free inserts (`places` in its new log) into its module's published
 /// scope, where a run would put them: a round-0 op of a list is replayed before any expansion
-/// adds to it, so its index is the number of the same ops before it in the log.
+/// adds to it, so its index is the number of the same ops before it in the log. Whether the
+/// scope was set.
 fn apply_direct(
     db: &mut Db,
     cs: &CrateState,
@@ -1098,7 +1178,7 @@ fn apply_direct(
     places: &[u32],
     old_items: &mut Items,
     work: &mut Work,
-) {
+) -> bool {
     let input = *cs
         .inputs
         .get(&group)
@@ -1136,7 +1216,9 @@ fn apply_direct(
             _ => {}
         }
     }
-    work.slices += u64::from(publish::set_scope_alone(db, input, scope));
+    let set = publish::set_scope_alone(db, input, scope);
+    work.slices += u64::from(set);
+    set
 }
 
 /// `scope` with `imp` at `at` of its impls, its bits as `define_impl` in order makes them.
@@ -1178,6 +1260,7 @@ fn cold(
         removed: &[],
         roots: &[],
         crates: true,
+        crates_added: &[],
         included: &[],
         proc_macros: &[],
     };
@@ -1283,6 +1366,7 @@ fn empty_delta(krate: Crate) -> CrateDelta {
         bindings: Vec::new(),      // alloc: as above
         touched: Vec::new(),       // alloc: as above
         touched_impls: Vec::new(), // alloc: as above
+        scopes: Vec::new(),        // alloc: as above
     }
 }
 

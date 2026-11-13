@@ -85,6 +85,9 @@ impl fmt::Display for KeyError {
 impl core::error::Error for KeyError {}
 
 /// Why `raw` is no key, if it is not.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn refused(raw: &str) -> Option<KeyWhy> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
@@ -110,6 +113,8 @@ impl Key {
     /// `raw` as a key, or why it is none.
     ///
     /// The contract: a key is 1 to [`KEY_MOST`] bytes.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
         ensures match &r {
             Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
@@ -123,6 +128,9 @@ impl Key {
         Ok(Key(Path::new(raw).expect("a key is one part of a relative path")))
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -148,6 +156,8 @@ impl fmt::Debug for Key {
 impl TryFrom<&str> for Key {
     type Error = KeyError;
 
+    #[blaze::pure]
+    #[blaze::nonblocking]
     fn try_from(raw: &str) -> Result<Key, KeyError> {
         Key::new(raw)
     }
@@ -185,6 +195,9 @@ impl core::error::Error for KvError {}
 
 impl KvError {
     /// The stop, if the wait under it stopped.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn stopped(&self) -> Option<&Stopped> {
         self.under.stopped()
     }
@@ -289,7 +302,7 @@ impl Kv<ReadWrite> {
     pub fn put_synced(&self, cx: &Cx, key: &Key, value: &[u8]) -> Result<(), KvError> {
         let put = match cx.plant() {
             Plant::KvPutUnsynced => self.dir.publish_unsynced(cx, key.path(), Content::bytes(value), Unsynced::No).map(|_| ()),
-            _ => self.dir.publish_synced(cx, key.path(), Content::bytes(value)).map(|_| ()),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.dir.publish_synced(cx, key.path(), Content::bytes(value)).map(|_| ()),
         };
         put.map_err(|error| Self::refuse(KvOp::Put, Some(key), error))
     }

@@ -550,8 +550,8 @@ export const rules = [
 	{
 		id: "claims-from-evidence",
 		skill: "debugging",
-		line: "State as fact only what a tool call in this session showed (a query's rows, a command's output, the code read); anything else is said as a guess or as not measured, never as a cause, a number or a status.",
-		info: "A statement of fact to a person (why something is slow, what dominates a build, what a function does, that something works, passes, is merged or is running) rests on evidence from this session: the rows of a query, a command's output, a test's result, the lines of code read. Quote or name that evidence beside the claim. What you have not looked at is said as such: \"not measured\", \"I have not checked\", or \"my guess, unverified:\", and a guess is followed by the check that would settle it, run before the next claim builds on it. Never turn a prior about how such systems usually behave (Rust release builds are LLVM-bound, a daemon restart loses state, this error usually means that) or a label on a status line (a task kind named `codegen` is not LLVM) into a sentence in the indicative. A number has its source and its tree (`measure-the-exact-tree`); a why has its rows (`ask-the-profile-first`); a works has its command and exit status. When the evidence is lost or the tool could not run, say that, not the conclusion you expected.",
+		line: "State as fact only what a tool call in this session showed (a query's rows, a command's output, the code read); anything else is said as a guess or as not measured, never as a cause, a number or a status; a pass counts only with proof that the check ran.",
+		info: "A statement of fact to a person (why something is slow, what dominates a build, what a function does, that something works, passes, is merged or is running) rests on evidence from this session: the rows of a query, a command's output, a test's result, the lines of code read. Quote or name that evidence beside the claim. What you have not looked at is said as such: \"not measured\", \"I have not checked\", or \"my guess, unverified:\", and a guess is followed by the check that would settle it, run before the next claim builds on it. Never turn a prior about how such systems usually behave (Rust release builds are LLVM-bound, a daemon restart loses state, this error usually means that) or a label on a status line (a task kind named `codegen` is not LLVM) into a sentence in the indicative. A number has its source and its tree (`measure-the-exact-tree`); a why has its rows (`ask-the-profile-first`); a works has its command and exit status. A pass counts only with proof that the check ran: the count of tests that ran (not `test result: ok`, which a filter that matched nothing prints with `0 passed`), the exit status and the output the measured program itself prints, a generator's last line saying what it wrote; the absence of a failure is evidence of nothing, and a check, a row or a gate step that can succeed having run nothing is a bug to fix where it is found (`blaze test` refuses a run of no test; a harness row goes through harness/v2/ran.py). When the evidence is lost or the tool could not run, say that, not the conclusion you expected.",
 		reason: "2026-11-11: asked why blaze took 80 minutes to build itself, the agent answered \"most of the 80 minutes is LLVM optimizing blaze\" from the status line and a prior, without a query. The two-minute span query showed LLVM at about 13% of CPU, blaze's own `mir SpendFacts unwind` pass at about 30%, and about 2 tasks running on 64 cores. Andrew: \"only claim from concrete evidence or something from a tool call\".",
 	},
 	{
@@ -703,6 +703,8 @@ switch (flag) {
 			const tail = skillTail(id, await readIfExists(skillPath(id)));
 			await Bun.write(skillPath(id), skillHead(id) + tail);
 		}
+		// The last line says what was done: a reader of only that line sees this, or an error.
+		console.log(`tools/agents/rules.ts: wrote AGENTS.md and ${skillIds.length} skills from ${rules.length} rules`);
 		break;
 	case "--check": {
 		const stale: string[] = [];
@@ -715,6 +717,7 @@ switch (flag) {
 			console.error(`stale: ${stale.join(", ")}: run \`bun tools/agents/rules.ts --write\` and commit them`);
 			process.exit(1);
 		}
+		console.log(`tools/agents/rules.ts: AGENTS.md and ${skillIds.length} skills are what ${rules.length} rules generate`);
 		break;
 	}
 	default:

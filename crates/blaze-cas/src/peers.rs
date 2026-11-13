@@ -14,6 +14,11 @@
 //! reads the same, since a key's bytes are the same wherever it is made. Every value read from
 //! any writer's directory is checked against its hash, as in any store.
 //!
+//! A home's store reads shared directories the same way, as layers ([`crate::Config::layers`]):
+//! every writer's store under each is a tier behind its own, looked at again on a miss, and it
+//! writes into none of them. So the machine's std records are kept once and read in place by
+//! every home, never copied into it.
+//!
 //! What another writer does to its own directory while it is read here is safe by the store's
 //! own rules: it appends past what its head names, replaces its index tables and head by
 //! renaming, and removes a pack only once its head no longer names it, so a mapping made here
@@ -53,7 +58,13 @@ pub struct SharedConfig {
 
 /// What a store of a shared directory knows of the other writers.
 pub(crate) struct Peers {
-    root: FileName,
+    /// The shared directories it lists: its own shared directory alone ([`Store::open_shared`]),
+    /// or a home's layers ([`crate::Config::layers`]).
+    roots: Vec<FileName>,
+    /// Whether it is a writer of `roots[0]`: its own directory is in it, it writes its first
+    /// head there for the others to find, and the whole shared directory must be the user's
+    /// alone. A home with layers is a writer of none of them.
+    shared: bool,
     /// Its own directory.
     own: FileName,
     /// The tier of each other writer's directory.
@@ -72,14 +83,40 @@ pub(crate) struct Peers {
 }
 
 struct Looking {
-    listed: bool,
+    /// The roots whose listing has not come.
+    unlisted: usize,
     /// The tiers whose heads it read that are not yet open as those heads say.
     waiting: HashSet<usize, Global>, // alloc: the store's view of the other writers, for its life
 }
 
 impl Peers {
+    /// What a home's store opened with `config` knows of its layers: `None` when it has none.
+    pub(crate) fn of_layers(config: &Config) -> Option<Peers> {
+        if config.layers.is_empty() {
+            return None;
+        }
+        // clone: setup, once per store
+        Some(Peers::new(config.layers.clone(), false, config.dir.clone()))
+    }
+
+    fn new(roots: Vec<FileName>, shared: bool, own: FileName) -> Peers {
+        Peers {
+            roots,
+            shared,
+            own,
+            tier_of: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
+            tries: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
+            look: None,
+            again: false,
+            // alloc: empty, allocates nothing
+            restart: Vec::new(),
+            asked: 0,
+            done: 0,
+        }
+    }
+
     fn end_look(&mut self) {
-        if self.look.as_ref().is_some_and(|look| look.listed && look.waiting.is_empty()) {
+        if self.look.as_ref().is_some_and(|look| look.unlisted == 0 && look.waiting.is_empty()) {
             self.look = None;
             self.done = self.asked;
         }
@@ -101,23 +138,12 @@ impl Store {
     /// naming the file; nothing is read another way.
     pub fn open_shared(config: SharedConfig, effects: &mut Vec<Effect>) -> Store {
         let own = writer_dir(&config.root, &config.writer);
-        let peers = Peers {
-            root: config.root,
-            // clone: setup, once per store
-            own: own.clone(),
-            tier_of: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
-            tries: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
-            look: None,
-            again: false,
-            // alloc: empty, allocates nothing
-            restart: Vec::new(),
-            asked: 0,
-            done: 0,
-        };
+        // alloc: setup, once per store; clone: setup, the peers and the config each own the name
+        let peers = Peers::new(vec![config.root], true, own.clone());
         // alloc: empty, no layers: allocates nothing
         let config =
             Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader };
-        let mut store = Store::new(config, Some(peers));
+        let mut store = Store::new(config, Some(peers), crate::pool::WINDOWS);
         store.ask_private(effects);
         store
     }
@@ -146,9 +172,15 @@ impl Store {
         at != 0 && self.peers.is_some()
     }
 
-    /// The directory [`Effect::Private`] checks: the shared one, with every writer's in it.
+    /// The directory [`Effect::Private`] checks: a shared store's shared directory, with every
+    /// writer's in it; else its own. A layer is read-only and may be another user's to share,
+    /// so is not asked of: what is read from it is checked against its hash, and its machine
+    /// code reads as another's ([`crate::Origin::Behind`]).
     pub(crate) fn private_dir(&self) -> &FileName {
-        self.peers.as_ref().map_or(&self.config.dir, |it| &it.root)
+        match &self.peers {
+            Some(peers) if peers.shared => &peers.roots[0],
+            _ => &self.config.dir,
+        }
     }
 
     /// Whether a shared store can answer gets: its own directory open and its first look in.
@@ -157,12 +189,16 @@ impl Store {
     }
 
     fn start_look(&mut self, effects: &mut Vec<Effect>) -> u64 {
-        let tag = self.tags.ask(Op::Peers);
+        let roots = self.peers.as_ref().expect("a look is of a shared store").roots.len();
+        for root in 0..roots {
+            let tag = self.tags.ask(Op::Peers { root });
+            let peers = self.peers.as_ref().expect("a look is of a shared store");
+            // clone: once per root a look, the effect owns the name
+            effects.push(Effect::Entries { dir: peers.roots[root].clone(), tag });
+        }
         let peers = self.peers.as_mut().expect("a look is of a shared store");
         peers.asked += 1;
-        peers.look = Some(Looking { listed: false, waiting: HashSet::new_in(Global) }); // alloc: the store's view of the other writers, for its life
-        // clone: once per look, the effect owns the name
-        effects.push(Effect::Entries { dir: peers.root.clone(), tag });
+        peers.look = Some(Looking { unlisted: roots, waiting: HashSet::new_in(Global) }); // alloc: the store's view of the other writers, for its life
         peers.asked
     }
 
@@ -180,7 +216,8 @@ impl Store {
             if self.broken.is_some() {
                 return;
             }
-            if fresh {
+            let shared = self.peers.as_ref().is_some_and(|it| it.shared);
+            if fresh && shared {
                 // Its directory holds a head from its opening on, so a listing of the shared
                 // directory is never of nothing, and the other writers open it as a store that
                 // holds nothing yet.
@@ -250,16 +287,16 @@ impl Store {
         };
     }
 
-    /// The listing of the shared directory came: each other writer's head is read.
-    pub(crate) fn peers_listed(&mut self, done: Done, effects: &mut Vec<Effect>) {
+    /// The listing of the `root_at`th shared directory came: each writer's head in it is read.
+    pub(crate) fn peers_listed(&mut self, root_at: usize, done: Done, effects: &mut Vec<Effect>) {
         let entries = match done {
             Done::Entries(entries) => entries,
             done => {
                 // clone: the name of what failed, on an error path
                 let root =
-                    self.peers.as_ref().expect("a listing is of a shared store").root.clone();
+                    self.peers.as_ref().expect("a listing is of a shared store").roots[root_at].clone();
                 if self.retry(&root, &done) {
-                    let tag = self.tags.ask(Op::Peers);
+                    let tag = self.tags.ask(Op::Peers { root: root_at });
                     effects.push(Effect::Entries { dir: root, tag });
                 }
                 return;
@@ -276,7 +313,7 @@ impl Store {
                 Some(&at) => at,
                 None if self.tiers.len() >= TIERS_MOST => {
                     // clone: the error that breaks the store
-                    let root = peers.root.clone();
+                    let root = peers.roots[root_at].clone();
                     // alloc: the error that breaks the store
                     return self.fail(
                         root,
@@ -298,7 +335,7 @@ impl Store {
         }
         let peers = self.peers.as_mut().expect("a listing is of a shared store");
         if let Some(look) = &mut peers.look {
-            look.listed = true;
+            look.unlisted = look.unlisted.saturating_sub(1);
         }
         peers.end_look();
     }

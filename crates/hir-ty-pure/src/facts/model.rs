@@ -165,6 +165,11 @@ impl Program {
                         EffectSet::one(Rule::Indirect)
                     }
                 });
+                // A call whose result is used prints it: the caller's own `Io`, whatever the
+                // callee does.
+                if let Op::Call(Call { used: true, .. }) = *op {
+                    own = own.union(EffectSet::one(Rule::Io));
+                }
             }
             kinds[at] = own;
         }

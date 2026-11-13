@@ -7,5 +7,7 @@
  "cost": "a wrong claim to Andrew, retracted 25 minutes later",
  "cause": "timing harness that discards stdout and the return code",
  "workaround": "every timing script asserts the expected output and counts failures",
- "state": "fixed in the harness (/tmp/blaze-h2h2.py); rule claims-from-evidence already said so"
+ "state": "fixed in the harness (/tmp/blaze-h2h2.py); rule claims-from-evidence already said so",
+ "class": "vacuous success (A39): a timing reported without its exit status or its output",
+ "prevention": "harness/v2/ran.py: a row has a number only with the exit status expected and the caller's proof that the program ran (f714b267c5)"
 }

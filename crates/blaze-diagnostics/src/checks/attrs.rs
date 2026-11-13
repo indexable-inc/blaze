@@ -30,7 +30,7 @@ mod check;
 pub(in crate::checks) mod parsed;
 mod parsers;
 
-pub(in crate::checks) use self::accept::Session;
+pub(in crate::checks) use self::accept::{Session, registered_tools};
 
 use blaze_items::Fact;
 use blaze_mem::Frame;

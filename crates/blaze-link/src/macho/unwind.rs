@@ -2288,6 +2288,7 @@ mod tests {
             binds: &[],
             same_names: true,
             same_regions: true,
+            same_places: true,
             written,
             from,
         }

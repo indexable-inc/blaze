@@ -1,16 +1,16 @@
 ---
 status: plan
-summary: "#[blaze::may(..)]: a function says what it may do (panic, alloc, block, diverge); what it leaves out is checked over MIR on pure's walk. The old spellings (nopanic, noalloc, nonblocking), which loops are known to end, and where #[blaze::constant_time] would sit."
-date: 2026-11-10
+summary: "#[blaze::expect(..)]: a function says exactly what it does (panic, alloc, block, diverge); what it leaves out is checked absent and what its own list has is checked present, over MIR on pure's walk. The old spellings (nopanic, noalloc, nonblocking), which loops are known to end, and where #[blaze::constant_time] would sit."
+date: 2026-11-12
 ---
-# Effects: what a function may do
+# Effects: what a function is expected to do
 
 One blaze extension (AGENTS.md rule 4: opt-in, inert under rustc with
 `#![feature(register_tool)] #![register_tool(blaze)]`, changing no code that blaze builds) says
-what a function, and everything it can call, may do:
+what a function, and everything it can call, is expected to do:
 
 ```rust
-#[blaze::may(panic, alloc)]
+#[blaze::expect(panic, alloc)]
 pub fn parse(text: &str) -> Tree { .. }
 ```
 
@@ -22,20 +22,23 @@ pub fn parse(text: &str) -> Tree { .. }
 | `diverge` | not return: a loop not known to end, or recursion | none |
 
 A word the list leaves out is an effect the function does not have, checked through every call
-it makes. `#[blaze::may()]` (or `#[blaze::may]`) is a function with none of the four.
+it makes; a word a function's own list has is an effect it has, as Rust's own `#[expect(lint)]`
+is fulfilled or reported. `#[blaze::expect()]` (or `#[blaze::expect]`) is a function with none
+of the four. The name was `#[blaze::may(..)]`, a permission; it is deleted, with no alias: written,
+it is refused (`blaze::undeclared_effect`) naming `blaze::expect`, and the fix respells it.
 
 **Why the list is positive.** A signature that lists what can happen is complete to its reader:
 nothing unlisted happens, so there is no second question ("and does it block?") the mark leaves
 open, as `#[blaze::nopanic]` alone does. A new effect touches only the functions that have it,
 where a negative spelling would have to be added to every function that does not. It matches
 capabilities, which are already positive (a function touches the disk because it was handed a
-`Dir`). And it makes the two mistakes different in kind: a mark is a permission, so listing
-too little is an error and listing too much is advice.
+`Dir`). And a list that is exact is never stale: listing too little and listing too much are
+both errors, so a reader can take every word as true.
 
 There is no word for code the check can't see (a foreign function no table knows, inline
 assembly, a function pointer taken as a parameter, a call of an unlisted method through a
 `dyn` taken as a parameter, a body that does not lower): it may do anything, so it is refused for every word the list leaves out. Only
-`#[blaze::may(panic, alloc, block, diverge)]`, "may anything", admits it, or a callee taken at
+`#[blaze::expect(panic, alloc, block, diverge)]`, "anything", admits it, or a callee taken at
 its word (`trusted`, below). `pure` needs no word either: see "Purity" below.
 
 They are checked on the one walk that `#[blaze::pure]` uses ([pure-fns.md](pure-fns.md)): one
@@ -44,26 +47,27 @@ effect, `hir_ty_pure::effects::Rule`) with a witness of each. Each word has an `
 (`effect_attrs::of_word`: `NOPANIC`, `NOALLOC`, `NONBLOCKING`, `TERMINATES`), a mask over those
 kinds; a list without the word asks for it, and checking one reads the root's summary.
 
-Code: `crates/hir-def/src/attrs.rs` (the attributes: `MayWord`, `MayAttr`, `AttrFlags::MAY` bit
-101, `BLAZE_EFFECTS` bit 102; the old spellings' `EffectWord`, bits 97 to 99),
-`crates/hir-ty-pure/src/may.rs` (the one home of what is declared: `declared`, `Marks`,
-`allowed`, `verdict`), `effect_attrs.rs` (the definitions, the site rules and the tables),
-`loops.rs` (which loops end), `crates/blaze-lints/src/blaze/may.rs` (the lints of the list) and
-`effects.rs` (the old spellings' lints).
+Code: `crates/hir-def/src/attrs.rs` (the attributes: `ExpectWord`, `ExpectAttr`,
+`AttrFlags::EXPECT` bit 101, `BLAZE_EFFECTS` bit 102; the old spellings' `EffectWord`, bits 97
+to 99), `crates/hir-ty-pure/src/expect.rs` (the one home of what is declared: `declared`,
+`Marks` with `exact`, `allowed`, `unfulfilled`, `verdict`), `effect_attrs.rs` (the
+definitions, the site rules and the tables), `loops.rs` (which loops end),
+`crates/blaze-lints/src/blaze/expect.rs` (the lints of the list and of the deleted spelling)
+and `effects.rs` (the old spellings' lints).
 
 ## What is declared, and where it comes from
 
 A function's *allowance* is the set of words it may have. The first of these that is written
-holds, alone; nothing is merged (`hir_ty_pure::may::allowed`):
+holds, alone; nothing is merged (`hir_ty_pure::expect::allowed`):
 
-1. **Its own list**, `#[blaze::may(..)]` on the function. What is written on the function is
-   what holds: it replaces a default around it entirely, so `#[blaze::may(alloc)]` in a module
+1. **Its own list**, `#[blaze::expect(..)]` on the function. What is written on the function is
+   what holds: it replaces a default around it entirely, so `#[blaze::expect(alloc)]` in a module
    whose default is `panic` may allocate and may not panic.
 2. **Its trait's**, for a method of an impl of a trait (or a trait's default method): the
-   `#[blaze::may(..)]` of the trait's method, else of the trait. A trait method's list is the
+   `#[blaze::expect(..)]` of the trait's method, else of the trait. A trait method's list is the
    bound every impl must stay within. An impl's method may write its own list with fewer words,
    never more: one with a word the trait's method lacks is refused.
-3. **The default around it**: `#![blaze::may(panic)]` in a module or at the crate's root is the
+3. **The default around it**: `#![blaze::expect(panic)]` in a module or at the crate's root is the
    allowance of every function in it with none of the above; the nearest module's holds.
    `#![blaze::effects]` at the crate's root is the default "nothing": every function of the
    crate with no list on it or around it may have no effect. This is the gate. The blaze
@@ -78,18 +82,39 @@ holds, alone; nothing is merged (`hir_ty_pure::may::allowed`):
 **Under-declaring is an error** (`blaze::undeclared_effect`, `deny`): a function with an effect
 outside its allowance is refused at its name, saying each such effect with its witness (the
 call chain down to what has it, each step with its file and line, or the loop's line), where
-the allowance is written, and the fix: "add `panic` to its `#[blaze::may(..)]`, or handle it".
+the allowance is written, and the fix: "add `panic` to its `#[blaze::expect(..)]`, or handle it".
 `blaze check --fix` writes the list with the missing words added (a new list above the
 signature where the function had none), which is how a crate is brought under the gate: turn
 `#![blaze::effects]` on and apply the fixes. It replaces the four `unmarked_*` lints of the
 earlier design.
 
-**Over-declaring is advice** (`blaze::unneeded_effect`, `warn`, with a fix that takes the word
-off): a word of a list for an effect the function is proved not to have. Only on a private
-function: a function with a visibility written may reserve the right in its signature, a
-trait method's list is its impls' bound, and an impl's method may keep what its trait allows.
+**Over-declaring is an error too** (`blaze::unfulfilled_effect`, `deny`, with a fix that takes
+the word off): a function's own list is exact, so a word of it for an effect the function is
+proved not to have is an unfulfilled expectation. It applies to every function with a body
+whose list is its own, private and public alike, and to an impl's method that writes its own
+list. The finding names the function, the word and why it is known not to hold ("no call or
+operation in it allocates from the global heap, through every call it makes"); `panic` is
+proved absent only where the crate keeps overflow checks, so the shorter list holds in dev and
+in release. The cost is plain: a callee that stops having an effect makes each caller's word
+for it unfulfilled, so removing an effect reaches the callers; their fix is automatic
+(`blaze check --fix` takes the word off, caller by caller up the chain).
 
-**`trusted`.** `#[blaze::may(alloc, trusted = "why")]` is a list taken at its word: the function
+Where exactness has nothing to prove, the list stays a bound:
+
+- A trait method's list bounds its impls (a default body among them): it says what any impl
+  may do, not what one does.
+- A list a function gets from its trait or from a module's default and did not write is not
+  checked for unfulfilled words: a default cannot be exact for every function under it. An
+  impl's method that inherits its trait's list is held within it; one that writes its own is
+  held exact.
+- A `trusted` list is taken at its word.
+- Where the function's effects are not known (a `dyn` call with no list, a body that does not
+  lower), a word is neither proved nor refuted, so it is not reported.
+
+`blaze::unneeded_effect`, the advice this was (a private function's word only), is deleted, not
+renamed: naming it is reported as a removed lint.
+
+**`trusted`.** `#[blaze::expect(alloc, trusted = "why")]` is a list taken at its word: the function
 is not checked, and every call of it has exactly the listed effects (on a trait: every impl's
 method, and every call through `dyn` of it). The reason is recorded in the proof
 (`EffectProof::trusted`) so a reviewer reads every promise made by hand. A module's default
@@ -118,7 +143,7 @@ takes no `trusted`.
   the body is different: what it points to was walked where it was made (the walk is
   closed-world), so its panics, allocations and waits are already counted, and the call adds
   only `diverge`, since the pointer may lead back to the caller. Effects in function pointer
-  types (`fn(u32) -> u32 may(panic)`) would lift both: the type would carry the list, a
+  types (`fn(u32) -> u32 expect(panic)`) would lift both: the type would carry the list, a
   coercion of a function to it would check the function's list against it, and a call through
   it would have the type's list. That needs the list in the type system (a part of `FnSig`,
   with subtyping from fewer words to more), not an attribute.
@@ -130,17 +155,18 @@ takes no `trusted`.
 and mean exactly what they meant: a promise of the absence of one effect, held by their own
 lints (`blaze::nopanic`, `blaze::noalloc`, `blaze::nonblocking`). Internally there is one
 representation, the allowance: an old spelling lowers to "every word but this one"
-(`may::declared`), so a function with one is not held to a default around it for the others.
+(`expect::declared`), so a function with one is not held to a default around it for the others.
 Where effects are declared (under a module's default or the gate), `blaze::negative_effect`
 (`warn`) asks for the positive form, and its fix writes it: every word the old spellings do not
 take off that the function is not proved free of. A function with `nopanic` and `nonblocking`
-that allocates and has a loop not known to end becomes `#[blaze::may(alloc, diverge)]`. A
+that allocates and has a loop not known to end becomes `#[blaze::expect(alloc, diverge)]`. A
 function with both spellings is refused. `diverge` has no negative spelling: there never was a
 `#[blaze::terminates]`.
 
 `AttrFlags::effect_attr(db, owner, EffectWord)` reads an old spelling's argument (one bit test
-for an item without one); `AttrFlags::may_attr(db, owner)` reads a list (`MayAttr`: the words,
-`trusted`, or the text of one that is malformed). No codegen key or signature reads the bits:
+for an item without one); `AttrFlags::expect_attr(db, owner)` reads a list (`ExpectAttr`: the
+words, `trusted`, or the text of one that is malformed). The deleted `#[blaze::may(..)]` sets
+no bit and is read by nothing but the lint that refuses it. No codegen key or signature reads the bits:
 a function without an attribute builds byte for byte as before, and so does one with it.
 
 ## Purity
@@ -158,8 +184,8 @@ make purity a promise the lint holds.
 ## `diverge`: what "returns" means, and which loops end
 
 A function that may not `diverge` **returns or panics; it never runs for ever**. A panic or an
-abort ends it, so `diverge` and `panic` are independent: `#[blaze::may(panic)]` is "ends, maybe
-by panicking", and `#[blaze::may()]` is total: it returns. A wait is not its business either:
+abort ends it, so `diverge` and `panic` are independent: `#[blaze::expect(panic)]` is "ends, maybe
+by panicking", and `#[blaze::expect()]` is total: it returns. A wait is not its business either:
 the function returns whenever every wait it makes does, and leaving out `block` says there is
 none.
 
@@ -201,7 +227,7 @@ algorithm (`loops::Bounding`). This slice has one, sound from the MIR alone:
   untested rule is not shipped.
 - `while i < v.len()` (the limit is computed in the loop), `while let Some(x) = stack.pop()`,
   `loop { .. break .. }`, iterator adaptors, and every loop inside std that these rules do not
-  cover. A callee proven by hand is marked `#[blaze::may(.., trusted = "why")]`.
+  cover. A callee proven by hand is marked `#[blaze::expect(.., trusted = "why")]`.
 - A **`decreases` clause** proved by the verifier lane ([contracts.md](contracts.md)) is the
   general answer: a measure that falls on every turn. It is one more `Bounding`, tried on a
   component after these; the algorithm and its test do not change.
@@ -344,11 +370,14 @@ that use a frame also call the database, which allocates its memos from the glob
 ## Tests
 
 Per effect, one crate that passes and one per kind of refusal, named for the property
-(`crates/blaze-lints/src/blaze/effects_tests.rs` for the old spellings, `may_tests.rs` for the
-list: each word's under-declaration with its witness, the counted `while` and its near misses,
-recursion, function pointers and `dyn`, an impl within its trait's list, a module's default
-and a function's own list, over-declaration, the rewrite of the old spellings, and a crate
-that declares nothing), plus `an_effect_attribute_changes_no_signature` in hir-def: a
+(`crates/blaze-lints/src/blaze/effects_tests.rs` for the old spellings, `expect_tests.rs` for
+the list: each word's under-declaration with its witness, the counted `while` and its near
+misses, recursion, function pointers and `dyn`, an impl within its trait's list, a module's
+default and a function's own list, an unfulfilled word refused on a private and a public
+function with its fix (control: the old private-only rule lets the public one through), the
+bounds that pass with an unneeded word (a trait method's, an inherited one, a default, a
+`trusted` one), an impl method's own list held exact, the deleted `#[blaze::may(..)]` refused
+and respelled, the rewrite of the old spellings, and a crate that declares nothing), plus `an_effect_attribute_changes_no_signature` in hir-def: a
 function's signature and flags other than the effect bits are the same with the attributes
 and without, so an unmarked crate builds byte for byte the same.
 
@@ -357,10 +386,11 @@ Two invariants are stated and tested with Hegel, each with planted-bug controls:
 - `loops.rs`: a control flow graph the analysis accepts has no infinite path. Random small
   graphs with random bounding facts, model-checked by brute force. Controls: a self-loop not
   seen as a cycle; a bounding block taken off a component its exit stays in.
-- `may.rs`: the checker accepts exactly when every function's inferred effects are within its
-  allowed set, where allowed sets flow as specified. Random call graphs, effect sources and
-  declarations against a reference model. Controls: an impl allowed more than its trait; a
-  module's default merged with a function's own list.
+- `expect.rs`: the checker accepts exactly when every function's inferred effects are within
+  its allowed set, where allowed sets flow as specified, and every word of an own list held
+  exact is an effect the function has. Random call graphs, effect sources and declarations
+  against a reference model. Controls: an impl allowed more than its trait; a module's default
+  merged with a function's own list; an own list treated as a bound.
 
 ## `#[blaze::constant_time]` on the same seam (later, not this lane)
 
@@ -394,7 +424,7 @@ operand is tainted by a secret, which this walk does not track. How it sits on t
   check, though it runs once per field.
 - Every call through a function pointer or an unlisted `dyn` needs `diverge`, whether or not
   its targets could reach the caller: no whole-program graph of indirect calls is built.
-- A malformed `#![blaze::may(..)]` on a module is read as the words before its error and is
+- A malformed `#![blaze::expect(..)]` on a module is read as the words before its error and is
   not reported itself; a function's is.
 - The edition gate is `#![blaze::effects]` until `edition = "blaze-2026.11"` exists.
 - No consumer keys on `derived_pure` yet.

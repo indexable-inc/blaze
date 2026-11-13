@@ -209,7 +209,7 @@ struct Parts {
     entry_names: Vec<u32>,
     entry_nodes: Vec<u32>,
     entry_modes: Vec<u8>,
-    files: Vec<[u64; 2]>,
+    files: Vec<u64>,
     index: Vec<u32>,
     spans: Vec<[u32; 2]>,
     name_bytes: Vec<u8>,
@@ -229,7 +229,7 @@ impl Parts {
             entry_names: vec![0, 1],
             entry_nodes: vec![0, 1],
             entry_modes: vec![0, 1],
-            files: vec![[0, 1], [1, 2]],
+            files: vec![1, 2],
             index,
             spans: vec![[0, 1], [1, 1]],
             name_bytes: b"ab".to_vec(),
@@ -237,7 +237,7 @@ impl Parts {
         }
     }
 
-    fn check(&self, blobs: u64) -> Result<(), &'static str> {
+    fn check(&self) -> Result<(), &'static str> {
         Base {
             ids: &self.ids,
             shapes: &self.shapes,
@@ -251,20 +251,21 @@ impl Parts {
             name_index: &self.name_index,
             name_key: [0, 0],
         }
-        .check(blobs)
+        .check()
     }
 }
 
 #[test]
 fn a_well_formed_base_passes_its_check() {
-    assert_eq!(Parts::new().check(3), Ok(()));
+    assert_eq!(Parts::new().check(), Ok(()));
 }
 
 /// Each way a base can send a read out of bounds or a walk round forever is refused.
 #[test]
 fn a_malformed_base_is_refused() {
-    let broken: [(&str, fn(&mut Parts)); 9] = [
-        ("a file past the blobs section", |parts| parts.files[1] = [2, 2]),
+    let broken: [(&str, fn(&mut Parts)); 10] = [
+        ("a file that is not the next of the file column", |parts| parts.shapes[1] = [0, FILE]),
+        ("a file column longer than the base's files", |parts| parts.files.push(3)),
         ("an entry naming a node not before its directory", |parts| parts.entry_nodes[1] = 2),
         ("an entry whose mode is not its node's kind", |parts| parts.entry_modes[0] = DIR),
         ("a directory's entries not sorted by name, or a name twice", |parts| {
@@ -279,11 +280,11 @@ fn a_malformed_base_is_refused() {
     for (want, breaks) in broken {
         let mut parts = Parts::new();
         breaks(&mut parts);
-        assert_eq!(parts.check(3), Err(want));
+        assert_eq!(parts.check(), Err(want));
     }
     let mut parts = Parts::new();
     parts.entry_modes.pop();
-    assert_eq!(parts.check(3), Err("node or entry columns of different lengths"));
+    assert_eq!(parts.check(), Err("node or entry columns of different lengths"));
 }
 
 /// Adopted bytes are the `Vec`'s own buffer, read back as an `Arc` copy of them reads, from the
@@ -304,10 +305,10 @@ fn adopted_bytes_are_the_vecs_own() {
         let id = ContentId::of("store test adopt", &adopted);
         let node = writer.file(id, adopted.clone());
         let table = writer.table();
-        let lent = table.bytes(table.shape(node)).unwrap();
+        let lent = table.bytes(node).unwrap();
         drop(adopted);
         assert_eq!(&*lent, &*copy);
-        assert_eq!(table.blob(table.shape(node)).unwrap(), &*copy);
+        assert_eq!(table.blob(node).unwrap(), &*copy);
         if len > 0 {
             assert_eq!(lent.as_ptr(), ptr, "the store lends the adopted buffer");
         }
@@ -332,7 +333,7 @@ fn model_a_node_reads_whole_or_not_at_all() {
                     let entries = table.entries(table.shape(node));
                     assert_eq!(entries.len(), 1);
                     assert_eq!(table.id(entries.nodes[0]), &file);
-                    assert_eq!(table.blob(table.shape(entries.nodes[0])).unwrap(), b"f");
+                    assert_eq!(table.blob(entries.nodes[0]).unwrap(), b"f");
                 }
             })
         };

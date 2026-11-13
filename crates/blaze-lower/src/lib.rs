@@ -20,6 +20,10 @@
 //!   [`Lowered::macros`].
 //! - **Another view** of the same units is applied by [`Lowered::refresh`]: what it read from
 //!   the view read again and applied as a change, the database and its memos kept.
+//! - **Another plan** of the same checkout (`test` after `build`, `--release`, another feature
+//!   set) is lowered into the same front end by [`Lowered::relower`]: a request's units are a
+//!   view ([`Crates`]) over the one crate graph the front end keeps ([`Graph`]), each crate
+//!   found or made, and nothing of a crate that is there written.
 //! - **What a running proc macro asks** of the database (a span's text, file, line or parent)
 //!   is answered by [`answer`], whichever runtime runs it.
 //!
@@ -36,6 +40,11 @@ mod const_macros;
 mod crates;
 mod doctests;
 mod files;
+#[expect(
+    dead_code,
+    reason = "the plan key is called by the find-records decision of `lower_writes`, piece D of restore.md's \"Restart reads records (d)\", which is not switched on yet"
+)]
+mod found;
 mod harness;
 pub mod places;
 #[cfg(test)]
@@ -50,7 +59,7 @@ use base_db::{
 };
 use base_db::{FileSetConfig, Trigger};
 use blaze_hash::HashSet;
-use blaze_ids::{Hasher, radix};
+use blaze_ids::Hasher;
 use blaze_query::db::{Database as _, Durability, Setter};
 use blaze_units::{
     query::{BuildConfig, PackagePlan, Units},
@@ -68,7 +77,7 @@ pub use self::answer::{SubRequest, SubResponse, answer};
 pub use self::code::{CodeText, code_identity, code_text_of, still_text, still_text_of};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
-pub use self::harness::{Appended, macros_loaded, wasm_macro};
+pub use self::harness::{Appended, edition_program, macros_loaded, wasm_macro};
 
 /// What [`lower`] lowers.
 pub struct Lower<'a, T> {
@@ -82,6 +91,18 @@ pub struct Lower<'a, T> {
     /// The machine's CPU, for a `-C target-cpu=native` in the rustflags; without it such a
     /// flag is an error naming it.
     pub host_cpu: Option<&'a HostCpu>,
+    /// What pins each package's sources, in `units.packages`' order: the digest of the tree it
+    /// is read from, or none, as the driver's one rule decides it (blaze-cargo's
+    /// `serve::sealed::pin`). Written on each crate of the package as
+    /// [`base_db::CrateData::sealed`]; a list of another length is refused. [`unsealed`]
+    /// for a lowering that seals nothing.
+    pub sealed: &'a [Option<ContentId>],
+}
+
+/// What a lowering that seals no crate passes as [`Lower::sealed`]: `units`' packages, none
+/// pinned. A test's, a probe's.
+pub fn unsealed(units: &Units) -> Vec<Option<ContentId>> {
+    vec![None; units.packages.len()] // alloc: once a lowering, a slot a package
 }
 
 // A view of references, copied whatever `T` is: a derive would ask `T: Copy`.
@@ -166,15 +187,22 @@ impl fmt::Display for LowerError {
 impl std::error::Error for LowerError {}
 
 /// What a build script's run gave: what [`Lowered::ran`] applies to the units depending on it.
+///
+/// Its bytes are the run's result's own: each file's text and its variables are shared
+/// (`Arc`), never copied, by the front end that applies it ([`Lowered::ran`]: the file texts,
+/// and each dependent crate's record of the run), so a run's bytes exist once in the daemon.
+/// Until 2026-11-12 each file was copied into the texts, and its variables into every
+/// dependent crate's record of it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ran {
     /// As `--cfg` takes them (`foo`, `foo="bar"`).
     pub cfgs: Vec<String>,
-    pub env: Vec<(String, String)>,
+    pub env: std::sync::Arc<[(String, String)]>,
     /// Absolute, as cargo names it.
     pub out_dir: String,
-    /// What it left in `OUT_DIR`, by `/`-separated path under it.
-    pub files: Vec<(String, Vec<u8>)>,
+    /// What it left in `OUT_DIR`, by `/`-separated path under it: the bytes of the run's
+    /// result (blaze-usercode's `OutFile`), shared.
+    pub files: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
 /// A build's units in the front end, owned by the daemon's loop. Tasks read it through a
@@ -184,10 +212,15 @@ pub struct Ran {
 pub struct Lowered {
     db: Db,
     crates: std::sync::Arc<Crates>,
-    /// By crate: the runs applied to it, by the run's class ([`crates::run_classes`]), the
-    /// first run of the class. By crate, not by unit: units apart only in which run of a class
-    /// they depend on share a crate, and each of its writes is made from all its runs.
-    applied: blaze_hash::HashMap<Crate, Vec<(usize, Applied)>, Global>,
+    /// What it keeps of every plan lowered into it: its source roots, crates and what they
+    /// were made of ([`Lowered::relower`]).
+    graph: Graph,
+    /// By crate: the runs applied to it, one for each run class ([`crates::run_classes`]) by
+    /// the class's `OUT_DIR` (its first run's, [`Applied::out_dir`]), sorted by it. By crate,
+    /// not by unit: units apart only in which run of a class they depend on share a crate, and
+    /// each of its writes is made from all its runs. By `OUT_DIR`, not by the run's index: a
+    /// unit's index is its plan's, and a crate is every plan's that names it.
+    applied: blaze_hash::HashMap<Crate, Vec<Applied>, Global>,
     /// By run class with more than one run: the run of it applied first since the last
     /// [`Lowered::refresh`], the one [`Lowered::ran`] applies for the class in this job. Per
     /// job: each job applies its runs again, and the first of a class to end is its own.
@@ -207,6 +240,10 @@ pub struct Lowered {
     /// The narrowed identities [`Lowered::library_narrows`] worked out, the store having none,
     /// each with its key, for the driver to keep ([`Lowered::take_library_narrows`]).
     library_made: Vec<(ContentId, Vec<u8>)>,
+    /// What a record carried of a workspace crate's own texts ([`Lowered::carry_own_surface`]),
+    /// which [`slot_of`] takes in place of parsing the crate's files: let go for a crate in
+    /// the write that changes a file of its source root, its settings or its root's text.
+    carried: blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -238,12 +275,16 @@ struct Load {
 }
 
 /// What every task of a build reads and nothing writes once [`lower`] made it: each unit's
-/// crate.
+/// crate. One plan's view over the front end's crate graph: a later plan lowered into the same
+/// front end ([`Lowered::relower`]) has its own.
 pub struct Crates {
     units: Vec<Lowering>,
-    /// How many source roots of packages there are: `SourceRootId(0..sets)`, then the one of
-    /// files of no package.
+    /// How many source roots the front end had when these units were lowered:
+    /// `SourceRootId(0..sets)`, the packages', the one of files of no package (`other`) and
+    /// each doctest example's.
     sets: usize,
+    /// The source root of files of no package.
+    other: usize,
 }
 
 impl Crates {
@@ -259,6 +300,20 @@ impl Crates {
     pub fn is_proc_macro(&self, unit: usize) -> bool {
         self.units.get(unit).is_some_and(|it| it.proc_macro)
     }
+
+    /// The cfg unit `unit`'s crate was lowered with, before any build script's run applied its
+    /// `cargo:rustc-cfg`s: what the daemon's front-end carry driver evaluates a `mod`'s gates
+    /// against (`blaze_cargo::serve::front_carry`). None for a `RunCustomBuild` unit or an
+    /// index past the units.
+    pub fn cfg(&self, unit: usize) -> Option<&CfgOptions> {
+        self.units.get(unit).filter(|it| it.krate.is_some()).map(|it| &it.cfg)
+    }
+}
+
+/// The Rust edition unit `unit`'s crate is parsed in ([`crates::edition`]: a blaze edition's
+/// Rust edition), for a caller outside the lowering: the daemon's front-end carry driver.
+pub fn unit_edition(unit: &Unit) -> Result<span::Edition, LowerError> {
+    crates::edition(unit, &unit.target.name)
 }
 
 /// One unit as lowered.
@@ -290,6 +345,9 @@ struct Lowering {
     /// whose `OUT_DIR` the front end reads every run of the class's files under; its own index
     /// for any other unit.
     class: usize,
+    /// Whether it is a `Doctest` unit, whose examples' crates [`Lowered::doctests`] keeps by
+    /// unit: a later plan's unit of the same crate takes them over ([`Lowered::relower`]).
+    doctest: bool,
 }
 
 /// What a macro-host crate's cfg was decided by ([`crates::host_side`]): its root, the root's
@@ -303,15 +361,143 @@ struct MacroHost {
     links: bool,
 }
 
+/// A run as one dependent crate has it applied: its cfgs and variables shared with every
+/// other crate it is applied to and with the run itself ([`Ran`]), never a copy a crate.
 struct Applied {
-    cfgs: Vec<CfgAtom>,
-    env: Vec<(String, String)>,
+    cfgs: std::sync::Arc<[CfgAtom]>,
+    env: std::sync::Arc<[(String, String)]>,
     out_dir: String,
 }
 
 /// The crate graph, source roots and files of `lower.units` in a new database.
 pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     lower_into(Db::new(), lower)
+}
+
+/// What a front end keeps of every plan lowered into it, so that a plan is a view over one
+/// crate graph and never the identity of the database ([`Lowered::relower`]).
+///
+/// The invariant: a source root, a directory read and a crate are each made once a front end,
+/// found again by what they are (the package's id; the directory; the crate's root file, data,
+/// cfg, env, runs and spelling, [`Made`]) by every plan that names them, and never unmade
+/// because another plan arrived. So lowering plan A, then B, then A again writes no input the
+/// third time: every find hits.
+struct Graph {
+    /// By source root id, what the root is of.
+    roots: Vec<RootOf>,
+    /// The root of files of no package, once the first plan is lowered.
+    other: Option<usize>,
+    /// The one root of the standard library's packages.
+    std_set: Option<usize>,
+    /// Each package's root, by the package's id.
+    set_of: blaze_hash::HashMap<String, usize, Global>,
+    /// The directories the plans' builds write (target and build directories, each run's
+    /// `OUT_DIR`), sorted: read into no root.
+    excluded: Vec<String>,
+    /// The crates' workspace data by triple and whether the crates are the standard
+    /// library's: one value each, which crates of one are compared by ([`Made::workspace`]).
+    workspaces: HashMap<(String, bool), Arc<CrateWorkspaceData>>,
+    /// The crates made, by their root file on disk.
+    made: blaze_hash::HashMap<FileId, Vec<Made>, Global>,
+    /// Each crate made with how cargo passes its root ([`Spellings::new`]).
+    spelled: Vec<(Crate, Spelling)>,
+    /// Whether a plan lowered had const macros, whose crates are made by the first plan alone
+    /// (`const_macros::make`): a later plan is then lowered anew ([`Relowered::Anew`]).
+    const_macros: bool,
+}
+
+/// What a source root of the front end is of ([`Graph::roots`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootOf {
+    /// A library's packages: the standard library's, a registry's or git's.
+    Library,
+    /// A path package's, or the files of no package.
+    Local,
+    /// One doctest example's file ([`Lowered::doctests`]), in no list of the packages' roots.
+    Example,
+}
+
+impl Graph {
+    fn new() -> Graph {
+        Graph {
+            roots: Vec::new(),                           // alloc: none
+            other: None,
+            std_set: None,
+            set_of: blaze_hash::HashMap::new_in(Global), // alloc: none
+            excluded: Vec::new(),                        // alloc: none
+            workspaces: HashMap::new(),                  // alloc: none
+            made: blaze_hash::HashMap::new_in(Global),   // alloc: none
+            spelled: Vec::new(),                         // alloc: none
+            const_macros: false,
+        }
+    }
+
+    /// A new source root's id, of `of`.
+    fn root(&mut self, of: RootOf) -> usize {
+        self.roots.push(of);
+        self.roots.len() - 1
+    }
+
+    /// The packages' roots and the one of files of no package that are libraries'
+    /// (`library`), or local.
+    fn roots_of(&self, library: bool) -> HashSet<SourceRootId, Global> {
+        let wanted = if library { RootOf::Library } else { RootOf::Local };
+        (self.roots.iter().enumerate())
+            .filter(|(_, of)| **of == wanted)
+            .map(|(id, _)| SourceRootId(id as u32))
+            .collect()
+    }
+}
+
+/// What a plan lowered into a front end that was there made ([`Lowered::relower`]): nothing,
+/// for a plan every crate of which the front end holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Placed {
+    /// The crates made: a crate the front end did not hold (a `cfg(test)` twin, a crate under
+    /// another feature set or profile where the front end reads it, a new dependency).
+    pub crates_made: usize,
+    /// The source roots made: a package no earlier plan named.
+    pub roots_made: usize,
+    /// The directories read: such a package's, or a target root's outside its package's.
+    pub dirs_read: usize,
+}
+
+impl Placed {
+    /// Whether the plan was found whole: nothing made, so nothing written.
+    pub fn found_whole(&self) -> bool {
+        *self == Placed::default()
+    }
+}
+
+/// How [`Lowered::relower`] went.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Relowered {
+    /// The plan is lowered into the front end, which made this of it.
+    Into(Placed),
+    /// The front end can't take the plan beside what it holds, for this reason: it is to be
+    /// let go and the plan [`lower`]ed anew. The front end may be half written.
+    Anew(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: the plan is the identity of what was lowered again, so a
+    /// plan lowered into a front end that holds its crates finds none of them and makes each
+    /// anew, as every switch of request did before the front end kept its crate graph.
+    pub(crate) static PLAN_IS_IDENTITY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Why [`lower_writes`] did not lower.
+enum Refused {
+    Error(LowerError),
+    /// [`Relowered::Anew`].
+    Anew(String),
+}
+
+impl From<LowerError> for Refused {
+    fn from(error: LowerError) -> Refused {
+        Refused::Error(error)
+    }
 }
 
 /// [`lower`] into `db`, a build's database just made and never written ([`Db::new`], or
@@ -323,20 +509,39 @@ pub fn lower_into<T: blaze_query::Tree>(
     mut db: Db,
     lower: Lower<'_, T>,
 ) -> Result<Lowered, LowerError> {
-    let setup = db.batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower))?;
+    let mut graph = Graph::new();
+    let kept = Kept { loads: &[], workspace_root: None };
+    let setup = db
+        .batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower, &mut graph, kept));
+    let setup = match setup {
+        Ok(setup) => setup,
+        Err(Refused::Error(error)) => return Err(error),
+        // Only a front end that holds a plan refuses one.
+        Err(Refused::Anew(why)) => {
+            return Err(LowerError::new(format!(
+                "a new front end did not take its first plan: {why}"
+            )));
+        }
+    };
     db.require_batches();
-    let Setup { lowerings, sets, loads, view, workspace_root, const_macros, spellings } = setup;
-    let paths = paths_of(&db, sets);
+    let Setup { lowerings, sets, other, loads, view, workspace_root, const_macros, spellings, placed: _ } =
+        setup;
+    let Some(spellings) = spellings else {
+        return Err(LowerError::new("a new front end was given no spellings of its crates' roots"));
+    };
+    let paths = paths_of(&db, &graph);
     Ok(Lowered {
         db,
+        graph,
         applied: blaze_hash::HashMap::new_in(Global),
         class_runs: blaze_hash::HashMap::new_in(Global),
-        crates: std::sync::Arc::new(Crates { units: lowerings, sets }),
+        crates: std::sync::Arc::new(Crates { units: lowerings, sets, other }),
         paths: std::sync::Arc::new(paths),
         identities: blaze_hash::HashMap::new_in(Global),
         narrowed: blaze_hash::HashMap::new_in(Global),
         library: blaze_hash::HashMap::new_in(Global),
         library_made: Vec::new(), // alloc: none
+        carried: blaze_hash::HashMap::new_in(Global),
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -352,11 +557,26 @@ struct Setup {
     lowerings: Vec<Lowering>,
     /// [`Crates::sets`].
     sets: usize,
+    /// [`Crates::other`].
+    other: usize,
+    /// The directories it read: those no earlier plan of the front end read.
     loads: Vec<Load>,
     view: ContentId,
     workspace_root: crates::Root,
     const_macros: Vec<const_macros::Loaded>,
-    spellings: std::sync::Arc<Spellings>,
+    /// The spellings of every crate of the front end, when this plan made a crate: none when
+    /// the ones the front end has stand.
+    spellings: Option<std::sync::Arc<Spellings>>,
+    placed: Placed,
+}
+
+/// What [`lower_writes`] is given of the front end it lowers into: nothing, for a new one.
+#[derive(Clone, Copy)]
+struct Kept<'a> {
+    /// The directories read into it.
+    loads: &'a [Load],
+    /// The workspace's root its crates are made with.
+    workspace_root: Option<&'a crates::Root>,
 }
 
 /// A crate root's directory as the source roots have it and as cargo passed the root to rustc
@@ -452,22 +672,39 @@ impl Spellings {
     }
 }
 
-/// The writes of [`lower_into`], in its batch: the crate graph, source roots and files of
-/// `lower.units`, and what the database is told of the build.
+/// The writes of [`lower_into`] and of [`Lowered::relower`], in their batch: the crate graph,
+/// source roots and files of `lower.units`, and what the database is told of the build. Each
+/// source root, directory and crate is found in `graph`, what the front end keeps of the plans
+/// lowered before (`kept`: nothing, for a new front end), or made and kept there: what is
+/// found is not written.
 fn lower_writes<T: blaze_query::Tree>(
     db: &mut Db,
     lower: Lower<'_, T>,
-) -> Result<Setup, LowerError> {
-    let Lower { units, config, files, root, host_cpu } = lower;
+    graph: &mut Graph,
+    kept: Kept<'_>,
+) -> Result<Setup, Refused> {
+    let Lower { units, config, files, root, host_cpu, sealed } = lower;
+    // The first plan of the front end: what is told once a database is told now.
+    let first = graph.other.is_none();
     let unit_count = units.graph.units.len();
     if units.plans.len() != unit_count {
-        return Err(LowerError::new(format!(
+        return Err(Refused::Error(LowerError::new(format!(
             "the build has {unit_count} units and {} plans of them",
             units.plans.len()
-        )));
+        ))));
     }
     let packages: blaze_hash::HashMap<&str, &PackagePlan, Global> =
         units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
+    if sealed.len() != units.packages.len() {
+        return Err(Refused::Error(LowerError::new(format!(
+            "the build has {} packages and {} pins of them (`Lower::sealed`)",
+            units.packages.len(),
+            sealed.len()
+        ))));
+    }
+    // What pins each package, by its id ([`Lower::sealed`]).
+    let pins: blaze_hash::HashMap<&str, Option<ContentId>, Global> =
+        units.packages.iter().zip(sealed).map(|(it, pin)| (it.id.as_str(), *pin)).collect();
     let package_of = |unit: &Unit| {
         packages.get(unit.pkg_id.as_str()).copied().ok_or_else(|| {
             LowerError::at(
@@ -486,32 +723,76 @@ fn lower_writes<T: blaze_query::Tree>(
     let package_index: blaze_hash::HashMap<&str, usize, Global> =
         units.packages.iter().enumerate().map(|(index, it)| (it.id.as_str(), index)).collect();
     let mut const_plan = const_macros::plan(units, &package_index, &whats)?;
+    // A macro crate and `const-ast` are made by the first plan alone (`const_macros::make`
+    // keeps what it made in the plan, not in the front end).
+    if !first && (graph.const_macros || !const_plan.is_empty()) {
+        // alloc: a reason, once per front end let go
+        return Err(Refused::Anew(
+            "a package of the plan, or of the plans lowered before it, has const macros, whose crates are made once a front end".to_owned(),
+        ));
+    }
+    graph.const_macros |= !const_plan.is_empty();
 
-    // One source root per package with a unit, in the order of `units.packages`, but one for
-    // every package of the standard library; each directory read is one root's, the innermost
-    // when one is in another's.
+    let tree = files::Mounts {
+        mounts: &config.mounts,
+        view: root,
+        tree: files,
+        read_view: Cell::new(false),
+    };
+    // Every crate is made with the workspace's root and what its manifest sets: a plan whose
+    // root is another (a member outside the workspace the front end was lowered for) is not
+    // lowered beside its crates.
+    let workspace_root = crates::root(units, &tree)?;
+    if kept.workspace_root.is_some_and(|was| *was != workspace_root) {
+        // alloc: a reason, once per front end let go
+        return Err(Refused::Anew(
+            "the plan's workspace root, or what its root manifest sets, is not the one the front end's crates are made with".to_owned(),
+        ));
+    }
+
+    // One source root per package with a unit, in the order of `units.packages` for those no
+    // plan before had, but one for every package of the standard library; each directory read
+    // is one root's, the innermost when one is in another's. A package's root is found by the
+    // package's id: every plan that names the package reads the same root.
     let mut used: blaze_hash::HashMap<&str, bool, Global> = blaze_hash::HashMap::new_in(Global);
     for unit in &units.graph.units {
         *used.entry(unit.pkg_id.as_str()).or_default() |= unit.is_std;
     }
-    let mut library: Vec<bool> = Vec::new();
+    let roots_before = graph.roots.len();
     let mut set_of: blaze_hash::HashMap<&str, usize, Global> = blaze_hash::HashMap::new_in(Global);
-    let mut loads: blaze_hash::HashMap<String, usize, Global> = blaze_hash::HashMap::new_in(Global);
-    let mut std_set = None;
+    // The directories read before come first: a directory under one of them is that one's.
+    // clone: once a lowering, each kept directory's path
+    let mut loads: blaze_hash::HashMap<String, usize, Global> =
+        kept.loads.iter().map(|it| (it.dir.clone(), it.set)).collect();
     for package in &units.packages {
         let Some(&is_std) = used.get(package.id.as_str()) else { continue };
-        let set = match (is_std, std_set) {
-            (true, Some(set)) => set,
-            (true, None) => {
-                let set = library.len();
-                library.push(true);
-                loads.insert(config.library.trim_end_matches('/').to_owned(), set);
-                std_set = Some(set);
+        let set = match is_std {
+            true => {
+                let set = match graph.std_set {
+                    Some(set) => set,
+                    None => {
+                        let set = graph.root(RootOf::Library);
+                        graph.std_set = Some(set);
+                        set
+                    }
+                };
+                loads.entry(config.library.trim_end_matches('/').to_owned()).or_insert(set);
                 set
             }
-            (false, _) => {
-                let set = library.len();
-                library.push(!crates::is_path(package));
+            false => {
+                let set = match graph.set_of.get(package.id.as_str()) {
+                    Some(&set) => set,
+                    None => {
+                        let of = match crates::is_path(package) {
+                            true => RootOf::Local,
+                            false => RootOf::Library,
+                        };
+                        let set = graph.root(of);
+                        // clone: once per package a front end first sees, its id
+                        graph.set_of.insert(package.id.clone(), set);
+                        set
+                    }
+                };
                 loads.entry(files::parent(&package.manifest_path).to_owned()).or_insert(set);
                 set
             }
@@ -519,11 +800,19 @@ fn lower_writes<T: blaze_query::Tree>(
         set_of.insert(package.id.as_str(), set);
     }
     // blaze's copy of `const-ast`, a library's root of its own, when a package has const macros.
-    let const_ast_set = (!const_plan.is_empty()).then(|| {
-        library.push(true);
-        library.len() - 1
-    });
-    let mut excluded: HashSet<String, Global> = HashSet::new_in(Global);
+    let const_ast_set = (!const_plan.is_empty()).then(|| graph.root(RootOf::Library));
+    // The root of files of no package: after the first plan's packages'.
+    let other_set = match graph.other {
+        Some(other) => other,
+        None => {
+            let other = graph.root(RootOf::Local);
+            graph.other = Some(other);
+            other
+        }
+    };
+    let root_count = graph.roots.len();
+    // clone: once a lowering, the directories the plans before it excluded
+    let mut excluded: HashSet<String, Global> = graph.excluded.iter().cloned().collect();
     excluded.insert(units.target_dir.clone());
     excluded.insert(units.build_dir.clone());
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -551,19 +840,36 @@ fn lower_writes<T: blaze_query::Tree>(
     loads.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     let mut excluded: Vec<String> = excluded.into_iter().collect();
     excluded.sort_unstable();
+    // A directory read before was read with what was under it then. One that is now a
+    // directory of its own under it (a package no plan before named, nested in one that was
+    // read; a directory the build writes that was not excluded) would have to give its files
+    // to another root, or lose them: the front end is lowered anew instead, and says so.
+    for was in kept.loads {
+        let under = (loads.iter().map(|(it, _)| it).chain(excluded.iter()))
+            .filter(|it| **it != was.dir && files::rest(it, &was.dir).is_some());
+        for dir in under {
+            if !was.skipped.iter().any(|skipped| files::rest(dir, skipped).is_some()) {
+                // alloc: a reason, once per front end let go
+                return Err(Refused::Anew(format!(
+                    "`{dir}` is a directory of its own in this plan (a package's, a target root's or one the build writes) under `{}`, whose files the front end read with it",
+                    was.dir
+                )));
+            }
+        }
+    }
+    // clone: once a lowering, the directories its build writes
+    graph.excluded.clone_from(&excluded);
 
-    let tree = files::Mounts {
-        mounts: &config.mounts,
-        view: root,
-        tree: files,
-        read_view: Cell::new(false),
-    };
-    ProcMacros::init_default(db, Durability::HIGH);
-    // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
-    // writes have bodies, which recording them without expanding (rust-analyzer's fast path)
-    // leaves out.
-    hir_def::nameres::set_expand_builtin_derives(db, true);
-    for (index, &is_library) in library.iter().enumerate() {
+    if first {
+        // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
+        // writes have bodies, which recording them without expanding (rust-analyzer's fast
+        // path) leaves out.
+        hir_def::nameres::set_expand_builtin_derives(db, true);
+    }
+    // The roots this plan is the first to name: the first plan's packages', then the one of
+    // files of no package; a later plan's new packages' after those.
+    for index in roots_before..root_count {
+        let is_library = graph.roots[index] == RootOf::Library;
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
             false => SourceRoot::new_local(FileSet::default()),
@@ -575,24 +881,33 @@ fn lower_writes<T: blaze_query::Tree>(
             durability,
         );
     }
-    let other = SourceRootId(library.len() as u32);
-    db.set_source_root_with_durability(
-        other,
-        Arc::new(SourceRoot::new_local(FileSet::default())),
-        Durability::LOW,
-    );
-    let roots = |library_too: bool| -> HashSet<SourceRootId, Global> {
-        (0..=library.len())
-            .filter(|&it| library.get(it).copied().unwrap_or(false) == library_too)
-            .map(|it| SourceRootId(it as u32))
-            .collect()
-    };
-    _ = LibraryRoots::new(db, Durability::MEDIUM, roots(true));
-    _ = LocalRoots::new(db, Durability::MEDIUM, roots(false));
+    let other = SourceRootId(other_set as u32);
+    match (first, root_count > roots_before) {
+        (true, _) => {
+            _ = LibraryRoots::new(db, Durability::MEDIUM, graph.roots_of(true));
+            _ = LocalRoots::new(db, Durability::MEDIUM, graph.roots_of(false));
+        }
+        // A plan that names a package no plan before did: the lists gain its root.
+        (false, true) => {
+            let (library, local) = (graph.roots_of(true), graph.roots_of(false));
+            if *LibraryRoots::get(&*db).roots(&*db) != library {
+                LibraryRoots::get(&*db).set_roots(db).to(library);
+            }
+            if *LocalRoots::get(&*db).roots(&*db) != local {
+                LocalRoots::get(&*db).set_roots(db).to(local);
+            }
+        }
+        (false, false) => {}
+    }
 
     let mut loaded = Vec::new();
     let mut read = Vec::with_capacity(loads.len());
     for (load, set) in &loads {
+        // A directory a plan before read is in the front end, and [`Lowered::refresh`] keeps
+        // it at the view: not read again.
+        if kept.loads.iter().any(|it| it.dir == *load) {
+            continue;
+        }
         let set = *set;
         // What is under another load, or written by the build, is not this one's.
         let skipped: Vec<String> = loads
@@ -606,7 +921,7 @@ fn lower_writes<T: blaze_query::Tree>(
         tree.read_view.set(false);
         tree.walk(load, &skipped, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
-        set_files(db, load, &built, set, library.len(), &loaded)?;
+        set_files(db, load, &built, set, root_count, other_set, &loaded)?;
         read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get() });
     }
 
@@ -614,16 +929,16 @@ fn lower_writes<T: blaze_query::Tree>(
     let const_ast_root = match const_ast_set {
         Some(set) => {
             let loaded = const_macros::const_ast_files(&const_ast_dir);
-            set_files(db, &const_ast_dir, &[], set, library.len(), &loaded)?;
+            set_files(db, &const_ast_dir, &[], set, root_count, other_set, &loaded)?;
             let root = VfsPath::from(abs(&format!("{const_ast_dir}/lib.rs"))?);
             db.source_root(SourceRootId(set as u32)).source_root(&*db).file_for_path(&root).copied()
         }
         None => None,
     };
 
-    let workspace_root = crates::root(units, &tree)?;
     let toolchain = crates::toolchain()?;
-    // By triple and whether the crates are the standard library's.
+    // By triple and whether the crates are the standard library's: this plan's, each found
+    // in the front end's or made into it, so crates of one triple in two plans share one.
     let mut workspaces: HashMap<(&str, bool), Arc<CrateWorkspaceData>> = HashMap::new();
     // Runs of one build script apart only in their `OUT_DIR` are one run to the front end, and
     // runs apart in their profile's `OPT_LEVEL` or `DEBUG` too are told apart by their
@@ -646,18 +961,19 @@ fn lower_writes<T: blaze_query::Tree>(
             proc_macro: unit.gives_expanders(),
             macro_host: None,
             class: class[index],
+            doctest: unit.mode == Mode::Doctest,
         });
     }
     for (index, unit) in units.graph.units.iter().enumerate() {
         for dep in &unit.dependencies {
             let Some(lowering) = lowerings.get_mut(dep.index) else {
-                return Err(LowerError::at(
+                return Err(Refused::Error(LowerError::at(
                     format!(
                         "a dependency `{}` on unit {}, which the build lacks",
                         dep.extern_crate_name, dep.index
                     ),
                     whats[index].clone(),
-                ));
+                )));
             };
             if !lowering.dependents.contains(&index) {
                 lowering.dependents.push(index);
@@ -666,12 +982,9 @@ fn lower_writes<T: blaze_query::Tree>(
     }
 
     let order = crates::topological(units, &whats, &const_plan.after)?;
-    let mut all = Vec::with_capacity(order.len());
-    // alloc: once a lowering, the crates made by their root file, for the units after to share.
-    let mut made: blaze_hash::HashMap<FileId, Vec<Made>, Global> =
-        blaze_hash::HashMap::new_in(Global);
-    // alloc: once a lowering, each crate made with how cargo passes its root
-    let mut spelled: Vec<(Crate, Spelling)> = Vec::new();
+    // The crates this plan makes, in the order made (each after those it depends on): none
+    // for a plan the front end holds whole.
+    let mut all = Vec::new(); // alloc: none until a crate is made
     let mut const_listed = Vec::new();
     let mut const_made = Vec::new();
     for index in order {
@@ -683,16 +996,25 @@ fn lower_writes<T: blaze_query::Tree>(
         let workspace = match workspaces.get(&(triple, unit.is_std)) {
             Some(it) => it.clone(),
             None => {
-                // The workspace's `const-eval` budget is for its own crates: the standard
-                // library's are evaluated under blaze's, the same in every workspace.
-                // So is its trusted list: the toolchain's trust is blaze's.
-                let (const_eval, trusted) = if unit.is_std {
-                    (ConstEvalBudget::default(), Box::default())
-                } else {
-                    // clone: once per triple, the workspace's trusted crates
-                    (workspace_root.const_eval, workspace_root.trusted.clone())
+                // alloc: once per triple a plan, the key the front end keeps it by
+                let key = (triple.to_owned(), unit.is_std);
+                let made = match graph.workspaces.get(&key) {
+                    Some(it) => it.clone(),
+                    None => {
+                        // The workspace's `const-eval` budget is for its own crates: the
+                        // standard library's are evaluated under blaze's, the same in every
+                        // workspace. So is its trusted list: the toolchain's trust is blaze's.
+                        let (const_eval, trusted) = if unit.is_std {
+                            (ConstEvalBudget::default(), Box::default())
+                        } else {
+                            // clone: once per triple, the workspace's trusted crates
+                            (workspace_root.const_eval, workspace_root.trusted.clone())
+                        };
+                        let made = crates::workspace_data(triple, &toolchain, const_eval, trusted)?;
+                        graph.workspaces.insert(key, made.clone());
+                        made
+                    }
                 };
-                let made = crates::workspace_data(triple, &toolchain, const_eval, trusted)?;
                 workspaces.insert((triple, unit.is_std), made.clone());
                 made
             }
@@ -708,7 +1030,7 @@ fn lower_writes<T: blaze_query::Tree>(
                 cfg.extend([crates::run_profile_atom(units, dep.index)]);
             }
         }
-        let durability = if library[set_of[unit.pkg_id.as_str()]] {
+        let durability = if graph.roots[set_of[unit.pkg_id.as_str()]] == RootOf::Library {
             Durability::HIGH
         } else {
             Durability::MEDIUM
@@ -742,7 +1064,11 @@ fn lower_writes<T: blaze_query::Tree>(
                             root: macros_root,
                             const_ast_root,
                             const_ast_dir: &const_ast_dir,
-                            proc_macro_cwd: abs(&crates::proc_macro_cwd(&workspace_root, package))?,
+                            proc_macro_cwd: abs(&crates::proc_macro_cwd(
+                                &workspace_root,
+                                package,
+                                unit.is_std.then_some(config.library.as_str()),
+                            ))?,
                             durability,
                         };
                         let (made, listed) =
@@ -771,10 +1097,10 @@ fn lower_writes<T: blaze_query::Tree>(
             .map_or(other, |(_, set)| SourceRootId(*set as u32));
         let root_file = db.source_root(set).source_root(&*db).file_for_path(&src_path).copied();
         let Some(root_file) = root_file else {
-            return Err(LowerError::at(
+            return Err(Refused::Error(LowerError::at(
                 format!("the root file `{src}` of {what} is not among its package's files"),
                 src,
-            ));
+            )));
         };
         // A crate of the macro host that links `proc_macro` is told of the host's side, as
         // rustc builds it for the host (`crates::host_side`). Decided from the root's text,
@@ -809,10 +1135,10 @@ fn lower_writes<T: blaze_query::Tree>(
                 continue;
             }
             let Some(krate) = lowerings[dep.index].krate else {
-                return Err(LowerError::at(
+                return Err(Refused::Error(LowerError::at(
                     format!("{what} depends on {}, which has no crate", whats[dep.index]),
                     what.clone(),
-                ));
+                )));
             };
             dependencies.push(crates::dependency(unit, on, dep, krate, what)?);
         }
@@ -824,11 +1150,18 @@ fn lower_writes<T: blaze_query::Tree>(
             edition: crates::edition(unit, what)?,
             dependencies,
             origin: crates::origin(package, unit),
-            crate_attrs: Box::new([]),
+            crate_attrs: crates::blaze_edition_attrs(unit, what)?,
             target_kind: crates::target_kind(unit, plan, what)?,
             manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,
-            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
+            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(
+                &workspace_root,
+                package,
+                unit.is_std.then_some(config.library.as_str()),
+            ))?),
+            // Its package's pin, every crate of it alike ([`Lower::sealed`]): a fact of the
+            // tree it is read from, written at its durability with the rest of its data.
+            sealed: pins.get(package.id.as_str()).copied().flatten(),
         };
         let extra = base_db::ExtraCrateData {
             version: Some(package.version.clone()),
@@ -839,24 +1172,28 @@ fn lower_writes<T: blaze_query::Tree>(
         };
         // Its `OUT_DIR` and its runs by their run class: units apart only in which run of a
         // class they depend on (two profiles apart only in what a run never reads, as
-        // `codegen-units`) are one crate below.
+        // `codegen-units`) are one crate below. Its runs are in `extra`, each by its class's
+        // stable identity (`crates::build_script_runs`), never by a unit's index: an index is
+        // its plan's, and the crate is every plan's that makes the same of it.
         let plan_env = crates::class_env(units, unit, &plan.env, class);
         let env: Env = plan_env.iter().cloned().collect();
-        let runs: Vec<usize> = unit
-            .dependencies
-            .iter()
-            .filter(|dep| units.graph.units[dep.index].mode == Mode::RunCustomBuild)
-            .map(|dep| class[dep.index])
-            .collect();
         // A crate whose root blaze appends a module to ([`Lowered::append_roots`]: a test's
         // harness, a wasm proc macro's list of macros and bridge glue) has a root of its own,
         // an alias of the file on disk, so no other crate of that file reads the module.
-        let aliased = (crates::is_test(unit, plan) && plan.harness) || wasm_macro(unit, plan);
+        // So has a program of a blaze edition, whose entry is appended ([`edition_program`]).
+        let aliased = (crates::is_test(unit, plan) && plan.harness)
+            || wasm_macro(unit, plan)
+            || edition_program(unit, plan);
         // Units cargo keeps apart for what the front end does not read (a profile's opt-level
         // or debuginfo, and which run of a run class they depend on) are one crate: two
         // crates of one key would name each other's items (`blaze_items::key::check_crate_keys`).
         // Their codegen stays apart: each unit's policy is of its own profile.
-        let made_of_root = made.entry(root_file).or_default();
+        //
+        // And so are the units of two plans: a crate an earlier plan of the front end made of
+        // all the same is this unit's (`graph.made`), found and not written. What differs in
+        // anything the front end reads (`cfg(test)`, a feature, `debug_assertions`, a
+        // dependency that is itself another crate) is another crate, beside it.
+        let made_of_root = graph.made.entry(root_file).or_default();
         let same = made_of_root.iter().find(|it| {
             it.data == data
                 && it.aliased == aliased
@@ -865,9 +1202,11 @@ fn lower_writes<T: blaze_query::Tree>(
                 && it.cfg == cfg
                 && it.env == env
                 && it.durability == durability
-                && it.runs == runs
                 && it.spelling == spelling
         });
+        // The planted bug of the control: a crate of a plan lowered before is never found.
+        #[cfg(test)]
+        let same = same.filter(|_| first || !PLAN_IS_IDENTITY.get());
         let krate = match same {
             Some(it) => it.krate,
             None => {
@@ -884,7 +1223,9 @@ fn lower_writes<T: blaze_query::Tree>(
                     })?;
                 }
                 // clone: as `made_of`
-                let krate = Crate::create(
+                // Added beside the crates there (`base_db::add_crates` below): the write
+                // names it, and the maintainers run it and no crate that was there.
+                let krate = Crate::create_added(
                     db,
                     made_of,
                     extra.clone(),
@@ -894,7 +1235,7 @@ fn lower_writes<T: blaze_query::Tree>(
                     durability,
                 );
                 // clone: once per crate made
-                spelled.push((krate, spelling.clone()));
+                graph.spelled.push((krate, spelling.clone()));
                 made_of_root.push(Made {
                     data,
                     aliased,
@@ -903,7 +1244,6 @@ fn lower_writes<T: blaze_query::Tree>(
                     cfg: cfg.clone(),
                     env,
                     durability,
-                    runs,
                     spelling,
                     krate,
                 });
@@ -917,30 +1257,61 @@ fn lower_writes<T: blaze_query::Tree>(
         lowering.macro_host = macro_host;
         lowering.env = plan_env;
     }
-    base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
+    // After the crates there, which keep their places: the write is the list alone, and a
+    // plan found whole writes none.
+    base_db::add_crates(db, &all, Durability::MEDIUM);
+    if first {
+        // The first plan's graph is a change of the whole graph to every maintainer, as it
+        // was when the list was set whole.
+        db.note_crates_changed();
+    }
 
-    let not_built = lowerings
+    // Only a crate this plan made has no expanders yet: one that was there keeps those its
+    // last build loaded, until this build loads them again ([`Lowered::macros`]).
+    // alloc: once a lowering that made a crate, the proc-macro crates among them
+    let not_built: Vec<(Crate, ProcMacroLoadResult)> = lowerings
         .iter()
         .filter(|it| it.proc_macro)
         .filter_map(|it| it.krate)
-        .map(|krate| (krate, Err(base_db::ProcMacroLoadingError::NotYetBuilt)));
-    ProcMacros::give(db, not_built);
+        .filter(|krate| all.contains(krate))
+        .map(|krate| (krate, Err(base_db::ProcMacroLoadingError::NotYetBuilt)))
+        .collect();
+    if !not_built.is_empty() {
+        ProcMacros::give(db, not_built);
+    }
     const_macros::set_macros(db, const_listed);
     base_db::set_process_env(db, config.invocation.env.iter().cloned().collect());
     // `CARGO_PRIMARY_PACKAGE` is of the request, in no crate's variables: the crates of the
-    // units of its primary packages see it ([`blaze_units::query::Units::is_primary`]).
-    // alloc: once per lowering, the primary units' crates
-    let primary = (lowerings.iter().enumerate())
-        .filter(|(at, _)| units.is_primary(*at))
-        .filter_map(|(_, it)| it.krate)
-        .collect();
+    // units of its primary packages see it ([`blaze_units::query::Units::is_primary`]). A
+    // crate this plan does not name stays what it was (another plan's, a doctest example's):
+    // nothing of this request reads it, and a crate that flips is every maintainer's to run.
+    // alloc: once per lowering, the plan's crates and the primary ones
+    let in_plan: HashSet<Crate, Global> = lowerings.iter().filter_map(|it| it.krate).collect();
+    let mut primary: Vec<Crate> =
+        base_db::primary_crates(db).iter().copied().filter(|it| !in_plan.contains(it)).collect();
+    primary.extend(
+        (lowerings.iter().enumerate())
+            .filter(|(at, _)| units.is_primary(*at))
+            .filter_map(|(_, it)| it.krate),
+    );
     base_db::set_primary_crates(db, primary);
-    let spellings = std::sync::Arc::new(Spellings::new(spelled));
-    name_sources(db, workspace_root.dir.as_deref(), &config.library, &spellings);
+    // The spellings are of every crate of the front end: made again only when one was made.
+    let spellings = (first || !all.is_empty()).then(|| {
+        // clone: once a lowering that made a crate, each crate's spelling
+        let spellings = std::sync::Arc::new(Spellings::new(graph.spelled.clone()));
+        name_sources(db, workspace_root.dir.as_deref(), &config.library, &spellings);
+        spellings
+    });
 
     Ok(Setup {
         lowerings,
-        sets: library.len(),
+        sets: graph.roots.len(),
+        other: other_set,
+        placed: Placed {
+            crates_made: all.len(),
+            roots_made: root_count - roots_before - usize::from(first),
+            dirs_read: read.len(),
+        },
         loads: read,
         view: root,
         workspace_root,
@@ -949,8 +1320,9 @@ fn lower_writes<T: blaze_query::Tree>(
     })
 }
 
-/// What a crate of [`lower_into`] was made of, and the build scripts' runs its unit is given
-/// (by run class): a later unit of all the same is lowered to it.
+/// What a crate of the front end was made of ([`Graph::made`]); the build scripts' runs its
+/// unit is given are in `extra`, by run class (`ExtraCrateData::build_script_runs`). A later
+/// unit of all the same, of this plan or of a later one, is lowered to it.
 struct Made {
     /// With the root file on disk, which an aliased crate's root is an alias of.
     data: base_db::BuiltCrateData,
@@ -961,7 +1333,6 @@ struct Made {
     cfg: CfgOptions,
     env: Env,
     durability: Durability,
-    runs: Vec<usize>,
     /// How cargo passes its root: one file passed two ways is two crates, as rustc names their
     /// files apart.
     spelling: Spelling,
@@ -992,6 +1363,16 @@ impl Lowered {
     /// build lacks.
     pub fn what(&self, unit: usize) -> &str {
         self.crates.units.get(unit).map_or("", |it| it.what.as_str())
+    }
+
+    /// Tells the front end how its portable keys write paths ([`base_db::Port`]), once a
+    /// database and before any identity is asked ([`Lowered::identity`],
+    /// [`Lowered::narrowed`]): each unit's identity then holds its crate's paths against the
+    /// directories the port names, and is the same for the same sources wherever those are.
+    /// Told again (a kept front end a later build lowers into), the first stays: one database
+    /// is one checkout's under one home, whose directories do not move.
+    pub fn set_port(&self, port: std::sync::Arc<dyn base_db::Port>) {
+        let _ = self.db.files().set_port(port);
     }
 
     /// What every task reads: each unit's crate. Made once by [`lower`] and never written.
@@ -1067,7 +1448,80 @@ impl Lowered {
             &self.const_macros,
             &mut self.narrowed,
         );
-        narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
+        narrow.own.then_some(Narrowed {
+            code: narrow.code,
+            checked: narrow.checked,
+            built: narrow.built,
+        })
+    }
+
+    /// What a front end above reads of `krate` and, through it, of every crate it depends
+    /// on, as the one digest a crate enters the image key of a crate above it by
+    /// (`hir_def::deps::given::set_surface`, [`Lowered::give_surfaces`]; restore.md, "Restart
+    /// reads records (d)", E): [`slot_of`]. Always one; made from texts and settings alone,
+    /// so asking it parses a workspace crate's files and resolves nothing.
+    ///
+    /// Not the fold a unit's narrow key holds ([`Narrowed::built`]), which takes a registry
+    /// crate by its narrowed identity once the store or a parse gave it one
+    /// ([`Lowered::library_narrows`]): that is given unit by unit as a build goes, after the
+    /// first serve, and an image key must be the same before it and after, in the build that
+    /// keeps an image and in the restart that looks for it. So here a library crate is its
+    /// whole identity, always.
+    pub fn surface_of(&mut self, krate: Crate) -> ContentId {
+        identity_of(&self.db, krate, &self.spellings, &mut self.identities);
+        // alloc: once a crate asked, a crate of its closure each
+        let mut known = blaze_hash::HashMap::new_in(Global);
+        slot_of(
+            &self.db,
+            krate,
+            &self.spellings,
+            &self.identities,
+            &self.const_macros,
+            &self.carried,
+            &mut known,
+        )
+        .digest
+    }
+
+    /// What of `krate`'s own texts and settings its surface is made of, as bytes a record
+    /// can carry (`code::OwnNarrow::kept`: its code text's, interface's and surface's
+    /// digests and what a crate above is asked of it), so a later database gives the crate
+    /// its surface with none of its files parsed ([`Lowered::carry_own_surface`]). None for a
+    /// crate with no code text of its own (a library source root's, whose surface is its
+    /// whole identity).
+    ///
+    /// It is a function of the crate's files (paths and texts, its root's alone for a crate
+    /// that reads no other), the module appended to its root, and its settings with those of
+    /// every crate below it (cfg, env, edition, target: `Crate::ported_content`). A record
+    /// that carries it must be keyed by all of those.
+    pub fn own_surface(&self, krate: Crate) -> Option<Vec<u8>> {
+        let own = match self.carried.get(&krate) {
+            Some(own) => *own,
+            None => code::own_narrow(&self.db, krate),
+        };
+        own.code.map(|_| own.kept().to_vec()) // alloc: a record's field, once a crate kept
+    }
+
+    /// Takes `kept`, what [`Lowered::own_surface`] gave of this crate in the database that
+    /// kept its record, in place of parsing the crate's files to work it out; call
+    /// [`Lowered::give_surfaces`] after the last one. The caller vouches that the record
+    /// `kept` came from is keyed by everything it is made of (see there), and so never gives
+    /// one for a crate that a build script's run applies to, or that is above one: a run's
+    /// cfgs, env and `OUT_DIR` files are in the settings and files, and in no key made before
+    /// the run. It is let go in the write that changes a file of the crate's source root or
+    /// appends to its root, and the crate is parsed then. Bytes that are no such record are
+    /// refused, naming the crate.
+    pub fn carry_own_surface(&mut self, krate: Crate, kept: &[u8]) -> Result<(), LowerError> {
+        let own = code::OwnNarrow::restored(kept).map_err(|why| {
+            let named = format!("{}", krate.named(&self.db)); // alloc: error path
+            LowerError::at(
+                // alloc: error path
+                format!("the surface a record carried of the crate {named}: {why}"),
+                named,
+            )
+        })?;
+        self.carried.insert(krate, own);
+        Ok(())
     }
 
     /// The workspace sources a build keyed by code texts alone can vouch for
@@ -1238,28 +1692,46 @@ impl Lowered {
     /// refused unless they make the identity the front end holds, so they never describe
     /// another identity than the one a key was made from; the files are those of the source
     /// root whose content that identity holds.
-    pub fn identity_parts(&self, unit: usize) -> Result<Vec<IdentityPart>, String> {
+    ///
+    /// `looked` is the identity the record was looked up under: parts are named only of it.
+    /// When the crate's identity now is another, a write since the lookup moved it, and that
+    /// is the error.
+    pub fn identity_parts(
+        &self,
+        unit: usize,
+        looked: ContentId,
+    ) -> Result<Vec<IdentityPart>, String> {
         let db = &self.db;
         let Some(krate) = self.crates.krate(unit) else {
             return Err("it has no crate in the front end".to_owned()); // alloc: error path
         };
-        let Some(known) = self.identities.get(&krate).copied() else {
+        // The identities worked out since the last write, and the rest of this crate's
+        // closure worked out here: a write between a record's lookup and its miss being
+        // named (a build script's run applied, a proc macro's expanders given) lets them go,
+        // and the parts are of the database as it is now. Until 2026-11-12 that was an error
+        // (`its crate's identity was not worked out since the front end's last write`), the
+        // reason given for most of the units reth made again. The caller holds the parts to
+        // the key the record was looked up under, so parts of other inputs are never named.
+        // clone: the identities known, once a miss
+        let mut identities = self.identities.clone();
+        let known = identity_of(db, krate, &self.spellings, &mut identities);
+        if known != looked {
             // alloc: error path
             return Err(
-                "its crate's identity was not worked out since the front end's last write"
+                "its crate's identity moved after its record was looked up (a build script's run or a proc macro's expanders were applied to it or to a crate it depends on in this build), so its parts now would not describe the key it missed under"
                     .to_owned(),
             );
-        };
+        }
         let data = krate.data(db);
         let root_file = data.root_file_id;
         let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
-        let settings = krate.content(db);
+        let settings = code::ported_crate(db, krate);
         let alone = code::root_alone(db, krate);
         let mut hasher = Hasher::new(IDENTITY);
         hasher.id(&settings).id(&db.file_text(root_file).content(db));
         match alone {
             true => hasher.update(ROOT_ALONE),
-            false => hasher.id(&root.content(db)),
+            false => hasher.id(&code::ported_files(db, krate)),
         };
         let mut spelled = Hasher::new(IDENTITY_PART);
         match self.spellings.of(krate) {
@@ -1271,14 +1743,16 @@ impl Lowered {
                 hasher.update(&[1]);
                 spelled.update(&[1]);
                 for text in [&spelling.dir, &spelling.passed] {
-                    hasher.update(&(text.len() as u64).to_le_bytes());
-                    hasher.update(text.as_bytes());
+                    hasher.part(&db.files().ported(text.as_bytes()));
                     spelled.part(text.as_bytes());
                 }
             }
         }
         // alloc: once a unit's record missed, a part each thing its identity is made of
         let mut parts = vec![IdentityPart::Settings(settings)];
+        parts.extend(
+            krate.settings_parts(db).into_iter().map(|(what, id)| IdentityPart::Setting { what, id }),
+        );
         let set = root.source_root_ref(db);
         let path = |file: &FileId| {
             set.path_for_file(file).and_then(|it| it.as_path()).map(|it| it.as_str())
@@ -1311,11 +1785,11 @@ impl Lowered {
             }),
             (false, _) if set.is_library => parts.push(IdentityPart::Files {
                 what: "its source files (a library's, taken as one)",
-                content: root.content(db),
+                content: base_db::crate_root_content(db, krate),
             }),
             (false, _) if unpathed => parts.push(IdentityPart::Files {
                 what: "the files of its source root (one of which has no path)",
-                content: root.content(db),
+                content: base_db::crate_root_content(db, krate),
             }),
             (false, _) => {
                 let named = files.len().min(FILES_NAMED);
@@ -1341,13 +1815,7 @@ impl Lowered {
         parts.push(IdentityPart::Spelling(spelled.finish()));
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
-            let Some(identity) = self.identities.get(&dep.crate_id).copied() else {
-                // alloc: error path
-                return Err(format!(
-                    "the identity of `{}`, a crate it depends on, was not worked out since the front end's last write",
-                    dep.name
-                ));
-            };
+            let identity = identity_of(db, dep.crate_id, &self.spellings, &mut identities);
             hasher.id(&identity);
             parts.push(IdentityPart::Dependency {
                 krate: dep.crate_id,
@@ -1363,6 +1831,81 @@ impl Lowered {
             );
         }
         Ok(parts)
+    }
+
+    /// What unit `unit`'s narrowed identity ([`Lowered::narrowed`]) holds of each crate of
+    /// its closure, by the crate's name, sorted: what of the crate alone can be observed
+    /// ([`code::OwnNarrow`]), its code text and its interface each an id, and where it is from (a library crate's from the
+    /// store or a full parse, [`Lowered::library_narrows`]; one not given, which is then its
+    /// whole text; a workspace crate's code text). For `blaze why`: a unit's record is looked
+    /// up under its narrow key first, so a narrowed identity that moved while the whole one
+    /// stayed (a library crate narrowed in one build and not in the next) is otherwise a
+    /// miss with no part that changed. Asked on a miss only; it works out what a write let go.
+    pub fn narrow_parts(&self, unit: usize) -> Vec<(String, ContentId)> {
+        let db = &self.db;
+        let Some(krate) = self.crates.krate(unit) else { return Vec::new() }; // alloc: none
+        // alloc: once a miss, a crate of its closure each
+        let mut parts: Vec<(String, ContentId)> = krate
+            .transitive_deps(db)
+            .iter()
+            .map(|&at| {
+                let (own, from) = match self.library.get(&at) {
+                    Some((_, own)) => (*own, "narrowed from the store or a full parse"),
+                    None if code::library_narrowed(db, at) => {
+                        (code::own_narrow(db, at), "a library crate not narrowed: its whole text")
+                    }
+                    None => (code::own_narrow(db, at), "its own code text"),
+                };
+                // Where it is from is in the id, not the name: a crate narrowed in one build
+                // and not in the next is one part that changed.
+                let part = |held: &[u8]| {
+                    Hasher::new(IDENTITY_PART).part(from.as_bytes()).part(held).finish()
+                };
+                let named = at.named(db);
+                // Two parts a crate, as a narrow key holds one or the other of it: its code
+                // text (a program's build, and every unit of the crate itself), or its
+                // interface (a check, and a library's build that stops at the crate boundary:
+                // [`Narrowed::built`]). A body edit moves the first alone, so a library over
+                // it whose record missed is not told that the body is why. A crate with no
+                // code text of its own is one part, its whole text.
+                // alloc: as above, a part's name each
+                match (own.code, own.interface) {
+                    (Some(code), interface) => [
+                        Some((
+                            format!("the code text its narrow key holds of the crate {named} (a program's build, and the crate's own units)"),
+                            part(&code.0),
+                        )),
+                        Some((
+                            format!("the interface its narrow key holds of the crate {named} (a check, and a library's build)"),
+                            part(&interface.unwrap_or(code).0),
+                        )),
+                    ],
+                    (None, _) => [
+                        Some((
+                            format!("what its narrow key holds of the crate {named}"),
+                            part(&own.kept()),
+                        )),
+                        None,
+                    ],
+                }
+            })
+            .flatten()
+            .flatten()
+            .collect();
+        parts.sort_unstable();
+        parts.dedup();
+        // Two crates of one name (two versions, or one built for the host and for macros)
+        // are one part, of both: a part's name is said once in a key.
+        let mut merged: Vec<(String, ContentId)> = Vec::with_capacity(parts.len()); // alloc: as above
+        for (name, id) in parts {
+            match merged.last_mut() {
+                Some((last, held)) if *last == name => {
+                    *held = Hasher::new(IDENTITY_PART).id(held).id(&id).finish();
+                }
+                _ => merged.push((name, id)),
+            }
+        }
+        merged
     }
 
     /// The first variable of the process that a crate of the front end read through `env!` or
@@ -1415,7 +1958,8 @@ impl Lowered {
             return Ok(());
         }
         let ran = canonical_run(&crates, run, ran);
-        let cfgs = cfg_atoms(&ran, &lowering.what)?;
+        // alloc: once per apply, the run's cfgs parsed, shared by every crate it applies to
+        let cfgs: std::sync::Arc<[CfgAtom]> = cfg_atoms(&ran, &lowering.what)?.into();
         let trigger = Trigger::of("a build script's run applied", &lowering.what);
         self.batch(trigger, |this| this.apply_run(&ran, &crates, lowering, &cfgs))
     }
@@ -1436,30 +1980,49 @@ impl Lowered {
         ran: &Ran,
         crates: &Crates,
         lowering: &Lowering,
-        cfgs: &[CfgAtom],
+        cfgs: &std::sync::Arc<[CfgAtom]>,
     ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
+        // Each file with the bytes the run left, for the reads of it made before the run.
+        let mut left: Vec<(String, std::sync::Arc<[u8]>)> = Vec::with_capacity(ran.files.len()); // alloc: once per apply, a file the run left each
         for (path, bytes) in &ran.files {
             let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-            let bytes = blaze_vfs::Bytes::from(std::sync::Arc::<[u8]>::from(bytes.as_slice()));
-            loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes });
+            // The run's own bytes, shared: the text is the allocation the run's result holds.
+            let shared = std::sync::Arc::clone(bytes); // clone: a count
+            let at = format!("{out_dir}/{path}");
+            left.push((at.clone(), std::sync::Arc::clone(&shared))); // clone: a count and the path, once per file per apply
+            loaded.push(files::Loaded { path: at, id, bytes: blaze_vfs::Bytes::from(shared) });
         }
 
         let db = &mut self.db;
-        let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
+        let change = set_files(db, out_dir, &[], lowering.set, crates.sets, crates.other, &loaded)?;
         note(&mut self.paths, db, lowering.set, &change);
+        // A crate given this `OUT_DIR` by the plan is resolved before the run is applied (the
+        // name resolution maintainer ends every write), and its `include!` of a file the run
+        // had not left yet read the disk and kept "no such file" as an input
+        // ([`base_db::Files::included_file`]). The run's files are final here: each such
+        // read is set to the bytes the run left, in this write, so its readers run again now
+        // and the read is what the disk holds. Left as it was, the next build's
+        // [`Lowered::refresh`] found each of them moved on disk and wrote them then: reth's
+        // first edit after a cold build wrote 11 (serde's, thiserror's, snap's, bindgen's ..),
+        // each write waking every module of every crate that expands an `include!`.
+        let mut settled = false;
+        for (path, bytes) in left {
+            let path = abs(&path)?;
+            settled |= db.settle_included_file(&path, bytes);
+        }
         // Whether the run changed anything the front end reads: a file of its `OUT_DIR`, or
         // below a dependent's cfg or env. A run applied again with what it gave before (a
         // script blaze ran again whose outputs are byte for byte the last run's) writes
         // nothing, so the identities made of the database stay: until 2026-11-10 every
         // applied run dropped them, and each unit's was made again in every build.
-        let mut changed = !(change.set.is_empty()
-            && change.added.is_empty()
-            && change.removed.is_empty()
-            && change.no_text.is_empty()
-            && change.roots.is_empty());
-        let class = lowering.class;
+        let mut changed = settled
+            || !(change.set.is_empty()
+                && change.added.is_empty()
+                && change.removed.is_empty()
+                && change.no_text.is_empty()
+                && change.roots.is_empty());
         // Each crate once: units of one crate depend on runs of the same classes.
         let mut written: Vec<Crate> = Vec::with_capacity(lowering.dependents.len()); // alloc: once per apply, a handful
         for &dependent in &lowering.dependents {
@@ -1468,16 +2031,22 @@ impl Lowered {
                 continue;
             }
             written.push(krate);
+            // By the class's `OUT_DIR` (`ran` is its class's, `canonical_run`): the one name
+            // of a run class that every plan naming this crate has for it.
             let runs = self.applied.entry(krate).or_default();
-            runs.retain(|(it, _)| *it != class);
-            let applying =
-                Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
-            runs.push((class, applying));
-            radix::sort_by_key(runs, |(it, _)| *it as u64);
+            runs.retain(|it| it.out_dir != *out_dir);
+            // clone: two counts and the `OUT_DIR`, once per dependent crate
+            let applying = Applied {
+                cfgs: std::sync::Arc::clone(cfgs),
+                env: std::sync::Arc::clone(&ran.env),
+                out_dir: out_dir.clone(),
+            };
+            runs.push(applying);
+            runs.sort_by(|a, b| a.out_dir.cmp(&b.out_dir));
             let base = &crates.units[dependent];
             let mut cfg = base.cfg.clone();
             let mut env: Env = base.env.iter().cloned().collect();
-            for (_, applying) in runs.iter() {
+            for applying in runs.iter() {
                 cfg.extend(applying.cfgs.iter().cloned());
                 env.extend(applying.env.iter().cloned());
                 env.set("OUT_DIR", applying.out_dir.clone());
@@ -1494,6 +2063,16 @@ impl Lowered {
         if changed {
             self.identities.clear();
             self.narrowed.clear();
+            // A run's cfgs, env and files are in the settings and files of the crates it
+            // applies to, and their settings in those of every crate above them: what a
+            // record carried of any of those is let go.
+            let db = &self.db;
+            self.carried.retain(|krate, _| {
+                !written.contains(krate)
+                    && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
+            });
+            // In this run's batch: the crates given the run have other settings or files.
+            self.give_surfaces();
         }
         Ok(())
     }
@@ -1517,10 +2096,12 @@ impl Lowered {
     /// not run when the view did not move (nothing is written, so nothing is parsed again) or
     /// on `Ok(false)`.
     ///
-    /// A write, as [`Lowered::ran`] is.
+    /// A write, as [`Lowered::ran`] is. Each look at the disk the reads again make is pushed
+    /// to `looks`, the list of the build the front end is moved for.
     pub fn refresh<T: blaze_query::Tree>(
         &mut self,
         lower: Lower<'_, T>,
+        looks: &base_db::Looks,
         seed: impl FnOnce(&Db) -> Result<(), LowerError>,
     ) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
@@ -1537,7 +2118,7 @@ impl Lowered {
         self.class_runs.clear();
         if root == self.view {
             // The view did not move, but a file outside it may have.
-            self.db.reload_included_files(INCLUDED_MOVED);
+            self.db.reload_included_files(INCLUDED_MOVED, looks);
             return Ok(true);
         }
         let tree = files::Mounts {
@@ -1553,7 +2134,7 @@ impl Lowered {
         self.narrowed.clear();
         // One change: the view's files, the seeds and the const macros they list, one batch.
         self.batch(Trigger::named("the view moved"), |this| {
-            this.refresh_writes(&tree, root, seed)
+            this.refresh_writes(&tree, root, looks, seed)
         })?;
         // A crate of the macro host whose root now links `proc_macro` or no longer does is
         // made with another cfg (`crates::host_side`): lowered anew, as a moved root is.
@@ -1577,9 +2158,10 @@ impl Lowered {
         &mut self,
         tree: &files::Mounts<'_, T>,
         root: ContentId,
+        looks: &base_db::Looks,
         seed: impl FnOnce(&Db) -> Result<(), LowerError>,
     ) -> Result<(), LowerError> {
-        let sets = self.crates.sets;
+        let (sets, other) = (self.crates.sets, self.crates.other);
         let mut loaded = Vec::new();
         let mut removed = false;
         let (loads, paths, db) = (&mut self.loads, &mut self.paths, &mut self.db);
@@ -1591,14 +2173,26 @@ impl Lowered {
             tree.read_view.set(false);
             tree.walk(&load.dir, &load.skipped, &mut loaded)?;
             load.view = tree.read_view.get();
-            let change = set_files(db, &load.dir, &load.built, load.set, sets, &loaded)?;
+            let change = set_files(db, &load.dir, &load.built, load.set, sets, other, &loaded)?;
             removed |= !change.removed.is_empty();
+            // A crate of a source root with a file set, added or removed is parsed for its
+            // surface again: what a record carried of it is of the files before.
+            if !(change.set.is_empty()
+                && change.added.is_empty()
+                && change.removed.is_empty()
+                && change.no_text.is_empty())
+            {
+                let root = SourceRootId(load.set as u32);
+                self.carried.retain(|krate, _| {
+                    db.file_source_root(krate.data(&*db).root_file_id).source_root_id(&*db) != root
+                });
+            }
             note(paths, db, load.set, &change);
         }
         seed(db)?;
         // In this batch: one change, one pass. A file outside the VFS moves with no move of the
         // view, and one inside it may be newly outside: read again whatever the view did.
-        db.reload_included_files(INCLUDED_MOVED);
+        db.reload_included_files(INCLUDED_MOVED, looks);
         self.view = root;
         if removed {
             for lowering in &self.crates.units {
@@ -1619,7 +2213,90 @@ impl Lowered {
             }
         }
         const_macros::set_macros(&mut self.db, listed);
+        // The view's texts are set and seeded: each crate's surface as it is now, in this
+        // batch, so no image key is asked of this view before it and the maintainers run
+        // once.
+        self.give_surfaces();
         Ok(())
+    }
+
+    /// Another plan of the checkout lowered into this front end: `lower`'s units as a view
+    /// over the crate graph it keeps, at the view it is at (after [`Lowered::refresh`], which
+    /// the caller runs first with the same `lower`).
+    ///
+    /// The invariant: each source root, directory and crate of the plan is found in what the
+    /// front end keeps ([`Graph`]) or made beside it, and nothing found is written: no file
+    /// read again, no crate's data, cfg, env or proc macros set, the crate graph's list set
+    /// only when a crate was made. So a plan lowered before (`build`, then `test`, then
+    /// `build` again) is [`Placed::found_whole`], in no write and no maintainer's pass, and a
+    /// plan that adds a crate (a `cfg(test)` twin beside the crate it is a twin of, a crate
+    /// under another feature set, a dev-dependency) writes that crate and its files alone,
+    /// noted as crates added ([`base_db::Written::crates_added`]). No crate is unmade: the
+    /// crates of the plans before stay, with what was resolved, inferred and applied to them
+    /// (a build script's run, a proc macro's expanders), for the request that names them
+    /// next.
+    ///
+    /// What is per plan is made again from `lower`: each unit's crate ([`Crates`], which
+    /// [`Lowered::crates`] gives from now on), the runs' classes, the roots appended to. The
+    /// doctest examples made for a `Doctest` unit stay with the unit of this plan that has
+    /// the same crate.
+    ///
+    /// [`Relowered::Anew`] when the front end can't take the plan beside what it holds, by
+    /// name: the plan's workspace root is another; a directory read whole now holds a
+    /// directory of its own (a package nested in one read before); a package has const
+    /// macros. The caller lets the front end go and [`lower`]s anew, saying why.
+    ///
+    /// A write, as [`Lowered::ran`] is: one batch.
+    pub fn relower<T: blaze_query::Tree>(
+        &mut self,
+        lower: Lower<'_, T>,
+    ) -> Result<Relowered, LowerError> {
+        if lower.root != self.view {
+            // alloc: an error
+            return Err(LowerError::new(format!(
+                "a plan is lowered into a front end at the view {:x}, and the plan is of the view {:x}: the front end is moved to the plan's view first (`Lowered::refresh`)",
+                self.view, lower.root
+            )));
+        }
+        let was = std::sync::Arc::clone(&self.crates);
+        let made = self.batch(Trigger::named("a plan lowered into the front end"), |this| {
+            let kept = Kept { loads: &this.loads, workspace_root: Some(&this.workspace_root) };
+            lower_writes(&mut this.db, lower, &mut this.graph, kept)
+        });
+        let setup = match made {
+            Ok(setup) => setup,
+            Err(Refused::Error(error)) => return Err(error),
+            Err(Refused::Anew(why)) => return Ok(Relowered::Anew(why)),
+        };
+        let Setup { lowerings, sets, other, loads, view: _, workspace_root: _, const_macros, spellings, placed } =
+            setup;
+        // The examples of a `Doctest` unit are its crate's: with the unit of this plan that
+        // has that crate, or with none until a plan has one again.
+        for of_unit in &mut self.doctests {
+            let krate = was.krate(of_unit.unit);
+            of_unit.unit = lowerings
+                .iter()
+                .position(|it| it.doctest && it.krate.is_some() && it.krate == krate)
+                .unwrap_or(usize::MAX);
+        }
+        self.crates = std::sync::Arc::new(Crates { units: lowerings, sets, other });
+        self.loads.extend(loads);
+        self.const_macros.extend(const_macros);
+        if let Some(spellings) = spellings {
+            self.spellings = spellings;
+        }
+        // Per job, as after a refresh: a unit's index is this plan's.
+        self.appended.clear();
+        self.class_runs.clear();
+        if !placed.found_whole() {
+            self.paths = std::sync::Arc::new(paths_of(&self.db, &self.graph));
+            self.identities.clear();
+            self.narrowed.clear();
+        }
+        // The plan's crates, those found and those made: a crate this plan is the first to
+        // name has no surface given yet.
+        self.give_surfaces();
+        Ok(Relowered::Into(placed))
     }
 
     /// The front end's tables by owner and name: how many each holds and their bytes, as
@@ -1694,10 +2371,23 @@ impl Lowered {
             });
             macros
         });
-        self.identities.clear();
-        self.narrowed.clear();
         let trigger = Trigger::of("a proc macro's expanders loaded", &self.crates.units[unit].what);
-        Db::batch_in(&mut self.db, |db| db, trigger, |db| ProcMacros::give(db, [(krate, macros)]));
+        let changed = Db::batch_in(
+            &mut self.db,
+            |db| db,
+            trigger,
+            |db| ProcMacros::give(db, [(krate, macros)]),
+        );
+        // Expanders loaded again that run the code the crate's already run change nothing
+        // the front end reads: the identities made of the database stay, as after a build
+        // script's run applied again with what it gave before ([`Lowered::apply_run`]).
+        if changed {
+            self.identities.clear();
+            self.narrowed.clear();
+            // A proc macro's crate is its code to the crates above it; the expanders loaded
+            // move nothing a surface holds, and the call writes nothing then.
+            self.give_surfaces();
+        }
         Ok(())
     }
 
@@ -1727,16 +2417,91 @@ impl Lowered {
             .map_err(LowerError::new)
     }
 
-    /// The images of the crates `served` keyed and found none of, written to `images` from
-    /// what this front end resolves them to ([`hir_def::deps::store`]), with each crate refused
-    /// and why.
+    /// Gives the front end the surface ([`Lowered::surface_of`]) of every crate of the plan
+    /// and of every crate they depend on (`hir_def::deps::given::set_surface`), dependencies
+    /// first: what a crate enters the image key of a crate above it by, which hir-def cannot
+    /// work out (the texts are this crate's). A digest that is the one already given writes
+    /// nothing, so after the first call only a crate whose surface moved is written, and with
+    /// it the keys above it. A library crate's at `HIGH` (its files do not change), a
+    /// workspace crate's at `LOW`.
+    ///
+    /// The invariant: whenever an image key is asked, each crate's slot holds the surface of
+    /// the files and settings the database holds. So this runs at the end of every write
+    /// that can move one, in that write's batch or right after it, once the texts are set:
+    /// [`Lowered::refresh`], [`Lowered::relower`], a run applied ([`Lowered::ran`]), proc
+    /// macros loaded ([`Lowered::macros`]), a root appended to ([`Lowered::append_roots`]);
+    /// and once after [`Lowered::set_port`] by the driver (a surface holds the crate's
+    /// settings as the port writes them, so none is worked out before the port is told).
+    /// Never inside a serve: blaze-cargo's `deps::images` takes the database's view before
+    /// it walks the keys.
+    ///
+    /// What it reads is inputs and parses alone (file texts, crate data, settings), none of
+    /// it kept by a maintainer, so it may run inside an open batch, before that batch's
+    /// maintainers ran. A gift notes nothing to the maintainers (`base_db::Crate::give`
+    /// writes the crate's slot and no other input).
+    ///
+    /// A write, as [`Lowered::ran`] is, when any digest moved; none when none did.
+    pub fn give_surfaces(&mut self) {
+        // alloc: once a write that could move a surface, the plan's crates
+        let mut crates: Vec<Crate> = self.crates.units.iter().filter_map(|it| it.krate).collect();
+        crates.sort_unstable();
+        crates.dedup();
+        // The whole identities of every crate of the closures: what a library crate's slot is.
+        for &krate in &crates {
+            identity_of(&self.db, krate, &self.spellings, &mut self.identities);
+        }
+        let db = &self.db;
+        // alloc: as above, a crate of the closure each
+        let mut known = blaze_hash::HashMap::new_in(Global);
+        for &krate in &crates {
+            slot_of(
+                db,
+                krate,
+                &self.spellings,
+                &self.identities,
+                &self.const_macros,
+                &self.carried,
+                &mut known,
+            );
+        }
+        // Dependencies first: a crate's slot is made of its dependencies', so in the order
+        // of how deep each is below the plan's crates, then by crate.
+        // alloc: as above
+        let mut given: Vec<(usize, Crate, ContentId, blaze_query::db::Durability)> = Vec::new();
+        for (&krate, slot) in &known {
+            if hir_def::deps::given::surface(db, krate) == Some(slot.digest) {
+                continue;
+            }
+            let root_file = krate.data(db).root_file_id;
+            let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+            let durability = match root.source_root_ref(db).is_library {
+                true => blaze_query::db::Durability::HIGH,
+                false => blaze_query::db::Durability::LOW,
+            };
+            given.push((slot.height, krate, slot.digest, durability));
+        }
+        if given.is_empty() {
+            return;
+        }
+        given.sort_unstable_by_key(|it| (it.0, it.1));
+        self.db.batch(Trigger::named("the crates' surfaces given"), |db| {
+            for (_, krate, surface, durability) in given {
+                hir_def::deps::given::set_surface(db, krate, surface, durability);
+            }
+        });
+    }
+
+    /// The images of the crates `served` keyed and found none of that `which` names, written
+    /// to `images` from what this front end resolves them to ([`hir_def::deps::store`]), with
+    /// each crate refused and why.
     pub fn store_deps(
         &self,
         served: &hir_def::deps::Served,
         // dyn: as in `serve_deps`
         images: &dyn hir_def::deps::ImageStore,
+        which: hir_def::deps::Which,
     ) -> Result<hir_def::deps::Stored, LowerError> {
-        hir_def::deps::store(&self.db, served, images).map_err(LowerError::new)
+        hir_def::deps::store(&self.db, served, images, which).map_err(LowerError::new)
     }
 
     /// The database to give what else the store served for the crates [`Lowered::serve_deps`]
@@ -1793,14 +2558,17 @@ fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> 
         cfgs: ran.cfgs.iter().map(text).collect(), // alloc: as above
         env: ran.env.iter().map(|(name, value)| (name.clone(), text(value))).collect(), // alloc: as above
         out_dir: out_dir.to_owned(), // alloc: as above
+        // A file that does not name its `OUT_DIR` is the run's own bytes, shared; one that
+        // does is written anew, once.
         files: ran
             .files
             .iter()
             .map(|(path, bytes)| {
-                (
-                    path.clone(),
-                    crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()).into_owned(),
-                )
+                let bytes = match crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()) {
+                    Cow::Borrowed(_) => std::sync::Arc::clone(bytes), // clone: a count
+                    Cow::Owned(written) => std::sync::Arc::from(written), // alloc: as above
+                };
+                (path.clone(), bytes)
             })
             .collect(), // alloc: as above
     })
@@ -1811,7 +2579,10 @@ fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> 
 const INCLUDED_MOVED: Trigger<'static> =
     Trigger::named("files include_bytes! or include_str! read moved on disk");
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 5";
+/// 6: a crate's settings, its files' paths and how cargo passes its root are written as a
+/// portable key writes paths ([`base_db::Files::ported`]), so the identity does not say where
+/// the checkout, its build directory or the machine's shared directories are.
+const IDENTITY: &str = "blaze v2 cargo unit identity 6";
 
 /// The domain of a part of an identity hashed alone ([`Lowered::identity_parts`]).
 const IDENTITY_PART: &str = "blaze v2 cargo unit identity part 1";
@@ -1825,6 +2596,9 @@ pub enum IdentityPart {
     /// Its crate's own settings ([`base_db::Crate::content`]: its root's path, cfgs, env,
     /// edition, target and the rest).
     Settings(ContentId),
+    /// One of those settings by what it is ([`base_db::Crate::settings_parts`]), with a hash
+    /// of its own: what says which setting moved when [`IdentityPart::Settings`] did.
+    Setting { what: String, id: ContentId },
     /// A file it is made from, by its absolute path: its bytes' content, and for a Rust file
     /// of a workspace crate what code can observe of it (its text with each comment no macro
     /// sees as its shape), so an edit that moves the first and not the second changed no item.
@@ -1856,10 +2630,19 @@ pub struct Narrowed {
     /// builds code, which reads every body it reaches.
     pub code: ContentId,
     /// What a check of the crate can observe: its own code text, and of each crate it depends
-    /// on only its interface (each body no other crate's check can read as its shape too).
+    /// on only its surface ([`code::CodeText::surface`]: each body no other crate's front end
+    /// reads as a mark, and no position a line alone moves).
     /// For a unit that only checks. Equal to `code` wherever a check may read more: a crate
     /// that names blaze's extensions or reads files by path.
     pub checked: ContentId,
+    /// What a library's build that stops at the crate boundary can observe (store.md, "Early
+    /// cutoff between crates"): its own code text, and of each crate it depends on only its
+    /// surface ([`code::CodeText::surface`]): what a front end reads of it, with no position
+    /// in it but the ones a constant can hold, and an `#[inline(always)]` body whole.
+    /// For a unit that makes a library with no MIR inlining across crates, whose record names
+    /// no function of another crate (blaze-cargo's `narrow_identity` says which units those
+    /// are). Equal to `code` wherever `checked` is.
+    pub built: ContentId,
 }
 
 /// A crate's narrowed identities, as [`narrow_of`] keeps them.
@@ -1876,13 +2659,32 @@ struct Narrow {
     interface: ContentId,
     /// [`Narrowed::checked`].
     checked: ContentId,
+    /// [`Narrowed::built`].
+    built: ContentId,
+    /// What another crate's front end observes of it and, through it, of what it depends on,
+    /// with no position but the ones a constant can hold: its surface text and its
+    /// dependencies' surfaces ([`code::CodeText::surface`]). `interface` where it has no
+    /// surface, or could hold a position its surface does not say (`locates` and its own
+    /// calls).
+    surface: ContentId,
+    /// Whether it or a crate it depends on could give a constant of a crate above its
+    /// caller's position: it has a `#[track_caller]` `const fn` ([`code::CodeText::tracks`])
+    /// and names `Location` or is above a crate that gives positions (a tracked function
+    /// that calls one passes its own caller's on). A library crate with no code text of its
+    /// own is taken to, unless it is the standard library's, whose one such function is
+    /// named where it is called (`Location::caller`, which the surface holds with its place).
+    locates: bool,
     /// Whether it or a workspace crate it depends on names blaze's extensions.
     extends: bool,
 }
 
-const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 1";
-const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 1";
-const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 1";
+const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 2";
+const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 2";
+/// 3: a dependency by its surface.
+const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 3";
+/// 2: a dependency by its surface.
+const NARROW_BUILT: &str = "blaze v2 cargo unit narrow built 2";
+const NARROW_SURFACE: &str = "blaze v2 cargo unit narrow surface 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -1924,12 +2726,27 @@ fn narrow_of(
             None => code::own_narrow(db, at),
         };
         let extends = own.extends || data.dependencies.iter().any(|it| known[&it.crate_id].extends);
+        let locates_below = data.dependencies.iter().any(|it| known[&it.crate_id].locates);
         let Some(own_code) = own.code else {
             // A crate that keeps its whole text is its whole identity to everything.
             let id = whole[&at];
-            known.insert(at, Narrow { own: false, code: id, interface: id, checked: id, extends });
+            let locates = locates_below || !data.origin.is_lang();
+            known.insert(
+                at,
+                Narrow {
+                    own: false,
+                    code: id,
+                    interface: id,
+                    checked: id,
+                    built: id,
+                    surface: id,
+                    locates,
+                    extends,
+                },
+            );
             continue;
         };
+        let locates = locates_below || (own.tracks && (own.names_location || locates_below));
         // Of `own_text` and each dependency by `of`, with how cargo passes the root, which
         // the crate's code says of its files, as the whole identity has it.
         let folded = |domain: &'static str, own_text: ContentId, of: fn(&Narrow) -> ContentId| {
@@ -1942,7 +2759,7 @@ fn narrow_of(
                 Some(spelling) => {
                     hasher.update(&[1]);
                     for text in [&spelling.dir, &spelling.passed] {
-                        hasher.part(text.as_bytes());
+                        hasher.part(&db.files().ported(text.as_bytes()));
                     }
                 }
             }
@@ -1965,11 +2782,139 @@ fn narrow_of(
             }
             _ => code,
         };
+        // A constant of this crate made by a call of a function that gives its caller's
+        // position holds a position no token says: then the interface, which holds them all.
+        let positioned = locates && own.calls && !code::planted(code::Plant::Located);
+        let surface = match own.surface {
+            Some(own_surface) if library && !extends && !positioned => {
+                folded(NARROW_SURFACE, own_surface, |it| it.surface)
+            }
+            _ => interface,
+        };
         let checked = match extends || own.reaches || code::planted(code::Plant::Deep) {
             true => code,
-            false => folded(NARROW_CHECKED, own_code, |it| it.interface),
+            false => folded(NARROW_CHECKED, own_code, |it| it.surface),
         };
-        known.insert(at, Narrow { own: true, code, interface, checked, extends });
+        // A library built up to the crate boundary reads of a dependency what a check does,
+        // and compiles of it only the bodies its interface holds whole: the same fold as
+        // `checked`, under its own domain, as the two are keys of two things. With the cutoff
+        // taken away (the planted control) it is the deep code identity again.
+        let built = match extends || own.reaches || code::planted(code::Plant::Uncut) {
+            true => code,
+            false => folded(NARROW_BUILT, own_code, |it| it.surface),
+        };
+        known.insert(
+            at,
+            Narrow { own: true, code, interface, checked, built, surface, locates, extends },
+        );
+    }
+    known[&krate]
+}
+
+/// A crate's slot digest and what the crates above it are asked of it ([`slot_of`]).
+#[derive(Clone, Copy)]
+struct Slot {
+    digest: ContentId,
+    /// How many crates deep its dependencies go: 0 for a crate with none. A crate's is more
+    /// than each of its dependencies', so slots given in this order are given dependencies
+    /// first.
+    height: usize,
+    /// As [`Narrow::locates`], a library crate that is not the standard library's always
+    /// taken to.
+    locates: bool,
+    /// As [`Narrow::extends`].
+    extends: bool,
+}
+
+const NARROW_SLOT: &str = "blaze v2 crate surface slot 1";
+
+/// What a front end above reads of `krate` and of the crates below it, as the digest it is
+/// given as ([`Lowered::surface_of`]), each crate of its closure worked out once into `known`,
+/// dependencies first; `whole` holds the whole identity ([`identity_of`]) of every crate of
+/// the closure.
+///
+/// A crate with no code text of its own (a library source root's, which does not change; one
+/// that reads Rust as bytes) is its whole identity. Any other is its own text and each
+/// dependency's slot: its surface text where it has one and holds no position its tokens do
+/// not say, else its interface text, else its code text, by the rule of [`narrow_of`]
+/// (a proc macro, a build script, a program and a const-macro crate are their code; so is a
+/// crate that names blaze's extensions or is above a workspace crate that does). It reads no
+/// library crate's narrowed identity ([`Lowered::library_narrows`]): what it gives must not
+/// depend on which units were identified yet. A library crate other than the standard
+/// library's is therefore taken to give a constant its caller's position, and a workspace
+/// crate above one that calls a function where a constant is evaluated keeps its positions
+/// (its interface text): a moved line in it then moves the keys above. Sound, and coarser
+/// than a unit's key; closing it needs the narrowed identities read before the first serve.
+fn slot_of(
+    db: &Db,
+    krate: Crate,
+    spellings: &Spellings,
+    whole: &blaze_hash::HashMap<Crate, ContentId, Global>,
+    const_macros: &[const_macros::Loaded],
+    carried: &blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
+    known: &mut blaze_hash::HashMap<Crate, Slot, Global>,
+) -> Slot {
+    if let Some(slot) = known.get(&krate) {
+        return *slot;
+    }
+    let mut stack = vec![(krate, false)]; // alloc: once per crate asked between writes
+    while let Some((at, deps_known)) = stack.pop() {
+        if known.contains_key(&at) {
+            continue;
+        }
+        let data = at.data(db);
+        if !deps_known {
+            stack.push((at, true));
+            stack.extend(
+                data.dependencies
+                    .iter()
+                    .filter(|it| !known.contains_key(&it.crate_id))
+                    .map(|it| (it.crate_id, false)),
+            );
+            continue;
+        }
+        let below = |of: fn(&Slot) -> bool| data.dependencies.iter().any(|it| of(&known[&it.crate_id]));
+        let height =
+            data.dependencies.iter().map(|it| known[&it.crate_id].height + 1).max().unwrap_or(0);
+        // What a record carried of it, where one did: none of its files is parsed.
+        let own = match carried.get(&at) {
+            Some(own) => *own,
+            None => code::own_narrow(db, at),
+        };
+        let extends = own.extends || below(|it| it.extends);
+        let Some(own_code) = own.code else {
+            let locates = below(|it| it.locates) || !data.origin.is_lang();
+            known.insert(at, Slot { digest: whole[&at], height, locates, extends });
+            continue;
+        };
+        let locates_below = below(|it| it.locates);
+        let locates = locates_below || (own.tracks && own.names_location);
+        let library = matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: false })
+            && const_macros.iter().all(|it| it.krate != at);
+        let read_by_interface = library && !extends;
+        let (which, own_text) = match (own.surface, own.interface) {
+            (Some(surface), _) if read_by_interface && !(locates && own.calls) => (2u8, surface),
+            (_, Some(interface)) if read_by_interface => (1, interface),
+            _ => (0, own_code),
+        };
+        let mut hasher = Hasher::new(NARROW_SLOT);
+        hasher.update(&[which]).id(&own_text);
+        match spellings.of(at) {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(spelling) => {
+                hasher.update(&[1]);
+                for text in [&spelling.dir, &spelling.passed] {
+                    hasher.part(&db.files().ported(text.as_bytes()));
+                }
+            }
+        }
+        hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+        for dep in &data.dependencies {
+            hasher.id(&known[&dep.crate_id].digest);
+        }
+        known.insert(at, Slot { digest: hasher.finish(), height, locates, extends });
     }
     known[&krate]
 }
@@ -2006,15 +2951,17 @@ fn identity_of(
             );
             continue;
         }
-        let root = db.file_source_root(data.root_file_id).source_root_id(db);
+        // Its settings and its files' paths as a portable key writes them
+        // ([`code::ported_crate`], [`code::ported_files`]): the same sources in another
+        // directory, under another home or on another machine are the same identity.
         let mut hasher = Hasher::new(IDENTITY);
-        hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db));
+        hasher.id(&code::ported_crate(db, at)).id(&db.file_text(data.root_file_id).content(db));
         // The files of its source root, unless its root file proves it can read none of them
         // but itself ([`code::root_alone`]): then the root's text above is all of them it is
         // made from, and an edit of another target's source in the package leaves it as it was.
         match code::root_alone(db, at) {
             true => hasher.update(ROOT_ALONE),
-            false => hasher.id(&db.source_root(root).content(db)),
+            false => hasher.id(&code::ported_files(db, at)),
         };
         // How rustc names the crate's files, which its code says (`file!()`, panic locations).
         match spellings.of(at) {
@@ -2024,8 +2971,7 @@ fn identity_of(
             Some(spelling) => {
                 hasher.update(&[1]);
                 for text in [&spelling.dir, &spelling.passed] {
-                    hasher.update(&(text.len() as u64).to_le_bytes());
-                    hasher.update(text.as_bytes());
+                    hasher.part(&db.files().ported(text.as_bytes()));
                 }
             }
         }
@@ -2113,11 +3059,15 @@ fn note(
     }
 }
 
-/// Every file of the source roots `0..=sets` by its absolute path, and each alias of one by
-/// the path of the file it is an alias of.
-fn paths_of(db: &Db, sets: usize) -> HashMap<FileId, String> {
+/// Every file of the packages' source roots and of the one of files of no package by its
+/// absolute path, and each alias of one by the path of the file it is an alias of. Never a
+/// doctest example's file: [`Lowered::doctests`] names those.
+fn paths_of(db: &Db, graph: &Graph) -> HashMap<FileId, String> {
     let mut paths = HashMap::new();
-    for set in 0..=sets {
+    for (set, of) in graph.roots.iter().enumerate() {
+        if *of == RootOf::Example {
+            continue;
+        }
         let root = db.source_root(SourceRootId(set as u32)).source_root(db);
         for file in root.iter().chain(root.aliases().map(|(alias, _)| alias)) {
             if let Some(path) = root.path_for_file(&file).and_then(VfsPath::as_path) {
@@ -2128,14 +3078,16 @@ fn paths_of(db: &Db, sets: usize) -> HashMap<FileId, String> {
     paths
 }
 
-/// Puts `loaded`, the files under `base`, into the source root `set` of the `sets` packages'.
-/// Files under `base` it lacks and none of `built` has are taken out.
+/// Puts `loaded`, the files under `base`, into the source root `set` of the front end's
+/// `sets` ([`Crates::sets`]), `other` the one of files of no package. Files under `base` it
+/// lacks and none of `built` has are taken out.
 fn set_files(
     db: &mut Db,
     base: &str,
     built: &[AbsPathBuf],
     set: usize,
     sets: usize,
+    other: usize,
     loaded: &[files::Loaded],
 ) -> Result<ViewChange, LowerError> {
     let base_path = abs(base)?;
@@ -2150,7 +3102,7 @@ fn set_files(
         });
     }
     let partition = partition.build();
-    let other = SourceRootId(sets as u32);
+    let other = SourceRootId(other as u32);
     let mut view = Vec::with_capacity(loaded.len());
     for file in loaded {
         let Some(path) = files::rest(&file.path, base).filter(|it| !it.is_empty()) else {

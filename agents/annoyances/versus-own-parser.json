@@ -1,0 +1,14 @@
+{
+ "id": "versus-own-parser",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 8 of round 1112",
+ "where": "harness/v2/versus.py parsed/fitted, harness/v2/ran.py parsed/fitted",
+ "what": "versus.py takes a float (`factor`) and a list of nested dataclasses with an optional field; ran.py's typed-input parser reads no float, so versus.py carries a second copy of `parsed`/`fitted` that does.",
+ "cost": "two parsers of one rule (scripts-take-typed-input) that can drift",
+ "cause": "ran.py's `fitted` grew one type at a time for its own callers instead of covering JSON's types once",
+ "class": "a shared helper that covers only what its first callers needed, copied by the next caller",
+ "prevention": "one typed-input parser for harness scripts that covers every JSON type (number as float, nested and optional dataclasses), and scripts import it",
+ "workaround": "versus.py's own parser, same refusals as ran.py's",
+ "fix": "Wanted (not made, ran.py is outside track 8): ran.fitted reads `float` (an int or float JSON number) and versus.py imports ran.parsed and deletes its copy.",
+ "state": "open"
+}

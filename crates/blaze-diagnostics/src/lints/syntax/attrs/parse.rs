@@ -53,7 +53,6 @@ const PREVIOUSLY_ACCEPTED: &str = "this was previously accepted by the compiler 
 /// What the crate says that the attribute parser reads: its root file and its features.
 pub(crate) struct Krate {
     root: Option<hir_expand::EditionedFileId>,
-    root_name: String,
     fn_delegation: bool,
     stmt_expr_attributes: bool,
     extern_types: bool,
@@ -62,34 +61,18 @@ pub(crate) struct Krate {
 }
 
 impl Krate {
-    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner<'_>]) -> Krate {
-        let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db);
-        let root_name = root.map(|it| cx.file_name(it.file_id(cx.db))).unwrap_or_default();
-        let mut krate = Krate {
-            root,
-            root_name,
-            fn_delegation: false,
-            stmt_expr_attributes: false,
-            extern_types: false,
-            fn_align: false,
-            static_align: false,
-        };
-        let crate_attrs =
-            owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
-        for attr in crate_attrs {
-            let (true, Args::List(tt)) = (attr.is("feature"), attr.args()) else { continue };
-            for item in items(tt) {
-                match word(&item) {
-                    Some("fn_delegation") => krate.fn_delegation = true,
-                    Some("stmt_expr_attributes") => krate.stmt_expr_attributes = true,
-                    Some("extern_types") => krate.extern_types = true,
-                    Some("fn_align") => krate.fn_align = true,
-                    Some("static_align") => krate.static_align = true,
-                    _ => {}
-                }
-            }
+    /// From the crate's settings ([`Cx::settings`]), which a piece's probe is given too: the
+    /// root and the features the parsers' targets depend on.
+    pub(crate) fn of(cx: &Cx<'_, '_>) -> Krate {
+        let settings = cx.settings();
+        Krate {
+            root: settings.root,
+            fn_delegation: settings.enabled("fn_delegation"),
+            stmt_expr_attributes: settings.enabled("stmt_expr_attributes"),
+            extern_types: settings.enabled("extern_types"),
+            fn_align: settings.enabled("fn_align"),
+            static_align: settings.enabled("static_align"),
         }
-        krate
     }
 }
 
@@ -114,7 +97,7 @@ struct MacroUse {
 
 /// The lints attribute parsing gives of `owners`' builtin attributes.
 pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> Vec<Emitted> {
-    let krate = Krate::of(cx, owners);
+    let krate = Krate::of(cx);
     // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
     // alloc: as above; then one buffer for the crate
@@ -718,9 +701,13 @@ pub(crate) fn crate_level(
             ),
         );
     }
-    if attr.inner && krate.root.is_some_and(|root| attr.file.original_file(cx.db) != root) {
+    if attr.inner
+        && let Some(root) = krate.root
+        && attr.file.original_file(cx.db) != root
+    {
+        let root_name = cx.file_name(root.file_id(cx.db));
         // alloc: as above
-        diag.help(format!("the crate root is at `{}`", krate.root_name));
+        diag.help(blaze_report::say!("the crate root is at ", blaze_report::say::Code(&root_name)).flat());
     }
     diag
 }
@@ -988,7 +975,6 @@ mod tests {
     fn similar_targets_are_named_as_a_group() {
         let krate = Krate {
             root: None,
-            root_name: String::new(),
             fn_delegation: false,
             stmt_expr_attributes: false,
             extern_types: false,

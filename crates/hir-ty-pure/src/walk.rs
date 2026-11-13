@@ -16,7 +16,7 @@
 //! (`static mut`, thread-locals, foreign statics, statics with interior mutability), bodies
 //! that do not lower, code pointers made of bytes, and instances past [`LONGEST`].
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
@@ -68,10 +68,14 @@ use smallvec::SmallVec;
 use std::alloc::Global;
 use syntax::{SyntaxKind, TextRange};
 
+pub(crate) use crate::sealed::summary;
+#[cfg(test)]
+pub(crate) use crate::sealed::summary_in;
 use crate::{
     Abs, Effects, Impure, Proof, Purity, allowed_env, effect_attrs,
     effects::{self, EFFECTS, EffectDef, EffectSet, Rule},
     identity, loops,
+    sealed::{Sealed, summary_within},
     memory::{self, CallKind, MemoryEffects, Origin, SiteFacts},
     models::{Applied, Leaf, Model, Transfer, apply_leaf, effect_row, model_of, tag},
     values::{Flow, Spread, Values, evaluate},
@@ -90,6 +94,21 @@ pub(crate) enum Def {
 pub(crate) struct Instance {
     pub(crate) def: Def,
     pub(crate) args: StoredGenericArgs,
+}
+
+/// The body it runs (the function a leaf models) and what its arguments name: whose a query
+/// keyed by it is ([`blaze_query::db::Storage::ids_of`]), as hir-ty-identity's `Instance`
+/// says it, so an edit's firewall tells the instances of the edited body from another's.
+impl blaze_query::db::NamesIds for Instance {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        match self.def {
+            Def::Body(Body::Fn(it)) | Def::Leaf(it, _) => out.push(it.as_id()),
+            Def::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
+                out.push(it)
+            }
+        }
+        blaze_query::db::NamesIds::names_ids(&self.args, out);
+    }
 }
 
 /// A leaf whose arguments depend on the instance's parameters: each caller applies it again
@@ -146,7 +165,7 @@ impl Summary {
     /// ([`Rule::Recursion`], for each effect that keeps it), and the memory of a call that may
     /// not return. Every instance of the cycle reads it, of itself or through the others, so at
     /// the fixpoint each of them, and each of their callers, has the kind through a site.
-    fn recursive() -> Summary {
+    pub(crate) fn recursive() -> Summary {
         let recursion = EffectSet::one(Rule::Recursion);
         let mut sets = Sets::new();
         let mut witnesses = Vec::new(); // alloc: one witness per effect that keeps it, per cycle
@@ -411,7 +430,11 @@ fn prove<'db>(db: &'db Db, cx: &Cx<'db>, roots: &[(Instance, String)]) -> Purity
         }
     }
     let (order, index) = reached(db, &cx.stored, roots.iter().map(|(it, _)| it));
-    let callees: Vec<&[Instance]> = order.iter().map(|it| callees_of(db, &cx.stored, it)).collect(); // alloc: one slice per instance, once per script
+    // alloc: one summary per instance, once per script
+    let summaries: Vec<Option<Arc<Summary>>> =
+        order.iter().map(|it| callees_of(db, &cx.stored, it)).collect();
+    let callees: Vec<&[Instance]> =
+        summaries.iter().map(|it| it.as_deref().map_or(&[][..], |it| &it.callees[..])).collect(); // alloc: one slice per instance, once per script
     let identity = match identity::of(db, &cx.stored, &order, &callees, &index) {
         Ok(it) => it,
         Err(what) => return Purity::Impure(Impure { what, through: vec!["`main`".to_owned()] }), // alloc: an impure script's reason, once
@@ -465,8 +488,8 @@ fn reached<'a>(
         stack.push((order.len() - 1, 0));
         while let Some(top) = stack.last_mut() {
             let (at, next) = *top;
-            let callees = callees_of(db, stored, &order[at]);
-            let Some(callee) = callees.get(next) else {
+            let summary = callees_of(db, stored, &order[at]);
+            let Some(callee) = summary.as_ref().and_then(|it| it.callees.get(next)) else {
                 stack.pop();
                 continue;
             };
@@ -481,14 +504,15 @@ fn reached<'a>(
     (order, index)
 }
 
-fn callees_of<'db>(
-    db: &'db Db,
+/// The summary whose `callees` are `instance`'s: a body's; none for a leaf, which calls none.
+fn callees_of(
+    db: &Db,
     stored: &StoredParamEnvAndCrate,
     instance: &Instance,
-) -> &'db [Instance] {
+) -> Option<Arc<Summary>> {
     match instance.def {
-        Def::Leaf(..) => &[],
-        _ => &summary(db, stored.clone(), instance.clone()).callees, // clone: the query's key, reference counts
+        Def::Leaf(..) => None,
+        _ => Some(summary(db, stored.clone(), instance.clone())), // clone: the query's key, reference counts
     }
 }
 
@@ -519,23 +543,9 @@ pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
     }
 }
 
-/// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
-/// build script that reaches it shares one summary. A body instance is a step of the walk's
-/// bound, if one is set (`blaze_query::db::with_steps`), however often it is asked for.
-pub(crate) fn summary<'db>(
-    db: &'db Db,
-    env: StoredParamEnvAndCrate,
-    instance: Instance,
-) -> &'db Summary {
-    if let Def::Body(body) = instance.def {
-        blaze_query::db::step(|| step_key(body, &instance.args), || name_of(db, &instance));
-    }
-    summary_in(db, home_env(db, &env, &instance), instance)
-}
-
 /// The body instance `body<args>` as one number, a different one for each instance: what its
 /// step is known by.
-fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
+pub(crate) fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     let (kind, id) = match body {
         Body::Fn(func) => (0u128, func.as_id()),
         Body::Closure(id) => (1, id),
@@ -545,36 +555,80 @@ fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
 }
 
-/// What the instance does, in `env`. A cycle of instances starts from the summary of a
-/// recursion ([`Summary::recursive`]) and iterates to its fixpoint: each local's value only
-/// rises, in a lattice three high, and the recursion's witness keeps one depth.
-#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::recursive())]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
-)]
-pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
-    let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
-    match body {
-        Ok(body) => {
-            let cx = Cx::new(db, env);
-            summarize(&cx, body, instance.def)
-        }
-        Err(error) => {
-            let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
-            let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
-            let mut own = Own::trusted(trust);
-            own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
-            let (sets, witnesses) = own.into_sets();
-            Summary {
-                impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
-                kinds: EffectSet::one(Rule::Unchecked),
-                sets,
-                witnesses,
-                memory: MemoryEffects::UNKNOWN,
-                ..Summary::default()
-            }
-        }
+/// What the instance does, in `env`: the body of both [`crate::sealed::summary_in`] (a workspace
+/// home's row)
+/// and the task-scoped summary of a sealed home (`crate::sealed`), run under the witnessing frame of
+/// `within`, the [`Sealed`] of the home's crate, which its callees are asked through.
+pub(crate) fn summarized(
+    db: &Db,
+    within: Option<&Sealed>,
+    env: StoredParamEnvAndCrate,
+    instance: &Instance,
+) -> Arc<Summary> {
+    let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
+    let cx = Cx::within(db, env, within.cloned()); // clone: two reference counts
+    // The body is read here once and only the summary is kept: made for this run and dropped
+    // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
+    // monomorphized body an instance the walk reaches until the build lets every MIR go.
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count test: the memoized body, as until 2026-11-12.
+        // clone: the body query's keys, reference counts
+        return Arc::new(match dispatch::body_of(db, cx.stored.clone(), of, instance.args.clone()) {
+            Ok(body) => summarize(&cx, body, instance.def),
+            Err(error) => unlowered(db, instance, &error),
+        }); // alloc: the summary, once per instance
+    }
+    // alloc: the summary, once per instance
+    Arc::new(match dispatch::body_once(db, &cx.stored, of, &instance.args) {
+        // The callees' summaries are asked one after another on this stack, by the walk
+        // itself. A pre-ask of them on the pool (`ask_ahead`, 2026-11-11 to 12) is gone: an
+        // ask that would wait on its own asker gave way and ran again, with no bound, and on
+        // mutually recursive functions (syn's `to_tokens`) the smoke's second build made 5.6
+        // to 6.8 million waits on this query (one key changed owner 486,616 times) and did not
+        // end in 600 s; with the pre-ask off the same daemon's builds made 954 and 27.
+        Ok(body) => summarize(&cx, &body, instance.def),
+        Err(error) => unlowered(db, instance, &error),
+    })
+}
+
+/// What a test plants in the walk.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn keeps_bodies() -> bool {
+        KEEPS_BODIES.with(Cell::get)
+    }
+
+    /// `work` with every summary made on this thread reading its body from the memo that
+    /// keeps it.
+    pub(crate) fn keeping_bodies<R>(work: impl FnOnce() -> R) -> R {
+        KEEPS_BODIES.with(|it| it.set(true));
+        let made = work();
+        KEEPS_BODIES.with(|it| it.set(false));
+        made
+    }
+}
+
+/// The summary of an instance whose body did not lower to MIR, for `error`.
+fn unlowered(db: &Db, instance: &Instance, error: &MirLowerError<'_>) -> Summary {
+    let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
+    let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
+    let mut own = Own::trusted(trust);
+    own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
+    let (sets, witnesses) = own.into_sets();
+    Summary {
+        impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
+        kinds: EffectSet::one(Rule::Unchecked),
+        sets,
+        witnesses,
+        memory: MemoryEffects::UNKNOWN,
+        ..Summary::default()
     }
 }
 
@@ -659,17 +713,25 @@ impl Own {
     }
 }
 
-/// The monomorphized body of `instance` in `env`; none for a leaf, which has no body walked.
-pub(crate) fn body_of<'db>(
+/// The monomorphized body of `instance` in `env`, made for the caller and dropped by it
+/// ([`dispatch::body_once`]); none for a leaf, which has no body walked. Each reader keeps what
+/// it worked out of the body (an instance's identity part, a refusal's place), never the body:
+/// a memo of it would hold one body an instance the walk reaches.
+pub(crate) fn body_once<'db>(
     db: &'db Db,
     env: &StoredParamEnvAndCrate,
     instance: &Instance,
-) -> Option<Result<&'db MirBody<'db>, MirLowerError<'db>>> {
-    match instance.def {
-        // clone: handles of interned values, for the body query's key
-        Def::Body(body) => Some(dispatch::body_of(db, env.clone(), body, instance.args.clone())),
-        Def::Leaf(..) => None,
+) -> Option<Result<MirBody<'db>, MirLowerError<'db>>> {
+    let Def::Body(body) = instance.def else { return None };
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count tests: the memoized body, as until 2026-11-13.
+        // clone: the body query's keys, reference counts; the memo's body, a planted bug's copy
+        return Some(
+            dispatch::body_of(db, env.clone(), body, instance.args.clone()).map(Clone::clone),
+        );
     }
+    Some(dispatch::body_once(db, env, body, &instance.args))
 }
 
 /// What the queries of one environment share.
@@ -680,14 +742,33 @@ pub(crate) struct Cx<'db> {
     pub(crate) env: ParamEnvAndCrate<'db>,
     pub(crate) stored: StoredParamEnvAndCrate,
     lang: &'db LangItems,
+    /// The sealed crate whose covered run this is ([`Cx::within`]): its callees' summaries are
+    /// found through it, never by a read of `crate::sealed::sealed` under the frame.
+    sealed: Option<Sealed>,
 }
 
 impl<'db> Cx<'db> {
     pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate) -> Cx<'db> {
+        Cx::within(db, stored, None)
+    }
+
+    /// [`Cx::new`] for a run under the witnessing frame of `sealed` (`None`: no such run).
+    pub(crate) fn within(
+        db: &'db Db,
+        stored: StoredParamEnvAndCrate,
+        sealed: Option<Sealed>,
+    ) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate) }
+        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), sealed }
+    }
+
+    /// The summary of `instance` asked from this environment: through the sealed crate this run
+    /// is under, if it is one.
+    pub(crate) fn summary(&self, instance: Instance) -> Arc<Summary> {
+        // clone: the query's key, reference counts
+        summary_within(self.db, self.sealed.as_ref(), self.stored.clone(), instance)
     }
 
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -828,12 +909,12 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
                 memory::leaf_memory(leaf)
             }
             Def::Body(def) => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
+                let callee = cx.summary(instance.clone()); // clone: the query's key, reference counts
                 fold.callee(
                     db,
                     def,
                     instance.args.as_ref(),
-                    callee,
+                    &callee,
                     walk.workspace,
                     at,
                     discharged,
@@ -864,8 +945,8 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         match instance.def {
             Def::Leaf(func, leaf) => out.leaf(db, func, leaf, &params, None),
             _ => {
-                let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                out.callee(db, instance, callee, &params);
+                let callee = cx.summary(instance.clone()); // clone: the query's key, reference counts
+                out.callee(db, instance, &callee, &params);
             }
         }
         callees.push(instance.clone()); // clone: reference counts
@@ -1411,7 +1492,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// [`Walk::refuse_with`], not counted for the effects of `except` (a bit per effect of
-    /// [`EFFECTS`]: a trait's method whose `#[blaze::may(..)]` bounds what every impl does).
+    /// [`EFFECTS`]: a trait's method whose `#[blaze::expect(..)]` bounds what every impl does).
     fn refuse_except(&mut self, rule: Rule, except: u32, what: impl FnOnce() -> String) {
         let script = self.own.is_none() && !self.giving;
         if !script && self.kinds.full.has(rule) {
@@ -1433,7 +1514,7 @@ impl<'a, 'db> Walk<'a, 'db> {
 
     /// The effects (a bit per effect of [`EFFECTS`]) a call of the trait's method `f` that only
     /// an instance decides cannot have, when `rule` is [`Rule::Open`]: the method's
-    /// `#[blaze::may(..)]` bounds every impl.
+    /// `#[blaze::expect(..)]` bounds every impl.
     fn open_bound(&self, rule: Rule, f: FunctionId) -> u32 {
         match rule {
             Rule::Open => effects::bound_mask(self.cx.db, f),
@@ -1671,7 +1752,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
-        let ret = summary(self.cx.db, self.cx.stored.clone(), instance.clone()).ret; // clone: the query's key, reference counts
+        let ret = self.cx.summary(instance.clone()).ret; // clone: the query's key, reference counts
         self.push(Reached::Walk(instance, spread), call);
         Flow::Ret { ret, spread }
     }
@@ -1794,14 +1875,14 @@ impl<'a, 'db> Walk<'a, 'db> {
             Callee::Virtual | Callee::FnPtr(_) => {
                 // What a `dyn` call reaches was walked where its vtable was made; a method of a
                 // trait trusted for an effect (a door) is trusted wherever the vtable is from,
-                // and one whose `#[blaze::may(..)]` leaves `diverge` out ends in every impl.
+                // and one whose `#[blaze::expect(..)]` leaves `diverge` out ends in every impl.
                 if matches!(callee, Callee::Virtual) {
                     let except = self.trusted_call(f) | effects::bound_mask(db, f);
-                    // The method's own `#[blaze::may(..)]`, or its trait's trust, says what a
+                    // The method's own `#[blaze::expect(..)]`, or its trait's trust, says what a
                     // call of it through any object cannot do; for the rest nothing does.
                     if !self.kinds.full.has(Rule::Dyn) {
                         let what = format!(
-                            "calls {} through a `dyn`: nothing says the object's method cannot do this (a `#[blaze::may(..)]` on the trait's method that leaves it out would)",
+                            "calls {} through a `dyn`: nothing says the object's method cannot do this (a `#[blaze::expect(..)]` on the trait's method that leaves it out would)",
                             fn_name(db, f)
                         ); // alloc: a witness's text, once per body
                         self.observe_except(EffectSet::one(Rule::Dyn), &what, except);

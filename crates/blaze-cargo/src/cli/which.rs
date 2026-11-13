@@ -93,8 +93,8 @@ pub fn warn_if_other(color: bool) {
     })();
     match asked {
         Ok(None) => {}
-        Ok(Some(line)) => eprint!("{}", super::say::warning(&line, color)),
-        Err(error) => eprint!(
+        Ok(Some(line)) => blaze_report::err!("{}", super::say::warning(&line, color)),
+        Err(error) => blaze_report::err!(
             "{}",
             super::say::warning(&format!("which blaze the daemon is was not learned: {error:#}"), color)
         ),
@@ -143,6 +143,7 @@ mod tests {
                         memory_bytes: 0,
                         budget_bytes: 0,
                         uptime_ms: 40,
+                        placed_by: None,
                         build: self.build.clone(),
                         bugs: Vec::new(),
                         builds: Vec::new(),

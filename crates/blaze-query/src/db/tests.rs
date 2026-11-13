@@ -1438,24 +1438,6 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
         assert!(message.contains("asked from outside any query"), "{message}");
         assert!(message.contains("a key of another database, forged"), "{message}");
         assert!(message.contains("the call stack of the ask"), "{message}");
-        // No test of this binary notes a restore, so it says no restored file holds the key;
-        // with one noted, it names the file, its format and what checks it.
-        assert!(message.contains("restored no persisted state"), "{message}");
-        let restored = super::NeverGiven {
-            restored: Some(super::RestoredFrom {
-                file: "/home/v2/db/image".to_owned(),
-                format: "layout-7".to_owned(),
-                hash: "abc".to_owned(),
-            }),
-            ..never.clone()
-        };
-        let message = restored.to_string();
-        assert!(
-            message.contains("restored its state from /home/v2/db/image (format layout-7, hash abc)")
-                && message.contains("that restore is suspect")
-                && message.contains("`blaze doctor`"),
-            "{message}"
-        );
     }
     assert_eq!(*get::<Double>(&db, cell), 6);
 
@@ -1748,6 +1730,25 @@ impl Input for Config {
     }
 }
 
+query!(AsksConfig, u64, |db, _key| u64::from(input_singleton::<Config>(db.storage()).is_some()));
+
+/// The invariant: a singleton's absence is a tracked read. A row that asked for a singleton
+/// nobody had made runs again when it is made, and not for a write of anything else: no
+/// reader has to report the absence as an untracked read (which would run it in every view).
+#[test]
+fn a_singletons_absence_is_a_tracked_read() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 5);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 0);
+    // Another write: the row is verified, not run.
+    cell.set_a(&mut db, 1);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 0);
+    assert_eq!(db.runs("AsksConfig"), 1, "a write of another input ran a row that read only the absence");
+    input_new_singleton::<Config, 1>(db.storage_mut(), (3,), [Durability::HIGH]);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 1, "the row kept the absence it read after the singleton was made");
+    assert_eq!(db.runs("AsksConfig"), 2);
+}
+
 #[test]
 fn a_singleton_is_made_once() {
     let mut db = TestDb::new();
@@ -2019,6 +2020,163 @@ fn captured_reads_replay_into_another_query() {
     assert!(*get::<Unshare>(&db, cell));
 }
 
+query!(OverLibrary, u64, |db, key| {
+    let library = Cell(db.cells.lock()[0]);
+    let (value, reads) = capture_reads(db, || *get::<Label>(db, library) + key.a(db));
+    db.shared.lock().insert(key.0.as_u32(), (value, reads.expect("plain reads are shareable")));
+    value
+});
+query!(AsksOfItself, u64, |db, key| {
+    let own = DatabaseKeyIndex::new(<AsksOfItself as Spec>::cache().index(), key.0);
+    u64::from(super::refresh(db, own) == super::Refreshed::Unsettled)
+});
+
+/// The inputs a capture's value rests on below every function row it read: the fields
+/// [`Reads::for_each_read_through`] gives when every function is read through.
+fn leaves(db: &TestDb, reads: Reads) -> Vec<(u32, ReadKind)> {
+    let mut out = Vec::new();
+    let _: Option<()> = reads.for_each_read_through(
+        db,
+        |read| read.kind == ReadKind::Function,
+        |row| {
+            match row {
+                super::RowRead::Read(read) => out.push((read.key.key_index().as_u32(), read.kind)),
+                other => panic!("{other:?}: every row here can be brought up to date"),
+            }
+            ControlFlow::Continue(())
+        },
+    );
+    out
+}
+
+/// A row is read through by its key alone. After a write of a file, the library's `Label` row
+/// is proved by its durability when `OverLibrary`'s verify meets its edge, so the `Parity`
+/// row below it is never asked for and keeps the stamp of the view before: the walk brings it
+/// up to date itself (`refresh`), running nothing, and gives the library's field in place of
+/// both rows. The control: with no refresh the row is not current, which `row_reads` refuses.
+#[test]
+fn reading_through_brings_a_row_proved_by_durability_up_to_date_by_its_key() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let file = Cell::new(&db, 1, 0);
+    db.cells.lock().push(library.0);
+    assert_eq!(*get::<OverLibrary>(&db, file), 2);
+    let expected = vec![(library.0.as_u32(), ReadKind::InputField(0)), (file.0.as_u32(), ReadKind::InputField(0))];
+    let (_, reads) = db.shared.lock()[&file.0.as_u32()];
+    assert_eq!(leaves(&db, reads), expected);
+
+    file.set_a(&mut db, 2);
+    assert_eq!(*get::<OverLibrary>(&db, file), 3);
+    let parity = DatabaseKeyIndex::new(<Parity as Spec>::cache().index(), library.0);
+    let stale = catch_unwind(AssertUnwindSafe(|| {
+        db.storage().row_reads(parity, |_| ControlFlow::<()>::Continue(()))
+    }));
+    assert!(stale.is_err(), "the control: nothing asked for the library's `Parity` in this view");
+    let (_, reads) = db.shared.lock()[&file.0.as_u32()];
+    assert_eq!(leaves(&db, reads), expected);
+    assert_eq!((db.runs("Label"), db.runs("Parity")), (1, 1), "brought up to date, not run");
+    let mut below = Vec::new();
+    let _: Option<()> = db.storage().row_reads(parity, |read| {
+        below.push(read.kind);
+        ControlFlow::Continue(())
+    });
+    assert_eq!(below, [ReadKind::InputField(0)]);
+}
+
+/// `refresh` says what it could not do instead of doing something else: a row running on
+/// the asking task is unsettled (a cycle through it), and a key of an input names no row to
+/// bring up to date.
+#[test]
+fn a_refresh_names_a_row_it_cannot_bring_up_to_date() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<AsksOfItself>(&db, cell), 1);
+    let input = DatabaseKeyIndex::new(Cells::ingredient().index(), cell.0);
+    assert_eq!(super::refresh(&db, input), super::Refreshed::NotAFunction);
+    let own = DatabaseKeyIndex::new(<AsksOfItself as Spec>::cache().index(), cell.0);
+    assert_eq!(super::refresh(&db, own), super::Refreshed::Current);
+    assert_eq!(db.runs("AsksOfItself"), 1);
+}
+
+query!(Picks, u64, |db, key| if key.a(db) % 2 == 0 { key.b(db) } else { 0 });
+query!(KeptOfPicks, u64, |db, key| {
+    let picks = DatabaseKeyIndex::new(<Picks as Spec>::cache().index(), key.0);
+    assert_eq!(super::refresh(db, picks), super::Refreshed::Current);
+    let mut kept = 0;
+    let _: Option<()> = db.storage().row_reads(picks, |_| {
+        kept += 1;
+        ControlFlow::Continue(())
+    });
+    kept
+});
+
+/// What a `Picks` row holds once refreshed by its key: what `refresh` said, its value (a
+/// fetch, after the kept reads were listed, so the refresh is what brought it up to date),
+/// and the kinds of its kept reads.
+fn picked(db: &TestDb, cell: Cell) -> (super::Refreshed, u64, Vec<ReadKind>) {
+    let picks = DatabaseKeyIndex::new(<Picks as Spec>::cache().index(), cell.0);
+    let refreshed = super::refresh(db, picks);
+    let mut kept = Vec::new();
+    let _: Option<()> = db.storage().row_reads(picks, |read| {
+        kept.push(read.kind);
+        ControlFlow::Continue(())
+    });
+    (refreshed, *get::<Picks>(db, cell), kept)
+}
+
+/// The invariant: a row `refresh` calls current is what a fresh run of its function gives in
+/// this view, its value and its kept reads both. `Picks` reads `b` only when `a` is even, so
+/// a write of `a` changes both; the oracle is a new database that never saw the old `a`.
+/// The control: a refresh that stamps the row current with no look at its edges
+/// (`REFRESH_UNVERIFIED`) serves the old value and the old reads after the write.
+#[test]
+fn a_refreshed_row_is_what_a_fresh_run_gives_after_an_input_write() {
+    let fresh = |a| {
+        let db = TestDb::new();
+        let cell = Cell::new(&db, a, 7);
+        picked(&db, cell)
+    };
+    for planted in [false, true] {
+        let mut db = TestDb::new();
+        let cell = Cell::new(&db, 1, 7);
+        assert_eq!(picked(&db, cell), fresh(1));
+        cell.set_a(&mut db, 2);
+        super::function::probe::REFRESH_UNVERIFIED.with(|it| it.set(planted));
+        let after = picked(&db, cell);
+        super::function::probe::REFRESH_UNVERIFIED.with(|it| it.set(false));
+        if planted {
+            assert_eq!(
+                after,
+                (super::Refreshed::Current, 0, vec![ReadKind::InputField(0)]),
+                "the control: an unverified refresh serves the value from before the write"
+            );
+            assert_ne!(after, fresh(2));
+        } else {
+            assert_eq!(after, fresh(2));
+            assert_eq!(after.1, 7);
+        }
+    }
+}
+
+/// The invariant: a query that refreshes a row by its key reads it, so it runs again when
+/// the row does: `KeptOfPicks` counts `Picks`' kept reads, which a write of `a` changes. The
+/// control: a refresh that records no read (`REFRESH_RECORDS_NO_READ`) leaves the count
+/// standing on nothing, and it is never run again.
+#[test]
+fn a_query_that_refreshes_a_row_runs_again_when_the_row_does() {
+    for planted in [false, true] {
+        let mut db = TestDb::new();
+        let cell = Cell::new(&db, 1, 7);
+        super::function::probe::REFRESH_RECORDS_NO_READ.with(|it| it.set(planted));
+        assert_eq!(*get::<KeptOfPicks>(&db, cell), 1);
+        cell.set_a(&mut db, 2);
+        let after = *get::<KeptOfPicks>(&db, cell);
+        super::function::probe::REFRESH_RECORDS_NO_READ.with(|it| it.set(false));
+        let expected = if planted { 1 } else { 2 };
+        assert_eq!(after, expected, "planted: {planted}");
+    }
+}
+
 query!(
     Tens,
     u64,
@@ -2179,6 +2337,7 @@ fn counts_of(query: &str) -> Counts {
                 ran_changed: was.ran_changed + counts.ran_changed,
                 ran_untracked: was.ran_untracked + counts.ran_untracked,
                 ran_cycle: was.ran_cycle + counts.ran_cycle,
+                validity: was.validity.plus(counts.validity),
             };
         }
         None => taken.push((name, counts)),
@@ -2272,18 +2431,27 @@ fn written_value(fields: &mut (u64,)) -> &mut u64 {
 }
 
 /// What `query_counts.written` holds: each setter's write of an input's field counts once
-/// against that input, an equal value too (it opens a view all the same), and making one
-/// counts nothing. harness/incremental.py names a no-op build's re-runs by it.
+/// against that input, and making one counts nothing; a set of the value the field holds, at
+/// its durability, is no write (it opens no view), and a set of an equal value at another
+/// durability is one. harness/incremental.py names a no-op build's re-runs by it.
 #[test]
-fn each_set_of_an_input_is_counted_as_written() {
+fn each_write_of_an_input_is_counted_as_written_and_an_equal_set_is_none() {
     let mut db = TestDb::new();
     let id = input_new::<Written, 1>(db.storage(), (1,), [Durability::LOW]);
     assert_eq!(counts_of("Written").written, 0, "made, not written");
     input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
-    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    let view = db.storage().view();
+    let old = input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    assert_eq!(old, 2, "the old value of an equal set is the value");
+    assert_eq!(db.storage().view(), view, "an equal set opens no view");
     let counts = counts_of("Written");
-    assert_eq!(counts.written, 2, "two writes, the second of an equal value: {counts:?}");
+    assert_eq!(counts.written, 1, "one write, and one set of an equal value: {counts:?}");
     assert_eq!(counts.executed, 0, "{counts:?}");
+    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value)
+        .with_durability(Durability::HIGH)
+        .to(2);
+    assert_ne!(db.storage().view(), view, "an equal value at another durability is a write");
+    assert_eq!(counts_of("Written").written, 1);
 }
 
 /// Asks for one key of `F` in two views, then for two other keys in a third, and opens a
@@ -3318,5 +3486,383 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
 mod changed;
 /// A fixpoint over nested cycles: an inner head hands on that a row above it moved.
 mod inner_heads;
+mod sealed;
 mod small;
 mod stale_head;
+/// The [`super::unrecorded`] guard: reads in it land in no run's edges and no capture.
+mod unrecorded;
+/// The validity census ([`super::Validity`]): each proof of a row counted under its own name.
+mod validity;
+/// The frames that are no row's (`witnessed`, `covered`), `changed_keys_since` and
+/// `Scoped::settled`.
+mod witness;
+
+/// One request of the no-op simulation ([`requests_cost_what_they_change`]).
+#[derive(Clone, Copy, Debug)]
+enum Request {
+    /// The host gives every input again the value it holds, as a build of an unchanged tree
+    /// does (its environment, each proc macro's expanders, each build script's run).
+    Unchanged,
+    /// One input is given another value; every other is given the value it holds.
+    Edit(usize),
+}
+
+/// The nodes of `graph` that read input `input`, through any number of nodes.
+fn reached(graph: &[GNode], input: usize) -> Vec<bool> {
+    let mut reads = vec![false; graph.len()];
+    for (at, spec) in graph.iter().enumerate() {
+        reads[at] = spec.deps.iter().any(|&dep| match dep {
+            Dep::Input(it) => it == input,
+            Dep::Query(it) => reads[it],
+        });
+    }
+    reads
+}
+
+/// Runs `requests` over `graph` with `inputs` inputs, every node asked after each, and holds
+/// each to what it changed; an error names the request that cost more.
+///
+/// The invariant: a request that changes nothing writes no input (no view opens), runs no
+/// row and leaves every value as it was, whatever the size of the graph; a request that
+/// changes one input runs only rows that read it, each at most once; and every value is the
+/// one a run from scratch gives.
+fn requests_cost_what_they_change(
+    inputs: usize,
+    graph: Vec<GNode>,
+    requests: &[Request],
+    plant: super::frontier::Plant,
+) -> Result<(), String> {
+    let queries = graph.len();
+    let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
+    let mut db = TestDb::made(None, graph);
+    db.storage_mut().plant_in_changed_set(plant);
+    let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let ask = |db: &TestDb, values: &[u64]| -> Result<(), String> {
+        let expected = evaluate(&db.graph, values);
+        for at in 0..queries {
+            let got = *fetch::<Graph>(db, node(db, at));
+            if got != expected[at] {
+                return Err(format!("node {at} is {got}, and from scratch {}", expected[at]));
+            }
+        }
+        Ok(())
+    };
+    ask(&db, &values)?;
+    for (step, &request) in requests.iter().enumerate() {
+        let view = db.storage().view();
+        let ran = db.log.lock().len();
+        if let Request::Edit(input) = request {
+            values[input] += 1;
+        }
+        // The host does not know what changed: it gives every input.
+        for (cell, &value) in cells.iter().zip(&values) {
+            cell.set_a(&mut db, value);
+        }
+        ask(&db, &values).map_err(|why| format!("request {step} ({request:?}): {why}"))?;
+        let runs: Vec<u32> = db.log.lock()[ran..].iter().map(|it| it.1).collect();
+        match request {
+            Request::Unchanged => {
+                if db.storage().view() != view {
+                    return Err(format!(
+                        "request {step} changed nothing and opened a view: it wrote an input"
+                    ));
+                }
+                if !runs.is_empty() {
+                    return Err(format!("request {step} changed nothing and ran {} rows", runs.len()));
+                }
+            }
+            Request::Edit(input) => {
+                let reads = reached(&db.graph, input);
+                let may: Vec<u32> = (0..queries)
+                    .filter(|&at| reads[at])
+                    .map(|at| node(&db, at).0.as_u32())
+                    .collect();
+                if let Some(other) = runs.iter().find(|it| !may.contains(it)) {
+                    return Err(format!(
+                        "request {step} edited input {input} and ran row {other}, which does not read it"
+                    ));
+                }
+                if runs.len() > may.len() {
+                    return Err(format!(
+                        "request {step} edited input {input} and ran {} rows of the {} that read it",
+                        runs.len(),
+                        may.len()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The invariant of [`requests_cost_what_they_change`], over random graphs and requests.
+#[hegel::test]
+fn a_request_that_changes_nothing_writes_no_input_and_an_edit_runs_what_reads_it(tc: TestCase) {
+    let (inputs, graph) = random_graph(&tc);
+    let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let requests: Vec<Request> = (0..count)
+        .map(|_| match tc.draw(gs::booleans()) {
+            true => Request::Unchanged,
+            false => Request::Edit(tc.draw(gs::integers::<usize>().max_value(inputs - 1))),
+        })
+        .collect();
+    if let Err(why) = requests_cost_what_they_change(inputs, graph, &requests, super::frontier::Plant::None) {
+        panic!("{why}");
+    }
+}
+
+/// A graph and requests the invariant holds over, for the control below.
+fn two_nodes() -> (Vec<GNode>, [Request; 3]) {
+    let graph = vec![
+        GNode { op: Op::Sum, deps: vec![Dep::Input(0), Dep::Input(1)] },
+        GNode { op: Op::Max, deps: vec![Dep::Query(0), Dep::Input(1)] },
+    ];
+    (graph, [Request::Edit(0), Request::Unchanged, Request::Edit(1)])
+}
+
+#[test]
+fn two_nodes_cost_what_their_requests_change() {
+    let (graph, requests) = two_nodes();
+    assert_eq!(requests_cost_what_they_change(2, graph, &requests, super::frontier::Plant::None), Ok(()));
+}
+
+/// The control: with a set of an equal value opening a view, as every set did until
+/// 2026-11-12, the request that changes nothing repaints each field it sets, and the rows
+/// that read them run again on the values they had: the graph's own check of a rerun, which
+/// comes before the oracle's count of views, names the first.
+#[test]
+#[should_panic(expected = "ran again though nothing it read changed")]
+fn the_oracle_catches_an_equal_set_that_opens_a_view() {
+    let (graph, requests) = two_nodes();
+    _ = requests_cost_what_they_change(2, graph, &requests, super::frontier::Plant::EqualSetsWrite);
+}
+
+use super::{
+    plumbing::{Scoped, fetch_scoped},
+    scoped::probe as scoped_probe,
+    task_scope,
+};
+
+/// A task-scoped function of one input: twice its `a`.
+struct Twice;
+
+impl Scoped for Twice {
+    type Db = TestDb;
+    type Key = (Cell,);
+    type Value = u64;
+    const NAME: &'static str = "Twice";
+    const CYCLE: CycleKind = CycleKind::Panic;
+    const TAG: Tag = Tag::Query;
+
+    fn execute(db: &TestDb, key: &(Cell,)) -> u64 {
+        db.ran("Twice", key.0.0);
+        key.0.a(db) * 2
+    }
+
+    fn cycle_initial(_: &TestDb, _: &(Cell,)) -> u64 {
+        unreachable!("`Twice` has no cycle_initial")
+    }
+
+    fn equal(old: &u64, new: &u64) -> bool {
+        old == new
+    }
+
+    fn write_key(key: &(Cell,), out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.0)
+    }
+}
+
+fn twice(db: &TestDb, cell: Cell) -> u64 {
+    fetch_scoped::<Twice, _>(db, (cell,), |it| *it)
+}
+
+query!(TwiceAndOne, u64, |db, key| twice(db, key) + 1);
+query!(TwiceAndTwo, u64, |db, key| twice(db, key) + 2);
+
+/// The two callers of [`Twice`] in a fresh database whose cell's `a` is `a`: the oracle.
+fn fresh_twice(a: u64) -> (u64, u64) {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, a, 0);
+    task_scope(&db, || (*get::<TwiceAndOne>(&db, cell), *get::<TwiceAndTwo>(&db, cell)))
+}
+
+/// The two callers of [`Twice`] after its cell's `a` is written from 3 to 5: the first ran
+/// the scoped value and the second hit it, in one scope; each is asked again in a new one.
+/// `plant`: the planted bug that drops the reads a scoped run forwards to its callers.
+fn scoped_after_a_write(plant: bool) -> (u64, u64) {
+    scoped_probe::DROP_FORWARDED_READS.with(|it| it.set(plant));
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    let first =
+        task_scope(&db, || (*get::<TwiceAndOne>(&db, cell), *get::<TwiceAndTwo>(&db, cell)));
+    assert_eq!(first, (7, 8));
+    assert_eq!(db.runs("Twice"), 1, "two callers of one key in one scope run it once");
+    cell.set_a(&mut db, 5);
+    let after =
+        task_scope(&db, || (*get::<TwiceAndOne>(&db, cell), *get::<TwiceAndTwo>(&db, cell)));
+    scoped_probe::DROP_FORWARDED_READS.with(|it| it.set(false));
+    after
+}
+
+/// The invariant: a task-scoped function keeps nothing in the storage (after its scope ends
+/// `Storage::held_bytes` is what it was before, and no table of it is held); two calls of one
+/// key inside one scope run it once; and its reads are its persistent callers': an input it
+/// read, written, reruns each caller, the one that ran the scoped value and the one that hit
+/// it, so both equal a fresh database's. Control: with the planted bug that drops the reads a
+/// scoped run forwards, the callers stay stale and differ from the fresh database.
+#[test]
+fn a_task_scoped_memo_leaves_no_row_and_its_reads_are_its_callers() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    let before = db.storage.held_bytes();
+    assert_eq!(task_scope(&db, || twice(&db, cell) + twice(&db, cell)), 12);
+    assert_eq!(db.runs("Twice"), 1, "two calls of one key in one scope run it once");
+    assert_eq!(db.storage.held_bytes(), before, "a scope's values leave nothing in the storage");
+    let mut held = Vec::new();
+    db.storage.held_by_function(&mut held);
+    assert!(held.iter().all(|it| it.0 != "Twice"), "a scoped function has no table: {held:?}");
+    // A scope's table is dropped with it: the next one runs the key again.
+    assert_eq!(task_scope(&db, || twice(&db, cell)), 6);
+    assert_eq!(db.runs("Twice"), 2);
+
+    assert_eq!(scoped_after_a_write(false), fresh_twice(5));
+    assert_ne!(
+        scoped_after_a_write(true),
+        fresh_twice(5),
+        "the control: callers given none of the scoped run's reads stay stale"
+    );
+}
+
+/// The invariant: a scoped function called with no task scope open is refused, naming it and
+/// its key, and never answered from a row: called directly, and from inside a persistent
+/// query. Control: the same call inside a scope is served.
+#[test]
+fn a_scoped_function_outside_a_scope_is_refused() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    let direct = catch_unwind(AssertUnwindSafe(|| twice(&db, cell))).expect_err("no scope is open");
+    let text = message(&*direct);
+    assert!(text.contains("task-scoped `Twice`") && text.contains("no task scope open"), "{text}");
+    let inside = catch_unwind(AssertUnwindSafe(|| *get::<TwiceAndOne>(&db, cell)))
+        .expect_err("no scope is open around the persistent caller");
+    assert!(message(&*inside).contains("task-scoped `Twice`"), "{}", message(&*inside));
+    assert_eq!(db.runs("Twice"), 0);
+    let other = Cell::new(&db, 4, 0);
+    assert_eq!(task_scope(&db, || *get::<TwiceAndOne>(&db, other)), 9);
+}
+
+/// A task-scoped fixpoint: one more than its own value, up to its cell's `a`.
+struct Climb;
+
+impl Scoped for Climb {
+    type Db = TestDb;
+    type Key = (Cell,);
+    type Value = u64;
+    const NAME: &'static str = "Climb";
+    const CYCLE: CycleKind = CycleKind::Fixpoint;
+    const TAG: Tag = Tag::Query;
+
+    fn execute(db: &TestDb, key: &(Cell,)) -> u64 {
+        db.ran("Climb", key.0.0);
+        let below = fetch_scoped::<Climb, _>(db, *key, |it| *it);
+        (below + 1).min(key.0.a(db))
+    }
+
+    fn cycle_initial(_: &TestDb, _: &(Cell,)) -> u64 {
+        0
+    }
+
+    fn equal(old: &u64, new: &u64) -> bool {
+        old == new
+    }
+
+    fn write_key(key: &(Cell,), out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.0)
+    }
+}
+
+/// A task-scoped function that asks for itself, with no `cycle_initial`.
+struct Loops;
+
+impl Scoped for Loops {
+    type Db = TestDb;
+    type Key = (Cell,);
+    type Value = u64;
+    const NAME: &'static str = "Loops";
+    const CYCLE: CycleKind = CycleKind::Panic;
+    const TAG: Tag = Tag::Query;
+
+    fn execute(db: &TestDb, key: &(Cell,)) -> u64 {
+        fetch_scoped::<Loops, _>(db, *key, |it| *it)
+    }
+
+    fn cycle_initial(_: &TestDb, _: &(Cell,)) -> u64 {
+        unreachable!("`Loops` has no cycle_initial")
+    }
+
+    fn equal(old: &u64, new: &u64) -> bool {
+        old == new
+    }
+
+    fn write_key(key: &(Cell,), out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.0)
+    }
+}
+
+/// The invariant: a cycle through a scoped function iterates from its `cycle_initial` at the
+/// run it reached until a round gives the last round's value: from 0, each round one higher,
+/// to the cell's `a` (4), the fifth round giving 4 again. Control: one with no
+/// `cycle_initial` is refused by name.
+#[test]
+fn a_cycle_through_a_scoped_function_iterates_to_its_fixpoint() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 4, 0);
+    assert_eq!(task_scope(&db, || fetch_scoped::<Climb, _>(&db, (cell,), |it| *it)), 4);
+    assert_eq!(db.runs("Climb"), 5);
+    let refused = catch_unwind(AssertUnwindSafe(|| {
+        task_scope(&db, || fetch_scoped::<Loops, _>(&db, (cell,), |it| *it))
+    }))
+    .expect_err("a cycle with no cycle_initial");
+    let text = message(&*refused);
+    assert!(text.contains("task-scoped `Loops`") && text.contains("no `cycle_initial`"), "{text}");
+}
+
+/// The invariant: `held_by_function` says, from counters alone, what the walk of
+/// `memory_usage` finds: each function's bytes are its `held()`, and while no value was let go
+/// its values are its rows that ran. Control: once a function's values are evicted its count
+/// is 0 while the walk still finds every row that ran: the count is of values, not rows.
+#[test]
+fn held_by_function_says_from_counters_what_the_walk_finds() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..5).map(|n| Cell::new(&db, n * 10, 0)).collect();
+    for &cell in &cells {
+        get::<Double>(&db, cell);
+        get::<Tens>(&db, cell);
+    }
+    get::<Parity>(&db, cells[0]);
+    let report = |db: &TestDb| {
+        let mut held = Vec::new();
+        db.storage.held_by_function(&mut held);
+        let mut usage = Vec::new();
+        db.storage.memory_usage(&mut usage);
+        (held, usage)
+    };
+    let values_of = |held: &[(&'static str, u64, u64)], name: &str| {
+        held.iter().find(|it| it.0 == name).map(|it| it.1)
+    };
+    let (held, usage) = report(&db);
+    for &(name, values, bytes) in &held {
+        let walked = usage.iter().find(|it| it.name == name).expect("a function the walk names");
+        assert_eq!(bytes, walked.held(), "`{name}`'s bytes");
+        assert_eq!(values, walked.used, "`{name}`: every row that ran holds its value");
+    }
+    assert_eq!(
+        (values_of(&held, "Double"), values_of(&held, "Tens"), values_of(&held, "Parity")),
+        (Some(5), Some(5), Some(1))
+    );
+    evict_values::<Tens>(&mut db);
+    let (held, usage) = report(&db);
+    assert_eq!(values_of(&held, "Tens"), Some(0));
+    assert_eq!(usage.iter().find(|it| it.name == "Tens").map(|it| it.used), Some(5));
+}

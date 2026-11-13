@@ -22,14 +22,18 @@
 //!   `place % COLUMNS` (ids, shapes, entry names, entry nodes, entry modes, files, index, spans, name
 //!   bytes, name index); 2, the bytes at `offset` of the disks section; 3, the bytes at
 //!   `offset` anywhere in the tree section. For 1 to 3, `((kind >> 2) & 7) + 1` of the value's
-//!   low bytes are written, cut at the end of what they land in. The blobs are never damaged.
+//!   low bytes are written, cut at the end of what they land in. The image holds no file's
+//!   bytes (they are the content store's, here a `HeldTexts` the image's writer put them in),
+//!   so no text is damaged.
 //!
 //! Invariants, each checked below (a violation panics, which the engine reports as a crash):
 //! - restoring never panics or hangs, and asks for at most `blaze_fuzz::allowed` of the image's
 //!   and the journal's bytes at once;
 //! - an image the check passes (`ImageUse::Used`, or `Resumed`): every head is a root the tree
-//!   has, and every path under it lists, reads and follows; each file's bytes lie in the
-//!   mapping, and no read is corrupt;
+//!   has, and every path under it lists, reads and follows; each file's bytes are its ID's;
+//!   no read is refused when the tree is undamaged, and one of a damaged tree is refused only
+//!   as a file whose text the store does not give as the tree names it (`Cause::Text`: a
+//!   damaged ID or size), never read as other bytes;
 //! - an image refused says why in `Recovered::image`: `Malformed` with the check's reason (the
 //!   column), `Corrupt` of the tree section for a column its header places past the section or
 //!   misaligned (never a CRC), `Unnamed` for a header that no longer names the journal's image;
@@ -39,14 +43,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping};
 use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
 use blaze_image::{Builder, Cause, Image, MIN_GROUP_SHIFT, Section, SectionId};
 use blaze_vfs::{
-    ImageMark, ImageUse, Mode, Op, OpError, Vfs, View,
+    FILE_DOMAIN, HeldTexts, ImageFile, ImageMark, ImageUse, Mode, Op, OpError, Vfs, View,
     tree_layout::{
         C_NAME_BYTES, C_SHAPES, COLUMNS, LAYOUT, MAGIC, MAGIC_BYTES, W_COLUMNS, W_ENTRIES, W_MAGIC,
         W_NODES, WORDS,
@@ -84,7 +88,7 @@ fn check(data: &[u8]) {
     let mut input = Input(data);
     let count = input.u8() & 15;
     let ops: Vec<Op> = (0..count).filter_map(|_| op(&mut input)).collect();
-    let Imaged { mut vfs, mark, image, journal } = imaged(&ops);
+    let Imaged { mut vfs, mark, image, journal, texts } = imaged(&ops);
 
     let mut sections = sections(&image);
     let of = |id: SectionId| sections.iter().position(|(it, _)| it.id == id);
@@ -117,10 +121,9 @@ fn check(data: &[u8]) {
         }
     };
 
-    let mapping = Mapping::copy(&image);
-    let held = mapping.clone();
+    let file = ImageFile { file: Mapping::copy(&image), texts };
     let (largest, (mut back, mut found)) =
-        blaze_fuzz::largest_allocation(|| Vfs::restore(journal_name(), 0, &journal, Some(mapping)));
+        blaze_fuzz::largest_allocation(|| Vfs::restore(journal_name(), 0, &journal, Some(file)));
     let allowed = blaze_fuzz::allowed(image.len() + journal.len());
     assert!(
         largest <= allowed,
@@ -182,21 +185,22 @@ fn check(data: &[u8]) {
         assert_eq!(heads(&back), heads(&alone), "a refused image leaves the journal's heads");
         for (head, root, _) in heads(&back) {
             assert_eq!(
-                walk(&mut back, root, None),
-                walk(&mut alone, root, None),
+                walk(&mut back, root, false),
+                walk(&mut alone, root, false),
                 "a refused image leaves the journal's files at {head}"
             );
         }
         return;
     }
 
-    let mapped = held.bytes();
     for (head, root, sequence) in heads(&back) {
         assert!(back.has(root), "the restored head {head:?} is at a root the tree has");
         assert!(sequence.is_some(), "the restored head {head:?} has a sequence number");
-        walk(&mut back, root, Some(mapped));
+        walk(&mut back, root, !tree_damaged);
     }
-    assert_eq!(back.corrupt(), None, "no read of the undamaged blobs is corrupt");
+    if !tree_damaged {
+        assert_eq!(back.corrupt(), None, "no read of an undamaged tree's text is refused");
+    }
 
     if !tree_damaged && !disks_damaged {
         assert_eq!(
@@ -212,8 +216,8 @@ fn check(data: &[u8]) {
         assert_eq!(heads(&back), heads(&vfs), "an undamaged image restores the heads written");
         for (head, root, _) in heads(&vfs) {
             assert_eq!(
-                walk(&mut back, root, Some(mapped)),
-                walk(&mut vfs, root, None),
+                walk(&mut back, root, true),
+                walk(&mut vfs, root, true),
                 "an undamaged image restores {head} as it was written"
             );
         }
@@ -351,6 +355,8 @@ struct Imaged {
     mark: ImageMark,
     image: Vec<u8>,
     journal: Vec<u8>,
+    /// The store the image's texts were put in.
+    texts: Arc<HeldTexts>,
 }
 
 /// `ops` committed to `main` one at a time and settled, the image written and made durable,
@@ -367,12 +373,13 @@ fn imaged(ops: &[Op]) -> Imaged {
         vfs.set_head(HEAD, empty).expect("the empty root is the tree's");
     }
     settle(&mut vfs, &mut journal);
+    let texts = HeldTexts::shared();
     let mut builder = Builder::with_group_shift(MIN_GROUP_SHIFT);
-    let mark = vfs.write_image(&mut builder).expect("an image of a settled VFS");
+    let mark = vfs.write_image(&mut builder, &*texts).expect("an image of a settled VFS");
     let image = builder.finish().expect("an image under the limit");
     assert!(vfs.image_durable(mark.name), "the image just written is the one staged");
     settle(&mut vfs, &mut journal);
-    Imaged { vfs, mark, image, journal }
+    Imaged { vfs, mark, image, journal, texts }
 }
 
 /// Every section of `image` and its bytes, in order.
@@ -441,11 +448,14 @@ enum Seen {
     File(ContentId, Mode, Vec<u8>),
     /// Listed, but not found by its path: a name the damaged name index misplaces.
     Missing,
+    /// A file of a damaged tree whose text the store does not give as the tree names it.
+    Refused(Cause),
 }
 
 /// Lists, reads and follows every path under `root`, up to [`WALK`] of them, each file's bytes
-/// checked to lie in `mapped` when given; what it found, in the walk's order.
-fn walk(vfs: &mut Vfs, root: ContentId, mapped: Option<&[u8]>) -> Vec<(String, Seen)> {
+/// checked to be its ID's; what it found, in the walk's order. `whole`: the tree is undamaged,
+/// so no read is refused; else one may be, only as a text the store does not give.
+fn walk(vfs: &mut Vfs, root: ContentId, whole: bool) -> Vec<(String, Seen)> {
     let view = vfs.open(View { root }).expect("a head's root opens");
     let mut paths = vec![String::new()];
     let mut seen = Vec::new();
@@ -455,7 +465,8 @@ fn walk(vfs: &mut Vfs, root: ContentId, mapped: Option<&[u8]>) -> Vec<(String, S
         }
         let id = vfs.lookup(view, &path);
         match vfs.follow(view, &path) {
-            Ok(Some(file)) => within(file.bytes, mapped, &path),
+            Ok(Some(file)) => within(file.id, file.bytes, &path),
+            Err(OpError::Corrupt { section, .. }) if !whole && section == SectionId::VFS_TREE.0 => {}
             Err(OpError::Corrupt { section, group }) => {
                 panic!(
                     "{path:?}: following it reads group {group} of section {section:#x}, corrupt"
@@ -473,10 +484,13 @@ fn walk(vfs: &mut Vfs, root: ContentId, mapped: Option<&[u8]>) -> Vec<(String, S
             }
             None => match vfs.read(view, &path) {
                 Ok(Some(file)) => {
-                    within(file.bytes, mapped, &path);
+                    within(file.id, file.bytes, &path);
                     Seen::File(file.id, file.mode, file.bytes.to_vec())
                 }
                 Ok(None) => Seen::Missing,
+                Err(corrupt) if !whole && matches!(corrupt.cause, Cause::Text { .. }) => {
+                    Seen::Refused(corrupt.cause)
+                }
                 Err(corrupt) => panic!("{path:?}: a read is corrupt: {corrupt}"),
             },
         };
@@ -486,13 +500,12 @@ fn walk(vfs: &mut Vfs, root: ContentId, mapped: Option<&[u8]>) -> Vec<(String, S
     seen
 }
 
-/// Checks that `bytes`, a file read at `path`, lie in `mapped`.
-fn within(bytes: &[u8], mapped: Option<&[u8]>, path: &str) {
-    let Some(mapped) = mapped else { return };
-    let (at, start) = (bytes.as_ptr() as usize, mapped.as_ptr() as usize);
-    assert!(
-        bytes.is_empty() || (at >= start && at + bytes.len() <= start + mapped.len()),
-        "{path:?}: a file's {} bytes are read from outside the image's mapping",
+/// Checks that `bytes`, the file `id` read at `path`, are that file's.
+fn within(id: ContentId, bytes: &[u8], path: &str) {
+    assert_eq!(
+        ContentId::of(FILE_DOMAIN, bytes),
+        id,
+        "{path:?}: a file's {} bytes are not the file its ID names",
         bytes.len()
     );
 }

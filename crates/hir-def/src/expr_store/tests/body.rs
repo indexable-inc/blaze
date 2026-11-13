@@ -1,5 +1,6 @@
 mod block;
 mod hygiene;
+mod synthesized;
 
 use crate::{
     DefWithBodyId, ModuleDefId,
@@ -52,6 +53,7 @@ fn round_trip(db: &TestDB, def: DefWithBodyId) {
     if let Some(source_map) = Body::relative(db, def) {
         crate::expr_store::persist::assert_round_trip(of, source_map);
     }
+    synthesized::assert_synthesized_is_the_maps(db, def);
 }
 
 fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {

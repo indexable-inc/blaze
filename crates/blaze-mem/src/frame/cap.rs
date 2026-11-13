@@ -276,7 +276,7 @@ impl Shared {
     fn try_add(&self, bytes: u64) -> Option<u64> {
         let limit = self.limit;
         self.held
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 held.checked_add(bytes).filter(|&after| after <= limit)
             })
             .ok()

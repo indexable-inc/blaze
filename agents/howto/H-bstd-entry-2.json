@@ -1,0 +1,9 @@
+{
+ "id": "H-bstd-entry-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+ "task": "Build and run a package of the blaze edition (`edition = \"blaze-2026.11\"`) from a checkout",
+ "do": "`blaze new --vcs none --bstd <checkout>/crates/blaze-std hello`, copy the checkout's Cargo.lock to hello/Cargo.lock (bstd's dependencies at the tree's versions), `blaze run` in it. The end-to-end tests are `the_blaze_edition_*` and `blaze_new_then_run_*` in crates/blaze-engine/tests/repro.rs.",
+ "why": "A package of the edition names bstd by path until blaze ships it (docs/v2/plan/design/std.md, row S5d).",
+ "state": "current"
+}

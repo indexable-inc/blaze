@@ -34,28 +34,17 @@ pub fn set_build(db: &mut Db, build: ContentId) {
             front_end.set_build(db).with_durability(blaze_query::db::Durability::HIGH).to(build);
         }
         None => {
+            // What read the singleton's absence ([`build`]) read its field's node, which
+            // making it changes (blaze-query's `a_singletons_absence_is_a_tracked_read`).
             _ = FrontEnd::new(db, blaze_query::db::Durability::HIGH, build);
-            // Reading a singleton that does not exist yet is not tracked: what read it before
-            // reported an untracked read ([`build`]), which a new revision makes stale.
-            db.storage_mut().synthetic_write(blaze_query::db::Durability::LOW);
         }
     }
 }
 
 /// The build [`set_build`] told, `None` before it was told.
 pub(crate) fn build(db: &Db) -> Option<ContentId> {
-    match FrontEnd::try_get(db) {
-        Some(front_end) => Some(front_end.build(db)),
-        None => {
-            blaze_query::db::report_untracked_read(
-                db,
-                blaze_query::db::Untracked {
-                    what: "the absence of the `FrontEnd` singleton (`set_build` not told yet)",
-                },
-            );
-            None
-        }
-    }
+    // The absence is a tracked read: what read it runs again when `set_build` makes it.
+    FrontEnd::try_get(db).map(|front_end| front_end.build(db))
 }
 
 /// What every body of `krate` is inferred, lowered to MIR and borrow checked with, beyond its

@@ -1,0 +1,33 @@
+[package]
+name = "blaze-launcher"
+description = "blaze's launcher (docs/v2/plan/design/launcher.md): the process a program built for `edit` runs in. The file at cargo's path is a clone of this binary beside a sidecar naming the program; it asks the daemon for the program's code, a function at its first call, and takes edits while the program runs"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaze-launcher"
+path = "src/main.rs"
+test = false
+doctest = false
+
+# On `std`, not bstd, for the reason blaze-launch's documentation gives.
+[dependencies]
+blaze-launch.workspace = true
+blaze-launch-rt.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Starts the daemon the sidecar names, for a program started from its file with no daemon
+# (`blaze_client::start::daemon`), and the one deadline it waits to.
+blaze-client.workspace = true
+blaze-core.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

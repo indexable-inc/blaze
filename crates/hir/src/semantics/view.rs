@@ -14,7 +14,11 @@ mod source_to_def;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::RefCell, fmt, ptr, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    fmt, ptr,
+    sync::Arc,
+};
 
 use base_db::{Db, toolchain_channel};
 use blaze_hash::{HashMap, HashSet};
@@ -41,7 +45,20 @@ pub struct Semantics<'db> {
     pub(super) imp: SemanticsImpl<'db>,
     /// The file of each tree this handed out, by the address of the file's tree.
     roots: RefCell<HashMap<usize, HirFileId, Global>>,
+    /// Made by [`Semantics::new_probe`]: anything asked of it unwinds with [`Asked`].
+    probe: bool,
+    /// A probe was asked something ([`Semantics::asked`]).
+    asked: Cell<bool>,
 }
+
+/// What a probe's `Semantics` ([`Semantics::new_probe`]) unwinds with when it is asked
+/// anything: a query whose key covers only position-free syntax (a by-piece check's piece,
+/// blaze-diagnostics' `pieces`) reads no tree this hands out, which is the live file's and so
+/// moves with every edit. The unwind is the probe's answer, "beyond its key", caught by the
+/// probe's own query; nothing stands in for what was asked, and no panic hook runs
+/// (`resume_unwind`), as with `blaze_query`'s `Cancelled`.
+#[derive(Debug)]
+pub struct Asked;
 
 impl fmt::Debug for Semantics<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,7 +90,13 @@ impl Drop for Semantics<'_> {
 
 impl<'db> Semantics<'db> {
     pub fn new(db: &'db Db) -> Semantics<'db> {
-        Semantics { db, imp: SemanticsImpl::new(db), roots: RefCell::new(ROOTS.take()) }
+        Semantics {
+            db,
+            imp: SemanticsImpl::new(db),
+            roots: RefCell::new(ROOTS.take()),
+            probe: false,
+            asked: Cell::new(false),
+        }
     }
 
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
@@ -81,11 +104,48 @@ impl<'db> Semantics<'db> {
     pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
-        Semantics { db, imp, roots: RefCell::new(ROOTS.take()) }
+        Semantics {
+            db,
+            imp,
+            roots: RefCell::new(ROOTS.take()),
+            probe: false,
+            asked: Cell::new(false),
+        }
+    }
+
+    /// [`Semantics::new_within`] for a probe: the first thing asked of it, a tree handed out
+    /// ([`Semantics::cache`]), a node put in its file ([`Semantics::find_file`]) or a
+    /// source-to-def lookup (`with_ctx`), sets [`Semantics::asked`] and unwinds with [`Asked`].
+    pub fn new_probe(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
+        let mut imp = SemanticsImpl::new(db);
+        imp.s2d_cache.get_mut().within = Some(crates);
+        Semantics {
+            db,
+            imp,
+            roots: RefCell::new(ROOTS.take()),
+            probe: true,
+            asked: Cell::new(false),
+        }
+    }
+
+    /// Whether this probe was asked anything ([`Semantics::new_probe`]); always false of any
+    /// other `Semantics`.
+    pub fn asked(&self) -> bool {
+        self.asked.get()
+    }
+
+    /// Of a probe, notes the ask and unwinds with [`Asked`]; nothing of any other `Semantics`.
+    #[inline]
+    fn ask(&self) {
+        if self.probe {
+            self.asked.set(true);
+            std::panic::resume_unwind(Box::new(Asked)); // alloc: an unwind's payload
+        }
     }
 
     /// Records `root`'s tree as the tree of `file_id`.
     pub(super) fn cache(&self, root: Node<'db>, file_id: HirFileId) {
+        self.ask();
         assert!(root.parent().is_none(), "{root:?} of {file_id:?} is not a tree's root");
         let prev = self.roots.borrow_mut().insert(tree_key(root), file_id);
         assert!(
@@ -104,6 +164,7 @@ impl<'db> Semantics<'db> {
     ///
     /// When `node` is of a tree this `Semantics` did not hand out, as the handle version does.
     pub(super) fn find_file(&self, node: Node<'db>) -> InFile<Node<'db>> {
+        self.ask();
         let file_id = self.lookup(node).unwrap_or_else(|| {
             panic!(
                 "\n\nFailed to lookup {node:?} in this view::Semantics.\n\

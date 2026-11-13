@@ -1,0 +1,15 @@
+about = "A first call after `blaze stop` that no record answers is made by the front end, loaded then and only then: the program calls a second workspace function only when given an argument, so the run before the stop never calls it, the start image does not hold it and, a workspace function, it has no bind record. Run with none, stop, run with one: the output is the file `blaze build` makes, run with the same argument, so `second` was made after the start, which only the build the daemon sends itself for the first call (`serve::daemon::launch`, `launch: the daemon builds a program for a first call`) makes; and the client's own request lowered nothing, answered from its certificate and the restored image. The spans read are the client's build's alone (`real.rs` reads the build `build-finished` names, or none for the no-op lane): the daemon's own build is another build, so its count and its `lower workspace` are not seen here; `serve::tests::launched_restart` holds it to one build. Track 7c, task B; it passes once task C is in."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello\n"
+as_built = true
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+args = ["--", "there"]
+prints = "hello\nand there\n"
+as_built = true
+spans = { "lower workspace" = 0 }

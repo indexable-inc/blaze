@@ -3,7 +3,8 @@
 //! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
 //! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
-//! (the machine's, whatever `BLAZE_HOME` says: [`toolchains`]) as rustup lays out a toolchain,
+//! (the machine's, whatever `BLAZE_HOME` says, or where `BLAZE_TOOLCHAINS` names:
+//! [`toolchains`]) as rustup lays out a toolchain,
 //! its records and channel manifest included, so that what reads a sysroot reads this one
 //! unchanged.
 //!
@@ -130,8 +131,12 @@ impl Release {
 
     /// Where blaze keeps this release: under this machine's [`toolchains`], whatever
     /// `BLAZE_HOME` says.
-    pub fn dir(&self) -> Option<PathBuf> {
-        Some(toolchains()?.join(format!("{}-{}", self.version, self.host)))
+    ///
+    /// # Errors
+    ///
+    /// As [`toolchains`].
+    pub fn dir(&self) -> Result<PathBuf, String> {
+        Ok(toolchains()?.join(format!("{}-{}", self.version, self.host)))
     }
 }
 
@@ -171,8 +176,53 @@ pub fn host() -> Option<&'static str> {
 /// daemon's settings and state, never what it builds with. A home of its own (a harness's, a
 /// CI job's, a second daemon's) neither downloads the release again nor fails for not having
 /// it. [`fetch`]'s lock keeps two processes from laying it out at once.
-pub fn toolchains() -> Option<PathBuf> {
-    Some(blaze_manifest::user_config::user_home()?.join(".blaze").join("toolchains"))
+///
+/// [`VAR`] (`BLAZE_TOOLCHAINS`) names another directory: for a machine whose home is small,
+/// read-only or not there (a CI runner, a sandbox, a unit of a user with no home). The home is
+/// [`blaze_core::home::user`]'s (`HOME`, else the system's record of the user), so a unit
+/// with no `HOME` finds the same copy a shell does. A relative one is taken against the
+/// current directory.
+///
+/// # Errors
+///
+/// What blaze keeps there, why no home was found (what was tried) and that [`VAR`] names a
+/// directory; or the current directory, when a relative one cannot be taken against it.
+pub fn toolchains() -> Result<PathBuf, String> {
+    let dir = toolchains_in(|name| std::env::var_os(name), blaze_core::home::record).map_err(|why| {
+        // alloc: error path
+        format!(
+            "blaze keeps the Rust it builds with in .blaze/toolchains in your home directory, \
+             shared by every BLAZE_HOME, and {why}; {VAR} names another directory to keep it in"
+        )
+    })?;
+    std::path::absolute(&dir).map_err(|error| {
+        // alloc: error path
+        format!("blaze's toolchains directory {} against the current directory: {error}", dir.display())
+    })
+}
+
+/// The one setting for where blaze's toolchains are kept ([`toolchains`]): a directory, in
+/// place of `.blaze/toolchains` in the user's home. Like that default it is the machine's,
+/// not a `BLAZE_HOME`'s: every home that sets the same one reads the one copy. The daemon
+/// keeps the one it was started with (`serve::settings::STARTED_WITH`).
+pub const VAR: &str = "BLAZE_TOOLCHAINS";
+
+/// [`toolchains`]' decision, with no IO of its own: [`VAR`] when `var` has it set and not
+/// empty, else `.blaze/toolchains` in the user's home, which is [`blaze_core::home::decide`]
+/// of `var` and `record` (the system's record of the user, asked only when neither [`VAR`]
+/// nor `HOME` answers).
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when [`VAR`] is unset and the user has no home.
+pub fn toolchains_in(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    record: impl FnOnce() -> Result<PathBuf, blaze_core::home::NoRecord>,
+) -> Result<PathBuf, blaze_core::home::NoHome> {
+    if let Some(named) = var(VAR).filter(|it| !it.is_empty()) {
+        return Ok(PathBuf::from(named));
+    }
+    Ok(blaze_core::home::decide(&var, record)?.join(".blaze").join("toolchains"))
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one
@@ -668,6 +718,46 @@ fn list_files(dir: &Path, named: &str, files: &mut Vec<String>) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: blaze's toolchains are where `BLAZE_TOOLCHAINS` names, else in
+    /// `.blaze/toolchains` of the user's home (`HOME`, else the system's record), whatever
+    /// `BLAZE_HOME` says; with neither, an error that says what was tried. The record is
+    /// asked only when no variable answers.
+    #[test]
+    fn toolchains_are_where_the_setting_names_else_in_the_users_home() {
+        use blaze_core::home::{NoHome, NoRecord};
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| std::ffi::OsString::from(*value))
+            }
+        };
+        let none = || Err(NoRecord::NoEntry { uid: 0 });
+        let recorded = || Ok(PathBuf::from("/root"));
+        let unasked = || -> Result<PathBuf, NoRecord> { panic!("a variable answered, and the user database was asked") };
+        // `HOME` set, the setting not: the default, and `BLAZE_HOME` moves nothing.
+        let home = PathBuf::from("/u/.blaze/toolchains");
+        assert_eq!(toolchains_in(env(&[("HOME", "/u")]), unasked), Ok(home.clone())); // clone: a test's expected path
+        assert_eq!(toolchains_in(env(&[("HOME", "/u"), ("BLAZE_HOME", "/b")]), unasked), Ok(home));
+        // `HOME` empty or unset, and the system has a record (the unit that found this:
+        // `BLAZE_HOME=/root/bh`, no `HOME`, uid 0).
+        let unit = PathBuf::from("/root/.blaze/toolchains");
+        assert_eq!(toolchains_in(env(&[("HOME", ""), ("BLAZE_HOME", "/root/bh")]), recorded), Ok(unit.clone())); // clone: a test's expected path
+        assert_eq!(toolchains_in(env(&[("BLAZE_HOME", "/root/bh")]), recorded), Ok(unit));
+        // Unset, and the system has none: the error says both.
+        let refused = toolchains_in(env(&[("BLAZE_HOME", "/root/bh")]), none).unwrap_err();
+        assert_eq!(refused, NoHome { record: NoRecord::NoEntry { uid: 0 } });
+        // The setting wins over the home, needs none, and an empty one is unset.
+        let named = PathBuf::from("/t");
+        assert_eq!(toolchains_in(env(&[(VAR, "/t"), ("HOME", "/u")]), unasked), Ok(named.clone())); // clone: a test's expected path
+        assert_eq!(toolchains_in(env(&[(VAR, "/t")]), unasked), Ok(named));
+        assert_eq!(toolchains_in(env(&[(VAR, ""), ("HOME", "/u")]), unasked), Ok(PathBuf::from("/u/.blaze/toolchains")));
+        // The control (rule test-the-cause): with everything else the same, taking the
+        // setting away is what moves the directory back under the home.
+        assert_ne!(
+            toolchains_in(env(&[(VAR, "/t"), ("HOME", "/u")]), none),
+            toolchains_in(env(&[("HOME", "/u")]), none)
+        );
+    }
 
     /// A package as the Rust project makes them: one directory with `components`, and each
     /// component's files with its `manifest.in`, as a `.tar.xz`.

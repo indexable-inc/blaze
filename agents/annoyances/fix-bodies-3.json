@@ -1,0 +1,14 @@
+{
+ "id": "fix-bodies-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-bodies",
+ "where": "crates/hir-ty/src/body_store/konst.rs, crates/hir-ty/src/consteval.rs (evaluate, const_eval_query), crates/blaze-item-hash/src/reads.rs (RULES), crates/blaze-item-hash/src/tests/classify.rs (REFUSALS)",
+ "what": "the constants step (`Step::Const`) was added with tests over a facts double that covers every read; under the real facts its evaluation's read of `monomorphized_runtime_mir_body_query` (the constant's own runtime MIR) has no rule, so each evaluated constant is refused at its offer and the step stores nothing. Read from the code, not measured on a build.",
+ "cost": "a coverage test failed with an unlisted refusal; while the step was on, per constant, a lookup, a capture and a classify with no hit",
+ "cause": "the step was written before the fact its main read needs exists (restore.md lists \"the runtime stage as a step\" as left), and its tests could not see the real classification",
+ "class": "a cache step shipped ahead of the fact that keys it, tested only against a double that says yes (rule 21, rule 23)",
+ "prevention": "a new `Step` adds its bodies to blaze-item-hash's `steps_seen` fixture and asserts at least one of them is stored under the real facts (`Flushed::written` for that step above 0), so a step that can never hit fails where it is added",
+ "workaround": "none",
+ "fix": "lane cache-audit-1112 switched the step off: `const_eval_query` no longer calls it (`consteval::stored_constant` is the tests' door) until runtime MIR is a step of the item store (docs/v2/plan/design/caches.md, `dep-consts` row); so no step makes the read and `REFUSALS` lists nothing for it",
+ "state": "open"
+}

@@ -18,9 +18,15 @@
 // then sees the visible variables alone, which the run's key has, until the process says it
 // walks it (std's `__blaze_environ_walked`; `system`, `popen`): then every lent variable is put
 // back in the environment, and the whole environment is said read, `/.blaze-env/* <why>`.
+// What is lent so is the walk set (`blaze_usercode::confine::walk_sees`): a variable outside
+// it is an entry `__BLAZE_NAMED=NAME=VALUE` instead, answered by name and said the same way
+// and never put back, so "the whole environment" a walk reads is the visible variables and
+// the walk set, the same in every shell.
 //
 // A program the process runs with its own environment gets the lent variables back in it, as
 // with no sandbox, and the visible names in `__BLAZE_VISIBLE_CHILD`: running it is no read.
+// The variables lent by name alone go to it as the entries they are, while the process has
+// not walked its environment: the program's own copy of this library answers them by name.
 // Its own copy of this library lends it what is not visible when its executable exports
 // `__blaze_std_says_walks` (blaze's linker proves std alone walks its environment), and says
 // `/.blaze-env/* <program> does not export ...` as it loads otherwise: a C program, or a shell
@@ -59,6 +65,10 @@ extern char **environ;
 #define LOADED_MARK "/.blaze-loaded"
 #define INTERPOSING "__BLAZE_INTERPOSE"
 #define LENT "__BLAZE_LENT"
+// A variable lent by name alone, `__BLAZE_NAMED=NAME=VALUE` (`sandbox/v2.rs`, `NAMED`): one
+// outside the walk set. Answered by `getenv` like a lent one, and never put back in the
+// environment, whoever walks it.
+#define NAMED "__BLAZE_NAMED"
 // The visible names, `NAME=NAME=...` (`sandbox/v2.rs`, `VISIBLE`): from the launcher, to the
 // program it lends to; from this library, to each program a process runs, which lends to
 // itself when it proves it says its walks.
@@ -183,6 +193,8 @@ static char *lookup(const char *name) {
 // stays where the kernel put it. Set as the library loads, before the program runs.
 static char **lent;
 static unsigned char *lent_gone;
+// Of each whether it is lent by name alone (an entry `NAMED`): never put back for a walk.
+static unsigned char *lent_named;
 static size_t lent_count;
 // Whether every lent variable is back in `environ`: the process walked its environment.
 static int lent_back;
@@ -204,12 +216,15 @@ static int lending(void) {
     return lent_count && !__atomic_load_n(&lent_back, __ATOMIC_ACQUIRE);
 }
 
-// The value of `name` lent and not taken away, while it is lent rather than in `environ`.
+// The value of `name` lent and not taken away: of one lent until a walk, while it is lent
+// rather than in `environ`; of one lent by name alone, always.
 static char *lent_value(const char *name) {
-    if (!lending() || !name) return NULL;
+    if (!lent_count || !name) return NULL;
+    int back = __atomic_load_n(&lent_back, __ATOMIC_ACQUIRE);
     size_t len = strlen(name);
     for (size_t i = 0; i < lent_count; i++)
-        if (!lent_gone[i] && entry_of(lent[i], name, len)) return lent[i] + len + 1;
+        if (!lent_gone[i] && (lent_named[i] || !back) && entry_of(lent[i], name, len))
+            return lent[i] + len + 1;
     return NULL;
 }
 
@@ -217,8 +232,10 @@ static char *lent_value(const char *name) {
 // that runs before this library's is answered.
 static char *encoded_value(const char *name) {
     size_t len = strlen(name);
-    for (char **it = environ; it && *it; it++)
+    for (char **it = environ; it && *it; it++) {
         if (named(*it, LENT) && entry_of(*it + sizeof LENT, name, len)) return *it + sizeof LENT + len + 1;
+        if (named(*it, NAMED) && entry_of(*it + sizeof NAMED, name, len)) return *it + sizeof NAMED + len + 1;
+    }
     return NULL;
 }
 
@@ -250,8 +267,8 @@ static int is_visible(const char *entry) {
     return 0;
 }
 
-// Every lent variable not taken away, and not set by the process since, put back in
-// `environ`, once: a new array of what it has and those, mapped rather than allocated (the
+// Every variable lent until a walk (not one lent by name alone) that was not taken away, and
+// not set by the process since, put back in `environ`, once: a new array of what it has and those, mapped rather than allocated (the
 // process may be a `vfork` or `fork` child, which must not allocate), and never unmapped (a
 // thread may still be reading the one before). One that can't be made ends the process: it
 // would see less than it was given.
@@ -263,7 +280,7 @@ static void lend_back(void) {
         size_t have = 0, add = 0;
         while (environ && environ[have]) have++;
         for (size_t i = 0; i < lent_count; i++)
-            if (!lent_gone[i] && !has(environ, lent[i])) add++;
+            if (!lent_gone[i] && !lent_named[i] && !has(environ, lent[i])) add++;
         size_t bytes = (have + add + 1) * sizeof(char *);
         char **all = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (all == MAP_FAILED) {
@@ -275,7 +292,7 @@ static void lend_back(void) {
         size_t n = 0;
         for (size_t i = 0; i < have; i++) all[n++] = environ[i];
         for (size_t i = 0; i < lent_count; i++)
-            if (!lent_gone[i] && !has(environ, lent[i])) all[n++] = lent[i];
+            if (!lent_gone[i] && !lent_named[i] && !has(environ, lent[i])) all[n++] = lent[i];
         all[n] = NULL;
         environ = all;
         __atomic_store_n(&lent_back, 1, __ATOMIC_RELEASE);
@@ -283,8 +300,8 @@ static void lend_back(void) {
     __atomic_store_n(&lent_busy, 0, __ATOMIC_RELEASE);
 }
 
-// The process walks its whole environment, as `why` (`* <why>`) says: it read every variable,
-// lent ones too.
+// The process walks its whole environment, as `why` (`* <why>`) says: it read every variable
+// a walk sees, those lent until one too (never one lent by name alone).
 static void walked_whole(const char *why) {
     read_var(why);
     lend_back();
@@ -308,14 +325,22 @@ static void out_of_memory(void) {
 static void take_lent(void) {
     size_t n = 0;
     for (char **it = environ; it && *it; it++)
-        if (named(*it, LENT)) n++;
+        if (named(*it, LENT) || named(*it, NAMED)) n++;
     if (!n) return;
     lent = malloc(n * sizeof *lent);
     lent_gone = calloc(n, 1);
-    if (!lent || !lent_gone) out_of_memory();
-    for (char **it = environ; it && *it; it++)
-        if (named(*it, LENT)) lent[lent_count++] = *it + sizeof LENT;
+    lent_named = calloc(n, 1);
+    if (!lent || !lent_gone || !lent_named) out_of_memory();
+    for (char **it = environ; it && *it; it++) {
+        if (named(*it, LENT)) {
+            lent[lent_count++] = *it + sizeof LENT;
+        } else if (named(*it, NAMED)) {
+            lent_named[lent_count] = 1;
+            lent[lent_count++] = *it + sizeof NAMED;
+        }
+    }
     REAL(unsetenv)(LENT);
+    REAL(unsetenv)(NAMED);
 }
 
 // The variables of `environ` that are not visible, taken out of it as the library loads: a
@@ -325,13 +350,18 @@ static void lend_rest(void) {
     for (char **it = environ; it && *it; it++)
         if (!is_visible(*it)) n++;
     if (!n) return;
-    lent = malloc(n * sizeof *lent);
-    lent_gone = calloc(n, 1);
-    if (!lent || !lent_gone) out_of_memory();
-    for (char **it = environ; it && *it && lent_count < n; it++)
+    // After what `take_lent` took (the variables lent by name alone, passed on as entries).
+    size_t first = lent_count, most = lent_count + n;
+    lent = realloc(lent, most * sizeof *lent);
+    lent_gone = realloc(lent_gone, most);
+    lent_named = realloc(lent_named, most);
+    if (!lent || !lent_gone || !lent_named) out_of_memory();
+    memset(lent_gone + first, 0, n);
+    memset(lent_named + first, 0, n);
+    for (char **it = environ; it && *it && lent_count < most; it++)
         if (!is_visible(*it)) lent[lent_count++] = *it;
     char name[LONGEST_NAME + 1];
-    for (size_t i = 0; i < lent_count; i++) {
+    for (size_t i = first; i < lent_count; i++) {
         size_t len = strcspn(lent[i], "=");
         if (len > LONGEST_NAME) {
             // Not taken away: in `environ` a walk could see it, so every variable is read.
@@ -483,7 +513,8 @@ static size_t preload_len(char *const envp[]) {
     return sizeof PRELOAD + self_len + 1;
 }
 
-// How many lent variables a program run with `envp` is given back: all of them, when `envp`
+// How many lent variables a program run with `envp` is given: all of them (those lent until a
+// walk back in its environment, those lent by name alone as the entries they are), when `envp`
 // is the process's own environment and they are still lent. A program run with an
 // environment the process made itself is given what it made.
 static size_t lent_room(char *const envp[]) {
@@ -502,7 +533,8 @@ static void environment(char *const envp[], size_t lent_n, char **out, char *pre
     size_t n = 0;
     int put = 0;
     for (char *const *it = envp; it && *it; it++) {
-        if (named(*it, INTERPOSING) || named(*it, VISIBLE) || named(*it, CHILD_VISIBLE) || named(*it, LENT))
+        if (named(*it, INTERPOSING) || named(*it, VISIBLE) || named(*it, CHILD_VISIBLE) || named(*it, LENT) ||
+            named(*it, NAMED))
             continue;
         if (named(*it, PRELOAD)) {
             const char *theirs = *it + sizeof PRELOAD;
@@ -525,7 +557,9 @@ static void environment(char *const envp[], size_t lent_n, char **out, char *pre
     out[n] = NULL;
     for (size_t i = 0, added = 0; i < lent_count && added < lent_n; i++) {
         if (lent_gone[i] || has(out, lent[i])) continue;
-        out[n++] = lent[i];
+        // One lent by name alone goes on as its whole entry (`NAMED=NAME=VALUE`, which is
+        // where the kernel put it, `sizeof NAMED` bytes before its name).
+        out[n++] = lent_named[i] ? lent[i] - sizeof NAMED : lent[i];
         out[n] = NULL;
         added++;
     }

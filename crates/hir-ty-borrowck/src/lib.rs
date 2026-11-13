@@ -64,7 +64,11 @@ mod missing_body_tests;
 #[cfg(test)]
 mod rpitit_tests;
 #[cfg(test)]
+mod tainted_tests;
+#[cfg(test)]
 mod views_tests;
+#[cfg(test)]
+mod kept_tests;
 #[cfg(test)]
 mod served;
 
@@ -334,15 +338,81 @@ impl NotChecked {
 }
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
+///
+/// The one place a stored verdict is looked at: with an item store installed, a kept verdict of
+/// `def` by the checker in use (one the daemon served, or one this build offered and flushed)
+/// is the answer, `BorrowckResult::default()`, with no check run. A verdict is kept only for a
+/// result equal to that ([`kept`]), so the answer is the one the check would give. Under
+/// [`hir_ty::body_store::Mode::Verify`] a kept verdict runs the check as well, and its result is
+/// the answer (and is not offered again).
 #[blaze_query::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     let mode = mode(db);
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
+    let mut verified = None;
+    let served = hir_ty::body_store::lookup_passed(db, def, checker, || {
+        let result = borrowck_in_mode(db, def, mode);
+        let passes = kept(def, &result);
+        verified = Some(result);
+        passes
+    });
+    if served {
+        return BorrowckResult::default();
+    }
+    if let Some(result) = verified {
+        return result;
+    }
     let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
-    if gate::verdict(def, &result).is_ok() {
+    if kept(def, &result) {
         hir_ty::body_store::offer_passed(db, def, checker, reads);
     }
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of `kept_tests`: [`kept`] is the verdict alone, so a pass with a lint is
+    /// kept, and its served answer would drop the lint.
+    pub(crate) static KEEP_LOUD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `result`, `def`'s borrow check, is kept as a verdict: it passed and has nothing to
+/// say. A verdict holds no bytes, so the query answers a served one with
+/// `BorrowckResult::default()`; a pass with a lint (`unused_mut`) or one not checked
+/// (`NotChecked::Off`) is never kept, as its answer is not that.
+pub(crate) fn kept(def: DefWithBodyId, result: &BorrowckResult) -> bool {
+    if gate::verdict(def, result).is_err() {
+        return false;
+    }
+    #[cfg(test)]
+    if KEEP_LOUD.with(std::cell::Cell::get) {
+        return true;
+    }
+    if !result.diagnostics.is_empty() || result.not_checked.is_some() {
+        tracing::debug!(
+            target: "blaze",
+            ?def,
+            lints = result.diagnostics.len(),
+            not_checked = ?result.not_checked,
+            "a passing borrow check with something to say: no verdict kept"
+        );
+        return false;
+    }
+    true
+}
+
+/// The name the item store files the database's verdicts under, none when no check runs: what
+/// the driver keys a served borrow check by.
+pub fn checker_name(db: &Db) -> Option<&'static str> {
+    checker(mode(db))
+}
+
+/// The checker's name when `def`'s borrow check (the [`borrowck`] query, run or served) passed
+/// with nothing to say, so its verdict may be kept: the driver's borrow check step. None when
+/// it did not, or no check runs.
+pub fn silent_pass(db: &Db, def: DefWithBodyId) -> Option<&'static str> {
+    let checker = checker_name(db)?;
+    kept(def, borrowck(db, def)).then_some(checker)
 }
 
 /// The name the item store files `mode`'s verdicts under: each checker accepts other programs.
@@ -427,37 +497,53 @@ fn check_def<'db>(
             Some("a body that is written but lowered to no expression: nothing to check".into());
         return result;
     }
-    let owner = InferBodyId::DefWithBodyId(def);
-    let infer = InferenceResult::of(db, owner);
-    if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
-        result.not_checked = Some(NotChecked::TypeErrors);
+    if let Some(why) = tainted_by_errors(db, def) {
+        result.not_checked = Some(why);
         return result;
     }
-    // rustc borrow checks no body its lowering or type check found an error in, which an
-    // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    // A query of whether there was one, which reads no position: an edit elsewhere in the
-    // file checks the body again only if it changes that.
+    let owner = InferBodyId::DefWithBodyId(def);
+    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
+    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
+    if root.is_none() {
+        drop_early::add_notes(db, def, mode, &mut result);
+    }
+    result
+}
+
+/// Why `def`'s body has no meaningful MIR, by the first error found before MIR is built in it
+/// or in a closure, coroutine or `const { .. }` block in it; `None` when it has none.
+///
+/// The rule, rustc's `tainted_by_errors`: an error reported in a body before borrow checking
+/// (type checking, E0063's missing fields among its errors, lowering, a macro call that did not
+/// expand, match checking, `check_tail_calls`, an unsized `static`) gives it rustc's error
+/// body, which nothing borrow checks, const-checks or evaluates. The user sees that error once,
+/// and never a second one saying the body could not be checked. The one place this is asked:
+/// the borrow check ([`borrowck`]) and every other consumer of a body's MIR that may only run
+/// on a body without errors (`hir`'s evaluation of a `const` or `static`).
+pub fn tainted_by_errors(db: &Db, def: DefWithBodyId) -> Option<NotChecked> {
+    let owner = InferBodyId::DefWithBodyId(def);
+    if type_check_failed(InferenceResult::of(db, owner)) {
+        return Some(NotChecked::TypeErrors);
+    }
+    // A query of whether lowering found an error (a cast that is not one, `..base` in a
+    // destructuring assignment), which reads no position: an edit elsewhere in the file checks
+    // the body again only if it changes that.
     if hir_def::expr_store::Body::has_lowering_errors(db, def) {
-        result.not_checked = Some(NotChecked::LoweringErrors);
-        return result;
+        return Some(NotChecked::LoweringErrors);
     }
     if hir_ty_mir::mir::has_failed_expansion(db, owner) {
-        result.not_checked = Some(NotChecked::ExpansionErrors);
-        return result;
+        return Some(NotChecked::ExpansionErrors);
     }
     if hir_ty_matchck::match_check(db, def).failed {
-        result.not_checked = Some(NotChecked::MatchErrors);
-        return result;
+        return Some(NotChecked::MatchErrors);
     }
-    // rustc's `check_tail_calls` refused a `become` of the body or a closure in it, whose
-    // error MIR taints the body's borrow check. One bit of the store first, so a body without
-    // a `become` reads no more.
+    // One bit of the store first, so a body without a `become` reads no more.
+    let body = hir_def::expr_store::Body::of(db, def);
     if hir_ty_tailck::has_become(body) && hir_ty_tailck::tail_call_check(db, def).failed() {
-        result.not_checked = Some(NotChecked::TailCallErrors);
-        return result;
+        return Some(NotChecked::TailCallErrors);
     }
-    // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
-    // borrow checked; a `const` is checked all the same.
+    // A `static` of a type that is not `Sized` is rustc's E0277; a `const` is checked all the
+    // same.
     if let DefWithBodyId::StaticId(it) = def
         && let Some(ty) = db.value_ty(it.into())
         && {
@@ -469,15 +555,15 @@ fn check_def<'db>(
             )
         }
     {
-        result.not_checked = Some(NotChecked::UnsizedStatic);
-        return result;
+        return Some(NotChecked::UnsizedStatic);
     }
-    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
-    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
-    if root.is_none() {
-        drop_early::add_notes(db, def, mode, &mut result);
-    }
-    result
+    None
+}
+
+/// Whether type checking a body (an item's or a constant of a signature's) reported an error in
+/// it, which taints it: [`tainted_by_errors`]'s first question.
+fn type_check_failed(infer: &InferenceResult<'_>) -> bool {
+    infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty()
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -495,8 +581,7 @@ pub fn borrowck_anon_const<'db>(
     }
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         let owner = InferBodyId::AnonConstId(konst);
-        let infer = InferenceResult::of(db, owner);
-        if infer.has_type_mismatches() || infer.is_erroneous() {
+        if type_check_failed(InferenceResult::of(db, owner)) {
             return BorrowckResult {
                 not_checked: Some(NotChecked::TypeErrors),
                 ..Default::default()

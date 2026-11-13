@@ -23,6 +23,7 @@ mod bounds_check_in_loop;
 mod box_large_new;
 mod boxed_recursive_node;
 mod build_script_ambient;
+mod not_latest_edition;
 mod checkfree;
 mod clone;
 mod cold_error;
@@ -45,9 +46,9 @@ mod edition_tests;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
-mod may;
+mod expect;
 #[cfg(test)]
-mod may_tests;
+mod expect_tests;
 mod enum_vec_padded;
 mod error_debug;
 #[cfg(test)]
@@ -279,7 +280,7 @@ pub enum Lint {
     UnmarkedNonblocking,
     MutRef,
     UndeclaredEffect,
-    UnneededEffect,
+    UnfulfilledEffect,
     NegativeEffect,
     DurableWrite,
     UnboundedWait,
@@ -288,6 +289,7 @@ pub enum Lint {
     ProcMacroAttribute,
     ProcMacroFnLike,
     BuildScriptAmbient,
+    NotLatestEdition,
     StdUse,
     ProgramLifetime,
     CouldBeProgramLifetime,
@@ -324,8 +326,9 @@ pub(crate) enum Kind {
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
 /// `#[blaze::nonblocking]`, `#[blaze::pure]`, `#![blaze::capabilities]`, and for
-/// `undeclared_effect` a `#[blaze::may(..)]` on the function, its trait or a module around it,
-/// or `#![blaze::effects]`), so a finding is a broken promise.
+/// `undeclared_effect` a `#[blaze::expect(..)]` on the function, its trait or a module around it,
+/// or `#![blaze::effects]`, for `unfulfilled_effect` a function's own `#[blaze::expect(..)]`),
+/// so a finding is a broken promise.
 pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Checkfree,
     Lint::Nopanic,
@@ -334,6 +337,8 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Pure,
     Lint::Capabilities,
     Lint::UndeclaredEffect,
+    // An expectation is exact: a listed word the function is proved not to have is refused.
+    Lint::UnfulfilledEffect,
     // Fires only on a type declared `#[blaze::program_lifetime]`.
     Lint::ProgramLifetime,
     // Fires only on a `blaze::unreachable!()`.
@@ -358,6 +363,8 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
     (Lint::ProcMacroFnLike, true),
     (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+    // Once a package of the edition builds wherever blaze runs (bstd ships with blaze).
+    (Lint::NotLatestEdition, ready::EDITION_SHIPS),
     // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), a
     // workspace by its `lints-when-ready` table once `ready::BSTD_IN_TREE`, and blaze's own
     // denies it in its `lints-ratchet` ahead of the switch.
@@ -375,6 +382,12 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::UnmarkedNoalloc, false),
     (Lint::UnmarkedNonblocking, false),
     (Lint::MutRef, false),
+    // docs/v2/plan/design/facts.md: `program_lifetime` checks what the code declared and is
+    // `deny` where it fires ([`DENY_BY_DEFAULT`], which wins over this); the two that say where
+    // the attribute and `Ref32` would pay wait for the group, as blaze-lint-defs has them.
+    (Lint::ProgramLifetime, false),
+    (Lint::CouldBeProgramLifetime, false),
+    (Lint::CouldBeRef32, false),
 ];
 
 /// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate
@@ -533,7 +546,7 @@ impl Lint {
         Lint::UnmarkedNonblocking,
         Lint::MutRef,
         Lint::UndeclaredEffect,
-        Lint::UnneededEffect,
+        Lint::UnfulfilledEffect,
         Lint::NegativeEffect,
         Lint::DurableWrite,
         Lint::UnboundedWait,
@@ -542,6 +555,7 @@ impl Lint {
         Lint::ProcMacroAttribute,
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
+        Lint::NotLatestEdition,
         Lint::StdUse,
         Lint::ProgramLifetime,
         Lint::CouldBeProgramLifetime,
@@ -608,10 +622,11 @@ impl Lint {
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
             | Lint::NativeContracts
-            // Fire only where the code declares what a function may do (`#[blaze::may(..)]`, a
-            // module's default, `#![blaze::effects]`): `undeclared_effect` is `deny` there.
+            // Fire only where the code declares what a function is expected to do
+            // (`#[blaze::expect(..)]`, a module's default, `#![blaze::effects]`):
+            // `undeclared_effect` and `unfulfilled_effect` are `deny` there.
             | Lint::UndeclaredEffect
-            | Lint::UnneededEffect
+            | Lint::UnfulfilledEffect
             | Lint::NegativeEffect => Kind::General,
             // `packable`'s fix is a field with no address and a shift and mask per access,
             // and its `#[blaze::bits]` is an opt-in extension.
@@ -634,6 +649,8 @@ impl Lint {
             | Lint::ProcMacroAttribute
             | Lint::ProcMacroFnLike
             | Lint::BuildScriptAmbient
+            // A package not on the latest blaze edition: the edition itself, asked for.
+            | Lint::NotLatestEdition
             // What blaze's standard library replaces, which the edition's `std` no longer has.
             | Lint::StdUse => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
@@ -820,7 +837,7 @@ impl Lint {
             Lint::UnmarkedNonblocking => "unmarked_nonblocking",
             Lint::MutRef => "mut_ref",
             Lint::UndeclaredEffect => "undeclared_effect",
-            Lint::UnneededEffect => "unneeded_effect",
+            Lint::UnfulfilledEffect => "unfulfilled_effect",
             Lint::NegativeEffect => "negative_effect",
             Lint::DurableWrite => "durable_write",
             Lint::UnboundedWait => "unbounded_wait",
@@ -829,6 +846,7 @@ impl Lint {
             Lint::ProcMacroAttribute => "proc_macro_attribute",
             Lint::ProcMacroFnLike => "proc_macro_fn_like",
             Lint::BuildScriptAmbient => "build_script_ambient",
+            Lint::NotLatestEdition => "not_latest_edition",
             Lint::StdUse => "std_use",
             Lint::ProgramLifetime => "program_lifetime",
             Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
@@ -940,8 +958,8 @@ impl Lint {
             | Lint::UnmarkedNoalloc
             | Lint::UnmarkedNonblocking => concat!(general_docs!(), "#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking"),
             Lint::MutRef => concat!(general_docs!(), "#mut_ref"),
-            Lint::UndeclaredEffect | Lint::UnneededEffect | Lint::NegativeEffect => {
-                concat!(general_docs!(), "#undeclared_effect-unneeded_effect-negative_effect")
+            Lint::UndeclaredEffect | Lint::UnfulfilledEffect | Lint::NegativeEffect => {
+                concat!(general_docs!(), "#undeclared_effect-unfulfilled_effect-negative_effect")
             }
             Lint::DurableWrite => concat!(docs!(), "#durable_write"),
             Lint::UnboundedWait => concat!(docs!(), "#unbounded_wait"),
@@ -950,6 +968,7 @@ impl Lint {
                 concat!(general_docs!(), "#proc_macro")
             }
             Lint::BuildScriptAmbient => concat!(general_docs!(), "#build_script_ambient"),
+            Lint::NotLatestEdition => concat!(general_docs!(), "#not_latest_edition"),
             Lint::StdUse => concat!(general_docs!(), "#std_use"),
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
                 concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
@@ -1009,13 +1028,13 @@ impl Lint {
                 "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
             }
             Lint::UndeclaredEffect => {
-                "add the word to the function's `#[blaze::may(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::may(.., trusted = \"why\")]` without the word"
+                "add the word to the function's `#[blaze::expect(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::expect(.., trusted = \"why\")]` without the word"
             }
-            Lint::UnneededEffect => {
-                "take the word off the list (`blaze check --fix` does), or keep the right to the effect with `#[expect(blaze::unneeded_effect, reason = \"..\")]`"
+            Lint::UnfulfilledEffect => {
+                "take the word off the list (`blaze check --fix` does): a function's own list is exact; a right kept for impls to come is a trait method's list, which bounds them"
             }
             Lint::NegativeEffect => {
-                "write what the function may do, `#[blaze::may(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
+                "write what the function may do, `#[blaze::expect(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
             }
             Lint::DurableWrite => {
                 "take `Effect::WriteUnsynced` or `Effect::RenameUnsynced` where a build can make the data again and its reader checks it, or say what must survive a crash with `// durable: <why>` on its line or the line above"
@@ -1290,6 +1309,13 @@ impl Lint {
                     "nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is"
                 }
             }
+            Lint::NotLatestEdition => {
+                if ready::EDITION_SHIPS {
+                    "set `edition = \"blaze-2026.11\"` under `[package]` in Cargo.toml (`blaze fix --edition`, which will rewrite the sources, is planned and not in this blaze), or keep the package as it is and say so: `not_latest_edition = \"allow\"` under `[workspace.metadata.blaze.lints]`, or `#![allow(blaze::not_latest_edition)]` at the crate root"
+                } else {
+                    "nothing to change yet: the opt-in is `edition = \"blaze-2026.11\"` under `[package]` in Cargo.toml, and a package of it names bstd as a dependency until blaze ships bstd with itself (docs/v2/plan/design/std.md, row S5d), which is planned and not in this blaze; this lint is `allow` by default until it is, and `blaze fix --edition` is planned too"
+                }
+            }
             Lint::StdUse => {
                 if ready::BSTD_IN_TREE {
                     "take the capability, or write the form of blaze's standard library, that the finding names (bstd, docs/v2/plan/design/std.md): a function then says in its signature everything it can touch, wait for and allocate from; where the finding has a fix, `blaze check --fix` makes it; or say why std's stays with `#[expect(blaze::std_use, reason = \"..\")]`"
@@ -1368,6 +1394,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         default_policy::check_adt(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
+    }
+    if node.kind() == syntax::SyntaxKind::ATTR {
+        expect::check_deleted(cx, node);
     }
     if let Some(f) = ast::Fn::cast(node) {
         untyped_error::check(cx, f);
@@ -1487,7 +1516,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         proved_unreachable::check(cx);
         todo::check(cx);
         unmarked_effects::check(cx);
-        may::check(cx);
+        expect::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);
@@ -1496,6 +1525,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         lossy_as::check(cx);
         implicit_overflow::check(cx);
         build_script_ambient::check(cx);
+        not_latest_edition::check(cx);
         std_use::check(cx);
         check_body(cx);
     }

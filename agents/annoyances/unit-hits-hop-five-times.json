@@ -1,0 +1,14 @@
+{
+ "id": "unit-hits-hop-five-times",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 11 T1 executor, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::build (`let phases = phases_of(unit);`), serve/job/standing.rs",
+ "what": "Every unit posted a plane node for each of its five phases whether or not anything of it could have changed: on a body edit of the six-dependency project on the Mac the other units' 187 phase tasks were all record hits, held 2.3 ms of work and took 5.3 to 7.3 ms of the daemon's 47.5 ms, each phase a node waiting on the one before and on its dependencies' last through a loop turn and a worker's wake.",
+ "cost": "an estimated 4-6 ms of each six-dependency edit row and 3-4 ms of hello's, against Relax on rows decided by milliseconds",
+ "cause": "the job decided how a unit is posted from its mode alone; what the last build of the same plan left (each unit's record found or stored) was known on the loop and never kept",
+ "class": "work posted by shape instead of by what can have changed since the last build of the same inputs",
+ "prevention": "a unit that is sealed, was kept by the last ok build of the same plan (its units' Arc) and config, over units that stand, is one node whose task looks its record up and replays it (Front::stand); a record not found there fails the unit by name and the failed build leaves nothing standing",
+ "workaround": "none",
+ "fix": "serve/job/standing.rs (sans-IO: Stood, hops) and LastPlan::stood, taken by Jobs::build and set by an ok whole build's end in Jobs::plane_finished; Does::Compile carries hops; Front::stand and Front::sealed. Tests: standing's Hegel model with three planted bugs; serve::tests a_sealed_unit_the_last_build_kept_stands_in_one_task_and_its_record_gone_fails_by_name and its controls (deps-blind, environment-blind) against a fresh daemon's records. Written, not built or measured.",
+ "state": "written"
+}

@@ -16,6 +16,7 @@ use std::{fmt, panic::UnwindSafe};
 
 mod budget;
 mod capture;
+mod census;
 mod counts;
 mod dense;
 pub mod edit_work;
@@ -29,6 +30,8 @@ mod local;
 mod provenance;
 mod reverse;
 mod row;
+mod scoped;
+mod seal;
 mod slot;
 mod storage;
 #[cfg(test)]
@@ -37,27 +40,37 @@ mod tests;
 mod tracked;
 mod value;
 mod verify;
+mod witness;
 
 pub use capture::{
-    Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
+    Read, ReadKind, Reads, RowRead, capture_reads, for_span_text, recorded_if, replay_reads,
+    unrecorded, unshareable_reads,
 };
 pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
-pub use counts::{Counts, take as take_counts};
-pub use frontier::{Changed, ChangedSetWork, Unknown as ChangedUnknown};
-pub use function::completed;
+pub use census::{Blocker as DurabilityBlocker, Census as DurabilityCensus};
+pub use counts::{Counts, Validity, take as take_counts};
+pub use frontier::{
+    Changed, ChangedSetWork, Settled, Unknown as ChangedUnknown, changed_keys_since,
+};
+pub use function::{Refreshed, completed, refresh_by_key as refresh};
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;
 /// The most reads one query run held and the most pending rows one task held, process-wide:
 /// what the query stack's runaway bounds are set against (the daemon's memory line says them).
 pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
+pub use scoped::task_scope;
 pub use provenance::{
-    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, Taken, log_runs, name_rows,
-    take_log_in,
+    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, SAMPLE_EVERY, SAMPLED_MOST,
+    Taken, log_runs, name_rows, take_log_in,
+};
+pub use seal::{
+    SealCensus, SealGroup, SealGroupCensus, SealKind, SealNotWhole, SealPass, SealState,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, Unread, View};
 pub use value::Value;
+pub use witness::{Witness, covered, witnessed};
 
 /// What generated code calls: the ingredient traits, their statics' vtables, and the typed
 /// entry points.
@@ -72,10 +85,12 @@ pub mod plumbing {
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
-            input_set, input_singleton, input_written_since,
+            input_seal_group, input_set, input_singleton, input_singleton_seal_group,
+            input_written_since,
         },
         interned::{Interned, intern, intern_by, interned_arguments, interned_fields},
         owner_is,
+        scoped::{Scoped, fetch_scoped},
         tracked::{Tracked, tracked_fields, tracked_identity, tracked_new},
         value::{
             HashEqLike, IdOfAsId, IdOfNamed, IdOfOther, IdsOf, KeyText, KeyTextDebug, KeyTextId,
@@ -455,58 +470,11 @@ pub struct NeverGiven {
     pub thread: String,
     /// The call stack of the ask ([`std::backtrace::Backtrace::force_capture`]).
     pub backtrace: String,
-    /// The persisted state this process restored from ([`note_restored`]): a key decoded from
-    /// it is the first suspect. `None` for a process that restored nothing.
-    pub restored: Option<RestoredFrom>,
-}
-
-/// The persisted state a process restored its state from, as a host noted it
-/// ([`note_restored`]): what a [`NeverGiven`] names, so the report of a key no database gave
-/// says which file may hold it and what checks that file.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct RestoredFrom {
-    /// The file, as a person names it: `/home/v2/db/image`.
-    pub file: String,
-    /// Its format: the layout it was written in.
-    pub format: String,
-    /// Its content hash, as the host's log names it.
-    pub hash: String,
-}
-
-static RESTORED: std::sync::OnceLock<RestoredFrom> = std::sync::OnceLock::new();
-
-/// Notes that this process restored its state from `from`. The first note stands (a process
-/// restores once, at its start).
-pub fn note_restored(from: RestoredFrom) {
-    _ = RESTORED.set(from);
-}
-
-/// What [`note_restored`] was told, if anything.
-pub fn restored_from() -> Option<&'static RestoredFrom> {
-    RESTORED.get()
-}
-
-impl NeverGiven {
-    /// What the report says of the persisted state: the file to suspect and the command that
-    /// checks it, or that the process restored nothing so no file is the cause.
-    fn restore_said(&self) -> String {
-        match &self.restored {
-            // alloc: an error's text, once
-            Some(RestoredFrom { file, format, hash }) => format!(
-                "this process restored its state from {file} (format {format}, hash {hash}), \
-                 so that restore is suspect: `blaze doctor` checks the file and prints the \
-                 command that sets it aside"
-            ),
-            // alloc: as above
-            None => "this process restored no persisted state, so no restored file holds the key"
-                .to_owned(),
-        }
-    }
 }
 
 impl fmt::Display for NeverGiven {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let NeverGiven { query, key, page, pages, view, asker, frames, thread, backtrace, .. } =
+        let NeverGiven { query, key, page, pages, view, asker, frames, thread, backtrace } =
             self;
         write!(
             f,
@@ -531,11 +499,13 @@ impl fmt::Display for NeverGiven {
             )?,
             None => f.write_str("; asked from outside any query")?,
         }
-        write!(
-            f,
-            ", on thread `{thread}`; {}; the call stack of the ask:\n{backtrace}",
-            self.restore_said()
-        )
+        let said = blaze_report::say!(
+            ", on thread ",
+            blaze_report::say::Code(thread),
+            "; the call stack of the ask:\n",
+            blaze_report::say::Words(backtrace),
+        );
+        f.write_str(&said.flat())
     }
 }
 
@@ -568,7 +538,6 @@ pub(crate) fn never_given(storage: &Storage, index: u32, id: Id) -> ! {
         frames,
         thread: thread.name().unwrap_or("(unnamed)").to_owned(), // alloc: an error's text, once
         backtrace: std::backtrace::Backtrace::force_capture().to_string(), // alloc: as above
-        restored: restored_from().cloned(), // clone: an error's text, once
     };
     tracing::error!(target: "blaze", never_given = %out, "a query was asked for a key its database never gave and fails");
     std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
@@ -630,6 +599,7 @@ pub(crate) fn noted(storage: &Storage, note: local::Note) {
         local::Note::Fine => {}
         local::Note::Most(held) => name_most_reads(storage, held),
         local::Note::Runaway => runaway_reads(storage),
+        local::Note::Uncovered(node) => witness::uncovered(storage, node),
     }
 }
 
@@ -817,20 +787,51 @@ pub struct Untracked {
     pub what: &'static str,
 }
 
+/// The running query's value was answered from a store by a key that stands for reads the
+/// run did not make (a record of an earlier process, found by content): the row is marked
+/// (`row::STORED`). Nothing about when it runs again changes: the key's inputs are inputs
+/// here, which the run read. What changes is what a list of the row's reads may be taken
+/// for: [`Storage::seal_group_whole`] says such a group's imports are not every part its
+/// rows' values rest on. With no running query it does nothing.
+pub fn report_stored_read<D: Database>(db: &D) {
+    let storage = db.storage();
+    local::with(|local| {
+        if let Some(frame) = local.recording(storage) {
+            frame.stored = true;
+        }
+    });
+}
+
 /// The running query made the read `why` names, which the engine can't see: it runs again in
 /// every view, at durability `LOW`, and its captures give `None`. The read is told to the trace
 /// (`blaze_query` target), naming the query, and the run's first such read to the run log
 /// ([`log_runs`]), so the profile's `provenance` table names what makes a row rerun.
+///
+/// # Panics
+///
+/// Under a covered frame ([`covered`]), naming `why` and what the frame is held for: a run
+/// held to `Durability::HIGH` reads makes none the engine can't see.
 pub fn report_untracked_read<D: Database>(db: &D, why: Untracked) {
     let storage = db.storage();
     let query = local::with(|local| {
         let frame = local.recording(storage)?;
+        if frame.kind == (local::Kind::Witness { covered: true }) {
+            return Some(Err(frame.what));
+        }
         let first = !frame.untracked;
         frame.untracked = true;
         frame.unshareable = true;
         frame.changed = frame.changed.max(storage.view_bits());
-        Some((frame.ingredient, frame.node, first))
+        // A witness frame is no row: its run is in no log (its caller is told it is not
+        // complete, [`Witness::complete`]).
+        let row = frame.kind == local::Kind::Run;
+        Some(Ok((frame.ingredient, frame.node, first && row)))
     });
+    let query = match query {
+        Some(Err(what)) => witness::refuse_untracked(what, why),
+        Some(Ok(query)) => Some(query),
+        None => None,
+    };
     if let Some((index, node, first)) = query {
         if first && provenance::logging() {
             storage.run_log.log(

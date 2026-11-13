@@ -480,7 +480,7 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
     let mut history =
-        crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+        crate::history::History::open(dir, crate::history::CAP_MOST, crate::sampler::unsampled())
             .unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
@@ -613,7 +613,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
 fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+    crate::history::History::open(&dir, crate::history::CAP_MOST, crate::sampler::unsampled())
         .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb)
@@ -781,4 +781,52 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
         }
     }
     _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The proportionality warning reaches the person who asks why: a build whose account names
+/// an alarm (here the no-op that wrote 53 inputs, 2026-11-12) says it in `blaze slow`, with
+/// the account's line and its ratios; the control is the same build with nothing written,
+/// which warns of nothing, and a history with no account, which says that it holds none.
+#[test]
+fn a_builds_account_and_its_warnings_are_said_before_the_findings() {
+    use crate::{
+        account::{Account, Seen},
+        facts::QueryCountRow,
+    };
+    let quiet = QueryCountRow {
+        build_id: 1,
+        query: "ScopeInput",
+        executed: 0,
+        verified: 0,
+        reran: 0,
+        evicted_asked: 0,
+        evicted: 0,
+        dropped: 0,
+        reads_recorded: 0,
+        reads_kept: 0,
+        reads_most: 0,
+        written: 0,
+        ran_new: 0,
+        ran_changed: 0,
+        ran_untracked: 0,
+        ran_cycle: 0,
+        validity: crate::facts::Validity::default(),
+    };
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = || vec![span(1, 1, None, "job", 0, 100, 1)];
+    // The report of build 1, as the account's row is: a `Facts` left at its default says
+    // build 0, the id of no build.
+    let said = |facts: &Facts| {
+        let facts = Facts { build: BuildFacts { id: 1, ..BuildFacts::default() }, ..facts.clone() };
+        text(&report(switches(), spans(), 100, &facts), 10)
+    };
+    let wrote = Account::of(1, &[QueryCountRow { written: 53, ..quiet }], &[], Seen::default());
+    let warned = said(&Facts { account: Some(wrote.row), ..workers([1]) });
+    assert!(warned.contains("  account: 53 inputs written (0 source, 0 environment, 0 plan, 53 derived, 0 unattributed)"), "{warned}");
+    assert!(warned.contains("    warning (needless-writes): build 1 wrote 53 inputs and no row ran for a changed read"), "{warned}");
+    let calm = Account::of(1, &[quiet], &[], Seen::default());
+    let calm = said(&Facts { account: Some(calm.row), ..workers([1]) });
+    assert!(calm.contains("  account: 0 inputs written") && !calm.contains("warning ("), "{calm}");
+    let none = said(&workers([1]));
+    assert!(none.contains("  account: the history holds none for build 1"), "{none}");
 }

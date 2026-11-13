@@ -34,6 +34,7 @@ hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
+hir-ty-borrowck.workspace = true
 # `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
 blaze-doc.workspace = true
 # `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
@@ -122,13 +123,23 @@ blaze-cas.workspace = true
 blaze-gc.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-record.workspace = true
+# The request certificate and its machine, which the daemon drives over its store and view.
+blaze-certify.workspace = true
 blaze-kernel.workspace = true
+# the front end as kernel steps, carried by the daemon across builds (serve/front_carry.rs)
+blaze-front-items.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true
 blaze-testsel.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
+# The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).
+blaze-launch.workspace = true
+# Packs (docs/remote-cache.md, "Packs"): the sans-IO cores `serve/packs` and `cli/store` drive.
+blaze-pack.workspace = true
+blaze-launch-host.workspace = true
 blaze-lower.workspace = true
 # The device build of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` written as MSL at its
 # link (`serve/unit/compile.rs`, `assemble`), which the record key covers as this crate's code.
@@ -136,8 +147,8 @@ blaze-shader.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
-# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm with `native`.
-ratatui.workspace = true
+# What a build shows: the screen's one core, driven by `cli/show.rs` (docs/terminal.md).
+blaze-screen.workspace = true
 # `extended`: the `mi_collect` binding.
 libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 
@@ -156,6 +167,8 @@ lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
 # The property test of the no-op lane (`serve/job/noop/tests.rs`).
 hegeltest.workspace = true
+# The request machine's planted bugs, for the controls of `serve/job/certify/tests.rs`.
+blaze-certify = { workspace = true, features = ["plants"] }
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).
 test-utils.workspace = true
 # A database of a fixture's files, for a unit's check run again (`serve/unit/checks/tests.rs`).
@@ -171,8 +184,7 @@ default = ["native"]
 # leaves out, as one switch: LLVM as a code producer and the stencils it makes at build time
 # (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
 # (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
-# blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze
-# test`'s live view on a terminal (`cli/live.rs`, crossterm, which has no wasm32), `blaze tree` and `blaze metadata` (blaze-metadata
+# blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze tree` and `blaze metadata` (blaze-metadata
 # fetches over the network), `blaze serve`
 # with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
 # (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one
@@ -185,7 +197,6 @@ native = [
     "dep:blaze-tree",
     "dep:blaze-metadata",
     "dep:libmimalloc-sys",
-    "ratatui/crossterm",
 ]
 
 [lints]

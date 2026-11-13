@@ -62,6 +62,12 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+# The launcher the slot-calling code is made for (`src/tests/launched.rs`): real tier 0
+# code placed in its mapping, bound on first call and replaced while a thread calls it.
+blaze-launch.workspace = true
+blaze-launch-rt.workspace = true
+blake3.workspace = true
+crossbeam-channel.workspace = true
 
 [features]
 default = ["llvm-stencils"]

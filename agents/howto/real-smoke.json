@@ -1,0 +1,9 @@
+{
+ "id": "real-smoke",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "task": "Decide whether a round`s merged tree may be offered to anyone (a measuring lane, the test tables) as the tree",
+ "do": "Build it, copy `blaze` and `blaze-engine` out of the build tree to a directory of their own, and run `python3 -I harness/v2/real_smoke.py {\"blaze\": \"<that directory>\", \"work\": \"<a directory on a disk>\", \"tmpfs\": \"/dev/shm/<name>\"}` BEFORE any test table or measurement: a small real workspace (crossbeam, serde derive, serde_json, getrandom, parking_lot, a cc -sys crate; harness/v2/smoke) built cold, run again and edited, once with its home on a disk and once on a tmpfs, each row counted only with exit 0 and the program`s own line (ran.py). Only a tree whose every row counts is offered; keep the last tree that passed as the base the measuring lane uses, and say which it is.",
+ "why": "Twice on 2026-11-12 a tree that built and passed its small tests failed a real project at its build scripts (the second: the embedded sandbox interposer had a RUNPATH naming blaze-cargo`s build directory after a rebuild under nixpkgs` cc wrapper, and ten of reth`s build scripts were refused): a hello-world has no build script, no proc macro and no C, and a blaze started from a build tree or under cargo is not what a user runs.",
+ "state": "current"
+}

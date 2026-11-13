@@ -73,14 +73,10 @@ pub(crate) enum Spare {
 }
 
 impl Tree {
-    /// Watches `dir` under `root` and everything under it: with fanotify unless the process
-    /// lacks `CAP_SYS_ADMIN` or `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), with
-    /// inotify then. Any other failure of fanotify's is the watch's.
-    pub(crate) fn new(root: &Path, dir: &FileName, nonblocking: bool) -> io::Result<Tree> {
-        Tree::reusing(None, root, dir, nonblocking)
-    }
-
-    /// As [`Tree::new`], into the tables `spare` kept.
+    /// Watches `dir` under `root` and everything under it, into the tables `spare` kept when
+    /// there are any: with fanotify unless the process lacks `CAP_SYS_ADMIN` or
+    /// `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), with inotify then. Any other
+    /// failure of fanotify's is the watch's.
     pub(crate) fn reusing(
         spare: Option<Spare>,
         root: &Path,

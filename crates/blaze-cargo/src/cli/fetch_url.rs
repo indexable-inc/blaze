@@ -26,7 +26,7 @@ const USAGE: &str = "blaze fetch-url takes one JSON value: '{\"url\": \"https://
 
 pub fn main(words: &[OsString], color: bool) -> i32 {
     let refused = |what: &str, code: i32| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         code
     };
     let json = match words {
@@ -83,7 +83,7 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
     });
     match (asked, stored) {
         (Ok(()), Some(said)) => {
-            println!("{said}");
+            blaze_report::outln!("{said}");
             0
         }
         (Ok(()), None) => refused("blaze fetch-url: the daemon answered with nothing stored", 1),

@@ -19,10 +19,23 @@ pub enum Step {
     Mir = 1,
     /// `hir_ty_borrowck::gate::checked`: that the borrow check passed.
     Borrowck = 2,
+    /// `const_eval_query` of a `const` item with no generic arguments: its value
+    /// (`super::konst`).
+    Const = 3,
 }
 
 impl Step {
-    pub const ALL: [Step; 3] = [Step::Infer, Step::Mir, Step::Borrowck];
+    pub const ALL: [Step; 4] = [Step::Infer, Step::Mir, Step::Borrowck, Step::Const];
+    /// How many steps there are: the length of an array indexed by a step.
+    pub const COUNT: usize = Step::ALL.len();
+
+    /// Whether the step's answers come from the kernel's verified body entries
+    /// ([`super::entries`], posted by [`super::entries::serve`]), not from the item store's
+    /// own records: every step but a constant's value, which has no entry yet
+    /// (`blaze_kernel::steps::BODY_CONST` is its number, owed).
+    pub const fn served(self) -> bool {
+        !matches!(self, Step::Const)
+    }
 }
 
 /// What one read a step made stands for.
@@ -32,6 +45,19 @@ pub enum Classified {
     Covered,
     /// It stands for this fact, whose value goes into the record's key.
     Fact(FactRef),
+    /// As [`Classified::Fact`], of a read that took a whole table where a lookup would do (an
+    /// iteration of a module's scope): its fact changes with any row of the table, so the
+    /// flush counts it by who read it ([`Flushed::scans`](super::Flushed::scans)).
+    Scan(FactRef),
+    /// Its value is a function of what its own row read and nothing else (a type's layout,
+    /// and the derived tables a layout reads): the store classifies the row's kept reads in
+    /// its place, through any of them that is `Through` again, down to reads that are
+    /// covered, facts or refused. So what decides the value is traced as the facts there
+    /// already are, each keyed by an item or a crate, and nothing is keyed by the read's own
+    /// arguments (a type, whose interned id is one process's). Any function's row may be
+    /// given this: the walk brings it up to date by its key (`blaze_query::db::refresh`).
+    /// One a store answered, or that cannot be brought up to date, is refused by name.
+    Through,
     /// It stands for nothing the store can key: the result is not stored.
     Refused,
 }
@@ -61,10 +87,18 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// crates it loads); `None` when it cannot be hashed now.
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId>;
 
-    /// The key of a definition `body`'s record names, relative to `body`: `body` itself and what
-    /// it owns (closures, coroutines, opaque types, anonymous constants) as "self", an item one of
-    /// its paths names as "the target of that path", anything else by its item key. Two bodies of
-    /// one identity give the same item the same key in every database, under any renaming.
+    /// The earlier step of the body itself that `fact` stands for, where it is one (a body's
+    /// MIR reads its own inference): a kernel entry reads that step's entry for it
+    /// ([`super::entries`]), not a fact of the world. `None` for every other fact.
+    fn own_step(&self, fact: FactRef) -> Option<Step> {
+        let _ = fact;
+        None
+    }
+
+    /// The key of a definition `body`'s record names: `body` itself and what it owns (closures
+    /// with their kind, coroutines, opaque types) as "self", relative to `body`; anything else,
+    /// an item one of its paths names among them, by its plain item key, the same in every
+    /// database. Reading a key back ([`BodyFacts::def_of`]) lowers no body.
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId;
 
     /// The definition [`BodyFacts::def_key`] gave `key` for `body` in `db`; `None` when there is

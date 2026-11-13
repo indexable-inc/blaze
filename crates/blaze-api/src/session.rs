@@ -56,6 +56,9 @@ pub struct Daemon<'a> {
     pub budget_bytes: u64,
     /// How long the daemon has run, on its driver's clock, for [`Status::uptime_ms`].
     pub uptime_ms: u64,
+    /// How the daemon's store places outputs, once its open decided, for
+    /// [`Status::placed_by`].
+    pub placed_by: Option<&'static str>,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
     /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
     pub memory: fn() -> Snapshot,
@@ -387,9 +390,12 @@ impl Session {
         job: JobId,
         ok: bool,
         error: Option<ApiError>,
-        mut queries: Option<ViewId>,
+        built: Option<(ViewId, ContentId)>,
         out: &mut Vec<Reply>,
     ) {
+        // The view handed over and the root it is of: the root the job built, which is what
+        // the view is kept under, not the root the request was asked on where they differ.
+        let (mut queries, built_root) = (built.map(|it| it.0), built.map(|it| it.1));
         let Some(Job::Request { serial, candidate }) =
             handle(job).and_then(|it| self.jobs.remove(it))
         else {
@@ -419,7 +425,7 @@ impl Session {
                 match best.finish(candidate, ok, ran) {
                     Some(opened) if ran => {
                         cx.vfs.close(opened.files);
-                        let opened = built_in(cx.db, opened, queries.take());
+                        let opened = built_in(cx.db, opened, queries.take(), built_root);
                         keep(&mut self.kept, cx.db, opened);
                     }
                     Some(opened) => close(cx, opened),
@@ -454,7 +460,7 @@ impl Session {
                 for opened in views.iter_mut().filter_map(Option::take) {
                     if error.is_none() && *kept == Some(opened) {
                         cx.vfs.close(opened.files);
-                        let opened = built_in(cx.db, opened, queries.take());
+                        let opened = built_in(cx.db, opened, queries.take(), built_root);
                         keep(&mut self.kept, cx.db, opened);
                     } else {
                         close(cx, opened);
@@ -767,6 +773,8 @@ impl Session {
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
                     uptime_ms: cx.uptime_ms,
+                    // alloc: the reply's own copy, once per Status.
+                    placed_by: cx.placed_by.map(str::to_owned),
                     bugs: (cx.bugs)(),
                     // clone: the reply's own copy, once per Status; none when idle.
                     builds: cx.builds.to_vec(),
@@ -793,6 +801,7 @@ impl Session {
             | Request::Rebuilt { .. }
             | Request::Launch { .. }
             | Request::FetchUrl { .. }
+            | Request::Store { .. }
             | Request::ClientRows { .. } => {
                 return Err(ApiError::new(
                     "the explorer, the live feed, the profile history's flush, the collector, the \
@@ -1063,11 +1072,19 @@ fn incremental(work: &Work) -> bool {
 
 /// `opened` with the database view its build ran in, when the daemon handed one over: the
 /// session's own is closed for it.
-fn built_in(db: &blaze_query::Database, opened: Opened, queries: Option<ViewId>) -> Opened {
+fn built_in(
+    db: &blaze_query::Database,
+    opened: Opened,
+    queries: Option<ViewId>,
+    root: Option<ContentId>,
+) -> Opened {
     match queries {
         Some(queries) => {
             db.close(opened.queries);
-            Opened { queries, ..opened }
+            // Of the root the build ran on, when the daemon says which: [`keep`] files the
+            // view under it, so [`Request::Why`] of that root finds its build.
+            let view = View { root: root.unwrap_or(opened.view.root) };
+            Opened { queries, view, ..opened }
         }
         None => opened,
     }
@@ -1113,6 +1130,19 @@ fn commit_error(head: &str, base: ContentId, error: &CommitError) -> ApiError {
             format!("a commit to head `{head}` on {base:x}: {error}"),
             Some(op_path(error)),
         ),
+        CommitError::Record(error) => ApiError::new(
+            // alloc: error path, a commit the journal could not record.
+            blaze_report::say!(
+                "a commit to head ",
+                blaze_report::say::Code(head),
+                " on ",
+                blaze_report::say::Words(&format!("{base:x}")), // alloc: as above
+                " was not recorded, so the head did not move: ",
+                blaze_report::say::Words(&error.to_string()), // alloc: as above
+            )
+            .flat(),
+            Some(error.what.clone()), // clone: as above, what the record is of.
+        ),
     }
 }
 
@@ -1125,6 +1155,7 @@ fn op_path(error: &OpError) -> String {
         | OpError::NotADirectory(path)
         | OpError::Exists(path)
         | OpError::OutOfRange { path, .. }
+        | OpError::TooLarge { path, .. }
         // clone: error path, the error's own path.
         | OpError::BadLink { path, .. } => path.clone(),
         // alloc: error path, the root an op was given.
@@ -1144,6 +1175,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",
         Request::FetchUrl { .. } => "blaze fetch-url",
+        Request::Store { .. } => "blaze store",
         Request::ClientRows { .. } => "a client's profile rows",
         _ => "a request",
     }

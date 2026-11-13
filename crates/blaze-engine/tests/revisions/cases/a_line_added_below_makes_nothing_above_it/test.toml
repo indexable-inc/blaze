@@ -1,0 +1,24 @@
+about = "Positions are in no key above a crate (docs/v2/plan/design/store.md, \"Early cutoff between crates\"): in the chain `a <- b <- c <- app`, a line added to a body of `a`, which moves every line below it, makes `a`'s library and the program that links it and neither library above; then a comment and a blank line added at the top of the file, which change no token, do the same. The control of the mechanism is `a_body_edit_below_with_libraries_keyed_by_code`; the control of the positions is blaze-lower's `the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines`."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "10 10\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "22 10\n"
+redone_has = ["a::base"]
+reused = ["b::mid", "b::mid_beside", "c::top", "c::top_beside"]
+max_units = 2
+max_records = 2
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "22 10\n"
+reused = ["b::mid", "b::mid_beside", "c::top", "c::top_beside"]
+max_units = 2
+max_records = 2

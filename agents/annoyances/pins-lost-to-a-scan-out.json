@@ -1,0 +1,14 @@
+{
+ "id": "pins-lost-to-a-scan-out",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), VFS image H3 lane, int-1112",
+ "where": "crates/blaze-cas/src/collect.rs Store::keep_scan, Store::pin, current_pins (now newest_pins)",
+ "what": "Rooting the daemon image's texts needed a pin that is the name's from the moment it is made. Reading the store's pins showed three ways it was not: keep_scan replaced the store's pins with the scan's, so a pin made while a scan was out was dropped from memory until the next scan; the newest pin of a name was picked by its maker's clock, so an earlier run on a clock that ran ahead outdid a later pin; and a pin's release (empty keys) was not rooted, so once it was forgotten an older pin of the name came back on the next open. Found by reading, not by a failure: no test made a pin with a scan out.",
+ "cost": "most of the lane's reading before the file set itself could be written",
+ "cause": "the pins in memory were a cache of the last scan rather than the store's own record of what it made, and 'newest' was a wall-clock comparison across runs",
+ "class": "state rebuilt wholesale from a snapshot that was taken before the latest writes, and order across processes decided by an unsynchronised clock",
+ "prevention": "the store tracks the pins it made since opening (Collecting::made) and merges them over every scan; Store::pin writes `when` past every known pin of the name; releases are roots",
+ "workaround": "none",
+ "fix": "written, not yet compiled: the made-pin merge in keep_scan (a pin outdone by a clock rewritten past it), the `when` bump in Store::pin, newest_pins keeping releases; tests a_pin_made_while_a_scan_is_out_is_the_names_when_it_comes_back and the FileSet DST",
+ "state": "written"
+}

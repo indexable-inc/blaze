@@ -228,7 +228,7 @@ impl Body {
 }
 
 /// The syntax of the item `def` is the body of.
-fn def_syntax(db: &Db, def: DefWithBodyId) -> InFile<view::Node<'_>> {
+pub(crate) fn def_syntax(db: &Db, def: DefWithBodyId) -> InFile<view::Node<'_>> {
     match def {
         DefWithBodyId::FunctionId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
         DefWithBodyId::ConstId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
@@ -485,6 +485,15 @@ fn holds_lazy(node: view::Node<'_>) -> bool {
 fn tree_hash(node: view::Node<'_>) -> u128 {
     let (tree, at) = node.flat();
     subtree_hash(tree, at)
+}
+
+/// [`tree_hash`] of the node `node` names in its file: what a macro call (its path and tokens,
+/// the item a derive or an attribute is on) is made of, wherever it is written. What a result
+/// of a body the call writes is keyed by before the call is expanded
+/// (`blaze_item_hash::identity::early_identity`). It reads the file's tree.
+pub fn ast_node_hash(db: &Db, node: InFile<ErasedFileAstId>) -> u128 {
+    let ptr = node.file_id.ast_id_map(db).get_erased(node.value);
+    tree_hash(view::to_node(ptr, node.file_id.root(db)))
 }
 
 /// [`syntax::FlatTree::subtree_hash`] of `at`: what a body's or a signature's tree is compared

@@ -1,0 +1,19 @@
+{
+ "id": "kernel-parts-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-parts",
+ "where": "crates/blaze-kernel/src/nest.rs, crates/blaze-kernel/src/session.rs, crates/blaze-kernel/src/exhaustive/nested.rs",
+ "what": "A lane with a 200K context that must not read whole files spent over half of it reading the functions a part read crosses (Reads, the walk, the engine, the carry, the session's post, seed and queue), because a read of a step's value is special-cased by `ReadKind::STEP` in six places across four files with no one function that says what a kernel-answered read is. The exhaustive model in exhaustive/nested.rs (619 lines) could then not be read and extended in the same lane, so the three controls of part reads were written as a smaller exhaustive check in tests/cost.rs and the model's way is owed.",
+ "cost": "the brief's exhaustive piece moved to a successor lane; piece 2 (maintained steps) not started",
+ "whys": [
+  "why half the context went to reading: a step read is valued in `Walk::now`, `Engine::now`, `Reads::step`, `Session::post`, `Session::seed` and `Kernel::describe`, each by its own `kind == STEP` test",
+  "why six places: the first step read was added as a special case of a world read, and nothing since gathered the cases",
+  "why the model was out of reach: nest.rs and session.rs are over 1,100 lines each, and the model can only be extended by someone who has read both it and them"
+ ],
+ "cause": "the kinds of read the kernel answers itself had no single home: each consumer tested for the one kind there was",
+ "class": "a second case of something special-cased by an equality test in many places costs a reading of every place",
+ "prevention": "`table::split(read)` is now the one function that says which step, and what of its value, a kernel-answered read is of, and `ReadKind::is_kernels` the one test; a new kernel kind is added there",
+ "workaround": "",
+ "fix": "done for the lookup, the run, the session and the carry; owed: the table step as a way of the model in exhaustive/nested.rs",
+ "state": "open"
+}

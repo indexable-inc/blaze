@@ -1,0 +1,14 @@
+{
+ "id": "launcher-needs-a-daemon-to-start",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 10 task C executor, int-1112",
+ "where": "crates/blaze-launcher/src/main.rs main, crates/blaze-launch-rt/src/control.rs Control::run",
+ "what": "A built program run by hand, or a `blaze run` with nothing changed, could not start without a daemon: the launcher connected to the daemon's socket before running a line and stopped when nothing listened, and the thin `blaze` asked the daemon even when nothing had changed. So a run with nothing to do cost a daemon kept alive (or started) for it, and a daemon that exited when idle would have broken every program run by hand.",
+ "cost": "the no-daemon run (end-state/daemon.md 4.3) could not be built until both sides were changed; D29 had kept 'not a process a run' because of it",
+ "cause": "the launcher's first state was a socket, and nothing the daemon wrote let a process outside it start the program or vouch for its last answer",
+ "class": "a client whose first step is a server, so the server's lifetime is set by its clients rather than by the work it has",
+ "prevention": "what a client needs to start is a file the server wrote durably (the start file, the request slot), checked by lstat stamps; the server is joined only when the file does not vouch",
+ "workaround": "keep a daemon running",
+ "fix": "the launcher starts from `<program>.blaze-start` and joins a daemon once, on its first need (Join::Later); the thin client answers from `<state>/slots/<key>` (blaze-thin solo.rs) and leaves the rest to a daemon. Controls: control.rs Plant::JoinsTwice, the start file's cut frame, and the five revision cases' altered outputs.",
+ "state": "written, not built"
+}

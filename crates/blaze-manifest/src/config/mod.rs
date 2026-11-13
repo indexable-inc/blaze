@@ -1348,20 +1348,11 @@ fn cargo_home(cwd: &Path, env: &BTreeMap<String, String>) -> anyhow::Result<Path
     match env.get("CARGO_HOME").filter(|h| !h.is_empty()) {
         Some(home) => Ok(cwd.join(home)),
         None => {
-            let dir = home_dir(env)
-                .ok_or_else(|| anyhow!("Cargo couldn't find your home directory. This probably means that $HOME was not set."))?;
+            // The home of the user whose environment `env` is ([`blaze_core::home`], the one
+            // answer): its `HOME`, else the system's record of the user.
+            let dir = blaze_core::home::user_in(|name| env.get(name).map(std::ffi::OsString::from))
+                .map_err(|why| anyhow!("CARGO_HOME is not set, and cargo's home is .cargo in your home directory: {why}"))?;
             Ok(dir.join(".cargo"))
         }
-    }
-}
-
-fn home_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    if cfg!(windows) {
-        env.get("USERPROFILE")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
-            .or_else(std::env::home_dir)
-    } else {
-        env.get("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).or_else(std::env::home_dir)
     }
 }

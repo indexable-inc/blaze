@@ -60,14 +60,14 @@ several readers.
     file's; `blaze slow` still reads every file, as its recorder counts take the last counter
     before the build.
 
-    **The cap.** Past `history::CAP_BYTES` (256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's
-    environment sets another, and 4096 is what it was until 2026-11-11) the history first
+    **The cap.** Past `history::cap_for` of the home's store as the daemon started (a quarter
+    of its bytes, between 8 and 256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's environment
+    sets another, and 4096 is what it was until 2026-11-11) the history first
     deletes its files of no build (what a daemon wrote between builds), oldest first, and only
     then its oldest builds whole, every table of a build at once, never one table of a build:
     a daemon left idle never writes a build's rows out of the history while rows of no build
-    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB, so the default
-    holds a small project's cold build and several hundred edits, and of a large workspace its
-    newest builds.
+    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB; the newest
+    flush's builds are never retired, so the build asked about is whole whatever the cap.
 
     **Between builds.** What a default profile records while no build runs is lean
     (2026-11-11: an idle daemon wrote 1.2 MB a minute, now 0.15 MB). A thread blocked inside
@@ -352,6 +352,156 @@ The `fiber_stacks` view has one row per job, and `jobs_by_stack_high_water` rank
 jobs by `deepest + grown`. A later choice between fibers and a narrow stackless primitive
 rests on these numbers.
 
+### `accounts`: one row a build that ended, its account
+
+The build's account (`crates/blaze-profile/src/account.rs`): one small fixed record that says
+what change the build saw, what work it did, and for each piece of work the cause that made
+it necessary. It is made for every build that ends, on the history's thread, from rows the
+build already gave (`query_counts` and the ends of `blaze why`'s chains of reasons), so no
+part of a build has to remember to report to it. `blaze explain account [build=N]` prints
+it with its proportions and what the profile lost; `blaze slow` prints it in a line under
+the build's problems; `blaze explain unaccounted` lists the builds whose account alarms.
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64 | the build |
+| written | u64 | the engine's input writes, an equal value too: the change the build saw |
+| written_source | u64 | of `written`, writes of a file's bytes (`FileText`, `IncludedFile`) |
+| written_environment | u64 | of `written`, writes of the process environment |
+| written_plan | u64 | of `written`, writes of the plan: crates, source roots, settings, proc macros, the front end's identity |
+| written_derived | u64 | of `written`, what blaze publishes into the engine from its own results: blaze's own writes |
+| written_unattributed | u64 | of `written`, writes of an input kind `account::Writer::of_input` does not name: must be 0 |
+| executed | u64 | the engine's rows run |
+| verified | u64 | the engine's rows proved unchanged without running |
+| ran_new | u64 | of `executed`, first runs |
+| ran_changed | u64 | of `executed`, runs because a read changed |
+| ran_untracked | u64 | of `executed`, runs because of an untracked read |
+| ran_cycle | u64 | of `executed`, runs for a cycle |
+| ran_evicted | u64 | of `executed`, runs for a value evicted and asked for again |
+| ran_uncaused | u64 | of `executed`, runs no cause counts: must be 0 |
+| unbalanced | u64 | how many of the account's sums do not hold: must be 0 |
+| steps | u64 | the steps computed again: the build's `misses` rows |
+| units | u64 | of `steps`, units whose record was not found |
+| unkept | u64 | of `steps`, units made whose record was not kept: the next build makes them again |
+| scripts | u64 | of `steps`, build scripts' runs |
+| functions | u64 | of `steps`, functions whose code was made again |
+| other_steps | u64 | of `steps`, the rest |
+| links | u64 | images linked |
+| by_workspace_file | u64 | steps whose chain of reasons ends in a changed file of the workspace |
+| by_built_file | u64 | steps that end in a changed file under a build directory |
+| by_lock_file | u64 | steps that end in a changed lock file |
+| by_outside_file | u64 | steps that end in a changed file outside the workspace |
+| by_input | u64 | steps that end in a changed input that is no file |
+| by_first | u64 | steps computed for the first time |
+| by_evicted | u64 | steps whose result or record was dropped since they were last computed |
+| by_left | u64 | steps the build before left: it failed or was stopped, and kept nothing |
+| by_forced | u64 | steps computed because that was asked for |
+| by_unstable | u64 | steps whose key differs with the same inputs: must be 0 |
+| by_unexplained | u64 | steps with no recorded reason: must be 0 |
+| changes | u64 | the distinct changed inputs the steps' chains name |
+| first_change | utf8? | the first of them by name |
+| history_dropped | u64 | rows the history could not write since the daemon began, by this build's end |
+| alarms | utf8? | what the account warns of, by name, joined with `, `; null when the work is explained and fits the change |
+
+**The sums.** Each is held when the account is made, and one that fails is counted in
+`unbalanced`, said as a WARN event naming it, and is a bug in blaze:
+
+- per query function, `ran_new + ran_changed + ran_untracked + ran_cycle + evicted_asked` is
+  `executed` (what is over is `ran_uncaused`);
+- the five `written_*` add up to `written`;
+- the eleven `by_*` add up to `steps`: each step is counted once, under the first of its
+  chain's ends in this order: unexplained, unstable, a changed workspace file, a changed
+  input that is no file, a changed file outside the workspace, a lock file, a built file,
+  left, evicted, forced, first. A bug comes first so no change hides one;
+- `units + unkept + scripts + functions + other_steps` is `steps`.
+
+The last three hold by how the row is counted and are asserted in debug builds; the first
+is the engine's counters', read while its threads count, and is reported, not asserted.
+
+**Unexplained is a number that must be zero.** `by_unexplained + by_unstable + ran_uncaused`
+is work with no recorded cause. Where it is not zero the bug is in the code that started
+the work without saying why, and `blaze why --unexplained` lists the steps. Code that starts
+work and wants its cause checked says it through `account::Ledger`: `Ledger::did(stage,
+what, cause)` takes the `Cause` as an argument (a change of this build, other work of this
+build whose result it reads, or a standing reason: first time, evicted with the give-back
+that evicted it, not kept and why, left by a failed build, forced), so a site cannot start
+work and leave it out, and `Ledger::close` follows every cause to its root and holds each
+stage's pieces to the total the stage said.
+
+**Proportion.** A build's work is set against the size of its change, and past a threshold
+the account names an alarm, which is a WARN event of the build (so `blaze explain problems`,
+`blaze slow` and `blaze why` list it) and a name in `alarms`:
+
+| alarm | when | what it found (2026-11-11/12) |
+|---|---|---|
+| `unexplained` | a step with no recorded reason or an unstable key, or a run no cause counts | 9 of 53 builds of the soundness oracle |
+| `unbalanced` | a sum above does not hold | |
+| `unattributed` | a write of an input kind with no writer named | |
+| `work-without-change` | nothing was written from outside and no step names a changed input, yet more than 64 rows ran for a reason other than a first run, or a step was made for a bug | 820,026 queries rerun under "up to date" |
+| `needless-writes` | inputs were written, and no row ran for a changed read, no row ran first and no step names a change | a no-op that wrote 53 inputs |
+| `disproportionate` | more than 16 steps made again for each changed input | 46 units remade by every build of reth |
+| `rows-per-write` | more than 10,000 rows run for a change or verified, for each input written from outside | |
+| `unkept` | a unit was made whose record was not kept | the same 46 units |
+
+The thresholds are `account::QUIET_ROWS`, `STEPS_PER_CHANGE` and `ROWS_PER_WRITE`. The
+revision harness holds every revision of every case to "no alarm" (its check `account`), and
+the budget smoke holds each warm step to it (`harness/v2/guards.py`, the bounds `unexplained`,
+`unbalanced`, `alarms`, `history_dropped`); what fails today is listed with its cause in each
+case's `known` and in `harness/v2/guards-known.toml`, and a listed failure that passes fails
+the run until it is taken out, so the lists only shrink.
+
+**Who wrote an input.** The engine counts a write per input kind and no write says who made
+it, so the account attributes by kind (`account::Writer::of_input`), and a test over the
+tree's `#[blaze_query::input]`s fails for a kind with no writer named. One input is written
+by a plan and by blaze alike: base-db's `CrateSlot`, one a thing given to one crate
+(`Crate::give::<K>`). Its writes are counted by the slot's kind `K` (`base_db::take_given`,
+taken with the engine's counts) and attributed by it (`account::Writer::of_slot`: a plan's
+proc macros and its primary flag to the plan, a published resolution or a served
+dependency's slot to blaze); the
+same test fails for a kind given anywhere in the tree with no writer named, and a write of
+`CrateSlot` no kind counted is unattributed. A kind's first gift to a crate makes the slot,
+which is no write of `CrateSlot` to the engine; it writes the crate's list of slots, a
+write of `Crate`, counted with the plan's whatever the kind. A file's writes are
+told apart further where they matter, in the steps: a step that ends in a changed file is
+counted by where the file is (the workspace, a build directory, a lock file, outside the
+workspace). Not recorded yet: which code wrote an input (the watcher's wake, the request's
+plan, a publication), which needs the setter to take its writer; until then `blaze explain
+writes` names each written input's fields that reruns followed.
+
+### When the history loses rows
+
+The history never stops silently (`crates/blaze-profile/src/supervise.rs`):
+
+- **A batch arrow cannot hold.** A table's rows are made into batches of at most 65,536
+  rows; a batch whose making panics (a text column past the 2 GiB its `i32` offsets address)
+  is halved until its rows fit, at most 64 halvings a table a flush, and a row that fits no
+  batch alone is left out. A WARN event names the table, the rows and the halvings, so the
+  table whose text passed the bound is on record the first time it happens. The fact tables
+  (`misses`, `key_parts`, `provenance`) are bounded by their text's bytes before that
+  (`facts::BATCH_TEXT_BYTES`).
+- **A flush that panics** is contained (`History::flush_contained`): the rows it had read
+  are dropped, counted by table, and the next flush goes on.
+- **A build's explaining that panics** fails that build's explanation alone: `blaze why`
+  answers it with the one reason that it could not be explained, and its account counts
+  that step unexplained.
+- **Any other panic of the history's thread** is caught by its supervisor: said once (again
+  when the panic is another one), and the thread goes on with the next message, keeping
+  what it held. More than 8 panics within 60 s end the thread, which says so; from then on
+  the daemon says with every build that no build is written.
+- **What was dropped is counted by table** since the daemon began (`History::dropped`) and
+  shown: the `history:` line of `blaze daemon status` says the tables and the rows, each
+  build's account carries the total (`accounts.history_dropped`), and `blaze slow` says it
+  under the account.
+- **The flight recorder's own losses** (`profile spans lost`, `profile rows skipped`) are a
+  WARN event each flush they grew in, `blaze slow`'s recorder line, and columns of `blaze
+  explain account`.
+
+`blaze explain problems` reads the picked builds' events alone before it joins anything
+(an event of a picked build is tagged with it or with none and is no earlier than the first
+picked build's start); DuckDB runs with 8 threads, a 4 GiB limit and a spill directory
+(`sql.rs`). Not tested on a large history yet: the largest history each view is tested at
+is the fixtures' few rows.
+
 ### `builds`: one row a build request the daemon ran
 
 | column | type | |
@@ -374,6 +524,8 @@ rests on these numbers.
 | client_ended_ns | i64? | when that client sent its rows, at its request's end |
 | daemon_user_ns | i64? | the daemon process's user CPU over the build (getrusage `RUSAGE_SELF`, the end less the start); null in the `running` row |
 | daemon_system_ns | i64? | the same, system CPU |
+| solo_slot | utf8? | a solo answer's request slot key: its client answered with no daemon asked, and the next daemon took its kept rows (client times as its own, misses 0); null for a daemon's build |
+| solo_certified_by | u64? | a solo answer's: the build whose answer its slot held |
 
 A build has two rows: one of outcome `running` and null `dur_ns`, written as it starts (the
 history flushes at once), and one as it ends, with the same `started_ns`. The `builds` view keeps
@@ -394,7 +546,20 @@ request's end as `Request::ClientRows` (blaze-api schema 38), every row tagged w
 id the daemon gave it in `Worked::build_id`, with its start and end on the history's clock.
 The daemon writes them into `spans`, `events` and `folded` as the client's process
 (`process_name` = `blaze client`, `pid` the client's) and refuses rows of another build. The
-times go on a third row of the build in `builds` with `client_started_ns` and
+thin `blaze`, which has no flight recorder, sends its spans by name instead (schema 55,
+`ClientRows::timed`) on the request's own connection just before it execs the program:
+`client: exec to main` (from the kernel's start of the process), `client: solo check`,
+`client: connect`, `client: request on the wire` and `client: answer to exec`; the daemon
+makes them `spans` rows of the client's process. Every client sends its rows on the command's
+own connection, before it closes: a command is one connection (until 2026-11-12 the engine's
+were a second). When the thin `blaze` hands its answer to the engine (blaze-thin
+`handover`), the spans it timed until then and the kernel's start of the process go with it;
+the engine sends them inside its own `spans` batch, after its recorder's rows, so the
+command's rows are one client's, once each, and its start is the thin `blaze`'s. A command the
+thin `blaze` answered with no daemon (its own check, blaze-thin `solo`) writes its spans as
+`<state>/solo-rows/<pid>` (blaze-thin `kept`: made whole as `<pid>.part`, then renamed), which
+the next daemon is to take, each as a build of its own (the daemon's side is not built yet).
+The times go on a third row of the build in `builds` with `client_started_ns` and
 `client_ended_ns`; the view keeps the row with `dur_ns` and those times. A client's rows that
 arrive before the build's end row are held and go on it. The daemon answers the client as it
 hands the rows to the history's thread, before they are written, so the client's exit waits
@@ -519,8 +684,11 @@ The query engine's run log (`blaze_query::db::take_log_in`), on while the daemon
 first run (a cold build's runs are `query_counts.ran_new` alone, so a cold build writes few
 rows), and one row the first untracked read of a run. Verified rows are counted, not listed.
 Rows are sorted by query, key, view and cause, so two runs of one build write the same rows.
-Past 2^19 entries between two builds' ends the log keeps the first and the daemon warns with
-the number dropped; the counts still hold every run. Before schema 4 nothing wrote this table.
+The log keeps its first 2^19 entries between two builds' ends whole; past them it keeps one
+entry in 64 as a sample (`weight` 64: `sum(weight)` estimates the runs and a `GROUP BY
+cause_key` keeps their proportions), up to 2^18 samples, and only counts what is past those.
+The daemon warns with the numbers each time, and `query_counts` holds every run exactly
+whatever the log keeps. Before schema 4 nothing wrote this table.
 
 | column | type | |
 |---|---|---|
@@ -533,6 +701,7 @@ the number dropped; the counts still hold every run. Before schema 4 nothing wro
 | cause_key | utf8? | for `changed`: the read that changed, `` `Input.field`(<row>) `` for an input's or tracked struct's field (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``; another row by its id), else a memo named as `query_key` names it, whose own row says why it changed |
 | cause_kind | dict? | what `cause_key` is: `input`, `tracked`, `interned` or `function` |
 | what | utf8? | for `untracked read`: its name, the `what` of `Untracked { what }` |
+| weight | u32? | how many logged runs the row stands for: 1 for a run kept whole, 64 for a sample of the runs past the log's bound; null in files of a blaze before it (every row one run) |
 
 Each storage keeps its own log as node keys, so logging formats nothing; the build's front end
 takes it as the build ends, with its database attached (`blaze_query::db::take_log_in`, through

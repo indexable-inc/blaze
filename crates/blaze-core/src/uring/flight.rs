@@ -220,7 +220,10 @@ impl Uring {
             }
             Kind::Sync => {
                 let (fd, flags) = kept();
-                Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
+                // `fsync_flags`: the data and the length alone for a barrier, which is all
+                // an ordering needs; everything of the inode for a sync.
+                let op_flags = if hot.flags & ops::DATA != 0 { IORING_FSYNC_DATASYNC } else { 0 };
+                Sqe { opcode: OP_FSYNC, flags, fd, op_flags, user_data, ..Sqe::default() }
             }
             // The asker's memory, which stays where it is until the request's last completion
             // (`Effect::ReadInto`'s and `Effect::WriteFrom`'s contract, `Spans::register`'s).
@@ -629,7 +632,14 @@ impl Uring {
                 }
             }
             Kind::Sync if res < 0 => Step::Ends(failed(res)),
-            Kind::Sync => Step::Ends(Some(self.synced(Handle::from_bits(hot.of)))),
+            Kind::Sync => {
+                let done = match (self.synced(Handle::from_bits(hot.of)), hot.flags & ops::DATA) {
+                    (Done::Synced, 0) => Done::Synced,
+                    (Done::Synced, _) => Done::Ordered,
+                    (failed, _) => failed,
+                };
+                Step::Ends(Some(done))
+            }
             Kind::WriteAt
             | Kind::Write
             | Kind::Rename

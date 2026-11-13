@@ -946,6 +946,8 @@ mod tests {
                 defaults: RecordDefaults(&[1]),
             },
             TypeRef::Record { names: Names::EMPTY, types: &[], defaults: RecordDefaults(&[]) },
+            // `T0 | T1`, an error union.
+            TypeRef::Union(&[T0, T1]),
         ]
     }
 

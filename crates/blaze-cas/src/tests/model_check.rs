@@ -1,4 +1,4 @@
-//! The store against a map: any run of puts, flushes, settles and reopens reads back what the
+//! The store against a map: any run of puts, flushes, settles (whole, and in steps) and reopens reads back what the
 //! map holds, refuses other bytes under a key it has, and verifies clean.
 
 use std::collections::BTreeMap;
@@ -14,8 +14,11 @@ enum Op {
     Put(u64, Vec<u8>),
     Get(u64),
     Flush,
-    /// Settles until it has nothing more to do now, as the daemon's idle loop does.
+    /// Settles until it has nothing more to do now.
     Settle,
+    /// A period ended and its moves made in steps of at most this many bytes, as the daemon's
+    /// loop does between requests.
+    Steps(u64),
     /// A flush, then the store dropped and opened again.
     Reopen,
 }
@@ -34,11 +37,12 @@ fn bytes(tc: &TestCase) -> Vec<u8> {
 
 #[hegel::composite]
 fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
+    match tc.draw(gs::integers::<u8>().max_value(10)) {
         0..5 => Op::Put(tc.draw(gs::integers().max_value(15)), bytes(tc)),
         5 | 6 => Op::Get(tc.draw(gs::integers().max_value(15))),
         7 => Op::Flush,
         8 => Op::Settle,
+        9 => Op::Steps(tc.draw(gs::integers().min_value(1).max_value(300 << 10))),
         _ => Op::Reopen,
     }
 }
@@ -108,6 +112,9 @@ fn runs_as_a_map_does(ops: Vec<Op>, seed: u64, plant: bool) -> Result<(), String
                         break;
                     }
                 }
+            }
+            Op::Steps(most) => {
+                settle_in_steps(&mut sim, &mut store, most);
             }
             Op::Reopen => {
                 flush(&mut sim, &mut store);

@@ -110,7 +110,7 @@ pub fn found() -> Option<Chosen> {
         return Some(Chosen(dir.clone()));
     }
     let release = own::Release::ours()?;
-    let dir = release.dir()?;
+    let dir = release.dir().ok()?;
     if !own::complete(&release, &dir) {
         return None;
     }
@@ -130,13 +130,9 @@ pub fn ensure() -> Result<Chosen, String> {
             "blaze builds with Rust {ours}, and the Rust project publishes no copy of it for this machine that blaze knows"
         ));
     };
-    let Some(dir) = release.dir() else {
-        return Err(format!(
-            "blaze builds with Rust {ours} and keeps it in .blaze/toolchains in your home \
-             directory, for every BLAZE_HOME, and no home directory is set (HOME, or \
-             USERPROFILE on Windows)"
-        ));
-    };
+    // Why there is no directory names what was tried and the setting that names one
+    // (`own::toolchains`, `BLAZE_TOOLCHAINS`).
+    let dir = release.dir().map_err(|why| format!("blaze builds with Rust {ours}: {why}"))?;
     own::fetch(&release, &dir)?;
     let _ = FOUND.set(dir.clone());
     Ok(Chosen(dir))

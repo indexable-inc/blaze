@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a build of reth with nothing changed (query engine, ProcMacros)",
+ "what": "Every build of reth with nothing changed wrote 53 inputs, all `ProcMacros` (query_counts of builds 5 and 7), and verified 22.7 to 23.3 million rows. Each build loads every proc-macro crate's expanders again (its unit's record replayed); each load cleared every unit's identity and set the one map of every crate's macros at Durability::HIGH, with expanders compared by the address of a library made anew each load.",
+ "cost": "the floor of every warm request on reth: 23 M verifications, 53 maintenance passes; found in one evening from `query_counts.written`",
+ "cause": "a setter that opens a view for an equal value, and a caller (`ProcMacros::give`) that did not compare first",
+ "whys": [
+  "why slow: 23 M rows verify again in a build that changed nothing",
+  "why: a view of kind HIGH opened 53 times",
+  "why: `ProcMacros::give` set the map though each crate's list was the one it had",
+  "why possible: `InputSetter::to` opened a view for any set, equal or not, so every one of some hundred write sites had to remember to compare, and equality of expanders was pointer equality",
+  "property: writing an input is a change by definition of the engine, whatever is written"
+ ],
+ "class": "an unchanged value written as a change: any host that gives an input again what it gave before (environment, proc macros, a build script's run, a file's text) invalidates by durability, at a cost of the whole database",
+ "prevention": "built (a84da462e0, 92b7dc9ef0): `InputSetter::to` of the value the field holds at its durability opens no view and counts no write (input fields are PartialEq; handle types compare by handle); the engine simulation `a_request_that_changes_nothing_writes_no_input_and_an_edit_runs_what_reads_it` with the control `the_oracle_catches_an_equal_set_that_opens_a_view` (Plant::EqualSetsWrite); the revision harness's `max_written` (0 for a request that changes nothing) in the case a_build_with_nothing_changed_writes_no_input_and_makes_no_unit",
+ "fix": "a84da462e0: on reth the second build with nothing changed writes 0 inputs and verifies 61,409 rows (was 53 and 22,720,518)",
+ "state": "fixed a84da462e0"
+}

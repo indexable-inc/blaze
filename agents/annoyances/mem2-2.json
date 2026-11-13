@@ -7,5 +7,6 @@
  "cost": "one measurement run that never started, found twenty minutes later",
  "cause": "pattern matching on full command lines",
  "workaround": "`pgrep -f \"engine serv[e]\" | xargs -r kill`",
- "state": "open"
+ "state": "open",
+ "class": "vacuous success (A39): the rest of a script silently did not run"
 }

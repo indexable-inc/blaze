@@ -1,5 +1,5 @@
-//! Built MIR through the item store: a body's MIR and its closure's, built and flushed in one
-//! database, are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
+//! Built MIR through the item store: a body's MIR and its closure's, built in one database and
+//! kept by the kernel's entries (`body_store::tests::kept_by_the_kernel`), are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
 //! built there; both databases encode it to the same bytes; a lowering error is never stored; a
 //! corrupt answer is an error naming the body; a hit allocates only what decoding makes; a
 //! record holds a slot for each location literal and reads it where the body is now.
@@ -16,7 +16,6 @@ use blaze_hash::HashMap;
 use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
-    deps::ImageStore,
     expr_store::{Body, ExpressionStore},
     hir::{BindingId, ClosureKind, Expr, ExprId},
     nameres::{crate_def_map, demand::crate_body_owners},
@@ -27,14 +26,14 @@ use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_type_ir::inherent::Ty as _;
 use std::alloc::Global;
 
-use super::{RAN, built, decode, encode, lookup_mir, place};
+use super::{ONE_PLACE, RAN, built, decode, encode, lookup_mir, place, schema_of};
 use crate::{
     CallableDefId, InferBodyId, MemoryMap,
     body_store::{
         BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
-        record::{self, AnswerKey, ShapeRef},
         tests::{
-            BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps,
+            Defs, FIXTURE, Memory, Session, db_of, function, kept_by_the_kernel, second, session,
+            without_steps,
         },
     },
     db::{InternedClosure, InternedClosureId},
@@ -43,7 +42,7 @@ use crate::{
         MirPhase, MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue,
         Statement, StatementKind, Terminator, TerminatorKind,
     },
-    next_solver::{DbInterner, Ty, default_types, goal_store::solver_version},
+    next_solver::{DbInterner, Ty, default_types},
 };
 
 /// What a test asks the store for: the MIR of `closures` or of its closure, or a lowering that
@@ -308,32 +307,18 @@ fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
         assert_eq!(*built, mir_of(&first.db, owner_of(&first.db, ask)));
         forms[usize::from(closure)] = stable(&first, owner_of(&first.db, ask));
     }
+    kept_by_the_kernel(&first, &memory);
     let flushed = first.installed.flush().unwrap();
-    assert_eq!(flushed.written, 2, "the body's MIR and its closure's, each a record: {flushed:?}");
-    assert_eq!(memory.len(), 4, "a shape and an answer each");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
+    assert_eq!(memory.len(), 0, "nothing is filed in the item store's records");
+    assert_eq!(memory.entries(), 2, "the body's MIR and its closure's, each an entry");
     (memory, defs, forms)
 }
 
-/// Where `owner`'s MIR answer is in `memory`, from its shape in slot 0: its store key and its
-/// answer key.
-fn answer_of<'db>(
-    memory: &Memory,
-    s: &'db Session,
-    owner: MirOwner<'db>,
-) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
-    let (def, schema) = place(&s.db, owner).unwrap();
-    let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
-    let base = record::base_key(&identity, Step::Mir, &schema, &solver_version(&BUILD));
-    let shape_key = record::shape_key(&base, 0);
-    let shape =
-        memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
-    let mut key = AnswerKey::new(&shape_key);
-    for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, def, fact).unwrap());
-    }
-    let answer_key = key.finish();
-    (record::answer_at(Step::Mir, &answer_key), answer_key)
+/// The schema `owner`'s MIR is filed under.
+fn schema_of_mir<'db>(s: &'db Session, owner: MirOwner<'db>) -> blaze_format::SchemaHash {
+    let (def, at) = place(&s.db, owner).expect("the test's owners are a body's");
+    schema_of(&s.db, def, at)
 }
 
 #[test]
@@ -342,10 +327,14 @@ fn a_body_and_its_closure_are_two_records_under_the_body() {
     let def = function(&db, "closures");
     let body = MirOwner::Body(InferBodyId::DefWithBodyId(def));
     let closure = MirOwner::Closure(closure_of(&db, def));
-    let (body_def, body_schema) = place(&db, body).unwrap();
-    let (closure_def, closure_schema) = place(&db, closure).unwrap();
+    let (body_def, body_place) = place(&db, body).unwrap();
+    let (closure_def, closure_place) = place(&db, closure).unwrap();
     assert_eq!((body_def, closure_def), (def, def), "a closure's MIR is filed under its body");
-    assert_ne!(body_schema, closure_schema, "and apart from the body's own");
+    assert_ne!(
+        schema_of(&db, def, body_place),
+        schema_of(&db, def, closure_place),
+        "and apart from the body's own"
+    );
 }
 
 #[test]
@@ -398,19 +387,19 @@ fn a_lowering_error_is_never_stored() {
     reset_ran();
     assert!(built_mir(&first.db, failing).is_ok());
     assert_eq!(ran(), 1, "the body is built once it lowers");
-    assert_eq!(first.installed.flush().unwrap().written, 1);
+    assert_eq!(first.installed.flush().unwrap().written, 0, "a served step's record is the kernel's entry");
 }
 
 #[test]
 fn a_corrupt_answer_is_an_error_naming_the_body() {
     let (memory, defs, _) = stored();
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, answer_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     drop(probe);
 
     let mut garbage = vec![0u8; 256];
     garbage[..16].copy_from_slice(b"not a MIR answer");
-    memory.set(at, &record::write_answer(&answer_key, &garbage));
+    memory.set_answer_under("closures", Step::Mir, schema, &garbage);
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     let ask = ask(&fresh, false);
     let def = ask.def(&fresh.db);
@@ -460,10 +449,10 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
 
     // The body's answer swapped for its closure's: it decodes, and differs.
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, body_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     let closure_bytes = stable(&probe, owner_of(&probe.db, ask(&probe, true)));
     drop(probe);
-    memory.set(at, &record::write_answer(&body_key, &closure_bytes));
+    memory.set_answer_under("closures", Step::Mir, schema, &closure_bytes);
     let wrong = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
     let ask = ask(&wrong, false);
     let def = ask.def(&wrong.db);
@@ -478,12 +467,11 @@ fn a_hit_allocates_only_the_decoded_mir() {
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     for closure in [false, true] {
         let owner = owner_of(&fresh.db, ask(&fresh, closure));
-        let (def, schema) = place(&fresh.db, owner).unwrap();
+        let (def, at) = place(&fresh.db, owner).unwrap();
+        let schema = super::schema_of(&fresh.db, def, at);
         // Warm: the identity, the facts' values and every type the MIR interns.
         assert!(matches!(lookup_mir(&fresh.db, def, owner, schema), Lookup::Hit { .. }));
-        let (at, answer_key) = answer_of(&memory, &fresh, owner);
-        let answer = memory.get(&at).unwrap().unwrap();
-        let body = Aligned::copy_from(record::open_answer(answer.bytes(), &answer_key).unwrap());
+        let body = Aligned::copy_from(&memory.answer_under("closures", Step::Mir, schema));
         let (decoded, decoding) = measure(|| decode(&fresh.db, &*fresh.facts, def, &body));
         drop(decoded.unwrap());
         let (found, hit) = measure(|| lookup_mir(&fresh.db, def, owner, schema));
@@ -689,8 +677,56 @@ fn no_store_builds_as_without_one() {
     let db = second(FIXTURE);
     let def = function(&db, "closures");
     let owner = MirOwner::Body(InferBodyId::DefWithBodyId(def));
-    let (_, schema) = place(&db, owner).unwrap();
+    let (_, at) = place(&db, owner).unwrap();
+    let schema = super::schema_of(&db, def, at);
     assert!(matches!(lookup_mir(&db, def, owner, schema), Lookup::Off));
     let ask = Ask::new(&db, Durability::LOW, def, false, false);
     assert_eq!(*built_mir(&db, ask).as_ref().unwrap(), mir_of(&db, owner_of(&db, ask)));
+}
+
+/// A function with a closure and an `async` block: three MIR owners, each its own entry.
+const OWNERS: &str = r#"
+//- minicore: sized, copy, fn, future
+//- /main.rs crate:main deps:core new_source_root:local
+pub fn owners() -> u32 {
+    let id = |x: u32| x;
+    let _later = async { 2u32 };
+    id(1)
+}
+"#;
+
+/// The invariant: each MIR owner of a body has its own place and schema: `places` are
+/// distinct, and the place `place_of` finds by an owner's schema is that owner's. `Err` names
+/// the first owner that breaks it.
+fn owners_apart() -> Result<(), String> {
+    use crate::body_store::entries::{mir_schema, place_of, places};
+    let db = db_of(OWNERS);
+    let def = function(&db, "owners");
+    let places = places(&db, def);
+    assert_eq!(places.len(), 3, "the body, its closure and its `async` block: {places:?}");
+    for (n, &at) in places.iter().enumerate() {
+        if places[..n].contains(&at) {
+            return Err(format!("two owners of `owners` at {at:?}"));
+        }
+        let found = place_of(&db, def, mir_schema(&db, def, at));
+        if found != Some(at) {
+            return Err(format!("the owner at {at:?} is found at {found:?} by its schema"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn each_owner_of_a_body_has_its_own_place_and_schema() {
+    owners_apart().unwrap();
+}
+
+/// The control: owners all filed at one place ([`ONE_PLACE`]) share it, and the oracle finds
+/// them.
+#[test]
+fn the_oracle_catches_owners_filed_at_one_place() {
+    ONE_PLACE.with(|it| it.set(true));
+    let caught = owners_apart();
+    ONE_PLACE.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
 }

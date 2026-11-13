@@ -431,12 +431,25 @@ pub fn parent<'db>(
     let loc = call.loc(db);
     let at = loc.to_node_view(db);
     let around = match loc.kind {
-        MacroCallKind::FnLike { .. } => at.value.ancestors().skip(1).find(|it| {
-            !matches!(
-                it.kind(),
-                SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE
-            )
-        }),
+        MacroCallKind::FnLike { .. } => {
+            let around = at.value.ancestors().skip(1).find(|it| {
+                !matches!(
+                    it.kind(),
+                    SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE
+                )
+            });
+            match around {
+                Some(it) => Some(it),
+                // The call is the whole of an expansion (`$crate::inner!(..)`, all that
+                // `outer!` expands to): what is around it is what is around that expansion,
+                // out through its own call. Each turn leaves one expansion, so the walk ends
+                // at a file's node within the expansion depth.
+                None => {
+                    let root = at.value.ancestors().last()?;
+                    return parent(db, krate, at.with_value(root));
+                }
+            }
+        }
         MacroCallKind::Derive { .. } => {
             at.value.ancestors().find(|it| ast::Adt::can_cast(it.kind())).and_then(|it| it.parent())
         }

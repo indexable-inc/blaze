@@ -57,6 +57,8 @@ fn the_number_table_is_libcs() {
         ("FDATASYNC", libc::SYS_fdatasync),
         ("SYNC_FILE_RANGE", libc::SYS_sync_file_range),
         ("FTRUNCATE", libc::SYS_ftruncate),
+        ("LSEEK", libc::SYS_lseek),
+        ("COPY_FILE_RANGE", libc::SYS_copy_file_range),
         ("RENAMEAT2", libc::SYS_renameat2),
         ("UNLINKAT", libc::SYS_unlinkat),
         ("MKDIRAT", libc::SYS_mkdirat),
@@ -405,6 +407,49 @@ fn a_path_is_made_in_a_buffer_or_refused() {
     assert_eq!(Path::in_buffer(b"12345678", &mut buffer).map(|_| ()), Err(Errno::NameTooLong));
     assert_eq!(Path::in_buffer(b"a\0b", &mut buffer).map(|_| ()), Err(Errno::Inval));
     assert_eq!(Path::in_buffer(b"", &mut buffer).unwrap().bytes(), b"");
+}
+
+/// The symbols of `Effect::CopyData` exist and do what it rests on: `lseek` finds a file's
+/// data and its holes (a file system that keeps no holes says the whole file is data, which
+/// is still true of it), `copy_file_range` copies a range between two files at the offsets
+/// given without moving either's position, and a file made by `ftruncate` plus a copy of the
+/// data alone reads the same as its source. Each against libc's same call.
+#[test]
+fn a_files_data_is_found_and_copied_in_the_kernel() {
+    const LEN: u64 = 1 << 20;
+    const AT: u64 = 512 << 10;
+    let scratch = Scratch::new("copy-data");
+    let from = openat(scratch.fd(), Path::new(c"from"), CREATE, 0o644).unwrap();
+    assert_eq!(ftruncate(from.fd(), LEN), Ok(()));
+    assert_eq!(pwrite(from.fd(), &[7u8; 4096], AT), Ok(4096));
+    // SAFETY: both calls take numbers and no memory.
+    let (data, hole) = unsafe {
+        (libc::lseek(from.fd().raw(), 0, libc::SEEK_DATA), libc::lseek(from.fd().raw(), AT as i64, libc::SEEK_HOLE))
+    };
+    let first = lseek(from.fd(), 0, Whence::Data).unwrap();
+    assert_eq!(first as i64, data, "the first data is where libc finds it");
+    assert!(first <= AT, "the data written at {AT} is found at or before it: {first}");
+    let end = lseek(from.fd(), AT, Whence::Hole).unwrap();
+    assert_eq!(end as i64, hole, "the data's end is where libc finds it");
+    assert!((AT + 4096..=LEN).contains(&end), "{end}");
+    assert_eq!(lseek(from.fd(), LEN, Whence::Data), Err(Errno::Nxio), "no data at the end");
+
+    let to = openat(scratch.fd(), Path::new(c"to"), CREATE | OpenFlags::EXCLUSIVE, 0o644).unwrap();
+    assert_eq!(ftruncate(to.fd(), LEN), Ok(()));
+    let mut at = first;
+    while at < end {
+        let copied = copy_file_range(from.fd(), at, to.fd(), at, end - at).unwrap();
+        assert!(copied > 0, "a copy inside the source's length moves bytes");
+        at += copied as u64;
+    }
+    assert_eq!(copy_file_range(from.fd(), LEN, to.fd(), LEN, 4096), Ok(0), "nothing past the end");
+    let mut back = [1u8; 8192];
+    assert_eq!(pread(to.fd(), &mut back, AT - 2048), Ok(8192));
+    assert_eq!(back[..2048], [0u8; 2048]);
+    assert_eq!(back[2048..6144], [7u8; 4096]);
+    assert_eq!(back[6144..], [0u8; 2048]);
+    let len = statx(to.fd(), Path::EMPTY, AtFlags::EMPTY_PATH, StatxMask::BASIC).unwrap();
+    assert_eq!(len.size, LEN);
 }
 
 /// A clone shares the source's bytes where the file system can, and is the typed refusal

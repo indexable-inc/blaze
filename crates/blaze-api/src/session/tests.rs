@@ -86,6 +86,7 @@ impl World {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -478,7 +479,7 @@ fn why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over() {
     let job = world.last_job();
     let built = world.db.open(View { root });
     let replies =
-        world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some(built), out));
+        world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some((built, root)), out));
     assert_eq!(replies, [done(1, 1, true)]);
     assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(root, built)]);
 
@@ -486,7 +487,7 @@ fn why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over() {
     let job = world.last_job();
     let failed = world.db.open(View { root });
     let error = Some(ApiError::new("no".to_owned(), None));
-    world.call(|session, cx, out| session.finish_in(cx, job, false, error, Some(failed), out));
+    world.call(|session, cx, out| session.finish_in(cx, job, false, error, Some((failed, root)), out));
     assert_eq!(
         world.session.kept.iter().copied().collect::<Vec<_>>(),
         [(root, built)],
@@ -514,6 +515,7 @@ fn status_lists_every_connections_requests_sorted() {
         memory_bytes: 10,
         budget_bytes: 20,
         uptime_ms: 40,
+        placed_by: None,
         build: BUILD.clone(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -547,6 +549,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -570,6 +573,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             build: BUILD.clone(),
             bugs: Vec::new(),
             settings: Vec::new(),
@@ -697,7 +701,7 @@ fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
         (4, Request::Flush, "a read of the profile history"),
-        (5, Request::Gc { dry_run: true }, "blaze cache gc"),
+        (5, Request::Gc { dry_run: true, unkept: false }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);
         assert_eq!(error_at(&refused).as_deref(), Some(named), "{refused:?}");
@@ -850,6 +854,7 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
 fn worked() -> Response {
     Response::Work(crate::Worked {
         why: None,
+        storage: None,
         reran: 3,
         misses: 0,
         green: 9,
@@ -1017,6 +1022,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -1040,6 +1046,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -1709,4 +1716,22 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
         assert_eq!(world.session.views(), 0, "seed {seed}");
         assert_eq!(world.session.deadline(), None, "seed {seed}");
     }
+}
+
+/// A build that ran on another root than the one its request was asked on (its plan's lock
+/// files were written into its view) is kept under the root it built: `why` of that root,
+/// which is where the checkout's head is once the watcher reports the files, finds it. Until
+/// 2026-11-12 it was kept under the root asked, and `why` on the head after a cold build
+/// found no build.
+#[test]
+fn why_keeps_a_handed_view_under_the_root_the_job_built() {
+    let mut world = World::new();
+    let asked = world.commit(&[("src/lib.rs", "")]);
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    let built_root = world.commit(&[("Cargo.lock", "# a lock\n")]);
+    assert_ne!(built_root, asked);
+    let built = world.db.open(View { root: built_root });
+    world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some((built, built_root)), out));
+    assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(built_root, built)]);
 }

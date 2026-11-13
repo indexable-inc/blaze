@@ -540,6 +540,25 @@ impl<I, S> Later<I, S> {
     }
 }
 
+/// `key`'s function of `nodes` compiled alone at its dev backend, for a caller whose nodes
+/// were described just now ([`Build::near`]): the store's template, else one build's of the
+/// memo. With what the caller puts in the store.
+pub(super) fn compile_alone<B: Prepare, L: Lookup + ?Sized>(
+    backend: &B,
+    frontend: &B::Frontend,
+    memo: &Memo,
+    nodes: &Sorted<InstanceKey, Node<B>>,
+    key: InstanceKey,
+    store: &L,
+) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
+    let node = lazy_node(nodes, key)?;
+    if let Some(function) = stored_one(node, node.template_key(), key, store)? {
+        // alloc: none, empty
+        return Ok((function, Vec::new()));
+    }
+    claimed(backend, frontend, memo, nodes, node, &node.unit, &node.spec, || Ok(())).map(|it| (it.0, it.1))
+}
+
 impl<B: Prepare> Build<'_, B> {
     /// [`Build::run_with_statics`] for a live build that compiles lazily (`later`): every
     /// instance the roots reach is walked and checked, the statics are compiled, and of the

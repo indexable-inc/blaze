@@ -168,13 +168,35 @@ pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_all(&Kernel, file.fd(), bytes, None, Plant::None)
 }
 
+/// The file at `path` opened to be synced: read-only where it is there, as `fsync` and
+/// `fdatasync` need no write access and a file sealed read-only (a placed output, mode 0444)
+/// refuses an open for writing with `EACCES`; made, opened to append as an append makes it,
+/// only where it is missing (the contract of a sync and a barrier: "made where it is
+/// missing"). A file that is there is never opened for writing.
+fn to_sync(path: &Path) -> io::Result<OwnedFd> {
+    match open(path, OpenFlags::READ, Plant::None) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            open(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND, Plant::None)
+        }
+        opened => opened,
+    }
+}
+
 /// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
-/// device.
+/// device. Opened read-only where it is there ([`to_sync`]).
 pub(crate) fn sync(path: &Path) -> io::Result<()> {
-    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND;
-    let file = open(path, flags, Plant::None)?;
+    let file = to_sync(path)?;
     // durable: the effect is the sync its caller asked for.
     sys::fsync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
+}
+
+/// [`crate::Effect::Barrier`]: the file at `path`, made where it is missing, with its data
+/// (and the metadata a read of it needs: its length) on the device: `fdatasync`. Opened
+/// read-only where it is there ([`to_sync`]).
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    let file = to_sync(path)?;
+    // durable: the effect is the ordering its caller asked for; Linux's cheapest call for it is a data sync.
+    sys::fdatasync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
 }
 
 /// [`crate::Effect::WriteBack`]: the file's data that is only in memory written to its

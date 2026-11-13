@@ -29,10 +29,15 @@ pub struct BlobId([u8; 32]);
 
 impl BlobId {
     /// The id of `bytes`.
+    #[blaze::pure]
     pub fn of(bytes: &[u8]) -> BlobId {
         BlobId(blaze_ids::b3::hash(bytes))
     }
 
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

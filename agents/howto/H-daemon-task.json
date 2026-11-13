@@ -1,0 +1,9 @@
+{
+ "id": "H-daemon-task",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane carry-driver3 round 4",
+ "task": "Add a task of the daemon's plane that is no job's (crates/blaze-cargo/src/serve/job.rs)",
+ "do": "Copy the front-end carry's six places (they mirror giving.rs::give_values): (1) a kind in crates/blaze-graph/src/admission.rs `kinds` plus its `name_of` and `tag_of` arms; (2) a `Does` arm and its span in `Step::run`'s first match and its body in the second; (3) a `Value` arm (carry nothing private: hand results back through an `Arc<Lock<..>>` shared with the loop, as `CarryHand`); (4) the post: `w.plane.open`, `fresh`, `push_learned` with a per-checkout cost key, `Step::of(&never, does)`, `self.store_requests.insert(request)`, `w.plane.add`, `w.plane.close`; (5) the value in `Jobs::did`; (6) settled-without-value in `Jobs::settled`. Workers never write the store: read through `blaze_kernel::Reading { reader, guard: &blaze_cas::enter() }`, keep puts in an overlay (`front_carry::Overlay`), put them on the loop with `w.store.put` and keep the tickets.",
+ "why": "No doc says it; the previous round spent its context finding these by reading job.rs (9.6k lines).",
+ "state": "current"
+}

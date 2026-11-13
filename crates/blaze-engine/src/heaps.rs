@@ -341,7 +341,7 @@ fn make(tag: Tag) -> Option<*mut mi_heap_t> {
                 unnamed(made);
             }
             blaze_mem::tag::heap_by_tag();
-            blaze_mem::tag::heap_committed_by(committed);
+            blaze_mem::tag::heap_committed_by(committed_now);
             blaze_mem::tag::heap_gives_back_by(settle);
             blaze_mem::tag::heap_pages_by(pages);
             Some(made)
@@ -379,12 +379,22 @@ fn holder(ptr: *mut u8) -> Option<Tag> {
     None
 }
 
-/// What mimalloc has committed from the system now, over every heap: its live blocks and the free
-/// pages it keeps until it purges them (`mi_process_info`'s `current_commit`, its count of the
-/// pages it commits and decommits, kept in every build). What the memory line sets the global
-/// heap's live bytes against, and what a release's pressure counts of the heap
-/// (`blaze_mem::tag::Snapshot::heap_footprint`). It allocates nothing.
-fn committed() -> u64 {
+/// What mimalloc has committed from the system now, over every heap: its live blocks, the free
+/// pages it keeps until it purges them, and arenas it committed whole and never touched
+/// (`mi_process_info`'s `current_commit`, its count of the pages it commits and decommits, kept
+/// in every build). What the memory line sets the global heap's live bytes against, and what a
+/// release's pressure counts of the heap (`blaze_mem::tag::Snapshot::heap_footprint`). It
+/// allocates nothing.
+///
+/// Whether a purge lowers it: yes, by what the purge decommits. mimalloc 3's arena purge
+/// (`mi_arena_purge`) calls `_mi_os_purge_ex` with the purged slices that were committed, and
+/// with `purge_decommits` at its default of 1 that is `mi_os_decommit_ex`, which takes them off
+/// `committed`; so once every thread that held the pages collected them
+/// ([`blaze_mem::tag::heap_give_back_settled`]) the count falls by them, as
+/// `a_freed_heap_is_no_longer_committed_after_every_thread_settles` holds. It is still no
+/// footprint: an arena committed eagerly counts whole before a page of it is touched (Linux,
+/// `arena_eager_commit`), so it can stand far above what the system charges.
+pub(crate) fn committed_now() -> u64 {
     let mut current = 0usize;
     // SAFETY: every out-pointer but `current_commit` is null, which `mi_process_info` skips;
     // `current` is a live `usize` of ours.
@@ -632,6 +642,11 @@ mod tests {
         Layout::from_size_align(size, 16).expect("a valid layout")
     }
 
+    /// Held by each test here that measures what mimalloc commits or the process's footprint:
+    /// another's allocations between its two readings would be counted as its own.
+    static MEASURING: blaze_core::lock::Lock<()> =
+        blaze_core::lock::Lock::new("engine.heaps.test.measuring", ());
+
     /// A block made for a tag is found on that tag's heap from any thread, goes to the heap of
     /// the tag a realloc that moves it is for, and one made outside any task is no tag's.
     #[test]
@@ -700,6 +715,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_give_back_purges_the_pages_a_thread_freed_at_once() {
+        let _measuring = MEASURING.lock();
         const BLOCK: usize = 4 << 10;
         const BLOCKS: usize = 64 << 10; // 256 MiB
         let (freed, asked, settled) =
@@ -751,6 +767,7 @@ mod tests {
     /// fails the first bound.
     #[test]
     fn the_page_walk_counts_a_tags_live_blocks_and_sees_them_go() {
+        let _measuring = MEASURING.lock();
         const BLOCK: usize = 1 << 10;
         const BLOCKS: usize = 4 << 10; // 4 MiB
         let of = |tag: Tag| {
@@ -817,6 +834,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_purge_reads_the_footprint_after_a_worker_gave_back_what_another_thread_freed() {
+        let _measuring = MEASURING.lock();
         use std::sync::atomic::AtomicBool;
 
         use blaze_core::wait::{Clock as _, Deadline, Monotonic};
@@ -880,6 +898,138 @@ mod tests {
             purged.returned() >= freed / 2,
             "the purge returned {} bytes of the {freed} the worker's freed blocks held: {purged:?}",
             purged.returned(),
+        );
+    }
+
+    /// What [`freed_by_another`] saw: mimalloc's committed bytes before the blocks were made
+    /// and once the give-back settled or its wait ran out, and where the give-back stood.
+    struct Committed {
+        start: u64,
+        end: u64,
+        settle: blaze_mem::tag::Settle,
+    }
+
+    /// Four counted threads each make and touch 64 MiB of blocks (256 MiB in all), this thread
+    /// frees every one of them (so into the makers' own pages, which only each maker may
+    /// collect), asks a give-back and waits `within` for it to settle. The first `settling`
+    /// makers look for a give-back every millisecond, as an idle worker woken for it does; the
+    /// rest never do.
+    fn freed_by_another(settling: usize, within: std::time::Duration) -> Committed {
+        use std::sync::atomic::AtomicBool;
+
+        use blaze_core::wait::{Clock as _, Deadline, Monotonic};
+
+        const MAKERS: usize = 4;
+        const BLOCK: usize = 16 << 10;
+        const EACH: usize = (64 << 20) / BLOCK;
+        let blocks: Vec<AtomicPtr<u8>> =
+            (0..MAKERS * EACH).map(|_| AtomicPtr::new(ptr::null_mut())).collect();
+        let made = std::sync::Barrier::new(MAKERS + 1);
+        let stop = AtomicBool::new(false);
+        let start = committed_now();
+        std::thread::scope(|scope| {
+            for maker in 0..MAKERS {
+                let (blocks, made, stop) = (&blocks, &made, &stop);
+                scope.spawn(move || {
+                    // A pool worker's count: the give-back settles only once this thread gave.
+                    let _settles = blaze_mem::tag::count_heap_settles();
+                    for slot in &blocks[maker * EACH..(maker + 1) * EACH] {
+                        // SAFETY: a valid layout; the block is freed once, with it, below.
+                        let block = unsafe { Heaps.alloc_for(Tag::Parse, layout(BLOCK), false) };
+                        assert!(!block.is_null());
+                        // Touched, so its pages are committed and resident.
+                        // SAFETY: the block is `BLOCK` bytes, ours.
+                        unsafe { block.write_bytes(1, BLOCK) };
+                        slot.store(block, Ordering::Release);
+                    }
+                    made.wait();
+                    let clock = Monotonic::new();
+                    while !stop.load(Ordering::Acquire) {
+                        if maker < settling {
+                            blaze_mem::tag::settle_heap();
+                        }
+                        let next = Deadline::after(clock.now(), std::time::Duration::from_millis(1));
+                        blaze_core::wait::sleep_until("the test maker's next look", next, &clock)
+                            .expect("the test maker sleeps");
+                    }
+                });
+            }
+            made.wait();
+            for slot in &blocks {
+                // SAFETY: a live block a maker made with this layout, freed once.
+                unsafe { Heaps.dealloc(slot.load(Ordering::Acquire), layout(BLOCK)) };
+            }
+            let asked = blaze_mem::tag::ask_heap_give_back();
+            let clock = Monotonic::new();
+            let deadline = Deadline::after(clock.now(), within);
+            let settle = loop {
+                let settle = blaze_mem::tag::heap_give_back_settled();
+                let settled = matches!(
+                    settle,
+                    blaze_mem::tag::Settle::Settled { generation } if generation >= asked
+                );
+                if settled || deadline.passed(clock.now()) {
+                    break settle;
+                }
+                let next = Deadline::after(clock.now(), std::time::Duration::from_millis(1));
+                blaze_core::wait::sleep_until("the test's next look at the give-back", next, &clock)
+                    .expect("the test sleeps");
+            };
+            // The purge after every maker, as `blaze_cargo::raw::memory::purge` does (its step
+            // 3): a maker's own forced purge skips every arena while another maker holds
+            // mimalloc's purge guard, so the pages it gave back are reached only by a purge
+            // that begins after the last one gave.
+            // SAFETY: `mi_collect` reads and writes no memory of ours; callable from any thread.
+            unsafe { mi_collect(true) };
+            let end = committed_now();
+            stop.store(true, Ordering::Release);
+            Committed { start, end, settle }
+        })
+    }
+
+    /// The invariant: once every thread that holds pages of freed blocks gave back for a
+    /// give-back asked after the frees, and the arenas were purged after the last of them (the
+    /// daemon's purge, `blaze_cargo::raw::memory::purge`, steps 2 and 3), [`committed_now`] is
+    /// within 8 MiB of what it was before
+    /// the blocks were made: 256 MiB made on four threads and freed on a fifth leave mimalloc's
+    /// count, as [`committed_now`]'s doc says a purge does. The control, by removing the cause:
+    /// with one maker that never gives back the give-back never settles and its 64 MiB part
+    /// stays committed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_freed_heap_is_no_longer_committed_after_every_thread_settles() {
+        const SLACK: u64 = 8 << 20;
+        let _measuring = MEASURING.lock();
+        // The tag's heap made first, so the allocator's give-back is set
+        // (`heap_gives_back_by`) before the makers count.
+        // SAFETY: a valid layout; the block is freed at once, with it.
+        unsafe { Heaps.dealloc(Heaps.alloc_for(Tag::Parse, layout(64), false), layout(64)) };
+        let all = freed_by_another(4, std::time::Duration::from_secs(10));
+        assert!(
+            matches!(all.settle, blaze_mem::tag::Settle::Settled { .. }),
+            "every maker gave back, yet the give-back did not settle: {:?}",
+            all.settle,
+        );
+        assert!(
+            all.end <= all.start + SLACK,
+            "mimalloc committed {} bytes before the blocks and {} once every thread gave back: \
+             {} more, past the {SLACK} allowed",
+            all.start,
+            all.end,
+            all.end.saturating_sub(all.start),
+        );
+        let control = freed_by_another(3, std::time::Duration::from_millis(500));
+        assert!(
+            matches!(control.settle, blaze_mem::tag::Settle::Pending { .. }),
+            "control: a maker never gave back, yet the give-back settled: {:?}",
+            control.settle,
+        );
+        assert!(
+            control.end > control.start + SLACK,
+            "control: the maker that never gave back still holds its part, yet committed went \
+             from {} to {}",
+            control.start,
+            control.end,
         );
     }
 

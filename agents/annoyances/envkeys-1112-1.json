@@ -1,0 +1,17 @@
+{
+ "id": "envkeys-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane envkeys-1112",
+ "where": "a build script that walks its environment (env::vars, a Command whose environment it changes, any child C compiler or shell): crates/blaze-cargo/src/sandbox/v2.rs, the interposers",
+ "what": "Such a run was lent, and keyed by, the whole environment of the request: every variable of the user`s shell by name and value. Read from the code, not measured: any new or changed variable (another pane`s TERM, systemd`s INVOCATION_ID, a LIBCLANG_PATH added to fix two bindgen scripts) reran every script that starts a compiler. The reth miss rows `the names of every environment variable (it read them all)`, `the variable INVOCATION_ID it read` are this.",
+ "cost": "not measured by this lane; the tempo rerun of 2026-11-12 (about 6,700 of 7,909 steps, 15 minutes) is what the shape predicts for the scripts, and is unconfirmed for the units behind them",
+ "cause": "the rule `a walk reads all of it` was sound and the `all` was the user`s shell",
+ "whys": [
+  "lending by name was built first, and a walk was given everything so that no program saw less than under cargo",
+  "nothing listed what programs a script runs take from their environment unasked"
+ ],
+ "class": "a key that holds an input nothing read",
+ "prevention": "the walk set (blaze_usercode::confine::WALK_NAMES/WALK_PREFIXES): a walk sees that fixed list; anything else is read by name and traced; revision case a_variable_no_step_reads holds max_runs = 0",
+ "workaround": "run every command of one build under one fixed environment (how-to H2)",
+ "state": "open"
+}

@@ -41,6 +41,7 @@ use base_db::{Crate, Db};
 use blaze_cas::Key;
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_ids::{ContentId, Hasher};
+use blaze_usercode::roots::{Role, Roots};
 
 /// The domain of a record's slots and of a record filed by its reads.
 /// 3: the crates that read `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]). 4: the files outside
@@ -49,6 +50,117 @@ const DOMAIN: &str = "blaze v2 cargo unit record reads 4";
 
 /// The first byte of a slot's bytes: the version of [`Reads::encode`].
 const VERSION: u8 = 4;
+
+/// Every process variable a record's reads named in a lookup or a filing in this process
+/// ([`Reads::hash`]): the `env!` and `option_env!` reads a unit record is found or kept by.
+/// What the no-op lane compares of a request's environment for the records' sake
+/// ([`named_env`]). The process's, not a job's: a name another checkout's record read is a
+/// variable more compared, never one missed. A few names (the variables crates read at
+/// compile time), each once.
+static NAMED: blaze_core::lock::Lock<Vec<String>> =
+    blaze_core::lock::Lock::new("serve.unit.reads.named", Vec::new());
+
+/// Each of `names` noted in [`NAMED`].
+fn note_named(names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let mut named = NAMED.lock();
+    for name in names {
+        if !named.contains(name) {
+            named.push(name.clone()); // clone: a name, once for the process's life
+        }
+    }
+}
+
+/// Every path a record's reads named in a lookup or a filing in this process
+/// ([`Reads::hash`]): the files outside every source root its crates `include!`d and the
+/// files its proc-macro expansions read, then the directories those listed, each as the path
+/// it is in this checkout; each sorted, each once. The last is why, once an expansion's reads
+/// did not decode or named a root it has not: what it read is then not known. The process's, as [`NAMED`] is, and for the same reader: a path here is one the
+/// no-op lane never takes for another request's output ([`read_paths`]).
+static PATHS: blaze_core::lock::Lock<Noted> =
+    blaze_core::lock::Lock::new("serve.unit.reads.paths", (Vec::new(), Vec::new(), None));
+
+/// `path` kept in `sorted`, once.
+fn note_path(sorted: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+    if let Err(at) = sorted.binary_search_by(|it| it.as_path().cmp(path)) {
+        sorted.insert(at, path.to_owned()); // alloc: a path, once for the process's life
+    }
+}
+
+/// What an expansion read under the first bytes of a shape verified across checkouts
+/// ([`shape_said`]).
+const VERIFIED_SHAPE: &[u8] = b"blaze v2 verified expansion reads 1\0";
+
+/// The paths noted ([`PATHS`]): files, directories, and why they are not known.
+type Noted = (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, Option<String>);
+
+/// The reads of `reads` by path noted in [`PATHS`].
+fn note_paths(reads: &Reads) {
+    if reads.files.is_empty() && reads.expansions.is_empty() {
+        return;
+    }
+    note_paths_in(&mut PATHS.lock(), reads);
+}
+
+/// The reads of `reads` by path noted in `paths`.
+fn note_paths_in(paths: &mut Noted, reads: &Reads) {
+    for (path, _) in &reads.files {
+        note_path(&mut paths.0, std::path::Path::new(path));
+    }
+    for expansions in &reads.expansions {
+        // A shape is written against the calling crate's roots (`proc_macro_api::kept::roots`:
+        // its package and `OUT_DIR`, from the variables the slot keeps): each path is noted
+        // as the file it is in this checkout, and a root's mark, whose value is the root's
+        // path and which names no file, is not a read of the disk.
+        let get = |name: &str| expansions.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
+        let named = [(Role::Package, get("CARGO_MANIFEST_DIR")), (Role::OutDir, get("OUT_DIR"))];
+        let roots = Roots::new(named.into_iter().filter_map(|(role, path)| Some((role, path?))));
+        for (shape, _) in &expansions.shapes {
+            let rest = match shape.strip_prefix(VERIFIED_SHAPE) {
+                Some(rest) if rest.len() >= 32 => &rest[32..],
+                _ => shape.as_slice(),
+            };
+            let shape = match blaze_usercode::index::Shape::decode(rest) {
+                Ok(it) => it,
+                Err(why) => {
+                    // alloc: a reason, once for the process's life
+                    paths.2.get_or_insert_with(|| format!("a unit record's proc-macro expansion reads do not decode ({why}): what it read is not known"));
+                    continue;
+                }
+            };
+            for (list, at) in [(&shape.files, 0), (&shape.dirs, 1)] {
+                for path in list.iter().filter(|it| !blaze_usercode::roots::is_mark(it)) {
+                    match roots.real_path(path) {
+                        Ok(real) if at == 0 => note_path(&mut paths.0, &real),
+                        Ok(real) => note_path(&mut paths.1, &real),
+                        Err(why) => {
+                            // alloc: a reason, once for the process's life
+                            paths.2.get_or_insert_with(|| format!("a unit record's proc-macro expansion read is not a path of this checkout: {why}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The files and the directories any record's reads named in this process so far
+/// ([`PATHS`]), each as the path it is in this checkout; an error naming why once an
+/// expansion's reads did not decode or named a root the expansion has not.
+pub(crate) fn read_paths() -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+    let paths = PATHS.lock();
+    if let Some(why) = &paths.2 {
+        return Err(why.clone()); // clone: a reason, once a build
+    }
+    Ok((paths.0.clone(), paths.1.clone())) // clone: once a build that walked and made nothing
+}
+
+/// The process variables any record's reads named in this process so far ([`NAMED`]).
+pub(crate) fn named_env() -> Vec<String> {
+    NAMED.lock().clone() // clone: once a build that walked and made nothing
+}
 
 /// How many sets of names one base key keeps. A crate's code reads other names only where a
 /// value it read picks them (`env!(concat!(env!("A"), ..))`), so one in practice.
@@ -383,6 +495,68 @@ impl Reads {
         self.hash(env, primary, |at, shape, _| now(&given[at], shape), |path, _| Ok(file_now(path)))
     }
 
+    /// Each read by name with the id of its value, in the order [`Reads::hash`] hashes them,
+    /// for a person: what `blaze why` and the `unit_reads` view name when a record whose key
+    /// is as it was is not found (the values `expansion` and `file` give: those the reads
+    /// had as they were made, or those they have now). An expansion is named by what its
+    /// shape reads ([`shape_said`]).
+    pub(crate) fn named_values(
+        &self,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+        mut expansion: impl FnMut(usize, &[u8], Option<ContentId>) -> Result<ContentId, String>,
+        mut file: impl FnMut(&str, Option<ContentId>) -> Result<ContentId, String>,
+    ) -> Result<Vec<(String, ContentId)>, String> {
+        let var =
+            |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
+        let value = |it: Option<&[u8]>| Hasher::new(DOMAIN).opt_part(it).finish();
+        // alloc: once a record filed or missed, a read each
+        let mut out = Vec::new();
+        for name in &self.names {
+            out.push((format!("the process variable {name}"), value(var(name)))); // alloc: as above
+        }
+        for manifest in &self.primary {
+            let it = match primary(manifest) {
+                true => Some(b"1".as_slice()),
+                false => var(base_db::PRIMARY_PACKAGE),
+            };
+            // alloc: as above
+            out.push((format!("CARGO_PRIMARY_PACKAGE of {manifest}"), value(it)));
+        }
+        for (at, it) in self.expansions.iter().enumerate() {
+            let of = it
+                .env
+                .iter()
+                .find(|(name, _)| name == "CARGO_MANIFEST_PATH")
+                .map_or("a crate with no CARGO_MANIFEST_PATH", |(_, path)| path.as_str());
+            for (shape, then) in &it.shapes {
+                // alloc: as above
+                let name = format!("a proc-macro expansion of {of} that read {}", shape_said(shape));
+                out.push((name, expansion(at, shape, *then)?));
+            }
+        }
+        for (path, then) in &self.files {
+            out.push((format!("the included file {path}"), file(path, *then)?)); // alloc: as above
+        }
+        Ok(out)
+    }
+
+    /// [`Reads::named_values`] with the values the reads had as they were made; an error for
+    /// reads decoded from a slot.
+    pub(crate) fn named_then(
+        &self,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<(String, ContentId)>, String> {
+        let unknown = || "a record's reads read from the store, named as if made here".to_owned();
+        self.named_values(
+            env,
+            primary,
+            |_, _, then| then.ok_or_else(unknown),
+            |_, then| then.ok_or_else(unknown),
+        )
+    }
+
     /// The hash of the values `env` gives the variables, an unset one apart from every value,
     /// then `CARGO_PRIMARY_PACKAGE` of each crate that read it (`1` when `primary` says its
     /// package is primary, else the process's, as [`base_db::env_var`] reads it), then of each
@@ -399,6 +573,10 @@ impl Reads {
             |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
         let mut hasher = Hasher::new(DOMAIN);
         hasher.part(b"values");
+        // Every lookup and every filing of a record by its reads passes here: the names
+        // are noted for the no-op lane, which compares them of a later request.
+        note_named(&self.names);
+        note_paths(self);
         for name in &self.names {
             hasher.opt_part(var(name));
         }
@@ -421,6 +599,90 @@ impl Reads {
         }
         Ok(hasher.finish())
     }
+}
+
+/// What an expansion's shape reads, for a person: its files, listings and variables by name
+/// (the first few of each), or that it is of an expansion verified across checkouts, whose
+/// value moves when the record that retracts it is put.
+fn shape_said(shape: &[u8]) -> String {
+    const SHOWN: usize = 4;
+    const VERIFIED: &[u8] = b"blaze v2 verified expansion reads 1\0";
+    let (verified, rest) = match shape.strip_prefix(VERIFIED) {
+        Some(rest) if rest.len() >= 32 => (true, &rest[32..]),
+        _ => (false, shape),
+    };
+    let listed = |what: &str, all: Vec<String>| match all.len() {
+        0 => String::new(), // alloc: none
+        // alloc: once a read named
+        n if n > SHOWN => format!(" {what} {} and {} more;", all[..SHOWN].join(", "), n - SHOWN),
+        _ => format!(" {what} {};", all.join(", ")), // alloc: as above
+    };
+    let said = match blaze_usercode::index::Shape::decode(rest) {
+        Ok(it) => {
+            let paths = |all: &[std::path::PathBuf]| -> Vec<String> {
+                all.iter().map(|it| it.display().to_string()).collect() // alloc: as above
+            };
+            let env = it.env.iter().map(|it| it.to_string_lossy().into_owned()).collect();
+            let untraceable = it.untraceable.iter().map(|it| format!("{it:?}")).collect();
+            let all = [
+                listed("files", paths(&it.files)),
+                listed("listings", paths(&it.dirs)),
+                listed("variables", env),
+                listed("untraceable", untraceable),
+            ]
+            .concat();
+            match all.is_empty() {
+                true => "nothing by name".to_owned(), // alloc: as above
+                false => all.trim().trim_end_matches(';').to_owned(), // alloc: as above
+            }
+        }
+        // alloc: as above
+        Err(_) => format!("a shape of {} bytes that does not decode", rest.len()),
+    };
+    match verified {
+        // alloc: as above
+        true => format!("{said} (verified across checkouts: its value moves when it is retracted)"),
+        false => said,
+    }
+}
+
+/// Each slot of `base` that `get` gives with its reads named and the values they have now
+/// ([`Reads::named_values`]), as [`find`] works them out: what a record whose key is as it
+/// was and that is not found was looked for under. A slot that does not decode, or whose
+/// values can't be worked out, is an error naming it.
+pub(crate) fn looked_under<'g>(
+    base: Key,
+    env: &[(String, String)],
+    primary: &dyn Fn(&str) -> bool,
+    mut now: impl FnMut(&base_db::Env, &[u8]) -> Result<ContentId, String>,
+    mut file_now: impl FnMut(&str) -> ContentId,
+    mut get: impl FnMut(&Key) -> Option<&'g [u8]>,
+) -> Result<Vec<(u32, Vec<(String, ContentId)>)>, String> {
+    let mut out = Vec::new(); // alloc: once a miss, a slot each
+    for n in 0..SLOTS {
+        let Some(record) = get(&slot(base, n)) else { break };
+        let reads = Reads::decode(record)
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        let given: Vec<base_db::Env> = (reads.expansions.iter())
+            .map(|it| {
+                let manifest = it.env.iter().find(|(name, _)| name == "CARGO_MANIFEST_PATH");
+                // clone: a crate's variables, once per slot named
+                let own: base_db::Env = it.env.iter().cloned().collect();
+                base_db::given_macro_env(&own, manifest.is_some_and(|(_, path)| primary(path)))
+                    .into_owned()
+            })
+            .collect();
+        let named = reads
+            .named_values(
+                env,
+                primary,
+                |at, shape, _| now(&given[at], shape),
+                |path, _| Ok(file_now(path)),
+            )
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        out.push((n, named));
+    }
+    Ok(out)
 }
 
 /// Slot `n` of base key `base`: where the `n`th set of names its records read is kept.

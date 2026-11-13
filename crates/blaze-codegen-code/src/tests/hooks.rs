@@ -249,15 +249,18 @@ fn past_generics(tokens: &[Token], mut at: usize) -> usize {
     at
 }
 
-/// The path that starts at `at` (`a::b::C<T>`): its last segment and the index past it.
-fn path_at(tokens: &[Token], mut at: usize) -> Option<(String, usize)> {
+/// The path that starts at `at` (`a::b::C<T>`): its segments (`["a", "b", "C"]`, never
+/// empty) and the index past it.
+fn path_at(tokens: &[Token], mut at: usize) -> Option<(Vec<String>, usize)> {
     if tokens.get(at) == Some(&Token::Path) {
         at += 1;
     }
-    let mut last = None;
+    let mut segments = Vec::new();
     loop {
-        let Some(Token::Ident(segment)) = tokens.get(at) else { return last.map(|it| (it, at)) };
-        last = Some(segment.clone());
+        let Some(Token::Ident(segment)) = tokens.get(at) else {
+            return (!segments.is_empty()).then_some((segments, at));
+        };
+        segments.push(segment.clone());
         at += 1;
         if punct(tokens.get(at), '<') {
             at = past_generics(tokens, at);
@@ -265,18 +268,86 @@ fn path_at(tokens: &[Token], mut at: usize) -> Option<(String, usize)> {
         if tokens.get(at) == Some(&Token::Path) {
             at += 1;
         } else {
-            return last.map(|it| (it, at));
+            return Some((segments, at));
+        }
+    }
+}
+
+/// The use tree that starts at `at` under `prefix` (`a::{b, c::D as E, self}`, `::x::Y`):
+/// each name it brings in, with the path it names, into `out` (the first path of a name kept).
+/// A glob brings in no name it can tell. Returns the index past the tree.
+fn use_tree(
+    tokens: &[Token],
+    mut at: usize,
+    prefix: &[String],
+    out: &mut BTreeMap<String, Vec<String>>,
+) -> usize {
+    let mut path = prefix.to_vec();
+    if tokens.get(at) == Some(&Token::Path) {
+        at += 1;
+    }
+    loop {
+        match tokens.get(at) {
+            Some(Token::Punct('{')) => {
+                at += 1;
+                loop {
+                    if punct(tokens.get(at), '}') {
+                        return at + 1;
+                    }
+                    let past = use_tree(tokens, at, &path, out);
+                    if past == at {
+                        return at;
+                    }
+                    at = past;
+                    if punct(tokens.get(at), ',') {
+                        at += 1;
+                    } else if punct(tokens.get(at), '}') {
+                        return at + 1;
+                    } else {
+                        return at;
+                    }
+                }
+            }
+            Some(Token::Punct('*')) => return at + 1,
+            Some(Token::Ident(segment)) => {
+                path.push(segment.clone());
+                at += 1;
+                if tokens.get(at) == Some(&Token::Path) {
+                    at += 1;
+                    continue;
+                }
+                if path.last().is_some_and(|it| it == "self") {
+                    path.pop();
+                }
+                let name = match (is(tokens.get(at), "as"), tokens.get(at + 1)) {
+                    (true, Some(Token::Ident(name))) => {
+                        at += 2;
+                        name.clone()
+                    }
+                    _ => match path.last() {
+                        Some(last) => last.clone(),
+                        None => return at,
+                    },
+                };
+                if name != "_" {
+                    out.entry(name).or_insert(path);
+                }
+                return at;
+            }
+            _ => return at,
         }
     }
 }
 
 /// What a file's tokens say of traits: those it defines, those it names `dyn`, and those it
-/// implements, each with the line of its `impl`.
+/// implements, each by the path its `impl` names it by; and the names its `use` items bring
+/// in, each with the path it names, to tell which package an implemented trait is of.
 #[derive(Default, Debug)]
 pub(super) struct Traits {
     pub(super) defined: BTreeSet<String>,
-    pub(super) dyns: BTreeSet<String>,
-    pub(super) implemented: Vec<String>,
+    pub(super) dyns: Vec<Vec<String>>,
+    pub(super) implemented: Vec<Vec<String>>,
+    pub(super) uses: BTreeMap<String, Vec<String>>,
 }
 
 pub(super) fn traits(tokens: &[Token]) -> Traits {
@@ -294,8 +365,8 @@ pub(super) fn traits(tokens: &[Token]) -> Traits {
                 if is(tokens.get(next), "for") && punct(tokens.get(next + 1), '<') {
                     next = past_generics(tokens, next + 1);
                 }
-                if let Some((name, _)) = path_at(tokens, next) {
-                    out.dyns.insert(name);
+                if let Some((path, _)) = path_at(tokens, next) {
+                    out.dyns.push(path);
                 }
             }
             "impl" => {
@@ -309,11 +380,14 @@ pub(super) fn traits(tokens: &[Token]) -> Traits {
                 if is(tokens.get(next), "dyn") {
                     continue;
                 }
-                if let Some((name, past)) = path_at(tokens, next)
+                if let Some((path, past)) = path_at(tokens, next)
                     && is(tokens.get(past), "for")
                 {
-                    out.implemented.push(name);
+                    out.implemented.push(path);
                 }
+            }
+            "use" => {
+                use_tree(tokens, at + 1, &[], &mut out.uses);
             }
             _ => {}
         }
@@ -512,10 +586,83 @@ fn package_traits(dir: &Path, program: bool) -> Vec<(PathBuf, Traits)> {
         .into_iter()
         .map(|file| {
             let text = std::fs::read_to_string(&file).unwrap();
-            let traits = traits(&tokens(&text));
+            // A module under `#[cfg(test)]` is built into the package's tests, never the program.
+            let traits = traits(&outside_tests(&tokens(&text)));
             (file, traits)
         })
         .collect()
+}
+
+/// Which package the trait an `impl` names by `path` is of, read from the file's `use` items.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TraitOf {
+    /// A package of the checkout, by name: where the path leads (it may re-export the trait).
+    Package(String),
+    /// Outside the checkout: `std`, `core`, `alloc`, or a crate of a registry.
+    Outside,
+    /// Not told by the tokens: a name no `use` names and the file does not define (a glob
+    /// import, the prelude, an item of the same module in another file).
+    Unknown,
+}
+
+/// [`TraitOf`] the trait `path` names in a file of `own` whose `use` items are `uses` and that
+/// defines `defined`; `crates` maps a crate's name in paths to its package.
+fn trait_of(
+    path: &[String],
+    own: &str,
+    uses: &BTreeMap<String, Vec<String>>,
+    defined: &BTreeSet<String>,
+    crates: &BTreeMap<String, String>,
+) -> TraitOf {
+    let mut path = path.to_vec();
+    // A `use` leads to a path, which may start at another `use`'s name: a few steps at most.
+    for _ in 0..8 {
+        let Some(first) = path.first() else { return TraitOf::Unknown };
+        if path.len() == 1 {
+            match uses.get(first) {
+                Some(full) if *full != path => {
+                    path = full.clone();
+                    continue;
+                }
+                _ if defined.contains(first) => return TraitOf::Package(own.to_owned()),
+                _ => return TraitOf::Unknown,
+            }
+        }
+        match first.as_str() {
+            "crate" | "self" | "super" => return TraitOf::Package(own.to_owned()),
+            "std" | "core" | "alloc" => return TraitOf::Outside,
+            _ => {}
+        }
+        if let Some(package) = crates.get(first) {
+            return TraitOf::Package(package.clone());
+        }
+        match uses.get(first) {
+            Some(full) if full.first() != Some(first) || full.len() > 1 => {
+                let rest = path[1..].to_vec();
+                path = full.clone();
+                path.extend(rest);
+            }
+            // A crate the checkout has none of.
+            _ => return TraitOf::Outside,
+        }
+    }
+    TraitOf::Unknown
+}
+
+/// The name each package of the checkout is named by in paths: its `[lib] name`, or its own
+/// name with `-` as `_`.
+fn crate_names(checkout: &BTreeMap<&str, &Path>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (&name, &dir) in checkout {
+        let lib = std::fs::read_to_string(dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|manifest| {
+                manifest.get("lib")?.get("name")?.as_str().map(str::to_owned)
+            });
+        out.insert(lib.unwrap_or_else(|| name.replace('-', "_")), name.to_owned());
+    }
+    out
 }
 
 /// For blaze-engine's program and each of `identities`: every implementation, in a package of the
@@ -527,45 +674,100 @@ fn unreviewed(identities: &[&Identity]) -> Vec<String> {
     let workspace = crate::Workspace::read(&engine).unwrap();
     let linked = workspace.linked_names().unwrap();
     let checkout: BTreeMap<&str, &Path> = workspace.checkout().into_iter().collect();
+    let crates = crate_names(&checkout);
+    let mut built_from_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut built_from = |package: &str| -> BTreeSet<String> {
+        built_from_of
+            .entry(package.to_owned())
+            .or_insert_with(|| workspace.built_from_names(package).unwrap_or_else(|why| panic!("{why}")))
+            .clone()
+    };
     // Every package the program links is scanned once; each closure is of linked packages.
     let scanned: BTreeMap<&str, Vec<(PathBuf, Traits)>> = checkout
         .iter()
         .filter(|&(&name, _)| linked.contains(name))
         .map(|(&name, &dir)| (name, package_traits(dir, name == workspace.program)))
         .collect();
+    // Whether a package of the checkout defines a trait of the name.
+    let defines = |package: &str, name: &str| {
+        scanned.get(package).is_some_and(|files| files.iter().any(|(_, it)| it.defined.contains(name)))
+    };
+    // The packages among `definers` that the trait a file of `package` names by `path` is of:
+    // where the path leads, or the definers it is built from when it leads to a package that
+    // re-exports the trait, or (not told) the definers `package` is built from.
+    let mut of_path = |path: &[String],
+                       package: &str,
+                       traits: &Traits,
+                       definers: &BTreeSet<String>|
+     -> BTreeSet<String> {
+        let name = path.last().map_or("", String::as_str);
+        let mut of = trait_of(path, package, &traits.uses, &traits.defined, &crates);
+        if of == TraitOf::Unknown && defines(package, name) {
+            of = TraitOf::Package(package.to_owned());
+        }
+        let at = match of {
+            TraitOf::Outside => return BTreeSet::new(),
+            TraitOf::Package(at) if definers.contains(&at) => return [at].into_iter().collect(),
+            TraitOf::Package(at) if defines(&at, name) => return BTreeSet::new(),
+            TraitOf::Package(at) => at,
+            TraitOf::Unknown => package.to_owned(),
+        };
+        let from = built_from(&at);
+        definers.iter().filter(|it| from.contains(*it) && **it != at).cloned().collect()
+    };
     let mut problems = Vec::new();
     for identity in identities {
         let closure = workspace.closure_names_of(identity).unwrap();
-        // Each hook by name, with the packages of the closure that define it (none: listed).
-        let mut hooks: BTreeMap<String, BTreeSet<String>> =
-            identity.hooks.iter().map(|it| ((*it).to_owned(), BTreeSet::new())).collect();
-        let mut defined: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut dyns = BTreeSet::new();
-        for package in closure.iter().filter(|it| checkout.contains_key(it.as_str())) {
+        let in_closure: Vec<&String> =
+            closure.iter().filter(|it| checkout.contains_key(it.as_str())).collect();
+        // Each trait name with the packages of the closure that define one of it.
+        let mut definers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for package in &in_closure {
             for (_, traits) in &scanned[package.as_str()] {
                 for name in &traits.defined {
-                    defined.entry(name.clone()).or_default().insert(package.clone());
+                    definers.entry(name.clone()).or_default().insert((*package).clone());
                 }
-                dyns.extend(traits.dyns.iter().cloned());
             }
         }
-        for (name, packages) in defined {
-            if dyns.contains(&name) {
-                hooks.entry(name).or_default().extend(packages);
+        // Each hook by name, with the packages whose trait of that name is the hook: a listed
+        // one is each closure package's that defines it (none found: any trait of the name);
+        // and each trait a closure package names `dyn`, resolved to its package.
+        let mut hooks: BTreeMap<String, BTreeSet<String>> = identity
+            .hooks
+            .iter()
+            .map(|it| ((*it).to_owned(), definers.get(*it).cloned().unwrap_or_default()))
+            .collect();
+        for package in &in_closure {
+            for (_, traits) in &scanned[package.as_str()] {
+                for path in &traits.dyns {
+                    let Some(name) = path.last() else { continue };
+                    let Some(defined_in) = definers.get(name) else { continue };
+                    let of = of_path(path, package.as_str(), traits, defined_in);
+                    if !of.is_empty() {
+                        hooks.entry(name.clone()).or_default().extend(of);
+                    }
+                }
             }
         }
         let mut found = BTreeSet::new();
         for package in
             linked.iter().filter(|it| checkout.contains_key(it.as_str()) && !closure.contains(*it))
         {
-            let built_from = workspace.built_from_names(package).unwrap();
             for (file, traits) in &scanned[package.as_str()] {
-                for name in &traits.implemented {
+                for path in &traits.implemented {
+                    let Some(name) = path.last() else { continue };
                     let Some(defined_in) = hooks.get(name) else { continue };
-                    // A trait of the same name it is not built from is another trait.
-                    if !defined_in.is_empty()
-                        && !defined_in.iter().any(|it| built_from.contains(it) && it != package)
-                    {
+                    // The trait the path resolves to, by the file's `use` items: a trait of the
+                    // same name of another package (a package's own `Sink`, std's `Wake`) is
+                    // another trait.
+                    let hook = match defined_in.is_empty() {
+                        true => {
+                            trait_of(path, package, &traits.uses, &traits.defined, &crates)
+                                != TraitOf::Outside
+                        }
+                        false => !of_path(path, package.as_str(), traits, defined_in).is_empty(),
+                    };
+                    if !hook {
                         continue;
                     }
                     found.insert((package.clone(), name.clone()));
@@ -630,10 +832,11 @@ fn an_impl_names_its_trait_and_a_fixture_string_names_none() {
         impl Last for Y {}
     "##;
     let traits = traits(&tokens(text));
-    assert_eq!(traits.implemented, ["BodyFacts", "Lookup", "Prepare", "Send", "Last"]);
+    let names: Vec<&str> = traits.implemented.iter().filter_map(|it| it.last()).map(String::as_str).collect();
+    assert_eq!(names, ["BodyFacts", "Lookup", "Prepare", "Send", "Last"]);
+    assert_eq!(traits.implemented[1], ["blaze_codegen", "driver", "Lookup"]);
     assert_eq!(traits.defined, ["Hook".to_owned()].into_iter().collect());
-    assert_eq!(
-        traits.dyns,
-        ["Hooked".to_owned(), "Shown".to_owned(), "Fn".to_owned()].into_iter().collect()
-    );
+    let dyns: BTreeSet<&str> = traits.dyns.iter().filter_map(|it| it.last()).map(String::as_str).collect();
+    assert_eq!(dyns, ["Fn", "Hooked", "Shown"].into_iter().collect());
+    assert_eq!(traits.dyns.last().unwrap(), &["other", "Hooked"]);
 }

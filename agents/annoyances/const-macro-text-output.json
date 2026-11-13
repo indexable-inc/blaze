@@ -1,0 +1,14 @@
+{
+ "id": "const-macro-text-output",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 9 T3/T4, int-1112",
+ "where": "crates/hir-ty-mir/src/const_macro.rs, crates/hir-ty-mir/src/mir/eval/macro_call.rs, docs/future/const-macros.md, site/content/updates/const-macros.flecs",
+ "what": "A const macro returned `String`: its output was printed text, lexed back on the host with the call site's span on every token. A spliced name lost its span, a quote that was not Rust failed at every use instead of where the macro was written, and the site told readers the text form was the API for now. Input had already been a flat tree (`&const_ast::Item`) since stage 2 step 2.",
+ "cost": "every expansion paid a print, a lex and a parse of its text (about 35,000 MIR steps for a 20-field derive against about 23,000 with the builder, estimated); errors pointed at the derive; the owner had to object to the site sentence",
+ "cause": "stage 0 chose text to need no const heap and no const traits, and stage 2 changed the input to a tree but left the output for 'the const proc_macro', a token API that was never the target",
+ "class": "a stage-0 interface kept past the point its reason went away, because the next step was defined against a different end state (token streams) than the one the tree input had already chosen",
+ "prevention": "the output is the same structure as the input (`const_ast::Output`, a flat tree); the host checks it against its tokens' parse, and `const_ast::quote!` is parsed by blaze's parser when the macro crate is analyzed, so there is no text path left to keep",
+ "workaround": "none",
+ "fix": "const_ast::Builder and Output (task 1), the host reading the four arrays and checking the parse (task 2), const_ast::quote! lowered by hir-ty-mir's const_macro/quote.rs on the const_ast_quote twin crate (tasks 3 and 4). Control: a_quote_that_splices_a_type_where_a_name_goes_is_refused_by_the_host.",
+ "state": "fixed, not yet compiled"
+}

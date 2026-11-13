@@ -21,6 +21,14 @@
 //!   of the round is in, nothing vouches, and once it is, every change made before the round
 //!   began has been heard. The daemon runs one round per request, before its checks.
 //!
+//! - **By path** ([`Dirs::only_since`]): the table also keeps the last [`CHANGES_KEPT`] changes
+//!   heard, each with its generation and the path the system named, so a caller that knows
+//!   which paths it rests on can tell a change to one of them from a change beside them in the
+//!   same directory (a build's kept answer and another build's output placed next to its own).
+//!   A lost report, a directory replaced and a watch that stopped vouching are kept as a change
+//!   with no path, which no caller can set aside; a caller asking from before what is kept is
+//!   told no.
+//!
 //! Sound: [`unchanged_since`]`(path, g)` is true only when some directory at or above `path`
 //! was confirmed before `g` was read (`since <= g`: its watch was in place before whatever the
 //! caller looked at after reading `g`), heard nothing after (`changed <= g`), and the last
@@ -58,6 +66,139 @@ const MOST: u32 = (TABLE << (TABLES - 1)) as u32 / 2;
 /// The most bytes of the directories' paths together: 64 on average at [`MOST`].
 const PATH_BYTES: usize = 64 * MOST as usize;
 
+/// The most changes heard that the table keeps by path ([`Dirs::only_since`]): a build's
+/// placements between two requests (a few thousand outputs at most, a path each). Past it the
+/// oldest go, and a caller asking from before them is told no.
+pub const CHANGES_KEPT: usize = 4096;
+
+/// The most bytes of the kept changes' paths together: 256 a path at [`CHANGES_KEPT`], address
+/// space committed as it fills. Past it the oldest go as past [`CHANGES_KEPT`]. A path longer
+/// than all of it is kept as a change with no path, which no caller sets aside.
+const CHANGE_BYTES: usize = 256 * CHANGES_KEPT;
+
+/// A change kept: its generation, and where its path's bytes are in [`Changes::bytes`].
+#[derive(Clone, Copy)]
+struct Heard {
+    generation: u64,
+    at: u32,
+    len: u32,
+    /// Whether it names a path: not for one that names nothing a caller could set aside (a
+    /// lost report, a directory replaced, a watch that stopped vouching).
+    named: bool,
+}
+
+/// The changes heard, by path, oldest first ([`Dirs::only_since`]): two rings over regions
+/// reserved once, so a change heard allocates nothing. Each path's bytes are contiguous in
+/// `bytes`, written from `end` onward, or from 0 once they would run past [`CHANGE_BYTES`]; a
+/// path goes in only where no kept path is, the oldest let go of until there is room.
+struct Changes {
+    /// The generation of the newest change let go of: what is kept is every change after it.
+    from: u64,
+    /// At most [`CHANGES_KEPT`], the oldest at `first`, `count` of them.
+    heard: RegionVec<Heard>,
+    first: usize,
+    count: usize,
+    /// How many of the kept are named.
+    named: usize,
+    bytes: RegionVec<u8>,
+    /// Where the next path's bytes go.
+    end: usize,
+    /// How many of the named kept were written before the bytes last went back to 0: while
+    /// any is, they are the oldest named, from where the oldest is to where it went back, and
+    /// the newer are from 0 to `end`.
+    before_wrap: usize,
+}
+
+impl Changes {
+    fn new(tag: blaze_mem::Tag) -> Result<Changes, MemError> {
+        Ok(Changes {
+            from: 0,
+            heard: RegionVec::new(CHANGES_KEPT, tag)?,
+            first: 0,
+            count: 0,
+            named: 0,
+            bytes: RegionVec::new(CHANGE_BYTES, tag)?,
+            end: 0,
+            before_wrap: 0,
+        })
+    }
+
+    /// Each kept change, oldest first, with its path's bytes if it names one.
+    fn kept(&self) -> impl Iterator<Item = (u64, Option<&[u8]>)> {
+        (0..self.count).map(move |at| {
+            let it = self.heard[(self.first + at) % CHANGES_KEPT];
+            let at = it.at as usize;
+            (it.generation, it.named.then(|| &self.bytes[at..at + it.len as usize]))
+        })
+    }
+
+    /// The oldest kept let go of.
+    fn let_go(&mut self) {
+        let gone = self.heard[self.first];
+        self.first = (self.first + 1) % CHANGES_KEPT;
+        self.count -= 1;
+        self.from = self.from.max(gone.generation);
+        if gone.named {
+            self.named -= 1;
+            self.before_wrap = self.before_wrap.saturating_sub(1);
+        }
+    }
+
+    /// Where the oldest named path's bytes begin.
+    fn oldest_at(&self) -> usize {
+        (0..self.count)
+            .map(|at| self.heard[(self.first + at) % CHANGES_KEPT])
+            .find(|it| it.named)
+            .map_or(self.end, |it| it.at as usize)
+    }
+
+    /// A change heard at `generation` kept, by `path` if it names one: the oldest go while
+    /// there is no room.
+    fn hear(&mut self, generation: u64, path: Option<&[u8]>) {
+        if self.count == CHANGES_KEPT {
+            self.let_go();
+        }
+        let path = path.filter(|it| it.len() <= CHANGE_BYTES);
+        let mut heard = Heard { generation, at: 0, len: 0, named: false };
+        if let Some(path) = path {
+            let len = path.len();
+            let at = loop {
+                if self.named == 0 {
+                    self.end = 0;
+                    self.before_wrap = 0;
+                }
+                if self.before_wrap == 0 {
+                    // The named kept are from the oldest's start to `end`: after `end` is free.
+                    if self.end + len <= CHANGE_BYTES {
+                        break self.end;
+                    }
+                    self.before_wrap = self.named;
+                    self.end = 0;
+                } else if self.end + len <= self.oldest_at() {
+                    // Between `end` and the oldest's start is free.
+                    break self.end;
+                } else {
+                    self.let_go();
+                }
+            };
+            let have = self.bytes.len();
+            // `at` is never past what was written: `end` is the end of the last path written.
+            let inside = (have - at).min(len);
+            self.bytes[at..at + inside].copy_from_slice(&path[..inside]);
+            self.bytes.extend_from_slice(&path[inside..]);
+            self.end = at + len;
+            self.named += 1;
+            heard = Heard { generation, at: at as u32, len: len as u32, named: true };
+        }
+        let next = (self.first + self.count) % CHANGES_KEPT;
+        match next < self.heard.len() {
+            true => self.heard[next] = heard,
+            false => _ = self.heard.push(heard),
+        }
+        self.count += 1;
+    }
+}
+
 /// A directory watched: its two generations, the directory wanted later that covers it, and
 /// where its path is, as it was wanted. `since` and `changed` lead a 16-byte-aligned struct, so a
 /// check's two loads are always on one cache line.
@@ -70,6 +211,10 @@ struct Entry {
     /// Its path's bytes: `paths[start..start + len]`.
     start: u32,
     len: u32,
+    /// Someone asks of everything under it ([`Dirs::want`]): `changed` is kept for it. A
+    /// directory wanted only for names in it ([`Dirs::watch_name`]) has a watch and no
+    /// `changed`: what is heard under it moves the names it names, nothing else.
+    recursive: AtomicBool,
 }
 
 #[cfg(not(blaze_check))]
@@ -149,6 +294,24 @@ pub struct Dirs {
     places: AppendVec<AtomicU64>,
     /// Held to add a directory: cold, once per directory per process.
     adding: Lock<()>,
+    /// The last changes heard, by path: written by the driver once a change heard, read only
+    /// by a check that the generations alone refused ([`Dirs::only_since`]).
+    changes: Lock<Changes>,
+    /// The directories names were asked of ([`Dirs::watch_name`]), each directory above them
+    /// too, by path: what was heard of each.
+    names: Lock<blaze_hash::HashMap<Box<[u8]>, Named, std::alloc::Global>>,
+}
+
+/// What was heard of a directory a name was asked in, or of one above such a directory.
+#[derive(Clone, Copy)]
+struct Named {
+    /// The generation it was first asked of at: what was heard before it is not here.
+    since: u64,
+    /// The generation of the last change heard that named the directory itself (it was made,
+    /// removed, moved or replaced).
+    own: u64,
+    /// The generation of the last change heard that named an entry directly in it.
+    direct: u64,
 }
 
 /// The places of table `level` in `places`.
@@ -214,10 +377,35 @@ pub struct Cover<'d> {
 
 impl<'d> Cover<'d> {
     /// [`Dirs::unchanged_since`] of every path under this directory.
+    ///
+    /// A directory wanted above this one later takes its watch over (the driver ends this
+    /// one's, which then never vouches again): the directory asked is then that one, and so
+    /// on up. Until 2026-11-12 a cover kept with an answer stayed on the retired directory,
+    /// so every file of glibc's `lib` (wanted first, then its package's directory for its
+    /// `etc`) was looked at on the disk in every build for the daemon's life.
     pub fn unchanged_since(self, generation: u64) -> bool {
-        self.dirs.hot.settled.load(Ordering::Acquire)
-            && self.entry.since.load(Ordering::Acquire) <= generation
-            && self.entry.changed.load(Ordering::Acquire) <= generation
+        if !self.dirs.hot.settled.load(Ordering::Acquire) {
+            return false;
+        }
+        // Its own directory heard nothing, under a watch unbroken since: its own, or that of
+        // the directory that took it over.
+        if !self.entry.recursive.load(Ordering::Acquire)
+            || self.entry.changed.load(Ordering::Acquire) > generation
+        {
+            return false;
+        }
+        let mut entry = self.entry;
+        // Bounded: each directory above is a shorter path.
+        loop {
+            if entry.since.load(Ordering::Acquire) <= generation {
+                return true;
+            }
+            match entry.subsumed_by.load(Ordering::Acquire) {
+                0 => return false,
+                _ if COVER_STAYS_ON_THE_RETIRED.get() => return false,
+                by => entry = self.dirs.dir(by - 1).entry,
+            }
+        }
     }
 
     pub fn dir(self) -> Dir<'d> {
@@ -256,6 +444,11 @@ impl Dirs {
             paths: AppendVec::new(PATH_BYTES, tag)?,
             places: AppendVec::new(PLACES, tag)?,
             adding: Lock::new("vfs.outside.adding", ()),
+            changes: Lock::new("vfs.outside.changes", Changes::new(tag)?),
+            names: Lock::new(
+                "vfs.outside.names",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
         })
     }
 
@@ -277,14 +470,115 @@ impl Dirs {
             return false;
         }
         let bytes = trimmed(path);
-        let mut vouched = false;
+        // A directory asked of whole ([`Dirs::want`]) at or above the path that heard nothing
+        // since, under a watch (its own, or one of a directory above it) unbroken since.
+        let (mut watched, mut vouched) = (false, false);
         prefixes(bytes, |end, tag| {
-            vouched = self
-                .find(&bytes[..end], tag)
-                .is_some_and(|dir| dir.since() <= generation && dir.changed() <= generation);
+            if let Some(dir) = self.find(&bytes[..end], tag) {
+                watched |= dir.since() <= generation;
+                vouched = watched
+                    && dir.entry.recursive.load(Ordering::Acquire)
+                    && dir.changed() <= generation;
+            }
             !vouched
         });
         vouched
+    }
+
+    /// Asks the watches of the one name `name` (a file, a link, a directory, or a name that
+    /// is not there): its directory is watched, and what is heard that names it, an entry
+    /// directly in its directory, or a directory above it, is kept for
+    /// [`Dirs::name_unchanged_since`]. Nothing is asked of what is under its directory
+    /// otherwise: a home directory something writes under every second still vouches for
+    /// `~/.gitconfig`. Until 2026-11-12 a name's directory was asked of whole, so a build
+    /// script that looked at `/root/wt` made `/root` and everything under it (the daemon's
+    /// own home) one directory that was never quiet, and no build was answered again
+    /// without a walk. `name` is canonical but for its last part, as [`Dirs::want`] asks.
+    pub fn watch_name(&self, name: &Path) {
+        let Some(dir) = name.parent() else { return };
+        self.want_as(dir, false);
+        let bytes = trimmed(dir);
+        let mut names = self.names.lock();
+        prefixes(bytes, |end, _| {
+            if !names.contains_key(&bytes[..end]) {
+                let since = self.bump();
+                // alloc: once per directory a name is asked in, and per directory above it
+                names.insert(bytes[..end].into(), Named { since, own: 0, direct: 0 });
+            }
+            true
+        });
+    }
+
+    /// Whether the name `name` ([`Dirs::watch_name`]) is what it was when `generation` was
+    /// read: a watch at or above its directory is unbroken since, and since then nothing
+    /// heard named it or an entry beside it, or a directory above it. False is "look at the
+    /// disk". No allocation.
+    pub fn name_unchanged_since(&self, name: &Path, generation: u64) -> bool {
+        if !self.hot.settled.load(Ordering::Acquire) || NAMES_HEAR_NOTHING_BESIDE.get() {
+            return false;
+        }
+        let Some(dir) = name.parent() else { return false };
+        let bytes = trimmed(dir);
+        let mut watched = false;
+        prefixes(bytes, |end, tag| {
+            watched = self.find(&bytes[..end], tag).is_some_and(|dir| dir.since() <= generation);
+            !watched
+        });
+        if !watched {
+            return false;
+        }
+        let names = self.names.lock();
+        let mut same = true;
+        prefixes(bytes, |end, _| {
+            same = names.get(&bytes[..end]).is_some_and(|it| {
+                it.since <= generation
+                    && it.own <= generation
+                    && (end < bytes.len() || it.direct <= generation)
+            });
+            same
+        });
+        same
+    }
+
+    /// The changes `files` (each named from `root`, the driver's) were heard at `generation`:
+    /// each directory asked of whole at or above one is changed, and each name's directory
+    /// ([`Dirs::watch_name`]) one names, or names an entry of. Whether any was.
+    fn heard(&self, root: &Path, files: &[FileName], generation: u64, path: &mut PathBuf) -> bool {
+        let mut hit = false;
+        let mut names = self.names.lock();
+        for file in files {
+            // Whether this file was a change of anything asked of before it: kept by its
+            // path then ([`Dirs::only_since`]), for whoever knows it is beside what it
+            // rests on. A file that hit nothing moved nothing, and is not kept.
+            let before = std::mem::replace(&mut hit, false);
+            path.clear();
+            path.push(root);
+            path.push(file.as_str());
+            let bytes = trimmed(path);
+            prefixes(bytes, |end, tag| {
+                if let Some(dir) = self.find(&bytes[..end], tag)
+                    && dir.entry.recursive.load(Ordering::Acquire)
+                {
+                    dir.entry.changed.fetch_max(generation, Ordering::AcqRel);
+                    hit = true;
+                }
+                true
+            });
+            if let Some(named) = names.get_mut(bytes) {
+                named.own = generation;
+                hit = true;
+            }
+            let parent = bytes.iter().rposition(|it| is_separator(*it)).map(|at| &bytes[..at.max(1)]);
+            if let Some(named) = parent.and_then(|it| names.get_mut(it)) {
+                named.direct = generation;
+                hit = true;
+            }
+            if hit {
+                self.hear(generation, Some(path.as_os_str().as_encoded_bytes()));
+            }
+            hit |= before;
+        }
+        hit
     }
 
     /// The directory to keep with an answer about `path`, so its later checks are
@@ -308,6 +602,30 @@ impl Dirs {
         confirmed.or(wanted).map(|dir: Dir<'_>| Cover { dirs: self, entry: dir.entry })
     }
 
+    /// Whether nothing is to add for `key`: it is there (and asked of whole from now, when
+    /// `recursive`), or a directory above it is, asked of whole when `recursive`.
+    fn wanted(&self, key: &[u8], tag: u32, recursive: bool) -> bool {
+        if let Some(dir) = self.find(key, tag) {
+            if recursive && !dir.entry.recursive.load(Ordering::Acquire) {
+                // What was heard under it before now is not in `changed`.
+                dir.entry.changed.fetch_max(self.bump(), Ordering::AcqRel);
+                dir.entry.recursive.store(true, Ordering::Release);
+            }
+            return true;
+        }
+        if !recursive {
+            return self.covered(key);
+        }
+        let mut found = false;
+        prefixes(key, |end, tag| {
+            found = self
+                .find(&key[..end], tag)
+                .is_some_and(|dir| dir.entry.recursive.load(Ordering::Acquire));
+            !found
+        });
+        found
+    }
+
     /// Whether `key` or a directory above it is wanted.
     fn covered(&self, key: &[u8]) -> bool {
         let mut found = false;
@@ -328,6 +646,12 @@ impl Dirs {
     /// ends their watches. A round then costs one flush per directory not under another (the
     /// toolchain, the SDK, `/usr/include`), not one per directory a trace named.
     pub fn want(&self, dir: &Path) {
+        self.want_as(dir, true);
+    }
+
+    /// [`Dirs::want`], or, not `recursive`, a watch of `dir` for the names in it alone
+    /// ([`Dirs::watch_name`]).
+    fn want_as(&self, dir: &Path, recursive: bool) {
         let dir = dir.components().as_path();
         if dir.parent().is_none() {
             return;
@@ -339,14 +663,14 @@ impl Dirs {
             return;
         }
         let key = dir.as_os_str().as_encoded_bytes();
-        if self.covered(key) {
+        let tag = tag(key);
+        if self.wanted(key, tag, recursive) {
             return;
         }
         let _adding = self.adding.lock();
-        if self.covered(key) {
+        if self.wanted(key, tag, recursive) {
             return;
         }
-        let tag = tag(key);
         let raw = self.len.load(Ordering::Relaxed);
         assert!(raw < MOST, "more than {MOST} directories watched outside every view");
         let start = self.paths.len();
@@ -357,13 +681,25 @@ impl Dirs {
         for &byte in key {
             self.paths.append(byte);
         }
+        // A directory asked of whole under one watched for its names: that one's watch is
+        // its watch (the topmost such, which nothing covers).
+        let paths = self.paths.as_slice();
+        let above = self.entries.as_slice()[..raw as usize].iter().position(|other| {
+            let bytes = &paths[other.start as usize..][..other.len as usize];
+            other.subsumed_by.load(Ordering::Acquire) == 0
+                && key.len() > bytes.len()
+                && key.starts_with(bytes)
+                && is_separator(key[bytes.len()])
+        });
         // Published before the index names it, and the index before `len` counts it.
         let at = self.entries.append(Entry {
             since: AtomicU64::new(UNCONFIRMED),
-            changed: AtomicU64::new(0),
-            subsumed_by: AtomicU32::new(0),
+            // Asked of whole from now: what was heard under it before is not in `changed`.
+            changed: AtomicU64::new(if recursive { self.bump() } else { 0 }),
+            subsumed_by: AtomicU32::new(above.map_or(0, |it| it as u32 + 1)),
             start,
             len: key.len() as u32,
+            recursive: AtomicBool::new(recursive),
         });
         debug_assert_eq!(at, raw);
         let mut level = self.level.load(Ordering::Relaxed) as usize;
@@ -494,6 +830,55 @@ impl Dirs {
     fn settle(&self, settled: bool) {
         self.hot.settled.store(settled, Ordering::Release);
     }
+
+    /// A change heard at `generation` kept by `path`'s bytes; `None` for one no caller can set
+    /// aside.
+    fn hear(&self, generation: u64, path: Option<&[u8]>) {
+        self.changes.lock().hear(generation, path);
+    }
+
+    /// Whether everything heard under any watched directory since `generation` was read is a
+    /// change `aside` sets aside, by its path: the last round of flushes is in, every change
+    /// since then is still kept ([`CHANGES_KEPT`]), each names a path, and `aside` says yes to
+    /// each. What [`Dirs::quiet_since`] says with no change heard at all, said of the changes
+    /// a caller knows are beside what it rests on. It says nothing of whether a directory was
+    /// watched then: ask [`Dirs::watched_since`] of each directory rested on.
+    ///
+    /// Cold: asked only where the generations refused, under the changes' lock, a compare a
+    /// change heard since.
+    pub fn only_since(&self, generation: u64, mut aside: impl FnMut(&Path) -> bool) -> bool {
+        if !self.hot.settled.load(Ordering::Acquire) {
+            return false;
+        }
+        let changes = self.changes.lock();
+        changes.from <= generation
+            && changes
+                .kept()
+                .filter(|(heard, _)| *heard > generation)
+                .all(|(_, path)| path.is_some_and(|it| aside(as_path(it))))
+    }
+
+    /// Whether a directory at or above `path` has been watched without a break since before
+    /// `generation` was read, whatever was heard under it since, and the last round of
+    /// flushes is in: [`Dirs::unchanged_since`] less its second half, for a caller that asks
+    /// [`Dirs::only_since`] of what was heard. `path` is canonical, as there.
+    pub fn watched_since(&self, path: &Path, generation: u64) -> bool {
+        if !self.hot.settled.load(Ordering::Acquire) {
+            return false;
+        }
+        let bytes = trimmed(path);
+        // As [`Dirs::unchanged_since`] finds them: a directory asked of whole at or above the
+        // path, under a watch (its own, or one of a directory above it) unbroken since.
+        let (mut watched, mut whole) = (false, false);
+        prefixes(bytes, |end, tag| {
+            if let Some(dir) = self.find(&bytes[..end], tag) {
+                watched |= dir.since() <= generation;
+                whole = watched && dir.entry.recursive.load(Ordering::Acquire);
+            }
+            !whole
+        });
+        whole
+    }
 }
 
 impl Default for Dirs {
@@ -519,52 +904,200 @@ pub fn quiet_since(generation: u64) -> bool {
     DIRS.quiet_since(generation)
 }
 
-/// How many times this process looked at the disk for what a path outside every view is now,
-/// in place of an answer a watch vouched for ([`looked`]).
-static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What a look at the disk was of ([`Look`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum LookKind {
+    /// A file's content, links followed: the answer is its content's hash.
+    File,
+    /// The path itself, a link not followed: the answer is a hash of what it is (a
+    /// directory, or a file's or a link's id and mode).
+    Entry,
+    /// The names in a directory: the answer is the hash of its listing.
+    Listing,
+}
 
-/// Whether [`looked`] keeps the path it is told ([`name_looks`]).
-static NAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The last path [`looked`] was told while looks were named.
-static LAST_LOOK: Lock<PathBuf> = Lock::new("vfs.outside.last_look", PathBuf::new());
-
-/// Counts a look at the disk for what `path`, outside every view, is now (a `stat`, a read, a
-/// listing), made because no watch vouched for the answer kept. Called by each place that
-/// checks such a path: blaze-usercode's `inputs` (a traced file, entry or listing) and
-/// `roots` (a root resolved through a link), base-db's `IncludedFile::read_now` (a file an
-/// `include!` read), blaze-lints' `profile::load` (a lint profile) and the daemon's pinned
-/// native layouts. While looks are named ([`name_looks`]) the path is kept for
-/// [`last_look`].
-pub fn looked(path: &Path) {
-    LOOKS.fetch_add(1, Ordering::Relaxed);
-    if NAMING.load(Ordering::Relaxed) {
-        let mut last = LAST_LOOK.lock();
-        last.clear();
-        last.push(path); // alloc: grows to the longest path looked at, then is used again
+impl std::fmt::Display for LookKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LookKind::File => "the file",
+            LookKind::Entry => "the entry",
+            LookKind::Listing => "the names in",
+        })
     }
 }
 
-/// Has [`looked`] keep the path of each look from now on, or stop: on while someone will
-/// ask [`last_look`] (the daemon, while a build that may be answered again later walks), so
-/// a build no one asks about pays one load a look.
-pub fn name_looks(on: bool) {
-    NAMING.store(on, Ordering::Relaxed);
+/// One look at the disk for what `path`, outside every view, is now (a read, a `stat`, a
+/// listing), made because no watch vouched for the answer kept: the path, which question was
+/// asked of it, what the disk said (`None`: nothing is there), and the caller that looked.
+/// Made by each place that checks such a path (blaze-usercode's `inputs` and `roots`, base-db's
+/// `IncludedFile::read_now`, blaze-lints' `profile::load`, the daemon's pinned native layouts)
+/// and kept by the build it was made for ([`Looks`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Look {
+    pub path: PathBuf,
+    pub kind: LookKind,
+    pub answer: Option<[u8; 32]>,
+    pub by: &'static std::panic::Location<'static>,
 }
 
-/// The last path looked at while looks were named, for a person: which path no watch
-/// vouched for.
-pub fn last_look() -> Option<PathBuf> {
-    let last = LAST_LOOK.lock();
-    // clone: a reason, once a build asked about
-    (!last.as_os_str().is_empty()).then(|| last.clone())
+/// The looks one build made, owned by that build: every place that looks at the disk is
+/// handed the `Looks` of the build it looks for and pushes its look there, so no look is kept
+/// by the process and none is another build's. A clone is the same list. No cap: a first
+/// build after a daemon start looks at every native input and traced path once.
+///
+/// The invariant: a look is in the list of the build it was made for and of no other, each
+/// distinct (path, kind, answer) once, in an order that depends on no thread's timing.
+#[derive(Clone)]
+pub struct Looks(Option<std::sync::Arc<Lock<Kept>>>);
+
+/// A build's looks by (path, kind, answer), sorted: the same set from any interleaving.
+type Kept = std::collections::BTreeMap<(PathBuf, LookKind, Option<[u8; 32]>), &'static std::panic::Location<'static>>;
+
+impl Looks {
+    /// An empty list, for one build.
+    pub fn new() -> Looks {
+        // alloc: once a build, the list its looks are kept in
+        Looks(Some(std::sync::Arc::new(Lock::new("vfs.outside.looks", Kept::new()))))
+    }
+
+    /// A handle that keeps nothing, for a caller with no build (a check at a certificate
+    /// hit, a test): such a caller uses the answer of its look itself.
+    pub const fn none() -> Looks {
+        Looks(None)
+    }
+
+    /// Whether this keeps what it is told ([`Looks::new`]).
+    pub fn keeps(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Keeps a look of `kind` at `path` that said `answer`. A second look that said the same
+    /// is the same row; one that said something else is a second row ([`Looks::twice`]).
+    #[track_caller]
+    pub fn push(&self, path: &Path, kind: LookKind, answer: Option<[u8; 32]>) {
+        let Some(kept) = &self.0 else { return };
+        let by = std::panic::Location::caller();
+        // alloc: once a look at the disk, its path as the key it is kept by
+        kept.lock().entry((path.to_path_buf(), kind, answer)).or_insert(by);
+    }
+
+    /// Keeps each of `looks` too: a build that used a task another build ran holds that
+    /// task's looks as its own.
+    pub fn extend(&self, looks: &[Look]) {
+        let Some(kept) = &self.0 else { return };
+        let mut kept = kept.lock();
+        for look in looks {
+            // clone: a look copied to a second build, once per look per build
+            kept.entry((look.path.clone(), look.kind, look.answer)).or_insert(look.by);
+        }
+    }
+
+    /// How many looks are kept.
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |kept| kept.lock().len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every look kept, sorted by path, kind and answer.
+    pub fn all(&self) -> Vec<Look> {
+        let Some(kept) = &self.0 else { return Vec::new() }; // alloc: none
+        // alloc: once a build's end, its looks; clone: each path, once
+        kept.lock()
+            .iter()
+            .map(|((path, kind, answer), by)| Look { path: path.clone(), kind: *kind, answer: *answer, by: *by })
+            .collect()
+    }
+
+    /// Each pair of looks in `looks` (sorted, as [`Looks::all`] gives them) of one path and
+    /// kind that said two things: what such a build cannot be checked again by.
+    pub fn twice(looks: &[Look]) -> impl Iterator<Item = (&Look, &Look)> {
+        looks.windows(2).filter(|it| it[0].path == it[1].path && it[0].kind == it[1].kind).map(|it| (&it[0], &it[1]))
+    }
 }
 
-/// How many looks ([`looked`]) this process has made. A stretch of work across which it did
-/// not move checked no path outside every view on the disk: each it checked was vouched for by
-/// a watch, which [`quiet_since`] then covers.
-pub fn looks() -> u64 {
-    LOOKS.load(Ordering::Relaxed)
+impl Default for Looks {
+    fn default() -> Looks {
+        Looks::new()
+    }
+}
+
+impl std::fmt::Debug for Looks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.all().iter()).finish()
+    }
+}
+
+/// Each directory wanted at or above `path` with its state, beside `generation` and the
+/// table's: why [`unchanged_since`] says what it says of a directory asked of whole, for a
+/// person. Cold.
+pub fn why_changed(path: &Path, generation: u64) -> String {
+    let dirs = &*DIRS;
+    let bytes = trimmed(path);
+    // alloc: a reason, once a refusal said
+    let mut said = format!(
+        "asked at generation {generation}, now {}, settled {}:",
+        dirs.generation(),
+        dirs.hot.settled.load(Ordering::Acquire)
+    );
+    let mut any = false;
+    prefixes(bytes, |end, tag| {
+        if let Some(dir) = dirs.find(&bytes[..end], tag) {
+            any = true;
+            let since = match dir.since() {
+                UNCONFIRMED => "unconfirmed".to_owned(), // alloc: as above
+                since => since.to_string(),
+            };
+            said.push_str(&format!(
+                " {} (watched since {since}, changed at {}, asked of whole: {}, taken over: {});",
+                dir.path().display(),
+                dir.changed(),
+                dir.entry.recursive.load(Ordering::Acquire),
+                dir.subsumed_by().is_some()
+            ));
+        }
+        true
+    });
+    if !any {
+        said.push_str(" no directory at or above it is wanted");
+    }
+    said
+}
+
+/// Why no watch vouches for `path` now, for a person: the directory wanted at or above it and
+/// its two generations beside the table's, or that none is wanted. Cold: asked of the few
+/// paths a build names as looked at.
+pub fn why_looked(path: &Path) -> String {
+    let dirs = &*DIRS;
+    let settled = dirs.hot.settled.load(Ordering::Acquire);
+    let now = dirs.generation();
+    // alloc: a reason, once a path named
+    match dirs.cover(path) {
+        None => format!("no directory at or above it is wanted watched (of {} wanted; settled {settled})", dirs.len()),
+        Some(cover) => {
+            let named = path.parent().and_then(|dir| dirs.names.lock().get(trimmed(dir)).copied());
+            let named = match named {
+                // alloc: as above
+                Some(it) => format!(
+                    "; its directory's names asked of since {}, last named itself at {}, an entry of it at {}",
+                    it.since, it.own, it.direct
+                ),
+                None => "; no name asked of in its directory".to_owned(), // alloc: as above
+            };
+            let dir = cover.dir();
+            let since = match dir.since() {
+                UNCONFIRMED => "unconfirmed".to_owned(), // alloc: as above
+                since => since.to_string(),
+            };
+            format!(
+                "under the wanted {}: watched since generation {since}, last change heard at {}, now {now}, settled {settled}{named}",
+                dir.path().display(),
+                dir.changed()
+            )
+        }
+    }
 }
 
 /// [`Dirs::unchanged_since`] of the process's table.
@@ -572,9 +1105,29 @@ pub fn unchanged_since(path: &Path, generation: u64) -> bool {
     DIRS.unchanged_since(path, generation)
 }
 
+/// [`Dirs::only_since`] of the process's table.
+pub fn only_since(generation: u64, aside: impl FnMut(&Path) -> bool) -> bool {
+    DIRS.only_since(generation, aside)
+}
+
+/// [`Dirs::watched_since`] of the process's table.
+pub fn watched_since(path: &Path, generation: u64) -> bool {
+    DIRS.watched_since(path, generation)
+}
+
 /// [`Dirs::cover`] of the process's table.
 pub fn cover(path: &Path) -> Option<Cover<'static>> {
     DIRS.cover(path)
+}
+
+/// [`Dirs::watch_name`] of the process's table.
+pub fn watch_name(name: &Path) {
+    DIRS.watch_name(name)
+}
+
+/// [`Dirs::name_unchanged_since`] of the process's table.
+pub fn name_unchanged_since(name: &Path, generation: u64) -> bool {
+    DIRS.name_unchanged_since(name, generation)
 }
 
 /// [`Dirs::want`] of the process's table.
@@ -629,6 +1182,8 @@ pub struct Outside<'d> {
     dirs: &'d Dirs,
     /// The driver's root: what the directories are named under.
     root: PathBuf,
+    /// A changed file's whole path, as it is looked up: one buffer, grown to the longest.
+    heard: PathBuf,
     tags: u64,
     /// One per directory of the table, by its number; never removed (a retired one stays).
     watches: RegionVec<Watch>,
@@ -645,7 +1200,8 @@ impl<'d> Outside<'d> {
         let watches = RegionVec::new(MOST as usize, blaze_mem::Tag::Vfs)
             .unwrap_or_else(|error| panic!("the watches of directories outside views: {error}"));
         assert!(!dirs.driven.swap(true, Ordering::AcqRel), "another Outside drives this table");
-        Outside { dirs, root: root.into(), tags, watches, round: 0, left: 0 }
+        // alloc: once a driver, the buffer a changed file's path is looked up in
+        Outside { dirs, root: root.into(), heard: PathBuf::with_capacity(1024), tags, watches, round: 0, left: 0 }
     }
 
     /// Whether a completion is of an effect this asked for.
@@ -755,8 +1311,38 @@ impl<'d> Outside<'d> {
         let round = self.round;
         let watch = &mut self.watches[at];
         match (kind, completion.done) {
+            // A wake that names nothing and lost nothing is no change under this directory.
+            // Linux's watch is a mark of the whole file system (`blaze_core::fanotify`), so
+            // every write anywhere on it wakes every watch, and one whose events were all
+            // outside its directory completes with no file. Taken as a change, each build's
+            // own outputs made every watched directory "changed" (the toolchain's, glibc's in
+            // the nix store, which nothing writes): no answer was ever vouched for on Linux,
+            // and no build was answered again without a walk (2026-11-12, `blaze_vfs::
+            // outside::why_looked`: `watched since generation 6, last change heard at 3124,
+            // now 3128`).
+            (WATCH, Done::Changed { files, lost: false })
+                if files.is_empty() && !EMPTY_WAKE_IS_A_CHANGE.get() => {}
             (WATCH, Done::Changed { files, lost }) => {
-                dir.entry.changed.fetch_max(dirs.disturb(), Ordering::AcqRel);
+                // What it names: the directories asked of whole above each file, and the
+                // names asked of that it names. Nothing else under this watch moved
+                // ([`Dirs::quiet_since`]); what was lost is said below, by the watch's end.
+                // Each file that moved something is kept by its path ([`Dirs::heard`],
+                // [`Dirs::only_since`]).
+                let generation = dirs.bump();
+                if dirs.heard(&self.root, &files, generation, &mut self.heard) || lost {
+                    dirs.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
+                }
+                if lost {
+                    // The names are not all of them: no caller sets that aside.
+                    dirs.hear(generation, None);
+                }
+                if files.is_empty() && !lost {
+                    // Only with `EMPTY_WAKE_IS_A_CHANGE` planted: the wake as a change of all.
+                    dir.entry.changed.fetch_max(generation, Ordering::AcqRel);
+                    dirs.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
+                    dirs.hear(generation, None);
+                }
+                let watch = &mut self.watches[at];
                 let replaced = lost || watch.file.as_ref().is_some_and(|it| files.contains(it));
                 if watch.retired {
                     // Its end is asked already; the directory above it hears the rest.
@@ -895,6 +1481,29 @@ impl<'d> Outside<'d> {
     }
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: a name is never vouched for
+    /// ([`Dirs::name_unchanged_since`]), as before names were asked of apart from their
+    /// directories' whole trees a home directory's names never were. Never set outside a test.
+    #[doc(hidden)]
+    pub static NAMES_HEAR_NOTHING_BESIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a cover asks only the directory it was found
+    /// with, though a directory above took its watch over, as until 2026-11-12. Never set
+    /// outside a test.
+    #[doc(hidden)]
+    pub static COVER_STAYS_ON_THE_RETIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a watch's wake that names no file and lost none
+    /// is taken as a change under its directory, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static EMPTY_WAKE_IS_A_CHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Every directory stops vouching once nothing drives it.
 impl Drop for Outside<'_> {
     fn drop(&mut self) {
@@ -909,8 +1518,10 @@ impl Drop for Outside<'_> {
 fn unconfirm(dirs: &Dirs, dir: Dir<'_>, watch: &mut Watch) {
     dir.entry.since.store(UNCONFIRMED, Ordering::Release);
     watch.confirmed = false;
-    // What it vouched for is vouched for no more ([`Dirs::quiet_since`]).
-    dirs.disturb();
+    // What it vouched for is vouched for no more ([`Dirs::quiet_since`]), and no caller sets
+    // that aside ([`Dirs::only_since`]).
+    let heard = dirs.disturb();
+    dirs.hear(heard, None);
 }
 
 fn back_off(watch: &mut Watch, round: u64) {

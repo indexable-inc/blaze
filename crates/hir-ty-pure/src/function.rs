@@ -10,7 +10,7 @@
 //! The inferred facts ([`instance_effects`], [`fn_memory`]) are the same summary's, for any
 //! instance, with or without an attribute.
 
-use std::alloc::Global;
+use std::{alloc::Global, sync::Arc};
 
 use base_db::{Crate, CrateOrigin, Db, FileId};
 use blaze_hash::HashSet;
@@ -42,7 +42,7 @@ use rustc_type_ir::{
 use crate::{
     effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index, trusted_trait},
     memory::MemoryEffects,
-    walk::{Cx, Def, How, Instance, Summary, body_of, never_returns, summary},
+    walk::{Cx, Def, How, Instance, Summary, body_once, never_returns, summary},
 };
 
 /// What a check found of an instance.
@@ -302,12 +302,12 @@ fn checked(
     if let Some(taken) = &found.unlisted_dyn
         && summary.set(index).has(Rule::Dyn)
     {
-        let mut refusal = refusal(&cx, def, index, Rule::Dyn, &root, summary);
+        let mut refusal = refusal(&cx, def, index, Rule::Dyn, &root, &summary);
         refusal.rule = Rule::Unchecked;
         refusal.says = (def.says)(Rule::Unchecked);
         // alloc: the refusal's text, once
         refusal.what = format!(
-            "{}; the function takes `{taken}`, whose calls the check can't see: give the trait's method a `#[blaze::may(..)]`, take a type parameter, or mark the trait trusted",
+            "{}; the function takes `{taken}`, whose calls the check can't see: give the trait's method a `#[blaze::expect(..)]`, take a type parameter, or mark the trait trusted",
             refusal.what
         )
         .into();
@@ -323,7 +323,7 @@ fn checked(
         .iter()
         .min_by_key(|rule| summary.witness(index, *rule).map_or(u16::MAX, |it| it.depth));
     if let Some(rule) = shortest {
-        return FnPurity::Impure(refusal(&cx, def, index, rule, &root, summary));
+        return FnPurity::Impure(refusal(&cx, def, index, rule, &root, &summary));
     }
     let instances = reach(db, &env, &root, def, &mut found);
     FnPurity::Pure(found.proof(instances))
@@ -419,7 +419,9 @@ fn refusal(
 ) -> Refusal {
     let db = cx.db;
     let mut chain: Vec<Step> = Vec::new(); // alloc: the refusal's chain, once
-    let mut at = (root.clone(), summary); // clone: reference counts
+    // The instance the chain is at, and its summary where it is a callee's (the root's is
+    // `summary`).
+    let mut at: (Instance, Option<Arc<Summary>>) = (root.clone(), None); // clone: reference counts
     let mut what: Box<str> = rule.said().into();
     // A witness's depth falls by one each call: the bound is the root's. A recursion's does
     // not (`walk::RECURSION_DEPTH`): its chain ends where the next instance is one already in
@@ -430,7 +432,7 @@ fn refusal(
     };
     let mut named: Vec<Instance> = Vec::new(); // alloc: the instances of a recursion's chain
     for _ in 0..=bound {
-        let (instance, summary) = (&at.0, at.1);
+        let (instance, summary) = (&at.0, at.1.as_deref().unwrap_or(summary));
         if rule == Rule::Recursion {
             named.push(instance.clone()); // clone: reference counts
         }
@@ -470,7 +472,7 @@ fn refusal(
                     break;
                 };
                 let callee = crate::walk::summary(db, cx.stored.clone(), next.clone()); // clone: the query's key
-                at = (next, callee);
+                at = (next, Some(callee));
             }
         }
     }
@@ -492,8 +494,9 @@ const CHAIN: usize = 64;
 /// body inlined into it.
 fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     let db = cx.db;
-    let body = body_of(db, &cx.stored, instance)?.ok()?;
-    let (span, _) = source_span(body, span);
+    // Read once, for a refusal's text, and dropped with it.
+    let body = body_once(db, &cx.stored, instance)?.ok()?;
+    let (span, _) = source_span(&body, span);
     let owner = match body.owner {
         InferBodyId::DefWithBodyId(owner) => owner,
         InferBodyId::AnonConstId(_) => return None,
@@ -645,7 +648,7 @@ impl<'db> Params<'_, 'db> {
             }),
             TyKind::Dynamic(bounds, _) => {
                 let door = bounds.principal().map(|it| it.skip_binder().def_id.0);
-                // Every method of the trait is held, in each impl, within a `#[blaze::may(..)]`
+                // Every method of the trait is held, in each impl, within a `#[blaze::expect(..)]`
                 // that leaves this effect's word out: a call through the `dyn` cannot have it.
                 if door.is_some_and(|it| bounded_trait(cx.db, it, self.def)) {
                     return;
@@ -730,7 +733,7 @@ impl<'db> Params<'_, 'db> {
     }
 }
 
-/// Whether every method of `trait_` (it has one) is bounded for `def` by a `#[blaze::may(..)]`
+/// Whether every method of `trait_` (it has one) is bounded for `def` by a `#[blaze::expect(..)]`
 /// on it or on the trait ([`effects::bound_mask`]).
 fn bounded_trait(db: &Db, trait_: TraitId, def: &EffectDef) -> bool {
     let Some(index) = effect_index(def) else { return false };

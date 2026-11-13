@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-format.workspace = true
+# `ContentMap`'s table: `ByHash`, keyed by the content ID itself.
+blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 

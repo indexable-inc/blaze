@@ -228,7 +228,7 @@ impl<'p> Scope<'p> {
         live.last.set(name);
         let frame = match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
             Ok(frame) => frame,
-            Err(_) => {
+            Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. }) => {
                 let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
                 let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
                 return Task { name, outcome: Err(error), scope: PhantomData };
@@ -275,16 +275,24 @@ impl<'p> Scope<'p> {
 
     /// Cancels the scope: the next wait of each task under it ends with
     /// [`Stopped::Cancelled`].
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cancel(&self) {
         self.live.cx.cancel();
     }
 
     /// The scope's own context.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cx(&self) -> &Cx {
         &self.live.cx
     }
 
     /// How many of its tasks are running now: none, under `Inline`, outside a task.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn running(&self) -> usize {
         self.live.running.get()
     }
@@ -303,8 +311,8 @@ impl<'p> Scope<'p> {
                 why: TaskWhy::Unended { running, stopped },
             }),
             Settled::All => match (failed, cx.plant()) {
-                (Some(_), Plant::JoinDropsFailure) | (None, _) => Ok(()),
-                (Some(failed), _) => Err(failed),
+                (Some(_), Plant::JoinDropsFailure) | (None, Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned) => Ok(()),
+                (Some(failed), Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned) => Err(failed),
             },
         }
     }
@@ -312,6 +320,9 @@ impl<'p> Scope<'p> {
 
 impl<T> Task<'_, T> {
     /// Its name in its scope.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -319,6 +330,9 @@ impl<T> Task<'_, T> {
     /// The task finished: what it returned, or how it failed (named by its scope and its
     /// name). Under `Inline` it ended at its spawn, so this does not wait.
     #[blaze::consumes]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn join(self, _cx: &Cx) -> Result<T, TaskError> {
         self.outcome
     }

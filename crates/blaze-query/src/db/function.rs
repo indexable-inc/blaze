@@ -50,8 +50,8 @@ use super::{
         UNTRACKED, VALUE, VIEW_MASK, span,
     },
     storage::{
-        ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
-        node_key, or,
+        ALL, Durability, FIELD, LOOSE, Relocate, Restamp, Storage, Summary, Table, color,
+        key_parts, node_key, or,
     },
     verify,
 };
@@ -171,7 +171,9 @@ impl Vtable {
             made: None,
             memory: memory::<F>,
             used: Some(used::<F> as fn(&Storage, u32) -> u64),
+            values: Some(values::<F> as fn(&Storage, u32) -> u64),
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
+            db: Some(std::any::TypeId::of::<F::Db> as fn() -> std::any::TypeId),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
             weighed: if F::BUDGETED {
                 Some(Weighed {
@@ -467,6 +469,18 @@ fn refresh<F: Function>(
             }
             return State::OnStack(at);
         }
+        // A row behind a seal a write may have reached: its group is checked once, here, and
+        // every row of it is proved by that check, or the seal is broken and the row is
+        // verified as any other is ([`super::seal`]).
+        if word & (RUNNING | PROVISIONAL) == 0
+            && node != 0
+            && word & VIEW_MASK != 0
+            && word & VIEW_MASK != view
+            && let Some(group) = storage.seals.suspect_of(node)
+            && super::seal::resolve(std::ptr::from_ref(db).cast::<()>(), storage, group, None)
+        {
+            continue;
+        }
         if word & PROVISIONAL != 0 {
             let head = header.extra.load(Ordering::Relaxed) as u32;
             match local::with(|local| local.find(storage, head)) {
@@ -490,6 +504,7 @@ fn refresh<F: Function>(
         {
             // A changed-set walk ended in this view and did not reach the row: it is
             // unchanged, with no look at its edges. A mark another task won is looked at again.
+            counts::count(index, counts::PROVED_FIRST);
             mark(storage, header, word, node, index, id);
             continue;
         } else if word & RUNNING == 0
@@ -655,9 +670,7 @@ fn claimed<F: Function>(
         run::<F>(db, storage, index, row, key, None, false);
         return None;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-        || storage.inputs_unchanged(storage.node(node), word & VIEW_MASK)
-    {
+    if storage.holds(node, storage.node(node), meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
             storage.record_run(node, Cause::Evicted);
             run::<F>(db, storage, index, row, key, None, true);
@@ -765,6 +778,11 @@ pub(crate) mod probe {
         /// frame at round 1 again, so its `cycle_recover` is told 1 in every round
         /// ([`super::run`], `tests/inner_heads.rs`).
         pub(crate) static KEPT_HEADS_START_AGAIN: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] stamps a row current with
+        /// no look at its edges.
+        pub(crate) static REFRESH_UNVERIFIED: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] records no read edge.
+        pub(crate) static REFRESH_RECORDS_NO_READ: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -836,7 +854,10 @@ fn verify_claimed(
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
     let mut summary = [0; 2];
+    // The census: this row's edges are looked at, and how many, counted when the look ends.
+    let mut census = counts::Claimed::of(key_parts(storage.key_of(row_node)).0);
     for at in start..start + len {
+        census.compared += 1;
         let node = storage.edge(at);
         let row = storage.node(node);
         let mut seen = row.color();
@@ -884,12 +905,102 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
     }
 }
 
+/// What [`refresh_by_key`] found of a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refreshed {
+    /// A function's row, verified (or run) in this view: its kept reads are those of its last
+    /// run and are not replaced in this view. Its value may have been let go: none is made for
+    /// this.
+    Current,
+    /// A function's row that cannot be brought up to date from here: running on this task (a
+    /// cycle through it), provisional, proved only on the assumption of a verify open lower
+    /// on this task's stack, or of a key its function no longer takes. No read is recorded.
+    Unsettled,
+    /// Not a function's row (an input's field, an interned or a tracked struct): it keeps no
+    /// reads, and there is nothing to bring up to date.
+    NotAFunction,
+}
+
+/// Brings the row `key` names up to date in this view, without knowing which function it is
+/// a row of: [`Vtable::verify`], what a reader's edge on the row does, asked by its key.
+///
+/// The invariant: a row this answers [`Refreshed::Current`] for is what a fresh run of its
+/// function gives in this view (its value, and the reads its run kept: verified by its edges,
+/// each dependency brought up to date first, and run again if one changed, or run when it
+/// never ran), and the running query, if any, now has a read edge on it, as a fetch of it
+/// leaves. So a query that uses what the row holds besides its value (its kept reads:
+/// [`super::Storage::row_reads`], [`super::Reads::for_each_read_through`], which asks this
+/// itself) runs again when the row does. A row a reader proved by durability, with no look
+/// at its edges, keeps the stamp of the view it was last verified in until it is asked for:
+/// this is the asking. No value is made for a row whose value was let go.
+///
+/// For the engine's own operation reachable by key alone, so no caller keeps a list of the
+/// queries it may meet (a `match` over each function's typed `arguments`).
+///
+/// # Panics
+///
+/// When `D` is not the database type of `key`'s function or of the storage, or `key` is an
+/// ID the storage never gave ([`super::NeverGiven`]). Unwinds as a fetch does (a pending
+/// write, a bound that ran out).
+pub fn refresh_by_key<D: Database>(db: &D, key: DatabaseKeyIndex) -> Refreshed {
+    let storage = db.storage();
+    let (index, id) = (key.ingredient_index(), key.key_index());
+    let Some(vtable) = ingredient::vtable(index) else {
+        return Refreshed::NotAFunction;
+    };
+    let (Some(verify), Some(db_type)) = (vtable.verify, vtable.db) else {
+        return Refreshed::NotAFunction;
+    };
+    // The cast below is to the function's own database type, so `D` must be it: a key of
+    // another database's function (ingredients are the process's) is refused by name. Its
+    // table, made by the verify if this storage has none, checks `F::Db` against the
+    // storage's one database type.
+    assert!(
+        db_type() == std::any::TypeId::of::<D>(),
+        "{}",
+        blaze_report::say!(
+            blaze_report::say::Code(vtable.name),
+            " was asked to refresh with a database of another type (",
+            blaze_report::say::Words(std::any::type_name::<D>()),
+            ")",
+        )
+        .flat()
+    );
+    #[cfg(test)]
+    if probe::REFRESH_UNVERIFIED.with(Cell::get)
+        && let Some(header) = header_of(storage, index, id)
+    {
+        // The planted bug: the row is stamped current with no look at its edges.
+        let word = header.verified.load(Ordering::Acquire);
+        header.verified.store(storage.view_bits() | (word & VALUE), Ordering::Release);
+        read(storage, header);
+        return Refreshed::Current;
+    }
+    // SAFETY: `db` is a `&D`, and `D` is the function's `F::Db` (checked above);
+    // `id` is passed as it is, and `verify_edge` refuses an ID that is not a key of its
+    // function (`FromIdIn`) or that the storage never gave.
+    match unsafe { verify(std::ptr::from_ref(db).cast::<()>(), storage, id) } {
+        Verified::Current => {
+            let header = header_of(storage, index, id)
+                .expect("a row verified in this view has its page: `verify_edge` made it");
+            #[cfg(test)]
+            if probe::REFRESH_RECORDS_NO_READ.with(Cell::get) {
+                return Refreshed::Current;
+            }
+            read(storage, header);
+            Refreshed::Current
+        }
+        Verified::Changed | Verified::Assumed => Refreshed::Unsettled,
+    }
+}
+
 /// What a run leaves on its frame.
 struct Ran {
     head: u32,
     reentered: bool,
     unconverged: bool,
     untracked: bool,
+    stored: bool,
     durability: u8,
     changed: u32,
     round: u32,
@@ -906,6 +1017,7 @@ fn ran(at: u32) -> Ran {
             reentered: frame.reentered,
             unconverged: frame.unconverged,
             untracked: frame.untracked,
+            stored: frame.stored,
             durability: frame.durability,
             changed: frame.changed,
             round: frame.round,
@@ -1121,15 +1233,18 @@ fn store_edges(storage: &Storage, header: &Header, at: u32) {
 }
 
 /// Sets the summary of the run at `at` (node `node`): the OR of its edges' and its replayed
-/// reads', all bits when it made an untracked read.
-fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
+/// reads', all bits when it made an untracked read. Its seal group is worked out from the
+/// same edges ([`super::seal::Seals::derived`]); `made`: the row had run before.
+fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool, made: bool) {
     let summary = if untracked {
         ALL
     } else {
         local::with(|local| {
             let frame = &local.frames[at as usize];
             let start = frame.edges_start as usize;
-            or(frame.summary, storage.summary_of_edges(&local.edges[start..]))
+            let edges = &local.edges[start..];
+            let summary = or(frame.summary, storage.summary_of_edges(edges));
+            storage.seals.derived(storage, node, edges, summary, made)
         })
     };
     storage.set_summary(node, summary);
@@ -1182,7 +1297,9 @@ fn finish<F: Function>(
     } else {
         gained(table, id);
     }
-    let meta = durability | if done.untracked { UNTRACKED } else { 0 };
+    let meta = durability
+        | if done.untracked { UNTRACKED } else { 0 }
+        | if done.stored { row::STORED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { put(table, row, new) };
     // A head whose last round read no row of its cycle (or a verify turned run that was met
@@ -1199,7 +1316,7 @@ fn finish<F: Function>(
     // publishes, so a task waiting on this flight finds them never made.
     drop_orphans(storage, done.members, done.node);
     store_edges(storage, header, at);
-    summarize(storage, done.node, at, done.untracked);
+    summarize(storage, done.node, at, done.untracked, made_before);
     header.changed.store(changed, Ordering::Relaxed);
     header.meta.store(meta, Ordering::Relaxed);
     storage.paint(done.node, color(view, changed));
@@ -1378,7 +1495,8 @@ fn head_round<F: Function>(
         if reads.untracked != 0 {
             storage.frontier.untracked(done.node);
         }
-        storage.set_summary(done.node, reads.summary);
+        // A cycle's rows are of no seal group: what they read is no one group's to cover.
+        storage.set_summary(done.node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(meta, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -1487,7 +1605,8 @@ fn finalize(storage: &Storage, from: u32, head: u32, reads: Converged) -> u32 {
         if reads.untracked != 0 {
             storage.frontier.untracked(node);
         }
-        storage.set_summary(node, reads.summary);
+        // As its head: of no seal group.
+        storage.set_summary(node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(lowest | CYCLE | reads.untracked, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -1562,7 +1681,9 @@ fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
         below -= 1;
         let frame = &mut local.frames[below];
         match frame.kind {
-            FrameKind::Barrier { .. } => {
+            // A witness frame is passed through as a barrier is: a cycle member's hand-over reaches
+            // the run below it, and the witness ends not complete (its provisional read set its head).
+            FrameKind::Barrier { .. } | FrameKind::Witness { .. } => {
                 // Its pop must not cut the reads it is under.
                 frame.edges_start = top as u32;
             }
@@ -2053,6 +2174,11 @@ fn memory<F: Function>(storage: &Storage, index: u32) -> MemoryUsage {
         // A budgeted function's values say what they hold beside themselves ([`Function::weigh`]).
         value_bytes: weighed,
     }
+}
+
+/// [`Vtable::values`] of `F`: the values its table holds now, one load.
+fn values<F: Function>(storage: &Storage, index: u32) -> u64 {
+    storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed) as u64)
 }
 
 /// [`Vtable::used`] of `F`: its rows that ran, each holding a node from its first run

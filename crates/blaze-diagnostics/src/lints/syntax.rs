@@ -44,8 +44,9 @@ use syntax::{
 };
 
 use crate::{
-    cx::Cx,
+    cx::{Beyond, Cx},
     lints::CommandLine,
+    pieces::Walked,
     lower::{Found, Phase},
     model::Diag,
 };
@@ -219,7 +220,30 @@ pub(crate) struct Walk<'db> {
 }
 
 impl<'db> Walk<'db> {
+    /// The walk `cx` is made for: of a piece's probe ([`Cx::piece_probe`]), the piece's own
+    /// tree alone, position-free, whose expansions the probe does not follow (one is beyond its
+    /// key: it stops there); of a scoped context ([`Cx::scoped`]), every file and expansion of
+    /// the crate's walk but a file whose pieces are all clean and the subtree of each clean
+    /// body, so an expansion is added only of a call in a piece walked; else the crate's.
     pub(crate) fn of(cx: &Cx<'_, 'db>) -> Walk<'db> {
+        if let Some(piece) = cx.probed_piece() {
+            let mut walk = Walk {
+                // alloc: setup, once per probe, one tree
+                trees: Vec::with_capacity(1),
+                cfg: cx.krate.cfg(cx.db),
+                index: HashMap::new_in(Global),
+                // The modules' order is read only to order what a pass found, which a probe
+                // stops before.
+                modules: HashMap::new_in(Global),
+            };
+            let Some((file, root)) = crate::pieces::piece_root(cx.db, piece) else {
+                cx.note_beyond(Beyond::Other);
+                return walk;
+            };
+            walk.add(cx, file, root, Vec::new(), &[]);
+            return walk;
+        }
+        let scope = cx.scope().map(|it| crate::pieces::FileScopes::of(it, cx.db));
         let modules = crate::checks::modules(cx);
         let mut walk = Walk {
             // alloc: setup, the walk is made once per check (`Cx::walk`)
@@ -245,20 +269,31 @@ impl<'db> Walk<'db> {
             }
             // clone: setup, as above
             places.insert(file_id, place.clone());
+            let skips = match scope.as_ref().map(|it| it.walked(file)) {
+                None => &[][..],
+                Some(Walked::Not) => continue,
+                Some(Walked::Skipping(skips)) => skips,
+            };
             let root = cx.vsema.parse(file).syntax();
-            walk.add(cx, file_id, root, place);
+            walk.add(cx, file_id, root, place, skips);
         }
         walk
     }
 
-    /// Adds the tree `root` of `file`, and the trees of what the macros in it expand to.
+    /// Adds the tree `root` of `file`, and the trees of what the macros in it expand to, but
+    /// the subtree at each of `skips` (clean bodies' ranges, in order: [`Cx::scoped`]). Of a
+    /// piece's probe, `root` is the piece's own tree, and the first expansion, `#[expect]` or
+    /// checked `cfg` met stops the probe ([`Cx::note_beyond`]): no `cx.vsema` is asked of a
+    /// tree it did not hand out.
     fn add(
         &mut self,
         cx: &Cx<'_, 'db>,
         file: HirFileId,
         root: ast::Node<'db>,
         place: Vec<(u32, u32)>,
+        skips: &[TextRange],
     ) {
+        let probe = cx.probed_piece();
         // The tree's index is taken now: what it expands to is added after it is pushed.
         match self.index.entry(file) {
             Entry::Occupied(_) => return,
@@ -293,34 +328,62 @@ impl<'db> Walk<'db> {
                 }
             };
             let kind = node.kind();
+            let range = node.text_range();
+            if let Ok(at) = skips.binary_search_by_key(&range.start(), |it| it.start())
+                && skips[at] == range
+            {
+                // A clean body: the passes find nothing in it.
+                events.skip_subtree();
+                continue;
+            }
             if let Some(owner) = ast::AnyHasAttrs::cast(node)
                 && !self.on(owner)
             {
+                if probe.is_some() && cx.probe_checks_cfg() {
+                    // `--check-cfg` checks the `cfg` that removes it, with flags the probe
+                    // is not given.
+                    cx.note_beyond(Beyond::Other);
+                }
                 off.push(node);
                 events.skip_subtree();
                 continue;
             }
             if let Some(item) = ast::Item::cast(node)
                 && item.attrs().next().is_some()
-                && let Some(expanded) = cx.vsema.expand_attr_macro(item)
             {
-                expansions.push((entered(node.text_range()), expanded.value));
-                replaced.push(node);
-                events.skip_subtree();
-                continue;
+                if probe.is_some() {
+                    if item.attrs().any(|it| !crate::pieces::inert(it)) {
+                        cx.note_beyond(Beyond::Expansion);
+                    }
+                } else if let Some(expanded) = cx.vsema.expand_attr_macro(item) {
+                    expansions.push((entered(range), expanded.value));
+                    replaced.push(node);
+                    events.skip_subtree();
+                    continue;
+                }
             }
             if kind == SyntaxKind::MACRO_CALL
                 && let Some(call) = ast::MacroCall::cast(node)
-                && let Some(expanded) = cx.vsema.expand_macro_call(call)
             {
-                expansions.push((entered(node.text_range()), expanded));
+                if probe.is_some() {
+                    cx.note_beyond(Beyond::Expansion);
+                } else if let Some(expanded) = cx.vsema.expand_macro_call(call) {
+                    expansions.push((entered(range), expanded));
+                }
             }
-            if kind == SyntaxKind::MODULE
-                && let Some(module) = self.block_module(cx, file, node)
-            {
-                expansions.push((entered(node.text_range()), module));
+            if kind == SyntaxKind::MODULE {
+                if let Some(piece) = probe {
+                    if ast::Module::cast(node).is_some_and(|it| it.item_list().is_none())
+                        && crate::pieces::in_block(node, piece)
+                    {
+                        cx.note_beyond(Beyond::Expansion);
+                    }
+                } else if let Some(module) = self.block_module(cx, file, node) {
+                    expansions.push((entered(range), module));
+                }
             }
-            if ast::Adt::can_cast(kind)
+            if probe.is_none()
+                && ast::Adt::can_cast(kind)
                 && let Some(owner) = ast::AnyHasAttrs::cast(node)
             {
                 // What a derive makes comes after the item it is on.
@@ -342,6 +405,9 @@ impl<'db> Walk<'db> {
             }
             // What holds an attribute is in `nodes`: the walk skips no node above one it enters.
             if kind == SyntaxKind::ATTR {
+                if probe.is_some() {
+                    crate::pieces::probe_attr(cx, node);
+                }
                 for &at in open.iter().rev().take(3) {
                     attrs[at as usize] = true;
                 }
@@ -374,7 +440,7 @@ impl<'db> Walk<'db> {
             // clone: setup, once per tree an expansion adds, its place
             let mut place = self.trees[tree].place.clone();
             place.push(at);
-            self.add(cx, expanded.file_id, expanded.value, place);
+            self.add(cx, expanded.file_id, expanded.value, place, &[]);
         }
     }
 
@@ -937,7 +1003,7 @@ extern "C" {
                     modules: HashMap::new_in(Global),
                 };
                 blaze_alloc_count::assert_at_most(4, "the walk of a tree", || {
-                    again.add(cx, tree.file, tree.root, Vec::new());
+                    again.add(cx, tree.file, tree.root, Vec::new(), &[]);
                 });
                 assert_eq!(again.trees[0].nodes, tree.nodes);
                 assert!(tree.nodes.len() > 10 * fns, "{}", tree.nodes.len());

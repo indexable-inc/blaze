@@ -7,6 +7,18 @@
 //! The column of a restored image is read in place ([`Base`]: sorted names, their ends and their
 //! stamps, decoded field by field as they are read); what changes after goes into an overlay,
 //! and the next image merges both into one sorted column again.
+//!
+//! What changes between images is in the VFS journal too, as `SEEN` records (one per committed
+//! batch, after the head record it vouches for, and one per disk in a rewrite: its overlay), so
+//! a start with no image since the last edit, or after a crash, still finds every stamp
+//! ([`Disks::replay`]). A stamp taken within [`window_ns`] of its file's change is never saved: a
+//! later write in the same tick of the file system's clock could leave the same stamp over other
+//! bytes. The name is saved as [`Stamp::UNKNOWN`] and read again once steady.
+//!
+//! Beside the disks, the journal keeps a machine's local facts by name ([`Marks`]: the tool's
+//! hash, each placed output's stamp and content, each checkout's carry), each a `MARK` record.
+
+use std::collections::BTreeMap;
 
 use blaze_core::{Cursor, FileName, Names, Stamp};
 use blaze_format::cursor::{self, Put as _, Reader, Wanted};
@@ -17,6 +29,109 @@ use std::alloc::Global;
 use crate::section::Section;
 
 const MAGIC: [u8; 4] = *b"BZD2";
+
+/// How long after a file's change its stamp vouches for nothing on a file system whose stamps
+/// are whole seconds (HFS+ keeps one second, FAT and some network file systems two): a second
+/// write in the tick of the first can leave the stamp as it was. Taken past this, a stamp can
+/// only be left by a write that moves it.
+pub const COARSE_NS: u64 = 2_000_000_000;
+
+/// The window of a stamp with a sub-second part: such a file system's clock ticks at the
+/// kernel's tick or finer (Linux's coarse clock, `current_time`, ticks at a jiffy, 10 ms at
+/// `HZ=100`, the slowest; APFS, NTFS and ext4 with nanosecond stamps are finer), and this is
+/// twice that tick. A file system whose fine clock ticks coarser than 10 ms is not covered by
+/// this rule: it must be added by name, with a window of its own, never by widening this one.
+pub const FINE_NS: u64 = 20_000_000;
+
+/// The racy window of `stamp`, git's racy rule by the file system's clock: [`COARSE_NS`] when
+/// its mtime and ctime both have no sub-second part (a coarse clock, or a fine one that landed
+/// on a whole second: conservative either way), else [`FINE_NS`]. The one home of the window:
+/// the watcher's column, the daemon's evidence of outputs and its local facts all ask
+/// [`racy`].
+pub fn window_ns(stamp: &Stamp) -> u64 {
+    const SECOND: u64 = 1_000_000_000;
+    match stamp.mtime_ns % SECOND == 0 && stamp.ctime_ns % SECOND == 0 {
+        true => COARSE_NS,
+        false => FINE_NS,
+    }
+}
+
+/// The bit of a saved stamp's mode that says the head chose other bytes than the disk had at
+/// that stamp: a conflict ([`crate::Watched::Conflict`]) or a commit to the head by anyone but
+/// its watcher. No file system's mode reaches it (`st_mode` and `stx_mode` are 16 bits; the
+/// drivers' synthesized modes are too). The watcher reads the stamp without it ([`plain`]): the
+/// disk was seen at that stamp, and while it stays there the head keeps its choice. The column a
+/// client checks ([`crate::Column`]) hands it as [`Stamp::UNKNOWN`]: it vouches for no bytes the
+/// root holds. Kept in the stamp's own bytes, so the image's column and `SEEN` records carry it
+/// with no layout of their own, and a column of the layout before it has none set.
+const CHOSE: u32 = 1 << 31;
+
+/// `stamp`, saved as one the head chose against ([`CHOSE`]). A gone or unknown one is itself.
+pub(crate) fn chose(stamp: Stamp) -> Stamp {
+    match stamp.is_gone() || stamp.is_unknown() {
+        true => stamp,
+        false => Stamp { mode: stamp.mode | CHOSE, ..stamp },
+    }
+}
+
+/// `stamp` as the disk gave it: [`CHOSE`] cleared.
+pub(crate) fn plain(stamp: Stamp) -> Stamp {
+    match stamp.is_unknown() {
+        true => stamp,
+        false => Stamp { mode: stamp.mode & !CHOSE, ..stamp },
+    }
+}
+
+/// Whether a saved stamp vouches that the column's root holds the bytes the disk had at it:
+/// known, and not one the head chose against.
+pub(crate) fn vouches(stamp: &Stamp) -> bool {
+    !stamp.is_unknown() && stamp.mode & CHOSE == 0
+}
+
+/// When `stamp`'s file last changed, by the file system's clock.
+pub(crate) fn changed_ns(stamp: &Stamp) -> u64 {
+    stamp.mtime_ns.max(stamp.ctime_ns)
+}
+
+/// The first instant by the file system's clock at which a look finds `stamp` steady.
+pub(crate) fn steady_at(stamp: &Stamp) -> u64 {
+    changed_ns(stamp).saturating_add(window_ns(stamp))
+}
+
+/// Whether `stamp`, asked for at `asked_ns` or later, is within its [`window_ns`] of its
+/// change: a racy stamp vouches for nothing.
+pub fn racy(stamp: &Stamp, asked_ns: u64) -> bool {
+    steady_at(stamp) > asked_ns
+}
+
+/// One entry of a `SEEN` record: a name and its stamp ([`Stamp::GONE`]: it and everything
+/// under it are gone).
+pub(crate) fn put_entry(out: &mut Vec<u8>, name: &str, stamp: Stamp) {
+    out.put_bytes_u32(name.as_bytes());
+    stamp.encode(out);
+}
+
+/// A `SEEN` record's payload, the one home of its layout: `head str_u32 | dir str_u32 | cursor
+/// (25 B) | root: u8 flag + 32 B | count u32 | count x (name str_u32, stamp 36 B)`, the entries
+/// ([`put_entry`]'s, `count` of them) in the order they were applied, `disk`'s cursor as it is
+/// now, and `root` (the disk's, or none for all but the last of a split record:
+/// `journal::frame_seen`).
+pub(crate) fn encode_seen(
+    out: &mut Vec<u8>,
+    head: &str,
+    disk: &Disk,
+    root: Option<ContentId>,
+    count: u32,
+    entries: &[u8],
+) {
+    out.put_bytes_u32(head.as_bytes());
+    out.put_bytes_u32(disk.dir.as_str().as_bytes());
+    disk.cursor.encode(out);
+    out.put_u8(u8::from(root.is_some()));
+    out.put_bytes(&root.unwrap_or_default().0);
+    out.put_u32(count);
+    out.put_bytes(entries);
+}
 
 /// A restored column: `count` names sorted bytewise, each with a NUL after it as [`Names`] lays
 /// names out (so a sweep of the whole column is one copy), its end past the NUL in `ends`, and
@@ -77,8 +192,15 @@ impl Base {
 pub(crate) struct Disk {
     pub(crate) dir: FileName,
     pub(crate) cursor: Cursor,
-    /// The head's root when the column last held all of it: a rescan takes from the head only
-    /// what changed since (its diff), not every file. `None`: the head is looked at whole.
+    /// The root the column holds all of and vouches for, the head's when it was set. The
+    /// invariant: every file of `root` is a name in the column, and every name whose saved
+    /// stamp [`vouches`] holds in `root` the bytes the disk had at that stamp. So a rescan takes
+    /// from the head only what changed since `root` (its diff), and the column a client checks
+    /// pairs its stamps with `root` while it is the head's ([`crate::Vfs::column`]). Set by the
+    /// watcher's commits ([`crate::Watcher`]: kept on from the head it was, or begun by a look
+    /// at the whole directory) and moved by every other commit to the head, which marks what it
+    /// changed ([`crate::Vfs::commit`]). `None`: neither is promised; the head is looked at
+    /// whole, and the next look at the whole directory reads every file.
     pub(crate) root: Option<ContentId>,
     base: Option<Base>,
     /// Paths changed since `base`, by name under the driver's root: [`Stamp::GONE`] for one gone.
@@ -90,8 +212,14 @@ impl Disk {
         Disk { dir, cursor: Cursor::None, root: None, base: None, over: HashMap::new_in(Global) }
     }
 
-    /// What `name` was when last seen; `None` for a name not seen or gone.
+    /// What `name` was when last seen, as the disk gave it ([`plain`]); `None` for a name not
+    /// seen or gone.
     pub(crate) fn get(&self, name: &str) -> Option<Stamp> {
+        self.saved(name).map(plain)
+    }
+
+    /// What the column saved of `name`, [`CHOSE`] and all; `None` for a name not seen or gone.
+    pub(crate) fn saved(&self, name: &str) -> Option<Stamp> {
         let stamp = match self.over.get(name) {
             Some(stamp) => *stamp,
             None => {
@@ -109,6 +237,15 @@ impl Disk {
         }
     }
 
+    /// What changed since the column it was opened from, sorted bytewise: a journal rewrite's
+    /// `SEEN` record of this disk ([`Stamp::GONE`] for a name gone).
+    pub(crate) fn overlay(&self) -> Vec<(&str, Stamp)> {
+        // alloc: once a rewrite, the overlay's names in order.
+        let mut out: Vec<(&str, Stamp)> = self.over.iter().map(|(it, s)| (&**it, *s)).collect();
+        out.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
     /// `name` and every name under it gone.
     pub(crate) fn remove_under(&mut self, name: &str) {
         // alloc: per gone directory, its names under it.
@@ -119,9 +256,15 @@ impl Disk {
         }
     }
 
-    /// Calls `f` with every name seen at or under `name` and its stamp, in name order, merging
-    /// the column and what changed since.
+    /// Calls `f` with every name seen at or under `name` and its stamp as the disk gave it
+    /// ([`plain`]), in name order, merging the column and what changed since.
     pub(crate) fn under(&self, name: &str, mut f: impl FnMut(&str, Stamp)) {
+        self.under_saved(name, |it, stamp| f(it, plain(stamp)));
+    }
+
+    /// [`Disk::under`] with each stamp as saved, [`CHOSE`] and all: what the image keeps and
+    /// what the column a client checks hands.
+    pub(crate) fn under_saved(&self, name: &str, mut f: impl FnMut(&str, Stamp)) {
         let within = |it: &str| {
             it.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         };
@@ -167,8 +310,9 @@ impl Disk {
         }
     }
 
-    /// Calls `f` with every name seen directly in `dir` and its stamp, in no set order. The
-    /// column's subtree of each child is skipped by a search, not walked.
+    /// Calls `f` with every name seen directly in `dir` and its stamp as saved, [`CHOSE`] and
+    /// all (the watcher takes [`vouches`] of it with the name), in no set order. The column's subtree of each child is skipped by a search,
+    /// not walked.
     pub(crate) fn children(&self, dir: &str, mut f: impl FnMut(&str, Stamp)) {
         let direct = |it: &str| {
             it.strip_prefix(dir)
@@ -217,8 +361,10 @@ impl Disk {
         (count + self.over.len(), bytes + over)
     }
 
-    /// Every name seen at or under `name` into `names`, in name order, and its stamp into
-    /// `stamps`. Every name the column holds was checked as it was opened or set. The whole
+    /// Every name seen at or under `name` into `names`, in name order, and its stamp as saved,
+    /// [`CHOSE`] and all, into `stamps` (the watcher compares [`plain`] of it with the disk's and
+    /// takes [`vouches`] of it as it sweeps). Every name the column holds was checked as it was
+    /// opened or set. The whole
     /// directory of a column with nothing changed since it was mapped (a restart's sweep) is
     /// one copy of its names; any other sweep of the whole directory sizes its buffers once.
     pub(crate) fn sweep(&self, name: &str, names: &mut Names, stamps: &mut Vec<Stamp>) {
@@ -234,7 +380,7 @@ impl Disk {
             }
             *names = Names::with_capacity(count, bytes);
         }
-        self.under(name, |it, stamp| {
+        self.under_saved(name, |it, stamp| {
             names.push_checked(it);
             stamps.push(stamp);
         });
@@ -262,6 +408,43 @@ impl Disks {
         self.by_head.get(head)
     }
 
+    /// Applies one `SEEN` record's payload ([`encode_seen`]'s layout): the head's disk watching
+    /// its directory takes the record's cursor and root, then each entry in order, a
+    /// [`Stamp::GONE`] one by [`Disk::remove_under`], any other by [`Disk::set`]. The whole
+    /// payload is checked before any of it is applied: `None` for a malformed one (cut short, a
+    /// name not under the directory, bytes past the last entry), which applies nothing.
+    pub(crate) fn replay(&mut self, payload: &[u8]) -> Option<()> {
+        let mut read = Reader::new(payload);
+        let head = read.str_u32().ok()?;
+        let dir = FileName::new(read.str_u32().ok()?)?;
+        let cursor = Cursor::decode(read.take(Cursor::BYTES).ok()?)?;
+        let root = match read.array::<33>().ok()? {
+            [0, ..] => None,
+            [1, id @ ..] => Some(ContentId(*id)),
+            _ => return None,
+        };
+        let count = read.u32().ok()?;
+        let entries = read.at();
+        for _ in 0..count {
+            let name = read.str_u32().ok()?;
+            FileName::new(name).filter(|it| it.is_under(&dir))?;
+            Stamp::decode(read.take(Stamp::BYTES).ok()?)?;
+        }
+        read.finish().ok()?;
+        let disk = self.of(head, &dir);
+        disk.cursor = cursor;
+        disk.root = root;
+        let mut read = Reader::starting_at(payload, entries).ok()?;
+        for _ in 0..count {
+            let name = read.str_u32().ok()?;
+            match Stamp::decode(read.take(Stamp::BYTES).ok()?)? {
+                stamp if stamp.is_gone() => disk.remove_under(name),
+                stamp => disk.set(name, stamp),
+            }
+        }
+        Some(())
+    }
+
     /// The image's bytes of every disk: `MAGIC`, a count, then per disk (heads in name order)
     /// its head, its directory, its cursor, its root (a byte saying whether, then 32), its count
     /// of names, its names' length, each name's end (past its NUL), each stamp, the names, each
@@ -283,7 +466,7 @@ impl Disks {
             out.put_bytes(&disk.root.unwrap_or_default().0);
             (ends.clear(), stamps.clear(), names.clear());
             let mut count = 0u32;
-            disk.under(disk.dir.as_str(), |name, stamp| {
+            disk.under_saved(disk.dir.as_str(), |name, stamp| {
                 names.put_cstr(name.as_bytes());
                 ends.put_u32(names.len() as u32);
                 stamp.encode(&mut stamps);
@@ -357,6 +540,64 @@ impl Disks {
     }
 }
 
+/// The most bytes one mark holds: a mark is a fact (a stamp and a hash), not a store, and the
+/// journal is rewritten whole with every mark in it.
+pub const MARK_MOST: usize = 1 << 20;
+
+/// A machine's local facts by name, each the bytes of its last `MARK` record: kept in name order,
+/// so a rewrite frames them in one order and a prefix is one range.
+#[derive(Default)]
+pub(crate) struct Marks {
+    // alloc: the daemon's lifetime; a few marks per checkout and output, ordered by name.
+    by_name: BTreeMap<Box<str>, Box<[u8]>>,
+}
+
+impl Marks {
+    /// Applies one `MARK` record's payload (`name str_u32 | bytes to the record's end`, empty
+    /// bytes: the name has no mark); `None` for a malformed one, which applies nothing.
+    pub(crate) fn replay(&mut self, payload: &[u8]) -> Option<()> {
+        let mut read = Reader::new(payload);
+        let name = read.str_u32().ok()?;
+        let bytes = read.take_rest();
+        (bytes.len() <= MARK_MOST).then_some(())?;
+        self.set(name, bytes);
+        Some(())
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&[u8]> {
+        self.by_name.get(name).map(|it| &**it)
+    }
+
+    /// `name`'s mark is `bytes` from now; empty bytes remove it.
+    pub(crate) fn set(&mut self, name: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            self.by_name.remove(name);
+        } else {
+            // alloc: once per mark set, the value it keeps.
+            self.by_name.insert(name.into(), bytes.into());
+        }
+    }
+
+    /// Every mark whose name starts with `prefix`, in name order.
+    pub(crate) fn under<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a str, &'a [u8])> {
+        self.by_name
+            .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .take_while(move |(name, _)| name.starts_with(prefix))
+            .map(|(name, bytes)| (&**name, &**bytes))
+    }
+
+    /// Every mark in name order: a journal rewrite frames them all.
+    pub(crate) fn all(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.by_name.iter().map(|(name, bytes)| (&**name, &**bytes))
+    }
+}
+
+/// A `MARK` record's payload, the one home of its layout.
+pub(crate) fn encode_mark(out: &mut Vec<u8>, name: &str, bytes: &[u8]) {
+    out.put_bytes_u32(name.as_bytes());
+    out.put_bytes(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +622,51 @@ mod tests {
         let mut out = Vec::new();
         disk.under(under, |it, stamp| out.push((it.to_owned(), stamp.ino)));
         out
+    }
+
+    /// The invariant: a [`crate::Column`] hands each name at or under its directory once, in
+    /// name order, with the stamp last set for it, whether it is in the image's column, set
+    /// since, or both; a name removed since, and a name outside the directory, is not handed.
+    /// Against a map kept beside it. Control: the overlay alone (the image's column left out)
+    /// misses names the model holds, and the oracle says so.
+    #[test]
+    fn a_column_hands_every_name_once_in_order_with_its_stamp() {
+        let mut disks = Disks::default();
+        let mut model = BTreeMap::new();
+        let disk = disks.of("main", &name("w"));
+        for (n, it) in ["w", "w/a", "w/b", "w/b/c", "w/b-d", "w/z"].into_iter().enumerate() {
+            disk.set(it, stamp(n as u64 + 1));
+            model.insert(it.to_owned(), n as u64 + 1);
+        }
+        disk.set("x/out", stamp(99));
+        let mut disks = reopen(&disks);
+        let disk = disks.by_head.get_mut("main").unwrap();
+        disk.root = Some(ContentId([7; 32]));
+        // After the image: one name changed, one added, one subtree gone.
+        disk.set("w/a", stamp(20));
+        disk.set("w/b/e", stamp(21));
+        disk.remove_under("w/b-d");
+        model.insert("w/a".to_owned(), 20);
+        model.insert("w/b/e".to_owned(), 21);
+        model.remove("w/b-d");
+        let disk = &disks.by_head["main"];
+        let handed = |column: &crate::Column<'_>| {
+            let mut out = Vec::new();
+            column.each(|it, stamp| out.push((it.to_owned(), stamp.ino)));
+            out
+        };
+        let column = crate::Column { dir: disk.dir.as_str(), root: disk.root, disk };
+        let wanted: Vec<(String, u64)> = model.iter().map(|(it, n)| (it.clone(), *n)).collect();
+        assert_eq!(handed(&column), wanted);
+        assert_eq!(column.root, Some(ContentId([7; 32])));
+        assert!(column.len() >= wanted.len(), "len is at least the names handed");
+
+        let mut overlay = Disk::new(name("w"));
+        for (it, stamp) in disk.overlay() {
+            overlay.set(it, stamp);
+        }
+        let planted = crate::Column { dir: "w", root: None, disk: &overlay };
+        assert_ne!(handed(&planted), wanted, "the control: the overlay alone is caught");
     }
 
     #[test]
@@ -412,7 +698,8 @@ mod tests {
     }
 
     /// A restart's sweep of a mapped column is one copy of its names, and gives what the
-    /// merging walk gives, name for name and stamp for stamp; so does every sweep after a change.
+    /// merging walk gives, name for name and stamp for stamp as saved (a stamp the head chose
+    /// against keeps its [`CHOSE`]); so does every sweep after a change.
     #[test]
     fn a_sweep_of_a_mapped_column_is_its_names_as_they_are() {
         let mut disks = Disks::default();
@@ -422,9 +709,10 @@ mod tests {
         for (n, it) in names.into_iter().enumerate() {
             disk.set(it, stamp(n as u64 + 1));
         }
+        disk.set("w/a.c", chose(stamp(4)));
         let walked = |disk: &Disk, under: &str| {
             let (mut names, mut stamps) = (Names::default(), Vec::new());
-            disk.under(under, |it, stamp| {
+            disk.under_saved(under, |it, stamp| {
                 names.push_checked(it);
                 stamps.push(stamp);
             });
@@ -440,6 +728,7 @@ mod tests {
         assert_eq!(disk.size(), (names.len(), names.iter().map(|it| it.len() + 1).sum()));
         let whole = swept(&disk, "w");
         assert_eq!(whole, walked(&disk, "w"));
+        assert!(whole.1.iter().any(|it| !vouches(it)), "the chosen stamp is swept as saved");
         assert_eq!(whole.0.iter().collect::<Vec<_>>(), names);
         assert_eq!(swept(&disk, "w/a"), walked(&disk, "w/a"));
         disk.set("w/a/new.rs", stamp(9));

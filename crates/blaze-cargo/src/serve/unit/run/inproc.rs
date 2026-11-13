@@ -188,16 +188,27 @@ impl DevRuns {
     /// `blaze run`'s start of the executable at `path` as process `pid`: the start hook's
     /// variables when the daemon holds it as a dev executable ([`Loaded::launch`]); `None` for
     /// a file that is no dev executable (its headers reserve nothing for a code memory's
-    /// arena), which runs as linked. A dev executable this daemon neither linked nor replayed
-    /// from a record ([`DevRuns::adopt`]) is an error naming it, never a run of its file that
-    /// edits would not reach.
+    /// arena), which runs as linked.
     ///
     /// `placed` is the content key of the output the daemon's builds placed at `path` and found
-    /// unchanged at their last look (`Jobs::placed_key`), or `None`. A dev executable whose
-    /// memory's file is that output is started from the file as it is: the launch writes
+    /// unchanged at their last look (`Jobs::placed_key`; after a start, the placement the
+    /// request certificate vouched for by its stamp or hashed), or `None`. A dev executable
+    /// whose memory's file is that output is started from the file as it is: the launch writes
     /// nothing, so the build after it places nothing and its outputs' watch hears nothing
     /// (`file=placed` on the span). Any other is written from the memory first
     /// (`file=written`, or `kept` for one this host wrote and nothing changed since).
+    ///
+    /// A dev executable this daemon holds no memory of (it started since the build that
+    /// placed it, and nothing since linked or replayed it) is made its memory from the placed
+    /// file ([`Unheld::Adopt`], `adopted=true` on the span): the file is read once, its key
+    /// is computed from those bytes and compared with `placed` ([`placed_file`]), and only
+    /// those same bytes, its pages that are not zero, are laid into the memory ([`adopted`]).
+    /// That is the memory a replay of the unit's record would make (the record files the file
+    /// under the same key, compile.rs `held`), which is why the request certificate takes the
+    /// file for the code (request.rs `file_is_code`). A file that is not the placed one is a
+    /// refusal naming the path and both keys ([`NotPlaced::Changed`]), never a run of its
+    /// bytes; with nothing placed it is an error naming it ([`DevRuns::unheld`]), never a run
+    /// of its file that edits would not reach.
     pub(crate) fn launch(
         &self,
         path: &str,
@@ -210,28 +221,66 @@ impl DevRuns {
             path,
             pid,
             file = tracing::field::Empty,
+            adopted = false,
         )
         .entered();
         // clone: a count, once per launch, so no guard of the table is held while it writes
         let loaded = self.programs.pin().get(path).cloned();
-        if let Some(loaded) = loaded {
-            let (env, wrote) = loaded.launch(path, pid, placed)?;
-            span.record(
-                "file",
-                match wrote {
-                    host::Wrote::Placed => "placed",
-                    host::Wrote::Kept => "kept",
-                    host::Wrote::Cloned => "cloned",
-                    host::Wrote::Written => "written",
-                },
-            );
-            return Ok(Some(env));
-        }
-        let Some(format) = Format::host() else { return Ok(None) };
-        if reserves(format, std::path::Path::new(path))? {
-            return Err(self.unheld(path));
-        }
-        Ok(None)
+        let loaded = match loaded {
+            Some(it) => it,
+            None => {
+                let Some(format) = Format::host() else { return Ok(None) };
+                let reserves = reserves(format, std::path::Path::new(path))?;
+                match unheld_launch(reserves, placed) {
+                    Unheld::File => return Ok(None),
+                    Unheld::Refused => return Err(self.unheld(path)),
+                    Unheld::Adopt(key) => {
+                        let told = self.adopt(path, None, key, || {
+                            placed_file(path, key)
+                                .map(std::borrow::Cow::Owned)
+                                .map_err(|it| it.to_string())
+                        })?;
+                        // Nothing was held at `path` a moment ago: a program the adopt
+                        // replaced there is one a link held meanwhile, whose runs were told.
+                        if let Told::Restart { why } = told {
+                            return Err(format!(
+                                "{path}: a link held its program while this launch made its code memory from the \
+                                 placed file, and its runs were told to start again ({why}); run it again"
+                            ));
+                        }
+                        span.record("adopted", true);
+                        // clone: a count, the program the adopt just held
+                        self.programs.pin().get(path).cloned().ok_or_else(|| {
+                            format!(
+                                "{path}: the code memory made from its placed file is not held under its path (a \
+                                 bug of blaze's: `DevRuns::adopt` holds what it makes)"
+                            )
+                        })?
+                    }
+                }
+            }
+        };
+        let (env, wrote) = loaded.launch(path, pid, placed)?;
+        span.record(
+            "file",
+            match wrote {
+                host::Wrote::Placed => "placed",
+                host::Wrote::Kept => "kept",
+                host::Wrote::Cloned => "cloned",
+                host::Wrote::Written => "written",
+            },
+        );
+        Ok(Some(env))
+    }
+
+    /// The code this daemon's memory holds for the dev executable at `path`, by the key of the
+    /// file it holds ([`Program::file`]); `None` where it holds none there. A request
+    /// certificate's output (`Steps::held_code`): a run executes the memory, whatever file is
+    /// at `path`.
+    pub(crate) fn held_code(&self, path: &str) -> Option<crate::serve::work::HeldCode> {
+        let programs = self.programs.pin();
+        let loaded = programs.get(path)?;
+        Some(crate::serve::work::HeldCode::Is(blaze_ids::ContentId(loaded.program.file())))
     }
 
     /// The dev executable at `path` as this daemon holds it, for a run or a test queue of the
@@ -295,10 +344,19 @@ impl DevRuns {
             None => {
                 let bytes = bytes()?;
                 let len = bytes.len();
-                let _span = tracing::info_span!(target: "blaze", "dev run adopt", path, len).entered();
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "dev run adopt",
+                    path,
+                    len,
+                    written = tracing::field::Empty,
+                )
+                .entered();
                 let host = self.host()?;
                 let name = path.rsplit('/').next().unwrap_or(path);
-                Arc::new(adopted(&host, name, &bytes, key)?)
+                let (loaded, written) = adopted(&host, name, &bytes, key)?;
+                span.record("written", written);
+                Arc::new(loaded)
             }
         };
         let replaced = hold(self, path, runs_from, &loaded);
@@ -537,8 +595,9 @@ pub(crate) fn load(
 /// a file whose headers reserve no arena is refused by the layout, naming it. Its lineage and
 /// generation are its live descriptor's, read back from the file ([`blaze_link::descriptor_of`]),
 /// so a later link of the path tells its runs to start again as it would its own image's. No
-/// patch comes to it: no image of this daemon's is its file.
-fn adopted(host: &Arc<Host>, name: &str, bytes: &[u8], key: Key) -> Result<Loaded, String> {
+/// patch comes to it: no image of this daemon's is its file. Only the file's pages that are
+/// not zero are written ([`write_file`]); with how many bytes that was.
+fn adopted(host: &Arc<Host>, name: &str, bytes: &[u8], key: Key) -> Result<(Loaded, u64), String> {
     let format =
         Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
     let len = bytes.len() as u64;
@@ -551,17 +610,166 @@ fn adopted(host: &Arc<Host>, name: &str, bytes: &[u8], key: Key) -> Result<Loade
         .map_err(|it| format!("the dev executable `{name}`'s kept file: {it}"))?;
     let mut memory = CodeMemory::with_cells(name, IMAGE, ARENA, dev_run(None).cells)
         .map_err(|it| it.to_string())?;
-    memory
-        .write(0, bytes)
+    let written = write_file(&mut memory, bytes)
         .map_err(|it| format!("writing `{name}`'s kept file into its code memory: {it}"))?;
-    memory
-        .publish(CodeRange { offset: 0, len })
-        .map_err(|it| format!("publishing `{name}`'s kept file: {it}"))?;
     memory
         .lay_out(format)
         .map_err(|it| format!("laying `{name}`'s code memory out from its kept file: {it}"))?;
     let file = host::Image { key: key.0.0, len, store: None };
-    held(host, name, memory, file, descriptor.generation, descriptor.id)
+    Ok((held(host, name, memory, file, descriptor.generation, descriptor.id)?, written))
+}
+
+/// `bytes`, a file, laid into the image part of `memory`, a code memory just made (nothing
+/// written into it yet, so every page of it is zeros): each run of [`CodeMemory::page`]-sized
+/// chunks that are not all zeros is written and published, and a chunk of zeros is skipped,
+/// so it stays a page never written, which takes no memory (`CodeMemory::zero`'s rule, the
+/// `written` bits). An image is mostly room nothing wrote (its patch room, 64 MiB each of
+/// code and data at least, `CodeMemory::zero`), so this writes its code and data, not its
+/// size. How many bytes were written.
+///
+/// The invariant (`tests`): after it the memory's first `bytes.len()` bytes are `bytes`, and
+/// the count is the length of the chunks of `bytes` that hold a byte that is not zero.
+fn write_file(memory: &mut CodeMemory, bytes: &[u8]) -> Result<u64, String> {
+    let page = usize::try_from(memory.page())
+        .map_err(|_| format!("the code memory's page, {:#x} bytes, is longer than an address", memory.page()))?;
+    let mut written = 0u64;
+    // The start of the run of chunks that are not zeros being gathered.
+    let mut run: Option<usize> = None;
+    let mut flush = |memory: &mut CodeMemory, from: usize, to: usize| -> Result<(), String> {
+        let range = CodeRange { offset: from as u64, len: (to - from) as u64 };
+        memory.write(range.offset, &bytes[from..to]).map_err(|it| it.to_string())?;
+        memory.publish(range).map_err(|it| it.to_string())?;
+        written += range.len;
+        Ok(())
+    };
+    for (nth, chunk) in bytes.chunks(page).enumerate() {
+        let at = nth * page;
+        let zeros = !planted(Plant::WritesEveryPage) && chunk.iter().all(|it| *it == 0);
+        match (zeros, run) {
+            (true, Some(from)) => {
+                flush(memory, from, at)?;
+                run = None;
+            }
+            (false, None) => run = Some(at),
+            (true, None) | (false, Some(_)) => {}
+        }
+    }
+    if let Some(from) = run {
+        flush(memory, from, bytes.len())?;
+    }
+    Ok(written)
+}
+
+/// What a launch of a path this daemon holds no program at does: run the file as linked (no
+/// dev executable: its headers reserve no arena), make the program's memory from the file
+/// placed there under its key, or refuse (a dev executable no build of this daemon's placed,
+/// linked or replayed: its file may be any build's, which edits would not reach).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Unheld {
+    File,
+    Adopt(Key),
+    Refused,
+}
+
+/// [`Unheld`] for a file that `reserves` a code memory's arena or not, and `placed`, the key
+/// of the output the daemon's builds placed there and found unchanged (`Jobs::placed_key`).
+fn unheld_launch(reserves: bool, placed: Option<[u8; 32]>) -> Unheld {
+    match (reserves, placed) {
+        (false, _) => Unheld::File,
+        (true, Some(key)) => Unheld::Adopt(Key(blaze_ids::ContentId(key))),
+        (true, None) => Unheld::Refused,
+    }
+}
+
+/// Why the file at a path is not the output placed there: read, its key is not the placed
+/// one. Each names the path and, for a changed file, both keys.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum NotPlaced {
+    /// The file could not be read.
+    Unread { path: String, why: String },
+    /// The file's key, computed from its bytes ([`dev_file_key`]), is not the placed one.
+    Changed { path: String, placed: Key, found: Key },
+}
+
+impl std::fmt::Display for NotPlaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotPlaced::Unread { path, why } => {
+                write!(f, "reading {path}, the dev executable placed there, to make its code memory: {why}")
+            }
+            NotPlaced::Changed { path, placed, found } => write!(
+                f,
+                "{path} is not the dev executable placed there: the placed file is {:x}, the file there now is \
+                 {:x} (the linker's digest of its bytes); none of it was laid into a code memory. Something wrote it \
+                 since its build placed it: run it again, which builds it",
+                placed.0, found.0
+            ),
+        }
+    }
+}
+
+/// The store's key of a dev executable's file from its `bytes`: the linker's digest of them
+/// ([`blaze_link::digest::Digest`]), under the key a link files its image by
+/// ([`linked_key`], [`file_key`], compile.rs `Written::Linked`). A dev executable is always
+/// blaze's linker's image, so a placed key of any other form is no dev executable's file and
+/// is refused by [`placed_file`] as changed.
+fn dev_file_key(bytes: &[u8]) -> Key {
+    linked_key(&blaze_link::digest::Digest::of(bytes).root())
+}
+
+/// The file at `path`, read whole once, when its key computed from those bytes
+/// ([`dev_file_key`]) is `placed`: the bytes a code memory may be made from. An artifact is
+/// never used unverified: `placed` says what the daemon placed there and last found
+/// unchanged, by a stamp, and a stamp is not the bytes; what is laid into the memory is
+/// exactly what was hashed here, so nothing written after this read reaches it. Any other
+/// file is [`NotPlaced::Changed`].
+///
+/// The invariant (`tests`): the bytes given are the bytes whose key is `placed`; a file that
+/// changed since its key was taken is refused naming the path and both keys.
+fn placed_file(path: &str, placed: Key) -> Result<Vec<u8>, NotPlaced> {
+    // alloc: once per launch after a start, the placed file whole, laid into the memory and dropped
+    let bytes = std::fs::read(path).map_err(|it| NotPlaced::Unread {
+        // alloc: error path, the path
+        path: path.to_owned(),
+        // alloc: error path, its reason
+        why: it.to_string(),
+    })?;
+    if planted(Plant::TrustsThePlacedKey) {
+        return Ok(bytes);
+    }
+    let found = dev_file_key(&bytes);
+    if found != placed {
+        // alloc: error path, the path
+        return Err(NotPlaced::Changed { path: path.to_owned(), placed, found });
+    }
+    Ok(bytes)
+}
+
+/// A bug planted for a test's control: with it the launch's oracle (the memory is the placed
+/// file's bytes, and only its pages that are not zero are written) fails, and the test says so.
+/// Never planted outside a test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plant {
+    /// [`placed_file`] gives the file's bytes without computing their key.
+    TrustsThePlacedKey,
+    /// [`write_file`] writes a chunk of zeros too.
+    WritesEveryPage,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLANT: std::cell::Cell<Option<Plant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn planted(plant: Plant) -> bool {
+    PLANT.get() == Some(plant)
+}
+
+#[cfg(not(test))]
+fn planted(plant: Plant) -> bool {
+    let _ = plant;
+    false
 }
 
 /// `memory`, laid out, as a program whose runs attach through `host`, and the thread that

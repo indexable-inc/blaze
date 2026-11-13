@@ -5,21 +5,29 @@
 //! A read stands for a fact when its query is keyed by one item and what the query returns for
 //! that item is part of what the fact hashes (the notes' table, section 3.4). A read of a
 //! dependency's batch (its impls' traits, self types and predicates, its fields' types, lowered
-//! for the whole crate at once) stands for the crate's [`Fact::Crate`]. A read of another
-//! crate-wide table, or of a query keyed by several arguments, names no one item: it stands for
-//! no fact, and the goal is not stored.
+//! for the whole crate at once) stands for the crate's [`Fact::Crate`]. A read of the impls of one
+//! type or one trait, or of the traits with an item of one name, in a crate the goal's crate sees,
+//! stands for that listing's fact as the goal's crate sees it ([`Fact::InherentImpls`],
+//! [`Fact::TraitImpls`], [`Fact::TraitsNamed`]); a read of a module's traits in scope by name, or
+//! of a block's impls, for [`Fact::ScopeTraitsNamed`] or [`Fact::BlockImpls`]. A read of another
+//! crate-wide table names no one item: it stands for no fact, and the goal is not stored.
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::db::{Database as _, FromIdIn, Id};
 use hir_def::{
-    AdtId, AttrDefId, EnumVariantId, GenericDefId, HasModule, ItemContainerId, Lookup, TypeAliasId,
-    VariantId,
+    AdtId, AttrDefId, BlockIdLt, EnumVariantId, GenericDefId, HasModule, ItemContainerId, Lookup,
+    TypeAliasId, VariantId,
     lang_item::{LangItemEnum, lang_items},
 };
 use hir_ty::{
     db::InternedOpaqueTyId,
-    method_resolution::{ImplPair, RelevantImplsKey, SelfTyKey, loaded_crates},
+    method_resolution::{
+        ImplPair, InherentImpls_in_block_for_self_ty, InherentImpls_in_crate_for_self_ty,
+        RelevantImplsKey, SelfTyKey, TraitImpls_for_crate_and_trait,
+        TraitImpls_in_block_for_trait_and_self_ty, in_crate_trait_value_items, loaded_crates,
+        scope_sets::module_items_named,
+    },
     next_solver::{
         SolverDefId,
         goal_store::{FactRef, GoalFacts},
@@ -194,6 +202,38 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
                 },
             })
         }
+        // A crate's tables of impls and of traits by item name, read of `krate` or a crate it
+        // loads: the fact of `krate`'s view, which covers every crate it loads (more than the
+        // read, never less, as the loaded set is closed). Another crate's view may cover crates
+        // `krate` never loads: no fact.
+        "InherentImpls::in_crate_for_self_ty" => {
+            let (read, SelfTyKey(self_ty)) = InherentImpls_in_crate_for_self_ty::arguments(db, key)?;
+            loads(db, krate, read).then(|| facts::inherent_impls(db, &self_ty))
+        }
+        "TraitImpls::for_crate_and_trait" => {
+            let (read, trait_) = TraitImpls_for_crate_and_trait::arguments(db, key)?;
+            loads(db, krate, read).then(|| facts::trait_impls(db, trait_))
+        }
+        "in_crate_trait_value_items" => {
+            let (read, name) = in_crate_trait_value_items::arguments(db, key)?;
+            loads(db, krate, read).then(|| facts::traits_named(&name))
+        }
+        // One module's traits in scope, the same whoever asks.
+        "module_items_named" => {
+            let (module, name) = module_items_named::arguments(db, key)?;
+            Some(facts::scope_traits_named(db, module, &name))
+        }
+        // A block's impls, all of them: a read of one type's or one trait's there is covered.
+        "TraitImpls::for_block" | "InherentImpls::for_block" => {
+            Some(facts::block_impls(db, arg::<BlockIdLt<'_>>(db, key)?))
+        }
+        "InherentImpls::in_block_for_self_ty" => {
+            Some(facts::block_impls(db, InherentImpls_in_block_for_self_ty::arguments(db, key)?.0))
+        }
+        "TraitImpls::in_block_for_trait_and_self_ty" => Some(facts::block_impls(
+            db,
+            TraitImpls_in_block_for_trait_and_self_ty::arguments(db, key)?.0,
+        )),
         "may_specialize" => Some(facts::specializes(db, arg(db, key)?)),
         // Whether one impl specializes another is solved in the specializing impl's crate, over
         // the parent's where clauses: it reads impls of any trait those name, which no fact of
@@ -204,6 +244,11 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
         }
         _ => None,
     }
+}
+
+/// Whether `krate` sees the tables of `read`: it is `krate` or a crate `krate` loads.
+fn loads(db: &Db, krate: Crate, read: Crate) -> bool {
+    read == krate || loaded_crates(db, krate).contains(&read)
 }
 
 /// `key` as a `T`, if its page holds `T`s.

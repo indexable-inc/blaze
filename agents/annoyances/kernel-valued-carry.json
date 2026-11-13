@@ -1,0 +1,14 @@
+{
+ "id": "kernel-valued-carry",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 4c T1, int-1112",
+ "where": "crates/blaze-kernel/src/session.rs Session::post, Session::seed_valued, Changed::valued; lib.rs find_key",
+ "what": "A carried session needed an exact difference for every kind of read, and no maintainer gives one (31 fact kinds, deltas that hold one write, a changed set that leaves out released memos), so every kind a body read was said `everything` and every entry was looked up again from its read list at each revision. The session knew every read an entry made but not what it saw: `Session::post` took names only, though the walk and the trace had each value in hand.",
+ "cost": "a revision re-verified every body entry of a crate (microseconds an entry) where the carry reached a handful",
+ "cause": "the index kept who read what but threw away what was read, so the only exact difference had to come from outside the kernel",
+ "class": "a dependency index that records edges without the value each edge observed, which forces every invalidation to trust an external producer",
+ "prevention": "a posting keeps what its read saw (layout 3); `Changed::valued(kind)` values each distinct posted read once and seeds only the readers of those that differ, so no kind is ever always dirty; the exhaustive check runs under all three ways of saying a difference with four planted bugs (ValuedGoneSame, ValuedUnloaded, SeenAtFirstPost, KindSaidClean)",
+ "workaround": "none",
+ "fix": "written, not yet built or run: the main agent's build of int-1112 decides",
+ "state": "open"
+}

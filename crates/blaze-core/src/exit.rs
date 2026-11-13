@@ -57,6 +57,11 @@ exits! {
     /// The CLI refused its command line and did nothing: clap's code for a command line it
     /// refuses.
     Usage = 1, "USAGE", "its command line was refused";
+    /// `blaze test` or `blaze bench` built what it was asked and ran no test: its selection (a
+    /// name filter, `--skip`, a package with no tests) matched nothing, and no `--no-tests pass`
+    /// said that is meant. The number is cargo-nextest's for the same end (`NO_TESTS_RUN`), so a
+    /// script tells "nothing ran" from "a test failed" (101) by the code alone.
+    NoTests = 4, "NO_TESTS", "its test run ran no test";
     /// The daemon's stop made no progress for its bound (`serve::stop`): it ends without its
     /// image, having written what it was inside.
     StopStalled = 75, "STOP_STALLED", "its stop made no progress for the stall bound, and it ended without its image";
@@ -69,6 +74,14 @@ exits! {
     /// tag, and what each thread was inside, then ended it rather than let it take the machine
     /// down.
     MemoryCeiling = 77, "MEMORY_CEILING", "its footprint passed its memory ceiling";
+    /// The daemon was started to exit once nothing holds it (`BLAZE_DAEMON_EXIT_UNHELD`,
+    /// `serve::unheld`), and no client or launcher connection was open for its grace: it
+    /// stopped itself as `blaze stop` stops it, its image written.
+    Unheld = 78, "UNHELD", "no connection held it for its grace, and it stopped itself, its image written";
+    /// A daemon started while another held its state found that one listening at its socket
+    /// (two commands started one at once): it started none over it, and the command that
+    /// started it connects to the one listening (`serve::hold`, `cli::daemon::connect`).
+    Served = 79, "SERVED", "another daemon of its state listens at its socket, so it started none";
     /// A build or test failed, or the CLI met an error of its own: cargo's code for both.
     Failed = 101, "FAILED", "a build or test failed, or blaze met an error of its own";
     /// A sandbox launcher could not make the sandbox, so the program it was given did not run:

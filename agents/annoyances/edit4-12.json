@@ -1,0 +1,11 @@
+{
+ "id": "edit4-12",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "my own method: a temporary counter of who asks each memo",
+ "what": "To find who verifies each memo I patched blaze-query's counter to keep one stack in three (never committed). The first build of it sampled from the daemon's start, so the cold build took a stack for every third of millions of memos and did not end; and my filter for ix's progress lines (`grep -v '^  '`) hid the first table, whose lines began with two spaces.",
+ "cost": "two extra builds of the engine (12 minutes) and one empty report",
+ "cause": "the profile has no table of who asked a memo from outside a query; `query_counts` says how many",
+ "workaround": "the counter starts when a file appears; report lines begin with a letter",
+ "state": "open: a `verified_by` sample (the asker's innermost non-engine frame, one in N) in the profile would have answered this with no build"
+}

@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a unit whose record is not kept (serve/unit/compile.rs)",
+ "what": "46 units of reth were made again in every build because their record was never kept (`no key covers what a proc-macro expansion read .. it asked the database`), and nothing said so where a person looks: the build that made them logged an INFO event, the next build's `misses` said `beyond` (the values its record is filed under) or `failed: its crate's identity was not worked out since the front end's last write`, and `blaze why` could not name a part. In the cold build 226 units were unkept the same way for another reason.",
+ "cost": "two lanes (redit-1111, this one) read `beyond` and `failed` rows for hours; the reason was one grep of `events` away",
+ "cause": "`store` dropped the record when its reads were unknown (`key.filter(|_| read.is_ok())`) with an info log; the miss was explained from a memo of identities that any write clears",
+ "whys": [
+  "why remade: no record in the store",
+  "why none: the unit's closure holds an expansion whose reads are `Unknown`",
+  "why unknown: any question to the database made the expansion's reads unknown to every key, though a unit's key holds the sources the answer is a function of",
+  "why unseen: not keeping a record was a quiet fallback (rule no-fallback), and the explanation of a miss read state a write lets go",
+  "property: one `Unknown` for two scopes of coverage (the expansion's own key, and every key above it), and a miss explained from what the last write left instead of from the key that was looked up"
+ ],
+ "class": "a value that cannot be kept is made again forever and the reason is said nowhere a person looks: a silent non-keep",
+ "prevention": "built: a unit made whose record is not kept is a `misses` row of step `unit record` (cause `always`, with the reason) and a WARN, in the build that made it (dafa7c4938, 92b7dc9ef0); the revision harness's `max_unkept`; the expansion names what it asked (`Asked`), and a question whose answer is a function of the closure's code texts by position leaves its reads known (`Asked::by_position`, a84da462e0); identity parts are worked out again after a write and held to the identity looked up; events `a unit record's read` and the view `unit_reads` name the read whose value moved; a miss names what the narrow key holds of each crate",
+ "fix": "see prevention; whether reth's 46 are kept with it is being measured on 6fd7961cf9",
+ "state": "fixed: dafa7c4938, 92b7dc9ef0 (the tooling); the units themselves by rows reth-1112-10 and reth-1112-11"
+}

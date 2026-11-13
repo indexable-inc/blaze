@@ -161,9 +161,21 @@ impl Storage {
     }
 }
 
-/// The most entries a storage's run log holds between two takes: 32 bytes each, so 16 MiB.
-/// Past it a run is counted in [`Taken::dropped`], never kept over an older one.
+/// The most entries a storage's run log holds whole between two takes: 32 bytes each, so
+/// 16 MiB. Past it one run in [`SAMPLE_EVERY`] is kept, as a sample that stands for that many
+/// ([`LoggedRun::weight`]), up to [`SAMPLED_MOST`] samples; every run not kept is counted in
+/// [`Taken::dropped`], never kept over an older one. The counts (`counts::RAN_*`) hold every
+/// run exactly whatever the log keeps.
 pub const LOG_MOST: u64 = 1 << 19;
+
+/// Past [`LOG_MOST`], one run in this many is kept. Until 2026-11-12 none was: a build that
+/// ran 820,026 queries again had rows for its first 524,288 runs and nothing that said which
+/// causes the rest had; a sample says them in proportion.
+pub const SAMPLE_EVERY: u64 = 64;
+
+/// The most samples kept past [`LOG_MOST`]: with [`SAMPLE_EVERY`], the log samples the next
+/// 16.7 million runs in 8 MiB more, and only counts what is past them.
+pub const SAMPLED_MOST: u64 = 1 << 18;
 
 static LOGGING: AtomicBool = AtomicBool::new(false);
 
@@ -181,15 +193,21 @@ impl RunLog {
         RunLog { entries: SegQueue::new(), logged: AtomicU64::new(0), dropped: AtomicU64::new(0) }
     }
 
-    /// Logs one event, past [`LOG_MOST`] counting it instead.
+    /// Logs one event; past [`LOG_MOST`], one in [`SAMPLE_EVERY`] as a sample, the others
+    /// counted instead.
     #[cold]
     #[inline(never)]
     pub(crate) fn log(&self, key: u64, read: u64, view: u32, why: Logged) {
-        if self.logged.fetch_add(1, Ordering::Relaxed) >= LOG_MOST {
+        let at = self.logged.fetch_add(1, Ordering::Relaxed);
+        let Some(past) = at.checked_sub(LOG_MOST) else {
+            self.entries.push(Entry { key, read, view, why, weight: 1 });
+            return;
+        };
+        if past % SAMPLE_EVERY != 0 || past / SAMPLE_EVERY >= SAMPLED_MOST {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.entries.push(Entry { key, read, view, why });
+        self.entries.push(Entry { key, read, view, why, weight: SAMPLE_EVERY as u32 });
     }
 }
 
@@ -202,6 +220,8 @@ struct Entry {
     read: u64,
     view: u32,
     why: Logged,
+    /// How many runs it stands for: 1, or [`SAMPLE_EVERY`] for a sample past [`LOG_MOST`].
+    weight: u32,
 }
 
 /// Why an entry of the run log was logged.
@@ -228,14 +248,21 @@ pub struct LoggedRun {
     pub read: Option<String>,
     /// What that read is of: `input`, `tracked`, `interned` or `function`.
     pub read_kind: Option<&'static str>,
+    /// How many logged events this row stands for: 1 for one kept whole, [`SAMPLE_EVERY`] for
+    /// a sample of the events past [`LOG_MOST`].
+    pub weight: u32,
 }
 
-/// What [`take_log_in`] took: the rows, sorted, and the runs past [`LOG_MOST`] it could not
-/// keep.
+/// What [`take_log_in`] took: the rows, sorted, and the events past [`LOG_MOST`] it did not
+/// keep. Of those, `sampled` are stood for by the rows of [`LoggedRun::weight`]
+/// [`SAMPLE_EVERY`] (each sample stands for itself and the `SAMPLE_EVERY - 1` not kept after
+/// it); the rest, past [`SAMPLED_MOST`] samples, are in the counts alone.
 #[derive(Default, Debug)]
 pub struct Taken {
     pub rows: Vec<LoggedRun>,
     pub dropped: u64,
+    /// Of `dropped`, the events a sample stands for.
+    pub sampled: u64,
 }
 
 /// Turns the run log on or off, for every storage. Off, logging costs a run one relaxed load.
@@ -317,7 +344,9 @@ pub(crate) fn name_ids(text: String) -> String {
             .rev()
             .take_while(|it| it.is_ascii_alphanumeric() || **it == b'_')
             .count();
-        if end == digits || word == 0 || bytes.get(end) != Some(&b')') {
+        // A row is the whole `Word(Id(n))`: the ID's own `)` and the row's after it. Text cut
+        // before the row's `)` is not a row's `Debug`, so nothing in it is named.
+        if end == digits || word == 0 || bytes.get(end..end + 2) != Some(b"))".as_slice()) {
             continue;
         }
         let Some(id) = text[digits..end].parse::<u32>().ok().and_then(Id::new) else { continue };
@@ -378,6 +407,7 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
                 why: entry.why,
                 read,
                 read_kind,
+                weight: entry.weight,
             });
         }
         // The database's holder takes the log outside any query, so what is in it now is what
@@ -394,7 +424,9 @@ pub fn take_log_in<D: super::Database>(db: &D) -> Taken {
                 &b.read,
             ))
         });
-        Taken { rows, dropped }
+        let samples = rows.iter().filter(|it| it.weight > 1).count() as u64;
+        let sampled = dropped.min(samples * (SAMPLE_EVERY - 1));
+        Taken { rows, dropped, sampled }
     })
 }
 
@@ -463,5 +495,33 @@ mod name_tests {
         for unchanged in ["NamedForTheLogTest(Id(x))", "(Id(3))", "NamedForTheLogTest(Id(3)", "f(1)"] {
             assert_eq!(named(unchanged), unchanged);
         }
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    /// Every event logged is kept whole, kept as a sample, or counted, and
+    /// nothing else: whole + samples + dropped is the events logged, the first [`LOG_MOST`]
+    /// are whole, and past them exactly one in [`SAMPLE_EVERY`] is a sample of that weight.
+    #[test]
+    fn past_its_bound_the_run_log_keeps_one_run_in_64_and_counts_the_rest() {
+        let log = RunLog::new();
+        let logged = LOG_MOST + 10 * SAMPLE_EVERY + 5;
+        for key in 0..logged {
+            log.log(key + 1, 0, 1, Logged::Ran(Cause::Untracked));
+        }
+        let (mut whole, mut samples) = (0u64, 0u64);
+        while let Some(entry) = log.entries.pop() {
+            match u64::from(entry.weight) {
+                1 => whole += 1,
+                SAMPLE_EVERY => samples += 1,
+                other => panic!("an entry of weight {other}"),
+            }
+        }
+        let dropped = log.dropped.load(Ordering::Relaxed);
+        assert_eq!((whole, samples), (LOG_MOST, 11));
+        assert_eq!(whole + samples + dropped, logged);
     }
 }

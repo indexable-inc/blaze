@@ -73,7 +73,7 @@
 //! |---|---|---|
 //! | [`mem`] | allocators by lifetime | blaze-mem |
 //! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied | blaze-bytes |
-//! | [`map`], [`set`], [`hash`] | the one hash map and set, the identity and content hashers | blaze-hash |
+//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, sorted, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, `alloc` |
 //! | [`id`] | content ids, dense indices, the interner | blaze-ids |
 //! | [`sync`], [`cell`] | `Shared`, named locks, `Atomic`, token cells, the spin, reclamation | std, blaze-core, blaze-spin, blaze-reclaim |
 //! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
@@ -102,7 +102,6 @@
 // by a `Default` or a `new()` that takes nothing (std.md, "The second rule").
 #![warn(blaze::default_policy)]
 #![feature(
-    allocator_api,
     allocator_ext,
     atomic_internals,
     blaze_comptime,
@@ -117,6 +116,7 @@
     macro_attr,
     marker_trait_attr,
     register_tool,
+    rustc_attrs,
     type_info,
     unsize
 )]
@@ -125,7 +125,8 @@
     reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
               (`type_id_vtable`, of an unsized type); `atomic_internals` for the bound of \
               `Atomic<T>` (`AtomicPrimitive`), which `own`'s one `Owns` impl for every atomic \
-              has to name"
+              has to name; `rustc_attrs` for `#[rustc_comptime]` on `own`'s walk, which calls \
+              reflection's compile-time-only functions and so is compile-time-only itself"
 )]
 #![register_tool(blaze)]
 
@@ -159,6 +160,7 @@ pub mod cx;
 pub mod device;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
+pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
@@ -186,6 +188,7 @@ mod narrow;
 pub mod net;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
+pub mod out;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(
@@ -245,17 +248,35 @@ pub mod text {
     pub use blaze_bytes::{Text, text_of};
 }
 
-/// The one hash map: hashbrown's, on foldhash with one fixed seed, in the allocator its type
-/// names; shared between threads, papaya's lock-free map (blaze-hash).
+/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); every one is made with
+/// `new_in(alloc)` or `with_capacity_in(n, alloc)`, and none has a `new()`.
+///
+/// | need | type |
+/// |---|---|
+/// | ordinary keys | [`map::HashMap`] |
+/// | keys that are hashes already | [`map::ByHash`] |
+/// | values stored once, found by their content | [`map::ContentMap`] (one owner), [`id::Sharded`] (shared, dense indices) |
+/// | iteration in insertion order, lookup by position | [`map::IndexMap`] |
+/// | sorted keys, ranges | [`map::SortedMap`] |
+/// | dense ids with a generation | [`mem::Slab`] and [`mem::Handle`] |
+/// | keys an attacker may pick | [`map::KeyedMap`], made with a [`hash::SipKey`] |
+/// | shared between threads | [`map::SharedMap`], [`map::SharedByHash`] |
 pub mod map {
+    /// Sorted by key, with range queries: `alloc`'s B-tree, which takes its allocator on this
+    /// nightly (`SortedMap::new_in(alloc)`).
+    pub use alloc::collections::BTreeMap as SortedMap;
     pub use blaze_hash::{
-        ByHash, Equivalent, HashMap as Map, Operation, SharedByHash, SharedMap, hash_map::Entry,
+        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, Operation, OrderMap, SharedByHash,
+        SharedMap, hash_map::Entry,
     };
+    pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};
 }
 
-/// The one hash set, as [`map`] (blaze-hash).
+/// The sets, as [`map`].
 pub mod set {
-    pub use blaze_hash::{ByHashSet, HashSet as Set, SharedSet};
+    /// Sorted, with range queries: `alloc`'s B-tree set, in a named allocator.
+    pub use alloc::collections::BTreeSet as SortedSet;
+    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet, SharedSet};
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
@@ -306,7 +327,7 @@ pub mod digest {
 pub mod record {
     pub use blaze_format::{
         ALIGN, Aligned, FormatError, HEADER_LEN, Header, MAGIC, Part, Persist, Placed, Record,
-        Rel, SCHEMA_DOMAIN, SchemaHash, Slice, Str, Sym, Writer, buffer_id, bytes_of_slice,
+        Rel, SCHEMA_DOMAIN, SchemaHash, Slice, Str, Writer, buffer_id, bytes_of_slice,
         header, open, open_as, open_verified, read_verified, record_at, schema, schema_of,
         to_bytes,
     };
@@ -357,6 +378,35 @@ pub mod test {
     /// `cfg(blaze_check)`.
     pub mod checked {
         pub use blaze_check::{cell, hint, linear, sync, thread};
+    }
+}
+
+/// What a crate of the blaze edition has in scope unasked (docs/v2/plan/design/std.md, "The
+/// blaze edition: opting in"): one module an edition, named for it, as Rust's `std::prelude`
+/// has one a Rust edition.
+pub mod prelude {
+    /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
+    /// a `main` names (`Cx`, `Io` and the entry's `Error`), and `core`'s macros that Rust's `std` hands on from its
+    /// root. The collections are here by their types, to be made in an allocator the code
+    /// was handed (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `String` is
+    /// bstd's, which is made in one, with `format_in!` in place of `format!`. `vec!` and
+    /// `format!`, which reach the global heap by themselves, are not (std.md, "Memory is
+    /// explicit").
+    pub mod blaze_2026_11 {
+        pub use core::prelude::rust_2024::*;
+        pub use core::{
+            assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, matches, panic, todo,
+            unimplemented, unreachable, write, writeln,
+        };
+
+        pub use alloc::{boxed::Box, vec::Vec};
+
+        pub use crate::{
+            cx::Cx,
+            entry::Error,
+            io::Io,
+            mem::{String, format_in},
+        };
     }
 }
 
@@ -419,6 +469,10 @@ impl core::error::Error for Stopped {}
 /// Consumes a linear value that has no fields left to move out (a fieldless marker such as
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
 #[blaze::consumes]
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug

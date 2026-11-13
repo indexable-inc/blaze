@@ -31,7 +31,7 @@ fn an_evaluator_error_names_its_type_outside_an_attach() {
 fn ran(output: Result<crate::stream::Stream, String>) -> super::Ran {
     super::Ran {
         output,
-        asked: false,
+        asked: None,
         tracked: Vec::new(),
         emitted: Vec::new(),
         seen: Vec::new(),

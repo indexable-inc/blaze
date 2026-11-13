@@ -6,8 +6,8 @@ use blaze_ids::rng::SplitMix64 as Rng;
 use super::*;
 
 const PAGE: u32 = 12;
-const A: SectionId = SectionId::DB_MEMOS;
-const B: SectionId = SectionId::SYMBOLS;
+const A: SectionId = SectionId::VFS_TREE;
+const B: SectionId = SectionId::VFS_DISKS;
 const C: SectionId = SectionId::PLANE_HISTORY;
 const D: SectionId = SectionId::vfs(1);
 
@@ -283,8 +283,8 @@ fn an_image_written_over_in_place_never_reads_old_bytes() {
 fn sections_are_refused_by_schema_or_absence() {
     let image = open(build(PAGE, &contents()));
     assert_eq!(
-        image.section(SectionId::DB_EDGES, schema_a()),
-        Err(Refused::Missing { id: SectionId::DB_EDGES })
+        image.section(SectionId(7), schema_a()),
+        Err(Refused::Missing { id: SectionId(7) })
     );
     let other = schema("test section a 2");
     assert_eq!(
@@ -370,7 +370,7 @@ fn group_sizes_and_limits() {
     assert_eq!(empty.len(), 4096, "an empty image is its spine");
     let mut many = Builder::with_group_shift(PAGE);
     for id in 0..100 {
-        many.add(SectionId::interned(id), schema_a(), &[id as u8]);
+        many.add(SectionId(0x2_0000 | id), schema_a(), &[id as u8]);
     }
     let error = many.finish().unwrap_err();
     assert_eq!(error.group, 4096);
@@ -379,9 +379,16 @@ fn group_sizes_and_limits() {
 #[test]
 fn ids_name_their_sections() {
     assert_eq!(SectionId::vfs(3).name(), "the VFS tree");
-    assert_eq!(SectionId::interned(9).name(), "an interned table");
     assert_eq!(SectionId(7).name(), "a section this blaze does not know");
-    assert!(SectionId::SYMBOLS.to_string().contains("0x200"));
+    assert!(SectionId::PLANE_HISTORY.to_string().contains("0x400"));
+    let live = [SectionId::PLANE_HISTORY, SectionId::VFS_TREE, SectionId::VFS_DISKS];
+    for (at, retired) in SectionId::RETIRED.into_iter().enumerate() {
+        assert!(retired.name().ends_with("a section no blaze writes now"), "{retired}");
+        assert!(!live.contains(&retired), "{retired} is retired, so never taken again");
+        assert!(!SectionId::RETIRED[..at].contains(&retired), "{retired} is retired once");
+    }
+    let interned = SectionId(0x1_0009);
+    assert_eq!(interned.name(), "an interned table, a section no blaze writes now");
 }
 
 /// What the VFS keeps: a section as the shared mapping and a range of it, checked whole, the

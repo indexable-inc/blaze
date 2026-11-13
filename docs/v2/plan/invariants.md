@@ -448,6 +448,13 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 - **`clones_never_share_a_feature_set`** *tested* (`crates/target-features/src/multiversion.rs`): no two clones of a plan have one feature set, and none has the unit's, so the baseline and the clones are compiled with pairwise different sets and (their feature names being part of an instance's shape) never share a code identity.
   Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
 
+### tests
+
+- **`the_region_fits_and_leaves_nothing_behind`** *tested* (`crates/blaze-screen/tests/properties.rs`): on a terminal of any size the live region fits (never taller than the terminal less a row, never wider than it less a column), every frame leaves exactly the lines that stay and the region with no stale row, a resize in the middle included, and the last frame leaves the lines that stay alone, the cursor shown and the progress report cleared.
+  Controls: `a_region_taller_than_the_terminal`, `a_row_wider_than_the_terminal`, `a_region_left_at_the_end`, `rows_left_by_a_resize`, `a_terminals_frame_sent_to_a_pipe`.
+- **`a_pipe_is_written_no_escape`** *tested* (`crates/blaze-screen/tests/properties.rs`): what is written to a pipe holds no escape byte and no carriage return.
+  Controls: `a_region_taller_than_the_terminal`, `a_row_wider_than_the_terminal`, `a_region_left_at_the_end`, `rows_left_by_a_resize`, `a_terminals_frame_sent_to_a_pipe`.
+
 ### v2
 
 - **`a_function_of_the_build_is_one_request_however_a_body_names_it`** *tested* (`crates/hir-ty-codegen/v2/release.rs`): a release compile asks for each function of the build once, whatever the bodies it is made of call it: a request of an import's body whose target among the compile's references is one the compile already asks for, with the same signature, is that request. The import's body is linked under the first request of its function ([`emit`]), so a call through a second would be of a declaration LLVM has no body of, and whether there is a second follows from which crate each body was compiled in (the first asker's of the walk), which no key of the compile holds: the store then held one key's code two ways (`BLAZE_VERIFY_STORE`, 2026-11-11: `alloc::vec::from_elem::<u8>` built `RawVecInner::try_allocate_in` in at both of its calls in one program's unit and at one of them in another's).
@@ -580,3 +587,7 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 ### hir-ty-mir
 
 - **`model_is_acyclic`** (`crates/hir-ty-mir/src/tests/consteval/reach.rs`): `S{root}` can own itself when some cell it owns (at any depth) owns (at any depth) a counted pointer whose pointee owns (at any depth) an `S{root}`. An explicit search with no pruning and no position flag, over the same description.
+
+### vt
+
+- **`Vt`** (`crates/blaze-screen/tests/vt/mod.rs`): a terminal that takes the encoder's sequences and no other, keeps rows with their wraps, reflows them when resized, never moves its cursor above its top row, and erases a row only when told to: what the screen's properties read a terminal's state from.

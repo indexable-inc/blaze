@@ -889,6 +889,7 @@ impl Iocp {
             | Effect::Rename { .. }
             | Effect::RenameUnsynced { .. }
             | Effect::Clone { .. }
+            | Effect::CopyData { .. }
             | Effect::Link { .. }
             | Effect::Remove { .. }) => {
                 match &effect {
@@ -899,7 +900,9 @@ impl Iocp {
                         self.forget(from);
                         self.forget(to);
                     }
-                    Effect::Clone { to, .. } | Effect::Link { to, .. } => self.forget(to),
+                    Effect::Clone { to, .. }
+                    | Effect::CopyData { to, .. }
+                    | Effect::Link { to, .. } => self.forget(to),
                     _ => {}
                 }
                 self.to_threads(Work::File(effect));
@@ -913,7 +916,9 @@ impl Iocp {
             | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
+            | Effect::Barrier { .. }
             | Effect::WriteBack { .. }
+            | Effect::Prewarm { .. }
             | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
@@ -2433,6 +2438,10 @@ impl Driver for Iocp {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
     }
 }
 

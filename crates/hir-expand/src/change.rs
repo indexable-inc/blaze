@@ -1,10 +1,9 @@
 //! Defines a unit of change that can applied to the database to get the next
 //! state. Changes are transactional.
 use base_db::{CrateGraphBuilder, CratesIdMap, Db, FileChange, SourceRoot};
-use blaze_query::db::Durability;
 use span::FileId;
 
-use crate::proc_macro::{ProcMacros, ProcMacrosBuilder};
+use crate::proc_macro::ProcMacrosBuilder;
 
 #[derive(Debug, Default)]
 pub struct ChangeWithProcMacros {
@@ -14,13 +13,10 @@ pub struct ChangeWithProcMacros {
 
 impl ChangeWithProcMacros {
     /// Makes the change as one write: the maintainers run once, after the crate graph and the
-    /// proc macros it carries are both set, and a change setting a crate graph needs no
-    /// [`ProcMacros`] input made before it.
+    /// proc macros it carries are both set. A crate's proc macros are a field of the crate
+    /// (`ProcMacros`), so nothing is made before the graph.
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
         db.batch(base_db::Trigger::named("Change::apply"), |db| {
-            if self.source_change.crate_graph.is_some() && ProcMacros::try_get(db).is_none() {
-                ProcMacros::init_default(db, Durability::HIGH);
-            }
             let crates_id_map = self.source_change.apply(db);
             if let Some(proc_macros) = self.proc_macros {
                 proc_macros.build_in(

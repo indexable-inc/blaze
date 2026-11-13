@@ -343,6 +343,44 @@ pub fn test_result(out: &mut String, result: &TestResult) {
     out.push('}');
 }
 
+/// `blaze-test-summary`, blaze's own (cargo has none), without its newline: the end of a
+/// `test` or `bench` run, its counts whole ([`blaze_screen::Tally`]), so a harness or an agent
+/// checks how many tests ran from fields and never takes a run of none for a pass. `ok` is
+/// the command's verdict (its exit code is 0); `why` is what refused a run in which no test
+/// failed (`cli::test::refusal`).
+pub fn test_summary(
+    out: &mut String,
+    tally: &blaze_screen::Tally,
+    ok: bool,
+    why: Option<&str>,
+    elapsed_ms: u64,
+) {
+    out.push_str(r#"{"reason":"blaze-test-summary","ok":"#);
+    boolean(out, ok);
+    for (name, count) in [
+        ("selected", tally.selected()),
+        ("ran", tally.ran()),
+        ("passed", tally.passed),
+        ("failed", tally.failed),
+        ("ignored", tally.ignored),
+        ("measured", tally.measured),
+        ("filtered_out", tally.filtered_out),
+        ("unreached", tally.unreached),
+        ("binaries", tally.binaries),
+        ("unbuilt", tally.unbuilt),
+    ] {
+        out.push_str(",\"");
+        out.push_str(name);
+        out.push_str("\":");
+        num(out, u64::from(count));
+    }
+    out.push_str(r#","elapsed_ms":"#);
+    num(out, elapsed_ms);
+    out.push_str(r#","why":"#);
+    opt(out, why);
+    out.push('}');
+}
+
 /// How a build was served: by the daemon `blaze` connects to (or starts), or by the engine the
 /// seed runs in its own process for the one command (docs/future/bootstrap.md).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -409,13 +447,18 @@ pub struct Finished<'a> {
     pub took_ms: u64,
     /// `None` for a request that sent no work report (a failed load, `doc`).
     pub work: Option<Work>,
+    /// The one program the build placed, where it placed exactly one: its path, whole.
+    pub program: Option<&'a str>,
+    /// What that program takes on disk, in bytes.
+    pub size_bytes: Option<u64>,
 }
 
 /// `build-finished`, without its newline: cargo's `reason` and `success` first, then blaze's
 /// own fields, each always present (`null` where unknown), so a reader's shape never varies:
 /// `{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,
 /// "build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,
-/// "full":0}}`. docs/cargo.md names each field.
+/// "full":0},"program":"/w/target/debug/app","size_bytes":4123456}`. docs/cargo.md names each
+/// field.
 pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
     out.push_str(r#"{"reason":"build-finished","success":"#);
     boolean(out, finished.success);
@@ -444,10 +487,18 @@ pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
             num(out, work.unchanged);
             out.push_str(r#","full":"#);
             num(out, work.full);
-            out.push_str("}}");
+            out.push('}');
         }
-        None => out.push_str(r#","units":null,"links":null}"#),
+        None => out.push_str(r#","units":null,"links":null"#),
     }
+    out.push_str(r#","program":"#);
+    opt(out, finished.program);
+    out.push_str(r#","size_bytes":"#);
+    match finished.size_bytes {
+        Some(bytes) => num(out, bytes),
+        None => out.push_str("null"),
+    }
+    out.push('}');
 }
 
 /// The name of the profile a `Finished` text names (`` `dev` profile [unoptimized + debuginfo]

@@ -998,12 +998,18 @@ const CHAINED: usize = 256;
 
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
+///
+/// It is an identity (equal prints are taken as equal code, with no compare after), so it is
+/// BLAKE3 under a domain, 128 bits kept (docs/v2/plan/design/caches.md, "Hash functions"):
+/// until 2026-11-12 it was SipHash-128 under a fixed public key, which is no identity.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
-    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    code.hash(&mut hasher);
-    let type_id::Fingerprint(low, high) = hasher.finish();
-    u128::from(low) | u128::from(high) << 64
+    let mut hasher = blaze_ids::Hasher::new(PRINT_DOMAIN);
+    code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+    hasher.finish().fingerprint().0
 }
+
+/// The domain of [`print_of`].
+const PRINT_DOMAIN: &str = "blaze v2 compiled code print 1";
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
@@ -2249,9 +2255,11 @@ pub fn exported_symbol(db: &Db, func: FunctionId) -> Option<String> {
 }
 
 /// Whether a function is `#[rustc_comptime]`: one the const evaluator alone runs, such as
-/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code.
+/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code. Nothing that
+/// runs calls one in a crate the check passed
+/// (`hir_ty_mir::mir::const_check::comptime::comptime_calls`).
 pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
-    AttrFlags::has_word(db, func.into(), "rustc_comptime")
+    hir_ty_mir::mir::const_check::comptime::is_comptime(db, func)
 }
 
 /// The refusal of `method` of the impl a builtin derive makes for `self_ty`, as `lookup_impl_method`
@@ -3905,6 +3913,15 @@ struct SuspendedState {
     held: hir_ty_mir::mir::HeldLocals,
 }
 
+/// The bugs a test plants in the process caches of interned rows.
+#[cfg(test)]
+pub(crate) mod plant {
+    /// [`super::erase_regions`]' map is kept across a release of the interner's tables, as
+    /// before it kept the release it was filled under.
+    pub(crate) static KEEPS_ERASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
 /// code, and the ones a caller passes on are its own parameters, which mean nothing in the
 /// callee. The fold is compile identity's ([`hir_ty_identity::instance::erased`]), which folds
@@ -3921,25 +3938,41 @@ pub(crate) fn erase_regions<'db>(
     use rustc_type_ir::TypeVisitableExt;
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
+    /// The release of the interner's tables ([`hir_ty::evict::tables_released`]) the map was
+    /// filled under, and the map: a release frees the rows it names, and the next row interned
+    /// takes a freed one's number, so the map starts over when the count moved. A release runs
+    /// only while no task does, so this thread's first use after it sees the move.
+    type Erased = (u64, HashMap<StoredGenericArgs, StoredGenericArgs, Global>);
     thread_local! {
-        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs, Global>> =
-            std::cell::RefCell::default();
+        static ERASED: std::cell::RefCell<Erased> = std::cell::RefCell::default();
     }
     // Binders are anonymized too (`erased`), so a type with bound variables but no free region
     // is erased as well: `for<'a> fn(&'a u8)` and `for<'b> fn(&'b u8)` are one instance.
     if !args.has_type_flags(hir_ty_identity::instance::ERASES) {
         return args;
     }
+    let released = hir_ty::evict::tables_released();
     let key = args.store();
-    if let Some(known) = ERASED.with_borrow(|it| it.get(&key).map(|it| it.as_ref())) {
+    let known = ERASED.with_borrow_mut(|(under, map)| {
+        #[cfg(test)]
+        if plant::KEEPS_ERASED.load(std::sync::atomic::Ordering::Relaxed) {
+            *under = released;
+        }
+        if *under != released {
+            map.clear();
+            *under = released;
+        }
+        map.get(&key).map(|it| it.as_ref())
+    });
+    if let Some(known) = known {
         return known;
     }
     let erased = hir_ty_identity::instance::erased(interner, args);
-    ERASED.with_borrow_mut(|it| {
-        if it.len() >= KEPT {
-            it.clear();
+    ERASED.with_borrow_mut(|(_, map)| {
+        if map.len() >= KEPT {
+            map.clear();
         }
-        it.insert(key, erased.store());
+        map.insert(key, erased.store());
     });
     erased
 }
@@ -16849,6 +16882,24 @@ mod number_ranges {
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
+
+    /// The invariant: a print is the first 128 bits of the BLAKE3 of the code's `Hash` under
+    /// `PRINT_DOMAIN`, the same in every process, and other code has another print. The
+    /// control is the hash it replaced: SipHash-128 of the same value is not the print.
+    #[test]
+    fn a_print_is_blake3_under_its_domain() {
+        use std::hash::Hash as _;
+        let code = (7u32, "body", [1u8, 2, 3]);
+        let mut hasher = blaze_ids::Hasher::new(super::PRINT_DOMAIN);
+        code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+        assert_eq!(super::print_of(&code), hasher.finish().fingerprint().0);
+        assert_eq!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 3])));
+        assert_ne!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 4])));
+        let mut sip = rustc_stable_hash::StableSipHasher128::new();
+        code.hash(&mut sip);
+        let super::type_id::Fingerprint(low, high) = sip.finish();
+        assert_ne!(super::print_of(&code), u128::from(low) | u128::from(high) << 64);
+    }
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// core's two UB checks are known by their pre-interned symbols, however the name was

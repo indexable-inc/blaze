@@ -22,7 +22,7 @@ use crate::{
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 35;
+const REQUESTS: usize = 36;
 const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
@@ -223,6 +223,7 @@ impl Gen {
             command: self.text(),
             refused: self.maybe(Gen::u32),
             verbose: self.next() as u8,
+            prebuilt: self.yes(),
         }
     }
 
@@ -312,7 +313,7 @@ impl Gen {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
-            28 => Request::Gc { dry_run: self.yes() },
+            28 => Request::Gc { dry_run: self.yes(), unkept: self.yes() },
             29 => Request::Rebuilt {
                 all: self.yes(),
                 cwd: self.maybe_text(),
@@ -336,8 +337,17 @@ impl Gen {
                 spans: self.bytes(),
                 ended_ns: self.wide() as i64,
                 started_ns: self.wide() as i64,
+                pid: self.u32(),
+                timed: (0..self.below(3))
+                    .map(|_| crate::Timed {
+                        name: self.text(),
+                        start_ns: self.wide() as i64,
+                        end_ns: self.wide() as i64,
+                    })
+                    .collect(),
             },
             33 => Request::Lock { view: self.view(0), targets: self.targets() },
+            35 => Request::Store { words: self.texts(0) },
             _ => Request::Stop,
         }
     }
@@ -448,6 +458,7 @@ impl Gen {
             target: self.unit_target(),
             package_id: self.text(),
             manifest_path: self.text(),
+            primary: self.yes(),
         }
     }
 
@@ -589,6 +600,16 @@ impl Gen {
                     optimized: g.wide(),
                     functions: g.wide(),
                 }),
+                storage: self.maybe(|g| crate::Storage {
+                    store_bytes: g.wide(),
+                    store_delta_bytes: g.wide() as i64,
+                    held_bytes: g.wide(),
+                    budget_bytes: g.wide(),
+                    collectable_bytes: g.wide(),
+                    volume_free_bytes: g.wide(),
+                    over_budget: g.yes(),
+                    warning: g.maybe_text(),
+                }),
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),
@@ -623,6 +644,7 @@ impl Gen {
                 settings: self
                     .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
                 uptime_ms: self.wide(),
+                placed_by: self.maybe_text(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 builds: self.many(depth, |g| crate::Building {
@@ -842,7 +864,7 @@ impl Gen {
     }
 
     fn report_text(&mut self) -> crate::Text {
-        crate::Text(self.many(1, |g| match g.below(9) {
+        crate::Text(self.many(1, |g| match g.below(11) {
             0 => crate::ReportSpan::Plain(g.text()),
             1 => crate::ReportSpan::Code(g.text()),
             2 => crate::ReportSpan::Path(g.text()),
@@ -851,7 +873,9 @@ impl Gen {
             5 => crate::ReportSpan::Hash(g.text()),
             6 => crate::ReportSpan::Var(g.text()),
             7 => crate::ReportSpan::Count(g.wide()),
-            _ => crate::ReportSpan::Took(g.wide()),
+            8 => crate::ReportSpan::Took(g.wide()),
+            9 => crate::ReportSpan::Command(g.text()),
+            _ => crate::ReportSpan::Strong(g.text()),
         }))
     }
 
@@ -1018,6 +1042,7 @@ fn request_index(request: &Request) -> usize {
         Request::ClientRows { .. } => 32,
         Request::Lock { .. } => 33,
         Request::Stop => 34,
+        Request::Store { .. } => 35,
     }
 }
 

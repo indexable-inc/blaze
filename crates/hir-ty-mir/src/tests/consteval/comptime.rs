@@ -138,7 +138,10 @@ fn a_fn_pointer_call_in_const_is_checked_when_evaluated() {
             unreachable!()
         };
         assert_eq!(*through, Dispatch::FnPointer, "{text}");
-        assert!(text.contains("`eight`") && text.contains("function pointer"), "{text}");
+        // Named by its path, as the evaluator names every target it refuses (an impl's method
+        // as `<Eight as Get>::get`): unambiguous wherever the refusal is read.
+        assert!(text.contains("`ra_test_fixture::eight`"), "{text}");
+        assert!(text.contains("function pointer"), "{text}");
     });
 }
 

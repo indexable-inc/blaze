@@ -1,0 +1,21 @@
+{
+  "id": "records-impls-1",
+  "date": "2026-11-12",
+  "who": "records-impls (claude-fable-5-2)",
+  "what": "A record another crate lays out (hir-ty's impl table pages) could not be written or read a segment at a time with hir-def's frozen encoding: `Enc`/`Dec` are public but a segment needs their private fields (reset the per-segment macro-call tables, borrow the files and closure), and the only code doing it was private to nameres/frozen/pages.rs.",
+  "whys": [
+    "pages.rs was written for one record, the def map, inside hir-def.",
+    "Its segment writer and reader are private functions over private fields of Enc and Dec.",
+    "The public surface of the encoding is one stream (Enc::finish, Dec::new_checked), which a reader decodes from its start with a closure walk and a files check a reader.",
+    "So every later record of another crate (impls, bodies, signatures) either decodes whole or copies the segment code.",
+    "Nothing said that 'a record read a part at a time' is a general need of the encoding, not of the def map."
+  ],
+  "class": "A general mechanism built inside its first user, private to it.",
+  "prevention": "`hir_def::nameres::frozen::segments` (Writer, files, reader) is the one home; pages.rs should use it and drop its private `write_segment`/`segment`/`closure_of`.",
+  "where": "crates/hir-def/src/nameres/frozen/pages.rs, crates/hir-def/src/nameres/frozen/segments.rs",
+  "state": "open",
+  "cause": "The segment code was private to the def-map pages.",
+  "cost": "a new file and a second copy of ~40 lines until pages.rs is moved onto it",
+  "workaround": "Use `segments` for every new record.",
+  "fix": ""
+}

@@ -1,0 +1,12 @@
+{
+ "id": "cross-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+ "where": "lanebase-1112 /root/loop.sh",
+ "what": "A queued call printed nothing for over twenty minutes (twice); the first time the queue was held by a daemon that inherited the lock. A call's output is only shown when it ends, so a waiting caller cannot tell queued from building from hung.",
+ "cost": "about fifty minutes of waiting across two calls",
+ "cause": "one lock, no line saying who holds it or how many wait",
+ "workaround": "did the reading and data work meanwhile",
+ "fix": "the loop prints `waiting behind <branch> (<seconds> s)` every 30 s, unbuffered",
+ "state": "open"
+}

@@ -45,8 +45,11 @@ pub const GEN_ROWS: u64 = 4096;
 /// How many generations back a row's own ids may reach: older tokens are linked. Under 256, so
 /// the low byte of a generation names one of the window.
 pub const WINDOW: u32 = 32;
-/// Generations a reader keeps of each ring: names of older ones read as forgotten.
-pub const RETAIN: usize = 64;
+/// Generations a reader keeps of each ring: names of older ones read as forgotten. The window
+/// and the generation a row is in: a row names at most [`WINDOW`] generations back of its own,
+/// so one more held would be read by no row (a name a span holds longer is kept apart,
+/// [`Streams::hold`]).
+pub const RETAIN: usize = WINDOW as usize + 1;
 /// The longest text a definition holds; a longer one is cut at a character's boundary.
 pub const TEXT_MAX: usize = (1 << 16) - 1;
 /// Bytes of text a definition row holds: its seven words other than its tag.
@@ -121,6 +124,9 @@ pub enum Plant {
     /// A reader takes a row sym's generation as the newest it holds with that low byte, not the
     /// one in the row's window.
     NoWindow,
+    /// A reader keeps 64 generations of each ring, as before 2026-11-12, not [`RETAIN`]: the
+    /// generations past a row's window held for nothing.
+    RetainSixtyFour,
 }
 
 /// Counts a core hands its driver ([`Out::counted`]).
@@ -360,31 +366,100 @@ fn row_text(row: &[u64; WORDS], into: &mut Vec<u8>, len: usize) {
 
 // --- The readers ------------------------------------------------------------------------
 
-/// What an index of a generation names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Def {
-    Text(Arc<str>),
+/// What an index of a generation names, as [`Gen::def`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Def<'a> {
+    Text(&'a str),
     /// A name of another ring or generation, by its full token.
     Link(Token),
 }
 
+/// An index of [`Gen::at`] with no definition.
+const NO_DEF: u32 = u32::MAX;
+/// An index of [`Gen::at`] that is a link: its second number is its place in [`Gen::links`].
+const LINK_DEF: u32 = u32::MAX - 1;
+
 /// One generation of a ring as a reader holds it: where it began, how far it was read with no
-/// row missed, and its definitions by index.
+/// row missed, and its definitions by index: their texts one after another in one buffer, so a
+/// generation is one allocation of text, not one a name (a name made its own `Arc<str>` here,
+/// in `Stream::finish`, was the first site of the untagged heap's held samples on tempo,
+/// 2026-11-12: samples, not bytes).
 struct Gen {
     generation: u32,
     from: u64,
     /// The index after the last row of it read with every row from `from` read: a row past it
     /// may be of a generation whose [`GEN_ROW`] was written over unread.
     to: u64,
-    defs: Vec<Option<Def>>,
+    /// The texts of its definitions, one after another.
+    text: String,
+    /// Each index's definition: `(NO_DEF, 0)` none, `(LINK_DEF, k)` the token `links[k]`, else
+    /// `(start, len)` of its text in `text`.
+    at: Vec<(u32, u32)>,
+    links: Vec<Token>,
 }
 
-/// A definition whose rows are being read: its index, its length, the part next, its bytes.
+impl Gen {
+    fn new(generation: u32, from: u64) -> Gen {
+        Gen { generation, from, to: from + 1, text: String::new(), at: Vec::new(), links: Vec::new() }
+    }
+
+    /// What index `index` names, if a definition of it was read.
+    fn def(&self, index: usize) -> Option<Def<'_>> {
+        let &(start, len) = self.at.get(index)?;
+        match start {
+            NO_DEF => None,
+            LINK_DEF => self.links.get(len as usize).map(|it| Def::Link(*it)),
+            _ => self.text.get(start as usize..start as usize + len as usize).map(Def::Text),
+        }
+    }
+
+    fn set(&mut self, index: u16, def: (u32, u32)) {
+        let at = usize::from(index);
+        if self.at.len() <= at {
+            // alloc: a generation's index of its definitions, held with it
+            self.at.resize(at + 1, (NO_DEF, 0));
+        }
+        self.at[at] = def;
+    }
+
+    /// Defines `index` as `text`, appended to the generation's one buffer.
+    fn define_text(&mut self, index: u16, text: &str) {
+        // A generation holds at most INDEX_MAX names of at most TEXT_MAX bytes: under 2^28.
+        let (start, len) = (self.text.len() as u32, text.len() as u32);
+        // alloc: the generation's one text buffer, grown as its names are read
+        self.text.push_str(text);
+        self.set(index, (start, len));
+    }
+
+    /// Defines `index` as a link to `token`.
+    fn define_link(&mut self, index: u16, token: Token) {
+        let k = self.links.len() as u32;
+        // alloc: a generation's links, held with it
+        self.links.push(token);
+        self.set(index, (LINK_DEF, k));
+    }
+
+    /// Lets go of the room past what it holds: a generation no longer read into.
+    fn settle(&mut self) {
+        self.text.shrink_to_fit();
+        self.at.shrink_to_fit();
+        self.links.shrink_to_fit();
+    }
+
+    /// The bytes it holds of the heap.
+    fn held_bytes(&self) -> u64 {
+        (self.text.capacity()
+            + self.at.capacity() * size_of::<(u32, u32)>()
+            + self.links.capacity() * size_of::<Token>()) as u64
+    }
+}
+
+/// A definition whose rows are being read: its index, its length and the part next; its bytes
+/// are the stream's ([`Stream::bytes`]).
 struct Building {
     index: u16,
     len: usize,
     next: u64,
-    bytes: Vec<u8>,
 }
 
 /// What a reader holds of one ring.
@@ -395,6 +470,9 @@ struct Stream {
     /// The generations held, oldest first, at most [`RETAIN`].
     gens: Vec<Gen>,
     building: Option<Building>,
+    /// The bytes of the definition being read: one buffer a ring, reused definition after
+    /// definition.
+    bytes: Vec<u8>,
 }
 
 /// Where a [`Streams`] reads rows from: the driver's rings, or nothing (a postmortem, which
@@ -415,9 +493,10 @@ impl Source for Fed {
     }
 }
 
-/// What a row sym or a token names, as the definitions held say.
-enum Found {
-    Text(Arc<str>),
+/// What a row sym or a token names, as the definitions held say: the text borrowed from them,
+/// made into a caller's own only at the read that wants one.
+enum Found<'a> {
+    Text(&'a str),
     Link(Token),
     Forgotten,
 }
@@ -443,6 +522,12 @@ pub struct Streams {
 impl Streams {
     pub fn plant(&mut self, plant: Plant) {
         self.plant = plant;
+    }
+
+    /// Generations kept of each ring: [`RETAIN`], or as many as before 2026-11-12 under
+    /// [`Plant::RetainSixtyFour`].
+    fn retain(&self) -> usize {
+        if self.plant == Plant::RetainSixtyFour { 64 } else { RETAIN }
     }
 
     fn stream(&mut self, ring: u16) -> &mut Stream {
@@ -474,6 +559,7 @@ impl Streams {
         head: u64,
         rows: impl IntoIterator<Item = (u64, &'a [u64; WORDS])>,
     ) {
+        let retain = self.retain();
         let stream = self.stream(ring);
         if first > stream.to {
             // Rows missed: the generation held is known only up to them, and a definition
@@ -483,7 +569,7 @@ impl Streams {
         }
         for (i, row) in rows {
             if i >= stream.to && is_names_row(row) {
-                stream.take(i, row);
+                stream.take(i, row, retain);
             }
         }
         stream.advance(head);
@@ -491,7 +577,8 @@ impl Streams {
 
     /// What `sym` names, a row's own id (not a kept name's) of the row at index `at` of ring
     /// `ring`, a link followed (catching its ring up through `source`); `None`, counted as
-    /// forgotten, when no definition held says.
+    /// forgotten, when no definition held says. The text made into one of the caller's own:
+    /// [`Streams::resolve_str`] borrows it.
     pub fn resolve(
         &mut self,
         ring: u16,
@@ -499,32 +586,69 @@ impl Streams {
         sym: u32,
         source: &mut impl Source,
     ) -> Option<Arc<str>> {
-        let found = match self.lookup(ring, at, sym) {
-            Found::Text(text) => Some(text),
-            Found::Link(token) => self.text(token, source),
-            Found::Forgotten => None,
+        // alloc: the text, the caller's own
+        self.resolve_str(ring, at, sym, source).map(Arc::from)
+    }
+
+    /// [`Streams::resolve`], the text borrowed from the definitions held: a reader that keeps
+    /// texts of its own (`flight`'s table) copies one only where it has none.
+    pub fn resolve_str(
+        &mut self,
+        ring: u16,
+        at: u64,
+        sym: u32,
+        source: &mut impl Source,
+    ) -> Option<&str> {
+        let link = match self.lookup(ring, at, sym) {
+            Found::Text(_) => None,
+            Found::Link(token) => Some(token),
+            Found::Forgotten => {
+                self.forgotten += 1;
+                return None;
+            }
         };
-        if found.is_none() {
-            self.forgotten += 1;
+        match link {
+            Some(token) => {
+                if !self.knows(token, source) {
+                    self.forgotten += 1;
+                    return None;
+                }
+                match self.of_token(token) {
+                    Found::Text(text) => Some(text),
+                    Found::Link(_) | Found::Forgotten => None,
+                }
+            }
+            None => match self.lookup(ring, at, sym) {
+                Found::Text(text) => Some(text),
+                Found::Link(_) | Found::Forgotten => None,
+            },
         }
-        found
     }
 
     /// The text of `token`, a ring's name, its ring caught up through `source` when the
     /// definitions held don't say; `None` when none does. Kept names are the driver's.
     pub fn text(&mut self, token: Token, source: &mut impl Source) -> Option<Arc<str>> {
-        if let Found::Text(text) = self.of_token(token) {
-            return Some(text);
+        if !self.knows(token, source) {
+            return None;
         }
-        let (ring, ..) = parts(token)?;
-        self.catch_up(ring, source);
         match self.of_token(token) {
-            Found::Text(text) => Some(text),
-            _ => None,
+            // alloc: the text, the caller's own
+            Found::Text(text) => Some(Arc::from(text)),
+            Found::Link(_) | Found::Forgotten => None,
         }
     }
 
-    fn lookup(&self, ring: u16, at: u64, sym: u32) -> Found {
+    /// Whether a text of `token` is held, its ring caught up through `source` first if not.
+    fn knows(&mut self, token: Token, source: &mut impl Source) -> bool {
+        if matches!(self.of_token(token), Found::Text(_)) {
+            return true;
+        }
+        let Some((ring, ..)) = parts(token) else { return false };
+        self.catch_up(ring, source);
+        matches!(self.of_token(token), Found::Text(_))
+    }
+
+    fn lookup(&self, ring: u16, at: u64, sym: u32) -> Found<'_> {
         let Some(stream) = self.rings.get(usize::from(ring)) else { return Found::Forgotten };
         let (low, index) = (sym >> 12 & 0xff, usize::from((sym & 0xfff) as u16));
         let held = if self.plant == Plant::NoWindow {
@@ -538,23 +662,22 @@ impl Streams {
                 stream.gens.iter().rev().find(|it| it.generation == generation)
             })
         };
-        match held.and_then(|it| it.defs.get(index)).and_then(Option::as_ref) {
-            // clone: a refcount
-            Some(Def::Text(text)) => Found::Text(text.clone()),
-            Some(Def::Link(token)) => Found::Link(*token),
+        match held.and_then(|it| it.def(index)) {
+            Some(Def::Text(text)) => Found::Text(text),
+            Some(Def::Link(token)) => Found::Link(token),
             None => Found::Forgotten,
         }
     }
 
-    fn of_token(&self, token: Token) -> Found {
+    fn of_token(&self, token: Token) -> Found<'_> {
         let Some((ring, generation, index)) = parts(token) else { return Found::Forgotten };
         let Some(stream) = self.rings.get(usize::from(ring)) else { return Found::Forgotten };
         let held = stream.gens.iter().rev().find(|it| it.generation == generation);
-        match held.and_then(|it| it.defs.get(usize::from(index))).and_then(Option::as_ref) {
-            Some(Def::Text(text)) => Found::Text(Arc::clone(text)),
+        match held.and_then(|it| it.def(usize::from(index))) {
+            Some(Def::Text(text)) => Found::Text(text),
             // A token is a text's: a link to a link is not one a writer writes.
             Some(Def::Link(_)) | None => match self.held.get(&token) {
-                Some((text, _)) => Found::Text(Arc::clone(text)),
+                Some((text, _)) => Found::Text(text),
                 None => Found::Forgotten,
             },
         }
@@ -567,14 +690,15 @@ impl Streams {
         let stream = self.rings.get((key >> 20) as usize)?;
         let (low, index) = (key >> 12 & 0xff, (key & 0xfff) as usize);
         let held = stream.gens.iter().rev().find(|it| it.generation & 0xff == low)?;
-        match held.defs.get(index)?.as_ref()? {
-            // clone: a refcount
-            Def::Text(text) => Some(text.clone()),
-            Def::Link(token) => match self.of_token(*token) {
-                Found::Text(text) => Some(text),
-                _ => None,
+        let text = match held.def(index)? {
+            Def::Text(text) => text,
+            Def::Link(token) => match self.of_token(token) {
+                Found::Text(text) => text,
+                Found::Link(_) | Found::Forgotten => return None,
             },
-        }
+        };
+        // alloc: the text, the caller's own
+        Some(Arc::from(text))
     }
 
     /// Keeps the text of each of `tokens`, the names the spans open now hold, while a read
@@ -596,6 +720,53 @@ impl Streams {
         }
         // Kept through the next read: a span that closed since this one wrote its row then.
         self.held.retain(|_, it| it.1 + 1 >= reads);
+    }
+
+    /// The bytes of the heap the definitions held take: each generation's buffers, each ring's
+    /// buffer of a definition being read, the texts open spans hold, and the reader's rows
+    /// read. What `flight::names_held` says of the readers' names.
+    pub fn held_bytes(&self) -> u64 {
+        let rings: u64 = self
+            .rings
+            .iter()
+            .map(|stream| {
+                stream.gens.iter().map(Gen::held_bytes).sum::<u64>()
+                    + (stream.gens.capacity() * size_of::<Gen>() + stream.bytes.capacity()) as u64
+            })
+            .sum();
+        let held: u64 = self
+            .held
+            .values()
+            .map(|(text, _)| (text.len() + size_of::<(Token, (Arc<str>, u64))>()) as u64)
+            .sum();
+        rings
+            + held
+            + (self.rings.capacity() * size_of::<Stream>()
+                + self.scratch.capacity() * size_of::<(u64, [u64; WORDS])>()) as u64
+    }
+
+    /// Lets go of what no read can need again: every generation but the newest of each ring
+    /// whose thread ended (`ended`, by ring number; no row of it is written again, and those
+    /// written were read), the room past what each generation holds, and the reader's rows
+    /// read. A live ring keeps its window: its next row may name any generation of it. The
+    /// bytes [`Streams::held_bytes`] fell by.
+    pub fn trim(&mut self, ended: impl Fn(u16) -> bool) -> u64 {
+        let before = self.held_bytes();
+        for (ring, stream) in self.rings.iter_mut().enumerate() {
+            if u16::try_from(ring).is_ok_and(&ended) {
+                let older = stream.gens.len().saturating_sub(1);
+                stream.gens.drain(..older);
+            }
+            for generation in &mut stream.gens {
+                generation.settle();
+            }
+            stream.gens.shrink_to_fit();
+            if stream.building.is_none() {
+                stream.bytes = Vec::new();
+            }
+        }
+        self.scratch = Vec::new();
+        before.saturating_sub(self.held_bytes())
     }
 
     /// Forgets every ring, as a reader that starts again.
@@ -620,29 +791,35 @@ impl Stream {
         self.to = to;
     }
 
-    /// Takes the names row `row` at index `i`, every row before it read.
-    fn take(&mut self, i: u64, row: &[u64; WORDS]) {
+    /// Takes the names row `row` at index `i`, every row before it read, keeping `retain`
+    /// generations.
+    fn take(&mut self, i: u64, row: &[u64; WORDS], retain: usize) {
         self.advance(i);
         let tag = row[4];
         let index = (tag >> 8 & 0xfff) as u16;
         match tag & 0xff {
             GEN_ROW => {
                 self.building = None;
-                if self.gens.len() == RETAIN {
-                    self.gens.remove(0);
+                if self.gens.len() >= retain {
+                    let gone = self.gens.len() + 1 - retain;
+                    self.gens.drain(..gone);
                 }
-                // alloc: a generation's definitions, a reader's, kept RETAIN generations a ring
-                let held = Gen { generation: row[0] as u32, from: i, to: i + 1, defs: Vec::new() };
-                self.gens.push(held);
+                // No row reads into the one before again: its buffers lose their spare room.
+                if let Some(last) = self.gens.last_mut() {
+                    last.settle();
+                }
+                // alloc: a generation's record, a reader's, kept RETAIN generations a ring
+                self.gens.push(Gen::new(row[0] as u32, i));
                 self.to = i + 1;
                 return;
             }
             NAME_ROW => {
                 let len = (tag >> 20 & 0xffff) as usize;
-                // alloc: a definition's bytes while its rows are read
-                let mut bytes = Vec::with_capacity(len);
-                row_text(row, &mut bytes, len);
-                self.building = Some(Building { index, len, next: 1, bytes });
+                self.bytes.clear();
+                // alloc: the ring's one buffer of a definition being read, grown to its longest
+                self.bytes.reserve(len);
+                row_text(row, &mut self.bytes, len);
+                self.building = Some(Building { index, len, next: 1 });
                 self.finish();
             }
             NAME_MORE_ROW => {
@@ -652,7 +829,7 @@ impl Stream {
                     Some(building) if building.index == index && building.next == part => {
                         building.next += 1;
                         let len = building.len;
-                        row_text(row, &mut building.bytes, len);
+                        row_text(row, &mut self.bytes, len);
                         self.finish();
                     }
                     _ => self.building = None,
@@ -660,35 +837,35 @@ impl Stream {
             }
             LINK_ROW => {
                 self.building = None;
-                self.define(index, Def::Link(row[0]));
+                if let Some(held) = self.newest() {
+                    held.define_link(index, row[0]);
+                }
             }
             _ => {}
         }
         self.advance(i + 1);
     }
 
-    /// Ends the definition being read if it is whole.
-    fn finish(&mut self) {
-        let Some(building) = &self.building else { return };
-        if building.bytes.len() < building.len {
-            return;
-        }
-        let Some(building) = self.building.take() else { return };
-        // alloc: a name a reader holds, kept with its generation
-        let text: Arc<str> = String::from_utf8_lossy(&building.bytes).into();
-        self.define(building.index, Def::Text(text));
+    /// The generation the row just read is in: none when that generation's start was missed.
+    fn newest(&mut self) -> Option<&mut Gen> {
+        let to = self.to;
+        self.gens.last_mut().filter(|it| it.to == to)
     }
 
-    /// Defines `index` of the generation the row just read is in: none when that generation's
-    /// start was missed.
-    fn define(&mut self, index: u16, def: Def) {
+    /// Ends the definition being read if it is whole, its text into its generation's buffer.
+    fn finish(&mut self) {
+        let Some(building) = &self.building else { return };
+        if self.bytes.len() < building.len {
+            return;
+        }
+        let index = building.index;
+        self.building = None;
         let to = self.to;
         let Some(held) = self.gens.last_mut().filter(|it| it.to == to) else { return };
-        let at = usize::from(index);
-        if held.defs.len() <= at {
-            held.defs.resize(at + 1, None);
-        }
-        held.defs[at] = Some(def);
+        // Borrowed where the bytes are UTF-8, as a writer's text is; a torn character is
+        // replaced, as the reader always read it.
+        let text = String::from_utf8_lossy(&self.bytes);
+        held.define_text(index, &text);
     }
 }
 

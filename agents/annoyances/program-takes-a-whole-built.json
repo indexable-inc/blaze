@@ -1,0 +1,14 @@
+{
+ "id": "program-takes-a-whole-built",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor T2 of 7b-launched, int-1112",
+ "where": "crates/blaze-launch-host/src/program.rs Program::built (now Program::started, Program::took), src/bind.rs",
+ "what": "The launch host took only a whole build (`Program::built` of a `Built` with every function and static of the reached closure), so a launched run could not start before the daemon had compiled, recorded and held everything it could reach: a cold hello-world took 9,727 ms against Relax's 220 ms and the daemon held 351 MB of codegen and link memory. A record also named the program's own symbols as Extern places, which the launcher fills by dlsym and the wire cannot number.",
+ "cost": "every launched cold start paid the whole closure; the 73 ms target was out of reach by design",
+ "cause": "the program's interface was a whole-build value, so the unit of what the host takes was the build, not the function",
+ "class": "an interface whose unit is a container (the build) where the consumer needs the item (one function at its first call)",
+ "prevention": "the host takes pieces (`Piece`, `Bound`) by slot identity; a bind record carries one function's record with its names and is read with no database; a lazy program is held to the whole build's binds by a refinement test",
+ "workaround": "none",
+ "fix": "Program::started takes the start, Program::said gives Said::Want for a slot it does not hold, Program::took binds the piece the driver answers with; bind.rs encodes a Bound under bind_key(ask, naming, policy, symbols, maker). Controls: Plant::StaleSlot, Plant::DropsStaticNames, Plant::WantTwice. Not yet compiled: the main agent builds it, T3 rewrites the driver.",
+ "state": "written, not compiled"
+}

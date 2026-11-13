@@ -76,12 +76,10 @@ pub enum Fresh {
     /// The build was given nothing to keep its walk in ([`super::Build::keeping`]).
     Unkept,
     /// Nothing was kept for the front end's database and configuration: the daemon started,
-    /// or the database was made again, since the last build. What is kept is memory of one
-    /// process and names one database's ids, so it is never restored.
+    /// the database was made again, or what was kept was let go when memory was short
+    /// (blaze-cargo's front end release, which leaves no entry), since the last build. What
+    /// is kept is memory of one process and names one database's ids, so it is never restored.
     Restart,
-    /// What was kept for the front end's database and configuration was let go when memory
-    /// was short (blaze-cargo's front end release), and nothing was kept since.
-    LetGo,
     /// The first build of this program (these roots, check roots, policy and kind of build)
     /// over what is kept: builds of other programs were kept, none of this one.
     First,
@@ -98,11 +96,8 @@ impl Fresh {
             Fresh::Unkept => "the build keeps no walk",
             Fresh::Restart => {
                 "nothing was kept for this front end's database and settings: the daemon \
-                 started or the database was made again since the last build"
-            }
-            Fresh::LetGo => {
-                "the walks kept for this front end's database and settings were let go when \
-                 memory was short, and none was kept since"
+                 started, the database was made again, or what was kept was let go when \
+                 memory was short, since the last build"
             }
             Fresh::First => "the first build of this program since the daemon started",
             Fresh::Inputs(what) => what,

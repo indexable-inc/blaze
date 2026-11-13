@@ -1,14 +1,14 @@
-//! What the crate's name resolution goes through: every path of the crate, its `use` items'
-//! own included, resolved prefix by prefix in hir-def's scopes, each import, `extern crate`
-//! item and `#[macro_use]` import a prefix is found through marked used as rustc's
-//! `record_use` marks it, with the imports each of those is found through in turn; the
-//! traits in scope at each method call, field and type-relative path (rustc's
-//! `traits_in_scope`), with the imports type checking uses of them; the macros invoked and
-//! the rules of theirs that matched; and which imports the crate re-exports.
-//!
-//! What a prefix is found through is checked against what hir resolves the path to: where
-//! they differ, or the path does not resolve, every import the name could be found through
-//! counts as used, so nothing is linted that rustc may find used.
+//! What the crate's name resolution goes through: its `use` items' own paths resolved prefix by
+//! prefix in hir-def's scopes, each import, `extern crate` item and `#[macro_use]` import a
+//! prefix is found through marked used as rustc's `record_use` marks it, with the imports each
+//! of those is found through in turn; then what the front end's per-body records hold of every
+//! other path, macro call and trait lookup of the crate (`hir_ty::used_imports_with_traits`):
+//! the imports paths used, those type checking used for the traits it picked, the names that
+//! resolve to nothing (every import such a name could be found through counts as used, so
+//! nothing is linted that rustc may find used), the lookups the traits in scope may answer
+//! (rustc's `traits_in_scope`), the macros invoked and the rules of theirs that matched; and
+//! which imports the crate re-exports. No syntax is read but an `extern crate`'s
+//! `#[macro_use]` list and where an item is.
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/lib.rs` (`record_use`, `traits_in_scope`,
 //! `traits_in_module`, `find_transitive_imports`), `ident.rs` (`resolve_ident_in_scope_set`,
@@ -29,30 +29,32 @@ use blaze_hash::{FixedHasher, HashMap, HashSet};
 use blaze_ids::bits::Bits;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
-use hir::{AsAssocItem, HirFileId, InFile, ModuleDef, PathResolution};
+use hir::InFile;
 use hir_def::{
     ExternCrateId, Lookup as _, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     item_scope::{GlobId, ImportId, ImportOrExternCrate, ImportOrGlob},
+    item_tree::{ImportAlias, UseTreeKind, extern_crate_item, use_item_trees},
+    nameres::uses::{self, MacroInvoked, TraitAsk, UnresolvedName, UsedImports},
     per_ns::PerNs,
     resolver::HasResolver,
-    src::use_tree_sources_view,
-    visibility::Visibility,
+    src::use_tree_to_view,
+    visibility::{RawVisibility, Visibility},
 };
 use hir_expand::{
     mod_path::{ModPath, PathKind},
-    name::{AsName, Name},
+    name::Name,
 };
 use intern::sym;
 use smallvec::SmallVec;
 use span::Edition;
 use std::alloc::Global;
 use syntax::{
-    SyntaxKind, TextRange, TextSize,
-    view::{self as ast, AstNode as _, HasAttrs, HasVisibility, Node},
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _},
 };
 
 use super::Places;
-use crate::{cx::Cx, lints::syntax::Walk};
+use crate::cx::Cx;
 
 /// What a name is found through: rustc's `Import` of a `use` tree, glob or `extern crate` item.
 pub(super) type Binding = ImportOrExternCrate;
@@ -133,12 +135,19 @@ pub(super) enum TreeKind {
     List,
 }
 
-/// A `use` tree.
-pub(super) struct Tree<'db> {
-    pub(super) node: ast::UseTree<'db>,
+/// A `use` tree, as its item tree lowered it: no syntax, so a body edit leaves it the same.
+pub(super) struct Tree {
+    /// Its `use` item and its index there, in the pre-order the item tree numbers the trees
+    /// in: the binding's id for a single import, the glob's index for a glob, a list's own.
+    pub(super) id: ImportId,
     /// The index of the tree whose list it is in.
     pub(super) parent: Option<u32>,
     pub(super) kind: TreeKind,
+    /// Its own path: a single import's, a glob's (`None` for `*`), a list's prefix (`None` for
+    /// `{..}`).
+    pub(super) path: Option<ModPath>,
+    /// A list with no trees: `a::{}`.
+    pub(super) empty: bool,
     /// The import it is; `None` for a list.
     pub(super) binding: Option<Binding>,
     /// The name it imports, the module's for `self` in a list.
@@ -156,21 +165,81 @@ pub(super) struct Tree<'db> {
     pub(super) imported: PerNs,
 }
 
-/// A `use` item of the crate.
-pub(super) struct UseItem<'db> {
-    pub(super) node: InFile<ast::Use<'db>>,
+impl Tree {
+    /// Its syntax, for a finding: its `use` item lowered again ([`use_tree_to_view`]).
+    pub(super) fn node<'db>(&self, cx: &Cx<'_, 'db>) -> ast::UseTree<'db> {
+        use_tree_to_view(cx.db, self.id.use_.lookup(cx.db).id, self.id.idx)
+    }
+}
+
+/// A `use` item of the crate, from its module's scope and its item tree.
+pub(super) struct UseItem {
     pub(super) id: UseId,
     /// The module it is in, a block's when it is in one.
     pub(super) module: ModuleId,
     /// `pub use`.
     pub(super) public: bool,
     /// Its trees in pre-order, the root first.
-    pub(super) trees: Vec<Tree<'db>>,
+    pub(super) trees: Vec<Tree>,
 }
 
-/// An `extern crate` item of the crate.
-pub(super) struct ExternCrate<'db> {
-    pub(super) node: InFile<ast::ExternCrate<'db>>,
+impl UseItem {
+    /// The item `id` of `module`: its trees as [`use_item_trees`] gives them, in its order.
+    fn of(cx: &Cx<'_, '_>, id: UseId, module: ModuleId) -> UseItem {
+        let item = use_item_trees(cx.db, id);
+        // alloc: one per `use` item, its trees (one for most)
+        let mut trees = Vec::with_capacity(item.trees.len());
+        for tree in &item.trees {
+            let own = ImportId { use_: id, idx: tree.idx };
+            let (kind, path, underscore, empty) = match &tree.kind {
+                UseTreeKind::Single { path, alias } => (
+                    TreeKind::Simple,
+                    Some(**path),
+                    matches!(alias, Some(ImportAlias::Underscore)),
+                    false,
+                ),
+                UseTreeKind::Glob { path } => (TreeKind::Glob, path.copied(), false, false),
+                UseTreeKind::Prefixed { prefix, list } => {
+                    (TreeKind::List, prefix.copied(), false, list.is_empty())
+                }
+            };
+            let binding = match kind {
+                TreeKind::List => None,
+                TreeKind::Glob => Some(Binding::Glob(GlobId { use_: id, idx: tree.idx })),
+                TreeKind::Simple => Some(Binding::Import(own)),
+            };
+            trees.push(Tree {
+                id: own,
+                parent: tree.parent,
+                kind,
+                path,
+                empty,
+                binding,
+                name: None,
+                underscore,
+                self_import: false,
+                lexical: false,
+                source: None,
+                imported: PerNs::default(),
+            });
+        }
+        UseItem { id, module, public: *item.visibility == RawVisibility::Public, trees }
+    }
+
+    /// Its syntax, for a finding and for the passes not yet ported off it.
+    pub(super) fn node<'db>(&self, cx: &Cx<'_, 'db>) -> InFile<ast::Use<'db>> {
+        self.id.lookup(cx.db).id.to_in_file_view(cx.db)
+    }
+
+    /// Where it is, as [`Places`] orders it.
+    fn ptr(&self, cx: &Cx<'_, '_>) -> InFile<SyntaxNodePtr> {
+        let id = self.id.lookup(cx.db).id;
+        InFile::new(id.file_id, id.erase().to_ptr(cx.db))
+    }
+}
+
+/// An `extern crate` item of the crate, from its module's scope and its item tree.
+pub(super) struct ExternCrate {
     pub(super) id: ExternCrateId,
     pub(super) module: ModuleId,
     /// The name it binds.
@@ -180,9 +249,91 @@ pub(super) struct ExternCrate<'db> {
     pub(super) public: bool,
     /// The crate it loads, when it resolves.
     pub(super) krate: Option<hir::Crate>,
-    /// Its `#[macro_use]` imports: the attribute for `#[macro_use]`, else each name
-    /// `#[macro_use(a, b)]` lists, with where it is written.
-    pub(super) macro_use: Vec<(TextRange, Option<Name>)>,
+    /// Whether it has `#[macro_use]`, with or without a list.
+    pub(super) macro_use: bool,
+}
+
+impl ExternCrate {
+    /// The item `id` of `module`, as [`extern_crate_item`] gives it.
+    fn of(cx: &Cx<'_, '_>, id: ExternCrateId, module: ModuleId) -> ExternCrate {
+        let db = cx.db;
+        let item = extern_crate_item(db, id);
+        let name = match &item.alias {
+            Some(ImportAlias::Underscore) => Name::new_symbol_root(sym::underscore),
+            Some(ImportAlias::Alias(it)) => *it,
+            None => item.name,
+        };
+        // rustc's `build_reduced_graph_for_extern_crate`: `self` is this crate, any other name
+        // the dependency `--extern` names so.
+        let home = module.krate(db);
+        let krate = if item.name == sym::self_ {
+            Some(hir::Crate::from(home))
+        } else {
+            home.data(db)
+                .dependencies
+                .iter()
+                .find(|dep| dep.name.symbol() == item.name.symbol())
+                .map(|dep| hir::Crate::from(dep.crate_id))
+        };
+        ExternCrate {
+            id,
+            module,
+            name,
+            renames: item.alias.is_some(),
+            public: *item.visibility == RawVisibility::Public,
+            krate,
+            macro_use: item.macro_use,
+        }
+    }
+
+    /// Its syntax, for a finding.
+    pub(super) fn node<'db>(&self, cx: &Cx<'_, 'db>) -> InFile<ast::ExternCrate<'db>> {
+        self.id.lookup(cx.db).id.to_in_file_view(cx.db)
+    }
+
+    /// Where it is, as [`Places`] orders it.
+    fn ptr(&self, cx: &Cx<'_, '_>) -> InFile<SyntaxNodePtr> {
+        let id = self.id.lookup(cx.db).id;
+        InFile::new(id.file_id, id.erase().to_ptr(cx.db))
+    }
+
+    /// Its `#[macro_use]` imports, for their lints: the attribute for `#[macro_use]`, else each
+    /// name `#[macro_use(a, b)]` lists, with where it is written. Read from its syntax: only
+    /// the lints of an item with [`ExternCrate::macro_use`] ask.
+    pub(super) fn macro_use_imports(&self, cx: &Cx<'_, '_>) -> Vec<(TextRange, Option<Name>)> {
+        // alloc: only `#[macro_use]` imports, almost never there; empty, it allocates nothing
+        let mut macro_use = Vec::new();
+        if !self.macro_use {
+            return macro_use;
+        }
+        let node = self.node(cx);
+        let owner = ast::AnyHasAttrs::new(node.value);
+        for (meta, attr) in cx.walk().attrs(owner) {
+            let path = match &meta {
+                ast::Meta::PathMeta(it) => it.path(),
+                ast::Meta::TokenTreeMeta(it) => it.path(),
+                _ => None,
+            };
+            if path.and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "macro_use")
+            {
+                continue;
+            }
+            match &meta {
+                ast::Meta::TokenTreeMeta(it) => {
+                    let Some(tt) = it.token_tree() else { continue };
+                    for token in tt.syntax().children_with_tokens().filter_map(|it| it.into_token())
+                    {
+                        if token.kind() == SyntaxKind::IDENT {
+                            macro_use
+                                .push((token.text_range(), Some(Name::new_root(token.text()))));
+                        }
+                    }
+                }
+                _ => macro_use.push((attr.syntax().text_range(), None)),
+            }
+        }
+        macro_use
+    }
 }
 
 /// What the crate's name resolution goes through.
@@ -192,12 +343,12 @@ pub(super) struct ExternCrate<'db> {
 /// module's imports or a binding's tree cost one probe and no scan. `lookups` memoizes scope
 /// lookups, hashed once over the borrowed key: a hit allocates nothing. `traits` memoizes the
 /// traits in scope as CSR ranges of `trait_rows` and `trait_chains`: a hit copies two `u32`s.
-pub(super) struct Uses<'f, 'db> {
+pub(super) struct Uses<'f> {
     frame: &'f Frame,
     /// The `use` items, in the order rustc's walk comes to them.
-    pub(super) items: Vec<UseItem<'db>, &'f Frame>,
+    pub(super) items: Vec<UseItem, &'f Frame>,
     /// The `extern crate` items, in that order.
-    pub(super) crates: Vec<ExternCrate<'db>, &'f Frame>,
+    pub(super) crates: Vec<ExternCrate, &'f Frame>,
     /// The local bindings used, each as it was used most: rustc's `import_use_map`.
     pub(super) used: HashMap<Binding, Used, Global>,
     /// The trait imports a method call, field or type-relative path could use, in the order
@@ -235,15 +386,25 @@ pub(super) struct Uses<'f, 'db> {
     /// A trait in scope and the imports it is found through, a range of `trait_chains`.
     trait_rows: Vec<(TraitId, u32, u32), &'f Frame>,
     trait_chains: Vec<Binding, &'f Frame>,
-    /// Each module's `use` items by file and start, filled once per module.
-    use_ids: HashMap<(HirFileId, TextSize), UseId, Global>,
-    indexed: HashSet<ModuleId, Global>,
     lookups: RefCell<HashTable<Lookup>>,
     krate: base_db::Crate,
 }
 
-impl<'f, 'db> Uses<'f, 'db> {
-    pub(super) fn of(cx: &Cx<'f, 'db>, walk: &Walk<'db>, places: &Places) -> Uses<'f, 'db> {
+impl<'f> Uses<'f> {
+    /// What the crate's name resolution goes through: its `use` and `extern crate` items
+    /// resolved ([`Uses::resolved`]), then what the front end recorded of every other path,
+    /// macro call and trait lookup of the crate ([`Uses::read`]), then what it re-exports.
+    pub(super) fn of(cx: &Cx<'f, '_>, places: &Places) -> Uses<'f> {
+        let mut uses = Uses::resolved(cx, places);
+        let front = hir_ty::used_imports_with_traits(cx.db, cx.krate.base());
+        uses.read(cx, front);
+        uses.export(cx);
+        uses
+    }
+
+    /// The crate's `use` and `extern crate` items from its def maps, each tree resolved as
+    /// `finalize_import` resolves it, with what those paths go through marked used.
+    fn resolved(cx: &Cx<'f, '_>, places: &Places) -> Uses<'f> {
         let frame = cx.frame();
         let extern_prelude = cx
             .krate
@@ -277,30 +438,10 @@ impl<'f, 'db> Uses<'f, 'db> {
             traits: HashMap::new_in(Global),
             trait_rows: Vec::new_in(frame),
             trait_chains: Vec::new_in(frame),
-            use_ids: HashMap::new_in(Global),
-            indexed: HashSet::new_in(Global),
             lookups: RefCell::new(HashTable::new()),
             krate: cx.krate.base(),
         };
-        for tree in &walk.trees {
-            for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE))
-            {
-                match node.kind() {
-                    SyntaxKind::USE => {
-                        uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node).unwrap()))
-                    }
-                    SyntaxKind::EXTERN_CRATE => uses.extern_crate(
-                        cx,
-                        walk,
-                        InFile::new(tree.file, ast::ExternCrate::cast(node).unwrap()),
-                    ),
-                    _ => {}
-                }
-            }
-        }
-        let place = |node: InFile<Node<'_>>| places.place(cx, node.map(ast::ptr));
-        uses.items.sort_by_cached_key(|it| place(it.node.map(|it| it.syntax())));
-        uses.crates.sort_by_cached_key(|it| place(it.node.map(|it| it.syntax())));
+        uses.declared(cx, places);
         let bindings = uses.items.iter().map(|it| it.trees.len()).sum();
         uses.trees.reserve(bindings);
         for (i, item) in uses.items.iter().enumerate() {
@@ -319,35 +460,78 @@ impl<'f, 'db> Uses<'f, 'db> {
         }
         for krate in 0..uses.crates.len() {
             let it = &uses.crates[krate];
-            if !it.macro_use.is_empty() || it.krate.is_none() {
+            if it.macro_use || it.krate.is_none() {
                 uses.used.insert(Binding::ExternCrate(it.id), Used::Other);
             }
         }
-        let read = |kind: SyntaxKind| {
-            matches!(
-                kind,
-                SyntaxKind::PATH
-                    | SyntaxKind::METHOD_CALL_EXPR
-                    | SyntaxKind::FIELD_EXPR
-                    | SyntaxKind::MACRO_CALL
-            ) || ast::Adt::can_cast(kind)
-        };
-        for tree in &walk.trees {
-            for node in tree.of_kind(read) {
-                uses.node(cx, walk, tree.file, node);
-            }
-        }
-        for tree in &walk.trees {
-            for item in tree.replaced.iter().filter_map(|&it| ast::Item::cast(it)) {
-                uses.attr_macro(cx, InFile::new(tree.file, item));
-            }
-        }
-        uses.export(cx);
         uses
     }
 
+    /// Marks what the front end's records of the crate say its paths, macro calls and trait
+    /// lookups go through (`hir_ty::used_imports_with_traits`, folded from the per-body
+    /// records of `hir_def::nameres::uses`): each import a path used, as it was used most
+    /// (`paths_used`, rustc's `import_use_map`); the trait imports type checking used
+    /// (`typeck_used`, rustc's `used_trait_imports`); the `#[macro_use]` imports used; the
+    /// macros invoked and the rules matched; the names of calls of no macro; every import
+    /// a name that resolves to nothing could be found through ([`Uses::taint`]); and the trait
+    /// imports each lookup the traits in scope answer could use ([`Uses::ask_traits`]).
+    fn read(&mut self, cx: &Cx<'_, '_>, front: &UsedImports) {
+        for (binding, _) in front.imports() {
+            if let Some(by) = front.paths_used(binding) {
+                let by = match by {
+                    uses::Used::Scope => Used::Scope,
+                    uses::Used::Other => Used::Other,
+                };
+                let was = self.used.entry(binding).or_insert(by);
+                *was = (*was).max(by);
+            }
+            if front.typeck_used(binding) {
+                self.typeck.insert(binding);
+            }
+        }
+        for (id, _) in front.macro_uses() {
+            self.macro_uses.insert((id, None));
+        }
+        for (id, name) in front.macro_use_names() {
+            self.macro_uses.insert((id, Some(name)));
+        }
+        for &MacroInvoked { def, arm } in front.invoked() {
+            self.macros.insert(def);
+            match arm {
+                Some(arm) => {
+                    self.arms.entry(def).or_default().insert_growing(arm as usize);
+                }
+                None => {
+                    self.arms_unknown.insert(def);
+                }
+            }
+        }
+        self.macros_unknown.extend(front.macros_unknown().iter().copied());
+        for &UnresolvedName { module, name, lexical } in front.unresolved_names() {
+            self.taint(cx, module, &name, lexical, None);
+        }
+        for &TraitAsk { module, name } in front.trait_asks() {
+            self.ask_traits(cx, module, &name);
+        }
+    }
+
+    /// Records the trait imports a lookup of `name` at `module` could use: each import every
+    /// trait in scope there with a value item of that name is found through, in the order they
+    /// are first found (rustc's `maybe_unused_trait_imports`).
+    fn ask_traits(&mut self, cx: &Cx<'_, '_>, module: ModuleId, name: &Name) -> (u32, u32) {
+        let (start, end) = self.traits_in_scope(cx, module, name);
+        for &(_, from, to) in &self.trait_rows[start as usize..end as usize] {
+            for &binding in &self.trait_chains[from as usize..to as usize] {
+                if self.candidate_set.insert(binding) {
+                    self.candidates.push(binding);
+                }
+            }
+        }
+        (start, end)
+    }
+
     /// The tree `binding` is.
-    pub(super) fn tree(&self, binding: Binding) -> Option<(&UseItem<'db>, &Tree<'db>)> {
+    pub(super) fn tree(&self, binding: Binding) -> Option<(&UseItem, &Tree)> {
         let &(i, j) = self.trees.get(&binding)?;
         let item = &self.items[i as usize];
         Some((item, &item.trees[j as usize]))
@@ -380,7 +564,7 @@ impl<'f, 'db> Uses<'f, 'db> {
     }
 
     /// The `use` items of `module`.
-    pub(super) fn items_of(&self, module: ModuleId) -> impl Iterator<Item = &UseItem<'db>> + '_ {
+    pub(super) fn items_of(&self, module: ModuleId) -> impl Iterator<Item = &UseItem> + '_ {
         self.by_module.get(&module).into_iter().flatten().map(|&i| &self.items[i as usize])
     }
 
@@ -388,7 +572,7 @@ impl<'f, 'db> Uses<'f, 'db> {
     pub(super) fn globs_of(
         &self,
         module: ModuleId,
-    ) -> impl Iterator<Item = (&UseItem<'db>, &Tree<'db>)> + '_ {
+    ) -> impl Iterator<Item = (&UseItem, &Tree)> + '_ {
         self.globs.get(&module).into_iter().flatten().map(|&(i, j)| {
             let item = &self.items[i as usize];
             (item, &item.trees[j as usize])
@@ -406,146 +590,34 @@ impl<'f, 'db> Uses<'f, 'db> {
     }
 
     /// The `extern crate` item `id`.
-    pub(super) fn extern_crate_of(&self, id: ExternCrateId) -> Option<&ExternCrate<'db>> {
+    pub(super) fn extern_crate_of(&self, id: ExternCrateId) -> Option<&ExternCrate> {
         self.crates.iter().find(|it| it.id == id)
     }
 
     /// Whether the root's `extern crate` item `it` is what puts its name in the extern
     /// prelude: rustc's `introduced_by_item`, when it renames the crate or `--extern` does not
     /// name it.
-    pub(super) fn introduces(&self, it: &ExternCrate<'_>) -> bool {
+    pub(super) fn introduces(&self, it: &ExternCrate) -> bool {
         it.renames || !self.extern_prelude.contains(&it.name)
     }
 
-    fn use_item(&mut self, cx: &Cx<'_, 'db>, node: InFile<ast::Use<'db>>) {
+    /// The crate's `use` and `extern crate` items, from the scope of each of its modules, the
+    /// blocks' included ([`crate::checks::defs::scopes`]); no syntax is read but where each
+    /// is, which orders them as rustc's walk comes to them.
+    fn declared(&mut self, cx: &Cx<'_, '_>, places: &Places) {
         let db = cx.db;
-        let Some(scope) = cx.vsema.scope(node.value.syntax()) else { return };
-        let module = ModuleId::from(scope.module());
-        if self.indexed.insert(module) {
-            for id in module.def_map(db).module(db, module).scope(db).use_decls() {
-                let loc = id.lookup(db);
-                self.use_ids.insert((loc.id.file_id, loc.id.to_ptr(db).text_range().start()), id);
+        for module in crate::checks::defs::scopes(cx) {
+            let module = ModuleId::from(module);
+            let scope = module.def_map(db).module(db, module).scope(db);
+            for id in scope.use_decls() {
+                self.items.push(UseItem::of(cx, id, module));
+            }
+            for id in scope.extern_crate_decls() {
+                self.crates.push(ExternCrate::of(cx, id, module));
             }
         }
-        let Some(&id) = self.use_ids.get(&(node.file_id, node.value.syntax().text_range().start()))
-        else {
-            return;
-        };
-        let sources = use_tree_sources_view(db, id);
-        let public =
-            node.value.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
-        let mut trees: Vec<Tree<'db>> = Vec::with_capacity(sources.value.values().count());
-        // The trees enclosing the one being added, innermost last: pre-order makes the parent
-        // the innermost that still contains it.
-        let mut open: SmallVec<[(TextRange, u32); 4]> = SmallVec::new();
-        for tree in node.value.syntax().descendants().filter_map(ast::UseTree::cast) {
-            let range = tree.syntax().text_range();
-            while open.last().is_some_and(|(it, _)| !it.contains_range(range)) {
-                open.pop();
-            }
-            let parent = open.last().map(|&(_, it)| it);
-            open.push((range, trees.len() as u32));
-            // Lowering numbers an item's trees in pre-order as well, so starting at this tree's
-            // own index the scan stops at its first step.
-            let idx = sources
-                .value
-                .iter()
-                .skip(trees.len())
-                .chain(sources.value.iter().take(trees.len()))
-                .find(|(_, it)| it.syntax().text_range() == range)
-                .map(|(idx, _)| idx);
-            let kind = if tree.use_tree_list().is_some() {
-                TreeKind::List
-            } else if tree.star_token().is_some() {
-                TreeKind::Glob
-            } else {
-                TreeKind::Simple
-            };
-            let binding = match (kind, idx) {
-                (TreeKind::List, _) | (_, None) => None,
-                (TreeKind::Glob, Some(idx)) => Some(Binding::Glob(GlobId { use_: id, idx })),
-                (TreeKind::Simple, Some(idx)) => Some(Binding::Import(ImportId { use_: id, idx })),
-            };
-            let underscore = tree.rename().is_some_and(|it| it.underscore_token().is_some());
-            trees.push(Tree {
-                node: tree,
-                parent,
-                kind,
-                binding,
-                name: None,
-                underscore,
-                self_import: false,
-                lexical: false,
-                source: None,
-                imported: PerNs::default(),
-            });
-        }
-        self.items.push(UseItem { node, id, module, public, trees });
-    }
-
-    fn extern_crate(
-        &mut self,
-        cx: &Cx<'_, 'db>,
-        walk: &Walk<'db>,
-        node: InFile<ast::ExternCrate<'db>>,
-    ) {
-        let db = cx.db;
-        let Some(decl) = cx.vsema.to_def(node.value) else { return };
-        let id = ExternCrateId::from(decl);
-        let module = id.lookup(db).container;
-        let name = match node.value.rename() {
-            Some(rename) if rename.underscore_token().is_some() => {
-                Name::new_symbol_root(sym::underscore)
-            }
-            Some(rename) => match ast::HasName::name(&rename) {
-                Some(it) => it.as_name(),
-                None => return,
-            },
-            None => match node.value.name_ref() {
-                Some(it) => it.as_name(),
-                None => return,
-            },
-        };
-        // alloc: only `#[macro_use]` imports, almost never there; empty, it allocates nothing
-        let mut macro_use = Vec::new();
-        let owner = ast::AnyHasAttrs::new(node.value);
-        for (meta, attr) in walk.attrs(owner) {
-            let path = match &meta {
-                ast::Meta::PathMeta(it) => it.path(),
-                ast::Meta::TokenTreeMeta(it) => it.path(),
-                _ => None,
-            };
-            if path.and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "macro_use")
-            {
-                continue;
-            }
-            match &meta {
-                ast::Meta::TokenTreeMeta(it) => {
-                    let Some(tt) = it.token_tree() else { continue };
-                    for token in tt.syntax().children_with_tokens().filter_map(|it| it.into_token())
-                    {
-                        if token.kind() == SyntaxKind::IDENT {
-                            macro_use
-                                .push((token.text_range(), Some(Name::new_root(token.text()))));
-                        }
-                    }
-                }
-                _ => macro_use.push((attr.syntax().text_range(), None)),
-            }
-        }
-        let public =
-            node.value.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
-        let renames = node.value.rename().is_some();
-        self.crates.push(ExternCrate {
-            node,
-            id,
-            module,
-            name,
-            renames,
-            public,
-            krate: decl.resolved_crate(db),
-            macro_use,
-        });
+        self.items.sort_by_cached_key(|it| places.place(cx, it.ptr(cx)));
+        self.crates.sort_by_cached_key(|it| places.place(cx, it.ptr(cx)));
     }
 
     /// Marks `binding` used, and what it is found through in turn (as `name` in `ns`), as
@@ -645,7 +717,7 @@ impl<'f, 'db> Uses<'f, 'db> {
                 if it.module == root && it.name == *name {
                     self.used.entry(Binding::ExternCrate(it.id)).or_insert(Used::Other);
                 }
-                if !it.macro_use.is_empty() {
+                if it.macro_use {
                     self.macro_uses.insert((it.id, None));
                     self.macro_uses.insert((it.id, Some(*name)));
                 }
@@ -656,36 +728,24 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// Resolves the trees of the `use` item `item` as `finalize_import` does: each prefix in
     /// the type namespace, each leaf in every namespace, marking what each is found through.
     fn resolve_use(&mut self, cx: &Cx<'_, '_>, item: usize) {
-        let file = self.items[item].node.file_id;
         let module = self.items[item].module;
-        let span_map = file.span_map(cx.db);
         let count = self.items[item].trees.len();
         // Each tree's prefix as its kind and a range of `flat`; a child's starts with a copy of
         // its parent's.
         let mut prefixes: SmallVec<[Option<(PathKind, u32, u32)>; 4]> =
             SmallVec::with_capacity(count);
         let mut flat: SmallVec<[Name; 8]> = SmallVec::new();
+        // `*` and `{..}` with no path of their own: `::*` is lowered with its `::`.
+        let plain = ModPath::from_kind(PathKind::Plain);
         for j in 0..count {
-            let tree = self.items[item].trees[j].node;
             let base = match self.items[item].trees[j].parent {
                 Some(parent) => prefixes[parent as usize],
                 None => Some((PathKind::Plain, 0, 0)),
             };
             let inherited = base.map_or(0, |(_, start, end)| (end - start) as usize);
-            let own = match tree.path() {
-                Some(path) => ModPath::from_src_view(cx.db, path, &mut |range| {
-                    span_map.span_for_range(range).ctx
-                }),
-                None => Some(ModPath::from_kind(if tree.coloncolon_token().is_some() {
-                    PathKind::Abs
-                } else {
-                    PathKind::Plain
-                })),
-            };
+            let own = self.items[item].trees[j].path.as_ref().unwrap_or(&plain);
             let prefix = match (base, own) {
-                (Some((kind, start, end)), Some(own))
-                    if start == end && kind == PathKind::Plain =>
-                {
+                (Some((kind, start, end)), own) if start == end && kind == PathKind::Plain => {
                     let mut kind = own.kind;
                     if kind == PathKind::Plain
                         && cx.edition == Edition::Edition2015
@@ -697,7 +757,7 @@ impl<'f, 'db> Uses<'f, 'db> {
                     flat.extend_from_slice(own.segments());
                     Some((kind, start, flat.len() as u32))
                 }
-                (Some((kind, start, end)), Some(own)) if own.kind == PathKind::Plain => {
+                (Some((kind, start, end)), own) if own.kind == PathKind::Plain => {
                     let new = flat.len() as u32;
                     for k in start as usize..end as usize {
                         let name = flat[k];
@@ -706,7 +766,7 @@ impl<'f, 'db> Uses<'f, 'db> {
                     flat.extend_from_slice(own.segments());
                     Some((kind, new, flat.len() as u32))
                 }
-                (Some(base), Some(own))
+                (Some(base), own)
                     if own.kind == PathKind::Super(0) && own.segments().is_empty() =>
                 {
                     self.items[item].trees[j].self_import = true;
@@ -817,360 +877,6 @@ impl<'f, 'db> Uses<'f, 'db> {
         tree.imported = imported;
     }
 
-    /// Marks what the paths, method calls, macro calls and derives of `node` go through.
-    fn node(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, file: HirFileId, node: Node<'db>) {
-        let kind = node.kind();
-        if kind == SyntaxKind::PATH {
-            let path = ast::Path::cast(node).unwrap();
-            self.path(cx, file, path);
-            if path.parent_path().is_none()
-                && let Some(parent) = path.syntax().parent()
-                && matches!(
-                    parent.kind(),
-                    SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT
-                )
-            {
-                self.type_relative(cx, path);
-            }
-        } else if kind == SyntaxKind::METHOD_CALL_EXPR {
-            let call = ast::MethodCallExpr::cast(node).unwrap();
-            let Some(name) = call.name_ref() else { return };
-            let resolved = cx.vsema.resolve_method_call(call).map(|it| it.as_assoc_item(cx.db));
-            self.lookup_trait_item(cx, call.syntax(), &name.as_name(), Some(resolved.flatten()));
-        } else if kind == SyntaxKind::FIELD_EXPR {
-            let field = ast::FieldExpr::cast(node).unwrap();
-            let Some(name) = field.name_ref() else { return };
-            self.lookup_trait_item(cx, field.syntax(), &name.as_name(), None);
-        } else if kind == SyntaxKind::MACRO_CALL {
-            let call = ast::MacroCall::cast(node).unwrap();
-            match cx.vsema.resolve_macro_call(call) {
-                Some(it) => {
-                    let id = MacroId::from(it);
-                    self.macros.insert(id);
-                    match cx.vsema.resolve_macro_call_arm(call) {
-                        Some(arm) => {
-                            self.arms.entry(id).or_default().insert_growing(arm as usize);
-                        }
-                        None => {
-                            self.arms_unknown.insert(id);
-                        }
-                    }
-                }
-                None => {
-                    if let Some(name) =
-                        call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref())
-                    {
-                        self.macros_unknown.insert(name.as_name());
-                    }
-                }
-            }
-        } else if ast::Adt::can_cast(kind)
-            && let Some(owner) = ast::AnyHasAttrs::cast(node)
-            && owner.attrs().next().is_some()
-        {
-            for (meta, _) in walk.attrs(owner) {
-                let ast::Meta::TokenTreeMeta(it) = &meta else { continue };
-                if it
-                    .path()
-                    .and_then(|it| it.as_single_name_ref())
-                    .is_none_or(|it| it.text() != "derive")
-                {
-                    continue;
-                }
-                self.derive(cx, node, meta);
-            }
-        }
-    }
-
-    /// Marks what each path of a `#[derive(..)]` goes through.
-    fn derive(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>) {
-        let Some(scope) = cx.vsema.scope(owner) else { return };
-        let module = ModuleId::from(scope.module());
-        let resolved = cx.vsema.resolve_derive_macro(meta).unwrap_or_default();
-        let mut next = 0usize;
-        crate::cx::derive_path_tokens_view(meta, |_, tokens| {
-            let k = next;
-            next += 1;
-            let (kind, names) = Self::derive_path(tokens);
-            if names.is_empty() {
-                return;
-            }
-            let expected = resolved.get(k).copied().flatten();
-            if let Some(it) = expected {
-                let id = MacroId::from(it);
-                self.macros.insert(id);
-                self.arms_unknown.insert(id);
-            }
-            for n in 0..names.len() {
-                let used =
-                    if n == 0 && kind == PathKind::Plain { Used::Scope } else { Used::Other };
-                let per = self.lookup(cx, module, kind, &names[..=n]);
-                let (ns, expected) = if n + 1 == names.len() {
-                    (Ns::Macros, expected.map(|it| ModuleDefId::MacroId(it.into())))
-                } else {
-                    (
-                        Ns::Types,
-                        entry(&per, Ns::Types)
-                            .map(|it| it.def)
-                            .filter(|it| matches!(it, ModuleDefId::ModuleId(_))),
-                    )
-                };
-                match (entry(&per, ns), expected) {
-                    (Some(found), Some(expected)) if found.def == expected => {
-                        if let Some(binding) = found.import {
-                            self.mark(cx, binding, used, &names[n], ns);
-                        }
-                    }
-                    _ => {
-                        self.taint(cx, module, &names[n], n == 0 && kind == PathKind::Plain, None);
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    /// The kind and names of a derive path from its tokens: its text split on `::` (colons
-    /// paired left to right, a `::` token as two), with a leading empty segment as `::`,
-    /// `crate`/`self` first or `super` anywhere as the path's kind, and `r#` trimmed off names.
-    fn derive_path(tokens: &[ast::Token<'_>]) -> (PathKind, SmallVec<[Name; 4]>) {
-        let mut kind = PathKind::Plain;
-        let mut names: SmallVec<[Name; 4]> = SmallVec::new();
-        let mut i = 0usize;
-        let mut parts: SmallVec<[&str; 2]> = SmallVec::new();
-        let mut colon = false;
-        let mut segment = |parts: &mut SmallVec<[&str; 2]>, i: &mut usize| {
-            let joined;
-            let text = match parts.as_slice() {
-                [] => "",
-                [it] => *it,
-                _ => {
-                    // alloc: a malformed path only (a lone `:` or two names with nothing between)
-                    joined = parts.concat();
-                    &joined
-                }
-            };
-            match text {
-                "" if *i == 0 => kind = PathKind::Abs,
-                "crate" if *i == 0 => kind = PathKind::Crate,
-                "self" if *i == 0 => kind = PathKind::Super(0),
-                "super" => {
-                    kind = match kind {
-                        PathKind::Super(n) => PathKind::Super(n + 1),
-                        _ => PathKind::Super(1),
-                    }
-                }
-                name => names.push(Name::new_root(name.trim_start_matches("r#"))),
-            }
-            parts.clear();
-            *i += 1;
-        };
-        for token in tokens {
-            let colons = match token.kind() {
-                SyntaxKind::COLON2 => 2,
-                SyntaxKind::COLON => 1,
-                _ => {
-                    if std::mem::take(&mut colon) {
-                        parts.push(":");
-                    }
-                    parts.push(token.text());
-                    continue;
-                }
-            };
-            for _ in 0..colons {
-                if std::mem::take(&mut colon) {
-                    segment(&mut parts, &mut i);
-                } else {
-                    colon = true;
-                }
-            }
-        }
-        if colon {
-            parts.push(":");
-        }
-        segment(&mut parts, &mut i);
-        (kind, names)
-    }
-
-    /// Marks the attribute macro that replaces `item`, and what its attributes' paths go
-    /// through.
-    fn attr_macro(&mut self, cx: &Cx<'_, 'db>, item: InFile<ast::Item<'db>>) {
-        if let Some(it) = cx.vsema.resolve_attr_macro_call(item.value) {
-            let id = MacroId::from(it);
-            self.macros.insert(id);
-            self.arms_unknown.insert(id);
-        }
-        for attr in item.value.attrs() {
-            if let Some(path) = attr.path() {
-                for path in path.syntax().descendants().filter_map(ast::Path::cast) {
-                    self.path(cx, item.file_id, path);
-                }
-            }
-        }
-    }
-
-    /// Marks what `path`, not a `use` tree's, goes through: each prefix in the type namespace
-    /// as a module, the whole path in the namespaces hir resolves it in.
-    fn path(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, path: ast::Path<'db>) {
-        if path.parent_path().is_some()
-            || path.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::USE_TREE)
-        {
-            return;
-        }
-        let Some(scope) = cx.vsema.scope(path.syntax()) else { return };
-        let module = ModuleId::from(scope.module());
-        let span_map = file.span_map(cx.db);
-        let mut chain: SmallVec<[ast::Path<'db>; 4]> = SmallVec::new();
-        chain.push(path);
-        while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
-            chain.push(qualifier);
-        }
-        chain.reverse();
-        let mut done = 0;
-        for (i, &prefix) in chain.iter().enumerate() {
-            let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| {
-                span_map.span_for_range(range).ctx
-            }) else {
-                return;
-            };
-            let names = mod_path.segments();
-            if names.len() == done {
-                continue;
-            }
-            done = names.len();
-            let kind = mod_path.kind;
-            let name = names[names.len() - 1];
-            let lexical = kind == PathKind::Plain && names.len() == 1;
-            let used = if lexical { Used::Scope } else { Used::Other };
-            let per = self.lookup(cx, module, kind, names);
-            let in_module = if lexical {
-                Some(module)
-            } else {
-                match entry(&self.lookup(cx, module, kind, &names[..names.len() - 1]), Ns::Types) {
-                    Some(Entry { def: ModuleDefId::ModuleId(it), .. }) => Some(it),
-                    _ => None,
-                }
-            };
-            let last = i + 1 == chain.len();
-            let mut module_prefix = false;
-            let expected = if last {
-                expected(cx, path)
-            } else {
-                match cx.vsema.resolve_path(prefix) {
-                    Some(PathResolution::Def(def)) => {
-                        module_prefix = matches!(def, ModuleDef::Module(_));
-                        match ModuleDefId::try_from(def) {
-                            Ok(def) => Expected::one(Ns::Types, def),
-                            Err(()) => Expected::Other,
-                        }
-                    }
-                    Some(_) => Expected::Other,
-                    None => Expected::Unknown,
-                }
-            };
-            match expected {
-                Expected::Defs(defs) => {
-                    for (ns, def) in defs {
-                        match entry(&per, ns) {
-                            Some(found) if found.def == def => {
-                                if let Some(binding) = found.import {
-                                    self.mark(cx, binding, used, &name, ns);
-                                }
-                            }
-                            _ => {
-                                if let Some(at) = in_module {
-                                    self.taint(cx, at, &name, lexical, None);
-                                }
-                            }
-                        }
-                    }
-                }
-                Expected::Unknown => {
-                    if let Some(at) = in_module {
-                        self.taint(cx, at, &name, lexical, None);
-                    }
-                    return;
-                }
-                Expected::Other => return,
-            }
-            if !last && !module_prefix {
-                return;
-            }
-        }
-    }
-
-    /// Records the traits in scope for a value path whose type rustc resolves only in type
-    /// checking (`<T>::f`, `T::f`, `Self::f`, `Alias::f`).
-    fn type_relative(&mut self, cx: &Cx<'_, 'db>, path: ast::Path<'db>) {
-        let Some(qualifier) = path.qualifier() else { return };
-        let Some(name) = path.segment().and_then(|it| it.name_ref()) else { return };
-        let deferred = match qualifier.segment().and_then(|it| it.kind()) {
-            Some(ast::PathSegmentKind::Type { trait_ref: Some(_), .. }) => false,
-            Some(ast::PathSegmentKind::Type { .. } | ast::PathSegmentKind::SelfTypeKw) => true,
-            _ => match cx.vsema.resolve_path(qualifier) {
-                Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_)))) => !matches!(
-                    cx.vsema.resolve_path(path),
-                    Some(PathResolution::Def(ModuleDef::EnumVariant(_)))
-                ),
-                Some(PathResolution::Def(
-                    ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
-                ))
-                | Some(PathResolution::TypeParam(_) | PathResolution::SelfType(_)) => true,
-                _ => false,
-            },
-        };
-        if !deferred {
-            return;
-        }
-        let resolved = match cx.vsema.resolve_path(path) {
-            Some(PathResolution::Def(ModuleDef::Function(it))) => it.as_assoc_item(cx.db),
-            Some(PathResolution::Def(ModuleDef::Const(it))) => it.as_assoc_item(cx.db),
-            _ => None,
-        };
-        self.lookup_trait_item(cx, path.syntax(), &name.as_name(), Some(resolved));
-    }
-
-    /// Records the trait imports a lookup of `name` at `at` could use, and for a method call
-    /// or type-relative path (`picked` is `Some`) those type checking uses: the first
-    /// candidate of the trait of what it resolves to; every candidate when it does not resolve.
-    fn lookup_trait_item(
-        &mut self,
-        cx: &Cx<'_, 'db>,
-        at: Node<'db>,
-        name: &Name,
-        picked: Option<Option<hir::AssocItem>>,
-    ) {
-        let Some(scope) = cx.vsema.scope(at) else { return };
-        let module = ModuleId::from(scope.module());
-        let (start, end) = self.traits_in_scope(cx, module, name);
-        let rows = start as usize..end as usize;
-        for &(_, from, to) in &self.trait_rows[start as usize..end as usize] {
-            for &binding in &self.trait_chains[from as usize..to as usize] {
-                if self.candidate_set.insert(binding) {
-                    self.candidates.push(binding);
-                }
-            }
-        }
-        match picked {
-            None => {}
-            Some(Some(item)) => {
-                let Some(trait_) = item.container_or_implemented_trait(cx.db) else { return };
-                let trait_ = TraitId::from(trait_);
-                if let Some(&(_, from, to)) =
-                    self.trait_rows[rows].iter().find(|(it, _, _)| *it == trait_)
-                {
-                    self.typeck
-                        .extend(self.trait_chains[from as usize..to as usize].iter().copied());
-                }
-            }
-            Some(None) => {
-                for &(_, from, to) in &self.trait_rows[rows] {
-                    self.typeck
-                        .extend(self.trait_chains[from as usize..to as usize].iter().copied());
-                }
-            }
-        }
-    }
 
     /// The traits in scope at `module` with an associated value named `name`, from the
     /// innermost block out to the nearest module, each with the imports it is found through
@@ -1318,62 +1024,6 @@ impl<'f, 'db> Uses<'f, 'db> {
     }
 }
 
-/// What a path resolves to, as hir has it.
-enum Expected {
-    /// These definitions, each in its namespace: one per namespace at most.
-    Defs(SmallVec<[(Ns, ModuleDefId); 3]>),
-    /// Something no import is found through: a local, a generic parameter, a builtin attribute.
-    Other,
-    /// It does not resolve.
-    Unknown,
-}
-
-impl Expected {
-    fn one(ns: Ns, def: ModuleDefId) -> Expected {
-        let mut defs = SmallVec::new();
-        defs.push((ns, def));
-        Expected::Defs(defs)
-    }
-
-    /// Of what hir resolves a path to in each of the namespaces of `per`.
-    fn of<const N: usize>(per: [(Ns, Option<PathResolution<'_>>); N]) -> Expected {
-        let any = per.iter().any(|(_, it)| it.is_some());
-        let mut defs: SmallVec<[(Ns, ModuleDefId); 3]> = SmallVec::new();
-        defs.extend(per.into_iter().filter_map(|(ns, it)| match it {
-            Some(PathResolution::Def(def)) => ModuleDefId::try_from(def).ok().map(|it| (ns, it)),
-            _ => None,
-        }));
-        match (defs.is_empty(), any) {
-            (false, _) => Expected::Defs(defs),
-            (true, true) => Expected::Other,
-            (true, false) => Expected::Unknown,
-        }
-    }
-}
-
-/// What hir resolves the whole of `path` to, in the namespaces it is used in.
-fn expected<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Expected {
-    match path.syntax().parent() {
-        Some(parent) if ast::MacroCall::can_cast(parent.kind()) => {
-            let Some(call) = ast::MacroCall::cast(parent) else { return Expected::Unknown };
-            match cx.vsema.resolve_macro_call(call) {
-                Some(it) => Expected::one(Ns::Macros, ModuleDefId::MacroId(it.into())),
-                None => Expected::Unknown,
-            }
-        }
-        Some(parent) if ast::Meta::can_cast(parent.kind()) => {
-            Expected::of([(Ns::Macros, cx.vsema.resolve_path(path))])
-        }
-        _ => match cx.vsema.resolve_path_per_ns(path) {
-            Some(it) => Expected::of([
-                (Ns::Types, it.type_ns),
-                (Ns::Values, it.value_ns),
-                (Ns::Macros, it.macro_ns),
-            ]),
-            None => Expected::Unknown,
-        },
-    }
-}
 
 /// What `kind` and `names` resolve to from `module`, through which bindings: hir-def's
 /// `resolve_module_path_in_items`.
@@ -1410,19 +1060,656 @@ fn has_value_item(cx: &Cx<'_, '_>, trait_: TraitId, name: &Name) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! The reference model of what the front end's records give the lint: the syntax walk
+    //! [`Uses::of`] made before it read `hir_ty::used_imports_with_traits` (every `PATH`,
+    //! `IDENT_PAT`, `METHOD_CALL_EXPR`, `FIELD_EXPR`, `MACRO_CALL` and derive of the walk's
+    //! trees, each resolved through `vsema`, and the attribute macros of the items they
+    //! replace), moved here unchanged.
+
+    use hir::{AsAssocItem, HirFileId, InFile, ModuleDef, PathResolution};
     use hir_def::{
-        Lookup as _,
+        HasModule as _, Lookup as _, MacroId, ModuleDefId, ModuleId, TraitId,
         item_scope::{GlobId, ImportId},
-        nameres::uses,
         src::use_tree_to_view,
     };
+    use hir_expand::{
+        mod_path::{ModPath, PathKind},
+        name::{AsName, Name},
+    };
+    use smallvec::SmallVec;
+    use syntax::{
+        SyntaxKind,
+        view::{self as ast, AstNode as _, HasAttrs, Node},
+    };
 
-    use super::{super::Places, Binding, Used, Uses};
-    use crate::lower::break_outside_of_loop::tests::with_file;
+    use super::{
+        super::{Places, tests::names_fixtures},
+        Binding, Entry, Ns, TreeKind, Used, Uses, entry,
+    };
+    use crate::{Files, cx::Cx, lints::syntax::Walk};
+
+    impl<'f> Uses<'f> {
+        /// The reference model's walk: the two loops over the walk's trees `Uses::of` ran. Its
+        /// filter left `IDENT_PAT` out, so `ident_pat` (the fix for blaze-report's `palette.rs`)
+        /// never ran: the model reads identifier patterns as that fix meant, which is what the
+        /// front end's store gives (an identifier pattern naming a const or a unit variant is
+        /// lowered as a `Pat::Path`).
+        fn walk_syntax<'db>(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>) {
+            let read = |kind: SyntaxKind| {
+                matches!(
+                    kind,
+                    SyntaxKind::PATH
+                        | SyntaxKind::IDENT_PAT
+                        | SyntaxKind::METHOD_CALL_EXPR
+                        | SyntaxKind::FIELD_EXPR
+                        | SyntaxKind::MACRO_CALL
+                ) || ast::Adt::can_cast(kind)
+            };
+            self.dummy_bindings();
+            for tree in &walk.trees {
+                for node in tree.of_kind(read) {
+                    self.node(cx, walk, tree.file, node);
+                }
+            }
+            for tree in &walk.trees {
+                for item in tree.replaced.iter().filter_map(|&it| ast::Item::cast(it)) {
+                    self.attr_macro(cx, InFile::new(tree.file, item));
+                }
+            }
+        }
+
+        /// rustc's `import_dummy_binding`: an import that resolved to nothing is bound to a
+        /// dummy and recorded used (`record_use(.., Used::Other)` of a single import, the
+        /// `import_use_map` entry of a glob whose module is unknown), so it is never linted
+        /// unused; E0432 reports it. The front end's def map records such an import the same
+        /// way (`NameRecords::unresolved`). The syntax walk the model was moved from left them
+        /// out of `used` and its lint skipped them instead, which the names fixtures'
+        /// `use std::..` with no `std` (`dead/tuple-struct-field.rs`) shows.
+        fn dummy_bindings(&mut self) {
+            for item in &self.items {
+                for tree in &item.trees {
+                    let Some(binding) = tree.binding else { continue };
+                    let nothing = match tree.kind {
+                        TreeKind::Glob => tree.source.is_none(),
+                        TreeKind::Simple => {
+                            let it = &tree.imported;
+                            it.types.is_none() && it.values.is_none() && it.macros.is_none()
+                        }
+                        TreeKind::List => false,
+                    };
+                    if nothing {
+                        let was = self.used.entry(binding).or_insert(Used::Other);
+                        *was = (*was).max(Used::Other);
+                    }
+                }
+            }
+        }
+
+        /// Marks what the paths, method calls, macro calls and derives of `node` go through.
+        fn node<'db>(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, file: HirFileId, node: Node<'db>) {
+            let kind = node.kind();
+            if kind == SyntaxKind::PATH {
+                let path = ast::Path::cast(node).unwrap();
+                self.path(cx, file, path);
+                if path.parent_path().is_none()
+                    && let Some(parent) = path.syntax().parent()
+                    && matches!(
+                        parent.kind(),
+                        SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT
+                    )
+                {
+                    self.type_relative(cx, path);
+                }
+            } else if kind == SyntaxKind::IDENT_PAT {
+                self.ident_pat(cx, ast::IdentPat::cast(node).unwrap());
+            } else if kind == SyntaxKind::METHOD_CALL_EXPR {
+                let call = ast::MethodCallExpr::cast(node).unwrap();
+                let Some(name) = call.name_ref() else { return };
+                let resolved = cx.vsema.resolve_method_call(call).map(|it| it.as_assoc_item(cx.db));
+                self.lookup_trait_item(cx, call.syntax(), &name.as_name(), Some(resolved.flatten()));
+            } else if kind == SyntaxKind::FIELD_EXPR {
+                let field = ast::FieldExpr::cast(node).unwrap();
+                let Some(name) = field.name_ref() else { return };
+                self.lookup_trait_item(cx, field.syntax(), &name.as_name(), None);
+            } else if kind == SyntaxKind::MACRO_CALL {
+                let call = ast::MacroCall::cast(node).unwrap();
+                match cx.vsema.resolve_macro_call(call) {
+                    Some(it) => {
+                        let id = MacroId::from(it);
+                        self.macros.insert(id);
+                        match cx.vsema.resolve_macro_call_arm(call) {
+                            Some(arm) => {
+                                self.arms.entry(id).or_default().insert_growing(arm as usize);
+                            }
+                            None => {
+                                self.arms_unknown.insert(id);
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(name) =
+                            call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref())
+                        {
+                            self.macros_unknown.insert(name.as_name());
+                        }
+                    }
+                }
+            } else if ast::Adt::can_cast(kind)
+                && let Some(owner) = ast::AnyHasAttrs::cast(node)
+                && owner.attrs().next().is_some()
+            {
+                for (meta, _) in walk.attrs(owner) {
+                    let ast::Meta::TokenTreeMeta(it) = &meta else { continue };
+                    if it
+                        .path()
+                        .and_then(|it| it.as_single_name_ref())
+                        .is_none_or(|it| it.text() != "derive")
+                    {
+                        continue;
+                    }
+                    self.derive(cx, node, meta);
+                }
+            }
+        }
+
+        /// Marks what each path of a `#[derive(..)]` goes through.
+        fn derive<'db>(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>) {
+            let Some(scope) = cx.vsema.scope(owner) else { return };
+            let module = ModuleId::from(scope.module());
+            // A `#[derive]` that is no call of the builtin derive (`derive` names no macro in
+            // scope, as in a `#![no_core]` crate with no prelude) is a call of no macro, whose
+            // paths are not resolved: rustc's "cannot find attribute `derive`".
+            let Some(resolved) = cx.vsema.resolve_derive_macro(meta) else {
+                if let ast::Meta::TokenTreeMeta(it) = &meta
+                    && let Some(name) = it.path().and_then(|it| it.as_single_name_ref())
+                {
+                    self.macros_unknown.insert(name.as_name());
+                }
+                return;
+            };
+            let mut next = 0usize;
+            crate::cx::derive_path_tokens_view(meta, |_, tokens| {
+                let k = next;
+                next += 1;
+                let (kind, names) = Self::derive_path(tokens);
+                if names.is_empty() {
+                    return;
+                }
+                let expected = resolved.get(k).copied().flatten();
+                if let Some(it) = expected {
+                    let id = MacroId::from(it);
+                    self.macros.insert(id);
+                    self.arms_unknown.insert(id);
+                }
+                for n in 0..names.len() {
+                    let used =
+                        if n == 0 && kind == PathKind::Plain { Used::Scope } else { Used::Other };
+                    let per = self.lookup(cx, module, kind, &names[..=n]);
+                    let (ns, expected) = if n + 1 == names.len() {
+                        (Ns::Macros, expected.map(|it| ModuleDefId::MacroId(it.into())))
+                    } else {
+                        (
+                            Ns::Types,
+                            entry(&per, Ns::Types)
+                                .map(|it| it.def)
+                                .filter(|it| matches!(it, ModuleDefId::ModuleId(_))),
+                        )
+                    };
+                    match (entry(&per, ns), expected) {
+                        (Some(found), Some(expected)) if found.def == expected => {
+                            if let Some(binding) = found.import {
+                                self.mark(cx, binding, used, &names[n], ns);
+                            }
+                        }
+                        _ => {
+                            self.taint(cx, module, &names[n], n == 0 && kind == PathKind::Plain, None);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        /// The kind and names of a derive path from its tokens: its text split on `::` (colons
+        /// paired left to right, a `::` token as two), with a leading empty segment as `::`,
+        /// `crate`/`self` first or `super` anywhere as the path's kind, and `r#` trimmed off names.
+        fn derive_path(tokens: &[ast::Token<'_>]) -> (PathKind, SmallVec<[Name; 4]>) {
+            let mut kind = PathKind::Plain;
+            let mut names: SmallVec<[Name; 4]> = SmallVec::new();
+            let mut i = 0usize;
+            let mut parts: SmallVec<[&str; 2]> = SmallVec::new();
+            let mut colon = false;
+            let mut segment = |parts: &mut SmallVec<[&str; 2]>, i: &mut usize| {
+                let joined;
+                let text = match parts.as_slice() {
+                    [] => "",
+                    [it] => *it,
+                    _ => {
+                        // alloc: a malformed path only (a lone `:` or two names with nothing between)
+                        joined = parts.concat();
+                        &joined
+                    }
+                };
+                match text {
+                    "" if *i == 0 => kind = PathKind::Abs,
+                    "crate" if *i == 0 => kind = PathKind::Crate,
+                    "self" if *i == 0 => kind = PathKind::Super(0),
+                    "super" => {
+                        kind = match kind {
+                            PathKind::Super(n) => PathKind::Super(n + 1),
+                            _ => PathKind::Super(1),
+                        }
+                    }
+                    name => names.push(Name::new_root(name.trim_start_matches("r#"))),
+                }
+                parts.clear();
+                *i += 1;
+            };
+            for token in tokens {
+                let colons = match token.kind() {
+                    SyntaxKind::COLON2 => 2,
+                    SyntaxKind::COLON => 1,
+                    _ => {
+                        if std::mem::take(&mut colon) {
+                            parts.push(":");
+                        }
+                        parts.push(token.text());
+                        continue;
+                    }
+                };
+                for _ in 0..colons {
+                    if std::mem::take(&mut colon) {
+                        segment(&mut parts, &mut i);
+                    } else {
+                        colon = true;
+                    }
+                }
+            }
+            if colon {
+                parts.push(":");
+            }
+            segment(&mut parts, &mut i);
+            (kind, names)
+        }
+
+        /// Marks the attribute macro that replaces `item`, and what its attributes' paths go
+        /// through.
+        fn attr_macro<'db>(&mut self, cx: &Cx<'_, 'db>, item: InFile<ast::Item<'db>>) {
+            if let Some(it) = cx.vsema.resolve_attr_macro_call(item.value) {
+                let id = MacroId::from(it);
+                self.macros.insert(id);
+                self.arms_unknown.insert(id);
+            }
+            for attr in item.value.attrs() {
+                if let Some(path) = attr.path() {
+                    for path in path.syntax().descendants().filter_map(ast::Path::cast) {
+                        self.path(cx, item.file_id, path);
+                    }
+                }
+            }
+        }
+
+        /// Marks what `path`, not a `use` tree's, goes through: each prefix in the type namespace
+        /// as a module, the whole path in the namespaces hir resolves it in.
+        fn path<'db>(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, path: ast::Path<'db>) {
+            if path.parent_path().is_some()
+                || path.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::USE_TREE)
+            {
+                return;
+            }
+            let Some(scope) = cx.vsema.scope(path.syntax()) else { return };
+            let module = ModuleId::from(scope.module());
+            let span_map = file.span_map(cx.db);
+            let mut chain: SmallVec<[ast::Path<'db>; 4]> = SmallVec::new();
+            chain.push(path);
+            while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
+                chain.push(qualifier);
+            }
+            chain.reverse();
+            let mut done = 0;
+            for (i, &prefix) in chain.iter().enumerate() {
+                let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| {
+                    span_map.span_for_range(range).ctx
+                }) else {
+                    return;
+                };
+                let names = mod_path.segments();
+                if names.len() == done {
+                    continue;
+                }
+                done = names.len();
+                let kind = mod_path.kind;
+                let name = names[names.len() - 1];
+                let lexical = kind == PathKind::Plain && names.len() == 1;
+                let used = if lexical { Used::Scope } else { Used::Other };
+                let per = self.lookup(cx, module, kind, names);
+                let in_module = if lexical {
+                    Some(module)
+                } else {
+                    match entry(&self.lookup(cx, module, kind, &names[..names.len() - 1]), Ns::Types) {
+                        Some(Entry { def: ModuleDefId::ModuleId(it), .. }) => Some(it),
+                        _ => None,
+                    }
+                };
+                let last = i + 1 == chain.len();
+                let mut module_prefix = false;
+                let expected = if last {
+                    expected(cx, path)
+                } else {
+                    match cx.vsema.resolve_path(prefix) {
+                        Some(PathResolution::Def(def)) => {
+                            module_prefix = matches!(def, ModuleDef::Module(_));
+                            match ModuleDefId::try_from(def) {
+                                Ok(def) => Expected::one(Ns::Types, def),
+                                Err(()) => Expected::Other,
+                            }
+                        }
+                        Some(_) => Expected::Other,
+                        None => Expected::Unknown,
+                    }
+                };
+                match expected {
+                    Expected::Defs(defs) => {
+                        for (ns, def) in defs {
+                            match entry(&per, ns) {
+                                Some(found) if found.def == def => {
+                                    if let Some(binding) = found.import {
+                                        self.mark(cx, binding, used, &name, ns);
+                                    }
+                                }
+                                _ => {
+                                    if let Some(at) = in_module {
+                                        self.taint(cx, at, &name, lexical, None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Expected::Unknown => {
+                        if let Some(at) = in_module {
+                            self.taint(cx, at, &name, lexical, None);
+                        }
+                        return;
+                    }
+                    Expected::Other => return,
+                }
+                if !last && !module_prefix {
+                    return;
+                }
+            }
+        }
+
+        /// Marks what an identifier pattern is found through when it names an item and binds
+        /// nothing: `Success => ..` under `use Token::*;` is the variant, which rustc resolves as a
+        /// path of one segment in the value namespace (`late.rs`, `try_resolve_as_non_binding`) and
+        /// records the use of. Syntax has no path there, so the walk of paths never met it, and the
+        /// glob a `match` alone used was called unused (blaze-report's `palette.rs`, 2026-11-12).
+        fn ident_pat<'db>(&mut self, cx: &Cx<'_, 'db>, pat: ast::IdentPat<'db>) {
+            let Some(name) = ast::HasName::name(&pat) else { return };
+            // A fresh binding resolves to no item: nothing is used.
+            let Some(def) = cx.vsema.resolve_bind_pat_to_const(pat) else { return };
+            let Some(scope) = cx.vsema.scope(pat.syntax()) else { return };
+            let module = ModuleId::from(scope.module());
+            let name = name.as_name();
+            let per = self.lookup(cx, module, PathKind::Plain, std::slice::from_ref(&name));
+            match (ModuleDefId::try_from(def), entry(&per, Ns::Values)) {
+                (Ok(def), Some(found)) if found.def == def => {
+                    if let Some(binding) = found.import {
+                        self.mark(cx, binding, Used::Scope, &name, Ns::Values);
+                    }
+                }
+                // Found another way than this walk finds it: every import it could be through
+                // counts as used, as for a path.
+                _ => self.taint(cx, module, &name, true, None),
+            }
+        }
+
+        /// Records the traits in scope for a value path whose type rustc resolves only in type
+        /// checking (`<T>::f`, `T::f`, `Self::f`, `Alias::f`).
+        fn type_relative<'db>(&mut self, cx: &Cx<'_, 'db>, path: ast::Path<'db>) {
+            let Some(qualifier) = path.qualifier() else { return };
+            let Some(name) = path.segment().and_then(|it| it.name_ref()) else { return };
+            let deferred = match qualifier.segment().and_then(|it| it.kind()) {
+                Some(ast::PathSegmentKind::Type { trait_ref: Some(_), .. }) => false,
+                Some(ast::PathSegmentKind::Type { .. } | ast::PathSegmentKind::SelfTypeKw) => true,
+                _ => match cx.vsema.resolve_path(qualifier) {
+                    Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_)))) => !matches!(
+                        cx.vsema.resolve_path(path),
+                        Some(PathResolution::Def(ModuleDef::EnumVariant(_)))
+                    ),
+                    Some(PathResolution::Def(
+                        ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
+                    ))
+                    | Some(PathResolution::TypeParam(_) | PathResolution::SelfType(_)) => true,
+                    _ => false,
+                },
+            };
+            if !deferred {
+                return;
+            }
+            let resolved = match cx.vsema.resolve_path(path) {
+                Some(PathResolution::Def(ModuleDef::Function(it))) => it.as_assoc_item(cx.db),
+                Some(PathResolution::Def(ModuleDef::Const(it))) => it.as_assoc_item(cx.db),
+                _ => None,
+            };
+            self.lookup_trait_item(cx, path.syntax(), &name.as_name(), Some(resolved));
+        }
+
+        /// Records the trait imports a lookup of `name` at `at` could use, and for a method call
+        /// or type-relative path (`picked` is `Some`) those type checking uses: the first
+        /// candidate of the trait of what it resolves to; every candidate when it does not resolve.
+        fn lookup_trait_item<'db>(
+            &mut self,
+            cx: &Cx<'_, 'db>,
+            at: Node<'db>,
+            name: &Name,
+            picked: Option<Option<hir::AssocItem>>,
+        ) {
+            let Some(scope) = cx.vsema.scope(at) else { return };
+            let module = ModuleId::from(scope.module());
+            let (start, end) = self.traits_in_scope(cx, module, name);
+            let rows = start as usize..end as usize;
+            for &(_, from, to) in &self.trait_rows[start as usize..end as usize] {
+                for &binding in &self.trait_chains[from as usize..to as usize] {
+                    if self.candidate_set.insert(binding) {
+                        self.candidates.push(binding);
+                    }
+                }
+            }
+            match picked {
+                None => {}
+                Some(Some(item)) => {
+                    let Some(trait_) = item.container_or_implemented_trait(cx.db) else { return };
+                    let trait_ = TraitId::from(trait_);
+                    if let Some(&(_, from, to)) =
+                        self.trait_rows[rows].iter().find(|(it, _, _)| *it == trait_)
+                    {
+                        self.typeck
+                            .extend(self.trait_chains[from as usize..to as usize].iter().copied());
+                    }
+                }
+                Some(None) => {
+                    for &(_, from, to) in &self.trait_rows[rows] {
+                        self.typeck
+                            .extend(self.trait_chains[from as usize..to as usize].iter().copied());
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a path resolves to, as hir has it.
+    enum Expected {
+        /// These definitions, each in its namespace: one per namespace at most.
+        Defs(SmallVec<[(Ns, ModuleDefId); 3]>),
+        /// Something no import is found through: a local, a generic parameter, a builtin attribute.
+        Other,
+        /// It does not resolve.
+        Unknown,
+    }
+
+    impl Expected {
+        fn one(ns: Ns, def: ModuleDefId) -> Expected {
+            let mut defs = SmallVec::new();
+            defs.push((ns, def));
+            Expected::Defs(defs)
+        }
+
+        /// Of what hir resolves a path to in each of the namespaces of `per`.
+        fn of<const N: usize>(per: [(Ns, Option<PathResolution<'_>>); N]) -> Expected {
+            let any = per.iter().any(|(_, it)| it.is_some());
+            let mut defs: SmallVec<[(Ns, ModuleDefId); 3]> = SmallVec::new();
+            defs.extend(per.into_iter().filter_map(|(ns, it)| match it {
+                Some(PathResolution::Def(def)) => ModuleDefId::try_from(def).ok().map(|it| (ns, it)),
+                _ => None,
+            }));
+            match (defs.is_empty(), any) {
+                (false, _) => Expected::Defs(defs),
+                (true, true) => Expected::Other,
+                (true, false) => Expected::Unknown,
+            }
+        }
+    }
+
+    /// What hir resolves the whole of `path` to, in the namespaces it is used in.
+    fn expected<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Expected {
+        match path.syntax().parent() {
+            Some(parent) if ast::MacroCall::can_cast(parent.kind()) => {
+                let Some(call) = ast::MacroCall::cast(parent) else { return Expected::Unknown };
+                match cx.vsema.resolve_macro_call(call) {
+                    Some(it) => Expected::one(Ns::Macros, ModuleDefId::MacroId(it.into())),
+                    None => Expected::Unknown,
+                }
+            }
+            Some(parent) if ast::Meta::can_cast(parent.kind()) => {
+                Expected::of([(Ns::Macros, cx.vsema.resolve_path(path))])
+            }
+            _ => match cx.vsema.resolve_path_per_ns(path) {
+                Some(it) => Expected::of([
+                    (Ns::Types, it.type_ns),
+                    (Ns::Values, it.value_ns),
+                    (Ns::Macros, it.macro_ns),
+                ]),
+                None => Expected::Unknown,
+            },
+        }
+    }
+
+    /// A binding as the comparison names it: its id, and its tree's text for a failure's
+    /// message. Both sides read one database, so ids compare.
+    fn named(db: &base_db::Db, binding: Binding) -> String {
+        match binding {
+            Binding::Import(ImportId { use_, idx }) | Binding::Glob(GlobId { use_, idx }) => {
+                let text = use_tree_to_view(db, use_.lookup(db).id, idx).to_string();
+                blaze_report::say!(
+                    blaze_report::say::Words(&format!("{binding:?}")),
+                    " ",
+                    blaze_report::say::Code(&text)
+                )
+                .flat()
+            }
+            Binding::ExternCrate(_) => format!("{binding:?}"),
+        }
+    }
+
+    /// What the lint's passes read of a [`Uses`] its uses decide, each sorted: the bindings
+    /// used and how; type checking's trait imports among the candidates `unused` may lint (a
+    /// public one it never lints); the candidates; the `#[macro_use]` imports used; and of
+    /// the crate's own macros (the only ones `macros` lints) those invoked, the rules matched
+    /// and those whose rule can't be told; the names of calls of no macro.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Read {
+        used: Vec<(String, Used)>,
+        typeck: Vec<String>,
+        candidates: Vec<String>,
+        macro_uses: Vec<String>,
+        macros: Vec<String>,
+        arms: Vec<(String, Vec<usize>)>,
+        arms_unknown: Vec<String>,
+        macros_unknown: Vec<String>,
+    }
+
+    impl Read {
+        fn of(cx: &Cx<'_, '_>, uses: &Uses<'_>) -> Read {
+            let db = cx.db;
+            let local = |it: &MacroId| it.krate(db) == cx.krate.base();
+            let lintable = |it: &Binding| {
+                uses.candidate_set.contains(it)
+                    && uses.tree(*it).is_some_and(|(item, _)| !item.public)
+            };
+            fn sorted<T: Ord>(mut it: Vec<T>) -> Vec<T> {
+                it.sort();
+                it
+            }
+            // alloc: a test's rows
+            Read {
+                used: sorted(uses.used.iter().map(|(&it, &by)| (named(db, it), by)).collect()),
+                typeck: sorted(
+                    uses.typeck.iter().filter(|&it| lintable(it)).map(|&it| named(db, it)).collect(),
+                ),
+                candidates: sorted(uses.candidates.iter().map(|&it| named(db, it)).collect()),
+                macro_uses: sorted(uses.macro_uses.iter().map(|it| format!("{it:?}")).collect()),
+                macros: sorted(
+                    uses.macros.iter().filter(|&it| local(it)).map(|it| format!("{it:?}")).collect(),
+                ),
+                arms: sorted(
+                    uses.arms
+                        .iter()
+                        .filter(|&(it, _)| local(it))
+                        .map(|(it, rules)| (format!("{it:?}"), rules.iter().collect()))
+                        .collect(),
+                ),
+                arms_unknown: sorted(
+                    uses.arms_unknown
+                        .iter()
+                        .filter(|&it| local(it))
+                        .map(|it| format!("{it:?}"))
+                        .collect(),
+                ),
+                macros_unknown: sorted(
+                    uses.macros_unknown.iter().map(|it| it.as_str().to_owned()).collect(),
+                ),
+            }
+        }
+    }
+
+    /// What the test plants in the front end's side, to show the comparison catches it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Plant {
+        None,
+        /// The uses of glob imports the front end's records give left out of the fold: a glob
+        /// only a body's path reads is then unused.
+        GlobUsesLeftOut,
+    }
+
+    /// The front end's side and the reference model's of the crate of `source` (one file,
+    /// edition `edition`).
+    fn sides(source: &str, edition: &str, plant: Plant) -> [Read; 2] {
+        let fixture = format!("//- /main.rs crate:main edition:{edition}\n{source}");
+        let (db, names, _) = crate::tests::fixture_db(&fixture, "");
+        blaze_query::db::attach(&db, || {
+            let krate = hir::check::workspace_crates(&db)[0];
+            let frame = crate::tests::frame();
+            let cx = Cx::new(&db, krate, Files::new(&names, ""), &frame);
+            let places = Places::of(&cx);
+            let mut front = Uses::of(&cx, &places);
+            if plant == Plant::GlobUsesLeftOut {
+                let items_only = Uses::resolved(&cx, &places);
+                front.used.retain(|it, _| {
+                    !matches!(it, Binding::Glob(_)) || items_only.used.contains_key(it)
+                });
+            }
+            let mut walked = Uses::resolved(&cx, &places);
+            walked.walk_syntax(&cx, cx.walk());
+            walked.export(&cx);
+            [Read::of(&cx, &front), Read::of(&cx, &walked)]
+        })
+    }
 
     /// Single imports, `self` in a list, a glob, a re-export read on through, a
-    /// `#[macro_export]` macro, an import in a block, and trait imports a method call and a
-    /// type-relative path pick, one trait unused.
+    /// `#[macro_export]` macro, an import in a block, trait imports a method call and a
+    /// type-relative path pick, one trait unused, a unit variant named by an identifier
+    /// pattern through a glob, a derive and an attribute macro.
     const USES: &str = r#"
 mod m {
     pub struct S;
@@ -1439,6 +1726,7 @@ mod m {
 }
 mod globbed { pub struct G; pub struct H; }
 mod reexport { pub use crate::m::S as R; }
+mod tokens { pub enum Token { Success, Failure } }
 use m::S;
 use m::f;
 use m::inner::{self, T};
@@ -1446,8 +1734,11 @@ use m::{Method, Assoc, Unused};
 use globbed::*;
 use reexport::R;
 use crate::mac;
+use tokens::Token::*;
+macro_rules! two { () => {}; (x) => {} }
+macro_rules! never { () => {} }
 fn sig(_: S) -> G { G }
-fn body() {
+fn body(t: tokens::Token) {
     f();
     inner::g();
     let _: T;
@@ -1455,6 +1746,11 @@ fn body() {
     0u8.method();
     u8::assoc();
     mac!();
+    two!(x);
+    match t {
+        Success => {}
+        _ => {}
+    }
     {
         use m::inner::g;
         g();
@@ -1462,53 +1758,40 @@ fn body() {
 }
 "#;
 
-    fn named(db: &base_db::Db, binding: Binding) -> String {
-        match binding {
-            Binding::Import(ImportId { use_, idx }) | Binding::Glob(GlobId { use_, idx }) => {
-                use_tree_to_view(db, use_.lookup(db).id, idx).to_string()
-            }
-            Binding::ExternCrate(it) => format!("{it:?}"),
-        }
-    }
+    /// A glob import only a body's path reads.
+    const GLOB: &str = r#"
+mod a { pub struct S; }
+use a::*;
+fn main() { let _ = S; }
+"#;
 
-    /// The bindings this walk finds used, what type checking uses included, are those the front
-    /// end's `used_imports_with_traits` records, each as used: the condition for reading that
-    /// query here in place of resolving every path again.
+    /// The refinement: on every names fixture (src/tests/lints/names/**), in editions 2015 and
+    /// 2021, and on [`USES`], what the lint reads of [`Uses::of`], built from the front end's
+    /// per-body records, is byte for byte what the syntax walk it replaced found: the bindings
+    /// used and how, type checking's trait imports it may lint, the candidates, the
+    /// `#[macro_use]` imports used, the crate's macros invoked and their rules, and the names
+    /// of calls of no macro. Control: [`Plant::GlobUsesLeftOut`] is caught on [`GLOB`].
     #[test]
     fn what_the_walk_finds_used_is_what_the_front_end_records() {
-        with_file(USES, |cx, _| {
-            let places = Places::of(cx);
-            let old = Uses::of(cx, cx.walk(), &places);
-            let mut used = old.used.clone();
-            for &binding in &old.typeck {
-                used.entry(binding).or_insert(Used::Other);
+        let fixtures = names_fixtures();
+        assert!(fixtures.len() >= 40, "{} names fixtures", fixtures.len());
+        let mut used = 0;
+        for (path, source) in &fixtures {
+            for edition in ["2015", "2021"] {
+                let [front, walked] = sides(source, edition, Plant::None);
+                assert_eq!(front, walked, "{path} in edition {edition}");
+                used += front.used.len();
             }
-            let mut old_used: Vec<(String, Used)> =
-                used.iter().map(|(&it, &by)| (named(cx.db, it), by)).collect();
-            old_used.sort();
-            let front = hir_ty::used_imports_with_traits(cx.db, cx.krate.base());
-            let mut new_used: Vec<(String, Used)> = front
-                .imports()
-                .map(|(it, by)| {
-                    let by = match by {
-                        uses::Used::Scope => Used::Scope,
-                        uses::Used::Other => Used::Other,
-                    };
-                    (named(cx.db, it), by)
-                })
-                .collect();
-            new_used.sort();
-            assert_eq!(old_used, new_used);
-            assert!(old_used.len() >= 9, "{old_used:?}");
-            assert!(!old_used.iter().any(|(it, _)| it == "Unused"), "{old_used:?}");
-            let mut old_macro: Vec<String> =
-                old.macro_uses.iter().map(|(it, _)| format!("{it:?}")).collect();
-            old_macro.sort();
-            old_macro.dedup();
-            let mut new_macro: Vec<String> =
-                front.macro_uses().map(|(it, _)| format!("{it:?}")).collect();
-            new_macro.sort();
-            assert_eq!(old_macro, new_macro);
-        });
+        }
+        assert!(used >= 40, "{used} bindings used over the names fixtures");
+        let [front, walked] = sides(USES, "2021", Plant::None);
+        assert_eq!(front, walked, "USES");
+        assert!(front.used.len() >= 10, "{:?}", front.used);
+        assert!(!front.used.iter().any(|(it, _)| it.ends_with("`Unused`")), "{:?}", front.used);
+        assert!(front.used.iter().any(|(it, _)| it.ends_with("`tokens::Token::*`")));
+        let [front, walked] = sides(GLOB, "2021", Plant::None);
+        assert_eq!(front, walked, "the control's fixture holds unplanted");
+        let [front, walked] = sides(GLOB, "2021", Plant::GlobUsesLeftOut);
+        assert_ne!(front, walked, "a glob's uses left out of the fold are caught");
     }
 }

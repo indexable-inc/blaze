@@ -78,7 +78,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     match run(words) {
         Ok(()) => 0,
         Err((code, what)) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             code
         }
     }
@@ -277,7 +277,7 @@ fn export(loaded: &Loaded, view: &View, args: &[String]) -> Result<(), Refused> 
     };
     std::fs::write(&out, bytes)
         .map_err(|why| failed(format!("writing {}: {why}", out.display())))?;
-    eprintln!("wrote {}", out.display());
+    blaze_report::errln!("wrote {}", out.display());
     Ok(())
 }
 
@@ -309,7 +309,7 @@ fn load(source: &str, fetch: &Fetch) -> Result<Loaded, Refused> {
             .split_once('?')
             .is_some_and(|(_, q)| q.split('&').any(|kv| kv.starts_with("token=")))
         {
-            eprintln!(
+            blaze_report::errln!(
                 "warning: {source} carries its token on the command line, where every local user can read it (ps); \
                  use `blaze pprof --dir <IX_PROF> ENDPOINT`, or `--token-file FILE` with the token in a 0600 file of your own"
             );
@@ -412,14 +412,14 @@ fn serve(loaded: &Loaded, source: &str, addr: &str) -> Result<(), Refused> {
     let url = format!("http://{bound}/{file}?token={token}");
     let link = format!("https://ix.dev/explore#profile={}", encode_component(&url));
     // stdout is this user's terminal, not a command line.
-    println!("serving {source} at {url}\n{link}");
+    blaze_report::outln!("serving {source} at {url}\n{link}");
     match open_page(&link) {
         Ok((program, page)) => {
             if let Err(why) = std::process::Command::new(program).arg(&page).status() {
-                eprintln!("the link was not opened (`{program}`: {why}): open it in a browser");
+                blaze_report::errln!("the link was not opened (`{program}`: {why}): open it in a browser");
             }
         }
-        Err(why) => eprintln!("the link was not opened ({why}): open it in a browser"),
+        Err(why) => blaze_report::errln!("the link was not opened ({why}): open it in a browser"),
     }
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else { continue };

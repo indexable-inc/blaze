@@ -149,13 +149,13 @@ pub fn read_or_refuse(
     color: bool,
 ) -> Result<Read, i32> {
     let refused = |why: &str| {
-        eprint!("{}", say::error(why, color));
-        eprintln!("\nUsage: {usage}\n\nFor more information, try '--help'.");
+        blaze_report::err!("{}", say::error(why, color));
+        blaze_report::errln!("\nUsage: {usage}\n\nFor more information, try '--help'.");
         Exit::Usage.code()
     };
     match read(words, flags) {
         Ok(read) if read.has("--help") => {
-            println!("Usage: {usage}");
+            blaze_report::outln!("Usage: {usage}");
             Err(0)
         }
         Ok(read) => match read.positional.get(positionals) {
@@ -169,7 +169,7 @@ pub fn read_or_refuse(
 /// A command that failed with `error`, said as cargo says it (a manifest's diagnostic, or the
 /// error with each cause under `Caused by:`): [`Exit::Failed`]'s code.
 pub fn failed(error: &anyhow::Error, cwd: &Path, color: bool) -> i32 {
-    eprint!("{}", say::error(&blaze_manifest::diagnostic::rendered(error, cwd), color));
+    blaze_report::err!("{}", say::error(&blaze_manifest::diagnostic::rendered(error, cwd), color));
     Exit::Failed.code()
 }
 

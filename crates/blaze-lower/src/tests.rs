@@ -292,7 +292,7 @@ fn lowered(units: &Units) -> Result<Built, LowerError> {
     let tree = MemTree::default();
     let root = view(&tree);
     let config = config(root, library(&tree));
-    let lowered = lower(Lower { units, config: &config, files: &tree, root, host_cpu: None })?;
+    let lowered = lower(Lower { units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(units) })?;
     Ok(Built { lowered })
 }
 
@@ -405,13 +405,49 @@ fn twins(units: &mut Units, out_dir: &str, env: &[(&str, &str)]) -> (usize, usiz
 fn gen_ran(out_dir: &str, cfg: &str) -> Ran {
     Ran {
         cfgs: vec![cfg.to_owned()],
-        env: vec![("GEN".to_owned(), format!("{out_dir}/gen.rs"))],
+        env: [("GEN".to_owned(), format!("{out_dir}/gen.rs"))].into(),
         out_dir: out_dir.to_owned(),
         files: vec![(
             "gen.rs".to_owned(),
-            format!("// {out_dir}\npub fn gen() {{}}\n").into_bytes(),
+            format!("// {out_dir}\npub fn gen() {{}}\n").into_bytes().into(),
         )],
     }
+}
+
+/// The invariant: a build script's crate is made from its package's files, never from what
+/// its own run left. Applying the run puts `gen.rs` into the package's source root, whose
+/// content moves, and the library given that `OUT_DIR` is made from it; the script's own
+/// crate, of the same source root and given no `OUT_DIR`, has the content and the identity
+/// it had before the run ([`base_db::crate_root_content`]).
+///
+/// Its control is the tree before `crate_root_content`: every key took the root's content
+/// whole, so the first assertion on the script failed, and with it the first build after a
+/// cold one compiled the script again (the revision test
+/// `the_first_edit_after_a_cold_build_with_a_build_script_dependency`).
+#[test]
+fn a_run_applied_leaves_its_build_scripts_crate_as_it_was() {
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let (script, lib) = (krate(&built, BUILD_SCRIPT), krate(&built, LIB));
+    let seen = |built: &mut Built| {
+        let db = built.lowered.db();
+        let root = db.file_source_root(script.data(db).root_file_id).source_root_id(db);
+        assert_eq!(root, db.file_source_root(lib.data(db).root_file_id).source_root_id(db));
+        let whole = db.source_root(root).content(db);
+        let own = (base_db::crate_root_content(db, script), base_db::crate_root_content(db, lib));
+        assert_eq!(base_db::other_out_dirs(db, script), [OUT_DIR.to_owned()]);
+        assert!(base_db::other_out_dirs(db, lib).is_empty());
+        (whole, own.0, own.1, built.lowered.identity(BUILD_SCRIPT), built.lowered.identity(LIB))
+    };
+    let before = seen(&mut built);
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "made")).unwrap();
+    let after = seen(&mut built);
+    assert_ne!(before.0, after.0, "the run's file is in the package's source root");
+    assert_eq!(before.1, after.1, "the build script's crate is not made from its run's file");
+    assert_ne!(before.2, after.2, "the library given the `OUT_DIR` is");
+    assert_eq!(before.3, after.3, "the build script's identity stands");
+    assert_ne!(before.4, after.4, "the library's moves");
+    assert_eq!(after.2, after.0, "a crate whose root holds no other crate's `OUT_DIR` has the root's own content");
 }
 
 /// Whether `krate`'s cfg holds a [`crates::RUN_PROFILE`] atom.
@@ -577,7 +613,11 @@ fn readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities() {
     // Taking away the run identity brings back the clash and its diagnostic names the runs.
     let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
     same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
-    second.set_extra_data(built.lowered.served_db(), same);
+    // One change, in the batch that names it (`Db::require_batches`).
+    built.lowered.served_db().batch(
+        base_db::Trigger::named("the test takes away the run identity"),
+        |db| second.set_extra_data(db, same),
+    );
     let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
     assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
 }
@@ -801,9 +841,9 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     let mut built = lowered(&units()).unwrap();
     let ran = Ran {
         cfgs: vec!["has_gen".to_owned(), "gen=\"two\"".to_owned()],
-        env: vec![("GEN".to_owned(), "1".to_owned())],
+        env: [("GEN".to_owned(), "1".to_owned())].into(),
         out_dir: OUT_DIR.to_owned(),
-        files: vec![("gen.rs".to_owned(), b"pub fn gen() {}\n".to_vec())],
+        files: vec![("gen.rs".to_owned(), b"pub fn gen() {}\n".as_slice().into())],
     };
     built.lowered.ran(RUN, &ran).unwrap();
     let db = built.lowered.db();
@@ -835,6 +875,40 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     assert!(!krate(&built, LIB).cfg_options(db).check_atom(&flag("has_gen")));
     assert!(root_of(db, krate(&built, LIB)).file_for_path(&generated).is_none());
     assert!(!built.lowered.paths().contains_key(&file));
+}
+
+/// The invariant: a run's bytes exist once. After the run is applied, the file text the front
+/// end reads is the run's own allocation (its count is the run's and the front end's), and so
+/// are the variables each dependent crate's record of the run holds; nothing is a copy.
+/// The control is the copy this replaced (`Arc::from(bytes.as_slice())`, `env.clone()`):
+/// with it each count stays at one, which the assertions refuse.
+#[test]
+fn an_applied_run_shares_its_bytes_and_copies_none() {
+    let mut built = lowered(&units()).unwrap();
+    let text: std::sync::Arc<[u8]> = b"pub fn gen() {}\n".as_slice().into();
+    let ran = Ran {
+        cfgs: vec!["has_gen".to_owned()],
+        env: [("GEN".to_owned(), "1".to_owned())].into(),
+        out_dir: OUT_DIR.to_owned(),
+        files: vec![("gen.rs".to_owned(), std::sync::Arc::clone(&text))],
+    };
+    // The test's handle, the run's.
+    assert_eq!(std::sync::Arc::strong_count(&text), 2);
+    assert_eq!(std::sync::Arc::strong_count(&ran.env), 1);
+    built.lowered.ran(RUN, &ran).unwrap();
+    assert!(
+        std::sync::Arc::strong_count(&text) > 2,
+        "the front end's text of gen.rs is a copy of the run's bytes, not the run's own"
+    );
+    assert!(
+        std::sync::Arc::strong_count(&ran.env) > 1,
+        "the dependent crates' record of the run holds a copy of its variables"
+    );
+    // Dropped, the run leaves the front end's text the one allocation of those bytes.
+    drop(ran);
+    assert!(std::sync::Arc::strong_count(&text) > 1);
+    let db = built.lowered.db();
+    assert_eq!(krate(&built, LIB).env(db).get("GEN").as_deref(), Some("1"));
 }
 
 #[test]
@@ -1006,7 +1080,7 @@ fn a_macro_host_crate_that_links_proc_macro_is_told_the_hosts_side() {
         let root = changed(&tree, &[("a/src/lib.rs", Some(gated)), ("a/src/more.rs", Some(more))]);
         let config = config_of(root);
         built.lowered.refresh(
-            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
             |_| Ok(()),
         )
     };
@@ -1031,6 +1105,132 @@ fn a_native_unit_lowers_the_same_beside_a_wasm_one() {
             "unit {unit}"
         );
         assert_eq!(beside.lowered.identity(unit), alone.lowered.identity(unit), "unit {unit}");
+    }
+}
+
+/// [`units`] without the library's test: the plan of a `build`, where [`units`] is a `test`'s.
+fn build_units() -> Units {
+    let mut units = units();
+    assert_eq!(units.graph.units.len(), LIB_TEST + 1, "the test's unit is the last");
+    units.graph.units.pop();
+    units.plans.pop();
+    units.graph.roots = vec![BIN];
+    units
+}
+
+/// `plan` lowered into `built`'s front end at the view it was lowered at, as the daemon does
+/// for a request of another plan: moved to the view (which did not move), then the plan.
+fn relowered(built: &mut Built, plan: &Units) -> crate::Relowered {
+    let tree = MemTree::default();
+    let root = view(&tree);
+    let config = config(root, library(&tree));
+    let sealed = crate::unsealed(plan);
+    let lower = || Lower { units: plan, config: &config, files: &tree, root, host_cpu: None, sealed: &sealed };
+    assert_eq!(built.lowered.refresh(lower(), &base_db::Looks::none(), |_| Ok(())), Ok(true), "the view did not move");
+    built.lowered.relower(lower()).unwrap()
+}
+
+/// What a plan lowered again must leave as it was: the database's view (no input written),
+/// its maintainers' passes, and the crate graph.
+fn written(built: &Built) -> (blaze_query::db::View, u64, ContentId) {
+    let db = built.lowered.db();
+    (db.nonce_and_revision().1, db.maintain_passes(), base_db::all_crates_content(db))
+}
+
+/// The invariant ([`crate::Graph`]): a request's units are a view over the one crate graph a
+/// front end keeps. Lowering plan A (`build`), then B (`test`: A's units and the library's
+/// `cfg(test)` twin), then A, then B: B makes one crate, the twin, beside A's, each of A's
+/// units keeps its crate, and from then on each plan is found whole: no crate made, no
+/// directory read, no input written (the database's view stands), no maintainer's pass, and
+/// each unit has the crate it had the first time. A build script's run applied under A is
+/// still applied when A is back.
+///
+/// Its control is [`the_control_a_plan_that_is_the_front_ends_identity_makes_its_crates_again`].
+#[test]
+fn a_plan_lowered_again_is_found_whole_and_writes_nothing() {
+    let (build, test) = (build_units(), units());
+    let mut built = lowered(&build).unwrap();
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "made")).unwrap();
+    let of_build: Vec<Crate> =
+        [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().map(|&unit| krate(&built, unit)).collect();
+    let ran_cfg = |built: &Built| {
+        let db = built.lowered.db();
+        of_build[2].cfg_options(db).check_atom(&flag("made"))
+    };
+    assert!(ran_cfg(&built), "the run's cfg is the library's");
+    let crates_of_build = base_db::all_crates(built.lowered.db()).len();
+
+    // B: the twin is made beside the crates there, which stay.
+    let first_test = relowered(&mut built, &test);
+    assert_eq!(
+        first_test,
+        crate::Relowered::Into(crate::Placed { crates_made: 1, roots_made: 0, dirs_read: 0 }),
+        "the `cfg(test)` twin, of a package and a directory the front end has"
+    );
+    let twin = krate(&built, LIB_TEST);
+    assert!(!of_build.contains(&twin), "the twin is a crate of its own");
+    for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
+        assert_eq!(krate(&built, unit), of_build[at], "unit {unit} keeps its crate");
+    }
+    let all = base_db::all_crates(built.lowered.db());
+    assert_eq!(all.len(), crates_of_build + 1);
+    assert_eq!(all.last(), Some(&twin), "added after the crates that were there");
+    assert!(ran_cfg(&built), "the run applied to the library under `build` stays applied");
+
+    // A again, B again, A again: each found whole, nothing written.
+    let before = written(&built);
+    for (plan, name) in [(&build, "build"), (&test, "test"), (&build, "build")] {
+        let again = relowered(&mut built, plan);
+        assert_eq!(
+            again,
+            crate::Relowered::Into(crate::Placed::default()),
+            "`{name}` again makes nothing"
+        );
+        assert_eq!(written(&built), before, "`{name}` again writes no input and runs no pass");
+        for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
+            assert_eq!(krate(&built, unit), of_build[at], "`{name}` again: unit {unit}");
+        }
+        if name == "test" {
+            assert_eq!(krate(&built, LIB_TEST), twin, "the twin is found again");
+        } else {
+            assert_eq!(built.lowered.krate(LIB_TEST), None, "`build` has no such unit");
+        }
+        assert!(ran_cfg(&built), "`{name}` again: the run stays applied");
+    }
+}
+
+/// The control of [`a_plan_lowered_again_is_found_whole_and_writes_nothing`]: with the plan
+/// made the identity of what is lowered again (the planted bug: no crate of an earlier plan
+/// is found), `build` after `test` makes each of its crates anew and writes them, which that
+/// test's assertions refuse.
+#[test]
+fn the_control_a_plan_that_is_the_front_ends_identity_makes_its_crates_again() {
+    let (build, test) = (build_units(), units());
+    let mut built = lowered(&build).unwrap();
+    assert!(matches!(relowered(&mut built, &test), crate::Relowered::Into(_)));
+    let before = written(&built);
+    crate::PLAN_IS_IDENTITY.set(true);
+    let again = relowered(&mut built, &build);
+    crate::PLAN_IS_IDENTITY.set(false);
+    let crate::Relowered::Into(placed) = again else { panic!("not lowered into: {again:?}") };
+    assert!(placed.crates_made >= 5, "every crate of `build` is made again: {placed:?}");
+    assert_ne!(written(&built), before, "and written: the oracle of the test above sees it");
+}
+
+/// A plan the front end can't take beside what it holds is refused by name, never lowered
+/// half: here a plan whose build writes into a directory the front end read as source.
+#[test]
+fn a_plan_whose_build_writes_where_the_front_end_read_is_lowered_anew() {
+    let build = build_units();
+    let mut built = lowered(&build).unwrap();
+    let mut moved = build_units();
+    // `a/src` was read whole with package `a`; this plan's build directory is in it.
+    moved.build_dir = "/w/a/src".to_owned(); // alloc: test input
+    match relowered(&mut built, &moved) {
+        crate::Relowered::Anew(why) => {
+            assert!(why.contains("/w/a/src") && why.contains("/w/a"), "names both: {why}");
+        }
+        other => panic!("lowered into: {other:?}"),
     }
 }
 
@@ -1161,7 +1361,7 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     // only the file's content tells its identity apart, and the bin's through the lib's.
     let ran = |text: &str| Ran {
         out_dir: OUT_DIR.to_owned(),
-        files: vec![("gen.rs".to_owned(), text.as_bytes().to_vec())],
+        files: vec![("gen.rs".to_owned(), text.as_bytes().into())],
         ..Ran::default()
     };
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
@@ -1194,8 +1394,8 @@ fn a_code_identity_takes_a_file_with_no_text_by_its_bytes() {
         Ran {
             out_dir: OUT_DIR.to_owned(),
             files: vec![
-                ("gen.rs".to_owned(), generated.to_vec()),
-                ("libgen.a".to_owned(), archive.to_vec()),
+                ("gen.rs".to_owned(), generated.into()),
+                ("libgen.a".to_owned(), archive.into()),
             ],
             ..Ran::default()
         }
@@ -1240,7 +1440,7 @@ fn a_units_identity_leaves_out_the_process_environment() {
         config.invocation.env =
             env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
         let mut lowered =
-            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
                 .unwrap();
         [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
     };
@@ -1268,7 +1468,7 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
     let root = changed(&tree, &[("a/src/more.rs", Some(more)), ("a/src/new.rs", Some(new))]);
     let config = config(root, library(&MemTree::default()));
     let refreshed = built.lowered.refresh(
-        Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
@@ -1294,15 +1494,16 @@ fn a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error() {
     let more: &'static [u8] = b"pub fn more() -> u8 { 1 }\n";
     let root = changed(&tree, &[("a/src/more.rs", Some(more))]);
     let config = config(root, library(&MemTree::default()));
-    let lower = || Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
+    let sealed = crate::unsealed(&units);
+    let lower = || Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &sealed };
     let mut built = lowered(&units).unwrap();
     let mut seeded = 0;
-    let refreshed = built.lowered.refresh(lower(), |_| {
+    let refreshed = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| {
         seeded += 1;
         Ok(())
     });
     assert_eq!((refreshed, seeded), (Ok(true), 1));
-    let again = built.lowered.refresh(lower(), |_| panic!("seeded with no text written"));
+    let again = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| panic!("seeded with no text written"));
     assert_eq!(again, Ok(true), "the view did not move");
 
     let mut built = lowered(&units).unwrap();
@@ -1310,7 +1511,7 @@ fn a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error() {
         what: "the edit's parse was not taken".to_owned(),
         at: Some("/w/a/src/more.rs".to_owned()),
     };
-    let error = built.lowered.refresh(lower(), |_| Err(refused.clone()));
+    let error = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| Err(refused.clone()));
     assert_eq!(error, Err(refused));
 }
 
@@ -1324,7 +1525,7 @@ fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower()
         let root = changed(&tree, changes);
         let config = config(root, library);
         built.lowered.refresh(
-            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
             |_| Ok(()),
         )
     };
@@ -1438,8 +1639,8 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     let tree = MemTree::default();
     let view = view(&tree);
     let config = config(view, library(&tree));
-    let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
-    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
+    let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None, sealed: &crate::unsealed(&units) };
+    assert_eq!(built.lowered.refresh(next, &base_db::Looks::none(), |_| Ok(())), Ok(true));
     let unrecorded = harness("pub fn main() { let _ = 1; }");
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(unrecorded.clone())), Ok(1));
     assert_eq!(text_of(&built.lowered, root), format!("{disk}{unrecorded}"));
@@ -1538,8 +1739,8 @@ fn an_edit_of_a_root_file_reaches_every_root_of_it() {
     let tree = MemTree::default();
     let root = changed(&tree, &[("m/src/lib.rs", Some(EDITED))]);
     let config = config(root, library(&tree));
-    let next = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
-    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
+    let next = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) };
+    assert_eq!(built.lowered.refresh(next, &base_db::Looks::none(), |_| Ok(())), Ok(true));
     let edited = std::str::from_utf8(EDITED).unwrap();
     assert_eq!(text_of(&built.lowered, disk), edited);
     assert_eq!(text_of(&built.lowered, test_root), format!("{edited}{}", test_harness().after));
@@ -1763,7 +1964,7 @@ fn lowered_with(
 ) -> Result<Built, LowerError> {
     let root = changed(tree, changes);
     let config = config(root, library_with_proc_macro(tree));
-    let lowered = lower(Lower { units, config: &config, files: tree, root, host_cpu: None })?;
+    let lowered = lower(Lower { units, config: &config, files: tree, root, host_cpu: None, sealed: &crate::unsealed(units) })?;
     Ok(Built { lowered })
 }
 
@@ -1782,8 +1983,8 @@ fn library_with_proc_macro(tree: &MemTree) -> ContentId {
 
 /// The const macros of `krate`'s macro crate, by name.
 fn const_macros_of(db: &Db, krate: Crate) -> Vec<String> {
-    let all = hir_expand::proc_macro::ProcMacros::get(db);
-    let macros = all.by_crate(db).get(&krate).cloned().expect("the macro crate has macros");
+    let macros = hir_expand::proc_macro::ProcMacros::given(db, krate)
+        .expect("the macro crate has macros");
     macros.macros().expect("listed").iter().map(|it| it.name.as_str().to_owned()).collect()
 }
 
@@ -1841,14 +2042,24 @@ fn a_packages_const_macros_are_one_crate_its_crates_depend_on_by_the_files_stem(
         Some("/rustc/abc/blaze/const-ast/lib.rs")
     );
     let on: Vec<Crate> = const_ast.data(db).dependencies.iter().map(|it| it.crate_id).collect();
-    assert_eq!(on, [krate(&built, CORE)]);
+    let quote = dependency_of(db, const_ast, "const_ast_quote").expect("`quote!`'s crate");
+    assert_eq!(on, [krate(&built, CORE), quote]);
+    // `quote!`'s crate: a proc-macro crate on the same root file, whose one macro is `quote`.
+    assert_eq!(quote.data(db).root_file_id, root, "one root file, two crates");
+    assert_eq!(quote.data(db).target_kind, TargetKind::Lib { is_proc_macro: true });
+    assert!(quote.cfg_options(db).check_atom(&flag("blaze_const_quote")));
+    assert!(!quote.cfg_options(db).check_atom(&flag("blaze_const_eval")));
+    assert!(const_ast.cfg_options(db).check_atom(&flag("blaze_const_eval")));
+    assert!(!const_ast.cfg_options(db).check_atom(&flag("blaze_const_quote")));
+    assert_eq!(const_macros_of(db, quote), ["quote"]);
 
     // Its macros are listed from its file, and every crate comes after what it depends on.
     assert_eq!(const_macros_of(db, macros), ["double"]);
     let all = base_db::all_crates(db);
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 10, "the units' 7, the macro crate, `const_ast` and `const_ast_quote`");
     let at = |krate: Crate| all.iter().position(|it| *it == krate).unwrap();
     assert!(at(krate(&built, PROC_MACRO)) < at(macros) && at(const_ast) < at(macros));
+    assert!(at(quote) < at(const_ast));
     assert!(at(macros) < at(krate(&built, LIB)) && at(macros) < at(krate(&built, LIB_TEST)));
 }
 
@@ -1874,7 +2085,7 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let root = changed(&tree, &[("a/src/macros.rs", Some(more))]);
     let with_more = config(root, library_with_proc_macro(&tree));
     let refreshed = built.lowered.refresh(
-        Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
@@ -1883,7 +2094,7 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let root = changed(&tree, &[]);
     let without = config(root, library_with_proc_macro(&tree));
     let Err(error) = built.lowered.refresh(
-        Lower { units: &units, config: &without, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &without, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     ) else {
         panic!("the const macros' file went and nothing said so")
@@ -1916,7 +2127,7 @@ fn a_derived_method_has_a_body() {
     let config = config(root, library);
     let units = units();
     let lowered =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let db = lowered.db();
     let core = lowered.krate(CORE).expect("core is a crate");
@@ -2080,6 +2291,9 @@ fn a_target_of_the_hosts_own_triple_lowers_to_crates_of_keys_of_their_own() {
     let const_ast = |unit| dependency_of(db, macros(unit), "const_ast").expect("const-ast");
     assert_ne!(const_ast(LIB), const_ast(lib), "const-ast, once for each side");
     assert_eq!(const_ast(lib).extra_data(db).built_for, target);
+    let quote = |unit| dependency_of(db, const_ast(unit), "const_ast_quote").expect("its quote");
+    assert_ne!(quote(LIB), quote(lib), "`quote!`'s crate, once for each side");
+    assert_eq!(quote(lib).extra_data(db).built_for, target);
     blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
 }
 
@@ -2149,8 +2363,8 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     let config = config(root, library(&tree));
     let refresh = |built: &mut Built| {
         let passes = built.lowered.db().maintain_passes();
-        let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
-        assert_eq!(built.lowered.refresh(lower, |_| Ok(())), Ok(true));
+        let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) };
+        assert_eq!(built.lowered.refresh(lower, &base_db::Looks::none(), |_| Ok(())), Ok(true));
         built.lowered.db().maintain_passes() - passes
     };
     let unmoved = refresh(&mut built);
@@ -2230,7 +2444,7 @@ fn outside_root(twice: bool) -> Lowered {
     }
     units.packages.sort_by(|x, y| x.id.cmp(&y.id));
     let config = config(root, library);
-    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
 }
 
 /// A target whose root is outside its package's directory: cargo's `src_path` keeps the `..`s,
@@ -2369,7 +2583,7 @@ fn front_over(changes: &[(&'static str, Option<&'static [u8]>)]) -> Lowered {
     let root = changed(&tree, changes);
     let config = config(root, library(&tree));
     let units = units();
-    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
 }
 
 /// The lib's root as a plain function, and the same after an edit of each kind.
@@ -2389,7 +2603,9 @@ const LIB_SIGNATURE: &[u8] = b"pub fn gen() -> u16 {\n    1\n}\n";
 
 /// What an edit of the lib's root from [`LIB_PLAIN`] to `lib` must leave as it was and must
 /// move, of the lib's keys and of the bin's above it: the oracle of the narrowed identities.
-/// `comment`: the edit is of comments alone. `body`: of a plain body, keeping its lines.
+/// `comment`: the edit is of comments alone. `body`: of what no front end above reads, a
+/// plain body or the lines of the file (a comment on a line of its own, a line more in a
+/// body): the crates above hold the lib's surface, which has no position in it.
 /// Any other edit is one every reader observes.
 fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), String> {
     let [(lib_whole, lib_was), (bin_whole, bin_was)] = narrowed_over(LIB_PLAIN);
@@ -2410,10 +2626,21 @@ fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), Strin
     if comment != (lib_was.checked == lib_now.checked) {
         return said("the lib's own check's identity");
     }
-    // What a check of the bin can observe of the lib: its interface, which a comment and a
-    // plain body leave as it was.
+    // What a check of the bin can observe of the lib: its surface, which a comment, a plain
+    // body and a moved line leave as it was.
     if (comment || body) != (bin_was.checked == bin_now.checked) {
         return said("the identity of the bin's check, which reads the lib's interface");
+    }
+    // What a library built up to the crate boundary can observe: of its own crate its code,
+    // of a crate below it the interface. (Which units are keyed by it is blaze-cargo's
+    // `cut_at_crates`; the identity is worked out of every crate.)
+    if comment != (lib_was.built == lib_now.built) {
+        return said("the identity the lib's own build up to the crate boundary is under");
+    }
+    if (comment || body) != (bin_was.built == bin_now.built) {
+        return said(
+            "the identity a library over the lib is built under, which holds the lib's interface",
+        );
     }
     Ok(())
 }
@@ -2428,11 +2655,26 @@ fn a_dependents_key_moves_only_with_what_it_observes_of_a_dependency() {
     assert_eq!(check_edit(LIB_COMMENTED, true, false), Ok(()));
     assert_eq!(check_edit(LIB_SPACED, true, false), Ok(()));
     assert_eq!(check_edit(LIB_ENDED, true, false), Ok(()));
-    assert_eq!(check_edit(LIB_HEADED, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_HEADED, false, true), Ok(()));
     assert_eq!(check_edit(LIB_DOCUMENTED, false, false), Ok(()));
     assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
-    assert_eq!(check_edit(LIB_LINE, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_LINE, false, true), Ok(()));
     assert_eq!(check_edit(LIB_SIGNATURE, false, false), Ok(()));
+}
+
+/// With a surface that keeps a left-out body's count of lines, a line added to a plain body
+/// moves the key of the check above it: the cutoff of positions is gone, and the oracle says
+/// where (the cause removed: the line before passes).
+#[test]
+fn the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines() {
+    assert_eq!(check_edit(LIB_LINE, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Lines, || check_edit(LIB_LINE, false, true)),
+        Err(format!(
+            "{}: the identity of the bin's check, which reads the lib's interface",
+            String::from_utf8_lossy(LIB_LINE)
+        ))
+    );
 }
 
 /// With a check keyed by its dependencies' code, a plain body's edit moves the checking
@@ -2463,6 +2705,86 @@ fn the_oracle_catches_a_program_keyed_by_its_dependencies_interfaces() {
     );
 }
 
+/// With a library's build keyed by its dependencies' code, a plain body's edit below it moves
+/// its key: the cutoff between crates is gone, and the oracle says where. The cause removed
+/// (test-the-cause): the same edit with the cutoff in passes the line before.
+#[test]
+fn the_oracle_catches_a_library_built_under_its_dependencies_code() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Uncut, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the identity a library over the lib is built under, which holds the lib's interface",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// The invariant: what a library's build up to the crate boundary is keyed by moves with
+/// what its front end reads of a crate below it (a signature, a `const fn`'s body, a
+/// constant's value, a macro's tokens) and with an `#[inline(always)]` body, which is built
+/// into its own code, and with nothing else of that crate: a plain, generic, `#[inline]` or
+/// default-method body, a line moved and a comment leave it as it was (the copies of a
+/// generic are functions of their own, in no library's record). The lib's own build's key
+/// moves with each of them but the comment.
+#[test]
+fn a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it() {
+    let built = |lib: &'static [u8]| {
+        let [(_, lib), (_, over)] = narrowed_over(lib);
+        (lib.built, over.built)
+    };
+    // (before, after, whether a library over the lib observes the edit)
+    let cases: [(&'static [u8], &'static [u8], bool); 10] = [
+        (LIB_PLAIN, LIB_BODY, false),
+        (LIB_PLAIN, LIB_SIGNATURE, true),
+        (LIB_PLAIN, LIB_LINE, false),
+        (
+            b"pub fn gen<T>(_t: T) -> u8 {\n    1\n}\n",
+            b"pub fn gen<T>(_t: T) -> u8 {\n    2\n}\n",
+            false,
+        ),
+        (
+            b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n",
+            false,
+        ),
+        (
+            b"#[inline(always)]\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[inline(always)]\npub fn gen() -> u8 {\n    2\n}\n",
+            true,
+        ),
+        (
+            b"pub const fn gen() -> u8 {\n    1\n}\n",
+            b"pub const fn gen() -> u8 {\n    2\n}\n",
+            true,
+        ),
+        (
+            b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        1\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        2\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            false,
+        ),
+        (
+            b"pub const N: u8 = 1;\npub fn gen() -> u8 {\n    1\n}\n",
+            b"pub const N: u8 = 2;\npub fn gen() -> u8 {\n    1\n}\n",
+            true,
+        ),
+        (
+            b"#[macro_export]\nmacro_rules! one {\n    () => {\n        1u8\n    };\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[macro_export]\nmacro_rules! one {\n    () => {\n        2u8\n    };\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            true,
+        ),
+    ];
+    for (before, after, observed) in cases {
+        let (lib_was, over_was) = built(before);
+        let (lib_now, over_now) = built(after);
+        let shown = String::from_utf8_lossy(after);
+        assert_ne!(lib_was, lib_now, "the lib's own build: {shown}");
+        assert_eq!(observed, over_was != over_now, "a library over the lib: {shown}");
+    }
+    let (lib_was, over_was) = built(LIB_PLAIN);
+    assert_eq!((lib_was, over_was), built(LIB_COMMENTED), "a comment moves neither");
+}
+
 /// What takes the cutoff away, each kept whole: a dependency that runs at compile time (a
 /// proc macro) is read by its code; a crate that names blaze's extensions, whose proofs read
 /// bodies across crates, gives and takes no interface.
@@ -2476,7 +2798,19 @@ fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
     assert_ne!(pure.checked, pure_body.checked, "an effect is proved over the body");
     let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
     let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
-    assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+    assert_eq!(
+        inline.checked, inline_body.checked,
+        "an `#[inline]` body is no front end's to read: its copies are functions of their own"
+    );
+    // A library built over it is cut off, and not, by the same things.
+    assert_eq!(plain.built, body.built);
+    assert_ne!(pure.built, pure_body.built, "an effect is proved over the body");
+    assert_eq!(inline.built, inline_body.built);
+    let [_, (_, always)] = narrowed_over(b"#[inline(always)]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, always_body)] =
+        narrowed_over(b"#[inline(always)]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(always.checked, always_body.checked, "an `#[inline(always)]` body");
+    assert_ne!(always.built, always_body.built, "which is built into its callers' own code");
 }
 
 /// The edited crate's own unit, directed: an edit of its root that moves no token and no
@@ -2572,7 +2906,7 @@ fn library_over(
     let config = config(root, library(&tree));
     let units = units_with_a_registry_lib();
     let mut front =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     for unit in [LIB, BIN] {
         let kept = |key: &ContentId| {
@@ -2600,7 +2934,7 @@ fn a_comment_in_a_registry_crate_moves_no_key_once_it_is_parsed() {
         let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
         let config = config(root, library(&tree));
         let units = units_with_a_registry_lib();
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
     };
     assert!(root_of(front.db(), front.krate(LIB).unwrap()).is_library);
     assert_eq!(front.narrowed(LIB), None);
@@ -2643,8 +2977,10 @@ fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
         assert_eq!(own.kept().as_slice(), bytes.as_slice());
     }
 
-    // A value cut short, and one with a flag no narrowed identity has.
-    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] |= 0x80] {
+    // A value cut short, and one whose flags say it has no code text where it holds one's
+    // hash. (Each of the flags byte's eight bits is a flag since `names_location`, 0x80, came
+    // with the surface text, 0fbf2ca128, so no bit is one no narrowed identity has.)
+    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] &= !1] {
         let mut spoiled = kept.clone();
         spoil(&mut spoiled[0].1);
         let tree = MemTree::default();
@@ -2652,7 +2988,7 @@ fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
         let config = config(root, library(&tree));
         let units = units_with_a_registry_lib();
         let mut front =
-            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
                 .unwrap();
         let read = |key: &ContentId| {
             Ok(spoiled.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
@@ -2674,7 +3010,7 @@ fn a_kept_narrowed_identity_is_under_the_front_ends_code() {
     let config = config(root, library(&tree));
     let units = units_with_a_registry_lib();
     let mut front =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let other = ContentId([8; 32]);
     let kept = |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
@@ -2781,4 +3117,181 @@ fn a_dependency_built_with_other_features_is_keyed_apart() {
         assert_ne!(was.0, now.0, "unit {unit}");
         assert_ne!(was.1, now.1, "unit {unit}");
     }
+}
+
+/// [`program_units`] as a real plan gives the standard library: its packages are members of
+/// the library's own workspace (`blaze_units` loads it as one more workspace), and its units
+/// say they are the library's.
+fn program_units_of_a_real_library() -> Units {
+    let mut units = program_units(false);
+    for package in &mut units.packages {
+        if package.name == "core" {
+            package.is_member = true;
+        }
+    }
+    assert!(units.graph.units[CORE].is_std, "the fixture's `core` is a unit of the library");
+    units
+}
+
+/// [`program_units_of_a_real_library`] lowered in a workspace whose root is `/w` (the view's
+/// root manifest, with its `[workspace]`) or, with that manifest gone, the first member's own
+/// directory:
+/// two workspaces to every crate made with the workspace's root.
+fn lowered_in_workspace(rooted: bool) -> Built {
+    let tree = MemTree::default();
+    let unrooted: &[(&'static str, Option<&'static [u8]>)] = &[("Cargo.toml", None)];
+    let root = changed(&tree, if rooted { &[] } else { unrooted });
+    let config = config(root, library(&tree));
+    let units = program_units_of_a_real_library();
+    let lowered =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap();
+    Built { lowered }
+}
+
+/// The invariant: nothing of a crate of the standard library names the workspace that builds
+/// it. Its content ID, its identity and its image's key are the same in two workspaces (two
+/// roots), so the stores answer a new project's first build with what any other project's
+/// build left. A member of the workspace itself still holds its root (where its proc macros
+/// run), so the two workspaces' own crates stay apart (rule 21).
+#[test]
+fn the_standard_library_is_keyed_the_same_whatever_workspace_builds_it() {
+    let (mut one, mut other) = (lowered_in_workspace(true), lowered_in_workspace(false));
+    assert_eq!(shared_keys(&mut one, CORE), shared_keys(&mut other, CORE));
+    assert!(shared_keys(&mut one, CORE).2.is_some(), "`core`'s image key is among them");
+    let cwd = |built: &Built, unit| {
+        let krate = krate(built, unit);
+        krate.data(built.lowered.db()).proc_macro_cwd.as_str().to_owned()
+    };
+    assert_eq!(cwd(&one, CORE), LIBRARY, "the library's own workspace's root");
+    assert_eq!(cwd(&one, BIN), "/w");
+    assert_ne!(cwd(&other, BIN), "/w", "the premise: the two workspaces have two roots");
+    let (was, now) = (shared_keys(&mut one, BIN), shared_keys(&mut other, BIN));
+    assert_ne!(was.0, now.0, "a member's settings hold its workspace's root");
+    assert_ne!(was.1, now.1);
+}
+
+/// The control: with the library's members run in the asking workspace's root, as until
+/// 2026-11-11, `core` is another crate in each workspace, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_library_crate_made_with_the_workspaces_root() {
+    crate::crates::LIBRARY_RUNS_IN_THE_WORKSPACE.set(true);
+    let (mut one, mut other) = (lowered_in_workspace(true), lowered_in_workspace(false));
+    crate::crates::LIBRARY_RUNS_IN_THE_WORKSPACE.set(false);
+    let (was, now) = (shared_keys(&mut one, CORE), shared_keys(&mut other, CORE));
+    assert_ne!(was.0, now.0, "the oracle sees `core`'s content ID move with the workspace");
+    assert_ne!(was.1, now.1, "and its identity");
+}
+
+/// The workspace's root is found from a member of the workspace asked for, never from a
+/// member of the standard library's own workspace, wherever the plan's order puts each.
+#[test]
+fn the_workspaces_root_is_never_the_standard_librarys() {
+    let mut units = program_units_of_a_real_library();
+    // The library's package first, as a plan sorted by id gives it for a checkout whose path
+    // sorts after the library's.
+    let core = units.packages.iter().position(|it| it.name == "core").unwrap();
+    units.packages.swap(0, core);
+    let tree = MemTree::default();
+    let root = view(&tree);
+    let config = config(root, library(&tree));
+    let mounts = crate::files::Mounts {
+        mounts: &config.mounts,
+        view: root,
+        tree: &tree,
+        read_view: std::cell::Cell::new(false),
+    };
+    let found = crate::crates::root(&units, &mounts).unwrap();
+    assert_eq!(found.dir.as_deref(), Some("/w"));
+}
+
+/// The invariant: once the surfaces are given ([`Lowered::give_surfaces`]), every crate of
+/// the plan holds the one [`Lowered::surface_of`] works out, which an image key above it
+/// reads; an edit of what no front end above reads (a plain body, a moved line, a comment)
+/// leaves every crate's as it was, and a signature moves the crate's and the one above it.
+/// Given again with nothing moved, nothing is written.
+#[test]
+fn every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none() {
+    let surfaces = |lib: &'static [u8]| {
+        let mut front = front_over(&[("a/src/lib.rs", Some(lib))]);
+        front.give_surfaces();
+        let passes = front.db().maintain_passes();
+        front.give_surfaces();
+        assert_eq!(front.db().maintain_passes(), passes, "given again, nothing is written");
+        [LIB, BIN].map(|unit| {
+            let krate = front.krate(unit).expect("the unit's crate");
+            let given = hir_def::deps::given::surface(front.db(), krate)
+                .unwrap_or_else(|| panic!("unit {unit}'s crate was given no surface"));
+            assert_eq!(given, front.surface_of(krate), "unit {unit}");
+            given
+        })
+    };
+    let [lib, bin] = surfaces(LIB_PLAIN);
+    for unread in [LIB_BODY, LIB_LINE, LIB_HEADED, LIB_COMMENTED, LIB_SPACED, LIB_ENDED] {
+        assert_eq!(surfaces(unread), [lib, bin], "{}", String::from_utf8_lossy(unread));
+    }
+    let [lib_now, bin_now] = surfaces(LIB_SIGNATURE);
+    assert_ne!(lib, lib_now, "a signature is the crate's surface");
+    assert_ne!(bin, bin_now, "and the surface of the crate above holds it");
+    // A library crate of the plan is its whole identity, whatever was narrowed: its slot is
+    // the same before any unit is identified and after.
+    let registry = |lib: &'static [u8]| {
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front =
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
+                .unwrap();
+        let before = front.surface_of(front.krate(BIN).unwrap());
+        let mut store = KeptNarrows::new();
+        for unit in [LIB, BIN] {
+            let kept =
+                |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
+            front.library_narrows(unit, &FRONT_END, kept).unwrap();
+        }
+        store.extend(front.take_library_narrows());
+        assert_eq!(before, front.surface_of(front.krate(BIN).unwrap()), "narrowed or not");
+        before
+    };
+    assert_ne!(registry(LIB_PLAIN), registry(LIB_BODY), "a registry crate is its bytes here");
+}
+
+/// The invariant: what a record carries of a crate's own texts ([`Lowered::own_surface`])
+/// gives, in another database of the same files, the slot a parse gives there, for the crate
+/// and for the one above it ([`Lowered::carry_own_surface`]). The control (test-the-cause):
+/// carried into a database whose file differs, which no caller may do, the slot is the
+/// carried one and not that database's own, so the fold does read what was carried and a
+/// record keyed by less than the crate's files would be stale. Bytes that are no such record
+/// are refused, naming the crate.
+#[test]
+fn a_carried_surface_is_the_one_a_parse_gives() {
+    let slots = |front: &mut Lowered| {
+        [LIB, BIN].map(|unit| {
+            let krate = front.krate(unit).expect("the unit's crate");
+            front.surface_of(krate)
+        })
+    };
+    let mut first = front_over(&[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let worked_out = slots(&mut first);
+    let lib = first.krate(LIB).expect("the lib's crate");
+    let kept = first.own_surface(lib).expect("a workspace crate has texts of its own");
+
+    let mut second = front_over(&[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let lib = second.krate(LIB).expect("the lib's crate");
+    second.carry_own_surface(lib, &kept).unwrap();
+    assert_eq!(slots(&mut second), worked_out, "carried, the slots are the ones a parse gives");
+    assert_eq!(second.own_surface(lib), Some(kept.clone()), "and it is carried on as it was");
+
+    let mut other = front_over(&[("a/src/lib.rs", Some(LIB_SIGNATURE))]);
+    let own = slots(&mut other);
+    assert_ne!(own, worked_out, "another signature is another surface");
+    let lib = other.krate(LIB).expect("the lib's crate");
+    other.carry_own_surface(lib, &kept).unwrap();
+    assert_eq!(slots(&mut other), worked_out, "the control: what is carried is taken as it is");
+
+    let refused = match other.carry_own_surface(lib, b"not one") {
+        Err(refused) => refused.to_string(),
+        Ok(()) => panic!("bytes that are no carried surface were taken"),
+    };
+    assert!(refused.contains("the surface a record carried of the crate"), "{refused}");
 }

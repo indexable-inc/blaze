@@ -416,6 +416,8 @@ pub fn named(request: &Request) -> &'static str {
         Request::Rebuilt { .. } => "Rebuilt",
         Request::Launch { .. } => "Launch",
         Request::FetchUrl { .. } => "FetchUrl",
+        // Lane packs-1112.
+        Request::Store { .. } => "Store",
         Request::Lock { .. } => "Lock",
         Request::ClientRows { .. } => "ClientRows",
     }

@@ -167,6 +167,7 @@ diagnostics![AnyDiagnostic<'db> ->
     ComptimeUnsupported,
     ReflectedMemberUnmet<'db>,
     ConstCheckError,
+    ComptimeCall,
     ConstEvalFailed,
     ConstImpure,
     CannotBeDereferenced<'db>,
@@ -814,6 +815,19 @@ pub struct ConstCheckError {
     pub message: String,
     pub kind: hir_ty_mir::mir::const_check::ConstCheckKind,
     pub context: hir_ty_mir::mir::const_check::ConstContext,
+}
+
+/// A call of a compile-time-only function (`#[rustc_comptime]`) where the call would run:
+/// rustc's "comptime functions can only be called at compile time".
+#[derive(Debug)]
+pub struct ComptimeCall {
+    pub node: InFile<SyntaxNodePtr>,
+    pub callee: Function,
+}
+
+impl ComptimeCall {
+    /// rustc's message, which has no error code.
+    pub const MESSAGE: &'static str = hir_ty_mir::mir::const_check::comptime::MESSAGE;
 }
 
 /// A `const fn` whose result at run time depends on more than its arguments: "const fn reads
@@ -3048,7 +3062,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                         };
 
                         for &impl_ in
-                            TraitImpls::for_crate(self.db, self.krate).blanket_impls(trait_)
+                            TraitImpls::for_crate_and_trait(self.db, self.krate, trait_)
+                                .blanket_impls(trait_)
                         {
                             if impl_ == def {
                                 continue;
@@ -3566,7 +3581,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 self.collect_anon_const_valtree(source_map, konst);
             }
         }
-        self.collect_const_eval(def, body, infer, &placing);
+        self.collect_const_eval(def, body, &placing);
     }
 
     /// What `check_tail_calls` refuses of the body's `become`s, and the tail calls of
@@ -3608,7 +3623,6 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         &mut self,
         def: DefWithBodyId,
         body: &Body,
-        infer: &InferenceResult<'db>,
         placing: &Placing<'db>,
     ) {
         use hir_def::{
@@ -3637,7 +3651,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
             DefWithBodyId::FunctionId(_) | DefWithBodyId::VariantId(_) => return,
         };
-        if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
+        // rustc evaluates no body an error before MIR taints, whether or not it is borrow
+        // checked (`BLAZE_BORROWCK=off`).
+        if hir_ty_borrowck::tainted_by_errors(db, def).is_some() {
             return;
         }
         let borrowck = hir_ty_borrowck::borrowck(db, def);
@@ -3852,6 +3868,26 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 }
                 .into(),
             );
+        }
+        // Every function, `const` or not: what is left in its body after its `const { .. }`
+        // blocks runs when it does.
+        let comptime = hir_ty_mir::mir::const_check::comptime::comptime_calls(self.db, def);
+        for call in &comptime.calls {
+            let Some(node) = node_of(call.span) else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), placing.get()),
+                        what: Unplaced::ConstCheck {
+                            code: "",
+                            // alloc: error path, a reported error's message
+                            message: ComptimeCall::MESSAGE.to_owned(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
+            self.acc.push(ComptimeCall { node, callee: call.callee.into() }.into());
         }
         // `blaze::const_impure` is fn-cache's lint: no other crate's `const fn` is walked for it.
         if let DefWithBodyId::FunctionId(func) = def
@@ -5872,7 +5908,7 @@ fn unplaced_inference_text<'db>(
             "E0730: cannot pattern-match on an array without a fixed length".to_owned()
         }
         InferenceDiagnostic::ExpectedArrayOrSlicePat { found, .. } => {
-            format!("E0529: expected an array or slice, found `{}`", ty(found))
+            blaze_report::say!("E0529: expected an array or slice, found ", blaze_report::say::Code(&ty(found))).flat()
         }
         InferenceDiagnostic::InvalidRangePatType { .. } => {
             "E0029: only `char` and numeric types are allowed in range patterns".to_owned()

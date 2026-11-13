@@ -48,7 +48,10 @@
 //! `unit bodies` 782 ms. What is kept is bounded: the values of at most [`EDIT_CRATES`]
 //! crates a build, and of those only what the next two builds read again
 //! ([`blaze_query::db::Storage::end_epoch`], run at every build's end, lets go of what the
-//! last two did not read); memory short takes it all as before.
+//! last two did not read); memory short takes it all as before. Past its own wait with nothing
+//! to do ([`crate::serve::idle::front_after`]: 64 times its last remake, from 30 s to 30
+//! minutes), nothing is kept for the next edit: the daemon is held to
+//! [`crate::serve::idle::BUDGET`], and the front end goes whole (`job::giving`).
 //!
 //! **Every other build that compiles holds the inference of the workspace's crates it
 //! finished last** ([`Release::held`]): a cold build and a rebuild of many crates let go of a
@@ -64,7 +67,8 @@
 //! 5.7 s, each later one 0.95 s). The bound: a build holds the inference of at most
 //! [`EDIT_CRATES`] crates more than it did, from each one's last unit to the build's end and
 //! past it under [`blaze_query::db::Storage::end_epoch`]'s rule; memory short lets go of the
-//! held crates with the rest. Its MIR goes at its end as before, every crate's by its tag
+//! held crates with the rest, and so does an idle daemon past the front end's wait
+//! ([`crate::serve::idle::front_after`]), with the whole front end. Its MIR goes at its end as before, every crate's by its tag
 //! (`hir::evict::drop_mir` keeps none by crate), so the first edit still lowers the edited
 //! crate's built and runtime MIR again where the lints read them: `mir_body_query` and
 //! `runtime_mir_body_query` under `evicted_asked` in that build's `query_counts`. A check
@@ -86,6 +90,12 @@
 
 use std::{alloc::Global, hash::Hash, sync::atomic::{AtomicU32, Ordering}};
 
+/// What blaze must hold again before the daemon's next release for memory is due
+/// (`blaze_graph::admission::Squeeze::mark`), as its last one left it: each build's squeeze
+/// starts from it ([`Release::new`]), so a release that freed little is not repeated by the
+/// next build at the same footprint. 0 until one ran.
+static SQUEEZED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The front end releases run since the daemon started, every build's: the build view's
 /// `releases` ([`crate::serve::job::doing::memory`]), a counter that only a release moves.
 pub(crate) static RELEASES: AtomicU32 = AtomicU32::new(0);
@@ -98,6 +108,129 @@ use blaze_query::db::{Database as _, MemoryUsage};
 
 #[cfg(test)]
 mod tests;
+
+/// Has every reader of `lowered`'s database unwind at its next query call
+/// (`blaze_query::db::Storage::stop_readers`): each task under way gives way
+/// (`super::cancellable`) and is posted again once the writer applied its release
+/// ([`resume_readers`]). The last thing given back for memory before a task fails
+/// (`blaze_graph::giveback::Rung::Running`); what the tasks had done is done again.
+pub(crate) fn stop_readers(lowered: &Lowered) {
+    lowered.db().storage().stop_readers();
+}
+
+/// Clears [`stop_readers`]' stop, with the front end exclusive: no reader is left, so the
+/// stop did its work, and the tasks posted next read on. Nothing where none was made.
+pub(crate) fn resume_readers(lowered: &mut Lowered) {
+    let db = lowered.served_db();
+    if db.storage().readers_stopped() {
+        db.storage_mut().resume_readers();
+    }
+}
+
+/// What codegen's tasks left on the global heap and nobody freed: with no codegen task
+/// running, that is what codegen keeps between builds, its kept walks first
+/// ([`hir_ty_codegen::v2::let_go_kept_walks`]: 13 GiB of a cold build of blaze). An estimate
+/// and an upper bound (`blaze_graph::giveback::Rung::Caches`): the tag's heap also holds what
+/// a kept image's link state took from codegen.
+pub(crate) fn kept_caches() -> u64 {
+    blaze_mem::tag::snapshot().get(blaze_mem::Tag::Codegen).heap
+}
+
+/// Lets go of codegen's kept walks, every database's and configuration's; the bytes the
+/// codegen tag's heap fell by. The next walk over each begins with nothing kept and says why
+/// (`blaze_codegen::driver::Fresh::LetGo`). For the loop, while no task that may walk runs:
+/// a walk in flight would keep its own table until it ends.
+pub(crate) fn give_kept_caches() -> u64 {
+    let before = kept_caches();
+    let describes = hir_ty_codegen::v2::let_go_kept_walks();
+    blaze_mem::tag::give_back_heap();
+    let gave = before.saturating_sub(kept_caches());
+    // None is left, nor an empty table put back in its place: the process tables
+    // ([`give_kept_tables`]) are released only while no walk is kept.
+    let kept_walks = hir_ty_codegen::v2::kept_walks();
+    tracing::info!(target: "blaze", describes, gave, kept_walks, "codegen's kept walks were let go");
+    gave
+}
+
+/// What the process tables every front end's ids index hold: the type interner's tables and
+/// the trait solver's shared caches (the `intern` and `solver` tags, blaze-mem's and the
+/// heap's). No drop of a front end frees them: they are statics of the process
+/// (hir-ty's `next_solver::interner`), freed only by [`give_kept_tables`].
+pub(crate) fn kept_tables() -> u64 {
+    let snapshot = blaze_mem::tag::snapshot();
+    let of = |tag: blaze_mem::Tag| {
+        let it = snapshot.get(tag);
+        it.live.saturating_add(it.heap)
+    };
+    of(blaze_mem::Tag::Intern).saturating_add(of(blaze_mem::Tag::Solver))
+}
+
+/// Releases the process tables ([`kept_tables`]) as a fresh process has them
+/// (`hir::evict::release_process_tables`), then gives this thread's freed heap back; the
+/// bytes [`kept_tables`] fell by. For the loop only while nothing names an interned id: no
+/// front end kept or out, no walk kept or in flight, no link image kept, no task running
+/// (`job::giving` lists the source only then); the release itself refuses, by panic naming
+/// both counts, while a front end is kept or a task is entered.
+pub(crate) fn give_kept_tables() -> u64 {
+    let before = kept_tables();
+    let released = hir::evict::release_process_tables();
+    blaze_mem::tag::give_back_heap();
+    let after = kept_tables();
+    let gave = before.saturating_sub(after);
+    tracing::info!(
+        target: "blaze",
+        tables = released.tables,
+        released = released.bytes,
+        before,
+        after,
+        gave,
+        "the process tables were released: no front end, walk or image names an interned id"
+    );
+    gave
+}
+
+/// What a kept front end's query storage holds, from counters
+/// (`blaze_query::db::Storage::held_bytes`): what letting go of the whole front end gives
+/// back, at least (`blaze_graph::giveback::Rung::FrontEnd`).
+pub(crate) fn kept_held(lowered: &Lowered) -> u64 {
+    lowered.db().storage().held_bytes()
+}
+
+/// What the values a kept front end keeps by bytes weigh now
+/// (`blaze_query::db::Storage::weighed_bytes`, summed): what it can give and the engine makes
+/// again from the memos (`blaze_graph::giveback::Rung::Values`). The front end is the
+/// caller's alone, as a kept one is the loop's.
+pub(crate) fn kept_values(lowered: &mut Lowered) -> u64 {
+    lowered.served_db().storage_mut().weighed_bytes().iter().sum()
+}
+
+/// Lets go of about `bytes` of the values a kept front end keeps by bytes, the least recently
+/// verified first, each tag by its part of what they weigh
+/// (`blaze_query::db::Storage::sweep_values` under caps lowered by that much); what went, as
+/// the weights say. Every value let go keeps its memo: a read makes it again and backdates
+/// it. The pages go back to the system at once on this thread, and on each other as it next
+/// allocates or idles (`blaze_mem::tag::give_back_heap`); the purge the give-back rule asks
+/// after reaches the rest.
+pub(crate) fn give_kept_values(lowered: &mut Lowered, bytes: u64) -> u64 {
+    let db = lowered.served_db();
+    let weights = db.storage_mut().weighed_bytes();
+    let before: u64 = weights.iter().sum();
+    if before == 0 || bytes == 0 {
+        return 0;
+    }
+    let keep = before.saturating_sub(bytes);
+    let mut caps = [u64::MAX; blaze_mem::Tag::COUNT];
+    for (cap, &weight) in caps.iter_mut().zip(&weights) {
+        if weight != 0 {
+            let part = u128::from(weight) * u128::from(keep) / u128::from(before);
+            *cap = u64::try_from(part).unwrap_or(u64::MAX);
+        }
+    }
+    db.storage_mut().sweep_values(&caps);
+    blaze_mem::tag::give_back_heap();
+    let after: u64 = db.storage_mut().weighed_bytes().iter().sum();
+    before.saturating_sub(after)
+}
 
 /// The most crates a build may make and still be an edit's ([`Finished::edit`]): the crate
 /// edited and the few a changed interface reaches at once. Past it the build is a rebuild,
@@ -282,7 +415,10 @@ impl Release<Crate> {
     /// check.
     pub(crate) fn new(crates: &Crates, units: usize, compiles: bool) -> Release {
         let of = (0..units).map(|unit| crates.krate(unit)).collect(); // alloc: a crate a unit, once per build
-        Release::of(Finished::new(of), compiles)
+        let mut release = Release::of(Finished::new(of), compiles);
+        // From where this daemon's last release for memory left off ([`SQUEEZED_AT`]).
+        release.squeeze = Squeeze::starting_after(SQUEEZED_AT.load(Ordering::Relaxed));
+        release
     }
 
     /// Unit `unit` compiled: whether memory makes a release due is asked now, once a unit,
@@ -341,19 +477,11 @@ impl Release<Crate> {
         }
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
-            // The walks codegen keeps for the next build's (each function's describe, each
-            // program's walk and lists) are a cache on the global heap under no budget: memory
-            // short takes them as it takes the values above. No walk is in flight (a walk reads
-            // the front end, which is exclusive here); the next begins with nothing kept and
-            // says so (`blaze_codegen::driver::Fresh::LetGo`).
-            let describes = hir_ty_codegen::v2::let_go_kept_walks();
-            span.record("kept_describes", describes);
-            if describes != 0 {
-                crate::serve::said::logged!(INFO,
-                    "blaze serve: front end release (memory): let go of the {describes} describes \
-                     codegen's walks kept for the next build's"
-                );
-            }
+            // The walks codegen keeps for the next build's are no longer let go here: they are
+            // the give-back's caches rung ([`give_kept_caches`], `blaze_graph::giveback`), asked
+            // in its order, measured, and only while no walk is in flight. Let go here, a
+            // release of a daemon at its line threw away 87,287 describes of a hello-world
+            // for 0.36 GiB, at every build (2026-11-12).
         }
         // The build is over: what neither it nor the build before it read of the front end's
         // evictable values goes, the results of revisions no edit since has asked for. Only
@@ -367,6 +495,29 @@ impl Release<Crate> {
         // build's path unless the lists doubled the index.
         if ended {
             db.storage_mut().pack_reverse();
+            // And what its pulls left for the next changed-set walk is settled: each row the
+            // build made again said it changed, and the next edit's walk would start from all
+            // of them (a hello-world's first edit: 381,137 rows asked and 381,101 set apart
+            // for a write of one file, 1.9 million memos verified, 2026-11-12). Here, after
+            // the answer, each costs a load a reader and runs nothing.
+            db.storage_mut().settle_changed_set();
+            // No seal pass here yet. `Storage::seal_quiet_groups` exists and is tested, but on
+            // 2026-11-12 its refinement test (`db::tests::sealed::
+            // a_sealed_database_answers_as_an_unsealed_one_under_random_writes`) found three
+            // stale answers in three runs, each from a different hole (a reader missed in a
+            // broken seal; a floor made over an untracked row; a row made after the seal and
+            // missed by the next write's walk). A real build must not answer from a mechanism
+            // its own oracle still breaks, so no build seals until that test has passed with
+            // its case budget raised a hundredfold on a named commit; the pass is then called
+            // here again, once a build, after the settle.
+        }
+        // Asked for by name (a diagnostic, a walk of every row): which rows are of which kind
+        // and the fields that hold a library's rows below `HIGH`, into the daemon's log.
+        if ended && std::env::var_os("BLAZE_DURABILITY_CENSUS").is_some() {
+            crate::serve::said::logged!(INFO,
+                "blaze serve: durability census: {}",
+                db.storage().durability_census()
+            );
         }
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
@@ -375,6 +526,7 @@ impl Release<Crate> {
         let after = Pressure::now();
         if pressed {
             self.squeeze.released(after);
+            SQUEEZED_AT.store(self.squeeze.mark(), Ordering::Relaxed);
         }
         span.record("bodies", dropped.bodies);
         span.record("inference", dropped.inference);

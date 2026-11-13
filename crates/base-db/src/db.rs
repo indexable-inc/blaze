@@ -32,9 +32,8 @@ use triomphe::Arc;
 
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
-    LibraryRoots, LocalRoots, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
+    LibraryRoots, LocalRoots, Looks, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
     ViewError, ViewRoot,
-    editioned_file_id::Parses,
     maintain::{Maintenance, Note, Trigger},
     set_all_crates_with_durability,
 };
@@ -55,8 +54,6 @@ pub struct Db {
     log: Option<std::sync::Arc<EventLog>>,
     /// The maintainers' state and the writes they have yet to see ([`crate::maintain`]).
     pub(crate) maintenance: Maintenance,
-    /// What the files' parses are read from besides parsing.
-    pub(crate) parses: Parses,
 }
 
 /// Where [`Db::run_all`] runs its tasks.
@@ -125,6 +122,22 @@ mod tests;
 
 pub use shared::{Reader, Shared};
 
+/// What a read of an included file gave, in a few words: its length and content, or its error.
+fn read_said(read: &Result<std::sync::Arc<[u8]>, crate::ReadError>) -> String {
+    match read {
+        // alloc: a moved file's event, at most [`MOVED_NAMED`] a reload
+        Ok(bytes) => format!(
+            "{} bytes, content {:?}",
+            bytes.len(),
+            IncludedFile::content_of(Ok(bytes.as_ref()))
+        ),
+        Err(error) => format!("unreadable: {error}"), // alloc: as above
+    }
+}
+
+/// The most moved files one [`Db::reload_included_files`] names in events.
+const MOVED_NAMED: usize = 16;
+
 impl Db {
     /// The database of a build: no crate, no source root, and its batches run as plane tasks
     /// of the process's pool. What the crates above need set before a query runs (proc-macro
@@ -184,7 +197,6 @@ impl Db {
             run,
             log,
             maintenance: Maintenance::default(),
-            parses: Parses::new(crate::trees::installed().cloned()),
         };
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
         crate::settings::set_from_env(&mut db);
@@ -263,11 +275,11 @@ impl Db {
         self.files.file_source_root(self, id)
     }
 
-    /// See [`Files::reload_included_file`].
-    pub fn reload_included_file(&mut self, path: &AbsPath) -> bool {
+    /// See [`Files::reload_included_file`]; `looks` is the list of the build it is read for.
+    pub fn reload_included_file(&mut self, path: &AbsPath, looks: &Looks) -> bool {
         let files = Arc::clone(&self.files);
         self.write("Db::reload_included_file", |db| {
-            let changed = files.reload_included_file(db, path);
+            let changed = files.reload_included_file(db, path, looks);
             if changed && let Some(file) = files.find_included(path) {
                 db.note(Note::Included(file));
                 // The text `include!` parses of it changed with it: a file no module is in.
@@ -294,6 +306,26 @@ impl Db {
         })
     }
 
+    /// The read of the file outside the VFS at `path` set to `bytes`, if any crate read it
+    /// ([`Files::included_file`]): for a file whose bytes are known before they are on disk
+    /// and that was read from disk before then (a file a build script's run left in
+    /// `OUT_DIR`, read by an `include!` resolved before the run). Unlike
+    /// [`Db::set_included_file`] it makes no read of a file nothing read. Whether a read
+    /// changed.
+    pub fn settle_included_file(&mut self, path: &AbsPath, bytes: std::sync::Arc<[u8]>) -> bool {
+        if self.files.find_included(path).is_none() {
+            return false;
+        }
+        // Held from here on: what is read of it is these bytes, not the disk's
+        // ([`IncludedFile::hold`]), under the name the front end has it by and the place it
+        // is on the disk.
+        let content = IncludedFile::content_of(Ok(&bytes[..]));
+        let at: &std::path::Path = path.as_ref();
+        IncludedFile::hold(at, content);
+        IncludedFile::hold(&self.files.on_disk(at), content);
+        self.set_included_file(path, bytes)
+    }
+
     /// Reads again each file outside the VFS that `include_bytes!` or `include_str!` read,
     /// through the one reader that read it first ([`Files::reload_included_file`]), and sets
     /// those whose read moved in one batch named by `trigger`: so exactly their readers run
@@ -302,8 +334,9 @@ impl Db {
     /// reads it reports the error naming the path, as rustc does. The paths set, sorted; when
     /// none moved, nothing is written and no maintenance pass runs. O(the files' bytes), once
     /// per call: for whoever owns the database across changes on disk (a daemon's kept front
-    /// end, each job), as a file outside the VFS can change with no change of the VFS.
-    pub fn reload_included_files(&mut self, trigger: Trigger<'_>) -> Vec<AbsPathBuf> {
+    /// end, each job), as a file outside the VFS can change with no change of the VFS. Each
+    /// look at the disk it makes is pushed to `looks`, the list of the build it is called for.
+    pub fn reload_included_files(&mut self, trigger: Trigger<'_>, looks: &Looks) -> Vec<AbsPathBuf> {
         let files = Arc::clone(&self.files);
         let span = tracing::info_span!(
             target: "blaze",
@@ -317,7 +350,7 @@ impl Db {
         let mut moved: Vec<AbsPathBuf> = files
             .included_paths()
             .inspect(|_| read += 1)
-            .filter(|path| !files.included_is_read(db, path))
+            .filter(|path| !files.included_is_read(db, path, looks))
             .map(|path| path.to_path_buf()) // alloc: a path that moved, the result
             .collect(); // alloc: none unless a file moved; the paths are the result
         span.record("files", read);
@@ -326,8 +359,25 @@ impl Db {
             return moved;
         }
         moved.sort();
+        // Each file that moved is named with what was read of it and what is read now: a
+        // write that every reader of the file runs again for must say which file it was
+        // (rule 19). Bounded: the first [`MOVED_NAMED`] of them, the rest counted.
+        for path in moved.iter().take(MOVED_NAMED) {
+            let path: &AbsPath = path.as_path();
+            let on_disk = files.on_disk(path.as_ref());
+            let was = files.find_included(path).map(|it| read_said(it.read_field(db)));
+            let now = read_said(&IncludedFile::read_now(&on_disk, looks));
+            tracing::info!(
+                target: "blaze",
+                path = %path,
+                on_disk = %on_disk.display(),
+                was = was.as_deref().unwrap_or("never read"),
+                now = %now,
+                "an included file outside the VFS moved on disk"
+            );
+        }
         // Read once more as each is set: one changed back since is not set, nor listed.
-        self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path)));
+        self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path, looks)));
         span.record("moved", moved.len() as u64);
         moved
     }

@@ -1,0 +1,14 @@
+{
+ "id": "owncrate-impls-refused",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor lanes owncrate-impls and refusals2, int-1112",
+ "where": "crates/blaze-item-hash/src/reads.rs Rule::DepCrate; crates/hir-ty/src/next_solver/interner.rs for_each_relevant_impl; crates/blaze-query/src/db/capture.rs unrecorded; crates/hir-ty/src/next_solver/goal_store.rs offer_goal, lookup",
+ "what": "tempo eb3376ba8c: bodies across many crates (build.rs, proc macros, libs; a different set each build) failed with the item store refusing their MIR on Read(\"TraitImpls::in_crate_and_deps_for_trait_and_self_ty\"); twice on Read(\"item_key\").",
+ "cost": "3-7 of 7,909 units failed per build, a different set each time",
+ "cause": "the solver reads the impls of (trait, simplified self type) with the goal's crate, which is the body's own; the classification had a fact for another crate's tables (whole Crate) and none for the own crate's, though lane items' Implements fact is exactly that per (trait, type). Which bodies saw the read raw depended on which body evaluated a goal first (item_key: the goal store's offer hashes facts inside the body's capture).",
+ "class": "a cache key made per crate for other crates and missing for the own one; bookkeeping reads of one cache leaking into another cache's trace in an order-dependent way",
+ "prevention": "every per-(trait, type) impl read is the Implements fact, own crate or loaded; a cache's offer must not record reads into the running query's capture",
+ "workaround": "none",
+ "fix": "reads::implements_read: own or loaded crate's in_crate_and_deps_for_trait_and_self_ty / in_crate_for_trait_and_self_ty -> Implements{trait, self type}, blanket_in_crate_and_deps -> Implements{trait, unsimplified}. Control: reads::planted::SELF_TY_IGNORED. item_key: handed to /tmp/plan/handoff-4a.md (goal_store offer outside the capture). refusals2: blaze_query::db::unrecorded (guard: truncates the edges, restores the frame's durability/changed/summary/dedup state, keeps cycle membership) wraps goal_store's offer; recorded_if drops a lookup miss's reads and keeps a hit's; goal_key computed unrecorded. Tests: blaze-query db::tests::unrecorded (3), hir-ty goal_store a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first (planted: goal_store::planted::RECORDED). Still refused for the own crate: InherentImpls::in_crate_for_self_ty, TraitImpls::for_crate_and_trait, in_crate_trait_value_items, module_items_named, TraitImpls::for_block (design in /tmp/plan/refusals2-next.md).",
+ "state": "written, not compiled"
+}

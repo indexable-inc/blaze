@@ -145,6 +145,7 @@ pub struct Pair {
 /// written and not yet read: the pair's one buffer, sized by its maker and never grown. A
 /// capacity of zero cannot be asked for (it was once raised to one unsaid). The two buffers
 /// are made in the global heap, once, here.
+#[blaze::nonblocking]
 pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
     let capacity = capacity.get();
     let pipe = |lock: &'static str| {
@@ -161,6 +162,9 @@ pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
 
 impl End {
     /// The pair's name.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn pair(&self) -> &'static str {
         self.half.link.name
     }

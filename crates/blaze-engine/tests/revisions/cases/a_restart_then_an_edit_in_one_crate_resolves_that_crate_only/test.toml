@@ -1,0 +1,45 @@
+about = "A restart, then an edit of one function's body in one crate of four: the first build resolves that crate from source (its one file's item tree and no other's) and reads the other three and the standard library from their records; the crates above it are not resolved, since a dependency enters a crate's key by its surface, which a body edit leaves as it was. So a restart's first build is bounded by the crates edited since, not by the workspace. rev3 edits `one` (a leaf `app` uses); rev4, after a kill, edits a file of `two`, below `three` and `app`: `two`'s two files are read and no file of `three`, `one` or `app`. Expected once the lane's pieces are in (the runner's measured numbers replace these): executed under 5,000 a revision, written about 250 and the edited file. The in-process controls (a found record left out, a stale one served) come with the found record and are not written yet."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+redone = []
+
+[[revision]]
+steps = ["stop", "edit"]
+action = "run"
+args = ["-p", "app"]
+prints = "11 6\n"
+redone = ["one::f"]
+max_executed = 5000
+max_written = 400
+max_ran = { file_item_tree = 1, crate_local_def_map = 1 }
+
+[revision.known]
+max_executed = "a restart resolves every workspace crate from source (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"
+max_written = "a restart writes every file of every package of the plan as an input (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
+max_ran = "as max_executed: four crates' item trees and def maps are made, not one's"
+
+[[revision]]
+steps = ["kill", "edit"]
+action = "run"
+args = ["-p", "app"]
+prints = "11 10\n"
+redone = ["two::deep::twice"]
+reused = ["one::f", "one::kept"]
+max_executed = 5000
+max_written = 400
+max_ran = { file_item_tree = 2, crate_local_def_map = 1 }
+
+[revision.known]
+max_executed = "as rev3"
+max_written = "as rev3"
+max_ran = "as rev3"

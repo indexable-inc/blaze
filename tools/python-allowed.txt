@@ -115,6 +115,7 @@ harness/v2/frontend/borrowck_flow.py
 harness/v2/frontend/cases.py
 harness/v2/guards.py
 harness/v2/incraudit.py
+harness/v2/integrate.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
 harness/v2/loop_syscalls.py
@@ -125,6 +126,7 @@ harness/v2/oracle.py
 harness/v2/pins.py
 harness/v2/proof.py
 harness/v2/pure_scripts.py
+harness/v2/ran.py
 harness/v2/reachable.py
 harness/v2/realprojects.py
 harness/v2/report.py

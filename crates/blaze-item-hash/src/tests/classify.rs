@@ -12,7 +12,7 @@ use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
+use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method, rpitit_tys};
 use hir_def::{
     AdtId, DefWithBodyId, HasModule, ImplId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
@@ -98,9 +98,10 @@ fn items_fact(fact: Fact) -> FactRef {
     let (subject, object) = match fact {
         Fact::Method { self_ty, name } => (self_ty.0, FactObject::Id(name.0)),
         Fact::Implements { trait_, self_ty } => (trait_.0, FactObject::Id(self_ty.0)),
-        Fact::Signature(it) | Fact::ConstValue(it) | Fact::AutoTraits(it) => {
-            (it.0, FactObject::None)
-        }
+        Fact::Signature(it)
+        | Fact::ConstValue(it)
+        | Fact::AutoTraits(it)
+        | Fact::RpititTys(it) => (it.0, FactObject::None),
         other => panic!("no test builds a {other:?}"),
     };
     FactRef { kind: fact.kind(), subject, object }
@@ -203,15 +204,41 @@ fn fields_changes_with_a_member_name_and_only_then() {
     ]);
 }
 
-/// Why `Fields` exists: lane items' interface hash names members by place, so it stays when a
-/// member is renamed.
+/// Why `Fields` exists: lane items' signature hash names a trait's and an impl's items by
+/// place (`blaze_items::form`'s `trait_`), so it stays when one is renamed, and a lookup by
+/// name reads the name. A type's fields and variants that hash names itself (`for const` over
+/// them reads `Field::NAME` and `Variant::NAME`: `form`'s `fields`), so a renamed field changes
+/// the type's signature and its `Fields`, which is over that signature.
 #[test]
-fn a_rename_keeps_the_signature_and_changes_the_fields() {
+fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
+    let signature =
+        |db: &Db, name: &str| items_fact(Fact::Signature(key::item_key(db, named(db, name))));
+    let value = |db: &Db, fact: FactRef| {
+        let value = values::value(db, local_crate(db), fact);
+        assert!(value.is_some(), "{fact:?} has no value");
+        value
+    };
+
+    // alloc: test fixtures
+    let (before, after) = (
+        db_of(&format!("{PRELUDE}pub trait T {{ fn m(&self); }} impl T for u8 {{ fn m(&self) {{}} }}")),
+        db_of(&format!("{PRELUDE}pub trait T {{ fn n(&self); }} impl T for u8 {{ fn n(&self) {{}} }}")),
+    );
+    assert_eq!(
+        value(&before, signature(&before, "T")),
+        value(&after, signature(&after, "T")),
+        "a trait's signature names its items by place"
+    );
+    let fields = fields_of("T");
+    assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
+
     let (before, after) =
         (db_of("pub struct S { pub a: u32 }"), db_of("pub struct S { pub b: u32 }"));
-    let signature = |db: &Db| items_fact(Fact::Signature(key::item_key(db, named(db, "S"))));
-    let value = |db: &Db, fact: FactRef| values::value(db, local_crate(db), fact);
-    assert_eq!(value(&before, signature(&before)), value(&after, signature(&after)));
+    assert_ne!(
+        value(&before, signature(&before, "S")),
+        value(&after, signature(&after, "S")),
+        "a type's signature names its fields"
+    );
     let fields = fields_of("S");
     assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
 }
@@ -240,7 +267,47 @@ fn attrs_changes_with_any_flag_the_signature_leaves_out() {
             changes: false,
             of: |db| attrs_of_item(db, "f"),
         },
+        // A layout reads an ADT's `#[repr]` (`AttrFlags::repr_assume_has`) as this fact: one
+        // that changes the integer keeps the flags as they were, and must change the fact.
+        Pair {
+            what: "an enum's #[repr] integer changed",
+            before: "#[repr(u8)] pub enum E { A, B }",
+            after: "#[repr(u16)] pub enum E { A, B }",
+            changes: true,
+            of: |db| attrs_of_item_or_adt(db, "E"),
+        },
+        Pair {
+            what: "a field added under the same #[repr]",
+            before: "#[repr(C)] pub struct S { pub a: u8 }",
+            after: "#[repr(C)] pub struct S { pub a: u8, pub b: u8 }",
+            changes: false,
+            of: |db| attrs_of_item_or_adt(db, "S"),
+        },
     ]);
+}
+
+/// The invariant: the `FieldOrder` fact, which every ADT layout's read of the plan stands
+/// for, is the plan's ID or that there is none: equal for an equal plan, another for another
+/// plan, and back to the first with the plan gone.
+#[test]
+fn the_field_order_fact_changes_with_the_plan_and_only_then() {
+    use hir_ty::layout::field_order::{self, FieldOrderPlan};
+    let mut db = db_of(&format!("{PRELUDE}pub struct S {{ pub a: u32 }}"));
+    let krate = local_crate(&db);
+    let fact = values::field_order();
+    // alloc: a test plan, once per install
+    let plan = |n: u8| Some(Arc::new(FieldOrderPlan::new(ContentId([n; 32]), HashMap::default())));
+    let none = values::value(&db, krate, fact);
+    assert!(none.is_some(), "no plan is a value");
+    field_order::install(&mut db, plan(1));
+    let one = values::value(&db, krate, fact);
+    field_order::install(&mut db, plan(1));
+    assert_eq!(values::value(&db, krate, fact), one, "the same plan again");
+    field_order::install(&mut db, plan(2));
+    let two = values::value(&db, krate, fact);
+    assert!(none != one && one != two && none != two, "{none:?} {one:?} {two:?}");
+    field_order::install(&mut db, None);
+    assert_eq!(values::value(&db, krate, fact), none, "the plan gone");
 }
 
 fn attrs_of_item(db: &Db, name: &str) -> FactRef {
@@ -276,6 +343,16 @@ fn crate_root_changes_with_the_root_and_not_with_a_body() {
 }
 
 /// Lane items' kinds, read through [`values::value`].
+/// An impl method whose type for the trait method's nested `impl Sized` is `<I as It>::Item`,
+/// which the impl of `It` for `I` gives: `u8` here,
+const NESTED_RPITIT_U8: &str = "pub trait It { type Item; } pub struct I; impl It for I { type Item = u8; }\n\
+     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+     pub struct S; impl T for S { fn f(&self) -> I { I } }";
+/// and `u16` here, with nothing else changed.
+const NESTED_RPITIT_U16: &str = "pub trait It { type Item; } pub struct I; impl It for I { type Item = u16; }\n\
+     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+     pub struct S; impl T for S { fn f(&self) -> I { I } }";
+
 #[test]
 fn items_facts_change_through_value() {
     check(&[
@@ -341,16 +418,23 @@ fn items_facts_change_through_value() {
             of: |db| items_fact(auto_traits(db, named(db, "f"), 0)),
         },
         // The impl method's type for the nested `impl Sized` is `<I as It>::Item`, which another
-        // impl gives: nothing its signature names changes, but the type does.
+        // impl gives: nothing its signature names changes, but the type does. The types are
+        // their own fact (`Fact::RpititTys`, what a read of `impl_rpitit_tys` stands for), so
+        // that fact changes,
         Pair {
             what: "the type an impl method gives a nested `impl Trait` changed by another impl",
-            before: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u8; }\n\
-                     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
-                     pub struct S; impl T for S { fn f(&self) -> I { I } }",
-            after: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u16; }\n\
-                    pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
-                    pub struct S; impl T for S { fn f(&self) -> I { I } }",
+            before: NESTED_RPITIT_U8,
+            after: NESTED_RPITIT_U16,
             changes: true,
+            of: |db| items_fact(rpitit_tys(db, impl_method(db, "f"))),
+        },
+        // and the method's signature, which holds none of them (it is read while they are
+        // found), does not.
+        Pair {
+            what: "the same change, asked of the impl method's signature",
+            before: NESTED_RPITIT_U8,
+            after: NESTED_RPITIT_U16,
+            changes: false,
             of: |db| {
                 items_fact(Fact::Signature(key::item_key(
                     db,
@@ -417,7 +501,7 @@ fn the_covered_reads_are_the_identitys() {
     let mut ours: Vec<(&str, Key)> = RULES
         .iter()
         .filter_map(|&(name, _, rule)| match rule {
-            Rule::Names => Some((name, Key::Any)),
+            Rule::Names | Rule::TraitsInScope => Some((name, Key::Any)),
             Rule::OwnBody | Rule::OwnStore => Some((name, Key::OwnBody)),
             Rule::CrateInput | Rule::OwnCrate(_) => Some((name, Key::OwnCrate)),
             _ => None,
@@ -485,34 +569,12 @@ pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 /// out of the store; it is never a wrong answer. Each is to be made a fact or covered by the
 /// request named, never by widening a rule here.
 const REFUSALS: &[(&str, &str)] = &[
-    // Tables of the body's own crate: another crate's are its `Crate` fact, but no fact lists
-    // the own crate's impls or traits.
-    ("InherentImpls::in_crate_for_self_ty", "the own crate's impls"),
-    ("TraitImpls::in_crate_and_deps_for_trait_and_self_ty", "the own crate's impls"),
-    ("TraitImpls::in_crate_for_trait_and_self_ty", "the own crate's impls"),
-    ("TraitImpls::blanket_in_crate_and_deps", "the own crate's impls"),
-    ("TraitImpls::for_crate_and_trait", "the own crate's impls"),
-    ("in_crate_trait_value_items", "the own crate's traits"),
-    ("module_items_named", "the items of the traits in scope of an own module"),
-    ("InherentImpls::in_block_for_self_ty", "a block's impls: no fact yet"),
     ("closure_exprs", "read for another body's closures"),
-    // Of a type or a goal in an environment: no fact names one.
-    ("lookup_impl_method_stored", "a method's impl, selected in an environment"),
-    ("layout_of_ty_query", "a type's layout in an environment"),
-    ("layout_of_adt_query", "an ADT's layout for its arguments in an environment"),
-    ("is_copy_query", "a type in an environment"),
-    ("drop_glue_query", "a type in an environment"),
-    ("prove_query", "a goal in an environment"),
-    ("normalize_query", "a type in an environment"),
-    ("auto_trait_depth", "an ADT's auto trait, for a crate"),
-    ("copy_clone_impl", "an ADT's Copy or Clone impl, for a crate"),
     // A const's value, a leak the signature hash marks (design section 4): `ConstValue` names
     // a const evaluated as itself only.
     ("const_eval_query", "a const with arguments or an environment"),
     ("anon_const_eval", "an anonymous const: ConstValue names none"),
-    // Keyed by a block of another body or a whole-crate walk: no fact names them.
-    ("TraitImpls::for_block", "a block's impls: no fact yet"),
-    ("InherentImpls::for_block", "a block's impls: no fact yet"),
+    // A whole-crate walk: no fact names it.
     ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
     ("modules", "a walk of every module of a published crate (DefMap::table)"),
     // Positions: the identity has no spans.
@@ -529,6 +591,17 @@ const REFUSALS: &[(&str, &str)] = &[
 /// classification kept.
 struct Probe {
     seen: Lock<Vec<Seen>>,
+    /// Answer a refused read as covered, so the store walks on past it and keeps the step
+    /// (what was seen still records the read as refused). The store's walk stops at the first
+    /// refused read, so a test of what the reads after one stand for needs this; a test of
+    /// what is refused never sets it.
+    answer_refused: bool,
+}
+
+impl Probe {
+    fn new(answer_refused: bool) -> Probe {
+        Probe { seen: Lock::new("test.itemhash.seen", Vec::new()), answer_refused }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -562,7 +635,10 @@ impl BodyFacts for Probe {
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
         self.seen.lock().push(Seen { def, step, read, kind, name, class });
-        class
+        match class {
+            Classified::Refused if self.answer_refused => Classified::Covered,
+            _ => class,
+        }
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
@@ -617,7 +693,7 @@ fn steps_seen() -> (Db, Vec<Seen>) {
 
 /// [`steps_seen`] of every body of `db`'s local crate.
 fn steps_seen_in(db: Db) -> (Db, Vec<Seen>) {
-    let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
+    let probe = Arc::new(Probe::new(false));
     let installed = body_store::install(
         &db,
         Arc::new(Memory::default()),
@@ -799,29 +875,54 @@ pub fn concrete() -> Option<u32> { let _ = 5u32.make(); <(u32,) as List>::valtyp
     assert!(flushed.written > 0, "no goal was stored: {flushed:?}");
 }
 
-/// A read keyed by several arguments (request 00827) is the fact of what its first names: a
-/// crate's table its `Crate` fact, refused for the body's own; an impl's or trait's item of a
-/// name its `Fields`; a const evaluated as itself its `ConstValue`.
+/// A read keyed by several arguments (request 00827) is the fact of what its first names: of
+/// the body's crate or one it loads, the fact per item of what it lists (`Implements` for the
+/// impls of one trait for one type or the blanket ones, `InherentImpls`, `TraitImpls`,
+/// `TraitsNamed`), a module's traits in scope by name `ScopeTraitsNamed`, another crate's
+/// table its `Crate` fact, never the body's own crate's, and never refused; an impl's or
+/// trait's item of a name its `Fields`; a const evaluated as itself its `ConstValue`.
 #[test]
 fn several_argument_reads_are_facts_of_their_first() {
+    use blaze_items::kinds as items;
     let (db, seen) = steps_seen();
     let mut facts = 0;
     for it in &seen {
         let want = match reads::rule_of(&db, it.read, it.name) {
-            Some(Rule::DepCrate(_)) => blaze_items::kinds::CRATE,
+            Some(Rule::DepCrate(_)) => items::CRATE,
             Some(Rule::FieldNamed(_)) => kinds::FIELDS,
-            Some(Rule::ConstEval) => blaze_items::kinds::CONST_VALUE,
+            Some(Rule::ConstEval) => items::CONST_VALUE,
             _ => continue,
         };
+        let per_item =
+            [items::INHERENT_IMPLS, items::TRAIT_IMPLS, items::TRAITS_NAMED, items::SCOPE_TRAITS_NAMED];
         match it.class {
+            Classified::Fact(fact) if fact.kind == items::IMPLEMENTS => {
+                assert_eq!(want, items::CRATE, "{}: Implements", it.name);
+                assert!(matches!(fact.object, FactObject::Id(_)), "{}: {fact:?}", it.name);
+                facts += 1;
+            }
+            Classified::Fact(fact) if per_item.contains(&fact.kind) => {
+                assert_eq!(want, items::CRATE, "{}: {fact:?} of a crate's table", it.name);
+                let object = matches!(fact.object, FactObject::Id(_));
+                let scoped = fact.kind == items::SCOPE_TRAITS_NAMED;
+                assert_eq!(object, scoped, "{}: {fact:?}", it.name);
+                facts += 1;
+            }
             Classified::Fact(fact) => {
                 assert_eq!(fact.kind, want, "{}", it.name);
                 let own = key::crate_key(&db, it.def.krate(&db));
-                assert!(want != blaze_items::kinds::CRATE || fact.subject != own, "{}", it.name);
+                assert!(want != items::CRATE || fact.subject != own, "{}", it.name);
                 facts += 1;
             }
-            Classified::Refused => assert_ne!(want, kinds::FIELDS, "{}: refused", it.name),
+            Classified::Refused => {
+                assert_ne!(want, kinds::FIELDS, "{}: refused", it.name);
+                assert_ne!(want, items::CRATE, "{}: a crate's table refused", it.name);
+            }
             Classified::Covered => panic!("{}: covered", it.name),
+            // Only the name-facts classification makes a scan; these reads are of other rules.
+            Classified::Scan(_) => panic!("{}: a scan", it.name),
+            // A read through is never handed to a store's facts as a read of its own.
+            Classified::Through => panic!("{}: read through", it.name),
         }
     }
     assert!(facts > 0, "no read of the steps by several arguments is a fact");
@@ -844,6 +945,9 @@ fn own_earlier_steps_are_step_facts() {
             }
             Classified::Refused => {}
             Classified::Covered => panic!("{}: covered", it.name),
+            Classified::Scan(_) => panic!("{}: a scan", it.name),
+            // A read through is never handed to a store's facts as a read of its own.
+            Classified::Through => panic!("{}: read through", it.name),
         }
     }
     assert!(infer && mir, "no MIR read of inference ({infer}) or borrow check read of MIR ({mir})");
@@ -940,7 +1044,7 @@ fn alike_bodies_list_one_shape(
                 .filter(|it| it.def == def && it.step == step)
                 .filter_map(|it| match it.class {
                     Classified::Fact(fact) => Some(listed(def, fact)),
-                    Classified::Covered | Classified::Refused => None,
+                    Classified::Covered | Classified::Refused | Classified::Scan(_) | Classified::Through => None,
                 })
                 .collect();
             facts.sort_unstable();
@@ -997,4 +1101,754 @@ fn the_oracle_catches_a_shape_that_names_its_own_body_by_key() {
             .expect_err("each body's key is its own");
         assert!(why.contains("one identity and two shapes of their"), "{why}");
     }
+}
+
+fn root_of(db: &Db) -> hir_def::ModuleId {
+    hir_def::nameres::crate_def_map(db, local_crate(db)).root
+}
+
+fn name_in_root(name: &'static str) -> impl Fn(&Db) -> FactRef {
+    move |db| values::resolves(db, root_of(db), &hir_expand::name::Name::new_root(name))
+}
+
+/// A name a body looked up and did not find is the `Resolves` fact with the value "nothing":
+/// an item that later supplies the name changes it, another item does not. The control is
+/// the third pair: were an absent name no fact (or one without a value), `check` would fail
+/// on "the fact has no value before".
+#[test]
+fn a_name_fact_changes_when_the_name_is_supplied_or_shadowed_and_only_then() {
+    check(&[
+        Pair {
+            what: "an absent name supplied",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 1 }\npub fn g() {}",
+            changes: true,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "an absent name, another item added",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 1 }\npub fn h() {}",
+            changes: false,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "a glob's name shadowed by an item",
+            before: "mod m { pub fn g() {} }\npub use m::*;\npub fn f() { g() }",
+            after: "mod m { pub fn g() {} }\npub use m::*;\npub fn g() {}\npub fn f() { g() }",
+            changes: true,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "a found name, its body edited",
+            before: "pub fn g() -> u8 { 1 }",
+            after: "pub fn g() -> u8 { 2 }",
+            changes: false,
+            of: |db| name_in_root("g")(db),
+        },
+    ]);
+}
+
+#[test]
+fn scope_and_crate_name_facts_change_with_what_they_hold_and_only_then() {
+    check(&[
+        Pair {
+            what: "a trait brought into scope",
+            before: "mod m { pub trait T {} }\npub fn f() {}",
+            after: "mod m { pub trait T {} }\nuse m::T;\npub fn f() {}",
+            changes: true,
+            of: |db| values::traits_in_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a function added, the traits in scope",
+            before: "pub trait T {}\npub fn f() {}",
+            after: "pub trait T {}\npub fn f() {}\npub fn g() {}",
+            changes: false,
+            of: |db| values::traits_in_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a function added, the whole scope",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\npub fn g() {}",
+            changes: true,
+            of: |db| values::whole_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a body edited, the whole scope",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 2 }",
+            changes: false,
+            of: |db| values::whole_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "an item added, the crate's names",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\npub struct New;",
+            changes: false,
+            of: |db| values::crate_names(db, local_crate(db)),
+        },
+        Pair {
+            what: "a primitive type shadowed, the crate's names",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\n#[allow(non_camel_case_types)]\npub struct u8;",
+            changes: true,
+            of: |db| values::crate_names(db, local_crate(db)),
+        },
+    ]);
+}
+
+/// Under `Names::Facts` every read of a row of name resolution the steps make is a fact with
+/// a value now, or a handle; none is refused and none is covered that `name_read` does not
+/// call a handle. The control: under `Names::Identity` the same reads are all covered
+/// (`names_rules_are_covered_for_any_key`), so a `classify_with` that ignored its switch
+/// fails here on the first name looked up.
+#[test]
+fn recorded_names_are_facts_with_values_or_handles() {
+    use hir_def::nameres::{NameRead, name_read};
+    let (db, seen) = steps_seen();
+    let (mut names, mut handles) = (0usize, 0usize);
+    for it in &seen {
+        let rule = reads::rule_of(&db, it.read, it.name);
+        if !matches!(rule, Some(Rule::Names | Rule::TraitsInScope)) {
+            continue;
+        }
+        let names_as = reads::Names::Facts;
+        let class =
+            reads::classify_with(&db, it.def, it.step, it.read, it.kind, it.name, names_as);
+        let read = name_read(&db, it.read, it.kind);
+        match class {
+            Classified::Covered => {
+                assert_eq!(read, Some(NameRead::Handle), "{}: covered, not a handle", it.name);
+                handles += 1;
+            }
+            Classified::Fact(fact) | Classified::Scan(fact) => {
+                assert!(
+                    values::value_in(&db, it.def, fact).is_some(),
+                    "{}: {fact:?} has no value",
+                    it.name
+                );
+                names += usize::from(fact.kind == blaze_items::kinds::RESOLVES);
+            }
+            Classified::Refused => panic!("{}: refused ({read:?})", it.name),
+            Classified::Through => panic!("{}: a name read read through ({read:?})", it.name),
+        }
+    }
+    assert!(names > 0 && handles > 0, "{names} name facts, {handles} handles");
+}
+
+/// Both shapes tempo's refused bodies have: a `main` that deserializes a local type whose impl
+/// a derive writes inside `const _: () = { .. };` (serde's), through a generic container, and
+/// a local `impl Trait for Local` that a method call of the same crate needs (syn's `Parse`).
+/// `Entry` has two impls of `De` (`De<u8>`, `De<u16>`), both of one simplified self type, so a
+/// third added or one removed is an edit of the impls of that (trait, type) and nothing else.
+const OWN_IMPLS: &str = r#"
+pub trait De<M> { fn de() -> Self; }
+pub struct Map<K, V> { pub k: K, pub v: V }
+pub struct Entry { pub a: u32 }
+const _: () = {
+    impl De<u8> for Entry { fn de() -> Entry { Entry { a: 1 } } }
+};
+impl De<u8> for u32 { fn de() -> u32 { 0 } }
+impl<K: De<u8>, V: De<u8>> De<u8> for Map<K, V> { fn de() -> Self { Map { k: K::de(), v: V::de() } } }
+pub fn from_str<T: De<u8>>() -> T { T::de() }
+pub fn main() { let e = from_str::<Entry>(); let m = from_str::<Map<u32, Entry>>(); let _ = (e.a, m.v.a); }
+pub trait Parse { fn parse(n: u32) -> Self; }
+pub struct Config { pub n: u32 }
+impl Parse for Config { fn parse(n: u32) -> Config { Config { n } } }
+pub trait Input { fn take<T: Parse>(&self) -> T; }
+impl Input for u32 { fn take<T: Parse>(&self) -> T { T::parse(*self) } }
+pub fn reads(s: u32) -> u32 { let c = s.take::<Config>(); c.n }
+impl Config { pub fn get(&self) -> u32 { self.n } }
+pub fn inherent(c: &Config) -> u32 { c.get() }
+pub fn local() -> u32 { struct L; impl L { fn v(&self) -> u32 { 1 } } L.v() }
+pub fn outer() -> u32 {
+    struct K;
+    impl K { fn w(&self) -> u32 { 2 } }
+    fn inner() -> u32 { K.w() }
+    inner()
+}
+"#;
+
+/// [`OWN_IMPLS`] with one more impl of `De` for `Entry`.
+const OWN_IMPLS_ADDED: &str = "impl De<u16> for Entry { fn de() -> Entry { Entry { a: 2 } } }\n";
+
+/// The reads of the own crate's impl tables of one trait for one type (or its blanket impls)
+/// that the steps of `body` made, with what each was classified as.
+fn own_impl_reads(db: &Db, seen: &[Seen], body: &str) -> Vec<(Classified, Option<SimplifiedType<SolverDefId<'static>>>)> {
+    let ItemId::Function(f) = named(db, body) else { panic!("`{body}` is no function") };
+    let def = DefWithBodyId::FunctionId(f);
+    let names = [
+        "TraitImpls::in_crate_and_deps_for_trait_and_self_ty",
+        "TraitImpls::in_crate_for_trait_and_self_ty",
+        "TraitImpls::blanket_in_crate_and_deps",
+    ];
+    seen.iter()
+        .filter(|it| it.def == def && names.iter().any(|name| reads::cmp_listed(name, it.name).is_eq()))
+        .map(|it| {
+            let self_ty = hir_ty::method_resolution::TraitImpls_in_crate_and_deps_for_trait_and_self_ty::arguments(
+                db,
+                it.read.key_index(),
+            )
+            .filter(|(krate, _, _)| *krate == local_crate(db))
+            .map(|(_, _, it)| erase(it.0));
+            (it.class, self_ty)
+        })
+        .collect() // alloc: test
+}
+
+/// A simplified type with its def's lifetime dropped, to compare across a test's databases'
+/// borrows: only `Adt` is asked for here.
+fn erase(ty: SimplifiedType<SolverDefId<'_>>) -> SimplifiedType<SolverDefId<'static>> {
+    match ty {
+        SimplifiedType::Adt(SolverDefId::AdtId(adt)) => adt_type(adt),
+        _ => SimplifiedType::Placeholder,
+    }
+}
+
+/// The orders the bodies' steps are asked in: whichever body runs a goal or a table read first
+/// changes which memos the next one finds.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    Forward,
+    Reversed,
+    /// The odd positions forward, then the even ones backward: neither of the others for three
+    /// bodies or more.
+    Shuffled,
+}
+
+/// The bodies of `db`'s local crate, and those of the items declared in their blocks, in
+/// `order`.
+fn bodies_in(db: &Db, order: Order) -> Vec<DefWithBodyId> {
+    let mut bodies: Vec<DefWithBodyId> = Vec::new(); // alloc: test
+    for &def in crate_body_owners(db, local_crate(db)).iter() {
+        bodies.push(def);
+        bodies.extend(hir_def::nameres::demand::body_blocks(db, def).owners.iter().copied());
+    }
+    let n = bodies.len();
+    match order {
+        Order::Forward => {}
+        Order::Reversed => bodies.reverse(),
+        Order::Shuffled => {
+            let at: Vec<usize> = (1..n).step_by(2).chain((0..n).step_by(2).rev()).collect(); // alloc: test
+            bodies = at.iter().map(|&i| bodies[i]).collect(); // alloc: test
+        }
+    }
+    bodies
+}
+
+/// [`steps_seen_in`] with the goal store installed too and the bodies asked in `order`: every
+/// body's inference, then every MIR, then every borrow check.
+fn steps_seen_ordered(db: Db, order: Order) -> (Db, Vec<Seen>) {
+    steps_seen_ordered_with(db, order, false)
+}
+
+/// [`steps_seen_ordered`] with the probe answering a refused read as covered where
+/// `answer_refused` ([`Probe::answer_refused`]).
+fn steps_seen_ordered_with(db: Db, order: Order, answer_refused: bool) -> (Db, Vec<Seen>) {
+    let probe = Arc::new(Probe::new(answer_refused));
+    let goals = hir_ty::next_solver::goal_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        Arc::new(blaze_items::goals::Goals),
+        ContentId([7; 32]),
+    )
+    .expect("a goal store for the test database");
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    let bodies = bodies_in(&db, order);
+    for &def in &bodies {
+        let _ = InferenceResult::of(&db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(&db, def);
+    }
+    installed.flush().expect("the test store flushes");
+    drop(installed);
+    goals.flush().expect("the test goal store flushes");
+    drop(goals);
+    let seen = std::mem::take(&mut *probe.seen.lock());
+    (db, seen)
+}
+
+/// One body's step as a trace: the body by its item's path (its id is one database's), the
+/// step, the sorted distinct (ingredient, class) of its reads, and whether it is stored (none
+/// refused).
+type Trace = (String, Step, Vec<(&'static str, String)>, bool);
+
+/// The traces of `seen`, sorted by body and step.
+fn traces(db: &Db, seen: &[Seen]) -> Vec<Trace> {
+    let mut by_step: Vec<((String, Step), (&'static str, String))> = seen // alloc: test
+        .iter()
+        .map(|it| {
+            let path = key::path(db, ItemId::of_body(db, it.def)); // alloc: test
+            ((path, it.step), (it.name, format!("{:?}", it.class))) // alloc: test
+        })
+        .collect();
+    by_step.sort_unstable();
+    by_step.dedup();
+    let mut out: Vec<Trace> = Vec::new(); // alloc: test
+    for ((path, step), read) in by_step {
+        let same = out.last().is_some_and(|(at, then, _, _)| *at == path && *then == step);
+        match out.last_mut() {
+            Some((_, _, reads, _)) if same => reads.push(read),
+            _ => out.push((path, step, vec![read], true)), // alloc: test
+        }
+    }
+    for (_, _, reads, stored) in &mut out {
+        *stored = !reads.iter().any(|(_, class)| class == "Refused");
+    }
+    out
+}
+
+/// The listing facts a read of the own crate's tables stands for.
+const LISTINGS: [blaze_query::QueryKind; 5] = [
+    blaze_items::kinds::INHERENT_IMPLS,
+    blaze_items::kinds::TRAIT_IMPLS,
+    blaze_items::kinds::TRAITS_NAMED,
+    blaze_items::kinds::SCOPE_TRAITS_NAMED,
+    blaze_items::kinds::BLOCK_IMPLS,
+];
+
+/// The reads this lane made facts: none of them is refused any more.
+const OWN_TABLES: [&str; 9] = [
+    "InherentImpls::in_crate_for_self_ty",
+    "TraitImpls::for_crate_and_trait",
+    "in_crate_trait_value_items",
+    "module_items_named",
+    "TraitImpls::for_block",
+    "InherentImpls::for_block",
+    "InherentImpls::in_block_for_self_ty",
+    "TraitImpls::in_block_for_trait_and_self_ty",
+    "TraitImpls::blanket_in_crate_and_deps",
+];
+
+/// The invariant: a body's step whose reads include its own crate's tables (the impls of one
+/// trait for one type or of its blanket ones, the inherent impls of a type, a trait's impls,
+/// the traits with an item of a name, a module's traits in scope by name, a block's impls) is
+/// not kept out by them: each is a fact with a value, never refused, and every body's trace,
+/// and whether its step is stored, is byte for byte the same whichever order the bodies ran
+/// in, with the goal store solving goals for whichever ran first.
+#[test]
+fn own_crate_impls_are_the_same_in_any_order() {
+    let mut by_order: Vec<Vec<Trace>> = Vec::new(); // alloc: test
+    for order in [Order::Forward, Order::Reversed, Order::Shuffled] {
+        let db = db_of(&format!("{PRELUDE}{OWN_IMPLS}"));
+        let (db, seen) = steps_seen_ordered(db, order);
+        for body in ["main", "reads"] {
+            let found = own_impl_reads(&db, &seen, body);
+            assert!(
+                found.iter().any(|(_, self_ty)| self_ty.is_some()),
+                "`{body}` read no own-crate impls of a trait for a type: the fixture misses the path"
+            );
+            for (class, _) in &found {
+                let Classified::Fact(fact) = class else {
+                    panic!("`{body}` ({order:?}): an own-crate impl read is {class:?}")
+                };
+                assert_eq!(fact.kind, blaze_items::kinds::IMPLEMENTS, "`{body}`: {fact:?}");
+                assert!(values::value(&db, local_crate(&db), *fact).is_some(), "`{body}`: {fact:?} has a value");
+            }
+        }
+        let mut listings = 0;
+        for it in &seen {
+            if OWN_TABLES.iter().any(|name| reads::cmp_listed(name, it.name).is_eq()) {
+                assert_ne!(it.class, Classified::Refused, "{order:?}: {} of {:?} refused", it.name, it.def);
+            }
+            let Classified::Fact(fact) = it.class else { continue };
+            if LISTINGS.contains(&fact.kind) {
+                let value = values::value_in(&db, it.def, fact);
+                assert!(value.is_some(), "{order:?}: {} as {fact:?} has no value", it.name);
+                listings += 1;
+            }
+        }
+        assert!(listings > 0, "{order:?}: no read of the own crate's tables: the fixture misses the path");
+        by_order.push(traces(&db, &seen));
+    }
+    assert_eq!(by_order[0], by_order[1], "the traces depend on the order (forward, reversed)");
+    assert_eq!(by_order[0], by_order[2], "the traces depend on the order (forward, shuffled)");
+}
+
+/// Whether the `Implements` fact `main`'s read of the impls of `De` for `Entry` stands for has
+/// another value once an impl of `De` for `Entry` is added: the key of `main`'s steps, which
+/// lists that fact's value, must change; removing it is the same pair the other way round.
+fn own_impl_fact_moves_with_an_added_impl() -> bool {
+    let value_in = |source: String| {
+        let (db, seen) = steps_seen_in(db_of(&source));
+        let ItemId::Adt(entry) = named(&db, "Entry") else { panic!("`Entry` is no ADT") };
+        let fact = own_impl_reads(&db, &seen, "main")
+            .into_iter()
+            .find_map(|(class, self_ty)| match class {
+                Classified::Fact(fact) if self_ty == Some(adt_type(entry)) => Some(fact),
+                _ => None,
+            })
+            .expect("`main` reads the own crate's impls of `De` for `Entry` as a fact");
+        values::value(&db, local_crate(&db), fact).expect("the fact has a value")
+    };
+    let before = value_in(format!("{PRELUDE}{OWN_IMPLS}"));
+    let after = value_in(format!("{PRELUDE}{OWN_IMPLS}{OWN_IMPLS_ADDED}"));
+    before != after
+}
+
+/// The invariant: an impl of the trait for the type added to (or removed from) the body's own
+/// crate changes the fact its read of those impls stands for, so its step's key.
+#[test]
+fn an_added_own_crate_impl_changes_the_implements_fact() {
+    assert!(own_impl_fact_moves_with_an_added_impl(), "an added impl left the fact as it was");
+}
+
+/// The control: with the planted bug (the read stands for the trait's blanket impls alone, so
+/// its value ignores an impl for the type), the oracle above sees no change.
+#[test]
+fn the_oracle_catches_an_implements_fact_that_ignores_an_added_impl() {
+    reads::planted::SELF_TY_IGNORED.set(true);
+    let moved = own_impl_fact_moves_with_an_added_impl();
+    reads::planted::SELF_TY_IGNORED.set(false);
+    assert!(!moved, "the planted bug went unseen: the fact moved with the type's impls ignored");
+}
+
+/// Bodies whose borrow checks read the solver queries the borrow check asks in an
+/// environment of its own: `moves` moves a value of a type that is not `Copy`
+/// (`is_copy_query`), `promoted` borrows a const for `'static` (`drop_glue_query`, whether
+/// the const may be promoted), `copies` copies a generic ADT whose `Copy` impl has a where
+/// clause (`prove_query`), and `item` names an associated type in its signature and in an
+/// annotated `let` (`normalize_query`). `other` is read by none.
+const SOLVER_QUERIES: &str = r#"
+//- minicore: sized, copy, clone, add, send, sync, drop
+pub trait Marker {}
+impl Marker for u8 {}
+pub struct W<T>(pub T);
+pub fn moves(w: W<u16>) -> W<u16> { let v = w; v }
+pub struct D { pub a: u8 }
+pub const DC: D = D { a: 1 };
+pub fn promoted() -> &'static D { &DC }
+pub struct G<T>(pub T);
+impl<T: Copy> Clone for G<T> { fn clone(&self) -> G<T> { *self } }
+impl<T: Copy> Copy for G<T> {}
+pub fn copies(g: G<u8>) -> (G<u8>, G<u8>) { (g, g) }
+pub trait It { type Item; }
+pub struct I;
+impl It for I { type Item = u8; }
+pub fn item(x: <I as It>::Item) -> <I as It>::Item { let y: <I as It>::Item = x; y }
+pub fn other() -> u8 { 1 }
+"#;
+
+/// A change a query sees, made to [`SOLVER_QUERIES`]: the body whose borrow check reads the
+/// query, the query, the change, and whether it changes nothing else that body's steps
+/// read (its identity, its inference and its MIR stay as they were), so only the query's
+/// facts can tell the old trace from the new program.
+struct SeenChange {
+    body: &'static str,
+    query: &'static str,
+    change: fn(&str) -> String,
+    isolating: bool,
+}
+
+const SEEN_CHANGES: [SeenChange; 5] = [
+    // A new `impl Copy` for the moved type's shape: `W<u16>` stays not `Copy`, but the impls
+    // of `Copy` for `W` the goal read are others.
+    SeenChange {
+        body: "moves",
+        query: "is_copy_query",
+        change: |source| {
+            format!(
+                "{source}impl Clone for W<u8> {{ fn clone(&self) -> W<u8> {{ W(self.0) }} }}\nimpl Copy for W<u8> {{}}\n"
+            )
+        },
+        isolating: true,
+    },
+    // A new `Drop` impl for the promoted const's type: the borrow is no longer promotable.
+    SeenChange {
+        body: "promoted",
+        query: "drop_glue_query",
+        change: |source| format!("{source}impl Drop for D {{ fn drop(&mut self) {{}} }}\n"),
+        isolating: true,
+    },
+    // A where clause on the impl that proves `G<u8>: Copy`: it still holds, by other means.
+    SeenChange {
+        body: "copies",
+        query: "prove_query",
+        change: |source| {
+            source.replace("impl<T: Copy> Copy for G<T>", "impl<T: Copy + Marker> Copy for G<T>")
+        },
+        isolating: true,
+    },
+    // A where clause on the impl that gives the associated type.
+    SeenChange {
+        body: "item",
+        query: "normalize_query",
+        change: |source| source.replace("impl It for I {", "impl It for I where u8: Marker {"),
+        isolating: true,
+    },
+    // The associated type itself, which inference sees too.
+    SeenChange {
+        body: "item",
+        query: "normalize_query",
+        change: |source| source.replace("type Item = u8;", "type Item = u16;"),
+        isolating: false,
+    },
+];
+
+/// A change no query of [`SOLVER_QUERIES`]' bodies sees: another body's edit.
+fn unseen_change(source: &str) -> String {
+    source.replace("pub fn other() -> u8 { 1 }", "pub fn other() -> u8 { 2 }")
+}
+
+/// Runs inference, MIR building and the borrow check of every body of `db`'s local crate with
+/// an item store installed whose probe answers refused reads as `answer_refused` says, flushes
+/// it, and gives what was seen to `then` while the store is still installed (a step fact's
+/// value is read through it).
+fn with_steps_run<R>(db: &Db, answer_refused: bool, then: impl FnOnce(&[Seen]) -> R) -> R {
+    let probe = Arc::new(Probe::new(answer_refused));
+    let installed = body_store::install(
+        db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    let bodies = crate_body_owners(db, local_crate(db));
+    for &def in &bodies {
+        let _ = InferenceResult::of(db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(db, def);
+    }
+    installed.flush().expect("the test store flushes");
+    let seen = std::mem::take(&mut *probe.seen.lock());
+    let out = then(&seen);
+    drop(installed);
+    out
+}
+
+/// A borrow check's trace as the store keeps it: the body by name, its identity, and each fact
+/// its reads stand for (through the rows read through) with the value it had.
+struct KeptTrace {
+    body: &'static str,
+    identity: ContentId,
+    facts: Vec<(FactRef, Option<ContentId>)>,
+    /// The queries the trace read through.
+    through: Vec<&'static str>,
+}
+
+/// `body`'s borrow-check trace in `source`. Refused reads are answered as covered, so the
+/// trace holds every fact its reads stand for even where one read (a source map's
+/// positions) keeps it out of a real store; what is compared here is what the facts see.
+fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, body);
+    let identity = crate::identity::identity(&db, def)
+        .unwrap_or_else(|it| panic!("`{body}` has no identity: {it:?}"));
+    with_steps_run(&db, true, |seen| {
+        let mut facts: Vec<(FactRef, Option<ContentId>)> = Vec::new(); // alloc: test
+        let mut through: Vec<&'static str> = Vec::new(); // alloc: test
+        for it in seen.iter().filter(|it| it.def == def && it.step == Step::Borrowck) {
+            match it.class {
+                Classified::Fact(fact) | Classified::Scan(fact) => {
+                    facts.push((fact, values::value_in(&db, def, fact)));
+                }
+                Classified::Through => through.push(it.name),
+                Classified::Covered | Classified::Refused => {}
+            }
+        }
+        assert!(!facts.is_empty(), "`{body}`'s borrow check read no fact: it did not run");
+        facts.sort_unstable();
+        facts.dedup();
+        through.sort_unstable();
+        through.dedup();
+        KeptTrace { body, identity, facts, through }
+    })
+}
+
+/// Whether `kept` would be reused in `source`: its body's identity is the same and every fact
+/// it lists has the value it had (the store's hit check, `hir_ty::body_store`).
+fn reused(kept: &KeptTrace, source: &str) -> bool {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, kept.body);
+    let probe = Arc::new(Probe::new(false));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe,
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the changed database");
+    let same = crate::identity::identity(&db, def).ok() == Some(kept.identity)
+        && kept.facts.iter().all(|&(fact, value)| values::value_in(&db, def, fact) == value);
+    drop(installed);
+    same
+}
+
+/// What of `kept` tells it apart in `source`: its identity, and each fact whose value is
+/// another there. Empty where [`reused`] holds.
+fn seen_by(kept: &KeptTrace, source: &str) -> Vec<String> {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, kept.body);
+    let probe = Arc::new(Probe::new(false));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe,
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the changed database");
+    let mut seen: Vec<String> = Vec::new(); // alloc: test
+    if crate::identity::identity(&db, def).ok() != Some(kept.identity) {
+        seen.push(String::from("the body's identity")); // alloc: test
+    }
+    for &(fact, value) in &kept.facts {
+        if values::value_in(&db, def, fact) != value {
+            seen.push(format!("{fact:?}")); // alloc: test
+        }
+    }
+    drop(installed);
+    seen
+}
+
+/// Each body of [`SOLVER_QUERIES`] reads its query through, never refused, and every fact
+/// below it has a value.
+#[test]
+fn the_borrow_checks_solver_queries_are_read_through() {
+    for case in &SEEN_CHANGES {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        assert!(
+            kept.through.iter().any(|&name| reads::cmp_listed(case.query, name).is_eq()),
+            "`{}`'s borrow check did not read `{}` through (read through: {:?}): the fixture misses the path",
+            case.body,
+            case.query,
+            kept.through,
+        );
+        for (fact, value) in &kept.facts {
+            assert!(value.is_some(), "`{}`: {fact:?} has no value", case.body);
+        }
+    }
+}
+
+/// Clean bodies, each with what lowering makes the source does not write (a `for` loop's
+/// iterator calls, `?`'s branch, a closure, `let else`, a destructuring assignment): every
+/// one a store would keep the borrow check's verdict of.
+const CLEAN_BODIES: &str = r#"
+//- minicore: sized, copy, clone, add, iterator, range, try, option, result, fn
+pub struct P { pub x: u32, pub y: u32 }
+pub fn plain(n: u32) -> u32 { let m = n + 1; m }
+pub fn loops(n: u32) -> u32 { let mut t = 0; for i in 0..n { t = t + i; } t }
+pub fn question(o: Option<u32>) -> Option<u32> { let v = o?; Some(v + 1) }
+pub fn closures(n: u32) -> u32 { let f = |x: u32| x + n; f(1) }
+pub fn let_else(o: Option<u32>) -> u32 { let Some(v) = o else { return 0; }; v }
+pub fn swaps(p: &mut P) { let (mut a, mut b) = (p.x, p.y); (a, b) = (b, a); p.x = a; p.y = b; }
+"#;
+
+/// The bodies of [`CLEAN_BODIES`].
+const CLEAN: [&str; 6] = ["plain", "loops", "question", "closures", "let_else", "swaps"];
+
+/// The invariant: a clean function body's borrow check reads no refused row, so its verdict
+/// is kept. In particular it reads no source map (`Body::relative`, `Body::source_map`): which
+/// expressions lowering made up is the store's fact (`ExpressionStore::is_synthesized`, read
+/// with `Body::of`), and positions are read only to render an error. The failure lists every
+/// read of the step, by ingredient and class, so a new refusal names itself.
+#[test]
+fn a_clean_bodys_borrow_check_reads_no_refused_row() {
+    let db = db_of(CLEAN_BODIES);
+    with_steps_run(&db, false, |seen| {
+        for name in CLEAN {
+            let def = body_named(&db, name);
+            let mut reads: Vec<(&'static str, String)> = seen // alloc: test
+                .iter()
+                .filter(|it| it.def == def && it.step == Step::Borrowck)
+                .map(|it| (it.name, format!("{:?}", it.class))) // alloc: test
+                .collect();
+            reads.sort_unstable();
+            reads.dedup();
+            assert!(!reads.is_empty(), "`{name}`'s borrow check read nothing: it did not run");
+            assert!(
+                reads.iter().all(|(_, class)| class != "Refused"),
+                "`{name}`'s borrow check read a refused row, so its verdict is not kept: {reads:#?}"
+            );
+            assert!(
+                reads.iter().any(|&(read, _)| reads::cmp_listed("Body::of", read).is_eq()),
+                "`{name}`'s borrow check did not read its body (`Body::of`), which holds the \
+                 synthesized expressions: {reads:#?}"
+            );
+        }
+    });
+}
+
+/// The invariant: a borrow-check trace kept under its solver queries' facts is not reused
+/// after a change one of those queries sees (a new `impl Copy`, a new `Drop` impl, an impl's
+/// where clause the goal was proved by, an associated type or its impl), and is reused after
+/// a change none of its reads sees (another body's edit).
+#[test]
+fn a_borrow_check_trace_misses_on_what_its_solver_queries_see_and_only_then() {
+    for case in &SEEN_CHANGES {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        let changed = (case.change)(SOLVER_QUERIES);
+        assert_ne!(changed, SOLVER_QUERIES, "the change to `{}` changed nothing", case.body);
+        assert!(
+            !reused(&kept, &changed),
+            "`{}`'s borrow check was reused after a change `{}` sees",
+            case.body,
+            case.query,
+        );
+        assert!(
+            reused(&kept, &unseen_change(SOLVER_QUERIES)),
+            "`{}`'s borrow check missed after another body's edit",
+            case.body,
+        );
+    }
+}
+
+/// The control: with the planted bug (the solver queries covered with no fact, as if
+/// they read nothing outside the body), each change that only those queries see leaves the
+/// trace reused, stale, so the oracle above catches a rule that drops their reads.
+#[test]
+fn the_oracle_catches_solver_queries_kept_under_no_fact() {
+    reads::planted::QUERIES_COVERED.set(true);
+    let mut missed: Vec<(&str, Vec<String>)> = Vec::new(); // alloc: test
+    for case in SEEN_CHANGES.iter().filter(|case| case.isolating) {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        let changed = (case.change)(SOLVER_QUERIES);
+        if !reused(&kept, &changed) {
+            missed.push((case.query, seen_by(&kept, &changed)));
+        }
+    }
+    reads::planted::QUERIES_COVERED.set(false);
+    assert!(
+        missed.is_empty(),
+        "with the queries covered, a change still missed (another read saw it, so the case does not isolate its query), each with what saw it: {missed:#?}"
+    );
+}
+
+/// The invariant: the borrow checks' traces through the solver queries, and whether each step
+/// is stored, are byte for byte the same whichever order the bodies ran in, with the goal
+/// store solving goals for whichever ran first.
+#[test]
+fn solver_query_traces_are_the_same_in_any_order() {
+    let mut by_order: Vec<Vec<Trace>> = Vec::new(); // alloc: test
+    for order in [Order::Forward, Order::Reversed, Order::Shuffled] {
+        let (db, seen) = steps_seen_ordered_with(db_of(SOLVER_QUERIES), order, true);
+        for query in reads::planted::QUERIES {
+            assert!(
+                seen.iter().any(|it| it.step == Step::Borrowck
+                    && it.class == Classified::Through
+                    && reads::cmp_listed(query, it.name).is_eq()),
+                "{order:?}: no borrow check read `{query}` through"
+            );
+        }
+        by_order.push(traces(&db, &seen));
+    }
+    assert_eq!(by_order[0], by_order[1], "the traces depend on the order (forward, reversed)");
+    assert_eq!(by_order[0], by_order[2], "the traces depend on the order (forward, shuffled)");
 }

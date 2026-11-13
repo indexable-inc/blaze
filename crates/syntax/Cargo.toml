@@ -17,6 +17,7 @@ blaze-bytes.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-phf.workspace = true
 crossbeam-channel.workspace = true
 either.workspace = true
 itertools.workspace = true

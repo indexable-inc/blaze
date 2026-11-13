@@ -1,0 +1,14 @@
+{
+ "id": "sealed-summary-route",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of the sealed-summary route task, int-1112",
+ "where": "crates/hir-ty-pure/src/sealed.rs sealed_or_row, from_table, publish; blaze-query db/witness.rs Witness::read_text; base-db files.rs set_included_file; hir-def deps/key.rs sealed_in",
+ "what": "A sealed crate's summary ran under `covered`, which panics at a read below HIGH; a registry library's `env!` of a process variable, an `include_bytes!` of a file the build writes, or a `#[path]` outside its package read below HIGH, so a program the pinned nightly builds would have panicked the build. Also: values settled inside a run were published to the shared table as they settled, before the outer run was known to read only HIGH, so a callee that read below HIGH would have been shared stale.",
+ "cost": "would have failed tempo/reth builds on the first dependency with `env!`; caught on reading, before a build",
+ "cause": "the route (shared or row) was decided by the crate (sealed or not), a guess about what its code reads, instead of by what the run read",
+ "class": "a property of a computation assumed from its container instead of observed from the computation",
+ "prevention": "the route is the witness's verdict: a run that read below HIGH is a row, said by a span and counted per crate; values a run settles wait in its attempt and reach the table only with the run's clean verdict",
+ "workaround": "none",
+ "fix": "witnessed in place of covered; Attempt (pending settled values) committed on a clean witness; Sealed::below_high memo and count; Witness::read_text names the read; set_included_file under a library root at HIGH; sealed_in needs the root in a library root (doctest crates). Tests: tests/sealed.rs by_variable/by_file rows that an edit reruns, control plant::sharing_below_high.",
+ "state": "written, not yet built (2026-11-12)"
+}

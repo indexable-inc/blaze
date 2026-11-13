@@ -685,6 +685,16 @@ impl Own {
                         pause(PutAt::InPrev);
                     }
                 }
+                // The key's record was forgotten alone (`crate::forget`): it keeps nothing, so
+                // this put's record is kept in the segment, and the drain makes it the key's
+                // home (`Store::record_home`): only the store's thread swaps a spot. Until
+                // then a reader finds nothing of the key, as before the put.
+                Err((_, (_, there))) if tier.spot_gone(there.place) => {
+                    if !kept {
+                        self.at += span;
+                        kept = true;
+                    }
+                }
                 // Lost in the delta, or in a `prev` no longer the store's, which the delta
                 // decides (`Own::lost_in_prev`).
                 Err((_, (_, there))) if !kept && tier.prev.is_none() => {

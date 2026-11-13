@@ -1,0 +1,12 @@
+{
+ "id": "launch3-13",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-launch-rt, crossbeam-channel on a program's threads",
+ "what": "crossbeam-channel needs a thread-local on both sides: a send wakes a waiting receiver through the sender's thread id (`current_thread_id`, which falls back to `std::thread::current()`), and a receive makes a `Context` of `thread::current()`. On Linux a function first called while a thread was ending (a thread-local destructor) aborted the program: `use of std::thread::current() is not possible after the thread's local data has been destroyed`. macOS ran the same program clean.",
+ "cost": "two rebuilds and a wrong first fix (the thread's end alone) before the backtrace showed the stub's own wait",
+ "cause": "the launcher's runtime shares its threads with a program whose teardown it does not control, and used a primitive that assumes a healthy Rust thread",
+ "workaround": "a queue and a pthread mutex and condition variable (`sys::Handoff`) for everything a program thread says or waits on",
+ "state": "fixed in e34a3b446f",
+ "fix": ""
+}

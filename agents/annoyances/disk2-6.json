@@ -1,0 +1,12 @@
+{
+ "id": "disk2-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "ix shell",
+ "what": "`ix shell VM -- cmd < file` delivered nothing on stdin inside a script; `cat file | ix shell VM -- cmd` did. A long `ix shell` whose output went through a pipe also ended once with no output at all while the work in the VM had finished.",
+ "cost": "twenty minutes, and one experiment run twice",
+ "cause": "not found",
+ "workaround": "pipe into it; write results to a file in the VM and read that",
+ "fix": "not known",
+ "state": "open"
+}

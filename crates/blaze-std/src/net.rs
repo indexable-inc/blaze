@@ -136,6 +136,9 @@ impl core::error::Error for HostPortError {}
 /// Why `host` is no host, if it is not: a DNS name, an IPv4 address (which is one by these
 /// rules too), or an IPv6 address in brackets. A `const fn`, shared by run time and
 /// [`crate::host!`].
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn refused_host(host: &str) -> Option<HostPortWhy> {
     let bytes = host.as_bytes();
     if bytes.is_empty() {
@@ -217,6 +220,9 @@ const fn port_of(digits: &[u8]) -> Result<u16, HostPortWhy> {
 }
 
 /// Why `raw` (`host:port`) is none, if it is not: [`HostPort::parse`]'s rule, as a `const fn`.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn refused(raw: &str) -> Option<HostPortWhy> {
     let colon = match split(raw) {
         Ok(colon) => colon,
@@ -238,6 +244,9 @@ pub const fn refused(raw: &str) -> Option<HostPortWhy> {
 }
 
 /// [`refused`], as a compile-time panic: what [`crate::host!`] evaluates in a `const`.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn check_literal(raw: &str) {
     if let Some(why) = refused(raw) {
         panic!("{}", why.says());
@@ -246,6 +255,8 @@ pub const fn check_literal(raw: &str) {
 
 impl HostPort {
     /// `host` and `port`, checked.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(host: &str, port: u16) -> Result<HostPort, HostPortError> {
         let why = match refused_host(host) {
             Some(why) => Some(why),
@@ -261,6 +272,8 @@ impl HostPort {
     }
 
     /// `host:port`, checked: `api.stripe.com:443`, `127.0.0.1:8080`, `[::1]:443`.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn parse(raw: &str) -> Result<HostPort, HostPortError> {
         // alloc: an error's message.
         let refuse = |why| HostPortError { given: raw.to_owned(), why };
@@ -274,16 +287,24 @@ impl HostPort {
     }
 
     /// The host, an IPv6 address with its brackets.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn host(&self) -> &str {
         &self.host
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn port(&self) -> u16 {
         self.port
     }
 
     /// The socket address it names when its host is an IP address; `None` for a DNS name,
     /// which needs a lookup.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         let host = self.host();
         let host = host.strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(host);
@@ -307,6 +328,8 @@ impl fmt::Debug for HostPort {
 impl TryFrom<&str> for HostPort {
     type Error = HostPortError;
 
+    #[blaze::pure]
+    #[blaze::nonblocking]
     fn try_from(raw: &str) -> Result<HostPort, HostPortError> {
         HostPort::parse(raw)
     }
@@ -337,10 +360,13 @@ impl Allowed {
         match self {
             Allowed::Any => Allowed::Only(at.clone()),
             Allowed::Only(only) if only == at => Allowed::Only(at.clone()),
-            Allowed::Only(_) | Allowed::Nothing => Allowed::Nothing,
+            Allowed::Only(Addr::Tcp(..) | Addr::Unix(..)) | Allowed::Nothing => Allowed::Nothing,
         }
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn allows(&self, at: &Addr) -> bool {
         match self {
             Allowed::Any => true,
@@ -427,6 +453,7 @@ impl fmt::Display for NetError {
 
 impl core::error::Error for NetError {}
 
+#[blaze::nonblocking]
 pub(crate) fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
     // clone: an error's address.
     NetError { op, addr: addr.clone(), kind }
@@ -453,11 +480,17 @@ pub struct Net {
 }
 
 impl Net {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Net {
         Net { io, connect: Allowed::Any, listen: Allowed::Any, budget: None }
     }
 
     /// The world it is in.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn io(&self) -> &Io {
         &self.io
     }
@@ -495,6 +528,8 @@ impl Net {
     }
 
     /// The bytes its connections may still send and receive; `None` with no limit.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn limit_left(&self) -> Option<u64> {
         self.budget.as_deref().map(Budget::left)
     }
@@ -650,6 +685,9 @@ impl Conn {
         Conn { link: Link { io: io.clone(), conn, open: true }, peer, budget }
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn peer(&self) -> &Addr {
         &self.peer
     }

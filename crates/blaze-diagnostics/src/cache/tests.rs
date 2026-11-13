@@ -289,6 +289,10 @@ fn an_empty_outcome_reads_without_allocating() {
     assert_eq!(empty.len(), HEADER + 2);
     let flags = flags(&["--cap-lints", "allow"]);
     let inputs = inputs(&flags);
+    // What a process does once before its first hash (the hash backend's start-up,
+    // `blake3_servil::initialize`, and the domain's context key) is not a read's: under a test
+    // runner that gives each test a process of its own it would land in the measurement.
+    let _ = key(ContentId([1; 32]), &inputs);
     let read =
         blaze_alloc_count::assert_at_most(0, "an empty outcome read and its key made", || {
             let _ = key(ContentId([1; 32]), &inputs);
@@ -418,7 +422,7 @@ fn imaged(db: &mut Db, store: &Memory) -> (ContentId, ContentId) {
     let all = base_db::all_crates(db).to_vec();
     let served = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
     assert!(served.hits.is_empty());
-    let stored = deps::store(db, &served, store).unwrap();
+    let stored = deps::store(db, &served, store, deps::Which::Sealed).unwrap();
     (stored.filed[&crate_named(db, "core")], stored.filed[&crate_named(db, "lib")])
 }
 

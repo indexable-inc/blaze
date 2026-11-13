@@ -1,0 +1,19 @@
+{
+  "id": "records-restart-1",
+  "date": "2026-11-12",
+  "who": "records-restart (claude-fable-5-2)",
+  "what": "Writing a per-query bound for the revision harness and restart_rows.py, the name of the column that holds a query's name in `query_counts` could not be taken from the debugging skill: its cycle example selects `kind`, while the view `counts_by_cause` (crates/blaze-profile/sql/examples.sql) selects `query`. The script was first written against `kind` and would have read every count as absent, which a write-only lane cannot see.",
+  "whys": [
+    "The skill's SQL examples are prose in a markdown file; nothing runs them against the schema.",
+    "The schema's column names live in blaze-profile's writer, the views in a .sql file, the skill in a third place.",
+    "A lane that runs nothing has only the text to go by, so a stale example becomes code."
+  ],
+  "class": "Documentation that quotes a schema without being checked against it.",
+  "prevention": "The docs script (scripts/src/bin/docs.rs) extracts each SQL block of the debugging skill and the docs and prepares it against an empty database of the profile's schema, failing the gate on an unknown column; scripts read counts through `blaze explain <view> --json`, whose columns the view's test already fixes.",
+  "where": ".claude/skills/debugging/SKILL.md (\"SELECT kind, ran_cycle, executed FROM query_counts\"); crates/blaze-profile/sql/examples.sql `counts_by_cause`",
+  "state": "open",
+  "cause": "Not confirmed which of the two is the table's column: the view was taken as the truth because it is compiled into blaze.",
+  "cost": "one wrong draft, caught by reading the view",
+  "workaround": "Read crates/blaze-profile/sql/examples.sql for a view's columns, never the skill's examples.",
+  "fix": ""
+}

@@ -20,8 +20,9 @@
 //!   **base**: its nodes, entries, names and both indexes are the image's own bytes, checked
 //!   once ([`Base::check`]) and read in place; nodes made after are appended in the columns
 //!   with numbers after the base's, and the index of the appended ones is probed after the
-//!   base's. A file of the base is a range of the image's blobs section, checked by its page
-//!   groups' CRC32C the first time it is read ([`Mapped::read`]).
+//!   base's. A file of the base is its content ID and size: its text is the content store's
+//!   ([`crate::Texts`]), paged in the first time it is read and checked to be that file's
+//!   ([`Mapped::text`]), then kept by the image's [`Mapped`] until a settle replaces the base.
 //!
 //! Why unsafe: the columns are read while the writer appends, with no lock (one acquire load
 //! and a compare per read). The safe version, a `RwLock<Vec<_>>` per column or a table copied
@@ -31,10 +32,11 @@
 //! Costs: a node is 32 bytes of ID plus an 8-byte [`Shape`], and 4 bytes of index place at
 //! most half full; a directory entry is 9 bytes (name, node, mode byte) in three columns; a
 //! file's bytes are one allocation shared with every reader (an `Arc<[u8]>`, or the `Vec` the
-//! op that wrote them owned, never copied), or a range of the image. Finding
+//! op that wrote them owned, never copied), or the content store's, paged in once. Finding
 //! a root is one probe of about 1.5 places (two when a base is there and the node is not in
 //! it); a path component is a binary search over the directory's name column. A base costs
-//! nothing in memory: it is the image's pages, read when something reads them.
+//! its image's pages, read when something reads them, and one empty slot a file (its text once
+//! paged in).
 
 use std::{
     marker::PhantomData,
@@ -47,11 +49,12 @@ use blaze_bytes::Bytes;
 use blaze_core::Mapping;
 use blaze_hash::SipKey;
 use blaze_ids::ContentId;
-use blaze_image::{Corrupt, Image, Section};
+use blaze_image::{Cause, Corrupt, Image, SectionId, TextWhy};
 use blaze_reclaim::{Guard, Limbo};
 
 use crate::{
-    Mode,
+    FILE_DOMAIN, Mode,
+    texts::Texts,
     sync::{
         Lock,
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
@@ -70,16 +73,6 @@ pub(crate) fn adopt(bytes: Vec<u8>) -> Bytes {
     // nothing can reach the `Vec` to grow or write it, and the `Bytes` hold it for as long as
     // they lend the slice.
     unsafe { Bytes::held(lent, owner) }
-}
-
-/// `len` bytes at `at` of `mapped`'s blobs section, once each page group they fall in matches
-/// its CRC32C.
-fn mapped_bytes(mapped: Arc<Mapped>, at: u64, len: u64) -> Result<Bytes, Corrupt> {
-    let bytes: *const [u8] = mapped.read(at, len)?;
-    // SAFETY: the bytes are the image's, which `mapped` holds through its `Arc<Image>`: the
-    // image's owner (`Mapping`, `Stable`) keeps them at one address, unwritten, for as long as
-    // it lives, and the `Bytes` hold `mapped` for as long as they lend them.
-    Ok(unsafe { Bytes::held(bytes, mapped) })
 }
 
 /// Chunk `k` of a column holds `FIRST << k` values from offset `FIRST * (2^k - 1)`, so an
@@ -360,7 +353,7 @@ impl Names {
         }
     }
 
-    fn base_len(&self) -> u32 {
+    pub(crate) fn base_len(&self) -> u32 {
         self.base_spans.len() as u32
     }
 
@@ -426,47 +419,99 @@ impl Names {
     /// The same names with the same numbers, for the next generation: the base's borrowed
     /// again (the next table holds the same image), the rest copied.
     fn carry(&self) -> Names {
+        self.after(self, self.base_len())
+    }
+
+    /// The names of `image` (an image's base, written by this tree) with this one's names
+    /// past them, numbered as here: what a table settled on that image names. `Err` when the
+    /// image's names are not this one's first names under the same numbers (an image this
+    /// tree did not write), or when this one has fewer names than the image.
+    fn onto(&self, image: &Names) -> Result<Names, &'static str> {
+        let base = image.base_len();
+        if base > self.len() {
+            return Err("an image with names this tree never had");
+        }
+        if (0..base).any(|name| self.get(name) != image.get(name)) {
+            return Err("an image whose names are not this tree's under the same numbers");
+        }
+        Ok(self.after(image, base))
+    }
+
+    /// `base`'s base borrowed (the next table holds `base`'s image), then this one's names
+    /// `from..` copied after it, keeping their numbers; `from` is `base`'s base length.
+    fn after(&self, base: &Names, from: u32) -> Names {
+        debug_assert_eq!(from, base.base_len(), "names after a base keep their numbers");
         let next = Names {
-            base_spans: self.base_spans,
-            base_bytes: self.base_bytes,
-            base_index: self.base_index,
-            base_key: self.base_key,
+            base_spans: base.base_spans,
+            base_bytes: base.base_bytes,
+            base_index: base.base_index,
+            base_key: base.base_key,
             ..Names::new()
         };
-        for at in 0..self.spans.len() {
-            let span = *self.spans.get(at);
-            let bytes = self.bytes.slice(span.start, span.len);
+        for name in from..self.len() {
+            let bytes = self.get(name);
+            let len = bytes.len() as u32;
             // SAFETY: `next` is new and only this thread has it.
-            let start = unsafe { next.bytes.push_run(span.len, 0, bytes.iter().copied()) };
+            let start = unsafe { next.bytes.push_run(len, 0, bytes.iter().copied()) };
             // SAFETY: as above.
-            unsafe { next.spans.push(Span { start, len: span.len }) };
+            unsafe { next.spans.push(Span { start, len }) };
         }
         next
     }
 }
 
-/// The daemon's image a table was restored from: what keeps its base's bytes mapped, and where
-/// its files' bytes are. Shared by every generation that has a node of it, and by every
-/// [`Bytes`] lent from it.
+/// The daemon's image a table was restored from (or settled on): what keeps its base mapped,
+/// the store its files' texts are in, and each base file's text once paged in. Shared by every
+/// generation that has a node of it.
 pub(crate) struct Mapped {
     pub(crate) image: Arc<Image<Mapping>>,
-    pub(crate) blobs: Section,
-    /// The first group of `blobs` a read found corrupt: what [`crate::Vfs::corrupt`] names.
+    texts: Arc<dyn Texts>,
+    /// The base, borrowed from `image`, which this holds for as long as it lives: what names
+    /// each base file (its ID) and says its size.
+    base: Base<'static>,
+    /// By base file: its text, once a read paged it in and found it the file's.
+    paged: Box<[OnceLock<Bytes>]>,
+    /// The first file a read found the store does not give as the image names it: what
+    /// [`crate::Vfs::corrupt`] names.
     corrupt: OnceLock<Corrupt>,
 }
 
 impl Mapped {
-    pub(crate) fn new(image: Arc<Image<Mapping>>, blobs: Section) -> Mapped {
-        Mapped { image, blobs, corrupt: OnceLock::new() }
+    /// The text of the base's file `node`: the one paged in, or the store's under its ID, once
+    /// it is that many bytes hashing to that ID. A store that lacks it, gives other bytes or
+    /// fails its own check is a [`Cause::Text`] naming the file, kept as the image's first
+    /// corruption; nothing else is read in its place.
+    pub(crate) fn text(&self, node: u32) -> Result<&Bytes, Corrupt> {
+        let [file, _] = self.base.shapes[node as usize];
+        let slot = &self.paged[file as usize];
+        if let Some(text) = slot.get() {
+            return Ok(text);
+        }
+        let (id, len) = (&self.base.ids[node as usize], self.base.files[file as usize]);
+        let refused = |why: TextWhy| {
+            let corrupt = Corrupt {
+                section: SectionId::VFS_TREE,
+                group: file,
+                cause: Cause::Text { file: *id, why },
+            };
+            let _ = self.corrupt.set(corrupt);
+            corrupt
+        };
+        let text = match self.texts.get(id) {
+            Ok(Some(text)) => text,
+            Ok(None) => return Err(refused(TextWhy::Missing)),
+            Err(_) => return Err(refused(TextWhy::Store)),
+        };
+        let found = ContentId::of(FILE_DOMAIN, &text);
+        if text.len() as u64 != len || found != *id {
+            return Err(refused(TextWhy::Mismatch { found, len: text.len() as u64 }));
+        }
+        Ok(slot.get_or_init(|| text))
     }
 
-    /// `len` bytes at `at` of the blobs section, each page group they fall in checked by its
-    /// CRC32C the first time it is read; a group that fails is never read, and is kept as the
-    /// image's first corruption.
-    pub(crate) fn read(&self, at: u64, len: u64) -> Result<&[u8], Corrupt> {
-        self.image.range(&self.blobs, at, len).inspect_err(|corrupt| {
-            let _ = self.corrupt.set(*corrupt);
-        })
+    /// The size of the base's file `node`, unread.
+    fn len(&self, node: u32) -> u64 {
+        self.base.files[self.base.shapes[node as usize][0] as usize]
     }
 
     pub(crate) fn corrupt(&self) -> Option<Corrupt> {
@@ -477,7 +522,7 @@ impl Mapped {
 /// The first generation's columns, read in place from a mapped image: what [`Writer::restore`]
 /// starts a table with. Node `n` of the base is `ids[n]` and `shapes[n]` (`[start, len]`); a
 /// directory's entries are `[start, start + len)` of the entry columns, a file is `files[start]`
-/// (where its bytes are in the blobs section, and how many). `index` holds a node plus one at
+/// (its size; its text is the content store's, by its ID). `index` holds a node plus one at
 /// the place its ID's [`home`] probes to, linearly; `name_index` a name plus one by
 /// [`SipKey::hash`] under `name_key` (the image's [`NAME_INDEX_KEY`] of its names); both are a
 /// power of two long and at most half full.
@@ -488,7 +533,7 @@ pub(crate) struct Base<'a> {
     pub(crate) entry_names: &'a [u32],
     pub(crate) entry_nodes: &'a [u32],
     pub(crate) entry_modes: &'a [u8],
-    pub(crate) files: &'a [[u64; 2]],
+    pub(crate) files: &'a [u64],
     pub(crate) index: &'a [u32],
     pub(crate) spans: &'a [[u32; 2]],
     pub(crate) name_bytes: &'a [u8],
@@ -500,10 +545,10 @@ pub(crate) struct Base<'a> {
 impl Base<'_> {
     /// Whether every read of the base stays in it and every walk of it ends: each name a path
     /// component of UTF-8 its span holds; each directory's entries in range, sorted by name
-    /// and naming only nodes before it, of a mode that is the child's kind; each file's bytes
-    /// in the blobs section (`blobs` long); each node found by the index where it is. The
-    /// image's CRCs say its bytes are those written; this says the writer wrote a tree.
-    pub(crate) fn check(&self, blobs: u64) -> Result<(), &'static str> {
+    /// and naming only nodes before it, of a mode that is the child's kind; each file's size
+    /// in the file column, once; each node found by the index where it is. The image's CRCs
+    /// say its bytes are those written; this says the writer wrote a tree.
+    pub(crate) fn check(&self) -> Result<(), &'static str> {
         let (nodes, entries) = (self.ids.len(), self.entry_names.len());
         if nodes == 0 || nodes >= FILE as usize || entries >= FILE as usize {
             return Err("a base of no nodes, or of 2^32");
@@ -530,17 +575,19 @@ impl Base<'_> {
                 return Err("a name that is not one path component");
             }
         }
+        let mut files = 0usize;
         let name = |name: u32| -> &[u8] {
             let [start, len] = self.spans[name as usize];
             &self.name_bytes[start as usize..start as usize + len as usize]
         };
         for (node, &[start, len]) in self.shapes.iter().enumerate() {
             if len == FILE {
-                let &[at, len] =
-                    self.files.get(start as usize).ok_or("a file past the file column")?;
-                if at.checked_add(len).is_none_or(|end| end > blobs) {
-                    return Err("a file past the blobs section");
+                // Files are numbered in node order, so each names the next size: none is read
+                // for two files, and none is left over (the text slots are by file).
+                if start as usize != files {
+                    return Err("a file that is not the next of the file column");
                 }
+                files += 1;
                 continue;
             }
             let range = start as usize..start as usize + len as usize;
@@ -564,6 +611,9 @@ impl Base<'_> {
                     return Err("a directory's entries not sorted by name, or a name twice");
                 }
             }
+        }
+        if files != self.files.len() {
+            return Err("a file column longer than the base's files");
         }
         if self.index.iter().any(|&plus_one| plus_one as usize > nodes) {
             return Err("an index place naming a node the base does not have");
@@ -661,27 +711,25 @@ impl Drop for Index {
 }
 
 /// Where a file node made after the base keeps its bytes: its own (an `Arc<[u8]>`, or the
-/// `Vec` an op wrote, [`adopt`]ed), or the range of the image's blobs section a base file had
-/// before a collection renumbered it.
+/// `Vec` an op wrote, [`adopt`]ed), or the content store's, as the file `node` of the base of
+/// [`Table::mapped`] it was before a collection renumbered it.
 enum Blob {
     Heap(Bytes),
-    Mapped { at: u64, len: u64 },
+    Stored { node: u32 },
 }
 
-/// Where [`Table::blob_at`] found a file's bytes: a base file's place, or the column's value.
+/// Where [`Table::blob_at`] found a file's bytes: the file `node` of [`Table::mapped`]'s base
+/// (this table's own base node, or one a collection carried), or its own.
 enum BlobAt<'a> {
-    Base(&'a u64, &'a u64),
-    Column(&'a Blob),
+    Stored(u32),
+    Heap(&'a Bytes),
 }
 
-/// Where a file's bytes are, without reading them: for the image's writer, which copies them.
+/// Where a file's bytes are, without reading them: the tree's own, or `len` bytes of the content
+/// store's (a file of the image's base, which names it).
 pub(crate) enum Source<'a> {
     Heap(&'a [u8]),
-    /// `len` bytes at `at` of the blobs section of [`Table::mapped`].
-    Mapped {
-        at: u64,
-        len: u64,
-    },
+    Stored { len: u64 },
 }
 
 /// One generation of nodes: a base (empty unless restored from an image), then the columns.
@@ -745,7 +793,7 @@ impl Table {
         &self.names
     }
 
-    /// The image its base and its mapped files are in.
+    /// The image its base is in, and its stored files' store.
     pub(crate) fn mapped(&self) -> Option<&Arc<Mapped>> {
         self.mapped.as_ref()
     }
@@ -833,54 +881,53 @@ impl Table {
         }
     }
 
-    /// The bytes of a file's shape, read in place; panics for a directory's. A file of the
-    /// image is read only once the page groups it is in match their CRC32C.
-    pub(crate) fn blob(&self, shape: Shape) -> Result<&[u8], Corrupt> {
-        match self.source(shape) {
-            Source::Heap(bytes) => Ok(bytes),
-            Source::Mapped { at, len } => self.mapped_ref().read(at, len),
+    /// The bytes of the file `node`, read in place; panics for a directory. A file of the
+    /// image's base is paged from the content store the first time it is read, and used only
+    /// once it is that file ([`Mapped::text`]).
+    pub(crate) fn blob(&self, node: u32) -> Result<&[u8], Corrupt> {
+        match self.blob_at(node) {
+            BlobAt::Heap(bytes) => Ok(bytes),
+            BlobAt::Stored(node) => self.mapped_ref().text(node).map(|text| &text[..]),
         }
     }
 
-    /// The bytes of a file's shape as [`Table::blob`] reads them, held: one count of the
-    /// file's `Arc` or of the image's.
-    pub(crate) fn bytes(&self, shape: Shape) -> Result<Bytes, Corrupt> {
-        match self.blob_at(shape) {
-            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
-                // clone: one count of the image, which the bytes lend from.
-                mapped_bytes(self.mapped_ref().clone(), at, len)
-            }
+    /// The bytes of the file `node` as [`Table::blob`] reads them, held: one count of the
+    /// file's owner, its own or the store's.
+    pub(crate) fn bytes(&self, node: u32) -> Result<Bytes, Corrupt> {
+        match self.blob_at(node) {
             // clone: one count of the file's owner, never its bytes.
-            BlobAt::Column(Blob::Heap(bytes)) => Ok(bytes.clone()),
+            BlobAt::Heap(bytes) => Ok(bytes.clone()),
+            // clone: one count of the text's owner, never its bytes.
+            BlobAt::Stored(node) => self.mapped_ref().text(node).cloned(),
         }
     }
 
-    /// Where a file's bytes are, read or not; panics for a directory.
-    pub(crate) fn source(&self, shape: Shape) -> Source<'_> {
-        match self.blob_at(shape) {
-            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
-                Source::Mapped { at, len }
-            }
-            BlobAt::Column(Blob::Heap(bytes)) => Source::Heap(&bytes[..]),
+    /// Where the file `node`'s bytes are, read or not; panics for a directory.
+    pub(crate) fn source(&self, node: u32) -> Source<'_> {
+        match self.blob_at(node) {
+            BlobAt::Heap(bytes) => Source::Heap(&bytes[..]),
+            BlobAt::Stored(node) => Source::Stored { len: self.mapped_ref().len(node) },
         }
     }
 
-    /// How many bytes a file has, without reading them.
-    pub(crate) fn file_len(&self, shape: Shape) -> u64 {
-        match self.source(shape) {
+    /// How many bytes the file `node` has, without reading them.
+    pub(crate) fn file_len(&self, node: u32) -> u64 {
+        match self.source(node) {
             Source::Heap(bytes) => bytes.len() as u64,
-            Source::Mapped { len, .. } => len,
+            Source::Stored { len } => len,
         }
     }
 
-    fn blob_at(&self, shape: Shape) -> BlobAt<'_> {
+    fn blob_at(&self, node: u32) -> BlobAt<'_> {
+        let shape = self.shape(node);
         assert!(!shape.is_dir(), "a directory has no bytes");
         match shape.start.checked_sub(self.base_files()) {
-            None => {
-                let [at, len] = &self.base.files[shape.start as usize];
-                BlobAt::Base(at, len)
-            }
-            Some(at) => BlobAt::Column(self.blobs.get(at)),
+            // A file of this table's base is the same node of its image's.
+            None => BlobAt::Stored(node),
+            Some(at) => match self.blobs.get(at) {
+                Blob::Heap(bytes) => BlobAt::Heap(bytes),
+                &Blob::Stored { node } => BlobAt::Stored(node),
+            },
         }
     }
 
@@ -898,7 +945,7 @@ impl Table {
             Ok(node) => return node,
             Err(place) => place,
         };
-        if matches!(blob, Blob::Mapped { .. }) {
+        if matches!(blob, Blob::Stored { .. }) {
             assert!(self.mapped.is_some(), "a file of an image in a table without it");
         }
         // SAFETY: the caller is the one writer.
@@ -1059,19 +1106,27 @@ impl Writer {
         Writer { shared: Arc::new(shared) }
     }
 
-    /// A tree whose first generation is `base`, read in place from `mapped`'s image. `base`
-    /// must lie in the image's bytes (else `Err`, and nothing is borrowed) and be a tree
-    /// ([`Base::check`]).
-    pub(crate) fn restore(mapped: Arc<Mapped>, base: Base<'_>) -> Result<Writer, &'static str> {
-        if !base.within(mapped.image.owner().bytes()) {
+    /// A tree whose first generation is `base`, read in place from `image`, its files' texts
+    /// in `texts`. `base` must lie in the image's bytes (else `Err`, and nothing is borrowed)
+    /// and be a tree ([`Base::check`]).
+    pub(crate) fn restore(
+        image: Arc<Image<Mapping>>,
+        texts: Arc<dyn Texts>,
+        base: Base<'_>,
+    ) -> Result<Writer, &'static str> {
+        if !base.within(image.owner().bytes()) {
             return Err("a base that is not in its image's bytes");
         }
-        base.check(mapped.blobs.len)?;
+        base.check()?;
         // SAFETY: every slice of `base` lies in the image's bytes (checked above), which stay
         // at one address, unwritten, for as long as the image lives (`Stable`'s contract). The
-        // table holds the image through `mapped` for its whole life, and lends the base only
+        // table and the `Mapped` hold the image for their whole lives, and lend the base only
         // through `&self`, so no borrow outlives it.
         let base: Base<'static> = unsafe { std::mem::transmute::<Base<'_>, Base<'static>>(base) };
+        // alloc: once per start or settle, one empty slot a base file for its text.
+        let paged = (0..base.files.len()).map(|_| OnceLock::new()).collect();
+        // alloc: once per start or settle, what every generation of the image shares.
+        let mapped = Arc::new(Mapped { image, texts, base, paged, corrupt: OnceLock::new() });
         let names = Names {
             base_spans: base.spans,
             base_bytes: base.name_bytes,
@@ -1160,20 +1215,44 @@ impl Building {
         Building(Table { names, mapped, ..Table::new(count) })
     }
 
+    /// A table for `count` nodes after the base of `image` (a table an image opened to,
+    /// [`Writer::restore`]'s), naming `from`'s names with their numbers: a settle's next
+    /// generation, in which every node the image holds is the image's, read from its mapping.
+    /// `Err` when `image` has no image, or its names are not `from`'s first names.
+    pub(crate) fn onto(
+        image: &Table,
+        from: &Table,
+        count: usize,
+    ) -> Result<Building, &'static str> {
+        let Some(mapped) = &image.mapped else {
+            return Err("a settle onto a table of no image");
+        };
+        let names = from.names.onto(&image.names)?;
+        // The invariant, as `Writer::restore`'s: `image.base` lies in the bytes `mapped` holds
+        // (it was checked to when `image` was restored), and this table holds that
+        // `Arc<Mapped>` for its whole life, so the borrow it copies never outlives them.
+        // clone: one count of the image, kept by the next generation.
+        let mapped = Some(Arc::clone(mapped));
+        Ok(Building(Table { base: image.base, names, mapped, ..Table::new(count) }))
+    }
+
+    /// The node whose content ID is `id`, of the base or added.
+    pub(crate) fn find(&self, id: &ContentId) -> Option<u32> {
+        self.0.find(id)
+    }
+
     pub(crate) fn file(&mut self, id: ContentId, bytes: impl Into<Bytes>) -> u32 {
         // SAFETY: `&mut self` on a table nobody else has yet.
         unsafe { self.0.add_file(id, Blob::Heap(bytes.into())) }
     }
 
-    /// The file `id` whose bytes are those of the file `shape` of `from`, the table this one
-    /// is [`Building::after`]: the same `Arc`, or the same range of the image, unread.
-    pub(crate) fn file_of(&mut self, id: ContentId, from: &Table, shape: Shape) -> u32 {
-        let blob = match from.blob_at(shape) {
-            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
-                Blob::Mapped { at, len }
-            }
+    /// The file `id` whose bytes are those of the file `node` of `from`, the table this one
+    /// is [`Building::after`]: the same `Arc`, or the same file of the image's base, unread.
+    pub(crate) fn file_of(&mut self, id: ContentId, from: &Table, node: u32) -> u32 {
+        let blob = match from.blob_at(node) {
+            BlobAt::Stored(node) => Blob::Stored { node },
             // clone: one count of the file's owner, never its bytes.
-            BlobAt::Column(Blob::Heap(bytes)) => Blob::Heap(bytes.clone()),
+            BlobAt::Heap(bytes) => Blob::Heap(bytes.clone()),
         };
         // SAFETY: as above.
         unsafe { self.0.add_file(id, blob) }

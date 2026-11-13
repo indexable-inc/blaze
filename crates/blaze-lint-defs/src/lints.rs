@@ -59,8 +59,6 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lock_across_query", Allow, "detects a lock guard held across a query call")
         .externally_loaded(),
-    l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
-        .externally_loaded(),
     l("blaze::blocking_on_pool", Allow, "detects a blocking call on a pool thread or fiber")
         .externally_loaded(),
     l("blaze::unnamed_wait", Allow, "detects a wait with no span naming what it waits for")
@@ -203,6 +201,9 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
         .externally_loaded(),
+    // In blaze-lints' `Lint::ALL` order (its discriminant), after the lints added before it.
+    l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
+        .externally_loaded(),
     l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
         .externally_loaded(),
     l("blaze::implicit_overflow", Allow, "detects integer `+`, `-`, `*`, `<<`, `>>`, unary `-` and a value-losing `as` that blaze cannot show fit, whose meaning (a panic or a wrap) is the profile's; `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*` or `try_from` says which is meant")
@@ -221,11 +222,11 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
         .externally_loaded(),
-    l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::may(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not")
+    l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::expect(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not; a list that is not one; and the deleted `#[blaze::may(..)]`, respelled `#[blaze::expect(..)]`")
         .externally_loaded(),
-    l("blaze::unneeded_effect", Warn, "detects a word of a private function's `#[blaze::may(..)]` for an effect the function is proved not to have")
+    l("blaze::unfulfilled_effect", Deny, "detects a word of a function's own `#[blaze::expect(..)]` for an effect the function is proved not to have, private or public: a function's own list is exact")
         .externally_loaded(),
-    l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function may do, `#[blaze::may(..)]`")
+    l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function is expected to do, `#[blaze::expect(..)]`")
         .externally_loaded(),
     l("blaze::durable_write", Allow, "detects a write that waits for the disk (a synced effect, `sync_all`, `fsync`) with no `// durable: <why>` saying what must survive a crash")
         .externally_loaded(),
@@ -242,6 +243,8 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::proc_macro_fn_like", Warn, "detects a function-like procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a `const fn` or a `const` block replaces unless it parses a foreign syntax")
         .externally_loaded(),
     l("blaze::build_script_ambient", ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS), "detects a build script of the workspace that reaches the file system, the environment, a process, the network or the clock through the standard library by itself, where a capability it is handed says what it can touch")
+        .externally_loaded(),
+    l("blaze::not_latest_edition", ready::level(ready::EDITION_SHIPS), "detects a package of the workspace that has not opted into the latest blaze edition (a Rust edition, or an older blaze edition), once per package, naming the manifest line that opts in")
         .externally_loaded(),
     // `allow` whatever `ready::BSTD_IN_TREE` says: a crate asks for it (`#![blaze::capabilities]`),
     // and a workspace does in its `lints-when-ready` table.

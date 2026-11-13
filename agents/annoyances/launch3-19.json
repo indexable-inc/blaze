@@ -1,0 +1,19 @@
+{
+ "id": "launch3-19",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "the daemon's edit build, between `lower workspace` and the binary's `unit names`",
+ "what": "In a body edit's build (26 to 36 ms of spans on the VM) 5 to 11 ms pass between `lower workspace` ending and `unit names` starting in which the workers' spans add to under 1 ms; no span names the stretch, `path_links` has no rows for the build, and it is the largest part of the edit.",
+ "cost": "the live edit is 30 ms where its named parts add to about 15; nobody can say from the profile what the rest is",
+ "cause": "not found: the time is on the daemon's loop thread, whose steps are not spans",
+ "whys": [
+  "why unknown: no span",
+  "why no span: the loop's own steps are counted only when one runs past 20 ms (`loop stalled`)",
+  "property: time on a thread the profile does not cover"
+ ],
+ "class": "unnamed time: a stretch of a build that no span, wait or critical-path row accounts for",
+ "prevention": "rule slow-is-p0-traced; a gate check that a build's named time (spans on its critical path) covers its wall time within a few percent",
+ "workaround": "none",
+ "state": "open; outside this lane's files (serve/job.rs)",
+ "fix": ""
+}

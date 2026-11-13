@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane body-entries round 3",
+ "where": "crates/hir-ty/src/body_store (tests.rs, mir/tests.rs) and crates/blaze-cargo/src/serve",
+ "what": "Moving inference, MIR and borrow check onto the kernel's served entries broke every old item-store test that flushed records in one database and hit them in another; those tests have no syntax world, so they now get the kernel's verdict from a helper (kept_by_the_kernel / served_by_the_kernel) while the real kernel path is tested in entries/tests.rs. The production world for the body entries needs the daemon's file texts and its front-end kernel, which live in serve/front_carry.rs (another lane's file), so the driver could not be built inside deps.rs alone.",
+ "cost": "most of one lane's context",
+ "cause": "the old tests were written against the record store, not against an interface the kernel also implements; the front-end kernel's world (front_carry::Tree) is not a BodyWorld",
+ "class": "a test harness tied to a deleted path; a driver split across lanes' files",
+ "prevention": "front_carry::Tree should implement BodyWorld (it already holds the files and the kernel), so body entries register on the one front-end kernel",
+ "workaround": "test helper posting the kernel's verdict",
+ "fix": "none yet",
+ "state": "open"
+}

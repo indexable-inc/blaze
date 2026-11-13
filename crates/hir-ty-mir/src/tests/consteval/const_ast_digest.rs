@@ -28,7 +28,7 @@ const fn tokens(mut h: u64, node: Node<'_>) -> u64 {
     let mut tokens = node.tokens();
     while let Some(token) = tokens.next() {
         h = text(h, token.text());
-        h = mix(h, token.span() as u64);
+        h = mix(h, token.span().index() as u64);
     }
     h
 }

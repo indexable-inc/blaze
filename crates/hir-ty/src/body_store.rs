@@ -4,10 +4,11 @@
 //!
 //! - A body's step is filed under its **base key** (its identity from [`BodyFacts::identity`],
 //!   the step, the schema of the step's answers, the records' schema and the solver version).
-//!   Under it, in one of [`record::SLOTS`] slots, a **shape** lists the facts the step read; the
-//!   **answer** is filed under the shape's key and those facts' values when it ran
-//!   ([`record`]). A lookup reads the shapes, hashes their facts as they are now, and asks for
-//!   the answer: the goal store's constructive trace (`next_solver::goal_store`), one level up.
+//!   Under it, in a slot of its chain, a **shape** lists the facts the step read; the
+//!   **answer** is filed under the shape's bytes and those facts' values when it ran
+//!   ([`record`]; the form, its keys and the chain are `blaze_record`'s). A lookup reads the
+//!   shapes, hashes their facts as they are now, and asks for the answer: the goal store's
+//!   constructive trace (`next_solver::goal_store`), one level up.
 //! - A step is stored only when every read it made is covered by the identity or stands for a
 //!   fact ([`BodyFacts::classify`]); any other read keeps it out, counted by name in
 //!   [`Flushed::refused`]. Only passing borrow checks are stored.
@@ -16,6 +17,15 @@
 //! - Under [`Mode::Verify`] a hit runs the step as well, and a result that differs from the
 //!   stored one is the build's error, naming the body and the step.
 //!
+//! - Each offer also keeps the run's trace (its facts and answer) per body, step and schema,
+//!   which the kernel entries of the three steps read ([`entries`]): a carry then reaches
+//!   exactly the bodies whose syntax record, identity or a fact changed.
+//! - Inference, MIR and the borrow check ([`Step::served`]) are answered from the kernel's
+//!   verified entries alone: the driver posts each entry it gets or carries
+//!   ([`entries::serve`]), valid only at the database's revision then, and the step's query
+//!   reads the entry's identity, facts and earlier steps again on a hit. They offer nothing to
+//!   the flush; the records above are a constant's value's until it has an entry.
+//!
 //! With no store installed for a database, every entry point is one load and a branch. A
 //! record that does not open under its key or a store that cannot be read is an error naming
 //! the body, reported by the next flush; the step is run then, which gives the same result. A
@@ -23,8 +33,10 @@
 //! refuses) is named in what the flush did ([`Flushed::failure`]) and keeps no other step out.
 //! A miss is a miss.
 
+pub mod entries;
 mod facts;
 mod infer;
+mod konst;
 mod mir;
 mod pending;
 mod record;
@@ -36,10 +48,9 @@ use std::{
     cell::Cell,
     fmt,
     ops::ControlFlow,
-    ptr::{self, NonNull},
     sync::{
         Arc,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -47,24 +58,23 @@ use base_db::{Db, Nonce};
 use blaze_core::lock::Lock;
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
-use blaze_reclaim::Limbo;
+use blaze_record::{AnswerKey, Bounds, Digest, Filing, Placed};
 use hir_def::{DefWithBodyId, deps::ImageStore};
 
 pub use facts::{BodyFacts, Classified, Step};
 pub(crate) use infer::inference;
+pub(crate) use konst::constant;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
+pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::location_literals;
+pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 
-use crate::next_solver::goal_store::{
-    FactRef,
-    slots::{self, Claimed},
-    solver_version,
-};
+use crate::next_solver::goal_store::{FactRef, slots, solver_version};
+use crate::store_registry::{Linked, Registry};
 use pending::{Counts, Offered, Pending, Tallies};
-use record::{AnswerKey, SLOTS, ShapeRef};
 
 /// What a store does on a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +116,26 @@ fn what(step: Step) -> &'static str {
         Step::Infer => "inference",
         Step::Mir => "MIR",
         Step::Borrowck => "borrow check",
+        Step::Const => "constant value",
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the hit report's test: the step whose hits are not told to the
+    /// engine ([`Store::lookup`]), as a hit site left out would be.
+    pub(crate) static UNREPORTED: Cell<Option<Step>> = const { Cell::new(None) };
+}
+
+/// Whether a test planted `step` as [`UNREPORTED`]: never, outside a test.
+#[cfg(test)]
+fn unreported(step: Step) -> bool {
+    UNREPORTED.with(|it| it.get() == Some(step))
+}
+
+#[cfg(not(test))]
+fn unreported(_step: Step) -> bool {
+    false
 }
 
 /// What [`lookup`] found of a body's step.
@@ -130,10 +159,31 @@ struct Store {
     // dyn: lane item-hash's identities and facts, above hir-ty; memoized queries on a hit
     facts: Arc<dyn BodyFacts>,
     pending: Pending,
+    /// Lookups since the last flush that found their base key's chain at its bound:
+    /// [`Flushed::lookups_full`].
+    full_lookups: AtomicUsize,
+    /// What each step's lookups since the last flush came to, as `blaze_record` counted them,
+    /// by [`Step`] as an index: [`Flushed::lookups`].
+    lookups: [blaze_record::Tally; Step::COUNT],
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key, a stored result that differs from running the step under
     /// [`Mode::Verify`]): [`Installed::flush`] stops with it.
     error: Lock<Option<String>>,
+    /// The trace of the last run of each body's step in this database, by the body, the step
+    /// and the schema it was offered under: what a kernel entry of the step reads
+    /// ([`entries`]). A run of the step replaces it, so it is always of the run that made the
+    /// value the database holds for the step now.
+    traces: Lock<blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<entries::Ran>, std::alloc::Global>>,
+    /// The kernel's verified answers of the served steps ([`Step::served`]) for this database,
+    /// each valid only at the revision it was posted at ([`entries::serve`]): what
+    /// [`Store::lookup`] answers those steps from.
+    served: Lock<entries::Posted>,
+}
+
+/// Where a hit's answer bytes are: the kernel's verified entry, or the item store's record.
+enum Answer {
+    Served(Arc<[u8]>),
+    Record(hir_def::deps::ImageBuf),
 }
 
 /// The buffers an offer fills, kept for the thread's next one. Taken out for the offer and put
@@ -181,14 +231,42 @@ impl Store {
             self.pending.looked_up(step, false);
             return Lookup::Off;
         };
-        let base = record::base_key(&identity, step, &schema, &self.version);
-        let found = match self.find(db, def, step, &base) {
+        // A served step's answer is the kernel's verified entry, posted at this revision
+        // (`entries::serve`); a constant's is the item store's own record until it has one.
+        let answer = match step.served() {
+            true => self.served_answer(db, def, step, schema, identity).map(|served| {
+                // clone: a counted reference to the posted answer
+                let at = served.answer.clone();
+                (Answer::Served(at), ContentId::default())
+            }),
+            false => {
+                let base = record::base_key(&identity, step, &schema, &self.version);
+                self.find_constant(db, def, &base).map(|(found, key)| (Answer::Record(found), key))
+            }
+        };
+        let found = match answer {
             None => Lookup::Miss,
             Some((found, answer_key)) => {
-                match record::open_answer(found.bytes(), &answer_key)
-                    .and_then(|body| decode(&*self.facts, body))
-                {
-                    Ok(value) => Lookup::Hit { value, verify: self.mode == Mode::Verify },
+                let opened = match &found {
+                    Answer::Served(bytes) => Ok(&bytes[..]),
+                    Answer::Record(found) => record::open_answer(found.bytes(), &answer_key),
+                };
+                match opened.and_then(|body| decode(&*self.facts, body)) {
+                    Ok(value) => {
+                        let verify = self.mode == Mode::Verify;
+                        // The one hit site of the three steps. The running query's value is
+                        // the record's, found by a key that stands for the reads of the run
+                        // that made it: the row is told so (`report_stored_read`), and a list
+                        // of what its crate's rows read (`Storage::seal_group_whole`, a
+                        // unit's read parts) knows this row's own reads are the key's (the
+                        // identity and each fact of the shape, read just above), not the
+                        // step's. Under `Mode::Verify` the step runs as well, in this
+                        // query, by its own reads: nothing to tell.
+                        if !verify && !unreported(step) {
+                            blaze_query::db::report_stored_read(db);
+                        }
+                        Lookup::Hit { value, verify }
+                    }
                     Err(why) => {
                         self.fail(format_args!(
                             "the stored {} of {def:?} (answer {answer_key:x}): {why}",
@@ -203,70 +281,108 @@ impl Store {
         found
     }
 
-    /// The answer record of the first slot of `base` whose facts hash the same now, and its
-    /// answer key.
-    fn find(
+    /// The kernel's verified answer of `step` of `def` under `schema` for this database at its
+    /// revision now, if one was posted ([`entries::serve`]) and it still holds: the body's
+    /// `identity` (read by the caller) and each fact it and every earlier step it read saw (the
+    /// row holds them all, `entries::serve`) are read again here, in the running
+    /// query, so the row depends on what the answer depends on, with nothing run. An answer
+    /// posted at another revision is no answer (the kernel verified it at that pin, not this
+    /// one). One whose identity or a fact differs now, at the revision it was verified at, is
+    /// the build's error (the kernel's world and this database disagree) and a miss.
+    fn served_answer(
         &self,
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        base: &ContentId,
-    ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
-        for n in 0..SLOTS {
-            let shape_key = record::shape_key(base, n);
-            let shape = match self.images.get(&record::shape_at(step, &shape_key)) {
-                Ok(Some(shape)) => shape,
-                Ok(None) => return None,
-                Err(why) => {
-                    self.fail(format_args!(
-                        "reading the shape of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
-                }
-            };
-            let shape = match ShapeRef::open(shape.bytes(), base) {
-                Ok(shape) => shape,
-                Err(why) => {
-                    self.fail(format_args!(
-                        "the shape of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
-                }
-            };
-            let Some(answer_key) = self.answer_key_now(db, def, &shape_key, shape) else {
-                continue;
-            };
-            match self.images.get(&record::answer_at(step, &answer_key)) {
-                Ok(Some(found)) => return Some((found, answer_key)),
-                Ok(None) => {}
-                Err(why) => {
-                    self.fail(format_args!(
-                        "reading the answer of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
-                }
+        schema: SchemaHash,
+        identity: ContentId,
+    ) -> Option<Arc<entries::Served>> {
+        let (_, now) = db.nonce_and_revision();
+        let served = self.served.lock().get(now, def, step, schema)?;
+        if served.identity != identity {
+            self.fail(format_args!(
+                "the served {} of {def:?} was verified with identity {:x}, and the database has {identity:x} at the same revision",
+                what(step),
+                served.identity
+            ));
+            return None;
+        }
+        for &(fact, seen) in &served.facts[..] {
+            let value = self.facts.value(db, def, fact).map_or(blaze_kernel::Seen::Gone, blaze_kernel::Seen::Is);
+            if value != seen {
+                self.fail(format_args!(
+                    "the served {} of {def:?} read {fact:?} as {:x}, and the database has {:x} at the same revision",
+                    what(step),
+                    seen.hash(),
+                    value.hash()
+                ));
+                return None;
             }
         }
-        None
+        Some(served)
     }
 
-    /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
-    /// when one of them cannot be hashed now.
-    fn answer_key_now(
+    /// The answer record of the first shape of `base` whose facts hash the same now, and its
+    /// answer key: of a constant's value, the one step with no kernel entry yet (not
+    /// [`Step::served`]). The served steps have no lookup of the item store's records.
+    fn find_constant(
         &self,
         db: &Db,
         def: DefWithBodyId,
-        shape_key: &ContentId,
-        shape: ShapeRef<'_>,
-    ) -> Option<ContentId> {
-        let mut key = AnswerKey::new(shape_key);
-        for fact in shape.facts() {
-            key.value(&self.facts.value(db, def, fact)?);
+        base: &ContentId,
+    ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
+        let step = Step::Const;
+        // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
+        // that is no fact. The shape is passed over, and the lookup is an error.
+        let mut no_fact = None;
+        let found = blaze_record::lookup(
+            &self.records(step),
+            Bounds::STANDARD,
+            base,
+            |name| match slots::fact_of(name) {
+                Ok(fact) => self.facts.value(db, def, fact).map(Digest::Is),
+                Err(why) => {
+                    no_fact.get_or_insert(why);
+                    None
+                }
+            },
+        );
+        if let Some(why) = no_fact {
+            self.fail(format_args!("the shape of the {} of {def:?}: {why}", what(step)));
+            return None;
         }
-        Some(key.finish())
+        match found {
+            Ok(blaze_record::Found::Hit { answer, key, at: _ }) => Some((answer, key)),
+            // A chain at its bound is counted here, and where the step's shape is then not
+            // placed (`Flushed::slots_full`, which names the step).
+            Ok(blaze_record::Found::Miss { lists: _, full }) => {
+                if full {
+                    self.full_lookups.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(error) => {
+                let slots::Refused { doing, why } = error.into();
+                self.fail(format_args!("{doing} the {} of {def:?}: {why}", what(step)));
+                None
+            }
+        }
+    }
+
+    /// The driver's store as `blaze_record` reads and writes the records of `step`: a shape
+    /// under [`record::shape_at`] of its key, an answer under [`record::answer_at`] of its.
+    fn records(
+        &self,
+        step: Step,
+    ) -> slots::Records<'_, impl Fn(blaze_record::Kind, &ContentId) -> ContentId> {
+        slots::Records {
+            images: &*self.images,
+            at: move |kind: blaze_record::Kind, key: &ContentId| match kind {
+                blaze_record::Kind::List => record::shape_at(step, key),
+                blaze_record::Kind::Answer => record::answer_at(step, key),
+            },
+            tally: &self.lookups[step as usize],
+        }
     }
 
     fn offer(
@@ -283,9 +399,15 @@ impl Store {
         scratch.facts.clear();
         scratch.values.clear();
         scratch.answer.clear();
-        if let Err(refusal) = self.offered(db, def, step, schema, reads, write, &mut scratch) {
-            self.pending.refused(step, refusal);
-        }
+        let offered = self.offered(db, def, step, schema, reads, write, &mut scratch);
+        let ran = match offered {
+            Ok(()) => Ok((&scratch.facts[..], &scratch.answer[..])),
+            Err(refusal) => {
+                self.pending.refused(step, refusal);
+                Err(refusal)
+            }
+        };
+        self.trace(def, step, schema, ran);
         SCRATCH.set(scratch);
     }
 
@@ -305,18 +427,56 @@ impl Store {
         let mut refused = None;
         let facts = &mut scratch.facts;
         let storage = blaze_query::db::Database::storage(db);
-        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {
+        // What the last `through` call found of the read it was asked about: `each` is given
+        // that read next when it is not descended, and takes the class from here rather than
+        // classify it twice.
+        let asked: Cell<Option<(blaze_query::db::DatabaseKeyIndex, Classified)>> = Cell::new(None);
+        let classify = |read: blaze_query::db::DatabaseKeyIndex, kind: blaze_query::db::ReadKind| {
+            let name = storage.read_name(read, kind);
+            (name, self.facts.classify(db, def, step, read, kind, name))
+        };
+        // A read whose value is a function of its row's own reads ([`Classified::Through`]) is
+        // not given: the walk brings the row up to date in this view by its key
+        // (`blaze_query::db::refresh`: a row its reader proved by durability keeps an older
+        // view's stamp) and gives the row's reads in its place.
+        let through = |&blaze_query::db::Read { key: read, kind }: &blaze_query::db::Read| {
+            let (_, class) = classify(read, kind);
+            asked.set(Some((read, class)));
+            class == Classified::Through
+        };
+        let _ = reads.for_each_read_through(db, through, |row| {
+            let blaze_query::db::Read { key: read, kind } = match row {
+                blaze_query::db::RowRead::Read(read) => read,
+                // A row to read through that a store answered (its kept reads are the
+                // lookup's, not what its value was made from), or that cannot be brought up
+                // to date here (a cycle through it): no fact stands for it.
+                blaze_query::db::RowRead::Stored(read)
+                | blaze_query::db::RowRead::Unsettled(read) => {
+                    refused = Some(storage.read_name(read.key, read.kind));
+                    return ControlFlow::Break(());
+                }
+            };
             if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
-            let name = storage.read_name(read, kind);
-            match self.facts.classify(db, def, step, read, kind, name) {
+            let (name, class) = match asked.take() {
+                Some((of, class)) if of == read => (storage.read_name(read, kind), class),
+                _ => classify(read, kind),
+            };
+            match class {
                 Classified::Covered => ControlFlow::Continue(()),
                 Classified::Fact(fact) => {
                     facts.push(fact);
                     ControlFlow::Continue(())
                 }
-                Classified::Refused => {
+                Classified::Scan(fact) => {
+                    self.pending.scanned(what(step), name);
+                    facts.push(fact);
+                    ControlFlow::Continue(())
+                }
+                // `Through` of a read that is no function's row (the walk descends only
+                // those): a rule given to the wrong ingredient, refused by name.
+                Classified::Through | Classified::Refused => {
                     refused = Some(name);
                     ControlFlow::Break(())
                 }
@@ -334,6 +494,11 @@ impl Store {
             tracing::debug!(?def, step = what(step), %why, "a step's result with no stored form");
             return Err(Refusal::Unencodable);
         }
+        // A served step's record is the kernel's entry, made from this trace
+        // ([`Store::trace`], read by `entries`' run of the step): nothing to flush.
+        if step.served() {
+            return Ok(());
+        }
         let base = record::base_key(&identity, step, &schema, &self.version);
         record::write_shape(&mut scratch.shape, &base, &scratch.facts);
         self.pending.push(Offered {
@@ -347,6 +512,30 @@ impl Store {
         Ok(())
     }
 
+    /// Keeps what the run of `step` of `def` under `schema` just made as its trace
+    /// ([`entries::Ran`]), replacing the trace of the run before.
+    fn trace(
+        &self,
+        def: DefWithBodyId,
+        step: Step,
+        schema: SchemaHash,
+        ran: Result<(&[FactRef], &[u8]), Refusal>,
+    ) {
+        let ran = match ran {
+            // alloc: one trace a body's step run, replacing the one before
+            Ok((facts, answer)) => entries::Ran::Kept { facts: facts.into(), answer: answer.into() },
+            Err(refusal) => entries::Ran::Refused(refusal),
+        };
+        // alloc: one trace a body's step, kept while the store is installed
+        self.traces.lock().insert((def, step, schema), Arc::new(ran));
+    }
+
+    /// The trace of the last run of `step` of `def` under `schema` in this database.
+    fn traced(&self, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<Arc<entries::Ran>> {
+        // clone: a counted reference
+        self.traces.lock().get(&(def, step, schema)).cloned()
+    }
+
     #[cold]
     #[inline(never)]
     fn fail(&self, why: fmt::Arguments<'_>) {
@@ -357,50 +546,46 @@ impl Store {
         }
     }
 
-    /// Writes one buffered step: its shape in the first slot that holds it or is free
-    /// (`claimed`: what this flush placed in the slots of the step's base key before,
-    /// `goal_store::slots`), then its answer under the shape's key and the values its facts
-    /// had.
+    /// Writes one buffered step: its shape in its base key's chain where it is held or the
+    /// first slot is free (`filing`: the placing of this flush's shapes of the step's base
+    /// key, `goal_store::slots::filing`), then its answer under the shape's bytes and the
+    /// values its facts had.
     fn write<'a>(
         &self,
         entry: &pending::Entry<'a>,
-        claimed: &mut Claimed<'a, { SLOTS as usize }>,
+        filing: &mut Filing<'a>,
     ) -> Result<Wrote, String> {
         let (step, def) = (entry.step, entry.def);
         // alloc: error text
         let error = |doing: &str, why: String| {
             format!("the item store: {doing} the {} of {def:?}: {why}", what(step))
         };
-        let placed = claimed
-            .claim(&*self.images, entry.shape, |n| {
-                record::shape_at(step, &record::shape_key(&entry.base, n))
-            })
-            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
-        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
-        let wrote = match written {
-            true => Wrote::Written,
-            false => Wrote::Kept,
+        let refused = |refused: blaze_record::Error<String>| {
+            let slots::Refused { doing, why } = refused.into();
+            error(doing, why)
         };
-        let shape_key = record::shape_key(&entry.base, n);
-        let mut key = AnswerKey::new(&shape_key);
+        let records = self.records(step);
+        let wrote = match filing.place(&records, entry.shape).map_err(&refused)? {
+            Placed::Written(_) => Wrote::Written,
+            Placed::Kept(_) => Wrote::Kept,
+            Placed::Full => return Ok(Wrote::SlotsFull),
+        };
+        let mut key = AnswerKey::new(entry.shape);
         for value in entry.values() {
-            key.value(&value);
+            key.value(Digest::Is(value));
         }
         let answer_key = key.finish();
-        let at = record::answer_at(step, &answer_key);
         // alloc: the answer's bytes, once per step written
         let answer = record::write_answer(&answer_key, entry.answer);
-        match self.images.get(&at).map_err(|why| error("reading the answer of", why))? {
-            Some(kept) if kept.bytes() == answer.as_slice() => Ok(wrote),
-            Some(_) => Err(error(
+        match blaze_record::keep_answer(&records, answer_key, &answer) {
+            Ok(blaze_record::Kept::Written) => Ok(Wrote::Written),
+            Ok(blaze_record::Kept::Held) => Ok(wrote),
+            Err(blaze_record::Error::TwoAnswers { key: _ }) => Err(error(
                 "two answers under one key of fact values for",
                 // alloc: error text
                 String::from("the step read something its identity and facts do not cover"),
             )),
-            None => {
-                self.images.put(at, answer).map_err(|why| error("keeping the answer of", why))?;
-                Ok(Wrote::Written)
-            }
+            Err(other) => Err(refused(other)),
         }
     }
 }
@@ -412,7 +597,7 @@ enum Wrote {
     Written,
     /// The store had both already.
     Kept,
-    /// Every slot of its base key holds another shape.
+    /// Every slot of its base key's chain holds another shape (`blaze_record::Placed::Full`).
     SlotsFull,
 }
 
@@ -423,11 +608,31 @@ pub struct Flushed {
     pub written: usize,
     /// Steps the store had already.
     pub kept: usize,
-    /// Steps not written as every slot of their base key holds another shape.
+    /// Steps not written as every slot of their base key's chain holds another shape: the
+    /// chain's bound (`blaze_record::Bounds::STANDARD`), which a later lookup of the step
+    /// misses on.
     pub slots_full: usize,
+    /// Lookups that found their key's chain at its bound (`blaze_record::Found::Miss`'s
+    /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
+    /// the chain holds its shape where a placing looks.
+    pub lookups_full: usize,
+    /// What each step's lookups of the store since the last flush came to, as `blaze_record`
+    /// counted them, by [`Step`] as an index: how many there were (a body with no identity
+    /// is not looked up), how many found an answer, the shapes they read and the facts they
+    /// valued, each a fact hashed again. [`Flushed::steps`]' hits are the answers that also
+    /// decoded.
+    pub lookups: [blaze_record::Counts; Step::COUNT],
+    /// The first, in the order the flush writes, of those counted in `slots_full`: which it
+    /// is, by its key, and the bound.
+    pub full: Option<String>,
     /// For each query or input whose read kept steps out (neither covered nor a fact), how
     /// many, most first: what lane item-hash's classification is asked to cover.
     pub refused: Vec<(&'static str, u64)>,
+    /// Reads that took a whole table where a lookup would do ([`Classified::Scan`]: an
+    /// iteration of a module's scope), by the step that read (as [`what`] names it) then the
+    /// row read, with how many offers made each, most first: each is a fact that any change
+    /// of the table changes, so who makes them is what to fix.
+    pub scans: Vec<(&'static str, &'static str, u64)>,
     /// Steps kept out as a fact they read could not be hashed.
     pub unhashable: u64,
     /// Lookups of bodies with no identity, which are neither looked up nor stored.
@@ -446,7 +651,7 @@ pub struct Flushed {
     pub failure: Option<String>,
     /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
     /// index.
-    pub steps: [StepCounts; 3],
+    pub steps: [StepCounts; Step::COUNT],
 }
 
 /// What one step's lookups found and its offers met.
@@ -460,37 +665,17 @@ pub struct StepCounts {
     pub refused: u64,
 }
 
-/// How many databases may have an item store at once.
-const STORES: usize = 16;
-
-/// How many item stores are installed: zero is the one load every entry point makes.
-static INSTALLED: AtomicUsize = AtomicUsize::new(0);
-
-/// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
-static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
-
-/// The process's one body store reclamation pool: all unlinked stores are retired together.
-static LIMBO: Lock<Limbo> = Lock::new("ty.body_store.limbo", Limbo::new());
+/// The installed item stores, one per database with one at once (see `crate::store_registry`).
+static REGISTRY: Registry<Store> = Registry::new("ty.body_store.limbo");
 
 /// Runs `f` on the item store of `db`, if one is installed.
 #[inline]
 fn with_store<R>(db: &Db, f: impl FnOnce(&Store) -> R) -> Option<R> {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return None;
     }
     let (nonce, _) = db.nonce_and_revision();
-    let _task = blaze_reclaim::enter();
-    for slot in &REGISTRY {
-        let held = slot.load(Ordering::Acquire);
-        // SAFETY: a store is freed only through `LIMBO`, after a grace started once `Installed`'s
-        // drop unlinked it; `_task` was entered before `held` was loaded and outlives `f`, so that
-        // grace has not passed while the store is used here.
-        let Some(store) = (unsafe { held.as_ref() }) else { continue };
-        if store.nonce == nonce {
-            return Some(f(store));
-        }
-    }
-    None
+    REGISTRY.with(|it| it.nonce == nonce, f)
 }
 
 /// Before running `step` of `def`: its stored result, decoded by `decode` from the answer's
@@ -506,7 +691,7 @@ pub(crate) fn lookup<T>(
     // dyn: as `Store::lookup`
     decode: impl FnOnce(&dyn BodyFacts, &[u8]) -> Result<T, String>,
 ) -> Lookup<T> {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return Lookup::Off;
     }
     with_store(db, |store| store.lookup(db, def, step, schema, decode)).unwrap_or(Lookup::Off)
@@ -525,7 +710,7 @@ pub(crate) fn offer(
     // dyn: as `Store::offer`
     write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
 ) {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return;
     }
     with_store(db, |store| store.offer(db, def, step, schema, reads, write));
@@ -543,7 +728,7 @@ pub(crate) fn fail(db: &Db, def: DefWithBodyId, step: Step, why: fmt::Arguments<
 /// [`offer`] and [`offer_passed`] are given. Only inside a query is anything captured.
 #[inline]
 pub fn capture<R>(db: &Db, run: impl FnOnce() -> R) -> (R, Option<blaze_query::db::Reads>) {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return (run(), None);
     }
     blaze_query::db::capture_reads(db, run)
@@ -561,7 +746,7 @@ pub fn lookup_passed(
     checker: &'static str,
     check: impl FnOnce() -> bool,
 ) -> bool {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return false;
     }
     lookup_passed_in(db, def, checker, check)
@@ -604,7 +789,7 @@ pub fn offer_passed(
     checker: &'static str,
     reads: Option<blaze_query::db::Reads>,
 ) {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return;
     }
     let schema = with_crate_attrs(db, def, passed_schema(checker));
@@ -631,64 +816,41 @@ pub fn install(
     mode: Mode,
 ) -> Result<Installed, String> {
     let (nonce, _) = db.nonce_and_revision();
-    {
-        let _task = blaze_reclaim::enter();
-        for slot in &REGISTRY {
-            // SAFETY: as in `with_store`, under `_task`.
-            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce)
-            {
-                // alloc: error text
-                return Err(String::from("this database has an item store installed already"));
-            }
-        }
+    if REGISTRY.with(|it| it.nonce == nonce, |_| ()).is_some() {
+        // alloc: error text
+        return Err(String::from("this database has an item store installed already"));
     }
-    // alloc: setup: once per installed store, freed through `LIMBO` when it is uninstalled
-    let store = Box::into_raw(Box::new(Store {
+    // alloc: setup: once per installed store, freed through the registry's limbo when it is
+    // uninstalled
+    let store = Box::new(Store {
         nonce,
         version: solver_version(&build),
         mode,
         images,
         facts,
         pending: Pending::new(),
+        full_lookups: AtomicUsize::new(0),
+        lookups: [const { blaze_record::Tally::new() }; Step::COUNT],
         error: Lock::new("ty.body_store.error", None),
-    }));
-    for (at, slot) in REGISTRY.iter().enumerate() {
-        if slot
-            .compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            INSTALLED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `Box::into_raw` never gives null.
-            return Ok(Installed { at, store: unsafe { NonNull::new_unchecked(store) } });
-        }
-    }
-    // SAFETY: never published, so this is its only owner.
-    drop(unsafe { Box::from_raw(store) });
-    // alloc: error text
-    Err(format!("more than {STORES} databases with an item store at once"))
+        traces: Lock::new("ty.body_store.traces", blaze_hash::HashMap::new_in(std::alloc::Global)),
+        served: Lock::new("ty.body_store.served", entries::Posted::default()),
+    });
+    Ok(Installed { linked: REGISTRY.link(store) })
 }
 
 /// An item store installed for a database ([`install`]); dropping it uninstalls it.
 pub struct Installed {
-    at: usize,
-    store: NonNull<Store>,
+    linked: Linked<Store>,
 }
-
-// SAFETY: `Installed` owns its `Store`, which is `Send + Sync` (its fields are), and hands out
-// only shared references to it.
-unsafe impl Send for Installed {}
-// SAFETY: as above.
-unsafe impl Sync for Installed {}
 
 impl Installed {
     fn store(&self) -> &Store {
-        // SAFETY: the store is freed only by `drop`, which takes `&mut self`.
-        unsafe { self.store.as_ref() }
+        self.linked.get()
     }
 
     /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
     /// index; the next flush's [`Flushed::steps`] has them too.
-    pub fn steps(&self) -> [StepCounts; 3] {
+    pub fn steps(&self) -> [StepCounts; Step::COUNT] {
         self.store().pending.steps()
     }
 
@@ -734,16 +896,21 @@ impl Installed {
             |a, b| entries[a].base == entries[b].base,
         );
         store.images.for_each(runs.len(), &|run| {
-            let mut claimed = Claimed::new();
             // clone: a range of two words
-            for &at in &order[runs[run].clone()] {
-                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            let run = &order[runs[run].clone()];
+            // A run is the entries of one base key, and never empty.
+            let mut filing = slots::filing(entries[run[0]].base);
+            for &at in run {
+                _ = results[at].set(store.write(&entries[at], &mut filing));
             }
         });
-        let Tallies { refused, counts } = tallies;
+        let Tallies { refused, scans, counts } = tallies;
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
         let mut flushed = Flushed {
+            lookups_full: store.full_lookups.swap(0, Ordering::Relaxed),
+            lookups: std::array::from_fn(|step| store.lookups[step].take()),
             refused,
+            scans,
             unhashable,
             no_identity,
             unshareable,
@@ -761,7 +928,20 @@ impl Installed {
             match wrote {
                 Ok(Wrote::Written) => flushed.written += 1,
                 Ok(Wrote::Kept) => flushed.kept += 1,
-                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Ok(Wrote::SlotsFull) => {
+                    flushed.slots_full += 1;
+                    if flushed.full.is_none() {
+                        let entry = &entries[at];
+                        // alloc: once per flush that met a full chain
+                        flushed.full = Some(format!(
+                            "the {} of {:?} (base key {:x}), whose chain holds {} other shapes",
+                            what(entry.step),
+                            entry.def,
+                            entry.base,
+                            slots::full_chain()
+                        ));
+                    }
+                }
                 Err(why) => {
                     flushed.failed += 1;
                     flushed.failure.get_or_insert(why);
@@ -769,20 +949,5 @@ impl Installed {
             }
         }
         Ok(flushed)
-    }
-}
-
-impl Drop for Installed {
-    fn drop(&mut self) {
-        let held = REGISTRY[self.at].swap(ptr::null_mut(), Ordering::AcqRel);
-        assert_eq!(held, self.store.as_ptr(), "an item store's slot held another store");
-        INSTALLED.fetch_sub(1, Ordering::Relaxed);
-        // SAFETY: made by `Box::into_raw` in `install`, and unlinked by the swap above, which only
-        // this guard makes; readers that loaded it are covered by the limbo's grace.
-        let store = unsafe { Box::from_raw(held) };
-        let mut limbo = LIMBO.lock();
-        limbo.retire(store);
-        // alloc: `Limbo::collect` frees; it is not an iterator's.
-        limbo.collect();
     }
 }

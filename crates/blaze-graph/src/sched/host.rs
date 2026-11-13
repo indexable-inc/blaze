@@ -544,6 +544,28 @@ impl<'a> Host<'a> {
         }
     }
 
+    /// Gives back what this worker's stacks hold for no job, as it parks after an idle
+    /// daemon's ask (`blaze_mem::frame::settle_spare`): each idle fiber is told to exit and
+    /// dropped, its stack unmapped and so its pages returned, and the pages of the worker's
+    /// own thread stack below the calling frame are given back
+    /// ([`super::stack::give_back_below_here`]). The next job makes a fiber again
+    /// ([`Host::run`]). Called on the worker's own thread stack, outside any fiber. The bytes
+    /// of the thread's stack it advised.
+    ///
+    /// # Errors
+    ///
+    /// Where the thread's stack could not be found or the kernel refused the advice, naming
+    /// the range: a refusal over a live stack is a bug in how the range was found, which the
+    /// pool stops on as on a refused park, never a page kept quietly.
+    pub(crate) fn give_back_stacks(&mut self) -> std::io::Result<usize> {
+        let _switch = DriverSpan::open(Driving::Switch);
+        for fiber in self.idle.drain(..) {
+            exit(fiber);
+        }
+        // The vector's room stays: a worker's own, made once.
+        super::stack::give_back_below_here()
+    }
+
     /// Runs `job` (one the pool was given, or a parked one given back) on a fiber until it ends
     /// or parks: the panic of a job's own `done`, if any.
     ///

@@ -1100,6 +1100,12 @@ impl<'q: 't, 't> Cx<'q, 't> {
         }
     }
 
+    /// Whether the walk is of the crate's root file itself: not a body's, not another file's,
+    /// not an expansion's. Where a lint about the crate as a whole says its one finding.
+    pub(crate) fn at_crate_root(&self) -> bool {
+        self.def.is_none() && self.in_file() && self.base.file == self.krate.root_file_id(self.db)
+    }
+
     /// Whether the walk is in the file's own tree, not in an expansion of a macro.
     pub(crate) fn in_file(&self) -> bool {
         self.walking.expansion.is_none() && self.walking.input.is_none()

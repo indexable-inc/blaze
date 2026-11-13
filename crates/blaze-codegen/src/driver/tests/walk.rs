@@ -210,3 +210,117 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     assert_eq!(reached, 4);
     assert!(waited.load(Ordering::Acquire), "f3's describe saw f4's before it ended");
 }
+
+/// A subscriber that keeps the last `done` and `known` recorded on any span: what a walk's
+/// span carries, as the profile's subscriber reads it.
+#[derive(Default)]
+struct Counts {
+    done: std::sync::atomic::AtomicU64,
+    known: std::sync::atomic::AtomicU64,
+    /// How many records named either field.
+    records: std::sync::atomic::AtomicU64,
+}
+
+struct CountsOf<'a>(&'a Counts);
+
+impl tracing::field::Visit for CountsOf<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        let slot = match field.name() {
+            "done" => &self.0.done,
+            "known" => &self.0.known,
+            _ => return,
+        };
+        slot.store(value, Ordering::Release);
+        self.0.records.fetch_add(1, Ordering::Release);
+    }
+
+    // dyn: tracing's visitor takes any other value by its `Debug`
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+struct Recorder(Arc<Counts>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        attributes.record(&mut CountsOf(&self.0));
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut CountsOf(&self.0));
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// What the span over a walk of `program` on `workers` carried last: (`done`, `known`), how
+/// many records named them, and how many functions and statics the walk gave.
+fn carried(program: &Program, workers: usize, bug: Option<Planted>) -> (u64, u64, u64, usize) {
+    let counts = Arc::new(Counts::default());
+    let pool = Pool::new(&Topology::flat(workers), false).unwrap();
+    let items = pool.install(|| {
+        tracing::subscriber::with_default(Recorder(Arc::clone(&counts)), || {
+            let policy = policy(OptLevel::O0, Mode::Output);
+            let (machine, memo) = (Machine::default(), Memo::new());
+            let build = Build::new(&machine, program, &policy, &memo);
+            let build = match bug {
+                Some(bug) => build.planting(bug),
+                None => build,
+            };
+            let roots: Vec<(u32, Origin)> = ROOTS.iter().map(|it| (*it, member())).collect();
+            let mut errors = Vec::new();
+            let span = tracing::info_span!(
+                target: "blaze",
+                "codegen walk",
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
+            );
+            let (nodes, statics, ..) =
+                span.in_scope(|| build.walk(&roots, &STATIC_ROOTS, &[], None, &mut errors));
+            assert!(errors.is_empty(), "{errors:?}");
+            nodes.len() + statics.len()
+        })
+    });
+    (
+        counts.done.load(Ordering::Acquire),
+        counts.known.load(Ordering::Acquire),
+        counts.records.load(Ordering::Acquire),
+        items,
+    )
+}
+
+/// The invariant: the walk's span carries how far the walk is: as it ends, every item sent
+/// was visited (`done == known`), that count is the walk's functions and statics, and it is
+/// the same on one worker and on eight.
+#[test]
+fn the_walks_span_carries_done_and_known() {
+    let program = generated(3);
+    let (done, known, records, items) = carried(&program, 1, None);
+    assert!(records >= 2, "the span was told its counts: {records} records");
+    assert_eq!(done, known, "every item sent was visited");
+    // One key a function here (`generated` gives each its own code), so the walk's nodes
+    // are its entries.
+    assert_eq!(done as usize, items, "the count is the walk's functions and statics");
+    let (done_8, known_8, ..) = carried(&program, 8, None);
+    assert_eq!((done_8, known_8), (done, known), "the same counts on eight workers");
+}
+
+/// The planted bug: only the roots are counted as known. The oracle of
+/// [`the_walks_span_carries_done_and_known`] compares `done` with `known`, and here more
+/// visits ended than items were said to be known.
+#[test]
+fn the_oracle_catches_a_walk_that_counts_only_its_roots() {
+    let program = generated(3);
+    let (done, known, ..) = carried(&program, 1, Some(Planted::UncountedSends));
+    assert!(done > known, "done {done}, known {known}");
+}

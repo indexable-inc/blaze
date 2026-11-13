@@ -75,7 +75,8 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
             .mode()
             .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
         // The entry's bytes in a block of their own, kept past the fetch with the VFS tree
-        // that holds them, read straight in: as many as its header says, which the archive's
+        // that holds them (the next image puts them in the content store by their id, and
+        // names them by that id alone), read straight in: as many as its header says, which the archive's
         // limit bounds (a header claiming more stops here, as the reader would at the limit).
         let size = entry.size();
         let size = usize::try_from(size).ok().filter(|_| size <= limit).ok_or_else(|| {

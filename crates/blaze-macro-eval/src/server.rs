@@ -28,6 +28,81 @@ use crate::{
     wire::{Reader, Writer},
 };
 
+/// What of a span an expansion learned that its key does not say: the first such thing it
+/// learned, which is what its reads are not known for ([`Asked::why`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Asked {
+    /// The edition of a span's context, to print a keyword of some editions (`dyn`, `async`).
+    Edition,
+    /// A span's `Debug` text, which is of the database's numbering.
+    Debug,
+    FilePath,
+    SourceText,
+    LineColumn,
+    ByteRange,
+    Source,
+    Parent,
+    /// The join of two spans anchored to two items of one file.
+    Join,
+}
+
+impl Asked {
+    /// The question of `req`.
+    fn of(req: &SubRequest) -> Asked {
+        match req {
+            SubRequest::FilePath { .. } | SubRequest::LocalFilePath { .. } => Asked::FilePath,
+            SubRequest::SourceText { .. } => Asked::SourceText,
+            SubRequest::LineColumn { .. } => Asked::LineColumn,
+            SubRequest::ByteRange { .. } => Asked::ByteRange,
+            SubRequest::SpanSource { .. } => Asked::Source,
+            SubRequest::SpanParent { .. } => Asked::Parent,
+            SubRequest::SpanJoin { .. } => Asked::Join,
+        }
+    }
+
+    /// Whether the answer is a function of the code texts of the calling crate and the crates
+    /// it depends on (`blaze_lower::code`): where items and tokens are by line and column,
+    /// which macro call a span is of, which edition a crate is, where a file is. A key that
+    /// holds those crates' identities covers it: a unit's record, a crate's image. So such a
+    /// question leaves the expansion's reads known; only the expansion's own key, which
+    /// numbers its anchors and contexts and says nothing of where they are, does not cover
+    /// the answer, and the expansion is kept under it by no store.
+    ///
+    /// Not so a span's source text and byte range, which see the comments and spaces a code
+    /// text leaves out, nor its `Debug` text, which is of this database's numbering: after
+    /// one of those the expansion's reads are not known.
+    pub(crate) fn by_position(self) -> bool {
+        match self {
+            Asked::Edition
+            | Asked::FilePath
+            | Asked::LineColumn
+            | Asked::Source
+            | Asked::Parent
+            | Asked::Join => true,
+            Asked::Debug | Asked::SourceText | Asked::ByteRange => false,
+        }
+    }
+
+    /// Why the expansion's reads are not known, naming what it asked (rule 19).
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            Asked::Edition => {
+                "it asked the database the edition of a span (to print a keyword of some editions)"
+            }
+            Asked::Debug => "it asked the database a span's `Debug` text",
+            Asked::FilePath => "it asked the database a span's file",
+            Asked::SourceText => "it asked the database a span's source text",
+            Asked::LineColumn => "it asked the database a span's line and column",
+            Asked::ByteRange => "it asked the database a span's byte range",
+            Asked::Source => "it asked the database a span's source (`Span::source`)",
+            Asked::Parent => "it asked the database a span's parent",
+            Asked::Join => {
+                "it asked the database the join of two spans of two items of one file"
+            }
+        }
+    }
+}
+
 /// A diagnostic the macro emitted (`proc_macro::Diagnostic::emit`), or an error rustc's
 /// session would have reported for it (a lexer error of `ts_from_str`), rendered.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -68,8 +143,9 @@ pub(crate) struct Server {
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
     forced_keywords: bool,
-    /// Whether the expansion learned of a span what its key does not say.
-    pub(crate) asked: bool,
+    /// What the expansion learned of a span that its key does not say, if anything: the
+    /// first question no key covers, else the first ([`Server::note_asked`]).
+    pub(crate) asked: Option<Asked>,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
     pub(crate) tracked: Vec<String>,
     pub(crate) emitted: Vec<Emitted>,
@@ -219,7 +295,7 @@ impl Server {
             sites,
             edition,
             forced_keywords,
-            asked: false,
+            asked: None,
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
             text: String::new(), // alloc: once per expansion, as above
@@ -310,8 +386,17 @@ impl Server {
         Ok(answer)
     }
 
+    /// Notes that the expansion learned `asked` of a span: the first question kept, and a
+    /// question no key covers ([`Asked::by_position`]) in place of one a key does.
+    fn note_asked(&mut self, asked: Asked) {
+        match self.asked {
+            Some(first) if !first.by_position() || asked.by_position() => {}
+            _ => self.asked = Some(asked),
+        }
+    }
+
     fn ask(&mut self, db: &(impl Answer + ?Sized), req: SubRequest) -> SubResponse {
-        self.asked = true;
+        self.note_asked(Asked::of(&req));
         match db.answer(req) {
             Ok(it) => it,
             Err(stop) => {
@@ -715,7 +800,9 @@ impl Server {
                         calling
                     })
                 });
-                self.asked |= asked;
+                if asked {
+                    self.note_asked(Asked::Edition);
+                }
                 if let Some(stop) = lost {
                     self.lost.get_or_insert(stop);
                 }
@@ -788,7 +875,7 @@ impl Server {
             Method::SpanDebug => {
                 let span = self.read_span(&mut r)?;
                 // What it says is of the database's numbering, which the key does not have.
-                self.asked = true;
+                self.note_asked(Asked::Debug);
                 let mut text = std::mem::take(&mut self.text);
                 text.clear();
                 _ = write!(text, "{span:?}");

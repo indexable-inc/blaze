@@ -220,7 +220,14 @@ fn replacing_a_function_with_one_importing_from_another_module_moves_the_import(
 #[test]
 fn a_wasm_image_is_laid_out_whole_each_link() {
     for triple in ["wasm32-wasip1", "wasm64-blaze-wasip1"] {
-        let output = crate::target::output(triple, None, crate::Debug::Lines, true).unwrap();
+        let output = crate::target::output(
+            triple,
+            None,
+            crate::Debug::Lines,
+            true,
+            crate::target::RunsOn::Here,
+        )
+        .unwrap();
         assert!(!output.incremental, "{triple}");
     }
     let error = Image::new(name(TO), Output { incremental: true, ..wasm() })

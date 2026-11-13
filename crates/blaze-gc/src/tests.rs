@@ -24,6 +24,7 @@ pub(crate) fn levels() -> Levels {
         floor_percent: 0,
         floor_bytes: 600,
         share_percent: 100,
+        budget_bytes: u64::MAX,
         hysteresis_permille: 50,
     }
 }

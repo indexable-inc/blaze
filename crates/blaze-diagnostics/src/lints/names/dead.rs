@@ -7,9 +7,9 @@
 //! Where the front end can't say what rustc's pass would (a `global_asm!` naming a symbol, a
 //! `pub macro` whose expansion reaches private items), nothing is linted.
 //!
-//! The crate's syntax is walked once (`defs`), numbering every definition; each later part
-//! reads that numbering, and what each asks of a definition (its level, its attributes, what
-//! its impl is of) is computed once.
+//! The crate is numbered once (`defs`) from its def maps, item trees and bodies' item lists,
+//! no syntax read; each later part reads that numbering, and what each asks of a definition
+//! (its level, its attributes, what its impl is of, where it is written) is computed once.
 //!
 //! blaze: `observe` runs the same pass for the lints over every configuration at once
 //! (`crate::reach`), with no diagnostic made.
@@ -25,6 +25,8 @@ mod reach;
 mod report;
 mod res;
 mod seed;
+#[cfg(test)]
+mod tests;
 
 use super::effective::Effective;
 use crate::{

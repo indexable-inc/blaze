@@ -2063,7 +2063,7 @@ include!({path:?});
     }
 
     std::fs::write(&code, "pub fn moved() {}\n").expect("code.rs");
-    assert!(db.reload_included_file(&at), "the file changed on disk");
+    assert!(db.reload_included_file(&at, &base_db::Looks::none()), "the file changed on disk");
     let dump = crate_def_map(&db, krate).dump(&db);
     std::fs::remove_dir_all(&dir).expect("the temporary directory");
     expect![[r#"

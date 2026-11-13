@@ -371,6 +371,10 @@ impl<M: Memo> Plane<M> {
             PlaneInput::Footprint { .. } | PlaneInput::Realized { .. } => {
                 unreachable!("the differential tests give no footprint")
             }
+            // Nor is a forecast between a push and a start: the differential tests give none.
+            PlaneInput::Forecast { .. } => {
+                unreachable!("the differential tests give no forecast")
+            }
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
@@ -382,9 +386,9 @@ impl<M: Memo> Plane<M> {
                     self.idle_running.retain(|&task| nodes[tasks[task].runner].request != r);
                 }
             }
-            PlaneInput::Yielded { id, .. } => {
+            PlaneInput::Yielded { id, needs, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, &mut out, &mut touched);
+                self.yielded(at, task, needs, &mut out, &mut touched);
             }
         }
         self.after(at, out, touched)
@@ -412,13 +416,17 @@ impl<M: Memo> Plane<M> {
         &mut self,
         at: u64,
         task: usize,
+        needs: u64,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<usize>,
     ) {
+        let most = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
         let t = &mut self.tasks[task];
         let (p, memory, yielding, runner) = (pool_at(t.pool), t.memory, t.yielding, t.runner);
         t.running = false;
         t.yielding = false;
+        // What it needed as it gave way is its forecast from now on, at most the budget.
+        t.memory = memory.max(needs.min(most));
         self.running[p] -= 1;
         self.granted -= memory;
         if yielding {
@@ -1126,11 +1134,11 @@ impl<M: Memo> Plane<M> {
                 None => Pick::None,
             };
         };
-        // A task that fits the budget starts once nothing granted memory runs, whatever the
-        // process holds besides: waiting could never make room for it. Under pressure it
-        // could, so none does.
-        let whole = self.budget_now().expect("a budget");
-        let alone = self.granted == 0 && self.cap.is_none();
+        // The liveness rule (`crate::plane::Plane::pick`'s invariant): once no running task
+        // holds a grant the first ready task in order starts, whatever it asks, whatever the
+        // process holds besides and under a pressure cap too: with nothing granted, holding
+        // it back frees no memory. No ledger is modelled, so no room binds between turns.
+        let alone = self.granted == 0;
         let hold = self.hold();
         let counts = !self.requests[r].idle;
         for &(_, _, me) in &self.requests[r].ready[p] {
@@ -1143,7 +1151,7 @@ impl<M: Memo> Plane<M> {
                         return Pick::Start(me);
                     }
                 }
-                _ if memory <= free || (memory <= whole && alone) => return Pick::Start(me),
+                _ if memory <= free || alone => return Pick::Start(me),
                 Some(_) => {}
                 None => {
                     if counts {
@@ -1157,6 +1165,13 @@ impl<M: Memo> Plane<M> {
 
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
         let task = self.nodes[me].task.expect("a ready node's task");
+        // A task that asks more than the budget is now (a pressure cap), started alone: granted
+        // the cap, and at least a byte, so no second one starts alone beside it.
+        if let Some(whole) = self.budget_now()
+            && self.tasks[task].memory > whole
+        {
+            self.tasks[task].memory = whole.max(1);
+        }
         let p = pool_at(self.tasks[task].pool);
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];

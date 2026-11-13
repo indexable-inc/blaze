@@ -19,31 +19,39 @@ mod effective;
 mod imports;
 mod items;
 mod stability;
+mod uses;
 
 pub(crate) use self::{
     effective::{Def as EffectiveDef, Effective},
     items::{Walk as ItemWalk, def_span},
 };
-use crate::{cx::Cx, lower::Found};
+use crate::{check::crate_pass, cx::Cx, lower::Found};
 
 /// What name resolution and the stability checks lint, given whatever else failed.
 pub(crate) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut found = imports::lints(cx);
-    found.extend(stability::lints(cx));
-    found.extend(items::before_abort(cx));
+    let mut found = crate_pass(cx, "imports", || imports::lints(cx));
+    found.extend(crate_pass(cx, "stability", || stability::lints(cx)));
+    found.extend(crate_pass(cx, "items before", || items::before_abort(cx)));
     found
 }
 
 /// What rustc's dead-code pass and its late lint passes of items lint, run only when nothing
 /// failed, in `misc_checking_3`'s order: private types in public interfaces, deathness, the
 /// late lint passes, then the extern declarations that clash.
+///
+/// Each under its span `crate pass` ([`crate_pass`]): `items and visibilities` (the item walk
+/// and the effective visibilities, when not made before), `private in public`, `dead code`,
+/// `items late`, `clashing externs`.
 pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let walk = cx.items();
-    let effective = cx.effective();
-    let mut found = items::private_in_public(cx, walk, effective);
-    found.extend(dead::lints(cx, effective));
-    found.extend(items::after_abort(cx, walk, effective));
-    found.extend(items::clashing_extern_declarations(cx, walk));
+    let (walk, effective) =
+        crate_pass(cx, "items and visibilities", || (cx.items(), cx.effective()));
+    let mut found =
+        crate_pass(cx, "private in public", || items::private_in_public(cx, walk, effective));
+    found.extend(crate_pass(cx, "dead code", || dead::lints(cx, effective)));
+    found.extend(crate_pass(cx, "items late", || items::after_abort(cx, walk, effective)));
+    found.extend(crate_pass(cx, "clashing externs", || {
+        items::clashing_extern_declarations(cx, walk)
+    }));
     found
 }
 

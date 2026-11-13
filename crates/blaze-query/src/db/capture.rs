@@ -16,8 +16,10 @@ use blaze_hash::FixedState;
 
 use super::{
     Database, DatabaseKeyIndex, Id, Storage,
+    function,
     ingredient::{self, Kind},
     local::{self, Capture, walk_capture},
+    row::{Header, PROVISIONAL, RUNNING, STORED, VIEW_MASK, span},
     storage::{Summary, key_parts, or},
 };
 
@@ -106,6 +108,159 @@ impl Reads {
         walk_capture(storage, self.capture, &mut spans, &mut walked, |node| {
             f(read_of_key(storage.key_of(node)))
         })
+    }
+}
+
+/// One read of [`Reads::for_each_read_through`].
+#[derive(Clone, Copy, Debug)]
+pub enum RowRead {
+    /// A read: one the capture made, or one of a row it was told to descend through.
+    Read(Read),
+    /// A row it was told to descend through whose last run was answered from a store by a
+    /// key ([`super::report_stored_read`]): its kept edges are that lookup's reads, not the
+    /// reads its value was first made from, so it is handed over whole and not descended.
+    /// The caller reads that record's own shape.
+    Stored(Read),
+    /// A row it was told to descend through that could not be brought up to date in this
+    /// view ([`super::Refreshed::Unsettled`]: on this task's stack, provisional): its kept
+    /// reads are not what its value rests on now, so it is handed over whole.
+    Unsettled(Read),
+}
+
+/// The header of the function row `read` names, when it is current in this view: verified
+/// in it, neither running nor provisional.
+///
+/// # Panics
+///
+/// When it is not, naming the row: its kept edges may be an older run's, or about to be
+/// replaced, and a list of them would be taken for what its value rests on now.
+fn current_row<'s>(storage: &'s Storage, read: &Read, why: &str) -> &'s Header {
+    let (index, id) = (read.key.ingredient_index(), read.key.key_index());
+    let current = function::header_of(storage, index, id).filter(|header| {
+        let word = header.verified.load(std::sync::atomic::Ordering::Acquire);
+        word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == storage.view_bits()
+    });
+    match current {
+        Some(header) => header,
+        None => panic!(
+            "the kept reads of `{}`({id:?}) were asked for ({why}) and the row is not up to \
+             date in this view: refresh it first",
+            ingredient::name(index)
+        ),
+    }
+}
+
+impl Reads {
+    /// [`Reads::for_each_read`], but where `through` says so of a read of a function's row,
+    /// that row's own kept reads are given in its place (and so on through them), the row
+    /// itself not given: for a caller that wants what a value rests on below some rows it
+    /// names (a body's lowering below `Body::of`). Each node is given once, whichever way it
+    /// is reached.
+    ///
+    /// What holds of a row descended through:
+    /// - its reads are those of its last run, kept until it runs again: letting its value go
+    ///   (`evict`, an epoch's end, a budget's pass) keeps them;
+    /// - it is brought up to date in this view first, by its key ([`super::refresh`]): a row
+    ///   its reader proved by durability keeps an older view's stamp until it is asked for.
+    ///   Once current it does not run again in the view, so its reads are not replaced under
+    ///   the walk, and the edge array moves only under `&mut`. The running query, if any,
+    ///   reads each row descended (the refresh records it), so it runs again when one of
+    ///   them does and its kept reads change;
+    /// - one that cannot be brought up to date is handed over as [`RowRead::Unsettled`], and
+    ///   one answered from a store as [`RowRead::Stored`]: neither is descended.
+    ///
+    /// An interned read records no edge, so none is given, here or in a row descended.
+    ///
+    /// # Panics
+    ///
+    /// If `self` was captured in another view than `db`'s storage's, or as
+    /// [`super::refresh`] does.
+    pub fn for_each_read_through<D: Database, B>(
+        &self,
+        db: &D,
+        through: impl Fn(&Read) -> bool,
+        mut each: impl FnMut(RowRead) -> ControlFlow<B>,
+    ) -> Option<B> {
+        let storage = db.storage();
+        self.check_view(storage);
+        // `each` may ask the database, so the walk's lists are its own, not the thread's.
+        let mut spans = Vec::new(); // alloc: a walk's open captures, once per read-out of a capture
+        let mut walked = hashbrown::HashSet::with_hasher(FixedState); // alloc: as above
+        let mut seen: hashbrown::HashSet<u32, FixedState> = hashbrown::HashSet::with_hasher(FixedState); // alloc: as above
+        let mut rows: Vec<(u64, u64)> = Vec::new(); // alloc: the rows being descended, a few
+        walk_capture(storage, self.capture, &mut spans, &mut walked, |node| {
+            // Depth first, in read order: the node itself, then (for a row descended through)
+            // its edges, each of which may be descended in turn. Bounded: a node is taken
+            // once (`seen`).
+            let mut next = Some(node);
+            loop {
+                let node = match next.take() {
+                    Some(node) => node,
+                    None => {
+                        let Some(top) = rows.last_mut() else { return ControlFlow::Continue(()) };
+                        if top.0 == top.1 {
+                            rows.pop();
+                            continue;
+                        }
+                        top.0 += 1;
+                        storage.edge(top.0 - 1)
+                    }
+                };
+                if !seen.insert(node) {
+                    continue;
+                }
+                let read = read_of_key(storage.key_of(node));
+                if read.kind != ReadKind::Function || !through(&read) {
+                    if let ControlFlow::Break(out) = each(RowRead::Read(read)) {
+                        rows.clear();
+                        return ControlFlow::Break(out);
+                    }
+                    continue;
+                }
+                if super::refresh(db, read.key) != super::Refreshed::Current {
+                    if let ControlFlow::Break(out) = each(RowRead::Unsettled(read)) {
+                        rows.clear();
+                        return ControlFlow::Break(out);
+                    }
+                    continue;
+                }
+                let header = current_row(storage, &read, "to descend through it");
+                if header.meta.load(std::sync::atomic::Ordering::Relaxed) & STORED != 0 {
+                    if let ControlFlow::Break(out) = each(RowRead::Stored(read)) {
+                        rows.clear();
+                        return ControlFlow::Break(out);
+                    }
+                    continue;
+                }
+                let kept = header.edges.load(std::sync::atomic::Ordering::Acquire);
+                rows.push((span::start(kept), span::start(kept) + span::len(kept))); // alloc: as above
+            }
+        })
+    }
+}
+
+impl Storage {
+    /// The kept reads of the function row `row`, in read order: those of its last run.
+    /// [`Reads::for_each_read_through`] says what holds of them.
+    ///
+    /// # Panics
+    ///
+    /// When the row is not current in this view, naming it: bring it up to date first
+    /// ([`super::refresh`]).
+    pub fn row_reads<B>(
+        &self,
+        row: DatabaseKeyIndex,
+        mut each: impl FnMut(Read) -> ControlFlow<B>,
+    ) -> Option<B> {
+        let read = Read { key: row, kind: ReadKind::Function };
+        let header = current_row(self, &read, "its own");
+        let kept = header.edges.load(std::sync::atomic::Ordering::Acquire);
+        for edge in span::start(kept)..span::start(kept) + span::len(kept) {
+            if let ControlFlow::Break(out) = each(read_of_key(self.key_of(self.edge(edge)))) {
+                return Some(out);
+            }
+        }
+        None
     }
 }
 
@@ -253,61 +408,162 @@ pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
 /// caller but `span_names`. A query `write` asks for still runs, and records its reads into its
 /// own row.
 ///
-/// `write` must not ask for a query that may be on this thread's stack: the cycle through it
-/// would make the running query a member of a cycle whose read this forgets.
+/// A query `write` asks for that is on this thread's stack joins the running query to that
+/// cycle as an ask outside the guard would ([`unrecorded`]).
 pub fn for_span_text<D: Database>(db: &D, out: &mut String, write: impl FnOnce(&D, &mut String)) {
-    let _restore = untracked(db);
+    let _restore = Unrecorded::open(db);
     write(db, out);
 }
 
-/// Stops recording reads into `db`'s running query until the guard drops.
-fn untracked<D: Database>(db: &D) -> Option<Unrecorded> {
-    let storage = db.storage();
-    local::with(|local| {
-        let edges = local.edges.len() as u32;
-        let at = local.frames.len().checked_sub(1)? as u32;
-        let frame = local.recording(storage)?;
-        Some(Unrecorded {
-            at,
-            edges,
-            dedup_floor: frame.dedup_floor,
-            durability: frame.durability,
-            changed: frame.changed,
-            summary: frame.summary,
-            head: frame.head,
-            unshareable: frame.unshareable,
-            untracked: frame.untracked,
-        })
-    })
+/// Runs `f` with none of its reads recorded into `db`'s running query or any capture open on
+/// it ([`capture_reads`]): when `f` returns or unwinds, the run's frame is as `f` found it.
+/// For bookkeeping about what the query computed whose result never reaches its value: a
+/// goal's offer to the goal store, which hashes the facts the goal read into the store's own
+/// record (`hir_ty::next_solver::goal_store`), so the trace of the body whose solve first
+/// offered a goal is the same as one that took it from the goal table. `.clippy.toml` limits
+/// its callers to those.
+///
+/// What it restores, exactly: the edge stack's length (its segments too), and what the reads
+/// folded into the frame (the lowest durability, the highest `changed`, the replayed
+/// summaries, whether it may be shared, whether it made an untracked or a stored read, its
+/// dedup count and limit). While `f` runs the frame's dedup floor is the stack's top, as a
+/// capture's is, so a dedup inside `f` moves none of the edges from before it. A capture `f`
+/// opens and closes is kept whole (its reads are its own, stored with it) and gone from the
+/// frame with the rest.
+///
+/// Sound under the engine's cycles: a cycle `f` meets through a row on the stack at or below
+/// the running query stays the run's (its cycle head, and whether a row of the stack heads a
+/// cycle or did not converge, are never put back), so the run is that cycle's member, run
+/// again with it, as an ask outside the guard would make it; only that membership is kept, as
+/// what `f` read still reaches no value. Under parallel loops: a task `f` runs on another
+/// worker records into no frame of this one, and one it runs here records above where `f`
+/// began. Nothing is held across a wait but stack indices.
+pub fn unrecorded<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> T {
+    let _restore = Unrecorded::open(db);
+    f()
 }
 
-/// The running query's frame as [`for_span_text`] found it, put back when it ends (an unwind
-/// out of its `write` too): its edges above `edges` dropped, and what those reads folded into it.
+/// [`unrecorded`], unless `keep` says of `f`'s value that its reads are the running query's
+/// after all: then they stay recorded, and in every capture open on it, as if no guard had
+/// been open. For a lookup whose reads are the key of what it found (a stored goal's answer)
+/// and are nothing of a miss, which the query computes otherwise and captures on its own.
+pub fn recorded_if<D: Database, T>(
+    db: &D,
+    f: impl FnOnce() -> T,
+    keep: impl FnOnce(&T) -> bool,
+) -> T {
+    let mut restore = Unrecorded::open(db);
+    let value = f();
+    if keep(&value)
+        && let Some(restore) = restore.as_mut()
+    {
+        restore.keep = true;
+    }
+    value
+}
+
+/// The running query's frame as an [`unrecorded`] guard found it, put back when it ends (an
+/// unwind out of its `f` too): its edges above `edges` dropped, and what those reads folded
+/// into it.
 struct Unrecorded {
     at: u32,
+    serial: u64,
     edges: u32,
     dedup_floor: u32,
+    dedup_at: u32,
+    dropped: u64,
     durability: u8,
     changed: u32,
     summary: Summary,
     head: u32,
     unshareable: bool,
     untracked: bool,
+    stored: bool,
+    /// [`recorded_if`]'s `keep` held: only the dedup floor is put back.
+    keep: bool,
+}
+
+impl Unrecorded {
+    /// Opens the guard on `db`'s running query; `None` with none recording (a barrier on top,
+    /// no query), where nothing is recorded to keep out.
+    fn open<D: Database>(db: &D) -> Option<Unrecorded> {
+        let storage = db.storage();
+        local::with(|local| {
+            let edges = local.edges.len() as u32;
+            let at = local.frames.len().checked_sub(1)? as u32;
+            let frame = local.recording(storage)?;
+            let open = Unrecorded {
+                at,
+                serial: frame.serial,
+                edges,
+                dedup_floor: frame.dedup_floor,
+                dedup_at: frame.dedup_at,
+                dropped: frame.dropped,
+                durability: frame.durability,
+                changed: frame.changed,
+                summary: frame.summary,
+                head: frame.head,
+                unshareable: frame.unshareable,
+                untracked: frame.untracked,
+                stored: frame.stored,
+                keep: false,
+            };
+            frame.dedup_floor = edges;
+            Some(open)
+        })
+    }
 }
 
 impl Drop for Unrecorded {
     fn drop(&mut self) {
         local::with(|local| {
+            let frame = local.frames.get(self.at as usize);
+            // A stack that is not as the guard found it is the engine's bug: said, unless an
+            // unwind is already under way (a panic in a drop then would abort, naming nothing).
+            if frame.is_none_or(|it| it.serial != self.serial) {
+                assert!(
+                    std::thread::panicking(),
+                    "blaze-query: an `unrecorded` guard opened on the run at stack index {} \
+                     (serial {}) ended with another run there: the stack was not unwound in order",
+                    self.at,
+                    self.serial,
+                );
+                return;
+            }
+            #[cfg(test)]
+            let keep = self.keep || probe::UNRECORDED_KEEPS.get();
+            #[cfg(not(test))]
+            let keep = self.keep;
+            if keep {
+                local.frames[self.at as usize].dedup_floor = self.dedup_floor;
+                return;
+            }
             local.truncate_edges(self.edges as usize);
-            let Some(frame) = local.frames.get_mut(self.at as usize) else { return };
+            let frame = &mut local.frames[self.at as usize];
             frame.dedup_floor = self.dedup_floor;
+            frame.dedup_at = self.dedup_at;
+            frame.dropped = self.dropped;
             frame.durability = self.durability;
             frame.changed = self.changed;
             frame.summary = self.summary;
-            frame.head = self.head;
+            // A cycle met through the stack stays the run's: see `unrecorded`.
+            frame.head = self.head.min(frame.head);
             frame.unshareable = self.unshareable;
             frame.untracked = self.untracked;
+            frame.stored = self.stored;
         });
+    }
+}
+
+/// The planted bug of the guard's oracle (`tests::unrecorded`).
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// An [`super::unrecorded`] guard puts nothing back: its reads stay the run's and its
+        /// captures', as if it were never open.
+        pub(crate) static UNRECORDED_KEEPS: Cell<bool> = const { Cell::new(false) };
     }
 }
 

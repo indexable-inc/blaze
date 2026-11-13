@@ -1,0 +1,19 @@
+{
+ "id": "cache-audit-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cache-audit-1112",
+ "where": "scripts/src/bin/domains.rs: what counts as a hash domain",
+ "what": "The gate's `domains` check saw only literals that end in a version number. Over sixty domains have none at their end and were held to nothing, among them the keys under audit today: `blaze v2 def map pages`, `blaze v2 item pages`, `blaze v2 impl tables`, `blaze v2 found record`, `blaze v2 dependency image`, the item store's and goal store's record domains, `blaze v2 serve no-op request`. Counted with the script's own rules in Python on int-1112: 470 domains by the old form, 530 with these.",
+ "cost": "not measured: no duplicate was found among them, so no wrong key came of it; the cost was that an inventory by domain could not be trusted to be whole",
+ "cause": "the domain form was defined by its ending, and a domain whose version is in the middle (`blaze v2 goal 3 solver`) or nowhere does not have it",
+ "whys": [
+  "the check was a port of a Python regex and kept its form",
+  "the form was inferred from the domains that existed when it was written",
+  "nothing makes a domain be declared: it is any string handed to a hasher",
+  "so a check can only find domains by what they look like"
+ ],
+ "class": "a guard that recognises its subject by spelling: what is spelled otherwise is unguarded and nothing says so",
+ "prevention": "built: the script takes every `blaze v2 ` literal as a domain, and holds each to a row of docs/v2/plan/design/caches.md. Not built, the root: a `Domain` type that is the only thing `blaze_ids::Hasher::new` takes, declared with a macro the script lists, so a domain is found by what it is",
+ "workaround": "none needed",
+ "state": "fixed in the script; the `Domain`-only constructor is open"
+}

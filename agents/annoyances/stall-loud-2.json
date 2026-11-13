@@ -1,0 +1,14 @@
+{
+ "id": "stall-loud-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane stall-loud",
+ "where": "crates/blaze-cargo/src/serve/daemon.rs (pressure, plot: give_pools_back(Unpinned)); crates/blaze-cargo/src/serve/job/giving.rs (the pool rung)",
+ "what": "Three paths evicted the stores' pool pages in line on the daemon's loop, two of them with Store::evict_pool(u64::MAX) on both stores once a second while memory was short. In a cold build of tempo they were 68 spans, 1,605 s of wall for 90 s of CPU on the loop's thread, with turns of up to 542 s, during which the give-back ladder and the typed failure of a task that does not fit (both run once a turn) could not run.",
+ "cost": "part of a 43 minute stall",
+ "cause": "the pool's eviction had three callers, each sized by itself, and none bounded what one loop turn does",
+ "class": "unbounded work in a turn of the one loop (rule 18); one concept in several homes (rule 30)",
+ "prevention": "blaze_graph::poolgive::Slices is the one rule (a slice a turn, dry after two empty sweeps) and Jobs::sweep_pools its one driver; its simulation's oracle refuses a sweep past a slice and a sweep of dry pools, with both planted",
+ "workaround": "none",
+ "fix": "the pressure handler and the plot ask (Jobs::ask_pools); the ladder's pool rung asks; PoolGive::Unpinned is gone",
+ "state": "fixed, not yet compiled or run by this lane (write-only); no daemon-simulation test, since the simulation's stores are pumped and give no page back"
+}

@@ -1,0 +1,12 @@
+{
+ "id": "disk2-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "the lane's scratch clone in its VM",
+ "what": "I typed `git stash` at the end of a command in the VM's clone by reflex. It stashed the applied working patch there; I dropped the stash at once, and the next sync applies the patch afresh, so nothing was lost and the user's worktrees were not touched. The rule is never `git stash`, anywhere.",
+ "cost": "none",
+ "cause": "habit",
+ "workaround": "dropped it",
+ "fix": "none needed beyond the rule",
+ "state": "accepted"
+}

@@ -1,0 +1,16 @@
+about = "A generic function of `a` that `c` instantiates: an edit of its body makes the instance again and no other function, and two units, `a`'s library and the program, whose walk compiles the copy; the libraries `b` and `c` are found, as no front end reads a generic body and no library's record holds a copy of one (store.md, \"Early cutoff between crates\"). The program prints the new value, so the instance is not stale."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "10 10\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "11 10\n"
+redone_has = ["a::twice<u32>"]
+reused = ["c::top", "c::top_beside", "b::mid", "b::mid_beside", "a::base", "a::beside"]
+max_units = 2
+max_records = 2

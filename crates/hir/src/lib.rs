@@ -127,6 +127,8 @@ use syntax::{
     view::{HasName as _, HasVisibility as _},
 };
 
+pub use syntax::builtin_attrs::AttributeTemplate;
+
 use crate::db::HirDatabase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +222,6 @@ pub use {
             HirFileRange, InFile, InFileWrapper, InMacroFile, InRealFile, MacroFilePosition,
             MacroFileRange,
         },
-        inert_attr_macro::AttributeTemplate,
         mod_path::{ModPath, PathKind, tool_path},
         name::{self, Name},
         proc_macro::{ProcMacros, ProcMacrosBuilder},
@@ -3642,18 +3643,17 @@ pub struct BuiltinAttr {
 
 impl BuiltinAttr {
     fn builtin(name: &str) -> Option<Self> {
-        hir_expand::inert_attr_macro::find_builtin_attr_idx(&Symbol::intern(name))
-            .map(|idx| BuiltinAttr { idx: idx as u32 })
+        syntax::builtin_attrs::find(name).map(|idx| BuiltinAttr { idx: idx as u32 })
     }
 
     pub fn name(&self) -> Name {
         Name::new_symbol_root(Symbol::intern(
-            hir_expand::inert_attr_macro::INERT_ATTRIBUTES[self.idx as usize].name,
+            syntax::builtin_attrs::INERT_ATTRIBUTES[self.idx as usize].name,
         ))
     }
 
     pub fn template(&self) -> Option<AttributeTemplate> {
-        Some(hir_expand::inert_attr_macro::INERT_ATTRIBUTES[self.idx as usize].template)
+        Some(syntax::builtin_attrs::INERT_ATTRIBUTES[self.idx as usize].template)
     }
 }
 
@@ -4060,11 +4060,12 @@ impl Impl {
             extend_with_impls(Either::Left(impls))
         });
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_ty) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
-                &mut |impls| extend_with_impls(Either::Left(impls.for_self_ty(&simplified_ty))),
+                &simplified_ty,
+                &mut |impls| extend_with_impls(Either::Left(impls)),
             );
             std::iter::successors(module.block(db), |block| block.module(db).block(db))
                 .filter_map(|block| TraitImpls::for_block(db, block))
@@ -4091,7 +4092,7 @@ impl Impl {
             });
         };
         for &seen in method_resolution::loaded_crates(db, krate.id) {
-            handle_impls(TraitImpls::for_crate(db, seen));
+            handle_impls(TraitImpls::for_crate_and_trait(db, seen, trait_.id));
         }
         if let Some(block) = module.block(db)
             && let Some(impls) = TraitImpls::for_block(db, block)
@@ -5709,12 +5710,13 @@ impl<'db> Type<'db> {
         );
 
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_type) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
+                &simplified_type,
                 &mut |impls| {
-                    handle_impls(impls.for_self_ty(&simplified_type));
+                    handle_impls(impls);
                 },
             );
         }

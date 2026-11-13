@@ -30,7 +30,6 @@ fn one_token_reads_and_writes_every_cell_of_its_kind() {
 fn a_token_behind_one_lock_guards_every_cell_across_threads() {
     const THREADS: u32 = 4;
     const EACH: u32 = 100;
-    let io = world(29, Plant::None);
     let (a, b) = Token::scope(|token| {
         let a = TokenCell::new(0u32);
         let b = TokenCell::new(0u64);
@@ -38,8 +37,11 @@ fn a_token_behind_one_lock_guards_every_cell_across_threads() {
         std::thread::scope(|threads| {
             for _ in 0..THREADS {
                 threads.spawn(|| {
-                    // A context is its thread's own (`Cx` is not `Send`): each thread waits
-                    // for the lock under its own root.
+                    // A context is its thread's own (`Cx` is not `Send`), and so is a world:
+                    // an `Io` is not `Sync` where the native driver is bound to its thread
+                    // (Linux: `blaze_core::Native` is the single-issuer ring). Each thread
+                    // waits for the lock under the root of a world of its own.
+                    let io = world(29, Plant::None);
                     let cx = root(&io);
                     for _ in 0..EACH {
                         match lock.lock(&cx) {

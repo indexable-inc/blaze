@@ -57,7 +57,7 @@ pub use render::{problems_text, text, thread_line};
 /// each stretch of the critical path of [`GAP_NS`] or more under no span, with its thread, the
 /// spans before and after it, and the stacks sampled in it; and the finding `unfinished` (fix
 /// `compare_after`) of a build that did the work its checkout's last, failed build left.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// The least stretch of the critical path under no span that is listed as a gap
 /// ([`Report::gaps`]): 20 ms, the bound the daemon's loop holds one step of a turn to
@@ -229,6 +229,9 @@ pub struct Facts {
     pub thread_cpu: Vec<ThreadCpu>,
     pub memory: Memory,
     pub recorder: Recorder,
+    /// The build's account (`accounts`): none in a history from before the table, or when the
+    /// history's writer lost the build's end.
+    pub account: Option<crate::account::AccountRow>,
     /// Which of the build's spans the model read ([`crate::time::load::SPAN_BUDGET`]).
     pub spans: crate::time::SpanCut,
 }
@@ -373,6 +376,57 @@ pub struct Report {
     pub gaps: Vec<Gap>,
     /// What the profile could not see, most time hidden first.
     pub blind_spots: Vec<BlindSpot>,
+    /// The build's account: the change it saw, the work it did by cause, and what the account
+    /// warns of. None when the history holds no account of the build.
+    pub account: Option<Accounted>,
+}
+
+/// A build's account as a report says it ([`crate::account`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Accounted {
+    /// The account in one line ([`crate::account::Account::line`]).
+    pub line: String,
+    /// Each alarm's name ([`crate::account::Alarm::name`]) and its warning in words.
+    pub warnings: Vec<Warning>,
+    /// Work with no recorded cause: steps `blaze why` cannot explain and rows no cause counts.
+    /// Must be 0.
+    pub unexplained: u64,
+    /// Rows run for a change or verified, for each input written from outside; none when
+    /// nothing was written.
+    pub rows_per_write: Option<f64>,
+    /// Steps made again for a change, for each changed input; none when nothing changed.
+    pub steps_per_change: Option<f64>,
+    /// Rows the history could not write since the daemon began.
+    pub history_dropped: u64,
+}
+
+/// One warning of a build's account: the alarm's name and what it says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Warning {
+    pub name: String,
+    pub says: String,
+}
+
+impl Accounted {
+    /// The account of `row`, a build's `accounts` row.
+    pub fn of(row: &crate::account::AccountRow) -> Accounted {
+        let account = row.clone().account(); // clone: a row, once a report
+        let outside = row.written_source + row.written_environment + row.written_plan;
+        Accounted {
+            line: account.line(),
+            // alloc: once a report
+            warnings: account
+                .alarms()
+                .iter()
+                .map(|it| Warning { name: it.name().to_owned(), says: it.text(row.build_id) })
+                .collect(),
+            unexplained: row.by_unexplained + row.by_unstable + row.ran_uncaused,
+            rows_per_write: (outside > 0)
+                .then(|| (row.ran_changed + row.verified) as f64 / outside as f64),
+            steps_per_change: (row.changes > 0).then(|| row.caused() as f64 / row.changes as f64),
+            history_dropped: row.history_dropped,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -668,6 +722,7 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
         findings,
         gaps: ctx.gaps(),
         blind_spots: blind,
+        account: facts.account.as_ref().map(Accounted::of),
     }
 }
 

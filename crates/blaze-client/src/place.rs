@@ -192,6 +192,12 @@ pub fn stderr_columns() -> Option<u16> {
     crate::sys::stderr_columns()
 }
 
+/// The columns and rows of the terminal stderr is; `None` when it is none.
+#[cfg(unix)]
+pub fn stderr_size() -> Option<(u16, u16)> {
+    crate::sys::stderr_size()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,17 @@
+{
+ "id": "sound-1112-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "blaze: an item added with a rename panics a build, one run in two",
+ "what": "Smoke run without the proc macro, revision 12 (the function `extra` and its call added, `helper` renamed with its caller, a terminal 200 wide, after eleven turns): `error: blaze panicked at crates/hir-def/src/expr_store/body.rs:620:9 on thread blaze-work-87, inside job > query verify > query verify > body_query: FunctionId(FunctionId(2edd6)): ErasedFileAstId { kind: Fn, index: 0, hash: 44CF } is outside fn bodies but no item of EditionedFileId(3, Edition2024) with a body has it, making this unit`; the build failed where a clean build succeeds. The same sequence with the proc macro in the workspace built (same tree, same hour).",
+ "cost": "a failed build after an ordinary edit",
+ "cause": "not found. The frames say a verification (`query verify` inside `query verify`) ran body_query for a function id of before the edit: a row keyed by something the edit removed, verified by a pull of the unit job, not by the changed-set walk (whose containment, UNWOUND_MOST, does not cover it)",
+ "whys": [
+  "a row's key names an item by an id that outlives the item",
+  "verifying a row runs its dependencies' queries on that key before anything establishes the key is still live"
+ ],
+ "class": "a dead key verified",
+ "prevention": "a query on a key whose item is gone answers a typed 'gone' its reader's verification takes as changed, never a panic; then UNWOUND_MOST has nothing to contain",
+ "workaround": "build again (not verified)",
+ "state": "open: replays are running (BLAZE_ORACLE_REPLAY='item rename width=200'); not yet minimized"
+}

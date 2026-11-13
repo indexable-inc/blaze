@@ -146,29 +146,41 @@ pub(super) fn of(db: &Db, item: Item) -> Option<(Crate, ContentId)> {
     Some((krate, ContentId::of_domain(&DOMAIN, &key.bytes)))
 }
 
-struct Key<'a> {
+pub(crate) struct Key<'a> {
     db: &'a Db,
     indexes: &'a HashMap<ModuleId, u32, Global>,
     bytes: SmallVec<[u8; 64]>,
 }
 
+impl<'a> Key<'a> {
+    /// A key of an item of `krate`'s modules, empty.
+    pub(crate) fn new(db: &'a Db, krate: Crate) -> Key<'a> {
+        Key { db, indexes: module_indexes(db, krate), bytes: SmallVec::new() }
+    }
+
+    /// The bytes written so far.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl Key<'_> {
-    fn u8(&mut self, it: u8) {
+    pub(crate) fn u8(&mut self, it: u8) {
         self.bytes.push(it);
     }
 
-    fn u32(&mut self, it: u32) {
+    pub(crate) fn u32(&mut self, it: u32) {
         self.bytes.extend_from_slice(&it.to_le_bytes());
     }
 
-    fn module(&mut self, module: ModuleId) {
+    pub(crate) fn module(&mut self, module: ModuleId) {
         let index = *self.indexes.get(&module).unwrap_or_else(|| {
             panic!("module {module:?} of an item is not in its crate's def map")
         });
         self.u32(index);
     }
 
-    fn adt(&mut self, it: AdtId) {
+    pub(crate) fn adt(&mut self, it: AdtId) {
         let db = self.db;
         let (container, file, id) = match it {
             AdtId::StructId(it) => {
@@ -189,19 +201,19 @@ impl Key<'_> {
         self.u32(id.into_raw());
     }
 
-    fn impl_(&mut self, it: ImplId) {
+    pub(crate) fn impl_(&mut self, it: ImplId) {
         let loc = it.lookup(self.db);
         self.module(loc.container);
         self.ast(loc.id);
     }
 
-    fn trait_(&mut self, it: TraitId) {
+    pub(crate) fn trait_(&mut self, it: TraitId) {
         let loc = it.lookup(self.db);
         self.module(loc.container);
         self.ast(loc.id);
     }
 
-    fn container(&mut self, it: ItemContainerId) {
+    pub(crate) fn container(&mut self, it: ItemContainerId) {
         match it {
             ItemContainerId::ModuleId(module) => {
                 self.u8(0);
@@ -224,12 +236,12 @@ impl Key<'_> {
         }
     }
 
-    fn ast<N>(&mut self, id: AstId<N>) {
+    pub(crate) fn ast<N>(&mut self, id: AstId<N>) {
         self.file(id.file_id);
         self.u32(id.value.erase().into_raw());
     }
 
-    fn file(&mut self, file: HirFileId) {
+    pub(crate) fn file(&mut self, file: HirFileId) {
         match file {
             HirFileId::FileId(file) => {
                 self.u8(0);
@@ -242,7 +254,7 @@ impl Key<'_> {
         }
     }
 
-    fn call(&mut self, call: MacroCallId) {
+    pub(crate) fn call(&mut self, call: MacroCallId) {
         let loc = call.lookup(self.db);
         match &loc.kind {
             MacroCallKind::FnLike { ast_id, eager, .. } => {

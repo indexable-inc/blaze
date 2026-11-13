@@ -17,7 +17,10 @@ use super::{
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
-    storage::{Durability, FIELD, Ids, Storage, Table, View, color, input_bits, node_key, or},
+    seal::SealGroup,
+    storage::{
+        Durability, FIELD, Ids, LOOSE, Storage, Table, View, color, input_bits, node_key, or,
+    },
 };
 
 /// One input struct. Its fields are numbered 0..FIELDS; each has its own stamp and node.
@@ -94,7 +97,9 @@ impl Vtable {
             made: None,
             memory: memory::<I>,
             used: None,
+            values: None,
             verify: None,
+            db: None,
             reset: None,
             weighed: None,
             explicit: None,
@@ -164,7 +169,8 @@ pub fn input_new<I: Input, const N: usize>(
     for (field, durability) in durability.into_iter().enumerate() {
         let node = first + field as u32;
         storage.set_key(node, node_key(index, id, field as u32));
-        storage.set_summary(node, input_bits(node));
+        // Of no seal group until its host says which ([`input_seal_group`]).
+        storage.set_summary(node, or(input_bits(node), LOOSE));
         storage.repaint(node, color(FIELD | u32::from(durability.0), view));
     }
     // SAFETY: the ID is fresh (`Ids::next` gives each once), so this task is the row's one
@@ -208,6 +214,33 @@ pub fn input_written_since<I: Input>(storage: &Storage, id: Id, since: View) -> 
     (0..I::FIELDS.max(1)).any(|field| storage.color_of(first + field) as u32 > stamp)
 }
 
+/// Says every field of input `id` is an input of seal group `group` ([`super::seal`]): a write
+/// of one opens that group and no other, found from the field with no walk of rows. For the
+/// host that makes the input, before a query reads it (a row that read it before stays as it
+/// was: of no group, verified row by row). An input of another group moves: it is removed
+/// from that group and added to this one (`Storage::seal_input`).
+pub fn input_seal_group<I: Input>(storage: &mut Storage, id: Id, group: SealGroup) {
+    let first = row::<I>(storage, id).first.load(Ordering::Relaxed);
+    for field in 0..I::FIELDS.max(1) {
+        storage.seal_input(first + field, group, I::NAME);
+    }
+}
+
+/// [`input_seal_group`] for the singleton `I`, made or not: its absence is read as its field
+/// 0, which is the group's input too.
+pub fn input_singleton_seal_group<I: Input>(storage: &mut Storage, group: SealGroup) {
+    let (table, id) = reserved::<I>(storage);
+    let first = table
+        .pages
+        .row::<RowOf<I>>(id)
+        .expect("the reserved row's page")
+        .first
+        .load(Ordering::Relaxed);
+    for field in 0..I::FIELDS.max(1) {
+        storage.seal_input(first + field, group, I::NAME);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32 {
     row::<I>(storage, id).first.load(Ordering::Relaxed) + field
@@ -247,7 +280,8 @@ fn reserve<I: Input>(storage: &Storage, table: &InputTable<I>, index: u32) -> Id
     for field in 0..I::FIELDS.max(1) {
         let node = first + field;
         storage.set_key(node, node_key(index, id, field));
-        storage.set_summary(node, input_bits(node));
+        // Of no seal group until its host says which ([`input_seal_group`]).
+        storage.set_summary(node, or(input_bits(node), LOOSE));
         storage.repaint(node, color(FIELD | u32::from(Durability::HIGH.0), 0));
     }
     row.first.store(first, Ordering::Relaxed);
@@ -326,7 +360,7 @@ pub struct InputSetter<'s, I: Input, T> {
 }
 
 /// The setter of `field` of input `id`, which `at` finds in its fields.
-pub fn input_set<'s, I: Input, T>(
+pub fn input_set<'s, I: Input, T: PartialEq>(
     storage: &'s mut Storage,
     id: Id,
     field: u32,
@@ -336,7 +370,7 @@ pub fn input_set<'s, I: Input, T>(
     InputSetter { storage, id, field, durability: None, at }
 }
 
-impl<I: Input, T> Setter for InputSetter<'_, I, T> {
+impl<I: Input, T: PartialEq> Setter for InputSetter<'_, I, T> {
     type FieldTy = T;
 
     fn with_durability(mut self, durability: Durability) -> Self {
@@ -344,11 +378,32 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         self
     }
 
+    /// The invariant: a set of the value the field holds, at the durability it has, writes
+    /// nothing: no view opens, no row verifies again, nothing is counted as written. So a
+    /// host that gives an input again what it gave before (a request's environment, a crate's
+    /// proc macros loaded again, a build script's run applied again) costs nothing, whatever
+    /// the database holds: a request that changes nothing writes no input. Until 2026-11-12
+    /// every set opened a view of the field's durability, and each caller had to compare
+    /// first; the one that did not (`ProcMacros::give`, at `HIGH`) made a build of reth with
+    /// nothing changed verify 23 million rows.
     fn to(self, value: T) -> T {
         let node = row::<I>(self.storage, self.id).first.load(Ordering::Relaxed) + self.field;
         let old =
             Durability(((*self.storage.node_mut(node).color_mut() >> 32) as u32 & !FIELD) as u8);
         let durability = self.durability.unwrap_or(old);
+        if durability == old && !self.storage.planted_equal_sets_write() {
+            let row = row::<I>(self.storage, self.id);
+            // SAFETY: `&mut` of the storage: no reference to the fields lives, and nobody
+            // else writes them.
+            let fields = unsafe { (*row.fields.get()).assume_init_mut() };
+            let held = (self.at)(fields);
+            if *held == value {
+                // The field takes the value given and the one it held is returned, as a
+                // write does (a caller that takes a value out to edit it in place and set
+                // it back gets the very one it set): equal, so nothing that read it differs.
+                return std::mem::replace(held, value);
+            }
+        }
         let view = self.storage.new_view(old.max(durability), input_bits(node));
         let row = row::<I>(self.storage, self.id);
         // SAFETY: `&mut` of the storage: no reference to the fields lives, and nobody else

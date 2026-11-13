@@ -1,0 +1,21 @@
+{
+  "id": "records-1112c-1",
+  "date": "2026-11-12",
+  "who": "records-1112c (claude-fable-5-2)",
+  "what": "A lane that took over another lane's files inherited its ready list (/tmp/round2/ready/records.txt) without knowing: while it was mid-write the runner snapshotted `crates/hir-def/src/deps.rs` with `pub mod awaited;` and no `deps/awaited.rs`, and a commit had to be reverted. Later the same lane edited listed files to call a function in a file not yet listed (hir-ty `frozen::serve`), a second window of the same kind.",
+  "whys": [
+    "The runner builds whatever paths a ready file lists, at the moment it looks.",
+    "A ready file says 'these paths are whole' forever, not 'these paths were whole at this content'.",
+    "A lane that starts editing a listed file has to remember to remove a file in /tmp, by hand, before its first edit; a successor lane does not know the file exists.",
+    "Nothing ties the declaration to the bytes declared: no content hash, no check that every `mod` line of a listed file resolves to a listed or committed file.",
+    "The hand-off between lanes is a message, and the state it needs (which files are declared whole, under which name) lives outside the tree."
+  ],
+  "class": "A declaration of readiness that outlives the content it was made about.",
+  "prevention": "The ready list names each path with its content hash (`shasum` at the time of declaring); the runner takes a path only when the hash still matches and reports the ones that moved to the lane. A python check before each snapshot that every `mod x;` of a taken file resolves to a file that is committed or taken. A lane brief for a successor names the predecessor's ready file.",
+  "where": "/tmp/round2/ready/<lane>.txt and the round runner's snapshot; crates/hir-def/src/deps.rs",
+  "state": "open",
+  "cause": "A ready file lists paths, not contents, and a successor lane was not told its predecessor's list was still live.",
+  "cost": "one reverted commit and one build round",
+  "workaround": "Remove the ready file before the first edit of any listed file; write it again when the piece is whole.",
+  "fix": ""
+}

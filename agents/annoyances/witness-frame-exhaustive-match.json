@@ -1,0 +1,14 @@
+{
+ "id": "witness-frame-exhaustive-match",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor T1 of /tmp/plan/5b-scoped.md, int-1112",
+ "where": "crates/blaze-query/src/db/local.rs Kind; crates/blaze-query/src/db/function.rs hand_over",
+ "what": "Adding a frame kind (Witness, for witnessed and covered runs) to the query stack breaks an exhaustive match on frame kinds in function.rs, a file outside the lane's list, so the lane's crate cannot compile without a one-arm edit by another owner.",
+ "cost": "a hand-off and a non-compiling tree until the main agent applies it",
+ "cause": "what a frame kind means to each walk of the stack (a cycle member's hand-over, find, recording) is decided by a match at each walker, not by the kind itself",
+ "class": "a closed enum whose meaning is spread across its matchers, so a new variant touches every file that walks it",
+ "prevention": "give Kind the predicates the walkers ask (passes_through, records, is_member) and match only there, so a new kind is one file's change",
+ "workaround": "function.rs hand_over: `FrameKind::Barrier { .. } | FrameKind::Witness { .. } => {` (in /tmp/plan/5b-T1-next.md)",
+ "fix": "not yet",
+ "state": "open"
+}

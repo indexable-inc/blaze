@@ -86,35 +86,37 @@ pub use crate::spine::{
 pub struct SectionId(pub u32);
 
 impl SectionId {
-    /// The database's memos (`blaze-query`).
-    pub const DB_MEMOS: SectionId = SectionId(0x0100);
-    /// The database's dependency edges, with the fingerprint each saw.
-    pub const DB_EDGES: SectionId = SectionId(0x0101);
-    /// The database's open-addressed key table.
-    pub const DB_TABLE: SectionId = SectionId(0x0102);
-    /// The database's inputs.
-    pub const DB_INPUTS: SectionId = SectionId(0x0103);
-    /// The database's values, key bytes and paths.
-    pub const DB_BLOB: SectionId = SectionId(0x0104);
-    /// The symbol table of `intern`: texts, order keys, the lookup index, the free ids.
-    pub const SYMBOLS: SectionId = SectionId(0x0200);
     /// The plane's history: what tasks of each kind held (`blaze-graph`).
     pub const PLANE_HISTORY: SectionId = SectionId(0x0400);
-    /// The query database's interned rows, at their IDs (`blaze_query::db`), so IDs stay
-    /// stable across restarts.
-    pub const QUERY_INTERNED: SectionId = SectionId(0x0500);
-    /// The query database's frozen graph (`blaze_query::db`).
-    pub const QUERY_GRAPH: SectionId = SectionId(0x0501);
-    /// The library files' parsed syntax trees (lane tree-store, `base_db::trees::SCHEMA`).
-    pub const SYNTAX_TREES: SectionId = SectionId(0x0600);
+    /// Ids no blaze writes any more and none may take again: an image of the layout before still
+    /// holds them, and its owner's start reads around them (a restart restores no engine state,
+    /// docs/v2/plan/design/end-state.md). `0x0100..=0x0104` held the old database's memos,
+    /// edges, key table, inputs and values, `0x0200` `intern`'s symbol table, `0x0500` and
+    /// `0x0501` the query database's interned rows and graph, `0x0600` the library files' syntax
+    /// trees, `0x0700` the front end's carry sessions (now a journal mark a checkout,
+    /// `serve::local::CARRY`), `0x0301` the VFS's file bytes (a file's text is the content
+    /// store's now, by its ID: the tree names it and its size); and every id `0x1_0000 | tag`,
+    /// past this list, held the table of `intern`'s mapped interner of that tag.
+    pub const RETIRED: [SectionId; 11] = [
+        SectionId(0x0100),
+        SectionId(0x0101),
+        SectionId(0x0102),
+        SectionId(0x0103),
+        SectionId(0x0104),
+        SectionId(0x0200),
+        SectionId(0x0500),
+        SectionId(0x0501),
+        SectionId(0x0600),
+        SectionId(0x0700),
+        SectionId::vfs(1),
+    ];
     /// The VFS's tree of nodes and names (`blaze-vfs`).
     pub const VFS_TREE: SectionId = SectionId::vfs(0);
-    /// The VFS's file bytes.
-    pub const VFS_BLOBS: SectionId = SectionId::vfs(1);
     /// The VFS's watchers' metadata and journal cursors.
     pub const VFS_DISKS: SectionId = SectionId::vfs(2);
 
     const VFS: u32 = 0x0300;
+    /// The retired range of the mapped interners' tables ([`SectionId::RETIRED`]).
     const INTERNED: u32 = 0x1_0000;
 
     /// Part `part` of the VFS tree (`blaze-vfs`): its nodes, names and the journal's position.
@@ -122,26 +124,27 @@ impl SectionId {
         SectionId(SectionId::VFS | part as u32)
     }
 
-    /// The table of `intern`'s mapped interner of tag `tag` (`intern::Mapped`).
-    pub const fn interned(tag: u16) -> SectionId {
-        SectionId(SectionId::INTERNED | tag as u32)
-    }
-
     /// What the section holds, for errors.
     pub fn name(self) -> &'static str {
         match self {
-            SectionId::DB_MEMOS => "the database's memos",
-            SectionId::DB_EDGES => "the database's edges",
-            SectionId::DB_TABLE => "the database's key table",
-            SectionId::DB_INPUTS => "the database's inputs",
-            SectionId::DB_BLOB => "the database's values",
-            SectionId::SYMBOLS => "the symbol table",
             SectionId::PLANE_HISTORY => "the plane's history",
-            SectionId::QUERY_INTERNED => "the query database's interned rows",
-            SectionId::QUERY_GRAPH => "the query graph",
-            SectionId::SYNTAX_TREES => "the library syntax trees",
+            SectionId(0x0100) => "the database's memos, a section no blaze writes now",
+            SectionId(0x0101) => "the database's edges, a section no blaze writes now",
+            SectionId(0x0102) => "the database's key table, a section no blaze writes now",
+            SectionId(0x0103) => "the database's inputs, a section no blaze writes now",
+            SectionId(0x0104) => "the database's values, a section no blaze writes now",
+            SectionId(0x0200) => "the symbol table, a section no blaze writes now",
+            SectionId(0x0500) => {
+                "the query database's interned rows, a section no blaze writes now"
+            }
+            SectionId(0x0501) => "the query graph, a section no blaze writes now",
+            SectionId(0x0600) => "the library syntax trees, a section no blaze writes now",
+            SectionId(0x0700) => "the front end's carry sessions, a section no blaze writes now",
+            SectionId(0x0301) => "the VFS's file bytes, a section no blaze writes now",
             SectionId(id) if id & !0xff == SectionId::VFS => "the VFS tree",
-            SectionId(id) if id & !0xffff == SectionId::INTERNED => "an interned table",
+            SectionId(id) if id & !0xffff == SectionId::INTERNED => {
+                "an interned table, a section no blaze writes now"
+            }
             _ => "a section this blaze does not know",
         }
     }
@@ -242,6 +245,21 @@ pub enum Cause {
     Bounds { at: u64, len: u64 },
     /// A read of a value aligned to `align` at `at` of the section, which is not.
     Misaligned { at: u64, align: u32 },
+    /// The VFS tree names the file `file` (by its content ID), whose text the content store
+    /// does not give as `file`'s: the image and the store disagree, and the file is not read.
+    /// `group` is the file's number among the tree's files.
+    Text { file: ContentId, why: TextWhy },
+}
+
+/// Why [`Cause::Text`]'s file was not read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextWhy {
+    /// The store holds no text under the file's key.
+    Missing,
+    /// The store's text is `len` bytes, hashing to `found`: not the file the tree names.
+    Mismatch { found: ContentId, len: u64 },
+    /// The store's value under the file's key failed the store's own check.
+    Store,
 }
 
 impl fmt::Display for Corrupt {
@@ -266,6 +284,21 @@ impl fmt::Display for Corrupt {
                     "{section} is read at {at} for a value aligned to {align} (group {group})"
                 )
             }
+            Cause::Text { file, why: TextWhy::Missing } => write!(
+                f,
+                "{section} names file {file:x} (its file {group}), whose text the content store \
+                 does not hold: an image names only texts the store holds durably"
+            ),
+            Cause::Text { file, why: TextWhy::Mismatch { found, len } } => write!(
+                f,
+                "{section} names file {file:x} (its file {group}), and the content store's text \
+                 under its key is {len} bytes hashing to {found:x}, not that file"
+            ),
+            Cause::Text { file, why: TextWhy::Store } => write!(
+                f,
+                "{section} names file {file:x} (its file {group}), whose text in the content \
+                 store failed the store's check"
+            ),
         }
     }
 }

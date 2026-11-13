@@ -431,13 +431,15 @@ impl Conf {
     }
 
     /// This configuration with the profile of [`Conf::profile_settings`] read in; an error
-    /// naming the profile's path when it doesn't read.
+    /// naming the profile's path when it doesn't read. The read's look at the disk is pushed
+    /// to `looks` ([`crate::profile::load`]).
     pub fn with_profile(
         mut self,
         workspace: Option<&crate::profile::Workspace<'_>>,
+        looks: &blaze_vfs::outside::Looks,
     ) -> Result<Conf, String> {
         if let Some(settings) = self.profile_settings(workspace)? {
-            self.profile = Some(crate::profile::load(settings)?);
+            self.profile = Some(crate::profile::load(settings, looks)?);
         }
         Ok(self)
     }

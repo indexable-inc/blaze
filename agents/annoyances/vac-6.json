@@ -1,0 +1,14 @@
+{
+ "id": "vac-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane vacuous-1112",
+ "where": "this lane's own self-test (harness/v2/ran.py selftest)",
+ "what": "I wrote that the self-test expects 31 checks; 29 ran. The count I had typed was a guess, and the self-test's own rule (state how many checks you expect to have run) caught it on the first run.",
+ "cost": "one run",
+ "cause": "a number written from memory",
+ "class": "vacuous success (A39), caught by its guard",
+ "prevention": "the self-test fails when the number of checks that ran is not the number stated (f714b267c5)",
+ "workaround": "none",
+ "fix": "none",
+ "state": "fixed"
+}

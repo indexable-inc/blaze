@@ -1,0 +1,19 @@
+{
+ "id": "sealgroups-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sealgroups-1112",
+ "where": "crates/blaze-graph/src/pump.rs (`Flights::get_or_run_named`, `Flights::run_if_idle`); crates/blaze-query/src/db/seal.rs (`resolve`)",
+ "what": "A seal group's check should run once and have other askers wait for it, which is what a flight is for. But a check verifies rows, a row's verification can ask for a row behind the same seal, and both `get_or_run_named` and `run_if_idle` panic (`Asked::Itself`, `Idle::Itself`) when the task that holds a key asks for it again. The only per-task state a caller could keep to know it holds the flight is `db::local::Local`, whose constructor, emptiness test and trim each list every field.",
+ "cost": "a redesign of the check's claim: one compare-and-swap on the group's state, no wait; askers that lose the claim verify their row by its own edges, and a walk breaks the seal of a group another task is still checking. Sound, but it does work a wait would save and it needs an interleaving simulation a flight would not have needed",
+ "cause": "a flight has no way to say \"this task already holds it\" as a value",
+ "whys": [
+  "`Flights` treats a key asked by its own holder as a cycle that can never end, which is true of a query's value and false of a check that only wants to know whether to go on by another road",
+  "the engine's flights are keyed by row, and every re-entrant case so far (cycles) is told apart before the flight is asked, by the task's frame stack (`Local::find`)",
+  "there is no frame kind for work that is not a row, so engine-level work under a flight (the changed-set walk, a group's check) cannot be found on the stack"
+ ],
+ "class": "a wait primitive whose only answer to re-entry is a panic",
+ "prevention": "`Flights::run_if_idle` returning a third outcome (`Mine`) for a key this task holds, or a frame kind for engine work so `Local::find` sees it; either lets a group's check be a flight with a named wait",
+ "workaround": "`seal::resolve` claims with a compare-and-swap (`SUSPECT` to `CHECKING`) and never waits",
+ "fix": "none",
+ "state": "open"
+}

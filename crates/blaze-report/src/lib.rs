@@ -46,14 +46,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod out;
+pub mod palette;
 mod render;
 pub mod rules;
+pub mod say;
 pub mod script;
 pub mod terminal;
 #[cfg(test)]
 mod tests;
 
-pub use render::{Caps, Roots, json, json_message, render, render_into};
+pub use render::{Caps, Roots, json, json_message, render, render_into, text_into};
 
 use serde::{Deserialize, Serialize};
 
@@ -287,6 +290,11 @@ impl Text {
         self
     }
 
+    pub fn command(mut self, command: &str) -> Text {
+        self.0.push(Span::Command(command.to_owned())); // alloc: as above
+        self
+    }
+
     pub fn var(mut self, name: &str) -> Text {
         self.0.push(Span::Var(name.to_owned())); // alloc: as above
         self
@@ -331,12 +339,12 @@ impl Text {
         for span in &self.0 {
             match span {
                 Span::Plain(words) => out.push_str(words),
-                Span::Code(code) | Span::Var(code) => {
+                Span::Code(code) | Span::Var(code) | Span::Command(code) => {
                     out.push('`');
                     out.push_str(code);
                     out.push('`');
                 }
-                Span::Path(it) | Span::Version(it) | Span::Hash(it) => out.push_str(it),
+                Span::Path(it) | Span::Version(it) | Span::Hash(it) | Span::Strong(it) => out.push_str(it),
                 Span::Package { name, version } => {
                     out.push_str(name);
                     if let Some(version) = version {
@@ -381,6 +389,11 @@ pub enum Span {
     Count(u64),
     /// A time, in nanoseconds: `0.12s`, `38s`, `1m12s`.
     Took(u64),
+    /// A command the reader can run as it is: drawn as one on a terminal, in backticks
+    /// elsewhere.
+    Command(String),
+    /// What the line is about, said with weight.
+    Strong(String),
 }
 
 /// One line of what was expected or found. `key` names it for data (`needs`, `found`,

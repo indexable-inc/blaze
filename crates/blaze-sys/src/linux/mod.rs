@@ -20,8 +20,8 @@ mod wait;
 pub use fs::{
     AtFlags, CWD, CloneRange, Entries, Entry, EntryKind, EventFlags, OpenFlags, OpenHow, OwnedFd,
     PipeFlags, RandomFlags, RenameFlags, Resolve, Statx, StatxMask, StatxTime, SyncRange, Unlink,
-    close, eventfd2, fdatasync, ficlone, ficlonerange, fsync, ftruncate, getdents64, getrandom,
-    mkdirat, open_beneath, openat, openat2, pipe2, pread, pwrite, read, renameat2, statx,
+    Whence, close, copy_file_range, eventfd2, fdatasync, ficlone, ficlonerange, fsync, ftruncate, getdents64, getrandom,
+    lseek, mkdirat, open_beneath, openat, openat2, pipe2, pread, pwrite, read, renameat2, statx,
     sync_file_range, unlinkat, write,
 };
 pub use mem::{Advice, MapFlags, Prot, madvise, mmap, mprotect, munmap};

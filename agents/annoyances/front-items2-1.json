@@ -1,0 +1,14 @@
+{
+ "id": "front-items2-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane front-items2",
+ "where": "crates/blaze-front-items/src/cutoffs.rs (a_header_edit_reaches_exactly_that_headers_reader)",
+ "what": "A write-only lane pins the kernel's carry counts (`Carried`) as predictions it cannot run. I predicted `parse` changes on every text edit; it does not: `parse(file)`'s value (`syntax::image`) is the tree's shape and holds no text, so an edit that swaps a token for one of the same kind and length is cut at `parse`. The main agent's run caught it (changed 1, cut 2 where I wrote 2, 1).",
+ "cost": "one compile-and-test round trip of the main agent",
+ "cause": "what a step's value holds is said in a doc line of steps.rs (`the record shares it, it does not hold it`), not where a reader of the value would look first (the step's own doc or the value's type)",
+ "class": "a prediction stated as a pinned number without evidence from a run (rule 61)",
+ "prevention": "a write-only lane marks every pinned count it has not seen as a prediction in its report, and states for each step what its value holds and what it reads directly (the cutoff test's `carried` doc now does)",
+ "workaround": "the test's doc says why parse is cut",
+ "fix": "the corrected count and its reason in cutoffs.rs",
+ "state": "fixed"
+}

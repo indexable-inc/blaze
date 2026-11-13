@@ -103,8 +103,15 @@ use serde::{Deserialize, Serialize};
 /// with the in-browser compiler they fed. 49: [`Worked::why`], the build's own summary in its
 /// `Work` when the daemon has it by then, so its client makes one round trip. 50:
 /// [`Targets::goal`] and [`Worked::tiers`], the build goal ([`Goal`]) and how much of the code
-/// a build linked is optimized.
-pub const SCHEMA: u32 = 50;
+/// a build linked is optimized. 51: [`Worked::storage`] ([`Storage`]: what the daemon's store
+/// and its home hold against their budget, on every build's end), `unkept` of
+/// [`Request::Gc`], and [`Status::placed_by`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
+/// request asked for. 53: [`Request::Store`] (not the `Request::Pack` that 48 removed: packs of store records, docs/remote-cache.md).
+/// 54: [`Cargo::prebuilt`] (`--no-prebuilt`), by which a request takes no record from a pack source.
+/// 55: `pid` and `timed` of [`Request::ClientRows`] ([`Timed`]): the thin `blaze`'s spans, by name,
+/// sent on the request's own connection; a `ClientRows` of 54 (neither field) reads as pid 0 and
+/// no timed spans.
+pub const SCHEMA: u32 = 55;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -138,6 +145,10 @@ pub enum ViewRef {
 /// What to build or run.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Targets {
+    /// What the request waits for (`--goal edit|max`); `None` for the profile's own
+    /// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). A check compiles no program,
+    /// so nothing of it reads this.
+    pub goal: Option<Goal>,
     /// Everything a cargo command line says beyond the fields below, for `blaze build`,
     /// `run`, `test`, `check` and `cargo blaze`; `None` for an agent's request, built as cargo
     /// builds the fields below with its defaults. Where both say something, this wins. A
@@ -146,10 +157,6 @@ pub struct Targets {
     /// A target triple; `None` for the machine's.
     pub target: Option<String>,
     pub profile: String,
-    /// What the request waits for (`--goal edit|max`); `None` for the profile's own
-    /// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). A check compiles no program,
-    /// so nothing of it reads this.
-    pub goal: Option<Goal>,
     pub features: Vec<String>,
     /// Packages by name; empty for the workspace's default members.
     pub packages: Vec<String>,
@@ -190,6 +197,11 @@ pub struct Cargo {
     /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
     /// none or with `-q`, which `args` says.
     pub verbose: u8,
+    /// Whether a record the home's store and the machine's layer miss may be fetched from a
+    /// pack source (packs.json's `remote`, an R2 bucket): `false` for blaze's `--no-prebuilt`,
+    /// which builds every such miss from source for this request, as packs.json's
+    /// `"prebuilt": false` does for every request.
+    pub prebuilt: bool,
 }
 
 /// [`Cargo::files`], each file's bytes one byte string.
@@ -224,6 +236,7 @@ impl std::fmt::Debug for Cargo {
             .field("width", &self.width)
             .field("verbose", &self.verbose)
             .field("refused", &self.refused)
+            .field("prebuilt", &self.prebuilt)
             .finish()
     }
 }
@@ -414,12 +427,23 @@ pub enum Request {
         top: u32,
         since: HotSince,
     },
-    /// `blaze cache gc` while the daemon holds the collector's areas: one run of the daemon's
-    /// collector to its end (`dry_run` plans and removes nothing), answered with
-    /// [`Response::Collected`] as it records. Answered by the daemon's loop, which holds the
-    /// collector.
+    /// `blaze gc` while the daemon holds the collector's areas: one run of the daemon's
+    /// collector to its end (`dry_run` plans and removes nothing), and one lap of its store's
+    /// collector (docs/gc.md, "The store's budget and collector"), answered with
+    /// [`Response::Collected`] as they end. `unkept` (`blaze clean --unkept`): the store's lap
+    /// forgets every record no pin and no root keeps, whatever the budget and its pack's age.
+    /// Answered by the daemon's loop, which holds the collectors.
     Gc {
+        unkept: bool,
         dry_run: bool,
+    },
+    /// `blaze store export|import|install ...` (docs/remote-cache.md, "Packs") while a daemon
+    /// holds the home's store: `words` are the command's words after `store`, run by the
+    /// daemon over its own store as the CLI runs them over a store no daemon holds. Answered
+    /// with what it did as note [`Response::Diagnostic`]s, or its error, by the daemon's
+    /// loop, which holds the store.
+    Store {
+        words: Vec<String>,
     },
     /// `blaze why [ITEM]`: what the last build that ended in this daemon's life computed again
     /// instead of reusing, grouped by step and reason, each group with its first items (every
@@ -475,10 +499,24 @@ pub enum Request {
     /// which writes them as the client's process and gives the build's row the two times
     /// (`builds.client_started_ns`, `client_ended_ns`); answered with `Done { ok: true }` once
     /// written. A daemon that keeps no history answers at once and keeps nothing.
+    ///
+    /// `pid` is the client's process and `timed` its spans by name ([`Timed`]): what a client
+    /// with no flight recorder of its own sends (the thin `blaze`, which links no Arrow), made
+    /// the client's `spans` rows by the daemon. A client sends its spans one way: `spans` or
+    /// `timed`, never both (the daemon refuses both, naming the build).
+    ///
+    /// The fields are declared in their keys' order (by length, then bytes), as deterministic
+    /// CBOR writes them.
     ClientRows {
+        /// 0 in a `ClientRows` of schema 54, which had no such field.
+        #[serde(default)]
+        pid: u32,
         build: u64,
         #[serde(with = "blaze_protocol::bytes")]
         spans: Vec<u8>,
+        /// Empty in a `ClientRows` of schema 54, which had no such field.
+        #[serde(default)]
+        timed: Vec<Timed>,
         #[serde(with = "blaze_protocol::bytes")]
         events: Vec<u8>,
         #[serde(with = "blaze_protocol::bytes")]
@@ -486,6 +524,29 @@ pub enum Request {
         ended_ns: i64,
         started_ns: i64,
     },
+}
+
+/// One span of a client's, by its name, on the profile's clock (`blaze_profile::clock::mono_ns`):
+/// from `start_ns` to `end_ns` ([`Request::ClientRows::timed`]). The names are the client's
+/// fixed set (`client: connect`, ...), each said once a command.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Timed {
+    // In their keys' order, as deterministic CBOR writes them.
+    pub name: String,
+    pub end_ns: i64,
+    pub start_ns: i64,
+}
+
+impl Timed {
+    /// The name of the client's span that ends as it becomes the program (`exec`): its end is
+    /// the instant the program's `program: exec to Hello` starts at.
+    pub const ANSWER_TO_EXEC: &'static str = "client: answer to exec";
+
+    /// Where a `run`'s client became its program: the end of its [`Timed::ANSWER_TO_EXEC`],
+    /// `None` for a client that ran none (a `build`).
+    pub fn exec_of(timed: &[Timed]) -> Option<i64> {
+        timed.iter().find(|it| it.name == Timed::ANSWER_TO_EXEC).map(|it| it.end_ns)
+    }
 }
 
 /// [`Request::Rebuilt`]'s answer.
@@ -1058,6 +1119,11 @@ pub struct UnitOf {
     /// The unit is a library's doc tests (cargo's `CompileMode::Doctest`), named
     /// `` `foo` (lib doctest) `` in "could not compile", never as the library itself.
     pub doctest: bool,
+    /// The unit's package is one the request asked for (cargo's `is_primary_package`), not
+    /// one built or checked only because such a package depends on it. `check --fix` edits
+    /// the files of these alone: a dependency in the checkout (another member, a vendored
+    /// crate) is checked, and its diagnostics shown, but it is not what was asked to be fixed.
+    pub primary: bool,
     pub package_id: String,
     pub manifest_path: String,
 }
@@ -1245,6 +1311,10 @@ pub struct Worked {
     pub links: Vec<Linked>,
     /// Queries executed.
     pub reran: u64,
+    /// The build's goal and how much of the code of the images it linked is optimized
+    /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
+    /// asked for compiles a program.
+    pub tiers: Option<Tiers>,
     /// The steps it computed again instead of reusing, each once: the misses `blaze why`
     /// explains and [`Rebuilt::summary`] sums up. 0 says that summary is empty, so the
     /// build's client asks for none ([`Request::Rebuilt`] with `build`).
@@ -1254,6 +1324,10 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
+    /// What the daemon's store and its home hold against their budget as the build ends.
+    /// `None` from a daemon that collects nothing (a test's, or one that is not `blaze
+    /// serve`'s).
+    pub storage: Option<Storage>,
     /// The build's id in the daemon's profile history (`builds.build_id`): what the client
     /// tags the rows it sends with ([`Request::ClientRows`]), what `build-finished` carries
     /// and what `blaze slow --build N` and `blaze debug sql` take. `None` for work no build
@@ -1266,10 +1340,32 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
-    /// The build's goal and how much of the code of the images it linked is optimized
-    /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
-    /// asked for compiles a program.
-    pub tiers: Option<Tiers>,
+}
+
+/// What blaze holds on disk as a build ends, against its budget (docs/gc.md, "The store's
+/// budget and collector"): data on every build, for whoever renders it. Bytes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Storage {
+    /// One line to print, when the daemon's policy says this build should say something
+    /// (held at 85% of the budget or more, or the volume low; at most once in six hours, once
+    /// an hour when over): it names the command that raises the budget and the one that
+    /// frees space. `None`: nothing to say.
+    pub warning: Option<String>,
+    /// Everything the home holds (its build dirs, its store, its image), and its budget: the
+    /// tightest of an absolute size, a share of the volume and what leaves the volume's floor
+    /// free. The share used is `held_bytes / budget_bytes`. A budget of 0: not measured yet.
+    pub held_bytes: u64,
+    /// The collector looked at everything and what is held is still at the budget or past
+    /// it: what is left is in use or kept.
+    pub over_budget: bool,
+    /// The daemon's store, and how much it grew or shrank since the build before ended.
+    pub store_bytes: u64,
+    pub budget_bytes: u64,
+    /// What the store's collector could give back: dead bytes, and records no root keeps.
+    pub collectable_bytes: u64,
+    pub store_delta_bytes: i64,
+    /// The volume's free space.
+    pub volume_free_bytes: u64,
 }
 
 /// What a build left unchecked ([`Response::Unchecked`]): said once a unit failed and any
@@ -1675,6 +1771,10 @@ pub struct Status {
     pub settings: Vec<Setting>,
     /// Every download in flight in the daemon (`blaze_fetch::downloads`), oldest first.
     pub downloads: Vec<Downloading>,
+    /// How the daemon's store places outputs, decided once as it opened (by cloning where
+    /// its file system shares blocks, else by copying), in one sentence; `None` until it has
+    /// decided, and from a daemon that says none.
+    pub placed_by: Option<String>,
     /// How long the daemon has run, on its driver's clock (which starts with it), as of this
     /// answer.
     pub uptime_ms: u64,
@@ -1979,6 +2079,69 @@ mod tests {
         assert_eq!(back.schema, SCHEMA);
     }
 
+    /// The invariant: a `ClientRows` written by schema 54 (no `pid`, no `timed`) reads as the
+    /// same rows with pid 0 and no timed spans, and one of 55 round-trips whole. Control: the
+    /// 55 value with its `timed` dropped is not equal to it, so the round trip would see a lost
+    /// field.
+    #[test]
+    fn client_rows_of_the_layout_before_timed_spans_still_read() {
+        #[derive(Serialize)]
+        enum Before {
+            ClientRows {
+                build: u64,
+                #[serde(with = "blaze_protocol::bytes")]
+                spans: Vec<u8>,
+                #[serde(with = "blaze_protocol::bytes")]
+                events: Vec<u8>,
+                #[serde(with = "blaze_protocol::bytes")]
+                folded: Vec<u8>,
+                ended_ns: i64,
+                started_ns: i64,
+            },
+        }
+        let before = Before::ClientRows {
+            build: 9,
+            spans: vec![1],
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&before).unwrap();
+        let read: Request = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        let old = Request::ClientRows {
+            build: 9,
+            spans: vec![1],
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+            pid: 0,
+            timed: Vec::new(),
+        };
+        assert_eq!(read, old);
+
+        let timed = vec![Timed { name: Timed::ANSWER_TO_EXEC.to_owned(), start_ns: 11, end_ns: 19 }];
+        let new = Request::ClientRows {
+            build: 9,
+            spans: Vec::new(),
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+            pid: 41,
+            timed: timed.clone(), // clone: the spans, kept to compare, once a test
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&new).unwrap();
+        let back: Request = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        assert_eq!(back, new);
+        assert_eq!(Timed::exec_of(&timed), Some(19));
+        // clone: the request, to plant a lost span in, once a test
+        let Request::ClientRows { timed: mut planted, .. } = new.clone() else { unreachable!() };
+        planted.clear();
+        assert_ne!(Some(planted), Some(timed), "the control: a dropped span is seen");
+    }
+
     /// A run's output is one byte string; JSON shows it as the array of numbers it was.
     #[test]
     fn bytes_go_out_as_byte_strings() {
@@ -2020,12 +2183,15 @@ mod tests {
             command: "build".to_owned(),
             verbose: 2,
             refused: None,
+            prebuilt: false,
         };
         let bytes = blaze_protocol::cbor::to_vec(&cargo).unwrap();
         let files = [0x65, b'f', b'i', b'l', b'e', b's', 0x81, 0x82, 0x62, b'/', b'c', 0x42, 1, 2];
         assert!(bytes.windows(files.len()).any(|it| it == files), "{bytes:02x?}");
         let width = [0x65, b'w', b'i', b'd', b't', b'h', 0x18, 100];
         assert!(bytes.windows(width.len()).any(|it| it == width), "{bytes:02x?}");
+        let prebuilt = [0x68, b'p', b'r', b'e', b'b', b'u', b'i', b'l', b't', 0xf4];
+        assert!(bytes.ends_with(&prebuilt), "the longest key last: {bytes:02x?}");
         assert_eq!(blaze_protocol::cbor::from_slice::<Cargo>(&bytes).unwrap(), cargo);
         let json = serde_json::to_value(&cargo).unwrap();
         assert_eq!(json["files"], serde_json::json!([["/c", [1, 2]]]));

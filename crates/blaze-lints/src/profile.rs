@@ -208,12 +208,13 @@ impl Hit {
 }
 
 /// The profile of `settings`, read off the machine: an error naming the path and where it was
-/// named when it can't be read, is no indexed profile, or has nothing counted.
-pub fn load(settings: Settings) -> Result<Loaded, String> {
+/// named when it can't be read, is no indexed profile, or has nothing counted. Read off the
+/// disk by every job that lints with it (no watch vouches for it): the look is pushed to
+/// `looks`, the list of the build it is read for, as a file's look at the hash of its bytes,
+/// what `blaze_usercode::inputs::Files` says of the path asked again. A profile that can't
+/// be read pushes nothing: the build fails on it.
+pub fn load(settings: Settings, looks: &blaze_vfs::outside::Looks) -> Result<Loaded, String> {
     let path = &settings.path;
-    // Read off the disk by every job that lints with it, and counted as a look: no watch
-    // vouches for it (`blaze_vfs::outside::looks`).
-    blaze_vfs::outside::looked(path);
     let bytes = std::fs::read(path).map_err(|error| {
         format!(
             "the lint profile `{}` (`profile` in {}) can't be read: {error}",
@@ -221,6 +222,9 @@ pub fn load(settings: Settings) -> Result<Loaded, String> {
             settings.named_in
         )
     })?;
+    if looks.keeps() && std::fs::metadata(path).is_ok_and(|it| it.is_file()) {
+        looks.push(path, blaze_vfs::outside::LookKind::File, Some(blaze_ids::b3::hash(&bytes)));
+    }
     let profile = read(&bytes).map_err(|what| {
         format!("the lint profile `{}` (`profile` in {}) {what}", path.display(), settings.named_in)
     })?;

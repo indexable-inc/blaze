@@ -26,6 +26,7 @@ struct Seen {
     removed: Vec<FileId>,
     roots: Vec<SourceRootId>,
     crates: bool,
+    crates_added: Vec<crate::Crate>,
     included: usize,
 }
 
@@ -37,6 +38,7 @@ impl Seen {
             removed: written.removed.to_vec(),
             roots: written.roots.to_vec(),
             crates: written.crates,
+            crates_added: written.crates_added.to_vec(),
             included: written.included.len(),
         }
     }
@@ -407,6 +409,56 @@ fn the_crate_graph_is_a_write_when_it_changes() {
     });
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }]);
     let probe = probed(None, None, || db.note_crates_changed());
+    assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }]);
+}
+
+/// The invariant: a crate made beside the graph's crates and added to it is a write that names
+/// that crate (`Written::crates_added`) and is not a change of the whole graph
+/// (`Written::crates`), so a maintainer runs the added crate first and leaves the others'
+/// state as it is; adding none is no write. The control: the same crate made with
+/// `Crate::create` is a change of the whole graph.
+#[test]
+fn a_crate_added_beside_the_graph_names_itself_and_not_the_graph() {
+    let mut db = Db::for_tests();
+    let graph = one_crate(&mut db);
+    _ = graph.set_in_db(&mut db);
+    let first = crate::all_crates(&db)[0];
+    let (data, extra, workspace, cfg) = (
+        first.data(&db).clone(),
+        first.extra_data(&db).clone(),
+        first.workspace_data(&db).clone(),
+        first.cfg_options(&db).clone(),
+    );
+    let twin = |name: &str| Env::from_iter([("TWIN".to_owned(), name.to_owned())]);
+    let mut added = None;
+    let probe = probed(None, None, || {
+        db.batch(crate::Trigger::named("a crate added"), |db| {
+            let krate = crate::Crate::create_added(
+                db,
+                data.clone(),
+                extra.clone(),
+                workspace.clone(),
+                cfg.clone(),
+                twin("added"),
+                Durability::LOW,
+            );
+            crate::add_crates(db, &[krate], Durability::MEDIUM);
+            added = Some(krate);
+        })
+    });
+    let added = added.unwrap();
+    assert_eq!(
+        probe.seen,
+        vec![Seen { crates_added: vec![added], ..Seen::default() }],
+        "one pass, the crate added named, the graph not noted as changed whole"
+    );
+    assert_eq!(&*crate::all_crates(&db), &[first, added], "after the crates that were there");
+    let probe = probed(None, None, || crate::add_crates(&mut db, &[], Durability::MEDIUM));
+    assert!(probe.seen.is_empty(), "adding no crate is no write: {:?}", probe.seen);
+    // The control: `Crate::create` notes the whole graph.
+    let probe = probed(None, None, || {
+        _ = crate::Crate::create(&mut db, data, extra, workspace, cfg, twin("whole"), Durability::LOW);
+    });
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }]);
 }
 

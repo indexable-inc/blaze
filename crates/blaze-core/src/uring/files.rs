@@ -32,7 +32,8 @@ use blaze_mem::RegionVec;
 use super::{
     flight::{error, failed, filled, raw, spare_of},
     ops::{
-        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, UNSYNCED, WHOLE,
+        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, READ_ONLY, SECOND, UNSYNCED,
+        WHOLE,
         arena_of,
     },
     *,
@@ -570,7 +571,9 @@ impl Uring {
         Step::Ends(Some(Done::Read(mem::take(bytes))))
     }
 
-    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`.
+    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`. A
+    /// file kept read-only ([`Kept::read_only`]) is opened `O_RDONLY` first, with no `make`:
+    /// where it is missing, [`Uring::opened`] opens it again to make it.
     pub(super) fn open(
         &mut self,
         file: Handle<Kept>,
@@ -578,10 +581,12 @@ impl Uring {
         make: bool,
     ) -> io::Result<()> {
         let mut hot = Hot::new(NOBODYS, Kind::Open, file.to_bits());
-        if make {
+        let kept = self.kept.get(file).expect("a file just kept");
+        if kept.read_only {
+            hot.flags |= READ_ONLY;
+        } else if make {
             hot.flags |= MAKE;
         }
-        let kept = self.kept.get(file).expect("a file just kept");
         if kept.positional {
             hot.flags |= ops::POSITIONAL;
         }
@@ -858,7 +863,12 @@ impl Uring {
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
                     (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
                     (true, false) => POSITIONAL_KEEP,
-                    (false, _) => KEEP | if hot.flags & MAKE != 0 { libc::O_CREAT } else { 0 },
+                    // Made where missing is opened to append, a sync's too (`Kept::read_only`).
+                    (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
+                        (true, _) => KEEP | libc::O_CREAT,
+                        (false, true) => libc::O_RDONLY,
+                        (false, false) => KEEP,
+                    },
                 };
                 sqes[0] = open(name(0), flags, 0o644, NO_SLOT, 0, ud(0));
                 1
@@ -1139,7 +1149,10 @@ impl Uring {
             // alloc: an error.
             let why = format!("opening {}: {}", self.name_of(id, 0).to_string_lossy(), error(res));
             self.wake(file, Some((res, &why)), true);
-            self.ops.get_mut(id).expect("in flight").flags |= MAKE;
+            // Made, it is opened to append: no longer read-only (`Kept::read_only`).
+            self.kept.get_mut(file).expect("held by its open").read_only = false;
+            let open = self.ops.get_mut(id).expect("in flight");
+            open.flags = open.flags & !READ_ONLY | MAKE;
             return Step::Again;
         }
         if res == -libc::ENOENT && hot.flags & MAKE != 0 && hot.flags & MADE == 0 {

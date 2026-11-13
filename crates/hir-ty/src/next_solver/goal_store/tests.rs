@@ -577,19 +577,34 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     let facts = Arc::new(TestFacts::new(knob, true));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
     assert_eq!(looked_up(&db, krate), None, "nothing stored yet");
+    // What the lookups since the last flush came to (`Flushed::lookups`): each `looked_up`
+    // is one, the goal's one shape names one fact, and an offer and a flush are none.
+    let counted =
+        |lookups, hits, lists, reads| blaze_record::Counts { lookups, hits, lists, reads };
 
     assert_eq!(offered(&db, knob), 1);
     assert_eq!(memory.len(), 0, "an offer writes nothing until the flush");
     let flushed = installed.flush().unwrap();
-    assert_eq!(flushed, Flushed { written: 1, ..Flushed::default() });
+    // The miss above: no shape to read yet.
+    let want = Flushed { written: 1, lookups: counted(1, 0, 0, 0), ..Flushed::default() };
+    assert_eq!(flushed, want);
     assert_eq!(memory.len(), 2, "a shape and an answer");
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
-    assert_eq!(installed.flush().unwrap(), Flushed::default(), "a flush writes each offer once");
+    // The hit: one shape read, its one fact valued.
+    assert_eq!(
+        installed.flush().unwrap(),
+        Flushed { lookups: counted(1, 1, 1, 1), ..Flushed::default() },
+        "a flush writes each offer once"
+    );
 
     knob.set_value(&mut db).to(2);
     assert_eq!(looked_up(&db, krate), None, "a fact it read hashes otherwise");
     assert_eq!(offered(&db, knob), 2);
-    assert_eq!(installed.flush().unwrap(), Flushed { written: 1, ..Flushed::default() });
+    // That miss read the shape and valued its fact, and found no answer under the value.
+    assert_eq!(
+        installed.flush().unwrap(),
+        Flushed { written: 1, lookups: counted(1, 0, 1, 1), ..Flushed::default() }
+    );
     assert_eq!(memory.len(), 3, "the same shape, a second answer");
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
     knob.set_value(&mut db).to(1);
@@ -599,7 +614,11 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     assert_eq!(looked_up(&db, krate), None, "no store installed");
     let other = install(&db, memory.clone(), facts, OTHER_BUILD).unwrap();
     assert_eq!(looked_up(&db, krate), None, "another solver version");
-    assert_eq!(other.flush().unwrap(), Flushed::default());
+    // Another version is another key: its lookup finds no shape to read.
+    assert_eq!(
+        other.flush().unwrap(),
+        Flushed { lookups: counted(1, 0, 0, 0), ..Flushed::default() }
+    );
 }
 
 /// A second answer under the same facts is the goal's refusal, named in what the flush did; it
@@ -724,4 +743,140 @@ fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
     let again = install(&db, memory.clone(), facts, before).unwrap();
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds), "the solver that kept it finds it");
     drop(again);
+}
+
+thread_local! {
+    /// The goal table of [`body`]'s crate: the goal's answer (the goal knob's value) and the
+    /// reads of solving it, for the next body to replay.
+    static TABLE: std::cell::Cell<Option<(u32, blaze_query::db::Reads)>> =
+        const { std::cell::Cell::new(None) };
+    /// The knob the goal's evaluation reads, the facts' knob (what the store's bookkeeping
+    /// reads: [`TestFacts::value`]) and each body's own, by name.
+    static KNOBS: std::cell::RefCell<Vec<(Knob, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Each body's trace by its own knob's name: its capture's reads, by knob name and field.
+    static TRACES: std::cell::RefCell<Vec<(&'static str, Vec<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `knob`'s name in [`KNOBS`].
+fn knob_name(knob: Knob) -> &'static str {
+    KNOBS.with_borrow(|knobs| {
+        knobs.iter().find(|(it, _)| *it == knob).map(|(_, name)| *name).expect("a test knob")
+    })
+}
+
+/// A body's step as `global_goals::evaluate_root_goal` runs a goal in it, under the step's
+/// capture (`body_store::capture`): the goal from the table, replayed; else looked up in the
+/// store (a miss: its one shape's fact has another value) and solved under a capture of its
+/// own (the goal knob's value), put in the table and offered. Then the body's own read.
+#[blaze_query::tracked(returns(copy))]
+fn body(db: &Db, own: Knob) -> u32 {
+    let interner = DbInterner::new_with(db, own.krate(db));
+    let goal = KNOBS.with_borrow(|knobs| knobs[0].0);
+    let (value, reads) = blaze_query::db::capture_reads(db, || {
+        let answer = match TABLE.get() {
+            Some((answer, reads)) => {
+                blaze_query::db::replay_reads(db, reads);
+                answer
+            }
+            None => {
+                let found = lookup_goal(interner, the_goal(interner));
+                assert!(found.is_none(), "the store holds the goal under another fact value");
+                let (answer, reads) = blaze_query::db::capture_reads(db, || goal.value(db));
+                let reads = reads.expect("an input's read is shareable");
+                TABLE.set(Some((answer, reads)));
+                offer_goal(interner, the_goal(interner), Answer::Holds, reads);
+                answer
+            }
+        };
+        answer + own.value(db)
+    });
+    let reads = reads.expect("plain reads are shareable");
+    let mut trace = Vec::new();
+    let storage = blaze_query::db::Database::storage(db);
+    let _: Option<()> = reads.for_each_read(storage, |read| {
+        let knob = KNOBS.with_borrow(|knobs| {
+            knobs
+                .iter()
+                .find(|(it, _)| blaze_query::db::AsId::as_id(it) == read.key.key_index())
+                .map(|(it, _)| *it)
+        });
+        // alloc: test
+        trace.push(match knob {
+            Some(knob) => format!("{}.{:?}", knob_name(knob), read.kind),
+            None => format!("{}({:?})", storage.read_name(read.key, read.kind), read.kind),
+        });
+        std::ops::ControlFlow::Continue(())
+    });
+    TRACES.with_borrow_mut(|traces| traces.push((knob_name(own), trace)));
+    value
+}
+
+/// Each body's trace, by its own knob's name, sorted by it, with the bodies run in `order`
+/// (indices into one, two, three) in a fresh database whose store holds the goal under another
+/// value of its fact: so each body that runs the goal first looks it up and misses, reading
+/// that fact's value, then solves and offers it.
+fn traces_in(order: &[usize]) -> Vec<(&'static str, Vec<String>)> {
+    let mut db = db_of(FIXTURE);
+    let krate = local_crate(&db);
+    let goal = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let facts_knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let own: Vec<Knob> =
+        (0..3u32).map(|n| Knob::new(&db, Durability::LOW, 10 * (n + 1), true, krate)).collect();
+    KNOBS.set(vec![
+        (goal, "goal"),
+        (facts_knob, "facts"),
+        (own[0], "one"),
+        (own[1], "two"),
+        (own[2], "three"),
+    ]);
+    TABLE.set(None);
+    TRACES.with_borrow_mut(Vec::clear);
+    let memory = Arc::new(Memory::default());
+    let installed =
+        install(&db, memory.clone(), Arc::new(TestFacts::new(facts_knob, true)), BUILD).unwrap();
+    assert_eq!(offered(&db, facts_knob), 1);
+    installed.flush().unwrap();
+    facts_knob.set_value(&mut db).to(2);
+    for &at in order {
+        assert_eq!(body(&db, own[at]), 1 + 10 * (at as u32 + 1));
+    }
+    installed.flush().unwrap();
+    let mut traces = TRACES.with_borrow_mut(std::mem::take);
+    traces.sort();
+    traces
+}
+
+/// The invariant: a body's trace is the same whichever body of its crate solved a goal first:
+/// the one that looked it up, missed, solved and offered it holds the goal's reads and its
+/// own, exactly what one that took the goal from the table replays, byte for byte, for the
+/// bodies run in order, reversed and shuffled. Neither the miss's read of a fact's value nor
+/// the offer's (both of the facts' knob) is any body's. Control: with the store's bookkeeping
+/// recorded ([`super::planted::RECORDED`], the code before the guard), the body run first
+/// lists the facts' knob and the orders' traces differ.
+#[test]
+fn a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first() {
+    let orders: [&[usize]; 3] = [&[0, 1, 2], &[2, 1, 0], &[1, 2, 0]];
+    // alloc: test
+    let want = |own: &'static str| {
+        (own, vec![String::from("goal.InputField(0)"), format!("{own}.InputField(0)")])
+    };
+    let first = traces_in(orders[0]);
+    assert_eq!(first, vec![want("one"), want("three"), want("two")]);
+    for order in &orders[1..] {
+        assert_eq!(traces_in(order), first, "bodies run in the order {order:?}");
+    }
+    super::planted::RECORDED.set(true);
+    let planted: Vec<_> = orders.iter().map(|order| traces_in(order)).collect();
+    super::planted::RECORDED.set(false);
+    for (order, traces) in orders.iter().zip(&planted) {
+        let solver = ["one", "two", "three"][order[0]];
+        let (_, trace) = traces.iter().find(|(own, _)| *own == solver).expect("each body's trace");
+        assert!(
+            trace.iter().any(|it| it.starts_with("facts.")),
+            "{order:?}: the planted bug unseen: {trace:?}"
+        );
+    }
+    assert_ne!(planted[0], planted[1], "the planted bug's traces depend on the order");
 }

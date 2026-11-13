@@ -1,0 +1,14 @@
+{
+ "id": "start-waits-for-history-http-and-a-cookie",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of S1 (/tmp/plan/6c-start.md), int-1112",
+ "where": "crates/blaze-cargo/src/serve.rs engine, build_of; serve/observe.rs keep_history; blaze-registry/src/http/client.rs HyperHttp::new; serve/heads.rs flush; blaze-vfs/src/watch.rs Watcher::start",
+ "what": "A CLI waited 385 ms for the daemon it started to listen, and its first request 503 ms more. engine() blocked on the profile history's open (about 200 ms) to learn the first build's number, made the HTTP client (tokio runtime and macOS root certificates, 70 ms or more) for a daemon that may never fetch, and hashed its own executable again; none of it had a span. The first request then waited for a flush of the journal (a cookie round trip) although the watcher's own start sweep already looked at every file.",
+ "cost": "about 0.9 s on every daemon start and first request, the row Relax wins on; unseen because engine() had no spans",
+ "cause": "work a later step needs was done eagerly on the start's path, and the first wait on a checkout reused the steady-state flush instead of the look that starting the watch already makes",
+ "class": "the start's critical path does what only a later request needs, and a wait asks for a proof the system already holds",
+ "prevention": "every part of engine() has a span; the plane takes its first number at its first open; the HTTP client is made by its first request; the executable's hash is read under its stamp from <state>/tool, one home for every reader; a start always sweeps, and the request that starts a watch waits for that look",
+ "workaround": "none",
+ "fix": "S1: Plane::number(Numbered::Later), a failed open stopping the daemon with Failed::History naming the history's dir; HyperHttp::made; local::tool_hash seeding blaze_profile::identity; Heads::flush's first wait is the look; Watcher::start sweeps with a cursor too. Controls: observe WAITS_AT_START, plane ASKS_AT_NUMBER, heads PassesBeforeTheLook, watch sweeps_only_without_cursor, local's always-steady stamp.",
+ "state": "fixed, not yet built"
+}

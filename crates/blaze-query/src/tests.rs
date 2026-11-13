@@ -13,18 +13,16 @@ use blaze_ids::{
     ContentId, Fingerprint,
     bits::{BitSet, Bits},
 };
-use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
+use blaze_image::{Cause, Corrupt, SectionId};
 use blaze_vfs::{Bytes, Mode, View, ViewId};
-use intern::Live;
 use blaze_core::lock::Lock;
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Mark, MemTree, Names as Lent,
     Query, QueryKey, QueryKind, Stored, Tree, kinds,
-    image::ImageMap,
     memo::MemoId,
     subtree::{Digest, Subtree, SubtreeKey},
-    table::{Aligned, EdgeRecord},
+    table::EdgeRecord,
 };
 
 #[derive(Clone, Copy)]
@@ -53,8 +51,6 @@ impl Persist for Num {
         blaze_format::open::<Word>(buffer).map(|word| word.0)
     }
 }
-
-mod restore;
 
 thread_local! {
     static RUNS: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
@@ -436,355 +432,6 @@ fn cold_values_move_to_disk_and_read_from_it() {
     assert_eq!(runs("double"), 1, "read from the cold pack, not made again");
 }
 
-/// The database's sections of an image, as the daemon writes them (it adds the symbol table
-/// and its own sections, which the database never reads).
-fn image_of(db: &Database, builder: Builder) -> (Vec<u8>, Live) {
-    let mut builder = builder;
-    let mut live = Live::new();
-    db.write_image(&mut builder, &mut live).expect("every kind is registered");
-    (builder.finish().expect("a small image"), live)
-}
-
-fn opened(bytes: &[u8]) -> Arc<Image<Mapping>> {
-    Arc::new(Image::open(mapping(bytes)).expect("an image this blaze wrote"))
-}
-
-#[test]
-fn the_image_holds_the_database() {
-    let (db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc")]);
-    double(&db, one, "a");
-    let (bytes, _) = image_of(&db, Builder::new());
-
-    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
-    register(&mut started);
-    reset();
-    let same = view(&started, &tree, &[("a", "abc")]);
-    assert_eq!(double(&started, same, "a"), 6);
-    assert_eq!((runs("len"), runs("double")), (0, 0), "every memo verified from the image");
-    assert!(matches!(
-        started.memo(&key::<Double>("a")).map(|memo| memo.value),
-        Some(Stored::Disk(_))
-    ));
-
-    let longer = view(&started, &tree, &[("a", "abcd")]);
-    assert_eq!(double(&started, longer, "a"), 8);
-    assert_eq!((runs("len"), runs("double")), (1, 1));
-    assert_eq!(started.take_corrupt(), vec![], "nothing read was corrupt");
-
-    assert_eq!(image_of(&db, Builder::new()).0, bytes, "the same database writes the same image");
-}
-
-/// Values name symbols by their IDs in the image's symbol table, so an image is used only
-/// after the table was restored from it.
-#[test]
-fn an_image_whose_symbols_were_not_restored_is_refused() {
-    let (db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc")]);
-    double(&db, one, "a");
-    let (bytes, _) = image_of(&db, Builder::new());
-    assert_eq!(intern::restored_from(), None, "no test restores the process's symbols");
-    assert_eq!(
-        Database::from_image_with(config(&tree), opened(&bytes)).err(),
-        Some(DbError::Symbols)
-    );
-}
-
-#[test]
-fn an_image_without_the_databases_sections_is_refused() {
-    let empty = Builder::new().finish().expect("an image");
-    assert!(matches!(
-        Database::open_image(Config::memory(), opened(&empty)),
-        Err(DbError::Refused(Refused::Missing { id: SectionId::DB_MEMOS }))
-    ));
-    let mut other = Builder::new();
-    other.add(SectionId::DB_MEMOS, blaze_format::schema("blaze v2 db memos 1"), &[]);
-    let other = other.finish().expect("an image");
-    let error = Database::open_image(Config::memory(), opened(&other)).err();
-    assert!(
-        matches!(error, Some(DbError::Refused(Refused::Schema { id: SectionId::DB_MEMOS, .. }))),
-        "{error:?}"
-    );
-    assert!(error.is_some_and(|error| error.is_image()));
-}
-
-#[test]
-fn a_kind_with_memos_must_be_registered_to_write_an_image() {
-    let (db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc")]);
-    double(&db, one, "a");
-    let (bytes, _) = image_of(&db, Builder::new());
-    let started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
-    let mut live = Live::new();
-    let error = started.write_image(&mut Builder::new(), &mut live).err();
-    assert!(matches!(error, Some(DbError::Unknown(_))), "{error:?}");
-}
-
-#[test]
-fn settling_swaps_to_the_mapped_image() {
-    let (mut db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc")]);
-    double(&db, one, "a");
-    let (bytes, _) = image_of(&db, Builder::new());
-    let mut effects = Vec::new();
-    assert_eq!(db.settle(opened(&bytes), &mut effects), Ok(()));
-    assert!(effects.is_empty(), "no cold packs to remove: {effects:?}");
-
-    assert_eq!(double(&db, one, "a"), 6, "the view stays open across the swap");
-    assert_eq!((runs("len"), runs("double")), (1, 1));
-    assert!(matches!(db.memo(&key::<Double>("a")).map(|memo| memo.value), Some(Stored::Disk(_))));
-    db.reclaim();
-}
-
-/// A cold pack still being written (or, `mapping_it`, mapped) when the database settles names the
-/// memos of the store it left (01251): once its I/O is done it is removed, never read into
-/// the image's store, and the image's memos serve.
-fn settle_with_a_cold_pack_in_flight(mapping_it: bool) {
-    let (mut db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc")]);
-    double(&db, one, "a");
-    db.close(one);
-    let mut effects = Vec::new();
-    db.collect(&[key::<Double>("a")], &mut effects);
-    let (file, bytes, mut tag) = written(&mut effects);
-    if mapping_it {
-        db.complete(Completion { tag, done: Done::Written }, &mut effects);
-        tag = mapped(&mut effects).1;
-    }
-    let (image, _) = image_of(&db, Builder::new());
-    assert_eq!(db.settle(opened(&image), &mut effects), Ok(()));
-    assert!(effects.is_empty(), "no pack was mapped yet: {effects:?}");
-
-    let done = if mapping_it { Done::Mapped(mapping(&bytes)) } else { Done::Written };
-    db.complete(Completion { tag, done }, &mut effects);
-    assert_eq!(effects.len(), 1, "{effects:?}");
-    let Some(Effect::Remove { file: removed, tag }) = effects.pop() else { panic!("not a remove") };
-    assert_eq!(removed.as_str(), file.as_str());
-    db.complete(Completion { tag, done: Done::Removed }, &mut effects);
-    assert!(effects.is_empty(), "{effects:?}");
-
-    let again = view(&db, &tree, &[("a", "abc")]);
-    assert_eq!(double(&db, again, "a"), 6);
-    assert_eq!((runs("len"), runs("double")), (1, 1), "verified from the image");
-    db.reclaim();
-}
-
-#[test]
-fn a_cold_pack_written_across_a_settle_is_removed() {
-    settle_with_a_cold_pack_in_flight(false);
-}
-
-#[test]
-fn a_cold_pack_mapped_across_a_settle_is_removed() {
-    settle_with_a_cold_pack_in_flight(true);
-}
-
-/// `bytes`, an image, written again with `section`'s bytes changed by `change`: every group's
-/// CRC is of the changed bytes, so it reads as an image a blaze with a bug wrote.
-fn rewritten(bytes: &[u8], section: SectionId, change: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
-    let image = opened(bytes);
-    let mut builder = Builder::new();
-    for it in image.sections() {
-        let mut held = image.whole(it).expect("a group that passes its CRC").to_vec();
-        if it.id == section {
-            change(&mut held);
-        }
-        builder.add(it.id, it.schema, &held);
-    }
-    builder.finish().expect("a small image")
-}
-
-/// A database of a few keys, as an image.
-fn small_image() -> (Vec<u8>, Arc<MemTree>) {
-    let (db, tree) = setup();
-    let one = view(&db, &tree, &[("a", "abc"), ("b", "abcd")]);
-    double(&db, one, "a");
-    double(&db, one, "b");
-    (image_of(&db, Builder::new()).0, tree)
-}
-
-/// The invariant: a database restored from an image holds no record that names a memo, an
-/// edge or bytes of the blob the image lacks: each is refused as the image is opened, naming
-/// the section and the record, never met by the first request that reads it. An image the
-/// database wrote passes, and written again unchanged it still does.
-#[test]
-fn a_restored_image_names_only_what_it_holds() {
-    let (bytes, tree) = small_image();
-    let checked = Database::check_image(opened(&bytes)).expect("an image this blaze wrote");
-    assert!(checked.memos >= 2 && checked.keys >= 2 && checked.inputs >= 2, "{checked:?}");
-    let same = rewritten(&bytes, SectionId::DB_TABLE, |_| {});
-    assert_eq!(Database::check_image(opened(&same)), Ok(checked));
-    Database::open_image(config(&tree), opened(&same)).expect("it opens too");
-
-    // Each reference a record makes, pointed past what the image holds.
-    let plant = |section, at: usize, word: u64| {
-        rewritten(&bytes, section, |held| {
-            held[at..at + 8].copy_from_slice(&word.to_le_bytes());
-        })
-    };
-    let table = opened(&bytes)
-        .sections()
-        .iter()
-        .find(|it| it.id == SectionId::DB_TABLE)
-        .map(|it| opened(&bytes).whole(it).expect("the table").to_vec())
-        .expect("a table");
-    let slot = table.chunks(8).position(|it| it != [0; 8]).expect("a slot that names a memo");
-    let planted = [
-        (SectionId::DB_TABLE, slot * 8, checked.memos + 7, "the memo"),
-        // A memo's value, key bytes and edges; an input's path.
-        (SectionId::DB_MEMOS, 160, 1 << 40, "a value"),
-        (SectionId::DB_MEMOS, 176, 1 << 40, "key bytes"),
-        (SectionId::DB_MEMOS, 152, u64::MAX, "edges"),
-        (SectionId::DB_INPUTS, 48, 1 << 40, "a path"),
-    ];
-    for (section, at, word, what) in planted {
-        let bad = plant(section, at, word);
-        let refused = Database::check_image(opened(&bad)).expect_err(what);
-        assert!(
-            matches!(&refused, DbError::Dangling { section: found, .. } if *found == section),
-            "{what}: {refused}"
-        );
-        assert!(refused.to_string().contains(what), "{what}: {refused}");
-        // At the restore, before any request: the database does not open.
-        let restored = Database::open_image(config(&tree), opened(&bad));
-        assert_eq!(restored.err(), Some(refused), "{what}");
-    }
-}
-
-/// The control of `a_restored_image_names_only_what_it_holds`: with the check at open left
-/// out (the image map opened alone, as before 2026-11-11), a table slot naming a memo the
-/// image lacks is met only by the read that reaches it, as a panic.
-#[test]
-fn the_oracle_catches_a_table_slot_naming_a_memo_the_image_lacks() {
-    let (bytes, _) = small_image();
-    let memos = Database::check_image(opened(&bytes)).expect("a good image").memos;
-    let bad = rewritten(&bytes, SectionId::DB_TABLE, |held| {
-        for slot in held.chunks_mut(8).filter(|it| *it != [0; 8]) {
-            slot.copy_from_slice(&(memos + 7).to_le_bytes());
-        }
-    });
-    let unchecked = ImageMap::open(opened(&bad)).expect("its sections are whole records");
-    let met = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unchecked.for_each_key(|_| {});
-    }));
-    assert!(met.is_err(), "unchecked, the slot is met at its first read");
-    assert!(
-        matches!(unchecked.check_references(), Err(DbError::Dangling { .. })),
-        "the check finds it"
-    );
-}
-
-/// One byte flipped in a group of the edges or the values: each request reading a key whose
-/// memos it held fails naming the section and group, every time, and nothing is computed again;
-/// every other key is used from the image, the group is reported once, and no image is written
-/// without it. A group of the table or the memo records, or one holding an input's path, is
-/// read at start, so the database does not start, naming it.
-#[test]
-fn a_corrupt_group_fails_the_keys_in_it() {
-    const KEYS: usize = 300;
-    let (db, tree) = setup();
-    let names: Vec<String> = (0..KEYS).map(|n| format!("f{n}")).collect();
-    let contents: Vec<String> = (0..KEYS).map(|n| "x".repeat(n % 7)).collect();
-    let files: Vec<(&str, &str)> =
-        names.iter().map(String::as_str).zip(contents.iter().map(String::as_str)).collect();
-    let one = view(&db, &tree, &files);
-    for name in &names {
-        double(&db, one, name);
-    }
-    // Groups of 4 KiB, so each section spans several.
-    let (bytes, _) = image_of(&db, Builder::with_group_shift(12));
-    let sections = opened(&bytes).sections().to_vec();
-    let mut tried = 0;
-    for section in sections.iter().filter(|it| it.id != SectionId::DB_INPUTS) {
-        for group in 0..section.groups {
-            let mut flipped = bytes.clone();
-            flipped[(section.at + u64::from(group) * 4096) as usize] ^= 0x40;
-            let image = opened(&flipped);
-            let mut started = match Database::open_image(config(&tree), image) {
-                Ok(started) => started,
-                Err(DbError::Corrupt(corrupt)) => {
-                    // The table and the memo records are read whole as the image opens (its
-                    // references are checked then), and so are the inputs' paths in the blob.
-                    assert_eq!((corrupt.section, corrupt.group), (section.id, group));
-                    assert!(
-                        [SectionId::DB_TABLE, SectionId::DB_MEMOS, SectionId::DB_BLOB]
-                            .contains(&section.id),
-                        "{} is not read at start",
-                        section.id
-                    );
-                    continue;
-                }
-                Err(error) => panic!("{error}"),
-            };
-            register(&mut started);
-            reset();
-            let same = view(&started, &tree, &files);
-            let the_group = |error: DbError, name: &str| match error {
-                DbError::Corrupt(corrupt) => assert_eq!(
-                    (corrupt.section, corrupt.group),
-                    (section.id, group),
-                    "{name} fails naming the corrupt group"
-                ),
-                error => panic!("{name}: {error}"),
-            };
-            let mut failed = Vec::new();
-            for (n, name) in names.iter().enumerate() {
-                match started.pin().get::<Double>(same, name) {
-                    Ok(value) => {
-                        assert_eq!(value, 2 * (n % 7) as u64, "{name} is right from the image")
-                    }
-                    Err(error) => {
-                        the_group(error, name);
-                        failed.push(name);
-                    }
-                }
-            }
-            assert!(
-                !failed.is_empty(),
-                "{} group {group} held memos: a key of it fails",
-                section.id
-            );
-            assert!(
-                failed.len() < KEYS,
-                "{} group {group}: the other keys answer from the image",
-                section.id
-            );
-            for &name in &failed {
-                the_group(
-                    started
-                        .pin()
-                        .get::<Double>(same, name)
-                        .expect_err("asked again, it fails again"),
-                    name,
-                );
-            }
-            assert_eq!(
-                runs("len") + runs("double"),
-                0,
-                "{} group {group}: nothing is computed again",
-                section.id
-            );
-            let mut live = Live::new();
-            the_group(
-                started
-                    .write_image(&mut Builder::new(), &mut live)
-                    .expect_err("no image without the group"),
-                "the image",
-            );
-            let found = started.take_corrupt();
-            assert_eq!(
-                found.iter().map(|it| (it.section, it.group)).collect::<Vec<_>>(),
-                vec![(section.id, group)],
-                "{} group {group}",
-                section.id
-            );
-            assert_eq!(started.take_corrupt(), vec![], "each group is reported once");
-            tried += 1;
-        }
-    }
-    assert!(tried > 2 * 2, "the edges and the values span groups: {tried} tried");
-}
-
 #[test]
 fn a_wait_that_would_close_a_cycle_is_cancelled() {
     let (db, tree) = setup();
@@ -879,16 +526,6 @@ fn another_roots_files_are_inputs_shared_by_every_view() {
         Input::file_at_key(newer, "core/lib.rs")
     );
     assert_ne!(Input::file_at_key(library, "core/lib.rs"), Input::file_key("core/lib.rs"));
-
-    let (bytes, _) = image_of(&db, Builder::new());
-    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
-    register(&mut started);
-    started.register::<RootLen>();
-    reset();
-    let three = view(&started, &tree, &[("b", "3")]);
-    assert_eq!(started.pin().get::<RootLen>(three, &core), Ok(402));
-    assert_eq!(runs("root len"), 0, "the root's inputs came back from the image");
-    assert_eq!(started.take_corrupt(), vec![], "nothing read was corrupt");
 }
 
 #[test]
@@ -1174,27 +811,7 @@ fn edges_round_trip_through_their_record() {
     };
     let record = EdgeRecord::new(edge.read, edge.saw);
     assert_eq!(record.edge(), edge);
-    let bytes = crate::image::encode_edge(&edge);
-    assert_eq!(bytes.len(), crate::table::EDGE_RECORD);
-    assert_eq!(
-        EdgeRecord::as_bytes(&[record]),
-        bytes.as_slice(),
-        "the image's layout, read in place"
-    );
-    let aligned = Aligned::copy(&bytes);
-    // SAFETY: `Aligned` is at a 16-byte boundary.
-    let read = unsafe { EdgeRecord::from_bytes(aligned.bytes()) };
-    assert_eq!(read.iter().map(EdgeRecord::edge).collect::<Vec<_>>(), vec![edge]);
-}
-
-/// A memo of no edges reads an empty range of the image, which is `&[]` at address 1: no
-/// records, never a cast of an unaligned pointer (the daemon's settle of a 14:13 home).
-#[test]
-fn no_edges_read_from_an_empty_range() {
-    let empty: &[u8] = &[];
-    assert_ne!(empty.as_ptr().addr() % align_of::<EdgeRecord>(), 0, "the case this covers");
-    // SAFETY: empty, which `from_bytes` takes at any address.
-    assert!(unsafe { EdgeRecord::from_bytes(empty) }.is_empty());
+    assert_eq!(EdgeRecord::as_bytes(&[record]).len(), crate::table::EDGE_RECORD);
 }
 
 /// Counts each thread's allocations for the budgets below and in `memo` and `table`'s tests.
@@ -1252,14 +869,13 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     let one = view(&db, &tree, &[("a", "abc")]);
     double(&db, one, "a");
     let task = blaze_reclaim::enter();
-    let slot = db.slot(&task, &key::<Len>("a")).expect("no image").expect("len(a) ran");
+    let slot = db.slot(&task, &key::<Len>("a")).expect("len(a) ran");
     let kept = slot.key().expect("its key's bytes").as_ptr();
     drop(task);
     double(&db, one, "a");
     let task = blaze_reclaim::enter();
     let again = db
         .slot(&task, &key::<Len>("a"))
-        .expect("no image")
         .and_then(|slot| slot.key())
         .expect("still kept");
     assert_eq!(again.as_ptr(), kept, "not encoded and swapped in again");
@@ -1289,7 +905,7 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     }
     collect_until_freed(&db);
     let task = blaze_reclaim::enter();
-    assert!(matches!(db.slot(&task, &key::<Len>("a")), Ok(None)), "len(a)'s slot is collected");
+    assert!(db.slot(&task, &key::<Len>("a")).is_none(), "len(a)'s slot is collected");
     assert!(db.keys.get(&task, &key::<Len>("a")).is_none(), "and its decoded key with it");
 }
 
@@ -1604,41 +1220,6 @@ fn a_parallel_mark_allocates_nothing_on_its_caller() {
     assert_eq!(again, warm.0.len());
 }
 
-/// The image's radix sort of keys orders them as a comparison sort does: random keys of a few
-/// kinds, with keys repeated and keys sharing their whole 8-byte prefix, at sizes on both sides
-/// of the radix sort's insertion and parallel cut-offs.
-#[test]
-fn keys_sort_for_the_image_as_by_comparison() {
-    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D);
-    let mut next = || rng.next_u64();
-    for len in [0usize, 1, 2, 63, 64, 65, 1000, 70_000, 150_000] {
-        let mut keys: Vec<QueryKey> = (0..len)
-            .map(|_| {
-                let mut input = [0u8; 32];
-                for chunk in input.chunks_mut(8) {
-                    chunk.copy_from_slice(&next().to_le_bytes());
-                }
-                QueryKey { kind: QueryKind((next() % 4) as u16), input: ContentId(input) }
-            })
-            .collect();
-        for at in 0..len / 10 {
-            let from = keys[(next() as usize) % len];
-            let to = (next() as usize) % len;
-            keys[to] = if at % 2 == 0 {
-                from
-            } else {
-                let mut shared = from;
-                shared.input.0[31] ^= 1;
-                shared
-            };
-        }
-        let mut expected = keys.clone();
-        expected.sort_unstable();
-        crate::sort_keys(&mut keys);
-        assert_eq!(keys, expected, "{len} keys");
-    }
-}
-
 /// A memo is stamped with the collection generation it was given in, in its cold row; an equal
 /// memo given later restamps the one its key keeps, and a stamp is never lowered.
 #[test]
@@ -1648,18 +1229,21 @@ fn a_memo_is_born_in_the_generation_its_key_last_resolved_to_it() {
     let key = QueryKey { kind: QueryKind(0x2f00), input: ContentId([4; 32]) };
     let code = db.store.code(WORD, ContentId([1; 32]));
     let first = db.store.make(key, Fingerprint(1), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, first), Ok(first));
+    assert_eq!(db.add_memo(&task, key, first), first);
     assert_eq!(db.store.born(&task, first), 0);
     db.generation.store(3, Ordering::SeqCst);
     let equal = db.store.make(key, Fingerprint(1), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, equal), Ok(first), "the key keeps the equal memo it had");
+    assert_eq!(db.add_memo(&task, key, equal), first, "the key keeps the equal memo it had");
     assert_eq!(db.store.born(&task, first), 3, "restamped as its key resolved to it again");
     let other = db.store.make(key, Fingerprint(2), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, other), Ok(other));
+    assert_eq!(db.add_memo(&task, key, other), other);
     assert_eq!(db.store.born(&task, other), 3);
     db.store.reborn_in(&task, first, 2);
     assert_eq!(db.store.born(&task, first), 3, "never lowered");
 }
+
+/// [`Pinned::inputs_of`](crate::Pinned::inputs_of): its own file, beside the queries it asks.
+mod inputs;
 
 mod some_kinds {
     crate::query_kinds! {
@@ -1688,7 +1272,7 @@ fn query_kinds_name_each_kind_both_ways() {
 }
 
 const BROKEN: Corrupt =
-    Corrupt { section: SectionId::VFS_BLOBS, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };
+    Corrupt { section: SectionId::VFS_TREE, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };
 
 /// A [`MemTree`] whose file `broken` names fails its check while it is set.
 struct Breaking {
@@ -1709,6 +1293,9 @@ impl Tree for Breaking {
     }
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Lent<'_, '_>)) -> bool {
         self.files.read_dir(root, path, read)
+    }
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        self.files.dir(root, path)
     }
 }
 
@@ -1854,6 +1441,9 @@ impl Tree for Backwards {
         names.reverse();
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
+    }
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        self.0.dir(root, path)
     }
 }
 
@@ -2165,7 +1755,7 @@ fn same_len(db: &Database, view: ViewId, name: &str) -> u64 {
 /// Each memo's value word of `name`'s key.
 fn words(db: &Database, name: &str) -> Vec<u64> {
     let task = blaze_reclaim::enter();
-    db.slot(&task, &key::<SameLen>(name)).expect("no image").map_or_else(Vec::new, |slot| {
+    db.slot(&task, &key::<SameLen>(name)).map_or_else(Vec::new, |slot| {
         slot.memos().iter().map(|&memo| db.store.value_word(&task, memo)).collect()
     })
 }
@@ -2240,47 +1830,9 @@ fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
     assert_eq!(db.store.shared_rows(), 0, "no memo names the row: it is freed");
     let task = blaze_reclaim::enter();
     assert!(
-        matches!(db.slot(&task, &key::<SameLen>("a")), Ok(None))
-            && matches!(db.slot(&task, &key::<SameLen>("b")), Ok(None))
+        db.slot(&task, &key::<SameLen>("a")).is_none()
+            && db.slot(&task, &key::<SameLen>("b")).is_none()
     );
-}
-
-/// The image writes equal values once, whatever their kind: a shared kind's memos and a plain
-/// kind's map the same bytes of the blob once started from it.
-#[test]
-fn equal_values_go_into_the_image_once() {
-    let (db, tree, one, _) = shared_three();
-    assert_eq!(
-        (db.pin().get::<Len>(one, &"a".to_owned()), db.pin().get::<Len>(one, &"b".to_owned())),
-        (Ok(3), Ok(3))
-    );
-    let (bytes, _) = image_of(&db, Builder::new());
-
-    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
-    register(&mut started);
-    started.register::<SameLen>();
-    reset();
-    let same = view(&started, &tree, &[("a", "xyz"), ("b", "abc")]);
-    assert_eq!((same_len(&started, same, "a"), same_len(&started, same, "b")), (3, 3));
-    let len = |name: &str| started.pin().get::<Len>(same, &name.to_owned());
-    assert_eq!((len("a"), len("b")), (Ok(3), Ok(3)));
-    assert_eq!((runs("same len"), runs("len")), (0, 0), "every memo verified from the image");
-
-    let task = blaze_reclaim::enter();
-    let at = |key: QueryKey| {
-        let slot = started.slot(&task, &key).expect("not corrupt").expect("a key of the image");
-        let bytes =
-            started.store.bytes(&task, *slot.memos().last().expect("a memo")).expect("mapped");
-        (bytes.as_ptr(), bytes.len())
-    };
-    let shared = at(key::<SameLen>("b"));
-    assert_eq!(
-        at(key::<SameLen>("a")),
-        shared,
-        "a shared kind's equal values are one copy in the blob"
-    );
-    assert_eq!(at(key::<Len>("a")), shared, "so are any kind's: Len's value has the same bytes");
-    assert_eq!(at(key::<Len>("b")), shared);
 }
 
 /// A cold pack writes equal values once, whatever their kind, and every memo maps them.
@@ -2411,7 +1963,7 @@ mod model {
                     let code = db.store.code(WORD, ContentId([1; 32]));
                     let made = db.store.make(KEY, Fingerprint(fingerprint), code, &[], &[]);
                     let saw_bump = db.generation.load(Ordering::SeqCst) > 0;
-                    db.add_memo(&task, KEY, made).expect("no image");
+                    db.add_memo(&task, KEY, made);
                     saw_bump
                 })
             };
@@ -2421,7 +1973,7 @@ mod model {
             db.collect(&[], &mut Vec::new());
             let saw = givers.map(|giver| giver.join().expect("a giver"));
             let task = blaze_reclaim::enter();
-            let kept: Vec<u128> = db.slot(&task, &KEY).expect("no image").map_or_else(Vec::new, |slot| {
+            let kept: Vec<u128> = db.slot(&task, &KEY).map_or_else(Vec::new, |slot| {
                 slot.memos().iter().map(|&memo| db.store.fingerprint(&task, memo).0).collect()
             });
             assert!(kept.iter().all(|it| *it == 1 || *it == 2), "only memos given are kept: {kept:?}");

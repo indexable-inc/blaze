@@ -315,8 +315,10 @@ pub use give_back::Settle;
 static HEAP_GIVE_BACKS: give_back::GiveBacks = give_back::GiveBacks::new();
 
 /// What wakes the threads that count for a give-back where they idle ([`heap_wakes_by`]):
-/// set once, by the worker pool.
-static HEAP_WAKE: OnceLock<fn()> = OnceLock::new();
+/// one slot an idler, each set once (the worker pool's workers park on its condvar, a wasm
+/// expansion thread blocks in its channel's `recv`), and every one is called at an ask. A
+/// fixed array of four, each slot set once at its idler's start and read without a lock.
+static HEAP_WAKES: [OnceLock<fn()>; 4] = [const { OnceLock::new() }; 4];
 
 thread_local! {
     /// This thread counts for a give-back ([`count_heap_settles`]), and the generation its
@@ -390,9 +392,33 @@ impl Drop for HeapSettles {
 }
 
 /// The threads that count for a give-back are woken where they idle with `wake`, so one that
-/// parks gives back now rather than at its next job. The first call wins; it allocates nothing.
+/// parks gives back now rather than at its next job. Each kind of idler (the pool, the wasm
+/// expansion threads) registers its own; each takes the first empty slot of four,
+/// and the same `wake` registered again is not a second slot. Allocates nothing.
+///
+/// # Panics
+///
+/// When every slot is taken by another waker: a fifth kind of idler is a new slot to add, and
+/// one quietly not woken would hold its pages through every purge.
+#[track_caller]
 pub fn heap_wakes_by(wake: fn()) {
-    _ = HEAP_WAKE.set(wake);
+    for slot in &HEAP_WAKES {
+        if slot.get().is_some_and(|set| std::ptr::fn_addr_eq(*set, wake)) {
+            return;
+        }
+        if slot.set(wake).is_ok() {
+            return;
+        }
+        if slot.get().is_some_and(|set| std::ptr::fn_addr_eq(*set, wake)) {
+            return;
+        }
+    }
+    panic!(
+        "blaze_mem::tag::heap_wakes_by: all {} heap-wake slots are taken; the waker registered at \
+         {} has no slot (add one to HEAP_WAKES)",
+        HEAP_WAKES.len(),
+        std::panic::Location::caller(),
+    );
 }
 
 /// Asks every thread of the global allocator to give back the free pages its heaps keep, wakes
@@ -400,7 +426,7 @@ pub fn heap_wakes_by(wake: fn()) {
 /// [`heap_give_back_settled`].
 pub fn ask_heap_give_back() -> u64 {
     let generation = HEAP_GIVE_BACKS.ask();
-    if let Some(wake) = HEAP_WAKE.get() {
+    for wake in HEAP_WAKES.iter().filter_map(OnceLock::get) {
         wake();
     }
     settle_heap();

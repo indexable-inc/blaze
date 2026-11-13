@@ -163,7 +163,9 @@ fn a_gated_crate_displays_unique_references_as_uniq() {
                     _ => None,
                 })
                 .expect("the binding `a`");
-            let shown = infer.pat_ty(a).display_test(&db, target).to_string();
+            // As a diagnostic shows it: the inference region of a binding's type (`'?`, which
+            // `display_test` writes) is not the reference's spelling.
+            let shown = infer.pat_ty(a).display(&db, target).to_string();
             assert_eq!(shown, spelled);
         });
     }
@@ -183,7 +185,8 @@ fn binding_ty(db: &base_db::Db, krate: base_db::Crate, func: &str, binding: &str
             _ => None,
         })
         .unwrap_or_else(|| panic!("the binding `{binding}` of `{func}`"));
-    (infer.pat_ty(pat).display_test(db, target).to_string(), infer.has_type_mismatches())
+    // As a diagnostic shows it, with no inference region (`'?`), which is not the spelling.
+    (infer.pat_ty(pat).display(db, target).to_string(), infer.has_type_mismatches())
 }
 
 /// `&uniq` where a macro carries it. `rust` has no gate and exports two macros; `gated` says

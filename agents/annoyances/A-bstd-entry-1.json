@@ -1,0 +1,12 @@
+{
+ "id": "A-bstd-entry-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+ "where": "/root/loop.sh on lanebase-1112",
+ "what": "A failed build printed 150 lines of `Cargo.toml` `unused_workspace_dependencies` warnings and no error: the script's `grep -E \"^(error|warning: unused)\" -A12 ... | head -150` is filled by them. Reading /root/loop-build.log afterwards showed another lane's build.",
+ "cost": "two build rounds (about ten minutes) without seeing the three errors",
+ "cause": "the filter matches cargo's manifest warnings; the log is shared",
+ "workaround": "H-bstd-entry-1",
+ "fix": "loop.sh greps `^error` alone and writes the log to /root/loop-build.<branch>.log",
+ "state": "open"
+}

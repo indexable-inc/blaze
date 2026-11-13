@@ -831,7 +831,7 @@ define_symbols! {
     atomic_xchg_release, atomic_xchg_seqcst, atomic_xor_acqrel, atomic_xor_acquire,
     atomic_xor_relaxed, atomic_xor_release, atomic_xor_seqcst, atomic_xsub_acqrel,
     atomic_xsub_acquire, atomic_xsub_relaxed, atomic_xsub_release, atomic_xsub_seqcst, box_new,
-    // Builtin attributes (`hir_expand::inert_attr_macro::INERT_ATTRIBUTES`) not named above,
+    // Builtin attributes (`syntax::builtin_attrs::INERT_ATTRIBUTES`) not named above,
     // so that each is a declared symbol `find_builtin_attr_idx` finds by its index.
     should_panic, automatically_derived, macro_escape, warn, expect, forbid, deny,
     must_not_suspend, crate_name, crate_id, link, link_name, no_link, link_section, used,

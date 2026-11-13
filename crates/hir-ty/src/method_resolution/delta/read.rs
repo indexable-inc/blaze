@@ -311,6 +311,12 @@ pub fn impl_row_hash<'db>(
 ) -> ContentId {
     let mut hasher = Hasher::new(IMPL_SET_DOMAIN);
     hasher.part(b"row");
+    if crate::method_resolution::frozen::served(db, krate) {
+        // A crate read from impl table pages: the row's entry alone, not the trait's table.
+        let table = TraitImpls::served_row(db, krate, trait_, &self_ty.0);
+        hash_table_trait(db, &mut hasher, &table, trait_, Some(Either::Right(&self_ty.0)));
+        return hasher.finish();
+    }
     let table = TraitImpls::for_crate_and_trait(db, krate, trait_);
     hash_table_trait(db, &mut hasher, table, trait_, Some(Either::Right(&self_ty.0)));
     hasher.finish()
@@ -321,6 +327,12 @@ pub fn impl_row_hash<'db>(
 pub fn blanket_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
     let mut hasher = Hasher::new(IMPL_SET_DOMAIN);
     hasher.part(b"blanket");
+    if crate::method_resolution::frozen::served(db, krate) {
+        // A crate read from impl table pages: the trait's entry alone, none of its rows.
+        let table = TraitImpls::served_blanket(db, krate, trait_);
+        hash_table_trait(db, &mut hasher, &table, trait_, Some(Either::Left(())));
+        return hasher.finish();
+    }
     let table = TraitImpls::for_crate_and_trait(db, krate, trait_);
     hash_table_trait(db, &mut hasher, table, trait_, Some(Either::Left(())));
     hasher.finish()
@@ -335,7 +347,15 @@ fn hash_table_trait<'db>(
     trait_: TraitId,
     only: Option<Either<(), &SimplifiedType<'db>>>,
 ) {
-    let Some(t) = table.trait_index(trait_) else { return };
+    let Some(t) = table.trait_index(trait_) else {
+        // A part of a trait with no impl in the table is that part empty, as it is for a
+        // trait with impls and none in the part: a reader of one row or of the blanket impls
+        // of a crate read from pages is not told which (`TraitImpls::served_row`).
+        if only.is_some() {
+            hasher.update(&0u64.to_le_bytes());
+        }
+        return;
+    };
     // Impls and rows go in by their identities' order: the table orders them by interned ids,
     // which two databases give out in different orders.
     let identities = |impls: &[ImplId]| {

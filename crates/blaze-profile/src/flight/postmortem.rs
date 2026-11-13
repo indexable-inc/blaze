@@ -42,7 +42,7 @@
 //! [`super::CAP`] rows of 64 bytes, and 4 KiB of head): about 55 MiB for a daemon on 18 cores
 //! (26 rings), at most about 516 MiB ([`FILE_MOST`], all [`MAPPED_RINGS`]).
 //! The history counts it, and the crash records beside it, against its cap
-//! ([`crate::history::CAP_BYTES`]).
+//! ([`crate::history::CAP_MOST`]).
 //!
 //! The writer holds an exclusive lock on its file for its life. A reader ([`dead`]) takes the
 //! files no one holds, which are of processes that died: their header must be of this layout,

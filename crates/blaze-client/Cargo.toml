@@ -23,6 +23,8 @@ blaze-api.workspace = true
 blaze-core.workspace = true
 blaze-protocol.workspace = true
 blaze-report.workspace = true
+# What `blaze-fast` says of a build: the screen's lines off a terminal (docs/terminal.md).
+blaze-screen.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
 tracing.workspace = true

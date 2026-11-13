@@ -69,7 +69,7 @@ pub(crate) fn fetch_for(version: &str, why: &str) -> anyhow::Result<PathBuf> {
         return Ok(exe);
     }
     let host = hir_ty_codegen::Target::host();
-    eprintln!("blaze: fetching blaze {version} for {host}, {why}");
+    blaze_report::errln!("blaze: fetching blaze {version} for {host}, {why}");
     fetched(version, host, &exe, |name| read_at(&format!("v{version}"), name))?;
     Ok(exe)
 }
@@ -206,9 +206,9 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
     pinned_in(&mut doc, ours).with_context(|| format!("pinning blaze in {shown}"))?;
     std::fs::write(&manifest, doc.to_string()).with_context(|| format!("writing {shown}"))?;
     match was {
-        Some(was) if was == ours => eprintln!("{shown} pins blaze {ours} already"),
-        Some(was) => eprintln!("{shown} pins blaze {ours}, in place of {was}"),
-        None => eprintln!("{shown} pins blaze {ours}"),
+        Some(was) if was == ours => blaze_report::errln!("{shown} pins blaze {ours} already"),
+        Some(was) => blaze_report::errln!("{shown} pins blaze {ours}, in place of {was}"),
+        None => blaze_report::errln!("{shown} pins blaze {ours}"),
     }
     Ok(0)
 }
@@ -440,7 +440,7 @@ const POINTERS: &str = "channels";
 /// its [`pin::channel_file`] for the launcher, which runs that release for a pin to the channel.
 pub(crate) fn resolve_command(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let channel = args.next().context("`version-resolve` is told the channel")?;
-    println!("{}", resolve(&channel)?);
+    blaze_report::outln!("{}", resolve(&channel)?);
     Ok(())
 }
 

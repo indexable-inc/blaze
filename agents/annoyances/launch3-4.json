@@ -1,0 +1,12 @@
+{
+ "id": "launch3-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-launcher restart in place",
+ "what": "`std::env::current_exe()` on Linux reads `/proc/self/exe`, which is `<path> (deleted)` once a build placed a new file at the path: `execv` of it failed, and the first version then left the program running on the code the daemon had replaced.",
+ "cost": "found by the first restart on a real program; a stale program for the length of one test",
+ "cause": "the launcher's file was placed again by every build, and the restart's failure was returned, not fatal",
+ "workaround": "the path is read once at start; a restart that cannot exec ends the process, saying why; the launcher's file is placed by the first build only",
+ "state": "fixed in 87522b0eca",
+ "fix": ""
+}

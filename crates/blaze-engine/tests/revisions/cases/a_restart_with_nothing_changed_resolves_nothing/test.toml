@@ -1,0 +1,50 @@
+about = "The first build after `blaze stop` with nothing changed finds every crate's front-end records by a key made from the plan and the content IDs the VFS holds, the workspace's four crates as the standard library's: it makes no item tree, expands no macro and resolves no crate, writes inputs by the plan's crates and not by their files, makes no unit and misses no record. Then the same after `kill -9`, which leaves what the last answered build stored. Expected once the lane's pieces are in (the runner's measured numbers replace these): written about 250 (about eight inputs a crate of 31, two a source root), executed under 2,000, well under a second. Until then every workspace crate is resolved from source at each restart and each file of the plan is written as an input (restore.md's table of the restart today). The in-process controls (a found record left out, a stale one served) come with the found record and are not written yet."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+redone = []
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+redone = []
+max_units = 0
+max_records = 0
+max_executed = 2000
+max_written = 400
+max_ms = 2000
+max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_local_def_map = 0 }
+
+[revision.known]
+max_executed = "a restart resolves every workspace crate from source, and a unit's record is found only by an identity that needs its crate resolved (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", steps 5 and 7; pieces E and F)"
+max_written = "a restart writes every file of every package of the plan as an input of a new database (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
+max_ms = "as max_executed: hello-world's first no-op after a restart is 3.9 s (2026-11-11)"
+max_ran = "a workspace crate has no records: `eligible` refuses a local crate (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"
+
+[[revision]]
+steps = ["kill"]
+action = "run"
+args = ["-p", "app"]
+prints = "2 6\n"
+redone = []
+max_units = 0
+max_records = 0
+max_executed = 2000
+max_written = 400
+max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_local_def_map = 0 }
+
+[revision.known]
+max_executed = "as rev3"
+max_written = "as rev3"
+max_ran = "as rev3"

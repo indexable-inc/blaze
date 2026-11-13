@@ -210,9 +210,11 @@ fn a_record_of_a_renamed_body_names_the_same_definitions() {
     let written = keys::def_key(&before, old, closure(&before, old));
     assert_eq!(keys::def_of(&after, new, written), Some(closure(&after, new)));
 
-    // An item a path of the body names, by the path.
+    // An item a path of the body names, by its plain item key: reading it back resolves no
+    // path of the body (restore.md, "One form, a function: the end state").
     let callee = |db: &Db| SolverDefId::FunctionId(body_fn(body(db, "g")));
     let named = keys::def_key(&before, old, callee(&before));
+    assert_eq!(named, key::def_key(&before, callee(&before)).0);
     let read = keys::def_of(&after, new, named).expect("the callee read back");
     assert_eq!(key::def_key(&after, read).0, key::def_key(&before, callee(&before)).0);
     assert_eq!(read, callee(&after));

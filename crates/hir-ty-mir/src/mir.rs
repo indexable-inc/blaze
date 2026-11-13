@@ -43,7 +43,7 @@ pub use eval::{
         Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow,
         Site, Stop, TypedCx,
     },
-    macro_call::{FlatInput, MacroArg, call_const_macro},
+    macro_call::{FlatInput, FlatOutput, OUTPUT_ELEMENTS, OUTPUT_TEXT, call_const_macro},
     render_const_using_debug_impl, run_function,
 };
 /// The function a cached function calls for the code of its body. The code generator answers

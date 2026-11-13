@@ -280,12 +280,17 @@ pub(crate) struct Loc {
 
 const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x04";
 const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
-const PACK_REF: usize = 32;
+/// A pack in a head of format 6: format 5's and when it was last used.
+const PACK_REF: usize = 40;
+/// A pack in a head of formats 4 and 5.
+const PACK_REF_5: usize = 32;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
 const UNIT_REF: usize = 32;
+/// A record forgotten alone ([`ForgottenRef`], format 7): its pack, four zeros, its offset.
+const FORGOTTEN_REF: usize = 16;
 const HEAD_CHECK: usize = 4;
-const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 32);
+const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 40 && PACK_REF_5 == 32);
 
 /// The index table a head names: which of the two slots, its length and its CRC-32C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -312,6 +317,11 @@ pub(crate) struct PackRef {
     /// Its live records were all copied on and the file is gone, or going: it is not mapped.
     /// It keeps its place in the list, which is the number index slots name.
     pub removed: bool,
+    /// When a record of it was last read, or it was last appended to with a new value, in
+    /// seconds since the Unix epoch on its store's clock ([`crate::Store::clock`]): what the
+    /// collector orders packs by (format 6). 0 for not known: a head of format 5 has none,
+    /// and the store that opens it stamps each pack with its clock.
+    pub used: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -321,10 +331,68 @@ pub(crate) struct DictionaryRef {
     pub offset: u64,
 }
 
+/// A whole file of the store as a head lists it: its content and length, or, with
+/// [`EXTERNAL_REMOVED`] for its length, a file no key names any more, which whoever opens the
+/// store removes if it is still there. `placed` (format 8): the file is a placed output's
+/// whole file, `placed/<content>`, made the home of its value's record once it was synced
+/// (`Store::home_placed`), not a hot value's `file-<content>` ([`external_file`]). A placed one
+/// listed as removed is not removed by the open: it is a placed file again, which the open's
+/// sweep of `placed/` keeps while a path names it and removes otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ExternalRef {
     pub content: ContentId,
     pub len: u64,
+    pub placed: bool,
+}
+
+/// [`ExternalRef::len`] of a whole file to remove (format 5): no file is this long.
+pub(crate) const EXTERNAL_REMOVED: u64 = u64::MAX;
+
+/// The word a head of format 8 writes for a placed file listed as removed ([`ExternalRef`]).
+const EXTERNAL_REMOVED_PLACED: u64 = u64::MAX - 1;
+
+/// The bit of a head's length word that says a file is placed (format 8): no file is 4 EiB
+/// long, and neither removal word is read as it ([`EXTERNAL_REMOVED`] and
+/// [`EXTERNAL_REMOVED_PLACED`] are matched first).
+pub(crate) const EXTERNAL_PLACED: u64 = 1 << 62;
+
+impl ExternalRef {
+    /// The length word a head of `format` writes for it.
+    fn word(&self, format: u32) -> u64 {
+        debug_assert!(format >= 8 || !self.placed, "a head of format {format} lists no placed file");
+        match (self.len == EXTERNAL_REMOVED, self.placed) {
+            (true, false) => EXTERNAL_REMOVED,
+            (true, true) => EXTERNAL_REMOVED_PLACED,
+            (false, false) => self.len,
+            (false, true) => self.len | EXTERNAL_PLACED,
+        }
+    }
+
+    /// It as a head of `format` wrote `word` for `content`. Before format 8 no word is placed.
+    fn of_word(content: ContentId, word: u64, format: u32) -> Result<ExternalRef, String> {
+        let (len, placed) = match word {
+            EXTERNAL_REMOVED => (EXTERNAL_REMOVED, false),
+            _ if format < 8 => (word, false),
+            EXTERNAL_REMOVED_PLACED => (EXTERNAL_REMOVED, true),
+            _ if word & EXTERNAL_PLACED != 0 => (word & !EXTERNAL_PLACED, true),
+            _ => (word, false),
+        };
+        if len != EXTERNAL_REMOVED && len & EXTERNAL_PLACED != 0 {
+            // alloc: the error's message
+            return Err(format!("it lists the whole file {content:x} at a length no file has"));
+        }
+        Ok(ExternalRef { content, len, placed })
+    }
+}
+
+/// A record forgotten alone (format 7, [`crate::forget`]): the record at `offset` of pack
+/// `pack` is no key's, though the pack is kept. A slot or a spot that points at it finds
+/// nothing, and an opening's scan past the index does not read it. Listed until its pack is
+/// removed, which forgets it with the rest.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct ForgottenRef {
+    pub pack: u32,
+    pub offset: u64,
 }
 
 /// What a store is: written whole and at once (`Effect::Write`) after everything it names is
@@ -340,21 +408,33 @@ pub(crate) struct Head {
     /// The crate versions with packs of their own, each once and never zero; a pack's unit `n`
     /// is `units[n - 1]`.
     pub units: Vec<ContentId>,
+    /// The records forgotten alone in packs it keeps, in order (format 7; none before).
+    pub forgotten: Vec<ForgottenRef>,
 }
 
 impl Head {
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_as(crate::FORMAT)
+    }
+
+    /// Its bytes as a store of `format` writes them: this one's, or (a test's, of a store an
+    /// older blaze left) format 4's and 5's, whose packs carry no time of use.
+    pub(crate) fn encode_as(&self, format: u32) -> Vec<u8> {
+        debug_assert!(format == crate::FORMAT || cfg!(test), "a head is written in this format");
         let mut out = Vec::with_capacity(
             HEAD_FIXED
                 + self.packs.len() * PACK_REF
                 + self.dictionaries.len() * DICTIONARY_REF
                 + self.externals.len() * EXTERNAL_REF
                 + self.units.len() * UNIT_REF
+                + self.forgotten.len() * FORGOTTEN_REF
                 + HEAD_CHECK,
         );
+        debug_assert!(format >= 7 || self.forgotten.is_empty(), "a head of format {format} forgets no record");
         out.put_bytes(&HEAD_MAGIC);
-        out.put_u32(crate::FORMAT);
-        out.put_u32(0);
+        out.put_u32(format);
+        // How many records it lists forgotten (format 7): zero in every head before.
+        out.put_u32(if format >= 7 { self.forgotten.len() as u32 } else { 0 });
         out.put_u64(self.generation);
         let index = self.index.unwrap_or(IndexRef { slot: u8::MAX, len: 0, check: 0, count: 0 });
         out.put_u64(u64::from(index.slot));
@@ -374,6 +454,9 @@ impl Head {
             out.put_u64(pack.committed);
             out.put_u64(pack.indexed);
             out.put_u64(pack.dead);
+            if format >= 6 {
+                out.put_u64(pack.used);
+            }
         }
         for dictionary in &self.dictionaries {
             out.put_u8(dictionary.kind.code());
@@ -383,10 +466,17 @@ impl Head {
         }
         for external in &self.externals {
             out.put_bytes(&external.content.0);
-            out.put_u64(external.len);
+            out.put_u64(external.word(format));
         }
         for unit in &self.units {
             out.put_bytes(&unit.0);
+        }
+        if format >= 7 {
+            for forgotten in &self.forgotten {
+                out.put_u32(forgotten.pack);
+                out.put_u32(0);
+                out.put_u64(forgotten.offset);
+            }
         }
         let check = crc::crc32c(&out);
         out.put_u32(check);
@@ -398,7 +488,7 @@ impl Head {
             return Err("it is not the head of a store of this format".into());
         }
         let format = u32_at(bytes, 8);
-        if format != crate::FORMAT {
+        if !(crate::FORMAT_READ..=crate::FORMAT).contains(&format) {
             // alloc: the error's message
             return Err(format!(
                 "it is of store format {format}, not {}: remove the directory to start a new \
@@ -426,13 +516,17 @@ impl Head {
         let dictionaries = u32_at(body, 60) as usize;
         let externals = u32_at(body, 64) as usize;
         let units = u32_at(body, 68) as usize;
+        // A head before format 7 wrote zero there.
+        let forgotten = if format >= 7 { u32_at(body, 12) as usize } else { 0 };
+        let pack_ref = if format >= 6 { PACK_REF } else { PACK_REF_5 };
         let want = packs
-            .checked_mul(PACK_REF)
+            .checked_mul(pack_ref)
             .zip(dictionaries.checked_mul(DICTIONARY_REF))
             .zip(externals.checked_mul(EXTERNAL_REF))
             .zip(units.checked_mul(UNIT_REF))
-            .and_then(|(((a, b), c), d)| {
-                a.checked_add(b)?.checked_add(c)?.checked_add(d)?.checked_add(HEAD_FIXED)
+            .zip(forgotten.checked_mul(FORGOTTEN_REF))
+            .and_then(|((((a, b), c), d), e)| {
+                a.checked_add(b)?.checked_add(c)?.checked_add(d)?.checked_add(e)?.checked_add(HEAD_FIXED)
             });
         if want != Some(body.len()) {
             return Err("its length is not what its counts say".into());
@@ -450,7 +544,8 @@ impl Head {
             }
             let unit = read.u32()?;
             let (committed, indexed, dead) = (read.u64()?, read.u64()?, read.u64()?);
-            head.packs.push(PackRef { unit, committed, indexed, dead, removed });
+            let used = if format >= 6 { read.u64()? } else { 0 };
+            head.packs.push(PackRef { unit, committed, indexed, dead, removed, used });
         }
         for _ in 0..dictionaries {
             let kind = Kind::from_code(read.u8()?).ok_or("a dictionary of no kind")?;
@@ -463,7 +558,7 @@ impl Head {
         }
         for _ in 0..externals {
             let content = ContentId(*read.array()?);
-            head.externals.push(ExternalRef { content, len: read.u64()? });
+            head.externals.push(ExternalRef::of_word(content, read.u64()?, format)?);
         }
         // The units seen live only while the head is read: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
@@ -477,6 +572,24 @@ impl Head {
             }
             Ok::<(), String>(())
         })?;
+        for _ in 0..forgotten {
+            let pack = read.u32()?;
+            if read.u32()? != 0 {
+                return Err("a forgotten record has bytes set that no head sets".into());
+            }
+            let it = ForgottenRef { pack, offset: read.u64()? };
+            let fits = head.packs.get(pack as usize).is_some_and(|it_pack| {
+                !it_pack.removed && it.offset >= PACK_HEADER && it.offset < it_pack.committed
+            });
+            if !fits || it.offset % ALIGN != 0 {
+                // alloc: the error's message
+                return Err(format!("it lists a forgotten record at {} of {} that is no record's place", it.offset, pack_file(pack as usize)));
+            }
+            if head.forgotten.last().is_some_and(|last| *last >= it) {
+                return Err("it lists forgotten records out of order, or one twice".into());
+            }
+            head.forgotten.push(it);
+        }
         for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed
                 || pack.dead > pack.committed

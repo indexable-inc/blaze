@@ -83,6 +83,13 @@ pub mod kinds {
     /// What a build left for the store (dependency images, check outcomes, goals) written from
     /// its front end as it is kept, before the build answers.
     pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
+    /// A kept front end's values given back because memory is short
+    /// ([`crate::giveback::Rung::Values`]): swept on a worker, never the loop. Pushed with no
+    /// memory of its own, since it runs because memory is short.
+    pub const GIVE_BACK: TaskKind = TaskKind(0x1_0010);
+    /// A checkout's front-end carry (`blaze_cargo::serve::front_carry`): its kernel session
+    /// carried to a build's pin and saved, on a worker after the build, never the loop.
+    pub const FRONT_CARRY: TaskKind = TaskKind(0x1_0011);
 }
 
 /// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
@@ -105,6 +112,8 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
         kinds::UNIT_STORE => "unit store",
         kinds::PROGRAM_LINK => "program link",
         kinds::STORE_KEPT => "store kept",
+        kinds::GIVE_BACK => "give back",
+        kinds::FRONT_CARRY => "front carry",
         _ => return None,
     })
 }
@@ -121,10 +130,11 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
         kinds::FETCH | kinds::UNIT_STORE | kinds::STORE_KEPT => Tag::Store,
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
         kinds::UNIT_NAMES => Tag::Nameres,
+        kinds::FRONT_CARRY => Tag::Parse,
         kinds::UNIT_BODIES => Tag::Infer,
         kinds::UNIT_LINK | kinds::PROGRAM_LINK => Tag::Link,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
-        kinds::WALK | TaskKind(4) => Tag::Query,
+        kinds::WALK | kinds::GIVE_BACK | TaskKind(4) => Tag::Query,
         TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
         TaskKind(0x1000..0x2000) => Tag::Nameres,
         TaskKind(0x2000..0x2200) => Tag::Parse,
@@ -201,6 +211,41 @@ pub fn set_budgets(machine: u64) {
     }
 }
 
+/// What the machine's ledger last told this daemon to hold at most for the other daemons'
+/// wants ([`set_yield_to`]); `u64::MAX` for none.
+static YIELD_TO: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// What this daemon is to hold at most so that the other daemons of the machine get what
+/// they want (`crate::ledger::Ledger::yielded`): `u64::MAX` while it yields nothing. The
+/// give-back takes the less of this and [`limit`] as the limit it gives back to.
+pub fn yield_to() -> u64 {
+    YIELD_TO.load(Ordering::Relaxed)
+}
+
+/// Says what the ledger's last turn told this daemon to hold at most ([`yield_to`]).
+pub fn set_yield_to(bytes: u64) {
+    YIELD_TO.store(bytes, Ordering::Relaxed);
+}
+
+/// Whether the daemon has nothing left to give back but the work of the tasks under way
+/// ([`set_short`]).
+static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether memory is so short that the daemon is giving back the work of running tasks
+/// (`crate::giveback::Rung::Running`): what a long task reads at a point where it holds
+/// nothing of the front end and little is lost, to give way there (the codegen walk, between
+/// two runs of its worklist). One relaxed load.
+pub fn short() -> bool {
+    SHORT.load(Ordering::Relaxed)
+}
+
+/// Says whether memory is that short ([`short`]): set by the give-back's driver as it gives
+/// the `running tasks` rung, cleared once the footprint is within the limit and no task
+/// waits.
+pub fn set_short(short: bool) {
+    SHORT.store(short, Ordering::Relaxed);
+}
+
 /// [`set_budgets`]' `machine`: the memory the daemon may hold in all; `u64::MAX` before.
 pub fn limit() -> u64 {
     LIMIT.load(Ordering::Relaxed)
@@ -273,9 +318,10 @@ impl Pressure {
         Pressure { held: crate::arena::own_of(&snapshot), limit, over }
     }
 
-    /// Whether blaze holds more than the limit less its [`LINE`]th.
+    /// Whether blaze holds more than the limit less its [`LINE`]th: the release line
+    /// ([`crate::lines::Lines::release`], where the limit's lines are ordered).
     pub const fn squeezed(&self) -> bool {
-        self.limit != u64::MAX && self.held >= self.limit - self.limit / LINE
+        self.limit != u64::MAX && self.held >= crate::lines::Lines::of(self.limit).release()
     }
 }
 
@@ -304,6 +350,21 @@ impl Squeeze {
     /// with the line at 41 (memadmit).
     pub const fn short(&self, now: Pressure) -> bool {
         now.limit != u64::MAX && now.held >= self.after
+    }
+
+    /// One that begins where a release of this daemon last left off: `after`, another's
+    /// [`Squeeze::mark`]. A build's squeeze starts from the daemon's last, never from nothing:
+    /// a daemon that sits at its limit's line (a hello-world's front end holding 19 GiB of a
+    /// limit of 21.78, 2026-11-12) otherwise stops every build for a release, whatever the
+    /// last one freed (143 ms on the loop for 0.36 GiB, then one for 0.00).
+    pub const fn starting_after(after: u64) -> Squeeze {
+        Squeeze { after }
+    }
+
+    /// What blaze must hold again before the next release is due: what it held as the last
+    /// one ended and a [`STEP`]th of the limit; 0 before any.
+    pub const fn mark(&self) -> u64 {
+        self.after
     }
 
     /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.
@@ -575,7 +636,8 @@ impl Prediction {
 /// What the plane asks for a node's [`Prediction`] and tells what the node then did. A
 /// prediction orders and admits work only: it never changes what is built.
 pub trait Predict: Send {
-    /// What a task of `kind` with `key` is predicted to cost.
+    /// What a task of `kind` with `key` is predicted to cost: its key's own record, or, with
+    /// none, its kind's prediction (what one ask with no key says), so one ask a node is enough.
     fn predict(&self, kind: TaskKind, key: Option<crate::Key>) -> Prediction;
     /// A task of `kind` with `key` ran for `ran_ns` of its own (not its waits) and held `peak`
     /// bytes at most.

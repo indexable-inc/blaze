@@ -178,6 +178,11 @@ impl Default for Faults {
     }
 }
 
+/// The bit of a mode that lets its owner write the file.
+const OWNER_WRITES: u32 = 0o200;
+/// What the system says of an open for writing it refuses (`EACCES`), as `io::Error` prints it.
+const PERMISSION_DENIED: &str = "Permission denied (os error 13)";
+
 #[derive(Debug)]
 struct SimFile {
     /// What survives a crash.
@@ -196,6 +201,19 @@ struct SimFile {
     /// ([`Effect::WriteBack`], or a clone that forced them out): not durable, but no longer
     /// only in memory. The ops after them are the file's dirty data.
     back: usize,
+    /// The epoch each of `ops` was made in, as far as they are stamped
+    /// ([`Sim::stamp_epochs`]): the count of barriers that had completed by then.
+    stamps: Vec<u64>,
+    /// Each barrier of the file ([`Effect::Barrier`]) no sync has covered yet: how many of
+    /// `ops` it covers, and the epoch it completed in. A crash that keeps a change of a later
+    /// epoch, of any file, keeps the changes it covers.
+    barriers: Vec<(usize, u64)>,
+    /// The sectors of it that hold blocks ([`SECTOR`] each, by index): what a write covered,
+    /// less what a cut dropped. A cut that grows the file, and every byte no write covered,
+    /// is a hole, which reads as zeros and takes no block ([`Sim::allocated`]). A copy of
+    /// its data ([`Effect::CopyData`]) and a clone keep its holes; a whole-file write has
+    /// none. What a crash tears is not taken back out: it says what was ever written.
+    blocks: std::collections::BTreeSet<u64>,
 }
 
 /// What a crash puts back when it undoes a write or a rename that waited for no sync.
@@ -217,13 +235,44 @@ impl Default for SimFile {
             link: false,
             undo: None,
             back: 0,
+            // alloc: none, two empty vectors.
+            stamps: Vec::new(),
+            barriers: Vec::new(),
+            // alloc: none, an empty set.
+            blocks: std::collections::BTreeSet::new(),
         }
     }
 }
 
 impl SimFile {
     fn whole(bytes: Vec<u8>) -> SimFile {
-        SimFile { durable: bytes, ..SimFile::default() }
+        let mut file = SimFile::default();
+        file.allocate(0, bytes.len() as u64);
+        SimFile { durable: bytes, ..file }
+    }
+
+    /// The sectors from `at` for `len` bytes given blocks.
+    fn allocate(&mut self, at: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let sector = SECTOR as u64;
+        // alloc: a sector's entry, once per sector a simulated write covers.
+        self.blocks.extend(at / sector..(at + len).div_ceil(sector));
+    }
+
+    /// A change made: the blocks it gives or drops, then the change kept.
+    fn push_op(&mut self, op: Op) {
+        match &op {
+            Op::Append(more) => self.allocate(self.len(), more.len() as u64),
+            Op::At(at, more) | Op::Sectors(at, more) => self.allocate(*at, more.len() as u64),
+            // The sectors wholly past the new end go; the one it ends in keeps its block.
+            Op::Cut(to) => {
+                let keep = to.div_ceil(SECTOR as u64);
+                self.blocks.retain(|it| *it < keep);
+            }
+        }
+        self.ops.push(op);
     }
 
     /// The whole file, for the test's look at it or a copy of it.
@@ -263,11 +312,17 @@ impl SimFile {
 
     /// The first `covers` of its changes made durable.
     fn sync(&mut self, covers: usize) {
-        let SimFile { durable, ops, undo, back, .. } = self;
+        let SimFile { durable, ops, undo, back, stamps, barriers, .. } = self;
         let covered = covers.min(ops.len());
         for op in ops.drain(..covered) {
             op.apply(durable);
         }
+        stamps.drain(..covered.min(stamps.len()));
+        // A barrier of what is durable now says nothing more; one of more covers the rest.
+        barriers.retain_mut(|(covers, _)| {
+            *covers = covers.saturating_sub(covered);
+            *covers > 0
+        });
         // What a sync covers it writes out; what came after it is as dirty as it was.
         *back = back.saturating_sub(covered);
         // A file synced whole is on the disk under its name: nothing is left to undo.
@@ -471,10 +526,15 @@ pub struct Sim {
     /// them ([`Sim::bytes_read`]).
     bytes_written: u64,
     bytes_read: u64,
+    /// Data bytes kernel copies copied ([`Sim::bytes_copied`]).
+    bytes_copied: u64,
     /// UDP sockets, the standard streams, the wall clock and directories made (`sim/host.rs`).
     host: host::Host,
     /// Bytes clones forced out of their sources ([`Sim::bytes_forced`]).
     bytes_forced: u64,
+    /// How many barriers ([`Effect::Barrier`]) have completed: the epoch changes are stamped
+    /// with ([`Sim::stamp_epochs`]).
+    epoch: u64,
     /// What a test under seeds armed it with ([`Sim::arm`]): its power cuts, trace and counts.
     armed: Option<Box<seeds::Armed>>,
 }
@@ -510,7 +570,7 @@ fn file_mut<'a>(
 
 impl Sim {
     pub fn new(seed: u64, faults: Faults) -> Sim {
-        Sim {
+        let mut sim = Sim {
             rng: Rng::new(seed),
             faults,
             now: Duration::ZERO,
@@ -561,10 +621,15 @@ impl Sim {
             stall_holders: None,
             bytes_written: 0,
             bytes_read: 0,
+            bytes_copied: 0,
             host: host::Host::new(seed),
             bytes_forced: 0,
+            epoch: 0,
             armed: None,
-        }
+        };
+        // The disk's clock is the wall clock from the start, so its first stamps are of then.
+        sim.disk.at(sim.wall_ns());
+        sim
     }
 
     /// The bytes every effect that completed wrote into files, ever: appends, whole-file
@@ -721,6 +786,7 @@ impl Sim {
         self.ends.clear();
         self.receiving.clear();
         self.host_crash();
+        self.stamp_epochs();
         // By name, so the seed's numbers go to the same files whatever the table's order.
         // alloc: a crash, not an op.
         let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
@@ -729,20 +795,67 @@ impl Sim {
         // nothing to undo draws no number here, so a run without them is as it was.
         // alloc: a crash, not an op.
         let mut undone: Vec<(FileName, Undo)> = Vec::new();
-        for (name, file) in files {
+        // What each file keeps of its changes not synced, drawn file by file as before
+        // barriers were modelled (a run with none draws the same numbers): how many, and the
+        // part of the next that landed.
+        // alloc: a crash, not an op.
+        let mut cuts: Vec<(usize, Vec<Op>)> = Vec::with_capacity(files.len());
+        for (name, file) in &mut files {
             match file.undo.take() {
                 // clone: a crash, not an op: the name the undo is of.
-                Some(undo) if self.rng.one_in(3) => undone.push((name.clone(), *undo)),
+                Some(undo) if self.rng.one_in(3) => undone.push(((*name).clone(), *undo)),
                 _ => {}
             }
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
             let torn = file.ops.get(kept).map(|op| op.torn(&mut self.rng)).unwrap_or_default();
+            cuts.push((kept, torn));
+        }
+        // A barrier's promise: a change made after it completed is on the disk only if what
+        // it covers is. So whatever is kept of a later epoch than a barrier keeps that
+        // barrier's changes whole, which may in turn be of an epoch later than another's.
+        let newest = |files: &[(&FileName, &mut SimFile)], cuts: &[(usize, Vec<Op>)]| {
+            files
+                .iter()
+                .zip(cuts)
+                .filter_map(|((_, file), (kept, torn))| {
+                    // A change torn in part is on the disk in part: it counts as kept.
+                    let reach = (*kept + usize::from(!torn.is_empty())).min(file.stamps.len());
+                    file.stamps[..reach].iter().max().copied()
+                })
+                .max()
+        };
+        // Bounded: each round keeps more of some file or ends.
+        for _ in 0..=files.iter().map(|(_, file)| file.barriers.len()).sum::<usize>() {
+            let Some(newest) = newest(&files, &cuts) else { break };
+            let mut forced = false;
+            for ((_, file), (kept, torn)) in files.iter().zip(&mut cuts) {
+                let covered = file
+                    .barriers
+                    .iter()
+                    .filter(|(_, epoch)| *epoch < newest)
+                    .map(|(covers, _)| *covers)
+                    .max()
+                    .unwrap_or(0);
+                if covered > *kept {
+                    *kept = covered;
+                    // The change after what a barrier covers may still be torn; none before.
+                    torn.clear();
+                    forced = true;
+                }
+            }
+            if !forced {
+                break;
+            }
+        }
+        for ((_, file), (kept, torn)) in files.into_iter().zip(cuts) {
             file.sync(kept);
             for op in torn {
                 op.apply(&mut file.durable);
             }
             file.ops.clear();
             file.back = 0;
+            file.stamps.clear();
+            file.barriers.clear();
         }
         for (name, Undo { was, from }) in undone {
             let file = self.files.remove(&name);
@@ -959,6 +1072,14 @@ impl Sim {
     /// by then is told at the next poll.
     pub fn advance(&mut self, by: Duration) {
         self.now = self.now.saturating_add(by);
+        self.disk.at(self.wall_ns());
+    }
+
+    /// The wall clock now, in nanoseconds since the epoch: the seed's start
+    /// ([`Sim::wall_start`]) plus the virtual clock, what [`Driver::wall_ns`] says and what the
+    /// disk's change times are of.
+    pub fn wall_ns(&self) -> u64 {
+        u64::try_from(self.wall_now().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// What a file holds now, synced or not.
@@ -984,6 +1105,15 @@ impl Sim {
         self.changed(file);
     }
 
+    /// `file` grown or cut to `len` bytes (a hole past its end), by something outside the state
+    /// machine: its stamp says `len` and watches of it hear of it, and nothing is allocated
+    /// until something reads it. Not durable: a crash takes the change back. For a file larger
+    /// than a test can hold (one past the 4 GiB a VFS file may be).
+    pub fn grow(&mut self, file: &FileName, len: u64) {
+        file_mut(&mut self.files, file).push_op(Op::Cut(len));
+        self.changed(file);
+    }
+
     /// `file` made a symbolic link to `target`, durably, by something outside the state
     /// machine (a checkout): watches of it hear of it.
     pub fn symlink(&mut self, file: &FileName, target: &str) {
@@ -993,13 +1123,28 @@ impl Sim {
         self.changed(file);
     }
 
-    /// `to` made with `from`'s contents and mode, durably: the simulation does not model
-    /// shared blocks or a link's shared inode.
+    /// `to` made with `from`'s contents, mode and blocks (its holes kept holes), durably: the
+    /// simulation does not model shared blocks or a link's shared inode.
     fn copy(&mut self, from: &FileName, to: &FileName) {
         let SimFile { mode, link, .. } = self.files[from];
+        // clone: the copy's own record of which sectors hold blocks
+        let blocks = self.files[from].blocks.clone();
         let bytes = self.contents(from);
-        *file_mut(&mut self.files, to) = SimFile { mode, link, ..SimFile::whole(bytes) };
+        *file_mut(&mut self.files, to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
         self.changed(to);
+    }
+
+    /// The bytes of `file` that hold blocks: its sectors a write covered, less what a cut
+    /// dropped; a hole (a cut that grew it, a run no write covered) holds none. 0 for a file
+    /// that is not there. For a test that a place keeps a file's holes holes.
+    pub fn allocated(&self, file: &FileName) -> u64 {
+        self.files.get(file).map_or(0, |it| it.blocks.len() as u64 * SECTOR as u64)
+    }
+
+    /// The data bytes copies made by the kernel copied, ever ([`Effect::CopyData`]): not in
+    /// [`Sim::bytes_written`], as no byte of them passed through the asker.
+    pub fn bytes_copied(&self) -> u64 {
+        self.bytes_copied
     }
 
     /// Where the symbolic link `file` leads, followed as the system opens a file (`None` when
@@ -1175,6 +1320,28 @@ impl Sim {
 
     /// Tells the watches of `file` it changed, in their slab's order, which is the seed's as
     /// everything else is.
+    /// Every change not stamped yet is of the epoch that is now: made since the last barrier
+    /// completed. Stamped as a barrier completes and at a crash, so no site that makes a
+    /// change has to.
+    fn stamp_epochs(&mut self) {
+        let epoch = self.epoch;
+        for file in self.files.values_mut() {
+            let missing = file.ops.len().saturating_sub(file.stamps.len());
+            file.stamps.extend(std::iter::repeat_n(epoch, missing));
+        }
+    }
+
+    /// A sync that waits for the drive completed ([`Effect::Sync`], [`Effect::SyncDir`], a
+    /// whole-file [`Effect::Write`], an [`Effect::Rename`]): the drive's cache was flushed,
+    /// and what every barrier before it covers went with it. Durable now.
+    fn flushed(&mut self) {
+        for file in self.files.values_mut() {
+            if let Some(covered) = file.barriers.iter().map(|(covers, _)| *covers).max() {
+                file.sync(covered);
+            }
+        }
+    }
+
     fn changed(&mut self, file: &FileName) {
         self.disk.touched(file, &self.files);
         self.tell_journals();
@@ -1365,6 +1532,29 @@ impl Sim {
         }
     }
 
+    /// The failure of `effect` where it opens for writing a file that is there whose mode
+    /// gives its owner no write bit (a file sealed read-only, [`Effect::Seal`]), as the kernel
+    /// refuses a user who is not root with `EACCES`: an append, a write at an offset or from
+    /// memory, a cut. A sync, a barrier and a write-back open the file read-only and are done;
+    /// a whole-file write puts a new file in its place by a rename, as a clone, a copy and a
+    /// link make a new name, so none of them is refused. A symbolic link's own bits are not
+    /// the file's, and this simulation follows no link for a write.
+    fn refused_write(&self, effect: &Effect) -> Option<Done> {
+        let file = match effect {
+            Effect::Append { file, .. }
+            | Effect::WriteAt { file, .. }
+            | Effect::WriteFrom { file, .. }
+            | Effect::Truncate { file, .. } => file,
+            _ => return None,
+        };
+        let sim = self.files.get(file)?;
+        if sim.link || sim.mode & OWNER_WRITES != 0 {
+            return None;
+        }
+        // alloc: an error's message.
+        Some(Done::Failed(IoError(format!("{file}: {PERMISSION_DENIED}"))))
+    }
+
     /// `effect` on a disk filling up ([`Sim::fill`]): handed back to be done, its bytes taken
     /// from the room, when it fits; else what it ends with, an append or a write at an offset
     /// having kept the part that fit.
@@ -1399,7 +1589,7 @@ impl Sim {
         match effect {
             Effect::Append { file, mut bytes, .. } => {
                 bytes.truncate(fits);
-                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
+                file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 if fits > 0 {
                     self.changed(&file);
                 }
@@ -1407,7 +1597,7 @@ impl Sim {
             Effect::WriteAt { file, at, mut bytes, .. } if fits > 0 => {
                 bytes.truncate(fits);
                 let sim = self.files.get_mut(&file).expect("looked up above");
-                sim.ops.push(Op::At(at, bytes));
+                sim.push_op(Op::At(at, bytes));
                 self.changed(&file);
             }
             // The sectors that fit, as a drive out of room takes the first of a request's.
@@ -1415,7 +1605,7 @@ impl Sim {
                 if let Ok(mut bytes) = Sim::bytes_of(&from, &file, at, cache) {
                     bytes.truncate(fits / SECTOR * SECTOR);
                     let sim = self.files.get_mut(&file).expect("looked up above");
-                    sim.ops.push(Op::Sectors(at, bytes));
+                    sim.push_op(Op::Sectors(at, bytes));
                     self.changed(&file);
                 }
             }
@@ -1614,6 +1804,10 @@ impl Sim {
     fn complete(&mut self, pending: Pending) -> Completion {
         let Pending { effect, covers, spawn } = pending;
         let tag = effect.tag();
+        // Before any fault: a torn append never lands in a file the kernel would not open.
+        if let Some(done) = self.refused_write(&effect) {
+            return Completion { tag, done };
+        }
         if !matches!(effect, Effect::Timer { .. })
             && self.rng.one_in(u64::from(self.faults.fail_one_in))
         {
@@ -1623,7 +1817,7 @@ impl Sim {
             if let Effect::Append { file, mut bytes, .. } = effect {
                 let torn = self.rng.below(bytes.len() as u64) as usize;
                 bytes.truncate(torn);
-                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
+                file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 if torn > 0 {
                     self.changed(&file);
                 }
@@ -1665,7 +1859,7 @@ impl Sim {
                     Ok(bytes) => match self.files.get_mut(&file) {
                         Some(sim) => {
                             self.bytes_written += bytes.len() as u64;
-                            sim.ops.push(Op::Sectors(at, bytes));
+                            sim.push_op(Op::Sectors(at, bytes));
                             self.changed(&file);
                             Done::Written
                         }
@@ -1676,13 +1870,31 @@ impl Sim {
             }
             Effect::Append { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
-                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
+                file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 self.changed(&file);
                 Done::Appended
             }
             Effect::Sync { file, .. } => {
                 self.files.entry(file).or_default().sync(covers);
+                self.flushed();
                 Done::Synced
+            }
+            // Ordered, not durable: what it covers is written before whatever is written
+            // from now on, so a crash that keeps any of that keeps this (`Sim::crash`), and a
+            // sync of anything that completes after this makes it durable (`Sim::flushed`).
+            // It covers what was written when it was asked, as a sync does.
+            Effect::Barrier { file, .. } => {
+                self.stamp_epochs();
+                let epoch = self.epoch;
+                let sim = self.files.entry(file).or_default();
+                let covered = covers.min(sim.ops.len());
+                if covered > 0 {
+                    sim.barriers.push((covered, epoch));
+                }
+                // Written out, as a write-back's: the file is clean as far as it covers.
+                sim.back = sim.back.max(covered);
+                self.epoch += 1;
+                Done::Ordered
             }
             // Written out, not durable: the file is clean, and a crash tears it as before.
             // It covers what was written when it was asked, as a sync does.
@@ -1697,9 +1909,12 @@ impl Sim {
             // This simulation keeps every name change through a crash (its names are
             // durable as they are made); what a crash may undo of names not synced is
             // modelled above it (bstd's ledger), which this completion tells.
-            Effect::SyncDir { .. } => Done::Synced,
+            Effect::SyncDir { .. } => {
+                self.flushed();
+                Done::Synced
+            }
             Effect::Truncate { file, len, .. } => {
-                file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
+                file_mut(&mut self.files, &file).push_op(Op::Cut(len));
                 self.changed(&file);
                 Done::Truncated
             }
@@ -1707,6 +1922,7 @@ impl Sim {
             Effect::Write { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
                 *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
+                self.flushed();
                 self.unlink_locks(&file);
                 self.changed(&file);
                 Done::Written
@@ -1726,7 +1942,14 @@ impl Sim {
                     // alloc: what a crash may put back, once per unsynced write.
                     undo: Some(Box::new(Undo { was, from: None })),
                     back: 0,
+                    // alloc: none, two empty vectors.
+                    stamps: Vec::new(),
+                    barriers: Vec::new(),
+                    // alloc: none, an empty set, filled below.
+                    blocks: std::collections::BTreeSet::new(),
                 };
+                let mut new = new;
+                new.allocate(0, new.len());
                 *file_mut(&mut self.files, &file) = new;
                 self.unlink_locks(&file);
                 self.changed(&file);
@@ -1735,7 +1958,7 @@ impl Sim {
             Effect::WriteAt { file, at, bytes, .. } => match self.files.get_mut(&file) {
                 Some(sim) => {
                     self.bytes_written += bytes.len() as u64;
-                    sim.ops.push(Op::At(at, bytes));
+                    sim.push_op(Op::At(at, bytes));
                     self.changed(&file);
                     Done::Written
                 }
@@ -1762,6 +1985,7 @@ impl Sim {
             },
             Effect::Rename { from, to, .. } => match self.files.remove(&from) {
                 Some(mut sim) => {
+                    self.flushed();
                     // The new name is on the disk: nothing of the name is left to undo.
                     sim.undo = None;
                     *file_mut(&mut self.files, &to) = sim;
@@ -1800,6 +2024,44 @@ impl Sim {
                     false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
                 }
             }
+            // A hint to the page cache, which the simulation has none of: the file to read
+            // ahead in is there (one it is like that is not holds nothing), and nothing of
+            // either changes. What the order of it is to the rename
+            // that follows is the asker's to hold (`blaze_cas::publish::Writing`).
+            Effect::Prewarm { like, file, .. } => {
+                let _ = like;
+                match self.files.contains_key(&file) {
+                    true => Done::Prewarmed { bytes: 0 },
+                    // alloc: an error's message.
+                    false => Done::Failed(IoError(format!("{file}: no such file"))),
+                }
+            }
+            Effect::CopyData { from, .. } if !self.files.contains_key(&from) => {
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{from}: no such file")))
+            }
+            Effect::CopyData { from, .. } if self.files[&from].link => {
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{from} {}", crate::CLONE_THROUGH_A_LINK)))
+            }
+            Effect::CopyData { to, .. } if self.files.contains_key(&to) => {
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{to}: already there")))
+            }
+            // The kernel's copy of each extent of data: read from what the source holds, its
+            // dirty pages included, so nothing is forced out (a clone forces them); its holes
+            // stay holes, and the bytes copied are its data's, not its length.
+            Effect::CopyData { from, to, .. } => {
+                let source = &self.files[&from];
+                let (len, sector) = (source.len(), SECTOR as u64);
+                let bytes: u64 =
+                    source.blocks.iter().map(|it| len.saturating_sub(it * sector).min(sector)).sum();
+                self.bytes_copied += bytes;
+                self.copy(&from, &to);
+                // A new file's mode whatever its source's, as a clone's: `Effect::CopyData`.
+                file_mut(&mut self.files, &to).mode = SimFile::default().mode;
+                Done::Copied { bytes }
+            }
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }
                 if !self.files.contains_key(&from) =>
             {
@@ -1831,8 +2093,18 @@ impl Sim {
                 file_mut(&mut self.files, &to).mode = SimFile::default().mode;
                 Done::Cloned
             }
+            // A second name of one file: one inode ([`journal::Disk::linked`]), so both
+            // names' looks give the same `ino`, times and change time. The bytes and mode are
+            // kept per name (a copy): no place writes or chmods a linked file in place before
+            // its looks, so a test of the store sees no difference.
             Effect::Link { from, to, .. } => {
-                self.copy(&from, &to);
+                let SimFile { mode, link, .. } = self.files[&from];
+                // clone: the second name's own record of which sectors hold blocks
+                let blocks = self.files[&from].blocks.clone();
+                let bytes = self.contents(&from);
+                *file_mut(&mut self.files, &to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
+                self.disk.linked(&from, &to, &self.files);
+                self.changed(&to);
                 Done::Linked
             }
             // A link is a file of its own length either way: the simulated disk follows none.
@@ -2283,6 +2555,7 @@ impl Driver for Sim {
                 (Effect::Timer { after, .. }, _) => *after,
                 (
                     Effect::Sync { file, .. }
+                    | Effect::Barrier { file, .. }
                     | Effect::WriteBack { file, .. }
                     | Effect::Write { file, .. }
                     | Effect::WriteUnsynced { file, .. }
@@ -2293,8 +2566,12 @@ impl Driver for Sim {
                 ) if file.is_under(dir) => *by,
                 _ => self.delay(),
             };
-            if let (Effect::Sync { file, .. } | Effect::WriteBack { file, .. }, Some(dir)) =
-                (&effect, &self.hold_syncs)
+            if let (
+                Effect::Sync { file, .. }
+                | Effect::Barrier { file, .. }
+                | Effect::WriteBack { file, .. },
+                Some(dir),
+            ) = (&effect, &self.hold_syncs)
                 && file.is_under(dir)
             {
                 let covers = self.files.get(file).map_or(0, |it| it.ops.len());
@@ -2320,8 +2597,12 @@ impl Driver for Sim {
                 self.tell(tag, done, Of::Op);
                 continue;
             }
-            if let (Effect::Sync { file, tag } | Effect::WriteBack { file, tag }, Some(dir)) =
-                (&effect, &self.fail_syncs)
+            if let (
+                Effect::Sync { file, tag }
+                | Effect::Barrier { file, tag }
+                | Effect::WriteBack { file, tag },
+                Some(dir),
+            ) = (&effect, &self.fail_syncs)
                 && file.is_under(dir)
             {
                 // alloc: an error's message.
@@ -2332,7 +2613,9 @@ impl Driver for Sim {
                 continue;
             }
             let covers = match &effect {
-                Effect::Sync { file, .. } | Effect::WriteBack { file, .. } => {
+                Effect::Sync { file, .. }
+                | Effect::Barrier { file, .. }
+                | Effect::WriteBack { file, .. } => {
                     self.files.get(file).map_or(0, |it| it.ops.len())
                 }
                 _ => 0,
@@ -2360,6 +2643,7 @@ impl Driver for Sim {
         };
         if first > self.now {
             self.now = self.wait(first, until);
+            self.disk.at(self.wall_ns());
             if self.now < first {
                 return 0;
             }
@@ -2372,7 +2656,9 @@ impl Driver for Sim {
         for pending in ready.drain(..) {
             if !self.recording.is_empty() {
                 let file = match &pending.effect {
-                    Effect::Sync { file, .. } => Some((file, true)),
+                    // A barrier is what a commit waits on the device for where it once
+                    // waited on a sync: recorded as one.
+                    Effect::Sync { file, .. } | Effect::Barrier { file, .. } => Some((file, true)),
                     Effect::Write { file, .. }
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::WriteAt { file, .. }
@@ -2431,6 +2717,12 @@ impl Driver for Sim {
     fn now(&self) -> Duration {
         self.now
     }
+
+    /// The seed's wall clock start plus the virtual clock: the clock the disk stamps change
+    /// times by ([`journal::Disk::at`]), so a look just after a write sees a racy stamp.
+    fn wall_ns(&self) -> u64 {
+        self.wall_ns()
+    }
 }
 
 #[cfg(test)]
@@ -2482,6 +2774,117 @@ mod tests {
         assert_ne!(run(7), run(8));
     }
 
+    /// A log committed by ordering alone: each round appends a record to `data`, asks for a
+    /// barrier of it (or, `plant`ed, for none), and only once that completed appends the
+    /// record's end to `commits`, which no one syncs. Gives what a crash at a drawn point
+    /// left of the two files.
+    fn barrier_log(seed: u64, plant: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut sim = Sim::new(seed, Faults::default());
+        let (data, commits) = (name("log/data"), name("log/commits"));
+        let rounds = 1 + sim.rng.below(6);
+        let crash_after = sim.rng.below(rounds * 3 + 1);
+        let mut steps = 0;
+        let mut step = |sim: &mut Sim, effect: Effect| {
+            if steps == crash_after {
+                return false;
+            }
+            steps += 1;
+            ran(sim, vec![effect]);
+            true
+        };
+        'rounds: for round in 0..rounds {
+            let record = vec![round as u8 + 1; 700];
+            let end = ((round + 1) * 700) as u32;
+            let effects = [
+                Effect::Append { file: data.clone(), bytes: record, tag: Tag(1) },
+                match plant {
+                    false => Effect::Barrier { file: data.clone(), tag: Tag(2) },
+                    // The planted bug: the bytes written back and nothing ordered.
+                    true => Effect::WriteBack { file: data.clone(), tag: Tag(2) },
+                },
+                Effect::Append { file: commits.clone(), bytes: end.to_le_bytes().to_vec(), tag: Tag(3) },
+            ];
+            for effect in effects {
+                if !step(&mut sim, effect) {
+                    break 'rounds;
+                }
+            }
+        }
+        sim.crash();
+        let read = |sim: &Sim, file: &FileName| match sim.exists(file) {
+            true => sim.contents(file),
+            false => Vec::new(),
+        };
+        (read(&sim, &data), read(&sim, &commits))
+    }
+
+    /// What the log's reader holds: every whole commit names bytes of `data` that are there
+    /// and are the records written, in order. `Err` says which commit names what is not.
+    fn barrier_log_holds((data, commits): &(Vec<u8>, Vec<u8>)) -> Result<(), String> {
+        for (n, end) in commits.chunks_exact(4).enumerate() {
+            let end = u32::from_le_bytes(end.try_into().unwrap()) as usize;
+            let want: Vec<u8> = (0..end).map(|at| (at / 700) as u8 + 1).collect();
+            if data.get(..end) != Some(&want[..]) {
+                return Err(format!(
+                    "commit {n} names {end} bytes of data, which holds {} and not those",
+                    data.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: what a barrier covers is ordered before every write asked for after it
+    /// completed. A commit record appended only after its data's barrier never survives a
+    /// crash that lost or tore the data it names, though nothing was synced: on every seed,
+    /// at every crash point.
+    #[test]
+    fn a_crash_keeps_no_write_made_after_a_barrier_without_what_the_barrier_covers() {
+        let mut committed = 0;
+        for seed in 0..4000 {
+            let left = barrier_log(seed, false);
+            if let Err(why) = barrier_log_holds(&left) {
+                panic!("seed {seed}: {why}");
+            }
+            committed += left.1.len() / 4;
+        }
+        assert!(committed > 2000, "the crashes kept {committed} commits: too few to judge by");
+    }
+
+    /// The planted-bug control: with a write-back where the barrier was (the bytes on their
+    /// way to the device and nothing ordered), some crash keeps a commit and loses the data it
+    /// names, and the oracle says so.
+    #[test]
+    fn the_oracle_catches_a_commit_ordered_by_a_write_back() {
+        let caught = (0..4000).find_map(|seed| barrier_log_holds(&barrier_log(seed, true)).err());
+        let why = caught.expect("the oracle missed a commit whose data no barrier ordered");
+        assert!(why.contains("names") && why.contains("bytes of data"), "{why}");
+    }
+
+    /// A barrier is not durable by itself, and is once any sync that waits for the drive
+    /// completes after it: that sync flushed the drive's cache, where the barrier's bytes
+    /// were.
+    #[test]
+    fn what_a_barrier_covers_is_durable_once_a_later_sync_of_any_file_completes() {
+        let (data, other) = (name("log/data"), name("log/other"));
+        let mut lost = false;
+        for seed in 0..200 {
+            let mut sim = Sim::new(seed, Faults::default());
+            ran(&mut sim, vec![Effect::Append { file: data.clone(), bytes: b"ordered".to_vec(), tag: Tag(1) }]);
+            let done = ran(&mut sim, vec![Effect::Barrier { file: data.clone(), tag: Tag(2) }]);
+            assert_eq!(done[&Tag(2)], Done::Ordered);
+            let mut after = Sim::new(seed, Faults::default());
+            ran(&mut after, vec![Effect::Append { file: data.clone(), bytes: b"ordered".to_vec(), tag: Tag(1) }]);
+            ran(&mut after, vec![Effect::Barrier { file: data.clone(), tag: Tag(2) }]);
+            ran(&mut after, vec![Effect::Sync { file: other.clone(), tag: Tag(3) }]);
+            sim.crash();
+            after.crash();
+            lost |= sim.contents(&data) != b"ordered";
+            assert_eq!(after.contents(&data), b"ordered", "seed {seed}");
+        }
+        assert!(lost, "a barrier alone never lost its bytes to a crash: it is modelled as a sync");
+    }
+
     #[test]
     fn a_sync_covers_only_what_was_appended_before_it() {
         let mut sim = Sim::new(
@@ -2494,7 +2897,7 @@ mod tests {
         run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
         sim.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         // Appended after the sync was asked for, completed before it.
-        sim.files.get_mut(&file).unwrap().ops.push(Op::Append(b"b".to_vec()));
+        sim.files.get_mut(&file).unwrap().push_op(Op::Append(b"b".to_vec()));
         let mut out = Vec::new();
         sim.poll(&mut out, Deadline::NEVER);
         let file = &sim.files[&file];
@@ -2515,7 +2918,7 @@ mod tests {
                     1 => Op::At(sim.rng.below(20), vec![b'b'; sim.rng.below(5) as usize]),
                     _ => Op::Cut(sim.rng.below(20)),
                 };
-                sim.files.get_mut(&file).unwrap().ops.push(op);
+                sim.files.get_mut(&file).unwrap().push_op(op);
                 let whole = sim.contents(&file);
                 assert_eq!(sim.files[&file].len(), whole.len() as u64, "seed {seed}");
                 let (at, len) = (sim.rng.below(25), sim.rng.below(25) as usize);
@@ -3007,6 +3410,31 @@ mod tests {
         assert_eq!(sim.contents(&name("target/b")), b"code");
     }
 
+    /// The invariant: a hard link is a second name of one inode: both names' looks give the
+    /// same `ino`, mtime and change time, the link moved the change time and not the mtime,
+    /// and a rename of either name moves the change time both looks see. The control: a
+    /// clone of the same file is an inode of its own.
+    #[test]
+    fn a_link_is_a_second_name_of_one_inode() {
+        let mut sim = Sim::new(5, Faults::default());
+        sim.change(&name("store/v"), b"code");
+        let before = sim.stamp(&name("store/v"));
+        let mut effects = vec![
+            Effect::Link { from: name("store/v"), to: name("target/b"), tag: Tag(1) },
+            Effect::Clone { from: name("store/v"), to: name("target/c"), tag: Tag(2) },
+        ];
+        run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
+        let (from, to) = (sim.stamp(&name("store/v")), sim.stamp(&name("target/b")));
+        assert_eq!((from.ino, from.mtime_ns, from.ctime_ns), (to.ino, to.mtime_ns, to.ctime_ns));
+        assert_eq!(from.mtime_ns, before.mtime_ns, "a link moves no mtime");
+        assert!(from.ctime_ns > before.ctime_ns, "a link moves the change time");
+        assert_ne!(sim.stamp(&name("target/c")).ino, from.ino, "the control: a clone is its own inode");
+        sim.rename(&name("target/b"), &name("target/d"));
+        let (from, to) = (sim.stamp(&name("store/v")), sim.stamp(&name("target/d")));
+        assert_eq!((from.ino, from.ctime_ns), (to.ino, to.ctime_ns), "the rename's change time is both names'");
+        assert!(to.ctime_ns > before.ctime_ns);
+    }
+
     fn command(program: &str, memory: Option<u64>) -> Box<Command> {
         Box::new(Command {
             program: program.into(),
@@ -3407,6 +3835,63 @@ mod tests {
         assert!(matches!(&seen[&Tag(3)], Done::Failed(_)));
         assert!(matches!(&seen[&Tag(4)], Done::Failed(_)));
         assert!(sim.dial(&at).is_err());
+    }
+
+    /// The invariant: a sync, a barrier and a write-back of a file sealed read-only succeed
+    /// in the simulation, as on the real file system (`fs::assert_syncs_a_sealed_file`), and
+    /// a sync of a missing file makes it; what opens the sealed file for writing (an append,
+    /// a write at an offset, a cut) fails with permission denied, as the kernel refuses a user
+    /// who is not root, and changes nothing; a whole-file write, a new file renamed over it,
+    /// does not. The control, the cause removed: the same file made writable again takes the
+    /// same append. On every seed.
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_and_a_write_of_it_is_refused() {
+        let (file, missing) = (name("store/placed/out"), name("store/placed/new"));
+        for seed in 0..64 {
+            let mut sim = Sim::new(seed, Faults::default());
+            sim.change(&file, b"placed");
+            let seal = Effect::Seal { file: file.clone(), mode: 0o444, tag: Tag(1) };
+            assert_eq!(ran(&mut sim, vec![seal])[&Tag(1)], Done::Moded);
+            let seen = ran(
+                &mut sim,
+                vec![
+                    Effect::Sync { file: file.clone(), tag: Tag(2) },
+                    Effect::Barrier { file: file.clone(), tag: Tag(3) },
+                    Effect::WriteBack { file: file.clone(), tag: Tag(4) },
+                    Effect::Sync { file: missing.clone(), tag: Tag(5) },
+                ],
+            );
+            assert_eq!(
+                (&seen[&Tag(2)], &seen[&Tag(3)], &seen[&Tag(4)], &seen[&Tag(5)]),
+                (&Done::Synced, &Done::Ordered, &Done::WrittenBack, &Done::Synced),
+                "seed {seed}"
+            );
+            assert!(sim.exists(&missing), "seed {seed}: a sync makes a missing file");
+            let seen = ran(
+                &mut sim,
+                vec![
+                    Effect::Append { file: file.clone(), bytes: b"!".to_vec(), tag: Tag(6) },
+                    Effect::WriteAt { file: file.clone(), at: 0, bytes: b"P".to_vec(), tag: Tag(7) },
+                    Effect::Truncate { file: file.clone(), len: 0, tag: Tag(8) },
+                ],
+            );
+            for tag in [6, 7, 8] {
+                assert!(
+                    matches!(&seen[&Tag(tag)], Done::Failed(IoError(why))
+                        if why == &format!("{file}: {PERMISSION_DENIED}")),
+                    "seed {seed}: tag {tag}: {:?}",
+                    seen[&Tag(tag)]
+                );
+            }
+            assert_eq!(sim.contents(&file), b"placed", "seed {seed}");
+            assert_eq!(sim.mode(&file), Some(0o444));
+            // The control: the cause, the missing write bit, removed.
+            let unseal = Effect::Mode { file: file.clone(), mode: 0o644, tag: Tag(9) };
+            assert_eq!(ran(&mut sim, vec![unseal])[&Tag(9)], Done::Moded);
+            let append = Effect::Append { file: file.clone(), bytes: b"!".to_vec(), tag: Tag(10) };
+            assert_eq!(ran(&mut sim, vec![append])[&Tag(10)], Done::Appended, "seed {seed}");
+            assert_eq!(sim.contents(&file), b"placed!", "seed {seed}");
+        }
     }
 
     /// Runs `effects` on `sim` until idle: each one's end by its tag.

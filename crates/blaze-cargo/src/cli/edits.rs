@@ -342,7 +342,7 @@ impl Held {
 impl Drop for Held {
     fn drop(&mut self) {
         if let Err(why) = self.restore() {
-            eprintln!("blaze: {why}");
+            blaze_report::errln!("blaze: {why}");
         }
     }
 }
@@ -1058,7 +1058,7 @@ fn record(file: &Path, record: &Record) -> Result<(), String> {
 fn run(asked: &Asked) -> Result<Report, String> {
     let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     if let Some(path) = recover(&state)? {
-        eprintln!(
+        blaze_report::errln!(
             "blaze: {} still held the edit of a `blaze debug edits` that was killed: it is restored",
             path.display()
         );
@@ -1120,14 +1120,14 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     let asked = match words.map_err(|it| format!("{} is not UTF-8", it.to_string_lossy())).and_then(parse) {
         Ok(asked) => asked,
         Err(what) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             return Exit::Usage.code();
         }
     };
     let report = match run(&asked) {
         Ok(report) => report,
         Err(what) => {
-            eprint!("{}", say::error(&format!("`blaze debug edits`: {what}"), color));
+            blaze_report::err!("{}", say::error(&format!("`blaze debug edits`: {what}"), color));
             return Exit::Failed.code();
         }
     };
@@ -1135,7 +1135,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         true => match serde_json::to_string(&report) {
             Ok(json) => json + "\n",
             Err(error) => {
-                eprint!("{}", say::error(&format!("`blaze debug edits`'s report as JSON: {error}"), color));
+                blaze_report::err!("{}", say::error(&format!("`blaze debug edits`'s report as JSON: {error}"), color));
                 return Exit::Failed.code();
             }
         },
@@ -1143,7 +1143,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     };
     let mut out = std::io::stdout().lock();
     if let Err(error) = out.write_all(printed.as_bytes()).and_then(|()| out.flush()) {
-        eprint!("{}", say::error(&format!("stdout: {error}"), color));
+        blaze_report::err!("{}", say::error(&format!("stdout: {error}"), color));
         return Exit::Failed.code();
     }
     match report.failed {

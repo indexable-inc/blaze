@@ -280,7 +280,7 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 | `Clock` | `io.clock()` | | `Instant`, wall time, `Deadline` |
 | `Rng` | `io.rng()` | `fork()` | random bytes; seeded in the simulation |
 | `Sandboxes` | `io.sandboxes()` | a smaller budget | `OsSandbox`, `Vm`, `WasmSandbox`, and the `Runner` each makes (below) |
-| `Out` | `io.out()` | | standard input, output and error |
+| `Out` | `io.out()` | | standard output (built); standard input (S5e). Standard error is the entry's, not a capability |
 | `Mem` | `io.mem()` | | named arenas and caches against the memory budget |
 | `AudioOut`, `AudioIn` | `io.audio()` | a device | playing and recording sound (below) |
 | `Gpu` | `io.gpu()` | `only(kernels)`, a memory budget | a device: buffers, kernel launches, offscreen render targets (below) |
@@ -951,7 +951,7 @@ parameter when records land; its cost and guarantee fields stay required.
 | `keys`, `procs`, `code`, `window`, `term`, `power`, `opener`, `automation` | every call takes `&Cx`; narrowing by typed name; `RawMode`, `Awake` linear | wait, authority, finishing | already explicit |
 | `path`, `url`, `name`, `env::VarName`, `net::HostPort` | checked constructors with a typed `Why`; `path!`/`var!`/`host!` at compile time | no lossy parse | already explicit |
 | `sort` | `sort::on(workers)`, `Serial` | which threads sort; no ambient pool | already explicit |
-| `map`, `hash` | fixed seed, `SipKey` handed in | no per-process hasher seed | already explicit |
+| `map`, `set`, `hash` | one type per need ([Collections](#collections)); fixed seed; `KeyedMap::with_hasher_in(key, a)` for keys from outside | no per-process hasher seed; the allocator; which removal | `bstd::map::Map` named `HashMap` two ways |
 
 Left implicit, with what each waits for (none is hidden by a default a caller could have
 chosen otherwise today, and each is a row to close):
@@ -982,7 +982,7 @@ path, the host) and the kind. No catch-all `io::Error`, no error without its sub
 ## Memory is explicit
 
 There is no global heap in bstd. Every collection is made in an allocator its code was handed
-(`Vec::new_in(a)`, `Map::new_in(a)`, `String::new_in(a)`); `Vec::new()` does not exist. This is
+(`Vec::new_in(a)`, `HashMap::new_in(a)`, `String::new_in(a)`); `Vec::new()` does not exist. This is
 Zig's rule, and it buys what the plan needs: every byte belongs to a task or a named cache
 (section 6), `noalloc` is visible in a signature, and tests can count and fail allocations.
 
@@ -1003,6 +1003,82 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 
 Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
+
+### Collections
+
+One type per need. Each is made with `new_in(alloc)` or `with_capacity_in(n, alloc)`; none has a
+`new()`, and none picks a hasher seed at run time. The names are the same in `bstd`, in
+`blaze-hash` and in the blaze edition's prelude (`HashMap`, not `Map`: `blaze_hash::Map` is the
+type generic over its hasher, which only the aliases below name).
+
+| need | type | what it is | what it costs |
+|---|---|---|---|
+| ordinary keys (ids, names, tuples, paths) | `map::HashMap<K, V, A>`, `set::HashSet<K, A>` | hashbrown on foldhash with one fixed seed | one hash, one probe; one allocation with room |
+| keys that are hashes already (a content id, a store key, a fingerprint) | `map::ByHash<K, V, A>`, `set::ByHashSet<K, A>` | the same table on the identity hasher: the key's first word places it | no hash at all |
+| values stored once, found by their content | `map::ContentMap<V, A>` (one owner); `blaze_hashcons::HashCons<T>` (shared between threads, a dense `Idx` and a handle that compares by address) | `insert(value) -> ContentId`, `get(&id) -> Option<&V>`; a `ByHash` on the BLAKE3 of the value under its type's domain | BLAKE3 once per insert, over the value; a lookup hashes nothing |
+| iteration that reaches an output, or entries named by position | `map::IndexMap<K, V, A>`, `set::IndexSet<K, A>` | entries dense in a vector in insertion order, and a table of `u32` indices; `swap_remove` (O(1), one entry moves) and `shift_remove` (O(n), order kept), no `remove` | a lookup is a hash map's plus one load; iteration is a vector's; two allocations with room |
+| sorted keys, range queries | `map::SortedMap<K, V, A>`, `set::SortedSet<K, A>` | `alloc`'s B-tree (`BTreeMap::new_in`: it takes an allocator on the pinned nightly, `allocator_ext`) | O(log n), a node per 11 entries |
+| dense ids whose slots are reused | `mem::Slab<T>` and `mem::Handle<T>` (blaze-mem) | `(index, generation)`: a stale handle is detected, not dereferenced; a `Slab` grows in place | a bounds check, one compare, one load; no hash |
+| keys an attacker may pick (names, paths and headers from outside) | `map::KeyedMap<K, V, A>`, `set::KeyedSet<K, A>` | the hash table on SipHash-1-3 under a `hash::SipKey` | SipHash per key, about 3 times foldhash on a short key |
+| shared between threads | `map::SharedMap<K, V>`, `map::SharedByHash<K, V>`, `set::SharedSet<K>` | papaya's lock-free tables; values are lent, never moved out | a read takes no lock and writes nothing shared |
+
+Decided, with the reason for each:
+
+- **A content map is two types, not one.** `ContentMap` has one owner, its allocator in the
+  type, removes, and no index. `HashCons` is shared (shards, lock-free reads), hands out a dense
+  `Idx`, never frees, and lives on the global heap. One type could not be both without paying
+  for the sharing in the single-owner case, which is the same split as `HashMap` and
+  `SharedMap`. They agree on what a value's id is (`content_of`: the type's `Domain`, then what
+  its `Content::hash_content` feeds), so a value keeps its id between them.
+- **The trust rule.** An id is trusted only where the map computed it. A value that arrives
+  with an id (from a file, a peer, a cache) goes in through `insert_claimed(id, value)`, which
+  hashes the value and returns `Mismatch { claimed, actual }` without storing when they differ.
+  Two unequal values with one id stop the process naming the type: the type's `hash_content`
+  leaves out something its `Eq` compares.
+- **Is a map from `Hash(v)` to `v` efficient?** The lookup is: no hashing, one probe. The
+  insert pays BLAKE3 over the value, about a nanosecond a byte for small values, so it is the
+  right table when the id is wanted anyway (it is persisted, sent or compared across runs), and
+  the wrong one for deduplicating in memory only, where a `HashSet` of the values costs a
+  foldhash. `ByHash` against `HashMap<[u8; 32]>` is the measured row below.
+- **An insertion-ordered map of bstd's own**, not the `indexmap` crate: that one has no
+  allocator parameter, holds `usize` indices (twice the table), and offers `remove`, which
+  hides which of the two removals a call meant. Equality here is of the order too, since the
+  order is what a reader of the map sees.
+- **No sorted map of bstd's own.** `alloc`'s B-tree already takes its allocator; a second tree
+  would be a second home for one concept.
+- **A fixed seed gives up resistance to chosen keys**, on purpose, for reproducible runs and a
+  hash the compiler folds. Where the keys come from outside and the table grows with them, the
+  maker hands a key in: `KeyedMap::with_hasher_in(SipKey::random(), alloc)` for a table nothing
+  persists, or a key derived from the content (`id::index_key`) for one an image lays out, or a
+  key from `io.rng()` in code that takes capabilities. `SipKey` has no `Default`, so a keyed
+  table has no `new_in`: it cannot be made without its key. Iteration order of a keyed
+  `HashMap` differs by key; a keyed table whose order is read is `OrderMap<K, V, SipKey, A>`.
+
+Proven by (`crates/blaze-hash/src/order_tests.rs`, `crates/blaze-hashcons/src/content_map.rs`):
+an ordered map equals a `Vec` of pairs under random inserts, both removals by key and by index,
+`pop` and `retain` (Hegel, 300 cases); its order is the same under the fixed seed, under random
+keys, at three capacities and in two other processes, with the control that a hash map's order
+under two keys differs; a table with room allocates when made (hash map 1, ordered map 2, content
+map 1) and never within the room; a content map equals the distinct values by id under random
+inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
+picked to collide under a known hasher spread under a key.
+
+Cost rows are printed by `cargo test --release -p blaze-hash --lib collections_cost -- --ignored
+--nocapture` (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
+`indexmap` crate and `HashMap`; lookup of a million 32-byte hashes for `ByHash` and
+`HashMap<[u8; 32]>`). Not measured yet: no run of it has printed (2026-11-12); the numbers go
+here with the commit and the machine's load when one has.
+
+Moving blaze's own code off the `indexmap` crate: nothing has moved yet, and `.clippy.toml` does
+not ban it yet. Its uses are 53 files of 14 crates, nearly all through `base_db::FxIndexMap` and
+`FxIndexSet` (hir-def 18 files, hir-ty 9, blaze-diagnostics 6, blaze-lints 5, base-db 4, ix-prof
+and blaze-engine 2, and one each in span, hir-ty-charon, hir-lint-levels, hir-expand, blaze-query,
+blaze-profile, blaze-explore-core). What a move has to settle first, since these are the front
+end's own tables: equality (`indexmap`'s ignores order, `OrderMap`'s does not, and `FileSet` and
+query values derive `PartialEq` over one); the entry API and serde, which `OrderMap` does not
+have yet; and `blaze_query`'s `container_values!` for it. The ban goes in with the port of
+`base_db`'s two aliases, as one batch (rule whole-ports), with its baseline. Decision D25 is not
+what holds it: `blaze-hash` builds under cargo.
 
 ### Contracts
 
@@ -1071,9 +1147,9 @@ nonblocking; [effects](effects.md)):
 
 Effect attributes on bstd itself. This branch has `#[blaze::pure]`, `nopanic`, `noalloc` and
 `nonblocking` ([effects](effects.md)); bstd marks with those where the mark holds and is
-checked, and the positive form being built (`#[blaze::may(block, alloc, ..)]`) replaces each
-with a list of what a function may do, so "only `_synced` and `flush` may block" becomes
-`may(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
+checked, and the positive form being built (`#[blaze::expect(block, alloc, ..)]`) replaces
+each with the exact list of what a function does, so "only `_synced` and `flush` may block"
+becomes `expect(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
 cancelled, check}`, `Budget`'s counting, `Instant::{since_start, since}`, `Durable::unsynced`,
 `How::says`, `Buffered::held`. Not marked, and why: every call that reaches the driver takes
 `Io`'s process lock and polls inline in S1, which the walk rightly reads as blocking, so
@@ -1118,6 +1194,119 @@ reason); `bstd` is on it. `blaze explain trusted <binary>` prints what a binary 
 opts in with `#![blaze::capabilities]`, which makes both effects errors in it and its
 dependencies' reached code.
 
+## The blaze edition: opting in
+
+Decided 2026-11-12 (S5, slice 1 built). A package opts in; nothing else changes anywhere.
+
+**The opt-in** is the manifest's edition, as [edition](edition.md) designed it:
+
+```toml
+[package]
+edition = "blaze-2026.11"
+```
+
+One spelling. A key cargo could read (`[package.metadata.blaze]`) lost: a package of the
+edition is not a cargo package (its `std` is bstd and its `main` takes parameters), so cargo
+stopping at the edition key, naming it, is the true error, and one that parsed would only fail
+later and worse. blaze's own crates stay on `edition = "2024"` while cargo builds blaze
+(decision D25) and use bstd as a dependency by name. `edition.workspace = true` inherits it.
+
+To the front end the manifest value is two things (`edition::BlazeEdition`, the one home of
+every spelling): the Rust edition it fixes (2024, for the parser, name resolution and every
+manifest rule) and the crate attribute `#![blaze::edition = "2026.11"]` on each crate of the
+package but its build script and a proc-macro target. The attribute is the tracked input: a
+crate's key hashes its crate attributes, so no query result, record or object is shared
+between a crate with it and one without. A root file may write the attribute itself (a
+single-file program); two that disagree, or a version that is no edition's, are errors.
+
+**What changes under it, and nothing else:**
+
+| | under the edition | built |
+|---|---|---|
+| `std` | names the dependency called `bstd`; Rust's `std` has no name in the crate (`core` is unchanged, `alloc` is by `extern crate alloc`). So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any path | yes |
+| the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, `Io`, the entry's `Error`, `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..), and for memory `Vec`, `Box`, bstd's `String` and `format_in!` ("Memory under the edition") | yes |
+| the entry | rule `entry-takes-roots`: `main`'s parameters are roots the runtime makes, each at most once, in the runtime's order, `&Cx` then `Io`. So `fn main()`, `fn main(cx: &Cx)`, `fn main(io: Io)` and `fn main(cx: &Cx, io: Io)`, by the rule and not by a list (`hir_ty::entry::takes`). It returns anything that is a `bstd::entry::Outcome` (a trait: `()`, a `Status`, a `Result` of one and an error that can be shown; a program's own type may implement it) | yes |
+| the root context | `main(cx, ..)` gets one with the named bounds `entry::MAIN_BUDGET` (no deadline) and `MAIN_SCRATCH`; a program that wants others takes `io` alone and calls `io.cx(budget, scratch)` | yes |
+| a test | takes the same roots, handed the simulation's (`Io::sim(seed)`, the seed printed on failure); `#[test(native)]` asks for the real one | S5b |
+
+The entry is library code. blaze appends one module to the program's root
+(`__blaze_entry`, as a test harness is appended; it is in the root's content, so in the
+crate's key) whose `main` is `std::entry::run(|cx, io| crate::main(cx, io))` with exactly the
+roots `main` takes; `run` makes the native `Io` (the start directory as its root, the command
+line, the environment), calls `main`, prints a failure as `error: <what>` on standard error
+and exits 0 or 1. `entry::run_in(io, ..)` is the same on an `Io` a test made. Standard output
+is the capability `Out` (`io.out()`), in the simulation and natively.
+
+**Saying something** is one call, whatever is said: `out.line(cx, "text")?` and
+`out.line(cx, format_args!("x = {x}"))?` (`write` for no line feed), on anything `Display`,
+formatted on the stack with no allocation, returning the `OutError` itself. `out.with(cx)` is
+a `core::fmt::Write` for `write!`/`writeln!` and keeps the first error, which `fmt::Error`
+cannot carry. bstd holds nothing between calls: a call of up to `out::HELD` (1024) bytes is
+one write, with the operating system when it returns, so a crash leaves on screen every line
+whose call returned. The price is one system call a line, which is what Rust's line-buffered
+`println!` pays too (measured: see the lane's report); a program that wants fewer builds its
+text in an allocator and writes once.
+
+**Memory under the edition.** The prelude has `Vec` and `Box` (alloc's types, for
+`Vec::new_in(cx.frame())` and `Box::new_in(v, a)`; the allocator API needs no `#![feature]`
+in the crate), bstd's `String` (made in an allocator) and `format_in!`. It has no `vec!` and
+no `format!`, and `alloc` is not nameable without `extern crate alloc`. That is not
+enforcement: `Vec::new()` is a method of the same type, and it allocates from the global
+heap. Two things refuse it. `blaze check` denies `blaze::std_use` in a crate of the edition
+(its table has the global-heap rows: `Vec::new`, `Box::new`, `String::from`, `to_string`,
+`format!`, `vec!`, the collections), naming the explicit form; built. The build's own
+refusal is the `global_alloc` effect of S2 over every function the program reaches; S5g,
+not built, so `blaze build` and `blaze run` of a program that writes `Vec::new()` succeed
+today. A dependency of a Rust edition allocates from the global heap as before and still
+works; its bytes belong to no task and no arena, so the program's accounting ("every byte
+belongs to a task or a named cache") covers the edition's own code and bstd's handed-back
+memory only, and says so, until S5g's walk either proves the reached code allocates nothing
+or the crate is on the trusted list with its heap counted as one named arena. bstd itself
+still has about 128 global allocations, each with its `// alloc:` line (effects' buffers,
+errors' messages, once-per-world tables), until S4.
+
+**Errors name the rule.** A `main` of the edition with a parameter that is no root, a root
+twice or out of order is refused at `main`, naming the parameter and `entry-takes-roots`. A
+`main` with parameters in a crate of a Rust edition (which rustc refuses as E0580, and blaze
+used to compile to a call with garbage arguments) is refused saying it needs the blaze
+edition and the manifest line to add. An edition crate with no `bstd` dependency says so.
+
+**Old code is untouched.** A package without the opt-in is given no attribute, and every
+branch above is behind `Crate::blaze_edition`, which is `None` for it: same keys, same
+resolution, same entry, same bytes. Checked by a build of the same program on both editions
+side by side, and by the fixtures of every crate that existed before.
+
+**Across the boundary.** Both directions link, since an edition is a property of a crate:
+
+- A new-edition package depends on old-edition crates as on any crate. What crosses is
+  ordinary Rust: types, traits, functions. The old crate keeps Rust std's ambient authority,
+  so the new program's "what can this reach" claim stops at that call: `ambient` (S2) proves
+  from source that the reached code has none, or the crate is on the trusted list. Until S2
+  and S5c the claim is about the edition's own code only, and says so.
+- An old-edition crate depends on a new-edition library by naming bstd too (`bstd::Cx`,
+  `bstd::Io`) and handing over capabilities it made (`bstd::entry::run`, `Io::sim`).
+
+**`blaze new`** writes a package of the latest blaze edition (the opt-in, and a `main(cx:
+&Cx, io: Io) -> Result<(), Error>` that writes its line through `io.need_out()?`) and
+`blaze new --rust` the plain Rust package, byte for byte cargo's. Until blaze ships bstd
+(S5d) a package of the edition names bstd as a dependency by path, so the edition is the
+default only where `--bstd <PATH>` says where bstd is; without it `blaze new` still writes
+the Rust package, and `--edition blaze-2026.11` alone is refused naming the flag. One
+constant, `blaze_new::BSTD_SHIPS`, makes it the default everywhere.
+
+**Not on the latest edition** is one lint, `blaze::not_latest_edition`
+([lints](../../../lints.md#not_latest_edition)), for a Rust edition and an older blaze edition
+alike: one finding a package, only for the workspace's own packages, saying what opting in
+gives and the manifest line; a diagnostic like any other (stored in the crate's record, a
+`compiler-message` in JSON, allowed or denied in the workspace's lint table or by flag). It
+warns by default from the same day `blaze new` defaults to the edition
+(`ready::EDITION_SHIPS`): until a package of the edition builds wherever blaze runs, telling
+people to move would be a nag. blaze's own workspace allows it while cargo builds blaze (D25).
+
+Deferred, a row each below: tests (S5b), the sandbox derived from `main` (S5c), bstd shipped
+with blaze (S5d), `Out` on the driver (S5e), build scripts and proc macros (S5f), the global
+heap refused by the build (S5g).
+
 ## Moving blaze onto it
 
 Interface first, bottom last, so nothing waits on the runtime and every step lands on its own.
@@ -1135,8 +1324,14 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1g | `bstd::audio`: `AudioOut`, `AudioIn`, PCM buffers, the mixer and resampler as cores, the simulation's provider and one native one; the audio track in the muxer; the types of the device capabilities | a simulated run's samples equal a model's; the callback's effects are refused when it waits or allocates |
 | S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
 | S4 | The bottom ([sys](sys.md)): `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]`. Slice 1 is written: `crates/blaze-sys` for Linux, the first file effects on it, bstd `#![no_std]` with one std module (`rt.rs`) | the ban list (`harness/v2/nostd.json`) is empty and no blaze crate links Rust's `std` (`harness/v2/nostd.py`); C1 still passes |
-| S5 | The edition: `edition = "blaze-2026.11"` makes `std` name bstd, `fn main(io: Io)` is the entry, and the OS sandbox of a program is derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
-| S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`) | each has its own row when S5 is met |
+| S5 | The edition, slice 1 ("The blaze edition: opting in"): `edition = "blaze-2026.11"` makes `std` name bstd and its prelude the crate's, `main` takes the roots the runtime makes (`entry-takes-roots`), `bstd::entry::run` makes them, `Out` is standard output, `blaze new` writes it where bstd is named, and `blaze::not_latest_edition` | built: a new-edition hello world builds, prints its line through `Out` and exits 0, and one returning `Err` prints the error and exits 1; the same program on Rust 2024 is unchanged; each direction of the boundary links; a bad `main` gets the named error (`crates/blaze-engine/tests/repro.rs`, `the_blaze_edition_*`) |
+| S5b | Tests of the edition: a `#[test]` takes the roots `main` may, handed `Io::sim(seed)`; `#[test(native)]` the real one; a harness that names no Rust `std` | `blaze test` of an edition package runs its tests on the simulation and prints the seed of a failure; today it stops naming this row |
+| S5c | The OS sandbox of a program derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
+| S5d | bstd ships with blaze and is given to every crate of the edition as `std` is given (`attach_std`), so the manifest's `bstd` line goes; `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS` turn on | `blaze new` then `blaze run` prints its line on a machine with no checkout of blaze; the release's install check uses it |
+| S5e | `Out` (and standard input) as effects of the drivers, with the context's deadline | `rt::write_out` is gone from S4's ban list |
+| S5g | No global heap in the edition, at build time: the `global_alloc` effect (S2) is an error in a crate of the edition over what it reaches, old-edition dependencies proved or trusted with their heap as one named arena | a program of the edition with `Vec::new()`, `Box::new`, `format!` or `extern crate alloc` + `vec!` fails `blaze build` naming the call path and `Vec::new_in(cx.frame())`; today only `blaze check` refuses it (`blaze::std_use`) |
+| S5f | A build script and a proc-macro target of an edition package take capabilities (`ready::CAPABILITIES_FOR_BUILD_SCRIPTS`) | they are of the edition, not Rust 2024 |
+| S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`, which rewrites `main`, `std::` paths the table of `blaze::std_use` covers, and the manifest) | each has its own row when S5c is met |
 
 S1 and S2 do not depend on each other. S3 is the long one: about 270 files name `std::fs`, 280
 `std::env`, 200 `std::process`, 200 `std::thread`, 160 the clock, and 410 `std::sync`.
@@ -1171,9 +1366,13 @@ with its path, or put on the trusted list with a reason.
 - **Context is a parameter**, as Go's `context` and Zig's allocator are, never a thread-local: a
   thread-local context is ambient authority over time and memory.
 - **No global heap.** Out of memory fails a task, never the process.
-- **`fn main(cx: &Cx, io: Io)`.**
+- **`fn main(cx: &Cx, io: Io)`**, or fewer of the roots, in that order ("The blaze edition:
+  opting in").
+- **The opt-in is the manifest's `edition`**, carried to the front end as a crate attribute.
 - **Structured tasks with deadlines**, as Trio's scopes.
-- **Standard error is not a capability; standard output is.**
+- **Standard output and standard error are each a capability** (`io.out()`, `io.err()`, one
+  type `Out`). Reversed 2026-11-12 from "standard error is not a capability": a program that
+  reports on standard error is saying something to whoever started it, as on standard output.
 - **No revocation** until something needs it.
 - **No default for a cost or a guarantee** (the second rule); a policy that changes an effect
   is a function of its own.

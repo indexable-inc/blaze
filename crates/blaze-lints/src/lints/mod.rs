@@ -1042,7 +1042,7 @@ mod tests {
             "`clippy::all` is clippy's five groups only"
         );
         let on = command_line_on(&flags(&format!(
-            "{} -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc",
+            "{} -A blaze::general -A blaze::edition -W clippy::dbg_macro -D blaze::hot_alloc",
             crate::tests::CLIPPY_OFF
         )));
         // Beside what the flags turn on: the lints outside `blaze::general` that are on by

@@ -8,10 +8,11 @@
 //!   with each definition by its item key, then the typing mode, the regions flag and the
 //!   crate's recursion limit. Its key hashes that form with the solver version and the crate's
 //!   key (its identity and lang items).
-//! - Under the goal's key, in one of [`record::SLOTS`] slots, a **shape** record lists the facts
-//!   the evaluation read; the **answer** is filed under the shape's key and those facts' values
-//!   when it was solved ([`record`]). A lookup reads the shapes, hashes their facts as they are
-//!   now, and asks for the answer: a constructive trace, as Bazel's action cache and Shake keep.
+//! - Under the goal's key, in a slot of its chain, a **shape** record lists the facts the
+//!   evaluation read; the **answer** is filed under the shape's bytes and those facts' values
+//!   when it was solved ([`record`]; the form, its keys and the chain are `blaze_record`'s). A
+//!   lookup reads the shapes, hashes their facts as they are now, and asks for the answer: a
+//!   constructive trace, as Bazel's action cache and Shake keep.
 //! - Only what the global-goal table offers is offered here: root, shareable, global goals,
 //!   never a cycle's provisional answer nor one with inference variables. A goal is stored only
 //!   when every read of its evaluation is an interned value or a fact; any other read (a query
@@ -33,10 +34,9 @@ mod tests;
 use std::{
     cell::Cell,
     ops::ControlFlow,
-    ptr::{self, NonNull},
     sync::{
         Arc,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -44,15 +44,15 @@ use base_db::{Crate, Db, Nonce};
 use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
-use blaze_reclaim::Limbo;
+use blaze_record::{AnswerKey, Bounds, Digest, Filing, Kept, Kind, Placed};
 use hir_def::deps::ImageStore;
 
 use super::{
     DbInterner, SolverDefId,
     global_goals::{Answer, GoalKey},
 };
+use crate::store_registry::{Linked, Registry};
 use pending::{Pending, Tallies};
-use record::{AnswerKey, SLOTS, ShapeRef, shape_key};
 use stable::Goal;
 
 /// What a goal's stable form and its facts come from, above hir-ty: lane items' item keys and
@@ -118,13 +118,20 @@ pub(crate) struct Found {
 /// hashes the same now. The fact checks are reads of the active query.
 #[inline]
 pub(crate) fn lookup<'db>(interner: DbInterner<'db>, key: GoalKey) -> Option<Found> {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return None;
     }
     lookup_goal(interner, Goal::of(key))
 }
 
 /// After solving: `key`'s answer, shareable, with what its evaluation read.
+///
+/// The offer is bookkeeping of the goal store, never part of the asking query's value: what it
+/// reads to file the goal (each read's fact, the facts' values, the crate's key, the goal's
+/// words with each definition's item key) is kept out of the running query and of every capture
+/// open on it ([`blaze_query::db::unrecorded`]). So a body whose solve offered a goal holds the
+/// goal's own reads and nothing more, exactly what a body that took the goal from the goal
+/// table replays: which body solved it first changes no body's trace.
 #[inline]
 pub(crate) fn offer<'db>(
     interner: DbInterner<'db>,
@@ -132,7 +139,7 @@ pub(crate) fn offer<'db>(
     answer: Answer,
     reads: blaze_query::db::Reads,
 ) {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return;
     }
     offer_goal(interner, Goal::of(key), answer, reads);
@@ -143,6 +150,7 @@ fn lookup_goal<'db>(interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found>
     with_store(interner.db, |store| store.lookup(interner, goal)).flatten()
 }
 
+#[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
 #[inline(never)]
 fn offer_goal<'db>(
     interner: DbInterner<'db>,
@@ -150,7 +158,28 @@ fn offer_goal<'db>(
     answer: Answer,
     reads: blaze_query::db::Reads,
 ) {
-    with_store(interner.db, |store| store.offer(interner, goal, answer, reads));
+    let file = || {
+        with_store(interner.db, |store| store.offer(interner, goal, answer, reads));
+    };
+    #[cfg(test)]
+    if planted::RECORDED.get() {
+        file();
+        return;
+    }
+    blaze_query::db::unrecorded(interner.db, file);
+}
+
+/// The planted bug of the order oracle's control
+/// (`tests::a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first`).
+#[cfg(test)]
+mod planted {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The store's bookkeeping is recorded into the asking query, as before the guard: an
+        /// offer's reads, and a lookup's on a miss.
+        pub(super) static RECORDED: Cell<bool> = const { Cell::new(false) };
+    }
 }
 
 const SOLVER_DOMAIN: &str = "blaze v2 goal 3 solver";
@@ -176,6 +205,12 @@ struct Store {
     // dyn: lane items' keys and facts, above hir-ty; asked on a miss and after a solve, never on a hit
     facts: Arc<dyn GoalFacts>,
     pending: Pending,
+    /// Lookups since the last flush that found their goal's chain at its bound:
+    /// [`Flushed::lookups_full`].
+    full_lookups: AtomicUsize,
+    /// What the lookups since the last flush came to, as `blaze_record` counted them:
+    /// [`Flushed::lookups`].
+    lookups: blaze_record::Tally,
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key): [`Installed::flush`] stops with it. The goal it met it on was
     /// solved instead, which gives the same answer, so the build's error comes at the flush.
@@ -207,74 +242,103 @@ enum Refusal {
 }
 
 impl Store {
+    /// A hit's reads (the crate's key and the values of the facts its record names) are the
+    /// key of its answer, the query's own as `report_stored_read` says, and the capture the
+    /// goal table keeps for the next asker to replay. A miss's are nothing of the query's: the
+    /// goal is solved next, under a capture of its own, so they are dropped
+    /// ([`blaze_query::db::recorded_if`]), and the body that missed holds what one that took
+    /// the solved goal from the table replays.
+    #[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
     fn lookup<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found> {
-        let (answer, reads) =
-            blaze_query::db::capture_reads(interner.db, || self.find(interner, goal));
-        Some(Found { answer: answer?, reads })
+        #[cfg(test)]
+        let recorded = planted::RECORDED.get();
+        #[cfg(not(test))]
+        let recorded = false;
+        let (answer, reads) = blaze_query::db::recorded_if(
+            interner.db,
+            || blaze_query::db::capture_reads(interner.db, || self.find(interner, goal)),
+            |(answer, _)| recorded || answer.is_some(),
+        );
+        let answer = answer?;
+        // A goal's answer taken from the store, in the query that asked it: that query's own
+        // reads are then the answer's key (the facts checked above), not the reads of solving
+        // the goal. Told to the engine after the capture, so it marks the query's own run and
+        // not the capture's (`report_stored_read`; the item store's hit site is
+        // `body_store::Store::lookup`).
+        blaze_query::db::report_stored_read(interner.db);
+        Some(Found { answer, reads })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
     fn find<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Answer> {
         let db = interner.db;
         let crate_key = self.facts.crate_key(db, interner.krate());
-        let goal_key = stable::goal_key(interner, &*self.facts, &self.version, &crate_key, goal)?;
-        for n in 0..SLOTS {
-            let at = shape_key(&goal_key, n);
-            let shape = match self.images.get(&at) {
-                Ok(Some(shape)) => shape,
-                Ok(None) => return None,
+        // The goal's words name each definition by its item key: an identity, which the facts
+        // the record names are keyed by and whose values are read below, so what the key reads
+        // is no part of the answer and is not recorded (as at the offer). The crate's key is:
+        // the answer holds for the crate's lang items and loaded crates it hashes.
+        let goal_key = blaze_query::db::unrecorded(db, || {
+            stable::goal_key(interner, &*self.facts, &self.version, &crate_key, goal)
+        })?;
+        // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
+        // that is no fact. The shape is passed over, and the lookup is an error.
+        let mut no_fact = None;
+        let found = blaze_record::lookup(
+            &self.records(),
+            Bounds::STANDARD,
+            &goal_key,
+            |name| match slots::fact_of(name) {
+                Ok(fact) => self.facts.value(db, interner.krate(), fact).map(Digest::Is),
                 Err(why) => {
-                    // alloc: error text
-                    self.fail(format!("reading the shape of goal {goal_key:x} in slot {n}: {why}"));
-                    return None;
+                    no_fact.get_or_insert(why);
+                    None
                 }
-            };
-            let shape = match ShapeRef::open(shape.bytes(), &goal_key, &self.version) {
-                Ok(shape) => shape,
-                Err(why) => {
-                    // alloc: error text
-                    self.fail(format!("the shape of goal {goal_key:x} in slot {n}: {why}"));
-                    return None;
-                }
-            };
-            let Some(answer_key) = self.answer_key_now(db, interner.krate(), &at, &shape) else {
-                continue;
-            };
-            match self.images.get(&answer_key) {
-                Ok(Some(found)) => match record::open_answer(found.bytes(), &answer_key) {
-                    Ok(answer) => return Some(answer),
+            },
+        );
+        if let Some(why) = no_fact {
+            // alloc: error text
+            self.fail(format!("the shape of goal {goal_key:x}: {why}"));
+            return None;
+        }
+        match found {
+            Ok(blaze_record::Found::Hit { answer, key, at }) => {
+                match record::open_answer(answer.bytes(), &key) {
+                    Ok(answer) => Some(answer),
                     Err(why) => {
                         // alloc: error text
-                        self.fail(format!("the answer of goal {goal_key:x} in slot {n}: {why}"));
-                        return None;
+                        self.fail(format!(
+                            "the answer of goal {goal_key:x} in generation {} slot {}: {why}",
+                            at.generation, at.n
+                        ));
+                        None
                     }
-                },
-                Ok(None) => {}
-                Err(why) => {
-                    // alloc: error text
-                    self.fail(format!(
-                        "reading the answer of goal {goal_key:x} in slot {n}: {why}"
-                    ));
-                    return None;
                 }
             }
+            // A chain at its bound is counted here, and where the goal's shape is then not
+            // placed (`Flushed::slots_full`, which names the goal).
+            Ok(blaze_record::Found::Miss { lists: _, full }) => {
+                if full {
+                    self.full_lookups.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(error) => {
+                let slots::Refused { doing, why } = error.into();
+                // alloc: error text
+                self.fail(format!("{doing} goal {goal_key:x}: {why}"));
+                None
+            }
         }
-        None
     }
 
-    /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
-    /// when one of them cannot be hashed now.
-    fn answer_key_now(
-        &self,
-        db: &Db,
-        krate: Option<Crate>,
-        shape_key: &ContentId,
-        shape: &ShapeRef<'_>,
-    ) -> Option<ContentId> {
-        let mut key = AnswerKey::new(shape_key);
-        for fact in shape.facts() {
-            key.value(&self.facts.value(db, krate, fact)?);
+    /// The driver's store as `blaze_record` reads and writes a goal's records: each under its
+    /// own key.
+    fn records(&self) -> slots::Records<'_, impl Fn(Kind, &ContentId) -> ContentId> {
+        slots::Records {
+            images: &*self.images,
+            at: |_: Kind, key: &ContentId| *key,
+            tally: &self.lookups,
         }
-        Some(key.finish())
     }
 
     fn offer<'db>(
@@ -353,46 +417,43 @@ impl Store {
         error.get_or_insert(why);
     }
 
-    /// Writes one buffered goal: its shape in the first slot that holds it or is free
-    /// (`claimed`: what this flush placed in the slots of the goal's key before, [`slots`]),
-    /// then its answer under the shape's key and the values its facts had.
+    /// Writes one buffered goal: its shape in its key's chain where it is held or the first
+    /// slot is free (`filing`: the placing of this flush's shapes of the goal's key,
+    /// [`slots::filing`]), then its answer under the shape's bytes and the values its facts
+    /// had.
     fn write<'a>(
         &self,
         entry: &pending::Entry<'a>,
-        claimed: &mut slots::Claimed<'a, { SLOTS as usize }>,
+        filing: &mut Filing<'a>,
     ) -> Result<Wrote, String> {
         let goal = entry.goal_key;
         // alloc: error text
         let error = |what: &str, why: String| format!("{what} goal {goal:x}: {why}");
-        let placed = claimed
-            .claim(&*self.images, entry.shape, |n| shape_key(&goal, n))
-            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
-        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
-        let wrote = match written {
-            true => Wrote::Written,
-            false => Wrote::Kept,
+        let refused = |refused: blaze_record::Error<String>| {
+            let slots::Refused { doing, why } = refused.into();
+            error(doing, why)
         };
-        let at = shape_key(&goal, n);
-        let mut key = AnswerKey::new(&at);
+        let records = self.records();
+        let wrote = match filing.place(&records, entry.shape).map_err(&refused)? {
+            Placed::Written(_) => Wrote::Written,
+            Placed::Kept(_) => Wrote::Kept,
+            Placed::Full => return Ok(Wrote::SlotsFull),
+        };
+        let mut key = AnswerKey::new(entry.shape);
         for value in entry.values() {
-            key.value(&value);
+            key.value(Digest::Is(value));
         }
         let answer_key = key.finish();
         let answer = record::answer_record(&answer_key, entry.answer);
-        match self.images.get(&answer_key).map_err(|why| error("reading the answer of", why))? {
-            Some(kept) if kept.bytes() == answer => Ok(wrote),
-            Some(_) => Err(error(
+        match blaze_record::keep_answer(&records, answer_key, &answer) {
+            Ok(Kept::Written) => Ok(Wrote::Written),
+            Ok(Kept::Held) => Ok(wrote),
+            Err(blaze_record::Error::TwoAnswers { key: _ }) => Err(error(
                 "two answers under the same fact values of",
                 // alloc: error text
                 String::from("its evaluation read something its facts do not cover"),
             )),
-            None => {
-                // alloc: the answer's bytes, once per goal written
-                self.images
-                    .put(answer_key, answer.to_vec())
-                    .map_err(|why| error("keeping the answer of", why))?;
-                Ok(Wrote::Written)
-            }
+            Err(other) => Err(refused(other)),
         }
     }
 }
@@ -404,7 +465,7 @@ enum Wrote {
     Written,
     /// The store had both already.
     Kept,
-    /// Every slot of its key holds another shape.
+    /// Every slot of its key's chain holds another shape (`blaze_record::Placed::Full`).
     SlotsFull,
 }
 
@@ -415,8 +476,20 @@ pub struct Flushed {
     pub written: usize,
     /// Goals the store had already.
     pub kept: usize,
-    /// Goals not written as every slot of their key holds another shape.
+    /// Goals not written as every slot of their key's chain holds another shape: the chain's
+    /// bound (`blaze_record::Bounds::STANDARD`), which a later lookup of the goal misses on.
     pub slots_full: usize,
+    /// Lookups that found their key's chain at its bound (`blaze_record::Found::Miss`'s
+    /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
+    /// the chain holds its shape where a placing looks.
+    pub lookups_full: usize,
+    /// What the store's lookups since the last flush came to, as `blaze_record` counted them:
+    /// how many there were (each a goal the global table did not have), how many found an
+    /// answer, the shapes they read and the facts they valued, each a fact hashed again.
+    pub lookups: blaze_record::Counts,
+    /// The first, in the order the flush writes, of those counted in `slots_full`: which it
+    /// is, by its key, and the bound.
+    pub full: Option<String>,
     /// For each query or input whose read kept goals out (it stands for no fact), how many,
     /// most first: the facts lane items is asked for.
     pub inexpressible: Vec<(&'static str, u64)>,
@@ -434,37 +507,17 @@ pub struct Flushed {
     pub failure: Option<String>,
 }
 
-/// How many databases may have a goal store at once.
-const STORES: usize = 16;
-
-/// How many goal stores are installed: zero is the one load [`lookup`] and [`offer`] make.
-static INSTALLED: AtomicUsize = AtomicUsize::new(0);
-
-/// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
-static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
-
-/// The process's one goal store reclamation pool: all unlinked stores are retired together.
-static LIMBO: Lock<Limbo> = Lock::new("ty.goal_store.limbo", Limbo::new());
+/// The installed goal stores, one per database with one at once (see `crate::store_registry`).
+static REGISTRY: Registry<Store> = Registry::new("ty.goal_store.limbo");
 
 /// Runs `f` on the goal store of `db`, if one is installed.
 #[inline]
 fn with_store<R>(db: &Db, f: impl FnOnce(&Store) -> R) -> Option<R> {
-    if INSTALLED.load(Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return None;
     }
     let (nonce, _) = db.nonce_and_revision();
-    let _task = blaze_reclaim::enter();
-    for slot in &REGISTRY {
-        let held = slot.load(Ordering::Acquire);
-        // SAFETY: a store is freed only through `LIMBO`, after a grace started once `Installed`'s
-        // drop unlinked it; `_task` was entered before `held` was loaded and outlives `f`, so that
-        // grace has not passed while the store is used here.
-        let Some(store) = (unsafe { held.as_ref() }) else { continue };
-        if store.nonce == nonce {
-            return Some(f(store));
-        }
-    }
-    None
+    REGISTRY.with(|it| it.nonce == nonce, f)
 }
 
 /// Gives `db` a goal store: `images`, the driver's store (the local store, or the local store
@@ -487,58 +540,33 @@ pub fn install(
     build: ContentId,
 ) -> Result<Installed, String> {
     let (nonce, _) = db.nonce_and_revision();
-    {
-        let _task = blaze_reclaim::enter();
-        for slot in &REGISTRY {
-            // SAFETY: as in `with_store`, under `_task`.
-            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce)
-            {
-                // alloc: error text
-                return Err(String::from("this database has a goal store installed already"));
-            }
-        }
+    if REGISTRY.with(|it| it.nonce == nonce, |_| ()).is_some() {
+        // alloc: error text
+        return Err(String::from("this database has a goal store installed already"));
     }
-    // alloc: setup: once per installed store, freed through `LIMBO` when it is uninstalled
-    let store = Box::into_raw(Box::new(Store {
+    // alloc: setup: once per installed store, freed through the registry's limbo when it is
+    // uninstalled
+    let store = Box::new(Store {
         nonce,
         version: solver_version(&build),
         images,
         facts,
         pending: Pending::new(),
+        full_lookups: AtomicUsize::new(0),
+        lookups: blaze_record::Tally::new(),
         error: Lock::new("ty.goal_store.error", None),
-    }));
-    for (at, slot) in REGISTRY.iter().enumerate() {
-        if slot
-            .compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            INSTALLED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `Box::into_raw` never gives null.
-            return Ok(Installed { at, store: unsafe { NonNull::new_unchecked(store) } });
-        }
-    }
-    // SAFETY: never published, so this is its only owner.
-    drop(unsafe { Box::from_raw(store) });
-    // alloc: error text
-    Err(format!("more than {STORES} databases with a goal store at once"))
+    });
+    Ok(Installed { linked: REGISTRY.link(store) })
 }
 
 /// A goal store installed for a database ([`install`]); dropping it uninstalls it.
 pub struct Installed {
-    at: usize,
-    store: NonNull<Store>,
+    linked: Linked<Store>,
 }
-
-// SAFETY: `Installed` owns its `Store`, which is `Send + Sync` (its fields are), and hands out
-// only shared references to it.
-unsafe impl Send for Installed {}
-// SAFETY: as above.
-unsafe impl Sync for Installed {}
 
 impl Installed {
     fn store(&self) -> &Store {
-        // SAFETY: the store is freed only by `drop`, which takes `&mut self`.
-        unsafe { self.store.as_ref() }
+        self.linked.get()
     }
 
     /// Writes every goal offered since the last flush, on the store's threads
@@ -568,15 +596,25 @@ impl Installed {
             |a, b| entries[a].goal_key == entries[b].goal_key,
         );
         store.images.for_each(runs.len(), &|run| {
-            let mut claimed = slots::Claimed::new();
             // clone: a range of two words
-            for &at in &order[runs[run].clone()] {
-                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            let run = &order[runs[run].clone()];
+            // A run is the entries of one goal key, and never empty.
+            let mut filing = slots::filing(entries[run[0]].goal_key);
+            for &at in run {
+                _ = results[at].set(store.write(&entries[at], &mut filing));
             }
         });
         let Tallies { inexpressible, unhashable, too_long, dropped } = tallies;
-        let mut flushed =
-            Flushed { inexpressible, unhashable, too_long, dropped, ..Flushed::default() };
+        let lookups_full = store.full_lookups.swap(0, Ordering::Relaxed);
+        let mut flushed = Flushed {
+            lookups_full,
+            lookups: store.lookups.take(),
+            inexpressible,
+            unhashable,
+            too_long,
+            dropped,
+            ..Flushed::default()
+        };
         let mut results = results;
         // In the order written, so the failure named is the same one whichever thread wrote it.
         for at in order {
@@ -586,7 +624,17 @@ impl Installed {
             match wrote {
                 Ok(Wrote::Written) => flushed.written += 1,
                 Ok(Wrote::Kept) => flushed.kept += 1,
-                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Ok(Wrote::SlotsFull) => {
+                    flushed.slots_full += 1;
+                    if flushed.full.is_none() {
+                        // alloc: once per flush that met a full chain
+                        flushed.full = Some(format!(
+                            "goal {:x}, whose chain holds {} other shapes",
+                            entries[at].goal_key,
+                            slots::full_chain()
+                        ));
+                    }
+                }
                 Err(why) => {
                     flushed.failed += 1;
                     flushed.failure.get_or_insert(why);
@@ -597,20 +645,5 @@ impl Installed {
             return Err(why);
         }
         Ok(flushed)
-    }
-}
-
-impl Drop for Installed {
-    fn drop(&mut self) {
-        let held = REGISTRY[self.at].swap(ptr::null_mut(), Ordering::AcqRel);
-        assert_eq!(held, self.store.as_ptr(), "a goal store's slot held another store");
-        INSTALLED.fetch_sub(1, Ordering::Relaxed);
-        // SAFETY: made by `Box::into_raw` in `install`, and unlinked by the swap above, which only
-        // this guard makes; readers that loaded it are covered by the limbo's grace.
-        let store = unsafe { Box::from_raw(held) };
-        let mut limbo = LIMBO.lock();
-        limbo.retire(store);
-        // alloc: `Limbo::collect` frees; it is not an iterator's.
-        limbo.collect();
     }
 }

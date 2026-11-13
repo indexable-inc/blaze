@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-one-mir-entry-a-body",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 4b task A, int-1112",
+ "where": "crates/hir-ty/src/body_store/entries.rs, body_store/mir.rs, body_store/value.rs, body_store.rs (Store::served_answer)",
+ "what": "A body had one MIR entry, keyed by the body alone, while the item store files each closure's and coroutine's MIR under its own schema: a borrow check's read of a closure's MIR was filed as the body's one MIR step and its entry read only the body's own MIR entry, so a fact only a closure's MIR read reached no borrow check entry. A served row kept its earlier steps by schema, one a step, so a borrow check over two MIR owners could not be checked at all. A claim of runs to keep was marked before its puts reached the store and never let go when the keep failed.",
+ "cost": "closures' MIR and every borrow check ran again in each new database; a failed keep lost its runs until the daemon restarted",
+ "cause": "an entry keyed coarser than the records it stands for (a body, where the store keys each MIR owner), and a mark made before the act it records with no undo",
+ "class": "a key coarser than the item its value is of; a claim with no release on the failure path",
+ "prevention": "key an entry exactly as the store keys the record it reads (one owner, one place, one schema), and make every claim an owner that releases on drop unless the act it claims is done",
+ "workaround": "none",
+ "fix": "entries::OwnerKey (body and mir::Place) keys a MIR entry per owner (mir::owners); the borrow check reads every owner's MIR entry; serve flattens each earlier step's facts into the row and served_answer checks the one row; Claim releases its marks on drop unless kept. Controls: ONE_PLACE, OWN_FACTS_ONLY, HELD, ANY_KIND.",
+ "state": "fixed, not yet built"
+}

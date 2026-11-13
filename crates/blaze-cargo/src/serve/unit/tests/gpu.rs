@@ -273,6 +273,7 @@ fn lowered(units: &Units) -> blaze_lower::Lowered {
         files: &tree,
         root: view,
         host_cpu: None,
+        sealed: &blaze_lower::unsealed(units),
     })
     .unwrap()
 }

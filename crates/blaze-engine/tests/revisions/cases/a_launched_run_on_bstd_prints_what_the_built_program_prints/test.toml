@@ -1,0 +1,19 @@
+about = "A launched run of a program of the blaze edition on bstd (crates/blaze-std, shaped as harness/v2/smoke/edition) is the program `blaze build` makes: cold, after a body edit, and under a second home whose store is a copy of the first's. bstd's crates are sealed roots as any registry crate's are; nothing of the path is bstd's own."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello: 55\n"
+as_built = true
+spans = { "codegen walk" = 0 }
+
+[[revision]]
+action = "run"
+prints = "hello: 56\n"
+as_built = true
+
+[[revision]]
+steps = ["home second"]
+action = "run"
+prints = "hello: 56\n"
+as_built = true

@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-15",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: `blaze explain` defaults and `blaze debug edits` on reth",
+ "what": "`blaze explain edit_work` and `writes` with no build read `max(build_id) FROM spans`, which is the after-answer phase of the last build and no build: `build 4 counted no work in any stage`, `0 rows`. `blaze debug edits` asks `problems` after each run, which pivoted every event's fields before filtering and ran DuckDB out of memory on reth, so the edit series failed at run 1; I measured edits with a hand loop instead. `debug edits .. -- build ARGS` also runs `build build`.",
+ "cost": "redit-14 and an hour of mine",
+ "cause": "views written against small histories; a default that names an id that is not a build",
+ "class": "a tool that works at hello-world's size only",
+ "prevention": "built: the default build is the last row of `builds` (94634cb751); `problems` filters before it pivots (fb-commit after f4ff6ea4e2). Not built: `debug edits` refusing a leading `build`",
+ "fix": "94634cb751 and the `problems` commit",
+ "state": "fixed; debug edits on reth not re-run yet"
+}

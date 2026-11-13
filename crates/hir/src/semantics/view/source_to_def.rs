@@ -12,6 +12,7 @@ use hir_def::{
     EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId, FieldId, FunctionId,
     GenericDefId, GenericParamId, HasModule as _, ImplId, LifetimeParamId, MacroId, ModuleId,
     StaticId, StructId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
+    attrs::AttrFlags,
     dyn_map::{
         DynMap,
         keys::{self, Key},
@@ -116,6 +117,8 @@ pub(super) struct ViewCtx<'db, 'a> {
 
 impl<'db> Semantics<'db> {
     pub(super) fn with_ctx<T>(&self, f: impl FnOnce(&mut ViewCtx<'db, '_>) -> T) -> T {
+        // A probe is asked nothing of what source maps to (`Semantics::new_probe`).
+        self.ask();
         let mut cache = self.imp.s2d_cache.borrow_mut();
         let mut ctx = ViewCtx {
             sema: self,
@@ -507,6 +510,39 @@ pub(super) fn macro_call_to_macro_id(
             let node = it.to_view(db);
             ctx.proc_macro_to_def(InFile::new(it.file_id, node))
         }
+    }
+}
+
+/// Why an item that holds defs maps to none itself: the reasons [`ViewCtx::find_container`]
+/// walks past it to the container further out. With any other the walk stops, naming the item
+/// ([`ViewCtx::walked_past`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Unmapped {
+    /// A `cfg` removes the item, or something around it: no def was made from it.
+    RemovedByCfg,
+    /// The item, or one around it, is the input of an attribute macro: the defs are made from
+    /// the macro's expansion, and its nodes map to them.
+    AttributeMacroInput,
+}
+
+/// Whether `node` is of a kind [`ViewCtx::container_to_def`] maps to a container: one that
+/// answers `None` for it found no def for the node.
+fn holds_defs(node: Node<'_>) -> bool {
+    match ast::Item::cast(node) {
+        Some(
+            ast::Item::Module(_)
+            | ast::Item::Trait(_)
+            | ast::Item::Impl(_)
+            | ast::Item::Enum(_)
+            | ast::Item::TypeAlias(_)
+            | ast::Item::Struct(_)
+            | ast::Item::Union(_)
+            | ast::Item::Fn(_)
+            | ast::Item::Static(_)
+            | ast::Item::Const(_),
+        ) => true,
+        Some(_) => false,
+        None => ast::Variant::cast(node).is_some(),
     }
 }
 
@@ -953,13 +989,90 @@ impl<'db> ViewCtx<'db, '_> {
         {
             self.call_crate = Some(macro_file.loc(self.db()).krate);
         }
+        // The nearest ancestor that holds defs and maps to none itself.
+        let mut unmapped: Option<InFile<Node<'db>>> = None;
         let def = self.parent_ancestors_with_macros(src, |this, container, child| {
-            this.container_to_def(container, child)
+            let def = this.container_to_def(container, child);
+            if def.is_none() && unmapped.is_none() && holds_defs(container.value) {
+                unmapped = Some(container);
+            }
+            def
         });
-        if let Some(def) = def {
-            return Some(def);
+        let found = match def {
+            Some(def) => def,
+            // No module here has the file: nothing in it has a def.
+            None => self.file_module(src.file_id)?.into(),
+        };
+        if let Some(item) = unmapped {
+            self.walked_past(item, src)?;
         }
-        Some(self.file_module(src.file_id)?.into())
+        Some(found)
+    }
+
+    /// Holds [`ViewCtx::find_container`] to its rule: an ancestor that holds defs and maps to
+    /// none is walked past, to the container further out, only for a reason of [`Unmapped`].
+    /// Any other is a wrong map from syntax to defs (a key that misses the file, a child a
+    /// container does not list), and answering with the outer container would read the node
+    /// in a scope it is not in: a generic parameter of the item becomes "cannot find type",
+    /// far from the cause. That stops here, naming the item. `None` when no module has the
+    /// item's file.
+    #[cold]
+    fn walked_past(
+        &mut self,
+        item: InFile<Node<'db>>,
+        src: InFile<Node<'db>>,
+    ) -> Option<Unmapped> {
+        let db = self.db();
+        let krate = match self.call_crate {
+            Some(krate) => krate,
+            None => self.file_module(item.file_id)?.krate(db),
+        };
+        if let Some(why) = self.why_unmapped(item, krate) {
+            return Some(why);
+        }
+        let head: String = item.value.text().chars().take(80).collect(); // alloc: the panic's text
+        panic!(
+            "{:?} `{head}` ({:?}, {:?}) maps to no def, and neither a `cfg` removes it, nor is \
+             it the input of an attribute macro: the container of the {:?} at {:?} in {:?} \
+             would be read from an item further out, a scope the node is not in \
+             (source_to_def's `find_container`)",
+            item.value.kind(),
+            item.file_id,
+            item.value.text_range(),
+            src.value.kind(),
+            src.value.text_range(),
+            src.file_id,
+        )
+    }
+
+    /// Why `item`, which holds defs, maps to none, when it is one of the [`Unmapped`] reasons:
+    /// asked of the item and of everything around it, out through the macro calls it is in.
+    fn why_unmapped(
+        &mut self,
+        item: InFile<Node<'db>>,
+        krate: base_db::Crate,
+    ) -> Option<Unmapped> {
+        let cfg_options = krate.cfg_options(self.db());
+        let removed = |node: InFile<Node<'db>>| {
+            ast::AnyHasAttrs::cast(node.value)
+                .is_some_and(|owner| AttrFlags::is_cfg_enabled_in(owner, cfg_options).is_err())
+                .then_some(Unmapped::RemovedByCfg)
+        };
+        if let Some(why) = removed(item) {
+            return Some(why);
+        }
+        if let Some(why) = self.parent_ancestors_with_macros(item, |_, node, _| removed(node)) {
+            return Some(why);
+        }
+        let input = |this: &mut Self, node: InFile<Node<'db>>| {
+            let it = ast::Item::cast(node.value)?;
+            this.item_to_macro_call(node.with_value(it))?;
+            Some(Unmapped::AttributeMacroInput)
+        };
+        if let Some(why) = input(self, item) {
+            return Some(why);
+        }
+        self.parent_ancestors_with_macros(item, |this, node, _| input(this, node))
     }
 
     fn find_generic_param_container(&mut self, src: InFile<Node<'db>>) -> Option<GenericDefId> {

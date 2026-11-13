@@ -1,0 +1,12 @@
+{
+ "id": "disk2-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "crates/blaze-cas tests on origin/main (248d8f0326)",
+ "what": "Five to six tests of blaze-cas fail on the untouched base, run with cargo in an ix VM: `a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack`, `a_pack_whose_header_names_another_unit_stops_the_store`, `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`, `place_made::a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` (some runs), and the two controls of a head written before its syncs, which caught the planted bug and failed on its wording (the pool says the pack was cut, the test wanted `its head names`).",
+ "cost": "every run of the suite had to be compared with the base's list",
+ "cause": "the pool's reads changed what an open says and the tests' expected text was not updated",
+ "workaround": "compared failures by name",
+ "fix": "the two controls accept the pool's wording now; the other four are open",
+ "state": "two fixed on disk2-1111, four open"
+}

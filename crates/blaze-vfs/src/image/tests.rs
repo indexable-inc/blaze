@@ -1,39 +1,97 @@
 //! The tree opened in place from an image against the same history recovered from a journal
 //! that never had one (docs/v2/plan/design/restore.md): equal over random histories, at every
-//! step of writing an image and rewriting the journal to start from it, with no file's bytes
-//! read until something reads that file, and a corrupt page group named.
+//! step of writing an image and rewriting the journal to start from it, with no file's text
+//! asked of the store until something reads that file, a text the store lacks named, and an
+//! image that holds no file's bytes.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use blaze_core::{
     Driver, Effect, FileName, Mapping,
     sim::{Faults, Rng, Sim},
 };
+use blaze_format::schema;
 use blaze_ids::ContentId;
-use blaze_image::{Builder, Image, MIN_GROUP_SHIFT, SectionId};
+use blaze_image::{Builder, Cause, Image, MIN_GROUP_SHIFT, Refused, SectionId, TextWhy};
 
 use super::{
-    BLOBS_SCHEMA, DISKS_SCHEMA, DisksUnused, ImageError, ImageMark, ImageUse, TREE_SCHEMA,
+    DISKS_SCHEMA, DisksUnused, ImageError, ImageFile, ImageMark, ImageUse, TREE_SCHEMA,
+    tree_layout::{W_TEXT_BYTES, WORDS},
 };
-use crate::{Change, Mode, Op, OpError, Vfs, journal::base_of, store::Source, tree::NodeId};
+use crate::{
+    Bytes, Change, FILE_DOMAIN, Mode, Op, OpError, Vfs,
+    journal::base_of,
+    texts::{HeldTexts, StoreFault, Texts},
+    tree::NodeId,
+};
 
-fn file() -> FileName {
+pub(crate) fn file() -> FileName {
     FileName::new("vfs/journal").unwrap()
 }
 
-/// Bytes at an address aligned for every column, as a mapped file's are.
-fn mapping(bytes: &[u8]) -> Mapping {
-    Mapping::copy(bytes)
+/// The store the tests' images put their texts in, one a process: texts are by content ID, so
+/// tests share it as homes share a machine's layer. A test that breaks a store makes its own.
+pub(crate) fn texts() -> Arc<HeldTexts> {
+    static TEXTS: OnceLock<Arc<HeldTexts>> = OnceLock::new();
+    // clone: a count of the tests' one store.
+    Arc::clone(TEXTS.get_or_init(HeldTexts::shared))
 }
 
-/// The image of `vfs` as it is now, in groups of the smallest size, so files span several.
-fn image_of(vfs: &mut Vfs) -> Result<(ImageMark, Vec<u8>), ImageError> {
+/// An image's bytes at an address aligned for every column, as a mapped file's are, with the
+/// tests' store of texts.
+pub(crate) fn mapping(bytes: &[u8]) -> ImageFile {
+    ImageFile { file: Mapping::copy(bytes), texts: texts() }
+}
+
+/// The image of `vfs` as it is now, its texts in the tests' store, in groups of the smallest
+/// size.
+pub(crate) fn image_of(vfs: &mut Vfs) -> Result<(ImageMark, Vec<u8>), ImageError> {
+    image_in(vfs, &*texts())
+}
+
+/// [`image_of`] with its texts put in `texts`.
+pub(crate) fn image_in(
+    vfs: &mut Vfs,
+    texts: &dyn Texts,
+) -> Result<(ImageMark, Vec<u8>), ImageError> {
     let mut builder = Builder::with_group_shift(MIN_GROUP_SHIFT);
-    let mark = vfs.write_image(&mut builder)?;
+    let mark = vfs.write_image(&mut builder, texts)?;
     Ok((mark, builder.finish().expect("an image under the limit")))
 }
 
-fn run(sim: &mut Sim, vfs: &mut Vfs, effects: &mut Vec<Effect>) {
+/// A store that counts the texts asked of it.
+struct Counted {
+    held: Arc<HeldTexts>,
+    gets: AtomicUsize,
+}
+
+impl Texts for Counted {
+    fn get(&self, id: &ContentId) -> Result<Option<Bytes>, StoreFault> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.held.get(id)
+    }
+
+    fn has(&self, id: &ContentId) -> bool {
+        self.held.has(id)
+    }
+
+    fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), StoreFault> {
+        self.held.put(id, bytes)
+    }
+
+    fn durable(&self) -> bool {
+        self.held.durable()
+    }
+}
+
+pub(crate) fn run(sim: &mut Sim, vfs: &mut Vfs, effects: &mut Vec<Effect>) {
     let mut done = Vec::new();
     while !effects.is_empty() || sim.in_flight() > 0 {
         sim.submit(effects);
@@ -46,20 +104,20 @@ fn run(sim: &mut Sim, vfs: &mut Vfs, effects: &mut Vec<Effect>) {
 }
 
 /// Flushes `vfs` and runs every effect that leads to.
-fn settle(sim: &mut Sim, vfs: &mut Vfs) {
+pub(crate) fn settle(sim: &mut Sim, vfs: &mut Vfs) {
     let mut effects = Vec::new();
     vfs.flush(&mut effects);
     run(sim, vfs, &mut effects);
 }
 
-fn start(seed: u64) -> (Vfs, Sim) {
+pub(crate) fn start(seed: u64) -> (Vfs, Sim) {
     (Vfs::recover(file(), 0, &[]).0, Sim::new(seed, Faults::default()))
 }
 
 /// Everything a VFS answers about its heads: each head's root and sequence, every file with
 /// its mode and bytes, every directory's listing, and the diff between each two heads.
 #[derive(PartialEq, Eq, Debug)]
-struct State {
+pub(crate) struct State {
     heads: Vec<(String, ContentId, u64)>,
     last: u64,
     files: BTreeMap<String, BTreeMap<String, (Mode, Vec<u8>)>>,
@@ -75,7 +133,7 @@ fn heads(vfs: &Vfs) -> Vec<(String, ContentId, u64)> {
         .collect()
 }
 
-fn state(vfs: &Vfs) -> State {
+pub(crate) fn state(vfs: &Vfs) -> State {
     let heads = heads(vfs);
     let (mut files, mut dirs) = (BTreeMap::new(), BTreeMap::new());
     for (name, root, _) in &heads {
@@ -116,7 +174,7 @@ fn list_dirs(vfs: &Vfs, node: NodeId, path: String, out: &mut Listings) {
 
 /// An image used whole: none given, the tree mapped with the journal's tail, or the whole
 /// journal over it after a stop between the image's rename and the journal's rewrite.
-fn usable(it: &ImageUse) -> bool {
+pub(crate) fn usable(it: &ImageUse) -> bool {
     matches!(
         it,
         ImageUse::None | ImageUse::Used { disks: None, .. } | ImageUse::Resumed { disks: None, .. }
@@ -126,7 +184,7 @@ fn usable(it: &ImageUse) -> bool {
 const HEADS: [&str; 3] = ["main", "b", "pr/1"];
 
 /// One step of a history, made from the random numbers once and done to every VFS alike.
-enum Act {
+pub(crate) enum Act {
     Commit(&'static str, Vec<Op>),
     Branch { from: &'static str, to: &'static str },
     Remove(&'static str),
@@ -157,7 +215,7 @@ fn commit(rng: &mut Rng, head: &'static str, step: usize) -> Act {
     Act::Commit(head, ops)
 }
 
-fn act(rng: &mut Rng, step: usize) -> Act {
+pub(crate) fn act(rng: &mut Rng, step: usize) -> Act {
     let head = |rng: &mut Rng| HEADS[rng.below(HEADS.len() as u64) as usize];
     match rng.below(20) {
         0 => Act::Collect,
@@ -171,7 +229,7 @@ fn act(rng: &mut Rng, step: usize) -> Act {
 }
 
 /// Does `act` to `vfs`; what it answered, to compare.
-fn apply(vfs: &mut Vfs, act: &Act) -> String {
+pub(crate) fn apply(vfs: &mut Vfs, act: &Act) -> String {
     match act {
         Act::Commit(head, ops) => {
             let base = vfs.head(head).unwrap_or(vfs.empty());
@@ -199,15 +257,19 @@ fn history_run(seed: u64) {
     let mut images = 0;
     for step in 0..160 {
         match rng.below(16) {
-            0 => match image_of(&mut imaged) {
-                Ok((mark, bytes)) => {
-                    image = Some(bytes);
-                    images += 1;
-                    assert!(imaged.image_durable(mark.name), "seed {seed}: {step}");
+            // An image is written only of a quiet journal: what was committed is durable first.
+            0 => {
+                settle(&mut sim, &mut imaged);
+                match image_of(&mut imaged) {
+                    Ok((mark, bytes)) => {
+                        image = Some(bytes);
+                        images += 1;
+                        assert!(imaged.image_durable(mark.name), "seed {seed}: {step}");
+                    }
+                    Err(ImageError::Busy) => {}
+                    Err(error) => panic!("seed {seed}: {step}: {error}"),
                 }
-                Err(ImageError::Busy) => {}
-                Err(error) => panic!("seed {seed}: {step}: {error}"),
-            },
+            }
             1 => {
                 let (back, found) =
                     Vfs::restore(file(), 0, &sim.contents(&file()), image.as_deref().map(mapping));
@@ -392,9 +454,9 @@ fn a_stop_at_any_step_of_moving_onto_an_image_loads_what_was_durable() {
     }
 }
 
-/// `main` with a small file and one spanning four page groups, its image durable and the
-/// journal rewritten onto it.
-fn imaged() -> (Vfs, Vec<u8>, ImageMark, Vec<u8>) {
+/// `main` with a small file and one spanning four page groups, its image durable (its texts
+/// in `texts`) and the journal rewritten onto it.
+fn imaged_in(texts: &dyn Texts) -> (Vfs, Vec<u8>, ImageMark, Vec<u8>) {
     let (mut vfs, mut sim) = start(1);
     let big: Vec<u8> = (0..4 << MIN_GROUP_SHIFT).map(|at: u32| (at % 253) as u8).collect();
     let ops = [
@@ -403,58 +465,66 @@ fn imaged() -> (Vfs, Vec<u8>, ImageMark, Vec<u8>) {
     ];
     vfs.commit("main", vfs.empty(), &ops).unwrap();
     settle(&mut sim, &mut vfs);
-    let (mark, image) = image_of(&mut vfs).unwrap();
+    let (mark, image) = image_in(&mut vfs, texts).unwrap();
     assert!(vfs.image_durable(mark.name));
     assert!(!vfs.image_durable(ContentId([7; 32])), "only the image last written");
     settle(&mut sim, &mut vfs);
     (vfs, image, mark, sim.contents(&file()))
 }
 
-/// Where the file at `path` of `main` is in the image's blobs section.
-fn place(vfs: &Vfs, path: &str) -> (u64, u64) {
+/// [`imaged_in`] the tests' store.
+fn imaged() -> (Vfs, Vec<u8>, ImageMark, Vec<u8>) {
+    imaged_in(&*texts())
+}
+
+/// The file node at `path` of `main`.
+fn node_at(vfs: &Vfs, path: &str) -> NodeId {
     let root = vfs.root(vfs.head("main").unwrap()).unwrap();
-    let (node, _) = vfs.tree.entry(root, path).unwrap();
-    let table = vfs.tree.table();
-    match table.source(table.shape(node.0)) {
-        Source::Mapped { at, len } => (at, len),
-        Source::Heap(_) => panic!("{path} is not the image's"),
-    }
+    vfs.tree.entry(root, path).unwrap().0
 }
 
-fn groups(at: u64, len: u64) -> std::ops::RangeInclusive<u32> {
-    (at >> MIN_GROUP_SHIFT) as u32..=((at + len - 1) >> MIN_GROUP_SHIFT) as u32
-}
-
+/// The invariant: a start asks the store for no text; the first read of a file asks for that
+/// file's alone, and a second read of it asks for nothing; the tree section is read whole.
+/// The control: a store that answers a read with another file's text is refused, naming the
+/// file (the read checks the text it is given, so a store or a key that is wrong is caught).
 #[test]
-fn a_start_reads_the_journals_tail_and_no_file_until_one_is_read() {
-    let (vfs, image, mark, journal) = imaged();
+fn a_start_reads_the_journals_tail_and_no_text_until_one_is_read() {
+    let held = HeldTexts::shared();
+    let (vfs, image, mark, journal) = imaged_in(&*held);
     assert_eq!(base_of(&journal), Some((mark.name, mark.nodes)));
     assert!(journal.len() < 512, "the journal holds no file the image has: {}", journal.len());
-    let (back, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&image)));
+    // clone: a count of the test's store.
+    let counted = Arc::new(Counted { held: Arc::clone(&held), gets: AtomicUsize::new(0) });
+    let texts: Arc<dyn Texts> = counted.clone(); // clone: a count, kept to read the counter
+    let (back, found) =
+        Vfs::restore(file(), 0, &journal, Some(ImageFile { file: Mapping::copy(&image), texts }));
     assert_eq!(found.image, ImageUse::Used { name: mark.name, nodes: mark.nodes, disks: None });
     assert_eq!(heads(&back), heads(&vfs));
+    assert_eq!(counted.gets.load(Ordering::Relaxed), 0, "a start reads no text");
 
-    let mapped = Arc::clone(back.tree.table().mapped().expect("a mapped base"));
-    let (image, blobs) = (&mapped.image, &mapped.blobs);
-    let checked = |group| image.is_checked(blobs, group);
-    assert!(blobs.groups >= 4);
-    assert!((0..blobs.groups).all(|group| !checked(group)), "a start reads no file");
     let root = back.root(back.head("main").unwrap()).unwrap();
     assert_eq!(back.tree.read(root, "small").unwrap(), Some(&b"small"[..]));
-    let (at, len) = place(&back, "small");
-    let small = groups(at, len);
-    for group in 0..blobs.groups {
-        assert_eq!(checked(group), small.contains(&group), "group {group}");
-    }
-    let tree = image.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap();
-    assert!((0..tree.groups).all(|group| image.is_checked(&tree, group)), "the tree, whole");
+    assert_eq!(counted.gets.load(Ordering::Relaxed), 1, "one read pages one text");
+    assert_eq!(back.tree.read(root, "small").unwrap(), Some(&b"small"[..]));
+    assert_eq!(counted.gets.load(Ordering::Relaxed), 1, "a text paged in is kept");
+    let mapped = Arc::clone(back.tree.table().mapped().expect("a mapped base"));
+    let tree = mapped.image.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap();
+    assert!((0..tree.groups).all(|group| mapped.image.is_checked(&tree, group)), "whole");
+
+    // The control: the store answers `dir/big` with `small`'s bytes.
+    let big = back.tree.id(node_at(&back, "dir/big"));
+    held.replace(&big, b"small");
+    let error = back.tree.read(root, "dir/big").unwrap_err();
+    let found = ContentId::of(FILE_DOMAIN, b"small");
+    assert_eq!(error.cause, Cause::Text { file: big, why: TextWhy::Mismatch { found, len: 5 } });
+    assert!(error.to_string().contains(&format!("{big:x}")), "{error}");
 }
 
 #[test]
 fn a_corrupt_disks_section_is_named_not_taken_for_another_schema() {
     let (_, image, _, journal) = imaged();
     let disks_at = {
-        let opened = Image::open(mapping(&image)).unwrap();
+        let opened = Image::open(Mapping::copy(&image)).unwrap();
         opened.section(SectionId::VFS_DISKS, DISKS_SCHEMA).unwrap().at
     };
     let mut corrupt = image.clone();
@@ -466,50 +536,222 @@ fn a_corrupt_disks_section_is_named_not_taken_for_another_schema() {
     assert_eq!(why.section, SectionId::VFS_DISKS);
 }
 
+/// The invariant: a file of the image whose text the store lacks reads as an error naming
+/// that file's ID (never as other bytes, never from another place), the VFS says so, and
+/// writing the same bytes again mends it. The control is the store before the text is
+/// dropped: the same read gives the file.
 #[test]
-fn a_corrupt_file_is_named_by_its_group_and_mended_by_writing_it_again() {
-    let (vfs, image, _, journal) = imaged();
-    let clean = Vfs::restore(file(), 0, &journal, Some(mapping(&image))).0;
-    let (big_at, big_len) = place(&clean, "dir/big");
-    let blobs_at = {
-        let opened = Image::open(mapping(&image)).unwrap();
-        opened.section(SectionId::VFS_BLOBS, BLOBS_SCHEMA).unwrap().at
+fn a_file_the_store_lacks_is_named_by_its_id_and_mended_by_writing_it_again() {
+    let held = HeldTexts::shared();
+    let (vfs, image, _, journal) = imaged_in(&*held);
+    let at = |held: &Arc<HeldTexts>| {
+        // clone: a count of the test's store.
+        let texts: Arc<dyn Texts> = held.clone();
+        Some(ImageFile { file: Mapping::copy(&image), texts })
     };
-    let bad = big_at + big_len / 2;
-    let mut corrupt = image.clone();
-    corrupt[(blobs_at + bad) as usize] ^= 1;
+    let clean = Vfs::restore(file(), 0, &journal, at(&held)).0;
+    let root = clean.root(clean.head("main").unwrap()).unwrap();
+    let big = vfs.tree.read(vfs.root(vfs.head("main").unwrap()).unwrap(), "dir/big").unwrap();
+    let big = big.expect("a file").to_vec();
+    assert_eq!(clean.tree.read(root, "dir/big").unwrap(), Some(&big[..]), "the control");
 
-    let (mut back, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&corrupt)));
+    let id = clean.tree.id(node_at(&clean, "dir/big"));
+    assert!(held.forget(&id));
+    let (mut back, found) = Vfs::restore(file(), 0, &journal, at(&held));
     assert!(matches!(found.image, ImageUse::Used { .. }), "{found:?}");
     assert_eq!(back.corrupt(), None, "nothing read yet");
-    let root = back.root(back.head("main").unwrap()).unwrap();
     assert_eq!(back.tree.read(root, "small").unwrap(), Some(&b"small"[..]));
     let error = back.tree.read(root, "dir/big").unwrap_err();
-    let group = (bad >> MIN_GROUP_SHIFT) as u32;
-    assert_eq!((error.section, error.group), (SectionId::VFS_BLOBS, group));
+    assert_eq!(error.section, SectionId::VFS_TREE);
+    assert_eq!(error.cause, Cause::Text { file: id, why: TextWhy::Missing });
+    assert!(error.to_string().contains(&format!("{id:x}")), "the error names the file: {error}");
     assert_eq!(back.corrupt(), Some(error));
     assert_eq!(
         OpError::from(error),
-        OpError::Corrupt { section: SectionId::VFS_BLOBS.0, group: error.group }
+        OpError::Corrupt { section: SectionId::VFS_TREE.0, group: error.group }
     );
-    // No image is written of bytes that are not there.
-    assert!(matches!(image_of(&mut back), Err(ImageError::Corrupt(it)) if it == error));
 
     // The same bytes written again (a scan of the disk, a checkout) are the node's again.
-    let big = vfs.tree.read(vfs.root(vfs.head("main").unwrap()).unwrap(), "dir/big").unwrap();
-    let bytes = big.expect("a file").to_vec();
-    let ops = [Op::Write { mode: Mode::Regular, path: "dir/big".into(), bytes }];
+    let ops = [Op::Write { mode: Mode::Regular, path: "dir/big".into(), bytes: big }];
     let main = back.head("main").unwrap();
     assert_eq!(back.commit("main", main, &ops).unwrap().root, main);
     assert_eq!(state(&back).files, state(&vfs).files);
-    assert!(image_of(&mut back).is_ok());
+    // An image is written only of a quiet journal: the commit is made durable first. It puts
+    // the mended text back.
+    settle(&mut Sim::new(5, Faults::default()), &mut back);
+    assert!(image_in(&mut back, &*held).is_ok());
+    assert!(held.has(&id), "the next image's write puts the text it names");
+}
+
+/// The invariant (persisted-state-round-trips): every file read from a restore of an image is,
+/// byte for byte, the file the tree that wrote it reads, and the image holds none of their
+/// bytes. The control: an image whose tree names an ID the store lacks fails that read,
+/// naming the ID.
+#[test]
+fn a_restore_reads_every_file_as_the_tree_that_wrote_it() {
+    let held = HeldTexts::shared();
+    let (mut vfs, mut sim) = start(21);
+    let mut rng = Rng::new(21);
+    // alloc: a test's ops
+    let ops: Vec<Op> = (0..40)
+        .map(|at| Op::Write {
+            mode: if at % 7 == 0 { Mode::Executable } else { Mode::Regular },
+            path: format!("d{}/f{at}", at % 5),
+            bytes: bytes(&mut rng),
+        })
+        .collect();
+    vfs.commit("main", vfs.empty(), &ops).unwrap();
+    settle(&mut sim, &mut vfs);
+    let (mark, image) = image_in(&mut vfs, &*held).unwrap();
+    assert!(vfs.image_durable(mark.name));
+    settle(&mut sim, &mut vfs);
+    for op in &ops {
+        let Op::Write { bytes, .. } = op else { unreachable!("writes") };
+        if bytes.len() >= 8 {
+            assert!(!contains(&image, bytes), "the image holds a file's bytes");
+        }
+    }
+    // clone: a count of the test's store.
+    let texts: Arc<dyn Texts> = held.clone();
+    let journal = sim.contents(&file());
+    let (back, found) =
+        Vfs::restore(file(), 0, &journal, Some(ImageFile { file: Mapping::copy(&image), texts }));
+    assert!(matches!(found.image, ImageUse::Used { .. }), "{found:?}");
+    assert_eq!(state(&back), state(&vfs), "every file read is the writer's, byte for byte");
+
+    // The control.
+    let gone = back.tree.id(node_at(&back, "d3/f3"));
+    held.forget(&gone);
+    // clone: a count of the test's store.
+    let texts: Arc<dyn Texts> = held.clone();
+    let (back, _) =
+        Vfs::restore(file(), 0, &journal, Some(ImageFile { file: Mapping::copy(&image), texts }));
+    let root = back.root(back.head("main").unwrap()).unwrap();
+    let error = back.tree.read(root, "d3/f3").unwrap_err();
+    assert_eq!(error.cause, Cause::Text { file: gone, why: TextWhy::Missing });
+}
+
+/// Whether `needle` is somewhere in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|it| it == needle)
+}
+
+/// The image of `n` files of `size` bytes each, under the same names.
+fn image_of_files(n: usize, size: usize) -> Vec<u8> {
+    let (mut vfs, mut sim) = start(31);
+    // alloc: a test's ops
+    let ops: Vec<Op> = (0..n)
+        .map(|at| {
+            let mut bytes = vec![(at % 251) as u8; size];
+            bytes[..8].copy_from_slice(&(at as u64).to_le_bytes());
+            Op::Write { mode: Mode::Regular, path: format!("lib/f{at:05}.rs"), bytes }
+        })
+        .collect();
+    vfs.commit("main", vfs.empty(), &ops).unwrap();
+    settle(&mut sim, &mut vfs);
+    let held = HeldTexts::new();
+    image_in(&mut vfs, &held).unwrap().1
+}
+
+/// The invariant: the image of a tree of N library files of B bytes in all is O(N),
+/// independent of B: 1,000 files of 16 bytes and of 4 KiB give images of one length, about
+/// 100 bytes a file. The control: an image that writes the texts back in (the layout before,
+/// planted) grows with B, and the same check fails.
+#[test]
+fn an_image_is_o_of_its_files_not_of_their_bytes() {
+    let (small, large) = (image_of_files(1000, 16), image_of_files(1000, 4 << 10));
+    assert_eq!(small.len(), large.len(), "an image's length is independent of its texts'");
+    assert!(large.len() < 1000 * 160, "about 100 bytes a file, not {}", large.len() / 1000);
+    let text_bytes = |image: &[u8]| {
+        let opened = Image::open(Mapping::copy(image)).unwrap();
+        let tree = opened.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap();
+        opened.slice::<u64>(&tree, 0, WORDS as u64).unwrap()[W_TEXT_BYTES]
+    };
+    assert_eq!(text_bytes(&large), 1000 * (4 << 10), "the header says the bytes it names");
+
+    PLANT_TEXTS.with(|it| it.set(true));
+    let planted = image_of_files(1000, 4 << 10);
+    PLANT_TEXTS.with(|it| it.set(false));
+    assert!(planted.len() > 1000 * (4 << 10), "the control writes the texts in");
+    assert_ne!(small.len(), planted.len(), "the control is caught by the length check");
+}
+
+thread_local! {
+    /// A planted bug, for [`an_image_is_o_of_its_files_not_of_their_bytes`]'s control: the
+    /// image's writer writes every file's bytes into a section of their own again.
+    pub(crate) static PLANT_TEXTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The invariant: an image is never written naming a text that is not durable in the store:
+/// with the store's puts held back, the write is refused and nothing is written; once they are
+/// durable the same write succeeds. The control: the store as it is (durable puts) writes it.
+#[test]
+fn an_image_waits_for_its_texts_to_be_durable() {
+    let (mut vfs, mut sim) = start(41);
+    let ops = [Op::Write { mode: Mode::Regular, path: "a".into(), bytes: b"a text".to_vec() }];
+    vfs.commit("main", vfs.empty(), &ops).unwrap();
+    settle(&mut sim, &mut vfs);
+    let held = HeldTexts::new();
+    held.hold_back(true);
+    let mut builder = Builder::with_group_shift(MIN_GROUP_SHIFT);
+    assert_eq!(vfs.write_image(&mut builder, &held), Err(ImageError::Storing));
+    let unwritten = Image::open(Mapping::copy(&builder.finish().unwrap())).unwrap();
+    assert!(
+        matches!(unwritten.section(SectionId::VFS_TREE, TREE_SCHEMA), Err(Refused::Missing { .. })),
+        "nothing is written of an image whose texts are not durable"
+    );
+    assert!(held.has(&ContentId::of(FILE_DOMAIN, b"a text")), "the text was put");
+    held.hold_back(false);
+    assert!(image_in(&mut vfs, &held).is_ok(), "the control: durable texts, an image");
+}
+
+/// The invariant (persisted-state-round-trips): an image of the layout before (tree 2, whose
+/// files were ranges of a blobs section) is a named miss, refused by its schema, and the
+/// journal is loaded alone, as `Vfs::recover` loads it; never a tree read as this layout. The
+/// control: the same section under this layout's schema is not refused by schema.
+#[test]
+fn an_image_of_the_layout_before_is_refused_by_its_schema() {
+    const TREE_2: blaze_format::SchemaHash = schema(
+        "blaze v2 vfs tree 2: header [u64; 30]; ids ContentId; shapes [u32; 2]; entry names u32; \
+         entry nodes u32; entry modes u8; files [u64; 2]; index u32; spans [u32; 2]; name bytes u8; \
+         name index u32 by SipHash-1-3 under the header's key, blaze_ids::index_key of the names",
+    );
+    let (_, image, _, journal) = imaged();
+    let opened = Image::open(Mapping::copy(&image)).unwrap();
+    let section = opened.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap();
+    let tree = opened.whole(&section).unwrap().to_vec();
+    let old = |schema| {
+        let mut builder = Builder::with_group_shift(MIN_GROUP_SHIFT);
+        builder.add(SectionId::VFS_TREE, schema, &tree);
+        builder.add(SectionId(0x0301), schema_blobs(), b"the bytes of every file");
+        builder.finish().unwrap()
+    };
+    let (back, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&old(TREE_2))));
+    assert_eq!(
+        found.image,
+        ImageUse::Refused(Refused::Schema {
+            id: SectionId::VFS_TREE,
+            found: TREE_2,
+            wanted: TREE_SCHEMA
+        })
+    );
+    let (alone, want) = Vfs::recover(file(), 0, &journal);
+    assert_eq!(heads(&back), heads(&alone), "the journal alone");
+    assert_eq!(found.heads_dropped, want.heads_dropped);
+    let (_, control) = Vfs::restore(file(), 0, &journal, Some(mapping(&old(TREE_SCHEMA))));
+    assert!(!matches!(control.image, ImageUse::Refused(_)), "{:?}", control.image);
+}
+
+/// The schema the retired blobs section was written with.
+fn schema_blobs() -> blaze_format::SchemaHash {
+    schema("blaze v2 vfs blobs 1: file bytes")
 }
 
 #[test]
 fn a_corrupt_tree_leaves_the_image_unused_and_says_so() {
     let (_, image, mark, journal) = imaged();
     let tree_at = {
-        let opened = Image::open(mapping(&image)).unwrap();
+        let opened = Image::open(Mapping::copy(&image)).unwrap();
         opened.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap().at
     };
     let mut corrupt = image.clone();
@@ -524,9 +766,10 @@ fn a_corrupt_tree_leaves_the_image_unused_and_says_so() {
     assert_eq!(back.head("main"), None);
 
     // An image this journal does not start from, nor was written over, is not used.
-    let (mut other, _) = start(9);
+    let (mut other, mut other_sim) = start(9);
     let ops = [Op::Write { mode: Mode::Regular, path: "x".into(), bytes: b"x".to_vec() }];
     other.commit("main", other.empty(), &ops).unwrap();
+    settle(&mut other_sim, &mut other);
     let (theirs, unrelated) = image_of(&mut other).unwrap();
     let (_, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&unrelated)));
     assert_eq!(found.image, ImageUse::Unnamed { image: theirs.name, journal: Some(mark.name) });

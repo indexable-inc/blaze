@@ -1,0 +1,14 @@
+{
+ "id": "restart-rehashes-outputs",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor R1 of 6b-restart-rest, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job/{certificate,certify,request}.rs, serve/local.rs",
+ "what": "A restarted daemon answered a no-op request through a job: its request certificate's evidence (the outputs' stamps), the tool's hash and the library's place lived only in the daemon's memory, so the first check after a start hashed every output again, hashed its own binary and waited for the late library job. Measured by the parent on the Mac: restart then no-op 2,685 ms against 128 ms warm; the competitor answers either in 28 ms. The evidence also kept its own two-field stamp (len, changed time) and its own racy constant beside the VFS's.",
+ "cost": "every restart paid a full output hash and a binary hash; two stamp types and two racy windows to keep true",
+ "cause": "evidence that must outlive the process was kept as process state, not as durable marks, and the stamp it compared had a second home",
+ "class": "durable facts held only in memory, so a start recomputes what it knew; one concept with two homes (the stamp, the racy window)",
+ "prevention": "the evidence's changes drain into the journal's marks (local::Placed, Tool, LibraryMark) and a start seeds from them; the stamp is blaze_core::Stamp compared whole and the window is blaze_vfs::racy alone",
+ "workaround": "none",
+ "fix": "Evidence::seeded/drain_changed over PLACED marks, the TOOL mark under two equal looks, the LIBRARY mark vouched by the digest file's stamp and the restored mounts. Controls: marks_through_crashes_vouch_only_for_what_the_files_hold catches keep_racy; the_oracle_catches_a_start_that_drops_the_marks.",
+ "state": "written, not yet compiled (executor rules: no build)"
+}

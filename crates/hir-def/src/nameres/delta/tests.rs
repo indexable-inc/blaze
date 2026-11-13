@@ -1386,6 +1386,39 @@ fn the_oracle_catches_a_woken_group_whose_log_is_not_read_again() {
     ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
 }
 
+/// The invariant: a crate given the proc macros it has is given nothing: `give` says nothing
+/// changed, no input is written (the view is the one before) and no maintainer runs, so no
+/// def map resolves again. A build loads every proc macro's expanders again; a build of reth
+/// with nothing changed wrote the map of every crate's macros 53 times, at `HIGH`.
+#[test]
+fn a_crate_given_the_macros_it_has_is_given_nothing() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, main, pm, given) = a_macro_that_declares_a_module();
+    assert!(ProcMacros::give(&mut loaded.db, [(pm, Ok(given.clone()))]), "its first macros");
+    assert_eq!(imports_from_the_made_module(&loaded.db, main), [true, true]);
+    let (view, passes) = (blaze_query::db::Database::storage(&loaded.db).view(), loaded.db.maintain_passes());
+    assert!(!ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]), "the macros it has");
+    assert_eq!(blaze_query::db::Database::storage(&loaded.db).view(), view, "an input was written");
+    assert_eq!(loaded.db.maintain_passes(), passes, "the maintainers ran");
+    assert_eq!(imports_from_the_made_module(&loaded.db, main), [true, true]);
+}
+
+/// The control of the invariant above: with `give` writing a list though it is the one the
+/// crate has, as it did until 2026-11-12, it says the crate's list changed and the
+/// maintainers run for it.
+#[test]
+fn the_oracle_catches_a_crate_given_the_macros_it_has_as_a_change() {
+    use hir_expand::proc_macro::{GIVES_EQUAL_LISTS, ProcMacros};
+    let (mut loaded, _, pm, given) = a_macro_that_declares_a_module();
+    assert!(ProcMacros::give(&mut loaded.db, [(pm, Ok(given.clone()))]));
+    let passes = loaded.db.maintain_passes();
+    GIVES_EQUAL_LISTS.set(true);
+    let changed = ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    GIVES_EQUAL_LISTS.set(false);
+    assert!(changed, "planted: an equal list is given as a change");
+    assert!(loaded.db.maintain_passes() > passes, "planted: the maintainers run for it");
+}
+
 /// The expanders of the macros `names` of the proc-macro crate `pm`, in its own map: whether
 /// each is one the crate's list gave.
 fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {
@@ -1725,4 +1758,62 @@ fn the_oracle_catches_an_include_whose_file_is_not_kept() {
         !failures.is_empty(),
         "`lib` kept the map from before its included file gained `more`, and the oracle found no difference"
     );
+}
+
+/// The fields below `HIGH` that the rows of `db` read, as `Struct.field` with how many of
+/// each: what the durability census names.
+fn fields_below_high(db: &Db) -> Vec<(String, u64)> {
+    let census = blaze_query::db::Database::storage(db).durability_census();
+    census.blockers.iter().map(|it| (format!("{}.{}", it.ingredient, it.field), it.fields)).collect()
+}
+
+/// How many def maps (`crate_local_def_map`'s pairs) of kind below `HIGH` a row of `db` reads.
+fn def_maps_below_high(db: &Db) -> u64 {
+    fields_below_high(db)
+        .iter()
+        .filter(|(name, _)| name == "DefMapPair.def_map")
+        .map(|(_, fields)| *fields)
+        .sum()
+}
+
+const A_WORKSPACE_CRATE_OVER_A_LIBRARY: &str = r#"
+//- /main.rs crate:main deps:lib
+use lib::m::S;
+pub fn f() -> S { S }
+//- /lib.rs crate:lib KIND
+pub mod m;
+//- /m.rs
+pub struct S;
+pub fn g() {}
+"#;
+
+/// Asks `db` for the def map of each crate and the scopes of its modules.
+fn ask_every_def_map(db: &Db) {
+    for &krate in all_crates(db).iter() {
+        let map = crate_local_def_map(db, krate).def_map(db);
+        for (id, _) in map.modules(db) {
+            _ = map.module(db, id).scope(db).entries().count();
+        }
+    }
+}
+
+/// The invariant: a library crate's def map, and every row that reads it, is of kind `HIGH`: the
+/// table that finds its resolution is the libraries' own, apart from the workspace's
+/// (`publish::LibraryResolutions`), so the workspace crate's rows that read it read a `HIGH`
+/// field, and a workspace edit's walk has no row of the library to verify.
+#[test]
+fn a_library_crates_def_map_reads_nothing_below_high() {
+    let loaded = Loaded::new(&A_WORKSPACE_CRATE_OVER_A_LIBRARY.replace("KIND", "library new_source_root:library"));
+    ask_every_def_map(&loaded.db);
+    let fields = fields_below_high(&loaded.db);
+    assert_eq!(def_maps_below_high(&loaded.db), 0, "`main` reads `lib`'s def map below HIGH: {fields:?}");
+}
+
+/// The control: the same crate found through the workspace's table (a local crate, as every
+/// crate was found until 2026-11-12) has its def map below `HIGH`, and the count says so.
+#[test]
+fn the_oracle_catches_a_library_found_through_the_workspaces_table() {
+    let loaded = Loaded::new(&A_WORKSPACE_CRATE_OVER_A_LIBRARY.replace("KIND", "new_source_root:local"));
+    ask_every_def_map(&loaded.db);
+    assert_eq!(def_maps_below_high(&loaded.db), 1, "{:?}", fields_below_high(&loaded.db));
 }

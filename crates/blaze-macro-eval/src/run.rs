@@ -129,8 +129,8 @@ pub(crate) struct Expansion<'a> {
 pub(crate) struct Ran {
     /// The output, or the macro's panic message.
     pub(crate) output: Result<Stream, String>,
-    /// Whether it learned of a span what its key does not say.
-    pub(crate) asked: bool,
+    /// What it first learned of a span that its key does not say, if anything.
+    pub(crate) asked: Option<crate::server::Asked>,
     pub(crate) tracked: Vec<String>,
     pub(crate) emitted: Vec<Emitted>,
     /// What it read, each line as `assemble_seen` takes it.

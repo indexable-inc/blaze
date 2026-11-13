@@ -17,7 +17,7 @@
 //! its deref is the slice, one load of a pointer and a length. The check is std's, after the
 //! ASCII the bytes start with is skipped 64 bytes at a time.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
 

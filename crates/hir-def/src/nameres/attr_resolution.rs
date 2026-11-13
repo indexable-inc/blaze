@@ -112,8 +112,8 @@ impl DefMap {
             // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
             // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
             // and `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`,
-            // `#[blaze::may(..)]` and `#![blaze::effects]` (`hir-ty-pure`, from
-            // `AttrFlags::effect_attr`, `AttrFlags::may_attr` and `AttrFlags::BLAZE_EFFECTS`),
+            // `#[blaze::expect(..)]` and `#![blaze::effects]` (`hir-ty-pure`, from
+            // `AttrFlags::effect_attr`, `AttrFlags::expect_attr` and `AttrFlags::BLAZE_EFFECTS`),
             // and `#![blaze::specialization]`
             // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
             // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
@@ -131,6 +131,10 @@ impl DefMap {
                         | "nopanic"
                         | "noalloc"
                         | "nonblocking"
+                        | "expect"
+                        // `#[blaze::may(..)]`, the deleted spelling of `expect`: inert here so
+                        // that it is refused by name, with the fix that respells it
+                        // (blaze-lints' `blaze::undeclared_effect`), not as an unresolved macro.
                         | "may"
                         | "effects"
                         | "specialization"
@@ -142,6 +146,10 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::edition = "2026.11"]`, the crate's blaze edition, read off
+                        // the root's tokens (`base_db::Crate::blaze_edition`,
+                        // docs/v2/plan/design/std.md, "The blaze edition: opting in").
+                        | "edition"
                         // `#![blaze::handles]`, from `DefMap::handles`, and the effect
                         // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
                         // (docs/v2/plan/design/edition.md, change 1).

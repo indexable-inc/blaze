@@ -1,0 +1,101 @@
+== 7000 ms
+ ▶ core  names    1.9s  ← 344 wait on it
+ building  ━━━────────────────  78/423 · 1 running · 7.0s
+== 14000 ms
+ ▶ anyhow (build script)       names    0.7s  ← 15 wait on it
+ ▶ crossbeam-deque (build sc…  names    0.7s  ← 20 wait on it
+ ▶ crossbeam-epoch (build sc…  names    0.7s  ← 25 wait on it
+ ▶ crossbeam-utils (build sc…  names    0.7s  ← 30 wait on it
+ ▶ libc (build script)         names    0.7s  ← 40 wait on it
+ ▶ ripgrep (build script)      names    0.7s  ← 10 wait on it
+   … 6 more running
+ building  ━━━━━━━━━━━━───────  269/423 · 13 running · 14.0s
+== 20000 ms
+ ▶ globset                     codegen    6.4s  ← 22 wait on it
+ ▶ serde_json (build script)   codegen    5.7s  ← 23 wait on it
+ ▶ crossbeam-deque (build sc…  codegen    5.5s  ← 18 wait on it
+ ▶ crossbeam-epoch (build sc…  codegen    5.5s  ← 23 wait on it
+ ▶ crossbeam-utils (build sc…  codegen    5.5s  ← 28 wait on it
+ ▶ zmij (build script)         codegen    4.8s  ← 28 wait on it
+   … 6 more running
+ building  ━━━━━━━━━━━━━──────  297/423 · 12 running · 20.0s
+== 27000 ms
+ ▶ crossbeam-deque (build sc…  run build script    3.2s  ← 15 wait on it
+ ▶ crossbeam-epoch (build sc…  run build script    3.2s  ← 20 wait on it
+ ▶ crossbeam-utils (build sc…  run build script    3.2s  ← 25 wait on it
+ ▶ libc (build script)         run build script    3.2s  ← 35 wait on it
+ ▶ ripgrep (build script)      run build script    3.2s  ← 5 wait on it
+ ▶ serde (build script)        run build script    3.2s  ← 20 wait on it
+   … 4 more running
+ building  ━━━━━━━━━━━━━━─────  333/423 · 10 running · 27.0s
+== 33000 ms
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:104:13
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+ ▶ anyhow (build script)  run build script    8.6s  ← 10 wait on it
+ building  ━━━━━━━━━━━━━━━━━━─  412/423 · 1 running · 33.0s
+== 40000 ms
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:104:13
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+ ▶ ripgrep (bin rg)  codegen    5.6s  ← 2 wait on it
+ building  ━━━━━━━━━━━━━━━━━━─  420/423 · 1 running · 40.0s
+== end
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:104:13
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+✓ built 81 units, 4 cached in 45.8s ·  · tier 0 · 3 warnings · blaze slow says w
+hy
+⚠ 1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained
+) (3 times) · blaze explain why:unexplained

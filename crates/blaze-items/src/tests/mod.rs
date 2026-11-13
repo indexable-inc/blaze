@@ -9,9 +9,10 @@ mod goals;
 mod hashes;
 mod mem;
 mod narrow;
+mod own_tables;
 mod table;
 
-use hir_def::{ModuleDefId, nameres::crate_def_map};
+use hir_def::{ModuleDefId, ModuleId, nameres::crate_def_map};
 use hir_expand::fixture;
 
 use crate::{ItemId, key};
@@ -64,6 +65,16 @@ pub(crate) fn item(db: &TestDB, path: &str) -> ItemId {
         [one] => one,
         _ => panic!("{} items at `{path}`: {found:?}", found.len()),
     }
+}
+
+/// The module of the fixture's crate named `name`.
+#[track_caller]
+pub(crate) fn module(db: &TestDB, name: &str) -> ModuleId {
+    crate_def_map(db, fixture::test_crate(db))
+        .modules(db)
+        .map(|(id, _)| id)
+        .find(|id| id.name(db).is_some_and(|it| it.as_str() == name))
+        .unwrap_or_else(|| panic!("no module `{name}`"))
 }
 
 /// The database of a one-file fixture, and a way to set that file's text.

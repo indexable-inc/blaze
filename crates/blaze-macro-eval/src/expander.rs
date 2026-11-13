@@ -205,6 +205,83 @@ struct Library {
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
     settled: Lock<Option<Settled>>,
+    /// How many runs that moved state on were said since it loaded ([`MOVED_SAID`] at most).
+    moved_said: std::sync::atomic::AtomicU32,
+}
+
+/// The most runs that moved state on a library says by name since it loaded.
+const MOVED_SAID: u32 = 8;
+
+thread_local! {
+    /// A planted bug, for a test's control: an output that is kept by no store is never shown
+    /// to be the same from either state, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static UNWRITABLE_IS_UNSHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a call of a session that moved on, or of a crate
+    /// whose state is not known, is never run again from the fresh state, so its reads stay
+    /// unknown, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static FRESH_IS_NOT_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a library loaded once the store has a verdict of
+    /// its crate is another than the one loaded before the store had seen it, as until
+    /// 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static VERDICT_LEARNED_IS_ANOTHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn planted_unwritable_is_unshown() -> bool {
+    UNWRITABLE_IS_UNSHOWN.get()
+}
+
+impl Library {
+    /// Whether `other` is this library, or one loaded again of the same crate that runs the
+    /// same code ([`Library::runs`]: the crate's code and its module) for the same daemon and
+    /// toolchain, the store saying of its state what it said of this one's. Such a load gives
+    /// its crate the expanders it has: every expansion of either gives the same, so the one
+    /// the front end holds stays (with its sessions, which start again each revision) and
+    /// nothing is written (`ProcMacros::give`). A verdict the store learned since (a crate
+    /// first seen in the build before) leaves it the same library; one verdict replaced by
+    /// another (settles, then stateful) is another library.
+    fn same(self: &Arc<Library>, other: &Arc<Library>) -> bool {
+        Arc::ptr_eq(self, other) || self.differs(other).is_none()
+    }
+
+    /// What of `other`, a library loaded for the same crate, is not as it is of this one:
+    /// why its expanders replace this one's, or none.
+    fn differs(&self, other: &Library) -> Option<&'static str> {
+        if !Arc::ptr_eq(&self.macros, &other.macros) {
+            Some("the daemon's macros they are kept by")
+        } else if self.krate != other.krate {
+            Some("the crate")
+        } else if self.toolchain != other.toolchain {
+            Some("the toolchain")
+        } else if self.loaded != other.loaded {
+            Some("the crate's code")
+        } else if self.runs != other.runs {
+            Some("the module its code was built into")
+        } else if self.seen.verdict() != other.seen.verdict()
+            && (VERDICT_LEARNED_IS_ANOTHER.get()
+                || !(self.seen.verdict() == Verdict::Unseen || other.seen.verdict() == Verdict::Unseen))
+        {
+            // Two verdicts the store gave, not one learned: a crate the store had not seen
+            // when one of the two loaded is the same library once the store has seen it. Its
+            // calls are judged one by one whatever the verdict (each is kept only when it
+            // gives what the fresh state gives), so the verdict arriving changes no
+            // expansion. Taken as another library, every macro crate's expanders were given
+            // again in the build after the one that first ran it: a hello-world's second
+            // `blaze run` set 7 crates' macros, ran 86 expansions again and took 3.1 s where
+            // the third took 0.26 s; reth's first build after a cold one set 47.
+            Some("what the store says of the state its expansions leave")
+        } else {
+            None
+        }
+    }
 }
 
 /// The settled state of a crate that settles: its digest ([`start_digest`]), and the statics,
@@ -398,10 +475,16 @@ impl Library {
             // alloc: once per calling crate and revision
             at,
             made_of: made_of.map(|it| it.map(str::to_owned)), // alloc: as above
-            map: roots.to_map(|map| match &self.macros.sources {
-                Some(sources) => map.with_sources(sources),
-                None => map,
-            }),
+            // Made once per calling crate and revision for every job that expands there: no
+            // build keeps the looks resolving the roots' links makes, and what the expansion
+            // read is in the reads of the unit's record, which each build using it takes.
+            map: roots.to_map(
+                |map| match &self.macros.sources {
+                    Some(sources) => map.with_sources(sources),
+                    None => map,
+                },
+                &blaze_vfs::outside::Looks::none(),
+            ),
         });
         pinned.insert(calling, Arc::clone(&kept)); // clone: as above
         kept
@@ -716,7 +799,18 @@ fn load_on(
         turns: Turns::default(),
         kept_roots: SharedMap::default(),
         settled: Lock::new("macro.library.settled", None),
+        moved_said: std::sync::atomic::AtomicU32::new(0),
     });
+    // Said once a load: what the crate's macros run and what the store says of their state,
+    // so two loads of one crate that give other expanders say what moved between them.
+    tracing::info!(
+        target: "blaze",
+        krate = %library.name,
+        code = %format_args!("{:x}", library.loaded),
+        runs = %format_args!("{:x}", library.runs),
+        verdict = ?library.seen.verdict(),
+        "a proc-macro crate's expanders loaded"
+    );
     macros.libraries.lock().push(Arc::downgrade(&library));
     // None for a proc-macro crate with none, which rustc builds: a use fails at the use.
     let functions = run::functions(db, krate);
@@ -885,7 +979,7 @@ impl Evaluated {
                 }
             };
             tracing::Span::current().record("ahead", true);
-            if ran.asked {
+            if ran.asked.is_some() {
                 // What it asked the database of a span was read outside this query, which so
                 // depends on nothing it read: run again in the next revision.
                 blaze_query::db::report_untracked_read(
@@ -908,11 +1002,45 @@ impl Evaluated {
             self.run_on(db, calling, call, &preset, replayed, &this)?
         };
         let left_holding = ran.statics.iter().any(|it| it.2);
-        library.saw(match () {
+        let left = match () {
             () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
             () if stateless && !left_holding => Left::First,
             () => Left::Moved,
-        })?;
+        };
+        // A run that moved state on is why its crate is stateful, and every unit that calls
+        // a stateful crate's macros is kept by no record: said, the first few times a load,
+        // with the statics it changed by name (rule 19). reth's `jsonrpsee_proc_macros` was
+        // stateful with nothing saying which static moved (2026-11-12).
+        if left == Left::Moved
+            && library.moved_said.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MOVED_SAID
+        {
+            // alloc: a few times a load of a stateful crate, the names of what it changed
+            let statics: Vec<String> = ran
+                .statics
+                .iter()
+                .map(|(id, bytes, holds)| {
+                    use hir_def::HasModule as _;
+                    format!(
+                        "{}::{} ({} bytes{})",
+                        id.module(db).krate(db).named(db),
+                        hir_def::signatures::StaticSignature::of(db, *id).name.as_str(),
+                        bytes.len(),
+                        if *holds { ", holds an address" } else { "" },
+                    )
+                })
+                .collect();
+            tracing::info!(
+                target: "blaze",
+                krate = %library.name,
+                r#macro = %self.name,
+                calling = %calling.named(db),
+                replayed = from.replayed,
+                from_fresh = stateless,
+                statics = %statics.join(", "),
+                "a proc macro's run moved its session's state on"
+            );
+        }
+        library.saw(left)?;
         let Some(mut session) = turn.update() else { return Ok((ran, from)) };
         if !ran.statics.is_empty() {
             session.holds |= left_holding;
@@ -1142,26 +1270,27 @@ impl Evaluated {
         call: &ProcMacroCall<'_>,
         ran: &Ran,
         from: From,
+        output: &tt::TopSubtree,
         bytes: Option<&[u8]>,
         spans: &Spans,
         demote: bool,
     ) -> Result<Result<(), &'static str>, ProcMacroExpansionError> {
-        const UNSHOWN: &str = "its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one";
         const DIFFERS: &str = "its macro's crate settles, yet it gives otherwise from the fresh state than from the settled one, or its first calls leave other states: what it gives depends on whether it ran first";
         let library = &*self.library;
-        let Some(bytes) = bytes else { return Ok(Err(UNSHOWN)) };
         let (at, _) = db.nonce_and_revision();
         // The settled state, and the statics to run the other state from: none for the fresh.
         let other: Vec<(StaticId, Vec<u8>)> = match (from.replayed, from.start) {
-            (true, _) => return Ok(Err(UNSHOWN)),
+            (true, _) => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": it ran after its session's calls before it again"))),
             // From the fresh state: the settled one is what it left, or, when it left the state
             // as it was, the one first calls left before.
-            (false, None) if ran.statics.iter().any(|it| it.2) => return Ok(Err(UNSHOWN)),
+            (false, None) if ran.statics.iter().any(|it| it.2) => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": the state it left holds an address"))),
             (false, None) if !ran.statics.is_empty() => {
                 // clone: once per first call of a session of a crate that settles
                 let statics: Vec<(StaticId, Vec<u8>)> =
                     ran.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
-                let Some(digest) = start_digest(db, &statics) else { return Ok(Err(UNSHOWN)) };
+                let Some(digest) = start_digest(db, &statics) else {
+                    return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": the state it left has no digest")));
+                };
                 let mut settled = library.settled.lock();
                 if settled.as_ref().is_some_and(|it| it.digest != digest) {
                     drop(settled);
@@ -1178,7 +1307,7 @@ impl Evaluated {
             (false, None) => match &*library.settled.lock() {
                 // clone: once per such call, the statics it runs from
                 Some(it) if it.at == at => it.statics.clone(),
-                _ => return Ok(Err(UNSHOWN)),
+                _ => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": it ran from the fresh state and left it, and no first call of this database has left the settled state yet"))),
             },
             // From the settled state: the other is the fresh one.
             (false, Some(digest)) => {
@@ -1206,8 +1335,8 @@ impl Evaluated {
             .entered();
             self.run_on(db, calling, call, &other, &[], &this)?
         };
-        if again.asked || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
-            return Ok(Err(UNSHOWN));
+        if again.asked.is_some_and(|it| !it.by_position()) || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
+            return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": its run from the other state asked what no key covers, read what can't be keyed or left an address")));
         }
         // What the extra run did to the state says the crate's state too: from the settled
         // state it changes nothing, and from the fresh one it leaves nothing or the settled
@@ -1229,8 +1358,20 @@ impl Evaluated {
             }
             return Ok(Err(DIFFERS));
         }
-        let gave = self.output(&again, call.call_site).ok().and_then(|it| written(&it, spans));
-        match gave.as_deref() == Some(bytes) {
+        // The two outputs as they are kept, or, for an output that is kept by no store (it
+        // has an anchor or a context its input has not: a span the database joined for it),
+        // the two trees themselves, which are of one database and one revision. Until
+        // 2026-11-12 such an output was never shown, so a serde derive on a struct a
+        // `macro_rules!` made (its spans joined across two items) left its unit, and every
+        // unit above it, with no record: 46 units of reth made again in every build.
+        let again_tree = self.output(&again, call.call_site).ok();
+        let same = match bytes {
+            Some(bytes) => {
+                again_tree.as_ref().and_then(|it| written(it, spans)).as_deref() == Some(bytes)
+            }
+            None => again_tree.as_ref() == Some(output) && !planted_unwritable_is_unshown(),
+        };
+        match same {
             true => Ok(Ok(())),
             false => {
                 if demote {
@@ -1239,6 +1380,36 @@ impl Evaluated {
                 Ok(Err(DIFFERS))
             }
         }
+    }
+
+    /// Whether `call`, which gave `output` in its session, gives the same run once more from
+    /// the fresh state, outside the session: then `output` is what the call's own inputs
+    /// give. Not shown when the run asks what no key covers or reads what can't be keyed.
+    fn same_from_fresh(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: &ProcMacroCall<'_>,
+        output: &tt::TopSubtree,
+    ) -> Result<bool, ProcMacroExpansionError> {
+        if FRESH_IS_NOT_TRIED.get() {
+            return Ok(false);
+        }
+        let this = self.kept(db, calling, call);
+        let again = {
+            // Its own span, beside the run's `macro expand`: the extra run this check costs.
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "proc macro expansion again from the fresh state",
+                r#macro = %MacroPath(self),
+            )
+            .entered();
+            self.run_on(db, calling, call, &[], &[], &this)?
+        };
+        if again.asked.is_some_and(|it| !it.by_position()) || again.unkeyable.is_some() {
+            return Ok(false);
+        }
+        Ok(self.output(&again, call.call_site).ok().as_ref() == Some(output))
     }
 
     /// Expands `call` from `calling`'s session, found or run, and states what it read and
@@ -1343,8 +1514,16 @@ impl Evaluated {
                     };
                     // A crate whose session's state is not known not to matter: what a call read
                     // does not fix what it gives (what calls ran before it does too).
+                    // Unless the value found is of the fresh state (its key says no start
+                    // state): then it is what a run from the fresh state gave, which is what
+                    // the call's own inputs give ([`Self::same_from_fresh`]); or, for an
+                    // unseen crate, of a state a first call left and shown to be the same
+                    // from either (`shown`: its key says so).
+                    let of_fresh = matches!(start, Some(None));
                     let reads = match verdict {
                         Verdict::Stateless | Verdict::Settles => reads,
+                        Verdict::Unseen | Verdict::Stateful if of_fresh => reads,
+                        Verdict::Unseen if shown => reads,
                         Verdict::Unseen | Verdict::Stateful => ExpansionReads::Unknown(UNSETTLED),
                     };
                     match keeping.mode {
@@ -1354,7 +1533,16 @@ impl Evaluated {
                             self.found(db, calling, &call)?;
                             // Found under its key, which a crate that settles keeps only shown
                             // calls under (`shown`).
-                            return Ok(Expanded { tree, reads, state: state_use(verdict, true) });
+                            // A value of the fresh state (or shown the same from either)
+                            // is fixed by its call and reads, whatever its crate's verdict.
+                            let state = match reads {
+                                ExpansionReads::Unknown(_) => state_use(verdict, true),
+                                _ if matches!(verdict, Verdict::Unseen | Verdict::Stateful) => {
+                                    StateUse::Fixed
+                                }
+                                _ => state_use(verdict, true),
+                            };
+                            return Ok(Expanded { tree, reads, state });
                         }
                         Mode::Check => found = Some((checked(value), reads, verified)),
                     }
@@ -1429,9 +1617,13 @@ impl Evaluated {
         let unknown = |tree: tt::TopSubtree, why: &'static str| {
             done(tree, ExpansionReads::Unknown(why), state_use(verdict, false))
         };
-        if ran.asked {
-            return unknown(output, "it asked the database");
+        // A question the calling crate's identity covers (`Asked::by_position`) leaves its
+        // reads known: the unit and the image made from it are kept. Its own key does not
+        // say the answer, so it is put in no store (below).
+        if let Some(asked) = ran.asked.filter(|it| !it.by_position()) {
+            return unknown(output, asked.why());
         }
+        let asked = ran.asked.is_some();
         // Kept only from the state its key says, left as it was: a hit then gives what a run
         // gives and leaves the session as the run would. Otherwise it is not kept.
         let session = from.replayed || !ran.statics.is_empty() || start != Some(from.start);
@@ -1451,10 +1643,23 @@ impl Evaluated {
             changed: !ran.statics.is_empty(),
             left_address: ran.statics.iter().any(|it| it.2),
         };
-        if session && !session_reads_known(verdict, left) {
+        // Unless it is shown to give what a run from the fresh state gives: then what it gave
+        // is what its own inputs give, whatever ran before it (a cache of what a macro
+        // looked up, as `proc_macro_crate::CACHE`, moves on and changes no output; a counter
+        // does, and is not shown). A call that started from the fresh state is that run; any
+        // other is run once more, from the fresh state, outside its session. So a unit whose
+        // macros keep such state, or whose macro crate the store has not seen yet (every
+        // crate, in the first build that runs it), has a record: until 2026-11-12 neither
+        // had, and 7 units of reth (jsonrpsee's `#[rpc]`) were made again in every build and
+        // 217 in the first build after a cold one.
+        let unsettled = matches!(verdict, Verdict::Unseen | Verdict::Stateful);
+        let moved = session && !session_reads_known(verdict, left);
+        let fresh_shown = (moved || unsettled)
+            && (left.fresh || self.same_from_fresh(db, calling, &call, &output)?);
+        if moved && !fresh_shown {
             return unknown(
                 output,
-                "its macro keeps a session that does not settle, or it moved its session's state on: its output depends on the calls before it, which ran in no order a key fixes",
+                "its macro keeps a session that does not settle, or it moved its session's state on, and it gives otherwise from the fresh state: its output depends on the calls before it, which ran in no order a key fixes",
             );
         }
         if !ran.emitted.is_empty() {
@@ -1507,6 +1712,7 @@ impl Evaluated {
                 &call,
                 &ran,
                 from,
+                &output,
                 bytes.as_deref(),
                 &spans,
                 true,
@@ -1521,6 +1727,7 @@ impl Evaluated {
                     &call,
                     &ran,
                     from,
+                    &output,
                     bytes.as_deref(),
                     &spans,
                     false,
@@ -1529,7 +1736,21 @@ impl Evaluated {
             }
             Verdict::Unseen | Verdict::Stateful => (true, Some(UNSETTLED), false),
         };
-        let state = state_use(verdict, proven);
+        // A call of a crate whose state is not known to settle, shown to give what the fresh
+        // state gives: its reads are what it read.
+        let unknown_why = match unsettled && fresh_shown {
+            true => None,
+            false => unknown_why,
+        };
+        // And its output is fixed by its call and reads: the front end keeps its expansion
+        // while those are the same, as any other's. Left as a session's (run again in every
+        // revision), each edit of reth ran all 26 `#[rpc]` expansions of reth-rpc-api again,
+        // one at a time with the calls before each run again, and every query that needs
+        // that crate's impls waited for them: 7 s of a 12 s body edit of another crate.
+        let state = match unsettled && fresh_shown {
+            true => StateUse::Fixed,
+            false => state_use(verdict, proven),
+        };
         if let Some(why) = unknown_why.filter(|_| !keep || session) {
             return done(output, ExpansionReads::Unknown(why), state);
         }
@@ -1538,9 +1759,10 @@ impl Evaluated {
             Some(why) => ExpansionReads::Unknown(why),
             None => reads,
         };
-        let Some(value) = bytes.filter(|_| !session) else {
-            // Nothing is kept (no bytes to keep, or it ran with state of a crate that settles):
-            // what it read is stated as this checkout's.
+        let Some(value) = bytes.filter(|_| !session && !asked) else {
+            // Nothing is kept (no bytes to keep, it ran with state of a crate that settles, or
+            // it asked the database what its key does not say): what it read is stated as
+            // this checkout's.
             let reads = stated(ExpansionReads::Traced {
                 shape: index::Shape::of(&marked.local).encode().into(), // alloc: once, as an expansion is kept
                 values: index::VALUES.traced(&marked.local),
@@ -1654,12 +1876,60 @@ impl ProcMacroExpander for Evaluated {
         self.expand_keyed(db, calling_crate, call)
     }
 
+    /// A macro of the same crate, code, daemon and toolchain built into another module (the
+    /// crate is two units of the build, one a profile) takes `held`'s place only when its
+    /// module is the lesser of the two by what it runs ([`Library::runs`]): whichever unit
+    /// ends first, and in every build, the crate has the expanders of that one module, so
+    /// the keys that hold what its macros run ([`ProcMacroExpander::code`]) do not move
+    /// with the order two units ended in. Until 2026-11-12 the crate had the expanders of
+    /// the unit that ended last, and each build wrote them twice.
+    fn replaces(&self, held: &dyn ProcMacroExpander) -> bool {
+        // dyn: the database's expander trait, the edge
+        let Some(other) = (held as &dyn std::any::Any).downcast_ref::<Evaluated>() else {
+            return true;
+        };
+        if self.eq_dyn(held) {
+            return false;
+        }
+        let (new, old) = (&self.library, &other.library);
+        let another_module = self.function == other.function
+            && self.index == other.index
+            && self.kind == other.kind
+            && self.name == other.name
+            && Arc::ptr_eq(&new.macros, &old.macros)
+            && new.krate == old.krate
+            && new.toolchain == old.toolchain
+            && new.loaded == old.loaded
+            && new.runs != old.runs;
+        match another_module {
+            true => new.runs < old.runs,
+            false => true,
+        }
+    }
+
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         // dyn: the database's expander trait, the edge
         (other as &dyn std::any::Any) // dyn: as above, told apart by type
             .downcast_ref::<Evaluated>()
             .is_some_and(|other| {
-                Arc::ptr_eq(&self.library, &other.library) && self.function == other.function
+                // Said once a macro whose library was loaded again otherwise: its crate's
+                // expanders are replaced, an input written and its users resolved again.
+                if !Arc::ptr_eq(&self.library, &other.library)
+                    && let Some(what) = self.library.differs(&other.library)
+                {
+                    tracing::info!(
+                        target: "blaze",
+                        krate = %self.library.name,
+                        r#macro = %self.name,
+                        differs = what,
+                        "a proc macro's expanders loaded again are not the ones its crate has"
+                    );
+                }
+                self.library.same(&other.library)
+                    && self.function == other.function
+                    && self.index == other.index
+                    && self.kind == other.kind
+                    && self.name == other.name
             })
     }
 }

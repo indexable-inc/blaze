@@ -1,0 +1,9 @@
+{
+ "id": "H-bstd-entry-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+ "task": "Read your own build errors from the shared loop (`/root/loop.sh`) as a lane",
+ "do": "`ix shell lanebase-1112 --noninteractive -- bash -c \"/root/loop.sh <branch> <cmd> >/tmp/x.out 2>&1; cp /root/loop-build.log /tmp/x-build.log; head -3 /tmp/x.out; grep -nE '^error' -A18 /tmp/x-build.log | head -200\"`: the copy is taken in the same call, right after the lock is released, and the errors are grepped from it.",
+ "why": "loop.sh prints `grep -E '^(error|warning: unused)' -A12 | head -150`, and cargo's `unused_workspace_dependencies` warnings (which start `warning: unused`) fill the 150 lines before the first error; and /root/loop-build.log is overwritten by the next lane's call.",
+ "state": "current"
+}

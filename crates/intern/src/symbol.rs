@@ -1,22 +1,12 @@
 //! Interned strings: symbols declared at compile time ([`symbols`]) and ones interned at
-//! runtime, as `u32` IDs that mean the same in every process that restores one image.
+//! runtime, as `u32` IDs.
 //!
 //! A [`Symbol`] is an ID in the symbol table (`text`): `1..=STATIC` are the compiled-in texts of
 //! [`symbols::TEXTS`] (the declared symbols, then each list's), every other one a text interned
-//! at runtime or restored from an image ([`restore_symbols`]), read in place. The table holds
-//! the compiled-in texts first, so interning a declared symbol's text gives the declared
-//! symbol. A symbol is never freed while the process runs; the image's GC ([`write_symbols`])
-//! keeps only the ones the other sections still name, each at its own ID.
+//! at runtime. The table holds the compiled-in texts first, so interning a declared symbol's
+//! text gives the declared symbol. A symbol is never freed while the process runs.
 
-use std::{cmp::Ordering, fmt, num::NonZeroU32, sync::Arc, sync::OnceLock};
-
-use blaze_format::SchemaHash;
-use blaze_ids::{ContentId, Hasher};
-use blaze_image::{Builder, Image, SectionId, Stable};
-
-use crate::table::{Jobs, Live, RestoreError};
-#[cfg(test)]
-use crate::table::{Table, serial};
+use std::{cmp::Ordering, fmt, num::NonZeroU32};
 
 pub mod symbols;
 
@@ -37,8 +27,8 @@ impl Text {
 
 /// # Invariant
 ///
-/// `id` names a text of the symbol table: compiled in (`id <= STATIC`), or made or restored
-/// by this process, which never frees it. Two symbols are one string exactly when they are
+/// `id` names a text of the symbol table: compiled in (`id <= STATIC`), or made by this
+/// process, which never frees it. Two symbols are one string exactly when they are
 /// one ID.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Symbol {
@@ -55,31 +45,25 @@ const _: () = assert!(size_of::<Symbol>() == size_of::<u32>());
 const _: () = assert!(size_of::<Option<Symbol>>() == size_of::<u32>());
 
 /// The process's symbol table, every value of which is text. Only this module reaches it, so
-/// every value in it is a compiled-in `&str`, a copy of a `&str` interned, or bytes of an image
-/// that `Table::restore` checked to be UTF-8 (`shape().text`): reading one as a `str` needs
-/// no check. That is what its one unsafe operation buys: [`Symbol::as_str`] costs a range check
-/// and two loads, where checking the UTF-8 again would scan every byte of the name each time.
+/// every value in it is a compiled-in `&str` or a copy of a `&str` interned: reading one as a
+/// `str` needs no check. That is what its one unsafe operation buys: [`Symbol::as_str`] costs a
+/// range check and two loads, where checking the UTF-8 again would scan every byte of the name
+/// each time.
 #[allow(unsafe_code)]
 mod text {
     use std::sync::OnceLock;
 
-    use blaze_image::{Image, SectionId, SectionWriter, Stable};
-
-    use super::{order_key, symbols, symbols_schema};
-    use crate::table::{Jobs, Live, Overlay, RestoreError, Shape, Table};
+    use super::{order_key, symbols};
+    use crate::table::{Shape, Table};
 
     static TABLE: OnceLock<Table> = OnceLock::new();
 
     /// The symbol table's shape: the compiled-in texts first, every value text.
-    pub(super) fn shape() -> Shape {
+    fn shape() -> Shape {
         Shape {
             statics: symbols::STATIC as u32,
             static_bytes: |id| symbols::TEXTS[id as usize - 1].str.as_bytes(),
             key: order_key,
-            align: 1,
-            size: 1,
-            text: true,
-            overlay: Overlay::Secret,
         }
     }
 
@@ -110,9 +94,8 @@ mod text {
     pub(super) fn str(id: u32) -> &'static str {
         let bytes = table().bytes(id);
         // SAFETY: every value of `TABLE` is text (the module's doc): its compiled-in values are
-        // `&str`s, `intern` copies a `&str`, and a restore checks every live value's UTF-8
-        // (`Table::validate`, as `shape().text` asks) before any is read. A value that was not
-        // would make a `&str` that is not UTF-8.
+        // `&str`s and `intern` copies a `&str`. A value that was not would make a `&str` that is
+        // not UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
@@ -120,87 +103,6 @@ mod text {
     #[cfg(test)]
     pub(super) fn end() -> u32 {
         table().end()
-    }
-
-    pub(super) fn write(live: &Live, out: &mut SectionWriter<'_>) {
-        table().write(live, out);
-    }
-
-    pub(super) fn restore<S: Stable>(
-        image: &'static Image<S>,
-        jobs: Jobs<'_>,
-    ) -> Result<(), RestoreError> {
-        Table::restore_into(&TABLE, shape(), image, SectionId::SYMBOLS, symbols_schema(), jobs)
-    }
-}
-
-#[cfg(test)]
-use self::text::shape;
-
-/// The schema of the symbol section: the table's layout and every compiled-in text, so an
-/// image is restored only by a blaze whose `STATIC` IDs are the same texts.
-pub fn symbols_schema() -> SchemaHash {
-    static SCHEMA: OnceLock<SchemaHash> = OnceLock::new();
-    *SCHEMA.get_or_init(|| {
-        let mut hasher = Hasher::new("blaze intern symbols");
-        hasher.update(crate::table::LAYOUT.as_bytes()).update(&crate::table::ROOT.0.0);
-        for text in &symbols::TEXTS {
-            hasher.update(&(text.str.len() as u64).to_le_bytes()).update(text.str.as_bytes());
-        }
-        SchemaHash(hasher.finish())
-    })
-}
-
-/// Makes the symbols of `image`'s [`SectionId::SYMBOLS`] this process's, read in place: every
-/// symbol a restored value names means the text it meant when the image was written. Must run
-/// before any symbol is interned or read; the image stays mapped until the process exits.
-///
-/// On an error no symbol was restored, so no other section of `image` that names symbols may
-/// be used: every one of them is recomputed from a cold start. The section is checked whole
-/// here, since every value depends on it, its CRCs and columns split across `jobs` (the
-/// daemon's pool: one core streams a tenth of what the machine's memory can).
-pub fn restore_symbols<S: Stable>(
-    image: Arc<Image<S>>,
-    jobs: Jobs<'_>,
-) -> Result<(), RestoreError> {
-    // alloc: once a restore, so the image outlives every symbol read from it
-    let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
-    text::restore(image, jobs)?;
-    RESTORED.set(image.hash()).expect("the symbol table is restored once");
-    Ok(())
-}
-
-static RESTORED: OnceLock<ContentId> = OnceLock::new();
-
-/// The hash of the image this process's symbols were restored from, `None` for a fresh table:
-/// what an owner of other sections checks before using them, since their values name symbol
-/// IDs that mean what they meant only in that image's table.
-pub fn restored_from() -> Option<ContentId> {
-    RESTORED.get().copied()
-}
-
-/// A symbol table restored into `cell`, as [`restore_symbols`] restores the process's.
-#[cfg(test)]
-fn restore_into<S: Stable>(
-    cell: &OnceLock<Table>,
-    image: &'static Image<S>,
-    jobs: Jobs<'_>,
-) -> Result<(), RestoreError> {
-    Table::restore_into(cell, shape(), image, SectionId::SYMBOLS, symbols_schema(), jobs)
-}
-
-/// Writes the symbol section into `builder`: every symbol `live` marks at its ID, every other
-/// ID free for the next process. The symbols interned while this runs are not in it.
-pub fn write_symbols(live: &Live, builder: &mut Builder) {
-    let mut out = builder.section(SectionId::SYMBOLS, symbols_schema());
-    text::write(live, &mut out);
-}
-
-impl Live {
-    /// Keeps `symbol` in the next image.
-    #[inline]
-    pub fn mark(&mut self, symbol: Symbol) {
-        self.mark_id(symbol.id());
     }
 }
 
@@ -239,7 +141,7 @@ impl Symbol {
         }
     }
 
-    /// The symbol of `s`, if one was interned or restored.
+    /// The symbol of `s`, if one was interned.
     #[inline]
     pub fn find(s: &str) -> Option<Symbol> {
         Symbol::find_hashed(s, blaze_phf::name_hash(s.as_bytes()))
@@ -264,8 +166,7 @@ impl Symbol {
         Symbol { id: NonZeroU32::new(id).expect("the table never gives ID 0") }
     }
 
-    /// The symbol's ID: what a persisted value stores, the same in every process that restored
-    /// the image it was written with.
+    /// The symbol's ID, which means this text in this process alone.
     #[inline]
     pub fn id(self) -> u32 {
         self.id.get()
@@ -281,7 +182,7 @@ impl Symbol {
 
     /// The symbol of an ID [`Symbol::id`] gave in this process, with no lookup: for columns of
     /// IDs that were symbols when written (`tt`'s token trees). An ID that names no symbol
-    /// panics when its text is read, as a symbol whose value the image's GC freed does.
+    /// panics when its text is read.
     #[inline]
     pub fn from_held_id(id: u32) -> Symbol {
         Symbol { id: NonZeroU32::new(id).expect("a symbol's ID is never 0") }
@@ -657,40 +558,5 @@ mod tests {
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         check_order(&names);
-    }
-
-    /// Restoring into a table that already interned is refused: its IDs may be the image's.
-    #[test]
-    fn a_restore_after_interning_is_refused() {
-        let image = image_of(&Table::new(shape()), &Live::new());
-        let cell = OnceLock::new();
-        let _ = cell.get_or_init(|| Table::new(shape()));
-        assert_eq!(
-            restore_into(&cell, image, &serial),
-            Err(RestoreError::Started { section: SectionId::SYMBOLS })
-        );
-        let fresh = OnceLock::new();
-        assert_eq!(restore_into(&fresh, image, &serial), Ok(()));
-        assert_eq!(fresh.get().unwrap().find(b"self"), Some(sym::self_.id()));
-    }
-
-    /// A symbol section written by a blaze with other compiled-in texts is refused by schema.
-    #[test]
-    fn another_symbol_list_is_refused() {
-        let mut builder = Builder::new();
-        let other = SchemaHash(Hasher::new("blaze intern symbols").finish());
-        Table::new(shape()).write(&Live::new(), &mut builder.section(SectionId::SYMBOLS, other));
-        let image: &'static Image<Vec<u8>> =
-            Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()));
-        assert!(matches!(
-            restore_into(&OnceLock::new(), image, &serial),
-            Err(RestoreError::Refused(blaze_image::Refused::Schema { .. }))
-        ));
-    }
-
-    fn image_of(table: &Table, live: &Live) -> &'static Image<Vec<u8>> {
-        let mut builder = Builder::new();
-        table.write(live, &mut builder.section(SectionId::SYMBOLS, symbols_schema()));
-        Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()))
     }
 }

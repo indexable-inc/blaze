@@ -7,5 +7,6 @@
  "cost": "a minute per rebuild, dozens of rebuilds",
  "cause": "`stop` goes through the versioned API",
  "workaround": "kill by pid",
- "state": "open: `stop` should work across schema versions"
+ "state": "open: `stop` should work across schema versions",
+ "prevention": "see A37: a daemon of another schema is named as running with its pid (from the state's lock), so no `pgrep` is needed; telling it to stop across schemas is still open (2afb298252)"
 }

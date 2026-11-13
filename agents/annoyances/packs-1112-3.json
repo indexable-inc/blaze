@@ -1,0 +1,21 @@
+{
+ "id": "packs-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane packs-1112",
+ "where": "docs/remote-cache.md, crates/blaze-global, crates/blaze-fetch/src/verified.rs, crates/blaze-cas/src/remote.rs",
+ "what": "Four designs for getting records from elsewhere were in the tree before this lane (the SHA-256 gateway plan, blaze-global's per-record signed cache with bundles, the store's remote tier, the chunk-tree fetch core), none wired to a build, each with its own manifest, trust and wire. Finding out which was current took the first third of the lane.",
+ "cost": "about 150k tokens of reading before the first line was written",
+ "cause": "each lane designed the piece it was asked for beside the others and the plan doc was appended to, not rewritten",
+ "whys": [
+  "a new lane could not tell which design to extend",
+  "the doc's status line says `plan` for all of them",
+  "nothing lists which remote mechanisms are wired and which are libraries",
+  "each was specified and partly built without the build path that would have forced one choice",
+  "rule spec-then-build was followed per lane, one-concept-one-home was not checked across lanes"
+ ],
+ "class": "parallel designs of one concept that never meet at a caller",
+ "prevention": "one row per remote mechanism in the objectives ledger with `wired: yes/no` and its caller; docs/remote-cache.md split so the built part (Packs) is `current` and the gateway plan is its own `plan` doc; delete or fold blaze-global's bundle and `verified.rs` once packs carry their cases",
+ "workaround": "the Packs section now says which it replaces and why",
+ "fix": "none yet",
+ "state": "open"
+}

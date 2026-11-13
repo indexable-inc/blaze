@@ -1,0 +1,21 @@
+{
+ "id": "memgive-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memgive-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs (Jobs::apply_writes, Jobs::let_go) and crates/blaze-graph/src/plane.rs (Plane::short)",
+ "what": "A task held back for 0.09 GiB made the daemon drop reth's whole kept front end (about 55 GiB held of a limit of 67.08 GiB); the next build, a one-line revert, took 195.4 s where it takes 4 to 16 s. The same code had been patched twice before for single cases (the room between two ledger turns, a whole-ceiling task) and the rule itself stayed.",
+ "cost": "195 s on the next edit of every checkout each time it fires; a third lane on the same decision",
+ "cause": "the driver had one answer to any memory wait: every kept front end, whole, in the loop turn that saw the wait, before the purge asked in the same step had landed",
+ "whys": [
+  "why wrong: 55 GiB of the dearest thing the daemon holds went for a 0.09 GiB wait",
+  "why possible: Jobs::let_go took no amount and no cost; Plane::short's number was only compared with 0",
+  "why not caught: each earlier fix removed one way for `short` to be non-zero and left what happens when it is",
+  "why easy: letting go of everything is one loop; a give-back in order needs a measure between steps, which nothing owned",
+  "property: a decision with one action, taken on a predicted number, in the same turn as the cheaper remedy was only asked for"
+ ],
+ "class": "an all-or-nothing remedy for a graded need",
+ "prevention": "blaze_graph::giveback::Planner is the one rule (order, proportion, floor, hold, measure between rungs), with a simulation whose control is the old behaviour; a `Give` carries a `Planned` mark only the planner can make, and the driver drops a front end for memory only on a `Give`; the existing guard bound `let_go` (no `kept front ends let go for memory` span on a warm edit) still counts the same span and log line",
+ "workaround": "none",
+ "fix": "crates/blaze-graph/src/giveback.rs and crates/blaze-cargo/src/serve/job/giving.rs (written, not compiled: write-only lane)",
+ "state": "written on int-1112, not compiled or run"
+}

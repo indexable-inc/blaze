@@ -190,9 +190,16 @@ reach = "deny"
 proc_macro = "deny"
 # Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
 # docs/v2/plan/design/std.md, step S3), in `edition` above and named here: on by Andrew's
-# decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
-# yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
+# decision of 2026-11-11 ahead of the switch. `ready::BSTD_IN_TREE` is `false`: bstd builds and
+# its tests run under a blaze built from this tree (`blaze build -p blaze-std`, `blaze test -p
+# blaze-std`; arm64 Linux, 2026-11-12), but it is not yet an API these crates can port to, since
+# cargo still builds them and rustc refuses bstd's blaze-only syntax (decision D25).
+# harness/v2/std_uses.py is the worklist.
 std_use = "deny"
+# A package not on the latest blaze edition (docs/lints.md#not_latest_edition): allowed here while
+# cargo builds blaze (decision D25, docs/v2/plan/decisions.json), since no crate cargo builds can
+# say `edition = "blaze-2026.11"`. Removed when the tree moves onto the edition.
+not_latest_edition = "allow"
 # Arithmetic whose meaning is the profile's (docs/lints.md#implicit_overflow,
 # docs/v2/plan/design/explicit-overflow.md), in `edition` above: crates opt in at their root
 # (`#![deny(blaze::implicit_overflow)]`), `blaze-std` and `blaze-mem` first, once a stage-0
@@ -410,6 +417,7 @@ blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
@@ -426,6 +434,7 @@ blaze-client-c = { path = "crates/blaze-client-c" }
 blaze-napi = { path = "crates/blaze-napi" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-kernel = { path = "crates/blaze-kernel" }
+blaze-front-items = { path = "crates/blaze-front-items" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
@@ -447,6 +456,9 @@ blaze-ids = { path = "crates/blaze-ids" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
+blaze-record = { path = "crates/blaze-record" }
+# The request certificate, its slot and the client's own check, with no compiler in it.
+blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 # bstd, blaze's own standard library (docs/v2/plan/design/std.md).
@@ -461,6 +473,10 @@ blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
+blaze-launch = { path = "crates/blaze-launch" }
+blaze-pack = { path = "crates/blaze-pack" }
+blaze-launch-host = { path = "crates/blaze-launch-host" }
+blaze-launch-rt = { path = "crates/blaze-launch-rt" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lints = { path = "crates/blaze-lints" }
@@ -594,10 +610,10 @@ libc = "0.2.191"
 memchr = "2.8.3"
 # mimalloc's C side: the `blaze` binary's general-purpose allocator, a first-class heap per
 # blaze-mem tag (blaze-engine's `heaps.rs`, docs/v2/plan/design/memory.md), `mi_collect` when the
-# daemon gives freed pages back, and (`extended`) its options. Not `no_thp`: its arenas stay
-# advised onto transparent huge pages, which is 17% of a body edit's time against 1.0 GiB
-# resident (blaze-engine's `huge.rs` has the measurement).
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+# daemon gives freed pages back, and (`extended`) its options. `no_thp`: its arenas are on base
+# pages, not advised onto transparent huge pages, which were 1.25 GiB of a hello-world daemon
+# for nothing it holds (blaze-engine's `huge.rs` has the measurement).
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended", "no_thp"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }
@@ -630,9 +646,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 triomphe = { version = "0.1.17", default-features = false, features = ["std"] }
 unicode-width = "0.2.3"
-# `blaze test`'s live view on a terminal (blaze_ui::test_view, drawn by blaze-cargo's
-# cli/live.rs): an inline viewport, never the alternate screen. Each crate turns on what it uses.
-ratatui = { version = "0.30.2", default-features = false }
 url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

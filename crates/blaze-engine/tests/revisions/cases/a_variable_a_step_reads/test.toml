@@ -1,0 +1,51 @@
+about = "A variable one build script reads by name and declares (MADE_VALUE), changed: that script runs again, and what is made from its output is made again (its library and the program), nothing else. A variable one crate reads with option_env! (APP_TAG), changed: that crate's unit, and no build script. Each difference that matters still separates: the program prints the new value both times."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "52 none\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { MADE_VALUE = "41" }
+prints = "53 none\n"
+reused = ["up::sum"]
+# The script's run, its library and the program: a run is counted among the units made.
+max_units = 3
+max_records = 2
+max_runs = 1
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "53 none\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { APP_TAG = "tagged" }
+prints = "53 tagged\n"
+reused = ["up::sum"]
+max_units = 1
+max_records = 1
+max_runs = 0
+known = { alarms = "after a variable a crate reads with option_env! moved, the kept front end is let go and the build lowers anew, and `blaze why` has no recorded reason for 2 of the steps that build recomputed (2026-11-12, int-1112 d45e70ddcd: unexplained=2); the units made are as bounded (1: app, redone app::tag)" }
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { MADE_VALUE = "40" }
+prints = "52 tagged\n"
+reused = ["up::sum"]
+max_units = 3
+max_runs = 1
