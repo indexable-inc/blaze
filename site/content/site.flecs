@@ -29,8 +29,8 @@ site {
     }
 
     Step why("Why it is fast") {
-      P cargo("cargo runs `rustc` once per crate, a fresh process each time, and links the whole program again after every build. A one-line edit deep in a big workspace can take seconds.")
-      P blaze("blaze keeps your whole program in memory, already parsed and type-checked. When you save, it recompiles **only the functions you changed**, and only what really depends on them.")
+      P cargo("`rustc` is incremental too: it saves its work on disk and recompiles only the **codegen units** (groups of functions) that changed. But cargo starts a new `rustc` for the crate you edited and for every crate that depends on it, each one reloads its saved state and rechecks its crate, and then the whole program is linked again.")
+      P blaze("blaze is one **daemon** that stays running with your whole workspace in memory, already parsed and type-checked. When you save, it redoes the work for **the functions you changed** and what really reads them, across crates, with nothing to reload.")
       Table numbers {
         Tr head { Th a("Edit one function in a 200-crate workspace"); Th b("cargo"); Th c("blaze") }
         Tr main_crate { Td a("in the main crate"); Td b("1.76 s"); Td c("0.42 s") }
