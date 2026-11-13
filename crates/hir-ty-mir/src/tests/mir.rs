@@ -7,3 +7,4 @@ mod eval;
 mod handles;
 mod lower;
 mod optimize;
+mod stabilized;
