@@ -43,6 +43,7 @@ main.intro[data-on] .wordmark canvas { display: block; }
 .race .ps { color: var(--ink-3); }
 .race .typed { color: var(--ink-1); }
 .race .st { font-weight: 600; color: #3fb950; }
+.race .st.cy { color: #39c5cf; }
 .race .caret { display: inline-block; width: 0.6em; height: 1.1em; margin-left: 1px; vertical-align: -0.2em; background: var(--ink-3); opacity: 0; }
 .race .caret.on { opacity: 0.8; }
 .race figcaption { font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }

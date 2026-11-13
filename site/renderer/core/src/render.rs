@@ -560,15 +560,12 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
         .find(|p| p.url == more)
         .ok_or_else(|| format!("{path}: Race more {more:?} is not a page of the site (/bench)"))?;
     let project = field(Some(raced), "project");
-    // "ripgrep 15.1.0" is cargo's "ripgrep v15.1.0".
-    let crate_line = match project.rsplit_once(' ') {
-        Some((name, version)) if version.starts_with(|c: char| c.is_ascii_digit()) => format!("{name} v{version}"),
-        _ => project.clone(),
-    };
     let term = |who: &str, seconds: f64, compiling: bool| {
         let (t, unit) = took(seconds);
+        // cargo's progress bar while it works (cargo clears it when done, so as rendered it is hidden); blaze is done
+        // before a bar would show.
         let compiling = if compiling {
-            format!("<span class=\"out\" data-at=\"0\">\n<b class=\"st\">   Compiling</b> {}</span>", esc(&crate_line))
+            "<span class=\"out run\" hidden>\n<b class=\"st cy\">    Building</b> [<span class=\"fill\"></span>]</span>".to_string()
         } else {
             String::new()
         };
