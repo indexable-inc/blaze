@@ -65,20 +65,6 @@ site {
       Dim watch("Rebuild on save with any watcher: `watchexec -e rs -- blaze build`.")
     }
 
-    Step own("No fallback") {
-      P never("`blaze` never hands your build to cargo or `rustc`. If it can't build something yet, it stops and names what and where.")
-    }
-
-    Step fallback_q("Check") {
-      Quiz q(prompt: "blaze meets code it can't compile yet. What happens?") {
-        Choice cargo("It quietly runs cargo instead.", "Never: a quiet fallback would hide the bug.")
-        Choice stop("It stops with an error naming the code.", "Right. Loud beats quietly different.") {
-          Right
-        }
-        Choice skip("It skips that crate.", "That would build a program you didn't write.")
-      }
-    }
-
     Step next("Next") {
       P path("Next: how blaze gets its speed, then what it adds to Rust: const generic math, effects, its own std, and proofs in Lean.")
       Dim map("All lessons: [the course map](/learn).")
