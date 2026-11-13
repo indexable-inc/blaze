@@ -67,11 +67,21 @@ impl Resolved {
     }
 }
 
-/// What `blaze::wall_clock` reports, after the configured entries: clippy refuses a `lint` key
-/// in `clippy.toml`, so the lint knows its paths, and an entry configured for one wins.
-const WALL_CLOCK: [&str; 3] =
-    ["std::time::Instant::now", "std::time::SystemTime::now", "std::time::Instant::elapsed"];
+/// The paths blaze's own lints report through this table, after the configured entries, each
+/// with its lint and reason: clippy refuses a `lint` key in `clippy.toml`, so the lints know
+/// their paths, and an entry configured for one wins.
+const BUILT_IN: [(&str, blaze::Lint, &str); 8] = [
+    ("std::time::Instant::now", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::SystemTime::now", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::Instant::elapsed", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::SystemTime::elapsed", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::sync::mpsc::channel", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("crossbeam_channel::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("tokio::sync::mpsc::unbounded_channel", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("flume::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+];
 const WALL_CLOCK_REASON: &str = "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 14); drivers read the wall clock";
+const UNBOUNDED_CHANNEL_REASON: &str = "a channel with no bound lets a fast sender grow it until memory runs out, and nothing slows the sender: make it bounded (`crossbeam_channel::bounded(n)`, `mpsc::sync_channel(n)`) so a full channel pushes back";
 
 /// The `disallowed-*` entries of `key`'s configuration, resolved as `krate` names their paths:
 /// once per crate and configuration.
@@ -134,7 +144,7 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             entries.push(Entry { kind, entry, blaze, replacement });
         }
     }
-    for path in WALL_CLOCK {
+    for (path, lint, reason) in BUILT_IN {
         let defs: Vec<ModuleDef> =
             resolve(db, krate, path).into_iter().filter(|it| of_kind(*it, Kind::Methods)).collect();
         if defs.is_empty() {
@@ -145,17 +155,12 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             resolved.by_def.entry(def).or_insert(at);
         }
         let entry = Disallowed {
-            path: (*path).to_owned(),
-            reason: Some(WALL_CLOCK_REASON.to_owned()),
-            lint: Some(format!("blaze::{}", blaze::Lint::WallClock.name())),
+            path: path.to_owned(),
+            reason: Some(reason.to_owned()),
+            lint: Some(format!("blaze::{}", lint.name())),
             ..Disallowed::default()
         };
-        entries.push(Entry {
-            kind: Kind::Methods,
-            entry,
-            blaze: Some(blaze::Lint::WallClock),
-            replacement: None,
-        });
+        entries.push(Entry { kind: Kind::Methods, entry, blaze: Some(lint), replacement: None });
     }
     resolved.entries = entries.into_boxed_slice();
     resolved.errors = errors.into_boxed_slice();
@@ -279,7 +284,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     if Kind::ALL.iter().all(|it| cx.conf().value(it.key()).is_none())
-        && !cx.on_blaze(blaze::Lint::WallClock)
+        && !BUILT_IN.iter().any(|(_, lint, _)| cx.on_blaze(*lint))
     {
         return;
     }

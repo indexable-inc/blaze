@@ -564,7 +564,7 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
-        Lint::LossyAs,
+        Lint::AsCast,
         Lint::GlobalState,
         Lint::AsyncFn,
         Lint::UnmarkedPure,
@@ -1186,6 +1186,9 @@ impl Lint {
             Lint::LockAcrossWait => {
                 "copy out what the wait needs and drop the guard before the call, or hand the guard to the wait (`signal.wait(&mut guard)` releases it)"
             }
+            Lint::TruncatingCast => {
+                "where a value that doesn't fit is a bug, convert with `T::try_from(x)` and a typed error naming the thing; where wrapping is meant, say why with `#[expect(blaze::truncating_cast, reason = \"..\")]`"
+            }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
             }
@@ -1393,8 +1396,8 @@ impl Lint {
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
             }
-            Lint::LossyAs => {
-                "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
+            Lint::AsCast => {
+                "write the operation the cast is (`T::from(x)`, `x.truncate::<T>()`, `cast_signed`, `cast_unsigned`, blaze-cast's named casts, `p.cast::<T>()`, `ptr::from_ref`), as `blaze check --fix` does; or say why with `#[expect(blaze::as_cast, reason = \"..\")]`"
             }
             Lint::GlobalState => {
                 "give the state one owner and pass it, or a handle to it, as a context to the code the finding lists as using it; or say why it stays global with `#[expect(blaze::global_state, reason = \"..\")]`"
@@ -1661,7 +1664,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
-        lossy_as::check(cx);
+        as_cast::check(cx);
+        truncating_cast::check(cx);
         build_script_ambient::check(cx);
         not_latest_edition::check(cx);
         std_use::check(cx);

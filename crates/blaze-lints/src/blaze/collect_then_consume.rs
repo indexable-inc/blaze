@@ -586,6 +586,50 @@ fn keep(x: u32) -> bool { x > 2 }
     }
 
     #[test]
+    fn a_collect_only_looped_over_by_value_is_fixed_to_loop_over_the_iterator() {
+        let found = perf_only(
+            LINT,
+            r#"
+pub fn looped(xs: &[u32]) -> u32 {
+    let mut sum = 0;
+    for x in xs.iter().map(|x| x * 2).collect::<Vec<u32>>() {
+        sum += x;
+    }
+    sum
+}
+pub fn borrowed(xs: &[u32]) -> u32 {
+    let mut sum = 0;
+    for x in &xs.iter().map(|x| x * 2).collect::<Vec<u32>>() {
+        sum += *x;
+    }
+    sum
+}
+pub fn called(xs: &[u32]) -> u32 {
+    let mut sum = 0;
+    for x in xs.iter().map(|x| twice(*x)).collect::<Vec<u32>>() {
+        sum += x;
+    }
+    sum
+}
+fn twice(x: u32) -> u32 { x * 2 }
+"#,
+        );
+        assert_eq!(found.matches(FOUND).count(), 3, "{found}");
+        assert!(
+            found.contains("for x in xs.iter().map(|x| x * 2) {"),
+            "the loop by value is fixed:\n{found}"
+        );
+        assert!(
+            !found.contains("for x in &xs.iter().map(|x| x * 2) {"),
+            "a loop over `&` of the `Vec` is not fixed:\n{found}"
+        );
+        assert!(
+            !found.contains("for x in xs.iter().map(|x| twice(*x)) {"),
+            "a closure that calls is not fixed:\n{found}"
+        );
+    }
+
+    #[test]
     fn a_local_used_once_by_a_loop_is_found_and_one_used_twice_or_read_again_is_not() {
         let found = perf_only(
             LINT,

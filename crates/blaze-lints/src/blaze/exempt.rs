@@ -152,7 +152,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher
         // The edition's lints name a construct the edition removes, not a cost on a line.
-        | Lint::LossyAs
+        | Lint::AsCast
         | Lint::GlobalState
         | Lint::AsyncFn
         | Lint::MutRef
@@ -183,7 +183,10 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Unwired
         | Lint::TmpPath
         | Lint::NarrowedLen
-        | Lint::ProcessStatic => None,
+        | Lint::ProcessStatic
+        // Kept with `#[expect(..)]` on the item: whether wrapping is meant is the code's
+        // choice, said once with its reason.
+        | Lint::TruncatingCast => None,
     }
 }
 

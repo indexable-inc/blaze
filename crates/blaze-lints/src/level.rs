@@ -98,7 +98,7 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
-/// The group `blaze::edition`: what the blaze edition removes or respells (`lossy_as`,
+/// The group `blaze::edition`: what the blaze edition removes or respells (`as_cast`,
 /// `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border (`unmarked_*`),
 /// the code blaze cannot analyse (`proc_macro_*`, `build_script_ambient`), what blaze's
 /// standard library replaces (`std_use`) and code written the way the edition wants it
