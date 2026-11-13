@@ -65,18 +65,20 @@ pub mod region;
 pub mod region_vec;
 pub mod revision;
 pub mod scratch;
+pub mod size;
 mod stack;
 pub mod swiss;
 pub mod syscalls;
 mod sync;
 pub mod tag;
 pub mod text;
+pub mod vec;
 
 pub use append::AppendVec;
 pub use arena::{Arena, ArenaLocal};
 pub use blocks::Kept;
 pub use column::{Block, Column};
-pub use error::MemError;
+pub use error::{MemError, Named, OutOfMemory};
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};
@@ -85,8 +87,10 @@ pub use program::{ProgramArena, ProgramError, ProgramLifetime, Ref32};
 pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};
+pub use size::{ByteLen, Offset, Overflow};
 pub use tag::Tag;
-pub use text::{FromUtf8Error, String};
+pub use text::{FormatError, FromUtf8Error, InsideChar, String, TooSmall};
+pub use vec::{InsertError, Vec};
 #[cfg(unix)]
 pub use text::{OsString, PathBuf};
 

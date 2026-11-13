@@ -40,33 +40,43 @@ use std::{
     str::{self, Utf8Error},
 };
 
+use crate::{Named, OutOfMemory, Vec};
+
 /// A growable UTF-8 string in `A`: std's `String` with an allocator, as `bumpalo`'s
-/// `collections::String` is in a `Bump`.
+/// `collections::String` is in a `Bump`. Every growth is fallible and names the arena
+/// ([`OutOfMemory`]); there is no other form (docs/v2/plan/design/fallible-bstd.md).
 pub struct String<A: Allocator> {
     /// UTF-8 whenever a method returns: only `str`s, `char`s and bytes checked by
     /// [`String::from_utf8`] go in, and only whole characters come out.
     bytes: Vec<u8, A>,
 }
 
+/// [`String::truncate`] was asked to cut inside a character.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InsideChar {
+    /// The byte offset asked for.
+    pub at: usize,
+    /// The string's length in bytes.
+    pub len: usize,
+}
+
+impl fmt::Display for InsideChar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "blaze_mem::String::truncate({}): byte {} of the {}-byte string is inside a character",
+            self.at, self.at, self.len
+        )
+    }
+}
+
+impl std::error::Error for InsideChar {}
+
 impl<A: Allocator> String<A> {
     /// An empty string in `alloc`; nothing is allocated until it grows.
     #[inline]
     pub fn new_in(alloc: A) -> String<A> {
         String { bytes: Vec::new_in(alloc) }
-    }
-
-    /// An empty string in `alloc` with room for `capacity` bytes.
-    #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> String<A> {
-        String { bytes: Vec::with_capacity_in(capacity, alloc) }
-    }
-
-    /// A copy of `text` in `alloc`.
-    #[inline]
-    pub fn from_str_in(text: &str, alloc: A) -> String<A> {
-        let mut out = String::with_capacity_in(text.len(), alloc);
-        out.push_str(text);
-        out
     }
 
     /// `bytes` as a string, when they are UTF-8; else the bytes back, with where they stop
@@ -76,17 +86,6 @@ impl<A: Allocator> String<A> {
             Ok(_) => Ok(String { bytes }),
             Err(error) => Err(FromUtf8Error { bytes, error }),
         }
-    }
-
-    #[inline]
-    pub fn push(&mut self, ch: char) {
-        let mut buffer = [0; 4];
-        self.bytes.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
-    }
-
-    #[inline]
-    pub fn push_str(&mut self, text: &str) {
-        self.bytes.extend_from_slice(text.as_bytes());
     }
 
     #[inline]
@@ -124,39 +123,30 @@ impl<A: Allocator> String<A> {
         self.bytes.capacity()
     }
 
-    /// Room for at least `additional` more bytes.
-    #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
-    }
-
     /// Empties it, keeping its capacity.
     #[inline]
     pub fn clear(&mut self) {
         self.bytes.clear();
     }
 
-    /// Shortens it to `new_len` bytes; nothing when it is no longer.
-    ///
-    /// # Panics
-    ///
-    /// When `new_len` is inside a character.
-    #[track_caller]
-    pub fn truncate(&mut self, new_len: usize) {
-        if new_len < self.len() {
-            assert!(
-                self.as_str().is_char_boundary(new_len),
-                "blaze_mem::String::truncate({new_len}): byte {new_len} of the {}-byte string is inside a character",
-                self.len(),
-            );
-            self.bytes.truncate(new_len);
+    /// Shortens it to `new_len` bytes; nothing when it is no longer. A `new_len` inside a
+    /// character is refused, the string as it was.
+    pub fn truncate(&mut self, new_len: usize) -> Result<(), InsideChar> {
+        if new_len >= self.len() {
+            return Ok(());
         }
+        if !self.as_str().is_char_boundary(new_len) {
+            return Err(InsideChar { at: new_len, len: self.len() });
+        }
+        self.bytes.truncate(new_len);
+        Ok(())
     }
 
     /// Takes its last character off.
     pub fn pop(&mut self) -> Option<char> {
         let ch = self.as_str().chars().next_back()?;
-        self.bytes.truncate(self.len() - ch.len_utf8());
+        // A character of the string is no longer than the string.
+        self.bytes.truncate(self.len().saturating_sub(ch.len_utf8()));
         Some(ch)
     }
 
@@ -171,45 +161,248 @@ impl<A: Allocator> String<A> {
     pub fn into_bytes(self) -> Vec<u8, A> {
         self.bytes
     }
+}
 
-    /// The text as a `Box<str, A>`, its room shrunk to its length.
-    pub fn into_boxed_str(self) -> Box<str, A> {
-        let (raw, alloc) = Box::into_raw_with_allocator(self.bytes.into_boxed_slice());
-        // SAFETY: `raw` and `alloc` are a `Box<[u8], A>` taken apart just above, whose bytes are
-        // UTF-8 (the field's invariant); `str` has `[u8]`'s layout and metadata, so the cast
-        // keeps the length and the box frees the same layout from the same allocator.
-        unsafe { Box::from_raw_in(raw as *mut str, alloc) }
+impl<A: Allocator + Named> String<A> {
+    /// An empty string in `alloc` with room for `capacity` bytes.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Result<String<A>, OutOfMemory> {
+        Ok(String { bytes: Vec::with_capacity_in(capacity, alloc)? })
+    }
+
+    /// A copy of `text` in `alloc`.
+    #[inline]
+    pub fn from_str_in(text: &str, alloc: A) -> Result<String<A>, OutOfMemory> {
+        Ok(String { bytes: Vec::from_slice_in(text.as_bytes(), alloc)? })
+    }
+
+    /// Appends `ch`, or says the arena that had no room; the string is then as it was.
+    #[inline]
+    pub fn push(&mut self, ch: char) -> Result<(), OutOfMemory> {
+        let mut buffer = [0; 4];
+        self.bytes.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes())
+    }
+
+    /// Appends `text`, or says the arena that had no room; the string is then as it was.
+    #[inline]
+    pub fn push_str(&mut self, text: &str) -> Result<(), OutOfMemory> {
+        self.bytes.extend_from_slice(text.as_bytes())
+    }
+
+    /// Room for at least `additional` more bytes.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) -> Result<(), OutOfMemory> {
+        self.bytes.reserve(additional)
+    }
+
+    /// Appends each of `texts`. On an error the texts before it are kept.
+    pub fn extend<'t>(
+        &mut self,
+        texts: impl IntoIterator<Item = &'t str>,
+    ) -> Result<(), OutOfMemory> {
+        for text in texts {
+            self.push_str(text)?;
+        }
+        Ok(())
+    }
+
+    /// Appends `args`, formatted: `write!` into the string, with the arena named when it has
+    /// no room. What was written before an error is kept.
+    pub fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<(), FormatError<OutOfMemory>> {
+        write_to(self, args)
+    }
+
+    /// A copy of it in the same allocator.
+    pub fn clone_in_place(&self) -> Result<String<A>, OutOfMemory>
+    where
+        A: Clone,
+    {
+        String::from_str_in(self.as_str(), self.allocator().clone())
     }
 }
+
+/// Where formatted text goes: the one formatting core under [`format_in!`](crate::format_in)
+/// (a growing [`String`]) and [`format_into!`](crate::format_into) (a buffer the caller
+/// lends), so neither repeats the other.
+trait Take {
+    /// Why it took no more.
+    type Full;
+
+    fn take(&mut self, text: &str) -> Result<(), Self::Full>;
+}
+
+impl<A: Allocator + Named> Take for String<A> {
+    type Full = OutOfMemory;
+
+    #[inline]
+    fn take(&mut self, text: &str) -> Result<(), OutOfMemory> {
+        self.push_str(text)
+    }
+}
+
+/// `core::fmt`'s writer over a [`Take`]: `fmt::Error` carries nothing, so why the taker
+/// stopped is kept here for [`write_to`] to return.
+struct Sink<'t, T: Take> {
+    to: &'t mut T,
+    full: Option<T::Full>,
+}
+
+impl<T: Take> fmt::Write for Sink<'_, T> {
+    #[inline]
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        match self.to.take(text) {
+            Ok(()) => Ok(()),
+            Err(full) => {
+                self.full = Some(full);
+                Err(fmt::Error)
+            }
+        }
+    }
+}
+
+/// The formatting core: `args` written into `to`.
+fn write_to<T: Take>(to: &mut T, args: fmt::Arguments<'_>) -> Result<(), FormatError<T::Full>> {
+    if let Some(text) = args.as_str() {
+        return to.take(text).map_err(FormatError::Full);
+    }
+    let mut sink = Sink { to, full: None };
+    match fmt::Write::write_fmt(&mut sink, args) {
+        Ok(()) => Ok(()),
+        Err(fmt::Error) => match sink.full {
+            Some(full) => Err(FormatError::Full(full)),
+            None => Err(FormatError::Trait),
+        },
+    }
+}
+
+/// Why [`format_in!`](crate::format_in), [`format_into!`](crate::format_into) or
+/// [`String::write_fmt`] did not finish its text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormatError<Full> {
+    /// Where the text goes had no room: an [`OutOfMemory`] naming the arena of a string, a
+    /// [`TooSmall`] saying what a lent buffer needed.
+    Full(Full),
+    /// A `Display` or `Debug` implementation among the arguments returned an error though
+    /// every byte it wrote was taken: that implementation is wrong (`format!` panics here).
+    Trait,
+}
+
+impl<Full: fmt::Display> fmt::Display for FormatError<Full> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FormatError::Full(full) => full.fmt(f),
+            FormatError::Trait => f.write_str(
+                "a formatting trait implementation returned an error when writing to text \
+                 that took every byte it was given",
+            ),
+        }
+    }
+}
+
+impl<Full: fmt::Debug + fmt::Display> std::error::Error for FormatError<Full> {}
 
 /// What [`format_in!`](crate::format_in) expands to: `args` written into a new string in
-/// `alloc`.
-///
-/// # Panics
-///
-/// When a `Display` or `Debug` implementation `args` call returns an error, as `format!`
-/// does: writing to a string never fails, so that implementation is wrong.
+/// `alloc`, or why not: the arena that had no room, or a formatting trait that returned an
+/// error of its own.
 #[doc(hidden)]
-#[track_caller]
-pub fn format<A: Allocator>(alloc: A, args: fmt::Arguments<'_>) -> String<A> {
-    if let Some(text) = args.as_str() {
-        return String::from_str_in(text, alloc);
-    }
+pub fn format<A: Allocator + Named>(
+    alloc: A,
+    args: fmt::Arguments<'_>,
+) -> Result<String<A>, FormatError<OutOfMemory>> {
     let mut out = String::new_in(alloc);
-    if fmt::Write::write_fmt(&mut out, args).is_err() {
-        panic!(
-            "blaze_mem::format_in!: a formatting trait implementation returned an error when writing to a string, which never fails"
-        );
-    }
-    out
+    write_to(&mut out, args)?;
+    Ok(out)
 }
 
-/// `format!` into the allocator given first: `format_in!(frame, "{name}-{n}")` is a
-/// [`String<&Frame>`](crate::String), as `bumpalo::format!(in bump, ..)` is in a `Bump`.
+/// `format!` into the allocator given first: `format_in!(frame, "{name}-{n}")?` is a
+/// [`String<&Frame>`](crate::String), as `bumpalo::format!(in bump, ..)` is in a `Bump`. It
+/// is a `Result`: an allocator with no room is a [`FormatError::Full`] naming it.
 #[macro_export]
 macro_rules! format_in {
     ($alloc:expr, $($arg:tt)*) => {
         $crate::text::format($alloc, ::std::format_args!($($arg)*))
+    };
+}
+
+/// A buffer [`format_into!`](crate::format_into) was lent is too small for its text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TooSmall {
+    /// The bytes the whole text takes.
+    pub needed: usize,
+    /// The bytes the buffer has.
+    pub room: usize,
+}
+
+impl fmt::Display for TooSmall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "blaze_mem::format_into!: the text takes {} bytes and the buffer lent has {}",
+            self.needed, self.room
+        )
+    }
+}
+
+impl std::error::Error for TooSmall {}
+
+/// A lent buffer being filled: it copies what fits and counts all of it, so a buffer that is
+/// too small still learns what the text needed.
+struct Lent<'b> {
+    buffer: &'b mut [u8],
+    /// Bytes of the text so far, those that did not fit included.
+    needed: usize,
+}
+
+impl Take for Lent<'_> {
+    type Full = TooSmall;
+
+    #[inline]
+    fn take(&mut self, text: &str) -> Result<(), TooSmall> {
+        let text = text.as_bytes();
+        if let Some(room) = self.buffer.get_mut(self.needed..) {
+            // What fits is copied. A text cut short may end inside a character:
+            // `format_into` returns no text then, only the count.
+            for (slot, byte) in room.iter_mut().zip(text) {
+                *slot = *byte;
+            }
+        }
+        self.needed = self.needed.saturating_add(text.len());
+        Ok(())
+    }
+}
+
+/// What [`format_into!`](crate::format_into) expands to: `args` written at the start of
+/// `buffer` and lent back as text, allocating nothing; or [`TooSmall`] with the bytes the
+/// whole text needs (the buffer then holds a prefix of it, possibly cut inside a character).
+#[doc(hidden)]
+pub fn format_into<'b>(
+    buffer: &'b mut [u8],
+    args: fmt::Arguments<'_>,
+) -> Result<&'b mut str, FormatError<TooSmall>> {
+    let room = buffer.len();
+    let mut lent = Lent { buffer, needed: 0 };
+    write_to(&mut lent, args)?;
+    let Lent { buffer, needed } = lent;
+    let Some(written) = buffer.get_mut(..needed) else {
+        return Err(FormatError::Full(TooSmall { needed, room }));
+    };
+    match str::from_utf8_mut(written) {
+        Ok(text) => Ok(text),
+        // Whole `str`s were copied in order and all of them fit, so the bytes are UTF-8;
+        // a formatting core that wrote anything else is refused, not trusted.
+        Err(_) => Err(FormatError::Trait),
+    }
+}
+
+/// `format!` into a buffer the caller lends, allocating nothing:
+/// `format_into!(&mut buffer, "{name}-{n}")?` is the text, as a `&mut str` of `buffer`. A
+/// buffer that is too small is a [`FormatError::Full`] of [`TooSmall`], which says how many
+/// bytes the text needs. For code that may not allocate; [`format_in!`](crate::format_in) is
+/// the same formatting core into a string that grows.
+#[macro_export]
+macro_rules! format_into {
+    ($buffer:expr, $($arg:tt)*) => {
+        $crate::text::format_into($buffer, ::std::format_args!($($arg)*))
     };
 }
 
@@ -307,20 +500,6 @@ impl<A: Allocator> BorrowMut<str> for String<A> {
     }
 }
 
-impl<A: Allocator> fmt::Write for String<A> {
-    #[inline]
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        self.push_str(text);
-        Ok(())
-    }
-
-    #[inline]
-    fn write_char(&mut self, ch: char) -> fmt::Result {
-        self.push(ch);
-        Ok(())
-    }
-}
-
 impl<A: Allocator> fmt::Display for String<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.as_str(), f)
@@ -330,12 +509,6 @@ impl<A: Allocator> fmt::Display for String<A> {
 impl<A: Allocator> fmt::Debug for String<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.as_str(), f)
-    }
-}
-
-impl<A: Allocator + Clone> Clone for String<A> {
-    fn clone(&self) -> String<A> {
-        String { bytes: self.bytes.clone() }
     }
 }
 
@@ -392,25 +565,5 @@ impl<A: Allocator> PartialEq<String<A>> for str {
 impl<A: Allocator> PartialEq<String<A>> for &str {
     fn eq(&self, other: &String<A>) -> bool {
         *self == other.as_str()
-    }
-}
-
-impl<A: Allocator> Extend<char> for String<A> {
-    fn extend<I: IntoIterator<Item = char>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
-        self.reserve(iter.size_hint().0);
-        iter.for_each(|ch| self.push(ch));
-    }
-}
-
-impl<'a, A: Allocator> Extend<&'a char> for String<A> {
-    fn extend<I: IntoIterator<Item = &'a char>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
-    }
-}
-
-impl<'a, A: Allocator> Extend<&'a str> for String<A> {
-    fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) {
-        iter.into_iter().for_each(|text| self.push_str(text));
     }
 }

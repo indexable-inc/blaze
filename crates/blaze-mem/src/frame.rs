@@ -58,7 +58,7 @@ use std::{
 };
 
 use crate::{
-    MemError, Region, Tag,
+    MemError, Named, OutOfMemory, Region, Tag,
     align::align_up,
     chunks::{self, CHUNK, Chunk},
     error::fail,
@@ -175,6 +175,8 @@ pub struct Frame {
     limit: usize,
     /// The subsystem of the task using it, for [`tag::task_ended`].
     tag: Cell<Tag>,
+    /// The name its running out says ([`Named`]): [`Frame::named`]'s, else its tag's.
+    name: Option<&'static str>,
     id: u32,
     /// A task's frame: its blocks come from and go back to its thread's shelves, under the cap.
     task: bool,
@@ -230,6 +232,15 @@ impl Frame {
         Ok(Frame::empty(bytes, tag, IDS.fetch_add(1, Ordering::Relaxed), false))
     }
 
+    /// A frame of at most `bytes` that says it is `name` when it runs out ([`Named`]): a
+    /// task's span, an arena's name.
+    #[track_caller]
+    pub fn named(name: &'static str, bytes: usize, tag: Tag) -> Result<Frame, MemError> {
+        let mut frame = Frame::with_reserve(bytes, tag)?;
+        frame.name = Some(name);
+        Ok(frame)
+    }
+
     #[track_caller]
     fn empty(limit: usize, tag: Tag, id: u32, task: bool) -> Frame {
         Frame {
@@ -245,6 +256,7 @@ impl Frame {
             held: Cell::new(0),
             limit,
             tag: Cell::new(tag),
+            name: None,
             id,
             task,
             lent: Cell::new(false),
@@ -964,6 +976,17 @@ impl Drop for Frame {
 // live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
 // `deallocate` and `shrink` only move the cursor back over the top block, never touching
 // another. A cancel by the cap unwinds before any of the frame's state changes.
+impl Named for Frame {
+    /// The name [`Frame::named`] gave it, else its tag's.
+    #[inline]
+    fn name(&self) -> &'static str {
+        match self.name {
+            Some(name) => name,
+            None => self.tag.get().name(),
+        }
+    }
+}
+
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -1783,17 +1806,20 @@ pub fn capped() -> u64 {
 /// The items of `items` in a vector in `frame`, its room the iterator's lower bound to start:
 /// `bumpalo`'s `Vec::from_iter_in`.
 #[inline]
-pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> Vec<T, &'f Frame> {
-    let items = items.into_iter();
-    let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
-    out.extend(items);
-    out
+pub fn collect<'f, T>(
+    frame: &'f Frame,
+    items: impl IntoIterator<Item = T>,
+) -> Result<crate::Vec<T, &'f Frame>, OutOfMemory> {
+    crate::Vec::from_iter_in(items, frame)
 }
 
 /// A copy of `text` in `frame`, to grow: `bumpalo`'s `String::from_str_in`. For finished text
 /// that won't grow, [`Frame::alloc_str`]; for formatting, [`format_in!`](crate::format_in).
 #[inline]
-pub fn string<'f>(frame: &'f Frame, text: &str) -> crate::text::String<&'f Frame> {
+pub fn string<'f>(
+    frame: &'f Frame,
+    text: &str,
+) -> Result<crate::text::String<&'f Frame>, OutOfMemory> {
     crate::text::String::from_str_in(text, frame)
 }
 
@@ -1803,7 +1829,7 @@ pub fn string<'f>(frame: &'f Frame, text: &str) -> crate::text::String<&'f Frame
 pub fn path<'f>(
     frame: &'f Frame,
     path: impl AsRef<std::path::Path>,
-) -> crate::text::PathBuf<&'f Frame> {
+) -> Result<crate::text::PathBuf<&'f Frame>, OutOfMemory> {
     crate::text::PathBuf::from_path_in(path, frame)
 }
 
@@ -1813,7 +1839,7 @@ pub fn path<'f>(
 pub fn os_string<'f>(
     frame: &'f Frame,
     text: impl AsRef<std::ffi::OsStr>,
-) -> crate::text::OsString<&'f Frame> {
+) -> Result<crate::text::OsString<&'f Frame>, OutOfMemory> {
     crate::text::OsString::from_os_str_in(text, frame)
 }
 

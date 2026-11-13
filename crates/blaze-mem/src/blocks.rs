@@ -846,6 +846,14 @@ impl Kept {
 // Blocks of one class are disjoint and live as long as the process (a class is never
 // unreserved), so a block stays valid until given back, and any `Kept` (a copy) may give back
 // what another took. Zero-size layouts are a dangling, aligned pointer, never given back.
+impl crate::Named for Kept {
+    /// The tag its blocks are counted to.
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.tag().name()
+    }
+}
+
 unsafe impl std::alloc::Allocator for Kept {
     fn allocate(
         &self,

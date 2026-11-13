@@ -70,6 +70,59 @@ impl std::error::Error for MemError {
     }
 }
 
+impl MemError {
+    /// The error as the collections say it: the arena (the tag's name) and the bytes asked.
+    /// [`MemError::Evict`] asked for none.
+    pub fn out_of_memory(&self) -> OutOfMemory {
+        let asked = match *self {
+            MemError::Reserve { bytes, .. } | MemError::Commit { bytes, .. } => bytes,
+            MemError::Exhausted { wanted, .. } | MemError::TooLarge { wanted, .. } => wanted,
+            MemError::Evict { .. } => 0,
+        };
+        OutOfMemory { arena: self.tag().name(), asked }
+    }
+}
+
+/// An allocator had no room: `arena` could not hand out `asked` more bytes. What every growth
+/// of a collection in an allocator returns ([`crate::Vec`], [`crate::String`]), so running out
+/// is an outcome its caller decides about and never `alloc`'s `handle_alloc_error`
+/// (docs/v2/plan/design/fallible-bstd.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutOfMemory {
+    /// The allocator's name ([`Named::name`]): a frame's, an arena's, a tag's.
+    pub arena: &'static str,
+    /// The bytes the growth asked for beyond what the collection held.
+    pub asked: usize,
+}
+
+impl fmt::Display for OutOfMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "arena {}: {} more bytes would pass its limit", self.arena, self.asked)
+    }
+}
+
+impl std::error::Error for OutOfMemory {}
+
+/// An allocator that says whose memory it hands out: the name an [`OutOfMemory`] carries.
+pub trait Named {
+    fn name(&self) -> &'static str;
+}
+
+impl<A: Named + ?Sized> Named for &A {
+    #[inline]
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
+/// The global heap, for the few collections bstd still keeps there (each with its
+/// `// alloc:` line).
+impl Named for std::alloc::Global {
+    fn name(&self) -> &'static str {
+        "the global heap"
+    }
+}
+
 /// Stops with `error`: what an infallible allocation does when memory cannot be had.
 #[cold]
 #[inline(never)]

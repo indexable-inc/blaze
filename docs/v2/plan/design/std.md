@@ -996,10 +996,10 @@ Zig's rule, and it buys what the plan needs: every byte belongs to a task or a n
 one memory budget ([memory](memory.md), [memory-budget](../../../memory-budget.md)). Every arena has
 a name and a limit, so "what holds the memory" always has an answer.
 
-**Running out is an outcome, not a crash.** An allocation over its limit or the budget fails the
-task with `Stopped::OutOfMemory { arena, asked }` through the same path as a panic (rule
-`panics-fail-one-job`); the process and the other tasks go on. Code that wants to handle it itself
-uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
+**Running out is an outcome, not a crash.** An allocation over its limit or the budget returns
+`Stopped::OutOfMemory { arena, asked }` to its caller; the process and the other tasks go on.
+Every growth is fallible and there is no other form (`push`, `reserve`, `format_in!` return
+`Result`; no `try_` prefix, no panicking twin): [fallible-bstd](fallible-bstd.md), decision D29.
 
 Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.

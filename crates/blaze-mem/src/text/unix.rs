@@ -13,6 +13,7 @@ use std::{
 };
 
 use super::String;
+use crate::{Named, OutOfMemory, Vec};
 
 /// A growable `OsStr` in `A`: std's `OsString` with an allocator.
 pub struct OsString<A: Allocator> {
@@ -27,16 +28,19 @@ impl<A: Allocator> OsString<A> {
     }
 
     #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> OsString<A> {
-        OsString { bytes: Vec::with_capacity_in(capacity, alloc) }
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Result<OsString<A>, OutOfMemory>
+    where
+        A: Named,
+    {
+        Ok(OsString { bytes: Vec::with_capacity_in(capacity, alloc)? })
     }
 
     /// A copy of `text` in `alloc`.
-    pub fn from_os_str_in(text: impl AsRef<OsStr>, alloc: A) -> OsString<A> {
-        let text = text.as_ref().as_bytes();
-        let mut bytes = Vec::with_capacity_in(text.len(), alloc);
-        bytes.extend_from_slice(text);
-        OsString { bytes }
+    pub fn from_os_str_in(text: impl AsRef<OsStr>, alloc: A) -> Result<OsString<A>, OutOfMemory>
+    where
+        A: Named,
+    {
+        Ok(OsString { bytes: Vec::from_slice_in(text.as_ref().as_bytes(), alloc)? })
     }
 
     /// Any bytes: on unix every byte string is an `OsStr`.
@@ -57,8 +61,19 @@ impl<A: Allocator> OsString<A> {
 
     /// Appends `text`.
     #[inline]
-    pub fn push(&mut self, text: impl AsRef<OsStr>) {
-        self.bytes.extend_from_slice(text.as_ref().as_bytes());
+    pub fn push(&mut self, text: impl AsRef<OsStr>) -> Result<(), OutOfMemory>
+    where
+        A: Named,
+    {
+        self.bytes.extend_from_slice(text.as_ref().as_bytes())
+    }
+
+    /// A copy of it in the same allocator.
+    pub fn clone_in_place(&self) -> Result<OsString<A>, OutOfMemory>
+    where
+        A: Named + Clone,
+    {
+        Ok(OsString { bytes: self.bytes.clone_in_place()? })
     }
 
     #[inline]
@@ -77,8 +92,11 @@ impl<A: Allocator> OsString<A> {
     }
 
     #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
+    pub fn reserve(&mut self, additional: usize) -> Result<(), OutOfMemory>
+    where
+        A: Named,
+    {
+        self.bytes.reserve(additional)
     }
 
     /// Empties it, keeping its capacity.
@@ -140,12 +158,6 @@ impl<A: Allocator> Borrow<OsStr> for OsString<A> {
 impl<A: Allocator> fmt::Debug for OsString<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.as_os_str(), f)
-    }
-}
-
-impl<A: Allocator + Clone> Clone for OsString<A> {
-    fn clone(&self) -> OsString<A> {
-        OsString { bytes: self.bytes.clone() }
     }
 }
 
@@ -216,16 +228,19 @@ impl<A: Allocator> PathBuf<A> {
     }
 
     #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> PathBuf<A> {
-        PathBuf { bytes: Vec::with_capacity_in(capacity, alloc) }
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Result<PathBuf<A>, OutOfMemory>
+    where
+        A: Named,
+    {
+        Ok(PathBuf { bytes: Vec::with_capacity_in(capacity, alloc)? })
     }
 
     /// A copy of `path` in `alloc`.
-    pub fn from_path_in(path: impl AsRef<Path>, alloc: A) -> PathBuf<A> {
-        let path = path.as_ref().as_os_str().as_bytes();
-        let mut bytes = Vec::with_capacity_in(path.len(), alloc);
-        bytes.extend_from_slice(path);
-        PathBuf { bytes }
+    pub fn from_path_in(path: impl AsRef<Path>, alloc: A) -> Result<PathBuf<A>, OutOfMemory>
+    where
+        A: Named,
+    {
+        Ok(PathBuf { bytes: Vec::from_slice_in(path.as_ref().as_os_str().as_bytes(), alloc)? })
     }
 
     #[inline]
@@ -240,14 +255,24 @@ impl<A: Allocator> PathBuf<A> {
 
     /// Extends it with `path` as std's `PathBuf::push` does on unix: a `path` with a root
     /// replaces it, and otherwise a `/` goes between unless it already ends in one or is empty.
-    pub fn push(&mut self, path: impl AsRef<Path>) {
+    ///
+    /// Room for all of it is had before anything changes: on an error the path is as it was.
+    pub fn push(&mut self, path: impl AsRef<Path>) -> Result<(), OutOfMemory>
+    where
+        A: Named,
+    {
         let path = path.as_ref();
+        let more = path.as_os_str().as_bytes();
         if path.has_root() {
+            self.bytes.reserve(more.len().saturating_sub(self.bytes.len()))?;
             self.bytes.clear();
-        } else if self.bytes.last().is_some_and(|&last| last != b'/') {
-            self.bytes.push(b'/');
+        } else {
+            self.bytes.reserve(more.len().saturating_add(1))?;
+            if self.bytes.last().is_some_and(|&last| last != b'/') {
+                self.bytes.push(b'/')?;
+            }
         }
-        self.bytes.extend_from_slice(path.as_os_str().as_bytes());
+        self.bytes.extend_from_slice(more)
     }
 
     /// Cuts it to its parent, as std's `PathBuf::pop` does; false when it has none.
@@ -262,18 +287,24 @@ impl<A: Allocator> PathBuf<A> {
     }
 
     /// A copy with `path` pushed, in the same allocator: `Path::join` without the global heap.
-    pub fn join(&self, path: impl AsRef<Path>) -> PathBuf<A>
+    pub fn join(&self, path: impl AsRef<Path>) -> Result<PathBuf<A>, OutOfMemory>
     where
-        A: Clone,
+        A: Named + Clone,
     {
         let path = path.as_ref();
-        let mut out = PathBuf::with_capacity_in(
-            self.bytes.len() + 1 + path.as_os_str().len(),
-            self.allocator().clone(),
-        );
-        out.bytes.extend_from_slice(&self.bytes);
-        out.push(path);
-        out
+        let room = self.bytes.len().saturating_add(1).saturating_add(path.as_os_str().len());
+        let mut out = PathBuf::with_capacity_in(room, self.allocator().clone())?;
+        out.bytes.extend_from_slice(&self.bytes)?;
+        out.push(path)?;
+        Ok(out)
+    }
+
+    /// A copy of it in the same allocator.
+    pub fn clone_in_place(&self) -> Result<PathBuf<A>, OutOfMemory>
+    where
+        A: Named + Clone,
+    {
+        Ok(PathBuf { bytes: self.bytes.clone_in_place()? })
     }
 
     #[inline]
@@ -292,8 +323,11 @@ impl<A: Allocator> PathBuf<A> {
     }
 
     #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
+    pub fn reserve(&mut self, additional: usize) -> Result<(), OutOfMemory>
+    where
+        A: Named,
+    {
+        self.bytes.reserve(additional)
     }
 
     /// Empties it, keeping its capacity.
@@ -360,12 +394,6 @@ impl<A: Allocator> Borrow<Path> for PathBuf<A> {
 impl<A: Allocator> fmt::Debug for PathBuf<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.as_path(), f)
-    }
-}
-
-impl<A: Allocator + Clone> Clone for PathBuf<A> {
-    fn clone(&self) -> PathBuf<A> {
-        PathBuf { bytes: self.bytes.clone() }
     }
 }
 

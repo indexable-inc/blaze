@@ -424,6 +424,14 @@ impl<'a> ArenaLocal<'a> {
 // of which take `&mut Arena` or ownership, impossible while this local (which borrows the arena
 // for `'a`) is alive. `deallocate` and `shrink` move only this local's cursor, and only over the
 // top block; nothing here unwinds.
+impl crate::Named for ArenaLocal<'_> {
+    /// Its arena's tag.
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.arena.tag().name()
+    }
+}
+
 unsafe impl Allocator for ArenaLocal<'_> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {

@@ -931,14 +931,15 @@ fn frame_collect_is_the_copies_it_replaced() {
     let frame = Frame::new(Tag::Infer).expect("reserve");
     for len in [0, 1, 7, 64, 1000] {
         let values: Vec<u64> = (0..len).map(|_| rng.next_u64()).collect();
-        let exact = frame::collect(&frame, values.iter().copied());
+        let exact = frame::collect(&frame, values.iter().copied()).expect("room");
         let reference = kept(&frame, values.iter().copied());
         assert_eq!(exact.as_slice(), values.as_slice());
         assert_eq!(
             (exact.as_slice(), exact.capacity()),
             (reference.as_slice(), reference.capacity())
         );
-        let filtered = frame::collect(&frame, values.iter().copied().filter(|it| it % 3 == 0));
+        let filtered =
+            frame::collect(&frame, values.iter().copied().filter(|it| it % 3 == 0)).expect("room");
         let reference = kept(&frame, values.iter().copied().filter(|it| it % 3 == 0));
         assert_eq!(
             (filtered.as_slice(), filtered.capacity()),
@@ -2874,35 +2875,33 @@ fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
     frame::task(Tag::Other, |frame| {
         let mut text = text::String::new_in(frame);
         for ch in ['a', 'é', '日', '🦀'] {
-            text.push(ch);
+            text.push(ch).expect("room");
             assert!(
                 std::str::from_utf8(text.as_bytes()).is_ok(),
                 "after pushing {ch:?}: {:?}",
                 text.as_bytes()
             );
         }
-        text.push_str("本");
+        text.push_str("本").expect("room");
         assert_eq!(text, "aé日🦀本");
         assert_eq!(text.len(), "aé日🦀本".len());
         assert_eq!(text.pop(), Some('本'));
         assert_eq!(text.pop(), Some('🦀'));
         assert_eq!(text, "aé日");
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text.truncate(2))).is_err(),
+        assert_eq!(
+            text.truncate(2),
+            Err(text::InsideChar { at: 2, len: text.len() }),
             "byte 2 is inside 'é'"
         );
         assert_eq!(text, "aé日", "a refused truncate leaves the text whole");
-        text.truncate(3);
+        assert_eq!(text.truncate(3), Ok(()));
         assert_eq!(text, "aé");
-        let bytes = text.clone().into_bytes();
+        let bytes = text.clone_in_place().expect("room").into_bytes();
         assert!(text::String::from_utf8(bytes).is_ok());
-        let mut bad: Vec<u8, &Frame> = Vec::new_in(frame);
-        bad.extend_from_slice(b"a\xff");
+        let bad = crate::Vec::from_slice_in(b"a\xff", frame).expect("room");
         let refused = text::String::from_utf8(bad).expect_err("0xff is not UTF-8");
         assert_eq!(refused.utf8_error().valid_up_to(), 1);
-        let boxed = text.into_boxed_str();
-        assert_eq!(&*boxed, "aé");
-        assert!(frame.contains(boxed.as_ptr()), "the boxed text stays in the frame");
+        assert!(frame.contains(text.as_ptr()), "the text stays in the frame");
     });
 }
 
@@ -2911,11 +2910,11 @@ fn a_frame_string_is_a_map_key_found_by_str() {
     frame::task(Tag::Other, |frame| {
         let mut units = std::collections::BTreeMap::new(); // alloc: a test's map, keys in the frame
         for (at, name) in ["serde", "syn", "quote"].into_iter().enumerate() {
-            units.insert(frame::string(frame, name), at);
+            units.insert(frame::string(frame, name).expect("room"), at);
         }
         assert_eq!(units.get("syn"), Some(&1), "looked up by &str through Borrow<str>");
         assert_eq!(units.get("proc-macro2"), None);
-        let key = frame::string(frame, "serde");
+        let key = frame::string(frame, "serde").expect("room");
         assert_eq!(
             hashed(&key),
             hashed("serde"),
@@ -2934,16 +2933,16 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
     let work = || {
         frame::task(Tag::Other, |frame| {
             let before = frame.used();
-            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
+            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7).expect("room");
             assert_eq!(unit, "unit-007");
             assert!(
                 frame.contains(unit.as_ptr()) && frame.used() > before,
                 "the text is the frame's"
             );
-            let plain = crate::format_in!(frame, "no arguments");
+            let plain = crate::format_in!(frame, "no arguments").expect("room");
             assert_eq!(plain, "no arguments");
             let name = "syn";
-            assert_eq!(crate::format_in!(frame, "{name}@{}", 2), "syn@2");
+            assert_eq!(crate::format_in!(frame, "{name}@{}", 2).expect("room"), "syn@2");
             unit.len()
         })
     };
@@ -2961,8 +2960,8 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
 fn a_frame_path_joins_and_pops_as_std_does() {
     use std::path::Path;
     frame::task(Tag::Other, |frame| {
-        let src = frame::path(frame, "/work/src");
-        let lib = src.join("lib.rs");
+        let src = frame::path(frame, "/work/src").expect("room");
+        let lib = src.join("lib.rs").expect("room");
         assert_eq!(lib, Path::new("/work/src/lib.rs"));
         assert!(frame.contains(lib.as_os_str().as_encoded_bytes().as_ptr()));
         for (base, more) in [
@@ -2974,19 +2973,19 @@ fn a_frame_path_joins_and_pops_as_std_does() {
             ("a", ""),
             ("a/b", "../c"),
         ] {
-            let mut ours = frame::path(frame, base);
-            ours.push(more);
+            let mut ours = frame::path(frame, base).expect("room");
+            ours.push(more).expect("room");
             let reference = Path::new(base).join(more); // alloc: std's join, to compare with
             assert_eq!(ours.as_os_str(), reference.as_os_str(), "{base:?} joined with {more:?}");
         }
-        let mut walk = frame::path(frame, "/a/b/c");
+        let mut walk = frame::path(frame, "/a/b/c").expect("room");
         assert!(walk.pop());
         assert_eq!(walk, Path::new("/a/b"));
         assert!(walk.pop() && walk.pop());
         assert_eq!(walk, Path::new("/"));
         assert!(!walk.pop(), "the root has no parent");
-        let mut os = frame::os_string(frame, "lib");
-        os.push(".rs");
+        let mut os = frame::os_string(frame, "lib").expect("room");
+        os.push(".rs").expect("room");
         assert_eq!(os, "lib.rs");
         assert_eq!(hashed(&lib), hashed(Path::new("/work/src/lib.rs")), "it hashes as Path does");
     });
