@@ -20,24 +20,20 @@
  * A page is swapped in only when it was built with the same scripts and styles as this document (the worker's
  * `x-blaze-assets` header against `BLAZE_ASSETS`, both from gen/build.ts): after a deploy, the next click is a load.
  *
- * A deploy that changed only content (client/lib/update.ts asks with `blaze:refresh`) fetches the page in view again,
- * past the cache, and swaps it in where it is: no history entry, the scroll and focus kept, the sidebar left alone.
- * It answers with `blaze:refreshed` (whether it could); it never falls back to a load itself.
- *
  * Only left clicks with no modifier on a same-origin link under the site's base are taken: not downloads, links with
- * a target, hash links within the page (the browser scrolls), the worker's routes that act (/api, /auth), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
+ * a target, hash links within the page (the browser scrolls), or files (`install.sh`, `search.json`). Anything that goes wrong (not 200, not HTML, a redirect out of
  * the site, a network error, a page in another frame, a page with a script from another origin, which would need its
  * own CSP) falls back to the browser's own navigation to the same URL. Without JS every link is
  * a plain link.
  */
 
-import { LEAVE, PAGE, REFRESH, REFRESHED } from './lib/page';
+import { LEAVE, PAGE } from './lib/page';
 
 /** The hash of the client scripts and styles this bundle was built with (gen/build.ts, Bun.build `define`). */
 declare const BLAZE_ASSETS: string;
 
-type Got = { url: string; html: string; live: boolean };
-type How = { mode: 'push' | 'replace' | 'pop' | 'refresh'; scroll?: number };
+type Got = { url: string; html: string };
+type How = { mode: 'push' | 'replace' | 'pop'; scroll?: number };
 
 class Miss extends Error {}
 
@@ -46,10 +42,7 @@ const BASE = (() => {
 	const css = document.querySelector<HTMLLinkElement>('link[rel="stylesheet"][href$="site.css"]');
 	return css ? new URL('.', css.href).pathname : '/';
 })();
-/** The worker's routes that do something or serve a file rather than a page (worker/index.ts). */
-const NOT_PAGES = ['api/', 'auth/'].map((p) => BASE + p);
-/** How long a fetched page is kept: a page with comments (rendered per request) briefly, the static ones longer. */
-const KEEP_LIVE_MS = 15_000;
+/** How long a fetched page is kept. */
 const KEEP_MS = 300_000;
 /** Hovering this long fetches the link ahead (a pointer passing over the sidebar shouldn't fetch every row). */
 const HOVER_MS = 40;
@@ -65,7 +58,6 @@ function routable(url: URL): boolean {
 	if (url.origin !== location.origin) return false;
 	const p = url.pathname;
 	if (p !== BASE.slice(0, -1) && !p.startsWith(BASE)) return false;
-	if (NOT_PAGES.some((n) => p.startsWith(n))) return false;
 	// A file, not a page: anything with an extension but .html.
 	const last = p.slice(p.lastIndexOf('/') + 1);
 	return !/\.[a-z0-9]+$/i.test(last) || last.endsWith('.html');
@@ -86,18 +78,14 @@ function linkOf(e: Event): HTMLAnchorElement | null {
 const cache = new Map<string, Promise<Got>>();
 const key = (u: URL) => u.origin + u.pathname + u.search;
 
-async function fetchPage(url: URL, fresh = false): Promise<Got> {
-	// Fresh: revalidated with the server, so a page the browser kept from before a deploy isn't swapped back in.
-	const res = await fetch(key(url), { headers: { Accept: 'text/html' }, credentials: 'same-origin', cache: fresh ? 'no-cache' : 'default' });
+async function fetchPage(url: URL): Promise<Got> {
+	const res = await fetch(key(url), { headers: { Accept: 'text/html' }, credentials: 'same-origin' });
 	if (!res.ok) throw new Miss(`HTTP ${res.status}`);
 	if (!/^text\/html\b/.test(res.headers.get('content-type') ?? '')) throw new Miss('not HTML');
 	if (res.headers.get('x-blaze-assets') !== BLAZE_ASSETS) throw new Miss('built with other scripts or styles');
 	const final = new URL(res.url);
 	if (!routable(final)) throw new Miss(`redirected to ${final.href}`);
-	const html = await res.text();
-	// Live: rendered for this request (comments, the reader), so used once and kept briefly.
-	const live = /<main\b[^>]*\sdata-doc="/.test(html) || /no-store|private/.test(res.headers.get('cache-control') ?? '');
-	return { url: final.pathname + final.search, html, live };
+	return { url: final.pathname + final.search, html: await res.text() };
 }
 
 function load(url: URL): Promise<Got> {
@@ -108,7 +96,7 @@ function load(url: URL): Promise<Got> {
 	cache.set(k, p);
 	const drop = () => cache.get(k) === p && cache.delete(k);
 	p.then(
-		(g) => setTimeout(drop, g.live ? KEEP_LIVE_MS : KEEP_MS),
+		() => setTimeout(drop, KEEP_MS),
 		() => drop(),
 	);
 	return p;
@@ -156,7 +144,7 @@ function swapHead(doc: Document) {
 }
 
 /** The sidebar's open row and section, from the new page's. */
-function swapSide(doc: Document, scroll = true) {
+function swapSide(doc: Document) {
 	const href = doc.querySelector('.navlist [aria-current="page"]')?.getAttribute('href') ?? null;
 	for (const r of document.querySelectorAll('.navlist [aria-current]')) r.removeAttribute('aria-current');
 	const open = new Set([...doc.querySelectorAll<HTMLElement>('details.sec[data-here]')].map((d) => d.dataset.sec));
@@ -172,7 +160,6 @@ function swapSide(doc: Document, scroll = true) {
 	row.setAttribute('aria-current', 'page');
 	for (let d = row.parentElement?.closest('details'); d; d = d.parentElement?.closest('details')) d.open = true;
 	// Into view if it is out of it, as a load would centre it; otherwise the sidebar doesn't move.
-	if (!scroll) return;
 	const box = document.querySelector<HTMLElement>('.side .scrollbox');
 	if (!box || box.clientHeight === 0) return;
 	const a = row.getBoundingClientRect();
@@ -222,8 +209,7 @@ function focusTitle() {
 let seq = 0;
 
 function fallback(url: URL, how: How) {
-	if (how.mode === 'refresh') dispatchEvent(new CustomEvent(REFRESHED, { detail: false }));
-	else if (how.mode === 'pop') location.reload();
+	if (how.mode === 'pop') location.reload();
 	else location.assign(url.href);
 }
 
@@ -235,7 +221,7 @@ async function go(url: URL, how: How) {
 	let got: Got;
 	let doc: Document;
 	try {
-		got = how.mode === 'refresh' ? await fetchPage(url, true) : await load(url);
+		got = await load(url);
 		if (n !== seq) return;
 		doc = new DOMParser().parseFromString(got.html, 'text/html');
 		if (!fits(doc)) throw new Miss('a different frame');
@@ -250,30 +236,25 @@ async function go(url: URL, how: How) {
 		clearTimeout(wait);
 		document.documentElement.classList.remove('nav-wait');
 	}
-	if (got.live) cache.delete(key(url));
 	const next = new URL(got.url + url.hash, location.href);
 
 	const apply = () => {
 		// A later navigation (a click, back or forward) started while this one waited for the transition: it wins.
 		if (n !== seq) return;
 		dispatchEvent(new Event(LEAVE));
-		const refresh = how.mode === 'refresh';
 		if (how.mode === 'push') history.pushState({ blaze: 1, scroll: 0 }, '', next.href);
 		else if (how.mode === 'replace') history.replaceState({ blaze: 1, scroll: 0 }, '', next.href);
 		shown = here();
 		swapHead(doc);
 		document.querySelector('.pane > .grid')!.replaceWith(document.adoptNode(doc.querySelector('.pane > .grid')!));
-		swapSide(doc, !refresh);
+		swapSide(doc);
 		place(how);
-		// Before the page scripts, so one that focuses something of its own (a comment form for #block-x) keeps it.
-		// A refresh leaves the focus where the reader has it (the chat, the search), unless it was in the old page.
-		if (!refresh || !document.activeElement || document.activeElement === document.body) focusTitle();
+		// Before the page scripts, so one that focuses something of its own keeps it.
+		focusTitle();
 		dispatchEvent(new Event(PAGE));
-		if (refresh) dispatchEvent(new CustomEvent(REFRESHED, { detail: true }));
 	};
 	try {
-		// A refresh is the same page: no cross-fade.
-		if (still.matches || how.mode === 'refresh' || typeof document.startViewTransition !== 'function') apply();
+		if (still.matches || typeof document.startViewTransition !== 'function') apply();
 		else await document.startViewTransition(apply).updateCallbackDone;
 	} catch (e) {
 		// Half swapped: the browser loads the URL now in the address bar, which is the new page's.
@@ -373,13 +354,3 @@ let scrolled: ReturnType<typeof setTimeout> | undefined;
 		{ passive: true },
 	);
 }
-
-// A deploy changed the content (client/lib/update.ts): every page kept ahead may be the old one, and this one is.
-addEventListener(REFRESH, () => {
-	cache.clear();
-	const n = seq + 1;
-	void go(new URL(location.href), { mode: 'refresh', scroll: scrollY }).then(() => {
-		// A click, back or forward took over: that page came past the cleared cache, so it is the new one too.
-		if (seq !== n) dispatchEvent(new CustomEvent(REFRESHED, { detail: true }));
-	});
-});

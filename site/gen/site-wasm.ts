@@ -1,38 +1,14 @@
 /**
- * The host side of the renderer's wasm modules (site/renderer, README.md "Wasm ABI"), for the worker and for the
- * build (gen/build.ts, under Bun). Neither module has imports. No Bun, Node or Workers APIs here.
+ * The host side of the renderer's wasm modules (site/renderer, README.md "Wasm ABI"), for the build (gen/build.ts,
+ * under Bun). Neither module has imports. No Bun or Node APIs here, so any wasm host can use it.
  *
  * - `Site` (site.wasm): a snapshot loaded once, then one page's HTML per call.
  * - `snapshot` (site-snapshot.wasm): the content scripts (and those the build generates) and the baked HTML to the
  *   snapshot, at build time.
  */
-import { encode, type Cbor } from './cbor';
-
-/** A comment as the renderer takes it: the D1 row of worker/pages.ts's query. */
-export type CommentRow = {
-	id: number;
-	block: string;
-	quote: string;
-	body: string;
-	created_at: string;
-	user_id: number;
-	login: string;
-	name: string;
-	avatar_url: string;
-};
-
-/** Who reads the page and what their thread shows. */
-export type Discussion = {
-	viewer: { id: number; login: string; admin: boolean } | null;
-	signIn: boolean;
-	error?: { block: string; message: string };
-};
 
 /** A page as the renderer lists it. */
-export type Page = { url: string; file: string; doc: string; discussable: boolean };
-
-/** Each discussable doc: its title and the blocks comments may attach to, with their text. */
-export type Discussable = Record<string, { title: string; blocks: Record<string, string> }>;
+export type Page = { url: string; file: string };
 
 /** The module answered with an error (status 1) rather than output. Its instance is still sound. */
 export class RenderError extends Error {}
@@ -107,16 +83,9 @@ export class Site {
 		return this.json('pages');
 	}
 
-	discussable(): Discussable {
-		return this.json('discussable');
-	}
-
-	/** The page at `url` with its comments, for `d`'s viewer: the whole HTML, or an exception. */
-	render(url: string, comments: CommentRow[], d: Discussion): string {
-		const discussion: Cbor = { viewer: d.viewer, sign_in: d.signIn, error: d.error ?? null };
-		const status = call(this.a, [utf8.encode(url), encode(comments), encode(discussion)], ([u, c, s]) =>
-			this.a.fn('render')(this.h, u.ptr, u.len, c.ptr, c.len, s.ptr, s.len),
-		);
+	/** The page at `url`: the whole HTML, or an exception. */
+	render(url: string): string {
+		const status = call(this.a, [utf8.encode(url)], ([u]) => this.a.fn('render')(this.h, u.ptr, u.len));
 		if (status !== 0) throw new RenderError(`site_render ${url}: ${this.text()}`);
 		return this.text();
 	}

@@ -351,6 +351,12 @@ pub fn sidebar(groups: &[Group], page: &Page, served: &Served, world: &World, si
     )
 }
 
+/// The bar at the top of the page column on a wide screen: the button that shuts the sidebar for more room to read
+/// (client/side.ts, which shows it; keep.ts shuts the sidebar again before the first paint). A phone has the drawer.
+pub fn topline() -> String {
+    "<div class=\"topline\"><button type=\"button\" class=\"tl-btn tl-side\" data-side-toggle hidden aria-pressed=\"false\" aria-label=\"Hide the sidebar\"><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><rect x=\"2\" y=\"3\" width=\"12\" height=\"10\" rx=\"2\"/><path d=\"M6.5 3v10\"/></svg></button></div>".to_string()
+}
+
 /// The phone bar above the page: Menu (opens the drawer, `#menu`), the logo, search.
 pub fn mobile_bar(served: &Served, world: &World, site: Id) -> String {
     format!(

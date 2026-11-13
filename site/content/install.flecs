@@ -9,7 +9,7 @@ site {
 
     Lede lede("One line, on macOS on Apple silicon or Linux, with or without Rust installed:")
     Command curl("curl -fsSL https://ix.dev/blaze | sh")
-    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).")
+    P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. The commands you'll use day to day are in [the first lesson](/).")
     Code first(lang: "bash", text: "blaze run")
 
     Section needs(title: "What you need") {
@@ -17,7 +17,7 @@ site {
         Li platform("**macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs are not supported, and neither is Windows yet ([platforms](https://github.com/indexable-inc/blaze/blob/main/docs/platforms.md#windows-x86-64-msvc)).")
         Li glibc("**On Linux, glibc 2.34 or newer:** RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Alpine and other musl systems are not supported; the installer says so.")
         Li cc("**A C compiler for linking:** `gcc` or `cc` on Linux, Apple's command line tools on macOS (`xcode-select --install`).")
-        Li container("**In a container, user namespaces.** Build scripts and proc macros run in a sandbox made of Linux namespaces, which Docker's default seccomp profile refuses: run the container with `--security-opt seccomp=unconfined`, or set `BLAZE_SANDBOX=off` to run them outside a sandbox, as cargo does.")
+        Li container("**User namespaces or Landlock.** Build scripts and proc macros run in a sandbox. In a container whose seccomp profile refuses both, run it with `--security-opt seccomp=unconfined`, or set `BLAZE_SANDBOX=off` to run them unsandboxed, as cargo does. The error says so.")
         Li memory("**Memory to spare.** blaze's background process holds a few GB for a small project and tens of GB for the largest ([numbers](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md#how-much-memory-and-disk-it-takes)).")
       }
       P rust("You do not need Rust or rustup. blaze is its own toolchain: it downloads its pinned nightly once into `~/.blaze` (rustc, cargo, the standard library and its source, about 100 to 130 MB), or uses rustup's copy of that nightly when it has one. It builds your project with that nightly whatever its `rust-toolchain.toml` says, so stable code and `#![feature(...)]` code both build ([why](https://github.com/indexable-inc/blaze/blob/main/docs/toolchain.md)).")

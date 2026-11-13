@@ -1,0 +1,72 @@
+// Lesson: generic const expressions, blaze's own gate `blaze_const_exprs` (crates/hir-def/src/unstable_features.rs;
+// tests in crates/hir-ty-mir/src/tests/where_const.rs; ledger row E16). Not rustc's `generic_const_exprs`: concrete
+// arguments are compared by evaluating them, generic ones by a normal form over + - * and literals; nothing is solved
+// for. `where const { .. }` bounds are in docs/v2/plan/design/comptime.md.
+site {
+  learn {
+    const_exprs : Page {
+      Narrow
+      Lesson: {6, "Arithmetic on const generics, the way you always wanted to write it.", "consts"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.incremental)
+      Title: {"Const generic math"}
+      Description: {"blaze's opt-in extension for arithmetic in const generic arguments: Arr<\{ N + M }> that just works."}
+
+      Step wall("A wall in today's Rust") {
+        P generic("Const generics let a type carry a number: `[T; N]`, or your own `Arr<const N: usize>`. But stable Rust won't let you do arithmetic with them in a type.")
+        Code join(lang: "rust", text: `// error on stable: generic parameters may not be
+        // used in const operations
+        fn join<const N: usize, const M: usize>(
+            a: Arr<N>, b: Arr<M>,
+        ) -> Arr<\{ N + M }>`)
+        Dim nightly("Nightly has `generic_const_exprs`, but it is incomplete and marked unsound in places.")
+      }
+
+      Step gate("blaze's own gate") {
+        P own("blaze owns its compiler, so it implements this properly, as an opt-in extension with its own feature name:")
+        Code on(lang: "rust", text: `#![feature(blaze_const_exprs)]
+
+        struct Arr<const N: usize>;
+
+        fn join<const N: usize, const M: usize>(
+            _: Arr<N>, _: Arr<M>,
+        ) -> Arr<\{ N + M }> \{ Arr }`)
+        Dim opt("A crate that doesn't name the feature builds exactly as before. rustc refuses these programs, so turning it on means building that crate with blaze.")
+      }
+
+      Step equal("When are two types equal?") {
+        P concrete("When the numbers are known, blaze simply evaluates: `Arr<\{ 2 + 1 }>` and `Arr<3>` are the same type.")
+        P symbolic("When they are generic, it compares a **normal form**: `N + M` and `M + N` are the same, and so are `2 * N` and `N + N`. This works for `+`, `-`, `*` and literals.")
+        Code commuted(lang: "rust", text: `fn commuted<const N: usize, const M: usize>(
+            a: Arr<N>, b: Arr<M>,
+        ) -> Arr<\{ M + N }> \{
+            join(a, b) // join returns Arr<\{ N + M }>: the same type
+        }`)
+      }
+
+      Step equal_q("Check: same type?") {
+        Quiz q(prompt: "With `blaze_const_exprs` on, which pair is NOT known to be the same type for every `N`?") {
+          Choice add("`Arr<\{ N + 1 }>` and `Arr<\{ 1 + N }>`", "Addition is put in a normal form, so the order doesn't matter: these are equal.")
+          Choice mul("`Arr<\{ 2 * N }>` and `Arr<\{ N + N }>`", "Both normalise to the same sum, so these are equal.")
+          Choice div("`Arr<\{ N / 2 * 2 }>` and `Arr<N>`", "Right: division has no normal form (and `N / 2 * 2` isn't `N` when `N` is odd), so it only equals itself.") {
+            Right
+          }
+        }
+      }
+
+      Step guess("No guessing") {
+        P solve("blaze never solves for a parameter. If a call needs `Arr<\{ N + M }>` to be `Arr<3>`, there are many answers (1 and 2, 0 and 3...), so it's an error that asks you to say which.")
+        P where("Conditions go in a `where const` bound, checked where the function is used:")
+        Code bound(lang: "rust", text: `fn split<const N: usize, const K: usize>(
+            a: Arr<N>,
+        ) -> (Arr<K>, Arr<\{ N - K }>)
+        where const \{ K <= N } \{ todo!() }`)
+      }
+
+      Step status("Where it stands") {
+        P now("Experimental: the first slice is written and tested inside blaze, and it is still settling. Next on the same road: compile-time reflection, looping over a type's fields with `for const`.")
+        Dim design("The design: [comptime.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/comptime.md).")
+      }
+    }
+  }
+}

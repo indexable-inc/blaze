@@ -1,18 +1,19 @@
 /**
- * The course (the lessons at /learn/<slug>, the updates at /updates/<slug>, What's new at /updates and the path on the
- * home page; Lesson, Update, Step, Quiz, Tap and Figure in content/schema.flecs, rendered by the renderer's render.rs).
- * Without JS a lesson or update is one page of steps under each other, each question with its answer in a fold. This
- * script turns it into the lesson player, one step at a time:
+ * The course (the home page is lesson 1, the other lessons are at /learn/<slug>, the updates at /updates/<slug>, the
+ * course map at /learn and What's new at /updates; Lesson, Update, Step, Quiz, Tap and Figure in content/schema.flecs,
+ * rendered by the renderer's render.rs). Without JS a lesson or update is one page of steps under each other, each
+ * question with its answer in a fold. This script turns it into the lesson player, one step at a time, in the page's
+ * column with the sidebar beside it:
  *
- * - a bar at the top (back to the course, how far along, step k of n) and one at the bottom, within thumb reach (Back,
- *   and the one big button: Start, Check, Continue, Finish), where a question's feedback appears too;
- * - a cover before the first step, and a short "lesson complete" after the last;
+ * - at the top, the lesson's name and its steps as segments (a seen one goes back to its step); at the bottom, Back and
+ *   the one big button (Check, Continue, Finish), where a question's feedback appears too;
+ * - it opens on the first step (or where the reader left off), and ends on a short "lesson complete";
  * - a question has to be answered before Continue: a wrong pick says why in one line and is crossed off, and the
  *   reader picks again. A Tap question (tap the parts of a diagram) gives its hint on a miss and, after two, offers
  *   the answer;
- * - keys: Enter is the big button, the arrows step back and forward, 1 to 9 pick a choice, Escape is the course.
+ * - keys: Enter is the big button, the arrows step back and forward, 1 to 9 pick a choice.
  *
- * On the home page it lights the course path (`.course`, render.rs `course`, a graph course.rs lays out) with the
+ * On the course map it lights the course path (`.course`, render.rs `course`, a graph course.rs lays out) with the
  * reader's progress: each node and its mastery cells (one per question, solid when it was right the first time), the
  * edges from finished nodes inked, the updates new since the reader's last visit marked New, Start or Continue on what
  * comes next, and the big button pointed at it. On What's new it marks each update the same way.
@@ -39,7 +40,6 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
 }
 
 const ICON = {
-	close: '<path d="M6 6l12 12M18 6L6 18"/>',
 	back: '<path d="M15 5l-7 7 7 7"/>',
 	sound: '<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>',
 	muted: '<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>',
@@ -175,55 +175,53 @@ function tapQuestion(q: HTMLElement, onChange: () => void): Question | null {
 	};
 }
 
+/**
+ * The player, in the page's own column with the sidebar beside it. Screens 0..n-1 are the steps and n the end. At the
+ * top: the lesson's eyebrow and a row of segments, one per step (filled once seen, ringed for a question; a seen one
+ * goes back to its step). At the bottom: Back and the one big button, with a question's feedback above them.
+ */
 function player(main: HTMLElement, signal: AbortSignal): () => void {
 	const lesson = main.dataset.lesson!;
 	const course = main.dataset.course!;
 	const steps = [...main.querySelectorAll<HTMLElement>(':scope > section.step')];
 	if (!steps.length) return () => {};
 	const quizIds = (main.dataset.quizzes ?? '').split(' ').filter(Boolean);
-	const quizCount = quizIds.length;
 	const title = main.querySelector('.head h1')?.textContent ?? document.title;
 	let saved = load();
 	let me = progress(saved, lesson);
 	const n = steps.length;
-
-	// Cover and end, as screens like the steps: 0 is the cover, 1..n the steps, n + 1 the end.
-	const cover = el('section', 'step lp-cover');
-	cover.innerHTML = `<p class="lp-eyebrow"></p><h2></h2><p class="lp-line"></p><p class="lp-meta"></p><ol class="lp-map" aria-label="Steps"></ol>`;
-	cover.querySelector('h2')!.textContent = title;
-	cover.querySelector('.lp-eyebrow')!.textContent = main.dataset.eyebrow ?? '';
 	// An update (render.rs gives it data-log, What's new) says so where a lesson says lesson.
 	const log = main.dataset.log;
 	const kind = log ? 'Update' : 'Lesson';
-	// The lesson's glyph (render.rs puts it above the page's title), as on its node on the course path.
-	const glyph = main.querySelector('.head .lesson-glyph');
-	if (glyph) cover.prepend(glyph.cloneNode(true));
-	cover.querySelector('.lp-line')!.textContent = main.dataset.line ?? '';
+
+	const end = el('section', 'step lp-end');
+	end.innerHTML = `<div class="lp-seal" aria-hidden="true">${seal()}</div><h2>${kind} complete</h2><p class="lp-score"></p><p class="lp-next"></p>`;
+	const screens = [...steps, end];
+	steps[n - 1]!.after(end);
+
+	// The top: which lesson, and the steps as segments.
+	const top = el('div', 'lp-top');
 	const minutes = Math.max(1, Math.ceil((n * 20) / 60));
-	cover.querySelector('.lp-meta')!.textContent = `${n} steps · ${minutes} min${quizCount ? ` · ${quizCount} questions` : ''}`;
-	const map = cover.querySelector('.lp-map')!;
-	steps.forEach((s, i) => {
+	top.innerHTML = `<div class="lp-head"><p class="lp-eyebrow"><span class="lp-k"></span><span class="lp-t"></span></p><span class="lp-count"></span><button type="button" class="lp-snd"></button></div><ol class="lp-segs" aria-label="Steps"></ol>`;
+	top.querySelector('.lp-k')!.textContent = main.dataset.eyebrow ?? kind;
+	top.querySelector('.lp-t')!.textContent = title;
+	top.querySelector('.lp-eyebrow')!.setAttribute('title', `${n} steps · ${minutes} min${quizIds.length ? ` · ${quizIds.length} questions` : ''}`);
+	const segs = top.querySelector('.lp-segs')!;
+	const segBtns = steps.map((s, i) => {
 		const li = el('li');
 		const b = el('button');
 		b.type = 'button';
-		b.setAttribute('aria-label', `Step ${i + 1}: ${s.querySelector('h2')?.textContent ?? ''}`);
-		b.title = s.querySelector('h2')?.textContent ?? '';
+		const h = s.querySelector('h2')?.textContent ?? '';
+		b.setAttribute('aria-label', `Step ${i + 1}: ${h}`);
+		b.title = h;
 		if (s.querySelector('.quiz')) b.dataset.q = '';
 		b.addEventListener('click', () => {
-			if (i + 1 <= me.seen || me.done) show(i + 1, 1);
+			if (i < me.seen || me.done) show(i, i < at ? -1 : 1);
 		});
 		li.append(b);
-		map.append(li);
+		segs.append(li);
+		return b;
 	});
-	const end = el('section', 'step lp-end');
-	end.innerHTML = `<div class="lp-seal" aria-hidden="true">${seal()}</div><h2>${kind} complete</h2><p class="lp-score"></p><p class="lp-next"></p>`;
-	const screens = [cover, ...steps, end];
-	steps[0]!.before(cover);
-	steps[n - 1]!.after(end);
-
-	// The bars.
-	const top = el('div', 'lp-top');
-	top.innerHTML = `<a class="lp-x" aria-label="Back to the course">${icon('close')}</a><div class="lp-bar" role="progressbar" aria-label="${kind} progress" aria-valuemin="0" aria-valuemax="${n}"><i></i></div><span class="lp-count"></span><button type="button" class="lp-snd"></button>`;
 	const snd = top.querySelector<HTMLButtonElement>('.lp-snd')!;
 	const paintSound = () => {
 		snd.innerHTML = icon(soundOn() ? 'sound' : 'muted');
@@ -236,9 +234,6 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		paintSound();
 		sound.pick();
 	});
-	const close = top.querySelector<HTMLAnchorElement>('.lp-x')!;
-	close.href = course;
-	const bar = top.querySelector<HTMLElement>('.lp-bar')!;
 	const count = top.querySelector<HTMLElement>('.lp-count')!;
 	const foot = el('div', 'lp-foot');
 	foot.innerHTML = `<div class="lp-fb" aria-live="polite"><p class="lp-fb-t"></p><p class="lp-fb-w"></p></div><div class="lp-row"><button type="button" class="lp-back" aria-label="Back">${icon('back')}</button><button type="button" class="lp-go"></button></div>`;
@@ -247,11 +242,8 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	const fbW = foot.querySelector<HTMLElement>('.lp-fb-w')!;
 	const backBtn = foot.querySelector<HTMLButtonElement>('.lp-back')!;
 	const goBtn = foot.querySelector<HTMLButtonElement>('.lp-go')!;
-	cover.before(top);
+	steps[0]!.before(top);
 	main.append(foot);
-	// The step's last line stays clear of the bottom bar, however tall its feedback grows.
-	const ro = new ResizeObserver(() => main.style.setProperty('--foot-h', `${foot.offsetHeight}px`));
-	ro.observe(foot);
 
 	// The questions, set up once: picks made on a step survive going back and forth.
 	const questions = new Map<HTMLElement, Question>();
@@ -265,8 +257,7 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		const made = q.classList.contains('tap') ? tapQuestion(q, picked) : choiceQuestion(q, picked);
 		if (!made) continue;
 		questions.set(s, made);
-		const p = me.pass[made.id];
-		if (p?.right) made.settle();
+		if (me.pass[made.id]?.right) made.settle();
 	}
 	// Each step's own figures (not the questions'): explorable diagrams.
 	const figures: Diagram[] = [];
@@ -290,7 +281,7 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		fb.hidden = !tone;
 	}
 
-	/** The buttons, the bar and the count for where the reader is. `picking`: a pick just changed. */
+	/** The buttons, the segments and the count for where the reader is. `picking`: a pick just changed. */
 	function sync(picking = false) {
 		const s = screens[at];
 		const q = s ? questions.get(s) : undefined;
@@ -301,27 +292,21 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		backBtn.disabled = at === 0;
 		goBtn.disabled = false;
 		goBtn.dataset.kind = '';
-		if (at === 0) goBtn.textContent = me.done ? 'Review' : me.seen > 0 ? 'Continue' : 'Start';
-		else if (at === n + 1) goBtn.textContent = main.dataset.next ? 'Next lesson' : 'Back to the course';
+		if (at === n) goBtn.textContent = main.dataset.next ? 'Next lesson' : 'Back to the course';
 		else if (q && !answered(s)) {
 			goBtn.textContent = 'Check';
 			goBtn.dataset.kind = 'check';
 			goBtn.disabled = !q.ready();
-		} else goBtn.textContent = at === n ? 'Finish' : 'Continue';
-		const k = Math.min(at, n);
-		bar.style.setProperty('--p', String(at === n + 1 ? 1 : Math.max(0, k - 1) / n));
-		bar.setAttribute('aria-valuenow', String(at === n + 1 ? n : Math.max(0, k - 1)));
-		count.textContent = at === 0 ? '' : at === n + 1 ? 'Done' : `${k} / ${n}`;
-		top.dataset.cover = String(at === 0);
-		cover.querySelectorAll<HTMLButtonElement>('.lp-map button').forEach((b, i) => {
-			const step = i + 1;
-			b.dataset.state = me.done || step <= me.seen ? 'seen' : '';
-			b.disabled = !(me.done || step <= me.seen);
+		} else goBtn.textContent = at === n - 1 ? 'Finish' : 'Continue';
+		count.textContent = at === n ? 'Done' : `${at + 1} / ${n}`;
+		segBtns.forEach((b, i) => {
+			b.dataset.state = i === at ? 'cur' : me.done || i < me.seen ? 'seen' : '';
+			b.disabled = !(me.done || i < me.seen);
 		});
 	}
 
 	function show(i: number, dir: 1 | -1 | 0) {
-		if (i === at || i < 0 || i > n + 1) return;
+		if (i === at || i < 0 || i > n) return;
 		const was = screens[at];
 		at = i;
 		misses = 0;
@@ -335,13 +320,13 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 			s.classList.add(dir > 0 ? 'in-fwd' : 'in-back');
 			s.addEventListener('animationend', () => s.classList.remove('in-fwd', 'in-back'), { once: true });
 		}
-		if (i >= 1 && i <= n) {
-			me.step = i;
-			me.seen = Math.max(me.seen, i);
+		if (i < n) {
+			me.step = i + 1;
+			me.seen = Math.max(me.seen, i + 1);
 		}
 		// The end: a rising phrase, or the full chord when every question was right the first time.
-		if (dir > 0) (i === n + 1 ? (quizIds.length && firstTime(me, quizIds) === quizIds.length ? sound.milestone : sound.done) : sound.tick)();
-		if (i === n + 1) {
+		if (dir > 0) (i === n ? (quizIds.length && firstTime(me, quizIds) === quizIds.length ? sound.milestone : sound.done) : sound.tick)();
+		if (i === n) {
 			me.done = true;
 			me.step = 0;
 			me.seen = n;
@@ -349,38 +334,38 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 		}
 		store(saved);
 		const q = questions.get(s);
-		if (q && answered(s)) {
-			const w = s.querySelector('details.answer p')?.innerHTML ?? '';
-			feedback('ok', 'Answered', w);
-		} else feedback('');
+		if (q && answered(s)) feedback('ok', 'Answered', s.querySelector('details.answer p')?.innerHTML ?? '');
+		else feedback('');
 		sync();
-		scrollTo({ top: 0, behavior: 'instant' });
-		const h = s.querySelector<HTMLElement>('h2');
-		if (h && dir) {
-			h.tabIndex = -1;
-			h.focus({ preventScroll: true });
+		if (dir) {
+			const y = main.getBoundingClientRect().top + scrollY - 8;
+			if (scrollY > y) scrollTo({ top: Math.max(0, y), behavior: 'instant' });
+			const h = s.querySelector<HTMLElement>('h2');
+			if (h) {
+				h.tabIndex = -1;
+				h.focus({ preventScroll: true });
+			}
 		}
 	}
 
 	function finish() {
-		const ids = (main.dataset.quizzes ?? '').split(' ').filter(Boolean);
-		const first = ids.filter((id) => me.pass[id]?.right && me.pass[id]!.tries === 1).length;
-		end.querySelector('.lp-score')!.textContent = ids.length
-			? first === ids.length
-				? `All ${ids.length} questions right the first time.`
-				: `${first} of ${ids.length} questions right the first time. The others count once you got them, so nothing is lost.`
+		const first = quizIds.filter((id) => me.pass[id]?.right && me.pass[id]!.tries === 1).length;
+		end.querySelector('.lp-score')!.textContent = quizIds.length
+			? first === quizIds.length
+				? `All ${quizIds.length} questions right the first time.`
+				: `${first} of ${quizIds.length} questions right the first time. The others count once you got them, so nothing is lost.`
 			: 'You went through every step.';
-		end.querySelector('.lp-seal')!.classList.toggle('all', ids.length > 0 && first === ids.length);
+		end.querySelector('.lp-seal')!.classList.toggle('all', quizIds.length > 0 && first === quizIds.length);
 		const next = end.querySelector('.lp-next')!;
 		next.replaceChildren();
 		if (main.dataset.next) {
 			next.append('Up next: ');
 			const a = el('a', '', main.dataset.nextTitle ?? 'the next lesson');
 			a.href = main.dataset.next;
-			next.append(a, '. Or go back to the ');
+			next.append(a, '. Or see the whole ');
 		} else if (log) next.append('Back to the ');
 		else next.append('That was the last lesson. Back to the ');
-		const c = el('a', '', 'course');
+		const c = el('a', '', 'course map');
 		c.href = course;
 		next.append(c);
 		if (log) {
@@ -394,8 +379,7 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	function primary() {
 		if (goBtn.disabled) return;
 		const s = screens[at];
-		if (at === 0) return show(me.done || me.step < 1 ? 1 : me.step, 1);
-		if (at === n + 1) return go(main.dataset.next ?? course);
+		if (at === n) return go(main.dataset.next ?? course);
 		const q = s ? questions.get(s) : undefined;
 		if (q && !answered(s)) {
 			const p = (me.pass[q.id] ??= { tries: 0, right: false });
@@ -449,19 +433,15 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 				e.preventDefault();
 				primary();
 			} else if (e.key === 'ArrowRight') {
-				const s = screens[at];
-				if (at <= n && answered(s)) {
+				if (at < n && answered(screens[at])) {
 					e.preventDefault();
-					if (at === 0) primary();
-					else show(at + 1, 1);
+					show(at + 1, 1);
 				}
 			} else if (e.key === 'ArrowLeft') {
 				if (at > 0) {
 					e.preventDefault();
 					show(at - 1, -1);
 				}
-			} else if (e.key === 'Escape') {
-				close.click();
 			} else if (/^[1-9]$/.test(e.key)) {
 				const q = questions.get(screens[at]!);
 				if (q?.key && !answered(screens[at])) {
@@ -485,14 +465,13 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	);
 
 	// Where to open: a link to one step (search results link to `#<step>`), else where the reader left off, else the
-	// cover. A finished lesson opens on its cover, to review.
+	// first step.
 	const hash = decodeURIComponent(location.hash.slice(1));
 	const linked = steps.findIndex((s) => s.id === hash);
 	main.dataset.on = '';
-	show(linked >= 0 ? linked + 1 : !me.done && me.step >= 1 && me.step <= n ? me.step : 0, 0);
+	show(linked >= 0 ? linked : !me.done && me.step >= 1 && me.step <= n ? me.step - 1 : 0, 0);
 
 	return () => {
-		ro.disconnect();
 		for (const q of questions.values()) q.stop();
 		for (const f of figures) f.stop();
 	};

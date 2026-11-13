@@ -1,0 +1,50 @@
+// Lesson: bstd, blaze's own standard library (crates/blaze-std, library name `bstd`; docs/v2/plan/design/std.md):
+// on core and alloc, capabilities handed to `main` as an `Io`, a `Cx` per task, one sans-IO core over io_uring,
+// kqueue, IOCP or the deterministic simulation. The `fn main(io: Io)` edition and `#![no_std]` are planned; today a
+// crate takes it as an ordinary dependency.
+site {
+  learn {
+    bstd : Page {
+      Narrow
+      Lesson: {8, "A standard library where a function can touch only what it was handed.", "capability"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.extensions)
+      Title: {"bstd, its own std"}
+      Description: {"bstd: blaze's own standard library, built on core and alloc, where IO is a capability you pass and every task runs under simulation too."}
+
+      Step ambient("Anything can touch anything") {
+        P std("In Rust's `std`, any function can open a file, read the clock or spawn a thread, and its signature won't tell you. That makes code hard to test and hard to trust.")
+      }
+
+      Step handed("Handed, not taken") {
+        P io("**bstd** is blaze's own standard library, written from scratch on `core` and `alloc`. In it, IO is a value: `main` receives an `Io`, and a function can only do what it was handed.")
+        Code main(lang: "rust", text: `fn main(cx: &Cx, io: Io) -> Result<(), Error> \{
+            let data: Dir<ReadWrite> = io.fs().open_dir(cx, path!("data"))?;
+            // a function given only \`data\` can touch that directory and nothing else
+            Ok(())
+        }`)
+        Dim cx("`Cx` is the task's context: its deadline, its cancellation, its trace span and the memory it allocates from.")
+      }
+
+      Step handed_q("Check: what can it touch?") {
+        Quiz q(prompt: "`fn save(dir: &Dir<ReadWrite>, doc: &Doc)` is written with bstd. What can `save` reach?") {
+          Choice all("Any file on the machine, like any Rust function.", "Not in bstd: there is no global way in. It can reach only what its arguments give it.")
+          Choice dir("Only the directory it was handed.", "Right. Its signature is the full list of what it can touch.") {
+            Right
+          }
+          Choice none("Nothing: bstd functions can't do IO.", "They can, through what they're handed: here, one directory.")
+        }
+      }
+
+      Step sim("The same code, simulated") {
+        P one("Underneath, one `Io` runs over io_uring on Linux, kqueue on macOS, IOCP on Windows, or a **deterministic simulation**: a fake clock, fake disks and reordered events, all from one seed.")
+        P why("So a test can crash a program halfway through a write, a thousand different ways, and replay the exact one that broke. blaze tests its own store and daemon this way.")
+      }
+
+      Step status("Where it stands") {
+        P now("Experimental: bstd's drivers and interfaces are written, and blaze's own new crates are moving onto it. Next: a `fn main(io: Io)` edition, so a program can say it uses bstd alone.")
+        Dim design("The design: [std.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/std.md).")
+      }
+    }
+  }
+}

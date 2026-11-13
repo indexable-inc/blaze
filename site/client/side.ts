@@ -13,17 +13,15 @@
  * - Search: the pill (and ⌘K, Ctrl K or /) opens a dialog over `search.json` (gen/build.ts writes it: one entry per
  *   page and per section, with its text); every word typed must appear, title and heading matches rank first.
  * - The outline: the section being read is marked, as the ix docs' "On this page" does.
+ * - Shut: the top line's button (render.rs `side::topline`) folds the sidebar away on a wide screen for more room to
+ *   read, remembered per browser (blaze.side.shut; keep.ts shuts it again before the first paint).
  *
  * The sidebar outlives the client router's swaps (client/nav.ts), so everything but the outline is set up once; the
  * outline is the page's own and is set up again on every page (client/lib/page.ts), and a swap closes the drawer.
- *
- * Every page has this script, so it also brings in who is here (client/lib/presence.ts): the top line and the faces
- * on the rows.
  */
 
 import { PAGE, onPage } from './lib/page';
-import './lib/presence';
-import './lib/tip';
+import { tipOn } from './lib/tip';
 import { SIDE, handle } from './lib/resize';
 import { CHANGED, KEY as PROGRESS, fresh, load, roll, stateOf, stateWords } from './lib/progress';
 
@@ -33,6 +31,7 @@ const FOLDED = 'blaze.side.folded';
 /** FoldOnPhone sections (Reference) the reader opened in the phone drawer: they stay open there. */
 const OPENED = 'blaze.side.opened';
 const phone = matchMedia('(max-width: 800px)');
+const SHUT = 'blaze.side.shut';
 
 function readFolded(key = FOLDED): Set<string> {
 	try {
@@ -350,10 +349,33 @@ function spy(signal: AbortSignal) {
 	mark();
 }
 
+/** The top line's button: shut the sidebar or open it again. The top line is outside the page column, so once. */
+function shutter() {
+	const b = document.querySelector<HTMLButtonElement>('[data-side-toggle]');
+	if (!b) return;
+	const show = (shut: boolean) => {
+		b.setAttribute('aria-pressed', String(shut));
+		tipOn(b, shut ? 'Show the sidebar' : 'Hide the sidebar');
+	};
+	b.hidden = false;
+	show(document.body.classList.contains('side-shut'));
+	b.addEventListener('click', () => {
+		const shut = document.body.classList.toggle('side-shut');
+		show(shut);
+		try {
+			if (shut) localStorage.setItem(SHUT, '1');
+			else localStorage.removeItem(SHUT);
+		} catch {
+			// Storage refused: shut for this page only.
+		}
+	});
+}
+
 folds();
 glide();
 drawer();
 search();
+shutter();
 // The sidebar's right edge drags its width (client/lib/resize.ts); not in the phone drawer (styles/shell.css).
 document.querySelector('.side')?.append(handle(SIDE));
 

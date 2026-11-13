@@ -2,7 +2,7 @@
 // (site.rfcs.capabilities is /rfcs/capabilities, site.index is /). A page's children, in order, are
 // its content, the way HTML nests: a node's kind is a component (P, Li, Code, Section ...), its links
 // are pairs ((Cites, refs.zig_io), (DependsOn, site.charter)), and pages are instances of the
-// prefabs at the end (Page, Doc, Rfc).
+// prefabs at the end (Page, Rfc).
 //
 // Text fields take inline markup: `code`, **strong**, *emphasis*, [label](https://...), and [[name]]
 // or [label][name] for a reference in refs.flecs. Prose is a "string" on one line; a code block is a
@@ -32,7 +32,7 @@ struct Brand(dark: string, light: string, width: i32, height: i32, still_dark: s
 // empty for the root). A link written /rfcs/x becomes <base>/rfcs/x; canonical and og:url are origin + base + path.
 struct Served(origin: string, base: string)
 
-// Blocks. In a Doc, every block has a name: its path under the page is the anchor comments use.
+// Blocks. A section's, heading's or question's path under the page is its URL fragment (`#motivation.why`).
 struct Lede(text: string)               // the opening paragraph, larger
 struct P(text: string)
 struct Dim(text: string)                // a quieter paragraph
@@ -142,7 +142,7 @@ struct Ref(href: string, label: string, note: string)
 // Relationships.
 Status { Exclusive }                    // one status per page or issue
 Draft {}                                // an RFC being written; anything in it may change
-Discussing {}                           // an RFC ready for comments
+Discussing {}                           // an RFC ready for review
 Accepted {}
 Rejected {}
 Open {}                                 // an issue nobody has settled
@@ -155,8 +155,6 @@ Requires {}                             // (Requires, page) on a lesson or updat
 InTheme { Exclusive }                   // (InTheme, themes.<name>): the band of the course path a lesson or update is in
 
 // Page kinds.
-Discussable {}                          // signed-in readers comment on each block (every other page has one discussion for the whole page)
-Quiet {}                                // no discussion at all (the 404)
 Narrow {}                               // a 560px column instead of 820px
 Wide {}                                 // a wide column, no outline beside it
 Hero {}                                 // the page's title is the logo, large (the home page)
@@ -164,9 +162,6 @@ Hero {}                                 // the page's title is the logo, large (
 prefab Page {
   OrderedChildren
 }
-prefab Doc : Page {                     // a page people discuss, block by block
-  Discussable
-}
-prefab Rfc : Doc {
+prefab Rfc : Page {
   (Status, Draft)
 }
