@@ -60,6 +60,11 @@ hn {
         Flex: {axis: Column, gap: $chat_queued_gap, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       }
+      // An external transcript has no composer: its source label occupies this otherwise empty slot.
+      external : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
       // The composer: one card holding the words, as wide as the transcript's column. A press anywhere on it that no
       // control takes gives the words the keys. While its draft starts with a space (an aside) it takes the aside's tint
       // (src/app/chat.rs sets its Fill and Edge from hn.Theme.aside and aside_line).
@@ -94,6 +99,15 @@ hn {
           }
         }
       }
+    }
+  }
+
+  prefab ExternalChatNote : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: $chat_foot_pad_t, b: $chat_foot_pad_b}
+    words : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: $line_chrome, role: 0, bold: 0}
     }
   }
 

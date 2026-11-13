@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 mod archive;
 mod browser;
 mod chat;
+mod external;
+mod library;
 mod floats;
 mod fold;
 mod keys;
@@ -90,6 +92,7 @@ enum Do {
     /// Run an action (a new object's act.Spawn), as its keys would.
     Act(u64),
     Select(u64),
+    OpenChat(String),
     /// An archived object: opened with the way back to the Archive.
     Archived(u64),
     Kill,
@@ -129,6 +132,7 @@ const CHAT_KINDS: [&str; 3] = ["claude", "codex", "cursor"];
 enum Mode {
     Commands,
     New,
+    Chats,
 }
 
 /// An act.Spawn action: the kind it makes and whose mark shows it (`claude-tui` shows Claude's), its name in the picker
@@ -212,6 +216,10 @@ pub struct App {
     run_terms: model::Terms,
     /// The chat sessions' transcripts, by session id, and each chat pane's own state (src/app/chat.rs).
     chats: model::Chats,
+    /// Actual daemon-session completions, independent of pane selection and transcript attachment.
+    sound_completions: crate::audio::CompletionTracker,
+    library: library::Library,
+    external: external::External,
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
     genui: std::cell::RefCell<chat::GenLive>,
@@ -564,6 +572,9 @@ impl App {
             terms,
             run_terms,
             chats,
+            sound_completions: crate::audio::CompletionTracker::default(),
+            library: library::Library::default(),
+            external: external::External::default(),
             chat: std::cell::RefCell::default(),
             genui: std::cell::RefCell::default(),
             rename: None,
@@ -980,6 +991,7 @@ impl App {
         let info = self.fold.merge(info, w);
         let menu_for = self.row_menu_for();
         let me = &*self;
+        let agent_models = self.link.agent_models();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
@@ -1089,6 +1101,14 @@ impl App {
                 // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
+                let (profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
+                    let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
+                    let chats = me.chats.borrow();
+                    let transcript = o.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
+                    chat::sidebar_model(transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()))
+                } else {
+                    (String::new(), String::new(), None)
+                };
                 let (name, meta, hint) = match &edit {
                     Some((shown, _)) => (shown.clone(), String::new(), String::new()),
                     None => (name, meta, hint),
@@ -1105,10 +1125,17 @@ impl App {
                             ("hint", Prop::Str(&hint)),
                             ("edit", Prop::Bool(edit.is_some())),
                             ("mark", Prop::Str(mark)),
+                            ("profile", Prop::Str(&profile)),
+                            ("profile_tip", Prop::Str(&profile_tip)),
                         ],
                     ]
                     .concat(),
                 );
+                if let Some(slot) = row.part("profile").and_then(|p| p.part("effort")) {
+                    view::for_each_of(slot, profile_effort.map(|level| ("meter", "hn.ChatEffort", level)), |meter, level, _| {
+                        chat::effort_meter(meter, Some(level), tone(w, "ink_muted"), tone(w, "ink_faint"));
+                    });
+                }
                 // Before its title, a mark only when there is something to say, so a quiet tree is plain words: a dot in
                 // the strong ink while its agent works, the same dot in the error ink when it failed (the row's one
                 // colour: its trailing words stay faint), nothing else. The dot is the chat's own running glyph
@@ -1217,6 +1244,9 @@ impl App {
             return;
         }
         let now = self.selected().and_then(|e| self.session_of(e));
+        if now.is_some_and(|sid| self.external_session(sid).is_some()) {
+            return;
+        }
         if self.saved != Some(now) {
             crate::prefs::set("selected", serde_json::json!(now));
             self.saved = Some(now);
@@ -1239,7 +1269,11 @@ impl App {
         let mut objs: Vec<(u64, String)> = Vec::new();
         self.world
             .new_query::<&model::Object>()
-            .each_entity(|e, o| objs.push((*e.id(), format!("s{}", o.id))));
+            .each_entity(|e, o| {
+                if self.external_session(o.id).is_none() {
+                    objs.push((*e.id(), format!("s{}", o.id)));
+                }
+            });
         self.world
             .new_query::<&model::Run>()
             .each_entity(|e, r| objs.push((*e.id(), format!("r{}", r.n))));
@@ -1320,6 +1354,9 @@ impl App {
 
     /// Keep object `e` in the tree whatever the rule says (its row's menu, Keep in Tree), or stop.
     pub fn toggle_pin(&mut self, e: u64) {
+        if self.session_of(e).is_some_and(|sid| self.external_session(sid).is_some()) {
+            return;
+        }
         let Some(key) = self.key_of(e) else { return };
         let o = self.world.entity_from_id(e);
         if self.pinned.remove(&key) {
@@ -1376,6 +1413,9 @@ impl App {
     /// runs) is killed and it goes to the Archive. The selected one goes through cmd+W itself, so what takes its place is
     /// selected; another leaves the selection where it is.
     pub fn close_object(&mut self, e: u64) {
+        if self.close_external(e) {
+            return;
+        }
         if !self.world.entity_from_id(e).is_alive() {
             return;
         }
@@ -1410,6 +1450,9 @@ impl App {
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
     fn entries(&self) -> Vec<(String, PalGlyph, String, String, Do)> {
+        if self.palette.as_ref().is_some_and(|p| p.mode == Mode::Chats) {
+            return self.library_entries();
+        }
         if self.picking() {
             return self
                 .picks()
@@ -1545,8 +1588,12 @@ impl App {
         if let Some(p) = self.palette.as_mut() {
             let q = p.query.trim().to_owned();
             if q != p.searched {
-                if q.chars().count() >= 2 && time - p.changed >= PALETTE_DEBOUNCE {
-                    self.link.runs_search(&q);
+                if (p.mode == Mode::Chats || q.chars().count() >= 2) && time - p.changed >= PALETTE_DEBOUNCE {
+                    if p.mode == Mode::Chats {
+                        self.library.query(&q);
+                    } else if p.mode == Mode::Commands {
+                        self.link.runs_search(&q);
+                    }
                     p.searched = q;
                 } else {
                     wait = true;
@@ -1573,6 +1620,7 @@ impl App {
                     w,
                     match mode {
                         Mode::Commands => "hn.Palette",
+                        Mode::Chats => "hn.ChatLibrary",
                         Mode::New => "hn.Picker",
                     },
                 );
@@ -1583,6 +1631,10 @@ impl App {
         let card = root.part("card");
         if mode == Mode::New {
             self.sync_picker(card, at);
+            return;
+        }
+        if mode == Mode::Chats {
+            self.sync_chat_library(card, at, &query);
             return;
         }
         let shown =
@@ -1767,12 +1819,13 @@ impl App {
     }
 
     /// Start the app's sound from the scene's `hn.sound` (scene/widgets/sound.flecs, src/audio.rs): the window's, never
-    /// an offscreen shot's. native.json `sound: false` keeps it silent, `music: false` leaves the music out, `ambient: false` the rain.
+    /// an offscreen shot's. Completion cues are on by default; music and rain require native.json `music: true`
+    /// and `ambient: true`. `sound: false` keeps it silent.
     ///
     /// # Errors
     /// The scene's sound is malformed (named), or the system refused the output.
     pub fn start_sound(&self) -> Result<(), String> {
-        let on = |k: &str| crate::prefs::get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+        let on = |k: &str| crate::prefs::get(k).and_then(|v| v.as_bool()).unwrap_or(k == "sound");
         if !on("sound") {
             return Ok(());
         }
@@ -1911,6 +1964,10 @@ impl App {
 
     /// Move the overlay's highlight by `by` rows: the palette's stops at its ends, the picker's few rows go round.
     fn palette_step(&mut self, by: i64) {
+        if self.palette.as_ref().is_some_and(|p| p.mode == Mode::Chats) {
+            self.step_library(by);
+            return;
+        }
         let n = self.entries().len() as i64;
         let Some(p) = self.palette.as_mut() else { return };
         if n == 0 {
@@ -1919,13 +1976,17 @@ impl App {
         let at = p.at as i64 + by;
         p.at = match p.mode {
             Mode::New => at.rem_euclid(n),
-            Mode::Commands => at.clamp(0, n - 1),
+            Mode::Commands | Mode::Chats => at.clamp(0, n - 1),
         } as usize;
     }
 
     /// An entry chosen (Return, or a click): it runs, and the overlay closes. A picker row runs its act.Spawn with the
     /// picker still open, so the action sees where it came from (`spawning`).
     fn choose(&mut self, d: Do) {
+        if matches!(d, Do::OpenChat(_)) {
+            self.run(d);
+            return;
+        }
         if !matches!(d, Do::Act(_)) {
             self.palette = None;
         }
@@ -1961,6 +2022,7 @@ impl App {
         upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
     ) -> Draw {
         self.time += dt;
+        self.poll_chat_library();
         self.pending = self.pending.saturating_sub(1);
         self.stats_begin();
         self.reload_keys_if_changed();
@@ -1980,15 +2042,39 @@ impl App {
         self.step_fold(dt);
         self.step_tree_scroll(dt);
         self.step_work_bar();
-        // The sound follows the chat in front (src/audio.rs; silent unless the window started it).
+        // Sounds follow the daemon's session state, never which pane is in front. Transcript parsers can reset on
+        // attach, so their `busy` flags are not completion evidence. A lost link or vanished session is silent.
         {
-            let front = self.focused_chat().is_some_and(|(_, _, sid)| self.chats.borrow().get(&sid).is_some_and(|t| t.busy));
-            let agents = self.chats.borrow().values().filter(|t| t.busy).count();
-            // Whether the chat in front's turn ended on an error: its ending rings low, not home.
-            let failed = self.focused_chat().is_some_and(|(_, _, sid)| {
-                self.chats.borrow().get(&sid).is_some_and(|t| t.items.iter().rev().find(|i| !matches!(i, model::chat::Item::TurnEnd { .. })).is_some_and(|i| matches!(i, model::chat::Item::Error { .. })))
-            });
-            crate::audio::scene(agents, front, failed, chat::plan::night(model::now_ms() / 1000));
+            let w = self.world.world_ref();
+            let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|s| *s.id() == *w.component_id::<model::Up>());
+            let chats = self.chats.borrow();
+            let mut snapshot = Vec::new(); // alloc: this frame's complete daemon chat snapshot
+            if up {
+                w.new_query::<&model::Object>().each_entity(|e, object| {
+                    if !e.has(model::ChatMode::id()) || self.external_session(object.id).is_some() {
+                        return;
+                    }
+                    let status = self.status_of(*e.id());
+                    if !matches!(status, "running" | "exited" | "killed") {
+                        return;
+                    }
+                    let failed = status == "killed"
+                        || e.try_cloned::<&model::ExitCode>().is_some_and(|code| code.code != 0)
+                        || chats.get(&object.id).is_some_and(|t| {
+                            t.items.iter().rev().find_map(|item| match item {
+                                model::chat::Item::TurnEnd { ok, .. } => Some(!ok),
+                                model::chat::Item::Error { .. } => Some(true),
+                                _ => None,
+                            }).unwrap_or(false)
+                        });
+                    snapshot.push((object.id, status == "running" && e.has(model::Busy::id()), failed));
+                });
+            }
+            let agents = snapshot.iter().filter(|(_, busy, _)| *busy).count();
+            if let Some(cue) = self.sound_completions.update(snapshot) {
+                crate::audio::cue(cue.name());
+            }
+            crate::audio::scene(agents, chat::plan::night(model::now_ms() / 1000));
         }
         self.sync_side_status();
         self.step_archive_scroll();
@@ -2317,6 +2403,8 @@ impl App {
                 self.tree_focus = false;
             } else if a == "pal:close" {
                 self.palette = None;
+            } else if let Some(key) = a.strip_prefix("library:choose:") {
+                self.choose_library_key(key);
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
                 if let Some((.., d)) = self.entries().into_iter().nth(i) {
                     self.choose(d);
@@ -2331,6 +2419,7 @@ impl App {
                 self.run_action(id, None);
             }
             Do::Select(e) => self.select(Some(e)),
+            Do::OpenChat(key) => self.library.open(&key),
             Do::Archived(e) => self.open_from_archive(e),
             Do::Kill => self.kill(),
             Do::Rename => self.rename_start(),
@@ -2440,7 +2529,7 @@ impl App {
     /// Text typed into the open palette (a key no binding takes): its query.
     fn palette_type(&mut self, chars: &str) {
         let time = self.time;
-        let Some(p) = self.palette.as_mut().filter(|p| p.mode == Mode::Commands) else { return };
+        let Some(p) = self.palette.as_mut().filter(|p| p.mode != Mode::New) else { return };
         let typed: String = chars
             .chars()
             .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
@@ -2575,6 +2664,9 @@ impl App {
 
     fn kill(&mut self) {
         let Some(e) = self.selected() else { return };
+        if self.close_external(e) {
+            return;
+        }
         if let Some((n, None)) = self.run_of(e) {
             // A run: killed while it runs, and closed; its session (if any) takes its place.
             if self.status_of(e) == "running" {

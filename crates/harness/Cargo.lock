@@ -134,6 +134,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "blaze-check"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-rng",
+ "libc",
+ "parking_lot",
+ "windows-sys",
+]
+
+[[package]]
+name = "blaze-hash"
+version = "0.0.0"
+dependencies = [
+ "foldhash",
+ "hashbrown 0.17.1",
+ "papaya",
+ "serde",
+]
+
+[[package]]
+name = "blaze-inproc"
+version = "0.0.0"
+dependencies = [
+ "blaze-inproc-rt",
+ "blaze-mem",
+ "crossbeam-channel",
+]
+
+[[package]]
+name = "blaze-inproc-rt"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "blaze-live"
+version = "0.1.0"
+dependencies = [
+ "blaze-inproc",
+ "blaze-inproc-rt",
+ "blaze-sha256",
+]
+
+[[package]]
+name = "blaze-mem"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+ "blaze-reclaim",
+ "crossbeam-channel",
+ "libc",
+ "parking_lot",
+ "windows-sys",
+]
+
+[[package]]
+name = "blaze-reclaim"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+]
+
+[[package]]
+name = "blaze-rng"
+version = "0.0.0"
+
+[[package]]
+name = "blaze-sha256"
+version = "0.0.0"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,6 +896,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu"
+version = "0.0.0"
+dependencies = [
+ "gpu-macros",
+]
+
+[[package]]
+name = "gpu-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,6 +987,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-chat-library"
+version = "0.1.0"
+dependencies = [
+ "harness-proto",
+ "hegeltest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-ghostty-config"
 version = "0.1.0"
 
@@ -908,10 +1009,12 @@ version = "0.1.0"
 name = "harness-native"
 version = "0.1.0"
 dependencies = [
+ "blaze-live",
  "block2",
  "bytemuck",
  "dispatch2",
  "harfrust",
+ "harness-chat-library",
  "harness-ghostty-config",
  "harness-mach",
  "harness-native-api",
@@ -1040,12 +1143,14 @@ dependencies = [
  "block2",
  "bytemuck",
  "dispatch2",
+ "gpu",
  "harfrust",
  "harness-mach",
  "harness-native-api",
  "harness-native-blaze",
  "harness-native-flecs",
  "harness-native-kip",
+ "harness-native-shaders",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
  "harness-native-ui-inline",
@@ -1091,6 +1196,15 @@ dependencies = [
 [[package]]
 name = "harness-native-scroll-physics"
 version = "0.1.0"
+
+[[package]]
+name = "harness-native-shaders"
+version = "0.1.0"
+dependencies = [
+ "gpu",
+ "harness-native-kip",
+ "hegeltest",
+]
 
 [[package]]
 name = "harness-native-ui-browser-api"
@@ -1359,6 +1473,8 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2368,6 +2484,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "papaya"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae"
+dependencies = [
+ "equivalent",
+ "seize",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2969,6 +3095,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seize"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "semver"

@@ -52,6 +52,9 @@ impl App {
         }
         let o = self.world.entity_from_id(e);
         let Some(sid) = o.try_cloned::<&model::Object>().map(|ob| ob.id) else { return };
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let was = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
         self.palette = None;
         self.chat_pick_close();

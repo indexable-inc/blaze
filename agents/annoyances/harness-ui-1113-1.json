@@ -1,0 +1,19 @@
+{
+ "id": "harness-ui-1113-1",
+ "date": "2026-11-13",
+ "who": "Codex GPT-6, main agent",
+ "where": "Native Harness build on the Mac",
+ "what": "The native app cannot currently be validated with installed Blaze: the workspace-pinned 0.20261105.4 rejects artifact=\"gpu\" as requiring bindeps; installed dev Blaze --ignore-pin exits at its 95 GiB ceiling while checking harness-native.",
+ "cost": "Native UI compile, scene tests and replacement app launch are blocked.",
+ "cause": "The pinned release predates the workspace GPU manifest support; the newer installed compiler reports excessive memory before check completion.",
+ "whys": [
+  "Native Harness uses a GPU artifact dependency.",
+  "Its workspace still pins a Blaze release that refuses that dependency.",
+  "The available dev compiler exits at its memory ceiling before it can validate the workspace."
+ ],
+ "class": "A consumer workspace depends on compiler features unavailable in its pinned release, without a passing consumer build gate.",
+ "prevention": "Need a native Harness compile/scene gate with its pinned compiler, plus a pin to a release that passes it; currently blocked by the available compiler.",
+ "workaround": "Andrew explicitly authorized Cargo. Native app built with pinned Cargo in a clean target, an ordinary host shader dependency in a temporary manifest, and existing Metal source rebound to current per-entry Rust slots; manifest restored after every command. 82 native tests, 15 search tests, 38 shader tests passed; offscreen search and external view inspected; updated window launched.",
+ "fix": "Pending a working Blaze build for the GPU workspace.",
+ "state": "open: Blaze build issues remain; native UI compiled and launched with authorized Cargo build"
+}

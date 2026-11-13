@@ -1106,11 +1106,8 @@ impl App {
             return;
         }
         self.set_marked(None);
-        if let Some(p) = self.palette.as_mut() {
-            if p.mode == super::Mode::Commands {
-                p.query.push_str(text);
-                p.at = 0;
-            }
+        if self.palette.is_some() {
+            self.palette_type(text);
             return;
         }
         if self.archive_text(text) || self.chat_type(text) {

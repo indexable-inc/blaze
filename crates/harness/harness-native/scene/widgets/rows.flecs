@@ -32,6 +32,8 @@ hn {
     prop focus: bool = false
     prop edit: bool = false
     prop menu: bool = false
+    prop profile: string = ""
+    prop profile_tip: string = ""
     (IsA, hn.TreeRowLook)
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
@@ -74,6 +76,27 @@ hn {
         count : hn.tree.Trail {
           Text: {s: $under}
         }
+      }
+    }
+    // The actual model family, then the same quiet effort bars as the composer.
+    profile : ui.Row {
+      Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: End, wrap: false}
+      Tooltip: {text: $profile_tip}
+      label : hn.tree.Trail { Text: {s: $profile} }
+      effort : ui.Row {
+        Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      if $profile != "" {
+        Size: {w: {kind: Fit, value: 0, min: 0, max: $tree_trail_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+      } else {
+        Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 0, r: 0, t: 0, b: 0}
+      }
+      if $hint == "" {
+        HoverShow: {row: 0, keep: true, away: false}
+      } else {
+        HoverShow: {row: 0, keep: false, away: true}
       }
     }
     meta : hn.tree.Trail {

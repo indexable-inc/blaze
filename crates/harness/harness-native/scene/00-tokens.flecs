@@ -877,6 +877,19 @@ export const size_gen_control = 13
 // How faint a control is drawn while it takes no input (disabled, or no handler): a Pose fade.
 export const gen_inert_fade = 0.55
 
+// Command-O: a compact result list beside one Markdown preview.
+export const library_w = 820
+export const library_list_w = 348
+export const library_body_h = 416
+export const library_query_h = 52
+export const library_footer_h = 32
+export const library_row_h = 50
+export const library_row_pad = 12
+export const library_row_gap = 4
+export const library_pad = 8
+export const library_preview_pad = 22
+export const library_preview_gap = 12
+
 // Generative UI, tier 3 (scene/widgets/genui.flecs, src/app/chat/genui/{layout,float,media}.rs): what floats over the
 // transcript (a popover, a menu, a dialog's plate over its scrim, a toast) and what folds, splits, tabs and shows status,
 // after den's 30-genui.flecs and 33-genui-prims.flecs.

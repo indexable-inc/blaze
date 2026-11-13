@@ -1,0 +1,21 @@
+{
+  "id": "harness-ui-1113-2",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Native Harness Command-O search results",
+  "what": "Andrew reported that the result overlay repeated long raw prompts as both title and excerpt, displayed Markdown syntax literally, and made indexing as prominent as a result. The sidebar also replaced actual model names with a generic capability tier.",
+  "cost": "The first installed interface was hard to scan and required another UI pass.",
+  "cause": "Search reused the generic command palette and rendered every field as an equally weighted line; the excerpt normalizer flattened Markdown whitespace before presentation.",
+  "whys": [
+    "Rows displayed all available metadata instead of separating recognition from reading.",
+    "The generic command palette had no selected-result preview.",
+    "A flattened excerpt prevented reuse of the existing Markdown block renderer.",
+    "The original visual check used a short fixture and missed real long titles and formatted messages.",
+    "Presentation owned a separate plain-text rendering path instead of sharing transcript rendering."
+  ],
+  "class": "Search previews discard source structure and compete with result identity in the same row.",
+  "prevention": "Command-O now owns a bounded results-and-preview layout. Search preserves excerpt whitespace, and selected previews and generated Markdown share the transcript block parser and row renderer. The ranking test checks whitespace preservation through recent, metadata and FTS stages. Offscreen fixtures cover long task titles, headings, lists, code, links and enlarged UI scale.",
+  "workaround": "None.",
+  "fix": "Model family names and existing effort meters replace the abstract tier in sidebar rows. Compact labels and provider/directory metadata identify results; only the selection renders an excerpt. Index progress and keyboard hints sit in the footer.",
+  "state": "fixed in this change"
+}

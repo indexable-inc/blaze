@@ -1,0 +1,14 @@
+[package]
+name = "harness-chat-library"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-proto = { path = "../harness-proto" }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+rusqlite = { version = "0.41.1", features = ["bundled", "serialize"] }
+hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }

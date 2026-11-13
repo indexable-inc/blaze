@@ -46,6 +46,7 @@ act {
   // cmd+N: a chat at once, no picker, of the agent kind a chat was last started with (native.json `chat_kind`, else
   // `new_kind` when that is an agent, else Claude); its model is changed afterwards from the chat's own model control.
   NewChat { MenuItem: {bar: "File", title: "New Chat"} }
+  OpenChat { MenuItem: {bar: "File", title: "Open Chat…"} }
   // The picker (File > New…, unbound): a row for each act.Spawn below with a `title`, in this order (the one picked last
   // is highlighted when it opens, native.json `new_kind`). A titled Spawn added in keys.flecs joins it.
   Picker { MenuItem: {bar: "File", title: "New…"} }
@@ -207,6 +208,8 @@ key {
   // No When: it holds over the chat's and the terminal's keys (cmd+R was bound to nothing before it).
   rename { Keybind: {key: "r", cmd: 1}
     (Does, act.Rename) }
+  open_chat { Keybind: {key: "o", cmd: 1}
+    (Does, act.OpenChat) }
   archive { Keybind: {key: "w", cmd: 1}
     (Does, act.Archive) }
 
