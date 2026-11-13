@@ -1,0 +1,18 @@
+== dedupe_old
+dedupe/generic_chains                               [  72.7 ms ...  78.4 ms ... 230.6 ms ]  stddev:  11.0 ms
+dedupe/generic_chains_keeping                       [ 118.9 ms ... 137.8 ms ... 175.3 ms ]  stddev:  10.2 ms
+dedupe/long_chains                                  [ 315.6 ms ... 327.2 ms ... 393.9 ms ]  stddev:  13.5 ms
+dedupe/floor/clone                                  [   3.8 ms ...   4.3 ms ...  18.7 ms ]  stddev: 521.5 us
+dedupe/floor/code_ids                               [  10.5 ms ...  11.7 ms ...  20.0 ms ]  stddev: 880.7 us
+== dedupe_new
+dedupe/generic_chains                               [  47.3 ms ...  54.8 ms ...  78.5 ms ]  stddev:   3.9 ms
+dedupe/generic_chains_keeping                       [  74.4 ms ...  93.3 ms ... 152.9 ms ]  stddev:   9.4 ms
+dedupe/long_chains                                  [  40.3 ms ...  46.8 ms ...  65.6 ms ]  stddev:   3.6 ms
+dedupe/floor/clone                                  [   3.9 ms ...   4.2 ms ...  12.6 ms ]  stddev: 303.3 us
+dedupe/floor/code_ids                               [  10.2 ms ...  11.8 ms ...  20.7 ms ]  stddev:   1.3 ms
+== dedupe_final
+dedupe/generic_chains                               [  36.5 ms ...  43.8 ms ... 207.9 ms ]  stddev:   9.2 ms
+dedupe/generic_chains_keeping                       [  34.1 ms ...  42.6 ms ... 235.6 ms ]  stddev:  10.9 ms
+dedupe/long_chains                                  [  20.9 ms ...  25.0 ms ... 128.2 ms ]  stddev:   5.3 ms
+dedupe/floor/clone                                  [   3.8 ms ...   4.3 ms ...  69.1 ms ]  stddev:   1.5 ms
+dedupe/floor/code_ids                               [  10.3 ms ...  11.6 ms ...  18.1 ms ]  stddev: 671.5 us

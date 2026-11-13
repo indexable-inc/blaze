@@ -82,6 +82,41 @@ How blaze's own numbers move from run to run, each platform on its own benchmark
 Not drawn until there are two runs on one machine: macOS arm64 instructions per merge (none yet), macOS arm64 edit times (one run), Linux aarch64 instructions per merge (none yet), Linux aarch64 edit times (one run), Linux x86-64 instructions per merge (none yet), Linux x86-64 edit times (one run), Windows x86-64 live-edit latency (one run).
 <!-- benchtrend:end -->
 
+## Benchmarks (this fork, `perf/speedup`)
+
+This fork speeds up one stage of blaze's codegen, **code dedupe** (identical code folding).
+Upstream's own benchmark measures it (`crates/blaze-bench/benches/dedupe.rs`).
+
+![blaze code dedupe: upstream vs this fork](docs/perf/dedupe-bench.svg)
+
+| Scenario | upstream `main` @615873fa | this fork | speedup |
+|---|---:|---:|---:|
+| `dedupe/generic_chains` (32,768 functions, 9 rounds) | 90.6 ms (86.2–95.6) | 52.5 ms (49.8–55.3) | **1.7×** |
+| `dedupe/generic_chains_keeping` (the same, with originals kept) | 150.1 ms (148.0–152.8) | 50.9 ms (48.7–53.1) | **2.9×** |
+| `dedupe/long_chains` (32,768 functions, 65 rounds) | 337.1 ms (325.2–355.2) | 32.0 ms (30.2–34.4) | **10.5×** |
+| `dedupe/floor/clone`, `floor/code_ids` (controls) | 4.4–4.9 / 11.9–12.6 ms | 4.2–4.9 / 11.4–12.2 ms | ~1.0× |
+
+How these were measured:
+
+- **Runs:** blaze-bench's paired `compare`, `-t 20 -o`, seeds 1, 2 and 3. Each cell is the mean
+  per iteration, and the range is the spread of the three per-seed means. Every scenario
+  difference is significant (|z| ≥ 2.6).
+- **Noise:** the control rows set the noise floor at about 5%.
+- **Machine:** an 8-vCPU Intel Xeon VM running Linux 6.12, built with `nightly-2026-10-27`.
+- **Reproducing:**
+
+  ```sh
+  NEW=$(ls -t target/release/build/blaze-bench/*/out/dedupe-* | head -1)   # after: cargo +nightly-2026-10-27 bench -p blaze-bench --bench dedupe --no-run
+  "$NEW" compare /path/to/upstream/dedupe-bench-binary -t 20 -o --seed 1
+  ```
+
+  The full steps, the raw output and the correctness tests (an equivalence check against
+  upstream's implementation on thousands of random builds) are in [PERF.md](PERF.md).
+
+**Not measured: end-to-end rebuild times.** blaze needs Linux 7.3 or later to run, and the
+benchmark machine runs 6.12, so the "How fast" numbers above are upstream's and were not
+re-measured. Dedupe is one stage of a build, so these speedups are not rebuild speedups.
+
 ## How it works
 
 blaze's daemon keeps your project compiled in memory, with no cargo or rustc under it. After an
