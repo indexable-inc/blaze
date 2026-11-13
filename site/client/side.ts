@@ -358,9 +358,9 @@ function shutter() {
 		tipOn(b, shut ? 'Show the sidebar' : 'Hide the sidebar');
 	};
 	b.hidden = false;
-	show(document.body.classList.contains('side-shut'));
+	show(document.documentElement.classList.contains('side-shut'));
 	b.addEventListener('click', () => {
-		const shut = document.body.classList.toggle('side-shut');
+		const shut = document.documentElement.classList.toggle('side-shut');
 		show(shut);
 		try {
 			if (shut) localStorage.setItem(SHUT, '1');

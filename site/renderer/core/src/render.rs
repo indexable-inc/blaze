@@ -1011,6 +1011,7 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />
+<script src=\"{early}\"></script>
 {scripts}
 </head>
 <body>
@@ -1041,6 +1042,8 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
         css = esc(&s.served.href("/site.css")),
         // Classic and synchronous on purpose: it runs as soon as the sidebar is parsed, before the first paint.
         keep = esc(&s.served.href("/js/keep.js")),
+        // In <head>, classic and synchronous: the sidebar's shut state and width are set before anything paints.
+        early = esc(&s.served.href("/js/early.js")),
     );
     Ok(html)
 }

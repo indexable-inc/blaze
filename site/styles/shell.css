@@ -210,8 +210,8 @@ html.nav-wait, html.nav-wait * { cursor: progress; }
 .tl-side svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; }
 .tl-side[aria-pressed='true'] svg path { stroke-dasharray: 2 1.6; }
 .frame { transition: grid-template-columns 0.22s cubic-bezier(0.2, 0.7, 0.3, 1); }
-body.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
-body.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
+html.side-shut .frame { grid-template-columns: 0 minmax(0, 1fr); padding-left: clamp(8px, 1vw, 14px); gap: 0; }
+html.side-shut .frame > .side { visibility: hidden; overflow: hidden; padding: 0; }
 @media (prefers-reduced-motion: reduce) { .frame { transition: none; } }
 @media (max-width: 800px) { .topline { display: none; } }
 

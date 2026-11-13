@@ -35,7 +35,7 @@ site {
       }
 
       Step typo("Which crates?") {
-        Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json, then follow the arrows back to every crate that uses it.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
+        Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json and follow the arrows.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
       }
 
       Step link("Then it all links again") {

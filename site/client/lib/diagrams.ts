@@ -68,18 +68,19 @@ const still = matchMedia('(prefers-reduced-motion: reduce)');
 /** `a`, `a and b`, `a, b and c`. */
 const list = (xs: string[]) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`);
 
-/** Every part that depends on `id` through `wires` (from user to used), with how many steps away, nearest first. */
-function users(wires: Wire[], id: string, skip: Set<string>): [string, number][] {
+/** Every part a change to `id` reaches along `wires` (each from a part to what it goes into), with how many steps
+ *  away, nearest first. */
+function reach(wires: Wire[], id: string, skip: Set<string>): [string, number][] {
 	const out: [string, number][] = [];
 	const seen = new Set([id]);
 	let edge = [id];
 	for (let d = 1; edge.length; d++) {
 		const next: string[] = [];
 		for (const w of wires)
-			if (edge.includes(w.to) && !seen.has(w.from) && !skip.has(w.from)) {
-				seen.add(w.from);
-				next.push(w.from);
-				out.push([w.from, d]);
+			if (edge.includes(w.from) && !seen.has(w.to) && !skip.has(w.to)) {
+				seen.add(w.to);
+				next.push(w.to);
+				out.push([w.to, d]);
 			}
 		edge = next;
 	}
@@ -126,11 +127,13 @@ function build(v: View) {
 }
 
 // Lesson 1: crates using crates; cargo reruns rustc on an edited crate and every crate that uses it, then links.
+// Every wire runs the way a change travels, from a crate into the crates that use it and on into the program, so the
+// arrows mean one thing and an edit lights exactly what the arrows lead to.
 const CRATE_WIRES: Wire[] = [
-	{ from: 'app', to: 'net' },
-	{ from: 'app', to: 'json' },
-	{ from: 'net', to: 'core' },
-	{ from: 'json', to: 'core' },
+	{ from: 'net', to: 'app' },
+	{ from: 'json', to: 'app' },
+	{ from: 'core', to: 'net' },
+	{ from: 'core', to: 'json' },
 	{ from: 'app', to: 'program' },
 ];
 const crates: Piece = {
@@ -146,16 +149,16 @@ const crates: Piece = {
 		{ id: 'program', label: 'program', x: 25, y: 1, at: 'r', fixed: true },
 	],
 	wires: CRATE_WIRES,
-	idle: 'Arrows point from a crate to the crates it uses. Tap a crate to edit it.',
+	idle: 'Arrows show where a change travels: into every crate that uses it, then into the program. Tap a crate to edit it.',
 	tap(v, id) {
 		if (id === 'program') return;
 		v.reset();
 		v.set(id, 'edit');
-		const up = users(CRATE_WIRES, id, new Set(['program']));
+		const up = reach(CRATE_WIRES, id, new Set(['program']));
 		let far = 0;
 		for (const [u, d] of up) {
 			v.set(u, 'lit', d * STEP);
-			for (const w of CRATE_WIRES) if (w.from === u && (w.to === id || up.some(([x]) => x === w.to))) v.wire(w.from, w.to, true, d * STEP);
+			for (const w of CRATE_WIRES) if (w.to === u && (w.from === id || up.some(([x]) => x === w.from))) v.wire(w.from, w.to, true, d * STEP);
 			far = Math.max(far, d);
 		}
 		v.wire('app', 'program', true, (far + 1) * STEP);
@@ -557,7 +560,7 @@ export function mount(el: HTMLElement, pickMode: boolean, onPick?: () => void): 
 	const hover = (id: string, on: boolean) => {
 		buttons.get(id)?.classList.toggle('hl', on);
 		for (const c of refs.get(id) ?? []) c.classList.toggle('hl', on);
-		for (const w of piece.wires) if (w.from === id) wires.get(`${w.from}>${w.to}`)?.classList.toggle('hl', on);
+		for (const w of piece.wires) if (w.from === id || w.to === id) wires.get(`${w.from}>${w.to}`)?.classList.toggle('hl', on);
 	};
 	for (const [id, b] of buttons) {
 		b.addEventListener('pointerenter', () => hover(id, true));
