@@ -154,6 +154,10 @@ mod linux {
         if ptr.is_null() {
             return made(size, 1, false);
         }
+        if let Some(old) = crate::heaps::boot_block(ptr.cast::<u8>()) {
+            // SAFETY: a boot block of `old` bytes, the caller's to read.
+            return unsafe { moved_from_boot(ptr, old, size) };
+        }
         if !Heaps.owns(ptr.cast::<u8>()) {
             // SAFETY: the caller says `ptr` is a live block of an allocator; not mimalloc's.
             return unsafe { foreign_realloc(ptr, size) };
@@ -184,7 +188,8 @@ mod linux {
     /// C's contract for `free`.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn free(ptr: *mut c_void) {
-        if ptr.is_null() {
+        if ptr.is_null() || crate::heaps::boot_block(ptr.cast::<u8>()).is_some() {
+            // A boot block is never reused: freeing one does nothing.
             return;
         }
         if Heaps.owns(ptr.cast::<u8>()) {
@@ -281,11 +286,25 @@ mod linux {
         if ptr.is_null() {
             return 0;
         }
+        if let Some(bytes) = crate::heaps::boot_block(ptr.cast::<u8>()) {
+            return bytes;
+        }
         if !Heaps.owns(ptr.cast::<u8>()) {
             stop("blaze: malloc_usable_size of a block mimalloc does not hold", ptr);
         }
         // SAFETY: a live block of mimalloc's.
         unsafe { Heaps.usable(ptr.cast()) }
+    }
+
+    /// `realloc` of a boot block of `old` bytes: a block of the arena with its bytes; the
+    /// boot block stays where it is, as every boot block does.
+    unsafe fn moved_from_boot(ptr: *mut c_void, old: usize, size: usize) -> *mut c_void {
+        let block = made(size, 1, false);
+        if !block.is_null() {
+            // SAFETY: both blocks live, apart, each at least the bytes copied.
+            unsafe { ptr::copy_nonoverlapping(ptr.cast::<u8>(), block.cast::<u8>(), old.min(size)) };
+        }
+        block
     }
 
     /// Frees a block another allocator made: glibc's own (`__libc_malloc`), its owner.
@@ -607,6 +626,9 @@ mod macos {
     }
 
     unsafe extern "C" fn size(_: *mut Zone, ptr: *const c_void) -> usize {
+        if let Some(bytes) = crate::heaps::boot_block(ptr.cast::<u8>()) {
+            return bytes;
+        }
         match Heaps.owns(ptr.cast::<u8>()) {
             // SAFETY: mimalloc holds it; libmalloc asks only of a live block.
             true => unsafe { Heaps.usable(ptr.cast_mut().cast()) },
@@ -643,7 +665,8 @@ mod macos {
     /// this zone was first, given to `malloc_zone_free` of the default zone, which sends it
     /// here) to that zone.
     unsafe extern "C" fn zone_free(_: *mut Zone, ptr: *mut c_void) {
-        if ptr.is_null() {
+        if ptr.is_null() || crate::heaps::boot_block(ptr.cast::<u8>()).is_some() {
+            // A boot block is never reused: freeing one does nothing.
             return;
         }
         if Heaps.owns(ptr.cast::<u8>()) {
@@ -670,6 +693,14 @@ mod macos {
     unsafe extern "C" fn zone_realloc(_: *mut Zone, ptr: *mut c_void, size: usize) -> *mut c_void {
         if ptr.is_null() {
             return made(size, 1, false);
+        }
+        if let Some(old) = crate::heaps::boot_block(ptr.cast::<u8>()) {
+            let block = made(size, 1, false);
+            if !block.is_null() {
+                // SAFETY: both blocks live, apart, each at least the bytes copied.
+                unsafe { ptr::copy_nonoverlapping(ptr.cast::<u8>(), block.cast::<u8>(), old.min(size)) };
+            }
+            return block;
         }
         if Heaps.owns(ptr.cast::<u8>()) {
             // SAFETY: a live block of mimalloc's.
