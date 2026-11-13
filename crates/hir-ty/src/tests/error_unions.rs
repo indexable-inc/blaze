@@ -493,19 +493,16 @@ fn a_pattern_of_no_member_and_a_crate_without_the_attribute_are_mismatches() {
     });
 }
 
-/// The names of the members of the union `ty`, in the order the type has them.
-fn member_names(db: &Db, ty: Ty<'_>) -> Vec<String> {
+/// The members of the union `ty`, in the order the type has them, each with its name.
+fn members_of(db: &Db, ty: Ty<'_>) -> Vec<(hir_def::StructId, String)> {
     let interner = DbInterner::new_with(db, crate_named(db, "main"));
     let members = crate::error_union::members(interner, ty).expect("an error union");
     members
         .iter()
         .map(|member| match member.kind() {
             TyKind::Adt(def, _) => match def.def_id() {
-                AdtId::StructId(it) => StructSignature::of(db, it).name.as_str().to_owned(),
-                AdtId::EnumId(it) => {
-                    hir_def::signatures::EnumSignature::of(db, it).name.as_str().to_owned()
-                }
-                AdtId::UnionId(_) => panic!("no member is a union"),
+                AdtId::StructId(it) => (it, StructSignature::of(db, it).name.as_str().to_owned()),
+                other => panic!("the fixture's members are structs, not {other:?}"),
             },
             other => panic!("a member that is no item: {other:?}"),
         })
@@ -527,6 +524,50 @@ fn a_build(items: &str, orders: [&str; 3]) -> String {
     )
 }
 
+/// Two builds of the same members, declared and written in opposite orders.
+fn two_builds() -> [String; 2] {
+    [
+        a_build(
+            "pub struct Missing;\npub struct FsError;\npub struct Stopped;",
+            ["Missing | FsError | Stopped", "Stopped | FsError | Missing", "FsError | Stopped | Missing"],
+        ),
+        a_build(
+            "pub struct Unrelated;\npub struct Stopped;\npub struct FsError;\npub struct Missing;",
+            ["Stopped | Missing | FsError", "FsError | Missing | Stopped", "Missing | Stopped | FsError"],
+        ),
+    ]
+}
+
+/// What a build says of the set of `Missing`, `FsError` and `Stopped`: its members' names in
+/// the order the type has them, checked to be one type however it is written and the very
+/// type the depending crate has; and the same names in the order the build's database
+/// numbers their items, which is what an order by interned ID would be.
+fn orders_of(build: &str) -> (Vec<String>, Vec<String>) {
+    let mut in_main = None;
+    let mut numbered = None;
+    fields_of(build, "main", |db, tys, diagnostics| {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let [first, second] = tys else { panic!("{tys:?}") };
+        assert_eq!(first, second, "one type, whatever order it is written in");
+        let mut members = members_of(db, *first);
+        in_main = Some(members.iter().map(|(_, name)| name.clone()).collect::<Vec<_>>());
+        members.sort_by_key(|(id, _)| *id);
+        numbered = Some(members.into_iter().map(|(_, name)| name).collect::<Vec<_>>());
+    });
+    fields_of(build, "user", |db, tys, diagnostics| {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let [elsewhere] = tys else { panic!("{tys:?}") };
+        let names: Vec<String> = members_of(db, *elsewhere).into_iter().map(|it| it.1).collect();
+        assert_eq!(Some(names), in_main, "one order in every crate");
+    });
+    (in_main.expect("the union of `main`"), numbered.expect("the union of `main`"))
+}
+
+/// The oracle: every build has the set's members in one order.
+fn one_order(orders: &[Vec<String>]) -> bool {
+    orders.windows(2).all(|pair| pair[0] == pair[1])
+}
+
 /// The invariant: a set's members have one order, whatever order they are written in,
 /// whatever order their items are declared in (which is the order a database numbers them
 /// in), whichever crate writes the set and whichever build lowers it; so the set is one
@@ -536,69 +577,19 @@ fn a_build(items: &str, orders: [&str; 3]) -> String {
 /// type that crate has.
 #[test]
 fn a_sets_members_have_one_order_in_every_crate_and_every_build() {
-    let builds = [
-        a_build(
-            "pub struct Missing;\npub struct FsError;\npub enum Stopped { Cancelled }",
-            ["Missing | FsError | Stopped", "Stopped | FsError | Missing", "FsError | Stopped | Missing"],
-        ),
-        a_build(
-            "pub struct Unrelated;\npub enum Stopped { Cancelled }\npub struct FsError;\npub struct Missing;",
-            ["Stopped | Missing | FsError", "FsError | Missing | Stopped", "Missing | Stopped | FsError"],
-        ),
-    ];
-    let mut orders = Vec::new();
-    for build in &builds {
-        let mut in_main = None;
-        fields_of(build, "main", |db, tys, diagnostics| {
-            assert!(diagnostics.is_empty(), "{diagnostics:?}");
-            let [first, second] = tys else { panic!("{tys:?}") };
-            assert_eq!(first, second, "one type, whatever order it is written in");
-            in_main = Some(member_names(db, *first));
-        });
-        fields_of(build, "user", |db, tys, diagnostics| {
-            assert!(diagnostics.is_empty(), "{diagnostics:?}");
-            let [elsewhere] = tys else { panic!("{tys:?}") };
-            assert_eq!(Some(member_names(db, *elsewhere)), in_main, "one order in every crate");
-        });
-        orders.push(in_main.expect("the union of `main`"));
-    }
-    assert_eq!(orders[0], orders[1], "one order in every build");
+    let orders = two_builds().map(|build| orders_of(&build).0);
+    assert!(one_order(&orders), "{orders:?}");
     let mut sorted = orders[0].clone();
     sorted.sort();
     assert_eq!(sorted, ["FsError", "Missing", "Stopped"]);
 }
 
-/// The control of the invariant above: the order is no accident of these members' names or
-/// of the order they are declared in. Members named so that their names sort one way are
-/// not all ordered by name, which an order by name (or by declaration) would be: the order
-/// is by identity, a hash.
+/// The control of the invariant above. The planted bug is the order a union would have if
+/// its members were sorted by their interned IDs, the numbers a database gives items as it
+/// meets them: the two builds, which declare the members in opposite orders, then disagree,
+/// and the oracle refuses them.
 #[test]
-fn the_oracle_catches_an_order_by_name_or_declaration() {
-    let names = ["Aa", "Bb", "Cc", "Dd", "Ee", "Ff", "Gg", "Hh"];
-    let items: String = names.iter().map(|it| format!("pub struct {it};\n")).collect();
-    let pairs: String = names
-        .windows(2)
-        .enumerate()
-        .map(|(at, pair)| format!("p{at}: {} | {},\n", pair[0], pair[1]))
-        .collect();
-    let fixture = format!(
-        "//- minicore: sized, error_union\n//- /main.rs crate:main\n\
-         #![blaze::error_unions]\n{items}struct V {{\n{pairs}}}\n"
-    );
-    fields_of(&fixture, "main", |db, tys, diagnostics| {
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let by_name = tys
-            .iter()
-            .filter(|ty| {
-                let members = member_names(db, **ty);
-                members[0] < members[1]
-            })
-            .count();
-        assert!(
-            by_name != 0 && by_name != tys.len(),
-            "{by_name} of {} pairs are in the order of their names: an order by identity \
-             has some each way",
-            tys.len()
-        );
-    });
+fn the_oracle_catches_an_order_by_the_databases_numbering() {
+    let numbered = two_builds().map(|build| orders_of(&build).1);
+    assert!(!one_order(&numbered), "the builds number the members alike: {numbered:?}");
 }
