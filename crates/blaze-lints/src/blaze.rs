@@ -81,6 +81,9 @@ mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
 mod loops;
+mod implicit_overflow;
+#[cfg(test)]
+mod implicit_overflow_tests;
 mod lossy_as;
 mod many_bools;
 mod missing_size_hint;
@@ -267,6 +270,7 @@ pub enum Lint {
     LenientDeserialize,
     LockHeldAcrossSlow,
     LossyAs,
+    ImplicitOverflow,
     GlobalState,
     AsyncFn,
     UnmarkedPure,
@@ -361,6 +365,9 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     // What the edition removes or respells, and the marks it writes: a workspace getting ready
     // for the edition turns the group on.
     (Lint::LossyAs, false),
+    // Its advice (`checked_*`, `wrapping_*`, `try_from`) is Rust's; a workspace or crate turns
+    // it on where arithmetic must mean one thing in every profile (`blaze-std`, `blaze-mem`).
+    (Lint::ImplicitOverflow, false),
     (Lint::GlobalState, false),
     (Lint::AsyncFn, false),
     (Lint::UnmarkedPure, false),
@@ -517,6 +524,7 @@ impl Lint {
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
         Lint::LossyAs,
+        Lint::ImplicitOverflow,
         Lint::GlobalState,
         Lint::AsyncFn,
         Lint::UnmarkedPure,
@@ -613,6 +621,8 @@ impl Lint {
             // What the blaze edition removes or respells; right for any crate getting ready
             // for it.
             Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
+            // Arithmetic whose meaning is the profile's, which the edition removes.
+            Lint::ImplicitOverflow => Kind::Edition,
             // What the blaze edition writes at a crate's border: an effect the code already has.
             Lint::UnmarkedPure
             | Lint::UnmarkedNopanic
@@ -801,6 +811,7 @@ impl Lint {
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
             Lint::LossyAs => "lossy_as",
+            Lint::ImplicitOverflow => "implicit_overflow",
             Lint::GlobalState => "global_state",
             Lint::AsyncFn => "async_fn",
             Lint::UnmarkedPure => "unmarked_pure",
@@ -921,6 +932,7 @@ impl Lint {
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
             Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
+            Lint::ImplicitOverflow => concat!(general_docs!(), "#implicit_overflow"),
             Lint::GlobalState => concat!(general_docs!(), "#global_state"),
             Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
             Lint::UnmarkedPure
@@ -1230,6 +1242,9 @@ impl Lint {
             Lint::LossyAs => {
                 "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
             }
+            Lint::ImplicitOverflow => {
+                "say what overflow means here: `checked_*` with `?` (or a typed error) where it is a failure, `wrapping_*` or `Wrapping<T>` where the wrap is meant, `saturating_*`, `overflowing_*`, `T::try_from(x)` for a cast; or bound the operands with a check blaze can see (`i < v.len()`, `if a <= b`); or say why with `#[expect(blaze::implicit_overflow, reason = \"..\")]`"
+            }
             Lint::GlobalState => {
                 "give the state one owner and pass it, or a handle to it, as a context to the code the finding lists as using it; or say why it stays global with `#[expect(blaze::global_state, reason = \"..\")]`"
             }
@@ -1479,6 +1494,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
         lossy_as::check(cx);
+        implicit_overflow::check(cx);
         build_script_ambient::check(cx);
         std_use::check(cx);
         check_body(cx);

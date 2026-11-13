@@ -207,7 +207,10 @@ fn edition_group_is_off_by_default_and_turns_all_three_on() {
     assert!(!off.contains("which the blaze edition removes"), "{off}");
     assert!(!off.contains("this `as` in"), "{off}");
     let on = linted(EACH, "-A clippy::all --warn=blaze::edition");
-    assert!(on.contains("this `as` in `fn narrow` casts `u64` to `u32`"), "{on}");
+    // With the group on, `implicit_overflow` judges the casts that can lose an integer's value,
+    // and `lossy_as` yields them.
+    assert!(on.contains("can't show `x as u32` keeps its value in `u32` here: nothing shows `x <= 4294967295`"), "{on}");
+    assert!(!on.contains("this `as` in `fn narrow` casts `u64` to `u32`"), "{on}");
     assert!(on.contains("`static mut COUNT: u32` is global state"), "{on}");
     assert!(on.contains("`async fn fetch` is `async`"), "{on}");
 }
