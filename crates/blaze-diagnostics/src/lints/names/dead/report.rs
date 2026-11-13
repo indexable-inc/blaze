@@ -221,7 +221,7 @@ impl Report<'_, '_, '_, '_> {
         if self.live.contains(def) || self.level(def).expect.is_none() {
             return;
         }
-        let Some(at) = self.k.defs[def].node else { return };
+        let Some(at) = self.k.defs.node(self.k.cx, def) else { return };
         let Some(span) = self.ident_or_def_span(def) else { return };
         // alloc: once per `#[expect]` on dead code under a dead parent
         let diag = Diag::lint(self.lint.name(), String::new(), span);
