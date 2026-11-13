@@ -680,3 +680,97 @@ pub fn unbounded(n: usize) -> usize {
     assert_eq!(names, ["by_two", "unbounded"], "{out}");
     assert!(out.contains("with overflow checks"), "{out}");
 }
+
+/// No level waives `blaze::unreachable`: an `allow`, `expect` or `warn` attribute that names
+/// it is an error at the attribute (on the crate, on a function, even on one whose site is
+/// proved), and the site under it is still refused. A group or `warnings` does not reach it.
+#[test]
+fn an_attribute_that_waives_blaze_unreachable_is_refused() {
+    let out = linted(
+        r#"
+#![allow(blaze::unreachable)]
+#[allow(blaze::unreachable)]
+pub fn allowed() -> u32 {
+    blaze::unreachable!()
+}
+#[expect(blaze::unreachable, reason = "trust me")]
+pub fn expected() -> u32 {
+    blaze::unreachable!()
+}
+#[warn(blaze::unreachable)]
+pub fn proved(o: Option<u32>) -> u32 {
+    match o {
+        Some(x) => x,
+        None => match o {
+            Some(_) => blaze::unreachable!(),
+            None => 0,
+        },
+    }
+}
+#[allow(warnings, blaze::general)]
+pub fn by_group() -> u32 {
+    blaze::unreachable!()
+}
+#[deny(blaze::unreachable)]
+pub fn denied(o: Option<u32>) -> u32 {
+    match o {
+        Some(x) => x,
+        None => 0,
+    }
+}
+"#,
+        "-A clippy::all",
+    );
+    let found = findings(&out, "unreachable");
+    assert!(found.iter().all(|it| it.starts_with("error")), "{out}");
+    let waivers: Vec<_> = found.iter().filter(|it| it.contains("can't be waived")).collect();
+    assert_eq!(waivers.len(), 4, "{out}");
+    assert!(waivers[0].contains("`#[allow(blaze::unreachable)]`"), "{out}");
+    assert!(waivers.iter().any(|it| it.contains("`#[expect(blaze::unreachable)]`")), "{out}");
+    assert!(waivers.iter().any(|it| it.contains("`#[warn(blaze::unreachable)]`")), "{out}");
+    let sites: Vec<_> = found.iter().filter(|it| it.contains("can't prove this")).collect();
+    assert_eq!(sites.len(), 3, "{out}");
+    for name in ["`allowed`", "`expected`", "`by_group`"] {
+        assert!(sites.iter().any(|it| it.contains(name)), "{name}: {out}");
+    }
+}
+
+/// A flag that sets `blaze::unreachable` below `deny` (the command line's, and so a `[lints]`
+/// table's, a workspace table's or a baseline's, which all reach the lints as flags) refuses
+/// the crate's check. `--cap-lints`, `-A warnings` and a group do not reach the lint: the site
+/// is still an error. `-D` and `-F` change nothing.
+#[test]
+fn a_flag_that_waives_blaze_unreachable_refuses_the_check() {
+    let main = "pub fn bare() -> u32 {\n    blaze::unreachable!()\n}\n";
+    let fixture =
+        format!("{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{main}");
+    for flags in [
+        "-A clippy::all -A blaze::unreachable",
+        "-A clippy::all -W blaze::unreachable",
+        "-A clippy::all --allow=blaze::unreachable",
+    ] {
+        let refused =
+            crate::tests::try_lint_once(&fixture, flags, Default::default(), |_| {});
+        let Err(error) = refused else { panic!("`{flags}` was accepted: {refused:?}") };
+        assert!(
+            matches!(error, crate::diag::CheckError::Unwaivable { .. }),
+            "{flags}: {error}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains("`blaze::unreachable` is set to") && said.contains("below `deny`"),
+            "{said}"
+        );
+    }
+    for flags in [
+        "-A clippy::all --cap-lints allow",
+        "-A clippy::all -A warnings -A blaze::general",
+        "-A clippy::all -D blaze::unreachable",
+        "-A clippy::all -F blaze::unreachable",
+    ] {
+        let out = lint(&fixture, flags);
+        let found = findings(&out, "unreachable");
+        assert_eq!(found.len(), 1, "{flags}: {out}");
+        assert!(found[0].starts_with("error: `bare`"), "{flags}: {out}");
+    }
+}

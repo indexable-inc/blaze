@@ -1188,8 +1188,8 @@ counted, here or in `unwind_across_ffi`.
 
 **What it catches.** A `blaze::unreachable!()` (a blaze extension, opt-in:
 [the design](v2/plan/design/proved-unreachable.md)) that blaze cannot prove no path reaches.
-`deny` by default: it fires only where the code wrote the macro. The finding is at the site
-and names the function and what could not be shown:
+An error that no level waives: it fires only where the code wrote the macro. The finding is at
+the site and names the function and what could not be shown:
 
 ```text
 error: `get`: can't prove this `blaze::unreachable!()` is never reached: can't show `i < v.len()` here: no check before this branch rules the path out
@@ -1204,13 +1204,18 @@ code after an expression that never returns. It forgets what it knew of a value 
 is reassigned, and of what a `&mut` leads to at every call and write through a pointer. It
 does not follow arithmetic (`v[len - 1]`) or what a function of your own returns.
 
-**How to fix it.** Add the check that rules the path out so that it dominates the site, or
-write `unreachable!()`, the promise blaze does not check.
+**How to fix it.** Add the check that rules the path out so that it dominates the site. Where
+blaze cannot prove it, return a `Result`, or write core's `unreachable!()`, the promise blaze
+does not check, which counts as a panic site (`nopanic`, `panic_in_drop`).
 
-**At run time** the macro is a panic, like `unreachable!()`, never undefined behaviour.
+**At run time** the macro is a panic, like `unreachable!()`, never undefined behaviour:
+defence in depth for code whose lints were not run.
 
-**Allowing it.** `#[expect(blaze::unreachable, reason = "..")]`; the site then panics if it is
-reached.
+**Allowing it.** It can't be. `#[allow(blaze::unreachable)]`, `#[expect(..)]` and `#[warn(..)]`
+are each an error at the attribute; a flag or a line of a manifest's lint table
+(`[lints]`, `[workspace.metadata.blaze.lints]`, its ratchet, a baseline) that sets it below
+`deny` refuses the check, naming the lint; `--cap-lints`, `warnings` and a group that covers
+it do not reach it.
 
 ## `todo`
 

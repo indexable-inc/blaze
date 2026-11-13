@@ -336,6 +336,14 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Unreachable,
 ];
 
+/// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
+/// attribute, a flag, a manifest table or `--cap-lints` says ([`crate::level::Levels::of`]).
+/// An attribute that names one below `deny` is itself a finding of the lint, at the attribute
+/// (`proved_unreachable::check_waiver`), and a flag that does refuses the crate's check
+/// ([`crate::diag::CheckError::Unwaivable`]). A group or `warnings` that covers one does not
+/// reach it and is no error: only naming the lint is.
+pub(crate) const UNWAIVABLE: &[Lint] = &[Lint::Unreachable];
+
 /// Each lint of [`Kind::Edition`] with whether what its help tells code to move to is in this
 /// blaze, so that it warns by default and not only where a workspace turns `blaze::edition`
 /// on. `const fn` and `const` blocks are Rust's, so a function-like macro's lint warns now; the
@@ -1294,6 +1302,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on_any(crate::lints::On::BLAZE) {
         return;
     }
+    proved_unreachable::check_waiver(cx, node);
     if let Some(ty) = ast::PathType::cast(node)
         && cx.on_blaze(Lint::DefaultHasher)
         && let Some(written) = hashmap::check_type(cx, ty)

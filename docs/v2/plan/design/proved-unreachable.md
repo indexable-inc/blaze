@@ -33,12 +33,18 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
   blaze::unreachable!()")`: at run time it is a panic, never undefined behaviour, so a build
   that skipped the check is still sound. A proved site is dead code the optimizer may delete
   (not built: `SpendFacts` reads the proof, facts.md).
-- **The check.** The lint `blaze::unreachable` (`blaze-lints`, `proved_unreachable.rs`),
-  `deny` by default as `nopanic` is (it fires only where the code wrote the macro): one finding
-  per unproved site. Sites are found by resolution (the call's macro is the builtin), never by
-  text. An `#[expect(blaze::unreachable)]` is a written waiver; the site then panics if
-  reached. Losing alternative: a hard error outside the lints (`hir::diagnostics`), which no
-  level could waive but which would be a second place panic proofs are reported.
+- **The check.** The lint `blaze::unreachable` (`blaze-lints`, `proved_unreachable.rs`): one
+  finding per unproved site, found by resolution (the call's macro is the builtin), never by
+  text. It fails the compile and **no level waives it** (`blaze::UNWAIVABLE`):
+  `Levels::of` gives it `deny` whatever an attribute, a flag, `warnings` or `--cap-lints`
+  says; an `#[allow]`, `#[expect]` or `#[warn]` that names it is itself an error at the
+  attribute; and a flag that names it below `deny` (the command line's, a `[lints]` table's,
+  `[workspace.metadata.blaze.lints]`, its `lints-ratchet`, a baseline: all reach the lints as
+  flags) refuses the crate's check (`CheckError::Unwaivable`); blaze-units refuses the same
+  line in a workspace table when it loads the manifest. A group or `warnings` that covers the
+  lint does not reach it and is no error. Whoever cannot prove a site returns a `Result` or
+  writes core's `unreachable!()` and accepts that it counts as a panic site. The run-time
+  panic stays as defence in depth (a crate whose lints are not run, a dependency).
 - **The prover.** `hir_ty_pure::reach` (rule `semantics-in-front-end`; beside `loops`, the other
   analysis the effect walk reads). `reach::prove(db, env, body) -> Reach` is a function of one
   body's runtime MIR (after drop elaboration and `transform::asserts`, before any optimization)

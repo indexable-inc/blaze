@@ -11,6 +11,7 @@
 //! finding saying so.
 
 use hir_def::{DefWithBodyId, hir::Expr};
+use syntax::view as ast;
 use hir_expand::{HirFileId, MacroCallId, MacroDefKind, builtin::BuiltinFnLikeExpander};
 
 use super::{Finding, Lint, facts};
@@ -24,6 +25,26 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
     }
     let found = find(cx);
     facts::report(cx, found);
+}
+
+/// An attribute that names `blaze::unreachable` below `deny` (`allow`, `expect`, `warn`) on
+/// `node`: a finding of the lint itself at the name, since no level waives it
+/// ([`super::UNWAIVABLE`]). It is refused where it is written, whether or not a
+/// `blaze::unreachable!()` is under it.
+pub(super) fn check_waiver<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
+    if cx.expansion().is_some() {
+        return;
+    }
+    for (range, level) in cx.waivers(node, LINT) {
+        let span = cx.span(range);
+        // alloc: a message
+        let message = format!(
+            "`#[{level}(blaze::unreachable)]`: this lint can't be waived: a `blaze::unreachable!()` compiles only where blaze proves no path reaches it"
+        );
+        cx.blaze(LINT, node, span, message)
+            .help("take the attribute off; where a site can't be proved, return a `Result` or write core's `unreachable!()`, which counts as a panic site")
+            .help(format!("for further information visit {}", LINT.docs_url())); // alloc: a help line
+    }
 }
 
 /// Whether `call` is a call of `blaze::unreachable!()`.

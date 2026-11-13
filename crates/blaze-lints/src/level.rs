@@ -303,6 +303,13 @@ impl Levels {
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
     /// their order: rustc's `reveal_actual_level_spec`.
     pub fn of(&self, lint: Lint<'_>, sets: &[Set]) -> Spec {
+        // A lint no level waives is `deny` here whatever is set: not an attribute, a flag,
+        // `warnings` or the cap reaches it ([`blaze::UNWAIVABLE`]).
+        if let Lint::Blaze(it) = lint
+            && blaze::UNWAIVABLE.contains(&it)
+        {
+            return Spec { level: Level::Deny, source: Source::Default };
+        }
         let mut spec = self.probe(lint, sets).unwrap_or_else(|| self.default_spec(lint, sets));
         if spec.level == Level::Warn
             && let Some(warnings) = self.probe(Lint::Warnings, sets)
