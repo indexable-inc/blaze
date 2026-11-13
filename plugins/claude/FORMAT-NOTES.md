@@ -14,8 +14,9 @@ reader can check the plugin against them. Pages: [plugins](https://code.claude.c
 
 ## The plugin root is `plugins/`, not `plugins/claude/`
 
-The hook runs the agent-neutral core in `plugins/agent/`, so the core has to be inside the
-plugin's directory:
+The hooks run `blaze agents hook claude` from `PATH` (crates/blaze-cargo/src/cli/agents.rs), so
+the plugin carries no script of its own; the root stays `plugins/` so the marketplace entry and
+the manifest keep their paths:
 
 > Every other marketplace plugin: Claude Code copies the plugin into
 > `cache/<marketplace>/<plugin>/<version>/` at install and loads that copy. Files outside the
@@ -53,15 +54,10 @@ The name `blaze` is not reserved: the reserved ones start with `claude-`, `anthr
 > uses. A file that contains only the event map, without that wrapper, fails to load.
 > (plugins-reference)
 
-The handler is exec form, so the plugin path is one argument:
-
-> **Exec form** runs when `args` is present. Claude Code resolves `command` as an executable on
-> `PATH` and spawns it directly with `args` as the argument vector. ... path placeholders like
-> `${CLAUDE_PLUGIN_ROOT}` are substituted into `command` and into each `args` element as plain
-> strings. (hooks)
-
-> `${CLAUDE_PLUGIN_ROOT}` | Absolute path of the plugin's installed version | Scripts, binaries,
-> and config files bundled with the plugin (plugins-reference)
+The handler is the shell form `blaze agents hook claude`, with no path in it: the same string
+`blaze agents install` writes into a settings file (with `vN` after it, so `blaze agents status`
+can say an install is out of date), and the same string works in Codex's `hooks.json`, which has
+no exec form. The plugin's handler carries no `vN`: it is read as following the blaze on `PATH`.
 
 ### The matcher: `Write|Edit`
 
@@ -75,7 +71,21 @@ The handler is exec form, so the plugin path is one argument:
 
 `MultiEdit` is not named on any of these pages today, so it is not in the matcher. `NotebookEdit`
 is a tool ("Modifies Jupyter notebook cells", tools-reference) and only writes notebooks, never a
-`.rs` file or a `Cargo.toml`, so matching it would start Python for nothing on every notebook edit.
+`.rs` file or a `Cargo.toml`, so matching it would start the hook for nothing on every notebook
+edit.
+
+### Before a shell command: `PreToolUse` on `Bash`
+
+Read from the hooks page in the same session as the quotes above, and summarized here, not
+quoted word for word (the fetch returned a summary): `PreToolUse` runs before a tool runs and
+matches on the tool name, `Bash` among them; a `Bash` call's input has the command line in
+`tool_input.command`; the hook's JSON answer can carry `hookSpecificOutput.additionalContext`
+(text added for Claude) or `hookSpecificOutput.permissionDecision: "deny"` with
+`permissionDecisionReason` (the call is refused and the reason shown to Claude), with
+`hookEventName: "PreToolUse"`. `blaze agents hook claude` answers a `cargo build|check|test|run|
+clippy|bench|doc` or `rustc` command with the context by default and with the denial under
+`--strict`; it answers nothing for any other command. Its timeout is 5 s: it reads no file and
+asks no daemon.
 
 ### The input on stdin
 
@@ -92,10 +102,10 @@ The PostToolUse example input: `"tool_name": "Write"`, `"tool_input": {"file_pat
 > For the file tools `Write`, `Edit`, and `Read`, `tool_input.file_path` is always absolute
 > (hooks)
 
-The session's state (the last check's diagnostics, the once-a-session marker) goes under
-`scratchpad_dir` when it is there; `${CLAUDE_PLUGIN_DATA}` is for what outlives sessions ("a
-directory that survives updates, for `node_modules`, virtual environments, and caches",
-components), which this state does not.
+The session's state (the token of each package's last check; the base it names is the daemon's)
+goes under `scratchpad_dir` when it is there, else the system's temporary directory;
+`${CLAUDE_PLUGIN_DATA}` is for what outlives sessions ("a directory that survives updates, for
+`node_modules`, virtual environments, and caches", components), which this state does not.
 
 ### What Claude sees
 
@@ -129,7 +139,7 @@ The cap on what the hook prints:
 > 2,000 characters. (hooks)
 
 Hence at most 10 diagnostics of each level and 8,000 characters of each kind
-(`CAP`, `TEXT_BUDGET` in plugins/agent/blaze_new_diagnostics.py).
+(`CAP`, `TEXT_BUDGET` in crates/blaze-cargo/src/cli/agents/decide.rs).
 
 ### The timeout: 30 s, the core's deadline 20 s
 
@@ -142,9 +152,9 @@ The hook runs synchronously after each write, so its timeout is how long one wri
 agent. A warm daemon answers in tens of milliseconds (13 ms unchanged, 42 to 92 ms a body edit on
 small projects, measured by the coordinator); only a first check of a cold project takes seconds
 to minutes. 20 s bounds that stall and is still long enough for most first checks; at 20 s the
-core says "still running in the daemon" itself and leaves the check running, and the 10 s margin
-to the 30 s timeout covers Python's start and the diff, so Claude Code never cancels the hook and
-discards what it would have said.
+hook says "still running in the daemon" itself (the daemon answers the request at its `wait_ms`)
+and leaves the check running, and the 10 s margin to the 30 s timeout covers starting blaze and
+the daemon, so Claude Code never cancels the hook and discards what it would have said.
 
 ## Commands: `plugins/claude/commands/*.md`
 

@@ -87,10 +87,16 @@ pub enum Rule {
     /// effect itself, and it crosses a callee trusted for the effect, which answers for its
     /// own code and not for the object it is given.
     Dyn,
+    /// Syncs a file's bytes to the disk (`fsync`, `fdatasync`, `File::sync_all`): a wait on the
+    /// drive, milliseconds or more (docs/v2/plan/design/effect-summary.md).
+    Sync,
+    /// Takes a lock (std's, `lock_api`'s, `blaze_core::lock`'s): which ones, by class, is the
+    /// summary's `locks` (`crate::locks`).
+    Lock,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 23] = [
+    pub const ALL: [Rule; 25] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -114,6 +120,8 @@ impl Rule {
         Rule::Indirect,
         Rule::Precondition,
         Rule::Dyn,
+        Rule::Sync,
+        Rule::Lock,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -142,6 +150,8 @@ impl Rule {
             Rule::Indirect => "makes a call that may reach it again",
             Rule::Precondition => "has an `unsafe` precondition its caller upholds",
             Rule::Dyn => "calls through a `dyn` it is given",
+            Rule::Sync => "syncs a file to the disk",
+            Rule::Lock => "takes a lock",
         }
     }
 
@@ -171,6 +181,8 @@ impl Rule {
             Rule::Indirect => "indirect",
             Rule::Precondition => "precondition",
             Rule::Dyn => "dyn",
+            Rule::Sync => "sync",
+            Rule::Lock => "lock",
         }
     }
 }
@@ -290,6 +302,8 @@ pub const EFFECTS: &[&EffectDef] = &[
     &crate::effect_attrs::AMBIENT,
     &crate::effect_attrs::UNSAFE,
     &crate::effect_attrs::GLOBAL_ALLOC,
+    &crate::roles::BOUNDED_TURN,
+    &crate::roles::ANSWERS_REQUEST,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's
@@ -560,6 +574,10 @@ const INIT: EffectSet = EffectSet::one(Rule::Block);
 /// A process, socket or terminal wait: [`Rule::Io`] and [`Rule::Block`].
 const IO_WAIT: EffectSet = EffectSet::of(&[Rule::Io, Rule::Block]);
 const SLEEPS: EffectSet = WAITS;
+/// A lock taken: a wait ([`WAITS`]) and [`Rule::Lock`], whose class is `crate::locks`'s.
+pub(crate) const LOCKS: EffectSet = EffectSet::of(&[Rule::Thread, Rule::Block, Rule::Lock]);
+/// A file's bytes synced to the disk: [`Rule::Io`], [`Rule::Block`] and [`Rule::Sync`].
+pub(crate) const SYNCS: EffectSet = EffectSet::of(&[Rule::Io, Rule::Block, Rule::Sync]);
 
 const fn wait_method(
     what: &'static str,
@@ -811,27 +829,44 @@ pub(crate) const MODELS: &[Modeled] = &[
         SLEEPS,
         "parks the thread",
     ),
-    wait_method("std::sync::Mutex::lock", &["sync", "Mutex"], "lock", WAITS, "waits for the lock"),
+    wait_method("std::sync::Mutex::lock", &["sync", "Mutex"], "lock", LOCKS, "waits for the lock"),
     wait_method(
         "std::sync::RwLock::read",
         &["sync", "RwLock"],
         "read",
-        WAITS,
+        LOCKS,
         "waits for the lock",
     ),
     wait_method(
         "std::sync::RwLock::write",
         &["sync", "RwLock"],
         "write",
-        WAITS,
+        LOCKS,
         "waits for the lock",
     ),
     wait_method(
         "std::sync::ReentrantLock::lock",
         &["sync", "ReentrantLock"],
         "lock",
-        WAITS,
+        LOCKS,
         "waits for the lock",
+    ),
+    // A file's bytes synced to the disk (docs/v2/plan/design/effect-summary.md): on Apple's
+    // systems `sync_all` is `fcntl(F_FULLFSYNC)`, which the symbol table can't tell from any
+    // other `fcntl`, so the row is the method's.
+    wait_method(
+        "std::fs::File::sync_all",
+        &["fs", "File"],
+        "sync_all",
+        SYNCS,
+        "syncs the file to the disk",
+    ),
+    wait_method(
+        "std::fs::File::sync_data",
+        &["fs", "File"],
+        "sync_data",
+        SYNCS,
+        "syncs the file's data to the disk",
     ),
     wait_method(
         "std::sync::Condvar::wait",

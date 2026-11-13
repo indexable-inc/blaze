@@ -1,0 +1,9 @@
+{
+ "id": "H-owed-linear",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane owed-1112",
+ "task": "Make a value that must be handed over (pending puts, a claim to answer) impossible to drop on some path",
+ "do": "Mark the type `#[blaze::linear]` and each function that ends it `#[blaze::consumes]` (crates/hir-ty-linear, docs/v2/plan/design/linear.md); the borrow check then refuses every non-unwinding path that drops one and names its consumers. Give it a `Drop` only when that `Drop` is a right abandonment for an error exit (a claim given back); a runtime bomb in `Drop` makes `?` drop the value silently. Never build it out of a closure given to an unmarked generic (`with_store(.., || Claim {..})`, `Option::map`): return the parts and build it after.",
+ "why": "There is no `blaze::owed` lint: linear types already are the language primitive for this, enforced as semantics with no `#[expect]`. A second mechanism would be two homes for one concept.",
+ "state": "current"
+}

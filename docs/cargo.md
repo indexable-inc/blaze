@@ -100,6 +100,11 @@ a build first needs it.
     blaze trace --out PATH
     blaze tables --format=json
     blaze pin
+    blaze diagnostics [--since TOKEN] [-p PKG]... [--workspace] [--manifest-path PATH] [--file FILE] [--client NAME] [--wait SECONDS] [--json]
+    blaze agents install|remove [claude|codex]... [--project|--user] [--strict] [--dry-run]
+    blaze agents status [--json]
+    blaze agents hook claude|codex vN [--strict]
+    blaze doctor [--json]
     blaze --version
 
 `blaze help <command>` lists the flags a command takes: cargo's, read as cargo's clap reads them
@@ -1357,6 +1362,29 @@ The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's al
 daemon refuses one another user owns or others may write to;
 [v2/plan/lanes/store.md](v2/plan/design/store.md)).
 
+## blaze doctor
+
+`blaze doctor` checks the whole installation without changing anything and without the network
+(`crates/blaze-cargo/src/cli/doctor.rs`). Its sections, in order:
+
+| section | checks |
+|---|---|
+| `version` | this blaze against the workspace's pin; against the newest release the last update check kept (`<blaze home>/update/state.json`) |
+| `agents` | `blaze agents status` for each agent installed for or used here ([agents.md](agents.md)) |
+| `daemon` | who holds the state (`serve.lock`, and whether that process still runs); whether the running daemon is another build of blaze |
+| `state` | the daemon image and the profile history read; the state's size against the disk's free bytes; directories of layouts this blaze no longer reads (`v2.store-format-*`, `runner-*`), with their sizes |
+| `toolchain` | the pinned Rust and its library sources; the machine's shared directory |
+| `project` | directories of 1 GiB or more with no `CACHEDIR.TAG` (not `target/`, `.git/`); a file system whose timestamps have no sub-second part |
+| `tools` | the sandbox build scripts and proc macros run in |
+
+Each check is `ok`, `absent` or `unused` (a part a daemon starts empty), `warn` (blaze works,
+worse or older than it could) or `fault` (it does not), says what it found, and names the command
+that fixes it. The first line is the answer (`blaze is sound here`, `blaze works here, with N
+warnings`, or `N faults, M warnings`); the exit code is nonzero only for a fault. `--json` prints
+`{"version": 2, "state": DIR, "ok": BOOL, "checks": [{"section", "what", "file", "verdict",
+"said", "fix"}], "quarantine": [COMMAND]}`; version 2 added `section`, `fix`, `warn` and every
+section past `state`.
+
 ## Pinning a release of blaze
 
 A project pins blaze, not Rust: each release of blaze builds with the Rust it ships, and
@@ -1592,7 +1620,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
+    help: blaze's commands are build, check, run, test, bench, doc, lock, clean, cache, gc, store, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach, slow, diagnostics, doctor, agents, pprof and perf
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

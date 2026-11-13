@@ -4,7 +4,7 @@
 //! `DEP_<links>_<KEY>` of the runs it depends on), its result kept in the store by what it read
 //! ([`blaze_usercode::run`]), a script that provably prints only constants not run at all
 //! ([`blaze_usercode::script::inert`]), and what it printed applied as cargo applies it: its
-//! cfgs and env to its package's units through the job's writer ([`Writer::ran`]), its link
+//! cfgs and env to its package's units through the job's writer ([`Asks::ran`]), its link
 //! libraries and search paths to what links them, its metadata to its dependents' scripts.
 //!
 //! A run outside the sandbox is one `BLAZE_SANDBOX=off` or the workspace's
@@ -46,12 +46,12 @@ use blaze_usercode::{
 };
 
 use super::{
-    Job, Real, UnitWriter,
+    Job, Real,
     error::{UnitError, manifest_dir},
     package_of, say,
 };
 use crate::serve::native::NativeDir;
-use crate::serve::work::{Looked, RunPuts, Runs, Seen, Writer};
+use crate::serve::work::{Asks, Looked, RunPuts, Runs, Seen};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
 /// what elision said of it: `verify`, or unset.
@@ -1796,7 +1796,7 @@ impl ScriptRun {
         start: &Start,
         value: Value,
         began: SystemTime,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2035,7 +2035,7 @@ impl Runs<Real> for ScriptRun {
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2063,7 +2063,7 @@ impl Runs<Real> for ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2090,7 +2090,7 @@ impl ScriptRun {
     fn begin(
         &mut self,
         store: &Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2208,7 +2208,7 @@ impl ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

@@ -606,6 +606,14 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    // `#[blaze::bounded_turn(trusted = "why")]` and `answers_request`: the
+                    // arguments are [`AttrFlags::role_attr`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::bounded_turn)) => {
+                        attr_flags.insert(AttrFlags::BOUNDED_TURN)
+                    }
+                    (Some(Word::blaze), Some(Word::answers_request)) => {
+                        attr_flags.insert(AttrFlags::ANSWERS_REQUEST)
+                    }
                     // `#[blaze::expect(panic, alloc)]`: the list is [`AttrFlags::expect_attr`]'s to
                     // read and refuse.
                     (Some(Word::blaze), Some(Word::expect)) => attr_flags.insert(AttrFlags::EXPECT),
@@ -773,6 +781,8 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::bounded_turn)) => AttrFlags::BOUNDED_TURN,
+                (Some(Word::blaze), Some(Word::answers_request)) => AttrFlags::ANSWERS_REQUEST,
                 (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
                 (Some(Word::blaze), Some(Word::expect)) => AttrFlags::EXPECT,
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
@@ -948,10 +958,12 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    answers_request,
     automatically_derived,
     bench,
     bits,
     blaze,
+    bounded_turn,
     canonical_cbor,
     capabilities,
     checkfree,
@@ -1254,6 +1266,14 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::bounded_turn]` or `#[blaze::bounded_turn(..)]`: as
+        /// [`AttrFlags::NOPANIC`], for a turn of a loop thread that does no blocking call, IO,
+        /// sync or lock (`blaze::loop_turn_effects`, docs/v2/plan/design/effect-summary.md).
+        const BOUNDED_TURN = 1 << 115;
+        /// `#[blaze::answers_request]` or `#[blaze::answers_request(..)]`: as
+        /// [`AttrFlags::NOPANIC`], for an answer path that never syncs a file to the disk
+        /// (`blaze::sync_on_answer_path`).
+        const ANSWERS_REQUEST = 1 << 116;
         /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
         /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
@@ -1994,6 +2014,41 @@ impl EffectWord {
     }
 }
 
+/// The role attributes `hir-ty-pure` checks over the effect summary
+/// (docs/v2/plan/design/effect-summary.md): what a function is to the daemon, each the absence
+/// of a set of effects through every callee. Unlike an [`EffectWord`], no word of
+/// `#[blaze::expect(..)]` spells one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RoleWord {
+    /// `#[blaze::bounded_turn]`: a loop thread's turn, which must not block, do IO, sync or
+    /// take a lock.
+    BoundedTurn,
+    /// `#[blaze::answers_request]`: an answer path, which must not sync a file to the disk.
+    AnswersRequest,
+}
+
+impl RoleWord {
+    /// Every role word, in the order of its index.
+    pub const ALL: [RoleWord; 2] = [RoleWord::BoundedTurn, RoleWord::AnswersRequest];
+
+    /// The word, as written after `blaze::`.
+    pub const fn text(self) -> &'static str {
+        match self {
+            RoleWord::BoundedTurn => "bounded_turn",
+            RoleWord::AnswersRequest => "answers_request",
+        }
+    }
+
+    /// The flag that says an item carries it.
+    pub const fn flag(self) -> AttrFlags {
+        match self {
+            RoleWord::BoundedTurn => AttrFlags::BOUNDED_TURN,
+            RoleWord::AnswersRequest => AttrFlags::ANSWERS_REQUEST,
+        }
+    }
+}
+
 /// A word of `#[blaze::expect(..)]`: an effect a function is expected to have. The positive
 /// spelling: what is not listed, the function does not have; on a function's own list, what
 /// is listed it has (`blaze::unfulfilled_effect`).
@@ -2608,6 +2663,43 @@ impl AttrFlags {
             for effect in EffectWord::ALL {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
+                    let it = match attr {
+                        ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            PureAttr::Checked
+                        }
+                        ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            match attr.token_tree() {
+                                Some(tt) => pure_args(tt),
+                                None => PureAttr::Checked,
+                            }
+                        }
+                        _ => return ControlFlow::Continue(()),
+                    };
+                    ControlFlow::Break(it)
+                });
+            }
+            read
+        }
+    }
+
+    /// What `#[blaze::bounded_turn]` or `#[blaze::answers_request]` (`role`) on `owner` says,
+    /// in the shape of [`AttrFlags::effect_attr`]'s: checked, trusted with its reason, or
+    /// malformed; `None` without it, one bit test.
+    #[inline]
+    pub fn role_attr(db: &Db, owner: AttrDefId, role: RoleWord) -> Option<PureAttr> {
+        if !AttrFlags::query(db, owner).contains(role.flag()) {
+            return None;
+        }
+        // clone: a handle of an interned reason
+        return role_attrs(db, owner)[role as usize].clone();
+
+        /// The role attributes of `owner` at once, by [`RoleWord`]'s index.
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        fn role_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 2] {
+            let mut read: [Option<PureAttr>; 2] = [None, None];
+            for role in RoleWord::ALL {
+                let word = role.text();
+                read[role as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {
                         ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => {
                             PureAttr::Checked

@@ -59,6 +59,7 @@
 //!     num_methods:
 //!     int_wrapping:
 //!     int_overflow: non_zero, from, result, option, iterator
+//!     int_cast: from
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -540,6 +541,8 @@ pub mod mem {
 
     // region:drop
     pub fn drop<T>(_x: T) {}
+    // A stand-in: core's runs no drop of `_x` (`ManuallyDrop::new`), which no test here reads.
+    pub fn forget<T>(_x: T) {}
     pub const fn replace<T>(dest: &mut T, src: T) -> T {
         unsafe {
             let result = crate::ptr::read(dest);
@@ -575,6 +578,14 @@ pub mod mem {
 }
 
 pub mod ptr {
+    // region:int_cast
+    // The functions `blaze::as_cast`'s fixes write for a reference or an address to a pointer.
+    pub const fn from_ref<T: crate::marker::PointeeSized>(r: &T) -> *const T { loop {} }
+    pub const fn from_mut<T: crate::marker::PointeeSized>(r: &mut T) -> *mut T { loop {} }
+    pub const fn with_exposed_provenance<T>(addr: usize) -> *const T { loop {} }
+    pub const fn with_exposed_provenance_mut<T>(addr: usize) -> *mut T { loop {} }
+    // endregion:int_cast
+
     // region:drop
     #[lang = "drop_in_place"]
     pub unsafe fn drop_in_place<T: crate::marker::PointeeSized>(to_drop: *mut T) {
@@ -3098,6 +3109,99 @@ impl_num_methods! {
     powf: f32 f64
 }
 // endregion:num_methods
+
+// region:int_cast
+// What `blaze::as_cast`'s fixes call in place of `as`, as the pinned nightly's core has them:
+// the lossless `From` impls between numbers, `bool` and `char`, `cast_signed` and
+// `cast_unsigned`, `widen` and `truncate` (`integer_widen_truncate`, same sign only), and the
+// pointer methods and functions that name a cast.
+pub mod int_cast {
+    use crate::convert::From;
+    use crate::marker::PointeeSized;
+
+    macro_rules! impl_from {
+        ($($from:ty => $($to:ty)*;)*) => {$($(
+            impl From<$from> for $to {
+                fn from(_: $from) -> $to { loop {} }
+            }
+        )*)*};
+    }
+
+    impl_from! {
+        u8 => u16 u32 u64 u128 usize i16 i32 i64 i128 isize f32 f64 char;
+        u16 => u32 u64 u128 usize i32 i64 i128 f32 f64;
+        u32 => u64 u128 i64 i128 f64;
+        u64 => u128 i128;
+        i8 => i16 i32 i64 i128 isize f32 f64;
+        i16 => i32 i64 i128 isize f32 f64;
+        i32 => i64 i128 f64;
+        i64 => i128;
+        bool => u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize;
+        char => u32 u64 u128;
+        f32 => f64;
+    }
+
+    macro_rules! impl_sign {
+        ($($u:ty, $s:ty;)*) => {$(
+            impl $u {
+                pub const fn cast_signed(self) -> $s { loop {} }
+            }
+            impl $s {
+                pub const fn cast_unsigned(self) -> $u { loop {} }
+            }
+        )*};
+    }
+
+    impl_sign! {
+        u8, i8; u16, i16; u32, i32; u64, i64; u128, i128; usize, isize;
+    }
+
+    /// The types `x.truncate::<T>()` narrows a `Self` to.
+    pub trait TruncateTarget<T> {}
+    /// The types `x.widen::<T>()` widens a `Self` to.
+    pub trait WidenTarget<T> {}
+
+    macro_rules! impl_targets {
+        ($($from:ty: truncate $($narrow:ty)*; widen $($wide:ty)*;)*) => {$(
+            $(impl TruncateTarget<$narrow> for $from {})*
+            $(impl WidenTarget<$wide> for $from {})*
+            impl $from {
+                pub const fn truncate<T>(self) -> T where Self: TruncateTarget<T> { loop {} }
+                pub const fn widen<T>(self) -> T where Self: WidenTarget<T> { loop {} }
+            }
+        )*};
+    }
+
+    impl_targets! {
+        u8: truncate; widen u16 u32 u64 u128 usize;
+        u16: truncate u8; widen u32 u64 u128 usize;
+        u32: truncate u16 u8; widen u64 u128;
+        u64: truncate u32 u16 u8; widen u128;
+        u128: truncate u64 u32 u16 u8; widen;
+        usize: truncate u16 u8; widen;
+        i8: truncate; widen i16 i32 i64 i128 isize;
+        i16: truncate i8; widen i32 i64 i128 isize;
+        i32: truncate i16 i8; widen i64 i128;
+        i64: truncate i32 i16 i8; widen i128;
+        i128: truncate i64 i32 i16 i8; widen;
+        isize: truncate i16 i8; widen;
+    }
+
+    impl<T: PointeeSized> *const T {
+        pub const fn cast<U>(self) -> *const U { loop {} }
+        pub const fn cast_mut(self) -> *mut T { loop {} }
+        pub fn addr(self) -> usize { loop {} }
+        pub fn expose_provenance(self) -> usize { loop {} }
+    }
+
+    impl<T: PointeeSized> *mut T {
+        pub const fn cast<U>(self) -> *mut U { loop {} }
+        pub const fn cast_const(self) -> *const T { loop {} }
+        pub fn addr(self) -> usize { loop {} }
+        pub fn expose_provenance(self) -> usize { loop {} }
+    }
+}
+// endregion:int_cast
 
 // region:error
 pub mod error {

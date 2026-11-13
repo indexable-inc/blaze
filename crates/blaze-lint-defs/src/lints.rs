@@ -284,6 +284,14 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::process_static", Allow, "detects a `static` or `thread_local!` key holding a growable collection beneath a lock or a cell, or a concurrent collection: state that grows for the process's life with no owner to drop it")
         .externally_loaded(),
+    l("blaze::loop_turn_effects", Deny, "detects a `#[blaze::bounded_turn]` function, a loop thread's turn, that may block the thread, do IO, sync a file to the disk or take a lock, through any call")
+        .externally_loaded(),
+    l("blaze::sync_on_answer_path", Deny, "detects a `#[blaze::answers_request]` function, an answer path, that may sync a file to the disk, through any call")
+        .externally_loaded(),
+    l("blaze::lock_order", Allow, "detects locks taken in a cycle: one function holds A while taking B and another holds B while taking A, through any call, which can deadlock two threads")
+        .externally_loaded(),
+    l("blaze::lock_across_wait", Allow, "detects a lock guard held across a call that blocks the thread (a condvar it is not handed, a channel, a sleep, a join, a blocking syscall), through any call")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

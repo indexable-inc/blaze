@@ -314,6 +314,20 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "  {} unit {}: {}\n", paint(DIM, "doing"), unit.id, unit.doing);
             }
         }
+        Response::Diagnostics(seen) => {
+            let (new, fixed) = (seen.new.len(), seen.fixed.len());
+            let unchanged = seen.unchanged.len();
+            match &seen.failed {
+                Some(error) => report_into(out, error.report(), color),
+                None if !seen.ended => {
+                    put!(out, "{} the check is still running\n", status("Waiting"))
+                }
+                None => put!(out, "{new} new, {fixed} fixed, {unchanged} unchanged\n"),
+            }
+            for found in &seen.new {
+                put!(out, "{} {}: {}\n", paint(GREEN, "new"), found.level.name(), found.message);
+            }
+        }
     }
 }
 

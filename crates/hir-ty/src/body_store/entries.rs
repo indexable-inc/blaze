@@ -899,6 +899,12 @@ pub struct Refused {
 /// returned early), each of its marks whose trace is still the one claimed is removed, so the
 /// next [`claim_keeps`] claims those runs again and none is lost to a keep that did not reach
 /// the store.
+///
+/// `#[blaze::linear]` (crates/hir-ty-linear): a claim is answered on every path. Its `Drop` is
+/// its abandonment path, so an error exit (a `?` that propagates the keep's failure, a returned
+/// `Err`) gives its runs back with no error; any other exit must call [`Claim::kept`] (the keep
+/// reached the store) or [`Claim::give_back`] (it did not, said so).
+#[blaze::linear]
 pub struct Claim<'db> {
     pub steps: Vec<(DefWithBodyId, Step, SchemaHash)>,
     pub refused: Vec<Refused>,
@@ -909,9 +915,15 @@ pub struct Claim<'db> {
 
 impl Claim<'_> {
     /// The keep reached the store: the marks stay, and no later claim takes these runs.
+    #[blaze::consumes]
     pub fn kept(mut self) {
         self.marks.clear();
     }
+
+    /// The keep did not reach the store: every run this claim took goes to the next
+    /// [`claim_keeps`], as the claim's `Drop` gives them back on an error exit or an unwind.
+    #[blaze::consumes]
+    pub fn give_back(self) {}
 }
 
 impl Drop for Claim<'_> {
@@ -939,7 +951,7 @@ impl Drop for Claim<'_> {
 /// taken under their lock, then the claims made under the posts' lock: never two at once, and
 /// neither across a wait. None where `db` has no item store installed.
 pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
-    with_store(db, |store| {
+    let claimed = with_store(db, |store| {
         // alloc: one claim's snapshot of the database's traces, a counted reference each
         let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)> = store
             .traces
@@ -949,7 +961,7 @@ pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
             .map(|(key, ran)| (*key, Arc::clone(ran)))
             .collect();
         let mut posted = store.served.lock();
-        let mut claim = Claim { steps: Vec::new(), refused: Vec::new(), db, marks: Vec::new() };
+        let (mut steps, mut refused, mut marks) = (Vec::new(), Vec::new(), Vec::new());
         for (key, ran) in traced {
             if posted.kept.get(&key).is_some_and(|it| Arc::ptr_eq(it, &ran)) {
                 continue;
@@ -957,15 +969,19 @@ pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
             let (def, step, _) = key;
             match &*ran {
                 // alloc: the refusal's text, named to the driver
-                Ran::Refused(refusal) => claim.refused.push(Refused { def, step, why: format!("{refusal:?}") }),
-                Ran::Kept { .. } => claim.steps.push(key),
+                Ran::Refused(refusal) => refused.push(Refused { def, step, why: format!("{refusal:?}") }),
+                Ran::Kept { .. } => steps.push(key),
             }
             // clone: a counted reference, the mark and the claim's record of it
             posted.kept.insert(key, Arc::clone(&ran));
-            claim.marks.push((key, ran));
+            marks.push((key, ran));
         }
-        claim
-    })
+        (steps, refused, marks)
+    });
+    // Made out here: a `Claim` is linear, and neither `with_store`'s result parameter nor a
+    // closure given to `Option::map` may give one back (crates/hir-ty-linear, rule 4).
+    let (steps, refused, marks) = claimed?;
+    Some(Claim { steps, refused, db, marks })
 }
 
 /// One producer's word on one kind of read: the key ([`Read::key`], as an entry wrote it:

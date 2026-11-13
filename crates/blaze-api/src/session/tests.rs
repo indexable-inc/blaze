@@ -131,7 +131,7 @@ impl World {
     }
 
     fn tick(&mut self, now_ns: u64) -> Vec<Reply> {
-        self.call(|session, cx, _| session.tick(cx, now_ns))
+        self.call(|session, cx, out| session.tick(cx, now_ns, out))
     }
 
     /// `main` with `files` written, made durable.
@@ -1734,4 +1734,179 @@ fn why_keeps_a_handed_view_under_the_root_the_job_built() {
     let built = world.db.open(View { root: built_root });
     world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some((built, built_root)), out));
     assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(built_root, built)]);
+}
+
+/// A `Request::Diagnostics` of the agent's session `agent` on `main`.
+fn asked_since(since: Option<ContentId>, wait_ms: u64) -> Request {
+    Request::Diagnostics {
+        view: head("main"),
+        since,
+        client: "agent".to_owned(),
+        targets: targets(),
+        wait_ms,
+    }
+}
+
+/// A diagnostic of the check at `src/lib.rs:line`.
+fn said_at(level: Level, message: &str, line: u32) -> Response {
+    let span = crate::Span {
+        file: "src/lib.rs".to_owned(),
+        line,
+        label: None,
+        column: 4,
+        primary: true,
+        byte_end: 0,
+        end_line: line,
+        byte_start: 0,
+        end_column: 5,
+        replacement: None,
+        applicability: None,
+    };
+    Response::Diagnostic(Diagnostic {
+        level,
+        code: Some("c".to_owned()),
+        message: message.to_owned(),
+        spans: vec![span],
+        children: Vec::new(),
+        facts: Vec::new(),
+        rendered: message.to_owned(),
+        unit: None,
+        explanation: None,
+    })
+}
+
+/// The one answer of a diagnostics request in `replies`, and its Done's `ok`.
+fn answer_of(replies: &[Reply]) -> (crate::Seen, bool) {
+    match replies {
+        [
+            Reply { response: Response::Diagnostics(seen), .. },
+            Reply { response: Response::Done { ok }, .. },
+        ] => (seen.clone(), *ok),
+        replies => panic!("not one answer and its Done: {replies:?}"),
+    }
+}
+
+fn messages(found: &[crate::Found]) -> Vec<&str> {
+    found.iter().map(|it| it.message.as_str()).collect()
+}
+
+/// One diagnostics request of the check of `main` as it is, its job reporting `said`, ending
+/// `ok`: the answer.
+fn checked(
+    world: &mut World,
+    id: u64,
+    since: Option<ContentId>,
+    said: &[Response],
+    ok: bool,
+) -> crate::Seen {
+    assert_eq!(world.request(1, id, asked_since(since, 0)), []);
+    let (job, _, work) = world.builder.started.last().cloned().expect("the check started");
+    assert_eq!(work, Work::Check(targets()));
+    for it in said {
+        assert_eq!(world.report(job, it.clone()), [], "a diagnostics check forwards nothing");
+    }
+    let (seen, done) = answer_of(&world.finish(job, ok, None));
+    assert!(done, "{seen:?}");
+    assert!(seen.ended && seen.failed.is_none(), "{seen:?}");
+    seen
+}
+
+/// The invariant: each answer says, against the last answer to the same client, exactly the
+/// diagnostics added (new), gone (fixed) and kept (unchanged), counted by id; an edit that
+/// only moves lines says nothing new and nothing fixed; a token the daemon does not hold
+/// answers everything new and says so. Control: the moved check with the line's text changed
+/// is a fixed one and a new one, so the id does read the line.
+#[test]
+fn a_diagnostics_check_says_what_is_new_fixed_and_unchanged_since_its_token() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\nfn b() {}\n")]);
+    let warning = |line| said_at(Level::Warning, "function `b` is never used", line);
+    let error = |line| said_at(Level::Error, "mismatched types", line);
+
+    let first = checked(&mut world, 1, None, &[warning(2)], true);
+    assert_eq!(first.base, crate::Base::First);
+    assert_eq!(messages(&first.new), ["function `b` is never used"]);
+    assert!(first.fixed.is_empty() && first.unchanged.is_empty());
+    assert_eq!(world.session.views(), 0, "its view closed");
+
+    world.commit(&[("src/lib.rs", "fn a() {}\nfn b() {}\nfn c() -> u8 {}\n")]);
+    let added = checked(&mut world, 2, first.token, &[warning(2), error(3)], false);
+    assert_eq!(added.base, crate::Base::Held);
+    assert_eq!(messages(&added.new), ["mismatched types"], "the edit that adds an error");
+    assert_eq!(messages(&added.unchanged), ["function `b` is never used"]);
+    assert!(added.fixed.is_empty());
+
+    world.commit(&[("src/lib.rs", "fn a() {}\npub fn b() {}\nfn c() -> u8 {}\n")]);
+    let fixed = checked(&mut world, 3, added.token, &[error(3)], false);
+    assert!(fixed.new.is_empty(), "the edit that fixes a warning: {fixed:?}");
+    assert_eq!(messages(&fixed.fixed), ["function `b` is never used"]);
+    assert_eq!(messages(&fixed.unchanged), ["mismatched types"]);
+
+    world.commit(&[("src/lib.rs", "\n\nfn a() {}\npub fn b() {}\nfn c() -> u8 {}\n")]);
+    let moved = checked(&mut world, 4, fixed.token, &[error(5)], false);
+    assert!(moved.new.is_empty() && moved.fixed.is_empty(), "lines only moved: {moved:?}");
+    assert_eq!(messages(&moved.unchanged), ["mismatched types"]);
+    assert_eq!(moved.token, fixed.token, "the same diagnostics are the same base");
+
+    world.commit(&[("src/lib.rs", "\n\nfn a() {}\npub fn b() {}\nfn c() -> u16 {}\n")]);
+    let control = checked(&mut world, 5, moved.token, &[error(5)], false);
+    assert_eq!((control.new.len(), control.fixed.len()), (1, 1), "the control: {control:?}");
+
+    let unknown = checked(&mut world, 6, Some(ContentId([9; 32])), &[error(5)], false);
+    assert_eq!(unknown.base, crate::Base::Unknown);
+    assert_eq!(messages(&unknown.new), ["mismatched types"], "everything is new");
+}
+
+/// The invariant: a check still running at the request's wait is answered `ended: false`
+/// with its base kept and its token unchanged, the request over (its id free); its end then
+/// says nothing and moves no base. Control: the next request with the old token is diffed.
+#[test]
+fn a_diagnostics_check_past_its_wait_is_answered_still_running_and_keeps_its_base() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let warning = said_at(Level::Warning, "function `a` is never used", 1);
+    let first = checked(&mut world, 1, None, &[warning.clone()], true);
+
+    world.tick(1_000);
+    assert_eq!(world.request(1, 2, asked_since(first.token, 20)), []);
+    let job = world.last_job();
+    assert_eq!(world.session.deadline(), Some(20_001_000));
+    assert_eq!(world.tick(20_000_999), []);
+    let (waited, done) = answer_of(&world.tick(20_001_000));
+    assert!(done && !waited.ended, "{waited:?}");
+    assert_eq!((waited.base, waited.token), (crate::Base::Held, first.token));
+    assert!(waited.new.is_empty() && waited.fixed.is_empty() && waited.unchanged.is_empty());
+    assert_eq!(world.session.deadline(), None);
+    assert!(world.session.live.is_empty(), "the request is over for its client");
+    assert_eq!(world.report(job, warning.clone()), []);
+    assert_eq!(world.finish(job, true, None), [], "its end says nothing more");
+    assert_eq!(world.session.views(), 0);
+
+    let again = checked(&mut world, 2, first.token, &[warning], true);
+    assert_eq!(again.base, crate::Base::Held, "the base was kept: {again:?}");
+    assert_eq!(again.unchanged.len(), 1);
+}
+
+/// The invariant: a check that could not run, or failed and said no error, is answered as
+/// blaze's failure (`failed`, Done not ok) and keeps the base. Control: a failed check with an
+/// error is the code's, answered as diagnostics.
+#[test]
+fn a_diagnostics_check_that_blaze_failed_is_said_as_blazes_and_keeps_the_base() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let first = checked(&mut world, 1, None, &[], true);
+
+    world.request(1, 2, asked_since(first.token, 0));
+    let error = ApiError::new("the daemon's store broke", Some("store".to_owned()));
+    let (seen, done) = answer_of(&world.finish(world.last_job(), true, Some(error.clone())));
+    assert!(!done && seen.ended, "{seen:?}");
+    assert_eq!((seen.failed, seen.token), (Some(error), first.token));
+
+    world.request(1, 3, asked_since(first.token, 0));
+    let (seen, done) = answer_of(&world.finish(world.last_job(), false, None));
+    assert!(!done, "{seen:?}");
+    assert!(seen.failed.unwrap().what.contains("said no error"));
+
+    let code = checked(&mut world, 4, first.token, &[said_at(Level::Error, "e", 1)], false);
+    assert_eq!((code.base, code.new.len()), (crate::Base::Held, 1), "the control");
 }

@@ -168,7 +168,11 @@ mod tests {
 
     fn daemon() -> Daemon {
         let history =
-            History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: Flush::new(|| Ok(0)) };
+            History {
+                duckdb: Err("the test gives none".to_owned()),
+                dir: PathBuf::from("/nowhere"),
+                flush: Flush::new(|| Ok(0)),
+            };
         Daemon { cx: Context { history }, daemon: "test", tasks: Arc::new(Tasks::new()) }
     }
 

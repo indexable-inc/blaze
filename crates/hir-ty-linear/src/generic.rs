@@ -70,6 +70,14 @@ fn check_operand<'db>(
     };
     let span = operand.span.unwrap_or(at);
     let db = types.db;
+    if let CallableDefId::FunctionId(func) = callable
+        && let Some(verb) = mem_drop(db, func)
+    {
+        for ty in args.types().filter(|&it| types.reaches(it)) {
+            out.push(given_to_drop(types, body, span, ty, func, verb));
+        }
+        return;
+    }
     let (def, args) = match callable {
         CallableDefId::FunctionId(func) => match resolve(types, func, args) {
             Some(it) => it,
@@ -126,6 +134,53 @@ fn check_operand<'db>(
                 ),
             ],
         });
+    }
+}
+
+/// What `func` does to the value it is given, when it is core's `mem::drop` (`"drops"`) or
+/// `mem::forget` (`"leaks"`): a call of either with a linear value gives it up on purpose,
+/// which is refused with its own message rather than as a parameter that admits no linear
+/// type. std's `mem::drop` and `mem::forget` are core's, re-exported.
+fn mem_drop(db: &base_db::Db, func: hir_def::FunctionId) -> Option<&'static str> {
+    use hir_def::{HasModule, signatures::FunctionSignature};
+    let module = func.module(db);
+    let in_mem = module.krate(db).data(db).origin.is_lang()
+        && module.name(db).is_some_and(|it| it.as_str() == "mem");
+    if !in_mem {
+        return None;
+    }
+    match FunctionSignature::of(db, func).name.as_str() {
+        "drop" => Some("drops"),
+        "forget" => Some("leaks"),
+        _ => None,
+    }
+}
+
+/// The error of a linear value of `ty` given to `mem::drop` or `mem::forget` (`func`), which
+/// `verb` it: neither consumes it, so the obligation it stands for is never met.
+fn given_to_drop<'db>(
+    types: &Types<'_, 'db>,
+    body: &MirBody<'db>,
+    span: MirSpan,
+    ty: Ty<'db>,
+    func: hir_def::FunctionId,
+    verb: &str,
+) -> LinearDiagnostic {
+    let db = types.db;
+    let shown = names::ty(db, body, ty);
+    let name = hir_def::signatures::FunctionSignature::of(db, func).name.as_str().to_owned(); // alloc: error path
+    let mut notes = Vec::new(); // alloc: error path
+    notes.extend(names::consumed_by(types, ty));
+    notes.push(crate::drops::CONSUME.to_owned()); // alloc: error path
+    LinearDiagnostic {
+        span,
+        message: format!(
+            "`{shown}` holds a `#[blaze::linear]` value and is given to `mem::{name}`, which \
+             {verb} it without consuming it: a linear value stands for something still owed, \
+             and giving it up on purpose is refused as dropping it is"
+        ),
+        labels: Vec::new(), // alloc: error path, empty
+        notes,
     }
 }
 

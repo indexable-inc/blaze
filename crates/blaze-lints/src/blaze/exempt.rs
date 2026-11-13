@@ -38,6 +38,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // Kept with `#[expect(..)]`: where a function reads a thread-local is its own choice.
         | Lint::ThreadLocalInWaitingFn
         | Lint::LockAcrossQuery
+        // Kept with `#[expect(..)]` on the function: what a turn, an answer or a lock order may
+        // reach is the function's choice, not one line's.
+        | Lint::LoopTurnEffects
+        | Lint::SyncOnAnswerPath
+        | Lint::LockOrder
+        | Lint::LockAcrossWait
         | Lint::LockHeldAcrossSlow
         | Lint::BlockingOnPool
         | Lint::UnnamedWait
@@ -148,7 +154,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher
         // The edition's lints name a construct the edition removes, not a cost on a line.
-        | Lint::LossyAs
+        | Lint::AsCast
         | Lint::ImplicitOverflow
         | Lint::GlobalState
         | Lint::AsyncFn
@@ -180,7 +186,10 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Unwired
         | Lint::TmpPath
         | Lint::NarrowedLen
-        | Lint::ProcessStatic => None,
+        | Lint::ProcessStatic
+        // Kept with `#[expect(..)]` on the item: whether wrapping is meant is the code's
+        // choice, said once with its reason.
+        | Lint::TruncatingCast => None,
     }
 }
 

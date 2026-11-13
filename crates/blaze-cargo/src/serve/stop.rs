@@ -177,7 +177,8 @@ fn counted(at: &Progress, working_now: usize) -> String {
 /// Watches the loop's turns until a stop: SIGTERM or SIGINT, or the daemon's own stop, as a
 /// byte on `pipe`. A turn that lasts half of `bound` is reported once ([`LoopWatch`]); a loop
 /// that has not turned while the worker pool's jobs and the queries stood still too, for the
-/// whole `bound` ([`Watchdog`]), is deadlocked, and the daemon ends ([`Exit::LoopStalled`])
+/// whole `bound` (the loop as a task of the task watchdog's core, [`loop_seen`]), is
+/// deadlocked, and the daemon ends ([`Exit::LoopStalled`])
 /// rather than leave its children unreaped and its clients waiting for ever. `true` once a stop
 /// began; `false` once the guard is disarmed ([`Guard::disarm`]) with no stop, or when the pipe
 /// can't be read, so no stop is bounded.
@@ -188,7 +189,10 @@ fn watch_turns(
     over: &Receiver<()>,
 ) -> bool {
     let mut turning = LoopWatch::new(bound / 2);
-    let mut watchdog = Watchdog::new(bound);
+    // The loop is one task of the task watchdog's core, on a thread of its own: the loop's
+    // driver may be the one that is stuck, and the task watchdog's reader takes the
+    // scheduler's locks, which a deadlock may hold. Its span is its progress.
+    let mut watch = blaze_profile::stuck::Watch::new();
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
     let pid = std::process::id();
@@ -215,12 +219,13 @@ fn watch_turns(
             steps: turns,
             working: 0,
         };
-        if let Some(quiet) = watchdog.tick(now, progress, look != Look::Turning) {
+        let seen = [loop_seen(&progress, now, bound)];
+        if let Some(quiet) = watch.look(now, &seen).first() {
             // alloc: once, as the process ends
             let why = format!(
                 "the loop has not finished a turn and nothing moved for {} s, its bound ({}): it ends with exit status {}",
-                quiet.for_ns / 1_000_000_000,
-                counted(&quiet.at, pool.working()),
+                quiet.still_ns / 1_000_000_000,
+                counted(&progress, pool.working()),
                 Exit::LoopStalled
             );
             let said = stuck_line(pid, &why);
@@ -250,6 +255,29 @@ fn watch_turns(
             }
             Err(error) => return unread(&error),
         }
+    }
+}
+
+/// The loop as a task of the task watchdog ([`blaze_profile::stuck`]): its span the loop's
+/// turns, the pool's jobs ended and the queries completed, so a turn, a job's end or a query
+/// moves it; no CPU of its own (a loop spinning inside a turn is as stuck as one parked); its
+/// bound the daemon's stall bound in place of its wait's.
+fn loop_seen(progress: &Progress, now_ns: u64, bound: Duration) -> blaze_profile::stuck::TaskSeen {
+    use blaze_profile::stuck::{Task, TaskSeen, WaitsOn};
+    let span = progress
+        .steps
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(21)
+        ^ progress.jobs.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(42)
+        ^ progress.queries.wrapping_mul(0x1656_67b1_9e37_79f9);
+    TaskSeen {
+        task: Task::Loop,
+        build: 0,
+        span,
+        span_since_ns: now_ns,
+        cpu_ns: None,
+        waits: WaitsOn::Nothing,
+        bound_ns: Some(u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
     }
 }
 

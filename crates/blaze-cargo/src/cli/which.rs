@@ -74,24 +74,7 @@ pub fn other<A: super::daemon::Api>(
 /// fails or not on its own.
 #[cfg(all(any(unix, windows), feature = "native"))]
 pub fn warn_if_other(color: bool) {
-    use anyhow::Context as _;
-    let asked = (|| -> anyhow::Result<Option<String>> {
-        let Some(mut client) = super::daemon::connect(super::daemon::Start::Never)? else {
-            return Ok(None);
-        };
-        let _span = tracing::info_span!(
-            target: "blaze",
-            "client: ask the daemon which blaze it is",
-        )
-        .entered();
-        let socket = crate::serve::socket()?;
-        let exe = std::env::current_exe().context("finding blaze's own executable")?;
-        let file = std::fs::File::open(&exe)
-            .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
-        let ours = crate::serve::executable(&exe, &file)?;
-        other(&mut client, &socket, &ours, || crate::serve::build_of(&exe))
-    })();
-    match asked {
+    match asked_other() {
         Ok(None) => {}
         Ok(Some(line)) => blaze_report::err!("{}", super::say::warning(&line, color)),
         Err(error) => blaze_report::err!(
@@ -101,9 +84,37 @@ pub fn warn_if_other(color: bool) {
     }
 }
 
+/// The line [`other_said`] says when a daemon is running and is another build of blaze than
+/// this process; `None` when none runs or it is this build. One Status round trip on a
+/// connection of its own (`blaze doctor` asks it too).
+#[cfg(all(any(unix, windows), feature = "native"))]
+pub fn asked_other() -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+    let Some(mut client) = super::daemon::connect(super::daemon::Start::Never)? else {
+        return Ok(None);
+    };
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "client: ask the daemon which blaze it is",
+    )
+    .entered();
+    let socket = crate::serve::socket()?;
+    let exe = std::env::current_exe().context("finding blaze's own executable")?;
+    let file = std::fs::File::open(&exe)
+        .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+    let ours = crate::serve::executable(&exe, &file)?;
+    other(&mut client, &socket, &ours, || crate::serve::build_of(&exe))
+}
+
 /// Where there is no daemon to ask (the seed, a platform with no socket), nothing is said.
 #[cfg(not(all(any(unix, windows), feature = "native")))]
 pub fn warn_if_other(_: bool) {}
+
+/// Where there is no daemon to ask, there is no other.
+#[cfg(not(all(any(unix, windows), feature = "native")))]
+pub fn asked_other() -> anyhow::Result<Option<String>> {
+    Ok(None)
+}
 
 #[cfg(all(test, feature = "native"))]
 mod tests {

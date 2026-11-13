@@ -61,6 +61,23 @@ pub fn coarse_clock_step() -> Option<std::time::Duration> {
     }
 }
 
+/// The bytes free to this user on the file system `path` is on (`statvfs`'s available blocks
+/// by its fragment size), None when it can't be asked (`path` is no C string, or `statvfs`
+/// refuses it).
+#[cfg(unix)]
+pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is integers only, for which all-zero bytes are a valid value.
+    let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a nul-terminated string borrowed for the call, which only reads it, and
+    // `fs` is a live, exclusive `struct statvfs` for the call to fill, and nothing else.
+    let done = unsafe { libc::statvfs(path.as_ptr(), &raw mut fs) };
+    #[allow(clippy::unnecessary_cast, reason = "the fields' widths differ by platform")]
+    let free = (fs.f_bavail as u64).saturating_mul(fs.f_frsize as u64);
+    (done == 0).then_some(free)
+}
+
 /// The per-user cache directory of macOS, as the system names it.
 #[cfg(target_os = "macos")]
 pub fn user_cache_dir() -> Option<std::ffi::OsString> {

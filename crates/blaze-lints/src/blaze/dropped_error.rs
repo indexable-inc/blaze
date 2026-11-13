@@ -8,9 +8,16 @@
 //! - `.unwrap_or_else(|_| ..)` and `.map_err(|_| ..)`: a closure whose one parameter is `_` or
 //!   `_name`, which never reads the error.
 //!
+//! - `let _ = <Result>;`: the whole `Result` dropped, its error with it;
+//! - `if let Ok(..) = <Result> { .. }` with no `else`: the `Err` case does nothing and says
+//!   nothing (a `while let Ok(..)` loop ends on the error, which is its stop, and is not found);
+//! - `.filter_map(Result::ok)` (or `.filter_map(|it| it.ok())` written as the path): every
+//!   error of an iterator of `Result`s dropped.
+//!
 //! A place a clippy port reports when it is on is left to it, so no place is reported twice:
-//! `x.ok();` as a statement is `unused_result_ok`'s, and `.map_err(|_| ..)` with a non-`move`
-//! closure whose parameter is exactly `_` is `map_err_ignore`'s.
+//! `x.ok();` as a statement is `unused_result_ok`'s, `.map_err(|_| ..)` with a non-`move`
+//! closure whose parameter is exactly `_` is `map_err_ignore`'s, and `let _ = <Result>;` is
+//! `let_underscore_must_use`'s.
 
 use blaze_hash::HashSet;
 use hir::HirDisplay as _;
@@ -21,7 +28,8 @@ use hir_def::{
     lang_item::lang_items,
     signatures::FunctionSignature,
 };
-use hir_ty::InferenceResult;
+use hir_ty::{InferenceResult, next_solver::TyKind};
+use rustc_type_ir::inherent::IntoKind as _;
 use std::alloc::Global;
 
 use super::{Finding, Lint, facts};
@@ -39,7 +47,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 struct Shared {
     unused_result_ok: bool,
     map_err_ignore: bool,
+    let_underscore_must_use: bool,
 }
+
+/// What the shapes that drop a whole `Result` say: rule no-fallback, AGENTS.md rule 3.
+const NO_FALLBACK: &str = "rule no-fallback (AGENTS.md rule 3): a failure is loud; hand the error on with `?`, or say \
+                           why dropping it is right with `#[expect(blaze::dropped_error, reason = \"..\")]`";
 
 fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the findings of one body, reported at the edge
@@ -49,15 +62,18 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let db = cx.db();
     let lang = lang_items(db, def.krate(db));
     let Some(err) = lang.ResultErr else { return found };
+    let ok = lang.ResultOk;
     let Some(hir::ModuleDef::Adt(result)) = cx.std_def(&["core", "result", "Result"]) else {
         return found;
     };
     let shared = Shared {
         unused_result_ok: cx.on(Implemented::UnusedResultOk),
         map_err_ignore: cx.on(Implemented::MapErrIgnore),
+        let_underscore_must_use: cx.on(Implemented::LetUnderscoreMustUse),
     };
     let body = analysis.body();
     let infer = analysis.infer();
+    let is_result = |expr: ExprId| analysis.ty(infer.expr_ty(expr)).as_adt() == Some(result);
     let target = cx.krate().to_display_target(db);
     let statements = shared.unused_result_ok.then(|| expression_statements(body));
     let error_of = |scrutinee: ExprId| {
@@ -96,8 +112,53 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     );
                 }
             }
+            Expr::Block { statements, .. } => {
+                if shared.let_underscore_must_use {
+                    continue;
+                }
+                for statement in statements {
+                    let Statement::Let { pat, initializer: Some(value), else_branch: None, .. } =
+                        statement
+                    else {
+                        continue;
+                    };
+                    if !matches!(body.pat(pat), Pat::Wild) || !is_result(value) {
+                        continue;
+                    }
+                    let Some(range) = analysis.expr_range(value) else { continue };
+                    let message =
+                        format!("`let _ =` throws away this `Result` and its {}", error_of(value));
+                    facts::push(&mut found, Lint::DroppedError, range, message, Some(NO_FALLBACK.to_owned()));
+                }
+            }
+            Expr::If { condition, else_branch: None, .. } => {
+                let Expr::Let { pat, expr: scrutinee } = body.expr(condition) else { continue };
+                if ok.is_none() || infer.variant_resolution_for_pat(pat) != ok.map(Into::into) {
+                    continue;
+                }
+                if !is_result(scrutinee) {
+                    continue;
+                }
+                let Some(range) = analysis.expr_range(condition) else { continue };
+                let message = format!(
+                    "this `if let Ok(..)` has no `else`: the {} of the `Result` is dropped and nothing says it failed",
+                    error_of(scrutinee)
+                );
+                facts::push(&mut found, Lint::DroppedError, range, message, Some(NO_FALLBACK.to_owned()));
+            }
             Expr::MethodCall { receiver, args, .. } => {
                 let Some((f, _)) = infer.method_resolution(id) else { continue };
+                if let [arg] = args
+                    && FunctionSignature::of(db, f).name.as_str() == "filter_map"
+                    && is_result_ok(db, infer, *arg, result)
+                {
+                    let Some(range) = analysis.expr_range(id) else { continue };
+                    let message =
+                        "`.filter_map(Result::ok)` throws away every error of the iterator's `Result`s"
+                            .to_owned();
+                    facts::push(&mut found, Lint::DroppedError, range, message, Some(NO_FALLBACK.to_owned()));
+                    continue;
+                }
                 if !of_result(db, f, result) {
                     continue;
                 }
@@ -187,6 +248,19 @@ fn of_result(db: &base_db::Db, f: hir_def::FunctionId, result: hir::Adt) -> bool
     let ItemContainerId::ImplId(it) = f.loc(db).container else { return false };
     let imp = hir::Impl::from(it);
     imp.trait_(db).is_none() && imp.self_ty(db).as_adt() == Some(result)
+}
+
+/// Whether `expr` names `Result::ok` as a value (`Result::ok`, `std::result::Result::ok`): the
+/// function item of `Result`'s own impl named `ok`.
+fn is_result_ok(
+    db: &base_db::Db,
+    infer: &InferenceResult<'_>,
+    expr: ExprId,
+    result: hir::Adt,
+) -> bool {
+    let TyKind::FnDef(def, _) = infer.expr_ty(expr).kind() else { return false };
+    let hir_def::CallableDefId::FunctionId(f) = def.0 else { return false };
+    of_result(db, f, result) && FunctionSignature::of(db, f).name.as_str() == "ok"
 }
 
 /// The expressions of `body` that are statements of their block (`x.ok();`).

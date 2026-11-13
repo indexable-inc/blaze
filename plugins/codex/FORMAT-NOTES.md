@@ -12,7 +12,8 @@ and [Custom instructions with AGENTS.md](https://learn.chatgpt.com/docs/agent-co
 > Hooks are enabled by default.
 
 So the adapter is a hook, like Claude Code's, not a notify program and not only an `AGENTS.md`
-line. The generic launcher (plugins/agent/README.md) stays for agents without hooks.
+line: `blaze agents hook codex vN`, which `blaze agents install codex` writes. An agent without
+hooks runs `blaze diagnostics --since TOKEN --file F` itself (docs/agents.md).
 
 ### Where it is configured
 
@@ -28,13 +29,14 @@ line. The generic launcher (plugins/agent/README.md) stays for agents without ho
 > definition. ... Use /hooks in the CLI to inspect hook sources, review new or changed hooks,
 > trust hooks
 
-`install.py '{"agent": "codex", ...}'` writes `hooks.json` (user or project) and says to trust
-the hook in `/hooks`.
+`blaze agents install codex [--project|--user]` merges its hooks into `hooks.json` (the
+project's `.codex/hooks.json` or `~/.codex/hooks.json`) and says to trust them in `/hooks`.
 
 > For repo-local hooks, prefer resolving from the git root instead of using a relative path such
 > as .codex/hooks/.... Codex may be started from a subdirectory
 
-Hence the project hook's command `python3 -I "$(git rev-parse --show-toplevel)/plugins/codex/check.py"`.
+Hence the hook's command names no path at all: `blaze agents hook codex v1` runs the `blaze` on
+`PATH`, from whatever directory Codex starts it in (the input's `cwd` says where the session is).
 
 ### The matcher: `apply_patch`
 
@@ -78,6 +80,17 @@ The handler sets 30, over the adapter's 20 s deadline, for the reasons in
 plugins/claude/FORMAT-NOTES.md ("The timeout").
 
 > Commands run with the session cwd as their working directory.
+
+## Before a shell command: `PreToolUse` on `Bash`
+
+Read from the hooks page in this session and summarized here, not quoted word for word (the fetch
+returned a summary): Codex has `PreToolUse`, and shell commands match it as `Bash`, with the
+command line in `tool_input.command`; the answer can carry
+`hookSpecificOutput.additionalContext`, or `hookSpecificOutput.permissionDecision: "deny"` with
+`permissionDecisionReason` to refuse the call, with `hookEventName: "PreToolUse"`; plain stdout
+is ignored. `blaze agents install codex` puts `blaze agents hook codex v1` there (`--strict`
+after it to refuse): context about a cargo or rustc command by default, a denial under
+`--strict`, nothing for any other command.
 
 ## Not confirmed from the docs (assumed)
 

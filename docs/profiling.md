@@ -106,6 +106,20 @@ several readers.
 DuckDB is never linked into blaze. `blaze debug sql` runs the pinned DuckDB CLI over the files the
 manifest lists, each table's list led by its `schema.<table>.parquet`.
 
+Reading the profile needs no setup. `blaze explain memory` runs no DuckDB: its six parts (the
+`memory_*` views, each a filter, a group and a sum over one or two tables) are read from the
+Parquet and aggregated in Rust (`blaze_profile::memory` over `blaze_profile::tables`), and
+`memory::tests` holds each to its view's SQL, cell for cell, on a fixture. The views whose
+answers are joins over many tables, windows or an ASOF join (`blaze slow`'s queries, `problems`
+under `blaze why`, every other view) stay on DuckDB. Those commands find it in this order, never
+on `PATH`: `BLAZE_DUCKDB`, an absolute path (set wrong, that command's error names the
+variable, the path and `unset BLAZE_DUCKDB`); else the DuckDB blaze pins (1.5.5, a SHA-256 per
+host in `DUCKDB_PINS`, crates/blaze-cargo/src/serve/observe.rs, whose doc has the command that
+prints the digests), fetched once through the daemon's store with a line saying so and laid
+out at `<state>/duckdb/1.5.5-<sha16>/duckdb`. A failed fetch names the URL and the file. No
+daemon start or build reads `BLAZE_DUCKDB`, and it is not a daemon setting: a bad value fails
+only the commands that run SQL.
+
 To profile any other Rust program (not blaze's builds), use ix-prof and `blaze pprof`, described in
 [ix-prof.md](ix-prof.md). Its format is specified in [ix-prof-format.md](ix-prof-format.md).
 blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-profile/src/symbols.rs`,

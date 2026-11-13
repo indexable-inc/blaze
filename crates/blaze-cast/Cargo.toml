@@ -1,0 +1,22 @@
+[package]
+name = "blaze-cast"
+description = "blaze's named casts: each `as` between numbers that std has no named operation for, as a const fn whose name says what it does (lossless on blaze's targets, truncated, rounded or saturated), the target of `blaze::as_cast`'s fix"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

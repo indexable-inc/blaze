@@ -41,13 +41,13 @@ use blaze_usercode::test::{
 };
 
 use super::{
-    Job, Real, UnitReader, UnitWriter,
+    Job, Real, UnitReader,
     compile::TestOf,
     error::{UnitError, manifest_dir},
     graph::flag,
     package_of,
 };
-use crate::serve::work::{Failed, RunPuts, Runs, Selection};
+use crate::serve::work::{Asks, Failed, RunPuts, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -813,7 +813,7 @@ impl Runs<Real> for TestRun {
     fn start(
         &mut self,
         store: &Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -988,7 +988,7 @@ impl Runs<Real> for TestRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

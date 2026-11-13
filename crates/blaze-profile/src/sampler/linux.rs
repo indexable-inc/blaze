@@ -89,6 +89,22 @@ impl Thread {
     pub(crate) fn leave(&mut self) {
         self.live = false;
     }
+
+    /// The CPU time the thread has used, read from another thread: `clock_gettime` of the
+    /// thread's own CPU clock, whose id the kernel makes from its tid (`MAKE_THREAD_CPUCLOCK`:
+    /// `!tid << 3 | CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_SCHED`, include/linux/posix-timers.h).
+    /// `None` for a thread that left (its tid may be another's by now) or a clock that fails.
+    /// The caller holds the lock the thread takes to leave, so the tid is its.
+    pub(crate) fn cpu_ns(&self) -> Option<u64> {
+        if !self.live {
+            return None;
+        }
+        let clock = (!(self.tid as libc::clockid_t)) << 3 | 6;
+        let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `at` is a timespec to fill; an id of no thread fails with EINVAL.
+        let got = unsafe { libc::clock_gettime(clock, &mut at) };
+        (got == 0).then(|| at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64)
+    }
 }
 
 /// The event on one thread, and what its switches left owed.

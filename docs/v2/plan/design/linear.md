@@ -39,7 +39,11 @@ value (`t`, `p.b`, `(x as Some).0`), its type, and the path:
 - an early exit: `return`, `?`, `break`, `continue` or `become`;
 - a branch that does not move it.
 
-The error is reported at that line, with a label at the declaration.
+The error is reported at that line, with a label at the declaration, and a note naming what
+consumes the value: the `#[blaze::consumes]` functions of its type's inherent impls, read off
+the impls (for an `OwedPuts`: "consumed by `OwedPuts::hand_on` or `OwedPuts::discard`"). A linear
+value given to `mem::drop` or `mem::forget` is refused with its own message (it drops or leaks
+the value on purpose); `let _ = x` moves nothing, so `x` is the error where its scope ends.
 
 Two things make this usable with fallible code. `Option` and `Result` hold a linear value and
 hand it on (rule 4), and an exit that returns a failure abandons a live value through its
@@ -274,6 +278,17 @@ and fed1eb428d:docs/research (nothing about linear types there).
 `#[blaze::consumes]`. A live patch that drops its `Pending` without finishing it never decides
 whether the patch is rolled back. Until now only `#[must_use]` guarded this, which says nothing
 once the value is bound to a variable.
+
+Owed values, a value that must be handed over (the bug class of `store()` dropping
+`body_puts` on an early return, after which every build reading that session failed):
+
+- `blaze-cargo` `serve::owed_puts::OwedPuts`, store puts owed to the loop: linear with no
+  `Drop`, so no exit abandons it, a `?` included; `hand_on` and `discard` consume it.
+- `hir_ty::body_store::entries::Claim`, the runs a keep claimed: linear with its `Drop` as the
+  abandonment path (an error exit gives the runs back); `kept` and `give_back` consume it.
+
+Both are checked by this check, not by a lint: a linear type is semantics, enforced where the
+borrow check is, with no `#[expect]` to silence it.
 
 ## Not checked yet (follow-ups)
 

@@ -35,9 +35,10 @@ use blaze_vfs::{CommitError, OpError, Ticket, Vfs, View, ViewId};
 use std::alloc::Global;
 
 use crate::{
-    ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, Targets,
-    ViewRef,
+    ApiError, Arrived, Diagnostic, Level, Memory, Reply, Request, RequestRef, Response, Seen,
+    Status, TagMemory, Targets, ViewRef,
     build::{Builder, JobId, Opened, Work},
+    diagnostics::{self, Bases, Key},
     session::{best_of::BestOf, intent::Intents},
 };
 
@@ -110,6 +111,12 @@ pub struct Session {
     /// Each subsystem's allocation rate since the last [`Request::Memory`].
     rate: Rate,
     buffers: Buffers,
+    /// What each client was last told by [`Request::Diagnostics`], bounded
+    /// ([`crate::diagnostics::BASES`], [`crate::diagnostics::HELD`]).
+    bases: Bases,
+    /// When each [`Request::Diagnostics`] with a `wait_ms` is answered with its check still
+    /// running, on [`Session::tick`]'s clock, and its request's number; in the order they came.
+    waits: Vec<(u64, u64)>,
 }
 
 /// Buffers kept between calls, cleared and refilled, so a warm call allocates none of them.
@@ -185,6 +192,9 @@ enum Kind {
         views: [Option<Opened>; 2],
         kept: Option<Opened>,
         owes_work: bool,
+        /// A [`Request::Diagnostics`]'s check: its reports are collected, not forwarded, and
+        /// its end is answered as one [`Response::Diagnostics`].
+        asked: Option<Box<Asked>>,
     },
     /// A [`Request::Edit`]'s job, on its base, and the ops it reported; it becomes the
     /// `Commit` of them when it ends.
@@ -196,6 +206,31 @@ enum Kind {
         ops: Option<Vec<blaze_vfs::Op>>,
     },
     BestOf(BestOf),
+}
+
+/// What a [`Request::Diagnostics`] collects of its check, and what it answers against.
+struct Asked {
+    key: Key,
+    since: Option<ContentId>,
+    /// The check's errors and warnings ([`crate::diagnostics::said`]), as it reported them.
+    diagnostics: Vec<Diagnostic>,
+    /// The check's build number, once its [`Response::Work`] said it.
+    build: Option<u64>,
+    /// Answered at its wait with the check still running: the check's end says nothing more
+    /// and keeps no base, since the client was not told of it.
+    answered: bool,
+}
+
+impl Asked {
+    fn report(&mut self, response: Response) {
+        match response {
+            Response::Diagnostic(it) if diagnostics::said(it.level) => self.diagnostics.push(it),
+            Response::Work(worked) => self.build = worked.build_id,
+            // A unit's start and end, a fetch, a build script's run, progress: the answer is
+            // the diagnostics alone.
+            _ => {}
+        }
+    }
 }
 
 impl Kind {
@@ -247,14 +282,45 @@ impl Session {
             now_ns: 0,
             rate: Rate::new(),
             buffers: Buffers::default(),
+            bases: Bases::default(),
+            waits: Vec::new(), // alloc: none until a diagnostics request waits
         }
     }
 
     /// The daemon's monotonic clock is `now_ns`: the intents whose wait it passed are
-    /// cancelled.
-    pub fn tick(&mut self, cx: &mut Daemon<'_>, now_ns: u64) {
+    /// cancelled, and each [`Request::Diagnostics`] whose wait it passed is answered with its
+    /// check still running.
+    pub fn tick(&mut self, cx: &mut Daemon<'_>, now_ns: u64, out: &mut Vec<Reply>) {
         self.now_ns = now_ns;
         self.intents.tick(cx.builder, now_ns);
+        self.waited(now_ns, out);
+    }
+
+    /// Each [`Request::Diagnostics`] whose wait `now_ns` passed, its check still running:
+    /// answered `ended: false` with its base kept, and the request over for its client (its
+    /// id free again); the check goes on and its end says nothing.
+    fn waited(&mut self, now_ns: u64, out: &mut Vec<Reply>) {
+        let mut at = 0;
+        while at < self.waits.len() {
+            let (deadline, serial) = self.waits[at];
+            if deadline > now_ns {
+                at += 1;
+                continue;
+            }
+            self.waits.remove(at);
+            let Some(pending) = self.pending.get_mut(&serial) else { continue };
+            let Kind::Job { asked: Some(asked), views, .. } = &mut pending.what else { continue };
+            if pending.sink.gone || asked.answered {
+                continue;
+            }
+            asked.answered = true;
+            let root = views[0].expect("a diagnostics check has its view").view.root;
+            let seen = self.bases.kept(&asked.key, asked.since, root, None);
+            pending.sink.send(out, Response::Diagnostics(seen));
+            pending.sink.send(out, Response::Done { ok: true });
+            self.live.remove(&pending.sink.to);
+            pending.sink.gone = true;
+        }
     }
 
     /// `snapshot` as [`Response::Memory`] gives it, each tag's rate since the last.
@@ -293,7 +359,11 @@ impl Session {
 
     /// When [`Session::tick`] next has something to do, on the clock it is given.
     pub fn deadline(&self) -> Option<u64> {
-        self.intents.deadline()
+        let waits = self.waits.iter().map(|it| it.0).min();
+        match (self.intents.deadline(), waits) {
+            (Some(intent), Some(wait)) => Some(intent.min(wait)),
+            (intent, wait) => intent.or(wait),
+        }
     }
 
     /// The daemon moved `head` to `root` itself (the watcher's commit): intent on the head is
@@ -347,11 +417,14 @@ impl Session {
                 best.count(candidate, &response);
                 sink.send(out, of(candidate, response));
             }
-            (Kind::Job { owes_work, .. }, _) => {
+            (Kind::Job { owes_work, asked, .. }, _) => {
                 if matches!(response, Response::Work(_)) {
                     *owes_work = false;
                 }
-                sink.send(out, response);
+                match asked {
+                    Some(asked) => asked.report(response),
+                    None => sink.send(out, response),
+                }
             }
             (Kind::Edit { ops, .. }, _) => match response {
                 Response::Edited(edited) if sink.gone => *ops = Some(edited.ops),
@@ -443,7 +516,17 @@ impl Session {
                     false
                 }
             }
-            (Kind::Job { views, kept, owes_work, cancelled, .. }, None) => {
+            (Kind::Job { views, kept, owes_work, cancelled, asked, .. }, None) => {
+                // A diagnostics check's answer, read while its view is open; none when it was
+                // answered at its wait, cancelled, or its client is gone.
+                let seen = match asked.take() {
+                    Some(asked) if !asked.answered && !sink.gone && !*cancelled => {
+                        let opened = views[0].expect("a diagnostics check has its view");
+                        // clone: error path, the answer's copy of the check's error.
+                        Some(seen_of(cx.vfs, &mut self.bases, *asked, opened, ok, error.clone()))
+                    }
+                    _ => None,
+                };
                 let error = match error {
                     None if *owes_work && !*cancelled => Some(ApiError::new(
                         // alloc: error path, a build that did not report its work.
@@ -466,10 +549,19 @@ impl Session {
                         close(cx, opened);
                     }
                 }
-                if let Some(error) = error {
-                    sink.send(out, Response::Error(error));
+                match seen {
+                    Some(seen) => {
+                        let ok = seen.failed.is_none();
+                        sink.send(out, Response::Diagnostics(seen));
+                        sink.send(out, Response::Done { ok });
+                    }
+                    None => {
+                        if let Some(error) = error {
+                            sink.send(out, Response::Error(error));
+                        }
+                        sink.send(out, Response::Done { ok });
+                    }
                 }
-                sink.send(out, Response::Done { ok });
                 true
             }
             _ => unreachable!("job {job:?}'s candidate does not match its request"),
@@ -478,6 +570,7 @@ impl Session {
             cx.db.close(queries);
         }
         if over {
+            self.waits.retain(|it| it.1 != serial);
             self.end(serial);
         }
     }
@@ -619,9 +712,31 @@ impl Session {
                 };
                 let changes = cx.vfs.diff(from.view.root, to.view.root);
                 let work = Work::Reach { from, changes, targets };
-                self.start(cx, req, Some(to), [Some(from), Some(to)], work);
+                self.start(cx, req, Some(to), [Some(from), Some(to)], work, None);
             }
-            Request::Snapshot => self.start(cx, req, None, [None, None], Work::Snapshot),
+            Request::Snapshot => {
+                self.start(cx, req, None, [None, None], Work::Snapshot, None);
+            }
+            Request::Diagnostics { view, since, client, targets, wait_ms } => {
+                let key = Key::of(&view, &targets, client);
+                let root = resolve(cx.vfs, &view)?;
+                let opened = open(cx, root)?;
+                let asked = Asked {
+                    key,
+                    since,
+                    diagnostics: Vec::new(), // alloc: none until the check reports one
+                    build: None,
+                    answered: false,
+                };
+                // alloc: the request's own state, once a request.
+                let asked = Some(Box::new(asked));
+                let work = Work::Check(targets);
+                let serial = self.start(cx, req, Some(opened), [Some(opened), None], work, asked);
+                if wait_ms > 0 {
+                    let at = self.now_ns.saturating_add(wait_ms.saturating_mul(1_000_000));
+                    self.waits.push((at, serial));
+                }
+            }
             Request::Stop => out.push(Reply { to: req, response: Response::Done { ok: true } }),
             Request::Edit { base, head, edits } => {
                 if !cx.vfs.has(base) {
@@ -875,10 +990,11 @@ impl Session {
     ) -> Result<(), ApiError> {
         let root = resolve(cx.vfs, view)?;
         let opened = open(cx, root)?;
-        self.start(cx, req, Some(opened), [Some(opened), None], work);
+        self.start(cx, req, Some(opened), [Some(opened), None], work, None);
         Ok(())
     }
 
+    /// A job of `work` begun for `req`: its number.
     fn start(
         &mut self,
         cx: &mut Daemon<'_>,
@@ -886,7 +1002,8 @@ impl Session {
         view: Option<Opened>,
         views: [Option<Opened>; 2],
         work: Work,
-    ) {
+        asked: Option<Box<Asked>>,
+    ) -> u64 {
         let serial = self.serial();
         let job = self.job(Job::Request { serial, candidate: None });
         let kept = view.filter(|_| incremental(&work));
@@ -894,8 +1011,10 @@ impl Session {
             self.intents.take_over(cx.builder, kept.view.root);
         }
         let owes_work = matches!(work, Work::Build(_) | Work::Test { .. } | Work::Run { .. });
-        self.begin_as(serial, req, Kind::Job { job, cancelled: false, views, kept, owes_work });
+        let what = Kind::Job { job, cancelled: false, views, kept, owes_work, asked };
+        self.begin_as(serial, req, what);
         cx.builder.start(job, view, work);
+        serial
     }
 
     /// Declared intent: `work` on `root` started through [`Builder::speculate`], belonging to
@@ -1046,6 +1165,79 @@ fn open(cx: &mut Daemon<'_>, root: ContentId) -> Result<Opened, ApiError> {
 fn close(cx: &mut Daemon<'_>, opened: Opened) {
     cx.vfs.close(opened.files);
     cx.db.close(opened.queries);
+}
+
+/// A [`Request::Diagnostics`]'s answer at its check's end (`ok`, `error`), against the base its
+/// `since` names, read while the check's view `opened` is open. A check that could not run, or
+/// failed and said no error, is blaze's failure, not the code's: answered `failed`, the base
+/// kept.
+fn seen_of(
+    vfs: &Vfs,
+    bases: &mut Bases,
+    asked: Asked,
+    opened: Opened,
+    ok: bool,
+    error: Option<ApiError>,
+) -> Seen {
+    let Asked { key, since, diagnostics: said, build, .. } = asked;
+    let root = opened.view.root;
+    if let Some(error) = error {
+        return bases.kept(&key, since, root, Some(error));
+    }
+    if !ok && !said.iter().any(|it| it.level == Level::Error) {
+        let error = ApiError::new(
+            // alloc: error path, a check that failed and named no error.
+            format!(
+                "the check of {root:x} failed and said no error: blaze failed in it, not the code"
+            ),
+            Some(format!("root {root:x}")), // alloc: as above.
+        );
+        return bases.kept(&key, since, root, Some(error));
+    }
+    let mut found = Vec::with_capacity(said.len()); // alloc: the answer's list, once
+    for diagnostic in said {
+        match located(vfs, opened.files, &key.checkout, &diagnostic) {
+            Ok((file, line)) => found.push(diagnostics::found(diagnostic, &file, line.as_deref())),
+            Err(error) => return bases.kept(&key, since, root, Some(error)),
+        }
+    }
+    bases.ended(key, since, found, root, build)
+}
+
+/// Where `diagnostic`'s primary span is in the view `files` of the checkout `head`: its file
+/// relative to the root and the text of its first line; the name as the span gives it, and no
+/// line, for a file outside the view (the standard library's, a registry crate's), and an
+/// empty name for a diagnostic of no span.
+fn located(
+    vfs: &Vfs,
+    files: ViewId,
+    head: &str,
+    diagnostic: &Diagnostic,
+) -> Result<(String, Option<String>), ApiError> {
+    let Some(span) = diagnostics::primary(&diagnostic.spans) else {
+        return Ok((String::new(), None)); // alloc: none, empty
+    };
+    let manifest_dir = diagnostic.unit.as_ref().and_then(|unit| {
+        let dir = unit.manifest_path.rsplit_once('/')?.0;
+        dir.strip_prefix(head).map(|it| it.trim_start_matches('/'))
+    });
+    for place in diagnostics::places(&span.file, head, manifest_dir) {
+        match vfs.read(files, &place) {
+            Ok(Some(file)) => {
+                let line = diagnostics::line_of(file.bytes, span.line);
+                return Ok((place, line));
+            }
+            Ok(None) => {}
+            Err(corrupt) => {
+                return Err(ApiError::new(
+                    // alloc: error path, a file of the view that does not read.
+                    format!("reading {place} of the view, to say where a diagnostic is: {corrupt}"),
+                    Some(place),
+                ));
+            }
+        }
+    }
+    Ok((span.file.clone(), None)) // clone: the answer's own name
 }
 
 /// Whether `work` runs the view's queries incrementally, so their reruns answer

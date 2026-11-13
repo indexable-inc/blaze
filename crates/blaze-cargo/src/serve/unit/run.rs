@@ -17,11 +17,11 @@ use blaze_units::schema::Mode;
 use std::alloc::Global;
 
 use super::{
-    Job, Real, UnitWriter, codegen,
+    Job, Real, codegen,
     error::{UnitError, manifest_dir},
     package_of,
 };
-use crate::serve::work::{RunPuts, Runs};
+use crate::serve::work::{Asks, RunPuts, Runs};
 
 pub(crate) mod inproc;
 pub(crate) mod launch;
@@ -323,7 +323,7 @@ impl Runs<Real> for Program {
     fn start(
         &mut self,
         _store: &Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -342,7 +342,7 @@ impl Runs<Real> for Program {
         &mut self,
         completion: Completion,
         _store: &mut Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

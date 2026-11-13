@@ -1,4 +1,4 @@
-//! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`, `mut_ref`): what each
+//! The lints of `blaze::edition` (`as_cast`, `global_state`, `async_fn`, `mut_ref`): what each
 //! finds and leaves alone, `mut_ref`'s fix, and that the group is off until turned on, over an
 //! `std` of their own: a `thread_local!` that declares one `const` key per item and calls itself
 //! for the rest, as std's does, and an atomic holding an `UnsafeCell`. Then the four
@@ -81,12 +81,12 @@ pub static mut COUNT: u32 = 0;
 pub async fn fetch() -> u32 { 1 }
 "#;
 
-/// A cast that can lose is found with both types and what is lost; one that can't, one to its
-/// own type, and one of a literal or `const` that fits are not.
+/// Every cast is found with both types; one that can lose says what it loses, one that can't
+/// says nothing more. The fixes per class are `as_cast_tests`'.
 #[test]
-fn lossy_as_finds_casts_that_can_lose_and_leaves_lossless_ones() {
+fn as_cast_finds_every_cast_and_says_what_a_lossy_one_loses() {
     let found = only(
-        "lossy_as",
+        "as_cast",
         r#"
 pub const SMALL: u64 = 200;
 pub fn narrow(x: u64) -> u32 { x as u32 }
@@ -104,19 +104,18 @@ pub fn flag(b: bool) -> u8 { b as u8 }
 pub fn float(x: f32) -> f64 { x as f64 }
 "#,
     );
-    assert_eq!(found.matches("this `as` in").count(), 7, "{found}");
+    assert_eq!(found.matches("this `as` in").count(), 13, "{found}");
     assert!(found.contains("this `as` in `fn narrow` casts `u64` to `u32`, which drops the high bits"), "{found}");
-    assert!(found.contains("`u32::try_from(x)`"), "{found}");
     assert!(found.contains("casts `i32` to `u32`, which turns a negative value into a large positive one"), "{found}");
-    assert!(found.contains("`x.cast_unsigned()`"), "{found}");
     assert!(found.contains("casts `u32` to `i32`, which turns a value above `i32::MAX` negative"), "{found}");
     assert!(found.contains("casts `f64` to `i32`, which drops the fraction"), "{found}");
     assert!(found.contains("casts `u64` to `f64`, which rounds"), "{found}");
     assert!(found.contains("casts `*const u8` to `usize`, which keeps the address"), "{found}");
-    assert!(found.contains("`ptr.addr()`"), "{found}");
-    assert!(found.contains("casts `usize` to `*const u8`, which makes a pointer with no provenance"), "{found}");
-    for clean in ["widen", "same", "literal", "constant", "flag", "float"] {
-        assert!(!found.contains(&format!("in `fn {clean}`")), "`fn {clean}`: {found}");
+    assert!(found.contains("casts `usize` to `*const u8`, which makes a pointer with the provenance"), "{found}");
+    for clean in ["widen", "same", "flag", "float"] {
+        let at = found.find(&format!("in `fn {clean}`")).unwrap_or_else(|| panic!("`fn {clean}`: {found}"));
+        let line = found[at..].lines().next().unwrap_or_default();
+        assert!(!line.contains(", which"), "`fn {clean}` loses nothing: {found}");
     }
 }
 
@@ -201,7 +200,7 @@ pub fn plain() -> u32 { PLAIN + LIMIT }
 #[test]
 fn edition_group_is_off_by_default_and_turns_all_three_on() {
     let off = linted(EACH, "-A clippy::all");
-    assert!(!off.contains("blaze::lossy_as"), "{off}");
+    assert!(!off.contains("blaze::as_cast"), "{off}");
     assert!(!off.contains("blaze::global_state"), "{off}");
     assert!(!off.contains("blaze::async_fn"), "{off}");
     assert!(!off.contains("which the blaze edition removes"), "{off}");

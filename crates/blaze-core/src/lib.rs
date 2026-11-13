@@ -77,7 +77,7 @@ mod process;
 /// ([`children::unreaped`]).
 #[cfg(unix)]
 pub mod children {
-    pub use crate::process::{State, Unreaped, Waiter, unreaped};
+    pub use crate::process::{State, Unreaped, Waiter, each_child, kill_listed, unreaped};
 }
 #[allow(
     unsafe_code,

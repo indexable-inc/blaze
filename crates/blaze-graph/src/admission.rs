@@ -73,6 +73,11 @@ pub mod kinds {
     /// A checkout's front-end carry (`blaze_cargo::serve::front_carry`): its kernel session
     /// carried to a build's pin and saved, on a worker after the build, never the loop.
     pub const FRONT_CARRY: TaskKind = TaskKind(0x1_0011);
+    /// A build's front-end write (`blaze_cargo::serve::job`, `Does::Write`): its proc macros'
+    /// loads, build scripts' runs and device builds' MSL applied, the harnesses written, the
+    /// units identified and their dependencies served, on a worker holding the job's writer
+    /// once no task reads its front end, never on the loop.
+    pub const FRONT_WRITE: TaskKind = TaskKind(0x1_0012);
 }
 
 /// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
@@ -97,6 +102,7 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
         kinds::STORE_KEPT => "store kept",
         kinds::GIVE_BACK => "give back",
         kinds::FRONT_CARRY => "front carry",
+        kinds::FRONT_WRITE => "front write",
         _ => return None,
     })
 }
@@ -114,6 +120,7 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
         kinds::UNIT_NAMES => Tag::Nameres,
         kinds::FRONT_CARRY => Tag::Parse,
+        kinds::FRONT_WRITE => Tag::Nameres,
         kinds::UNIT_BODIES => Tag::Infer,
         kinds::UNIT_LINK | kinds::PROGRAM_LINK => Tag::Link,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,

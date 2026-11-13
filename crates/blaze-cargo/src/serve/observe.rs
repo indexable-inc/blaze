@@ -2,9 +2,10 @@
 //! docs/v2/plan/design/explore.md, "Where it runs").
 //!
 //! - [`Profiling`]: the profile history, which the thread `blaze-history` keeps off the loop
-//!   ([`keep_history`]), and the DuckDB `nix run .#duckdb` pins ([`duckdb`]). `blaze serve`
-//!   alone has them; a simulation's daemon has none, and the requests that read them fail
-//!   saying so.
+//!   ([`keep_history`]), and what names the DuckDB its explorer runs ([`duckdb`], resolved
+//!   only when the explorer starts: a DuckDB that is missing or named wrong never stops the
+//!   daemon, it fails that one request). `blaze serve` alone has them; a simulation's daemon
+//!   has none, and the requests that read them fail saying so.
 //! - [`Observe`]: what the loop holds for the requests it answers itself: the explorer
 //!   (`blaze explore`), each live subscriber's feed (`blaze debug live`), and each reader's
 //!   ask that the history flush ([`blaze_api::Request::Flush`]), which the history's thread
@@ -40,7 +41,8 @@ use super::why::{Answer, Answers, Ask, Ledger, file::File};
 /// The variable naming the DuckDB `blaze debug sql` and the explorer run: an absolute path,
 /// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`. Unset,
 /// the history's readers run the DuckDB blaze pins ([`Pin`]), fetched on first use
-/// (`cli/duckdb.rs`).
+/// (`cli/duckdb.rs`). Read only by what runs SQL: a value naming nothing fails those commands,
+/// never a daemon's start or a build (a daemon refused to start on one, 2026-11-13).
 pub const DUCKDB: &str = "BLAZE_DUCKDB";
 
 /// The DuckDB blaze pins: flake.nix's `duckdb` asserts the same version.
@@ -57,7 +59,15 @@ pub struct Pin {
     pub sha256: &'static str,
 }
 
-/// Each host's pin, by `<arch>-<os>` (`std::env::consts`).
+/// Each host's pin, by `<arch>-<os>` (`std::env::consts`). Each digest is the one GitHub
+/// publishes for the asset (checked 2026-11-13); for another [`DUCKDB_VERSION`] this prints
+/// every asset's name and digest to copy in:
+///
+/// ```sh
+/// gh api repos/duckdb/duckdb/releases/tags/v1.5.5 --jq '.assets[]
+///   | select(.name | test("^duckdb_cli-(linux|osx)-(amd64|arm64)\\.gz$"))
+///   | "\(.name) \(.digest)"'
+/// ```
 pub const DUCKDB_PINS: &[(&str, Pin)] = &[
     (
         "aarch64-linux",
@@ -83,8 +93,9 @@ pub const DUCKDB_PINS: &[(&str, Pin)] = &[
     (
         "x86_64-macos",
         Pin {
-            asset: "duckdb_cli-osx-universal.gz",
-            sha256: "cbd6e7d472c33083db32e1e78d71ab9eefb32da872c349423294de370b8f4ca9",
+            // The x86_64 build alone: half the universal binary's 36 MB.
+            asset: "duckdb_cli-osx-amd64.gz",
+            sha256: "52ba07e03926b19454a627365761041faa2615eaed44afb42ce757d62f625f3d",
         },
     ),
 ];
@@ -113,22 +124,58 @@ impl Pin {
     }
 }
 
-/// The DuckDB [`DUCKDB`] names: `None` unset, and an error naming the variable and its value
-/// when set to anything but an absolute path to a file.
+/// What fixes a [`DUCKDB`] that names no DuckDB: the one command, said in each error.
+const DUCKDB_FIX: &str = "`unset BLAZE_DUCKDB` runs the DuckDB blaze pins (fetched on first use), \
+                          or set it to the absolute path of a DuckDB 1.5.5 CLI";
+
+/// The DuckDB [`DUCKDB`] names: `None` unset, and an error naming the variable, its value and
+/// the fix when set to anything but an absolute path to a file. Called only by what runs SQL
+/// (`cli/duckdb.rs`, [`Profiling::duckdb`]), never by a daemon's start.
 pub fn duckdb(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, String> {
     let Some(value) = value else { return Ok(None) };
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(format!(
             // alloc: error path
-            "{DUCKDB}={} is not an absolute path: it names the DuckDB `nix run .#duckdb` pins",
+            "{DUCKDB}={} is not an absolute path: {DUCKDB_FIX}",
             path.display()
         ));
     }
     match fs::metadata(&path) {
         Ok(meta) if meta.is_file() => Ok(Some(path)),
-        Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())), // alloc: error path
-        Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())), // alloc: error path
+        // alloc: error path
+        Ok(_) => Err(format!("{DUCKDB}={} is not a file: {DUCKDB_FIX}", path.display())),
+        // alloc: error path
+        Err(error) => Err(format!("{DUCKDB}={}: {error}: {DUCKDB_FIX}", path.display())),
+    }
+}
+
+/// The DuckDB a daemon's explorer runs: the one [`DUCKDB`] named as the daemon started
+/// (`named`, checked now, not at the start), else this host's pin where a reader of the
+/// history laid it out (`pinned`, [`Pin::laid_out`]); the daemon fetches nothing itself. An
+/// error names what is missing and the command that fixes it.
+pub fn explorer_duckdb(
+    named: Option<&std::ffi::OsStr>,
+    pinned: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = duckdb(named.map(std::ffi::OsStr::to_owned))? {
+        return Ok(path);
+    }
+    match pinned {
+        Some(at) if at.is_file() => Ok(at.to_owned()), // alloc: once an explorer
+        // alloc: error path
+        Some(at) => Err(format!(
+            "the pinned DuckDB {DUCKDB_VERSION} is not at {} yet: `blaze debug sql 'SELECT 1'` \
+             fetches it, or {DUCKDB} names another by its absolute path",
+            at.display()
+        )),
+        // alloc: error path
+        None => Err(format!(
+            "blaze pins no DuckDB {DUCKDB_VERSION} for this host ({}-{}): set {DUCKDB} to the \
+             absolute path of a DuckDB {DUCKDB_VERSION} CLI and start the daemon again",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )),
     }
 }
 
@@ -217,7 +264,12 @@ pub struct Profiling {
     /// The history's directory ([`history::dir_in`] of the daemon's state): what the
     /// `blaze-history` thread writes, and the explorer and `blaze debug sql` read.
     pub dir: PathBuf,
-    pub duckdb: Option<PathBuf>,
+    /// [`DUCKDB`] as the daemon was started, unchecked: resolved when the explorer starts
+    /// ([`Profiling::duckdb`]), so a value naming nothing fails that request alone.
+    pub duckdb: Option<std::ffi::OsString>,
+    /// Where this host's pinned DuckDB is once a reader of the history laid it out
+    /// ([`Pin::laid_out`] of the daemon's state); `None` for a host blaze pins none for.
+    pub pinned_duckdb: Option<PathBuf>,
     /// The number of the daemon's first build, once the history's thread opened it: past
     /// every build the history names, so a build stays one id across the daemon's restarts
     /// ([`History::next_build`]), never 0; or the history's error. Taken by
@@ -813,10 +865,11 @@ fn home_store_bytes(store: &Path) -> Result<u64, String> {
 /// does not open stops the daemon there, named ([`Unopened`]).
 pub fn keep_history(
     state: &Path,
-    duckdb: Option<PathBuf>,
+    duckdb: Option<std::ffi::OsString>,
     events: blaze_profile::logs::Policy,
 ) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
+    let pinned_duckdb = Pin::host().map(|pin| pin.laid_out(state));
     // How much is recorded between builds, and the cap, as the daemon was started
     // (`settings::STARTED_WITH`); one that does not read fails the start, naming it.
     let detail = std::env::var(blaze_profile::sampler::DETAIL_VAR);
@@ -897,7 +950,17 @@ pub fn keep_history(
     // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
     // ([`provenance_rows`]); one that keeps none counts alone.
     blaze_query::db::log_runs(true);
-    Ok((Profiling { dir, duckdb, opened: Some(opened), ended, failed, told, doing }, Keeper(thread)))
+    Ok((
+        Profiling { dir, duckdb, pinned_duckdb, opened: Some(opened), ended, failed, told, doing },
+        Keeper(thread),
+    ))
+}
+
+impl Profiling {
+    /// The DuckDB the explorer runs ([`explorer_duckdb`]), or why there is none.
+    pub fn duckdb(&self) -> Result<PathBuf, String> {
+        explorer_duckdb(self.duckdb.as_deref(), self.pinned_duckdb.as_deref())
+    }
 }
 
 /// The number of the daemon's first build, as the history's thread at `dir` tells it on
@@ -2010,8 +2073,9 @@ impl Observe {
         if self.explorer.is_none() {
             let config = blaze_explore::Config {
                 history: blaze_explore::History {
-                    // clone: two paths, once an explorer
-                    duckdb: profiling.duckdb.clone(),
+                    // A DuckDB named wrong or not yet fetched fails the explorer's queries,
+                    // each saying why, never its start or the daemon.
+                    duckdb: profiling.duckdb(),
                     dir: profiling.dir.clone(), // clone: once an explorer
                     flush: explorer_flush(profiling),
                 },
@@ -2266,6 +2330,9 @@ fn never_explained(oldest: Option<u64>) -> ApiError {
     ApiError::new(what, Some("blaze why".to_owned())) // alloc: error path
 }
 
+/// An answer path: nothing under it syncs a file (`blaze::sync_on_answer_path`,
+/// docs/v2/plan/design/effect-summary.md).
+#[blaze::answers_request]
 fn answer(out: &mut Vec<Reply>, to: RequestRef, response: Response) {
     out.push(Reply { to, response });
     out.push(Reply { to, response: Response::Done { ok: true } });
@@ -2315,9 +2382,35 @@ mod tests {
         assert!(not_a_file.contains("is not a file"), "{not_a_file}");
         let missing = duckdb(Some(dir.path().join("duckdb").into())).unwrap_err();
         assert!(missing.starts_with("BLAZE_DUCKDB="), "{missing}");
+        // The empty value the Mac had (2026-11-13): the error says the one command that fixes it.
+        let empty = duckdb(Some("".into())).unwrap_err();
+        assert!(empty.contains("BLAZE_DUCKDB= ") && empty.contains("`unset BLAZE_DUCKDB`"), "{empty}");
+        assert!(missing.contains("`unset BLAZE_DUCKDB`"), "{missing}");
         let file = dir.path().join("duckdb");
         fs::write(&file, b"").unwrap();
         assert_eq!(duckdb(Some(file.clone().into())), Ok(Some(file)));
+    }
+
+    /// The explorer's DuckDB is resolved when it starts: the variable as the daemon started
+    /// (checked then), else the pin where a reader laid it out; each missing one is an error
+    /// naming it, and none of it is looked at before.
+    #[test]
+    fn the_explorers_duckdb_is_the_variables_then_the_laid_out_pin_each_missing_one_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = dir.path().join("duckdb").join("1.5.5-00").join("duckdb");
+        let gone = std::ffi::OsString::from("/nix/store/gone/bin/duckdb");
+        let said = explorer_duckdb(Some(&gone), Some(&pinned)).unwrap_err();
+        assert!(said.contains("BLAZE_DUCKDB=/nix/store/gone/bin/duckdb"), "{said}");
+        let said = explorer_duckdb(None, Some(&pinned)).unwrap_err();
+        assert!(said.contains(&pinned.display().to_string()) && said.contains("blaze debug sql"), "{said}");
+        let said = explorer_duckdb(None, None).unwrap_err();
+        assert!(said.contains("pins no DuckDB") && said.contains("BLAZE_DUCKDB"), "{said}");
+        fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+        fs::write(&pinned, b"").unwrap();
+        assert_eq!(explorer_duckdb(None, Some(&pinned)), Ok(pinned.clone())); // clone: a test's path
+        let named = dir.path().join("named");
+        fs::write(&named, b"").unwrap();
+        assert_eq!(explorer_duckdb(Some(named.as_os_str()), Some(&pinned)), Ok(named));
     }
 
     #[test]
@@ -2801,6 +2894,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
+            pinned_duckdb: None,
             opened: None,
             ended,
             failed,
@@ -2912,6 +3006,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
+            pinned_duckdb: None,
             opened: None,
             ended,
             failed,
@@ -2985,6 +3080,7 @@ mod tests {
         Observe::new(Some(Profiling {
             dir: dir.to_path_buf(),
             duckdb: None,
+            pinned_duckdb: None,
             opened: Some(opened),
             ended,
             failed,

@@ -82,6 +82,12 @@ exits! {
     /// (two commands started one at once): it started none over it, and the command that
     /// started it connects to the one listening (`serve::hold`, `cli::daemon::connect`).
     Served = 79, "SERVED", "another daemon of its state listens at its socket, so it started none";
+    /// The daemon's task watchdog (`serve::stuck`) found more threads stuck where nothing can
+    /// unwind them (a lock or a signal that never comes) than its bound, a quarter of the
+    /// workers and at least two: each failed its build, but the pool has lost them for good
+    /// and a stuck thread holds what it held, so the daemon ends, having written what each
+    /// thread was inside, and the next command starts a whole one.
+    WorkersLost = 80, "WORKERS_LOST", "more of its threads were stuck for good than its bound, so it ended";
     /// A build or test failed, or the CLI met an error of its own: cargo's code for both.
     Failed = 101, "FAILED", "a build or test failed, or blaze met an error of its own";
     /// A sandbox launcher could not make the sandbox, so the program it was given did not run:
