@@ -774,3 +774,117 @@ fn a_flag_that_waives_blaze_unreachable_refuses_the_check() {
         assert!(found[0].starts_with("error: `bare`"), "{flags}: {out}");
     }
 }
+
+const LINEAR: &str = r#"
+#[blaze::nopanic]
+pub fn last(v: &[u32]) -> u32 {
+    if !v.is_empty() { v[v.len() - 1] } else { 0 }
+}
+#[blaze::nopanic]
+pub fn last_by_len(v: &[u32]) -> u32 {
+    if v.len() > 0 { v[v.len() - 1] } else { 0 }
+}
+#[blaze::nopanic]
+pub fn next(v: &[u32], i: usize) -> u32 {
+    if i < v.len() {
+        if i + 1 < v.len() {
+            return v[i + 1];
+        }
+    }
+    0
+}
+#[blaze::nopanic]
+pub fn pair(v: &[u32], i: usize) -> u32 {
+    if v.is_empty() {
+        return 0;
+    }
+    if i < v.len() - 1 { v[i] ^ v[i + 1] } else { 0 }
+}
+#[blaze::nopanic]
+pub fn middle(v: &[u32], lo: usize, hi: usize) -> u32 {
+    if lo < hi && hi <= v.len() {
+        let mid = lo + (hi - lo) / 2;
+        v[mid]
+    } else {
+        0
+    }
+}
+#[blaze::nopanic]
+pub fn from_end(v: &[u32], k: usize) -> u32 {
+    if k >= 1 && k <= v.len() { v[v.len() - k] } else { 0 }
+}
+#[blaze::nopanic]
+pub fn last_unguarded(v: &[u32]) -> u32 {
+    v[v.len() - 1]
+}
+#[blaze::nopanic]
+pub fn two_ahead(v: &[u32], i: usize) -> u32 {
+    if i < v.len() {
+        if i + 1 < v.len() {
+            return v[i + 2];
+        }
+    }
+    0
+}
+#[blaze::nopanic]
+pub fn product(v: &[u32], i: usize, j: usize) -> u32 {
+    if i < v.len() && j < v.len() { v[i * j] } else { 0 }
+}
+"#;
+
+/// The `#[blaze::nopanic]` functions of [`LINEAR`] refused in a crate with `meta`, each with
+/// whether what refuses it is an index or an overflow check.
+fn linear_refused(meta: &str) -> Vec<(String, &'static str)> {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std{meta}\n{}",
+        LINEAR.trim_start_matches('\n')
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::nopanic");
+    out.lines()
+        .filter(|line| line.contains("is `#[blaze::nopanic]`"))
+        .filter_map(|line| {
+            let name = line.split('`').nth(1)?;
+            let name = name.rsplit("::").next().unwrap_or(name).to_owned();
+            let what = match line.contains("checks an index against a length") {
+                true => "index",
+                false if line.contains("checks arithmetic for overflow") => "overflow",
+                false => "other",
+            };
+            Some((name, what))
+        })
+        .collect()
+}
+
+/// Linear arithmetic, in a crate without overflow checks (a wrapping `-` and `+`): the last
+/// element under a non-empty check, the next under `i + 1 < len`, a pair under `i < len - 1`
+/// of a slice known not empty, the middle of `lo < hi <= len`, and `len - k` for
+/// `1 <= k <= len` are no panic. Still reported, each for its index: `v[len - 1]` with no
+/// guard (the subtraction wraps on an empty slice), two ahead of a guard for one ahead, and a
+/// product, which is not linear.
+#[test]
+fn linear_arithmetic_without_overflow_checks() {
+    assert_eq!(
+        linear_refused(""),
+        [
+            ("last_unguarded".to_owned(), "index"),
+            ("two_ahead".to_owned(), "index"),
+            ("product".to_owned(), "index"),
+        ]
+    );
+}
+
+/// The same with overflow checks: the same functions pass (each `-` and `+` is shown not to
+/// overflow where it is), and the same three are refused: `len - 1` and `i * j` at the
+/// arithmetic, which can overflow before the index is reached, and two ahead at its index
+/// (`i + 2 <= len` follows from the guard, so that sum cannot overflow).
+#[test]
+fn linear_arithmetic_with_overflow_checks() {
+    assert_eq!(
+        linear_refused(" cfg:overflow_checks"),
+        [
+            ("last_unguarded".to_owned(), "overflow"),
+            ("two_ahead".to_owned(), "index"),
+            ("product".to_owned(), "overflow"),
+        ]
+    );
+}

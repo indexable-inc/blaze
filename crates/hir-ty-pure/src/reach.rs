@@ -111,7 +111,57 @@ enum Term {
     DerefAt(TermId, TermId),
     /// A struct, tuple or enum variant ([`NO_VARIANT`] when not a variant) of these fields.
     Agg(u32, Box<[TermId]>),
+    /// A linear form, the exact integer `sum of coefficient * term, plus constant`: the terms
+    /// in order, none a constant or a form itself, no coefficient 0, and not a lone term with
+    /// coefficient 1 and constant 0 ([`Solver::lin`]). It is a number, not a machine integer:
+    /// a local holds one only where the sum is shown not to leave its type.
+    Lin(Box<[(TermId, i128)]>, i128),
+    /// The exact value `.0` wrapped into an integer type (`.1`: its bits, 128 more when
+    /// signed): what `a + b` is where nothing shows it fits. The same operands give the same
+    /// term, so a guard and a use that compute one expression agree.
+    Wrap(TermId, u32),
 }
+
+/// A linear form as it is worked with: `(term, coefficient)` in term order, and the constant.
+type Form = (Vec<(TermId, i128)>, i128);
+
+/// `a + scale * b`; none when a coefficient or the constant leaves `i128`.
+fn form_add(a: &Form, b: &Form, scale: i128) -> Option<Form> {
+    let mut parts = Vec::with_capacity(a.0.len() + b.0.len()); // alloc: a form's terms, a few
+    let (mut i, mut j) = (0, 0);
+    while i < a.0.len() || j < b.0.len() {
+        let left = a.0.get(i).copied();
+        let right = b.0.get(j).copied();
+        let (term, coefficient) = match (left, right) {
+            (Some((t, c)), Some((u, d))) if t == u => {
+                (i, j) = (i + 1, j + 1);
+                (t, c.checked_add(d.checked_mul(scale)?)?)
+            }
+            (Some((t, c)), Some((u, _))) if t < u => {
+                i += 1;
+                (t, c)
+            }
+            (Some((t, c)), None) => {
+                i += 1;
+                (t, c)
+            }
+            (_, Some((u, d))) => {
+                j += 1;
+                (u, d.checked_mul(scale)?)
+            }
+            (None, None) => break,
+        };
+        if coefficient != 0 {
+            parts.push((term, coefficient));
+        }
+    }
+    Some((parts, a.1.checked_add(b.1.checked_mul(scale)?)?))
+}
+
+/// How many facts one linear proof may add up, and how many it may try: the budget of
+/// [`Solver::lin_le`]. A proof that needs more is not found, and the site stays reported.
+const LINEAR_DEPTH: u8 = 4;
+const LINEAR_FUEL: u32 = 256;
 
 /// `a rel b`, or for [`Fact::If`] an implication.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -567,8 +617,158 @@ impl<'a, 'db> Solver<'a, 'db> {
             };
             return self.constant(i128::from(holds));
         }
+        // Two forms that differ by a constant compare as that constant does with 0
+        // (`len - 1 < len`).
+        if let Some((parts, by)) = form_add(&self.form(a), &self.form(b), -1)
+            && parts.is_empty()
+        {
+            let holds = match rel {
+                Rel::Lt => by < 0,
+                Rel::Le => by <= 0,
+                Rel::Eq => by == 0,
+                Rel::Ne => by != 0,
+            };
+            return self.constant(i128::from(holds));
+        }
         let atom = Atom::new(rel, a, b);
         self.term(Term::Cmp(atom.rel, atom.a, atom.b), (0, 1))
+    }
+
+    /// `term` as a linear form: a constant, a form, or the term itself once.
+    fn form(&self, term: TermId) -> Form {
+        match &self.terms[term as usize] {
+            Term::Const(value) => (Vec::new(), *value),
+            Term::Lin(parts, constant) => (parts.to_vec(), *constant), // alloc: a form's terms, a few
+            _ => (vec![(term, 1)], 0), // alloc: one term
+        }
+    }
+
+    /// The term of a linear form: a constant, a lone term, or the form.
+    fn lin(&mut self, form: Form) -> TermId {
+        match (&form.0[..], form.1) {
+            ([], constant) => self.constant(constant),
+            ([(term, 1)], 0) => *term,
+            _ => self.term(Term::Lin(form.0.into_boxed_slice(), form.1), ANY),
+        }
+    }
+
+    /// The greatest value `form` can have by the bounds of each of its terms alone; none
+    /// when a term has no bound on that side.
+    fn form_high(&self, state: &State, form: &Form) -> Option<i128> {
+        let mut high = form.1;
+        for &(term, coefficient) in &form.0 {
+            let (least, most) = self.bounds(state, term);
+            let end = if coefficient > 0 { most } else { least };
+            if end == i128::MAX || end == i128::MIN {
+                return None;
+            }
+            high = high.checked_add(coefficient.checked_mul(end)?)?;
+        }
+        Some(high)
+    }
+
+    /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
+    /// `form <= bound`, the form with no constant.
+    fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
+        let mut known = Vec::with_capacity(state.facts.len()); // alloc: one bound per fact, per proof
+        let mut add = |left: &Form, right: &Form, slack: i128| {
+            if let Some((parts, constant)) = form_add(left, right, -1)
+                && !parts.is_empty()
+                && let Some(bound) = slack.checked_sub(constant)
+            {
+                known.push((parts, bound));
+            }
+        };
+        for fact in &state.facts {
+            let (a, b) = (self.form(fact.a), self.form(fact.b));
+            match fact.rel {
+                Rel::Lt => add(&a, &b, -1),
+                Rel::Le => add(&a, &b, 0),
+                Rel::Eq => {
+                    add(&a, &b, 0);
+                    add(&b, &a, 0);
+                }
+                Rel::Ne => {}
+            }
+        }
+        known
+    }
+
+    /// Whether the state entails `form <= limit`, by adding up facts: the bounds of the
+    /// form's terms give it, or some fact `f <= b` that cancels a term of the form leaves
+    /// `form - f <= limit - b` to show the same way. Shortest paths over difference
+    /// constraints (`x - y <= c`) are the case of two-term facts; this adds any linear
+    /// facts, at most `depth` of them, trying at most `fuel`.
+    fn lin_le(
+        &self,
+        state: &State,
+        form: &Form,
+        limit: i128,
+        known: &[(Vec<(TermId, i128)>, i128)],
+        depth: u8,
+        fuel: &mut u32,
+    ) -> bool {
+        let Some(limit) = limit.checked_sub(form.1) else { return false };
+        if form.0.is_empty() {
+            return 0 <= limit;
+        }
+        let bare = (form.0.clone(), 0); // clone: the form without its constant
+        if self.form_high(state, &bare).is_some_and(|high| high <= limit) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        for (parts, bound) in known {
+            let cancels = parts.iter().any(|&(term, coefficient)| {
+                bare.0.iter().any(|&(of, has)| of == term && (has > 0) == (coefficient > 0))
+            });
+            if !cancels {
+                continue;
+            }
+            if *fuel == 0 {
+                return false;
+            }
+            *fuel -= 1;
+            let fact = (parts.clone(), 0); // clone: subtracted from the form
+            let (Some(rest), Some(left)) = (form_add(&bare, &fact, -1), limit.checked_sub(*bound))
+            else {
+                continue;
+            };
+            if self.lin_le(state, &rest, left, known, depth - 1, fuel) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the state entails `atom` by linear reasoning ([`Self::lin_le`]).
+    fn linear(&self, state: &State, atom: Atom) -> bool {
+        let (a, b) = (self.form(atom.a), self.form(atom.b));
+        let known = self.known(state);
+        let mut fuel = LINEAR_FUEL;
+        let mut le = |left: &Form, right: &Form, limit: i128| {
+            form_add(left, right, -1).is_some_and(|form| {
+                self.lin_le(state, &form, limit, &known, LINEAR_DEPTH, &mut fuel)
+            })
+        };
+        match atom.rel {
+            Rel::Lt => le(&a, &b, -1),
+            Rel::Le => le(&a, &b, 0),
+            Rel::Eq => le(&a, &b, 0) && le(&b, &a, 0),
+            Rel::Ne => le(&a, &b, -1) || le(&b, &a, -1),
+        }
+    }
+
+    /// Whether the state shows the exact value `form` is within `least..=most`.
+    fn form_within(&self, state: &State, form: &Form, least: i128, most: i128) -> bool {
+        let known = self.known(state);
+        let mut fuel = LINEAR_FUEL;
+        let zero: Form = (Vec::new(), 0);
+        let Some(negated) = form_add(&zero, form, -1) else { return false };
+        let Some(floor) = least.checked_neg() else { return false };
+        self.lin_le(state, form, most, &known, LINEAR_DEPTH, &mut fuel)
+            && self.lin_le(state, &negated, floor, &known, LINEAR_DEPTH, &mut fuel)
     }
 
     fn not(&mut self, of: TermId) -> TermId {
@@ -585,6 +785,11 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// Narrows `term`'s range to what `ty` holds.
     fn typed(&mut self, term: TermId, ty: Ty<'db>) -> TermId {
+        // A linear form is a number whose bounds are its terms': a place it sits in says
+        // nothing of it in a state where it is not that place's value.
+        if matches!(self.terms[term as usize], Term::Lin(..) | Term::Const(_)) {
+            return term;
+        }
         if let Some(range) = int_range(ty, self.word) {
             let had = self.ranges[term as usize];
             self.ranges[term as usize] = (had.0.max(range.0), had.1.min(range.1));
@@ -608,6 +813,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                 self.mentions(*a, of) || self.mentions(*b, of)
             }
             Term::Agg(_, fields) => fields.iter().any(|&it| self.mentions(it, of)),
+            Term::Lin(parts, _) => parts.iter().any(|&(it, _)| self.mentions(it, of)),
+            Term::Wrap(a, _) => self.mentions(*a, of),
         }
     }
 
@@ -651,6 +858,20 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn bounds_by_constants(&self, state: &State, term: TermId) -> (i128, i128) {
         if let Some(value) = self.const_of(term) {
             return (value, value);
+        }
+        // A form's bounds are its terms', added up; an end a term leaves open is open.
+        if let Term::Lin(parts, constant) = &self.terms[term as usize] {
+            let (mut low, mut high) = (Some(*constant), Some(*constant));
+            for &(part, coefficient) in parts.iter() {
+                let (least, most) = self.bounds_by_constants(state, part);
+                let (down, up) = if coefficient > 0 { (least, most) } else { (most, least) };
+                let end = |sum: Option<i128>, end: i128| {
+                    let open = end == i128::MAX || end == i128::MIN;
+                    sum.filter(|_| !open)?.checked_add(coefficient.checked_mul(end)?)
+                };
+                (low, high) = (end(low, down), end(high, up));
+            }
+            return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
         for fact in &state.facts {
@@ -756,6 +977,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
         }
+        // Adding facts up: `i + 1 < n` gives `i < n`, `k <= n` gives `0 <= n - k`. Once, at
+        // the top: the steps below ask about single facts.
+        if depth >= 2 && self.linear(state, atom) {
+            return true;
+        }
         if depth == 0 {
             return false;
         }
@@ -827,25 +1053,31 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
         }
-        if self.entails(state, atom) {
-            return true;
-        }
-        state.put(atom);
-        for term in [atom.a, atom.b] {
-            let (low, high) = self.bounds(state, term);
-            if low > high {
-                return false;
+        // The fact is written down even when the state already entails it (through an
+        // implication, or by adding others up): the linear proofs read the facts as written.
+        let trivial = atom.a == atom.b
+            || (self.const_of(atom.a).is_some() && self.const_of(atom.b).is_some());
+        if !trivial && !state.has(atom) {
+            state.put(atom);
+            for term in [atom.a, atom.b] {
+                let (low, high) = self.bounds(state, term);
+                if low > high {
+                    return false;
+                }
             }
         }
-        // What the new fact is the premise of: each implication fires at most once.
+        self.saturate(state)
+    }
+
+    /// Writes down what the state's implications give: the conclusion of each whose premise
+    /// holds. False when one contradicts the state. Each implication fires at most once.
+    fn saturate(&self, state: &mut State) -> bool {
         let mut budget = state.imps.len();
         loop {
             let next = state
                 .imps
                 .iter()
-                .find(|&&(premise, then)| {
-                    self.entails(state, premise) && !self.entails(state, then)
-                })
+                .find(|&&(premise, then)| !state.has(then) && self.entails(state, premise))
                 .copied();
             let Some((_, then)) = next else { return true };
             if budget == 0 {
@@ -1082,7 +1314,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         };
     }
 
-    fn rvalue(&mut self, state: &State, to: &StoredPlace, rvalue: &Rvalue) -> TermId {
+    fn rvalue(&mut self, state: &mut State, to: &StoredPlace, rvalue: &Rvalue) -> TermId {
         match rvalue {
             Rvalue::Use(operand) => self.operand(state, operand),
             Rvalue::CopyForDeref(place) => self.read(state, place),
@@ -1134,48 +1366,158 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let value = self.operand(state, operand);
                 self.not(value)
             }
-            // `(a op b, overflowed)`: when the exact result fits the type whatever the operands
-            // are within their bounds, the flag is false and the check after it holds.
+            // Arithmetic that is linear: the exact sum, difference or multiple, as a form. A
+            // local holds it only where it fits the type: shown by the state, or, for a
+            // checked operation, on the far side of its overflow check (the flag being false
+            // implies the value is the form). A wrapping operation not shown to fit is the
+            // form wrapped, an unknown that the same operands give again.
             Rvalue::BinaryOp(
-                op @ (BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow),
+                op @ (BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Shl
+                | BinOp::AddWithOverflow
+                | BinOp::SubWithOverflow
+                | BinOp::MulWithOverflow),
                 left,
                 right,
             ) => {
-                let range = self.operand_ty(left).and_then(|it| int_range(it, self.word));
+                let ty = self.operand_ty(left);
+                let range = ty.and_then(|it| int_range(it, self.word));
                 let (a, b) = (self.operand(state, left), self.operand(state, right));
-                let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
-                let ends = match op {
-                    BinOp::AddWithOverflow => {
-                        low_a.checked_add(low_b).zip(high_a.checked_add(high_b))
-                    }
-                    BinOp::SubWithOverflow => {
-                        low_a.checked_sub(high_b).zip(high_a.checked_sub(low_b))
+                let (form_a, form_b) = (self.form(a), self.form(b));
+                let exact = match op {
+                    BinOp::Add | BinOp::AddWithOverflow => form_add(&form_a, &form_b, 1),
+                    BinOp::Sub | BinOp::SubWithOverflow => form_add(&form_a, &form_b, -1),
+                    BinOp::Mul | BinOp::MulWithOverflow => {
+                        let zero: Form = (Vec::new(), 0);
+                        match (form_a.0.is_empty(), form_b.0.is_empty()) {
+                            (true, _) => form_add(&zero, &form_b, form_a.1),
+                            (_, true) => form_add(&zero, &form_a, form_b.1),
+                            // A product of two unknowns is not linear.
+                            _ => None,
+                        }
                     }
                     _ => {
-                        let products = [
-                            low_a.checked_mul(low_b),
-                            low_a.checked_mul(high_b),
-                            high_a.checked_mul(low_b),
-                            high_a.checked_mul(high_b),
-                        ];
-                        match products {
-                            [Some(a), Some(b), Some(c), Some(d)] => {
-                                Some((a.min(b).min(c).min(d), a.max(b).max(c).max(d)))
+                        let zero: Form = (Vec::new(), 0);
+                        match form_b {
+                            (parts, by) if parts.is_empty() && (0..=100).contains(&by) => {
+                                form_add(&zero, &form_a, 1i128 << by)
                             }
                             _ => None,
                         }
                     }
                 };
-                match (ends, range) {
-                    (Some((low, high)), Some((least, most))) if least <= low && high <= most => {
-                        // The result is left unknown: a term's range is its type's, never a
-                        // state's.
-                        let ty = self.operand_ty(left);
-                        let value = self.fresh(ty);
-                        let flag = self.constant(0);
-                        self.term(Term::Agg(NO_VARIANT, Box::new([value, flag])), ANY)
+                let checked = matches!(
+                    op,
+                    BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow
+                );
+                let fits = match (&exact, range) {
+                    (Some(form), Some((least, most))) => self.form_within(state, form, least, most),
+                    _ => false,
+                };
+                let pair = |this: &mut Self, value, flag| {
+                    this.term(Term::Agg(NO_VARIANT, Box::new([value, flag])), ANY)
+                };
+                match (exact, range) {
+                    (Some(form), Some(_)) if fits && !checked => self.lin(form),
+                    (Some(form), Some(_)) if fits => {
+                        let (value, flag) = (self.lin(form), self.constant(0));
+                        pair(self, value, flag)
                     }
-                    _ => self.fresh(None),
+                    (Some(form), Some(_)) if checked => {
+                        let (value, flag) = (self.fresh(ty), self.fresh(None));
+                        self.ranges[flag as usize] = (0, 1);
+                        let (exact, zero) = (self.lin(form), self.constant(0));
+                        state.put_imp((
+                            Atom::new(Rel::Eq, flag, zero),
+                            Atom::new(Rel::Eq, value, exact),
+                        ));
+                        pair(self, value, flag)
+                    }
+                    (Some(form), Some((least, _))) => {
+                        let exact = self.lin(form);
+                        let bits = ty.map_or(0, |it| type_bits(it, self.word));
+                        let key = bits + if least < 0 { 128 } else { 0 };
+                        let wrapped = self.term(Term::Wrap(exact, key), ANY);
+                        match ty {
+                            Some(ty) => self.typed(wrapped, ty),
+                            None => wrapped,
+                        }
+                    }
+                    _ if checked => {
+                        // A product of two unknowns: its check holds when every product of
+                        // their bounds fits the type.
+                        let ((low_a, high_a), (low_b, high_b)) =
+                            (self.bounds(state, a), self.bounds(state, b));
+                        let ends = [
+                            low_a.checked_mul(low_b),
+                            low_a.checked_mul(high_b),
+                            high_a.checked_mul(low_b),
+                            high_a.checked_mul(high_b),
+                        ];
+                        let inside = match (ends, range) {
+                            ([Some(a), Some(b), Some(c), Some(d)], Some((least, most))) => {
+                                least <= a.min(b).min(c).min(d) && a.max(b).max(c).max(d) <= most
+                            }
+                            _ => false,
+                        };
+                        let value = self.fresh(ty);
+                        let flag = match inside {
+                            true => self.constant(0),
+                            false => {
+                                let flag = self.fresh(None);
+                                self.ranges[flag as usize] = (0, 1);
+                                flag
+                            }
+                        };
+                        pair(self, value, flag)
+                    }
+                    _ => {
+                        let ty = self.place_ty(to);
+                        self.fresh(Some(ty))
+                    }
+                }
+            }
+            // `x / d` and `x >> c` of a value known not negative, `d` a positive constant: a
+            // quotient `q` with `d * q <= x <= d * q + d - 1`, and so `q <= x`, and `q < x`
+            // when `d >= 2` and `x >= 1`.
+            Rvalue::BinaryOp(op @ (BinOp::Div | BinOp::Shr), left, right) => {
+                let ty = self.operand_ty(left);
+                let integral = ty.is_some_and(|it| int_range(it, self.word).is_some());
+                let (a, b) = (self.operand(state, left), self.operand(state, right));
+                let by = match (op, self.const_of(b)) {
+                    (BinOp::Div, Some(by)) if by > 0 => Some(by),
+                    (BinOp::Shr, Some(by)) if (0..=100).contains(&by) => Some(1i128 << by),
+                    _ => None,
+                };
+                let zero = self.constant(0);
+                let positive = integral && self.entails(state, Atom::new(Rel::Le, zero, a));
+                match by {
+                    Some(by) if positive => {
+                        let quotient = self.fresh(ty);
+                        let single: Form = (vec![(quotient, 1)], 0); // alloc: one term
+                        let none: Form = (Vec::new(), 0);
+                        state.put(Atom::new(Rel::Le, zero, quotient));
+                        state.put(Atom::new(Rel::Le, quotient, a));
+                        if let Some(low) = form_add(&none, &single, by) {
+                            let top = form_add(&low, &(Vec::new(), by - 1), 1);
+                            let low = self.lin(low);
+                            state.put(Atom::new(Rel::Le, low, a));
+                            if let Some(top) = top {
+                                let top = self.lin(top);
+                                state.put(Atom::new(Rel::Le, a, top));
+                            }
+                        }
+                        if by >= 2 && self.entails(state, Atom::new(Rel::Lt, zero, a)) {
+                            state.put(Atom::new(Rel::Lt, quotient, a));
+                        }
+                        quotient
+                    }
+                    _ => {
+                        let ty = self.place_ty(to);
+                        self.fresh(Some(ty))
+                    }
                 }
             }
             Rvalue::BinaryOp(op, left, right) => {
@@ -1327,6 +1669,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                         for (premise, then) in call.implies {
                             returned.put_imp((premise, then));
                         }
+                        runs = runs && self.saturate(&mut returned);
                         for fact in call.facts {
                             runs = runs && self.assume(&mut returned, fact);
                         }
@@ -1685,6 +2028,30 @@ impl<'a, 'db> Solver<'a, 'db> {
             Term::Discr(of) => format!("the variant of {}", self.said(*of)?), // alloc: a message's part
             Term::Cmp(rel, a, b) => self.said_atom(Atom { rel: *rel, a: *a, b: *b })?,
             Term::Not(of) => format!("!{}", self.said(*of)?), // alloc: a message's part
+            Term::Lin(parts, constant) => {
+                let mut text = String::new(); // alloc: a message's part
+                for &(part, coefficient) in parts.iter() {
+                    let name = self.said(part)?;
+                    let sign = if coefficient < 0 { "-" } else { "+" };
+                    if !text.is_empty() || coefficient < 0 {
+                        text.push_str(if text.is_empty() { "-" } else { sign });
+                        if text.len() > 1 {
+                            text.insert(text.len() - 1, ' ');
+                            text.push(' ');
+                        }
+                    }
+                    if coefficient.unsigned_abs() != 1 {
+                        text.push_str(&format!("{} * ", coefficient.unsigned_abs())); // alloc: a message's part
+                    }
+                    text.push_str(&name);
+                }
+                if *constant != 0 {
+                    let sign = if *constant < 0 { "-" } else { "+" };
+                    text.push_str(&format!(" {sign} {}", constant.unsigned_abs())); // alloc: a message's part
+                }
+                text
+            }
+            Term::Wrap(of, _) => self.said(*of)?,
             Term::Payload(..) | Term::Agg(..) => return None,
         })
     }
@@ -1818,6 +2185,15 @@ fn uint_bits(ty: UintTy, word: u32) -> u32 {
 
 fn int_bits(ty: IntTy, word: u32) -> u32 {
     ty.bit_width().map_or(word, |it| it as u32)
+}
+
+/// How many bits an integer type has; 0 for any other type.
+fn type_bits(ty: Ty<'_>, word: u32) -> u32 {
+    match ty.kind() {
+        TyKind::Uint(it) => uint_bits(it, word),
+        TyKind::Int(it) => int_bits(it, word),
+        _ => 0,
+    }
 }
 
 /// The value of `bits` read as a `ty`: sign-extended for a signed integer. None for a type
