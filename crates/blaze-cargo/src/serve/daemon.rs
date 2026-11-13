@@ -1564,20 +1564,21 @@ fn disks_used(unused: Option<DisksUnused>) -> Result<Option<Refused>, VfsFault> 
 }
 
 /// The machine's ledger fitted to the process's gate (docs/v2/plan/design/end-state/memory.md,
-/// sections 4.3 and 4.5): the gate says what its tasks commit and what its held tasks wait for
-/// past that ([`Plane::gate_needs`]); the slot moves to cover them ([`super::machine::Machine::fit`],
-/// one try, never a wait); the bytes the slot holds after are the gate's room
-/// ([`Plane::set_room`]), which wounds the youngest holders when it shrinks under what is
-/// committed and tells the plane what is free. The floor is the gate's two reads and, only when
-/// the slot moves a grain, one add and one pass of the ledger's slots.
+/// sections 4.3 and 4.5): the gate says what room it needs before anything is short (what its
+/// tasks commit, the overdrafts it sets aside and its front's lending) and what its held tasks
+/// wait for past that ([`Plane::gate_needs`]); the slot moves to cover them
+/// ([`super::machine::Machine::fit`], one try, never a wait); the bytes the slot holds after are
+/// the gate's room ([`Plane::set_room`]), which wounds the youngest holders only when the machine
+/// refused part of what the gate needs, and tells the plane what is free. The floor is the gate's
+/// two reads and, only when the slot moves a grain, one add and one pass of the ledger's slots.
 #[cfg(all(unix, feature = "native"))]
 fn fit_room<W: super::plane::Work, P: blaze_graph::admission::Predict>(
     machine: &mut super::Machine,
     plane: &mut Plane<W, P>,
     at: Duration,
 ) -> anyhow::Result<()> {
-    let (committed, wanted) = plane.gate_needs();
-    let held = machine.fit(committed, wanted)?;
+    let (needs, wanted) = plane.gate_needs();
+    let held = machine.fit(needs, wanted)?;
     plane.set_room(at, held);
     Ok(())
 }

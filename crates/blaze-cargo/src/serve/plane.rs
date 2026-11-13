@@ -36,6 +36,7 @@ use blaze_graph::{
 };
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
+use blaze_profile::stuck::again::{AGAIN_BOUND, Again, Inputs, Restart, SameAgain};
 use blaze_protocol::{
     events::{Event, NodeState},
     now::{self, Fold, Now},
@@ -864,6 +865,13 @@ pub struct Plane<W: Work, P: Predict> {
     walking: usize,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
     folds: Folds,
+    /// The thread tasks the gate wounded and that start again, counted while nothing they wait
+    /// on changes ([`blaze_profile::stuck::again`]): past its bound, the task fails as stuck
+    /// ([`Plane::same_again`]).
+    again: Again,
+    /// How many tasks of the plane have ended (done, failed or panicked): what a wounded task
+    /// waits on, as [`Inputs::ended`].
+    ended: u64,
 }
 
 /// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/design/build-view.md):
@@ -982,6 +990,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
             walking: 0,
             folds: Folds::new(),
+            again: Again::new(),
+            ended: 0,
         })
     }
 
@@ -992,12 +1002,17 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.gate = Some((gate, ceiling));
     }
 
-    /// What the gate counts as committed now, and what the head-of-line task memory holds
-    /// back wants past it ([`blaze_graph::Plane::wanted`]): what the machine's ledger is asked
-    /// to cover (`super::daemon::fit_room`). `(0, 0)` with no gate.
+    /// What the gate needs as room now before anything is short ([`blaze_mem::gate::Gate::needs`]:
+    /// what it has committed, every worker's overdraft and the front's lending), and what the
+    /// head-of-line task memory holds back wants past it ([`blaze_graph::Plane::wanted`]): what
+    /// the machine's ledger is asked to cover (`super::daemon::fit_room`). `(0, 0)` with no gate.
+    ///
+    /// Not [`blaze_mem::gate::Gate::committed`]: a room fitted to that is short by every
+    /// worker's overdraft, so each fit wounded the youngest holder and a lone task restarted
+    /// forever (2026-11-13, a hello-world's `names lowering`, 1,280 starts).
     pub fn gate_needs(&self) -> (u64, u64) {
         match &self.gate {
-            Some((gate, _)) => (gate.committed(), self.graph.wanted()),
+            Some((gate, _)) => (gate.needs(), self.graph.wanted()),
             None => (0, 0),
         }
     }
@@ -1011,6 +1026,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         let Some((gate, _)) = self.gate else { return };
         gate.room(held);
         self.room = Some(held);
+        self.again.room(held);
         self.tell_room(at);
         // A room that grew lets held tasks go.
         self.unheld_now(at);
@@ -1359,6 +1375,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     fn settled(&mut self, id: NodeId) {
         self.replays.remove(&id);
+        self.again.forget(u64::from(id.0));
         let Some((&first, batch)) = self.batches.range_mut(..=id.0).next_back() else { return };
         let Some(task) = batch.tasks.get_mut((id.0 - first) as usize) else { return };
         if *task != Task::Gone {
@@ -1527,6 +1544,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             let key = self.key(id);
             self.predict.observe(kind, key, ns(at).saturating_sub(start), 0);
         }
+        self.ended += 1;
         let input = PlaneInput::Done {
             at_ns: ns(at),
             id,
@@ -1609,6 +1627,54 @@ impl<W: Work, P: Predict> Plane<W, P> {
         true
     }
 
+    /// Node `task.id`'s task, wounded by the gate and started again more than [`AGAIN_BOUND`]
+    /// times in a row with nothing it waits on changed ([`SameAgain`]), fails: said once as a
+    /// stuck line, the watchdog's words ([`blaze_profile::stuck::SAID`]), with how many times and
+    /// what it waited on to change, and its build ends failed with the same words rather than
+    /// loop (rules bounded-progress, no-fallback). The gate forgets its parked task, so the
+    /// tasks held behind its age start.
+    fn same_again(&mut self, at: Duration, task: &Posting, same: SameAgain) {
+        let id = task.id;
+        // alloc: a task failed as the same work again, once per such task
+        let step = match admission::name_of(task.kind) {
+            Some(name) => format!("{name} (node {id})"),
+            None => format!("query kind {:#x} (node {id})", task.kind.0),
+        };
+        let room = match same.waited.room {
+            Some(bytes) => format!("the gate's room never grew past {} MiB", bytes >> 20),
+            None => "the machine's ledger never gave the gate a room".to_owned(),
+        };
+        let why = format!(
+            "{step}: {} and it was started again {} times in a row with nothing it waits on changed (no task ended, {room}), past the bound of {AGAIN_BOUND}: the same work again, not progress",
+            same.restart.said(),
+            same.times,
+        );
+        tracing::error!(target: "blaze", build = same.build, "{why}");
+        // logged: the event above
+        eprintln!("blaze serve: pid {}{}{why}", std::process::id(), blaze_profile::stuck::SAID);
+        let gate = self.gate.as_ref().map(|(gate, _)| *gate);
+        if let (Some(gate), Some(rank)) = (gate, task.rank) {
+            self.held_at_gate.remove(&rank.task.0);
+            self.unheld_early.remove(&rank.task.0);
+            let _forgotten: bool = gate.end_parked(rank.task).unwrap_or_else(|misuse| {
+                panic!("the gate refused to forget task {id}, failed as the same work again: {misuse:?}")
+            });
+        }
+        self.ended += 1;
+        self.again.forget(u64::from(id.0));
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id,
+            outcome: Outcome::Failed { why },
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input).unwrap_or_else(|error| {
+            panic!("the plane refused the end of task {id}, failed as the same work again: {error}")
+        });
+    }
+
     /// Takes the thread tasks that ended into the plane: a task done teaches its peak to
     /// [`admission::Peaks`]; one the gate wounded is ready again, keeping its rank. Nothing is
     /// measured on a timer and nothing purged: the gate counts every committed page as it is
@@ -1645,6 +1711,15 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     // behind the elder it gave way to, never before it (wound-wait).
                     if let Some(rank) = task.rank {
                         self.forecasts.remove(&rank.task.0);
+                    }
+                    // The same work again with nothing it waits on changed, past the bound: a
+                    // loop, not progress (rule bounded-progress). It fails, said as stuck.
+                    let now = Inputs { ended: self.ended, room: self.room };
+                    if let Some(same) =
+                        self.again.restarted(task.build, u64::from(id.0), Restart::Wounded, now)
+                    {
+                        self.same_again(at, &task, same);
+                        continue;
                     }
                     let input = PlaneInput::Yielded { at_ns: ns(at), id, held: false };
                     self.step(input).unwrap_or_else(|error| {
@@ -1687,6 +1762,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 self.forecasts.remove(&rank.task.0);
                 self.unheld_early.remove(&rank.task.0);
             }
+            // An end is what a task the gate holds or wounded waits on: a change for each.
+            self.ended += 1;
+            self.again.forget(u64::from(id.0));
             // What its work held at most, as its memory account was charged: its own and its
             // fan-out's bytes, never another task's, so it is what its key learns as it is.
             let key = self.key(id);

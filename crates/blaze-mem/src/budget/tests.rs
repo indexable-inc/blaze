@@ -726,3 +726,97 @@ fn the_incident_s_young_asker_waits_and_nothing_is_dropped() {
     assert_eq!(budget.start(young, Band(0), Age(3)), Ok(Started::Running));
     assert_eq!(budget.reserve(young, SHORT), Ok(Reserved::Granted));
 }
+
+// --- The room the machine's ledger is fitted to -------------------------------------------------
+
+/// The build VM's gate of 2026-11-13 (`gate::config_under` on 128 cores: 256 workers, core 3/8
+/// and the ungated reserve 1/8 of a 64 GiB ceiling, a 32 MiB overdraft each), with one task, the
+/// hello-world's lowering, holding 64 MiB.
+fn lone_lowering() -> Budget {
+    let config = Config {
+        ceiling: 64 * GIB,
+        core: 24 * GIB,
+        overdraft_per_worker: 32 * MIB,
+        workers: 256,
+        ungated: 8 * GIB,
+    };
+    let mut budget = Budget::new(config).expect("the build VM's config fits");
+    assert_eq!(budget.start(ELDEST, Band(0), Age(0)), Ok(Started::Running));
+    for _ in 0..4 {
+        assert_eq!(budget.reserve(ELDEST, 32 * MIB / QUANTUM), Ok(Reserved::Granted));
+        assert_eq!(budget.safe_point(ELDEST), Ok(SafePoint::Go));
+    }
+    budget
+}
+
+/// One worker's overdraft on [`lone_lowering`]'s gate, in quanta: the most one reserve asks.
+const STEP: u64 = 32 * MIB / QUANTUM;
+
+/// The room the daemon gives the gate for `needs` bytes: the machine's ledger moves its slot in
+/// 64 MiB grains, rounded up (`serve::machine::Machine::fit`), and `gate::Gate::needs` adds what
+/// its front may be lent; one step stands in for that here.
+fn fitted(needs: u64) -> u64 {
+    (needs + STEP * QUANTUM).div_ceil(64 * MIB) * (64 * MIB)
+}
+
+/// The invariant: a room fitted to [`Budget::needs`] before each step of a lone task marks
+/// nobody and grants every step: the task grows from 128 MiB to 1.1 GiB and never gives way.
+#[test]
+fn a_room_fitted_to_what_the_gate_needs_wounds_nobody() {
+    let mut budget = lone_lowering();
+    for step in 0..32 {
+        let roomed = budget.room(fitted(budget.needs()));
+        assert_eq!(roomed, Roomed { victims: Vec::new(), unheld: Vec::new() }, "step {step}");
+        assert_eq!(budget.reserve(ELDEST, STEP), Ok(Reserved::Granted), "step {step}");
+        assert_eq!(budget.safe_point(ELDEST), Ok(SafePoint::Go), "step {step}");
+    }
+}
+
+/// The control, the cause put back (test-the-cause): the same fit of the room to
+/// [`Budget::committed`], which leaves out the 8 GiB of overdrafts the room must also cover,
+/// wounds the lone task at the first fit, whatever it holds: the cause of 2026-11-13's 1,280
+/// starts of one lowering.
+#[test]
+fn a_room_fitted_to_what_the_gate_committed_wounds_the_lone_task() {
+    let mut budget = lone_lowering();
+    let roomed = budget.room(fitted(budget.committed()));
+    assert_eq!(roomed.victims, vec![ELDEST]);
+    assert_eq!(budget.safe_point(ELDEST), Ok(SafePoint::GiveWay));
+    assert!(budget.wounded_at_safe_point(ELDEST).is_ok());
+    // Held for the room it had; fitted to what is committed (none of it), the room never lets
+    // it go, while one fitted to what is needed does at once.
+    assert!(budget.room(fitted(budget.committed())).unheld.is_empty());
+    assert_eq!(budget.room(fitted(budget.needs())).unheld, vec![ELDEST]);
+}
+
+/// The invariant: a task that gave way to the room (it grew past the room between two fits)
+/// and started again finds the room kept for all it held before, so growing back to it never
+/// gives way at the same point again.
+#[test]
+fn a_task_started_again_finds_room_for_where_it_gave_way() {
+    let mut budget = lone_lowering();
+    budget.room(fitted(budget.needs()));
+    // Past the fitted room with no fit between: the lone task gives way to the room.
+    let mut gave_way = false;
+    for _ in 0..4 {
+        match budget.reserve(ELDEST, STEP) {
+            Ok(Reserved::Granted) => assert_eq!(budget.safe_point(ELDEST), Ok(SafePoint::Go)),
+            Ok(Reserved::Overdrawn { .. }) => {
+                gave_way = budget.safe_point(ELDEST) == Ok(SafePoint::GiveWay);
+                break;
+            }
+            other => panic!("a lone task's step: {other:?}"),
+        }
+    }
+    assert!(gave_way, "the room was not short");
+    let reach = budget.held_by(ELDEST).expect("it runs until it unwinds");
+    assert!(budget.wounded_at_safe_point(ELDEST).is_ok());
+    assert_eq!(budget.room(fitted(budget.needs())).unheld, vec![ELDEST]);
+    assert_eq!(budget.start(ELDEST, Band(0), Age(0)), Ok(Started::Running));
+    for step in 0..reach.div_ceil(STEP) {
+        let roomed = budget.room(fitted(budget.needs()));
+        assert!(roomed.victims.is_empty(), "step {step} back to {reach} quanta");
+        assert_eq!(budget.reserve(ELDEST, STEP), Ok(Reserved::Granted), "step {step}");
+        assert_eq!(budget.safe_point(ELDEST), Ok(SafePoint::Go), "step {step}");
+    }
+}

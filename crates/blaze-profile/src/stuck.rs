@@ -30,6 +30,9 @@
 //! - A cycle of waits: every member still [`CYCLE_AFTER`]. A cycle never ends by itself; one
 //!   look rules out a snapshot torn mid-handover.
 //!
+//! A task started again and again for the same work (each start a new span, so each look sees it
+//! move) is judged by [`again`], fed by the one driver that sees a task start again.
+//!
 //! A cycle is returned once, as one [`Stuck`] naming every edge; a task is returned once until it
 //! moves again. The cost against the floor: a look that finds nothing allocates nothing once its
 //! scratch has grown to the number of tasks (it reuses its vectors), and is `O(n log n)` in the
@@ -41,8 +44,13 @@
 
 use std::{alloc::Global, time::Duration};
 
+pub mod again;
 #[cfg(test)]
 mod tests;
+
+/// What `blaze serve`'s log says before a stuck task's line: `blaze serve: pid 7 task stuck:
+/// ...`. One text for every verdict, the look's and [`again`]'s, so one search finds them all.
+pub const SAID: &str = " task stuck: ";
 
 /// How often a driver looks: a stuck task is named within its bound plus this.
 pub const LOOK_EVERY: Duration = Duration::from_secs(5);

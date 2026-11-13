@@ -196,14 +196,15 @@ impl Machine {
         self.held
     }
 
-    /// Brings the slot to what the gate needs: `committed` bytes its gate holds now, and `wanted`
-    /// bytes its held tasks wait for past them. The slot moves in [`GRAIN`]s to `committed +
-    /// wanted`, rounded up: one try of a [`Reserve`] when more (never a sleep: the loop thread
+    /// Brings the slot to what the gate needs: `needs` bytes of room its gate needs now before
+    /// anything is short (`blaze_mem::gate::Gate::needs`, never what it has committed, which
+    /// leaves out the overdrafts), and `wanted` bytes its held tasks wait for past them. The slot
+    /// moves in [`GRAIN`]s to `needs + wanted`, rounded up: one try of a [`Reserve`] when more (never a sleep: the loop thread
     /// calls this; a refused try leaves the process's want in its slot, which the others see, and
     /// is tried again when the gate asks again), a [`Release`] when a grain or more is spare. The
     /// bytes the slot holds after, which the caller gives the gate as its room.
-    pub(crate) fn fit(&mut self, committed: u64, wanted: u64) -> anyhow::Result<u64> {
-        let target = committed.saturating_add(wanted).div_ceil(GRAIN).saturating_mul(GRAIN);
+    pub(crate) fn fit(&mut self, needs: u64, wanted: u64) -> anyhow::Result<u64> {
+        let target = needs.saturating_add(wanted).div_ceil(GRAIN).saturating_mul(GRAIN);
         let seat = self.seat;
         let shared = &seat.shared;
         if target > self.held {

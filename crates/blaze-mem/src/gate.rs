@@ -545,6 +545,18 @@ impl Gate {
         self.lock().budget.committed()
     }
 
+    /// The room this process needs from the machine before anything is short
+    /// ([`Budget::needs`]), plus what the front may still be lent, so a task's next steps are
+    /// not short before the machine's ledger is fitted again. At most the ceiling. What the
+    /// daemon fits its slot of the machine's ledger to; never [`Gate::committed`], which leaves
+    /// out the overdrafts the room must also cover.
+    pub fn needs(&self) -> u64 {
+        let mut state = self.lock();
+        self.absorb_all(&mut state);
+        let front = self.lend_most.load(Ordering::Relaxed).saturating_mul(QUANTUM);
+        state.budget.needs().saturating_add(front).min(state.budget.ceiling())
+    }
+
     pub fn ceiling(&self) -> u64 {
         self.lock().budget.ceiling()
     }

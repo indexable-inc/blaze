@@ -293,6 +293,10 @@ struct Running {
     /// as it unwinds while it is marked.
     over: u64,
     peak: u64,
+    /// The most it held before it last gave way, when it started again after giving way (0 on
+    /// a first start): the room is fitted to keep that much for it ([`Budget::needs`]), so it
+    /// is not short again at the same point while it grows back to where it was.
+    reach: u64,
     mark: Mark,
 }
 
@@ -511,6 +515,32 @@ impl Budget {
         self.tasks_room(self.config.ceiling)
     }
 
+    /// The least room, bytes, under which the Budget marks or holds anything now: core and the
+    /// ungated reserve, every worker's overdraft (set aside from the room, [`Budget::limit`]),
+    /// every quantum running tasks hold, owe or lent to the front, what a task started again
+    /// after giving way still has to grow back to its reach, and the most a task the room holds
+    /// back needs. A room at or above it marks no running task ([`Budget::room`]) and lets every
+    /// task the room holds go as room is freed; a task started again finds room up to where it
+    /// gave way, so it is not short at the same point twice. It is what the machine's ledger
+    /// must hold for this process before anything is short: not [`Budget::committed`], which
+    /// leaves the overdrafts out, so a room fitted to it is short by every worker's overdraft
+    /// whatever the tasks hold, and wounds every holder each time it is given (2026-11-13: a
+    /// hello-world's lowering wounded 1,280 times in 45 s).
+    pub fn needs(&self) -> u64 {
+        let held_back = self
+            .parked
+            .iter()
+            .filter_map(|it| match it.hold {
+                Some(Hold::Room { need }) => Some(need),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let regrow: u64 = self.running.iter().map(|it| it.reach.saturating_sub(it.held())).sum();
+        let quanta = self.reserved + self.debt + held_back + regrow;
+        self.set_aside().saturating_add(quanta.saturating_mul(QUANTUM))
+    }
+
     /// A task enters, at its rank. A task wounded before keeps its age.
     pub fn start(&mut self, task: TaskId, band: Band, age: Age) -> Result<Started, Misuse> {
         if self.at(task).is_some() {
@@ -518,12 +548,11 @@ impl Budget {
         }
         let rank = Rank { band, age, task };
         let heeds = !self.planted(Plant::ReadmitUnderElder);
+        let mut reach = 0;
         if let Some(at) = self.parked.iter().position(|parked| parked.rank.task == task) {
             match self.parked[at].hold {
                 Some(by) if heeds => return Ok(Started::Held { by }),
-                _ => {
-                    self.parked.swap_remove(at);
-                }
+                _ => reach = self.parked.swap_remove(at).peak,
             }
         }
         // An elder the room holds back starts before any task it outranks, or younger tasks
@@ -538,11 +567,11 @@ impl Budget {
             && heeds
         {
             let by = Hold::Behind(elder);
-            self.parked.push(Parked { rank, peak: 0, hold: Some(by) }); // alloc: a held task, once per hold
+            self.parked.push(Parked { rank, peak: reach, hold: Some(by) }); // alloc: a held task, once per hold
             return Ok(Started::Held { by });
         }
         let at = self.running.binary_search_by(|it| it.rank.cmp(&rank)).unwrap_or_else(|at| at);
-        let row = Running { rank, reserved: 0, over: 0, peak: 0, mark: Mark::No };
+        let row = Running { rank, reserved: 0, over: 0, peak: 0, reach, mark: Mark::No };
         self.running.insert(at, row); // alloc: a started task's row, grown to the most started at once
         Ok(Started::Running)
     }
@@ -902,11 +931,15 @@ impl Budget {
     /// Quanta tasks may reserve under `limit` bytes: what core, the ungated reserve and the
     /// overdrafts leave.
     fn tasks_room(&self, limit: u64) -> u64 {
-        let set_aside = match self.planted(Plant::OverdraftUncounted) {
+        limit.saturating_sub(self.set_aside()) / QUANTUM
+    }
+
+    /// Bytes of the room no task reserves: core, the ungated reserve and the overdrafts.
+    fn set_aside(&self) -> u64 {
+        match self.planted(Plant::OverdraftUncounted) {
             true => self.fixed,
             false => self.fixed + self.overdrafts() * QUANTUM,
-        };
-        limit.saturating_sub(set_aside) / QUANTUM
+        }
     }
 
     fn limit_q(&self) -> u64 {

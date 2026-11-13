@@ -34,7 +34,7 @@ use blaze_core::{
 };
 use blaze_profile::{
     flight,
-    stuck::{LOOK_EVERY, Stuck, Task, Watch, Why},
+    stuck::{LOOK_EVERY, SAID, Stuck, Task, Watch, Why},
     tasks::{Reader, Told},
 };
 use blaze_protocol::now;
@@ -44,9 +44,6 @@ use super::{
     pulse::{Pulse, StuckSaid},
     signals,
 };
-
-/// What `blaze serve`'s log says before a stuck task's line: `blaze serve: pid 7 stuck: ...`.
-pub const SAID: &str = " task stuck: ";
 
 /// The most threads the daemon loses to stuck waits before it ends ([`Exit::WorkersLost`]): a
 /// quarter of its workers, at least two. One lost thread is a bug said and survived; a quarter
