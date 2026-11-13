@@ -1,0 +1,65 @@
+/* The intro, the site's front door (a `Hero` page: render.rs writes it without the sidebar; client/intro.ts runs it).
+   The wordmark big in the middle of the window, then one line and the way in. Near-black, quiet: the fire is the
+   only colour on the page. */
+
+body.front { min-height: 100svh; }
+main.intro { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: clamp(18px, 3.2svh, 34px); max-width: none; min-height: 100svh; margin: 0; padding: 28px 16px 36px; text-align: center; overflow: hidden; }
+
+/* The wordmark's frame: the letters with room for their flames, 43 by 23 cells (the brand picture's own shape, which
+   is what shows without JS). intro.ts sizes it to a whole number of device pixels a cell and draws on the canvas,
+   which runs twelve rows above the frame, for the letters to fall through. */
+.wordmark { position: relative; flex: none; width: min(86vw, 46svh * 688 / 368, 946px); aspect-ratio: 688 / 368; margin: 0; line-height: 0; }
+.wordmark .logo, .wordmark .logo img { display: block; width: 100%; height: 100%; }
+.wordmark .logo img { margin: 0; border-radius: 0; box-shadow: none; background: none; image-rendering: pixelated; }
+.wordmark canvas { position: absolute; left: 0; top: 0; display: none; image-rendering: pixelated; pointer-events: none; }
+main.intro[data-on] .wordmark { aspect-ratio: auto; }
+main.intro[data-on] .wordmark .logo { display: none; }
+main.intro[data-on] .wordmark canvas { display: block; }
+
+/* Under the word: what blaze is, the way in, and the reference pages, quietly. */
+.intro-after { display: grid; justify-items: center; gap: 22px; max-width: 100%; }
+.doc.intro .lede { max-width: 30em; margin: 0; font-size: clamp(18px, 2.3vw, 22px); line-height: 1.45; letter-spacing: -0.015em; color: var(--ink-1); text-wrap: balance; }
+.doc.intro .dim { margin: 0; font-size: 14px; color: var(--ink-3); }
+.doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
+.doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+
+/* Go: a page's one big button, a link (content/schema.flecs). */
+.doc .go { margin: 0; }
+.doc .go a { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 52px; padding: 0 28px; border-radius: 14px; background: var(--ink-1); color: var(--bg); font-size: 16.5px; font-weight: 600; letter-spacing: -0.01em; text-decoration: none; transition: opacity 0.15s, transform 0.1s; }
+.doc .go a::after { content: '→'; }
+.doc .go a:hover { opacity: 0.9; }
+.doc .go a:active { transform: scale(0.985); }
+.doc .go a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 3px; }
+
+/* The speaker (intro.ts makes it): the intro again, with its soundtrack. Lit while the sound is on. */
+.intro-snd { position: absolute; top: 14px; right: 14px; display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 10px; background: none; color: var(--ink-3); cursor: pointer; transition: color 0.12s, background-color 0.12s; }
+.intro-snd .icon { width: 18px; height: 18px; }
+.intro-snd:hover { background: var(--s-tint); color: var(--ink-1); }
+.intro-snd[data-state='on'] { color: var(--fire); }
+.intro-snd[data-state='wait'] { color: var(--ink-1); cursor: progress; }
+.intro-snd:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 1px; }
+
+/* The line and the button wait for the word to catch. A module runs after the page is parsed, so until intro.ts
+   starts the still picture and the text are held back, not flashed; if the script never comes they show after 1.5 s.
+   With motion reduced nothing waits. */
+@media (scripting: enabled) and (prefers-reduced-motion: no-preference) {
+	main.intro:not([data-on]) :is(.wordmark .logo, .intro-after) { animation: intro-hold 0s 1.5s both; }
+	main.intro[data-on] .intro-after { transition: opacity 0.6s ease-out, visibility 0s; }
+	main.intro[data-on]:not([data-lit]) .intro-after { opacity: 0; visibility: hidden; transition: none; }
+}
+@keyframes intro-hold {
+	from { visibility: hidden; }
+	to { visibility: visible; }
+}
+
+@media (max-width: 520px) {
+	.doc .go a { height: 50px; }
+	.doc.intro .dim { font-size: 13.5px; }
+}
+/* A short window (a phone on its side): everything closes up so the word, the line and the button fit in it. */
+@media (max-height: 480px) {
+	main.intro { gap: 10px; padding-block: 12px; }
+	.intro-after { gap: 10px; }
+	.doc.intro .lede { max-width: none; font-size: 17px; }
+	.doc .go a { height: 44px; }
+}

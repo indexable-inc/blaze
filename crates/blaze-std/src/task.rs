@@ -379,7 +379,7 @@ fn message(error: &impl fmt::Display) -> Cow<'static, str> {
 }
 
 /// What a panic said: its text moved out of the payload, which copies nothing.
-fn said(payload: Box<dyn Any + Send>) -> Cow<'static, str> {
+pub(crate) fn said(payload: Box<dyn Any + Send>) -> Cow<'static, str> {
     match payload.downcast::<&'static str>() {
         Ok(said) => Cow::Borrowed(*said),
         Err(payload) => match payload.downcast::<String>() {

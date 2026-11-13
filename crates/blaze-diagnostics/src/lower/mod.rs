@@ -59,6 +59,7 @@ pub(crate) mod trait_impl_missing_assoc_items;
 pub(crate) mod trait_impl_orphan;
 pub(crate) mod trait_impl_redundant_assoc_items;
 pub(crate) mod trait_impl_unstable_default_body;
+pub(crate) mod method_call_on_diverging_infer_var;
 pub(crate) mod tyvar_behind_raw_pointer;
 pub(crate) mod unimplemented_builtin_macro;
 pub(crate) mod unresolved_extern_crate;
@@ -191,16 +192,26 @@ pub struct Found {
     /// For a lint of rustc's pre-expansion lint pass: its level is of `lint_at`'s file alone
     /// ([`hir_lint_levels::Levels::set_of_in_file`]).
     pub pre_expansion: bool,
+    /// Never written: it only fulfills the `#[expect]` its lint has at `lint_at`, if any
+    /// (rustc's `struct_expect` of a dummy diagnostic).
+    pub fulfills_only: bool,
 }
 
 impl Found {
     pub fn new(diag: Diag, phase: Phase) -> Found {
-        Found { diag, phase, lint_at: None, pre_expansion: false }
+        Found { diag, phase, lint_at: None, pre_expansion: false, fulfills_only: false }
     }
 
     /// A lint's diagnostic, its level decided at `at`.
     pub fn lint(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
-        Found { diag, phase, lint_at: Some(at), pre_expansion: false }
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: false }
+    }
+
+    /// What a lint would say at `at` and does not, because what it says there is already said
+    /// of something around it: `diag` is never written, and an `#[expect]` of the lint at `at`
+    /// is fulfilled as if it were.
+    pub fn fulfilling(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: true }
     }
 }
 
@@ -244,6 +255,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
             whole_value_write_through_refinement::lower(cx, &d)
         }
         AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
+        AnyDiagnostic::MethodCallOnDivergingInferVar(d) => {
+            method_call_on_diverging_infer_var::lower(cx, &d)
+        }
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),

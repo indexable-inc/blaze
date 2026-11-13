@@ -2,8 +2,7 @@ name: site
 
 # Builds `site/` and deploys it to Cloudflare Workers from `main`: the Rust renderer's two wasm modules
 # (site/renderer/build.py, uploaded as the `site-renderer` artifact that site/renderer/fetch.py downloads), then the
-# site with them (Flecs pages rendered to static HTML, plus a Worker that renders discussable pages with the same
-# module). A pull request builds only. Needs repo secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+# site with them (Flecs pages rendered to static HTML, served by a Worker). A pull request builds only. Needs repo secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
 on:
   push:
     branches: [main]
@@ -107,16 +106,6 @@ jobs:
         run: |
           if [ -n "$CLOUDFLARE_API_TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           echo "::warning::site not deployed: the secret CLOUDFLARE_API_TOKEN is not set in indexable-inc/blaze's Actions secrets"
-      # Migrations first: the new worker reads the tables and triggers they create. Each applies once (D1 records
-      # them in d1_migrations), so a run with nothing new is a no-op.
-      - name: Migrate
-        if: steps.credentials.outputs.present == 'true'
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: site
-          command: d1 migrations apply blaze-updates --remote
       - name: Deploy
         if: steps.credentials.outputs.present == 'true'
         uses: cloudflare/wrangler-action@v4

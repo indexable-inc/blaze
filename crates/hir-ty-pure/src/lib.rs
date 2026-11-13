@@ -35,6 +35,7 @@ pub mod may;
 mod memory;
 pub mod models;
 pub mod program_lifetime;
+pub mod reach;
 mod values;
 mod walk;
 

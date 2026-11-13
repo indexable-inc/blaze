@@ -1,0 +1,19 @@
+{
+ "id": "bstd-sim-test-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "blaze: bstd under cargo",
+ "what": "The lane's brief said `cargo test -p` for each crate touched, and cargo cannot build blaze-std: `cargo +nightly-2026-10-27 check -p blaze-std --tests` ends in 10 errors (contracts' `-> (r: T)`, `where const`, `core::reflect`, three unknown blaze features). The lane was told to run no blaze, so bstd's new code (simtest.rs, the Io::submit hook, tests/simtest.rs) could not be built by anything allowed.",
+ "cost": "about an hour of design to put the runner where cargo reaches it (blaze-core), and a scratch port to run the bstd side at all",
+ "cause": "rule blaze-uses-its-extensions meets rule blaze-builds-blaze's cargo dev loop, as in A10; a brief for bstd work written as if cargo checked bstd",
+ "whys": [
+  "bstd's tests ran nowhere in this lane",
+  "only a blaze compiles bstd and lanes run no blaze",
+  "the dev loop's builder (cargo) and the language bstd is written in differ",
+  "nothing in the loop compiles bstd per lane report"
+ ],
+ "class": "code only a blaze can check, written in a loop whose checker is cargo: it is unverified until someone else runs a blaze",
+ "prevention": "the main agent's per-crate check within minutes of a lane's report has to be `blaze check -p blaze-std --tests` on blaze-vm for any lane that touches bstd; state: not built here",
+ "workaround": "a scratch copy of crates/blaze-std outside the tree, with path dependencies into the worktree, that rustc compiles after these cuts: the four contracts (`-> (r: T) ensures ..` to `-> T`), every `where const {..}`, `core::reflect::MemoPoint` and `code_id_of` in eval.rs, the bodies of own/raw.rs's const fns, own.rs's two BTreeMap/BTreeSet `Owns` impls, `Shares::join`, and the three blaze features; tests own, eval and cell left out. There `cargo test --lib` ran 141 passed, 3 failed against 132 passed, 3 failed on the base commit (the same three). It proves nothing about blaze's build of bstd.",
+ "state": "open"
+}

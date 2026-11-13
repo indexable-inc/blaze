@@ -1044,6 +1044,18 @@ mod tests {
             "{} -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc",
             crate::tests::CLIPPY_OFF
         )));
-        assert_eq!(named(on), ["dbg_macro", "blaze::hot_alloc"]);
+        // Beside what the flags turn on: the lints outside `blaze::general` that are on by
+        // default (an edition lint whose advice this blaze has, a `deny` where the code
+        // declared something), and `blaze::unreachable`, which no flag turns off.
+        assert_eq!(
+            named(on),
+            [
+                "dbg_macro",
+                "blaze::hot_alloc",
+                "blaze::proc_macro_fn_like",
+                "blaze::program_lifetime",
+                "blaze::unreachable"
+            ]
+        );
     }
 }

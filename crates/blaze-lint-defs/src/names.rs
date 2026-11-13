@@ -32,6 +32,7 @@ pub(super) const GROUPS: &[(&str, &[&str])] = &[
             "unused_braces",
             "redundant_semicolons",
             "map_unit_fn",
+            "repeated_reprs",
         ],
     ),
     ("let_underscore", &["let_underscore_drop", "let_underscore_lock"]),
@@ -128,6 +129,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::nonblocking",
             "blaze::pure",
             "blaze::capabilities",
+            "blaze::unreachable",
+            "blaze::todo",
             "blaze::undeclared_effect",
             "blaze::unneeded_effect",
             "blaze::negative_effect",
@@ -477,6 +480,8 @@ pub(super) const REMOVED: &[(&str, &str)] = &[
         "repr_transparent_non_zst_fields",
         "converted into hard error, see <https://github.com/rust-lang/rust/issues/78586> for more information",
     ),
+    ("no_mangle_generic_items", "converted into hard error, generic items must always be mangled"),
+    ("dependency_on_unit_never_type_fallback", "the code warned by this lint no longer compiles"),
 ];
 
 /// `rustc::internal`, without `rustc::symbol_intern_string_literal`, as rustc leaves it out.

@@ -232,6 +232,14 @@
    "why": "A failure is an outcome the caller decides about, explicitly, in the signature; a hidden abort, unwind or panic at a push, an index or an unwrap is a failure no reader can see, and control flow that can end anywhere is not clear control flow. Before this, an over-limit push in bstd went to alloc's handle_alloc_error, which aborts the process (no hook in the tree; shown by blaze-mem's test the_oracle_catches_a_push_routed_to_allocs_infallible_one), contradicting std.md's 'running out is an outcome, not a crash'.",
    "recommended": "Yes (asked for by Andrew, 2026-11-12; widened the same day to every failure, to no unwrap or expect at all, to size and offset types and to formatting into a lent buffer).",
    "state": "built on branch bstd-fallible-alloc, not yet landed: checked with cargo for blaze-mem and its dependents and, for bstd, as a copy with its blaze-only syntax taken out (cargo cannot build bstd); blaze check and blaze test of bstd not run. What is left (the memory cap, frame::task and frame::current, Region::at, a few aborts and foreign allocations) is listed in the spec's last section"
+  },
+  {
+   "id": "D30",
+   "date": "2026-11-12",
+   "decision": "A function's error type is the exact set of failures it may return, checked like effects: the set is an error union (`A | B`, edition change 2, ledger E3), `?` widens a member or a smaller set with no `From` written, a failure the set lacks is an error naming the call, the member and the set, and a `match` covers every member. bstd's errors move onto sets: a kind variant that only holds another error (`FsKind::Stopped`, `HttpKind::Net`, `Refused::Stopped`, ...) becomes a member of the function's set (docs/v2/plan/design/error-sets.md has the list).",
+   "why": "Asked for by Andrew, 2026-11-12: bstd's ~30 error types should compose, so that `fn main(cx: &Cx) -> Result<(), E>` works when one function mixes `need_fs()?` (Missing) and `open_dir()?` (FsError) with no glue. The union type and its widening were already on main (E3 parts 1 and 2); what was missing was a set as a generic argument (a parser bug), matching by member, the error's words and the proof.",
+   "recommended": "Yes: a set costs what the hand-written enum costs (measured for layout), and each area keeps its own error; the alternative, one named enum per mix of areas with `From` impls, is the pattern the edition removes.",
+   "state": "built and tested under cargo on branch bstd-error-sets (parser, matching by member, diagnostics, determinism and layout tests); the bstd port waits for D29; the typed binding `e: T`, the unneeded-member advice and inferred sets are not built"
   }
  ]
 }

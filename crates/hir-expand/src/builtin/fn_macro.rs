@@ -146,6 +146,9 @@ register_builtin! {
     (quote, Quote) => quote_expand,
     (pattern_type, PatternType) => pattern_type_expand,
     (gca, Gca) => gca_expand,
+    // `blaze::unreachable!()` (`core::blaze::unreachable`). Appended: the nameres image stores
+    // a builtin macro by its index in `ALL`.
+    (blaze_unreachable, BlazeUnreachable) => blaze_unreachable_expand,
 }
 
 register_builtin! {
@@ -836,6 +839,32 @@ fn unreachable_expand<'f>(
 /// written, or of the macro that wrote it. A macro of the standard library that writes one
 /// (`assert!`, `debug_assert!`) has `#[allow_internal_unstable(edition_panic)]`, which only
 /// such a macro can have, and stands for where it is called itself.
+/// `blaze::unreachable!()` (docs/v2/plan/design/proved-unreachable.md): a site blaze must
+/// prove no path reaches (`hir_ty_pure::reach`, the lint `blaze::unreachable`). What it
+/// expands to is a panic, never undefined behaviour, so a build that did not run the check is
+/// still sound: `$crate::panicking::panic("..")`, core's `#[lang = "panic"]`.
+fn blaze_unreachable_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let dollar_crate = dollar_crate(span);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
+    let message = "internal error: entered code `blaze::unreachable!()` says is never reached";
+    let call = quote_in!(frame, call_site_span =>
+        #dollar_crate::panicking::panic(#message)
+    );
+    if tt.token_trees().len() != 0 {
+        return ExpandResult::new(
+            call,
+            ExpandError::other(span, "`blaze::unreachable!()` takes no arguments"),
+        );
+    }
+    ExpandResult::ok(call)
+}
+
 fn use_panic_2021(db: &Db, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
