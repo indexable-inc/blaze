@@ -12,8 +12,9 @@
  *   the same keystroke, each prints `Finished` at the moment it was measured to, a clock counting on each, so blaze is
  *   done before the eye has moved and cargo is still compiling.
  * - Start: the page burns away (client/lib/burn.ts), from the bottom left up and across in about three quarters of a
- *   second, and then the lesson, fetched while it burnt, takes the page's place without a load (`arrive`) and fades in (the site's page transition, styles/shell.css). A key or a second
- *   press during it goes at once. Back brings the intro back whole, not burnt.
+ *   second, and the lesson shows through where it has burnt: fetched when the reader reached for the button, it takes
+ *   the page's place without a load (`arrive`) under a still copy of the page that the fire cuts away. A key or a
+ *   second press during it ends it at once. Back brings the intro back whole, not burnt.
  * - Under prefers-reduced-motion nothing drops and nothing moves: the word is in place, burning, held still, the race
  *   stands finished, and Start goes at once.
  * - Sound: none until the reader asks (browsers allow none, and nobody wants a page that starts talking). The
@@ -56,7 +57,7 @@ const RACE_HOLD = 2.8;
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const light = matchMedia('(prefers-color-scheme: light)');
 
-type Term = { ms: number; typed: HTMLElement; caret: HTMLElement; took: HTMLElement; outs: { el: HTMLElement; at: number }[]; run: HTMLElement | null; fill: HTMLElement | null; text: string; word: string };
+type Term = { ms: number; typed: HTMLElement; caret: HTMLElement; took: HTMLElement; outs: { el: HTMLElement; at: number }[]; run: HTMLElement | null; fill: HTMLElement | null; rest: HTMLElement | null; text: string; word: string };
 /** cargo's progress bar: this many columns between its brackets. */
 const BAR = 28;
 
@@ -74,7 +75,8 @@ function racer(fig: HTMLElement): (t: number) => void {
 		const outs = [...el.querySelectorAll<HTMLElement>('.out[data-at]')].map((o) => ({ el: o, at: o.dataset.at === 'end' ? ms : Number(o.dataset.at) }));
 		const run = el.querySelector<HTMLElement>('.out.run');
 		const fill = el.querySelector<HTMLElement>('.fill');
-		return [{ ms, typed, caret, took, outs, run, fill, text: took.textContent ?? '', word: typed.textContent ?? '' }];
+		const rest = el.querySelector<HTMLElement>('.rest');
+		return [{ ms, typed, caret, took, outs, run, fill, rest, text: took.textContent ?? '', word: typed.textContent ?? '' }];
 	});
 	const longest = Math.max(...terms.map((m) => m.word.length));
 	const go = RACE_READY + longest * RACE_KEY + RACE_ENTER;
@@ -93,11 +95,14 @@ function racer(fig: HTMLElement): (t: number) => void {
 			const done = ran >= m.ms;
 			m.caret.classList.toggle('on', !done);
 			for (const o of m.outs) o.el.hidden = ran < o.at;
-			if (m.run && m.fill) {
+			if (m.run && m.fill && m.rest) {
 				m.run.hidden = ran < 0 || done;
-				const k = Math.min(BAR - 1, Math.floor((BAR * Math.max(0, ran)) / m.ms));
-				const bar = '='.repeat(k) + '>' + ' '.repeat(BAR - 1 - k);
-				if (m.fill.textContent !== bar) m.fill.textContent = bar;
+				// Berkeley Mono joins `=` only up to three, so the bar is drawn with box-drawing
+				// lines, which fill their whole cell and join into one solid bar on a dim rail.
+				const k = Math.min(BAR, Math.floor((BAR * Math.max(0, ran)) / m.ms));
+				const fill = '═'.repeat(k), rest = '─'.repeat(BAR - k);
+				if (m.fill.textContent !== fill) m.fill.textContent = fill;
+				if (m.rest.textContent !== rest) m.rest.textContent = rest;
 			}
 			const text = show(Math.min(Math.max(0, ran), m.ms), m.ms);
 			if (text !== m.text) m.took.textContent = m.text = text;
@@ -131,9 +136,11 @@ function fetchNext(href: string): Promise<Document | null> {
  * words, the body and the scripts change. The intro tears itself down first (`blaze:leave`), the entry is pushed,
  * then the new page's scripts run as a load would run them. False when the page needs a load (another stylesheet).
  */
+const sheets = (d: Document) => [...d.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute('href')).join('\n');
+/** Whether `doc` can take this page's place without a load: it is styled by the same sheets. */
+const fits = (doc: Document) => sheets(doc) === sheets(document);
 function arrive(doc: Document, href: string): boolean {
-	const sheets = (d: Document) => [...d.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute('href')).join('\n');
-	if (sheets(doc) !== sheets(document)) return false;
+	if (!fits(doc)) return false;
 	dispatchEvent(new Event(LEAVE));
 	history.pushState({ blaze: 1, scroll: 0 }, '', href);
 	document.title = doc.title;
@@ -309,9 +316,13 @@ onPage((signal) => {
 	document.addEventListener('visibilitychange', () => hidden(document.hidden), { signal });
 
 	/**
-	 * The exit: the page burns away, then `href` loads. The fire starts on the knock when there is one (never waiting
-	 * more than KNOCK_WAIT for it). A key or a press while it burns goes at once. `undo` puts the page back whole,
-	 * for a reader who comes back to it out of the back/forward cache.
+	 * The exit: the page burns away and the lesson is under it. As soon as the lesson is here (it was asked for when
+	 * the reader reached for the button) it takes the page's place, and a still copy of the page as it was is laid over
+	 * it, cut back cell by cell as the fire reaches each, so the lesson shows through where the page has burnt. The
+	 * fire starts on the knock when there is one (never waiting more than KNOCK_WAIT for it). A key or a press while
+	 * it burns ends it at once. A lesson that is not here by the time the page has burnt, or that needs a load, loads
+	 * after the fire, over the page's ash. `undo` puts the page back whole, for a reader who comes back to it out of
+	 * the back/forward cache.
 	 */
 	let undo: (() => void) | null = null;
 	const exit = (href: string) => {
@@ -319,24 +330,72 @@ onPage((signal) => {
 		const pressed = performance.now();
 		const dpr = devicePixelRatio || 1;
 		const r = canvas.getBoundingClientRect();
-		const fireOver = burn(px, Math.round(r.left * dpr), Math.round(r.top * dpr), theme(), getComputedStyle(document.documentElement).backgroundColor);
+		const ash = getComputedStyle(document.documentElement).backgroundColor;
+		const fireOver = burn(px, Math.round(r.left * dpr), Math.round(r.top * dpr), theme(), ash);
 		document.body.append(fireOver.canvas);
 		const gone = new AbortController();
 		let burning = 0;
 		let went = false;
+		let doc: Document | null = null;
 		const next = fetchNext(href);
+		void next.then((d) => (doc = d && fits(d) ? d : null));
+		// After the fire: the lesson in this page's place once it is here; a load if it can't be.
 		const go = () => {
 			if (went) return;
 			went = true;
-			// The lesson in this page's place once it is here (it was asked for on the press); a load if it can't be.
-			void next.then((doc) => {
-				if (doc && arrive(doc, href)) return;
+			void next.then((d) => {
+				if (d && arrive(d, href)) return;
 				location.assign(href);
 				setTimeout(() => went && undo?.(), STRANDED);
 			});
 		};
+		// The lesson under a still copy of the page, the copy burning away on the fire's own clock. It runs on past
+		// the intro's teardown (arrive ends the intro), so it owns its canvas, its layer and its listeners.
+		const through = (lesson: Document) => {
+			went = true;
+			undo = null;
+			gone.abort();
+			cancelAnimationFrame(burning);
+			const still = document.body.cloneNode(true) as HTMLElement;
+			still.querySelector('.intro-burn')?.remove();
+			// A copied canvas is blank: each gets its picture as it is now.
+			const live = [...document.body.querySelectorAll('canvas')].filter((c) => c !== fireOver.canvas);
+			still.querySelectorAll('canvas').forEach((c, i) => {
+				const from = live[i];
+				if (!from || !from.width || !from.height) return;
+				c.width = from.width;
+				c.height = from.height;
+				c.getContext('2d')?.drawImage(from, 0, 0);
+			});
+			still.style.transform = `translateY(${-scrollY}px)`;
+			arrive(lesson, href);
+			const layer = document.createElement('div');
+			layer.className = 'intro-old';
+			layer.style.background = ash;
+			layer.append(still);
+			document.body.append(layer, fireOver.canvas);
+			const done = new AbortController();
+			let raf = 0;
+			const end = () => {
+				done.abort();
+				cancelAnimationFrame(raf);
+				layer.remove();
+				fireOver.canvas.remove();
+			};
+			const frame = (now: number) => {
+				const t = (now - at) / 1000;
+				if (t >= fireOver.out) return end();
+				fireOver.draw(t, true);
+				layer.style.clipPath = fireOver.standing(t);
+				raf = requestAnimationFrame(frame);
+			};
+			addEventListener('keydown', end, { signal: done.signal });
+			addEventListener('pointerdown', end, { signal: done.signal });
+			frame(performance.now());
+		};
 		const step = (now: number) => {
 			const t = (now - at) / 1000;
+			if (!went && doc && t < BURNT) return through(doc);
 			fireOver.draw(t);
 			if (t >= BURNT) go();
 			// On after the page is asked for: the embers go out while the next one loads.
@@ -387,6 +446,7 @@ onPage((signal) => {
 			void fetchNext(go.href);
 		}, { signal });
 		go.addEventListener('pointerenter', () => void fetchNext(go.href), { signal });
+		go.addEventListener('focus', () => void fetchNext(go.href), { signal });
 		go.addEventListener(
 			'click',
 			(e) => {

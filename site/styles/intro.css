@@ -44,6 +44,8 @@ main.intro[data-on] .wordmark canvas { display: block; }
 .race .typed { color: var(--ink-1); }
 .race .st { font-weight: 600; color: #3fb950; }
 .race .st.cy { color: #39c5cf; }
+.race .fill { color: #39c5cf; font-weight: 800; }
+.race .rest { color: var(--line-2); }
 .race .caret { display: inline-block; width: 0.6em; height: 1.1em; margin-left: 1px; vertical-align: -0.2em; background: var(--ink-3); opacity: 0; }
 .race .caret.on { opacity: 0.8; }
 .race figcaption { font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
@@ -106,4 +108,5 @@ main.intro[data-on] .wordmark canvas { display: block; }
 }
 
 /* The exit (client/lib/burn.ts): the fire that burns the page away on Start, over everything. */
+.intro-old { position: fixed; z-index: 49; inset: 0; overflow: hidden; pointer-events: none; }
 .intro-burn { position: fixed; z-index: 50; top: 0; left: 0; image-rendering: pixelated; pointer-events: none; }
