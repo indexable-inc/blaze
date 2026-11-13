@@ -888,3 +888,55 @@ fn linear_arithmetic_with_overflow_checks() {
         ]
     );
 }
+
+const SEARCH: &str = r#"
+#[blaze::nopanic]
+pub fn search(v: &[u32], x: u32) -> usize {
+    let mut lo = 0;
+    let mut hi = v.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if v[mid] < x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+#[blaze::nopanic]
+pub fn search_past(v: &[u32], x: u32) -> usize {
+    let mut lo = 0;
+    let mut hi = v.len() + 1;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if v[mid] < x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+"#;
+
+/// A binary search written as a loop: `hi <= v.len()` holds on the way in and on every way
+/// round, so it holds at the loop's head, and `v[mid]` and each `+` and `-` are no panic, in
+/// both overflow profiles. Near miss: the same loop started one past the length.
+#[test]
+fn a_binary_search_loop_is_no_panic() {
+    for meta in ["", " cfg:overflow_checks"] {
+        let fixture = format!(
+            "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std{meta}\n{}",
+            SEARCH.trim_start_matches('\n')
+        );
+        let out = lint(&fixture, "-A clippy::all --deny=blaze::nopanic");
+        let names: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("is `#[blaze::nopanic]`"))
+            .filter_map(|line| line.split('`').nth(1))
+            .map(|name| name.rsplit("::").next().unwrap_or(name))
+            .collect();
+        assert_eq!(names, ["search_past"], "{meta}: {out}");
+    }
+}

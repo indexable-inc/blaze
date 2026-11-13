@@ -118,6 +118,13 @@ list only shrinks:
   Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
   baseline with no crate left, saying so. That lint is then `deny` everywhere.
 
+Two lints are apart from this. `todo` is named `warn` in the ratchet table, so a hole is a
+warning in a local check and the gate denies it on its command line
+(`blaze check --deny blaze::todo`, [`todo`](#todo)). `unreachable` is never below `deny`: a
+line that sets it to `allow` or `warn` in `[workspace.metadata.blaze.lints]`, the ratchet or a
+package's `[lints.blaze]`, a baseline `blaze.unreachable.txt`, and `--allow` or `--warn` of it
+on the command line are each an error naming it ([`unreachable`](#unreachable)).
+
 A new crate gets no line, so it is held to every lint from the start. Making a lint `warn`
 again for a crate is a change to this section's rule, not to a baseline.
 
@@ -1202,7 +1209,11 @@ answer is the same in every profile. It follows the checks that dominate the sit
 comparison with zero or a `NonZero`'s `get()`, comparisons of integers with constants, and
 code after an expression that never returns. It forgets what it knew of a value when the value
 is reassigned, and of what a `&mut` leads to at every call and write through a pointer. It
-does not follow arithmetic (`v[len - 1]`) or what a function of your own returns.
+follows linear arithmetic where the sum is shown not to wrap (`v[v.len() - 1]` under
+`!v.is_empty()`, `v[i + 1]` under `i + 1 < v.len()`, `lo + (hi - lo) / 2` under
+`lo < hi && hi <= v.len()`, and a binary search written as a loop), within a small budget of
+facts added up. It does not follow products, a relation between two values that both change
+round a loop, or what a function of your own returns.
 
 **How to fix it.** Add the check that rules the path out so that it dominates the site. Where
 blaze cannot prove it, return a `Result`, or write core's `unreachable!()`, the promise blaze
@@ -1228,7 +1239,9 @@ warning: `todo!()` in `open`: needs `Result<Dir, FsError>`; in scope: `cached`
 ```
 
 **Levels.** `warn` in every local build, dev and release alike. The merge gate and a build
-for a release deny it (`--deny blaze::todo`), so a hole never lands or ships. The prover
+for a release are to deny it with `blaze check --deny blaze::todo`; today the gate's
+`lint-baselines` job does, and the steps that run the released blaze wait for a release that
+has the option (docs/v2/plan/design/proved-unreachable.md). The prover
 behind [`unreachable`](#unreachable) never discharges a `todo!()`: it is unfinished, not dead.
 
 **Allowing it.** `#[expect(blaze::todo, reason = "..")]` on the function.

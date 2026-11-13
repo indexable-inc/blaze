@@ -48,6 +48,14 @@ pub(crate) enum Model {
     View,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A bug planted for the control of the invariant's test (`tests/reach_oracle.rs`):
+    /// `first` and `last` are taken to return `Some` whatever the length.
+    pub(crate) static PLANT_FIRST_ALWAYS_SOME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// The type a method is of, as the models tell types apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Head {
