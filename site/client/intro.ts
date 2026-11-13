@@ -12,7 +12,7 @@
  *   the same keystroke, each prints `Finished` at the moment it was measured to, a clock counting on each, so blaze is
  *   done before the eye has moved and cargo is still compiling.
  * - Start: the page burns away (client/lib/burn.ts), from the bottom left up and across in about three quarters of a
- *   second, and then the lesson loads and fades in (the site's page transition, styles/shell.css). A key or a second
+ *   second, and then the lesson, fetched while it burnt, takes the page's place without a load (`arrive`) and fades in (the site's page transition, styles/shell.css). A key or a second
  *   press during it goes at once. Back brings the intro back whole, not burnt.
  * - Under prefers-reduced-motion nothing drops and nothing moves: the word is in place, burning, held still, the race
  *   stands finished, and Start goes at once.
@@ -30,7 +30,7 @@ import { BURNT, burn } from './lib/burn';
 import { icon } from './lib/icon';
 import { hidden, leave, play, ready, sounding, stop, tap } from './lib/intro-sound';
 import { FPS, IGNITE_AT, LANDED, LIT } from './lib/intro-timeline';
-import { onPage } from './lib/page';
+import { LEAVE, onPage } from './lib/page';
 import { load } from './lib/progress';
 import { Fire, LEAD, SHOWN, THEMES, W, draw, knock } from './lib/wordmark';
 
@@ -56,7 +56,9 @@ const RACE_HOLD = 2.8;
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const light = matchMedia('(prefers-color-scheme: light)');
 
-type Term = { ms: number; typed: HTMLElement; caret: HTMLElement; took: HTMLElement; outs: { el: HTMLElement; at: number }[]; text: string; word: string };
+type Term = { ms: number; typed: HTMLElement; caret: HTMLElement; took: HTMLElement; outs: { el: HTMLElement; at: number }[]; run: HTMLElement | null; fill: HTMLElement | null; text: string; word: string };
+/** cargo's progress bar: this many columns between its brackets. */
+const BAR = 28;
 
 /**
  * The race, run in real time (see the top). `frame(t)` paints the moment `t` seconds after the page lit; as rendered,
@@ -69,8 +71,10 @@ function racer(fig: HTMLElement): (t: number) => void {
 		const caret = el.querySelector<HTMLElement>('.caret');
 		const took = el.querySelector<HTMLElement>('.took b');
 		if (!typed || !caret || !took || !(ms > 0)) return [];
-		const outs = [...el.querySelectorAll<HTMLElement>('.out')].map((o) => ({ el: o, at: o.dataset.at === 'end' ? ms : Number(o.dataset.at) }));
-		return [{ ms, typed, caret, took, outs, text: took.textContent ?? '', word: typed.textContent ?? '' }];
+		const outs = [...el.querySelectorAll<HTMLElement>('.out[data-at]')].map((o) => ({ el: o, at: o.dataset.at === 'end' ? ms : Number(o.dataset.at) }));
+		const run = el.querySelector<HTMLElement>('.out.run');
+		const fill = el.querySelector<HTMLElement>('.fill');
+		return [{ ms, typed, caret, took, outs, run, fill, text: took.textContent ?? '', word: typed.textContent ?? '' }];
 	});
 	const longest = Math.max(...terms.map((m) => m.word.length));
 	const go = RACE_READY + longest * RACE_KEY + RACE_ENTER;
@@ -89,11 +93,70 @@ function racer(fig: HTMLElement): (t: number) => void {
 			const done = ran >= m.ms;
 			m.caret.classList.toggle('on', !done);
 			for (const o of m.outs) o.el.hidden = ran < o.at;
+			if (m.run && m.fill) {
+				m.run.hidden = ran < 0 || done;
+				const k = Math.min(BAR - 1, Math.floor((BAR * Math.max(0, ran)) / m.ms));
+				const bar = '='.repeat(k) + '>' + ' '.repeat(BAR - 1 - k);
+				if (m.fill.textContent !== bar) m.fill.textContent = bar;
+			}
 			const text = show(Math.min(Math.max(0, ran), m.ms), m.ms);
 			if (text !== m.text) m.took.textContent = m.text = text;
 			m.took.parentElement?.classList.toggle('done', done);
 		}
 	};
+}
+
+/**
+ * The next page, asked for as soon as the reader reaches for the button, so it is here by the time the fire is out.
+ * `null` when it isn't an HTML page of this site built with these scripts and styles: then it loads as a page would.
+ */
+const fetched = new Map<string, Promise<Document | null>>();
+function fetchNext(href: string): Promise<Document | null> {
+	let got = fetched.get(href);
+	if (!got) {
+		got = fetch(href, { headers: { Accept: 'text/html' }, credentials: 'same-origin' })
+			.then(async (res) => {
+				if (!res.ok || !/^text\/html\b/.test(res.headers.get('content-type') ?? '')) return null;
+				if (new URL(res.url).origin !== location.origin) return null;
+				return new DOMParser().parseFromString(await res.text(), 'text/html');
+			})
+			.catch(() => null);
+		fetched.set(href, got);
+	}
+	return got;
+}
+
+/**
+ * The next page in this one's place, without a load: the same stylesheet (one bundle, site.css), so only the head's
+ * words, the body and the scripts change. The intro tears itself down first (`blaze:leave`), the entry is pushed,
+ * then the new page's scripts run as a load would run them. False when the page needs a load (another stylesheet).
+ */
+function arrive(doc: Document, href: string): boolean {
+	const sheets = (d: Document) => [...d.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute('href')).join('\n');
+	if (sheets(doc) !== sheets(document)) return false;
+	dispatchEvent(new Event(LEAVE));
+	history.pushState({ blaze: 1, scroll: 0 }, '', href);
+	document.title = doc.title;
+	for (const el of [...document.head.children]) if (!el.matches('link[rel="stylesheet"], script')) el.remove();
+	for (const el of [...doc.head.children]) if (!el.matches('link[rel="stylesheet"], script')) document.head.append(document.adoptNode(el));
+	for (const a of [...doc.documentElement.attributes]) document.documentElement.setAttribute(a.name, a.value);
+	const scripts = [...doc.querySelectorAll<HTMLScriptElement>('script[src]')].map((sc) => ({ src: new URL(sc.getAttribute('src')!, href).href, module: sc.type === 'module' }));
+	document.body.replaceWith(document.adoptNode(doc.body));
+	scrollTo(0, 0);
+	const have = new Set([...document.querySelectorAll<HTMLScriptElement>('script[src]')].map((sc) => sc.src));
+	for (const { src, module } of scripts) {
+		if (module) {
+			if (new URL(src).origin === location.origin) void import(src);
+			continue;
+		}
+		if (have.has(src)) continue;
+		// A script moved in with the body never runs; a new element does.
+		const run = document.createElement('script');
+		run.src = src;
+		run.async = false;
+		document.head.append(run);
+	}
+	return true;
 }
 
 onPage((signal) => {
@@ -261,11 +324,16 @@ onPage((signal) => {
 		const gone = new AbortController();
 		let burning = 0;
 		let went = false;
+		const next = fetchNext(href);
 		const go = () => {
 			if (went) return;
 			went = true;
-			location.assign(href);
-			setTimeout(() => went && undo?.(), STRANDED);
+			// The lesson in this page's place once it is here (it was asked for on the press); a load if it can't be.
+			void next.then((doc) => {
+				if (doc && arrive(doc, href)) return;
+				location.assign(href);
+				setTimeout(() => went && undo?.(), STRANDED);
+			});
 		};
 		const step = (now: number) => {
 			const t = (now - at) / 1000;
@@ -313,7 +381,12 @@ onPage((signal) => {
 			go.href = course;
 		}
 		// A mouse's press comes a moment before its click: the sound is made ready then, so the knock is on time.
-		go.addEventListener('pointerdown', (e) => e.button === 0 && ready(), { signal });
+		go.addEventListener('pointerdown', (e) => {
+			if (e.button !== 0) return;
+			ready();
+			void fetchNext(go.href);
+		}, { signal });
+		go.addEventListener('pointerenter', () => void fetchNext(go.href), { signal });
 		go.addEventListener(
 			'click',
 			(e) => {
