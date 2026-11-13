@@ -1883,6 +1883,38 @@ fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
     drop(daemon);
 }
 
+/// A `BLAZE_DUCKDB` naming a file that is gone is not the start's to check (a daemon refused
+/// to start on one, `BLAZE_DUCKDB=/nix/store/..../duckdb: No such file or directory`, and a
+/// whole `blaze check` died on it, 2026-11-13): a daemon whose history was kept with one
+/// starts and serves, and only its explorer's queries say what is missing.
+#[test]
+fn a_daemon_started_with_blaze_duckdb_naming_a_missing_file_starts_and_serves() {
+    crate::release::for_tests();
+    let state = tempfile::tempdir().unwrap();
+    let gone = state.path().join("gone").join("bin").join("duckdb");
+    let (profiling, _keeper) = super::observe::keep_history(
+        state.path(),
+        Some(gone.clone().into_os_string()), // clone: a test's path
+        blaze_profile::logs::Policy::default(),
+    )
+    .unwrap_or_else(|why| panic!("the history is kept whatever the DuckDB: {why}"));
+    let unfound = profiling.duckdb().unwrap_err();
+    assert!(
+        unfound.contains(&format!("BLAZE_DUCKDB={}", gone.display()))
+            && unfound.contains("unset BLAZE_DUCKDB"),
+        "{unfound}"
+    );
+    let sim = Sim::new(64, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let options = Options { profiling: Some(profiling), ..options() };
+    let mut daemon = Daemon::start(sim, options, steps.clone(), Runner::Inline(Inline::new(64)))
+        .unwrap_or_else(|why| panic!("a missing DuckDB stopped the daemon's start: {why}"));
+    let mut client = dial(&mut daemon);
+    let status = client.send(&mut daemon, Request::Status);
+    let said = client.wait(&mut daemon, status);
+    assert!(said.iter().any(|it| matches!(it, Response::Status(_))), "{said:#?}");
+}
+
 #[test]
 fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     let mut sim = Sim::new(1, Faults::default());

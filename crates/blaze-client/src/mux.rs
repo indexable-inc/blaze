@@ -420,6 +420,7 @@ pub fn named(request: &Request) -> &'static str {
         Request::Store { .. } => "Store",
         Request::Lock { .. } => "Lock",
         Request::ClientRows { .. } => "ClientRows",
+        Request::Diagnostics { .. } => "Diagnostics",
     }
 }
 

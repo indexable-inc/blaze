@@ -22,7 +22,11 @@
 //! `BLAZE_HOME`, which names the socket, so another home is another daemon; `BLAZE_API_TOKEN`,
 //! a secret, read only with `--http`, which no client starts; `BLAZE_STATS`, which each command
 //! also reads for itself (`cli.rs`), so one command asking for its counters must not be
-//! refused; `PATH` and `HOME`, which the daemon also keeps (`serve::engine`) but which differ
+//! refused; `BLAZE_DUCKDB`, which each reader of the history (`blaze debug sql`, `blaze
+//! explain`, `blaze slow`) resolves in its own process (`cli/duckdb.rs`) and the daemon keeps
+//! only for its explorer, checked when that starts (`observe::Profiling::duckdb`): a client
+//! refused for every command, builds too, over the DuckDB it names was a DuckDB fatal to a
+//! build (2026-11-13); `PATH` and `HOME`, which the daemon also keeps (`serve::engine`) but which differ
 //! between shells all the time, so a refusal on each would refuse most commands.
 
 use blaze_api::Setting;
@@ -39,8 +43,6 @@ pub const STARTED_WITH: &[&str] = &[
     // (blaze-core's `cores::get`, read once and lowered at the start): compared by the budget
     // and priority each gives ([`same`]).
     blaze_core::cores::VAR,
-    // The DuckDB the explorer and live SQL run (`serve::engine`, read once).
-    super::observe::DUCKDB,
     // The profile history's cap in MiB (`serve::observe::keep_history`, read once).
     blaze_profile::history::CAP_VAR,
     // What the profile records between builds (`serve::observe::keep_history`, read once).

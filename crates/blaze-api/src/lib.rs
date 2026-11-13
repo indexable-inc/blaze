@@ -22,6 +22,7 @@
 //!   [`Arrived`] and where each [`Reply`] goes.
 //! - [`session`]: what each request does, over the VFS, the database and the [`build::Builder`].
 //! - [`client`]: the CLI's and CI's side, blocking.
+//! - [`diagnostics`]: [`Request::Diagnostics`]'s ids, diff and bounded bases.
 //! - [`json`]: the rendering for people.
 //! - [`activation`]: the socket a service manager passes the daemon, the one unsafe module.
 //! - [`units`]: the launchd agent and systemd units that socket-activate it.
@@ -36,6 +37,7 @@ pub mod activation;
 pub mod borrowed;
 pub mod build;
 pub mod client;
+pub mod diagnostics;
 pub mod frames;
 pub mod goal;
 pub mod http;
@@ -56,6 +58,7 @@ pub use borrowed::{
     BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
+pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
@@ -114,7 +117,10 @@ use serde::{Deserialize, Serialize};
 /// 55: `pid` and `timed` of [`Request::ClientRows`] ([`Timed`]): the thin `blaze`'s spans, by name,
 /// sent on the request's own connection; a `ClientRows` of 54 (neither field) reads as pid 0 and
 /// no timed spans.
-pub const SCHEMA: u32 = 55;
+/// 56: [`Request::Diagnostics`] and [`Response::Diagnostics`] ([`Seen`]): a check's errors and
+/// warnings against what the client was last told, as new, fixed and unchanged, by stable id
+/// (`blaze diagnostics --since`, `blaze agents hook`).
+pub const SCHEMA: u32 = 56;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -498,6 +504,27 @@ pub enum Request {
     /// (`Targets::cargo` carries `--no-locked`); nothing checked or built, no build script run.
     /// Answered with what it wrote as note [`Response::Diagnostic`]s, or the load's error.
     Lock { view: ViewRef, targets: Targets },
+    /// `blaze diagnostics --since TOKEN` and the agents' after-write hook (`blaze agents
+    /// hook`): `view` checked as [`Request::Check`] checks it, and its errors and warnings
+    /// answered with one [`Response::Diagnostics`] against the ones this `client` (an agent's
+    /// session, a shell) was last told of the same checkout and scope (the targets' packages,
+    /// features, profile, target and command line: [`diagnostics::scope`]): new, fixed and
+    /// unchanged, each under an id that an edit moving lines leaves alone ([`diagnostics::id`]).
+    /// No `since` answers everything as new; a `since` the daemon no longer holds answers
+    /// everything as new and says it did not know it ([`diagnostics::Base::Unknown`]). The
+    /// daemon holds the last answer per (checkout, scope, client), at most
+    /// [`diagnostics::BASES`] of them and [`diagnostics::HELD`] diagnostics together, the
+    /// least recently answered dropped first. At `wait_ms` (0: no bound) with the check still
+    /// running, it answers `ended: false`, keeps the base, and lets the check go on. A check that
+    /// could not run answers with its error as `failed`, the base kept. No other response is
+    /// sent: not the check's own diagnostics, units or work.
+    Diagnostics {
+        view: ViewRef,
+        since: Option<ContentId>,
+        client: String,
+        targets: Targets,
+        wait_ms: u64,
+    },
     /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
     /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
     /// stream of the profile schema's table (empty for none), every row's `build_id` the
@@ -1002,6 +1029,8 @@ pub enum Response {
     /// command's live view shows it in place of a bare "compiling"; off a terminal its
     /// [`Doing::on`] is a line every few seconds.
     Doing(Doing),
+    /// [`Request::Diagnostics`]'s one answer.
+    Diagnostics(Seen),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -2147,6 +2176,67 @@ mod tests {
         let Request::ClientRows { timed: mut planted, .. } = new.clone() else { unreachable!() };
         planted.clear();
         assert_ne!(Some(planted), Some(timed), "the control: a dropped span is seen");
+    }
+
+    /// `Request::Diagnostics` and its answer are written in the codec's key order (shorter
+    /// keys first, then bytewise): the answer's bytes pinned whole, the request's keys in order.
+    #[test]
+    fn diagnostics_since_is_written_in_key_order() {
+        let seen = Response::Diagnostics(Seen {
+            new: Vec::new(),
+            base: Base::First,
+            root: ContentId([0; 32]),
+            build: None,
+            ended: true,
+            fixed: Vec::new(),
+            token: None,
+            failed: None,
+            unchanged: Vec::new(),
+        });
+        let bytes = blaze_protocol::cbor::to_vec(&seen).unwrap();
+        let mut want = vec![0xa1, 0x6b];
+        want.extend_from_slice(b"Diagnostics");
+        want.extend_from_slice(&[0xa9, 0x63, b'n', b'e', b'w', 0x80]);
+        want.extend_from_slice(&[0x64, b'b', b'a', b's', b'e', 0x65, b'F', b'i', b'r', b's', b't']);
+        want.extend_from_slice(&[0x64, b'r', b'o', b'o', b't', 0x58, 0x20]);
+        want.extend_from_slice(&[0; 32]);
+        want.extend_from_slice(&[0x65, b'b', b'u', b'i', b'l', b'd', 0xf6]);
+        want.extend_from_slice(&[0x65, b'e', b'n', b'd', b'e', b'd', 0xf5]);
+        want.extend_from_slice(&[0x65, b'f', b'i', b'x', b'e', b'd', 0x80]);
+        want.extend_from_slice(&[0x65, b't', b'o', b'k', b'e', b'n', 0xf6]);
+        want.extend_from_slice(&[0x66, b'f', b'a', b'i', b'l', b'e', b'd', 0xf6]);
+        want.push(0x69);
+        want.extend_from_slice(b"unchanged");
+        want.push(0x80);
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Response>(&bytes).unwrap(), seen);
+
+        let request = Request::Diagnostics {
+            view: ViewRef::Head("/w".to_owned()),
+            since: Some(ContentId([3; 32])),
+            client: "s".to_owned(),
+            targets: Targets {
+                goal: None,
+                cargo: None,
+                target: None,
+                profile: "dev".to_owned(),
+                features: Vec::new(),
+                packages: vec!["demo".to_owned()],
+                all_features: false,
+                no_default_features: false,
+            },
+            wait_ms: 20_000,
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&request).unwrap();
+        let at = |key: &str| {
+            let mut head = vec![0x60 | key.len() as u8];
+            head.extend_from_slice(key.as_bytes());
+            bytes.windows(head.len()).position(|it| it == head).unwrap_or_else(|| panic!("{key}"))
+        };
+        let keys = ["view", "since", "client", "targets", "wait_ms"].map(at);
+        assert!(keys.is_sorted(), "{keys:?}: {bytes:02x?}");
+        assert!(bytes.ends_with(&[0x67, b'w', b'a', b'i', b't', b'_', b'm', b's', 0x19, 0x4e, 0x20]));
+        assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
     }
 
     /// A run's output is one byte string; JSON shows it as the array of numbers it was.

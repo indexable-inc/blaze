@@ -3223,11 +3223,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// The session told the time before anything else it is told this turn; intent whose
-    /// time is up is cancelled.
+    /// time is up is cancelled, and a diagnostics request whose wait is up is answered.
     fn tick(&mut self) {
         let now = ns(self.driver.now());
         let due = self.session.deadline().is_some_and(|at| at <= now);
-        self.session.tick(&mut cx!(self), now);
+        let mut replies = std::mem::take(&mut self.replies);
+        self.session.tick(&mut cx!(self), now, &mut replies);
+        self.replies = replies;
         if due {
             self.after_session();
         }

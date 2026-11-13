@@ -18,9 +18,10 @@ use crate::{
 /// Where the history's queries run: the pinned DuckDB CLI and the history's directory.
 #[derive(Clone, Debug)]
 pub struct History {
-    /// `nix run .#duckdb`'s DuckDB, an absolute path; `None` when the daemon was not given one,
-    /// and then every op that reads the history says so.
-    pub duckdb: Option<PathBuf>,
+    /// The DuckDB the queries run, an absolute path (`BLAZE_DUCKDB`'s, or blaze's pin), or why
+    /// there is none (named wrong, not fetched yet, no daemon), which every op that reads the
+    /// history says: a missing DuckDB fails those ops, never the explorer's start.
+    pub duckdb: Result<PathBuf, String>,
     /// The history's directory (`blaze_profile::history::dir_in` of the daemon's state).
     pub dir: PathBuf,
     /// Run before every query, so it reads each row the daemon recorded before it was asked.
@@ -127,10 +128,13 @@ fn overlapping(build: u64, t0_ns: i64, t1_ns: i64) -> String {
 
 /// Runs `sql` over the history.
 fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, OpError> {
-    let Some(duckdb) = &cx.history.duckdb else {
-        let message = "the daemon was started with no DuckDB to query the history with: \
-                       `blaze explore` passes the one `nix run .#duckdb` pins";
-        return Err(OpError::new(Kind::Sql, message).with("query", sql));
+    let duckdb = match &cx.history.duckdb {
+        Ok(duckdb) => duckdb,
+        Err(why) => {
+            // alloc: error path
+            let message = format!("no DuckDB to query the history with: {why}");
+            return Err(OpError::new(Kind::Sql, message).with("query", sql));
+        }
     };
     (cx.history.flush.0)().map_err(|why| {
         OpError::new(
@@ -237,7 +241,7 @@ mod tests {
     fn cx() -> Context {
         Context {
             history: History {
-                duckdb: None,
+                duckdb: Err("the test gives none".to_owned()),
                 dir: PathBuf::from("/nowhere"),
                 flush: Flush::new(|| Ok(0)),
             },
@@ -276,7 +280,7 @@ mod tests {
         let error = answer(&cx(), Request::Sql { sql: "SELECT 1".to_owned() }).err().unwrap();
         assert_eq!(error.kind, Kind::Sql.name());
         assert_eq!(error.detail["query"], "SELECT 1");
-        assert!(error.message.contains("nix run .#duckdb"), "{error}");
+        assert!(error.message.contains("the test gives none"), "{error}");
         let error = answer(&cx(), Request::Builds {}).err().unwrap();
         assert_eq!(error.kind, Kind::Sql.name());
     }

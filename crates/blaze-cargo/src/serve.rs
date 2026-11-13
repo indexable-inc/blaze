@@ -1265,14 +1265,11 @@ pub(crate) fn engine(
         blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
     tracing::info!(target: "blaze", "{cores}");
     let threads = cores.budget.get();
-    // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
-    let duckdb =
-        observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
-    // Unset: the pinned DuckDB, where a reader of the history has laid it out (`cli/duckdb.rs`
-    // fetches it on first use; the daemon's start fetches nothing).
-    let duckdb = duckdb.or_else(|| {
-        observe::Pin::host().map(|pin| pin.laid_out(&paths.state)).filter(|it| it.is_file())
-    });
+    // Read once, unchecked: the DuckDB the explorer runs, resolved when it starts
+    // (`observe::Profiling::duckdb`; unset, the pin a reader of the history laid out). A value
+    // naming nothing fails the explorer's queries alone, never this start or a build (a daemon
+    // refused to start on a `BLAZE_DUCKDB` naming a deleted store path, 2026-11-13).
+    let duckdb = std::env::var_os(observe::DUCKDB);
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;

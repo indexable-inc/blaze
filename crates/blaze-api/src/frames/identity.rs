@@ -22,8 +22,8 @@ use crate::{
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 36;
-const RESPONSES: usize = 44;
+const REQUESTS: usize = 37;
+const RESPONSES: usize = 45;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -348,6 +348,13 @@ impl Gen {
             },
             33 => Request::Lock { view: self.view(0), targets: self.targets() },
             35 => Request::Store { words: self.texts(0) },
+            36 => Request::Diagnostics {
+                view: self.view(0),
+                since: self.maybe_id(),
+                client: self.text(),
+                targets: self.targets(),
+                wait_ms: self.wide(),
+            },
             _ => Request::Stop,
         }
     }
@@ -482,6 +489,24 @@ impl Gen {
             },
             rendered: self.text(),
             explanation: self.maybe(Gen::text),
+        }
+    }
+
+    fn found(&mut self) -> crate::Found {
+        crate::Found {
+            id: self.id(),
+            code: self.maybe(Gen::text),
+            help: self.texts(1),
+            span: self.maybe(Gen::span),
+            fixes: self.many(1, Gen::span),
+            level: match self.below(2) {
+                0 => Level::Error,
+                _ => Level::Warning,
+            },
+            message: self.text(),
+            package: self.maybe(Gen::text),
+            primary: self.yes(),
+            rendered: self.text(),
         }
     }
 
@@ -827,6 +852,21 @@ impl Gen {
                 for_ms: self.wide(),
                 running: self.maybe_text(),
             }),
+            43 => Response::Diagnostics(crate::Seen {
+                new: self.many(depth, Gen::found),
+                base: match self.below(3) {
+                    0 => crate::Base::First,
+                    1 => crate::Base::Held,
+                    _ => crate::Base::Unknown,
+                },
+                root: self.id(),
+                build: if self.yes() { Some(self.wide()) } else { None },
+                ended: self.yes(),
+                fixed: self.many(depth, Gen::found),
+                token: self.maybe_id(),
+                failed: self.maybe(|g| ApiError::from(g.report(depth))),
+                unchanged: self.many(depth, Gen::found),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -1043,6 +1083,7 @@ fn request_index(request: &Request) -> usize {
         Request::Lock { .. } => 33,
         Request::Stop => 34,
         Request::Store { .. } => 35,
+        Request::Diagnostics { .. } => 36,
     }
 }
 
@@ -1092,7 +1133,8 @@ fn response_index(response: &Response) -> usize {
         Response::Stored { .. } => 40,
         Response::Report { .. } => 41,
         Response::Doing(_) => 42,
-        Response::Of { .. } => 43,
+        Response::Diagnostics(_) => 43,
+        Response::Of { .. } => 44,
     }
 }
 
