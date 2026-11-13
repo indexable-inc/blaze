@@ -1274,6 +1274,12 @@ pub enum PatAdjust {
     /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
     /// pattern `[..]` against a scrutinee of type `Vec<T>`.
     OverloadedDeref,
+    /// blaze (`#![blaze::error_unions]`): the scrutinee is an error union (the adjustment's
+    /// `source`) and the pattern is of one of its members: it matches when the union holds
+    /// that member, against the member's value. Which member is the pattern's own type
+    /// ([`crate::error_union::member_index`]), so nothing but the kind is recorded
+    /// (docs/v2/plan/design/error-sets.md, "Matching").
+    UnionMember,
 }
 
 /// The result of type inference: A mapping from expressions and patterns to types.

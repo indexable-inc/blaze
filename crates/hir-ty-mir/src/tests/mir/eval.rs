@@ -86,7 +86,7 @@ pub(super) fn eval_main_at(
     })
 }
 
-fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
+pub(super) fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     check_pass_and_stdio(ra_fixture, "", "");
 }
 

@@ -2,6 +2,7 @@
 
 use blaze_mem::Frame;
 use hir_def::{
+    AdtId, EnumVariantId, LocalFieldId,
     hir::{ExprId, Literal, RecordFieldPat},
     signatures::VariantFields,
 };
@@ -330,6 +331,18 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                         adjustment.source.as_ref(),
                         (pattern, index as u32),
                         mode == MatchingMode::Check,
+                    )?;
+                    current = next;
+                    place
+                }
+                PatAdjust::UnionMember => {
+                    let (place, next) = self.union_member_place(
+                        current,
+                        &mut current_else,
+                        cond_place,
+                        adjustment.source.as_ref(),
+                        pattern,
+                        mode,
                     )?;
                     current = next;
                     place
@@ -942,6 +955,68 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
             .multi_projection_ty(&self.infcx, self.env, place.projection.as_slice())
             .ty;
         normalize_or_keep(&self.infcx, self.env, ty)
+    }
+
+    /// blaze: the variant of the `Repr` enum of the error union `union` that holds the member
+    /// a pattern of type `member` matches (`PatAdjust::UnionMember`, `hir_ty::error_union`).
+    pub(super) fn union_member_variant(
+        &self,
+        union: Ty<'db>,
+        member: Ty<'db>,
+    ) -> Option<EnumVariantId> {
+        let interner = self.interner();
+        let members = crate::error_union::members(interner, union)?;
+        let at = crate::error_union::member_index(members, member)?;
+        let repr = crate::error_union::repr_field(self.db, interner, union)?;
+        let repr = normalize_or_keep(&self.infcx, self.env, repr);
+        crate::error_union::repr_variant(self.db, repr, at)
+    }
+
+    /// blaze: the place of the member that `pattern`, a pattern of a member of the error
+    /// union `union` at `union_place`, matches: the one field of the variant of the union's
+    /// `Repr` enum that holds that member. When `mode` checks, control goes on (the block
+    /// returned) only where the union holds that member, and to `current_else` otherwise:
+    /// the test a variant's pattern makes of its enum.
+    fn union_member_place(
+        &mut self,
+        mut current: BasicBlockId,
+        current_else: &mut Option<BasicBlockId>,
+        union_place: Place<'db>,
+        union: Ty<'db>,
+        pattern: PatId,
+        mode: MatchingMode,
+    ) -> Result<'db, (Place<'db>, BasicBlockId)> {
+        const NOT_A_MEMBER: MirLowerError<'static> =
+            MirLowerError::TypeError("a pattern of no member of the error union it matches");
+        let member = self.infer.pat_ty(pattern);
+        let variant = self.union_member_variant(union, member).ok_or(NOT_A_MEMBER)?;
+        if !matches!(union.as_adt(), Some((AdtId::StructId(_), _))) {
+            return Err(NOT_A_MEMBER);
+        }
+        let first = LocalFieldId::from_raw(0u32.into());
+        let held = union_place.project(PlaceElem::Field(first.into()));
+        let span: MirSpan = pattern.into();
+        if mode == MatchingMode::Check {
+            let e = self.const_eval_discriminant(variant)? as u128;
+            let tmp = self.discr_temp_place(current);
+            self.push_assignment(current, tmp, Rvalue::Discriminant(held.store()), span);
+            let next = self.new_basic_block();
+            let else_target = current_else.get_or_insert_with(|| self.new_basic_block());
+            self.set_terminator(
+                current,
+                TerminatorKind::SwitchInt {
+                    discr: Operand { kind: OperandKind::Move(tmp.store()), span: None },
+                    targets: SwitchTargets::static_if(e, next, *else_target),
+                },
+                span,
+            );
+            current = next;
+        }
+        let of_variant = VariantId::EnumVariantId(variant);
+        let place = held
+            .project(ProjectionElem::Downcast(of_variant))
+            .project(PlaceElem::Field(first.into()));
+        Ok((place, current))
     }
 
     fn pattern_matching_variant(
