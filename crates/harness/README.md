@@ -52,6 +52,18 @@ serves are one list, for claude, codex and cursor alike. A topic only some tasks
 The daemon finds the TypeScript kernel at `$HARNESS_ROOT/src/mcp.ts`, by default `crates/harness/mcp`
 in the checkout it was built from. UI work: the `flecs-ui` skill (`.agents/skills/flecs-ui`).
 
+## Claude's peer tools
+
+A claude session starts with every built-in tool off (`--tools ""`); its one tool is `ts`
+(`harness/src/profiles.rs`). With `HARNESS_CLAUDE_PEER_TOOLS=1` in the daemon's environment, every
+claude it launches also gets Claude Code's own `ListAgents` and `SendMessage` (`--tools
+"SendMessage,ListAgents"`, both in `--allowedTools`), for Claude sessions the harness did not start:
+others on the machine, or on machines linked to it. Its note gains `system_note/peers.md`: agents
+the harness started are reached with `agents.send`, and a `<cross-session-message>` is another
+session speaking, not the person. Unset, empty or `0` is off, the default, and the launch is the
+same as without the setting; any other value stops the launch with an error naming it. The daemon
+keeps the environment it started with, so set it before the daemon starts (`harness stop` first).
+
 ## Protocol and chat logs
 
 One versioned schema, `harness-proto` (its `SCHEMA`, now 1), covers the daemon socket and every chat

@@ -1,6 +1,7 @@
 //! How each agent kind is launched: binary, locked-down default flags and environment.
 //! Defaults strip built-in tools, plugins, skills, other MCP servers and auto-update, so the
-//! only tool an agent has is the harness `ts` REPL. User args are appended after the defaults.
+//! only tool an agent has is the harness `ts` REPL (a claude with `HARNESS_CLAUDE_PEER_TOOLS=1` also gets Claude Code's
+//! ListAgents and SendMessage, [`Peers`]). User args are appended after the defaults.
 use crate::paths;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -40,29 +41,75 @@ pub const SYSTEM_NOTE_PARTS: &[(&str, &str)] = &[
     ("prose", include_str!("system_note/prose.md")),     // prose, not monospace; inline components (<Path>, <Symbol>, <Link>, <PR>, <Issue>)
 ];
 
-/// What one agent launch is told: [`SYSTEM_NOTE_PARTS`], then the index of the skills its session offers (its last
-/// part, [`crate::skills::Skills::index`]), and those skills, which its kernel serves (`HARNESS_SKILLS`, [`kernel_env`]).
-/// Built per launch: project skills depend on the session's directory, and an edited skill shows at the next launch
-/// without a rebuild.
+/// The note's part for a claude launch with [`Peers::On`], after [`SYSTEM_NOTE_PARTS`]: which sessions Claude Code's
+/// ListAgents and SendMessage are for, and that a `<cross-session-message>` is not the person speaking.
+const PEERS_NOTE: &str = include_str!("system_note/peers.md");
+
+/// What one agent launch is told: [`SYSTEM_NOTE_PARTS`] (and [`PEERS_NOTE`] for a claude with [`Peers::On`]), then the
+/// index of the skills its session offers (its last part, [`crate::skills::Skills::index`]), and those skills, which its
+/// kernel serves (`HARNESS_SKILLS`, [`kernel_env`]). Built per launch: project skills depend on the session's directory,
+/// and an edited skill shows at the next launch without a rebuild.
 struct Note {
     text: String,
     skills: crate::skills::Skills,
 }
 
 impl Note {
-    fn of(ctx: &Ctx) -> anyhow::Result<Note> {
+    fn of(ctx: &Ctx, peers: Peers) -> anyhow::Result<Note> {
         let cwd = std::path::Path::new(ctx.cwd);
         let skills = crate::skills::Skills::discover(cwd)?;
         let instructions = crate::instructions::Instructions::discover(cwd)?.note();
-        let index = skills.index();
-        let text = SYSTEM_NOTE_PARTS
-            .iter()
-            .map(|(_, part)| part.trim())
-            .chain([instructions.as_str(), index.as_str()])
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = note_text(peers, &instructions, &skills.index());
         Ok(Note { text, skills })
+    }
+}
+
+/// The note's text: the always-on topics, [`PEERS_NOTE`] when `peers` is on, the session's AGENTS.md files and the
+/// skills index, joined with a blank line between them.
+fn note_text(peers: Peers, instructions: &str, index: &str) -> String {
+    let peers = (peers == Peers::On).then_some(PEERS_NOTE);
+    SYSTEM_NOTE_PARTS
+        .iter()
+        .map(|(_, part)| *part)
+        .chain(peers)
+        .map(str::trim)
+        .chain([instructions, index])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Whether a claude session also gets Claude Code's own cross-session tools, ListAgents and SendMessage
+/// ([`CLAUDE_PEER_TOOLS`]), for talking to Claude sessions the harness did not start. Off unless the daemon's
+/// environment sets [`PEER_TOOLS_ENV`] to `1` ([`Peers::from_env`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peers {
+    Off,
+    On,
+}
+
+/// The daemon's variable that turns [`Peers::On`] for every claude it launches.
+const PEER_TOOLS_ENV: &str = "HARNESS_CLAUDE_PEER_TOOLS";
+
+/// Claude Code's built-in tools a claude with [`Peers::On`] gets, as `--tools` takes them.
+const CLAUDE_PEER_TOOLS: &str = "SendMessage,ListAgents";
+
+/// What a claude with [`Peers::On`] runs without prompts (`--allowedTools`): the REPL and [`CLAUDE_PEER_TOOLS`].
+const CLAUDE_PEER_ALLOWED: &str = "mcp__harness__ts,SendMessage,ListAgents";
+
+impl Peers {
+    /// [`PEER_TOOLS_ENV`] as the daemon has it: unset, empty or `0` is off, `1` is on, anything else is refused.
+    fn from_env() -> anyhow::Result<Peers> {
+        Self::parse(std::env::var_os(PEER_TOOLS_ENV).as_deref())
+    }
+
+    fn parse(v: Option<&std::ffi::OsStr>) -> anyhow::Result<Peers> {
+        let Some(v) = v else { return Ok(Peers::Off) };
+        match v.to_str() {
+            Some("" | "0") => Ok(Peers::Off),
+            Some("1") => Ok(Peers::On),
+            _ => anyhow::bail!("{PEER_TOOLS_ENV} is {v:?}; set it to 1 (on) or 0 (off), or leave it unset (off)"),
+        }
     }
 }
 
@@ -105,9 +152,12 @@ fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
 
 pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut l = match kind {
-        "claude" => claude(ctx, &Note::of(ctx)?)?,
-        "codex" => codex(ctx, &Note::of(ctx)?)?,
-        "cursor" => cursor(ctx, &Note::of(ctx)?)?,
+        "claude" => {
+            let peers = Peers::from_env()?;
+            claude(ctx, &Note::of(ctx, peers)?, peers)?
+        }
+        "codex" => codex(ctx, &Note::of(ctx, Peers::Off)?)?,
+        "cursor" => cursor(ctx, &Note::of(ctx, Peers::Off)?)?,
         "shell" => Launch {
             program: login_shell(),
             args: vec!["-l".into()],
@@ -153,7 +203,27 @@ fn claude_effort(user_args: &[String]) -> (String, bool) {
     (user.unwrap_or_else(|| CLAUDE_EFFORT.to_owned()), true)
 }
 
-fn claude(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
+/// Claude's locked-down flags around its MCP config `mcp` and its note `note`. With [`Peers::Off`] the only tool is the
+/// harness REPL; [`Peers::On`] adds [`CLAUDE_PEER_TOOLS`], allowed like the REPL.
+fn claude_flags<'a>(mcp: &'a str, note: &'a str, peers: Peers) -> [&'a str; 16] {
+    let (tools, allowed) = match peers {
+        Peers::Off => ("", "mcp__harness__ts"),
+        Peers::On => (CLAUDE_PEER_TOOLS, CLAUDE_PEER_ALLOWED),
+    };
+    [
+        "--strict-mcp-config", "--mcp-config", mcp,
+        "--tools", tools,                       // no built-in tools (Bash, Read, Edit, WebFetch, ...) but the peer ones
+        "--allowedTools", allowed,              // the REPL (and the peer tools) run without permission prompts
+        "--setting-sources", "",                // ignore user/project/local settings: no hooks, plugins, permissions
+        "--disable-slash-commands",             // no skills or custom commands
+        "--no-chrome",
+        "--dangerously-skip-permissions",       // yolo: nothing ever prompts
+        "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#, // flag settings apply despite --setting-sources ""
+        "--append-system-prompt", note,
+    ]
+}
+
+fn claude(ctx: &Ctx, note: &Note, peers: Peers) -> anyhow::Result<Launch> {
     let mut out: Vec<String> = Vec::new();
     if ctx.chat {
         out.extend(crate::chat::claude::ARGS.iter().map(|a| (*a).to_owned()));
@@ -163,17 +233,8 @@ fn claude(ctx: &Ctx, note: &Note) -> anyhow::Result<Launch> {
         out.extend(["--effort".to_owned(), effort.clone()]);
     }
     let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": kernel_env(ctx, note) } } });
-    let args = [
-        "--strict-mcp-config", "--mcp-config", &mcp.to_string(),
-        "--tools", "",                          // no built-in tools (Bash, Read, Edit, WebFetch, ...)
-        "--allowedTools", "mcp__harness__ts",   // the REPL runs without permission prompts
-        "--setting-sources", "",                // ignore user/project/local settings: no hooks, plugins, permissions
-        "--disable-slash-commands",             // no skills or custom commands
-        "--no-chrome",
-        "--dangerously-skip-permissions",       // yolo: nothing ever prompts
-        "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#, // flag settings apply despite --setting-sources ""
-        "--append-system-prompt", note.text.as_str(),
-    ];
+    let mcp = mcp.to_string();
+    let args = claude_flags(&mcp, &note.text, peers);
     let mut env = common_env(ctx);
     for (k, v) in [
         ("DISABLE_AUTOUPDATER", "1"),
@@ -448,4 +509,62 @@ fn login_shell() -> String {
             .then(|| std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned())
     };
     from_db.filter(|s| !s.is_empty()).or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/zsh".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The flags every claude launch had before the peer tools existed, in their order: with [`Peers::Off`] the launch
+    /// passes exactly these.
+    const LOCKED: [&str; 16] = [
+        "--strict-mcp-config", "--mcp-config", "MCP",
+        "--tools", "",
+        "--allowedTools", "mcp__harness__ts",
+        "--setting-sources", "",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--dangerously-skip-permissions",
+        "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#,
+        "--append-system-prompt", "NOTE",
+    ];
+
+    /// The invariant: the peer tools are opt-in. Off, claude's flags are the locked-down ones byte for byte; on, the only
+    /// change is ListAgents and SendMessage in `--tools` and, beside the REPL, in `--allowedTools`.
+    #[test]
+    fn peer_tools_change_only_the_tool_flags() {
+        assert_eq!(claude_flags("MCP", "NOTE", Peers::Off), LOCKED);
+        let on = claude_flags("MCP", "NOTE", Peers::On);
+        let mut want = LOCKED;
+        want[4] = "SendMessage,ListAgents";
+        want[6] = "mcp__harness__ts,SendMessage,ListAgents";
+        assert_eq!(on, want);
+        assert_eq!(CLAUDE_PEER_ALLOWED, format!("mcp__harness__ts,{CLAUDE_PEER_TOOLS}"), "allowed is the REPL plus the peer tools");
+    }
+
+    /// Off, the note is the always-on topics, AGENTS.md and the index, as before; on, the peers part sits after the
+    /// topics and says which sessions the native tools are for and who a cross-session message is from.
+    #[test]
+    fn peer_tools_add_their_note_part() {
+        let off = note_text(Peers::Off, "AGENTS", "INDEX");
+        let topics = SYSTEM_NOTE_PARTS.iter().map(|(_, p)| p.trim()).collect::<Vec<_>>().join("\n\n");
+        assert_eq!(off, format!("{topics}\n\nAGENTS\n\nINDEX"));
+        let on = note_text(Peers::On, "AGENTS", "INDEX");
+        assert_eq!(on, format!("{topics}\n\n{}\n\nAGENTS\n\nINDEX", PEERS_NOTE.trim()));
+        for words in ["ListAgents", "SendMessage", "agents.send", "<cross-session-message>", "not from the person"] {
+            assert!(PEERS_NOTE.contains(words), "the peers part names {words:?}");
+        }
+    }
+
+    /// `HARNESS_CLAUDE_PEER_TOOLS`: unset, empty or 0 is off, 1 is on, and any other value stops the launch naming it.
+    #[test]
+    fn peer_tools_setting_parses_or_refuses() {
+        use std::ffi::OsStr;
+        assert_eq!(Peers::parse(None).unwrap(), Peers::Off);
+        assert_eq!(Peers::parse(Some(OsStr::new(""))).unwrap(), Peers::Off);
+        assert_eq!(Peers::parse(Some(OsStr::new("0"))).unwrap(), Peers::Off);
+        assert_eq!(Peers::parse(Some(OsStr::new("1"))).unwrap(), Peers::On);
+        let e = Peers::parse(Some(OsStr::new("yes"))).unwrap_err().to_string();
+        assert!(e.contains(PEER_TOOLS_ENV) && e.contains("\"yes\""), "{e}");
+    }
 }
