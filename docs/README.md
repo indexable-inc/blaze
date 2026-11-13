@@ -140,6 +140,7 @@ Designs not (fully) built, newest first.
 
 Research, reports and measurements, true on their date and not brought up to date. Newest first.
 
+- [language.md](language.md) (2026-11-12): Each language change of Rust 1.80 to 1.100 checked against blaze's front end on 2026-11-12, with the test that holds it and what was fixed or is still missing.
 - [v2/plan/design/verus.md](v2/plan/design/verus.md) (2026-11-10): The spec form blaze kept from lane verus (Verus's clause syntax as native grammar, gated by `#![feature(blaze_verify)]`, lowered to clause groups in hir-def), and the record of the Z3 tier that proved it until 2026-11-10, when it was retired for Lean.
 - [CHANGELOG.md](CHANGELOG.md) (2026-11-03): Changelog: every user-visible change, by release, with [Unreleased] on top.
 - [support.md](support.md) (2026-10-30): What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
