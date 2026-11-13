@@ -60,7 +60,7 @@ site {
       }
 
       Step status("Where it stands") {
-        P now("Experimental: written and tested inside blaze. Next: compile-time reflection with `for const`.")
+        P now("Experimental: written and tested inside blaze. Next: [compile-time reflection](/learn/comptime) with `for const`.")
         Dim design("Design: [comptime.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/comptime.md).")
       }
     }
