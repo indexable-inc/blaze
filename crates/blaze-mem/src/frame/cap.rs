@@ -116,6 +116,7 @@ static INSTALLED: std::sync::atomic::AtomicPtr<Shared> =
 
 impl Cap {
     /// A cap of `limit` bytes, and what hears each time it passes `spill_at`.
+    #[expect(clippy::disallowed_methods, reason = "the memory cap's deadlock breaker, left as it is: a different mechanism from allocation failure (decision D29; docs/v2/plan/design/fallible-bstd.md, what is left)")]
     pub fn new(limit: u64, spill_at: u64) -> (Cap, Spills) {
         let (spills, heard) = crossbeam_channel::unbounded();
         let state = State {
@@ -166,6 +167,7 @@ impl Cap {
     ///
     /// When `bytes` alone are more than the limit (no wait would end), or when the thread holds
     /// bytes of another cap.
+    #[expect(clippy::panic, reason = "the memory cap's deadlock breaker, left as it is: a different mechanism from allocation failure (decision D29; docs/v2/plan/design/fallible-bstd.md, what is left)")]
     pub fn reserve(&self, bytes: u64) -> Result<Grant, Cancelled> {
         match reserve(self.0, bytes) {
             Ok(()) => Ok(Grant { cap: self.0, bytes, _thread: PhantomData }),
@@ -251,6 +253,7 @@ pub(crate) fn frame_reserve(bytes: usize) -> Result<bool, Refused> {
 }
 
 /// Gives back `bytes` the calling thread's task frames reserved with [`frame_reserve`].
+#[expect(clippy::unreachable, reason = "the memory cap's deadlock breaker, left as it is: a different mechanism from allocation failure (decision D29; docs/v2/plan/design/fallible-bstd.md, what is left)")]
 pub(crate) fn frame_release(bytes: usize) {
     match HOLDING.try_with(Cell::get) {
         Ok((Some(shared), held)) if held >= bytes as u64 => release(shared, bytes as u64),
@@ -331,6 +334,7 @@ impl State {
     }
 }
 
+#[expect(clippy::disallowed_methods, clippy::panic, reason = "the memory cap's deadlock breaker, left as it is: a different mechanism from allocation failure (decision D29; docs/v2/plan/design/fallible-bstd.md, what is left)")]
 fn reserve(shared: &'static Shared, bytes: u64) -> Result<(), Refused> {
     if bytes > shared.limit {
         return Err(Refused::TooBig { limit: shared.limit });

@@ -73,6 +73,7 @@ static CHOSEN: AtomicU8 = AtomicU8::new(0);
 /// The pages of a region that asks for huge pages in this process: what `BLAZE_HUGE_PAGES`
 /// names, checked against what the system has. An error names the variable, its value and
 /// what to do.
+#[expect(clippy::disallowed_methods, reason = "BLAZE_HUGE_PAGES, read once: the one setting blaze-mem takes from the environment (an older ban than decision D29's)")]
 pub fn chosen() -> io::Result<Pages> {
     if let Some(pages) = Pages::from_u8(CHOSEN.load(Ordering::Relaxed)) {
         return Ok(pages);

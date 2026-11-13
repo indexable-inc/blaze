@@ -257,6 +257,7 @@ impl Region {
     #[cold]
     #[inline(never)]
     #[track_caller]
+    #[expect(clippy::panic, reason = "Region::at keeps its signature, with 41 call sites (docs/v2/plan/design/fallible-bstd.md, what is left)")]
     fn past_reservation(&self, offset: usize) -> ! {
         panic!(
             "byte {offset} of a {:?} region of {} reserved bytes: past its reservation",

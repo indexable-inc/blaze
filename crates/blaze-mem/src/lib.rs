@@ -42,11 +42,11 @@
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
 // Decision D29 (docs/v2/plan/design/fallible-bstd.md): non-test code holds no panic path and no
-// infallible growth of alloc's. `warn` while the port is in progress; `deny` once the list is
-// empty.
+// infallible growth of alloc's, so a stray one is a build error. The few that are left each
+// carry an `#[expect]` whose reason says why, and are listed in that spec.
 #![cfg_attr(
     not(test),
-    warn(
+    deny(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

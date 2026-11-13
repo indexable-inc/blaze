@@ -34,7 +34,7 @@
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
 use alloc::{alloc::Global, boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{fmt, time::Duration};
+use core::{convert::Infallible, fmt, time::Duration};
 
 use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag,
@@ -1005,32 +1005,26 @@ impl Io {
     }
 
     /// The process ends with `status`: a real one exits; the simulated one remembers it and
-    /// unwinds the calling task with an [`Exit`] payload.
-    pub(crate) fn exit(&self, status: i32) -> ! {
-        let simulated = {
+    /// unwinds the calling task with an [`Exit`] payload. It returns only an error: a later
+    /// exit of a simulated world, whose first payload was caught already, found no room for
+    /// its own; the world then has not exited again and nothing unwinds.
+    pub(crate) fn exit(&self, status: i32) -> Result<Infallible, Stopped> {
+        let payload = {
             let mut world = self.world.lock();
-            let simulated = world.driver.sim().is_some();
-            if simulated {
-                world.exited = Some(status);
+            if world.driver.sim().is_none() {
+                drop(world);
+                crate::rt::exit(status);
             }
-            simulated
-        };
-        if !simulated {
-            crate::rt::exit(status);
-        }
-        let made = self.world.lock().exit.take();
-        let payload = match made {
-            Some(mut payload) => {
-                payload.status = status;
-                payload
-            }
-            // alloc: a later exit's payload, the first one's having been caught already.
-            None => match heap::boxed(Exit { status }) {
-                Ok(payload) => payload,
-                // `-> !` has no error to return and the unwind needs its payload: this is
-                // the process out of memory, as alloc would end it.
-                Err(_) => alloc::alloc::handle_alloc_error(core::alloc::Layout::new::<Exit>()),
-            },
+            let payload = match world.exit.take() {
+                Some(mut payload) => {
+                    payload.status = status;
+                    payload
+                }
+                // alloc: a later exit's payload, the first one's having been caught already.
+                None => heap::boxed(Exit { status })?,
+            };
+            world.exited = Some(status);
+            payload
         };
         crate::rt::resume_unwind(payload)
     }

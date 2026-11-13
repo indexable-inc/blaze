@@ -85,7 +85,10 @@ impl Host {
     /// The process ends with `status`. In the simulation the calling task unwinds with an
     /// [`Exit`] payload (no panic message) and the world remembers the status; a scope passes
     /// the unwind on rather than failing a task with it.
-    pub fn exit(&self, status: i32) -> ! {
+    ///
+    /// It never returns `Ok`: what it returns is why a simulated world could not exit, a
+    /// later exit that found no room on the global heap for its unwind's payload.
+    pub fn exit(&self, status: i32) -> Result<core::convert::Infallible, crate::Stopped> {
         self.io.exit(status)
     }
 }

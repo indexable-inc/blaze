@@ -43,6 +43,8 @@
 //! - [`requests`]: `Http::handler` and `Http::over` give the same answer to the same request,
 //!   and refuse the same ones once narrowed.
 //! - [`hosted`]: each simulated provider once, a scripted value in and a recorded one out.
+//! - [`growth`]: a growth past a task's frame is an error naming it, through every growth
+//!   path, and the task, its scope and the next task go on.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -67,6 +69,7 @@ mod durable;
 mod env;
 mod eval;
 mod explicit;
+mod growth;
 mod hosted;
 mod inflight;
 mod kv;

@@ -1339,6 +1339,7 @@ unsafe fn innermost<'a>() -> Option<&'a Frame> {
 /// on a thread whose current frame is another job's), which used as is corrupts both.
 #[cold]
 #[inline(never)]
+#[expect(clippy::panic, reason = "a thread's task stack carried wrong stops the task: frame::task and frame::current keep their signatures, with 526 call sites in 36 crates (docs/v2/plan/design/fallible-bstd.md, what is left)")]
 fn refuse_unmapped(outer: *const Frame, starting: u32) -> ! {
     panic!(
         "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
@@ -1360,6 +1361,7 @@ const LOWEST: usize = 1 << 16;
 
 #[cold]
 #[inline(never)]
+#[expect(clippy::panic, reason = "a thread's task stack carried wrong stops the task: frame::task and frame::current keep their signatures, with 526 call sites in 36 crates (docs/v2/plan/design/fallible-bstd.md, what is left)")]
 fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! {
     let why = if seal == UNSEALED { "dropped" } else { "not a frame, or overwritten" };
     // A frame's drop writes only its seal, so a frame sealed as dropped still has its other
@@ -1464,6 +1466,7 @@ fn read_seal(at: *const Frame) -> (u64, u32) {
 /// [`put_current`]) is not a live task's frame, so a frame carried wrong fails at the switch
 /// that carries it rather than at the next task that starts inside it.
 #[inline(never)]
+#[expect(clippy::panic, reason = "a thread's task stack carried wrong stops the task: frame::task and frame::current keep their signatures, with 526 call sites in 36 crates (docs/v2/plan/design/fallible-bstd.md, what is left)")]
 fn check_carried(frame: *const Frame, switch: &'static str) {
     if frame.is_null() {
         return;
@@ -1600,6 +1603,7 @@ fn end_task(frame: &Frame, outer: *const Frame, outer_below: usize, held: usize)
 /// Stops, naming the caller, when it is in none: code that allocates for a task runs in one
 /// (no-fallback). What `f` returns cannot borrow the frame.
 #[track_caller]
+#[expect(clippy::panic, reason = "a thread's task stack carried wrong stops the task: frame::task and frame::current keep their signatures, with 526 call sites in 36 crates (docs/v2/plan/design/fallible-bstd.md, what is left)")]
 pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
     // SAFETY: the frame is used only within `f`, called here, inside the task's closure.
     let frame = unsafe { innermost() };
@@ -1723,6 +1727,7 @@ pub fn in_task() -> bool {
 /// [`cancelling`] says so, for the guards the unwind drops on its way out (a query's claim,
 /// released to its waiters as a cancel, not a panic).
 #[track_caller]
+#[expect(clippy::disallowed_methods, reason = "the memory cap's deadlock breaker, left as it is: a different mechanism from allocation failure (decision D29; docs/v2/plan/design/fallible-bstd.md, what is left)")]
 pub fn cancel() -> ! {
     assert!(in_task(), "frame::cancel outside any frame::task");
     _ = STACK.try_with(|stack| stack.cancelling.set(true));

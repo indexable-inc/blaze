@@ -38,7 +38,12 @@ fn a_simulated_exit_unwinds_its_task_and_the_world_remembers_it() {
     let ended = catch_unwind(AssertUnwindSafe(|| {
         // An exit inside a task passes through its scope rather than failing the task.
         let _ = cx.scope_with(|s| {
-            let task = s.spawn("exits", TASK_FRAME, |_cx| -> Result<(), String> { host.exit(3) });
+            let task = s.spawn("exits", TASK_FRAME, |_cx| -> Result<(), String> {
+                match host.exit(3) {
+                    Ok(never) => match never {},
+                    Err(stopped) => Err(stopped.to_string()),
+                }
+            });
             let _ = task.join(s.cx());
         });
     }));

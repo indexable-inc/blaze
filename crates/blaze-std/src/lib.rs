@@ -98,11 +98,11 @@
 // harness, `eprintln!`).
 #![cfg_attr(not(test), no_std)]
 // Decision D29 (docs/v2/plan/design/fallible-bstd.md): non-test code holds no panic path and no
-// infallible growth of alloc's. `warn` while the port is in progress; `deny` once the list is
-// empty.
+// infallible growth of alloc's, so a stray one is a build error. The few that are left each
+// carry an `#[expect]` whose reason says why, and are listed in that spec.
 #![cfg_attr(
     not(test),
-    warn(
+    deny(
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
@@ -500,4 +500,7 @@ pub(crate) enum Plant {
     FlushedBeforeFlush,
     /// `Flushed::clone_to` does not look at whether its file was changed behind it.
     StaleFlushedCloned,
+    /// A push goes through `alloc`'s own `Vec::push`, the infallible one. bstd has no such
+    /// path to turn back on, so the growth test takes it itself (`tests::growth`).
+    PushThroughAlloc,
 }

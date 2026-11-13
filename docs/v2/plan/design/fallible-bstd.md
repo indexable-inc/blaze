@@ -93,15 +93,22 @@ so bstd uses `Arc::try_new`).
 
 ## Lints
 
-Per crate, non-test code, `deny`, no `allow` or `expect` attribute:
+Per crate, non-test code, `deny` (`#![cfg_attr(not(test), deny(..))]` in each `lib.rs`):
 `clippy::unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`,
 `indexing_slicing`, plus `disallowed_methods` and `disallowed_macros` for `alloc`'s infallible
 growth (`Vec::push`, `extend*`, `insert`, `reserve`, `resize`, `with_capacity*`, `String::push*`,
-`Box::new*`, `Arc::new`, `format!`, `vec!`, `to_vec`, `to_owned`, `to_string`) in
-`crates/blaze-mem/clippy.toml` and `crates/blaze-std/clippy.toml`. `arithmetic_side_effects` is
-not turned on: sizes that come from a caller go through `ByteLen` and `Offset` or `checked_*`;
-address arithmetic inside the allocators stays (300 sites, each within a block the allocator
-owns).
+`Box::new*`, `Arc::new`, `Rc::new`, `format!`, `vec!`, `to_vec`, `to_owned`, `to_string`,
+`collect`, `Extend::extend`, hashbrown's and the B-tree's `insert` and `entry`) in
+`crates/blaze-mem/clippy.toml` and `crates/blaze-std/clippy.toml`. A stray one is a build error.
+The sites that are left each carry an `#[expect(.., reason = "..")]` and are listed below; the
+end state has none.
+
+`arithmetic_side_effects` is not turned on: sizes that come from a caller go through `ByteLen`
+and `Offset` or `checked_*`; address arithmetic inside the allocators stays (about 300 sites,
+each within a block the allocator owns).
+
+What the lints do not see, and so is held by reading: a runtime `assert!`; an allocation
+through a trait (`Arc::from`, `Clone` of an owning value); `process::abort`.
 
 ## How it is proven
 
@@ -118,4 +125,43 @@ owns).
 
 ## What is built, and what is left
 
-Kept current as the work lands; the lane's report has the detail.
+Built (branch `bstd-fallible-alloc`, 2026-11-12): everything in "The design"; blaze-mem's
+allocators with one fallible form each and every caller in the workspace ported (renamed,
+propagated with `?`, or stopped at the call with the message it had before); bstd's files
+ported (allocation, panic paths, sizes in fs, mem, net and budgets); both property tests and
+both controls; the lints at `deny`.
+
+How it was checked: cargo with the pinned nightly for blaze-mem and its dependents. bstd uses
+blaze-only syntax and cargo cannot build it, so bstd was checked, linted and tested as a copy
+with that syntax taken out (contract clauses, `where const`, reflection stubbed); three of its
+tests fail in that copy before and after this work. `blaze check` and `blaze test` of bstd have
+not been run on this branch.
+
+Left in blaze-mem, each with its `#[expect]` or a comment:
+
+| what | where | why it is left |
+|---|---|---|
+| the memory cap: its cancel unwinds, its set-up allocates, and a reserve over the cap or a release it does not hold panics | `frame/cap.rs`, `frame::cancel` | a different mechanism, the cap's deadlock breaker; out of this decision's scope |
+| a thread's task stack carried wrong (a dropped frame where the enclosing task's should be, `frame::current` outside a task, a frame put back inside another task) panics | `frame.rs` (`refuse_unmapped`, `refuse_outer`, `check_carried`, `current`, `put_current`) | `frame::task` and `frame::current` have 526 call sites in 36 crates; making them return `Result` is its own port |
+| `Region::at` past the reservation panics | `region.rs` | 41 call sites; `Result` there is its own port |
+| a reservation released twice aborts | `os.rs` (`give`) | memory two regions would share; needs a release that cannot be said twice |
+| `pool::Shared::clone` aborts past `i32::MAX` owners | `pool.rs` | `Clone` cannot fail; a fallible `share` and no `Clone` is the fix |
+| `scratch` lends std `Vec`, `String` and `PathBuf` on the global heap | `scratch.rs` | 189 call sites in other crates grow them with `alloc`'s own methods |
+| a page size of 4096 when `sysconf` fails | `os.rs` | a default that predates this work; `page_size()` would have to return `Result` |
+| an `io::Error` made for a `MemError` boxes its payload | `os.rs` | `MemError`'s `os: io::Error` field |
+
+Left in bstd:
+
+| what | where | why it is left |
+|---|---|---|
+| a `where const` bound's message is a compile-time panic | `own/reach.rs` (`refuse`) | const evaluation has no other way to refuse with a message; never runs at run time |
+| the checks of `path!`, `var!`, `host!` panic in their own `const` blocks | `path.rs`, `env.rs`, `net.rs` | compile time only; `net::check_literal` is a public hidden `const fn` whose `assert!` would run if called at run time |
+| hashbrown's `insert` and `entry` after a successful reserve | `map.rs` (two `#[expect]`) | hashbrown has no insert that says in its type it cannot allocate |
+| `Arc<str>` and `Arc<[T]>` are made infallibly | `host.rs`; blaze-core's `FileName::new` | `alloc` has no fallible constructor for them; names bstd makes itself are `Arc<String>` |
+| blaze-core's effects and simulation copy bytes and names infallibly; blaze-http's h1 grows its own buffers and builds error strings | called from `fs.rs`, `disk.rs`, `requests.rs` | those crates are outside this decision; bstd reserves ahead where it can |
+| `TaskError` derives `Clone` over an owned message | `task.rs` | a copy of an error allocates unchecked; bstd's own copies go through a fallible one |
+| the shared map and set are papaya's | `map.rs` re-exports | papaya takes no allocator and has no fallible form |
+| errors are up to 232 bytes (`large-error-threshold = 256` in bstd's `clippy.toml`) | every bstd error with an `Excerpt` | the text an error names is kept inline so making an error allocates nothing; how errors compose is another lane's |
+
+Not done: the cost table's "1.0" for a push with room is from the source, not from generated
+code. `MemoLimit.bytes` in `eval.rs` is still a `usize`.

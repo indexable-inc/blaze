@@ -698,6 +698,7 @@ pub const fn none<T: ?Sized, Q: Question>() -> bool {
     }
 }
 
+#[expect(clippy::panic, reason = "compile time only: the message a `where const { none::<T, Q>() }` bound shows; nothing calls it at run time (docs/v2/plan/design/fallible-bstd.md, what is left)")]
 const fn refuse(reason: &str) -> ! {
     panic!("{}", reason)
 }
