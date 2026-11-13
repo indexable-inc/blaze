@@ -1,22 +1,29 @@
 //! The hints of a packed struct or union that contradict it: E0634 for a `packed` of another
 //! alignment than the type is packed to (the least of its `packed`s), E0587 for `packed` with
-//! `align`, both at the type.
+//! `align`, both at the type; and the lint `aligned_fields_in_packed` (deny by default) for a
+//! `repr(C, packed)` type that holds, through `repr(C)` structs and unions, a `repr(C,
+//! align)` one: a lint since Rust 1.100 (rust-lang/rust#162160), E0588 before it, whatever
+//! the reprs.
 //!
-//! Follows rustc's `compiler/rustc_hir_analysis/src/check/check.rs` (`check_packed`) (MIT or
-//! Apache-2.0).
+//! Follows rustc's `compiler/rustc_hir_analysis/src/check/check.rs` (`check_packed`,
+//! `check_packed_inner`) (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
+use hir::FieldSourceView;
 use hir_def::attrs::AttrFlags;
 use syntax::{
     NodeOrToken, SyntaxKind,
-    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _},
+    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _},
 };
 
 use crate::{
     cx::{Cx, def_range_view as def_range},
+    lints::registry::LintId,
     lower::{Found, Phase},
     model::Diag,
 };
+
+const ALIGNED_FIELDS_IN_PACKED: LintId = LintId::named("aligned_fields_in_packed");
 
 pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
     let node = match adt {
@@ -56,8 +63,95 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
         );
         diag.fact(fact(), what());
         found.push(Found::new(diag, Phase::Items));
+    } else if repr.c()
+        && cx.lint_may_fire(ALIGNED_FIELDS_IN_PACKED)
+        // alloc: the stack of the types on the way, empty for a type with no ADT field
+        && let Some(chain) = aligned_inside(cx, adt, &mut Vec::new())
+        && let Some(diag) = aligned_in_packed(cx, adt, &chain)
+    {
+        let at = node.map(|it| ast::ptr(it));
+        found.push(Found::lint(diag, Phase::Items, at));
     }
     found
+}
+
+/// rustc's `check_packed_inner`: the `repr(C, align)` struct or union `adt` is or holds,
+/// through fields of `repr(C)` structs and unions: that type, then each type on the way out
+/// to `adt` with the field it is held by, innermost first.
+fn aligned_inside(
+    cx: &Cx<'_, '_>,
+    adt: hir::Adt,
+    stack: &mut Vec<hir::Adt>,
+) -> Option<Vec<(hir::Adt, Option<hir::Field>)>> {
+    let fields = match adt {
+        hir::Adt::Struct(it) => it.fields(cx.db),
+        hir::Adt::Union(it) => it.fields(cx.db),
+        hir::Adt::Enum(_) => return None,
+    };
+    let repr = AttrFlags::repr(cx.db, hir_def::AdtId::from(adt))?;
+    if !repr.c() {
+        return None;
+    }
+    if repr.align.is_some() {
+        // alloc: the lint's chain, for a type that is linted
+        return Some(vec![(adt, None)]);
+    }
+    stack.push(adt);
+    for field in fields {
+        if let Some(inner) = field.ty(cx.db).as_adt()
+            && !stack.contains(&inner)
+            && let Some(mut chain) = aligned_inside(cx, inner, stack)
+        {
+            chain.push((inner, Some(field)));
+            return Some(chain);
+        }
+    }
+    stack.pop();
+    None
+}
+
+/// The lint at the packed `adt`, with rustc's notes: the aligned type, then, when it is not
+/// a field of `adt` itself, each field on the way to it.
+fn aligned_in_packed(
+    cx: &Cx<'_, '_>,
+    adt: hir::Adt,
+    chain: &[(hir::Adt, Option<hir::Field>)],
+) -> Option<Diag> {
+    let name = |adt: hir::Adt| adt.name(cx.db).as_str().to_owned();
+    let def_span = |adt: hir::Adt| super::recursive::def_span(cx, adt);
+    // rustc's `field.ident(tcx).span`: a named field's name, a positional one's type.
+    let field_span = |field: hir::Field| {
+        let source = cx.vsema.source(field)?;
+        let range = match source.value {
+            FieldSourceView::Named(it) => it.name()?.syntax().text_range(),
+            FieldSourceView::Pos(it) => it.ty()?.syntax().text_range(),
+        };
+        Some(cx.span(source.with_value(range)))
+    };
+    let (aligned, _) = *chain.first()?;
+    let mut diag = Diag::lint(
+        "aligned_fields_in_packed",
+        "packed type cannot transitively contain a `#[repr(align)]` type",
+        def_span(adt)?,
+    );
+    // alloc: the lint's notes, from here on
+    diag.span_note(
+        def_span(aligned)?,
+        format!("`{}` has a `#[repr(align)]` attribute", name(aligned)),
+    );
+    // Two types mean the aligned one is a field of the packed one: nothing more to say.
+    if chain.len() > 2 {
+        let mut first = true;
+        for &(held, field) in chain[1..].iter().rev() {
+            let message = match first {
+                true => format!("`{}` contains a field of type `{}`", name(adt), name(held)),
+                false => format!("...which contains a field of type `{}`", name(held)),
+            };
+            diag.span_note(field_span(field?)?, message);
+            first = false;
+        }
+    }
+    Some(diag)
 }
 
 /// The alignment of each `packed` hint of a `#[repr(..)]`: 1 for `packed`, `N` for
