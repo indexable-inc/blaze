@@ -2049,7 +2049,7 @@ impl Uring {
     /// file's kept positional descriptor, all written to the ring before the next submit, so
     /// the batch is one `io_uring_enter` where the ring has room. A part refused before it is
     /// asked (its span, its file's open) fails alone, at once; the batch is told when its last
-    /// part is in ([`Uring::part_ended`]).
+    /// part is in ([`Uring::read_part_ended`]).
     fn read_many(
         &mut self,
         tag: Tag,
@@ -2079,7 +2079,7 @@ impl Uring {
             {
                 // alloc: an error path.
                 let why = IoError(format!("{file} at {at} ({} bytes): {error}", into.len));
-                self.part_ended(tag, index32, Done::Failed(why));
+                self.read_part_ended(tag, index32, Done::Failed(why));
             }
         }
         Ok(())
@@ -2087,7 +2087,7 @@ impl Uring {
 
     /// The part `index` of the batch `tag` ended as `done`; the batch is told once its last
     /// part has.
-    pub(super) fn part_ended(&mut self, tag: Tag, index: u32, done: Done) {
+    pub(super) fn read_part_ended(&mut self, tag: Tag, index: u32, done: Done) {
         let batch = self.batches.get_mut(&tag).expect("a part's batch in flight");
         let part = &mut batch.parts[index as usize];
         part.got = match done {

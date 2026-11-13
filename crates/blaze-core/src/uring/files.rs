@@ -1213,6 +1213,11 @@ impl Uring {
             }
             self.on_open.remove(at);
             let (tag, whole) = (hot.tag, hot.flags & WHOLE != 0);
+            // A part of a batched read ends into its batch (`WHOLE` is `IDLE` on a read into
+            // memory, so it is read only for a `Kind::Read`).
+            let part = (hot.kind == Kind::ReadInto && hot.flags & ops::PART != 0)
+                .then(|| self.ops.cold(id).names[3]);
+            let whole = whole && hot.kind == Kind::Read;
             let Some((res, why)) = failed else {
                 self.queue(id);
                 continue;
@@ -1221,7 +1226,10 @@ impl Uring {
                 true => Done::Read(mem::take(self.ops.buf_mut(id))),
                 false => Done::Failed(IoError(why.to_owned())), // alloc: clone: an error.
             };
-            self.ready.push(Completion { tag, done });
+            match part {
+                Some(index) => self.read_part_ended(tag, index, done),
+                None => self.ready.push(Completion { tag, done }),
+            }
             self.end(id);
         }
     }

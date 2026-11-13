@@ -237,8 +237,8 @@ impl Mapped {
     ///
     /// # Safety
     ///
-    /// While the [`Mapped`] lives, nothing writes, appends to or truncates the file in place
-    /// ([`MapOptions::map`]).
+    /// While the [`Mapped`] lives, nothing writes the bytes below the length the file had when
+    /// mapped or truncates it; it may be appended to ([`MapOptions::map`]).
     pub unsafe fn map(file: &File) -> io::Result<Mapped> {
         // SAFETY: the caller's contract.
         unsafe { MapOptions::new().map(file) }

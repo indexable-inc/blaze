@@ -588,7 +588,7 @@ impl Uring {
             Step::Held => {}
             Step::Ends(done) => {
                 match (done, part) {
-                    (Some(done), Some(index)) => self.part_ended(tag, index, done),
+                    (Some(done), Some(index)) => self.read_part_ended(tag, index, done),
                     (Some(done), None) => self.ready.push(Completion { tag, done }),
                     (None, _) => {}
                 }
