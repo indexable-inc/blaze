@@ -593,6 +593,10 @@ fn section(
                 | elf::SHT_RELA
                 | elf::SHT_REL
                 | elf::SHT_NOTE
+                // Not copied: gas gives each input its own SFrame header; a consumer finds that
+                // format by the section name or by `PT_GNU_SFRAME`, and this writer does not
+                // merge FDEs or emit that header.
+                | elf::SHT_GNU_SFRAME
         )
         || section_name.starts_with(".note")
         || section_name == ".comment"
