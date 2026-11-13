@@ -49,19 +49,14 @@ use crate::values;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Rule {
     /// What name resolution reads (the def maps, module scopes and their names, the traits in
-    /// scope). Under [`Names::Identity`] the identity covers it for any key: it hashes what
-    /// each of the body's paths resolves to, its traits in scope and its module chain. Under
-    /// [`Names::Facts`] each is the fact `hir_def::nameres::name_read` says it was a read of
+    /// scope): each is the fact `hir_def::nameres::name_read` says it was a read of
     /// ([`name_fact`]): a name looked up, found or not, is its `Resolves` fact, whose value
     /// for a name the scope lacks is "nothing", so an item that later supplies or shadows the
     /// name changes it.
     Names,
     /// Keyed by a body, as a `DefWithBodyId` or its `InferBodyId`: refused for another's.
-    /// The body's own under [`Names::Identity`]: covered (its HIR, scopes and upvars are of
-    /// its codec bytes and resolutions, and whether its macro calls expanded as rustc parses
-    /// them is of the calls the identity hashes; a body whose expansion is refused builds no
-    /// MIR to store). The body's own under [`Names::Facts`], whose key is made of the item's
-    /// text and so covers nothing the lowering resolved:
+    /// The body's own, whose key is made of the item's text and so covers nothing the
+    /// lowering resolved:
     /// - read by the lowering step itself (`Step::Lower`): read through, so what the lowering
     ///   read (its names, macros, the item's own syntax) is each a fact or covered by its own
     ///   rule, and anything else refuses the lowering by name;
@@ -75,13 +70,12 @@ pub(crate) enum Rule {
     /// A row of a body's own syntax that its lowering reads (`hir_def::expr_store::body`'s
     /// `file_body_syntax`, an item's `syntax`, `placed_body_syntax`): covered when it is the
     /// body's own (`own_syntax_read`; `placed_body_syntax` keyed by the body itself), as the
-    /// key under [`Names::Facts`] hashes the item's text; refused for another's.
+    /// key hashes the item's text; refused for another's.
     OwnSyntax,
     /// A row of the body's own that only its lowering step may read: `Body::relative`, which
     /// `has_lowering_errors` reads for the diagnostics of its source map. Its spans are
-    /// relative to the body's anchor, and the lowering's answer holds none of them. Under
-    /// [`Names::Identity`] covered, under [`Names::Facts`] read through, for the lowering step
-    /// of the body itself; refused for any other step and any other body: a position reaching
+    /// relative to the body's anchor, and the lowering's answer holds none of them. Read
+    /// through for the lowering step of the body itself; refused for any other step and any other body: a position reaching
     /// an answer is what no fact covers.
     LowerOnly,
     /// A field of the `Crate` input: covered for the body's crate (the identity hashes its
@@ -131,8 +125,8 @@ pub(crate) enum Rule {
     /// Keyed by a block (`TraitImpls::for_block`, `InherentImpls::for_block`) or a block first
     /// (`InherentImpls::in_block_for_self_ty`, `TraitImpls::in_block_for_trait_and_self_ty`):
     /// lane items' `BlockImpls` fact of the block, each impl there by key and signature, for
-    /// the body's own block as for another's. The own block's is not covered: the identity
-    /// hashes what the body's paths resolve to, and an impl in a block is an item of the
+    /// the body's own block as for another's. The own block's is not covered: the key hashes
+    /// the body's text, not what its paths resolve to, and an impl in a block is an item of the
     /// block's item tree, whose paths (its trait, its self type) are not the body's. A block of
     /// no body's (a signature's array length) is refused.
     Block,
@@ -178,13 +172,11 @@ pub(crate) enum Rule {
     /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
     /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
     OwnMatchCheck,
-    /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact
-    /// under [`Names::Facts`].
+    /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact.
     TraitsInScope,
     /// `Modules`' `table`, every module of a crate: what `name_read` says of it
     /// (`NameRead::AllModules`, a block's `WholeScope`) in either mode, a [`Classified::Scan`].
-    /// Never covered: the identity hashes what the body's paths resolve to, and an iteration
-    /// of every module is none of them.
+    /// Never covered: an iteration of every module is no name the body looks up.
     AllModules,
     /// A row whose value is a function of what it read and nothing else, with no fact of its
     /// own: a type's layout (`layout_of_ty_query`, `layout_of_adt_query`, keyed by a type and
@@ -195,9 +187,8 @@ pub(crate) enum Rule {
     /// here, through again where that is `Through`: what decides a layout is traced as facts
     /// keyed by items and crates. A read below a layout row is classified
     /// for the same body and step as one the step made itself; a layout row reads no
-    /// name-resolution row of its own (it asks queries that do: field types, attributes), so
-    /// [`Rule::Names`] under [`Names::Identity`], which is sound only for the body's own
-    /// paths, is not met below one.
+    /// name-resolution row of its own (it asks queries that do: field types, attributes); a
+    /// [`Rule::Names`] read below one is a fact as anywhere else.
     ///
     /// The same holds of the queries that run the trait solver in an inference context of
     /// their own, keyed by a type, a goal or a trait method and an environment (the borrow
@@ -218,8 +209,8 @@ pub(crate) enum Rule {
     /// was. A fact of its own would be coarser and unsound: `Implements { Copy, W }` alone does
     /// not say whether `W<T>: Copy`, which needs `T: Copy` too, nor what the environment's
     /// where clauses prove. The solver resolves no path, so [`Rule::Names`] is met below none
-    /// of them but `path_bindings`, whose reads are of the body's own paths and scopes, which
-    /// the identity hashes.
+    /// of them but `path_bindings`, whose reads are of the body's own paths and scopes, each
+    /// a name fact.
     Through,
     /// The field order plan's input (`hir_ty::layout::field_order::FieldOrder`), which every
     /// ADT's layout reads: the build's `FieldOrder` fact.
@@ -227,18 +218,6 @@ pub(crate) enum Rule {
     /// A field of the front end's settings (`base_db::FrontSettings`), one for the build and
     /// the same for every body: the build's `Setting` fact of that field, by its name.
     Setting,
-}
-
-/// How a read of name resolution is stood for: the switch between the identity made from the
-/// lowered, resolved body and the key made before lowering (docs/v2/plan/design/restore.md,
-/// "The switch and what deletes the old identity"). [`Names::Identity`] goes with the old
-/// identity.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Names {
-    /// Covered by the body's identity, which hashes what each of its paths resolves to.
-    Identity,
-    /// Recorded: each read is a fact of the step's shape.
-    Facts,
 }
 
 /// The arguments of a [`Rule::DepCrate`] read, as the query's key interns them.
@@ -518,7 +497,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("orphan_rules_hold", "hir-ty/src/traits.rs", Rule::Coherence),
     // The variable each path of a body's store names: the body's own HIR and scopes
     // (`Body::of`, `ExprScopes`, covered for the body's own and refused for another's) and
-    // name resolution of its own paths, which the identity hashes ([`Rule::Names`]).
+    // name resolution of its own paths, each a name fact ([`Rule::Names`]).
     ("path_bindings", "hir-ty-borrowck/src/regions.rs", Rule::Through),
     ("placed_body_syntax", "hir-def/src/expr_store/body.rs", Rule::OwnSyntax),
     ("plan", "hir-ty/src/layout/field_order.rs", Rule::FieldOrder),
@@ -565,8 +544,9 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("workspace_data", "base-db/src/input.rs", Rule::CrateInput),
 ];
 
-/// What `read`, made by `step` of `def`, stands for under [`Names::Identity`]. `name` is its
-/// ingredient's debug name.
+/// What `read`, made by `step` of `def`, stands for: covered by the body's key, a fact, read
+/// through, or refused. A read of name resolution is the fact `hir_def::nameres::name_read`
+/// says it was a read of, found or not. `name` is its ingredient's debug name.
 pub fn classify(
     db: &Db,
     def: DefWithBodyId,
@@ -574,20 +554,6 @@ pub fn classify(
     read: blaze_query::db::DatabaseKeyIndex,
     kind: ReadKind,
     name: &'static str,
-) -> Classified {
-    classify_with(db, def, step, read, kind, name, Names::Identity)
-}
-
-/// What `read`, made by `step` of `def`, stands for, name resolution's reads as `names` says.
-/// `name` is its ingredient's debug name.
-pub fn classify_with(
-    db: &Db,
-    def: DefWithBodyId,
-    step: Step,
-    read: blaze_query::db::DatabaseKeyIndex,
-    kind: ReadKind,
-    name: &'static str,
-    names: Names,
 ) -> Classified {
     match kind {
         // An interned value is a function of its fields, which whoever interned it read.
@@ -600,7 +566,7 @@ pub fn classify_with(
         _ => name,
     };
     match rule_of(db, read, name) {
-        Some(rule) => apply(db, def, step, read, kind, name, rule, names),
+        Some(rule) => apply(db, def, step, read, kind, name, rule),
         None => Classified::Refused,
     }
 }
@@ -675,13 +641,9 @@ fn apply(
     kind: ReadKind,
     name: &'static str,
     rule: Rule,
-    names: Names,
 ) -> Classified {
     let key = read.key_index();
     let found = match rule {
-        Rule::Names | Rule::TraitsInScope if names == Names::Identity => {
-            return Classified::Covered;
-        }
         Rule::Names | Rule::AllModules => return name_fact(db, def, read, kind),
         Rule::Through => {
             #[cfg(test)]
@@ -700,10 +662,9 @@ fn apply(
                 Some(body) => body == def,
                 None => arg::<InferBodyId<'_>>(db, key) == Some(InferBodyId::DefWithBodyId(def)),
             };
-            return match (own, names) {
-                (false, _) => Classified::Refused,
-                (true, Names::Identity) => Classified::Covered,
-                (true, Names::Facts) => own_lowering(step, name),
+            return match own {
+                false => Classified::Refused,
+                true => own_lowering(step, name),
             };
         }
         Rule::OwnSyntax => {
@@ -717,9 +678,8 @@ fn apply(
             };
         }
         Rule::LowerOnly => {
-            return match (step, arg::<DefWithBodyId>(db, key) == Some(def), names) {
-                (Step::Lower, true, Names::Identity) => Classified::Covered,
-                (Step::Lower, true, Names::Facts) => Classified::Through,
+            return match (step, arg::<DefWithBodyId>(db, key) == Some(def)) {
+                (Step::Lower, true) => Classified::Through,
                 _ => Classified::Refused,
             };
         }
@@ -797,10 +757,9 @@ fn apply(
         .map(|item| values::fields(db, item)),
         Rule::OwnStore => {
             return match hir_ty::db::closure_exprs::arguments(db, key) {
-                Some((owner, ())) if owner == ExpressionStoreOwnerId::Body(def) => match names {
-                    Names::Identity => Classified::Covered,
-                    Names::Facts => own_lowering(step, name),
-                },
+                Some((owner, ())) if owner == ExpressionStoreOwnerId::Body(def) => {
+                    own_lowering(step, name)
+                }
                 _ => Classified::Refused,
             };
         }
@@ -830,24 +789,9 @@ fn apply(
     };
     match found {
         None => Classified::Refused,
-        // Under `Names::Facts` the base key is `identity::early_identity`, which names the
-        // owner and its container by key and hashes neither's signature or attributes: a
-        // read of one is a fact like any other item's.
-        Some(fact)
-            if names == Names::Identity
-                && fact.kind == items::SIGNATURE
-                && is_owner(db, def, fact.subject) =>
-        {
-            Classified::Covered
-        }
-        Some(fact)
-            if names == Names::Identity
-                && fact.kind == values::kinds::ATTRS
-                && is_own_attrs(db, def, fact.subject) =>
-        {
-            Classified::Covered
-        }
-        // The body's own item as "self", as its identity writes it: two bodies of one
+        // The base key (`identity::early_identity`) names the owner and its container by key
+        // and hashes neither's signature or attributes: a read of one is a fact like any
+        // other item's. The body's own item as "self", as its identity writes it: two bodies of one
         // identity that read the same of themselves list the same shape (`values::OWN`).
         Some(fact) => Classified::Fact(values::relative(db, def, fact)),
     }
@@ -902,7 +846,7 @@ const LOWERING_ROWS: [&str; 4] =
     ["Body::of", "Body::has_lowering_errors", "closure_exprs", "lowering"];
 
 /// What a read of a row of the body's own ([`Rule::OwnBody`], [`Rule::OwnStore`]) made by
-/// `step` stands for under [`Names::Facts`]: read through by the lowering itself, so each of
+/// `step` stands for: read through by the lowering itself, so each of
 /// its reads is classified in its place; by another step, the lowering's fact for a row of
 /// [`LOWERING_ROWS`], and read through for any other (the scopes and upvars, which read
 /// name resolution of their own).
@@ -917,7 +861,7 @@ fn own_lowering(step: Step, name: &str) -> Classified {
     }
 }
 
-/// The fact a read of one of name resolution's rows stands for ([`Names::Facts`]): refused
+/// The fact a read of one of name resolution's rows stands for: refused
 /// when `hir_def::nameres::name_read` does not know the row, so a row added there is listed
 /// by the flush until it is answered for.
 fn name_fact(
@@ -1171,20 +1115,6 @@ fn item_fact(db: &Db, kind: blaze_query::QueryKind, item: ItemId) -> FactRef {
 
 fn whole_crate(db: &Db, krate: Crate) -> FactRef {
     FactRef { kind: items::CRATE, subject: key::crate_key(db, krate), object: FactObject::None }
-}
-
-/// Whether `subject` is the key of `def`'s owner or of the impl or trait that holds it, whose
-/// signature hashes the identity has (section 3.2). A read whose value is a leak the signature
-/// hash marks (a hidden type: `rpit_hidden_types`) must never reach here as a `Signature` fact.
-fn is_owner(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
-    let (owner, parent) = owner_keys(db, def);
-    subject == owner || Some(subject) == parent
-}
-
-/// Whether `subject` is the key of the item `def` is the body of, whose attributes the
-/// identity hashes (`identity::own_attrs`): not a variant's discriminant's enum.
-fn is_own_attrs(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
-    !matches!(def, DefWithBodyId::VariantId(_)) && subject == owner_keys(db, def).0
 }
 
 #[blaze_query::tracked(returns(copy))]

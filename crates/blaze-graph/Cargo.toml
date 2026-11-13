@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
-blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true

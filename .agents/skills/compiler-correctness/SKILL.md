@@ -1,6 +1,6 @@
 ---
 name: compiler-correctness
-description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
+description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input and are computed from text before the work, positions item-relative in every key and record, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
 ---
 
 # Compiler correctness
@@ -112,9 +112,9 @@ Language semantics (MIR building and passes, borrow checking, const eval, layout
 hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
 rust-analyzer but no longer synced with it), whose queries run on blaze's own engine
 (`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one
-view at a time; persisted, shared results go through blaze-kernel), in a crate of their own where
-possible. Codegen, the store, the daemon, cargo integration and the runtime stay outside the front
-end.
+view at a time; what outlives a request is a record, `outputs-are-records`, never a row kept in the
+engine), in a crate of their own where possible. Codegen, the store, the driver (the daemon today),
+cargo integration and the runtime stay outside the front end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
@@ -172,22 +172,43 @@ See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
 ## granular-caching (rule 65)
 
-Whatever blaze keeps to avoid work (a query result, a body, inference, MIR, a signature, an impl
-table, a name table, a unit record, compiled code, a seal) is keyed at the grain of the smallest
-thing that can change alone: a function, a type, an impl, a name, a module's scope. The key is that
-item's own content plus the digests of exactly what it read of other items (the signatures, types,
-macros and names it resolved, with negative reads: a name looked up and absent, an impl searched and
-not found), recorded as reads when the entry is made and checked like traced reads; it is computable
-before the work it saves. Editing one function misses that function's entries and those of the items
-that read the part that changed, and nothing else: not the rest of its crate, not the crates above.
-A key at crate level (a crate's content key, an image key, a whole-interface digest) is never the
-key of an entry; it may stand in front as a quick first check that nothing in the crate moved, and a
-crate may be the container entries are packed in for storing, pinning and exporting. Two forms for
-one thing (a coarse one for quiet crates and a fine one for edited ones) is a duplicate to merge
-into the fine one. An existing crate-keyed cache is a defect to fix when met. Test it by counts:
-edit one item of N in a crate and N-1 entries hit with none of the saved work run, with a control
-keyed by the crate that misses all N.
+Whatever blaze keeps to avoid work (a body, inference, MIR, a signature, an impl table, a name
+table, a unit record, compiled code) is keyed at the grain of the smallest thing that can change
+alone: a function, a type, an impl, a name, a module's scope. The key is computed from text before
+the work it saves runs: the item's own tokens (positions item-relative, `item-relative-positions`),
+and for each name it mentions the key of what that name resolves to in its scope (absent is a
+resolution too), plus the settings that change its meaning (edition, cfg, target, tool). Finding an
+entry costs hashing that text and one lookup, never a replay of the work or a walk over recorded
+reads. A list of traced reads is kept only for what text cannot name: a build script's run and a
+proc macro's expansion (the files, variables and outside state they read), and the environment; such
+a record is keyed by the code's identity and its declared inputs, and its traced reads are checked
+on the next use. Where a text key is coarser than the reads would be (a macro outside item position,
+a common name whose edit moves many keys), the coarseness is measured and stated in the design,
+never patched by adding traced reads to front-end results. Editing one function misses that
+function's entries and those of the items that read the part that changed, and nothing else: not the
+rest of its crate, not the crates above. A key at crate level (a crate's content key, an image key,
+a whole-interface digest) is never the key of an entry; it may stand in front as a quick first check
+that nothing in the crate moved, and a crate may be the container entries are packed in for storing,
+pinning and exporting. Two forms for one thing (a coarse one for quiet crates and a fine one for
+edited ones) is a duplicate to merge into the fine one. An existing crate-keyed cache is a defect to
+fix when met. Test it by counts: edit one item of N in a crate and N-1 entries hit with none of the
+saved work run, with a control keyed by the crate that misses all N.
 
 See [docs/v2/plan/design/store.md](../../../docs/v2/plan/design/store.md).
+
+## item-relative-positions (rule 71)
+
+A position kept in a key or a record (a diagnostic, a span, a body record, a debug-info line, a
+panic location) is the item's path (the function's, the impl's, the type's) and an offset from the
+item's start. It becomes `file:line:col` only at the last step, printing or emitting, from the file
+image's line table. So an edit above an item (a comment, a new function) changes that file's line
+table and nothing keyed by its items: a comment edit reparses one file and reuses every body record.
+Where the program can observe an absolute position (`line!()`, `column!()`, `Location::caller`, a
+panic message), the absolute value is filled in late from the line table, at the one site that needs
+it, or is an input of that one record's key; it is never left out of the key
+(`keys-cover-every-input`). A printed error still carries the file and line
+(`errors-name-the-thing`), worked out when it is printed. A type for each kind of position
+(`item-relative` and `absolute` as different types) keeps the two from mixing
+(`type-then-lint-then-rule`).
 
 <!-- End of the generated rules. Hand-written notes follow. -->

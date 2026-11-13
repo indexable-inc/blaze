@@ -30,7 +30,14 @@ pub mod time {
         pub fn now() -> SystemTime {
             loop {}
         }
+        pub fn elapsed(&self) -> Duration {
+            loop {}
+        }
     }
+}
+pub mod thread {
+    pub fn sleep(_length: crate::time::Duration) {}
+    pub fn yield_now() {}
 }
 //- /src/lib.rs crate:main deps:hir_ty,std
 "#;
@@ -50,8 +57,15 @@ pub fn stamped() -> SystemTime {
 pub fn took(start: &Instant) -> Duration {
     start.elapsed() //~ wall_clock
 }
+pub fn aged(stamp: &SystemTime) -> Duration {
+    stamp.elapsed() //~ wall_clock
+}
 pub fn between(start: &Instant, end: Instant) -> Duration {
     start.duration_since(end)
+}
+pub fn waited(length: Duration) {
+    std::thread::sleep(length); //~ wall_clock
+    std::thread::yield_now();
 }
 "#,
         "-A clippy::all --warn=blaze::wall_clock",

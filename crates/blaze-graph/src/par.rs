@@ -469,9 +469,7 @@ pub fn enumerate<S: IntoSource>(items: S) -> Enumerate<S::Source> {
     Enumerate(items.into_source())
 }
 
-/// The workers a loop called here splits across: those its pool may run at once now, its core
-/// tokens on the machine's ledger where the process joined it ([`pool::set_tokens`]), not every
-/// worker it has.
+/// The workers a loop called here splits across: those its pool may run at once.
 pub fn threads() -> usize {
     pool::threads_here()
 }

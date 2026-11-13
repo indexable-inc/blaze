@@ -33,9 +33,8 @@
 //! crates it documents, once its check's own plane request is over.
 //!
 //! A build script's output ([`Writer::ran`]) and a proc macro's load ([`Writer::macros`]) are
-//! writes, and so is letting go of what a unit that compiled leaves in the front end for no task
-//! to come ([`Writer::compiled`]; the daemon's `unit::release`), which waits only when memory is
-//! short or no unit is open. Each is checked as it is asked for and applied by [`Writer::apply`], on the loop,
+//! writes; nothing is let go of the front end mid-build (what a build's end lets go is
+//! [`Steps::release_kept`]'s, after its answer). Each is checked as it is asked for and applied by [`Writer::apply`], on the loop,
 //! once no reader is alive: every reader is one of a task posted before the write was asked
 //! for, and from then until it is applied the loop posts no reading task of that job, but
 //! holds it and posts it after, with a reader of what the write made. That wait is the stop.
@@ -531,9 +530,8 @@ impl Phase {
 /// the bench fails an edit by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Linking {
-    /// None was kept at its path, so there was nothing to patch: the image's first link, or
-    /// the first since the kept link images' budget let its image go, which the loop says as
-    /// it posts the link (`job::Paths::take_images`).
+    /// None was kept at its path, so there was nothing to patch: the image's first link
+    /// (`job::Paths::take_images`).
     First,
     /// What changed was placed into the room the kept image keeps.
     Spliced,
@@ -860,25 +858,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
         let _ = kept;
         blaze_query::db::Taken::default()
     }
-    /// On the loop: the bytes of the caches the back end keeps only to make its next build
-    /// cheaper (codegen's kept walks), an estimate, at most
-    /// ([`blaze_graph::giveback::Rung::Caches`]). 0 for steps that keep none.
-    fn kept_caches(&self) -> u64 {
-        0
-    }
-    /// On the loop, while no task that may walk a program runs
-    /// (`super::plane::Plane::walks_in_flight`): lets go of those caches, every one; the
-    /// bytes they held, as the same estimate says.
-    fn give_caches(&self) -> u64 {
-        0
-    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
-    /// after the build's answer: what the build's end lets go of its front end (every MIR it
-    /// made, and the values no build read since the one before). The front end is the task's
-    /// alone, as it was the job's writer's. A release only lowers memory, so it is never a
+    /// after the build's answer: what the build's end lets go of its front end (its MIR and
+    /// inference no next build reads, by the build's kind), then the storage's end-of-build
+    /// upkeep. The front end is the task's alone, as it was the job's writer's. Never a
     /// precondition of the checkout's next build: once `wanted` is set (a request of the
-    /// checkout waits for the front end) it is skipped, unless blaze is past its limit's line,
-    /// and that build goes on with what was not let go.
+    /// checkout waits for the front end) it is skipped, and that build goes on with what was
+    /// not let go.
     fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
         let _ = (kept, wanted);
     }
@@ -1030,29 +1016,13 @@ pub trait KeptDb: Send + 'static {
     /// Its database, whose library parses the daemon's image stores
     /// ([`base_db::trees::write_section`]); `None` for a front end with none.
     fn db(&self) -> Option<&base_db::Db>;
-    /// The bytes its query storage holds, from counters: what letting go of it whole gives
-    /// back, at least ([`blaze_graph::giveback::Rung::FrontEnd`]). 0 for one that cannot say.
-    fn held(&self) -> u64 {
-        0
-    }
-    /// The bytes of values it keeps that it can let go and the engine makes again from their
-    /// memos ([`blaze_graph::giveback::Rung::Values`]). On the loop, which holds it alone.
-    fn values(&mut self) -> u64 {
-        0
-    }
-    /// Lets go of about `bytes` of those values, the least recently verified first; what
-    /// went. On the loop, which holds it alone.
-    fn give_values(&mut self, bytes: u64) -> u64 {
-        let _ = bytes;
-        0
-    }
 }
 
 pub trait Kept: Send + 'static {
     /// Its tables as the linker counts them: name, elements, bytes ([`Response::Tables`]).
     fn tables(&self) -> Vec<(&'static str, u64, u64)>;
-    /// The bytes it holds while kept between links: what the kept images' budget weighs it
-    /// by ([`super::job`]'s `KeptImages`).
+    /// The bytes it holds while kept between links. Nothing reads it since the kept images'
+    /// budget went with the memory gate (2026-11-13).
     fn held(&self) -> u64;
     /// Whether a run of user code maps it now (a dev executable's running program): such an
     /// image is never let go, or the next link could not patch what runs.
@@ -1099,9 +1069,6 @@ pub struct WriteWait {
     pub macros: u32,
     /// Device builds' MSL asked for.
     pub msls: u32,
-    /// The front end asks to let go of what nothing still to compile reads
-    /// (`unit::release::Release::due`).
-    pub release: bool,
     /// The readers of the front end alive besides the writer's own hold: tasks', and any
     /// that outlived its task.
     pub readers: u32,
@@ -1155,9 +1122,8 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// (`blaze_lower::Lowered::gpu_msl`), which its dependents' front ends read: checked now,
     /// applied by [`Writer::apply`], counted as a run's (`unit::graph::flag::GPU_MSL`).
     fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError>;
-    /// Whether a write was asked for and is not applied yet, or the front end asks to let go
-    /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
-    /// loop posts no reading task of the job until [`Writer::apply`] applied it.
+    /// Whether a write was asked for and is not applied yet: the loop posts no reading task
+    /// of the job until [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
     /// Whether no reader of the front end is alive, every task's dropped: one load of a
     /// reference count. The loop posts the write [`Writer::waiting`] asks for, as a task that
@@ -1169,26 +1135,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn write_wait(&self) -> WriteWait {
         WriteWait::default()
     }
-    /// On the loop, as unit `unit`'s first task starts: it is open until [`Writer::compiled`].
-    fn began(&mut self, unit: usize) {
-        let _ = unit;
-    }
     /// On the loop, as unit `unit` began and was found kept ([`Front::fresh`]): its compile
-    /// replays its record, and makes nothing in the front end for a release to let go.
+    /// replays its record, and makes nothing in the front end for the build's end to let go
+    /// ([`Steps::release_kept`]).
     fn found_kept(&mut self, unit: usize) {
         let _ = unit;
     }
     /// On the loop, as unit `unit`'s compile ended (its last phase gave its outcome, ok or
-    /// not): nothing of this build compiles it again, and what its front end keeps for it
-    /// alone may be let go, by a write [`Writer::waiting`] asks for.
+    /// not): counted for what the build's end lets go ([`Steps::release_kept`]).
     fn compiled(&mut self, unit: usize) {
         let _ = unit;
     }
-    /// On the loop, as the system says memory is short, or the core is past its line with
-    /// nothing cheaper left to give (`job::giving`, `blaze_graph::giveback::Rung::Values`):
-    /// let go of what the front end keeps for no task to come, by a write [`Writer::waiting`]
-    /// asks for, now.
-    fn pressed(&mut self) {}
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
@@ -1407,15 +1364,6 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
     /// span. `None` for a front that names no units.
     fn subject(&self, unit: usize) -> Option<(String, String)> {
-        let _ = unit;
-        None
-    }
-    /// On the loop: how many instances unit `unit`'s codegen walk reached in this build, once
-    /// it ended well; `None` before that, and for a front that walks nothing. Read by no
-    /// forecast since the gate (2026-11-13: the plane's one predictor is its peak record);
-    /// `Job::reached` and this go together, with `codegen::generate`'s set, as a change of
-    /// `serve::unit::codegen`.
-    fn reached(&self, unit: usize) -> Option<u64> {
         let _ = unit;
         None
     }

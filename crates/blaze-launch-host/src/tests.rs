@@ -1157,7 +1157,7 @@ fn a_build_is_an_edit_a_declaration_or_a_restart() {
 fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
     use blaze_codegen::Data;
     use blaze_launch::record::{Kind, Place, Record, To};
-    use blaze_link::SpanTable;
+    use blaze_link::{Span, SpanTable};
 
     use crate::record::Named;
 
@@ -1170,7 +1170,9 @@ fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
             if span.anchor != self.anchor {
                 return Err("no table of that anchor".to_owned());
             }
-            let position = self.table.spans[span.index as usize];
+            let position = self.table.spans[span.index as usize]
+                .resolve(&self.table.bases)
+                .ok_or_else(|| "a span of no base".to_owned())?;
             Ok((&self.table.files[position.file as usize], position))
         }
 
@@ -1184,7 +1186,8 @@ fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
         anchor,
         table: SpanTable {
             files: vec!["src/main.rs".to_owned()],
-            spans: vec![Position { file: 0, line: 4, column: 17 }],
+            spans: vec![Span::From { base: 0, line: 0, column: 0 }],
+            bases: vec![Position { file: 0, line: 4, column: 17 }],
         },
     };
     let datum = Data { id: id(8, 1, 0), align: 1, bytes: b"boom".to_vec(), relocs: Relocs::from_iter([]), writable: false };

@@ -9,6 +9,7 @@
 //! at the outermost macro call that wrote it (`format!`, `vec!`), and dropped where its
 //! exemption comment is.
 
+mod absolute_position;
 mod alloc;
 mod arc_clone_only_borrowed;
 mod as_cast;
@@ -143,6 +144,7 @@ mod small_map;
 mod soa_candidate;
 mod span_field_unrecorded;
 mod stable_sort_needless;
+mod std_mistakes;
 mod std_use;
 #[cfg(test)]
 mod std_use_tests;
@@ -185,6 +187,7 @@ use syntax::{NodeOrToken, TextRange, view as ast};
 use ast::AstNode as _;
 
 use crate::{check::Cx, diag::Applicability};
+pub(crate) use std_mistakes::library_code;
 
 macro_rules! docs {
     () => {
@@ -324,6 +327,7 @@ pub enum Lint {
     UntiedChild,
     UnboundedTestWait,
     ReadsPositions,
+    AbsolutePosition,
     CborFieldOrder,
     GappedLiteral,
     Retry,
@@ -338,6 +342,24 @@ pub enum Lint {
     LockAcrossWait,
     // docs/lints.md#as_cast: the wrapping operations `as_cast`'s fix writes.
     TruncatingCast,
+    // docs/lints.md#the-std-mistakes: std's API used in the ways people and LLMs get wrong.
+    PartialWrite,
+    PartialCmpUnwrap,
+    UnboundedRead,
+    LenMinus,
+    StrByteSlice,
+    Forget,
+    PathToStrUnwrap,
+    DetachedThread,
+    UnboundedChannel,
+    Transmute,
+    CloneToSatisfy,
+    UncheckedIndexInLoop,
+    DefaultNumericFallbackLen,
+    RefcellBorrowAcrossCall,
+    ProcessExit,
+    PrintInLib,
+    LockUnwrap,
 }
 
 /// Which workspaces a lint is for.
@@ -620,6 +642,7 @@ impl Lint {
         Lint::UntiedChild,
         Lint::UnboundedTestWait,
         Lint::ReadsPositions,
+        Lint::AbsolutePosition,
         Lint::CborFieldOrder,
         Lint::GappedLiteral,
         Lint::Retry,
@@ -632,6 +655,23 @@ impl Lint {
         Lint::LockOrder,
         Lint::LockAcrossWait,
         Lint::TruncatingCast,
+        Lint::PartialWrite,
+        Lint::PartialCmpUnwrap,
+        Lint::UnboundedRead,
+        Lint::LenMinus,
+        Lint::StrByteSlice,
+        Lint::Forget,
+        Lint::PathToStrUnwrap,
+        Lint::DetachedThread,
+        Lint::UnboundedChannel,
+        Lint::Transmute,
+        Lint::CloneToSatisfy,
+        Lint::UncheckedIndexInLoop,
+        Lint::DefaultNumericFallbackLen,
+        Lint::RefcellBorrowAcrossCall,
+        Lint::ProcessExit,
+        Lint::PrintInLib,
+        Lint::LockUnwrap,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -794,8 +834,9 @@ impl Lint {
             | Lint::UntiedChild
             | Lint::UnboundedTestWait
             // Rule keys-cover-every-input for the front end: a query reads positions only in a
-            // function marked `#[blaze::renders_positions]`.
+            // function marked `#[blaze::renders_positions]`, and a key or record holds none.
             | Lint::ReadsPositions
+            | Lint::AbsolutePosition
             // blaze-api's deterministic CBOR: a `#![blaze::canonical_cbor]` type declares its
             // fields in their keys' order.
             | Lint::CborFieldOrder
@@ -810,7 +851,25 @@ impl Lint {
             | Lint::ProcessStatic
             // The wrapping operations `as_cast`'s fix writes: a list of places to decide,
             // allowed in blaze's ratchet too.
-            | Lint::TruncatingCast => Kind::Internal,
+            | Lint::TruncatingCast
+            // The std mistakes: internal while each is proved on blaze's own tree.
+            | Lint::PartialWrite
+            | Lint::PartialCmpUnwrap
+            | Lint::UnboundedRead
+            | Lint::LenMinus
+            | Lint::StrByteSlice
+            | Lint::Forget
+            | Lint::PathToStrUnwrap
+            | Lint::DetachedThread
+            | Lint::UnboundedChannel
+            | Lint::Transmute
+            | Lint::CloneToSatisfy
+            | Lint::UncheckedIndexInLoop
+            | Lint::DefaultNumericFallbackLen
+            | Lint::RefcellBorrowAcrossCall
+            | Lint::ProcessExit
+            | Lint::PrintInLib
+            | Lint::LockUnwrap => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -958,6 +1017,7 @@ impl Lint {
             Lint::UntiedChild => "untied_child",
             Lint::UnboundedTestWait => "unbounded_test_wait",
             Lint::ReadsPositions => "reads_positions",
+            Lint::AbsolutePosition => "absolute_position",
             Lint::CborFieldOrder => "cbor_field_order",
             Lint::GappedLiteral => "gapped_literal",
             Lint::Retry => "retry",
@@ -970,6 +1030,23 @@ impl Lint {
             Lint::LockOrder => "lock_order",
             Lint::LockAcrossWait => "lock_across_wait",
             Lint::TruncatingCast => "truncating_cast",
+            Lint::PartialWrite => "partial_write",
+            Lint::PartialCmpUnwrap => "partial_cmp_unwrap",
+            Lint::UnboundedRead => "unbounded_read",
+            Lint::LenMinus => "len_minus",
+            Lint::StrByteSlice => "str_byte_slice",
+            Lint::Forget => "forget",
+            Lint::PathToStrUnwrap => "path_to_str_unwrap",
+            Lint::DetachedThread => "detached_thread",
+            Lint::UnboundedChannel => "unbounded_channel",
+            Lint::Transmute => "transmute",
+            Lint::CloneToSatisfy => "clone_to_satisfy",
+            Lint::UncheckedIndexInLoop => "unchecked_index_in_loop",
+            Lint::DefaultNumericFallbackLen => "default_numeric_fallback_len",
+            Lint::RefcellBorrowAcrossCall => "refcell_borrow_across_call",
+            Lint::ProcessExit => "process_exit",
+            Lint::PrintInLib => "print_in_lib",
+            Lint::LockUnwrap => "lock_unwrap",
         }
     }
 
@@ -1096,6 +1173,7 @@ impl Lint {
             Lint::UntiedChild => concat!(docs!(), "#untied_child"),
             Lint::UnboundedTestWait => concat!(docs!(), "#unbounded_test_wait"),
             Lint::ReadsPositions => concat!(docs!(), "#reads_positions"),
+            Lint::AbsolutePosition => concat!(docs!(), "#absolute_position"),
             Lint::CborFieldOrder => concat!(docs!(), "#cbor_field_order"),
             Lint::GappedLiteral => concat!(docs!(), "#gapped_literal"),
             Lint::Retry => concat!(docs!(), "#retry"),
@@ -1104,6 +1182,23 @@ impl Lint {
             Lint::NarrowedLen => concat!(docs!(), "#narrowed_len"),
             Lint::ProcessStatic => concat!(docs!(), "#process_static"),
             Lint::TruncatingCast => concat!(docs!(), "#truncating_cast"),
+            Lint::PartialWrite => concat!(docs!(), "#partial_write"),
+            Lint::PartialCmpUnwrap => concat!(docs!(), "#partial_cmp_unwrap"),
+            Lint::UnboundedRead => concat!(docs!(), "#unbounded_read"),
+            Lint::LenMinus => concat!(docs!(), "#len_minus"),
+            Lint::StrByteSlice => concat!(docs!(), "#str_byte_slice"),
+            Lint::Forget => concat!(docs!(), "#forget"),
+            Lint::PathToStrUnwrap => concat!(docs!(), "#path_to_str_unwrap"),
+            Lint::DetachedThread => concat!(docs!(), "#detached_thread"),
+            Lint::UnboundedChannel => concat!(docs!(), "#unbounded_channel"),
+            Lint::Transmute => concat!(docs!(), "#transmute"),
+            Lint::CloneToSatisfy => concat!(docs!(), "#clone_to_satisfy"),
+            Lint::UncheckedIndexInLoop => concat!(docs!(), "#unchecked_index_in_loop"),
+            Lint::DefaultNumericFallbackLen => concat!(docs!(), "#default_numeric_fallback_len"),
+            Lint::RefcellBorrowAcrossCall => concat!(docs!(), "#refcell_borrow_across_call"),
+            Lint::ProcessExit => concat!(docs!(), "#process_exit"),
+            Lint::PrintInLib => concat!(docs!(), "#print_in_lib"),
+            Lint::LockUnwrap => concat!(docs!(), "#lock_unwrap"),
             Lint::LoopTurnEffects | Lint::SyncOnAnswerPath => {
                 concat!(general_docs!(), "#loop_turn_effects-sync_on_answer_path")
             }
@@ -1193,6 +1288,9 @@ impl Lint {
             Lint::ReadsPositions => {
                 "read the position-free fact instead (the body, `ExpressionStore::is_synthesized`, the outline, the item index), or mark the function `#[blaze::renders_positions]` when what it makes is about where code is written (a diagnostic's words, debug info, an IDE lookup); else `#[expect(blaze::reads_positions, reason = \"<what must change>\")]`"
             }
+            Lint::AbsolutePosition => {
+                "hold the position item-relative (the item by key with `blaze_format::SpanRef` or `blaze_format::RelSpan`; in the process a `blaze_core::site::Site`) and make `file:line:column` only where it is printed, from the item's start; or, for a value that is shown and never a key, say why with `#[expect(blaze::absolute_position, reason = \"..\")]`"
+            }
             Lint::CborFieldOrder => {
                 "declare the fields in their keys' order, shorter key first, then bytewise (`blaze check --fix` moves each field whole; review the reorder when the type derives `PartialOrd`, `Ord` or `Hash`, whose derived order follows the declaration); or say why the declaration order must stay with `#[expect(blaze::cbor_field_order, reason = \"..\")]`"
             }
@@ -1228,6 +1326,57 @@ impl Lint {
             }
             Lint::TruncatingCast => {
                 "where a value that doesn't fit is a bug, convert with `T::try_from(x)` and a typed error naming the thing; where wrapping is meant, say why with `#[expect(blaze::truncating_cast, reason = \"..\")]`"
+            }
+            Lint::PartialWrite => {
+                "call `write_all`, which writes every byte or returns the error; where the count is the point, loop on it until the buffer is written"
+            }
+            Lint::PartialCmpUnwrap => {
+                "compare with `total_cmp`, or refuse NaN before the comparison with a typed error naming the value"
+            }
+            Lint::UnboundedRead => {
+                "bound the read (`.take(limit)`, a checked `metadata().len()`) and refuse the input past the limit, or say what bounds it with `#[expect(blaze::unbounded_read, reason = \"..\")]`"
+            }
+            Lint::LenMinus => {
+                "`checked_sub` with a typed error naming both lengths, a check before that the length is the larger, or `saturating_sub` where zero is the meant answer"
+            }
+            Lint::StrByteSlice => {
+                "`s.get(a..b)` or `split_at_checked` with the `None` handed on or refused with a typed error, or find the index with `char_indices`/`find` so it is on a boundary"
+            }
+            Lint::Forget => {
+                "end the `ManuallyDrop` with `drop`, `into_inner` or `take`, keep the `Box` with the owner that drops it, or say why the value lives for the process with `#[expect(blaze::forget, reason = \"..\")]`"
+            }
+            Lint::PathToStrUnwrap => {
+                "keep the `Path`/`OsStr` where the name goes back to the OS or into a key, `to_str().ok_or_else(..)?` with an error naming the path where UTF-8 is needed, `.display()` where it is shown"
+            }
+            Lint::DetachedThread => {
+                "keep the `JoinHandle` and `join` it, or spawn in `std::thread::scope`, which joins every thread it spawned"
+            }
+            Lint::UnboundedChannel => {
+                "make the channel bounded (`crossbeam_channel::bounded(n)`), so a full channel pushes back on its sender, or say what bounds it with `#[expect(blaze::unbounded_channel, reason = \"..\")]`"
+            }
+            Lint::Transmute => {
+                "use the safe function for the pair (`to_bits`, `from_bits`, `to_ne_bytes`, `from_ne_bytes`, `cast_signed`, `cast`), or say why no safe form exists with `#[expect(blaze::transmute, reason = \"..\")]`"
+            }
+            Lint::CloneToSatisfy => {
+                "borrow the value itself (`&x`, `x.method()`); where the borrow then conflicts, end the conflicting borrow first instead of copying the value"
+            }
+            Lint::UncheckedIndexInLoop => {
+                "iterate the items (`v.iter()`, `v.iter().enumerate()`, `v.iter().zip(w)`, `v.windows(n)`), or index with `get` and hand the `None` on"
+            }
+            Lint::DefaultNumericFallbackLen => {
+                "write the type the value is (`let mut n: usize = 0;`) and drop the casts"
+            }
+            Lint::RefcellBorrowAcrossCall => {
+                "end the guard before the call (`drop(guard)`, or a block around its use), or copy out what the call needs"
+            }
+            Lint::ProcessExit => {
+                "return from `main` (`-> ExitCode`, or `-> Result<(), E>` with a typed error) so destructors and flushes run; exit only in the binary's entry module, or say why with `#[expect(blaze::process_exit, reason = \"..\")]`"
+            }
+            Lint::PrintInLib => {
+                "hand the caller what it shows (a value, a typed error), take a `&mut impl Write`, or emit a `tracing` event; printing is the binary's choice, made in its entry module"
+            }
+            Lint::LockUnwrap => {
+                "use a lock that does not poison (`parking_lot::Mutex`, `blaze_core::lock::Lock`), or handle the `PoisonError`: `into_inner` where the data is still whole after a panic, a typed error naming the lock where it is not"
             }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
@@ -1574,6 +1723,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
         cbor_field_order::check(cx, adt);
+        absolute_position::check(cx, adt);
         program_lifetime::check(cx, adt);
         could_be_program_lifetime::check(cx, adt);
         default_policy::check_adt(cx, adt);
@@ -1660,6 +1810,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     unwired::check(cx, node);
     retry::check(cx, node);
     narrowed_len::check(cx, node);
+    std_mistakes::check_node(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);

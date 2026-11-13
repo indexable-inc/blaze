@@ -1,0 +1,9 @@
+{
+ "id": "H-in-process-host",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane in-process host (audit 2026-11-13 step 2)",
+ "task": "Serve a command in its own process with no daemon, and measure it against a daemon",
+ "do": "Put `[serve]\\nhost = \"process\"` in `$BLAZE_HOME/config.toml` (typed: `blaze_thin::host::Host`, read once by the thin client and by `cli::daemon::host`; \"daemon\" is the default). A certificate hit still answers in the thin client; a miss execs the engine, which runs `serve::once` (the daemon's engine on this thread, one in-process connection), stops and flushes, waits for the history's last flush and exits dropping nothing. A daemon already running for that home is refused by name (`blaze stop` first). Shared repro cases (`Case::new` in crates/blaze-engine/tests/repro.rs) follow the test process's own `[serve] host`; `Case::own` cases always use a daemon. Measure both side by side with `blaze run -q -p scripts --bin in_process -- '{\"project\": \"<dir>\", \"blaze\": \"<blaze>\", \"timeout_s\": 1800, \"edit\": {\"file\": \"<file>\", \"find\": \"<text once>\", \"replace\": [\"<other>\"]}, \"floor_ms\": {\"body\": 50}, \"work\": \"<dir not /tmp>\"}'` (fields: its DOC, or `selftest`).",
+ "why": "The audit's verdict (b) asks what no daemon costs; the mode and the script are where that number comes from, and neither is in a doc.",
+ "state": "current"
+}

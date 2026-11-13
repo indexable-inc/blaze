@@ -229,7 +229,7 @@ pub(crate) fn relocating<T>(table: &mut Relocation, f: impl FnOnce() -> T) -> T 
     stdx::lend(&RELOCATION, table, f)
 }
 
-/// Carries [`RELOCATION`] and [`ANONYMOUS`] with each job on a fiber across its waits
+/// Carries [`RELOCATION`] with each job on a fiber across its waits
 /// ([`blaze_query::carry`]), from the first scope on: a job that waits inside one resumes in
 /// it, wherever it resumes.
 fn carry_scopes() {
@@ -240,15 +240,10 @@ fn carry_scopes() {
             put: |it| stdx::lend::put_carried(&RELOCATION, Option::is_none, it),
             end: |it| stdx::lend::end_carried(&RELOCATION, it),
         });
-        blaze_query::carry(blaze_query::Carried {
-            take: || stdx::lend::take_carried(&ANONYMOUS, Option::is_none),
-            put: |it| stdx::lend::put_carried(&ANONYMOUS, Option::is_none, it),
-            end: |it| stdx::lend::end_carried(&ANONYMOUS, it),
-        });
     });
 }
 
-// Each access to `RELOCATION` or `ANONYMOUS` is a call of its own, never inlined: a job that
+// Each access to `RELOCATION` is a call of its own, never inlined: a job that
 // waits between two may resume on another thread, and an inlined access may reuse the address
 // of the first thread's slot (docs/v2/plan/design/may-suspend.md).
 
@@ -268,62 +263,6 @@ fn unrelocated(kind: Kind, index: u32) -> Option<Option<u64>> {
 #[inline(never)]
 fn in_scope() -> bool {
     RELOCATION.with(|slot| slot.borrow().is_some())
-}
-
-thread_local! {
-    /// What the [`anonymous`] scope this thread is in leaves out, if it is in one.
-    static ANONYMOUS: RefCell<Option<Anonymous>> = const { RefCell::new(None) };
-}
-
-/// What an [`anonymous`] scope writes as the empty name: every binding's and label's name, and
-/// for each path of the store (by its index in the store's paths) its first `blank[i]`
-/// segments, whose meaning the caller hashes as what they resolve to. A path past `blank` is
-/// written whole. Each literal expression of `slots` (raw expression ids, sorted) is written as
-/// a slot: its kind and type, not its value. A named lifetime that is one of `lifetimes` (the
-/// owner's lifetime parameters, its impl's or trait's first) is written as its index there.
-#[derive(Default)]
-pub(crate) struct Anonymous {
-    pub(crate) blank: Vec<u16>,
-    pub(crate) slots: Vec<u32>,
-    pub(crate) lifetimes: Vec<Name>,
-}
-
-/// Runs `f` with what [`Words`] writes anonymous as `it` says. Scopes do not nest. Only a
-/// write that is hashed, never read back, may be anonymous: it does not round-trip.
-pub(crate) fn anonymous<T>(it: &mut Anonymous, f: impl FnOnce() -> T) -> T {
-    carry_scopes();
-    stdx::lend(&ANONYMOUS, it, f)
-}
-
-/// Whether names of bindings and labels are written empty.
-#[inline(never)]
-pub(crate) fn names_blank() -> bool {
-    ANONYMOUS.with(|slot| slot.borrow().is_some())
-}
-
-/// How many leading segments of the store's path `at` are written empty.
-#[inline(never)]
-pub(crate) fn blank_segments(at: usize) -> usize {
-    ANONYMOUS.with(|slot| {
-        slot.borrow().as_ref().map_or(0, |it| it.blank.get(at).map_or(0, |&n| usize::from(n)))
-    })
-}
-
-/// The index of the lifetime `name` among the [`Anonymous::lifetimes`] of the scope this thread
-/// is in: `None` outside one, or for a name none of them has.
-#[inline(never)]
-pub(crate) fn lifetime_index(name: &Name) -> Option<u32> {
-    ANONYMOUS.with(|slot| {
-        let slot = slot.borrow();
-        let at = slot.as_ref()?.lifetimes.iter().rposition(|it| it == name)?;
-        Some(u32::try_from(at).expect("more than 2^32 lifetime parameters"))
-    })
-}
-
-/// `f` of the [`Anonymous::slots`] of the scope this thread is in, empty outside one.
-#[inline(never)]
-pub(crate) fn with_slots<T>(f: impl FnOnce(&[u32]) -> T) -> T {
-    ANONYMOUS.with(|slot| f(slot.borrow().as_ref().map_or(&[][..], |it| &it.slots[..])))
 }
 
 blaze_format::record! {
@@ -1581,7 +1520,7 @@ mod tests {
     }
 
     /// On a pool of one worker, two jobs (as two derives expanding for items of their own)
-    /// each enter a relocation and an anonymous scope of their own and park in them, the first
+    /// each enter a relocation scope of their own and park in it, the first
     /// on one key and the second on another; the keys end in the other order, so they resume
     /// on the one thread swapped. Each reads its own scopes after its wait, and the jobs after
     /// them none.
@@ -1595,8 +1534,8 @@ mod tests {
         use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
         use blaze_core::lock::Lock;
 
-        fn scopes_here() -> (Option<Option<u64>>, usize) {
-            (unrelocated(Kind::Struct, 0), blank_segments(0))
+        fn scopes_here() -> Option<Option<u64>> {
+            unrelocated(Kind::Struct, 0)
         }
 
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
@@ -1623,7 +1562,7 @@ mod tests {
                 run(
                     "the probe",
                     Box::new(|| {
-                        assert_eq!(scopes_here(), (None, 0), "a job came on in another's scopes")
+                        assert_eq!(scopes_here(), None, "a job came on in another's scopes")
                     }),
                 );
             };
@@ -1633,23 +1572,18 @@ mod tests {
                 pool.submit(
                     None,
                     move || {
-                        let own = (Some(Some(u64::from(mine) + 100)), mine as usize + 1);
-                        let mut table =
-                            Relocation::of(vec![(Kind::Struct, own.0.unwrap().unwrap())]);
-                        let mut blank =
-                            Anonymous { blank: vec![own.1 as u16], ..Anonymous::default() };
+                        let own = Some(Some(u64::from(mine) + 100));
+                        let mut table = Relocation::of(vec![(Kind::Struct, own.unwrap().unwrap())]);
                         relocating(&mut table, || {
-                            anonymous(&mut blank, || {
-                                assert_eq!(scopes_here(), own, "a job came on in another's scopes");
-                                waiting.fetch_add(1, Ordering::SeqCst);
-                                assert_eq!(
-                                    flights.get_or_run(on, || panic!("the test holds the key")),
-                                    Ok(round)
-                                );
-                                assert_eq!(scopes_here(), own, "a job resumed in another's scopes");
-                            })
+                            assert_eq!(scopes_here(), own, "a job came on in another's scopes");
+                            waiting.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(
+                                flights.get_or_run(on, || panic!("the test holds the key")),
+                                Ok(round)
+                            );
+                            assert_eq!(scopes_here(), own, "a job resumed in another's scopes");
                         });
-                        assert_eq!(scopes_here(), (None, 0), "a job kept scopes it left");
+                        assert_eq!(scopes_here(), None, "a job kept scopes it left");
                         order.lock().push(mine);
                         mine
                     },
@@ -1680,7 +1614,7 @@ mod tests {
             run(
                 "a later job",
                 Box::new(|| {
-                    assert_eq!(scopes_here(), (None, 0), "a job came on in its worker's scopes")
+                    assert_eq!(scopes_here(), None, "a job came on in its worker's scopes")
                 }),
             );
         }

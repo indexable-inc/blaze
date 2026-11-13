@@ -596,12 +596,6 @@ pub const RECORD_REVIEWED: &[Hook] = &[
               its crate's identity, which the record key hashes",
     },
     Hook {
-        package: "blaze-engine",
-        hook: "Holders",
-        why: "`Heaps` is the program's global allocator: where a value lives, never its bytes (AGENTS.md \
-              rule 25: no output depends on addresses)",
-    },
-    Hook {
         package: "blaze-history",
         hook: "Predict",
         why: "`History` predicts a node's time and peak for the plane's admission and critical path: \

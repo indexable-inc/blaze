@@ -330,7 +330,7 @@ mod tests {
         // A binary cargo built: rustc's own names for the shims, and the counting allocator's
         // `GlobalAlloc` impl as a trait path.
         let cargo_built = [
-            "<blaze_graph::arena::Counting<blaze_engine::heaps::Heaps> as core::alloc::global::GlobalAlloc>::realloc",
+            "<blaze_graph::arena::Counting<std::alloc::System> as core::alloc::global::GlobalAlloc>::realloc",
             "__rustc::__rust_realloc",
             "<blaze_query::db::reverse::Reverse>::add",
         ];

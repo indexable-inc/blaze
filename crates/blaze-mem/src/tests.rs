@@ -1687,23 +1687,6 @@ fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
 }
 
 #[test]
-fn frame_cancel_unwinds_its_task_and_says_so_until_the_outermost_task_ends() {
-    frame::task(Tag::Infer, |_| {
-        let unwound = std::panic::catch_unwind(|| frame::task(Tag::Mir, |_| frame::cancel()));
-        let payload = unwound.expect_err("a cancel unwinds");
-        assert!(payload.is::<frame::Cancelled>(), "its payload is `Cancelled`");
-        assert!(frame::cancelling(), "still inside the outer task");
-    });
-    assert!(!frame::cancelling(), "the outermost task has ended");
-}
-
-#[test]
-#[should_panic(expected = "frame::cancel outside any frame::task")]
-fn frame_cancel_outside_any_task_stops() {
-    frame::cancel();
-}
-
-#[test]
 fn chunks_refuse_a_numa_node_past_the_last() {
     assert!(matches!(
         chunks::set_thread_node(Some(chunks::MAX_NODES)),

@@ -41,10 +41,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    made, blaze stops. Skill: `compiler-correctness`.
 10. **proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` with blaze's own front end and run
     in Wasmtime; Cranelift never generates native code. Skill: `compiler-correctness`.
-11. **bump-allocate**: Don't allocate where a borrow, a fixed buffer or the caller's buffer does; where
-    an allocation is needed, allocate by lifetime and name the allocator (`Vec::new_in(frame)`, or
-    `Vec::new_in(Global)` for the global heap); never implied, and no comment stands in for it.
-    Skill: `memory-and-data`.
+11. **bump-allocate**: First, don't allocate where a borrow, a fixed buffer or the caller's buffer does;
+    second, where an allocation is needed, name its allocator in the code by lifetime
+    (`Vec::new_in(frame)`, or `Vec::new_in(Global)` for the global heap); never implied, and no `//
+    alloc:` comment stands in for it. Skill: `memory-and-data`.
 12. **standard-structures**: One standard structure per need (named `blaze_core::lock` locks, papaya and
     blaze_hash maps, crossbeam queues and channels, atomics). Skill: `runtime-code`.
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
@@ -61,12 +61,14 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 17. **ask-the-profile-first**: Answer why a build was slow, reran or used memory from its profile
     (`blaze explain`, `blaze debug sql`) before guessing or starting a new measurement. Skill:
     `debugging`.
-18. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome;
-    never an open loop or an uncapped spin. Skill: `runtime-code`.
+18. **bounded-progress**: Every loop that waits for progress has a bound and ends in a typed outcome; a
+    hang inside blaze, including the same work started again with nothing changed, is a bug the
+    watchdog turns into a typed failure and reports; never an open loop or an uncapped spin. Skill:
+    `runtime-code`.
 19. **errors-name-the-thing**: An error names the item it is about and the rule that refused it. Skill:
     `runtime-code`.
-20. **panics-fail-one-job**: A panic fails only its job, with a typed error; the daemon keeps serving
-    and the build keeps going. Skill: `runtime-code`.
+20. **panics-fail-one-job**: A panic fails only its job, with a typed error; the build keeps going, and
+    a `watch` session keeps serving. Skill: `runtime-code`.
 21. **keys-cover-every-input**: A key covers every input its value depends on; two values under one key
     is a typed refusal, and the fix is the key. Skill: `compiler-correctness`.
 22. **measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the exact tree it
@@ -89,7 +91,7 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 30. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
 31. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
-    (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
+    (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the driver and the
     runtime stay outside. Skill: `compiler-correctness`.
 32. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
@@ -99,14 +101,14 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
     one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
     build at a time. Skill: `build-and-test`.
-35. **fan-out-write-only**: Lanes only write code in the one integration directory and run nothing; the
-    main agent compiles and tests a lane's crate within minutes of its report, admits pieces one
-    lane at a time onto the last green head (the whole workspace check-compiles, test targets
-    included, or the head does not move), and measures on that green head; nothing is written on top
-    of code that has not compiled. Skill: `build-and-test`.
-36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
-    everything is tested at once; a worktree is the exception, for two lanes that must change the
-    same file or a variant tree; never `git stash`. Skill: `build-and-test`.
+35. **fan-out-write-only**: Lanes only write code and run nothing; the main agent compiles each lane's
+    piece within minutes of its report and admits it alone onto the last green head (the whole
+    workspace check-compiles, test targets included, or the head does not move); nothing is written
+    on top of code that has not compiled, and no new wave of lanes starts while the tree does not
+    compile. Skill: `build-and-test`.
+36. **worktree-per-lane**: Lanes write in the one integration directory, each in new files or in one
+    area's files no other lane touches; a worktree is the exception, for two lanes that must change
+    the same file or a variant tree; never `git stash`. Skill: `build-and-test`.
 37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
 38. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
@@ -135,18 +137,20 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     one) that says its outcome and its check; people follow tasks, not agents. Skill:
     `build-and-test`.
 48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane,
-    and start it now: a piece that can begin in parallel never waits in a list behind another; never
-    an agent for a piece that is small, dependent on another, or only reading. Skill:
-    `build-and-test`.
+    and start it now, with at most four lanes writing in one tree; a rewrite gets a fresh core in
+    new crates beside the old code, never many lanes editing the old code in place; never an agent
+    for a piece that is small, dependent on another, or only reading. Skill: `build-and-test`.
 49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
     unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or
     needed. Skill: `docs-and-scripts`.
-50. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure:
-    admission, the front end's release and the ceiling all decide on it. Skill: `memory-and-data`.
+50. **one-memory-measure**: Footprint, the number the kernel enforces, is the one memory measure blaze
+    reports, and the kernel's limit is the one ceiling; nothing admits, wounds, throttles or
+    releases work by memory. Skill: `memory-and-data`.
 51. **outputs-are-records**: What outlives its task (a query result, a compiled function, object code)
-    is a blaze-format record written once into the store and read in place through the store's
-    buffer pool; never a heap tree kept until something serializes it, and never an mmap of a store
-    file for the hot tier. Skill: `memory-and-data`.
+    is a blaze-format record written once into the store; a small record is read with pread into the
+    asking task's frame, a large plain array is mapped read-only, and the kernel's page cache is the
+    only cache; no private buffer pool, and never a heap tree kept until something serializes it.
+    Skill: `memory-and-data`.
 52. **cache-by-code-id**: A cache of a function's results is keyed by the function's code identity
     (`fn_info(&f).code_id`) and its arguments; nothing invalidates entries by hand. Skill:
     `memory-and-data`.
@@ -176,13 +180,13 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     reason it is that way, then fix that reason at its root, whatever it takes: a redesign, a
     language change, addition or removal. Skill: `changing-code`.
 60. **incremental-first**: Incremental builds come first: optimise and judge blaze by the edit loop
-    (no-op, comment, body edit, first edit, edit after restart, memory while warm); design so cold
-    builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
+    (no-op, comment, body edit, first edit, edit in a fresh process, memory between edits); design
+    so cold builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
     `perf-and-tracing`.
 61. **claims-from-evidence**: State as fact only what a tool call in this session showed (a query's
     rows, a command's output, the code read); anything else is said as a guess or as not measured,
-    never as a cause, a number or a status; a pass counts only with proof that the check ran. Skill:
-    `debugging`.
+    never as a cause, a number or a status; a pass counts only with proof that the check ran, and a
+    compile is no proof that the program runs. Skill: `debugging`.
 62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
     all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
     prove it on the real targets. Skill: `changing-code`.
@@ -191,22 +195,45 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     the annoyances for the area you are about to touch, and add a row as things happen, with who you
     are. Skill: `changing-code`.
 64. **simulate-first**: A test of anything stateful, incremental, concurrent or durable runs in the
-    deterministic simulation by default, in process, under many seeds; a real process, daemon or
-    kernel is used only for what the simulation cannot model, and a part that cannot run under
-    simulation is a sans-IO gap to close. Skill: `testing`.
-65. **granular-caching**: Every cache is keyed per item (a function, a type, an impl, a name), by that
-    item's own content and exactly what it read; a key at crate level is not acceptable, and a crate
-    is only a container entries are packed in. Skill: `compiler-correctness`.
+    deterministic simulation by default, in process, under many seeds; a real process or kernel is
+    used only for what the simulation cannot model, and a part that cannot run under simulation is a
+    sans-IO gap to close. Skill: `testing`.
+65. **granular-caching**: Every cache is keyed per item (a function, a type, an impl, a name) by a key
+    computed from text before the work it saves; a list of traced reads is kept only for outside
+    inputs (build scripts, proc macros, the environment); a key at crate level is not acceptable,
+    and a crate is only a container entries are packed in. Skill: `compiler-correctness`.
 66. **end-state-not-hill-climb**: Work toward the designed end state, never by climbing from fix to fix:
-    when an area needs a second fix for the same symptom, stop patching, write the end-state design
-    from first principles (with how the best existing systems do it), have it reviewed by someone
-    outside the work, and rebuild that part; a fast path bolted onto a slow default is the sign.
-    Skill: `changing-code`.
+    the second fix to one mechanism, or for one symptom, in a week stops all work on it until
+    someone outside the work has read its code and the best competing system's source and said
+    whether it should exist; then rebuild or delete it; a fast path bolted onto a slow default is
+    the sign. Skill: `changing-code`.
 67. **within-ten-percent-of-the-floor**: Design only what is within 10% of the theoretical best in time,
     memory and disk: a design states the floor of each operation it serves (an oracle that redoes
     only what changed and its direct readers, plus the I/O nobody avoids) and its own cost against
     it, and every measurement reports the ratio; what cannot reach the floor is said plainly, not
     built around. Skill: `changing-code`.
+68. **proof-before-merge**: Nothing merges to main until a release blaze built from the exact merge
+    commit has run the hello-world smoke on blaze-vm (cold run, no-op, body edit, comment edit, each
+    under a timeout) and the result is quoted in the pull request; a compile check is not evidence
+    that it runs. Skill: `landing`.
+69. **every-command-has-a-timeout**: Every command an agent runs (a build, a test, a blaze, a VM job)
+    has a timeout sized to its expected time, and on expiry prints the status or stall line; a
+    timeout is a finding to report, never a hang to wait out or a run to retry with a longer limit.
+    Skill: `build-and-test`.
+70. **no-state-between-requests**: State lives in records on disk: a command's process answers and
+    exits, nothing is kept between requests that is not a record, and `watch` and live runs are the
+    same binary staying alive, holding only what a restart could rebuild from records. Skill:
+    `memory-and-data`.
+71. **item-relative-positions**: Positions are item-relative in every key and record (the item's path
+    and a line and column from its start), and absolute (`file:line:col`) only when printed or
+    emitted; an edit above an item moves nothing keyed by it. Skill: `compiler-correctness`.
+72. **edit-rust-by-syntax**: Edit Rust only with the edit tools or a syntax-aware tool (`ast-grep`,
+    `blaze check --fix`/`--replace`); never a shell heredoc, `sed`, `awk`, or a script that writes
+    Rust as text. Skill: `changing-code`.
+73. **type-then-lint-then-rule**: Make a mistake impossible before you forbid it: first a type or a
+    signature that cannot express it, then a lint with an autofix, and only then a rule in this
+    file; before adding a lint, list the existing lints that cover the same mistake. Skill:
+    `changing-code`.
 
 ## Code Review Rules
 

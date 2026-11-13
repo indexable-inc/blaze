@@ -1,7 +1,6 @@
 //! The loop's pulse as threads outside it read it ([`Pulse`]), the judge of a loop that
-//! stopped turning ([`LoopWatch`]), the judge of a footprint against the daemon's memory
-//! ceiling ([`CeilingWatch`]) and the dedupe of the wait-for graph's stalls ([`StallWatch`]):
-//! sans-IO cores the stop's guard (`serve::stop`) drives.
+//! stopped turning ([`LoopWatch`]) and the dedupe of the wait-for graph's stalls
+//! ([`StallWatch`]): sans-IO cores the stop's guard (`serve::stop`) drives.
 //!
 //! The loop is the one thread that reaps the daemon's children and hands their completions on
 //! (blaze-core's drivers reap a child only as their `poll` sees it exit). A loop stuck inside a
@@ -200,74 +199,6 @@ impl LoopWatch {
     }
 }
 
-/// What one look at the daemon's footprint against its memory ceiling found
-/// ([`CeilingWatch::look`]).
-#[cfg(all(unix, feature = "native"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CeilingLook {
-    /// Under the ceiling, and no nearer or further than the last look said.
-    Under,
-    /// Within 1/8 of the ceiling, the first look so since it was last under 3/4 of it: said
-    /// once, so the log's last word on memory before a kill by the kernel says it was near.
-    Near,
-    /// Back under 3/4 of the ceiling after a look that said [`CeilingLook::Near`].
-    Eased,
-    /// Past the ceiling, the first look so since it was last at or under it: the driver purges
-    /// what the allocators keep freed (`raw::memory::purge`) and looks again at once. A freed
-    /// page the allocator keeps is no reason to end a daemon (a build died at 23.04 GiB with
-    /// 7.52 GiB of it freed and kept).
-    Purge,
-    /// Still past the ceiling after a purge: the daemon ends
-    /// ([`blaze_core::exit::Exit::MemoryCeiling`]).
-    Passed,
-}
-
-/// Judges the daemon's footprint against its ceiling, told both at each look: past it, the
-/// daemon ends; near it, or eased from near it, a line says so once. A ceiling of 0 is none,
-/// and a footprint at the ceiling is not past it. Allocates nothing, so the guard may look
-/// every 100 ms (`serve::ceiling::EVERY`).
-#[cfg(all(unix, feature = "native"))]
-#[derive(Debug, Default)]
-pub struct CeilingWatch {
-    /// The last look that was not under said near, and none has said eased since.
-    near: bool,
-    /// A look past the ceiling said purge, and none since was at or under it.
-    purged: bool,
-}
-
-#[cfg(all(unix, feature = "native"))]
-impl CeilingWatch {
-    /// One look: `footprint` the daemon's bytes as the system counts them
-    /// (`raw::memory::own_footprint`), `ceiling` its ceiling's (`serve::ceiling::ceiling`).
-    pub fn look(&mut self, footprint: u64, ceiling: u64) -> CeilingLook {
-        if ceiling == 0 {
-            self.near = false;
-            self.purged = false;
-            return CeilingLook::Under;
-        }
-        if footprint > ceiling {
-            if !std::mem::replace(&mut self.purged, true) {
-                return CeilingLook::Purge;
-            }
-            return CeilingLook::Passed;
-        }
-        self.purged = false;
-        let near = footprint >= ceiling - ceiling / 8;
-        let eased = footprint < ceiling / 4 * 3;
-        match (self.near, near, eased) {
-            (false, true, _) => {
-                self.near = true;
-                CeilingLook::Near
-            }
-            (true, _, true) => {
-                self.near = false;
-                CeilingLook::Eased
-            }
-            _ => CeilingLook::Under,
-        }
-    }
-}
-
 /// One stall as the dedupe tells two apart: a deadlock by its cycle's threads, sorted, and a
 /// convoy by its head, whatever it waits on and however many queue behind it.
 #[cfg(all(unix, feature = "native"))]
@@ -401,55 +332,6 @@ mod tests {
         for at in 0..100 {
             assert_eq!(watch.look(at * 10 * S, at), Look::Turning);
         }
-    }
-
-    const GIB: u64 = 1 << 30;
-
-    /// The guard's decision on a daemon's footprint against a ceiling of 48 GiB: under it, or
-    /// at it exactly, the daemon runs on; one byte past it, it purges, and still past it after
-    /// the purge, it ends. Near (42 GiB, 7/8) and back
-    /// under 3/4 (36 GiB) are each said once a crossing, never on every look. Make `look` never
-    /// say `Passed` and a daemon past its ceiling runs on; make it compare with `>=` and one
-    /// exactly at its ceiling is ended; make it skip the purge and one whose allocator only
-    /// kept freed pages is ended.
-    #[test]
-    fn a_footprint_past_its_ceiling_ends_the_daemon_and_near_it_is_said_once() {
-        let ceiling = 48 * GIB;
-        let mut watch = CeilingWatch::default();
-        let looks = [
-            GIB,
-            36 * GIB,
-            42 * GIB - 1,
-            42 * GIB,
-            45 * GIB,
-            ceiling,
-            40 * GIB,
-            36 * GIB,
-            35 * GIB,
-            30 * GIB,
-            47 * GIB,
-            ceiling + 1,
-            // The purge gave enough back.
-            ceiling,
-            ceiling + 1,
-            ceiling + 1,
-        ];
-        let said: Vec<CeilingLook> = looks.iter().map(|&at| watch.look(at, ceiling)).collect();
-        use CeilingLook::{Eased, Near, Passed, Purge, Under};
-        assert_eq!(
-            said,
-            [
-                Under, Under, Under, Near, Under, Under, Under, Under, Eased, Under, Near, Purge,
-                Under, Purge, Passed
-            ]
-        );
-        // No ceiling is no bound, whatever the footprint.
-        assert_eq!(CeilingWatch::default().look(u64::MAX, 0), Under);
-        // A tiny ceiling holds as a large one does.
-        let mut small = CeilingWatch::default();
-        assert_eq!(small.look(8, 8), Near);
-        assert_eq!(small.look(9, 8), Purge);
-        assert_eq!(small.look(9, 8), Passed);
     }
 
     fn convoy(head: u64, waiters: usize) -> Stall {

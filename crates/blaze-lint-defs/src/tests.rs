@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 132);
+    assert_eq!(blaze_lints().len(), 151);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -76,7 +76,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::not_latest_edition", ready::EDITION_SHIPS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
-        ("blaze::lossy_as", false),
+        ("blaze::as_cast", false),
         ("blaze::implicit_overflow", false),
         ("blaze::global_state", false),
         ("blaze::async_fn", false),

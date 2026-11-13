@@ -249,3 +249,21 @@ pub fn convert(x: u64) -> Result<u16, core::num::TryFromIntError> { Ok(x as u16)
     }
 }
 
+
+/// A length's subtraction `len_minus` reports is found once: by `len_minus` when both lints
+/// are on, by `implicit_overflow` alone when `len_minus` is off; one `len_minus` leaves alone
+/// (a check before it) stays `implicit_overflow`'s to judge.
+#[test]
+fn a_length_minus_is_found_once_with_len_minus_on() {
+    let main = r#"
+pub fn last(v: &[u32]) -> usize { v.len() - 1 }
+pub fn sub(a: u32, b: u32) -> u32 { a - b }
+"#;
+    let fixture = format!("{MINICORE}//- /src/lib.rs crate:main\n{}", main.trim_start_matches('\n'));
+    let both = lint(&fixture, "-A clippy::all --warn=blaze::implicit_overflow --warn=blaze::len_minus");
+    assert_eq!(both.matches("#len_minus").count(), 1, "{both}");
+    assert_eq!(both.matches("#implicit_overflow").count(), 1, "only `a - b`:\n{both}");
+    assert!(!both.contains("can't show `v.len() - 1`"), "{both}");
+    let alone = lint(&fixture, FLAGS);
+    assert!(alone.contains("can't show `v.len() - 1`"), "{alone}");
+}

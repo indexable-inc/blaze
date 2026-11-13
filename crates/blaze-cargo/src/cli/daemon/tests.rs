@@ -144,10 +144,7 @@ fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
         bugs: vec![bug(2), bug(1)],
         settings: vec![
             blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
-            blaze_api::Setting {
-                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
-                value: Some("80".to_owned()),
-            },
+            blaze_api::Setting { name: "BLAZE_EMIT".to_owned(), value: Some("obj".to_owned()) },
         ],
         builds: Vec::new(),
         downloads: Vec::new(),
@@ -161,7 +158,7 @@ fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
     assert_eq!(daemon["requests"], serde_json::json!([3, 7]));
     assert_eq!(
         daemon["settings"],
-        serde_json::json!({"BLAZE_DAEMON_MEMORY_GB": "80", "BLAZE_OPT": null})
+        serde_json::json!({"BLAZE_EMIT": "obj", "BLAZE_OPT": null})
     );
     assert_eq!(daemon["build"].as_str().map(str::len), Some(64), "the build's hash in hex");
 }
@@ -185,7 +182,7 @@ fn the_status_for_people() {
     };
     assert_eq!(
         status_lines(&status),
-        "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\nbugs: 0\n"
+        "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB\nbugs: 0\n"
     );
     let idle = Status {
         pid: 7,
@@ -204,21 +201,18 @@ fn the_status_for_people() {
     };
     assert_eq!(
         status_lines(&idle),
-        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nbugs: 0\n"
+        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B\nbugs: 0\n"
     );
     let told = Status {
         settings: vec![
-            blaze_api::Setting {
-                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
-                value: Some("80".to_owned()),
-            },
+            blaze_api::Setting { name: "BLAZE_EMIT".to_owned(), value: Some("obj".to_owned()) },
             blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
         ],
         ..idle.clone()
     };
     assert_eq!(
         status_lines(&told),
-        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nsettings: BLAZE_DAEMON_MEMORY_GB=80\nbugs: 0\n"
+        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B\nsettings: BLAZE_EMIT=obj\nbugs: 0\n"
     );
     let failed = Status {
         history: Some(
@@ -371,29 +365,24 @@ fn a_daemon_of_another_file_with_the_same_bytes_is_this_build() {
     assert_eq!(got, Builds::Same);
 }
 
-/// A daemon of this build told another memory limit than this command sets (the 80 GB daemon
-/// a client with `BLAZE_DAEMON_MEMORY_GB=100` built on, failing ten minutes in) is found from its
-/// Status alone, with the setting and both values, for the CLI to refuse before any request. A
-/// command that leaves the limit unset builds with the daemon's, `--memory-gb 80` included.
+/// A daemon of this build started with another setting than this command sets (a daemon of
+/// `BLAZE_OPT=2` a client with `BLAZE_OPT=3` would build on) is found from its Status alone,
+/// with the setting and both values, for the CLI to refuse before any request. A command that
+/// leaves the setting unset builds with the daemon's.
 #[test]
-fn a_daemon_started_with_another_limit_is_found_before_any_request() {
+fn a_daemon_started_with_another_setting_is_found_before_any_request() {
     let a = build(1, "/opt/blaze", 10);
-    let theirs = crate::serve::settings::of_daemon(
-        Some(&(80u64 << 30, "--memory-gb=80".to_owned())),
-        |_| None,
-    );
-    let ours = crate::serve::settings::of_client(|name| {
-        (name == crate::serve::MEMORY_VAR).then(|| "100".into())
-    });
+    let theirs = crate::serve::settings::of_daemon(|name| (name == "BLAZE_OPT").then(|| "2".into()));
+    let ours = crate::serve::settings::of_client(|name| (name == "BLAZE_OPT").then(|| "3".into()));
     let mut daemon = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
     let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &ours, || {
         panic!("hashed this blaze for an unchanged file")
     })
     .unwrap();
     let drift = vec![crate::serve::settings::Drift {
-        name: crate::serve::MEMORY_VAR.to_owned(),
-        theirs: Some("80".to_owned()),
-        ours: "100".to_owned(),
+        name: "BLAZE_OPT".to_owned(),
+        theirs: Some("2".to_owned()),
+        ours: "3".to_owned(),
     }];
     assert_eq!(got, Builds::Settings { pid: 77, drift });
     assert_eq!(
@@ -401,10 +390,10 @@ fn a_daemon_started_with_another_limit_is_found_before_any_request() {
         [Request::Status],
         "nothing but its Status is asked before the settings agree"
     );
-    for asked in [Some("80"), None] {
+    for asked in [Some("2"), None] {
         let mut same = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
         let ours = crate::serve::settings::of_client(|name| {
-            (name == crate::serve::MEMORY_VAR).then_some(asked).flatten().map(Into::into)
+            (name == "BLAZE_OPT").then_some(asked).flatten().map(Into::into)
         });
         assert_eq!(
             builds(&mut same, Path::new(SOCKET), &a.exe, &ours, || panic!("hashed")).unwrap(),

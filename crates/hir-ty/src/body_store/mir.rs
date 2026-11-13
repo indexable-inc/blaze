@@ -100,11 +100,93 @@ pub(super) fn calls_location_macro(db: &Db, body: &Body) -> bool {
     body.macro_calls().iter().any(|call| located(call.loc(db).def.kind))
 }
 
+/// The literal of expression `expr` of `owner`'s store as the program has it, when `line!()`
+/// or `column!()` made it: the expander writes a placeholder (hir-expand's
+/// `PLACE_PLACEHOLDER`), never the value, so a line added above the code changes no HIR body,
+/// and this is where it becomes the line or column the call is written at in the end
+/// (`written_place`, rustc's `expansion_cause`), of the suffix the expansion gave it. `Ok(None)`
+/// for any other expression. `Err` names a call written nowhere a place can be read (no
+/// file's text): a refusal, never a zero.
+///
+/// The one rule every reader of a literal's value takes for those two macros: MIR lowering
+/// where the value is a constant (a `const fn`, a `const` or `static`, `const { .. }`, a
+/// promoted borrow, a `#[track_caller]` function, a pattern, an `asm!` constant), the
+/// evaluator's literal fast path, a const generic's normal form and a MIR record's slot. MIR
+/// of a function that reads its `line!()` where the code runs takes none of this
+/// (`hir_ty_mir::mir::location::slots_lines`).
+#[blaze::renders_positions]
+pub fn placed_literal(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> Result<Option<hir_def::hir::Literal>, String> {
+    use hir_def::hir::Literal;
+    let store = ExpressionStore::of(db, owner);
+    let Expr::Literal(Literal::Uint(_, suffix)) = store.expr(expr) else { return Ok(None) };
+    let Some((call, line)) = place_call(db, owner, expr) else { return Ok(None) };
+    let name = if line { "line!" } else { "column!" };
+    let (at_line, at_column) = hir_expand::builtin::written_place(db, call)
+        // alloc: an error
+        .ok_or_else(|| format!("`{name}()` in {owner:?}: the call is not in its file's text"))?;
+    let value = if line { at_line } else { at_column };
+    Ok(Some(Literal::Uint(u128::from(value), *suffix)))
+}
+
+/// The `line!()` (`true`) or `column!()` (`false`) call whose placeholder the literal `expr`
+/// of `owner`'s store is, read from the source map without a position: `None` for any other
+/// expression. A reader that needs only what every place is (a `u32` of at least 1, so never
+/// a zero divisor) asks this, and so reads no line.
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion a literal came from is read off the unmoved source map, whose ids \
+              hold no line: the answer is the call, never where it is"
+)]
+pub fn place_call(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> Option<(hir_expand::MacroCallId, bool)> {
+    let store = ExpressionStore::of(db, owner);
+    if !matches!(store.expr(expr), Expr::Literal(hir_def::hir::Literal::Uint(..)))
+        || !calls_place_macro(db, store)
+    {
+        return None;
+    }
+    let file_id = match owner {
+        ExpressionStoreOwnerId::Body(def) => {
+            Body::unmoved_source_map(db, def).expr_syntax(expr).ok().map(|it| it.file_id)
+        }
+        _ => {
+            let (_, source_map) = ExpressionStore::with_source_map(db, owner);
+            source_map.expr_syntax(expr).ok().map(|it| it.file_id)
+        }
+    };
+    let call = file_id.and_then(|it| it.macro_file())?;
+    Some((call, place_macro(call.loc(db).def.kind)?))
+}
+
+/// Whether a macro `kind` is `line!` (`Some(true)`) or `column!` (`Some(false)`).
+fn place_macro(kind: MacroDefKind) -> Option<bool> {
+    match kind {
+        MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line) => Some(true),
+        MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Column) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `store` lowered a call of `line!` or `column!`: only then can an integer literal of
+/// it be a placeholder [`placed_literal`] gives the value of. Of its macro calls alone.
+pub fn calls_place_macro(db: &Db, store: &ExpressionStore) -> bool {
+    store.macro_calls().iter().any(|call| place_macro(call.loc(db).def.kind).is_some())
+}
+
 /// The location literals of `def`, for its records, with the address width of its crate's
 /// target, which their constants are made at.
 fn locations(db: &Db, def: DefWithBodyId) -> R<Locations<'_>> {
     let layout = db.target_data_layout(def.krate(db)).map_err(|error| error.to_string())?;
     Ok(Locations {
+        db,
+        owner: ExpressionStoreOwnerId::Body(def),
         store: Body::of(db, def),
         exprs: location_literals(db, def),
         word: layout.pointer_size().bytes_usize(),

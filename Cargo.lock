@@ -602,7 +602,6 @@ dependencies = [
  "intern",
  "ix-prof",
  "libc",
- "libmimalloc-sys",
  "lzma-rust2",
  "paths",
  "proc-macro-api",
@@ -940,8 +939,6 @@ dependencies = [
  "hir-ty-codegen",
  "intern",
  "ix-prof",
- "libmimalloc-sys",
- "llvm-sys",
  "lzma-rust2",
  "serde_json",
  "stdx",
@@ -1200,7 +1197,6 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-core",
- "blaze-format",
  "blaze-hash",
  "blaze-ids",
  "blaze-image",
@@ -1445,6 +1441,16 @@ dependencies = [
  "blaze-record",
  "blaze-report",
  "blaze-store-check",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-keyed"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-ids",
+ "blaze-rng",
  "hegeltest",
 ]
 
@@ -2224,6 +2230,7 @@ dependencies = [
  "blaze-screen",
  "libc",
  "stdx",
+ "toml",
  "tracing",
 ]
 
@@ -3020,12 +3027,6 @@ checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
 ]
-
-[[package]]
-name = "cty"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
 name = "darling"
@@ -4848,16 +4849,6 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
-dependencies = [
- "cc",
- "cty",
-]
 
 [[package]]
 name = "libzstd-rs-sys"

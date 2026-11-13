@@ -39,7 +39,6 @@ pub mod unstable_features;
 pub mod expr_store;
 mod heap;
 pub mod hir;
-pub mod item_hash;
 pub mod resolver;
 pub mod span_names;
 pub mod upvars;

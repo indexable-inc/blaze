@@ -141,7 +141,14 @@ pub fn send(client: &mut Client, wait: bool) -> Result<Option<PathBuf>, String> 
     if build == 0 || !cfg!(feature = "native") {
         return Ok(None);
     }
-    let request = rows(build)?;
+    // An engine served in this process (`[serve] host = "process"`) records this process's
+    // spans in its own history already, the client's with them: only what no span of the
+    // recorder can say, the stretch before the engine's `main` ([`handed`]), goes as named
+    // spans, so nothing is counted twice.
+    let request = match SERVED_HERE.load(Ordering::Relaxed) {
+        true => timed_only(build),
+        false => rows(build)?,
+    };
     let dir = std::env::var_os(PROFILE).filter(|it| !it.is_empty());
     let sent = match wait || dir.is_some() {
         true => answered(client, request),
@@ -150,6 +157,36 @@ pub fn send(client: &mut Client, wait: bool) -> Result<Option<PathBuf>, String> 
     sent.map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
     let Some(dir) = dir else { return Ok(None) };
     export(build, Path::new(&dir)).map(Some)
+}
+
+/// Whether the engine serves this command in this process ([`served_here`]).
+static SERVED_HERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The engine serves this command in this process (`serve::once`, `[serve] host = "process"`):
+/// its history records the process's own spans, so [`send`] sends only the named ones.
+pub fn served_here() {
+    SERVED_HERE.store(true, Ordering::Relaxed);
+}
+
+/// Build `build`'s client rows of a command served in its own process: the spans named by
+/// [`handed`] alone, with the command's start and end.
+fn timed_only(build: u64) -> Request {
+    let ended_ns = clock::mono_ns();
+    let (timed, started_ns) = match HANDED.get() {
+        // clone: a few named spans, once a command
+        Some((timed, started_ns)) => (timed.clone(), (*started_ns).min(began_ns())),
+        None => (Vec::new(), began_ns()),
+    };
+    Request::ClientRows {
+        pid: std::process::id(),
+        build,
+        timed,
+        events: Vec::new(),
+        folded: Vec::new(),
+        spans: Vec::new(),
+        ended_ns,
+        started_ns,
+    }
 }
 
 /// `request` sent on `client` and its answer waited for: an error the daemon said is the

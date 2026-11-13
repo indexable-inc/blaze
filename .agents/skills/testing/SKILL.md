@@ -15,15 +15,15 @@ hold. Pin a load-bearing one with a test named for the property.
 
 ## persisted-state-round-trips (rule 26)
 
-Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value
-is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build
-byte for byte, and a budget for restart to first answer. A file that another version of blaze can
-find (in the state directory, in a home, in `/tmp`) also has a test that a file of its previous
-layout is handled: refused by name with what to do, or read, or left alone under a name that carries
-its layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
-silently starts empty is a failure the daemon reports, naming why. A format that is written while
-blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point
-and checks the restore.
+Anything blaze persists (the store's records, the certificate, the profile history, and the daemon
+image while it exists; what a persisted value is, is `outputs-are-records`) has a test that restores
+it and checks the result equals a fresh build byte for byte, and a budget for a fresh process to
+first answer. A file that another version of blaze can find (in the state directory, in a home, in
+`/tmp`) also has a test that a file of its previous layout is handled: refused by name with what to
+do, or read, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive
+a version", lists each with its test. A restore that silently starts empty is a failure blaze
+reports, naming why. A format that is written while blaze runs and read after a crash also gets a
+DST (`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -71,7 +71,7 @@ proof is about what blaze compiles and not a hand-written copy; (3) each MIR tra
 correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
 translation validation (a checker, itself proved sound, that accepts each run's before and after),
 run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
-the front end's rules, and the daemon's state machines by refinement from their reference models
+the front end's rules, and the driver's state machines by refinement from their reference models
 (`invariants-are-stated`). Nothing counts as proved until Lean has checked it in the gate with only
 its allowed axioms and no `sorry`; `docs/v2/plan/invariants.md` gives each claim its level, and
 docs/v2/plan/design/formal-verification.md lists the trusted base (the Lean kernel, the semantics'
@@ -86,7 +86,7 @@ Default to the simulation. When you test behaviour over time (an edit after a bu
 crash, two requests at once, a file replaced under a watcher, a cache hit after a key change, a
 retry, a timeout), write the test against the sans-IO core driven by `blaze_core::sim::Sim` (virtual
 clock, simulated filesystem and network that can be slow, fail, tear or reorder, crashes at any
-step), not against a spawned daemon, real files, real sleeps or real threads. Such a test is
+step), not against a spawned blaze process, real files, real sleeps or real threads. Such a test is
 declarative (the steps and what must hold after each), runs under many seeds, prints the seed and
 the step on failure so it replays exactly, checks an oracle that states the invariant, and has a
 planted bug the oracle catches (`dst-not-review`). For incremental behaviour the shape is the

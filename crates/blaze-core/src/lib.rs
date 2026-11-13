@@ -93,6 +93,7 @@ pub mod reaped;
 pub mod shared;
 pub mod signal;
 pub mod sim;
+pub mod site;
 #[allow(
     unsafe_code,
     reason = "registered memory the drivers read into and write from by address, behind safe accessors"

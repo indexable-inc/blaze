@@ -153,8 +153,7 @@ pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, S
 /// The daemon's dev executables by every path a run starts them from (the path the link makes
 /// and the copy cargo runs it from, [`commit`]'s `runs_from`), and the host their runs attach
 /// through, made at the first one's link: one for the daemon's life ([`super::super::Shared`]).
-/// Nothing is ever taken out: a kept link image let go past its budget
-/// ([`crate::serve::job`]'s `kept link images evict`) drops the image, never its program here.
+/// Nothing is ever taken out.
 pub(crate) struct DevRuns {
     /// Where the host listens: the daemon's state directory's `inproc`.
     dir: PathBuf,

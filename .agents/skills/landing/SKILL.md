@@ -1,6 +1,6 @@
 ---
 name: landing
-description: "How a change gets to main: `land.py` and its merge gate, taking any open pull request or issue to done, and crediting people with `Co-authored-by:`. Load before committing, opening or finishing a pull request, or picking up someone else's."
+description: "How a change gets to main: the hello-world smoke run on blaze-vm with a release blaze of the exact merge commit, quoted in the pull request, before any merge; `land.py` and its merge gate; taking any open pull request or issue to done; and crediting people with `Co-authored-by:`. Load before committing, opening, merging (admin merges too) or finishing a pull request, or picking up someone else's."
 ---
 
 # Landing changes
@@ -10,8 +10,11 @@ description: "How a change gets to main: `land.py` and its merge gate, taking an
 ## land-through-pr (rule 37)
 
 Land small and often through a pull request: `python3 .github/scripts/land.py "what the branch
-does"` opens it, turns on auto-merge and waits for the merge gate (`--wait` resumes). Harnesses run
-after merge in the release train. Never push to main.
+does"` opens it, turns on auto-merge and waits for the merge gate (`--wait` resumes). Before the
+merge, the pull request quotes the smoke run of a release blaze built from its exact merge commit
+(`proof-before-merge`); the gate's compile and unit tests do not stand in for it, and an admin merge
+needs it as much as an automatic one. Harnesses run after merge in the release train. Never push to
+main.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
@@ -28,7 +31,46 @@ Name <id+login@users.noreply.github.com>` trailer for each of them and says wher
 
 See [docs/contributing.md#credit](../../../docs/contributing.md#credit).
 
+## proof-before-merge (rule 68)
+
+Nothing merges to main (through `land.py`, an admin merge, or a cut of the integration tree) until a
+release blaze built from the exact merge commit has run the smoke on blaze-vm and its result is
+quoted in the pull request. The exact merge commit is the branch merged into the main it will join,
+not the branch alone. The smoke is a hello-world in a fresh home, four steps: a cold `blaze run`, a
+no-op `blaze run`, a body edit then `blaze run`, a comment edit then `blaze run`. Each step runs
+under a timeout (`every-command-has-a-timeout`: minutes for the cold run, seconds for the rest) and
+counts only with exit status 0 and the program's own line, the new line after the body edit
+(`harness/v2/ran.py`). Quote, per step: the command, the wall time, the exit status and the line the
+program printed, with the commit and the binary's hash (`measure-the-exact-tree`). A change to build
+scripts, proc macros, C dependencies or the sandbox also runs `harness/v2/real_smoke.py` (how-to
+`real-smoke`). A step that fails or times out blocks the merge: fix it, never run it again hoping it
+passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this, and
+neither does a smoke of the branch before the merge or of another commit. A change that builds no
+binary (only docs or these rules) is exempt and says so in the pull request.
+
+See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
+
+## The smoke before a merge
+
+What `proof-before-merge` asks, step by step:
+
+1. Make the exact merge commit: the branch merged with the `origin/main` it will join, pushed as
+   a branch of its own (or the pull request's own merge ref).
+2. Build it once on blaze-vm: `ix shell blaze-vm --noninteractive -- timeout 1500
+   /root/loop.sh <that branch> <the smoke command>` (`loop.sh` checks the branch out, builds it,
+   installs to `/root/inst` and runs the command with `BLAZE=/root/inst/blaze`; how-to `H12`).
+   The binary must be the release profile's; say so with its hash. Send `loop.sh`'s whole
+   output to a file and read the file, never a `tail` of it (annoyance `onsave-1112-3`).
+3. The smoke command, in a fresh home and a fresh hello-world, each step under its own `timeout`:
+   `blaze run` cold (a few minutes), `blaze run` again (seconds: the no-op), a body edit that
+   changes the printed line then `blaze run` (seconds), a comment edit then `blaze run`
+   (seconds). Each counts only with exit 0 and the line the program prints after that step.
+4. On a timeout, take `blaze debug inspect` (or `blaze slow`) before the kill: that is the
+   finding, and the merge waits for its fix.
+5. Quote in the pull request, per step: the command, the wall time, the exit status, the printed
+   line, and the commit and binary hash.
 
 ## How landing works
 

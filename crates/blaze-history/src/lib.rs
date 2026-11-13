@@ -1,9 +1,9 @@
 //! Scheduling from history (docs/v2/plan/design/compile-time.md change 11,
 //! docs/v2/plan/design/compile-time.md): what each task took and held, by its kind and
 //! its key, predicts what the next task of that kind and key will take, for the plane's
-//! critical path (a node's cost, in nanoseconds of run time). Memory admission forecasts from
-//! one record of its own, `blaze_graph::admission::Peaks` (memory.md 4.3), not from here: a
-//! key's record keeps its last peak only for a reader of that key ([`History::record`]).
+//! critical path (a node's cost, in nanoseconds of run time). Nothing forecasts memory: the
+//! plane admits by threads alone and the kernel's limit is the one ceiling. A key's record
+//! keeps its last peak only for a reader of that key ([`History::record`]).
 //!
 //! - **By key** ([`table`]): a task key (`blaze_query::QueryKey::task_key`, a content hash)
 //!   has a record of 64 bytes of its last runs' times and its peak, in a table of fixed size
@@ -88,17 +88,13 @@ impl History {
 
     /// What a task of `kind` with `key` is predicted to take: its key's record where there is
     /// one, else its kind's. The cost is in nanoseconds for every task, so a request's costs
-    /// are of one unit. The peak is the key's last, 0 with no record of the key: admission
-    /// does not read it (`blaze_graph::admission::Peaks` is its record).
+    /// are of one unit.
     pub fn predict(&self, kind: TaskKind, key: Option<&Key>) -> Prediction {
         if let Some(record) = key.and_then(|key| self.keys.get(kind, key)) {
-            return Prediction {
-                cost: Some(record.ran_us().saturating_mul(1000)),
-                peak: record.peak,
-            };
+            return Prediction { cost: Some(record.ran_us().saturating_mul(1000)) };
         }
         let cost = self.times.get(kind).map_or(self.unseen_ns, |it| it.mean_ns);
-        Prediction { cost: Some(cost), peak: 0 }
+        Prediction { cost: Some(cost) }
     }
 
     /// A task of `kind` with `key` ran for `ran_ns` (its own run, not its wait) and held

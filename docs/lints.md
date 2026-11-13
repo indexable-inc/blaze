@@ -2375,6 +2375,41 @@ happens in a marked function at the edge.
 **Allowing it.** `#[expect(blaze::reads_positions, reason = "<what must change>")]` on the
 function.
 
+## `absolute_position`
+
+**The rule.** A position that reaches code, a cache key or a kept value is item-relative: the
+item by key and an offset or index in it (`blaze_format::SpanRef`, `blaze_format::RelSpan`, an
+anchor-relative `span::Span`). The absolute `file:line:column` is made only where it is printed,
+from where the item starts now (rules `keys-cover-every-input` and `granular-caching`). The other
+half of `reads_positions`: that lint finds a query that reads a position, this one a value that
+holds one.
+
+**What it catches.** In blaze's workspace, outside tests, macro output and the text layer
+(`text_size`, `line_index`, `rowan`, `syntax`, `syntax_tree`, `parser`, `span`, `tt`, `mbe`, the
+`ide` crates, `blaze_fmt`), by name resolution and types: a field of a struct, or of an enum's
+variant, whose type implements `Hash`, serde's `Serialize` or `Deserialize`, or `blaze_format`'s
+`Record` or `Persist` (derived or by hand), that is or holds (through references, tuples, arrays
+and type arguments) a `core::panic::Location`, a `text_size::TextRange`, a `line_index::LineCol`
+or `WideLineCol`, or `hir_expand`'s `FileRange` or `FilePosition`; and anywhere, a field that
+holds a `core::panic::Location` by value. Not found: `TextSize` (a length or an offset into any
+text as often as into a file), a bare `u32` line (no type tells it from a count), the position
+types' own definitions, and a `&'static Location` in a value that is neither hashed nor kept,
+which is the link's record by reference.
+
+**Why it matters.** A line added above a function changes every absolute position below it, so
+a key, record or identity holding one moves although the code did not change, and what it keys
+is made again. In code blaze builds a `Location` is the record the link places for one span of
+one item and patches in place after a shift; a copy of it in a value goes stale under a live
+patch.
+
+**The fix.** Hold the item by key and the position within it; render where it is shown. In the
+process a site is `blaze_core::site::Site`, the link's record by reference, with no `Hash` and no
+`Ord`. No fix is applied for you: each item-relative type needs the item's anchor, which the code
+that fills the field supplies.
+
+**Allowing it.** `#[expect(blaze::absolute_position, reason = "..")]` on the type, for a value
+that is shown and never a key.
+
 ## `cbor_field_order`
 
 **What it catches.** In a module marked `#![blaze::canonical_cbor]` (or under one: the marker on
@@ -2565,3 +2600,210 @@ with no sort, and the lint did not see it.
 `BTreeMap` or in an ordered `Vec`.
 
 **Allowing it.** `#[expect(blaze::hash_order_output, reason = "..")]` on the item.
+
+## The std mistakes
+
+The calls of std's API that people and LLMs most often get wrong: each compiles, passes a quick
+test and fails on the input nobody tried (a short write, a NaN, a multi-byte character, a 4 GiB
+file, a thread nobody joins). Each lint is in `blaze::internal`, `deny` in blaze's workspace
+through the ratchet, and finds its call by what it resolves to and the types inference gave,
+never by its text. Test code is left alone. A fix is machine-applicable only where behaviour is
+the same or a panic becomes a refusal the code hands on; any other fix is offered, not made.
+Each place that is right says why with `#[expect(blaze::<lint>, reason = "..")]`.
+
+Already found by other lints: a swallowed error (`.ok()`, `let _ =`, `unwrap_or_default` of a
+`Result`, `if let Ok` with no `else`, `map_err(|_| ..)`, `filter_map(Result::ok)`, a `flatten`
+of `Result`s) is [`dropped_error`](#dropped_error); the ambient clock and `thread::sleep` are
+[`wall_clock`](#wall_clock); a `collect` only counted, tested for emptiness or iterated is
+[`collect_then_consume`](#collect_then_consume); `dbg!` is clippy's `dbg_macro`;
+`mem::forget` is `.clippy.toml`'s ban, which `forget` follows; a narrowing `try_from` of a
+length is [`narrowed_len`](#narrowed_len).
+
+## `partial_write`
+
+**The mistake.** `w.write(buf)?;` with the count thrown away. `write` may write part of the
+buffer (a pipe, a socket, a full disk) and says how much; the rest is lost without an error.
+
+**The right form.** `w.write_all(buf)?`. The fix renames the call, machine-applicable: the count
+was unused, and a short write becomes an error. A loop on the count is not a finding.
+
+## `partial_cmp_unwrap`
+
+**The mistake.** `a.partial_cmp(b).unwrap()` (or `.expect`) on floats, mostly as
+`v.sort_by(|a, b| a.partial_cmp(b).unwrap())`: one NaN panics the sort.
+
+**The right form.** `a.total_cmp(b)`, offered (it orders `-0.0` before `+0.0` and puts NaN
+last where the code panicked), or a typed refusal of NaN before the comparison.
+
+## `unbounded_read`
+
+**The mistake.** `read_to_end`, `read_to_string`, `fs::read`, `fs::read_to_string`,
+`Command::output`, `BufRead::lines` and `read_line` with no limit: whoever writes the input
+chooses how much memory the process takes. A reader through `.take(limit)` is not a finding.
+
+**The right form.** `reader.by_ref().take(limit).read_to_end(&mut buf)?` and a refusal when the
+limit is reached; `fs::metadata(path)?.len()` checked against a cap before `fs::read`; a child
+spawned with piped output read through `take`. No fix: the limit is the caller's.
+
+## `len_minus`
+
+**The mistake.** `v.len() - 1`, `buf.len() - header` in an unsigned type with no check before
+it that the length is the larger: a debug build panics, a release build wraps to near
+`usize::MAX`. The left side is std's `len` (resolved, never a name), called there or the
+initializer of an immutable local it names. Not a finding: a right side that is `0`; a right
+side `n.min(len)` or `min(n, len)`; a dominating guard, in an enclosing condition or an earlier
+statement (`assert!` included), that compares the same length with the same right side (same by
+resolution), checks `is_empty` for a literal right side, or calls `checked_sub` on the two.
+`implicit_overflow` leaves exactly these findings to this lint while it is on.
+
+**The right form.** `checked_sub` with a typed error naming both lengths, the check before, or
+`saturating_sub` where zero is meant. In a function returning `Option`, the fix
+`len.checked_sub(n)?` is offered.
+
+## `str_byte_slice`
+
+**The mistake.** `&s[a..b]` or `s.split_at(n)` on a `str` at an index nothing says is on a
+character boundary: it panics inside `é` or an emoji. Not findings, all decided by resolution:
+a constant index, std's `s.len()`, an index made by std's `find`, `char_indices`, `len_utf8`,
+`floor_char_boundary` and the like (directly or through the local it names), and an index a
+dominating `s.is_char_boundary(i)` on the same string and index checks (an enclosing condition
+or an earlier statement, `assert!` included).
+
+**The right form.** `s.get(a..b)` or `split_at_checked(n)` with the `None` handled. In a
+function returning `Option` the fix writes `s.get(a..b)?`, machine-applicable: the panic becomes
+a `None` handed on.
+
+## `forget`
+
+**The mistake.** A `ManuallyDrop::new(x)` the function throws away or never ends, hands on or
+drops; a `Box::leak` outside a `static`'s initializer for a type that is not
+`#[blaze::program_lifetime]`. What it holds is never given back.
+
+**The right form.** End it with `ManuallyDrop::drop`, `into_inner` or `take`; keep the `Box`
+with its owner. No fix.
+
+## `path_to_str_unwrap`
+
+**The mistake.** `Path::to_str().unwrap()` or `OsStr::to_str().unwrap()`, which panic on a name
+that is not UTF-8, and `to_string_lossy()` outside a `Display` or `Debug` impl, which changes
+such a name silently so it names another file or merges two keys.
+
+**The right form.** Keep the `Path` (`join`, `as_os_str`, `as_encoded_bytes`) where it goes back
+to the OS or into a key; `to_str().ok_or_else(..)?` with an error naming the path where UTF-8 is
+needed; `.display()` where it is shown. No fix.
+
+## `detached_thread`
+
+**The mistake.** `thread::spawn(..)` or `Builder::spawn(..)` whose `JoinHandle` is dropped or
+bound and never named: a panic in it is lost, and the process can exit with it half done.
+
+**The right form.** Keep the handle and `join` it, or `std::thread::scope`. A handle returned,
+passed or stored is not followed. No fix.
+
+## `unbounded_channel`
+
+**The mistake.** A channel with no bound: `mpsc::channel`, `crossbeam_channel::unbounded` (and
+through `crossbeam::channel`), tokio's `unbounded_channel`, `flume`, `async_channel`, `kanal`
+and `futures`' `unbounded`. A fast sender grows it until memory runs out. Reported through the
+`disallowed_methods` table under this lint; a configured entry for the same path wins.
+
+**The right form.** `crossbeam_channel::bounded(n)`, `mpsc::sync_channel(n)`, so a full channel
+pushes back. No fix: the bound is the author's.
+
+## `transmute`
+
+**The mistake.** `mem::transmute` or `transmute_copy`, which check only the sizes.
+
+**The right form.** std's safe function for the pair, which the fix writes, machine-applicable
+for numbers (each is defined as that transmute): `to_bits`, `f64::from_bits`, `cast_signed`,
+`cast_unsigned`, `to_ne_bytes`, `from_ne_bytes`, `u8::from(bool)`, `u32::from(char)`. Raw
+pointers get `p.cast()` offered (not for fat pointers). Every other pair: `bytemuck` or an
+`#[expect]` with its reason.
+
+## `clone_to_satisfy`
+
+**The mistake.** A clone of a `String`, `Vec`, `Box`, map, set or path only borrowed at once:
+`f(&x.clone())`, `x.clone().len()`. The whole value is copied for one read.
+
+**The right form.** Borrow it: `f(&x)`, `x.len()`. The fix of `&x.clone()` as an argument of a
+call that names `x` nowhere else is machine-applicable; the rest are offered, as the longer
+borrow may meet a later `&mut x`. `let y = x.clone();` used only by reference is not found
+(`redundant_clone` finds a clone never used again).
+
+## `unchecked_index_in_loop`
+
+**The mistake.** `for i in 0..v.len()` whose body only indexes `v[i]`, indexes another sequence
+`w[i]` with nothing saying it is as long, or reaches `v[i + k]` / `v[i - k]` past the range.
+
+**The right form.** `for item in v.iter()`, `v.iter().zip(w)`, `v.windows(k + 1)`, or `get`.
+The fix rewrites the plain shape (every use `v[i]` read, `&v[i]`, `v[i].f`, `v[i].m(..)`) to
+`for item in v.iter()`, machine-applicable when `v` is a local, offered when it is a field.
+
+## `default_numeric_fallback_len`
+
+**The mistake.** `let mut n = 0;` that inference makes an `i32`, then `n as usize` where it is
+used: a length or index in the wrong type, overflowing at 2^31.
+
+**The right form.** `let mut n: usize = 0;` and no casts, which the fix offers (an `i32` use of
+it would no longer compile, and a value below zero now underflows).
+
+## `refcell_borrow_across_call`
+
+**The mistake.** A `RefCell` guard held while the function borrows the same cell again (either
+borrow mutable), or calls something it hands the cell or what holds it (`self`): a
+`BorrowMutError` panic on re-entry. Within one function and by the cell's written place: a call
+reaching the cell through a global, a thread-local or another name of the `Rc` is not seen.
+
+**The right form.** End the guard first (`drop(g)`, a block), or copy out what the call needs.
+No fix.
+
+## `process_exit`
+
+**The mistake.** `std::process::exit` or `abort` outside a binary's entry module (its crate
+root): no destructor runs, so buffered writers, temporary files and lock files are left as they
+are, and a library ends a process it does not own. Reported through the `disallowed_methods`
+table; a configured entry for the same path wins, as blaze's own `.clippy.toml` bans both
+everywhere.
+
+**The right form.** Return from `main` (`-> ExitCode`, or `-> Result<(), E>` with a typed
+error); an `abort` where nothing can unwind says so with `#[expect]`. No fix.
+
+## `print_in_lib`
+
+**The mistake.** `print!`, `println!`, `eprint!` or `eprintln!` in library code (a library
+target, or a binary's modules but its crate root). The stream is the program's: it may be a
+pipe or a protocol one stray line breaks, and nothing can match on or silence a print. Where
+clippy's `print_stdout` or `print_stderr` is on, the place is left to it.
+
+**The right form.** Hand the caller what it shows (a value, a typed error), take a
+`&mut impl Write`, or emit a `tracing` event. No fix.
+
+## `lock_unwrap`
+
+**The mistake.** std's `Mutex::lock()`, `RwLock::read()` or `write()` then `.unwrap()` or
+`.expect(..)`: after one panic inside the guard the lock is poisoned and every later caller
+panics too. Only where no configured ban of the lock type reports it already (blaze's
+`.clippy.toml` bans std's locks for `blaze_core::lock`).
+
+**The right form.** A lock that does not poison (`parking_lot`, `blaze_core::lock`), or the
+`PoisonError` handled: `into_inner` where the data is whole after a panic, a typed error where
+it is not. No fix.
+
+## `dropped_error`
+
+**What it catches.** An error thrown away for a value: an `Err(_)` arm that makes a value,
+`.ok()`, `.unwrap_or(..)`, `.unwrap_or_default()`, `.unwrap_or_else(|_| ..)` and
+`.map_err(|_| ..)` of a `Result`, `let _ = <Result>`, `if let Ok(..)` with no `else`,
+`.filter_map(Result::ok)`, and `.flatten()` of an iterator of `Result`s. A place a clippy port
+reports when it is on (`unused_result_ok`, `map_err_ignore`, `let_underscore_must_use`) is left
+to it.
+
+**The right form.** Hand the error on with `?`, or keep it as the new error's source.
+
+## `wall_clock`
+
+**What it catches.** `Instant::now`, `SystemTime::now`, their `elapsed`, and `thread::sleep`,
+outside a module a `clippy.toml` entry's `allow-in` names (a driver).
+
+**The right form.** A core reads time from its injected clock and waits for a deadline on it
+(AGENTS.md rule 14); the driver reads the wall clock and sleeps.

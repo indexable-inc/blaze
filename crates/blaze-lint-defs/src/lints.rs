@@ -204,7 +204,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // In blaze-lints' `Lint::ALL` order (its discriminant), after the lints added before it.
     l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
         .externally_loaded(),
-    l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
+    l("blaze::as_cast", Allow, "detects every `as` cast, which says neither whether it loses value, sign or provenance nor how, and writes it as the operation it is: `From`, a named widening, truncation or sign change, a float conversion naming its rounding, or a pointer method")
         .externally_loaded(),
     l("blaze::implicit_overflow", Allow, "detects integer `+`, `-`, `*`, `<<`, `>>`, unary `-` and a value-losing `as` that blaze cannot show fit, whose meaning (a panic or a wrap) is the profile's; `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*` or `try_from` says which is meant")
         .externally_loaded(),
@@ -270,6 +270,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::reads_positions", Allow, "detects a function of the front end's query crates that reads where code is written (a source map, the live parse, an ast id's range) without being marked `#[blaze::renders_positions]`, so its result depends on every edit above it")
         .externally_loaded(),
+    l("blaze::absolute_position", Allow, "detects a field holding an absolute source position (a `core::panic::Location`, a `TextRange`, a `LineCol`, a `FileRange`) in a type that is hashed or persisted, or a `Location` copied into a field, so the key or record moves with every line added above the code")
+        .externally_loaded(),
     l("blaze::cbor_field_order", Allow, "detects a struct or struct variant deriving serde's `Serialize` in a `#![blaze::canonical_cbor]` module with its fields declared out of their keys' deterministic-CBOR order (shorter first, then bytewise), which makes the encoder sort and copy the map")
         .externally_loaded(),
     l("blaze::gapped_literal", Allow, "detects a string literal one line of which holds a run of eight or more spaces between two characters of its text: a lost `\\` line continuation, which prints the message with a gap")
@@ -291,6 +293,42 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::lock_order", Allow, "detects locks taken in a cycle: one function holds A while taking B and another holds B while taking A, through any call, which can deadlock two threads")
         .externally_loaded(),
     l("blaze::lock_across_wait", Allow, "detects a lock guard held across a call that blocks the thread (a condvar it is not handed, a channel, a sleep, a join, a blocking syscall), through any call")
+        .externally_loaded(),
+    l("blaze::truncating_cast", Allow, "lists each integer truncation and sign change (`truncate`, `cast_signed`, `cast_unsigned`, blaze-cast's `*_truncated_from_*`), which wraps a value that does not fit, for a decision: a typed error, a bound said with `expect`, or the wrap kept")
+        .externally_loaded(),
+    l("blaze::partial_write", Allow, "detects a call of `std::io::Write::write` whose count of bytes written is thrown away, so the bytes it did not write are lost without an error")
+        .externally_loaded(),
+    l("blaze::partial_cmp_unwrap", Allow, "detects `partial_cmp(..).unwrap()` or `.expect(..)` of two floats, which panics on the first NaN")
+        .externally_loaded(),
+    l("blaze::unbounded_read", Allow, "detects a read of std's that takes as much as its input holds (`read_to_end`, `read_to_string`, `fs::read`, `Command::output`, `lines`, `read_line`) with no `take` bound")
+        .externally_loaded(),
+    l("blaze::len_minus", Allow, "detects a length minus something in an unsigned type where nothing before it says the length is the larger, which underflows")
+        .externally_loaded(),
+    l("blaze::str_byte_slice", Allow, "detects a `str` sliced or split at a byte index nothing says is on a character boundary, which panics inside a multi-byte character")
+        .externally_loaded(),
+    l("blaze::forget", Allow, "detects a `ManuallyDrop` never dropped, taken apart or handed on, and a `Box::leak` outside a `static` or a `#[blaze::program_lifetime]` type")
+        .externally_loaded(),
+    l("blaze::path_to_str_unwrap", Allow, "detects `Path::to_str` or `OsStr::to_str` unwrapped, which panics on a name that is not UTF-8, and `to_string_lossy` outside display code, which changes it silently")
+        .externally_loaded(),
+    l("blaze::detached_thread", Allow, "detects a `thread::spawn` or `thread::Builder::spawn` whose `JoinHandle` is dropped or never named, so nobody joins the thread")
+        .externally_loaded(),
+    l("blaze::unbounded_channel", Allow, "detects a channel made with no bound (`mpsc::channel`, `crossbeam_channel::unbounded`, tokio's `unbounded_channel`, `flume::unbounded`), which a fast sender grows until memory runs out")
+        .externally_loaded(),
+    l("blaze::transmute", Allow, "detects `std::mem::transmute` and `transmute_copy`, which check nothing but the sizes, and writes std's safe function where one exists for the pair")
+        .externally_loaded(),
+    l("blaze::clone_to_satisfy", Allow, "detects a clone of a heap-owning value only borrowed at once (`&x.clone()`, `x.clone().len()`), which copies the whole value for a read")
+        .externally_loaded(),
+    l("blaze::unchecked_index_in_loop", Allow, "detects a `for i in 0..v.len()` loop that only indexes `v`, indexes another sequence with `i`, or indexes past the range with `i + k`/`i - k`")
+        .externally_loaded(),
+    l("blaze::default_numeric_fallback_len", Allow, "detects an integer literal binding that falls back to `i32` and is cast `as usize` where it is used: a length, count or index in the wrong type")
+        .externally_loaded(),
+    l("blaze::refcell_borrow_across_call", Allow, "detects a `RefCell` guard held while the function borrows the cell again or calls something handed the cell or what holds it, which panics on re-entry")
+        .externally_loaded(),
+    l("blaze::process_exit", Allow, "detects `std::process::exit` and `abort` outside a binary's entry module, which end the process with no destructor run and no buffer flushed")
+        .externally_loaded(),
+    l("blaze::print_in_lib", Allow, "detects `print!`, `println!`, `eprint!` and `eprintln!` in library code, which writes to a stream the caller owns")
+        .externally_loaded(),
+    l("blaze::lock_unwrap", Allow, "detects std's `Mutex::lock`, `RwLock::read` or `write` unwrapped, which turns one panic into a panic of every thread that takes the lock after it")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

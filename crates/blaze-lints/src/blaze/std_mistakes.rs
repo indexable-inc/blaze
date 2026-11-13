@@ -14,9 +14,11 @@ mod default_numeric_fallback_len;
 mod detached_thread;
 mod forget;
 mod len_minus;
+mod lock_unwrap;
 mod partial_cmp_unwrap;
 mod partial_write;
 mod path_to_str_unwrap;
+mod print_in_lib;
 mod refcell_borrow_across_call;
 mod str_byte_slice;
 #[cfg(test)]
@@ -27,8 +29,10 @@ mod unchecked_index_in_loop;
 
 use syntax::{
     SyntaxKind, TextRange,
-    view::{self as ast, AstNode as _, HasArgList as _},
+    view::{self as ast, AstNode as _, HasArgList as _, HasName as _},
 };
+
+pub(super) use len_minus::reported as len_minus_reported;
 
 use super::{Lint, test_code};
 use crate::{check::Cx, diag::Applicability};
@@ -48,6 +52,8 @@ const LINTS: &[Lint] = &[
     Lint::UncheckedIndexInLoop,
     Lint::DefaultNumericFallbackLen,
     Lint::RefcellBorrowAcrossCall,
+    Lint::PrintInLib,
+    Lint::LockUnwrap,
 ];
 
 /// Every node of a file: each lint looks at the kinds it finds and returns at once otherwise.
@@ -62,6 +68,7 @@ pub(super) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             | SyntaxKind::REF_EXPR
             | SyntaxKind::FOR_EXPR
             | SyntaxKind::LET_STMT
+            | SyntaxKind::MACRO_CALL
     ) {
         return;
     }
@@ -85,6 +92,8 @@ pub(super) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     unchecked_index_in_loop::check(cx, node);
     default_numeric_fallback_len::check(cx, node);
     refcell_borrow_across_call::check(cx, node);
+    print_in_lib::check(cx, node);
+    lock_unwrap::check(cx, node);
 }
 
 /// A fix of a finding: the parts it rewrites and how sure it is.
@@ -117,6 +126,19 @@ fn report<'t>(
         diagnostic.multipart_suggestion(message, parts, applicability);
     }
     diagnostic.help(lint.help()).help(format!("for further information visit {}", lint.docs_url()));
+}
+
+/// Whether `module` of the crate linted is library code: any module of a library target, and a
+/// binary's or example's modules but its crate root, the entry module, which may print to a
+/// person and end the process. A test, bench or build-script target is none. The one home of
+/// the rule `untyped_error`, `print_in_lib` and `process_exit` share.
+pub(crate) fn library_code(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
+    let db = cx.db();
+    match cx.krate().target_kind(db) {
+        base_db::TargetKind::Lib { .. } => true,
+        base_db::TargetKind::Bin | base_db::TargetKind::Example => !module.is_crate_root(db),
+        _ => false,
+    }
 }
 
 /// Whether `node` is test code, which most of these lints leave alone: a test's input is the
@@ -319,6 +341,164 @@ fn constant<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
         }
         _ => false,
     }
+}
+
+/// The text of `expr`, written at `range`, as the receiver of a method call: as written when it
+/// binds tighter than `.` (a path, a field, a call, an index, parentheses), else in
+/// parentheses (`(a - b).checked_sub(..)`, `(-x).to_bits()`, `(1.5).to_bits()`).
+fn receiver_text<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>, range: TextRange) -> String {
+    match expr {
+        ast::Expr::MethodCallExpr(_)
+        | ast::Expr::PathExpr(_)
+        | ast::Expr::FieldExpr(_)
+        | ast::Expr::CallExpr(_)
+        | ast::Expr::IndexExpr(_)
+        | ast::Expr::ParenExpr(_) => cx.snippet(range).to_owned(),
+        _ => format!("({})", cx.snippet(range)),
+    }
+}
+
+/// Whether `call` resolves to the method `name` of std's (core's, alloc's or std's own crate):
+/// `v.len()` of a `Vec`, a slice, a `str` or an `ExactSizeIterator`, never a user's `len`.
+fn std_method<'t>(cx: &Cx<'_, 't>, call: ast::MethodCallExpr<'t>, name: &str) -> bool {
+    let Some(f) = cx.method(call) else { return false };
+    let db = cx.db();
+    f.name(db).as_str() == name && f.module(db).krate(db).base().data(db).origin.is_lang()
+}
+
+/// Whether `a` and `b` are the same place, by resolution and types, never by text: the same
+/// local, `const` or `static`; the same field of the same place; the same resolved method or
+/// function of the same places; the same operator of the same places; equal literals.
+fn same_place<'t>(cx: &Cx<'_, 't>, a: ast::Expr<'t>, b: ast::Expr<'t>) -> bool {
+    let all = |a: Option<ast::ArgList<'t>>, b: Option<ast::ArgList<'t>>| {
+        let (mut a, mut b) = (a.into_iter().flat_map(|it| it.args()), b.into_iter().flat_map(|it| it.args()));
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return true,
+                (Some(a), Some(b)) if same_place(cx, a, b) => {}
+                _ => return false,
+            }
+        }
+    };
+    let both = |a: Option<ast::Expr<'t>>, b: Option<ast::Expr<'t>>| match (a, b) {
+        (Some(a), Some(b)) => same_place(cx, a, b),
+        _ => false,
+    };
+    match (strip(a), strip(b)) {
+        (ast::Expr::PathExpr(a), ast::Expr::PathExpr(b)) => {
+            let resolved = |it: ast::PathExpr<'t>| it.path().and_then(|it| cx.path(it));
+            match (resolved(a), resolved(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
+        (ast::Expr::FieldExpr(a), ast::Expr::FieldExpr(b)) => {
+            let named = match (a.name_ref(), b.name_ref()) {
+                (Some(a), Some(b)) => a.text() == b.text(),
+                _ => false,
+            };
+            named && both(a.expr(), b.expr())
+        }
+        (ast::Expr::MethodCallExpr(a), ast::Expr::MethodCallExpr(b)) => {
+            cx.method(a).is_some_and(|f| cx.method(b) == Some(f))
+                && both(a.receiver(), b.receiver())
+                && all(a.arg_list(), b.arg_list())
+        }
+        (ast::Expr::CallExpr(a), ast::Expr::CallExpr(b)) => {
+            called(cx, a).is_some_and(|f| called(cx, b) == Some(f)) && all(a.arg_list(), b.arg_list())
+        }
+        (ast::Expr::Literal(a), ast::Expr::Literal(b)) => a.syntax().text() == b.syntax().text(),
+        (ast::Expr::PrefixExpr(a), ast::Expr::PrefixExpr(b)) => {
+            a.op_kind().is_some_and(|op| b.op_kind() == Some(op)) && both(a.expr(), b.expr())
+        }
+        (ast::Expr::RefExpr(a), ast::Expr::RefExpr(b)) => {
+            a.mut_token().is_some() == b.mut_token().is_some() && both(a.expr(), b.expr())
+        }
+        (ast::Expr::IndexExpr(a), ast::Expr::IndexExpr(b)) => {
+            both(a.base(), b.base()) && both(a.index(), b.index())
+        }
+        (ast::Expr::BinExpr(a), ast::Expr::BinExpr(b)) => {
+            a.op_kind().is_some_and(|op| b.op_kind() == Some(op))
+                && both(a.lhs(), b.lhs())
+                && both(a.rhs(), b.rhs())
+        }
+        _ => false,
+    }
+}
+
+/// How many statements before a node, per enclosing block, [`dominated`] reads for a check.
+const LOOKED_BACK: usize = 32;
+
+/// How deep [`dominated`] follows a macro call's arguments into another macro call's.
+const MACRO_DEPTH: usize = 4;
+
+/// Whether a check `holds` finds dominates `node`: an expression of the condition of an
+/// enclosing `if` or `while`, of its match arm's guard, or of a statement before it in an
+/// enclosing block (the last [`LOOKED_BACK`]), each read as the typed tree, the expressions
+/// written in a macro call's arguments included (`assert!(n <= v.len())`). The walk stops at
+/// the enclosing function, closure, `const` or `static`.
+fn dominated<'t>(
+    cx: &Cx<'_, 't>,
+    node: ast::Node<'t>,
+    holds: &dyn Fn(ast::Node<'t>) -> bool,
+) -> bool {
+    let outside = |check: ast::Node<'t>| !check.text_range().contains_range(node.text_range());
+    let mut child = node;
+    for ancestor in node.ancestors().skip(1) {
+        let condition = match ancestor.kind() {
+            SyntaxKind::FN | SyntaxKind::CLOSURE_EXPR | SyntaxKind::CONST | SyntaxKind::STATIC => {
+                return false;
+            }
+            SyntaxKind::IF_EXPR => ast::IfExpr::cast(ancestor).and_then(|it| it.condition()),
+            SyntaxKind::WHILE_EXPR => ast::WhileExpr::cast(ancestor).and_then(|it| it.condition()),
+            SyntaxKind::MATCH_ARM => {
+                ast::MatchArm::cast(ancestor).and_then(|it| it.guard()).and_then(|it| it.condition())
+            }
+            SyntaxKind::STMT_LIST => {
+                let before = ancestor.children().take_while(|it| *it != child).count();
+                let skip = before.saturating_sub(LOOKED_BACK);
+                if ancestor.children().take(before).skip(skip).any(|it| checks(cx, it, holds, 0)) {
+                    return true;
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(condition) = condition
+            && outside(condition.syntax())
+            && checks(cx, condition.syntax(), holds, 0)
+        {
+            return true;
+        }
+        child = ancestor;
+    }
+    false
+}
+
+/// Whether `holds` finds a check in `scope` or in the expressions written in a macro call's
+/// arguments under it, `depth` macro calls deep.
+fn checks<'t>(
+    cx: &Cx<'_, 't>,
+    scope: ast::Node<'t>,
+    holds: &dyn Fn(ast::Node<'t>) -> bool,
+    depth: usize,
+) -> bool {
+    // alloc: a macro call's few arguments, one check's
+    let mut args = Vec::new();
+    for node in scope.descendants() {
+        if holds(node) {
+            return true;
+        }
+        let Some(call) = ast::MacroCall::cast(node) else { continue };
+        if depth >= MACRO_DEPTH {
+            continue;
+        }
+        cx.macro_args(call, &mut args);
+        if args.iter().any(|(_, it)| checks(cx, it.syntax(), holds, depth + 1)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the function `node` is in returns an `Option`, so `?` on one hands a `None` on.

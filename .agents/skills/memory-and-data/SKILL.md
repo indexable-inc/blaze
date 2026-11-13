@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: an owner per lifetime (a task's frame, reset per item in a long task; the store for what outlives it), footprint as the one measure, outputs as blaze-format records written once and read in place through the store's own buffer pool (vmcache-style: reserved address range, explicit io_uring/kqueue reads, MADV_DONTNEED/MADV_FREE_REUSABLE eviction, no mmap), persistence from one generic impl over `for const`, and caches keyed by code identity. Load before allocating in a task, adding a query result or anything persisted, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -14,27 +14,36 @@ First, don't allocate where a borrow, a fixed buffer or the caller's buffer does
 `write!` instead of `format!` or `to_string`; use an array for a small `vec![..]`; pass an iterator
 on instead of `collect()`. Where an allocation is needed, allocate by lifetime and name the
 allocator: a collection that lives within one task (a query run, a codegen unit, a maintainer pass)
-uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, longer
-lifetimes use the request, revision or image allocator, and the global heap is named `Global` where
-it is used (`Vec::new_in(Global)`, `Box::new_in(x, Global)`). An allocator is never implied
-(`Vec::new`, `vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`,
-`to_vec`, a `clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps
-nothing, and an item that must keep an implied allocator says why with
-`#[expect(blaze::implicit_allocator, reason = "..")]`. `blaze::implicit_allocator` enforces this,
-with a fix to the explicit `Global` form, and `blaze::hot_alloc` for what a call reaches;
-`scripts/src/bin/allocs.rs` holds each crate's `// alloc:` lines left to convert, its `expect`s and
-its lines naming `Global` to a list that only shrinks.
+uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, the request's
+lifetime uses the request's allocator, what outlives the request is a record and not heap
+(`outputs-are-records`), and the global heap is named `Global` where it is used
+(`Vec::new_in(Global)`, `Box::new_in(x, Global)`). An allocator is never implied (`Vec::new`,
+`vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a
+`clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and
+an item that must keep an implied allocator says why with `#[expect(blaze::implicit_allocator,
+reason = "..")]`. `blaze::implicit_allocator` enforces this, with a fix to the explicit `Global`
+form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's
+`// alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
+shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
 ## one-memory-measure (rule 50)
 
 The footprint (macOS `phys_footprint`, Linux's cgroup charge) is the one measure of blaze's memory,
-because it is the number the kernel enforces. Admission, the front end's release and the daemon's
-ceiling all read it, and nothing decides on resident or live bytes alone. Live bytes per tag say who
-holds memory; the gap between footprint and live is memory freed but kept (by an allocator, or
-purged in a way the kernel still counts) and is a bug to find an owner for, never a number to tune a
-threshold around.
+because it is the number the kernel enforces: every build reports it, per build and per task, beside
+live bytes per tag, and nothing reports resident bytes as the memory. The kernel's limit (the
+cgroup's, the machine's) is the one ceiling. Memory is kept small by design, not by control: a
+task's scratch is its frame, what outlives a task is a record on disk (`outputs-are-records`),
+nothing is held between requests (`no-state-between-requests`), and the pool is bounded by cores. So
+nothing admits a task by a forecast of its memory, wounds or preempts one, throttles commits through
+a gate, gives memory back on a ladder, or releases the front end at a threshold. The machinery that
+does this today (admission and its giveback, the machine ledger, wound-wait, blaze-mem's gate and
+budget, the mimalloc heap per tag in `heaps.rs` and the C malloc override in `malloc.rs`) is to be
+deleted: never extend it, and a change that seems to need it is a sign the structure it compensates
+for should go (`end-state-not-hill-climb`). Live bytes per tag say who holds memory; the gap between
+footprint and live is memory freed but kept and is a bug to find an owner for, never a number to
+tune a threshold around.
 
 See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
 
@@ -42,14 +51,14 @@ See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
 
 A value that outlives the task that made it (a query result, a compiled function, a unit's object
 code) is a blaze-format record: no pointer, position-independent, written once and read in place
-through its `Persist::Ref`. Where the store takes it, the task appends it to the store's pack with
-explicit I/O (io_uring on Linux, kqueue and the read threads on macOS, through blaze-core), and
-readers reach it through the store's buffer pool: one reserved address range with a fixed slot per
-page, a page loaded by an explicit read the task yields on (never a page fault that blocks the
-worker), and evicted by blaze's one evictor with `MADV_DONTNEED` (Linux) or `MADV_FREE_REUSABLE`
-(macOS), never plain `MADV_FREE`, which the kernel still counts. Records are immutable, so no page
-is ever dirty and eviction writes nothing. The hot tier never mmaps a store file: a fault there
-blocks a worker thread, eviction and write-back are the kernel's, and a failed read is a SIGBUS. A
+through its `Persist::Ref`. A small record is read with one `pread` into the asking task's frame and
+is gone when the task ends. A large plain array (a crate surface's tables, a file image, object
+code) is mapped read-only and read in place. The kernel's page cache is the only cache: blaze keeps
+no buffer pool, evictor or second copy of its own, so memory after a request is the kernel's to
+reclaim and counts nothing against blaze. Records are immutable and a store file is removed whole
+(pruned at start by what the roots name, under a byte cap), never truncated or rewritten while it
+can be mapped, so a mapping never faults past its end. The store's buffer pool, collector and
+tenants that exist today are to be deleted by the target design: do not put new outputs on them. A
 new persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on
 the struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until
 then a hand-written one names the generic impl's issue. Its round-trip test is the `testing`
@@ -70,6 +79,21 @@ cannot see through, a body that does not lower) is an error naming it, never a c
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
+## no-state-between-requests (rule 70)
+
+A command (`blaze build`, `run`, `check`, `test`) is one process: it checks the certificate, does
+the work on a pool bounded by cores, writes records and exits. Nothing is kept between requests that
+is not a record (`outputs-are-records`). `watch` and live runs (`run --live`) are the same binary
+staying alive: what they hold in memory (mapped pages, the edited crates' tables, interners and
+dense ids) is only what a restart could rebuild from records, so killing one loses nothing.
+Interners and dense ids live for the process, a task's scratch for the task (`bump-allocate`).
+Today's daemon breaks this: its query graph kept across requests, its warm tables, process statics
+and images are to be deleted by the target design. Do not add state to it or anything like it: a
+cache, a warm table, a memo kept for the next request, or a decision that depends on what an earlier
+request left in memory is written as a record instead, or kept inside `watch` as a copy a restart
+rebuilds. The test: kill the process between any two requests, and the next answer equals the
+uninterrupted one byte for byte (`persisted-state-round-trips`).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 ## The model
@@ -79,48 +103,53 @@ Every byte has an owner chosen by how long it lives, and what outlives a task is
 | What | Lives | Where it goes |
 |---|---|---|
 | Scratch of blaze's own code in a task | the task | the task's `Frame` (`blaze_mem::frame::task`), freed whole when the task ends |
-| A long task's scratch, item by item (a function in a codegen unit, a body in MIR) | one item | the task's frame, reset to a marker after each item, so the peak is one item's scratch |
-| A task's output: a query result, a compiled function, object code | past the task | a blaze-format record appended to the store's pack, read through the store's buffer pool |
-| Names, types, paths | the daemon | the interner's tables (`u32` IDs), regions blaze-mem owns |
-| Small, long-lived, rare | the daemon | the global heap (mimalloc), named where it is used: `Vec::new_in(Global)` |
+| A long task's scratch, item by item (a function, a body) | one item | the task's frame, reset to a marker after each item, so the peak is one item's scratch |
+| A small record a task reads | the task | one `pread` into the task's frame |
+| A large plain array (a crate surface's tables, a file image, object code) | while mapped | a read-only mapping of the store file; the kernel's page cache holds it |
+| A task's output: a body's results, an instance's code, object code | past the task | a blaze-format record written once to the store |
+| Names, types, paths | the process | the interner's tables (`u32` IDs) |
+| Small, long-lived, rare | the process | the global heap, named where it is used: `Vec::new_in(Global)` |
 | Constant text | the program | a `&'static str` (`concat!`, const_format), not `format!` into a `String` |
 
-Why the gap between footprint and live happens: memory goes back to the kernel a page at a time,
-and a page goes back only when every block on it is free. When a big unit's scratch shares pages
-(the same heap) with long-lived data, a few live blocks pin each page, and the freed scratch stays
-counted. Separating by lifetime (a frame reset per item, the store) is what lets a task's
-memory leave when it ends; a release call or a purge threshold cannot undo a mixed page.
+Nothing lives between requests but records (`no-state-between-requests`): a command's process
+exits, and `watch` holds only what a restart could rebuild from records.
 
-Why a buffer pool of our own and not mmap: the store's hot tier is one reserved address range (address
-space, not memory) with a fixed slot per page, so page `n` is at `base + n * page_size`: finding it is
-arithmetic plus one state word, an evicted page comes back at the same address (record views and
-relative references stay valid), and a record spanning pages is one contiguous slice. A miss is an
-explicit read (io_uring, kqueue) the task yields on, where an mmap fault would block the worker thread;
-blaze's evictor chooses what leaves and drops it with `MADV_DONTNEED` / `MADV_FREE_REUSABLE`, which take
-it out of the footprint at once (plain `MADV_FREE` does not); a failed read is an error for one task,
-not a SIGBUS. Records are immutable, so a page is never dirty and eviction never writes. A cold start
-may still map the daemon image. Prior art: vmcache (Leis et al., SIGMOD 2023), and "Are You Sure You
-Want to Use MMAP in Your DBMS?" (CIDR 2022) for why not mmap.
+Why the gap between footprint and live happens: memory goes back to the kernel a page at a time,
+and a page goes back only when every block on it is free. When a big task's scratch shares pages
+with long-lived data, a few live blocks pin each page, and the freed scratch stays counted.
+Separating by lifetime (a frame reset per item, records on disk, a process that exits) is what
+lets a task's memory leave when it ends; a release call or a purge threshold cannot undo a mixed
+page, and a gate that throttles commits only counts it.
+
+Why pread and read-only maps, and no pool of our own: the kernel's page cache already caches the
+store's files, shares them between processes and drops them under pressure without counting them
+against blaze. A private pool would be a second cache of the same bytes, with its own evictor to
+tune. A small record is cheaper to copy into the frame than to map. A large array of plain data is
+read in place from a read-only mapping. Store files are immutable and removed whole, so a mapped
+page is never dirty and never vanishes under a reader. Prior art: Relax's store (one file per
+crate version, a sorted index, payloads mapped).
 
 ## Checking it
 
 - Where memory went in a build: the `debugging` skill (counters, task peaks, the breakdown by tag).
-- The lint `blaze::implicit_allocator` asks every global allocation to say why; it judges the
-  call site, not the bytes, and cannot see vendored code. A comment is not the check: a task's
-  global-heap bytes are, per tag and task, from the counting allocator.
+- `blaze::implicit_allocator` refuses any allocation whose allocator is not named in the code,
+  with a fix to the explicit `Global` form; no comment keeps one. It judges the call site, not the
+  bytes, and cannot see vendored code: a task's global-heap bytes, per tag and task, are the
+  counting allocator's.
 - A new persisted type: a round-trip test (the `testing` skill), and `Persist` from the generic
   impl once it lands.
 
-## What exists and what is planned (2026-11-09)
+## What exists, and what the target deletes (2026-11-13)
 
-- Built: blaze-mem (frames, arenas, pools, regions, tags, `MADV_FREE_REUSABLE`); mimalloc 3 with
-  a heap per tag (`crates/blaze-engine/src/heaps.rs`), which C's and C++'s `malloc` (LLVM's) go
-  through too, counted to the running task's tag (`crates/blaze-engine/src/malloc.rs`: exported
-  symbols on Linux, a malloc zone made first on macOS); blaze-format (`Persist`, records read in
-  place); the daemon image and the store's packs read from mapped files; `for const` and
-  `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
-  `const_make_global`) in the const evaluator.
-- Planned: frame markers per item in long tasks (codegen, MIR); a per-task budget on global-heap bytes;
-  the generic `Persist` over `for const`; the store's buffer pool (vmcache-style) with codegen
-  outputs and query memos on it; native code from stencils, not Cranelift; `fn_info(&f).code_id`
-  answered by const eval; types from const code (`type_of!`, phase 3).
+- Kept: blaze-mem's frames (`frame.rs`); blaze-format (`Persist`, records read in place); `for
+  const` and `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
+  `const_make_global`) in the const evaluator; tags for reporting only.
+- Exists today and is deleted by the target design (accepted audit, 2026-11-13): mimalloc with a
+  heap per tag (`crates/blaze-engine/src/heaps.rs`) and the C malloc override
+  (`crates/blaze-engine/src/malloc.rs`); blaze-mem's gate and budget; admission, its giveback
+  and the machine ledger in blaze-graph; wound-wait; the store's buffer pool, collector and
+  tenants in blaze-cas, and blaze-gc; the daemon image. Do not extend any of these (`one-memory-measure`).
+- Planned: frame markers per item in long tasks; the generic `Persist` over `for const`; the
+  store in the target's form (small records by pread, plain arrays mapped, pruning at start by
+  roots under a byte cap); per-instance code records; `fn_info(&f).code_id` answered by const
+  eval; types from const code (`type_of!`, phase 3).

@@ -900,24 +900,10 @@ pub(super) struct FakeInputs {
     checkout: String,
 }
 
-/// The fakes' front end has no database: their images store no library trees. What it holds
-/// and gives back for memory is the give-back simulation's model of its checkout
-/// (`job::giving::sim`): nothing, unless a test says so.
+/// The fakes' front end has no database: their images store no library trees.
 impl KeptDb for FakeInputs {
     fn db(&self) -> Option<&base_db::Db> {
         None
-    }
-
-    fn held(&self) -> u64 {
-        super::job::giving::sim::held(&self.checkout)
-    }
-
-    fn values(&mut self) -> u64 {
-        super::job::giving::sim::values(&self.checkout)
-    }
-
-    fn give_values(&mut self, bytes: u64) -> u64 {
-        super::job::giving::sim::give(&self.checkout, bytes)
     }
 }
 
@@ -932,28 +918,25 @@ pub(super) struct FakeWriter {
 /// A shared reference to the inputs, as the loop posted a task with it.
 pub(super) struct FakeReader(Arc<FakeInputs>);
 
-/// A kept image as the kept images' budget sees it: what it weighs and whether a run maps it.
-/// The fakes' compiles link nothing, so only a test of the budget ([`super::job`]'s `Paths`)
-/// makes one.
-pub(super) struct FakeImage {
-    pub(super) held: u64,
-    pub(super) live: bool,
-}
+/// The fakes' kept image: their compiles link nothing, so there is none.
+pub(super) enum FakeImage {}
 
 impl Kept for FakeImage {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
-        Vec::new()
+        match *self {}
     }
 
     fn held(&self) -> u64 {
-        self.held
+        match *self {}
     }
 
     fn live(&self) -> bool {
-        self.live
+        match *self {}
     }
 
-    fn rest(&mut self) {}
+    fn rest(&mut self) {
+        match *self {}
+    }
 }
 
 impl Writer<Fake> for FakeWriter {
@@ -1682,7 +1665,6 @@ fn options() -> Options {
         reads: crate::serve::direct::Reads::Lent,
         socket: Some(name(SOCKET)),
         http: None,
-        budget: None,
         threads: 2,
         io: 2,
         env: vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/home/u".into())],
@@ -1697,7 +1679,6 @@ fn options() -> Options {
         #[cfg(unix)]
         activated: None,
         profiling: None,
-        machine: None,
         without: super::daemon::Without::default(),
         premises: super::daemon::Premises::of_this_process().expect("the test's own executable"),
         unheld: None,
@@ -5700,7 +5681,7 @@ fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
     assert!(!parse(&[]).unwrap().activated);
     let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
-    assert!(refused.contains("`--activated`, `--ready-fd N`, `--stall-bound SECS` and `--memory-gb GB`, not `--activated=yes`"), "{refused}");
+    assert!(refused.contains("`--activated`, `--ready-fd N` and `--stall-bound SECS`, not `--activated=yes`"), "{refused}");
 }
 
 #[test]
@@ -5755,29 +5736,6 @@ fn the_loops_wait_between_turns_is_a_wait_span_naming_what_ends_it() {
     );
 }
 
-/// The limit the daemon runs under: `--memory-gb` first, else `BLAZE_DAEMON_MEMORY_GB`, each a
-/// number of GiB above 0 (a fraction allowed), named as given; a text that is no such number is
-/// an error naming where it came from, never the machine's in its place.
-#[test]
-fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
-    use super::{MEMORY_VAR, told_limit, told_memory};
-    const GIB: u64 = 1 << 30;
-    let var = |it: &str| Some(std::ffi::OsString::from(it));
-    assert_eq!(told_limit(None, None).unwrap(), None);
-    assert_eq!(told_limit(None, var("48")).unwrap(), Some((48 * GIB, format!("{MEMORY_VAR}=48"))));
-    assert_eq!(
-        told_limit(None, var("1.5")).unwrap(),
-        Some((3 * GIB / 2, format!("{MEMORY_VAR}=1.5")))
-    );
-    let flag = told_memory("--memory-gb", "24").unwrap();
-    assert_eq!(flag, (24 * GIB, "--memory-gb=24".to_owned()));
-    assert_eq!(told_limit(Some(flag.clone()), var("48")).unwrap(), Some(flag), "the flag wins");
-    for bad in ["0", "-3", "abc", "", "inf", "NaN"] {
-        let error = told_limit(None, var(bad)).unwrap_err().to_string();
-        assert!(error.starts_with(MEMORY_VAR) && error.contains("GiB above 0"), "{bad:?}: {error}");
-    }
-}
-
 
 /// A test command line's environment: the test process's own `BLAZE_CORES`, as a real
 /// command's carries it (the daemon's budget is the process's, and the CLI compares the two
@@ -5789,8 +5747,8 @@ fn command_env() -> Vec<(String, String)> {
 }
 
 mod ahead;
-mod giving;
 mod first_look;
+mod in_process;
 mod launched_restart;
 mod solo;
 mod client_spans;

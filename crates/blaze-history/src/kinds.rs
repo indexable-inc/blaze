@@ -1,6 +1,5 @@
 //! Each kind's run time: the prediction for a task whose key has no record, or has none.
-//! Kinds are few and kept (never evicted). Their peaks are not kept here: admission's one peak
-//! record is [`blaze_graph::admission::Peaks`], by kind and size class.
+//! Kinds are few and kept (never evicted). Their peaks are not kept: nothing forecasts memory.
 
 use blaze_graph::admission::TaskKind;
 use blaze_hash::HashMap;

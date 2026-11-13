@@ -1,0 +1,11 @@
+{
+ "id": "control-stack-gone",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane fix-hello-1113 (the memory control stack's removal)",
+ "where": "crates/blaze-mem (gate, budget), crates/blaze-engine (heaps.rs, malloc.rs, huge.rs), crates/blaze-graph (admission's memory half, plane admission, giveback, ledger, lines, poolgive, pool tokens), crates/blaze-cargo/src/serve (machine.rs, ceiling.rs, the stop guard's ceiling watch, job/giving.rs, job/paused.rs, unit/release.rs, the plane driver's gate)",
+ "what": "Three failures of one area in one day on a cold hello-world on Linux: a SIGSEGV in mi_usable_size from the C malloc override (b0b5f6d08), a lowering wound and re-admitted 1,280 times in 45 s because the ledger's room left out the workers' overdrafts (6f4e24121), then the gate's 4096-slot table panicking and mimalloc's arena refusing 640 B with 4 of 8 GiB committed. Each fix exposed the next; none of the machinery freed a byte, it only counted, throttled and wound memory made by structures that should not exist (audit-1113 verdicts (c) and (e)).",
+ "cost": "main could not build hello-world on Linux for a day; three lanes of fixes",
+ "cause": "a control stack (per-tag mimalloc heaps in a 512 GiB reserved arena, a commit gate every page passed, wound-wait preemption, forecasts 500x low, a shared machine ledger, a give-back ladder, a self-imposed ceiling) compensating for tasks with unbounded memory instead of removing the cause",
+ "workaround": "removed, not patched (rule end-state-not-hill-climb): the global allocator is the system's malloc behind a thin counting wrapper (`blaze_graph::arena::Counting<System>`, per-tag and per-task bytes for the profile only); frames stay; a task starts when a worker of its pool is free; the kernel's limit is the ceiling, and a kernel refusal is a loud typed error. Removed names are banned in .clippy.toml. Do not bring back a gate, a forecast, a ledger or a ceiling watch: shrink what holds the memory instead (records, frames reset per item, processes that exit).",
+ "state": "fixed"
+}

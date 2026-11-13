@@ -14,7 +14,7 @@
 
 use syntax::view::{self as ast, AstNode as _, HasArgList as _};
 
-use super::{Fix, in_test, report, strip, unwrap_of};
+use super::{Fix, in_test, receiver_text, report, strip, unwrap_of};
 use crate::{blaze::Lint, check::Cx, diag::Applicability};
 
 const LINT: Lint = Lint::PartialCmpUnwrap;
@@ -48,7 +48,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             (Some(l), Some(r)) => Some(Fix {
                 message: "order by IEEE 754's total order, which puts NaN last and `-0.0` before `+0.0`",
                 // alloc: the fix's one part
-                parts: vec![(range, format!("{}.total_cmp({})", cx.snippet(l), cx.snippet(r)))],
+                parts: vec![(
+                    range,
+                    format!("{}.total_cmp({})", receiver_text(cx, lhs, l), cx.snippet(r)),
+                )],
                 applicability: Applicability::MaybeIncorrect,
             }),
             _ => None,

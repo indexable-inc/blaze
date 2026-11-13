@@ -88,7 +88,9 @@ fn lint_of(message: &str) -> Option<&'static str> {
         Some("untyped_error")
     } else if message.contains("` is iterated in its hasher's order") {
         Some("hash_order_output")
-    } else if message.starts_with("use of a disallowed method `std::time::") {
+    } else if message.starts_with("use of a disallowed method `std::time::")
+        || message.starts_with("use of a disallowed method `std::thread::sleep`")
+    {
         Some("wall_clock")
     } else {
         None

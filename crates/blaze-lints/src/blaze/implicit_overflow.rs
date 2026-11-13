@@ -19,7 +19,9 @@
 //!
 //! A shift is judged by its amount alone: `<<` drops high bits in every profile, and only an
 //! amount of the bits or more panics or masks. Arithmetic the code wrote inside a macro call's
-//! arguments is judged where it is written; what a macro made up is not.
+//! arguments is judged where it is written; what a macro made up is not. A length's
+//! subtraction that `len_minus` reports (`v.len() - n` with no check before it) is left to
+//! `len_minus` when that lint is on, so the place is found once, with the advice for a length.
 //!
 //! There is no fallback: a body that does not lower, or whose proof does not settle, has each
 //! of its operations found, saying so. The fix, machine-applicable, is offered in a function
@@ -138,6 +140,17 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
         if at.file_id != file && !outer.is_some_and(|it| it.contains_range(range)) {
             continue;
         }
+        // A length's subtraction `len_minus` reports, when it is on, is its finding alone, so
+        // the one place is found once (the one home of the rule is `len_minus::reported`).
+        if let Site::Binary { op: ArithOp::Sub, compound: false, .. } = site
+            && cx.on_blaze(Lint::LenMinus)
+            && at.file_id == file
+            && cx.in_file()
+            && let Some(node) = written_bin(cx.root(), range)
+            && super::std_mistakes::len_minus_reported(cx, node)
+        {
+            continue;
+        }
         let quote = |expr: ExprId| quoted(cx, analysis, expr);
         // The type the operation is of: a compound assignment's is its place's.
         let ty = match site {
@@ -208,6 +221,19 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
         found.push(Found { range, message, note: NOTE, fix });
     }
     found
+}
+
+/// The binary expression of `root`'s tree written exactly at `range`.
+fn written_bin(root: syntax::view::Node<'_>, range: TextRange) -> Option<syntax::view::Node<'_>> {
+    if !root.text_range().contains_range(range) {
+        return None;
+    }
+    let at = match root.covering_element(range) {
+        NodeOrToken::Node(node) => node,
+        NodeOrToken::Token(token) => token.parent()?,
+    };
+    at.ancestors()
+        .find(|it| it.kind() == syntax::SyntaxKind::BIN_EXPR && it.text_range() == range)
 }
 
 /// What `expr` is, when the lint judges it.

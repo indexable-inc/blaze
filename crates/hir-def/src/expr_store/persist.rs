@@ -66,8 +66,7 @@ use crate::{
         col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{
-            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, id_of_bits,
-            lifetime_index, names_blank, syntax_context, with_slots,
+            Code, Column, Node, Placed, Read, Words, WordsRec, id_of_bits, syntax_context,
         },
     },
     lang_item::LangItemTarget,
@@ -563,67 +562,6 @@ fn slice<'c, T>(
     hir.map_or(&[][..], column)
 }
 
-/// Writes the literal table of `hir`: a count, then each literal, or for one an [`anonymous`]
-/// scope's slots name, [`SLOT`] and its kind and type.
-///
-/// [`anonymous`]: crate::hir::persist::anonymous
-fn put_literals(w: &mut Words, hir: Option<&HirColumns<Frozen>>) {
-    let literals = slice(hir, |c| &c.literals[..]);
-    let slotted = with_slots(|slots| match hir {
-        Some(hir) if !slots.is_empty() => {
-            let mut at: SmallVec<[u32; 4]> = slots
-                .iter()
-                .map(|&raw| ExprId::from_raw(RawIdx::from_u32(raw)))
-                .filter(|&expr| hir.expr_kind_of(expr) == ExprKind::Literal)
-                .map(|expr| hir.expr_data[expr.into_raw().into_u32() as usize])
-                // alloc: the literal rows of a body's location macros, inline for a few
-                .collect();
-            at.sort_unstable();
-            at
-        }
-        _ => SmallVec::new(),
-    });
-    if slotted.is_empty() {
-        w.seq(literals.iter());
-        return;
-    }
-    w.len(literals.len());
-    for (at, literal) in (0u32..).zip(literals) {
-        match slotted.binary_search(&at) {
-            Ok(_) => put_slot(w, literal),
-            Err(_) => literal.put(w),
-        }
-    }
-}
-
-/// The tag a slot is written with in place of a literal's: past every literal kind's.
-const SLOT: u32 = 8;
-
-/// A literal a location macro expanded to, as its slot: [`SLOT`], its kind, and its type where
-/// it has one, never its value.
-fn put_slot(w: &mut Words, literal: &Literal) {
-    w.u32(SLOT);
-    match literal {
-        Literal::String(_) => w.u32(0),
-        Literal::ByteString(_) => w.u32(1),
-        Literal::CString(_) => w.u32(2),
-        Literal::Char(_) => w.u32(3),
-        Literal::Bool(_) => w.u32(4),
-        Literal::Int(_, ty) => {
-            w.u32(5);
-            ty.put(w);
-        }
-        Literal::Uint(_, ty) => {
-            w.u32(6);
-            ty.put(w);
-        }
-        Literal::Float(_, ty) => {
-            w.u32(7);
-            ty.put(w);
-        }
-    }
-}
-
 /// The cold side tables of [`HirColumns`], read back from the words.
 struct SideTables {
     names: Vec<Name>,
@@ -639,7 +577,7 @@ impl SideTables {
     fn put(w: &mut Words, hir: Option<&HirColumns<Frozen>>) -> u32 {
         let at = w.at();
         w.seq(slice(hir, |c| &c.names[..]).iter());
-        put_literals(w, hir);
+        w.seq(slice(hir, |c| &c.literals[..]).iter());
         w.seq(slice(hir, |c| &c.offset_ofs[..]).iter());
         w.seq(slice(hir, |c| &c.asms[..]).iter());
         w.seq(slice(hir, |c| &c.macro_defs[..]).iter());
@@ -692,20 +630,8 @@ impl TypeSide {
         let paths = &types.paths;
         w.seq(types.bounds.iter());
         w.len(paths.mod_paths.len());
-        for (at, path) in paths.mod_paths.iter().enumerate() {
-            match blank_segments(at) {
-                0 => path.put(w),
-                blank => {
-                    path.kind.put(w);
-                    w.len(path.segments().len());
-                    for (index, segment) in path.segments().iter().enumerate() {
-                        match index < blank {
-                            true => w.str(""),
-                            false => segment.put(w),
-                        }
-                    }
-                }
-            }
+        for path in paths.mod_paths.iter() {
+            path.put(w);
         }
         w.seq(paths.lang_items.iter());
         w.seq(paths.generic_args.iter());
@@ -1817,10 +1743,7 @@ impl Persist for Body {
 
 fn put_binding(binding: &Binding, w: &mut Words) -> u32 {
     let Binding { name, mode, problems, hygiene } = binding;
-    match names_blank() {
-        true => w.str(""),
-        false => w.put(name),
-    }
+    w.put(name);
     w.put(mode);
     w.put(problems);
     w.put(hygiene);
@@ -1833,10 +1756,7 @@ fn get_binding((): (), r: &mut Read<'_>) -> Result<Binding, FormatError> {
 
 fn put_label(label: &Label, w: &mut Words) -> u32 {
     let Label { name } = label;
-    match names_blank() {
-        true => w.str(""),
-        false => w.put(name),
-    }
+    w.put(name);
     0
 }
 
@@ -1847,13 +1767,7 @@ fn get_label((): (), r: &mut Read<'_>) -> Result<Label, FormatError> {
 fn put_lifetime(lifetime: &LifetimeRef, w: &mut Words) -> u32 {
     let kind = match lifetime {
         LifetimeRef::Named(name) => {
-            match lifetime_index(name) {
-                Some(at) => {
-                    w.str("");
-                    w.u32(at);
-                }
-                None => w.put(name),
-            }
+            w.put(name);
             LifetimeRefKind::Named
         }
         LifetimeRef::Static => LifetimeRefKind::Static,

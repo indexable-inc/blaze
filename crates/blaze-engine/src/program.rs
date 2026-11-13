@@ -25,13 +25,6 @@ pub fn main() -> ExitCode {
         blaze_report::errln!("error: {why}");
         return ExitCode::FAILURE;
     }
-    // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
-    // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
-    #[cfg(feature = "native")]
-    if let Err(why) = crate::malloc::check() {
-        blaze_report::errln!("error: {why}");
-        return ExitCode::FAILURE;
-    }
     // A bug blaze reports and goes on past (`stdx::assert::reported`) is said by the daemon in
     // `blaze status` and the profile; it doesn't change how this process exits, as it does a
     // test's.
@@ -109,12 +102,6 @@ pub fn main() -> ExitCode {
             Ok(0)
         }
         _ => {
-            #[cfg(feature = "native")]
-            crate::huge::no_hugetlb_for_mimalloc();
-            // Freed pages leave the footprint as they are freed, in the client and the
-            // daemon alike.
-            #[cfg(feature = "native")]
-            crate::heaps::purge_at_once();
             // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
             // until it ends and its profile written to `<dir>`; with `<dir>` a target
             // directory's `layout`, the next build of blaze there lays its code out by it

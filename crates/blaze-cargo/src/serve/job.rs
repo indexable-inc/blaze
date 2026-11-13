@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub(super) mod doing;
-pub(super) mod giving;
+mod fronts;
 // The request certificate and its machine, in a crate with no compiler in it (a client alone
 // drives the same machine over a slot): `super::certificate` and `super::request` resolve here.
 use blaze_certify::{certificate, request};
@@ -43,10 +43,7 @@ mod certify;
 // The request slots a client alone answers from, and the start file a launcher starts from
 // (`daemon/launch.rs` places it through [`slot::Placing`]).
 pub(crate) mod slot;
-mod kept;
 mod noop;
-#[blaze::sans_io]
-mod paused;
 #[blaze::sans_io]
 mod plan_reads;
 #[blaze::sans_io]
@@ -232,10 +229,6 @@ pub enum Value<S: Steps> {
         Vec<ProvenanceRow>,
         crate::serve::unit::Filed,
     ),
-    /// A kept front end given back by the task that swept its values for memory
-    /// ([`Does::GiveValues`]), with the bytes that went: none when the sweep panicked, as it
-    /// may be half swept.
-    GaveValues(Option<S::KeptFront>, u64),
     /// A front-end carry's pass ran ([`Does::FrontCarry`]): what it gave is in its
     /// [`CarryHand`], which the loop finds by the node ([`Jobs::front_carried`]).
     FrontCarried,
@@ -550,17 +543,6 @@ pub(super) enum Does<S: Steps> {
         /// members, which no build's end posts ([`Jobs::store_members`]).
         filing: Option<Filing>,
     },
-    /// A kept front end gives back about `bytes` of the values it keeps, because memory is
-    /// short ([`Jobs::give_values`]): taken by the task, swept in slices
-    /// ([`giving::give_in_slices`]) and given back in its value. `wanted` is set once a build
-    /// a client waits on is held for the front end: the task stops at its slice's end. The
-    /// front end is shared with the loop so a task the plane refuses gives it back.
-    GiveValues {
-        kept: Arc<Lock<Option<S::KeptFront>>>,
-        checkout: String,
-        bytes: u64,
-        wanted: Arc<AtomicBool>,
-    },
     /// A job's front-end write ([`Writer::apply`]: its proc macros' loads, build scripts' runs
     /// and device builds' MSL; the harnesses; the units made ready identified; their
     /// dependencies served), on a worker, never the loop. Posted once no task reads the front
@@ -663,14 +645,12 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Ahead { .. } => tracing::info_span!("ahead"),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
-            Does::GiveValues { checkout, bytes, .. } => tracing::info_span!(target: "blaze", "give back a kept front end's values", checkout = %checkout, bytes = *bytes),
             Does::Write { asked, .. } => tracing::info_span!(
                 target: "blaze",
                 "front end write",
                 runs = asked.runs,
                 macros = asked.macros,
                 msls = asked.msls,
-                release = asked.release,
             ),
             Does::FrontCarry { checkout, .. } => tracing::info_span!(target: "blaze", "front end carry pass", checkout = %checkout),
         }
@@ -1011,30 +991,6 @@ impl<S: Steps> plane::Work for Step<S> {
                 };
                 self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it, ran, filed))
             }
-            Does::GiveValues { kept, bytes, wanted, .. } => {
-                let Some(mut front) = kept.lock().take() else {
-                    let error = ApiError::new(
-                        "the kept front end to give values back from was taken before its task ran",
-                        None,
-                    );
-                    return self
-                        .settle(Err::<(), _>(Failed::Error(error)), |_| Value::GaveValues(None, 0));
-                };
-                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    giving::give_in_slices(&mut front, *bytes, wanted)
-                }));
-                let (front, gave) = match caught {
-                    Ok(gave) => (Some(front), gave),
-                    Err(payload) => {
-                        // Half swept, it is dropped as a store's is: the loop says the loss.
-                        let panic = plane::panicked(&*payload);
-                        tracing::error!(target: "blaze", "blaze {panic}, giving back a kept front end's values; its front end is dropped");
-                        drop(front);
-                        (None, 0)
-                    }
-                };
-                self.settle(Ok::<(), Failed>(()), |_| Value::GaveValues(front, gave))
-            }
             Does::Write { slot, .. } => {
                 let taken = slot.lock().take();
                 let Some(mut writer) = taken else {
@@ -1126,10 +1082,9 @@ fn named(a: &str, b: &str) -> String {
     name
 }
 
-/// A node whose cost and memory the plane predicts as it is pushed: by its own key's last runs
-/// where it is learned by one (`Plane::push_learned`, its memory never under its kind's peak;
-/// `push_program`; or the plane's key), else by its kind's mean; the 1 stands only where the
-/// predictor has neither.
+/// A node whose cost the plane predicts as it is pushed: by its own key's last runs where it
+/// is learned by one (`Plane::push_learned`; `push_program`; or the plane's key), else by its
+/// kind's mean; the 1 stands only where the predictor has neither.
 fn node<'a>(
     kind: NodeKind,
     name: &'a str,
@@ -1137,38 +1092,7 @@ fn node<'a>(
     pool: Pool,
     key: Option<Key>,
 ) -> NodeRef<'a> {
-    NodeRef { kind, name, deps, pool, cost: 1, key, memory: 0 }
-}
-
-/// Why a build of `checkout` that keeps its front end is refused before it lowers anything:
-/// the task storing what it leaves for the store ([`Jobs::store_kept`]) last held, for this
-/// very checkout ([`store_cost_key`]'s record), more than the budget, so the plane would refuse
-/// it (`too_big`) only once the whole build is done (46.47 GB of a 42 GB budget, ten minutes
-/// in, on 2026-11-03).
-///
-/// Only this checkout's own record refuses: a checkout never measured, or one whose record
-/// fits, goes on, whatever another tree's stores held (the kind's peak). The refusal is the
-/// late one's verdict, minutes sooner: the store's node is predicted at least this record
-/// ([`lone_learned`] floors it at its kind's peak beside), and the record cannot come down
-/// while it is over the budget, as only a store of this checkout teaches it and none is
-/// admitted (earlyfail). The error says the exact `BLAZE_DAEMON_MEMORY_GB` that fits it.
-fn stores_too_much<S: Steps>(plane: &Tasks<S>, checkout: &str) -> Option<ApiError> {
-    let budget = plane.budget()?;
-    let need = plane.predict().record(kinds::STORE_KEPT, &store_cost_key(checkout))?.peak;
-    (need > budget.bytes).then(|| {
-        let gb = |bytes: u64| format!("{:.2} GB", bytes as f64 / f64::from(1 << 30));
-        // alloc: an error, once per build refused
-        let what = format!(
-            "the build of {checkout} would need {} of memory to store what it leaves for the store \
-             (as its last store of its kept front end held), more than blaze may use \
-             here: {} ({}), so nothing was built; {}",
-            gb(need),
-            gb(budget.bytes),
-            budget.from,
-            budget.advice(need)
-        );
-        ApiError::new(what, Some(checkout.to_owned()))
-    })
+    NodeRef { kind, name, deps, pool, cost: 1, key }
 }
 
 /// A batch of one thread task of kind `task`, with no deps.
@@ -1208,8 +1132,7 @@ fn lower_cost_key(checkout: &str) -> Key {
 }
 
 /// The predictor's key of the store of `checkout`'s kept front end ([`Jobs::store_kept`]):
-/// what it held is learned per checkout, as its lowering is ([`lower_cost_key`]), so a large
-/// tree's store refuses no other's early ([`stores_too_much`]).
+/// what it took is learned per checkout, as its lowering is ([`lower_cost_key`]).
 fn store_cost_key(checkout: &str) -> Key {
     let mut hasher = blaze_ids::Hasher::new("blaze v2 kept front end store cost 1");
     hasher.update(checkout.as_bytes());
@@ -2101,12 +2024,10 @@ struct Paths<S: Steps> {
     /// file is still so is not placed again.
     placed: Vec<Option<Placement>>,
     /// The image kept linked there: moved into the compile that relinks it and back once it
-    /// ends ([`Image`]), unless the kept images' budget lets it go ([`kept`]).
+    /// ends ([`Image`]). Nothing lets one go for memory: the kernel's limit is the ceiling.
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
-    /// What each of `images` weighs and when it was linked, for the budget.
-    weights: kept::KeptImages,
     /// The images a unit links beside its planned outputs (a library's doctests, each its own
     /// program, under its runner's `.doctests` directory), by the unit's first output: taken
     /// with that output's, so an edit relinks the one example it changed.
@@ -2125,17 +2046,9 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
-            weights: kept::KeptImages::new(),
             extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
-    }
-
-    /// What the kept images may hold together: [`kept::budget`] of the memory gate's ceiling
-    /// (`blaze_mem::gate`), the one limit the daemon runs under: the machine's, or the one it
-    /// was given. Read at each keep.
-    fn budget(&self) -> u64 {
-        kept::budget(blaze_mem::gate::process().ceiling())
     }
 
     fn intern(&mut self, path: &str) -> u32 {
@@ -2149,7 +2062,6 @@ impl<S: Steps> Paths<S> {
         self.files.push(FileName::new(path.trim_start_matches('/')));
         self.placed.push(None);
         self.images.push(None);
-        self.weights.path();
         id
     }
 
@@ -2175,63 +2087,36 @@ impl<S: Steps> Paths<S> {
         Outputs { units: units.clone(), starts, ids } // clone: a refcount, once per new units
     }
 
-    /// The images kept at `ids`, moved out for a compile. A path whose image the budget let go is said here, as its link is posted: that link
-    /// finds none kept and lays the image out whole ([`super::work::Linking::First`]).
+    /// The images kept at `ids`, moved out for a compile; a path with none kept is laid out
+    /// whole by its link ([`super::work::Linking::First`]). The images of compiles that gave
+    /// way come back first.
     fn take_images(&mut self, ids: &[u32]) -> Vec<Image<S>> {
-        let budget = self.budget();
-        self.take_images_under(ids, budget)
-    }
-
-    /// As [`Paths::take_images`], the kept images held to `budget` once these are taken.
-    /// memcap3 review K1: the images of compiles that gave way come back first, and the
-    /// eviction they may call for runs only after `ids`' images are out, so it never lets go
-    /// of the image this link is about to patch (which would lay it out whole for nothing).
-    fn take_images_under(&mut self, ids: &[u32], budget: u64) -> Vec<Image<S>> {
-        let mut back = false;
         while let Some(image) = self.back.pop() {
-            self.keep_one(&[], image, false);
-            back = true;
+            self.keep_one(&[], image);
         }
         let mut images = Vec::new(); // alloc: none unless an image is kept at an output
         let extras = ids.first().and_then(|first| self.extras.get(first));
         for &id in ids.iter().chain(extras.into_iter().flatten()) {
-            if self.weights.take(id) {
-                tracing::info!(
-                    target: "blaze",
-                    path = &*self.names[id as usize],
-                    budget,
-                    "link of a path whose kept image was let go past the kept link images' budget: none is kept, \
-                     so it is laid out whole"
-                );
-            }
             if let Some(image) = self.images[id as usize].take() {
                 self.kept -= 1;
                 images.push(image);
             }
         }
-        if back {
-            self.evict_to(budget);
-        }
         images
     }
 
     /// Images a compile gave back after linking them, kept at their paths, `ids` the unit's
-    /// outputs; then the kept images held to their budget.
+    /// outputs.
     fn keep(&mut self, ids: &[u32], images: Vec<Image<S>>) {
         for image in images {
-            self.keep_one(ids, image, true);
+            self.keep_one(ids, image);
         }
-        let budget = self.budget();
-        self.evict_to(budget);
     }
 
-    /// `image` kept at its path, rested and weighed ([`Kept::rest`], [`Kept::held`]):
-    /// `relinked` when a compile linked it, else as a compile that gave way took it.
-    fn keep_one(&mut self, ids: &[u32], mut image: Image<S>, relinked: bool) {
+    /// `image` kept at its path, rested ([`Kept::rest`]).
+    fn keep_one(&mut self, ids: &[u32], mut image: Image<S>) {
         image.kept.rest();
-        let bytes = image.kept.held();
         let id = self.find(ids, &image.path);
-        self.weights.keep(id, bytes, relinked);
         if let Some(&first) = ids.first()
             && !ids.contains(&id)
         {
@@ -2244,49 +2129,6 @@ impl<S: Steps> Paths<S> {
         let id = id as usize;
         if self.images[id].replace(image).is_none() {
             self.kept += 1;
-        }
-    }
-
-    /// Lets go of kept images, least recently linked first and never a live one, until the
-    /// rest fit `budget` ([`Paths::budget`], [`kept::evictions`]). Each one let go is dropped
-    /// here, its regions given back to the kernel and its heap freed: nothing else holds a kept
-    /// image.
-    fn evict_to(&mut self, budget: u64) {
-        if self.weights.held() <= budget {
-            return;
-        }
-        let _span = tracing::info_span!(target: "blaze", "kept link images evict", held = self.weights.held(), budget, kept = self.kept)
-            .entered();
-        // alloc: once per pass past the budget, a row per kept image
-        let mut rows: Vec<kept::Row> = (self.images.iter().enumerate())
-            .filter_map(|(id, image)| {
-                Some(self.weights.row(id as u32, image.as_ref()?.kept.live()))
-            })
-            .collect();
-        let evicted = kept::evictions(&mut rows, budget);
-        for &id in &evicted.ids {
-            let bytes = self.weights.let_go(id);
-            // Dropped here: its regions decommitted and released, its heap freed.
-            if self.images[id as usize].take().is_some() {
-                self.kept -= 1;
-            }
-            tracing::info!(
-                target: "blaze",
-                path = &*self.names[id as usize],
-                bytes,
-                budget,
-                kept = self.kept,
-                "kept link image let go past the kept link images' budget: the next link of it lays it out whole"
-            );
-        }
-        if evicted.held > budget {
-            tracing::info!(
-                target: "blaze",
-                held = evicted.held,
-                budget,
-                kept = self.kept,
-                "the kept link images are over their budget with every image no run maps let go: the rest are live"
-            );
         }
     }
 }
@@ -2988,10 +2830,8 @@ enum Ask {
     Ran(usize, blaze_lower::Ran),
     Macros(usize, blaze_lower::ProcMacroLoadResult),
     Msl(usize, Vec<u8>),
-    Began(usize),
     FoundKept(usize),
     Compiled(usize),
-    Pressed,
 }
 
 /// A job's writer ([`Build::writer`]): on the loop, or away on its write's task
@@ -3093,21 +2933,13 @@ impl<S: Steps> Writing<S> {
         self.ask(Ask::Msl(unit, msl))
     }
 
-    // The four below are refused only by a lost writer, whose job failed with it.
-    fn began(&mut self, unit: usize) {
-        _ = self.ask(Ask::Began(unit));
-    }
-
+    // The two below are refused only by a lost writer, whose job failed with it.
     fn found_kept(&mut self, unit: usize) {
         _ = self.ask(Ask::FoundKept(unit));
     }
 
     fn compiled(&mut self, unit: usize) {
         _ = self.ask(Ask::Compiled(unit));
-    }
-
-    fn pressed(&mut self) {
-        _ = self.ask(Ask::Pressed);
     }
 
     /// The writer taken for its write's task, node `node`: its slot, which the task takes it
@@ -3156,20 +2988,12 @@ fn asked<S: Steps>(writer: &mut S::Writer, ask: Ask) -> Result<(), ApiError> {
         Ask::Ran(run, ran) => writer.ran(run, ran),
         Ask::Macros(unit, macros) => writer.macros(unit, macros),
         Ask::Msl(unit, msl) => writer.gpu_msl(unit, msl),
-        Ask::Began(unit) => {
-            writer.began(unit);
-            Ok(())
-        }
         Ask::FoundKept(unit) => {
             writer.found_kept(unit);
             Ok(())
         }
         Ask::Compiled(unit) => {
             writer.compiled(unit);
-            Ok(())
-        }
-        Ask::Pressed => {
-            writer.pressed();
             Ok(())
         }
     }
@@ -3605,8 +3429,6 @@ struct Job<S: Steps> {
     /// lowering and held until the job is dropped: the collector renames no dir while a build
     /// holds it (docs/gc.md, "Leases").
     leases: Arc<Lock<Leases>>,
-    /// What its client is told of its wait for memory ([`Jobs::tell_paused`]).
-    paused: paused::Paused,
     /// When it began, on the injected clock ([`World::now`]): what its [`Response::Doing`]
     /// and `blaze status` count its time from.
     began: Duration,
@@ -4276,7 +4098,6 @@ impl<S: Steps> Job<S> {
             opened_ns: 0,
             opened_unix_ns: None,
             leases: Arc::new(Lock::new("serve.job.leases", Leases::default())), // alloc: once per job, shared with its lowering
-            paused: paused::Paused::default(),
             began,
             doing_said: None,
             missed: 0,
@@ -4780,9 +4601,9 @@ pub struct Jobs<S: Steps> {
     /// the daemon to hand to its history, before the build's answer is told to it, so the
     /// answer's flush writes them.
     pub errors: Vec<blaze_profile::errors::ErrorRow>,
-    /// What the daemon gives back when memory is short, and in which order
-    /// ([`Jobs::give_back`], `blaze_graph::giveback`).
-    giving: giving::Giving<S>,
+    /// What the loop knows of each checkout's kept front end besides the front end: its cost
+    /// to make from nothing, its members' pages, and the idle trim ([`fronts`]).
+    fronts: fronts::Fronts,
     /// Each job with a plane request, from its opening until its `Finish` is heard: the
     /// build it is in the history and how many `errors` rows it has, so a build that ends
     /// not ok with none is given one ([`Jobs::note_errors`]).
@@ -4811,10 +4632,6 @@ pub struct Jobs<S: Steps> {
     posts: Vec<(Posting, bool)>,
     /// The jobs that end, a buffer reused by each [`Jobs::wind_up`].
     over: Vec<(JobId, bool, Option<ApiError>)>,
-    /// The requests held back for memory, and the tasks granted memory running that they
-    /// wait on, buffers reused by each [`Jobs::tell_paused`].
-    held_back: Vec<u32>,
-    waited_on: Vec<u32>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
@@ -4926,7 +4743,7 @@ impl<S: Steps> Jobs<S> {
             lost: Vec::new(),     // alloc: none until settling loses something
             ran: Vec::new(),      // alloc: none until a kept front end's run log is named
             errors: Vec::new(),   // alloc: none until a build says an error
-            giving: giving::Giving::new(),
+            fronts: fronts::Fronts::new(),
             erring: HashMap::new_in(Global),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
@@ -4937,10 +4754,6 @@ impl<S: Steps> Jobs<S> {
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
             over: Vec::new(),    // alloc: none until a job ends, then reused
-            // alloc: none until a build is held back for memory, then reused
-            held_back: Vec::new(),
-            // alloc: none until a build is held back for memory, then reused
-            waited_on: Vec::new(),
             cold: false,
             ended: false,
             rows: Vec::new(),        // alloc: none until a build ends, then reused
@@ -4969,61 +4782,6 @@ impl<S: Steps> Jobs<S> {
         busy.extend(self.runs.iter_mut().map(|(_, it)| it.job));
         self.held_leases
             .retain(|(id, cancelled, _)| Arc::strong_count(cancelled) > 1 || busy.contains(id));
-    }
-
-    /// Each build's client told of its wait for memory (docs/memory-budget.md section 7, "What
-    /// the client is told"): a note once a task of its request has been held back for memory
-    /// alone for [`paused::PAUSED_AFTER_NS`], again as what it says changes, and
-    /// that it resumed once none is ([`paused::Paused`]). `machine` is the
-    /// machine ledger's say of who holds the rest, once its driver gives one. A speculative
-    /// job not promoted is told nothing: no client waits on it.
-    pub fn tell_paused(&mut self, w: &mut World<'_, S>, machine: Option<&str>) {
-        use paused::{RESUMED, Tell, paused_line};
-        let mut held_back = std::mem::take(&mut self.held_back);
-        held_back.clear();
-        w.plane.held_back(&mut held_back);
-        let (held, budget, cap) = w.plane.memory();
-        let waiting = |job: &Job<S>| job.paused.waiting();
-        let any = self.order.iter().any(|&id| self.jobs.get(key_of(id)).is_some_and(waiting));
-        let Some(budget) = budget.filter(|_| any || !held_back.is_empty()) else {
-            self.held_back = held_back;
-            return;
-        };
-        // What they wait on: the tasks granted memory running, in the order of their nodes,
-        // one a name (a task several requests share runs as one).
-        let plane: &Tasks<S> = &*w.plane;
-        // alloc: none but while a build is held back for memory, a pair a running task.
-        let mut running: Vec<(NodeId, &str)> = Vec::new();
-        plane.granted_running(|id, name| running.push((id, name)));
-        running.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
-        running.dedup_by(|a, b| a.1 == b.1);
-        running.sort_unstable_by_key(|it| it.0);
-        let mut on = std::mem::take(&mut self.waited_on);
-        on.clear();
-        on.extend(running.iter().map(|it| it.0.0)); // alloc: none once it has held this many.
-        let names: Vec<&str> = running.iter().take(3).map(|it| it.1).collect(); // alloc: three at most.
-        let at = super::plane::ns(w.now);
-        let mut line: Option<String> = None;
-        for &id in &self.order {
-            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            let Some(request) = job.request.filter(|_| !job.idle && !job.finished) else {
-                continue;
-            };
-            let now = held_back.binary_search(&request.0).is_ok();
-            let response = match job.paused.step(at, now, held, budget, &on) {
-                Tell::Nothing => continue,
-                Tell::Paused => {
-                    let line = line.get_or_insert_with(|| {
-                        paused_line(held, budget, cap, machine, on.len(), &names)
-                    });
-                    Diagnostic::note(line.clone()) // clone: one line, told to each build it holds back.
-                }
-                Tell::Resumed => Diagnostic::note(RESUMED.to_owned()), // alloc: once a resume
-            };
-            w.said.push(Said::Report(id, Response::Diagnostic(response)));
-        }
-        self.held_back = held_back;
-        self.waited_on = on;
     }
 
     /// Whether no job is under way. What answered jobs left to settle ([`Settling`]) is no
@@ -6211,24 +5969,6 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): the
-    /// kept front ends let go of the values they keep by bytes, on a worker, from the loop's
-    /// next turn ([`Jobs::press_kept`]), none of them whole, and each build's front end is asked for a release now
-    /// ([`Writer::pressed`]), whatever this daemon's own budget says. Until 2026-11-12 every
-    /// kept front end was let go here, as for any task held back for memory: the next edit
-    /// of each checkout then lowered anew, which takes minutes (reth: 195 s for a one-line
-    /// revert). A limit that falls under what the daemon holds is [`Jobs::give_back`]'s to
-    /// answer, cheapest first.
-    pub fn pressed(&mut self) {
-        self.giving.press();
-        for &id in &self.order {
-            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
-            if let Stage::Units(build) = &mut job.stage {
-                build.writer.pressed();
-            }
-        }
-    }
-
     /// Each job's waiting write sent to a task of its own where no reader of its front end is
     /// left ([`Jobs::send_write`]), and the tasks held while none waits posted with readers of
     /// what the last made. Asking a job whose readers still run costs one load of its
@@ -6240,10 +5980,9 @@ impl<S: Steps> Jobs<S> {
     /// one loop turn (the `unit narrowed identity` of blaze's own check, seconds a crate under
     /// a fresh store), every other job and client waiting behind it.
     pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
-        // The core past its line is answered by the give-back rule: the allocator's freed
-        // pages first, a kept front end last and never while anything cheaper covers it
-        // ([`Jobs::give_back`]). A task's own memory is the gate's (`blaze_mem::gate`).
-        self.give_back(w);
+        // An idle stretch trims what costs nothing to make again ([`Jobs::idle_turn`]); nothing
+        // is let go for memory: the kernel's limit is the ceiling.
+        self.idle_turn(w);
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
         let mut sends = Vec::new(); // alloc: none unless a write is sent this step
@@ -6293,7 +6032,7 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
-    /// holding the writer ([`Does::Write`]), as a kept front end's store and give-back are;
+    /// holding the writer ([`Does::Write`]), as a kept front end's store is;
     /// pushed free of admission, since every reading task of the job waits for it. Its value
     /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
     /// job fails naming the refusal.
@@ -6701,7 +6440,6 @@ impl<S: Steps> Jobs<S> {
                     storing.value = Some((front, stored, filed));
                 }
             }
-            Value::GaveValues(front, gave) => self.gave_values(w, node, front, gave),
             Value::FrontCarried => self.front_carried(w, node, true),
             Value::Wrote(writer, applied) => self.wrote(w, node, writer, applied),
             value => {
@@ -6722,9 +6460,6 @@ impl<S: Steps> Jobs<S> {
         why: Option<String>,
         skipped: Option<NodeId>,
     ) {
-        // A give-back of a kept front end's values, which is no job's: its value came before
-        // this ([`Jobs::gave_values`]), or never will ([`Jobs::give_settled`]).
-        self.give_settled(w, node);
         // A job's front-end write: its value came before this ([`Jobs::wrote`]), or never
         // will ([`Jobs::write_settled`]), and its job fails saying so.
         self.write_settled(w, node, why.as_deref());
@@ -7653,9 +7388,6 @@ impl<S: Steps> Jobs<S> {
                         storing.promoted = true;
                     }
                 }
-                // Or its values are being given back for memory, on a worker: that give
-                // stops at its slice's end for a build asked now ([`giving::Giving::wanted`]).
-                let on = on.or(self.giving.wanted(root, job_idle));
                 let span = tracing::info_span!(
                     target: "blaze",
                     "lowering waits for the kept front end's store",
@@ -7679,25 +7411,11 @@ impl<S: Steps> Jobs<S> {
         name: &str,
         checkout: String,
     ) {
-        // A check, build, test or run of a root keeps its front end and stores it once done
-        // ([`Jobs::store_kept`]): refused now, before anything is built, when this checkout's
-        // own last store could never be admitted. Every other work stores nothing.
-        let keeps = root.is_some()
-            && self.jobs.get(key_of(id)).is_some_and(|job| {
-                matches!(
-                    job.work,
-                    Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. }
-                )
-            });
-        if keeps && let Some(error) = stores_too_much(w.plane, &checkout) {
-            self.end(w, id, false, Some(error));
-            return;
-        }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let kept = root.and_then(|root| self.roots.fronts[root as usize].take());
         if let Some(root) = root {
-            // What a front end made from nothing takes is what giving it back costs.
-            self.giving.lowers(root, kept.is_some(), w.now);
+            // What a front end made from nothing takes is what the daemon's exit waits on.
+            self.fronts.lowers(root, kept.is_some(), w.now);
         }
         let kept = Lock::new("serve.job.lower.kept", kept);
         let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
@@ -7942,7 +7660,7 @@ impl<S: Steps> Jobs<S> {
                         format!("storing what the build of {checkout} left for the store: {why}")
                     });
                     if front.is_some() {
-                        self.giving.kept(root, w.now);
+                        self.fronts.kept(root, w.now);
                     }
                     self.roots.fronts[root as usize] = front;
                 }
@@ -8011,8 +7729,7 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// The lowerings held for checkout `root`'s front end posted, once nothing holds it any
-    /// more: no store of it and no give-back of its values is under way
-    /// ([`Jobs::stored_kept`], [`Jobs::gave_values`]).
+    /// more: no store of it is under way ([`Jobs::stored_kept`]).
     fn lower_waiting(&mut self, w: &mut World<'_, S>, root: u32) {
         // Another store of the root's front end still under way: its lowerings wait for it.
         if self.roots.storing[root as usize] > 0 {
@@ -8525,7 +8242,6 @@ impl<S: Steps> Jobs<S> {
         if !build.begins(node) {
             return;
         }
-        build.writer.began(at);
         let fresh = build.is_fresh(&mut w.reads, at);
         if fresh {
             build.writer.found_kept(at);
@@ -11029,7 +10745,6 @@ impl<S: Steps> Jobs<S> {
             vfs: &mut *w.vfs,
             store: &mut *w.store,
             predict: w.plane.predict(),
-            peaks: w.plane.peaks(),
             effects: &mut *w.effects,
         });
         // What it waits for, read before the flush: a put another thread makes between the

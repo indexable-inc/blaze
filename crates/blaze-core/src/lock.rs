@@ -4,11 +4,8 @@
 //! in the tree is banned in `.clippy.toml`.
 //!
 //! The fast path is `parking_lot`'s: an uncontended acquire is its one compare-and-swap, and a
-//! release adds one relaxed load of a counter on the same cache line. Each guard also counts
-//! itself in the memory gate's per-thread lock depth (one thread-local add each way,
-//! [`blaze_mem::gate::lock_taken`]), so no task unwinds at a memory safe point while it holds a
-//! lock. Nothing reads a clock or the profiler until an acquire has to wait. Then, on the slow
-//! path only:
+//! release adds one relaxed load of a counter on the same cache line. Nothing reads a clock,
+//! a thread-local or the profiler until an acquire has to wait. Then, on the slow path only:
 //!
 //! - the wait opens the profiler's `wait` span naming the lock (`every-wait-says-what`);
 //! - the waiter's start and end come from the [`Probe`]'s clock (the profiler's, or a
@@ -167,22 +164,6 @@ static PROBE: AtomicPtr<&'static dyn Probe> = AtomicPtr::new(ptr::null_mut());
 /// later install replaces it (a test's, then the profiler's).
 pub fn install(probe: &'static &'static dyn Probe) {
     PROBE.store(ptr::from_ref(probe).cast_mut(), Ordering::Release);
-    // The memory gate sits below this crate: its waits open their spans through these.
-    blaze_mem::gate::set_wait_spans(blaze_mem::gate::WaitSpans {
-        begin: gate_wait_begin,
-        end: gate_wait_end,
-    });
-}
-
-/// A memory gate's wait (`blaze_mem::gate`) opens a span naming it, as a [`Signal`]'s does.
-fn gate_wait_begin(what: &'static str) -> Option<u64> {
-    installed().map(|probe| probe.wait_begin(Awaits::Signal(what)))
-}
-
-fn gate_wait_end(token: u64) {
-    if let Some(probe) = installed() {
-        probe.wait_end(token);
-    }
 }
 
 /// The process's probe, if one is installed.
@@ -437,29 +418,6 @@ pub struct LockGuard<'a, T: ?Sized> {
     /// When it was taken, on the probe's clock; 0 when it was taken without waiting.
     acquired_ns: u64,
     inner: parking_lot::MutexGuard<'a, T>,
-    /// Last, so the memory gate hears of the release after the lock is let go.
-    _holding: Holding,
-}
-
-/// A held lock's mark on the memory gate's per-thread count ([`blaze_mem::gate::lock_taken`]):
-/// a task holding any named lock never unwinds at a safe point, which would leave what the
-/// lock guards half-written, so its frame defers the gate's word to its next safe point after
-/// the release. One thread-local add on acquire and one on release; no allocation.
-struct Holding;
-
-impl Holding {
-    #[inline]
-    fn take() -> Holding {
-        blaze_mem::gate::lock_taken();
-        Holding
-    }
-}
-
-impl Drop for Holding {
-    #[inline]
-    fn drop(&mut self) {
-        blaze_mem::gate::lock_released();
-    }
 }
 
 impl<T> Lock<T> {
@@ -504,7 +462,7 @@ impl<T: ?Sized> Lock<T> {
         match self.raw.try_lock() {
             Some(inner) => {
                 self.meta.stamp();
-                LockGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() }
+                LockGuard { meta: &self.meta, site, acquired_ns: 0, inner }
             }
             None => self.lock_slow(site),
         }
@@ -517,7 +475,7 @@ impl<T: ?Sized> Lock<T> {
         let inner = self.raw.lock();
         self.meta.stamp();
         let acquired_ns = waiting.taken();
-        LockGuard { meta: &self.meta, site, acquired_ns, inner, _holding: Holding::take() }
+        LockGuard { meta: &self.meta, site, acquired_ns, inner }
     }
 
     /// The lock if no one holds it, without waiting (and so without a record).
@@ -527,7 +485,7 @@ impl<T: ?Sized> Lock<T> {
         let site = Location::caller();
         self.raw.try_lock().map(|inner| {
             self.meta.stamp();
-            LockGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() }
+            LockGuard { meta: &self.meta, site, acquired_ns: 0, inner }
         })
     }
 
@@ -538,13 +496,13 @@ impl<T: ?Sized> Lock<T> {
         let site = Location::caller();
         if let Some(inner) = self.raw.try_lock() {
             self.meta.stamp();
-            return Some(LockGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() });
+            return Some(LockGuard { meta: &self.meta, site, acquired_ns: 0, inner });
         }
         let waiting = Waiting::begin(&self.meta, site, Mode::Lock, type_name::<T>());
         let inner = self.raw.try_lock_for(most)?;
         self.meta.stamp();
         let acquired_ns = waiting.taken();
-        Some(LockGuard { meta: &self.meta, site, acquired_ns, inner, _holding: Holding::take() })
+        Some(LockGuard { meta: &self.meta, site, acquired_ns, inner })
     }
 
     /// Begins a wait for the lock without blocking: the slow path's first half, for a
@@ -585,7 +543,7 @@ impl<'a, T: ?Sized> Queued<'a, T> {
                 lock.meta.stamp();
                 let site = waiting.site;
                 let acquired_ns = waiting.taken();
-                Ok(LockGuard { meta: &lock.meta, site, acquired_ns, inner, _holding: Holding::take() })
+                Ok(LockGuard { meta: &lock.meta, site, acquired_ns, inner })
             }
         }
     }
@@ -651,7 +609,6 @@ pub struct ReadGuard<'a, T: ?Sized> {
     site: &'static Location<'static>,
     acquired_ns: u64,
     inner: parking_lot::RwLockReadGuard<'a, T>,
-    _holding: Holding,
 }
 
 /// The exclusive write of a [`ReadLock`].
@@ -661,7 +618,6 @@ pub struct WriteGuard<'a, T: ?Sized> {
     site: &'static Location<'static>,
     acquired_ns: u64,
     inner: parking_lot::RwLockWriteGuard<'a, T>,
-    _holding: Holding,
 }
 
 impl<T> ReadLock<T> {
@@ -692,7 +648,7 @@ impl<T: ?Sized> ReadLock<T> {
     pub fn read(&self) -> ReadGuard<'_, T> {
         let site = Location::caller();
         match self.raw.try_read() {
-            Some(inner) => ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() },
+            Some(inner) => ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner },
             None => self.read_slow(site),
         }
     }
@@ -703,7 +659,7 @@ impl<T: ?Sized> ReadLock<T> {
         let waiting = Waiting::begin(&self.meta, site, Mode::Read, type_name::<T>());
         let inner = self.raw.read();
         let acquired_ns = waiting.taken();
-        ReadGuard { meta: &self.meta, site, acquired_ns, inner, _holding: Holding::take() }
+        ReadGuard { meta: &self.meta, site, acquired_ns, inner }
     }
 
     #[inline]
@@ -713,7 +669,7 @@ impl<T: ?Sized> ReadLock<T> {
         match self.raw.try_write() {
             Some(inner) => {
                 self.meta.stamp();
-                WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() }
+                WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner }
             }
             None => self.write_slow(site),
         }
@@ -726,14 +682,14 @@ impl<T: ?Sized> ReadLock<T> {
         let inner = self.raw.write();
         self.meta.stamp();
         let acquired_ns = waiting.taken();
-        WriteGuard { meta: &self.meta, site, acquired_ns, inner, _holding: Holding::take() }
+        WriteGuard { meta: &self.meta, site, acquired_ns, inner }
     }
 
     #[inline]
     #[track_caller]
     pub fn try_read(&self) -> Option<ReadGuard<'_, T>> {
         let site = Location::caller();
-        self.raw.try_read().map(|inner| ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() })
+        self.raw.try_read().map(|inner| ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner })
     }
 
     #[inline]
@@ -742,7 +698,7 @@ impl<T: ?Sized> ReadLock<T> {
         let site = Location::caller();
         self.raw.try_write().map(|inner| {
             self.meta.stamp();
-            WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner, _holding: Holding::take() }
+            WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner }
         })
     }
 

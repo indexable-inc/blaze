@@ -3007,6 +3007,9 @@ pub enum MirLowerError<'db> {
     /// A trait method's `impl Trait` normalized to the impl's item for it, which has no value:
     /// `crate::rpitit::RpititError::message`, naming the impl's method and the item.
     RpititValue(Box<str>),
+    /// A `line!()` or `column!()` whose value is asked where it is a constant, of a call
+    /// written in no file's text: `crate::body_store::placed_literal`'s message, naming it.
+    UnplacedLiteral(Box<str>),
 }
 
 impl From<LayoutError> for MirLowerError<'_> {

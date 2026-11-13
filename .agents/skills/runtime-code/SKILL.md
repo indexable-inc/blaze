@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime and what is persisted are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, daemon, query engine, store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, the request loop, `watch`, the query engine, the store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -61,38 +61,39 @@ deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. 
 transcript with no real clock, and a deterministic simulation test drives the core through
 `blaze_core::sim::Sim` (`testing` skill): a core that does its own IO cannot be simulated, so it
 cannot be proven. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own
-byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a remote-cache or
-registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it
-(tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A
-dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest,
-tokio-rustls) is replaced by a core and a driver, not wrapped. Persisted state is a core too: a
-writer of files that must survive a crash (a manifest, a journal, a history, a store) asks for each
-write, sync, rename, delete and lock as a blaze-core `Effect` and takes `Completion`s, so `Sim` sees
-every one and can tear what was not synced; its durability is the order of the effects it emits,
-never a direct `fsync`, `F_FULLFSYNC` or `flock`. Each core module carries `#![blaze::sans_io]` and
-`#![deny(blaze::sans_io_core)]`: the lint walks every call the module makes, through workspace
-functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`, `std::process`, `std::env`,
-OS randomness and `libc`/`rustix`/`nix`. What a core needs of its process beyond IO (its pid,
-whether another process lives, symbols to name a stack) comes through a trait the driver implements,
-taken as a type parameter: calls through it are the driver's, not the core's. Drivers are separate,
-unmarked modules, so the exemption is by module, never by an allow on a line. A core's errors carry
-the path the driver will report, and a step that waits on no effect is a typed error
-(`bounded-progress`). There is no part of blaze this does not cover: the daemon and its request
-loop, the build plan and the scheduler, the file watcher, the store, the linker's writes, the
-launcher, the client, the hub. Logic that does its own IO (reads a file, the clock or the
-environment, starts a thread or a process, opens a socket, sleeps) is not finished work, whoever
-wrote it and however long it has been there. When you meet such code in what you are changing, cut
-the seam in the same change without being asked: the decisions go into a core, the IO into a driver
-that only performs effects and returns completions; when it is too large for the change, add an an
-`agents/annoyances/` row naming the file and what blocks it, and a ledger row if it needs one. One
-implementation, the real one: the code that ships is the code the simulation runs. A fake, mock,
-stub, test double or second model written because the real code could not run in a test (a simulated
-daemon beside the real daemon, a toy scheduler in a test, a hand-written in-memory store with its
-own logic) is a duplicate (`one-concept-one-home`) that proves nothing about what ships: make the
-real code sans-IO, drive it with `Sim`, and delete the fake in the same change. What stays outside
-the cores is only the drivers, and a driver holds no decision: no branch on state, no retry, no
-ordering choice; if a driver needs a test of its logic, that logic belongs in the core. The same
-unifying goes for two cores that decide the same thing: merge them and ban the removed name.
+byte-in/byte-out `Connection`, never `tokio-rustls`), the client's wire protocol to `watch`, a
+remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend
+can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to
+the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util,
+reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped. Persisted state is a core
+too: a writer of files that must survive a crash (a manifest, a journal, a history, a store) asks
+for each write, sync, rename, delete and lock as a blaze-core `Effect` and takes `Completion`s, so
+`Sim` sees every one and can tear what was not synced; its durability is the order of the effects it
+emits, never a direct `fsync`, `F_FULLFSYNC` or `flock`. Each core module carries
+`#![blaze::sans_io]` and `#![deny(blaze::sans_io_core)]`: the lint walks every call the module
+makes, through workspace functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`,
+`std::process`, `std::env`, OS randomness and `libc`/`rustix`/`nix`. What a core needs of its
+process beyond IO (its pid, whether another process lives, symbols to name a stack) comes through a
+trait the driver implements, taken as a type parameter: calls through it are the driver's, not the
+core's. Drivers are separate, unmarked modules, so the exemption is by module, never by an allow on
+a line. A core's errors carry the path the driver will report, and a step that waits on no effect is
+a typed error (`bounded-progress`). There is no part of blaze this does not cover: the request loop
+(the daemon's today, one command's process in the target), `watch`, the build plan and the
+scheduler, the file watcher, the store, the linker's writes, the launcher, the client, the hub.
+Logic that does its own IO (reads a file, the clock or the environment, starts a thread or a
+process, opens a socket, sleeps) is not finished work, whoever wrote it and however long it has been
+there. When you meet such code in what you are changing, cut the seam in the same change without
+being asked: the decisions go into a core, the IO into a driver that only performs effects and
+returns completions; when it is too large for the change, add an an `agents/annoyances/` row naming
+the file and what blocks it, and a ledger row if it needs one. One implementation, the real one: the
+code that ships is the code the simulation runs. A fake, mock, stub, test double or second model
+written because the real code could not run in a test (a simulated request loop beside the real one,
+a toy scheduler in a test, a hand-written in-memory store with its own logic) is a duplicate
+(`one-concept-one-home`) that proves nothing about what ships: make the real code sans-IO, drive it
+with `Sim`, and delete the fake in the same change. What stays outside the cores is only the
+drivers, and a driver holds no decision: no branch on state, no retry, no ordering choice; if a
+driver needs a test of its logic, that logic belongs in the core. The same unifying goes for two
+cores that decide the same thing: merge them and ban the removed name.
 
 ## every-wait-says-what (rule 15)
 
@@ -102,23 +103,34 @@ covered by no span, are bugs; the profile test fails on them.
 
 ## bounded-progress (rule 18)
 
-Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a retry) has a bound
-(fuel, depth or a deadline from the injected clock) and ends in a typed outcome: done, or a failure
-naming what it was doing, the goal or key, and how far it got. Never an open loop whose only exit is
-success, and never a spin with no cap.
+Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a retry, a build's
+rounds) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed outcome:
+done, or a failure naming what it was doing, the goal or key, and how far it got. Never an open loop
+whose only exit is success, and never a spin with no cap. What no bound in the code catches, the
+watchdog does (`blaze_profile::stuck`, a sans-IO core): a task that has not moved for the bound of
+what it waits on, a cycle of waits, and a task started again and again for the same work with no
+input changed (`again`). Each is a hang, and a hang is a bug: the watchdog fails the build with a
+typed error that names the task, what it waits on or repeats, how long and how often, writes the
+flight recording and prints its path, so the person sees one line and a file to read, never a build
+that just runs on. A new kind of wait or a new loop over rounds feeds the watchdog in the same
+change, with a test that a planted hang of that kind is reported. A hang found by hand (a person or
+an agent saw it hang) is two bugs: the hang, and the watchdog not catching it; fix both. How an
+agent's own commands are bounded is `every-command-has-a-timeout`.
 
 ## errors-name-the-thing (rule 19)
 
-An error names the item it is about (the function or instance with its path, the crate, the key, the
-file and line) and the rule that refused it, in the message itself. "a template made against 6
-references is given 7" is unfinished until it says which function and which template.
+An error names the item it is about (the function or instance with its path, the crate, the key, and
+the file and line, worked out from the item-relative position when it is printed:
+`item-relative-positions`) and the rule that refused it, in the message itself. "a template made
+against 6 references is given 7" is unfinished until it says which function and which template.
 
 ## panics-fail-one-job (rule 20)
 
 A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with
-a typed error naming the panic and the job; the daemon keeps serving and keep-going (the default;
-`--fail-fast` opts out) keeps building the rest. Formatting an error must not panic: render what
-needs the database while the database is attached.
+a typed error naming the panic and the job; keep-going (the default; `--fail-fast` opts out) keeps
+building the rest, the command still writes the records of what succeeded and exits with the errors,
+and a `watch` session (or the daemon, while it exists) keeps serving. Formatting an error must not
+panic: render what needs the database while the database is attached.
 
 ## no-wait-across-thread-locals (rule 27)
 

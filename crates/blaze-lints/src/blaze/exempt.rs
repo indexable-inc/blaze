@@ -178,6 +178,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::UntiedChild
         | Lint::UnboundedTestWait
         | Lint::ReadsPositions
+        | Lint::AbsolutePosition
         | Lint::CborFieldOrder
         // Kept with `#[expect(..)]` on the item: a literal's alignment, a count, a silenced
         // design, a policy path, a bounded length and a bounded static are the item's choice.
@@ -189,7 +190,25 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ProcessStatic
         // Kept with `#[expect(..)]` on the item: whether wrapping is meant is the code's
         // choice, said once with its reason.
-        | Lint::TruncatingCast => None,
+        | Lint::TruncatingCast
+        // The std mistakes: each place that is right says why with `#[expect(..)]`.
+        | Lint::PartialWrite
+        | Lint::PartialCmpUnwrap
+        | Lint::UnboundedRead
+        | Lint::LenMinus
+        | Lint::StrByteSlice
+        | Lint::Forget
+        | Lint::PathToStrUnwrap
+        | Lint::DetachedThread
+        | Lint::UnboundedChannel
+        | Lint::Transmute
+        | Lint::CloneToSatisfy
+        | Lint::UncheckedIndexInLoop
+        | Lint::DefaultNumericFallbackLen
+        | Lint::RefcellBorrowAcrossCall
+        | Lint::ProcessExit
+        | Lint::PrintInLib
+        | Lint::LockUnwrap => None,
     }
 }
 

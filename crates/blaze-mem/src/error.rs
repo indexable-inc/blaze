@@ -10,10 +10,6 @@ pub enum MemError {
     Reserve { tag: Tag, bytes: usize, os: io::Error },
     /// The operating system refused to back reserved pages with memory.
     Commit { tag: Tag, bytes: usize, os: io::Error },
-    /// The memory gate's core owner has no room for a core region's commit
-    /// ([`crate::gate::Gate::core_reserve`]): plain numbers, made without allocating, as an
-    /// allocator's commit hook may meet it; formatted only where it is printed.
-    CoreFull { tag: Tag, bytes: usize, used: u64, core: u64 },
     /// A region's reservation is used up: the allocator would have to move to grow, which it
     /// never does.
     Exhausted { tag: Tag, reserved: usize, wanted: usize },
@@ -29,7 +25,6 @@ impl MemError {
         match *self {
             MemError::Reserve { tag, .. }
             | MemError::Commit { tag, .. }
-            | MemError::CoreFull { tag, .. }
             | MemError::Exhausted { tag, .. }
             | MemError::TooLarge { tag, .. }
             | MemError::Evict { tag, .. } => tag,
@@ -46,12 +41,6 @@ impl fmt::Display for MemError {
             MemError::Commit { tag, bytes, os } => {
                 write!(f, "{tag}: committing {bytes} bytes of reserved memory failed: {os}")
             }
-            MemError::CoreFull { tag, bytes, used, core } => write!(
-                f,
-                "{tag}: the memory gate's core owner holds {used} B of its {core} B, so a core \
-                 region cannot commit {bytes} B more (rule one-memory-measure; install a larger \
-                 core with blaze_mem::gate::install)"
-            ),
             MemError::Exhausted { tag, reserved, wanted } => write!(
                 f,
                 "{tag}: its region of {reserved} reserved bytes is used up ({wanted} bytes wanted); \
@@ -76,9 +65,7 @@ impl std::error::Error for MemError {
             MemError::Reserve { os, .. }
             | MemError::Commit { os, .. }
             | MemError::Evict { os, .. } => Some(os),
-            MemError::CoreFull { .. } | MemError::Exhausted { .. } | MemError::TooLarge { .. } => {
-                None
-            }
+            MemError::Exhausted { .. } | MemError::TooLarge { .. } => None,
         }
     }
 }

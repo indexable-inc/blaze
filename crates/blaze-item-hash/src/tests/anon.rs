@@ -1,6 +1,7 @@
-//! Sections 3.3, 3.5 and 3.7: a body's identity is anonymous (renames and moves keep it, and
-//! its presentation hash changes with them), and a record of it names what it names relative
-//! to the body, so a record of a renamed body is read back.
+//! A record of a body names what it names relative to the body (`crate::keys`), so a record
+//! filed under a body's key is read back in another database where the body moved, and the
+//! body's presentation hash (`crate::presentation`) changes with its names and place while its
+//! key, made from its position-free text, does not.
 //!
 //! Each test builds two databases from two fixtures and compares the body of the one function
 //! named `f` in the first with the one named `name` in the second.
@@ -16,160 +17,33 @@ use hir_ty::{
 };
 
 use super::perturb::{body, db, with_dep};
-use crate::{identity::identity, keys, presentation::presentation};
+use crate::{identity::early_identity, keys, presentation::presentation};
 
-/// The identity and presentation hash of the body of the function `name`.
+/// The key and presentation hash of the body of the function `name`.
 #[track_caller]
 fn hashes(fixture: &str, name: &str) -> (ContentId, ContentId) {
     let db = db(fixture);
     let def = body(&db, name);
-    (identity(&db, def).unwrap_or_else(|it| panic!("{it:?}")), presentation(&db, def))
-}
-
-/// `after`'s body of `name` is `before`'s of `f` renamed or moved: the same identity, another
-/// presentation.
-#[track_caller]
-fn renamed(before: &str, after: &str, name: &str) {
-    let (identity_before, presentation_before) = hashes(before, "f");
-    let (identity_after, presentation_after) = hashes(after, name);
-    assert_eq!(identity_before, identity_after, "identity\n{before}\n---\n{after}");
-    assert_ne!(presentation_before, presentation_after, "presentation\n{before}\n---\n{after}");
-}
-
-#[track_caller]
-fn differ(before: &str, after: &str) {
-    assert_ne!(hashes(before, "f").0, hashes(after, "f").0, "{before}\n---\n{after}");
+    (early_identity(&db, def).unwrap_or_else(|it| panic!("{it:?}")), presentation(&db, def))
 }
 
 #[test]
-fn renaming_a_parameter_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f(a: u8) -> u8 { a + 1 }"),
-        &with_dep("pub fn f(b: u8) -> u8 { b + 1 }"),
-        "f",
-    );
+fn moving_the_item_keeps_its_key_and_changes_its_presentation() {
+    let (key_before, presentation_before) =
+        hashes(&with_dep("pub fn f() -> u8 { dep::g() }\npub fn h() {}"), "f");
+    let (key_after, presentation_after) =
+        hashes(&with_dep("pub fn h() {}\n\n\npub fn f() -> u8 { dep::g() }"), "f");
+    assert_eq!(key_before, key_after, "the key is position-free");
+    assert_ne!(presentation_before, presentation_after, "the presentation holds the place");
 }
 
+/// The control: a rename is an edit of the item's text, which its key hashes. Two bodies of
+/// one text in two places share a key; two texts never do.
 #[test]
-fn renaming_a_local_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f() -> u8 { let x = dep::g(); let y = x; y }"),
-        &with_dep("pub fn f() -> u8 { let first = dep::g(); let second = first; second }"),
-        "f",
-    );
-}
-
-#[test]
-fn renaming_a_capture_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f() -> u8 { let x = 1; let c = || x; c() }"),
-        &with_dep("pub fn f() -> u8 { let y = 1; let c = || y; c() }"),
-        "f",
-    );
-}
-
-#[test]
-fn renaming_a_label_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f() { 'a: loop { break 'a; } }"),
-        &with_dep("pub fn f() { 'b: loop { break 'b; } }"),
-        "f",
-    );
-}
-
-#[test]
-fn renaming_a_generic_or_a_lifetime_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f<T: Copy>(t: T) -> T { let u: T = t; u }"),
-        &with_dep("pub fn f<U: Copy>(t: U) -> U { let u: U = t; u }"),
-        "f",
-    );
-    renamed(
-        &with_dep("pub fn f<'a>(x: &'a u8) -> &'a u8 { let y: &'a u8 = x; y }"),
-        &with_dep("pub fn f<'b>(x: &'b u8) -> &'b u8 { let y: &'b u8 = x; y }"),
-        "f",
-    );
-}
-
-#[test]
-fn renaming_the_item_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f() -> u8 { dep::g() }"),
-        &with_dep("pub fn renamed() -> u8 { dep::g() }"),
-        "renamed",
-    );
-    // A recursive call names the item as "self".
-    renamed(
-        &with_dep("pub fn f(n: u8) -> u8 { if n == 0 { 0 } else { f(n - 1) } }"),
-        &with_dep("pub fn renamed(n: u8) -> u8 { if n == 0 { 0 } else { renamed(n - 1) } }"),
-        "renamed",
-    );
-}
-
-#[test]
-fn an_import_alias_keeps_the_identity() {
-    renamed(
-        &with_dep("use dep::g;\npub fn f() -> u8 { g() }"),
-        &with_dep("use dep::g as other_name;\npub fn f() -> u8 { other_name() }"),
-        "f",
-    );
-}
-
-#[test]
-fn moving_the_item_in_its_file_keeps_the_identity() {
-    renamed(
-        &with_dep("pub fn f() -> u8 { dep::g() }\npub fn h() {}"),
-        &with_dep("pub fn h() {}\n\n\npub fn f() -> u8 { dep::g() }"),
-        "f",
-    );
-}
-
-#[test]
-fn renaming_a_callee_changes_the_identity() {
-    // A record holds facts of each item a path names by its key (its constant's value, its
-    // hidden type), so the callee's key is in the identity: two items with one signature are
-    // not interchangeable.
-    let fixture = |name: &str| {
-        format!(
-            "//- /main.rs crate:main deps:dep\npub fn f() -> u8 {{ dep::{name}() }}\n\
-             //- /dep.rs crate:dep\npub fn {name}() -> u8 {{ 0 }}\n"
-        )
-    };
-    differ(&fixture("g"), &fixture("renamed"));
-}
-
-#[test]
-fn swapping_two_locals_uses_changes_the_identity() {
-    differ(
-        &with_dep("pub fn f(a: u8, b: u8) -> u8 { a - b }"),
-        &with_dep("pub fn f(a: u8, b: u8) -> u8 { b - a }"),
-    );
-}
-
-#[test]
-fn another_field_or_method_changes_the_identity() {
-    let field = |name: &str| {
-        with_dep(&format!(
-            "pub struct P {{ pub x: u8, pub y: u8 }}\npub fn f(p: P) -> u8 {{ p.{name} }}"
-        ))
-    };
-    differ(&field("x"), &field("y"));
-    let method = |name: &str| {
-        with_dep(&format!(
-            "pub trait M {{ fn m(&self) -> u8; fn n(&self) -> u8; }}\n\
-             impl M for u8 {{ fn m(&self) -> u8 {{ 1 }} fn n(&self) -> u8 {{ 2 }} }}\n\
-             pub fn f() -> u8 {{ 1u8.{name}() }}"
-        ))
-    };
-    differ(&method("m"), &method("n"));
-}
-
-#[test]
-fn moving_into_another_module_changes_the_identity() {
-    differ(
-        &with_dep("pub mod a { pub fn f() -> u8 { dep::g() } }\npub mod b {}"),
-        &with_dep("pub mod a {}\npub mod b { pub fn f() -> u8 { dep::g() } }"),
-    );
+fn renaming_a_local_changes_the_key() {
+    let (before, _) = hashes(&with_dep("pub fn f() -> u8 { let x = dep::g(); x }"), "f");
+    let (after, _) = hashes(&with_dep("pub fn f() -> u8 { let y = dep::g(); y }"), "f");
+    assert_ne!(before, after);
 }
 
 #[test]
@@ -194,19 +68,19 @@ fn closure(db: &Db, def: DefWithBodyId) -> SolverDefId<'_> {
 }
 
 #[test]
-fn a_record_of_a_renamed_body_names_the_same_definitions() {
-    let before = db(&with_dep("pub fn f(a: u8) -> u8 { let c = |x: u8| x + a; c(dep::g()) }"));
-    let after =
-        db(&with_dep("\n\npub fn renamed(b: u8) -> u8 { let k = |y: u8| y + b; k(dep::g()) }"));
-    let (old, new) = (body(&before, "f"), body(&after, "renamed"));
-    assert_eq!(identity(&before, old), identity(&after, new));
+fn a_record_of_a_moved_body_names_the_same_definitions() {
+    let text = "pub fn f(a: u8) -> u8 { let c = |x: u8| x + a; c(dep::g()) }";
+    let before = db(&with_dep(text));
+    let after = db(&with_dep(&format!("pub struct Above;\n\n{text}")));
+    let (old, new) = (body(&before, "f"), body(&after, "f"));
+    assert_eq!(early_identity(&before, old), early_identity(&after, new));
 
     // The body's own item.
     let own = keys::def_key(&before, old, SolverDefId::FunctionId(body_fn(old)));
     assert_eq!(keys::def_of(&after, new, own), Some(SolverDefId::FunctionId(body_fn(new))));
     assert_ne!(own, key::def_key(&before, SolverDefId::FunctionId(body_fn(old))).0);
 
-    // A closure of the body, by its place in it.
+    // A closure of the body.
     let written = keys::def_key(&before, old, closure(&before, old));
     assert_eq!(keys::def_of(&after, new, written), Some(closure(&after, new)));
 

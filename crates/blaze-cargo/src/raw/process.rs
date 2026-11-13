@@ -18,9 +18,8 @@ pub fn alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// When the process `pid` started, in the unit the machine's memory ledger keeps
-/// (`blaze_graph::ledger::Process::start`), so that a pid the system gave again is told from
-/// the process that had it: field 22 of `/proc/<pid>/stat`, clock ticks after boot. `None` when
+/// When the process `pid` started, so that a pid the system gave again is told from the
+/// process that had it: field 22 of `/proc/<pid>/stat`, clock ticks after boot. `None` when
 /// no process has `pid`, or only a zombie (it holds no memory).
 #[cfg(target_os = "linux")]
 pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
@@ -55,9 +54,8 @@ pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
     }
 }
 
-/// When the process `pid` started, in the unit the machine's memory ledger keeps
-/// (`blaze_graph::ledger::Process::start`), so that a pid the system gave again is told from
-/// the process that had it: `proc_pidinfo`'s `PROC_PIDTBSDINFO`, microseconds since the
+/// When the process `pid` started, so that a pid the system gave again is told from the
+/// process that had it: `proc_pidinfo`'s `PROC_PIDTBSDINFO`, microseconds since the
 /// epoch. `None` when no process has `pid`, only a zombie does, or another user's process does
 /// (`EPERM`: then it is not the daemon of this user that had it).
 #[cfg(target_os = "macos")]

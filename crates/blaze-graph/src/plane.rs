@@ -22,34 +22,14 @@
 //! starts only when no request not idle has one ready that may start, its starts move only the
 //! virtual time idle requests share, and when a task of a request not idle waits for nothing
 //! but the threads of running idle tasks the plane asks the newest of them to give way
-//! ([`PlaneOutput::Yield`]). Its tasks are of band 1 at the gate ([`Plane::rank`]), so they
-//! never wound a task of a request not idle. [`PlaneInput::Promote`] makes it a request like
-//! the others.
+//! ([`PlaneOutput::Yield`]), which comes back as [`PlaneInput::Yielded`], ready again.
+//! [`PlaneInput::Promote`] makes it a request like the others.
 //!
-//! **Memory admission** (docs/v2/plan/design/end-state/memory.md, sections 4.3 and 9). Every
-//! commit of task memory passes one gate, `blaze_mem::budget::Budget`, which the driver owns;
-//! the plane only forecasts, for throughput. A task's forecast is its [`Spec::memory`] in
-//! whole quanta (`blaze_mem::budget::QUANTUM`), and 0 at or under
-//! [`crate::admission::STANDING`]. After each event of the gate the driver tells the plane what
-//! the gate leaves free ([`PlaneInput::Room`]); a ready task then starts when a thread of its
-//! pool is free and its forecast fits that, less the forecasts of the tasks the plane started
-//! since ([`Plane::fits`]). A task forecast 0 always fits, as everything does before the first
-//! `Room`, and so does the first task with a forecast while none with one runs: holding it
-//! back would free nothing, and the gate decides what it may hold. Once a task with a forecast
-//! does not fit, no later one starts in that dispatch (head of line), so a large task is never
-//! starved by small ones passing it, while tasks forecast 0 still take free threads. No task
-//! fails for memory here: the gate's `TooBig` is the one refusal, named by the driver.
-//!
-//! The gate ranks a task by `(band, age)` ([`Plane::rank`]): band 0 if it has a node of a
-//! request not idle, and an age given as the task is made and kept as it gives way. A task the
-//! gate wounds is told [`PlaneInput::Wound`], asked to give way ([`PlaneOutput::Yield`]), and
-//! comes back with [`PlaneInput::Yielded`], ready again at its age; with `held` it does not
-//! start until [`PlaneInput::Unheld`] (the elder it gave way to has ended).
-//!
-//! The floor of a start's admission (rule 67): one compare of its forecast with the room the
-//! plane counts, O(1) a start, against the ready heap's O(log n) to take it. A request's ready
-//! nodes of a pool are two heaps, those forecast 0 and the rest, so a blocked head of line
-//! costs nothing more to look past: the next start forecast 0 is a heap's root.
+//! **Admission is by threads alone.** A ready task starts when a thread of its pool is free:
+//! the plane forecasts no memory and holds no task back, wounds none and refuses none for it.
+//! What a process may hold is the kernel's to bound (a cgroup's `memory.max`, the machine), and
+//! a refusal there is a loud, typed error of the task that asked (2026-11-13: the gate, its
+//! forecasts and the machine's ledger were deleted, docs and audit-1113 verdict (e)).
 //!
 //! A request may be cancelled ([`Plane::cancel`]): what of it has not started is skipped, what
 //! runs is let finish, and it finishes failed. A plane lives as long as the daemon: a request
@@ -60,11 +40,11 @@
 //! reads (64 bytes a node, 32 a task) beside colder ones. Which slots are live is a
 //! [`Slab`] of each (docs/v2/plan/design/memory.md, "Generational handles"): a slot freed is
 //! taken again first, and what names a slot across lifetimes (a node's id in the index, a
-//! request's, a key in flight, a node's task, a task the gate holds, the idle tasks running)
+//! request's, a key in flight, a node's task, the idle tasks running)
 //! holds its [`Handle`], so a handle to a slot that ended is stale, not the slot's next
 //! occupant. A request's edges are one flat array: a node's deps a range of it, the
 //! nodes that wait for a node a list threaded through it. A task's members are a list threaded
-//! through the node rows. A request's ready nodes of a pool and forecast class are a 4-ary heap
+//! through the node rows. A request's ready nodes of a pool are a 4-ary heap
 //! of 24-byte entries that each node knows its place in, so a start, a raise and a leave are
 //! `O(log n)` with no allocation. A key is its own hash: the flight table indexes by its first
 //! eight bytes. What a step needs for a moment (a batch's order, the requests touched) is a
@@ -83,10 +63,7 @@ use std::{
 };
 
 use blaze_hash::{ByHash, HashMap};
-use blaze_mem::{
-    Handle, RegionVec, Slab, Tag as MemTag,
-    budget::{Age, Band, QUANTUM},
-};
+use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
 use std::alloc::Global;
@@ -183,30 +160,10 @@ pub enum PlaneInput {
     /// or finished (and so, once released, of one not known), it does nothing.
     Promote { at_ns: u64, request: RequestId },
     /// The task the plane asked to run as `id` gave way with no result (a
-    /// [`PlaneOutput::Yield`] asked, the gate wounded it, or the gate held it at its start):
-    /// its thread is free again and its nodes ready again, each in its own request at its own
-    /// priority (skipped, of a request cancelled, or failed and not keeping going), the task
-    /// keeping its age ([`Plane::rank`]). With `held` the task does not start again until
-    /// [`PlaneInput::Unheld`] of it: the gate holds it behind an elder or the room.
-    Yielded {
-        at_ns: u64,
-        id: NodeId,
-        #[serde(default)]
-        held: bool,
-    },
-    /// The task that gave way as `id` with `held` may start again: the gate let it go. Of a
-    /// task not held (it was dropped, its nodes skipped, or never held) it does nothing.
-    Unheld { at_ns: u64, id: NodeId },
-    /// The gate wounded the task running as `id`: the plane asks it to give way
-    /// ([`PlaneOutput::Yield`]), once a run. Of a task not running, or already asked, it does
-    /// nothing: a wound races the task's end.
-    Wound { at_ns: u64, id: NodeId },
-    /// What the gate leaves free for new starts now ([`crate::admission::free_for_starts`]: its
-    /// limit less what is committed, the overdrafts set aside and what running tasks are still
-    /// forecast to take), told after each event of the gate (a start, a reservation, a
-    /// give-way, an end, the machine's room). Admission
-    /// counts the forecasts of the tasks it starts from then on against it ([`Plane::fits`]).
-    Room { at_ns: u64, free: u64 },
+    /// [`PlaneOutput::Yield`] asked): its thread is free again and its nodes ready again, each
+    /// in its own request at its own priority (skipped, of a request cancelled, or failed and
+    /// not keeping going).
+    Yielded { at_ns: u64, id: NodeId },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
@@ -218,8 +175,8 @@ pub enum PlaneInput {
     Close { at_ns: u64, request: RequestId },
     /// The task the plane asked to run as `id` is done, on the thread group `group` where the
     /// executor has groups; its work found the nodes `added`, of `id`'s request. `peak` is the
-    /// most it committed, measured, for [`crate::admission::Peaks::observe`]; 0 when not
-    /// measured. Admission reads nothing of it.
+    /// most it held, measured, for the predictor's record and the profile; 0 when not measured.
+    /// Nothing is scheduled by it.
     Done {
         at_ns: u64,
         id: NodeId,
@@ -240,10 +197,7 @@ impl PlaneInput {
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Promote { at_ns, .. }
-            | PlaneInput::Yielded { at_ns, .. }
-            | PlaneInput::Unheld { at_ns, .. }
-            | PlaneInput::Wound { at_ns, .. }
-            | PlaneInput::Room { at_ns, .. } => *at_ns,
+            | PlaneInput::Yielded { at_ns, .. } => *at_ns,
         }
     }
 }
@@ -266,7 +220,6 @@ pub struct Nodes {
     pools: Vec<Pool>,
     costs: Vec<u64>,
     keys: Vec<Option<Key>>,
-    memory: Vec<u64>,
 }
 
 /// A node for [`Nodes::push`]: a [`Spec`] whose id is the next of the run, borrowing its name
@@ -279,7 +232,6 @@ pub struct NodeRef<'a> {
     pub pool: Pool,
     pub cost: u64,
     pub key: Option<Key>,
-    pub memory: u64,
 }
 
 impl Nodes {
@@ -303,7 +255,6 @@ impl Nodes {
             pools: Vec::with_capacity(nodes),
             costs: Vec::with_capacity(nodes),
             keys: Vec::with_capacity(nodes),
-            memory: Vec::with_capacity(nodes),
         }
     }
 
@@ -321,7 +272,6 @@ impl Nodes {
         self.pools.push(node.pool);
         self.costs.push(node.cost);
         self.keys.push(node.key);
-        self.memory.push(node.memory);
         NodeId(id)
     }
 
@@ -363,7 +313,6 @@ impl Nodes {
             pool: self.pools[at],
             cost: self.costs[at],
             key: self.keys[at],
-            memory: self.memory[at],
         }
     }
 
@@ -378,7 +327,6 @@ impl Nodes {
             pool: self.pools[at],
             cost: self.costs[at],
             key: self.keys[at],
-            memory: self.memory[at],
         }
     }
 
@@ -405,7 +353,6 @@ struct Columns {
     pools: Vec<Pool>,
     costs: Vec<u64>,
     keys: Vec<Option<Key>>,
-    memory: Vec<u64>,
 }
 
 impl TryFrom<Columns> for Nodes {
@@ -417,7 +364,6 @@ impl TryFrom<Columns> for Nodes {
             ("pools", it.pools.len()),
             ("costs", it.costs.len()),
             ("keys", it.keys.len()),
-            ("memory", it.memory.len()),
         ];
         for (column, its) in columns {
             if its != len {
@@ -459,7 +405,6 @@ impl TryFrom<Columns> for Nodes {
             pools: it.pools,
             costs: it.costs,
             keys: it.keys,
-            memory: it.memory,
         })
     }
 }
@@ -475,15 +420,14 @@ struct Parts<'a> {
     pool: Pool,
     cost: u64,
     key: Option<Key>,
-    memory: u64,
 }
 
 impl From<Spec> for Parts<'static> {
     fn from(spec: Spec) -> Parts<'static> {
-        let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
+        let Spec { id, kind, name, deps, pool, cost, key } = spec;
         // alloc: none: collected in place, `NodeId` being a `u32`
         let deps = Some(deps.into_iter().map(|it| it.0).collect());
-        Parts { id, kind, name: Cow::Owned(name), deps, pool, cost, key, memory }
+        Parts { id, kind, name: Cow::Owned(name), deps, pool, cost, key }
     }
 }
 
@@ -534,15 +478,10 @@ pub enum PlaneOutput {
     /// Every node of the request is settled. Nothing more comes of it.
     Finished { request: RequestId, ok: bool },
     /// Stop the task run as `id` at its next safe point and give the plane a
-    /// [`PlaneInput::Yielded`] of it (or its [`PlaneInput::Done`], if it ends first): the gate
-    /// wounded it ([`PlaneInput::Wound`]), or its nodes are all of idle requests and a task of
-    /// a request not idle is ready and waits for nothing but the thread it holds. Once a run.
+    /// [`PlaneInput::Yielded`] of it (or its [`PlaneInput::Done`], if it ends first): its nodes
+    /// are all of idle requests and a task of a request not idle is ready and waits for nothing
+    /// but the thread it holds. Once a run.
     Yield { id: NodeId },
-    /// A task that gave way, of the age `age` ([`Plane::rank`]), is dropped before it ran
-    /// again: every node of it was skipped (its requests cancelled or failed). The gate still
-    /// keeps it parked; the driver ends it there (`Budget::end`), or what it holds back waits
-    /// for good.
-    Dropped { age: u64 },
 }
 
 /// What the plane has done, for a person and for the tests.
@@ -559,15 +498,6 @@ pub struct Counts {
 /// What a start moves a request's virtual time on by, over its weight: divisible by every
 /// weight up to 16, so for those the shares are exact.
 const SHARE: u128 = 720_720 << 32;
-
-/// What memory admission did with a task as it started ([`Plane::admitted`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Admitted {
-    /// Its forecast, in bytes: whole quanta, 0 for a task at or under the standing frame.
-    pub forecast: u64,
-    /// The pool it runs on: what a wait that memory did not hold back waited for a thread of.
-    pub pool: Pool,
-}
 
 /// What one request did, for its proof of work ([`Plane::stats`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -712,10 +642,9 @@ struct NodeRow {
 const _: () = assert!(size_of::<NodeRow>() == 64);
 
 /// What a node needs now and then: as it becomes ready, as its task starts, as it settles,
-/// as its request ends. 64 bytes, found by its slot.
+/// as its request ends. 56 bytes, found by its slot.
 #[derive(Clone, Copy)]
 struct NodeCold {
-    memory: u64,
     done_at: u64,
     started_at: u64,
     /// The longest chain of measured run times through its request's nodes to it, its own
@@ -736,7 +665,7 @@ struct NodeCold {
     kind: NodeKind,
 }
 
-const _: () = assert!(size_of::<NodeCold>() == 64);
+const _: () = assert!(size_of::<NodeCold>() == 56);
 
 /// A dep of a node in its request's edges: the dep, the node that waits for it (`owner`), and
 /// the next edge of the same dep. A node's deps are one range of edges (CSR); the nodes that
@@ -750,20 +679,14 @@ struct Edge {
 
 const _: () = assert!(size_of::<Edge>() == 12);
 
-/// A task: 32 bytes, found by its slot; its key, if `keyed`, in a column beside.
+/// A task: 16 bytes, found by its slot; its key, if `keyed`, in a column beside.
 #[derive(Clone, Copy)]
 struct TaskRow {
-    /// Its place in admission order, given as it is made and kept as it gives way: the gate's
-    /// [`Age`].
-    age: u64,
-    /// Its forecast in quanta of the gate: 0 at or under the standing frame.
-    forecast: u32,
     /// The node whose id the task runs as, and whose request it counts against: the member
     /// that started it, once it runs.
     runner: u32,
     /// Every node that settles when it does, a list through [`NodeRow::next_member`] in the
-    /// order they joined. While it is not running (and not held), each is ready in its own
-    /// request.
+    /// order they joined. While it is not running, each is ready in its own request.
     first: u32,
     last: u32,
     pool: Pool,
@@ -771,15 +694,9 @@ struct TaskRow {
     keyed: bool,
     /// Running, and asked to give way ([`PlaneOutput::Yield`]).
     yielding: bool,
-    /// Gave way with `held` and not yet let go ([`PlaneInput::Unheld`]): its nodes are ready
-    /// but in no heap.
-    held: bool,
-    /// It gave way at least once: the gate keeps it parked, so dropping it says so
-    /// ([`PlaneOutput::Dropped`]).
-    gave_way: bool,
 }
 
-const _: () = assert!(size_of::<TaskRow>() == 32);
+const _: () = assert!(size_of::<TaskRow>() == 16);
 
 /// A ready node in its request's heap: the least `(rank, seq)` runs first, `rank` being the
 /// complement of its priority, so the longest path goes first and ties to the node added
@@ -818,12 +735,11 @@ struct Request {
     open: u32,
     /// Its first node that failed.
     failed: u32,
-    /// Its ready nodes of each pool and forecast class, each one of a task not running nor
-    /// held, as a 4-ary heap: the first to run first. By [`heap_of`]: a pool's tasks forecast
-    /// 0 apart from the rest, so the next one that never waits for memory is a root.
-    ready: [Vec<Ready>; 4],
-    /// Its place in the plane's `active` requests of each pool, while either heap of it is not
-    /// empty.
+    /// Its ready nodes of each pool, each one of a task not running, as a 4-ary heap: the
+    /// first to run first.
+    ready: [Vec<Ready>; 2],
+    /// Its place in the plane's `active` requests of each pool, while its heap of the pool is
+    /// not empty.
     active_at: [u32; 2],
     /// Its virtual time in each pool, for fair share.
     vtime: [u128; 2],
@@ -857,7 +773,7 @@ impl Request {
             release: false,
             open: 0,
             failed: NONE,
-            ready: [Vec::new(), Vec::new(), Vec::new(), Vec::new()], // alloc: none, empty; kept for the slot's next request
+            ready: [Vec::new(), Vec::new()], // alloc: none, empty; kept for the slot's next request
             active_at: [NONE; 2],
             vtime: [0; 2],
             running: BinaryHeap::new(),
@@ -1009,32 +925,6 @@ pub struct Plane<M = NoMemo> {
     /// Keys of tasks not yet settled.
     flight: ByKey<TaskHandle>,
     running: [usize; 2],
-    /// What the gate left free at the last [`PlaneInput::Room`]; `None` until one is told, and
-    /// then memory holds no task back.
-    free: Option<u64>,
-    /// The forecasts of the tasks started since the last [`PlaneInput::Room`], in bytes: what
-    /// they will take of `free`, which the gate has not counted yet.
-    started: u64,
-    /// The forecasts of the running tasks, in bytes: 0 lets the first task with a forecast
-    /// start whatever `free` says ([`Plane::fits`]).
-    running_forecast: u64,
-    /// The age the next task made takes.
-    next_age: u64,
-    /// A task with a forecast did not fit in this dispatch: none after it starts (head of
-    /// line). Reset as each dispatch begins.
-    blocked: bool,
-    /// The forecast of the task that set `blocked`, in bytes: 0 while `blocked` is not set.
-    held_back_by: u64,
-    /// The tasks held ([`TaskRow::held`]), by the node each ran as when it gave way: what an
-    /// [`PlaneInput::Unheld`] names.
-    held: HashMap<NodeId, TaskHandle, Global>, // alloc: the plane's index, for the daemon's life
-    /// The ages of the tasks that gave way and were dropped in this step, for
-    /// [`PlaneOutput::Dropped`].
-    dropped: Vec<u64>,
-    /// The planted bug of `plane_tests::budget`'s control: a held task starts as if it were
-    /// not.
-    #[cfg(test)]
-    pub(crate) ignore_held: bool,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests, which share it among themselves alone.
@@ -1045,7 +935,7 @@ pub struct Plane<M = NoMemo> {
     yielding: [usize; 2],
     /// The tasks a step asks to give way, a buffer.
     yields: Vec<TaskHandle>,
-    /// The requests whose ready heaps of each pool are not both empty, in no order.
+    /// The requests whose ready heap of each pool is not empty, in no order.
     active: [Vec<u32>; 2],
     /// Nodes to settle once the move under way is done, as the memo says, in order: settling
     /// them where they are found would nest without bound.
@@ -1067,17 +957,6 @@ fn pool_at(pool: Pool) -> usize {
         Pool::Io => 0,
         Pool::Work => 1,
     }
-}
-
-/// The ready heap of pool `p` for a task of `forecast` quanta: 2p for those forecast 0, which
-/// never wait for memory, 2p + 1 for the rest.
-fn heap_of(p: usize, forecast: u32) -> usize {
-    2 * p + usize::from(forecast > 0)
-}
-
-/// What task `t` is forecast to hold, in bytes.
-fn forecast_bytes(t: &TaskRow) -> u64 {
-    u64::from(t.forecast) * QUANTUM
 }
 
 impl Plane {
@@ -1115,16 +994,6 @@ impl<M: Memo> Plane<M> {
             memo,
             flight: ByKey::default(),
             running: [0; 2],
-            free: None,
-            started: 0,
-            running_forecast: 0,
-            next_age: 0,
-            blocked: false,
-            held_back_by: 0,
-            held: HashMap::new_in(Global), // alloc: the plane's index, for the daemon's life
-            dropped: Vec::new(),           // alloc: kept scratch
-            #[cfg(test)]
-            ignore_held: false,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             // Each `Vec` here is empty scratch the plane keeps: it grows to the most a step needs
@@ -1153,120 +1022,11 @@ impl<M: Memo> Plane<M> {
         self.counts
     }
 
-    /// What the gate left free at the last [`PlaneInput::Room`], less the forecasts of the
-    /// tasks started since: what admission counts a start against now. `None` until a `Room`
-    /// is told.
-    pub fn free(&self) -> Option<u64> {
-        Some(self.free?.saturating_sub(self.started))
-    }
-
-    /// The forecasts of the running tasks, in bytes.
-    pub fn running_forecast(&self) -> u64 {
-        self.running_forecast
-    }
-
-    /// Whether the last dispatch held a task back for memory: a task with a forecast did not
-    /// fit ([`Plane::fits`]), and none with a forecast after it started (the head of line).
-    pub fn held_back(&self) -> bool {
-        self.blocked
-    }
-
-    /// The forecast, in bytes, of the head-of-line task memory holds back now ([`Plane::held_back`]);
-    /// 0 when none. The driver adds it to the gate's committed bytes when it asks the machine's
-    /// ledger for room, so the room it asks for lets that task start. Kept as the plane
-    /// dispatches: O(1).
-    pub fn wanted(&self) -> u64 {
-        self.held_back_by
-    }
-
-    /// The task of node `id`'s rank at the gate: band 0 if it has a node of a request not
-    /// idle, else 1, and its age, given as the task was made and kept across its yields. `None`
-    /// for a node the plane does not hold or that has no task. The driver names the task at
-    /// the gate by its age (`TaskId(age)`), which no other task of the plane has.
-    pub fn rank(&self, id: NodeId) -> Option<(Band, Age)> {
-        let task = self.task_of_node(id)?;
-        let band = if self.foreground(task) { Band(0) } else { Band(1) };
-        Some((band, Age(self.tasks[row_of(task)].age)))
-    }
-
-    /// The live task node `id` is a member of.
-    fn task_of_node(&self, id: NodeId) -> Option<TaskHandle> {
-        let &node = self.index.get(&id)?;
-        let task = self.rows[node.index() as usize].task;
-        (task != NO_TASK && self.task_slots.live(task)).then_some(task)
-    }
-
-    /// What the task of node `id` is forecast to hold, in bytes (whole quanta, 0 at or under
-    /// the standing frame); `None` for a node the plane does not hold or that has no task.
-    pub fn memory_of(&self, id: NodeId) -> Option<u64> {
-        let task = self.task_of_node(id)?;
-        Some(forecast_bytes(&self.tasks[row_of(task)]))
-    }
-
-    /// Whether a task forecast `forecast` bytes may start now, as memory goes. A task forecast
-    /// 0 always may, and every task may before the first [`PlaneInput::Room`]; one with a
-    /// forecast may when it fits what the gate left free less the forecasts started since, or
-    /// when no task with a forecast runs. That last start is no exception to the gate, which
-    /// still decides what the task holds: holding it back would free nothing, so the plane's
-    /// wait would have no end it can name (rule 18).
-    ///
-    /// The invariant (liveness): in a dispatch where a pool has a free thread and a ready task
-    /// not held, and no task with a forecast runs, a task starts.
-    pub fn fits(&self, forecast: u64) -> bool {
-        match self.free() {
-            _ if forecast == 0 => true,
-            None => true,
-            Some(_) if self.running_forecast == 0 => true,
-            Some(free) => forecast <= free,
-        }
-    }
-
-    /// Whether the ready node `id` is held back for memory alone now: its task has a forecast
-    /// that does not fit ([`Plane::fits`]) or waits behind one that did not in the last
-    /// dispatch (the head of line), it is not held by the gate, and a thread of its pool is
-    /// free. `false` for a node not ready or a task forecast 0. What a stall says of a ready
-    /// node, and what its admission wait is labelled by.
-    pub fn waits_for_memory(&self, id: NodeId) -> bool {
-        let Some(&node) = self.index.get(&id) else { return false };
-        let m = node.index() as usize;
-        if self.states[m] != NodeState::Ready {
-            return false;
-        }
-        let task = self.rows[m].task;
-        if task == NO_TASK || !self.task_slots.live(task) {
-            return false;
-        }
-        let t = &self.tasks[row_of(task)];
-        let p = pool_at(t.pool);
-        let forecast = forecast_bytes(t);
-        !t.running
-            && !t.held
-            && forecast > 0
-            && (self.blocked || !self.fits(forecast))
-            && self.running[p] < self.threads_of(p)
-    }
-
-    /// Whether the ready node `id`'s task is held by the gate ([`PlaneInput::Yielded`] with
-    /// `held`), waiting for [`PlaneInput::Unheld`].
-    pub fn is_held(&self, id: NodeId) -> bool {
-        self.task_of_node(id).is_some_and(|task| self.tasks[row_of(task)].held)
-    }
-
     /// The state of `id`, if it was added.
     pub fn state(&self, id: NodeId) -> Option<&NodeState> {
         let node = *self.index.get(&id)?;
         debug_assert!(self.node_slots.live(node), "the index holds a stale handle of {id}");
         Some(&self.states[node.index() as usize])
-    }
-
-    /// What memory admission did with the task node `id` runs, read as it starts (after its
-    /// [`PlaneOutput::Run`]): its forecast and its pool. `None` for a node with no live task.
-    /// The driver writes it into the task's profile span (`blaze_profile::span::Task`), so a
-    /// forecast shows against the peak the task then had.
-    pub fn admitted(&self, id: NodeId) -> Option<Admitted> {
-        let task = self.task_of_node(id)?;
-        let row = &self.tasks[row_of(task)];
-        Some(Admitted { forecast: forecast_bytes(row), pool: row.pool })
     }
 
     /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.
@@ -1384,22 +1144,12 @@ impl<M: Memo> Plane<M> {
     }
 
     fn free_task(&mut self, task: TaskHandle) {
-        if self.tasks[row_of(task)].held {
-            self.tasks[row_of(task)].held = false;
-            self.held.retain(|_, &mut it| it != task);
-        }
         self.task_slots.give(task);
     }
 
     fn seq(&mut self) -> u64 {
         self.next_seq += 1;
         self.next_seq
-    }
-
-    /// The age of the next task made ([`TaskRow::age`]).
-    fn age(&mut self) -> u64 {
-        self.next_age += 1;
-        self.next_age - 1
     }
 
     pub fn step(&mut self, input: PlaneInput) -> Result<Vec<PlaneOutput>, Error> {
@@ -1467,31 +1217,9 @@ impl<M: Memo> Plane<M> {
                         .retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
                 }
             }
-            PlaneInput::Yielded { id, held, .. } => {
+            PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, id, held, out, touched);
-            }
-            PlaneInput::Unheld { id, .. } => {
-                // A task dropped since it was held is no longer the plane's to let go.
-                let Some(task) = self.held.remove(&id) else { return Ok(()) };
-                if self.task_slots.live(task) {
-                    self.unhold(task, touched);
-                }
-            }
-            PlaneInput::Wound { id, .. } => {
-                // A task that ended or gave way since the gate wounded it has let go already.
-                let Ok(task) = self.running_task(id) else { return Ok(()) };
-                let row = &mut self.tasks[row_of(task)];
-                if !row.yielding {
-                    row.yielding = true;
-                    let p = pool_at(row.pool);
-                    self.yielding[p] += 1;
-                    out.push(PlaneOutput::Yield { id });
-                }
-            }
-            PlaneInput::Room { free, .. } => {
-                self.free = Some(free);
-                self.started = 0;
+                self.yielded(at, task, out, touched);
             }
             PlaneInput::Add { request, nodes, .. } => {
                 let r = self.open_request(request)?;
@@ -1536,8 +1264,7 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::Done { id, outcome, added, group, .. } => {
-                // `peak` is the driver's to learn from (`admission::Peaks::observe`): the
-                // plane's forecast was fixed as the task was made.
+                // `peak` is the profile's: the plane admits by threads alone.
                 let task = self.running_task(id)?;
                 let runner = self.tasks[row_of(task)].runner;
                 let r = self.rows[runner as usize].request;
@@ -1641,7 +1368,6 @@ impl<M: Memo> Plane<M> {
         self.settle_deferred(at, out, touched);
         self.last_ns = at;
         self.dispatch(at, out);
-        out.extend(self.dropped.drain(..).map(|age| PlaneOutput::Dropped { age }));
         let requests = &self.requests;
         radix::sort_copy_by_key_in(
             touched,
@@ -1824,7 +1550,7 @@ impl<M: Memo> Plane<M> {
         place: usize,
         out: &mut Vec<PlaneOutput>,
     ) -> u32 {
-        let Parts { id, kind, name, deps, pool, cost, key, memory } = parts;
+        let Parts { id, kind, name, deps, pool, cost, key } = parts;
         let handle = self.node_slots.take();
         let me = handle.index();
         if me as usize == self.rows.len() {
@@ -1843,7 +1569,6 @@ impl<M: Memo> Plane<M> {
                 task: NO_TASK,
             });
             self.cold.push(NodeCold {
-                memory: 0,
                 done_at: 0,
                 started_at: 0,
                 path_ns: 0,
@@ -1941,7 +1666,6 @@ impl<M: Memo> Plane<M> {
             task: NO_TASK,
         };
         self.cold[m] = NodeCold {
-            memory,
             done_at: 0,
             started_at: 0,
             path_ns: 0,
@@ -1981,8 +1705,8 @@ impl<M: Memo> Plane<M> {
             }
             return;
         }
-        let h = self.heap_of_task(task);
-        let heap = &mut self.requests[r as usize].ready[h];
+        let p = self.pool_of_task(task);
+        let heap = &mut self.requests[r as usize].ready[p];
         heap[at as usize].rank = !priority;
         sift_up(heap, &mut self.rows, at as usize);
     }
@@ -2035,41 +1759,38 @@ impl<M: Memo> Plane<M> {
         row.priority >= running.max(ready.unwrap_or(0))
     }
 
-    /// The ready heap the nodes of `task` wait in ([`heap_of`]).
-    fn heap_of_task(&self, task: TaskHandle) -> usize {
-        let t = &self.tasks[row_of(task)];
-        heap_of(pool_at(t.pool), t.forecast)
+    /// The pool of `task`, whose ready heap its nodes wait in.
+    fn pool_of_task(&self, task: TaskHandle) -> usize {
+        pool_at(self.tasks[row_of(task)].pool)
     }
 
-    /// Puts `me`, of a task not running nor held, among its request's ready nodes of heap `h`
-    /// ([`heap_of`]). A request that had none of the pool comes back at the pool's virtual
-    /// time of its class: what it did not use while it had nothing to run is not owed to it.
-    fn make_ready(&mut self, me: u32, h: usize) {
-        let p = h / 2;
+    /// Puts `me`, of a task not running, among its request's ready nodes of pool `p`. A
+    /// request that had none of the pool comes back at the pool's virtual time of its class:
+    /// what it did not use while it had nothing to run is not owed to it.
+    fn make_ready(&mut self, me: u32, p: usize) {
         let row = self.rows[me as usize];
         let request = &mut self.requests[row.request as usize];
-        if request.ready[2 * p].is_empty() && request.ready[2 * p + 1].is_empty() {
+        if request.ready[p].is_empty() {
             let clock = if request.idle { self.idle_vclock[p] } else { self.vclock[p] };
             request.vtime[p] = request.vtime[p].max(clock);
             request.active_at[p] = self.active[p].len() as u32;
             self.active[p].push(row.request);
         }
         let entry = Ready { rank: !row.priority, seq: row.seq, node: me };
-        let heap = &mut request.ready[h];
+        let heap = &mut request.ready[p];
         heap.push(entry);
         let last = heap.len() - 1;
         sift_up(heap, &mut self.rows, last);
     }
 
-    /// Takes `me` from its request's ready nodes of heap `h`.
-    fn unready(&mut self, me: u32, h: usize) {
-        let p = h / 2;
+    /// Takes `me` from its request's ready nodes of pool `p`.
+    fn unready(&mut self, me: u32, p: usize) {
         let row = &self.rows[me as usize];
         let (r, at) = (row.request, row.heap_at);
         debug_assert!(at != NONE, "a node not ready taken from its ready nodes");
         let request = &mut self.requests[r as usize];
-        heap_remove(&mut request.ready[h], &mut self.rows, at as usize);
-        if request.ready[2 * p].is_empty() && request.ready[2 * p + 1].is_empty() {
+        heap_remove(&mut request.ready[p], &mut self.rows, at as usize);
+        if request.ready[p].is_empty() {
             let place = request.active_at[p];
             request.active_at[p] = NONE;
             self.active[p].swap_remove(place as usize);
@@ -2086,16 +1807,7 @@ impl<M: Memo> Plane<M> {
         let cold = self.cold[m];
         let r = self.rows[m].request as usize;
         let task = if cold.flags & KEYED == 0 {
-            let age = self.age();
-            new_task(
-                &mut self.tasks,
-                &mut self.task_keys,
-                &mut self.task_slots,
-                me,
-                &cold,
-                None,
-                age,
-            )
+            new_task(&mut self.tasks, &mut self.task_keys, &mut self.task_slots, me, &cold, None)
         } else {
             let key = self.keys[m];
             // A key in flight is not yet in the database: its task puts it there before its
@@ -2122,7 +1834,6 @@ impl<M: Memo> Plane<M> {
                 self.deferred.push((me, state));
                 return;
             }
-            self.next_age += 1;
             let task = new_task(
                 &mut self.tasks,
                 &mut self.task_keys,
@@ -2130,13 +1841,12 @@ impl<M: Memo> Plane<M> {
                 me,
                 &cold,
                 Some(key),
-                self.next_age - 1,
             );
             vacant.insert(task);
             task
         };
         self.rows[m].task = task;
-        self.make_ready(me, self.heap_of_task(task));
+        self.make_ready(me, self.pool_of_task(task));
         self.moved(at, me, NodeState::Ready, out);
     }
 
@@ -2147,17 +1857,14 @@ impl<M: Memo> Plane<M> {
         debug_assert!(t.last != NONE, "a task in flight has a member");
         self.rows[t.last as usize].next_member = me;
         t.last = me;
-        let (running, held, h) = (t.running, t.held, heap_of(pool_at(t.pool), t.forecast));
+        let (running, p) = (t.running, pool_at(t.pool));
         let row = &mut self.rows[me as usize];
         row.next_member = NONE;
         row.task = task;
         if running {
             self.moved(at, me, NodeState::Running, out);
         } else {
-            // A member of a held task waits in no heap until the gate lets it go.
-            if !held {
-                self.make_ready(me, h);
-            }
+            self.make_ready(me, p);
             self.moved(at, me, NodeState::Ready, out);
         }
     }
@@ -2246,9 +1953,7 @@ impl<M: Memo> Plane<M> {
         if t.running {
             return;
         }
-        if !t.held {
-            self.unready(me, heap_of(pool_at(t.pool), t.forecast));
-        }
+        self.unready(me, pool_at(t.pool));
         self.drop_if_empty(task);
     }
 
@@ -2285,8 +1990,7 @@ impl<M: Memo> Plane<M> {
         Some((task, t))
     }
 
-    /// Drops `task`, not running, once no node is left of it; one that gave way is said
-    /// ([`PlaneOutput::Dropped`]), as the gate still keeps it parked.
+    /// Drops `task`, not running, once no node is left of it.
     fn drop_if_empty(&mut self, task: TaskHandle) {
         let t = self.tasks[row_of(task)];
         if t.first == NONE {
@@ -2294,46 +1998,30 @@ impl<M: Memo> Plane<M> {
                 let key = self.task_keys[row_of(task)];
                 self.flight.remove(&key);
             }
-            if t.gave_way {
-                self.dropped.push(t.age);
-            }
             self.free_task(task);
         }
     }
 
-    /// Running `task`, run as `id`, gave way ([`PlaneInput::Yielded`]): its thread is free, it
-    /// is no start of its runner's request, and each of its nodes is ready again in its own
-    /// request at its own priority, or skipped as a node added to that request now would be.
-    /// `held`: the gate holds it until a [`PlaneInput::Unheld`] of `id`, and its nodes wait in
-    /// no heap until then.
+    /// Running `task` gave way ([`PlaneInput::Yielded`]): its thread is free, it is no start
+    /// of its runner's request, and each of its nodes is ready again in its own request at
+    /// its own priority, or skipped as a node added to that request now would be.
     fn yielded(
         &mut self,
         at: u64,
         task: TaskHandle,
-        id: NodeId,
-        held: bool,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<u32>,
     ) {
         let t = self.tasks[row_of(task)];
         let p = pool_at(t.pool);
         self.running[p] -= 1;
-        self.running_forecast -= forecast_bytes(&t);
         if t.yielding {
             self.yielding[p] -= 1;
         }
         self.idle_running.retain(|&it| it != task);
-        #[cfg(test)]
-        let held = held && !self.ignore_held;
         let row = &mut self.tasks[row_of(task)];
         row.running = false;
         row.yielding = false;
-        row.gave_way = true;
-        row.held = held;
-        if held {
-            self.held.insert(id, task);
-        }
-        let h = heap_of(p, t.forecast);
         let runner = t.runner as usize;
         self.requests[self.rows[runner].request as usize].stats.ran -= 1;
         self.cold[runner].flags &= !STARTED;
@@ -2356,32 +2044,13 @@ impl<M: Memo> Plane<M> {
                     self.moved(at, member, NodeState::Skipped { because }, out);
                 }
                 None => {
-                    if !held {
-                        self.make_ready(member, h);
-                    }
+                    self.make_ready(member, p);
                     self.moved(at, member, NodeState::Ready, out);
                 }
             }
             member = next;
         }
         self.drop_if_empty(task);
-    }
-
-    /// The gate let held `task` go ([`PlaneInput::Unheld`]): its nodes wait in their heaps
-    /// again.
-    fn unhold(&mut self, task: TaskHandle, touched: &mut Vec<u32>) {
-        let t = self.tasks[row_of(task)];
-        if !t.held || t.running {
-            return;
-        }
-        self.tasks[row_of(task)].held = false;
-        let h = heap_of(pool_at(t.pool), t.forecast);
-        let mut member = t.first;
-        while member != NONE {
-            touched.push(self.rows[member as usize].request);
-            self.make_ready(member, h);
-            member = self.rows[member as usize].next_member;
-        }
     }
 
     fn finish_task(
@@ -2397,7 +2066,6 @@ impl<M: Memo> Plane<M> {
         self.tasks[row_of(task)].running = false;
         let p = pool_at(t.pool);
         self.running[p] -= 1;
-        self.running_forecast -= forecast_bytes(&t);
         if t.yielding {
             self.tasks[row_of(task)].yielding = false;
             self.yielding[p] -= 1;
@@ -2449,17 +2117,11 @@ impl<M: Memo> Plane<M> {
         (request.idle, request.vtime[p], Reverse(request.weight), request.seq)
     }
 
-    /// Starts what the free threads and memory allow. In each pool, while a thread is free:
-    /// the request whose turn it is ([`Plane::turn`]) gives the better root of its two heaps
-    /// ([`heap_of`]); a root with a forecast that does not fit ([`Plane::fits`]) blocks every
-    /// later task with a forecast in this dispatch, plane-wide (head of line: nothing jumps a
-    /// task that waits for memory, so it waits only for what runs to end, never to starve),
-    /// and from then on only the roots forecast 0 start, by turn. Each start is O(log n) in
-    /// its heap, and choosing it reads two roots of each active request: the floor of a
-    /// scheduler that keeps an order, with no scan past a root.
+    /// Starts what the free threads allow. In each pool, while a thread is free, the request
+    /// whose turn it is ([`Plane::turn`]) gives the root of its heap of the pool. Each start
+    /// is O(log n) in its heap, and choosing it reads one root of each active request: the
+    /// floor of a scheduler that keeps an order, with no scan past a root.
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
-        self.blocked = false;
-        self.held_back_by = 0;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads_of(pool_at(pool)));
             while self.running[p] < limit {
@@ -2475,43 +2137,17 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// The ready node that starts next in pool `p`, if one may now ([`Plane::dispatch`]).
-    fn next(&mut self, p: usize) -> Option<u32> {
-        loop {
-            if self.blocked {
-                // Only the tasks that never wait for memory, by turn.
-                let r = self.active[p]
-                    .iter()
-                    .copied()
-                    .filter(|&r| !self.requests[r as usize].ready[2 * p].is_empty())
-                    .min_by_key(|&r| self.turn(r, p))?;
-                return Some(self.requests[r as usize].ready[2 * p][0].node);
-            }
-            let r = self.active[p].iter().copied().min_by_key(|&r| self.turn(r, p))?;
-            let request = &self.requests[r as usize];
-            let (zero, some) = (request.ready[2 * p].first(), request.ready[2 * p + 1].first());
-            let best = match (zero, some) {
-                (Some(zero), Some(some)) if some.before(zero) => *some,
-                (Some(zero), _) => *zero,
-                (None, Some(some)) => *some,
-                (None, None) => unreachable!("an active request has a ready node of its pool"),
-            };
-            let task = self.rows[best.node as usize].task;
-            let forecast = forecast_bytes(&self.tasks[row_of(task)]);
-            if self.fits(forecast) {
-                return Some(best.node);
-            }
-            self.blocked = true;
-            self.held_back_by = forecast;
-        }
+    /// The ready node that starts next in pool `p` ([`Plane::dispatch`]).
+    fn next(&self, p: usize) -> Option<u32> {
+        let r = self.active[p].iter().copied().min_by_key(|&r| self.turn(r, p))?;
+        let best = self.requests[r as usize].ready[p].first();
+        Some(best.expect("an active request has a ready node of its pool").node)
     }
 
     /// Asks running idle tasks to give way, the newest first, when a task of a request not
     /// idle that would start next in pool `p` waits for nothing but their threads, and as few
-    /// as that takes: none, if what is already giving way is enough. Memory is the gate's to
-    /// free: it wounds the idle tasks (band 1) for a task of band 0 ([`Plane::rank`]). Whether
-    /// such a task waits for idle tasks to give way, so no other idle task may start in `p`
-    /// now.
+    /// as that takes: none, if what is already giving way is enough. Whether such a task waits
+    /// for idle tasks to give way, so no other idle task may start in `p` now.
     fn yield_for(&mut self, p: usize, out: &mut Vec<PlaneOutput>) -> bool {
         if self.idle_running.is_empty() || !self.waiting(p) {
             return false;
@@ -2544,12 +2180,10 @@ impl<M: Memo> Plane<M> {
         let m = me as usize;
         let task = self.rows[m].task;
         let t = self.tasks[row_of(task)];
-        debug_assert!(!t.held, "a held task started");
         let p = pool_at(t.pool);
-        let h = heap_of(p, t.forecast);
         let mut member = t.first;
         while member != NONE {
-            self.unready(member, h);
+            self.unready(member, p);
             member = self.rows[member as usize].next_member;
         }
         self.cold[m].started_at = at;
@@ -2565,8 +2199,6 @@ impl<M: Memo> Plane<M> {
         self.tasks[row_of(task)].runner = me;
         self.tasks[row_of(task)].running = true;
         self.running[p] += 1;
-        self.started += forecast_bytes(&t);
-        self.running_forecast += forecast_bytes(&t);
         self.counts.ran += 1;
         let mut member = t.first;
         while member != NONE {
@@ -2614,15 +2246,8 @@ fn said(request: RequestId, at_ns: u64, event: Event) -> PlaneOutput {
     PlaneOutput::Said { request, record: Record { at_ns, event } }
 }
 
-/// The forecast, in quanta, of a node predicted `memory` bytes ([`admission::forecast_of`]).
-fn quanta_of(memory: u64) -> u32 {
-    u32::try_from(crate::admission::forecast_of(memory) / QUANTUM).unwrap_or(u32::MAX)
-}
-
-/// A task of `me` alone, not running, of age `age`, in a free slot (the last freed) or a new
-/// one: its handle. A node over the ceiling is no refusal here: the gate refuses it by name
-/// as it reserves past the ceiling (`blaze_mem::budget::TooBig`), from what it holds, not
-/// from a guess.
+/// A task of `me` alone, not running, in a free slot (the last freed) or a new one: its
+/// handle.
 fn new_task(
     tasks: &mut RegionVec<TaskRow>,
     task_keys: &mut RegionVec<Key>,
@@ -2630,11 +2255,8 @@ fn new_task(
     me: u32,
     cold: &NodeCold,
     key: Option<Key>,
-    age: u64,
 ) -> TaskHandle {
     let row = TaskRow {
-        age,
-        forecast: quanta_of(cold.memory),
         runner: me,
         first: me,
         last: me,
@@ -2642,8 +2264,6 @@ fn new_task(
         running: false,
         keyed: key.is_some(),
         yielding: false,
-        held: false,
-        gave_way: false,
     };
     let key = key.unwrap_or(Key([0; 32]));
     let task = slots.take();

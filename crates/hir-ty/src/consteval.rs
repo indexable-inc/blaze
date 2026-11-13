@@ -400,6 +400,14 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
         // it yet.
         expr = store.expr(tail);
     }
+    // A `line!()` or `column!()` is a placeholder in the store, its value where it is written
+    // (`body_store::placed_literal`): an anon const, whose MIR makes the value. Told by the
+    // call alone (`body_store::place_call`), so no line is read here.
+    if let Expr::Literal(_) = expr
+        && crate::body_store::place_call(interner.db, owner, path_expr).is_some()
+    {
+        return Err(CreateConstError::NeedsAnonConst);
+    }
     match expr {
         // A literal of another type is, as in rustc, an anon const whose own type check gives
         // E0308, when `mismatched_literal_as_anon_const`.

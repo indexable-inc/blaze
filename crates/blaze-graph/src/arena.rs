@@ -11,10 +11,8 @@
 //! fan-out included, never a sample of the whole process: two tasks running side by side are
 //! each charged their own bytes, not each other's (coord predict, 2026-11-04: a peak read
 //! process-wide while sixteen tasks ran was learned as one task's 121.59 GB). What a task held
-//! in its frames ([`blaze_mem::frame::task`]) is [`blaze_mem::frame::measure`]'s, and every
-//! page it commits passes the process's one gate ([`blaze_mem::gate`]). [`machine_budget`] is
-//! the ceiling that gate is installed under: the machine's limit, less what others use in
-//! blaze's own cgroup and a margin.
+//! in its frames ([`blaze_mem::frame::task`]) is [`blaze_mem::frame::measure`]'s. Nothing here
+//! limits memory: the counts report, and the kernel's limit is the one ceiling.
 //!
 //! Besides what is held, it counts the churn: the bytes allocated and freed in all, never
 //! netted, per account ([`Spent`]) and per tag (`blaze_mem::tag::heap_churned`), and every
@@ -24,9 +22,7 @@
 
 use std::{
     cell::Cell,
-    fmt, io,
     num::NonZeroUsize,
-    path::Path,
     sync::{
         OnceLock,
         atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -36,162 +32,7 @@ use std::{
 use blaze_mem::Tag;
 use crossbeam_queue::SegQueue;
 
-use serde::{Deserialize, Serialize};
-
-/// The memory blaze may use here ([`machine_budget`]), and what says so: the ceiling the
-/// driver gives the gate (`blaze_mem::budget::Config::ceiling`), and what a task over it is
-/// told to set (`blaze_mem::budget::TooBig`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: a daemon's config, at setup and in tests
-pub struct Budget {
-    pub bytes: u64,
-    pub from: String,
-    /// What the least limit loses before it is the budget: what others use and the margin
-    /// ([`machine_budget`]). The limit that fits a task is its need and this.
-    #[serde(default)]
-    pub kept_back: u64,
-}
-
-impl Budget {
-    /// The memory limit, in whole GiB, under which a task that holds `need` bytes fits: its
-    /// need and what the limit loses to others and the margin ([`Budget::kept_back`]).
-    pub fn to_fit(&self, need: u64) -> u64 {
-        need.saturating_add(self.kept_back).div_ceil(1 << 30)
-    }
-
-    /// What to tell blaze so a task that holds `need` bytes fits, for the error that refuses
-    /// it: the exact `BLAZE_DAEMON_MEMORY_GB`.
-    pub fn advice(&self, need: u64) -> String {
-        let fit = self.to_fit(need);
-        // alloc: the message of a task refused for memory, once
-        format!(
-            "to fit it, run with BLAZE_DAEMON_MEMORY_GB={fit} (or `--memory-gb {fit}`) on a \
-             machine with that much memory, which every other limit above must allow too; a \
-             command with another value than the daemon's restarts it when idle"
-        )
-    }
-}
-
-pub use global::{Holders, Malloc};
-
-/// The most task heaps open at once ([`heap_dies_with_task`]): the allocator's pool of them
-/// (blaze-engine's `heaps.rs`) has this many places, and [`TASK_NET`] a count for each.
-pub const MAX_TASK_HEAPS: usize = 1024;
-
-/// A heap of the global allocator's that one task allocates in and that is destroyed whole as
-/// the task ends ([`heap_dies_with_task`]): its place in the allocator's pool and the tag of
-/// the task that opened it, in one word (the place plus one in the low 24 bits, the tag's index
-/// in the high 8); 0 for none.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct TaskHeap(u32);
-
-const _: () = assert!(MAX_TASK_HEAPS < 1 << 24 && Tag::COUNT <= 1 << 8);
-
-impl TaskHeap {
-    /// No task heap: a block is in a tag's heap or outside any task.
-    pub const NONE: TaskHeap = TaskHeap(0);
-
-    /// The task heap at `place` of the pool, opened by a task of `tag`. `place` is below
-    /// [`MAX_TASK_HEAPS`].
-    pub fn new(place: usize, tag: Tag) -> TaskHeap {
-        assert!(place < MAX_TASK_HEAPS, "task heap place {place} past the pool's {MAX_TASK_HEAPS}");
-        TaskHeap((place as u32 + 1) | (tag.index() as u32) << 24)
-    }
-
-    /// Its place in the pool; `None` for none.
-    #[inline(always)]
-    pub fn place(self) -> Option<usize> {
-        ((self.0 & ((1 << 24) - 1)) as usize).checked_sub(1)
-    }
-
-    /// The tag of the task that opened it, which every block in it is counted to; `None` for
-    /// none.
-    #[inline(always)]
-    pub fn tag(self) -> Option<Tag> {
-        self.place()?;
-        Tag::ALL.get((self.0 >> 24) as usize).copied()
-    }
-}
-
-/// Where a block is, or is to be made: in the heap of a tag (`tag`, `task` none), in a task
-/// heap (`task`, with `tag` the opening task's, which the block is counted to), or outside any
-/// task (both none, [`Holder::OUTSIDE`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Holder {
-    pub tag: Option<Tag>,
-    pub task: TaskHeap,
-}
-
-impl Holder {
-    pub const OUTSIDE: Holder = Holder { tag: None, task: TaskHeap::NONE };
-
-    /// `tag`'s heap.
-    pub const fn of(tag: Tag) -> Holder {
-        Holder { tag: Some(tag), task: TaskHeap::NONE }
-    }
-
-    /// The task heap `task`, its blocks counted to its opener's tag.
-    pub fn in_task(task: TaskHeap) -> Holder {
-        Holder { tag: task.tag(), task }
-    }
-}
-
-/// What the blocks in each open task heap hold, as [`Counting`] counted them (each block at
-/// the size it was counted at, made less freed): what its tag's line is given back when the
-/// heap is destroyed with its blocks unfreed. An atomic add per allocation and free in a task
-/// heap, on a line of the heap's own.
-static TASK_NET: [TaskNet; MAX_TASK_HEAPS] = [const { TaskNet(AtomicI64::new(0)) }; MAX_TASK_HEAPS];
-
-#[repr(align(128))]
-struct TaskNet(AtomicI64);
-
-/// `delta` bytes of `task`'s blocks, made (positive) or freed.
-#[inline(always)]
-fn task_moved(task: TaskHeap, delta: i64) {
-    if let Some(place) = task.place() {
-        TASK_NET[place].0.fetch_add(delta, Ordering::Relaxed);
-    }
-}
-
-/// The task heaps of the global allocator: how one is opened for a task of a tag and destroyed
-/// whole at its end, registered by the allocator that makes them (blaze-engine's `heaps.rs`,
-/// [`task_heaps_by`]).
-#[derive(Clone, Copy)]
-pub struct TaskHeaps {
-    /// Opens a heap for a task of the tag, or says why none can be.
-    pub open: fn(Tag) -> Result<TaskHeap, TaskHeapRefused>,
-    /// Destroys the heap with every block left in it, and frees its place.
-    pub close: fn(TaskHeap),
-}
-
-static TASK_HEAPS: OnceLock<TaskHeaps> = OnceLock::new();
-
-/// Says how the global allocator opens and closes task heaps ([`heap_dies_with_task`]): set
-/// once, by the allocator, before the first task asks; the first call wins.
-pub fn task_heaps_by(heaps: TaskHeaps) {
-    _ = TASK_HEAPS.set(heaps);
-}
-
-/// Why no task heap was opened: every place of the pool is held by a task still running.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TaskHeapRefused {
-    /// The tag of the task that asked.
-    pub tag: Tag,
-    /// The pool's places, every one open.
-    pub open: usize,
-}
-
-impl fmt::Display for TaskHeapRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "a {:?} task asked for a heap that dies with it and all {} places of the task-heap \
-             pool are held by tasks still running (crates/blaze-graph/src/arena.rs \
-             MAX_TASK_HEAPS); the pool is sized for the most such tasks at once, so this is a \
-             leak of open task heaps or more of them than fibers",
-            self.tag, self.open,
-        )
-    }
-}
+pub use global::Holders;
 
 /// How far a thread's count may move before it is added to [`HELD`] (Linux's
 /// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
@@ -239,10 +80,6 @@ struct Local {
     sample_left: Cell<i64>,
     /// The heap sampler runs on this thread now: what it allocates is not sampled again.
     sampling: Cell<bool>,
-    /// The task heap the job on this thread allocates in ([`TaskHeap`]'s word; 0 for none):
-    /// its account's ([`heap_dies_with_task`]), set at every [`switch`] of the account, so it
-    /// rides the job across its waits with the account and is never the thread's.
-    task: Cell<u32>,
     #[cfg(test)]
     flushed: Cell<i64>,
 }
@@ -279,7 +116,6 @@ thread_local! {
             churn_freed: [const { Cell::new(0) }; HOLDERS],
             sample_left: Cell::new(SAMPLE_EVERY),
             sampling: Cell::new(false),
-            task: Cell::new(0),
             #[cfg(test)]
             flushed: Cell::new(0),
         }
@@ -344,26 +180,10 @@ pub fn fold_here() {
     });
 }
 
-/// [`count`] for a thread whose thread-locals are not there to count into
-/// ([`Locals::Gone`]): straight to [`HELD`] and the holder's tag line, two atomic adds, and
-/// to no account (the task that ran on the thread is over, or none began). Touches no
-/// thread-local.
-fn count_shared(holder: Option<Tag>, delta: i64) {
-    HELD.0.fetch_add(delta, Ordering::Relaxed);
-    blaze_mem::tag::heap_moved(holder, delta);
-}
 
-/// Where a block C allocated or freed is counted ([`Counting::c_malloc`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Locals {
-    /// In the thread's counts and its job's account, as a block of Rust's is.
-    Live,
-    /// Straight to the process's totals ([`count_shared`]), touching no thread-local: on
-    /// macOS, dyld makes a thread's thread-locals with `malloc` the first time the thread
-    /// touches one, and frees them with `free` as the thread ends, so a `malloc` or `free`
-    /// there that counted through them would make them again, through itself.
-    Gone,
-}
+
+
+
 
 #[cfg_attr(not(test), allow(unused_variables))]
 fn add(local: &Local, bytes: i64) {
@@ -545,87 +365,55 @@ mod global {
 
     use blaze_mem::Tag;
 
-    use super::{Counting, Holder, Locals, TaskHeap, count, count_shared, sampled, signed, task_moved};
+    use super::{Counting, count, sampled, signed};
 
     /// What [`Counting`] asks of the allocator under it to name the holder of a block: the
-    /// blaze-mem tag whose task allocated it, and the task heap it is in if any, kept apart so
-    /// that a free, on any thread, finds them again.
+    /// blaze-mem tag whose task allocated it, kept apart so that a free, on any thread, finds
+    /// it again.
     pub trait Holders: GlobalAlloc {
         /// Whether the allocator keeps blocks by tag. Where it does not, every block counts to
         /// what is held outside any task (`blaze_mem::tag::Snapshot::heap_outside`) and the
         /// tags' global-heap counts stay 0.
         const BY_TAG: bool;
 
-        /// Allocates `layout`, zeroed when `zeroed` is set, in `into` (a tag's heap or a task
-        /// heap, never [`Holder::OUTSIDE`], which [`GlobalAlloc::alloc`] serves).
+        /// Allocates `layout`, zeroed when `zeroed` is set, among `tag`'s blocks.
         ///
         /// # Safety
         ///
-        /// [`GlobalAlloc::alloc`]'s contract for `layout`; `into`'s task heap, if any, is open.
-        unsafe fn alloc_for(&self, into: Holder, layout: Layout, zeroed: bool) -> *mut u8;
+        /// [`GlobalAlloc::alloc`]'s contract for `layout`.
+        unsafe fn alloc_for(&self, tag: Tag, layout: Layout, zeroed: bool) -> *mut u8;
 
-        /// Where `ptr`'s block is ([`Holders::alloc_for`]); [`Holder::OUTSIDE`] for a block
+        /// The tag among whose blocks `ptr` is ([`Holders::alloc_for`]); `None` for a block
         /// allocated outside any task. Allocates nothing.
         ///
         /// # Safety
         ///
         /// `ptr` is a live block of this allocator.
-        unsafe fn holder(&self, ptr: *mut u8) -> Holder;
+        unsafe fn holder(&self, ptr: *mut u8) -> Option<Tag>;
 
-        /// [`GlobalAlloc::realloc`], putting the block in `into` when it moves. One grown or
-        /// shrunk in place stays where it was, so [`Holders::holder`] of the result says which.
+        /// [`GlobalAlloc::realloc`], putting the block among `into`'s blocks (the running
+        /// task's; `None`, the untagged ones) when it moves. One grown or shrunk in place stays
+        /// where it was, so [`Holders::holder`] of the result says which.
         ///
         /// # Safety
         ///
-        /// [`GlobalAlloc::realloc`]'s contract; `into`'s task heap, if any, is open.
+        /// [`GlobalAlloc::realloc`]'s contract.
         unsafe fn realloc_for(
             &self,
-            into: Holder,
+            into: Option<Tag>,
             ptr: *mut u8,
             layout: Layout,
             new_size: usize,
         ) -> *mut u8;
     }
 
-    /// What [`Counting`] asks of the allocator under it to serve C's `malloc`, `free` and
-    /// `realloc` (blaze-engine's `malloc.rs`), which name no layout: a block's owner and size
-    /// from its address alone. Every block C allocates through it is counted at its usable size,
-    /// as it is made and again as it is freed, so the two cancel whatever size was asked.
-    pub trait Malloc: Holders {
-        /// Whether `ptr` is in a block of this allocator's. Any address may be asked, one of
-        /// another allocator's too. Allocates nothing.
-        fn owns(&self, ptr: *const u8) -> bool;
+                    
 
-        /// The bytes `ptr`'s block holds: what C may use of it, and what it is counted at.
-        ///
-        /// # Safety
-        ///
-        /// `ptr` is a live block of this allocator.
-        unsafe fn usable(&self, ptr: *mut u8) -> usize;
-
-        /// Frees `ptr`, whatever layout it was made with.
-        ///
-        /// # Safety
-        ///
-        /// `ptr` is a live block of this allocator, not used after.
-        unsafe fn free(&self, ptr: *mut u8);
-
-        /// C's `realloc` of `ptr` to `new_size` bytes, at `malloc`'s alignment, putting the
-        /// block in `into` when it moves, as [`Holders::realloc_for`] does.
-        ///
-        /// # Safety
-        ///
-        /// `ptr` is a live block of this allocator; once this returns non-null, `ptr` is
-        /// not used again; `into`'s task heap, if any, is open.
-        unsafe fn realloc_in(&self, into: Holder, ptr: *mut u8, new_size: usize) -> *mut u8;
-    }
-
-    /// std's allocator keeps no blocks apart: its bytes are counted, not named, and it makes
-    /// no task heaps (it registers none, [`super::task_heaps_by`]), so `into` is never one.
+    /// std's allocator keeps no blocks apart: its bytes are counted, not named.
     impl Holders for System {
         const BY_TAG: bool = false;
 
-        unsafe fn alloc_for(&self, _: Holder, layout: Layout, zeroed: bool) -> *mut u8 {
+        unsafe fn alloc_for(&self, _: Tag, layout: Layout, zeroed: bool) -> *mut u8 {
             // SAFETY: the caller upholds `alloc`'s contract for `layout`.
             unsafe {
                 match zeroed {
@@ -635,13 +423,13 @@ mod global {
             }
         }
 
-        unsafe fn holder(&self, _: *mut u8) -> Holder {
-            Holder::OUTSIDE
+        unsafe fn holder(&self, _: *mut u8) -> Option<Tag> {
+            None
         }
 
         unsafe fn realloc_for(
             &self,
-            _: Holder,
+            _: Option<Tag>,
             ptr: *mut u8,
             layout: Layout,
             new_size: usize,
@@ -652,59 +440,39 @@ mod global {
     }
 
     impl<A: Holders> Counting<A> {
-        /// Where a block allocated now goes: the task heap of the job on this thread, if its
-        /// task's heap dies with it ([`super::heap_dies_with_task`]); else the running task's
-        /// tag's heap, where `A` keeps tags.
+        /// The tag a block allocated now is for: the running task's, where `A` keeps tags.
         #[inline(always)]
-        fn running() -> Holder {
-            if !A::BY_TAG {
-                return Holder::OUTSIDE;
-            }
-            match super::task_here() {
-                TaskHeap::NONE => Holder { tag: blaze_mem::frame::running_tag(), task: TaskHeap::NONE },
-                task => Holder::in_task(task),
-            }
-        }
-
-        /// Where a block `was` (a live one's holder) goes if a realloc now moves it: where a
-        /// new block would ([`Counting::running`]), but for a block from outside the running
-        /// job's task heap, which stays where it was. A buffer the caller made and the task
-        /// grows is the caller's, and must not die with the task's heap.
-        #[inline(always)]
-        fn moved_from(was: Holder) -> Holder {
-            let into = Self::running();
-            match into.task != TaskHeap::NONE && into.task != was.task {
-                true => was,
-                false => into,
+        fn running() -> Option<Tag> {
+            match A::BY_TAG {
+                true => blaze_mem::frame::running_tag(),
+                false => None,
             }
         }
 
         #[inline(always)]
         unsafe fn made(&self, layout: Layout, zeroed: bool) -> *mut u8 {
             let holder = Self::running();
-            // SAFETY: the caller upholds `alloc`'s contract for `layout`; a task heap the job
-            // allocates in is open until its task ends, after the job's last allocation in it.
+            // SAFETY: the caller upholds `alloc`'s contract for `layout`.
             let ptr = unsafe {
-                match (holder == Holder::OUTSIDE, zeroed) {
-                    (false, _) => self.0.alloc_for(holder, layout, zeroed),
-                    (true, true) => self.0.alloc_zeroed(layout),
-                    (true, false) => self.0.alloc(layout),
+                match (holder, zeroed) {
+                    (Some(tag), _) => self.0.alloc_for(tag, layout, zeroed),
+                    (None, true) => self.0.alloc_zeroed(layout),
+                    (None, false) => self.0.alloc(layout),
                 }
             };
             if !ptr.is_null() {
-                count(holder.tag, signed(layout.size()), ptr);
-                task_moved(holder.task, signed(layout.size()));
+                count(holder, signed(layout.size()), ptr);
             }
             ptr
         }
 
         /// What holds `ptr`, a live block of `A`.
         #[inline(always)]
-        unsafe fn holder(&self, ptr: *mut u8) -> Holder {
+        unsafe fn holder(&self, ptr: *mut u8) -> Option<Tag> {
             match A::BY_TAG {
                 // SAFETY: the caller says `ptr` is a live block of this allocator.
                 true => unsafe { self.0.holder(ptr) },
-                false => Holder::OUTSIDE,
+                false => None,
             }
         }
     }
@@ -734,141 +502,38 @@ mod global {
             sampled::freed(ptr);
             // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`.
             unsafe { self.0.dealloc(ptr, layout) };
-            count(holder.tag, -signed(layout.size()), std::ptr::null_mut());
-            task_moved(holder.task, -signed(layout.size()));
+            count(holder, -signed(layout.size()), std::ptr::null_mut());
         }
 
         /// A block that moves goes to the running task's tag, as a new one would: a buffer
         /// one task made and another grew (a thread's stack of reads, a memo's vector) is the
-        /// grower's once it moves, not whoever made its first few bytes. Never into a task
-        /// heap it was not made in ([`Counting::moved_from`]).
+        /// grower's once it moves, not whoever made its first few bytes.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             // SAFETY: the caller says `ptr` is a live block of this allocator.
             let was = unsafe { self.holder(ptr) };
             let lifted = sampled::lift(ptr);
             // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
-            let new = unsafe { self.0.realloc_for(Self::moved_from(was), ptr, layout, new_size) };
+            let new = unsafe { self.0.realloc_for(Self::running(), ptr, layout, new_size) };
             sampled::land(lifted, ptr, new);
             if !new.is_null() {
                 // SAFETY: `new` is the live block the realloc gave.
                 let now = unsafe { self.holder(new) };
-                moved(was, now, signed(layout.size()), signed(new_size), new, Locals::Live);
-            }
-            new
-        }
-    }
-
-    /// Counts a realloc that took a block of `old` bytes in `was` to `new` bytes in `now`
-    /// (`ptr`): in place, the difference; moved, the whole of each.
-    #[inline(always)]
-    fn moved(was: Holder, now: Holder, old: i64, new: i64, ptr: *mut u8, locals: Locals) {
-        match now == was {
-            true => {
-                tally(locals, was.tag, new - old, ptr);
-                task_moved(was.task, new - old);
-            }
-            false => {
-                tally(locals, was.tag, -old, std::ptr::null_mut());
-                task_moved(was.task, -old);
-                tally(locals, now.tag, new, ptr);
-                task_moved(now.task, new);
-            }
-        }
-    }
-
-    /// C's allocator, over `A`: the entry points blaze's `malloc`, `free` and `realloc` (and
-    /// on macOS its malloc zone) call, so a block C or C++ allocates (LLVM, through its C API
-    /// and its `operator new`) is made for the running task's tag and counted as Rust's are.
-    /// A block is counted at its usable size ([`Malloc::usable`]).
-    impl<A: Malloc> Counting<A> {
-        /// `malloc` (`zeroed`: `calloc`), and with `align` past a word `posix_memalign`,
-        /// `aligned_alloc` and the rest: a block of at least `size` bytes, in the running
-        /// task's tag, counted in this thread's counts ([`Locals::Live`]). Null where the
-        /// allocator has none, or `size` and `align` make no layout.
-        ///
-        /// # Safety
-        ///
-        /// `align` is a power of two; the thread's thread-locals are there to count into.
-        pub unsafe fn c_malloc(&self, size: usize, align: usize, zeroed: bool) -> *mut u8 {
-            // `malloc(0)` is a block of its own, as mimalloc makes it; a layout of 0 bytes is
-            // outside `GlobalAlloc`'s contract.
-            let Ok(layout) = Layout::from_size_align(size.max(1), align) else {
-                return std::ptr::null_mut();
-            };
-            let holder = Self::running();
-            // SAFETY: a valid layout of a nonzero size; a task heap the job allocates in is
-            // open until its task ends.
-            let ptr = unsafe {
-                match (holder == Holder::OUTSIDE, zeroed) {
-                    (false, _) => self.0.alloc_for(holder, layout, zeroed),
-                    (true, true) => self.0.alloc_zeroed(layout),
-                    (true, false) => self.0.alloc(layout),
+                match now == was {
+                    true => count(was, signed(new_size) - signed(layout.size()), new),
+                    false => {
+                        count(was, -signed(layout.size()), std::ptr::null_mut());
+                        count(now, signed(new_size), new);
+                    }
                 }
-            };
-            if !ptr.is_null() {
-                // SAFETY: the live block just made.
-                let bytes = signed(unsafe { self.0.usable(ptr) });
-                count(holder.tag, bytes, ptr);
-                task_moved(holder.task, bytes);
-            }
-            ptr
-        }
-
-        /// `free` of `ptr`, a live block of `A` (`usable`: its size, where the caller has it
-        /// from `A` already), taken off the tag whose heap holds it, wherever it was made.
-        ///
-        /// # Safety
-        ///
-        /// `ptr` is a live block of `A`, not used after; `usable`, if given, is
-        /// [`Malloc::usable`] of it.
-        pub unsafe fn c_free(&self, ptr: *mut u8, usable: Option<usize>, locals: Locals) {
-            // SAFETY: the caller says `ptr` is a live block of `A`.
-            let (holder, bytes) = unsafe {
-                (self.holder(ptr), usable.unwrap_or_else(|| self.0.usable(ptr)))
-            };
-            sampled::freed(ptr);
-            // SAFETY: as above, freed once.
-            unsafe { self.0.free(ptr) };
-            tally(locals, holder.tag, -signed(bytes), std::ptr::null_mut());
-            task_moved(holder.task, -signed(bytes));
-        }
-
-        /// `realloc` of `ptr`, a live block of `A`, to `new_size` bytes: one that moves goes
-        /// to the running task's tag ([`Locals::Live`]; the untagged blocks where the thread's
-        /// thread-locals are gone, which name no task), as Rust's do. Null, `ptr` untouched,
-        /// where the allocator has no room.
-        ///
-        /// # Safety
-        ///
-        /// `ptr` is a live block of `A`, not used again once this returns non-null.
-        pub unsafe fn c_realloc(&self, ptr: *mut u8, new_size: usize, locals: Locals) -> *mut u8 {
-            // SAFETY: the caller says `ptr` is a live block of `A`.
-            let (was, old) = unsafe { (self.holder(ptr), self.0.usable(ptr)) };
-            let into = match locals {
-                Locals::Live => Self::moved_from(was),
-                Locals::Gone => Holder::OUTSIDE,
-            };
-            let lifted = sampled::lift(ptr);
-            // SAFETY: as above; `realloc(p, 0)` keeps a block, as `malloc(0)` makes one.
-            let new = unsafe { self.0.realloc_in(into, ptr, new_size.max(1)) };
-            sampled::land(lifted, ptr, new);
-            if !new.is_null() {
-                // SAFETY: `new` is the live block the realloc gave.
-                let (now, bytes) = unsafe { (self.holder(new), self.0.usable(new)) };
-                moved(was, now, signed(old), signed(bytes), new, locals);
             }
             new
         }
     }
 
-    /// Counts `delta` bytes of `holder`'s where `locals` says.
-    #[inline(always)]
-    fn tally(locals: Locals, holder: Option<Tag>, delta: i64, ptr: *mut u8) {
-        match locals {
-            Locals::Live => count(holder, delta, ptr),
-            Locals::Gone => count_shared(holder, delta),
-        }
-    }
+                    
+
+        
+    
 }
 
 /// How far a thread's bytes for its account may move before they are charged to it: the
@@ -903,10 +568,6 @@ struct Slot {
     generation: AtomicU32,
     /// How many accounts enclose it: a charge walks this many parents at most.
     depth: AtomicU32,
-    /// The task heap its work allocates in ([`TaskHeap`]'s word, 0 for none): the one
-    /// [`heap_dies_with_task`] opened it with, or its parent's. Set before the slot is
-    /// published, read at each [`switch`] to it.
-    heap: AtomicU32,
     /// The id of the account it was opened inside, which every charge to it is charged to too;
     /// 0 for none.
     parent: AtomicUsize,
@@ -923,9 +584,7 @@ struct Slot {
 /// opened and never freed: a slot's address is fixed for the process's life, so the allocator's
 /// charges reach it with an acquire load and no lock. A segment is taken from the system
 /// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]'s Rust entry points:
-/// making one charges no account ([`uncharged`]) and never reenters a charge. In the daemon the
-/// system allocator is blaze's C allocator (blaze-engine's `malloc.rs`, [`Counting::c_malloc`]),
-/// so its bytes are in [`held`] and the heap's tag lines like any C block's.
+/// making one charges no account ([`uncharged`]) and never reenters a charge.
 static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
 
@@ -1092,11 +751,9 @@ fn charge(local: &Local, account: usize, net: i64) {
 /// `account` the thread's (the job's on it). The account it had.
 #[inline(never)]
 fn switch(account: Account) -> Account {
-    let heap = account.slot().map_or(0, |slot| slot.heap.load(Ordering::Relaxed));
     with_local(|local| {
         let moved = Moved::take(local);
         let was = Account(local.account.replace(account.0));
-        local.task.set(heap);
         if !moved.is_empty() {
             charge_to(was, moved);
         }
@@ -1104,41 +761,23 @@ fn switch(account: Account) -> Account {
     })
 }
 
-/// The task heap the job on this thread allocates in: its account's ([`switch`]). One
-/// thread-local load; not inlined, as [`with_local`] is not, so a job that waits reads the
-/// thread it resumed on.
-#[inline(never)]
-fn task_here() -> TaskHeap {
-    TaskHeap(LOCAL.with(|local| local.task.get()))
-}
-
 /// Runs `f`, the account table's own bookkeeping (the free slots' queue, which allocates a
 /// block per 31 pushes and frees it once popped empty, and a new segment of slots), charging no
 /// account: what the table holds is no task's work. Charged to the account opening or closing
 /// one, a block freed by an inner open counted against the outer account, whose peak then fell
 /// short of what its inner account held by the block (504 bytes), as other tasks' frees left
-/// the queue. Nor in a task heap: the table and its queue outlive every task.
+/// the queue.
 fn uncharged<R>(f: impl FnOnce() -> R) -> R {
-    let was = with_local(|local| (local.account.replace(0), local.task.replace(0)));
+    let was = with_local(|local| local.account.replace(0));
     let result = f();
-    with_local(|local| {
-        local.account.set(was.0);
-        local.task.set(was.1);
-    });
+    with_local(|local| local.account.set(was));
     result
 }
 
-/// Opens an account inside `parent` (or none) in a free slot, or a new one when none is free,
-/// its work allocating in `parent`'s task heap if it has one. It never fails and never waits:
-/// the table grows to the most accounts open at once ([`SEGMENTS`]), and accounts nest as deep
-/// as the work does.
+/// Opens an account inside `parent` (or none) in a free slot, or a new one when none is free.
+/// It never fails and never waits: the table grows to the most accounts open at once
+/// ([`SEGMENTS`]), and accounts nest as deep as the work does.
 fn open(parent: Account) -> Account {
-    let heap = parent.slot().map_or(TaskHeap::NONE, |slot| TaskHeap(slot.heap.load(Ordering::Relaxed)));
-    open_in(parent, heap)
-}
-
-/// [`open`], its work allocating in `heap`.
-fn open_in(parent: Account, heap: TaskHeap) -> Account {
     let depth =
         parent.slot().map_or(0, |slot| slot.depth.load(Ordering::Relaxed).saturating_add(1));
     let (index, slot) = uncharged(|| {
@@ -1150,7 +789,6 @@ fn open_in(parent: Account, heap: TaskHeap) -> Account {
     slot.allocated.store(0, Ordering::Relaxed);
     slot.freed.store(0, Ordering::Relaxed);
     slot.depth.store(depth, Ordering::Relaxed);
-    slot.heap.store(heap.0, Ordering::Relaxed);
     slot.parent.store(parent.0, Ordering::Relaxed);
     // The slot is this open's alone (popped or new): even to odd, published with its fields.
     let held = slot.generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
@@ -1188,8 +826,8 @@ pub struct Spent {
 }
 
 /// What `account`'s work held at most so far, while it is open: what a task has realized as it
-/// runs, read from another thread (the daemon's loop). `None` once it closed, so a task that ended is never read as
-/// another's whose account took its slot. Lock-free: one load of the slot's generation and one
+/// runs, read from another thread (the daemon's loop). `None` once it closed, so a task that
+/// ended is never read as another's whose account took its slot. Lock-free: one load of the slot's generation and one
 /// of its peak.
 pub fn peak_now(account: Account) -> Option<u64> {
     let slot = account.slot()?;
@@ -1264,103 +902,6 @@ pub fn charged_to<R>(account: Account, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Runs `f`, the work of the running task (`blaze_mem::frame::task`), with every block it
-/// allocates through [`Counting`] in a heap of its own that is destroyed whole, with whatever
-/// is left in it, when `f` returns or unwinds: "its heap dies with it", the explicit choice of a
-/// task whose results are records (written to the store) or bytes in buffers its caller made,
-/// never a value that owns a block `f` allocated. The default, a task without this, allocates
-/// in its tag's heap, whose blocks live until freed. What the heap held leaves its tag's
-/// [`blaze_mem::tag::Counters::heap`] at the end, and its pages go back to the allocator's arena
-/// at once, so a task's churn leaves no partly used pages behind (the 12.4 GiB "allocator kept"
-/// of tempo's cold build is that).
-///
-/// The work's pool scopes ([`charged_to`]) and the accounts it opens ([`measured`]) allocate in
-/// the same heap: the heap rides the task's [`account`], as its charges do, across every wait
-/// and thread. A block made outside it and grown by `f` stays outside it
-/// (`Counting::moved_from`), so a caller's buffer is never moved into a heap that dies.
-///
-/// A task that opts in, now: none in this crate's callers yet; the call goes inside the task's
-/// closure, `frame::task(Tag::Codegen, |frame| arena::heap_dies_with_task(|| lower(frame)))`.
-/// Never a query run: its memos, edges and interned values are heap values that outlive it
-/// until they are records (docs/v2/plan/design/end-state/memory.md 9.3).
-///
-/// A panic in `f` is carried out of the heap: its message is copied to a payload made outside
-/// it before the heap is destroyed, and the unwind goes on with that (a `&str` or `String`
-/// payload keeps its text; any other is named as such).
-///
-/// Where the global allocator makes no task heaps ([`task_heaps_by`] never called: std's, the
-/// tests' counting allocators) `f` runs in its tag's heap, as without this: there is no heap to
-/// destroy, and nothing kept past `f` is lost.
-///
-/// # Panics
-///
-/// Outside any task (no tag to count the heap to), and when every place of the pool is held
-/// ([`TaskHeapRefused`]), naming the tag.
-pub fn heap_dies_with_task<R>(f: impl FnOnce() -> R) -> R {
-    let Some(heaps) = TASK_HEAPS.get().copied() else { return f() };
-    let Some(tag) = blaze_mem::frame::running_tag() else {
-        panic!(
-            "arena::heap_dies_with_task outside any blaze_mem::frame::task: a task heap is \
-             counted to its task's tag, and here there is none"
-        )
-    };
-    let heap = (heaps.open)(tag).unwrap_or_else(|refused| panic!("{refused}"));
-    /// Closes the task's account and destroys its heap, on a return or an unwind: the job
-    /// charges and allocates where it did before, then the heap's blocks, uncounted by a free,
-    /// are taken off its tag, and the heap goes.
-    struct Open {
-        account: Account,
-        outer: Account,
-        heap: TaskHeap,
-        tag: Tag,
-        close: fn(TaskHeap),
-    }
-    impl Drop for Open {
-        fn drop(&mut self) {
-            switch(self.outer);
-            close(self.account);
-            let place = self.heap.place().expect("an open task heap has a place");
-            let left = TASK_NET[place].0.swap(0, Ordering::Relaxed);
-            if left != 0 {
-                count_shared(Some(self.tag), -left);
-                if left > 0 {
-                    blaze_mem::tag::heap_churned(Some(self.tag), 0, left.unsigned_abs());
-                }
-            }
-            (self.close)(self.heap);
-        }
-    }
-    let outer = current();
-    let account = open_in(outer, heap);
-    let open = Open { account, outer, heap, tag, close: heaps.close };
-    switch(account);
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(out) => {
-            drop(open);
-            out
-        }
-        Err(payload) => {
-            // Back outside the heap before the copy is made, so the copy outlives it.
-            switch(outer);
-            let copied: Box<dyn std::any::Any + Send> = match payload.downcast_ref::<String>() {
-                // alloc: the panic's message, carried out of the heap that dies
-                Some(message) => Box::new(message.clone()),
-                None => match payload.downcast_ref::<&'static str>() {
-                    Some(message) => Box::new(*message),
-                    None => Box::new(
-                        "a task whose heap died with it panicked with a payload that is neither \
-                         a String nor a &str, which could not be carried out of its heap",
-                    ),
-                },
-            };
-            // Freed into the heap while it is still there.
-            drop(payload);
-            drop(open);
-            std::panic::resume_unwind(copied)
-        }
-    }
-}
-
 /// Moves the account of the job that parks on this thread off it, charging what the thread
 /// moved for it first (`blaze_graph::sched::fiber::Carried`'s `take`): `None` when the job has
 /// none.
@@ -1389,8 +930,8 @@ pub fn held() -> u64 {
 /// ([`blaze_mem::tag::Snapshot::footprint`]: the global heap, as what its allocator committed
 /// where it says or [`held`] where it does not, and the pages `blaze_mem` committed for its
 /// regions, frames, chunks and pools, which it maps itself and [`Counting`] never sees, less the
-/// free chunks it purged). The counted sum is only an upper bound: mimalloc's committed count is
-/// never lowered by a purge, and committed pages never touched are not resident.
+/// free chunks it purged). The counted sum is only an upper bound: committed pages never
+/// touched are not resident.
 pub fn own() -> u64 {
     own_of(&blaze_mem::tag::snapshot())
 }
@@ -1403,540 +944,18 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
 /// What `footprint` holds past the live heap and what blaze-mem keeps committed and resident in
 /// `snapshot`: the free pages the allocators keep, the bytes a purge can give back
 /// (`blaze_cargo::raw::memory::purge`). An estimate, an upper bound: it holds the code, the
-/// stacks and the system zones too. mimalloc's own committed count is no measure of it, since a
-/// purge never lowers that count (`mi_os_decommit_ex`, os.c, on a release build).
+/// stacks and the system zones too.
 pub fn kept_of(snapshot: &blaze_mem::tag::Snapshot, footprint: u64) -> u64 {
     footprint.saturating_sub(held().saturating_add(snapshot.resident_committed()))
-}
-
-/// The share of each of the machine's own memory limits (`hw.memsize`, `MemTotal`, a cgroup's
-/// `memory.max`) that blaze may hold, as (numerator, denominator): 3/4 (docs/memory-budget.md
-/// section 7, "The machine budget"). The quarter left is the kernel's, the compressor's and the
-/// user's other programs', whatever blaze admits: on 2026-11-05 a 128 GiB Mac whose daemons
-/// were let hold all of it kernel-panicked twice with its compressor full. A limit the daemon is
-/// told (`BLAZE_DAEMON_MEMORY_GB`, `--memory-gb`) and `RLIMIT_AS` are not scaled: they are more
-/// limits, the least winning, so a daemon's ceiling is never more than this share.
-pub const MACHINE_SHARE: (u64, u64) = (3, 4);
-
-/// [`MACHINE_SHARE`] of `bytes`.
-const fn machine_share(bytes: u64) -> u64 {
-    bytes / MACHINE_SHARE.1 * MACHINE_SHARE.0
-}
-
-/// The memory the plane may grant: the machine's limit ([`MACHINE_SHARE`] of it), less what
-/// others use within it, less `margin`.
-///
-/// The limit is the least of what the machine has and what the process may use: on Linux
-/// the machine's memory ([`linux_machine`]: `MemTotal`, or the ceiling a VM that hot-plugs
-/// memory grows to), the `memory.max` of the process's cgroup and of each one above it
-/// (cgroup v2; v1's `memory.limit_in_bytes`), and `RLIMIT_AS`; on macOS `sysctl hw.memsize`
-/// and `RLIMIT_AS`.
-///
-/// What others use is what is in use in blaze's own cgroup (v2's `memory.current` of the group
-/// `/proc/self/cgroup` names; v1's `memory.usage_in_bytes` where the memory controller is
-/// v1's) less what blaze itself holds ([`own`]: [`held`], 0 when [`Counting`] is not the global
-/// allocator, so the budget is then the smaller, and the pages `blaze_mem` committed). It is not the machine's `MemTotal` less
-/// `MemAvailable`: that counts every process outside the cgroup against a limit they do not
-/// share, and a small cgroup on a busy machine would refuse builds that fit. The root cgroup
-/// keeps no count, and nothing is taken off there; nor on macOS, which has no cgroups.
-///
-/// `told` is the limit the daemon was started with, and what told it (`blaze serve
-/// --memory-gb`, or `BLAZE_DAEMON_MEMORY_GB` from whoever started it: a runner that stops the
-/// daemon past a footprint passes that footprint): one more limit, the least of all winning, so
-/// the budgets see a cap the machine's own numbers don't.
-///
-/// The budget's `from` names the limit and what was taken off. An error where one cannot be
-/// read or nothing is left, never a guess.
-pub fn machine_budget(margin: u64, told: Option<(u64, String)>) -> io::Result<Budget> {
-    let mut limits = machine_limits()?;
-    for (bytes, from) in &mut limits {
-        *bytes = machine_share(*bytes);
-        // alloc: the budget's name, once per daemon start
-        *from = format!("{}/{} of {from}", MACHINE_SHARE.0, MACHINE_SHARE.1);
-    }
-    limits.extend(told);
-    #[cfg(unix)]
-    // alloc: the budget's name, once per daemon start
-    limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
-    let in_use = machine_in_use(own())?;
-    least(limits, in_use.as_ref(), margin)
-}
-
-/// The machine budget every blaze daemon of the user on the host shares (docs/memory-budget.md,
-/// section 7, [`crate::ledger`]): the least of the machine's limits ([`machine_budget`]'s, not
-/// `RLIMIT_AS` or a limit the daemon was told, which are one process's) times 3/4, less what
-/// others use within it and `margin`. `blaze` is what the ledger's other daemons hold now: in
-/// use, but not by others, since the budget is theirs too.
-pub fn machine_wide(margin: u64, blaze: u64) -> io::Result<Budget> {
-    let limits = machine_limits()?
-        .into_iter()
-        // alloc: a limit's name, once per daemon start
-        .map(|(bytes, from)| (bytes / 4 * 3, format!("3/4 of {from} ({})", gb(bytes))))
-        .collect();
-    let in_use = machine_in_use(own().saturating_add(blaze))?;
-    least(limits, in_use.as_ref(), margin)
-}
-
-#[cfg(target_os = "linux")]
-fn machine_in_use(own: u64) -> io::Result<Option<(u64, String)>> {
-    linux_in_use(Path::new("/"), own)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn machine_in_use(_own: u64) -> io::Result<Option<(u64, String)>> {
-    Ok(None)
-}
-
-#[cfg(target_os = "linux")]
-fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-    linux_limits(Path::new("/"))
-}
-
-#[cfg(target_os = "macos")]
-use sys::machine_limits;
-#[cfg(unix)]
-use sys::rlimit_as;
-
-/// The kernel's word on the machine's memory: two calls that write into a buffer this passes,
-/// which only `libc`'s raw functions reach.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-mod sys {
-    use std::io;
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-        let mut bytes: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        // SAFETY: the name is a C string that outlives the call, and `bytes` and `len` say a
-        // buffer of `len` bytes; a `len` larger than `bytes` would let the kernel write past it.
-        let status = unsafe {
-            libc::sysctlbyname(
-                c"hw.memsize".as_ptr(),
-                (&raw mut bytes).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != 0 {
-            let why = io::Error::last_os_error();
-            // alloc: the error's message
-            return Err(io::Error::new(why.kind(), format!("sysctl hw.memsize: {why}")));
-        }
-        if len != std::mem::size_of::<u64>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                // alloc: the error's message
-                format!("sysctl hw.memsize gave {len} bytes, not 8"),
-            ));
-        }
-        // alloc: the limits and their names, once per daemon start
-        Ok(vec![(bytes, "sysctl hw.memsize".to_owned())])
-    }
-
-    pub(super) fn rlimit_as() -> io::Result<Option<u64>> {
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: `limit` is a `rlimit` the kernel writes and nothing else borrows.
-        if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
-            let why = io::Error::last_os_error();
-            // alloc: the error's message
-            return Err(io::Error::new(why.kind(), format!("getrlimit(RLIMIT_AS): {why}")));
-        }
-        let current: u64 = limit.rlim_cur;
-        Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(current))
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    // SAFETY: all zeros is a valid `MEMORYSTATUSEX`, whose `dwLength` is set as the call asks.
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-    // SAFETY: `status` is live for the call to write, and its length is set.
-    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
-        let why = io::Error::last_os_error();
-        // alloc: the error's message
-        return Err(io::Error::new(why.kind(), format!("GlobalMemoryStatusEx: {why}")));
-    }
-    // alloc: the limits and their names, once per daemon start
-    Ok(vec![(status.ullTotalPhys, "GlobalMemoryStatusEx ullTotalPhys".to_owned())])
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        // alloc: the error's message
-        format!(
-            "blaze reads the machine's memory only on Linux and macOS, not {}",
-            std::env::consts::OS
-        ),
-    ))
-}
-
-fn invalid(path: &Path, why: impl fmt::Display) -> io::Error {
-    // alloc: the error's message
-    io::Error::new(io::ErrorKind::InvalidData, format!("{}: {why}", path.display()))
-}
-
-fn read(path: &Path) -> io::Result<String> {
-    std::fs::read_to_string(path)
-        // alloc: the error's message
-        .map_err(|why| io::Error::new(why.kind(), format!("{}: {why}", path.display())))
-}
-
-/// The memory limits of a Linux machine whose file system is at `root`: the machine's memory
-/// ([`linux_machine`]), and each cgroup memory limit over the process.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
-    // alloc: the limits and their names, once per daemon start
-    let mut limits = vec![linux_machine(root)?];
-    let cgroup = root.join("proc/self/cgroup");
-    for line in read(&cgroup)?.lines().filter(|it| !it.is_empty()) {
-        let mut parts = line.splitn(3, ':');
-        let (Some(hierarchy), Some(controllers), Some(path)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            // alloc: the error's message
-            return Err(invalid(&cgroup, format!("a line `{line}`")));
-        };
-        // cgroup v2's `memory.high` is a limit too: past it the kernel throttles and reclaims,
-        // the slow death a budget is to keep a build from (docs/memory-budget.md, section 1).
-        let (mount, files): (_, &[&str]) = if hierarchy == "0" && controllers.is_empty() {
-            ("sys/fs/cgroup", &["memory.max", "memory.high"])
-        } else if controllers.split(',').any(|it| it == "memory") {
-            ("sys/fs/cgroup/memory", &["memory.limit_in_bytes"])
-        } else {
-            continue;
-        };
-        let mut at = Some(path);
-        while let Some(group) = at {
-            for file in files {
-                let limit = root.join(mount).join(group.trim_start_matches('/')).join(file);
-                match std::fs::read_to_string(&limit) {
-                    Ok(text) if text.trim() == "max" => {}
-                    Ok(text) => {
-                        let bytes = text.trim().parse::<u64>().map_err(|_| {
-                            // alloc: the error's message
-                            invalid(&limit, format!("a limit of `{}`", text.trim()))
-                        })?;
-                        // alloc: a limit's name, once per cgroup level per daemon start
-                        limits.push((bytes, format!("{file} of cgroup {group}")));
-                    }
-                    // A cgroup has no limit file at the root of its hierarchy.
-                    Err(why) if why.kind() == io::ErrorKind::NotFound => {}
-                    Err(why) => {
-                        return Err(io::Error::new(
-                            why.kind(),
-                            // alloc: the error's message
-                            format!("{}: {why}", limit.display()),
-                        ));
-                    }
-                }
-            }
-            at = match group.rfind('/') {
-                _ if group == "/" || group.is_empty() => None,
-                Some(0) => Some("/"),
-                Some(slash) => Some(&group[..slash]),
-                None => None,
-            };
-        }
-    }
-    Ok(limits)
-}
-
-/// The memory of a Linux machine whose file system is at `root`, named: `MemTotal`, or, on a
-/// VM that hot-plugs memory as it is used, the ceiling it grows to, with `MemTotal` named
-/// beside it. A virtio-mem VM (every ix VM) boots with a small floor and plugs more of its
-/// device's region on demand, and `MemTotal` counts only what is plugged now: a 256 GiB VM
-/// read 25 GB, and the budget refused a build that would have fit. The ceiling is the larger
-/// of what the kernel's `/proc/iomem` says of the virtio-mem regions ([`virtio_mem_unplugged`])
-/// and the `vm.max_memory_mib=` ix puts on the kernel's command line ([`cmdline_ceiling`]),
-/// either where it is all there is to read.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_machine(root: &Path) -> io::Result<(u64, String)> {
-    let meminfo = root.join("proc/meminfo");
-    let text = read(&meminfo)?;
-    let line = text
-        .lines()
-        .find_map(|it| it.strip_prefix("MemTotal:"))
-        .ok_or_else(|| invalid(&meminfo, "no MemTotal line"))?;
-    let kib = line
-        .trim()
-        .strip_suffix("kB")
-        .and_then(|it| it.trim().parse::<u64>().ok())
-        // alloc: the error's message
-        .ok_or_else(|| invalid(&meminfo, format!("MemTotal of `{}`", line.trim())))?;
-    let total = kib.checked_mul(1024).ok_or_else(|| invalid(&meminfo, "MemTotal past 2^64"))?;
-    let regions = virtio_mem_unplugged(root)?;
-    let mut ceiling = match &regions {
-        Regions::Sized { unplugged, devices } => Some((
-            total.saturating_add(*unplugged),
-            // alloc: the limit's name, once per daemon start
-            format!("MemTotal plus what is unplugged of virtio-mem {devices} in /proc/iomem"),
-        )),
-        Regions::None | Regions::Hidden { .. } => None,
-    };
-    if let Some(bytes) = cmdline_ceiling(root)?
-        && ceiling.as_ref().is_none_or(|it| bytes > it.0)
-    {
-        // alloc: the limit's name, once per daemon start
-        ceiling = Some((bytes, "vm.max_memory_mib of /proc/cmdline".to_owned()));
-    }
-    Ok(match (ceiling, regions) {
-        (Some((bytes, from)), _) if bytes > total => (
-            bytes,
-            // alloc: the limit's name, once per daemon start
-            format!(
-                "the ceiling virtio-mem grows the machine to ({from}; MemTotal of /proc/meminfo \
-                 is {} now)",
-                gb(total)
-            ),
-        ),
-        (_, Regions::Hidden { devices }) => (
-            total,
-            // alloc: the limit's name, once per daemon start
-            format!(
-                "MemTotal of /proc/meminfo, what is plugged now of a machine virtio-mem {devices} \
-                 can grow, whose regions /proc/iomem hides from this user and no \
-                 vm.max_memory_mib on /proc/cmdline names"
-            ),
-        ),
-        // alloc: the limit's name, once per daemon start
-        _ => (total, "MemTotal of /proc/meminfo".to_owned()),
-    })
-}
-
-/// What `/proc/iomem` says of a machine's virtio-mem devices.
-#[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-enum Regions {
-    /// No virtio-mem device, or no `/proc/iomem` to say.
-    None,
-    /// The bytes of the devices' regions not plugged now, which `MemTotal` leaves out, and the
-    /// devices (`virtio5`, or `virtio5, virtio6`).
-    Sized { unplugged: u64, devices: String },
-    /// Devices whose regions this user is shown as zeros: only `CAP_SYS_ADMIN` sees addresses.
-    Hidden { devices: String },
-}
-
-/// The virtio-mem devices of `/proc/iomem` on a Linux machine whose file system is at `root`.
-/// The driver claims each device's whole region at the top level, named by the device
-/// (`440000000-43bfffffff : virtio5`), and adds what it plugs below it as
-/// `System RAM (virtio_mem)`, which is what of the region `MemTotal` counts.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn virtio_mem_unplugged(root: &Path) -> io::Result<Regions> {
-    let iomem = root.join("proc/iomem");
-    let text = match std::fs::read_to_string(&iomem) {
-        Ok(text) => text,
-        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(Regions::None),
-        Err(why) => {
-            // alloc: the error's message
-            return Err(io::Error::new(why.kind(), format!("{}: {why}", iomem.display())));
-        }
-    };
-    // alloc: the devices' names, once per daemon start
-    let mut devices = String::new();
-    let (mut unplugged, mut hidden, mut in_device) = (0u64, false, false);
-    for line in text.lines().filter(|it| !it.trim().is_empty()) {
-        let entry = line.trim_start();
-        let top = entry.len() == line.len();
-        let (range, name) = entry
-            .split_once(" : ")
-            // alloc: the error's message
-            .ok_or_else(|| invalid(&iomem, format!("a line `{line}`")))?;
-        let (start, end) = range
-            .split_once('-')
-            .and_then(|(start, end)| {
-                Some((u64::from_str_radix(start, 16).ok()?, u64::from_str_radix(end, 16).ok()?))
-            })
-            // alloc: the error's message
-            .ok_or_else(|| invalid(&iomem, format!("a range `{range}`")))?;
-        let size = match end.checked_sub(start) {
-            Some(it) if end > 0 => it.saturating_add(1),
-            _ => 0,
-        };
-        if top {
-            in_device = name
-                .strip_prefix("virtio")
-                .is_some_and(|it| !it.is_empty() && it.bytes().all(|byte| byte.is_ascii_digit()));
-            if in_device {
-                if !devices.is_empty() {
-                    devices.push_str(", ");
-                }
-                devices.push_str(name);
-                hidden |= size == 0;
-                unplugged = unplugged.saturating_add(size);
-            }
-        } else if in_device && name == "System RAM (virtio_mem)" {
-            unplugged = unplugged.saturating_sub(size);
-        }
-    }
-    Ok(match (devices.is_empty(), hidden) {
-        (true, _) => Regions::None,
-        (false, true) => Regions::Hidden { devices },
-        (false, false) => Regions::Sized { unplugged, devices },
-    })
-}
-
-/// The ceiling ix puts on a VM's kernel command line, `vm.max_memory_mib=<MiB>`, in bytes, on a
-/// Linux machine whose file system is at `root`; `None` where there is none.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cmdline_ceiling(root: &Path) -> io::Result<Option<u64>> {
-    let cmdline = root.join("proc/cmdline");
-    let text = match std::fs::read_to_string(&cmdline) {
-        Ok(text) => text,
-        Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(why) => {
-            // alloc: the error's message
-            return Err(io::Error::new(why.kind(), format!("{}: {why}", cmdline.display())));
-        }
-    };
-    let Some(value) =
-        text.split_ascii_whitespace().find_map(|it| it.strip_prefix("vm.max_memory_mib="))
-    else {
-        return Ok(None);
-    };
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|&mib| mib > 0)
-        .and_then(|mib| mib.checked_mul(1 << 20))
-        .map(Some)
-        // alloc: the error's message
-        .ok_or_else(|| invalid(&cmdline, format!("vm.max_memory_mib of `{value}`")))
-}
-
-/// What others use in the cgroup of the process, on a Linux machine whose file system is at
-/// `root`, when blaze itself holds `own`: the bytes and what says so. `None` in the root
-/// cgroup, which keeps no count.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
-    let cgroup = root.join("proc/self/cgroup");
-    let (mut v1, mut v2) = (None, None);
-    let text = read(&cgroup)?;
-    for line in text.lines().filter(|it| !it.is_empty()) {
-        let mut parts = line.splitn(3, ':');
-        let (Some(hierarchy), Some(controllers), Some(path)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            // alloc: the error's message
-            return Err(invalid(&cgroup, format!("a line `{line}`")));
-        };
-        if hierarchy == "0" && controllers.is_empty() {
-            v2 = Some(path);
-        } else if controllers.split(',').any(|it| it == "memory") {
-            v1 = Some(path);
-        }
-    }
-    // Where the memory controller is v1's, the v2 hierarchy counts no memory.
-    let (mount, file, group) = match (v1, v2) {
-        (Some(group), _) => ("sys/fs/cgroup/memory", "memory.usage_in_bytes", group),
-        (None, Some(group)) => ("sys/fs/cgroup", "memory.current", group),
-        (None, None) => return Err(invalid(&cgroup, "no cgroup that counts memory")),
-    };
-    let count = root.join(mount).join(group.trim_start_matches('/')).join(file);
-    let current = match std::fs::read_to_string(&count) {
-        Ok(text) => text
-            .trim()
-            .parse::<u64>()
-            // alloc: the error's message
-            .map_err(|_| invalid(&count, format!("a count of `{}`", text.trim())))?,
-        Err(why) if why.kind() == io::ErrorKind::NotFound && group == "/" => return Ok(None),
-        Err(why) => {
-            // alloc: the error's message
-            return Err(io::Error::new(why.kind(), format!("{}: {why}", count.display())));
-        }
-    };
-    // What the group counts includes the page cache of files its processes wrote or read
-    // (an earlier build's outputs in the same unit): pages the kernel gives back when memory is
-    // asked for, so no one's use. The kernel's count of them is `memory.stat`'s `file` (v1 names
-    // the hierarchy's `total_cache`): the same count the daemon's own footprint leaves out
-    // (`blaze_cargo::raw::memory::charged`), so the ceiling and the footprint measure one
-    // thing. On 2026-11-11 a second build in one systemd unit was given a ceiling of
-    // 4.66 GB on a machine with 185 GB free, because 84 GB of the first build's outputs were
-    // still cached.
-    let stat = count.with_file_name("memory.stat");
-    let (cache, shared) =
-        if file == "memory.current" { ("file", "shmem") } else { ("total_cache", "total_shmem") };
-    let text = std::fs::read_to_string(&stat)
-        // alloc: the error's message
-        .map_err(|why| io::Error::new(why.kind(), format!("{}: {why}", stat.display())))?;
-    let field = |key: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.trim().parse::<u64>().ok())
-            // alloc: the error's message
-            .ok_or_else(|| invalid(&stat, format!("no count of `{key}`")))
-    };
-    // Shared memory and tmpfs are file pages too, and with no swap they stay: they are use.
-    let cached = field(cache)?.saturating_sub(field(shared)?);
-    let others = current.saturating_sub(cached).saturating_sub(own);
-    // alloc: the budget's name, once per daemon start
-    let from = match cached {
-        0 => format!(
-            "{} others use in cgroup {group} ({file} {} less blaze's own {})",
-            gb(others),
-            gb(current),
-            gb(own)
-        ),
-        _ => format!(
-            "{} others use in cgroup {group} ({file} {} less {} of file cache the kernel gives \
-             back and blaze's own {})",
-            gb(others),
-            gb(current),
-            gb(cached),
-            gb(own)
-        ),
-    };
-    Ok(Some((others, from)))
-}
-
-fn gb(bytes: u64) -> String {
-    // alloc: a part of the budget's name or an error's message, once per daemon start
-    format!("{:.2} GB", bytes as f64 / f64::from(1 << 30))
-}
-
-/// The least of `limits`, less what others use (`in_use`) and `margin`, named by what each was.
-fn least(
-    limits: Vec<(u64, String)>,
-    in_use: Option<&(u64, String)>,
-    margin: u64,
-) -> io::Result<Budget> {
-    let (bytes, from) = limits
-        .into_iter()
-        .reduce(|least, it| if it.0 < least.0 { it } else { least })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no memory limit was read"))?;
-    let others = in_use.as_ref().map_or(0, |it| it.0);
-    let taken = match &in_use {
-        // alloc: the budget's name, once per daemon start
-        Some((_, used)) => format!("{used} and a margin of {}", gb(margin)),
-        // alloc: the budget's name, once per daemon start
-        None => format!("a margin of {}", gb(margin)),
-    };
-    match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
-        Some(left) if left > 0 => {
-            // alloc: the budget's name, once per daemon start
-            Ok(Budget {
-                bytes: left,
-                from: format!("{from}, {}, less {taken}", gb(bytes)),
-                kept_back: bytes - left,
-            })
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            // alloc: the error's message
-            format!("no memory is left of the {} of {from} less {taken}", gb(bytes)),
-        )),
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
-    use std::alloc::{GlobalAlloc, Layout};
+    use std::{
+        alloc::{GlobalAlloc, Layout},
+        io,
+    };
 
     use blaze_ids::rng::SplitMix64;
 
@@ -1952,7 +971,7 @@ mod tests {
     impl Holders for blaze_alloc_count::Counting {
         const BY_TAG: bool = false;
 
-        unsafe fn alloc_for(&self, _: Holder, layout: Layout, zeroed: bool) -> *mut u8 {
+        unsafe fn alloc_for(&self, _: Tag, layout: Layout, zeroed: bool) -> *mut u8 {
             // SAFETY: the caller upholds `alloc`'s contract for `layout`.
             unsafe {
                 match zeroed {
@@ -1962,13 +981,13 @@ mod tests {
             }
         }
 
-        unsafe fn holder(&self, _: *mut u8) -> Holder {
-            Holder::OUTSIDE
+        unsafe fn holder(&self, _: *mut u8) -> Option<Tag> {
+            None
         }
 
         unsafe fn realloc_for(
             &self,
-            _: Holder,
+            _: Option<Tag>,
             ptr: *mut u8,
             layout: Layout,
             new_size: usize,
@@ -1978,8 +997,8 @@ mod tests {
         }
     }
 
-    /// Keeps blocks by tag in a byte before each block: what `Counting` asks of the daemon's
-    /// mimalloc heaps (blaze-engine's `heaps.rs`), the simplest way, for testing `Counting`.
+    /// Keeps blocks by tag in a byte before each block: what `Counting` asks of an allocator
+    /// that keeps tags ([`Holders::BY_TAG`]), the simplest way, for testing `Counting`.
     struct Labelled;
 
     /// The label's room before a block: at least the alignment the test asks for.
@@ -1999,7 +1018,7 @@ mod tests {
         use blaze_mem::Tag;
 
         use super::{LABEL, Labelled, OUTSIDE, labelled};
-        use crate::arena::{Holder, Holders};
+        use crate::arena::Holders;
 
         impl Labelled {
             unsafe fn made(&self, label: u8, layout: Layout, zeroed: bool) -> *mut u8 {
@@ -2035,24 +1054,21 @@ mod tests {
         impl Holders for Labelled {
             const BY_TAG: bool = true;
 
-            /// Labels by tag; it makes no task heaps (registers none), so `into` is a tag's.
-            unsafe fn alloc_for(&self, into: Holder, layout: Layout, zeroed: bool) -> *mut u8 {
-                let label = into.tag.map_or(OUTSIDE, |tag| tag as u8);
+            unsafe fn alloc_for(&self, tag: Tag, layout: Layout, zeroed: bool) -> *mut u8 {
                 // SAFETY: the caller's layout.
-                unsafe { self.made(label, layout, zeroed) }
+                unsafe { self.made(tag as u8, layout, zeroed) }
             }
 
-            unsafe fn holder(&self, ptr: *mut u8) -> Holder {
+            unsafe fn holder(&self, ptr: *mut u8) -> Option<Tag> {
                 // SAFETY: the label's byte, just before a live block.
-                let tag = Tag::ALL.get(usize::from(unsafe { ptr.sub(1).read() })).copied();
-                Holder { tag, ..Holder::OUTSIDE }
+                Tag::ALL.get(usize::from(unsafe { ptr.sub(1).read() })).copied()
             }
 
-            /// Every realloc here moves the block, as a large one does under mimalloc: it is
-            /// labelled `into`'s.
+            /// Every realloc here moves the block, as a large one does: it is labelled
+            /// `into`'s.
             unsafe fn realloc_for(
                 &self,
-                into: Holder,
+                into: Option<Tag>,
                 ptr: *mut u8,
                 layout: Layout,
                 new_size: usize,
@@ -2061,7 +1077,7 @@ mod tests {
                 unsafe {
                     let block = System.realloc(ptr.sub(LABEL), labelled(layout), new_size + LABEL);
                     assert!(!block.is_null(), "std's allocator grew a test block");
-                    block.add(LABEL - 1).write(into.tag.map_or(OUTSIDE, |tag| tag as u8));
+                    block.add(LABEL - 1).write(into.map_or(OUTSIDE, |tag| tag as u8));
                     block.add(LABEL)
                 }
             }
@@ -2355,353 +1371,5 @@ mod tests {
         })
         .join()
         .unwrap();
-    }
-
-    struct Tree(blaze_core::temp::TempDir);
-
-    impl Tree {
-        fn new(name: &str, files: &[(&str, &str)]) -> Tree {
-            let root = blaze_core::temp::TempDir::for_test(&format!("blaze-graph-arena-{name}-"));
-            for (path, text) in files {
-                let path = root.join(path);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, text).unwrap();
-            }
-            Tree(root)
-        }
-    }
-
-    #[expect(
-        blaze::gapped_literal,
-        reason = "a /proc/meminfo fixture, its columns aligned as the kernel writes them"
-    )]
-    const MEMINFO: &str = "MemTotal:       16384000 kB\nMemFree:         1000 kB\n";
-
-    #[test]
-    fn linux_limits_are_the_machine_and_every_cgroup_above_the_process() {
-        let tree = Tree::new(
-            "v2",
-            &[
-                ("proc/meminfo", MEMINFO),
-                ("proc/self/cgroup", "0::/user.slice/lane.scope\n"),
-                ("sys/fs/cgroup/user.slice/memory.max", "8589934592\n"),
-                ("sys/fs/cgroup/user.slice/lane.scope/memory.max", "max\n"),
-            ],
-        );
-        let limits = linux_limits(tree.0.path()).unwrap();
-        assert_eq!(
-            limits,
-            [
-                (16384000 * 1024, "MemTotal of /proc/meminfo".to_owned()),
-                (8589934592, "memory.max of cgroup /user.slice".to_owned()),
-            ]
-        );
-        let budget = least(limits, None, 1 << 30).unwrap();
-        assert_eq!(budget.bytes, 8589934592 - (1 << 30));
-        assert_eq!(
-            budget.from,
-            "memory.max of cgroup /user.slice, 8.00 GB, less a margin of 1.00 GB"
-        );
-    }
-
-    /// What others use is what blaze's own cgroup counts less what blaze holds, not what the
-    /// machine has in use: a busy machine does not shrink a small cgroup's budget.
-    #[test]
-    fn others_are_what_blazes_own_cgroup_uses_less_blaze() {
-        const GB: u64 = 1 << 30;
-        let busy = "MemTotal:       16384000 kB\nMemAvailable:     100000 kB\n";
-        let tree = Tree::new(
-            "current",
-            &[
-                ("proc/meminfo", busy),
-                ("proc/self/cgroup", "0::/lane.scope\n"),
-                ("sys/fs/cgroup/lane.scope/memory.max", "4294967296\n"),
-                ("sys/fs/cgroup/lane.scope/memory.current", "3221225472\n"),
-                ("sys/fs/cgroup/lane.scope/memory.stat", "anon 1\nfile 0\nfile_mapped 5\nshmem 0\n"),
-            ],
-        );
-        let in_use = linux_in_use(tree.0.path(),2 * GB).unwrap();
-        assert_eq!(
-            in_use,
-            Some((
-                GB,
-                "1.00 GB others use in cgroup /lane.scope (memory.current 3.00 GB less blaze's \
-                 own 2.00 GB)"
-                    .to_owned()
-            ))
-        );
-        let budget = least(linux_limits(tree.0.path()).unwrap(), in_use.as_ref(), GB / 2).unwrap();
-        assert_eq!(budget.bytes, 4 * GB - GB - GB / 2);
-        // The limit that fits a task of 3.25 GB is that and what the cgroup's limit loses to
-        // others (1 GB) and the margin (0.5 GB), rounded up to whole GiB: under a told limit of
-        // 5 the budget is 3.5 GB, under 4 it is 2.5 GB (earlyfail).
-        assert_eq!(budget.kept_back, GB + GB / 2);
-        assert_eq!(budget.to_fit(3 * GB + GB / 4), 5);
-        assert_eq!(budget.to_fit(budget.bytes), 4);
-        assert_eq!(
-            budget.from,
-            "memory.max of cgroup /lane.scope, 4.00 GB, less 1.00 GB others use in cgroup \
-             /lane.scope (memory.current 3.00 GB less blaze's own 2.00 GB) and a margin of 0.50 \
-             GB"
-        );
-        // Blaze holding more than the count says (it counts late) leaves others none.
-        assert_eq!(linux_in_use(tree.0.path(),4 * GB).unwrap().map(|it| it.0), Some(0));
-        // The file cache the kernel gives back is no one's use: an earlier build's outputs,
-        // still cached in the same cgroup, do not shrink the budget. The control: counted as
-        // use, the same group would leave others 3 GB.
-        let cached = Tree::new(
-            "current-cached",
-            &[
-                ("proc/self/cgroup", "0::/lane.scope\n"),
-                ("sys/fs/cgroup/lane.scope/memory.current", "4294967296\n"),
-                ("sys/fs/cgroup/lane.scope/memory.stat", "anon 9\nfile 3758096384\nfile_mapped 0\nshmem 536870912\n"),
-            ],
-        );
-        let in_use = linux_in_use(&cached.0, 0).unwrap().unwrap();
-        assert_eq!(in_use.0, GB);
-        assert!(in_use.1.contains("less 3.00 GB of file cache the kernel gives back"), "{}", in_use.1);
-        assert_ne!(in_use.0, 4 * GB, "the cache counted as use");
-        // A group with a count and no `memory.stat`, or one that names no file cache
-        // count, is an error naming the file, never a guess.
-        let none = Tree::new(
-            "current-nostat",
-            &[("proc/self/cgroup", "0::/x\n"), ("sys/fs/cgroup/x/memory.current", "1\n")],
-        );
-        assert!(linux_in_use(&none.0, 0).unwrap_err().to_string().contains("memory.stat"));
-        // Others that leave nothing are an error naming them.
-        let full = least(vec![(4 * GB, "x".to_owned())], Some(&(4 * GB, "y".to_owned())), 0);
-        let why = full.unwrap_err();
-        assert_eq!(why.kind(), io::ErrorKind::InvalidInput);
-        assert!(why.to_string().contains("less y and a margin"), "{why}");
-    }
-
-    #[test]
-    fn others_are_counted_by_v1_where_memory_is_v1s_and_not_in_the_root_cgroup() {
-        let tree = Tree::new(
-            "current-v1",
-            &[
-                ("proc/self/cgroup", "4:memory:/a/b\n0::/\n"),
-                ("sys/fs/cgroup/memory/a/b/memory.usage_in_bytes", "1073741824\n"),
-                ("sys/fs/cgroup/memory/a/b/memory.stat", "cache 0\ntotal_cache 0\ntotal_shmem 0\n"),
-            ],
-        );
-        assert_eq!(linux_in_use(tree.0.path(),0).unwrap().map(|it| it.0), Some(1 << 30));
-        let tree = Tree::new("current-root", &[("proc/self/cgroup", "0::/\n")]);
-        assert_eq!(linux_in_use(tree.0.path(),0).unwrap(), None);
-        // A group below the root has a count; one missing is an error, never a guess.
-        let tree = Tree::new("current-none", &[("proc/self/cgroup", "0::/x\n")]);
-        assert!(linux_in_use(tree.0.path(),0).unwrap_err().to_string().contains("memory.current"));
-        let tree = Tree::new(
-            "current-bad",
-            &[("proc/self/cgroup", "0::/x\n"), ("sys/fs/cgroup/x/memory.current", "lots\n")],
-        );
-        assert!(linux_in_use(tree.0.path(),0).unwrap_err().to_string().contains("a count of `lots`"));
-        let tree = Tree::new("current-nogroup", &[("proc/self/cgroup", "3:cpu:/a\n")]);
-        assert!(linux_in_use(tree.0.path(),0).unwrap_err().to_string().contains("counts memory"));
-    }
-
-    #[test]
-    fn linux_limits_read_cgroup_v1_and_a_namespace_root() {
-        let tree = Tree::new(
-            "v1",
-            &[
-                ("proc/meminfo", MEMINFO),
-                ("proc/self/cgroup", "12:cpu,cpuacct:/a\n4:memory:/a/b\n0::/\n"),
-                ("sys/fs/cgroup/memory/a/b/memory.limit_in_bytes", "2147483648\n"),
-                ("sys/fs/cgroup/memory/a/memory.limit_in_bytes", "9223372036854771712\n"),
-                ("sys/fs/cgroup/memory.max", "4294967296\n"),
-            ],
-        );
-        let limits = linux_limits(tree.0.path()).unwrap();
-        let mut bytes: Vec<u64> = limits.iter().map(|it| it.0).collect();
-        bytes.sort_unstable();
-        assert_eq!(bytes, [2147483648, 4294967296, 16384000 * 1024, 9223372036854771712]);
-        assert_eq!(least(limits, None, 0).unwrap().bytes, 2147483648);
-    }
-
-    #[test]
-    fn what_cannot_be_read_is_an_error_never_a_guess() {
-        let tree = Tree::new("none", &[("proc/meminfo", MEMINFO)]);
-        assert!(linux_limits(tree.0.path()).unwrap_err().to_string().contains("proc/self/cgroup"));
-        let tree = Tree::new(
-            "bad",
-            &[
-                ("proc/meminfo", MEMINFO),
-                ("proc/self/cgroup", "0::/x\n"),
-                ("sys/fs/cgroup/x/memory.max", "lots\n"),
-            ],
-        );
-        assert!(linux_limits(tree.0.path()).unwrap_err().to_string().contains("a limit of `lots`"));
-        let tree = Tree::new("nototal", &[("proc/meminfo", "MemFree: 1 kB\n")]);
-        assert!(linux_limits(tree.0.path()).unwrap_err().to_string().contains("no MemTotal"));
-        assert_eq!(
-            least(vec![(1 << 30, "x".to_owned())], None, 1 << 30).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
-
-    /// A virtio-mem VM, as ix makes one: 2 GiB at boot and a 254 GiB region of which 23 GiB is
-    /// plugged now, so `MemTotal` reads 25 GiB of its 256 GiB ceiling (blaze checking blaze, E5:
-    /// the budget took the 25 GB and refused a whole-workspace check that fit).
-    #[expect(
-        blaze::gapped_literal,
-        reason = "a /proc/meminfo fixture, its columns aligned as the kernel writes them"
-    )]
-    const GROWN: &str = "MemTotal:       26214400 kB\nMemFree:         1000 kB\n";
-    const IOMEM: &str = "00001000-0009fbff : System RAM\n\
-                         00100000-7fffffff : System RAM\n  \
-                         01000000-01ffffff : Kernel code\n\
-                         440000000-43bfffffff : virtio5\n  \
-                         440000000-9ffffffff : System RAM (virtio_mem)\n";
-    /// The same to a user without `CAP_SYS_ADMIN`, who is shown every address as zero.
-    const IOMEM_HIDDEN: &str = "00000000-00000000 : System RAM\n\
-                                00000000-00000000 : virtio5\n  \
-                                00000000-00000000 : System RAM (virtio_mem)\n";
-    const CMDLINE: &str = "BOOT_IMAGE=/vmlinuz console=hvc0 vm.max_memory_mib=262144\n";
-
-    #[test]
-    fn a_vm_that_hot_plugs_memory_is_limited_by_its_ceiling_not_what_is_plugged_now() {
-        const GIB: u64 = 1 << 30;
-        let tree = Tree::new(
-            "grown-iomem",
-            &[("proc/meminfo", GROWN), ("proc/iomem", IOMEM), ("proc/self/cgroup", "0::/\n")],
-        );
-        assert_eq!(
-            linux_limits(tree.0.path()).unwrap(),
-            [(
-                256 * GIB,
-                "the ceiling virtio-mem grows the machine to (MemTotal plus what is unplugged of \
-                 virtio-mem virtio5 in /proc/iomem; MemTotal of /proc/meminfo is 25.00 GB now)"
-                    .to_owned()
-            )]
-        );
-        // Hidden from this user, the region is sized by what ix puts on the command line.
-        let tree = Tree::new(
-            "grown-cmdline",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/iomem", IOMEM_HIDDEN),
-                ("proc/cmdline", CMDLINE),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
-        );
-        let limits = linux_limits(tree.0.path()).unwrap();
-        assert_eq!(
-            limits,
-            [(
-                256 * GIB,
-                "the ceiling virtio-mem grows the machine to (vm.max_memory_mib of /proc/cmdline; \
-                 MemTotal of /proc/meminfo is 25.00 GB now)"
-                    .to_owned()
-            )]
-        );
-        // The budget, and a refusal of it, name the ceiling and what is plugged now.
-        let budget = least(limits.clone(), None, GIB).unwrap();
-        assert_eq!(budget.bytes, 255 * GIB);
-        let named = |it: &str| it.contains("256.00 GB") && it.contains("25.00 GB now");
-        assert!(named(&budget.from), "{}", budget.from);
-        let refused = least(limits, Some(&(256 * GIB, "y".to_owned())), 0).unwrap_err();
-        assert!(named(&refused.to_string()), "{refused}");
-        // A cgroup's limit below the ceiling is still the least.
-        let tree = Tree::new(
-            "grown-cgroup",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/cmdline", CMDLINE),
-                ("proc/self/cgroup", "0::/lane.scope\n"),
-                ("sys/fs/cgroup/lane.scope/memory.max", "8589934592\n"),
-            ],
-        );
-        assert_eq!(least(linux_limits(tree.0.path()).unwrap(), None, 0).unwrap().bytes, 8 * GIB);
-    }
-
-    #[test]
-    fn a_hot_plug_ceiling_that_cannot_be_read_is_named_never_guessed() {
-        // Hidden regions and no command line: `MemTotal`, saying what it leaves out.
-        let tree = Tree::new(
-            "grown-hidden",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/iomem", IOMEM_HIDDEN),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
-        );
-        let limits = linux_limits(tree.0.path()).unwrap();
-        assert_eq!(limits[0].0, 26214400 * 1024);
-        assert!(limits[0].1.contains("virtio-mem virtio5 can grow"), "{}", limits[0].1);
-        // A machine with no virtio-mem device is its `MemTotal`, whatever else iomem holds.
-        let tree = Tree::new(
-            "plain-iomem",
-            &[
-                ("proc/meminfo", MEMINFO),
-                ("proc/iomem", "00100000-7fffffff : System RAM\n"),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
-        );
-        assert_eq!(
-            linux_limits(tree.0.path()).unwrap(),
-            [(16384000 * 1024, "MemTotal of /proc/meminfo".to_owned())]
-        );
-        let tree = Tree::new(
-            "bad-cmdline",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/cmdline", "vm.max_memory_mib=lots\n"),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
-        );
-        let why = linux_limits(tree.0.path()).unwrap_err().to_string();
-        assert!(why.contains("vm.max_memory_mib of `lots`"), "{why}");
-        let tree = Tree::new(
-            "bad-iomem",
-            &[("proc/meminfo", GROWN), ("proc/iomem", "garbage\n"), ("proc/self/cgroup", "0::/\n")],
-        );
-        assert!(linux_limits(tree.0.path()).unwrap_err().to_string().contains("a line `garbage`"));
-    }
-
-    /// The limit the daemon was told is one more limit of [`machine_budget`]: under the
-    /// machine's it is the budget, named by what told it. A limit of 1 GiB is under any machine's;
-    /// where others' use in the cgroup is taken off (Linux) nothing may be left of it, and the
-    /// error names it then.
-    #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn a_told_limit_under_the_machines_is_the_budget_and_named() {
-        let told = Some((1 << 30, "BLAZE_DAEMON_MEMORY_GB=1".to_owned()));
-        match machine_budget(1 << 20, told) {
-            Ok(budget) => {
-                assert!(
-                    budget.from.starts_with("BLAZE_DAEMON_MEMORY_GB=1, 1.00 GB"),
-                    "{}",
-                    budget.from
-                );
-                assert!(budget.bytes < 1 << 30, "{}", budget.bytes);
-            }
-            Err(error) => {
-                assert!(error.to_string().contains("of BLAZE_DAEMON_MEMORY_GB=1"), "{error}")
-            }
-        }
-        let over = Some((u64::MAX / 2, "blaze serve --memory-gb".to_owned()));
-        let budget = machine_budget(1 << 20, over).unwrap();
-        assert!(
-            !budget.from.contains("--memory-gb"),
-            "the machine's is the least: {}",
-            budget.from
-        );
-    }
-
-    #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn the_machine_budget_is_read() {
-        let budget = machine_budget(1 << 20, None).unwrap();
-        assert!(budget.bytes > 0);
-        assert!(budget.from.contains("a margin of 0.00 GB"), "{}", budget.from);
-        // The machine's own limit counts at its share, the quarter left to the machine.
-        assert!(
-            budget.from.starts_with("3/4 of ") || budget.from.starts_with("the process's RLIMIT_AS"),
-            "{}",
-            budget.from
-        );
-        #[cfg(target_os = "linux")]
-        assert!(budget.from.contains("others use in cgroup") || budget.from.contains("less a"));
     }
 }

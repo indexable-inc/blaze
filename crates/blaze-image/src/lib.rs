@@ -88,8 +88,9 @@ pub struct SectionId(pub u32);
 impl SectionId {
     /// The plane's history: what tasks of each kind and key took (`blaze-history`).
     pub const PLANE_HISTORY: SectionId = SectionId(0x0400);
-    /// Admission's peaks: each task kind and size class's peak, its memory forecast
-    /// (`blaze_graph::admission::Peaks`).
+    /// Admission's peaks: each task kind and size class's peak, the memory forecast of the
+    /// admission deleted on 2026-11-13 (`blaze_graph::admission::Peaks`, gone with it). To be
+    /// retired once the daemon's image (`blaze_cargo::serve::image`) stops writing it.
     pub const ADMISSION_PEAKS: SectionId = SectionId(0x0401);
     /// Ids no blaze writes any more and none may take again: an image of the layout before still
     /// holds them, and its owner's start reads around them (a restart restores no engine state,

@@ -1,0 +1,29 @@
+[package]
+name = "blaze-expansion"
+description = "Macro calls and build-script runs as records keyed before the work: the record of one proc-macro or declarative-macro call, the record of one build-script run with its traced outside reads, the sans-IO machine that answers a call from records or runs it once, and the seam by which an expander's module is a record a task waits on alone"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Hashes (`blaze_ids::Hasher`, BLAKE3 under a domain), the flight table's map on hashes
+# (`blaze_hash::ByHash`) and a script's directives as cargo's reader types them
+# (`blaze_build_script::output::Directive`): parsed there once, kept here. Nothing that does IO.
+[dependencies]
+blaze-build-script.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

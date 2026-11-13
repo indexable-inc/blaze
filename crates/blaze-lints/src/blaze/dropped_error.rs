@@ -11,8 +11,11 @@
 //! - `let _ = <Result>;`: the whole `Result` dropped, its error with it;
 //! - `if let Ok(..) = <Result> { .. }` with no `else`: the `Err` case does nothing and says
 //!   nothing (a `while let Ok(..)` loop ends on the error, which is its stop, and is not found);
-//! - `.filter_map(Result::ok)` (or `.filter_map(|it| it.ok())` written as the path): every
-//!   error of an iterator of `Result`s dropped.
+//! - `.filter_map(Result::ok)` (`.filter_map(|it| it.ok())` is the `.ok()` above): every
+//!   error of an iterator of `Result`s dropped;
+//! - `.flatten()` of an iterator whose `Item` is a `Result` (resolved: `Iterator`'s own
+//!   `flatten`, the item normalized): `Result`'s `IntoIterator` yields nothing for an `Err`, so
+//!   each error is skipped as `filter_map(Result::ok)` skips it.
 //!
 //! A place a clippy port reports when it is on is left to it, so no place is reported twice:
 //! `x.ok();` as a statement is `unused_result_ok`'s, `.map_err(|_| ..)` with a non-`move`
@@ -159,6 +162,22 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     facts::push(&mut found, Lint::DroppedError, range, message, Some(NO_FALLBACK.to_owned()));
                     continue;
                 }
+                if args.is_empty()
+                    && FunctionSignature::of(db, f).name.as_str() == "flatten"
+                    && let Some(item) = iterator_item(cx, f, &analysis.ty(infer.expr_ty(receiver)))
+                    && item.as_adt() == Some(result)
+                {
+                    let Some(range) = analysis.expr_range(id) else { continue };
+                    let error = match item.type_arguments().nth(1) {
+                        Some(it) => format!("`{}`", it.display(db, target)),
+                        None => "error".to_owned(),
+                    };
+                    let message = format!(
+                        "`.flatten()` throws away the {error} of each `Err` the iterator yields, as `Result`'s iterator yields nothing for one"
+                    );
+                    facts::push(&mut found, Lint::DroppedError, range, message, Some(NO_FALLBACK.to_owned()));
+                    continue;
+                }
                 if !of_result(db, f, result) {
                     continue;
                 }
@@ -241,6 +260,23 @@ fn ignores_param(body: &Body, expr: ExprId) -> Option<Ignored> {
         wild: matches!(body.pat(*param), Pat::Wild),
         by_move: matches!(capture_by, CaptureBy::Value),
     })
+}
+
+/// What the iterator `receiver` yields, when `f` is `Iterator`'s own method (`flatten`), so a
+/// `flatten` of an iterator of `Result`s is told from `Option::flatten` and the like.
+fn iterator_item<'q>(
+    cx: &Cx<'q, '_>,
+    f: hir_def::FunctionId,
+    receiver: &hir::Type<'q>,
+) -> Option<hir::Type<'q>> {
+    let db = cx.db();
+    let iterator = cx.famous().core_iter_Iterator()?;
+    let of = hir::AsAssocItem::as_assoc_item(hir::Function::from(f), db)?
+        .container_or_implemented_trait(db)?;
+    if of != iterator {
+        return None;
+    }
+    cx.assoc_ty(receiver, iterator, "Item")
 }
 
 /// Whether `f` is a method of `core::result::Result`'s own impl.

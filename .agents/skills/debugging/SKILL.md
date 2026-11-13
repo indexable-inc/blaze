@@ -9,12 +9,13 @@ description: "How to find out why a blaze build did what it did from its profile
 
 ## ask-the-profile-first (rule 17)
 
-Every daemon already records, per build, the footprint and live bytes, each task's granted and peak
-memory, admission waits, spans and reruns, in `<BLAZE_HOME>/v2/profile/*.parquet`. A why question
-(slow, rerunning, memory-hungry, idle workers) starts with `blaze explain footprint_per_build`,
-`task_memory`, `admission_waits`, `worker_states` or a `blaze debug sql` query on the daemon that
-showed it, and quotes the rows. A guess or a fresh experiment comes only after the rows can't
-answer, and then the gap gets a span or counter.
+Every build already records its footprint and live bytes, each task's peak memory, its spans, its
+waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (the daemon writes it
+today). A why question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze
+explain footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits`
+while admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and
+quotes the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the
+gap gets a span or counter.
 
 ## claims-from-evidence (rule 61)
 
@@ -27,18 +28,23 @@ before the next claim builds on it. Never turn a prior about how such systems us
 release builds are LLVM-bound, a daemon restart loses state, this error usually means that) or a
 label on a status line (a task kind named `codegen` is not LLVM) into a sentence in the indicative.
 A number has its source and its tree (`measure-the-exact-tree`); a why has its rows
-(`ask-the-profile-first`); a works has its command and exit status. A pass counts only with proof
-that the check ran: the count of tests that ran (not `test result: ok`, which a filter that matched
-nothing prints with `0 passed`), the exit status and the output the measured program itself prints,
-a generator's last line saying what it wrote; the absence of a failure is evidence of nothing, and a
-check, a row or a gate step that can succeed having run nothing is a bug to fix where it is found
-(`blaze test` refuses a run of no test; a harness row goes through harness/v2/ran.py). When the
-evidence is lost or the tool could not run, say that, not the conclusion you expected.
+(`ask-the-profile-first`); a works has its command and exit status, of the program itself being run:
+that it compiled or passed a check says only that it compiled (`proof-before-merge`). A pass counts
+only with proof that the check ran: the count of tests that ran (not `test result: ok`, which a
+filter that matched nothing prints with `0 passed`), the exit status and the output the measured
+program itself prints, a generator's last line saying what it wrote; the absence of a failure is
+evidence of nothing, and a check, a row or a gate step that can succeed having run nothing is a bug
+to fix where it is found (`blaze test` refuses a run of no test; a harness row goes through
+harness/v2/ran.py). When the evidence is lost or the tool could not run, say that, not the
+conclusion you expected.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 Every `blaze serve` daemon keeps a profile history: Parquet files that say what each build
-ran, why, for how long and with how much memory. Answer "why" questions from those rows, not
+ran, why, for how long and with how much memory. The target design (2026-11-13) has no daemon:
+each command's process writes the same history to its home before it exits. Below, what is
+marked "deleted by the target" stays documented as long as its table or view exists; do not
+build new work on it. Answer "why" questions from those rows, not
 from reading code and guessing. The schema is defined once, in
 `crates/blaze-profile/src/schema.rs`, and documented column by column in `docs/profiling.md`.
 This skill says how to read it and how to turn a reading into a proved cause.
@@ -226,7 +232,8 @@ Each query below is a named view (`blaze explain <name>`) unless it says otherwi
 - `blaze explain writes`: the inputs the build wrote, and for each the fields reruns name as
   their cause (which file, which crate, which module's scope) with how many memos reran.
 - `blaze explain scripts`: the build scripts that ran, with why each was not reused.
-- `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build.
+- `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build
+  (the buffer pool's are deleted by the target, with the pool: `outputs-are-records`).
 - `blaze explain kept`: what the build kept or lost as it ended and after its answer.
 - `blaze explain syscalls thread=loop`: what the loop thread blocked in.
 - `blaze explain account`: the build's account in one row: what it saw change (`written`,
@@ -310,7 +317,8 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
   allocated the most (`alloc_samples`, one sample per 4 MiB a thread allocates). Each part is
   also a view of its own: `memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
   `memory_sites`. Counters carry the build under way as `build_id`.
-- `blaze explain task_memory build=N` shows, per task kind, the memory granted against the peak
+- `blaze explain task_memory build=N` and `task_grants` (deleted by the target with admission:
+  `one-memory-measure`; the peaks stay) show, per task kind, the memory granted against the peak
   held, how many tasks went over their grant and how many stayed under half of it. A kind that
   is often over its grant has a forecast that is too low.
 - `blaze explain task_grants build=N` lists each task whose grant missed its peak (over, or
@@ -320,7 +328,7 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 - Single tasks: `SELECT function, node, granted_bytes, peak_bytes FROM spans WHERE build_id = 3
   AND name = 'task' ORDER BY peak_bytes DESC NULLS LAST LIMIT 20`.
 
-**Admission waits.**
+**Admission waits** (deleted by the target with admission; `wait` spans stay).
 - `blaze explain admission_waits build=N` gives, per task kind and what held it back (memory,
   a work or io thread, nothing), how many tasks waited, their whole and longest wait from ready
   to start, and how often memory passed them over.
@@ -341,6 +349,9 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
   and `blaze slow` reports a build whose daemon died.
 
 ## A daemon that hangs, stalls or dies
+
+A hang is a bug the watchdog must report (`bounded-progress`); one you found by hand is also a
+watchdog bug. What follows is for the daemon while it exists.
 
 - **While it lives:** `blaze debug inspect` prints one line of JSON from a thread and socket
   of the daemon's own, so it answers when every worker is busy and when the loop is stuck:

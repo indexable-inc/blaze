@@ -829,7 +829,9 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     // the answer: the program starts as soon as its image is known to be built. They go on the
     // command's own connection, before it closes: a command is one connection.
     sent_client_rows(&mut client, &mut err, color, !matches!(then, Ok(Then::Exec(_))));
-    // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
+    // An engine served in this process (the seed's, or `[serve] host = "process"`) stops here,
+    // making what outlives the process durable, and is left for the process's exit to free
+    // (`serve::once`); a daemon's connection just closes.
     let closed = client.close();
     if let Err(error) = closed {
         let _ = err.write_all(
@@ -1034,9 +1036,6 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
             printer.flush()?;
             // alloc: the error a command ends with, once
             let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
-                // Stopped at its memory ceiling, or killed by the kernel at its limit: that is
-                // the failure, said as itself, never as a hang-up.
-                Some(Ok(died)) if died.at_ceiling().is_some() => died.to_string(),
                 Some(Ok(died)) => format!("{error}: {died}"),
                 Some(Err(why)) => {
                     format!("{error}, and what came of the daemon is not known: {why:#}")

@@ -15,7 +15,7 @@
 //! - [`run`]: the program `cargo run` picks, run in the tests' sandbox.
 //! - [`reach`]: what a change reaches, from the database's facts.
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
-//! - [`release`]: what a build lets go of its front end once nothing still to compile reads it.
+//! - [`BuildEnd`]: what a build's end lets go of its front end.
 //!
 //! The front end is written by the loop alone, through the job's [`UnitWriter`], and read by
 //! each task through the [`UnitReader`] it was posted with, a shared reference: no worker
@@ -50,7 +50,6 @@ mod perf;
 pub(crate) mod portable;
 mod reach;
 mod reads;
-pub(super) mod release;
 pub(crate) mod run;
 mod say;
 mod script;
@@ -294,8 +293,7 @@ impl Steps for Real {
         // Its parts, borrowed apart below.
         let kept: &mut KeptParts = kept;
         // The build's end stores the sealed crates and keeps what it was served with; the
-        // second store, before the front end is let go for idleness or at a stop
-        // (`super::job::giving`'s `store_members`), writes the members and the crates above
+        // second store, at a stop (`super::job::fronts`'s `store_members`), writes the members and the crates above
         // them, and whatever was refused before is tried once more. An edited member's pages
         // written at the build's end would be paid by the next edit and thrown away by it.
         let (which, later, deps) = match kept.stored {
@@ -366,14 +364,6 @@ impl Steps for Real {
         hir_def::span_names::take_run_log(kept.lowered.db())
     }
 
-    fn kept_caches(&self) -> u64 {
-        release::kept_caches()
-    }
-
-    fn give_caches(&self) -> u64 {
-        release::give_kept_caches()
-    }
-
     fn serve_needs(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
         run::launch::serve_needs(kept, &self.shared.launches, wanted)
             .into_iter()
@@ -423,11 +413,10 @@ impl Steps for Real {
     }
 
     fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
-        let Some(mut release) = kept.release.take() else { return };
+        let Some(end) = kept.end.take() else { return };
         // A request of the checkout waits for this front end: it goes back now, and that
-        // build's own releases let go of what this one would have, unless memory is short,
-        // when the release is due before more work is admitted.
-        if wanted.load(Ordering::Acquire) && !release::Core::now().over() {
+        // build's own end lets go of what this one would have.
+        if wanted.load(Ordering::Acquire) {
             tracing::info_span!(
                 target: "blaze",
                 "front end release left to the checkout's next build, which waits for the front end",
@@ -436,7 +425,7 @@ impl Steps for Real {
             .in_scope(|| {});
             return;
         }
-        release.release(&mut kept.lowered);
+        end.release(&mut kept.lowered);
     }
 
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
@@ -671,11 +660,7 @@ impl Steps for Real {
                     &mut session,
                     &mut deps,
                 )?;
-                let release = release::Release::new(
-                    lowered.crates(),
-                    job.graph.len(),
-                    input.kind != JobKind::Check,
-                );
+                let end = BuildEnd::new(lowered.crates(), job.graph.len(), input.kind != JobKind::Check);
                 let writer = UnitWriter {
                     walks,
                     session,
@@ -691,7 +676,7 @@ impl Steps for Real {
                     broke: Vec::new(),
                     broken: false,
                     retractions,
-                    release,
+                    end,
                 };
                 Ok((writer, puts, misses))
             },
@@ -984,18 +969,6 @@ impl KeptDb for KeptLowered {
     fn db(&self) -> Option<&Db> {
         Some(self.lowered.db())
     }
-
-    fn held(&self) -> u64 {
-        release::kept_held(&self.lowered)
-    }
-
-    fn values(&mut self) -> u64 {
-        release::kept_values(&mut self.lowered)
-    }
-
-    fn give_values(&mut self, bytes: u64) -> u64 {
-        release::give_kept_values(&mut self.lowered, bytes)
-    }
 }
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
@@ -1098,10 +1071,9 @@ pub struct KeptParts {
     /// What its job's builds used of the code generator's memo, kept there while it is kept;
     /// taken by the next job of the head.
     memo: Option<memo::Held>,
-    /// What its build's end lets go of it ([`release::Release::end`]), until the task that
-    /// stores it runs the release or leaves it for a request that waits
-    /// ([`Steps::release_kept`]).
-    release: Option<release::Release>,
+    /// What its build's end lets go of it ([`BuildEnd`]), until the task that stores it runs
+    /// the release or leaves it for a request that waits ([`Steps::release_kept`]).
+    end: Option<BuildEnd>,
 }
 
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
@@ -1238,8 +1210,133 @@ pub struct UnitWriter {
     broken: bool,
     /// The epoch of retractions its job was lowered at, kept with it ([`KeptLowered`]).
     retractions: u64,
-    /// What the build lets go of its front end as its units compile ([`release`]).
-    release: release::Release,
+    /// What the build's end lets go of its front end, told as its units compile ([`BuildEnd`]).
+    end: BuildEnd,
+}
+
+/// The most crates a build may make and still be an edit's ([`BuildEnd::release`]): the crate
+/// edited and the few a changed interface reaches at once.
+const EDIT_CRATES: usize = 4;
+
+/// What a build's end lets go of its kept front end, run after the build's answer by the task
+/// that stores it ([`Steps::release_kept`]), with the front end the task's alone. Nothing lets
+/// go of the front end mid-build: until 2026-11-13 a release ran as a write of the job's
+/// writer, which stopped every reader for it, whenever no unit was open or memory was short
+/// (`unit::release`, deleted with the memory gate). A value let go keeps its memo, so a read
+/// of it by the next build makes it again and backdates it: nothing read can differ.
+///
+/// - A check keeps its inference, which the next check of the head reads again; its MIR goes.
+/// - An edit's build (it found a unit kept and made at most [`EDIT_CRATES`] crates) keeps its
+///   inference and MIR, which the next edit's check reads again (the lints of bodies), and
+///   lets go of the trait solver's caches, which are of this revision alone.
+/// - Any other build lets go of every MIR and of the inference of the dependencies it
+///   finished (no workspace member's, `CrateOrigin::Local`: those an edit makes again).
+///
+/// Then, at every end, the storage's upkeep: [`blaze_query::db::Storage::end_epoch`] lets go
+/// of what neither this build nor the one before read, the reverse edges are packed and the
+/// changed set settled.
+struct BuildEnd {
+    /// Each unit's crate; none for a build script's run.
+    of: Vec<Option<base_db::Crate>>,
+    /// Each unit found kept as it began ([`Writer::found_kept`]).
+    kept: Vec<bool>,
+    /// Each unit whose compile ended ([`Writer::compiled`]).
+    compiled: Vec<bool>,
+    /// Whether the build compiles code: none for a check.
+    compiles: bool,
+}
+
+impl BuildEnd {
+    fn new(crates: &Crates, units: usize, compiles: bool) -> BuildEnd {
+        BuildEnd {
+            of: (0..units).map(|unit| crates.krate(unit)).collect(), // alloc: a crate a unit, once per build
+            kept: vec![false; units],     // alloc: a flag a unit, once per build
+            compiled: vec![false; units], // alloc: a flag a unit, once per build
+            compiles,
+        }
+    }
+
+    /// How many crates the build made: those of a compiled unit not found kept.
+    fn made(&self) -> usize {
+        let mut made = blaze_hash::HashMap::new_in(std::alloc::Global);
+        for unit in 0..self.of.len() {
+            if let Some(krate) = self.of[unit]
+                && self.compiled[unit]
+                && !self.kept[unit]
+            {
+                made.insert(krate, ());
+            }
+        }
+        made.len()
+    }
+
+    /// The crates every unit of which compiled, in the order of their first unit.
+    fn finished(&self) -> Vec<base_db::Crate> {
+        // Each crate's place in `crates` and whether every unit of it compiled so far.
+        let mut seen = blaze_hash::HashMap::new_in(std::alloc::Global);
+        let mut crates: Vec<(base_db::Crate, bool)> = Vec::new(); // alloc: a crate a build, once per build
+        for unit in 0..self.of.len() {
+            let Some(krate) = self.of[unit] else { continue };
+            let at = *seen.entry(krate).or_insert_with(|| {
+                crates.push((krate, true));
+                crates.len() - 1
+            });
+            crates[at].1 &= self.compiled[unit];
+        }
+        crates.into_iter().filter(|it| it.1).map(|it| it.0).collect() // alloc: as above
+    }
+
+    /// Lets go of what the build's end lets go (the type's doc), under a span naming it.
+    fn release(self, lowered: &mut Lowered) {
+        use blaze_query::db::Database as _;
+
+        let db = lowered.served_db();
+        let found_kept = self.kept.iter().any(|&it| it);
+        let edit = self.compiles && found_kept && self.made() <= EDIT_CRATES;
+        let crates: Vec<base_db::Crate> = match (self.compiles, edit) {
+            (false, _) | (true, true) => Vec::new(), // alloc: none, empty
+            (true, false) => {
+                let db: &base_db::Db = &*db;
+                let mut finished = self.finished();
+                finished.retain(|krate| !krate.data(db).origin.is_local());
+                finished
+            }
+        };
+        let mir = !edit;
+        let span = tracing::info_span!(
+            target: "blaze",
+            "front end release at the build's end",
+            edit,
+            crates = crates.len(),
+            mir,
+            inference = tracing::field::Empty,
+            mir_dropped = tracing::field::Empty,
+            solver_caches = tracing::field::Empty,
+            unread = tracing::field::Empty,
+            query_storage = tracing::field::Empty,
+        );
+        let _release = span.enter();
+        let mut dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
+        if edit {
+            dropped.solver_caches += hir::evict::drop_every_solver_cache(db);
+        }
+        let unread = db.storage_mut().end_epoch();
+        db.storage_mut().pack_reverse();
+        // What its pulls left for the next changed-set walk is settled: each row the build
+        // made again said it changed, and the next edit's walk would start from all of them.
+        db.storage_mut().settle_changed_set();
+        if std::env::var_os("BLAZE_DURABILITY_CENSUS").is_some() {
+            crate::serve::said::logged!(INFO,
+                "blaze serve: durability census: {}",
+                db.storage().durability_census()
+            );
+        }
+        span.record("inference", dropped.inference);
+        span.record("mir_dropped", dropped.mir);
+        span.record("solver_caches", dropped.solver_caches);
+        span.record("unread", unread.values);
+        span.record("query_storage", db.storage().held_bytes());
+    }
 }
 
 /// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
@@ -1282,7 +1379,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
+        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty()
     }
 
     fn idle(&self) -> bool {
@@ -1295,25 +1392,20 @@ impl Writer<Real> for UnitWriter {
             runs: count(self.runs.len()),
             macros: count(self.macros.len()),
             msls: count(self.msls.len()),
-            release: self.release.due(),
             readers: count(Arc::strong_count(&self.front).saturating_sub(1)),
         }
     }
 
-    fn began(&mut self, unit: usize) {
-        self.release.began(unit);
-    }
-
     fn found_kept(&mut self, unit: usize) {
-        self.release.kept(unit);
+        if let Some(kept) = self.end.kept.get_mut(unit) {
+            *kept = true;
+        }
     }
 
     fn compiled(&mut self, unit: usize) {
-        self.release.compiled(unit);
-    }
-
-    fn pressed(&mut self) {
-        self.release.pressed();
+        if let Some(compiled) = self.end.compiled.get_mut(unit) {
+            *compiled = true;
+        }
     }
 
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
@@ -1328,15 +1420,6 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
-        // The readers stopped for this apply are all gone: what is posted after it reads on.
-        release::resume_readers(lowered);
-        self.job.gives_way.store(false, Ordering::Release);
-        // First, with the readers stopped for it or for the writes below: what the crates
-        // finished so far keep ([`release`]).
-        self.release.release(lowered);
-        if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
-            return Ok(true);
-        }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
         let touched: Vec<u32> = self
@@ -1669,7 +1752,7 @@ impl Writer<Real> for UnitWriter {
 
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         // The writes still asked for are applied. With none, only that no reader is alive is
-        // asked: a release that is due stays for the task that stores the front end.
+        // asked: the build's end's release is the task's that stores the front end.
         let applied = match self.runs.is_empty() && self.macros.is_empty() {
             true => Arc::get_mut(&mut self.front).is_some(),
             false => self.apply()?,
@@ -1682,13 +1765,10 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes, and every MIR it made, of a
-        // check as of any build, so the kept front end holds none of it into the build after
-        // the next (a check's MIR, kept, grew the heap by every check). Not here, on the loop
-        // before the build's answer: the release is kept with the front end and run by the
-        // task that stores it, after the answer ([`Steps::release_kept`]).
-        self.release.end();
-        let UnitWriter { walks, session, front, job, deps, retractions, release, .. } = self;
+        // The build is over: what its end lets go ([`BuildEnd`]) goes, not here, on the loop
+        // before the build's answer, but with the front end kept, by the task that stores it,
+        // after the answer ([`Steps::release_kept`]).
+        let UnitWriter { walks, session, front, job, deps, retractions, end, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
@@ -1713,7 +1793,7 @@ impl Writer<Real> for UnitWriter {
             flushed: None,
             seeds,
             memo,
-            release: Some(release),
+            end: Some(end),
         }))
     }
 }
@@ -2083,18 +2163,6 @@ pub(crate) struct Job {
     /// ([`codegen::judge`]): one that applied to nothing fails the job only when blaze made
     /// it, and is a warning otherwise.
     pub(crate) counted: Box<[OnceLock<Box<[(ContentId, blaze_codegen::driver::ProfileCounts)]>>]>,
-    /// How many instances each unit's codegen walk reached, by unit, set once as its walk
-    /// ends (`codegen::generate`, where `edit work` is logged): the size a unit that depends
-    /// on it is forecast by before its own walk starts, since a top crate reaches at least
-    /// what its largest dependency did (docs/v2/plan/design/memory.md, "Forecasts").
-    pub(crate) reached: Box<[OnceLock<u64>]>,
-    /// Set while the job's tasks are stopped for memory, from the stop until the release it
-    /// is for is applied; nothing sets it since the gate (2026-11-13) deleted the running
-    /// tasks' rung, and it goes with its readers. A task that reads it set gives way
-    /// ([`Failed::Again`]) as it does for a cancel, and is posted again whole. The codegen
-    /// walk reads it before every visit (its front end's stop), so a walk in a stretch with
-    /// no query call leaves as soon as one that makes them.
-    pub(crate) gives_way: std::sync::atomic::AtomicBool,
     /// The profiles its units' profile lints read (`profile` in `clippy.toml` or
     /// `[workspace.metadata.blaze.lints]`), read once and held while the job lives.
     pub(crate) lint_profiles: OnceLock<compile::LintProfiles>,
@@ -2168,8 +2236,6 @@ impl Job {
             script_reads: Lock::new("serve.unit.script_reads", script::ReadBytes::default()),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
-            reached: (0..slots).map(|_| OnceLock::new()).collect(),
-            gives_way: std::sync::atomic::AtomicBool::new(false),
             lint_profiles: Default::default(),
             layout: Default::default(),
             ub: Default::default(),
@@ -2521,10 +2587,6 @@ impl Front<Real> for JobFront {
 
     fn refused(&self, unit: usize, what: String) -> blaze_api::Diagnostic {
         say::refused(what, self.0.unit_of(unit).ok(), compile::drawing(&self.0).color)
-    }
-
-    fn reached(&self, unit: usize) -> Option<u64> {
-        self.0.reached.get(unit)?.get().copied()
     }
 
     fn subject(&self, unit: usize) -> Option<(String, String)> {

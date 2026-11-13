@@ -146,24 +146,30 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let table =
         |anchor: ContentId| &inputs.tables.iter().find(|it| it.anchor == anchor).unwrap().bytes;
     let body = table(start.anchor);
-    assert_eq!(&body[..8], b"BZSPANS1");
-    assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), 1, "one file");
-    let name_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    assert_eq!(&body[..8], b"BZSPANS2");
+    assert_eq!(word(body, 8), 1, "one file");
+    let name_len = word(body, 12) as usize;
     assert_eq!(&body[16..16 + name_len], b"src/lib.rs");
     let after = 16 + name_len;
-    let count = u32::from_le_bytes(body[after..after + 4].try_into().unwrap()) as usize;
+    let count = word(body, after) as usize;
     assert_eq!(count, BodyStore::of(db, owner).exprs().count(), "a row per expression");
-    assert_eq!(body.len(), after + 4 + 12 * count);
-    let row = after + 4 + 12 * start.index as usize;
-    let words: Vec<u32> = body[row..row + 12]
-        .chunks(4)
-        .map(|it| u32::from_le_bytes(it.try_into().unwrap()))
-        .collect();
+    let bases_at = after + 4 + 16 * count;
+    assert_eq!(word(body, bases_at), 2, "the anchor's start and the owner's declaration");
+    assert_eq!(body.len(), bases_at + 4 + 2 * 12);
+    let row = after + 4 + 16 * start.index as usize;
+    let [base, file, line, column] = std::array::from_fn(|n| word(body, row + 4 * n));
+    assert_ne!(base, u32::MAX, "a span of the body's own file is counted from a base");
+    assert_eq!(file, 0, "a relative span's file is its base's");
+    let base_at = bases_at + 4 + 12 * base as usize;
+    let [base_file, base_line, base_column] = std::array::from_fn(|n| word(body, base_at + 4 * n));
+    let resolved =
+        [base_file, base_line + line, if line == 0 { base_column + column } else { column }];
     // The body's block, on the first line, from its 25th column.
-    assert_eq!(words, [0, 1, 25]);
+    assert_eq!(resolved, [0, 1, 25]);
 
     let declaration = table(declared.anchor);
-    assert_eq!(declaration.len(), 8 + 4 + 4 + name_len + 4 + 12);
+    assert_eq!(declaration.len(), 8 + 4 + 4 + name_len + 4 + 16 + 4 + 12);
 
     // The same build linked again: the same snapshot, nothing made.
     let again = frontend.link_inputs(&built).unwrap();
@@ -248,12 +254,184 @@ fn a_reformat_changes_a_table_and_not_its_anchor() {
     let mut db = db;
     let file = file.file_id(&db);
     let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));
-    let before = positions(&db, owner(&db)).clone().unwrap();
+    let before = all_rows(&db, owner(&db));
     db.set_file_text(file, "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n");
-    let after = positions(&db, owner(&db)).clone().unwrap();
-    assert_eq!(before.starts, after.starts, "the same spans");
-    assert_ne!(before.rows, after.rows, "each two lines on");
-    assert!(before.rows.iter().zip(&after.rows).all(|(was, now)| now.1 == was.1 + 2));
+    let after = all_rows(&db, owner(&db));
+    assert_eq!(before.len(), after.len(), "the same spans");
+    assert_ne!(before, after, "each two lines on");
+    assert!(before.iter().zip(&after).all(|(was, now)| now.1 == was.1 + 2));
+}
+
+/// Every table's rows of `owner`, in table order ([`table_rows`]).
+fn all_rows(db: &TestDB, owner: DefWithBodyId) -> Vec<Row> {
+    (0..TABLES).flat_map(|table| table_rows(db, owner, table).unwrap()).collect()
+}
+
+const SHIFTED: &str = "pub fn above() -> u32 {\n    1\n}\npub fn f(x: u32) -> u32 {\n    let y = x + 1;\n    y * 2\n}\n";
+
+/// The invariant: a line added above a body changes where its positions are counted from and
+/// nothing else of them. Its places, the memo that reads its syntax, are kept and not run
+/// again; its bases, two rows, are; each row the link is given is the one found from where
+/// the body is in its file now, `N` lines on. The control: an edit of the body itself places
+/// it again.
+#[test]
+fn a_line_added_above_a_body_places_none_of_it_again() {
+    for n in [1usize, 3, 40] {
+        let fx = fixture::db(SHIFTED);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
+        let file = file.file_id(&db);
+        let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));
+        let before_rows = all_rows(&db, owner(&db));
+        let before_places = span_places(&db, owner(&db)).clone();
+        let cells_of = |db: &TestDB| -> Vec<(Vec<Cell>, Vec<Row>)> {
+            (0..TABLES).map(|table| table_cells(db, owner(db), table).unwrap()).collect()
+        };
+        let before_cells = cells_of(&db);
+
+        let shifted = format!("{}{SHIFTED}", "\n".repeat(n));
+        db.set_file_text(file, &shifted);
+        blaze_query::db::attach(&db, || {
+            let owner = owner(&db);
+            let mut after_rows = Vec::new();
+            let executed = db.log_executed(|| after_rows = all_rows(&db, owner));
+            assert!(executed.iter().any(|it| it == "span_bases"), "the bases move: {executed:#?}");
+            assert!(
+                !executed.iter().any(|it| it == "span_places"),
+                "{n} lines above the body placed it again: {executed:#?}"
+            );
+            assert_eq!(*span_places(&db, owner), before_places, "its places are as they were");
+            // What the link is given: each table's cells as they were, its bases `n` on.
+            for (table, ((cells, bases), (was_cells, was_bases))) in
+                cells_of(&db).into_iter().zip(&before_cells).enumerate()
+            {
+                assert_eq!(&cells, was_cells, "table {table}'s cells after {n} lines");
+                let moved: Vec<Row> = (was_bases.iter())
+                    .map(|&(file, line, column)| (file, line + n as u32, column))
+                    .collect();
+                assert_eq!(bases, moved, "table {table}'s bases after {n} lines");
+            }
+            assert_eq!(after_rows.len(), before_rows.len());
+            for (was, now) in before_rows.iter().zip(&after_rows) {
+                assert_eq!((now.0, now.1, now.2), (was.0, was.1 + n as u32, was.2), "{n} lines on");
+            }
+            // What the program prints: each row is the absolute one found from the whole file.
+            let store = BodyStore::of(&db, owner);
+            let starts = span_places(&db, owner).starts;
+            let rows = &after_rows[starts[code::EXPRS] as usize..starts[code::EXPRS + 1] as usize];
+            for (span, row) in store.expr_ids().map(MirSpan::ExprId).zip(rows) {
+                assert_eq!(
+                    Some(*row),
+                    hir_ty_mir::mir::location::source_location_in_file(&db, owner, span),
+                    "{span:?} after {n} lines"
+                );
+            }
+        });
+
+        // The control: the body's own edit places it again.
+        db.set_file_text(file, &shifted.replace("x + 1", "x + 10"));
+        blaze_query::db::attach(&db, || {
+            let owner = owner(&db);
+            let executed = db.log_executed(|| _ = all_rows(&db, owner));
+            assert!(
+                executed.iter().any(|it| it == "span_places"),
+                "an edit of the body: {executed:#?}"
+            );
+        });
+    }
+}
+
+const LINE_SHIFTED: &str = "#[rustc_builtin_macro]\nmacro_rules! line {() => {}}\npub fn above() -> u32 {\n    1\n}\npub fn f() -> u32 {\n    line!()\n}\n";
+
+/// The line, from 1, of the first `line!()` in `text`.
+fn line_of_call(text: &str) -> u32 {
+    text[..text.find("line!()").expect("the call")].matches('\n').count() as u32 + 1
+}
+
+/// The invariant: a body that reads `line!()` keeps, below `n` lines added above it, its HIR
+/// body (the call is the placeholder, not its line), its item key and its places; and the line
+/// it reads is still the one it is written on: the row its `Location` is filled from (the cell
+/// as it was, the base `n` on) and the value a constant takes of it
+/// (`hir_ty::body_store::placed_literal`) are both the absolute line in the shifted file. The
+/// control: that line is `n` more than before, so a body that kept a line would be caught.
+#[test]
+fn a_body_reading_its_line_keeps_its_hir_and_key_below_an_inserted_line() {
+    use hir_def::{
+        ExpressionStoreOwnerId,
+        hir::{Expr, Literal},
+    };
+    for n in [1usize, 5, 60] {
+        let fx = fixture::db(LINE_SHIFTED);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
+        let file = file.file_id(&db);
+        let func = |db: &TestDB| function(db, "f");
+        // What of the body a shift must keep, and where its `line!()` is read and placed.
+        let seen = |db: &TestDB| {
+            blaze_query::db::attach(db, || {
+                let owner = DefWithBodyId::FunctionId(func(db));
+                let store = BodyStore::of(db, owner);
+                let (expr, literal) = (store.exprs())
+                    .find_map(|(id, it)| match it {
+                        Expr::Literal(it @ Literal::Uint(..)) => Some((id, it.clone())), // clone: a test's comparison
+                        _ => None,
+                    })
+                    .expect("the literal `line!()` expands to");
+                let placed = hir_ty::body_store::placed_literal(
+                    db,
+                    ExpressionStoreOwnerId::Body(owner),
+                    expr,
+                )
+                .expect("the call is in its file's text");
+                let row = hir_ty_mir::mir::location::source_location_in_file(
+                    db,
+                    owner,
+                    MirSpan::ExprId(expr),
+                )
+                .expect("the literal has a place");
+                let starts = span_places(db, owner).starts;
+                let rows = all_rows(db, owner);
+                // The expressions' table is in `expr_ids` order, as the test above reads it.
+                let index = store.expr_ids().position(|it| it == expr).expect("the literal");
+                let linked = rows[starts[code::EXPRS] as usize + index];
+                (
+                    format!("{store:?}"),
+                    item_key(db, ItemId::Function(func(db))),
+                    span_places(db, owner).clone(), // clone: a test's comparison
+                    literal,
+                    placed,
+                    row,
+                    linked,
+                )
+            })
+        };
+        let (body, key, places, literal, placed, row, linked) = seen(&db);
+        let written = line_of_call(LINE_SHIFTED);
+        assert_eq!(
+            literal,
+            Literal::Uint(u128::from(hir_expand::builtin::PLACE_PLACEHOLDER), Some(hir_def::builtin_type::BuiltinUint::U32)),
+            "`line!()` is the placeholder in the body"
+        );
+        assert_eq!(placed, Some(Literal::Uint(u128::from(written), Some(hir_def::builtin_type::BuiltinUint::U32))));
+        assert_eq!((row.1, linked.1), (written, written), "the row a `Location` is filled from");
+
+        let shifted =
+            LINE_SHIFTED.replacen("pub fn above", &format!("{}pub fn above", "\n".repeat(n)), 1);
+        db.set_file_text(file, &shifted);
+        let (body2, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
+        let now = line_of_call(&shifted);
+        assert_eq!(now, written + n as u32, "the control: the call moved {n} lines");
+        assert_eq!(body2, body, "the HIR body after {n} lines");
+        assert_eq!(key2, key, "the item key after {n} lines");
+        assert_eq!(places2, places, "the places after {n} lines");
+        assert_eq!(literal2, literal, "the placeholder after {n} lines");
+        assert_eq!(
+            placed2,
+            Some(Literal::Uint(u128::from(now), Some(hir_def::builtin_type::BuiltinUint::U32))),
+            "a constant's value after {n} lines"
+        );
+        assert_eq!((row2.1, linked2.1), (now, now), "the printed line after {n} lines");
+    }
 }
 
 /// A body's positions are found by plain functions over its memos: each span's is the one
@@ -265,10 +443,12 @@ fn positions_are_placed_without_a_memo_per_span() {
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
         let owner = DefWithBodyId::FunctionId(function(&db, "f"));
-        let mut found = None;
-        let executed = db.log_executed(|| found = Some(positions(&db, owner).clone().unwrap()));
-        let found = found.expect("the positions");
-        assert!(executed.iter().any(|it| it == "positions"), "the log sees queries: {executed:#?}");
+        let mut rows = Vec::new();
+        let executed = db.log_executed(|| rows = all_rows(&db, owner));
+        assert!(
+            executed.iter().any(|it| it == "span_places"),
+            "the log sees queries: {executed:#?}"
+        );
         for per_span in
             ["source_place", "row_place", "source_location_in_file", "row_location_in_file"]
         {
@@ -278,7 +458,8 @@ fn positions_are_placed_without_a_memo_per_span() {
             );
         }
 
-        let table = |t: usize| &found.rows[found.starts[t] as usize..found.starts[t + 1] as usize];
+        let starts = span_places(&db, owner).starts;
+        let table = |t: usize| &rows[starts[t] as usize..starts[t + 1] as usize];
         let store = BodyStore::of(&db, owner);
         let in_file =
             |span: MirSpan| hir_ty_mir::mir::location::source_location_in_file(&db, owner, span);

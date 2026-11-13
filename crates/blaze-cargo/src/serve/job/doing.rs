@@ -342,22 +342,18 @@ pub fn fetching(downloads: &[Shown]) -> Vec<now::Download> {
 }
 
 /// The daemon's memory as every build's live model says it, read once a look: what blaze holds
-/// ([`blaze_graph::arena::own`], what `blaze status` says it holds), its limit (the memory
-/// gate's ceiling, `blaze_mem::gate`), and `core` while the gate's core is past its give-back
-/// line (`job::giving`; no subsystem has a share of its own since the gate, 2026-11-13).
-/// `held_back` is 0: the plane holds tasks back by request, not by count here. `peak` is the
-/// fold's to keep; `releases` is the front ends' releases since the daemon started
-/// ([`crate::serve::unit::release::RELEASES`]), which each fold turns into its build's own.
+/// ([`blaze_graph::arena::own`], what `blaze status` says it holds). Since the memory
+/// machinery went (2026-11-13) blaze sets no limit of its own (the kernel's is the ceiling),
+/// holds no task back for memory and releases no front end mid-build, so `limit`, `over`,
+/// `held_back` and `releases` are 0 and none. `peak` is the fold's to keep.
 pub fn memory() -> now::Memory {
-    let limit = blaze_mem::gate::process().ceiling();
-    let core = crate::serve::unit::release::Core::now();
     now::Memory {
         held: blaze_graph::arena::own(),
         peak: 0,
-        limit: if limit == u64::MAX { 0 } else { limit },
-        over: core.over().then(|| "core".to_owned()), // alloc: a look, once a second, while over
+        limit: 0,
+        over: None,
         held_back: 0,
-        releases: crate::serve::unit::release::RELEASES.load(std::sync::atomic::Ordering::Relaxed),
+        releases: 0,
     }
 }
 

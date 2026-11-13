@@ -99,7 +99,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     // What the blaze edition removes or respells (docs/v2/plan/design/edition.md): the code blaze
-    // cannot analyse, what blaze's standard library replaces (`std_use`), `lossy_as`,
+    // cannot analyse, what blaze's standard library replaces (`std_use`), `as_cast`,
     // `implicit_overflow`,
     // `global_state`, `async_fn`, `mut_ref`, and the marks it writes at a crate's border
     // (`unmarked_*`). Allowed until a workspace turns the group on, but for the members whose
@@ -113,7 +113,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::build_script_ambient",
             "blaze::not_latest_edition",
             "blaze::std_use",
-            "blaze::lossy_as",
+            "blaze::as_cast",
             "blaze::implicit_overflow",
             "blaze::global_state",
             "blaze::async_fn",
@@ -176,6 +176,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::untied_child",
             "blaze::unbounded_test_wait",
             "blaze::reads_positions",
+            "blaze::absolute_position",
             "blaze::cbor_field_order",
             "blaze::gapped_literal",
             "blaze::retry",
@@ -183,6 +184,24 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::tmp_path",
             "blaze::narrowed_len",
             "blaze::process_static",
+            "blaze::truncating_cast",
+            "blaze::partial_write",
+            "blaze::partial_cmp_unwrap",
+            "blaze::unbounded_read",
+            "blaze::len_minus",
+            "blaze::str_byte_slice",
+            "blaze::forget",
+            "blaze::path_to_str_unwrap",
+            "blaze::detached_thread",
+            "blaze::unbounded_channel",
+            "blaze::transmute",
+            "blaze::clone_to_satisfy",
+            "blaze::unchecked_index_in_loop",
+            "blaze::default_numeric_fallback_len",
+            "blaze::refcell_borrow_across_call",
+            "blaze::process_exit",
+            "blaze::print_in_lib",
+            "blaze::lock_unwrap",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
@@ -210,7 +229,8 @@ pub(super) const RENAMED: &[(&str, &str)] = &{
     out
 };
 
-const BLAZE_RENAMED: &[(&str, &str)] = &[("blaze::std_hashmap", "blaze::default_hasher")];
+const BLAZE_RENAMED: &[(&str, &str)] =
+    &[("blaze::std_hashmap", "blaze::default_hasher"), ("blaze::lossy_as", "blaze::as_cast")];
 
 /// `register_removed`: the name and why. blaze's own, deleted with no alias (AGENTS.md rule 30),
 /// then rustc's.
