@@ -22,6 +22,15 @@ main.intro[data-on] .wordmark canvas { display: block; }
 .doc.intro .dim { margin: 0; font-size: 13.5px; color: var(--ink-3); }
 .doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
 .doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+/* The command (intro.ts): one line of mono, big, under the word. `cargo` burns off and `blaze` catches in its place;
+   the caret shows while something is being typed. */
+.doc.intro .lede:has(.cmd) { font-size: clamp(22px, 3vw, 30px); }
+.doc.intro .lede code.cmd { display: inline-flex; align-items: baseline; padding: 0.15em 0.5em; border-radius: 10px; background: var(--s-tint); color: var(--ink-1); font-size: 1em; white-space: pre; }
+.doc.intro .cmd .tool span { display: inline-block; }
+.doc.intro .cmd .tool .cmd-new { color: var(--ink-1); }
+.doc.intro .cmd .sub { display: inline-block; min-width: 5ch; text-align: left; color: var(--fire); }
+.doc.intro .cmd .caret { display: inline-block; width: 0.55em; height: 1.05em; margin-left: 1px; align-self: center; background: currentColor; opacity: 0; }
+.doc.intro .cmd .caret.on { opacity: 0.7; }
 /* The last quiet line is the page's footer: the reference pages, at the bottom of the window, not under the button. */
 .doc.intro .intro-after > .dim:last-child { position: absolute; left: 0; right: 0; bottom: 18px; }
 
