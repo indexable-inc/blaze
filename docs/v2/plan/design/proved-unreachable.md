@@ -194,13 +194,22 @@ what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`;
 `cached`". The prover never discharges a `todo!()`: it is unfinished, not dead.
 
 - **The gate decides, not the profile.** Every local build, dev and `--release`, warns
-  (`blaze::todo` is a `blaze::general` lint; the profile is not an input of it). The merge
-  gate and a build for a release deny it with the lint's level, `--deny blaze::todo`. Built:
-  the lint and its levels (tests: a warning with and without `debug_assertions`, an error
-  under `--deny=blaze::todo`, test code allowed). Not built: the line in
-  `.github/workflows/blaze.yaml`'s workspace check and in `release.yaml` that passes the
-  level. blaze's own workspace already denies every general lint through its
-  `lints-ratchet` (docs/lints.md), locally too, and has no `todo!()` outside fixtures.
+  (`blaze::todo` is a `blaze::general` lint; the profile is not an input of it). The gate
+  denies it on the command line: `blaze check --deny blaze::todo`. `--allow`, `--warn`,
+  `--deny` and `--forbid LINT` are `check`'s lint levels (`blaze_units::lint_level`,
+  `crates/blaze-cargo/src/cli/args.rs`): each workspace member gets them after the
+  workspace's tables, the ratchet's baselines and its own `[lints]`, and they are part of the
+  load's key (the schema and producer versions of the asked invocation and the plan are
+  bumped). blaze's own workspace denies `general` in its `lints-ratchet`, read on every run,
+  so the table names `todo = "warn"` to keep a hole a warning locally.
+  Where the level is passed today: the `lint-baselines` job of `.github/workflows/blaze.yaml`,
+  the one step that checks with the blaze built from the tree (that job is not yet among the
+  gate's required ones). The `workspace-check` steps and `release.yaml` run the released
+  blaze (`.github/blaze-version`), which has neither the option nor the lint: each carries a
+  comment saying what to add once a release has them, and nothing in the release workflow
+  denies `blaze::todo` yet. A lint flag in `RUSTFLAGS` still comes after the command line's
+  (`blaze-lower`'s `lint_flags`), so `-A blaze::todo` there would undo the gate's level:
+  not fixed.
   Test code (`#[test]`, `#[cfg(test)]`) is allowed.
 - **At run time** a reached `todo!()` fails only its job with a typed error naming the site
   (rule `panics-fail-one-job`): the panic payload is `blaze_core::Todo { file, line, function }`,

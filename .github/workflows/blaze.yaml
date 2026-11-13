@@ -434,8 +434,10 @@ jobs:
             echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
           fi
           echo "blaze check $args --lib --tests"
+          # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
           # shellcheck disable=SC2086
           blaze check $args --lib --tests --message-format short
+      # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
       - run: blaze check --workspace --message-format short
       # Every target, the test targets among them: a test that no longer type-checks against
       # the code it tests fails here, in every crate, where the unit tests job compiles the test
@@ -443,6 +445,7 @@ jobs:
       # hir-ty-mir's tests/consteval/comptime.rs did not compile on main). A step of its own,
       # after the libraries', so the log says which of the two failed; what the first checked
       # is not checked again.
+      # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
       - name: blaze check --workspace --all-targets (the test targets compile)
         run: blaze check --workspace --all-targets --message-format short
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
@@ -468,6 +471,8 @@ jobs:
   # baselines are also the ratchet's: each crate a lint's lists is held at `warn` on it, every
   # other crate at `deny` (docs/lints.md, "Workspace levels and the ratchet"). They start with
   # every crate `unmeasured`, so the job fails until a run with `--bless-baselines` records them.
+  # The same check denies `blaze::todo`, which the workspace holds at `warn` for local checks
+  # (Cargo.toml's `lints-ratchet`): a `todo!()` outside test code fails it (docs/cargo.md#lints).
   lint-baselines:
     name: lint baselines
     needs: changes
@@ -505,6 +510,7 @@ jobs:
         run: >-
           target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
           --message-format short --baselines crates/blaze-lints/baselines
+          --deny blaze::todo
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log

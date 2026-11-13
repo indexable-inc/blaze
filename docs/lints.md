@@ -118,6 +118,13 @@ list only shrinks:
   Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
   baseline with no crate left, saying so. That lint is then `deny` everywhere.
 
+Two lints are apart from this. `todo` is named `warn` in the ratchet table, so a hole is a
+warning in a local check and the gate denies it on its command line
+(`blaze check --deny blaze::todo`, [`todo`](#todo)). `unreachable` is never below `deny`: a
+line that sets it to `allow` or `warn` in `[workspace.metadata.blaze.lints]`, the ratchet or a
+package's `[lints.blaze]`, a baseline `blaze.unreachable.txt`, and `--allow` or `--warn` of it
+on the command line are each an error naming it ([`unreachable`](#unreachable)).
+
 A new crate gets no line, so it is held to every lint from the start. Making a lint `warn`
 again for a crate is a change to this section's rule, not to a baseline.
 
@@ -1232,7 +1239,9 @@ warning: `todo!()` in `open`: needs `Result<Dir, FsError>`; in scope: `cached`
 ```
 
 **Levels.** `warn` in every local build, dev and release alike. The merge gate and a build
-for a release deny it (`--deny blaze::todo`), so a hole never lands or ships. The prover
+for a release are to deny it with `blaze check --deny blaze::todo`; today the gate's
+`lint-baselines` job does, and the steps that run the released blaze wait for a release that
+has the option (docs/v2/plan/design/proved-unreachable.md). The prover
 behind [`unreachable`](#unreachable) never discharges a `todo!()`: it is unfinished, not dead.
 
 **Allowing it.** `#[expect(blaze::todo, reason = "..")]` on the function.
