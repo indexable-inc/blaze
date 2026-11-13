@@ -323,6 +323,12 @@ impl<'db> InferenceTable<'db> {
         BitSlice::from_words(&self.diverging_type_vars[..])
     }
 
+    /// The words of [`Self::diverging_type_vars`], for a method probe
+    /// (`MethodResolutionContext::diverging_type_vars`).
+    pub(crate) fn diverging_type_var_words(&self) -> &[u64] {
+        &self.diverging_type_vars[..]
+    }
+
     pub(crate) fn next_ty_var(&self, span: Span) -> Ty<'db> {
         self.infer_ctxt.next_ty_var(span)
     }

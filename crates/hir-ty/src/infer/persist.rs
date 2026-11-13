@@ -2673,6 +2673,10 @@ impl Sink {
                 self.word(56);
                 self.span(*span);
             }
+            D::MethodCallOnDivergingInferVar { span } => {
+                self.word(57);
+                self.span(*span);
+            }
             D::InheritedRefMutabilityMismatch { pat } => self.words.extend([53, local(*pat)]),
             D::FnTraitArgsNotTuple { call_expr } => self.words.extend([54, local(*call_expr)]),
             D::SelfCtorNotTupleOrUnit { expr, self_ty } => {
@@ -3754,6 +3758,7 @@ impl Source<'_> {
             54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
             55 => D::SelfCtorNotTupleOrUnit { expr: self.local()?, self_ty: self.ty(tys)? },
             56 => D::TyvarBehindRawPointer { span: self.span()? },
+            57 => D::MethodCallOnDivergingInferVar { span: self.span()? },
             90 => D::WholeValueWriteThroughRefinement { place: self.local()?, ty: self.ty(tys)? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
@@ -4176,6 +4181,7 @@ mod tests {
             },
             D::MethodOnUnknownRawPointee { span: Span::PatId(pat(4)) },
             D::TyvarBehindRawPointer { span: Span::ExprId(expr(5)) },
+            D::MethodCallOnDivergingInferVar { span: Span::ExprId(expr(6)) },
             D::InheritedRefMutabilityMismatch { pat: pat(3) },
             D::FnTraitArgsNotTuple { call_expr: expr(9) },
             D::SelfCtorNotTupleOrUnit { expr: expr(2), self_ty: ty(types.never) },

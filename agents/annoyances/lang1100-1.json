@@ -1,0 +1,11 @@
+{
+ "id": "lang1100-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane rust-1100-lang",
+ "where": "crates/hir-ty-mir/src/tests/mir/eval.rs and consteval/intrinsics.rs: `fn should_not_reach() { _ }`",
+ "what": "A call of `should_not_reach()` runs to the end: `check_pass` of `fn should_not_reach() { _ }\\nfn main() { should_not_reach(); }` passes (run 2026-11-12 on 136432aa02 plus this lane). MIR lowering turns `Expr::Underscore` into nothing (mir/lower.rs, `Expr::Underscore => Ok(Some(current))`), and the typed hole that inference reports does not stop the lowering. 251 calls in the MIR evaluator tests use it as their only assertion, so a wrong drop count or value in them is not caught.",
+ "cost": "my first 30 runtime checks of drop order and layout all passed, the 2021 and 2024 editions with opposite expectations among them; found only because the file has a control (`the_oracle_catches_a_check_that_does_not_hold`)",
+ "cause": "class: vacuous success. The helper was written when a typed hole failed MIR lowering (rust-analyzer); blaze lowers it since, and nothing checked the helper itself",
+ "workaround": "`fn check(b: bool) { if !b { panic!(..) } }` with minicore `panic`, as crates/hir-ty-mir/src/tests/mir/stabilized.rs does, with a control test beside it",
+ "state": "open: replace the 251 `should_not_reach()` by a panic and fix or record what then fails"
+}
