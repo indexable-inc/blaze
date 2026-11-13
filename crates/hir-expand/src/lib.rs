@@ -76,8 +76,7 @@ pub use crate::files::{AstId, ErasedAstId, FileRange, InFile, InMacroFile, InRea
 
 pub use base_db::EditionedFileId;
 pub use mbe::{
-    DeclarativeMacro, ExpandErrorKind as MbeErrorKind, MacroCallStyle, MacroCallStyles,
-    MatchFailure, ValueResult,
+    DeclarativeMacro, ExpandErrorKind as MbeErrorKind, MacroCallStyles, MatchFailure, ValueResult,
 };
 
 pub use syntax_bridge::parse_to_token_tree_static_span;
@@ -556,11 +555,14 @@ impl AttrMacroAttrIds {
 }
 
 impl MacroCallKind {
-    pub(crate) fn call_style(&self) -> MacroCallStyle {
+    /// The call as a declarative macro is given it: for an attribute, with its arguments.
+    pub(crate) fn mbe_call(&self) -> mbe::MacroCall<'_> {
         match self {
-            MacroCallKind::FnLike { .. } => MacroCallStyle::FnLike,
-            MacroCallKind::Derive { .. } => MacroCallStyle::Derive,
-            MacroCallKind::Attr { .. } => MacroCallStyle::Attr,
+            MacroCallKind::FnLike { .. } => mbe::MacroCall::FnLike,
+            MacroCallKind::Derive { .. } => mbe::MacroCall::Derive,
+            MacroCallKind::Attr { attr_args, .. } => {
+                mbe::MacroCall::Attr { args: attr_args.as_deref() }
+            }
         }
     }
 }
