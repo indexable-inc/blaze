@@ -80,6 +80,20 @@ pub fn check(
     name_of: NameOf<'_>,
 ) -> Result<Vec<Found>, diag::CheckError> {
     blaze_query::db::attach(db, || {
+        // A flag that names a lint no level waives, below `deny`, refuses the check: it is
+        // never read as if it had not been given.
+        for (name, level) in &setup.command_line.lints.opts {
+            let waived = !matches!(level, Level::Deny | Level::Forbid)
+                && blaze::UNWAIVABLE
+                    .iter()
+                    .any(|it| Target::of(name) == Some(Target::Blaze(it.bit())));
+            if waived {
+                return Err(diag::CheckError::Unwaivable {
+                    lint: name.clone(), // clone: the error's own copy
+                    level: crate::level::flag_of(*level).trim_start_matches("--").to_owned(), // alloc: an error's part
+                });
+            }
+        }
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
         driver.run()?;
@@ -960,6 +974,33 @@ impl<'q: 't, 't> Cx<'q, 't> {
     #[inline]
     pub(crate) fn on_blaze(&self, lint: blaze::Lint) -> bool {
         self.on.intersects(lint.bit())
+    }
+
+    /// Where the lint attributes on `node` name exactly `lint` at a level below `deny`
+    /// (`allow`, `expect`, `warn`), `cfg_attr`s expanded: each name's range in `node`'s tree,
+    /// with the level as written.
+    pub(crate) fn waivers(
+        &self,
+        node: ast::Node<'_>,
+        lint: blaze::Lint,
+    ) -> Vec<(TextRange, &'static str)> {
+        let Some(owner) = ast::AnyHasAttrs::cast(node) else { return Vec::new() };
+        if owner.attrs().next().is_none() {
+            return Vec::new();
+        }
+        lint_attrs(self.cfg, owner)
+            .into_iter()
+            .filter(|it| it.target == Target::Blaze(lint.bit()))
+            .filter_map(|it| {
+                let level = match it.level {
+                    Level::Allow => "allow",
+                    Level::Expect => "expect",
+                    Level::Warn | Level::ForceWarn => "warn",
+                    Level::Deny | Level::Forbid => return None,
+                };
+                Some((it.range, level))
+            })
+            .collect() // alloc: the waivers on one node, none in almost every crate
     }
 
     /// Whether the crate's root denies or forbids `lint` (`blaze::hot` counts for its lints)

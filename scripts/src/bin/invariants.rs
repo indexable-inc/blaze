@@ -91,7 +91,9 @@ impl Patterns {
             doc: re(r"^\s*///(?: (.*))?$"),
             item: re(r"^\s*(?:pub(?:\([^)]*\))? )?(?:const |async |unsafe )*(?:fn|struct|enum|trait|type) (\w+)"),
             control: re(r"^\s*fn (the_oracle_catches_\w+)\("),
-            sim: re(r"\bsim::|\bSim\b|hegel::sim"),
+            // `#[bstd::test]` (in bstd itself, `#[crate::test]`) runs its test on the simulation
+            // without the file naming it (docs/v2/plan/design/bstd-sim-test.md).
+            sim: re(r"\bsim::|\bSim\b|hegel::sim|#\[(?:bstd|crate)::test\b"),
         }
     }
 }
@@ -439,6 +441,8 @@ fn selftest(p: &Patterns) {
     expect(entries[0].level == "tested" && entries[1].level.is_empty(), &format!("levels: {entries:?}"));
     let (simmed, _) = scanned(p, "a.rs", "use blaze_core::sim::Sim;\n\n/// The invariant: x.\nfn t() {}\n");
     expect(simmed[0].level == "simulated", &format!("a file on the simulation is simulated: {simmed:?}"));
+    let (seeded, _) = scanned(p, "a.rs", "/// The invariant: x.\n#[bstd::test(without(Crashes))]\nfn t(cx: &Cx, io: Io) {}\n");
+    expect(seeded[0].level == "simulated", &format!("a `#[bstd::test]` is simulated: {seeded:?}"));
     let (proved, _) =
         scanned(p, "a.rs", "/// The refinement (proved: proofs/A.lean): the map is the model.\nfn t() {}\n");
     expect(

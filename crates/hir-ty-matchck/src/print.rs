@@ -189,6 +189,26 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     fn write_witness(&self, out: &mut String, pat: &Witness<'a, 'db>) {
         let ty = *pat.ty();
+        // blaze: a witness of an error union (`#![blaze::error_unions]`) is written as the
+        // member it holds, the pattern that covers it (`FsError { .. }`), never as core's
+        // `ErrorUnion` struct around a variant of its `Repr` enum.
+        if matches!(pat.ctor(), Constructor::Struct)
+            && hir_ty::error_union::members(self.infcx.interner, ty).is_some()
+        {
+            let member = pat.iter_fields().next().and_then(|held| match held.ctor() {
+                Constructor::Variant(_) => held.iter_fields().next(),
+                _ => None,
+            });
+            match member {
+                Some(member) if would_print_as_wildcard(member, self.never_patterns) => {
+                    self.write_any_of(out, *member.ty())
+                }
+                Some(member) => self.write_witness(out, member),
+                // No member is covered: any value of the union.
+                None => out.push('_'),
+            }
+            return;
+        }
         match pat.ctor() {
             Constructor::Bool(b) => _ = write!(out, "{b}"),
             Constructor::Str(s) => _ = write!(out, "{:?}", s.as_str()),
@@ -279,6 +299,31 @@ impl<'a, 'db> Cx<'a, 'db> {
             | Constructor::F128Range(..)
             | Constructor::Opaque(..)
             | Constructor::Or => out.push('_'),
+        }
+    }
+
+    /// blaze: the pattern of every value of `ty`, a member of an error union no arm
+    /// covers, as a pattern of the member: a struct with its fields left out
+    /// (`FsError { .. }`, `Wrap(..)`, `Unit`), and an enum as `Stopped::_`, for every variant
+    /// of it (no pattern is of an enum whole: each variant is its own).
+    fn write_any_of(&self, out: &mut String, ty: Ty<'db>) {
+        let db = self.db;
+        match ty.kind() {
+            TyKind::Adt(def, _) => match def.def_id() {
+                AdtId::StructId(s) => {
+                    out.push_str(StructSignature::of(db, s).name.as_str());
+                    match VariantId::StructId(s).fields(db).shape {
+                        FieldsShape::Record => out.push_str(" { .. }"),
+                        FieldsShape::Tuple => out.push_str("(..)"),
+                        FieldsShape::Unit => {}
+                    }
+                }
+                AdtId::UnionId(u) => {
+                    _ = write!(out, "{} {{ .. }}", UnionSignature::of(db, u).name.as_str())
+                }
+                AdtId::EnumId(e) => _ = write!(out, "{}::_", EnumSignature::of(db, e).name.as_str()),
+            },
+            _ => out.push('_'),
         }
     }
 

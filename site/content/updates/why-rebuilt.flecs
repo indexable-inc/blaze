@@ -1,6 +1,6 @@
 // Update: a build says what it does while it does it, and why each function was rebuilt; `blaze why` (#878 in
 // v0.20261028.3; the live view, slow-function lists and timings in v0.20261028.9: #1249, #1257, #1267, #1270, #1271,
-// #1274). Canary. Extends lesson 2: the functions an edit rebuilt, named.
+// #1274). Canary. Extends Only what changed: the functions an edit rebuilt, named.
 site {
   updates {
     "why-rebuilt" : Page {
@@ -9,10 +9,10 @@ site {
       (InTheme, themes.canary)
       (Requires, site.learn.incremental)
       Title: {"Why it rebuilt"}
-      Description: {"Update to lesson 2: a build names each function it rebuilt and why, and blaze why says it again later."}
+      Description: {"Update to Only what changed: a build names each function it rebuilt and why, and blaze why says it again later."}
 
       Step names("Every function, with its why") {
-        P live("Lesson 2 said blaze rebuilds one function at a time. Now a build shows which: each step and each crate's functions as it goes, and one line at the end.")
+        P live("*Only what changed* said blaze rebuilds one function at a time. Now a build shows which: each step and each crate's functions as it goes, and one line at the end.")
         P line("`Rebuilt 3 fns: render (src/main.rs edited), draw, tick (uses what changed); 0.21s`")
       }
 

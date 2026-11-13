@@ -224,6 +224,14 @@
    "why": "Andrew, 2026-11-11: the comparison in the film should be \"to the existing system\" and \"data driven\"; \"more comparisons\".",
    "recommended": "Yes, as a second narrow exception beside D6.",
    "state": "in force; first numbers measured on hello-world"
+  },
+  {
+   "id": "D30",
+   "date": "2026-11-12",
+   "decision": "A function's error type is the exact set of failures it may return, checked like effects: the set is an error union (`A | B`, edition change 2, ledger E3), `?` widens a member or a smaller set with no `From` written, a failure the set lacks is an error naming the call, the member and the set, and a `match` covers every member. bstd's errors move onto sets: a kind variant that only holds another error (`FsKind::Stopped`, `HttpKind::Net`, `Refused::Stopped`, ...) becomes a member of the function's set (docs/v2/plan/design/error-sets.md has the list).",
+   "why": "Asked for by Andrew, 2026-11-12: bstd's ~30 error types should compose, so that `fn main(cx: &Cx) -> Result<(), E>` works when one function mixes `need_fs()?` (Missing) and `open_dir()?` (FsError) with no glue. The union type and its widening were already on main (E3 parts 1 and 2); what was missing was a set as a generic argument (a parser bug), matching by member, the error's words and the proof.",
+   "recommended": "Yes: a set costs what the hand-written enum costs (measured for layout), and each area keeps its own error; the alternative, one named enum per mix of areas with `From` impls, is the pattern the edition removes.",
+   "state": "built and tested under cargo on branch bstd-error-sets (parser, matching by member, diagnostics, determinism and layout tests); the bstd port waits for D29; the typed binding `e: T`, the unneeded-member advice and inferred sets are not built"
   }
  ]
 }

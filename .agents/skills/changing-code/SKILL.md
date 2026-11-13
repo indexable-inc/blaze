@@ -160,4 +160,51 @@ not a row; a how-to that keeps being broken, or a class with several rows, becom
 architectural change (`guard-the-cause`, `unease-is-work`). `'{"check": true}'` holds the files to
 their fields.
 
+## end-state-not-hill-climb (rule 66)
+
+A sequence of correct local fixes can stay inside a wrong design for weeks, because each fix has a
+real cause and a real measurement and so looks like progress. Guard against it. (1) Count fixes by
+symptom, not by cause: the second time one symptom (a no-op that walks, memory that grows, a restart
+that recomputes, a cache that misses) needs a fix, stop and ask why the design makes that symptom
+possible at all, one level above the bug. (2) Write the end state before more code: one short spec
+that starts from what the thing must do, states the invariant, and says how the best existing
+systems solve it (read their source; name the file); the spec covers the whole path the symptom runs
+through, not the component the last bug was in. (3) Get a review from outside the work (a fresh
+agent with the code and the spec but not your reasoning, or a person) before building; a frame you
+have held for days is not checked by you. (4) Build the end state directly and delete what it
+replaces in the same piece of work: a new mechanism beside the old ones (a fourth validity check, a
+third store for one thing, a second way a crate is loaded) is a failure of this rule, and so is a
+switch that selects between the old path and the new one for longer than the build of the new one.
+(5) Judge by end-to-end measurements on the real targets, taken on a quiet machine, before and
+after; a day of work with no end-to-end number is a day off course. The signs to stop on: a fast
+path that is an exception to a slower default and must survive a list of conditions; a list of
+special cases that keeps growing; a second mechanism added to cover the first one's gap; a fix whose
+explanation was a guess; work described as written and not compiled for more than one round. The
+speed of the next fix is never a reason to keep the design.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
+## within-ten-percent-of-the-floor (rule 67)
+
+The floor is what an oracle that already knows exactly which results changed would do: redo those
+and the direct readers of each changed value (a reader must rerun to learn whether its own value
+changed), plus unavoidable I/O (a process start, a socket round trip, the bytes of the result). The
+bar is bookkeeping of at most max(10% of that work, a few milliseconds); under a few milliseconds a
+percentage means nothing. Before building: (1) write the floor for each operation the design serves
+(no-op, comment edit, body edit, interface edit under many dependents, restart, idle memory, peak
+memory, bytes on disk) and the design's cost beside it as a formula in the things that grow
+(entries, reads, files, dependents), and reject a cost that grows with what is reachable where the
+floor grows with what changed; (2) count constants too: a check that costs microseconds where a mark
+costs nanoseconds is off by a hundred before any asymptotics; (3) where two measures trade (an index
+that buys time for memory or disk; small when idle against instant after idle), pick the point and
+say which measure pays; (4) say plainly what no design reaches (direct readers rerun; every
+instantiation of an edited generic is recompiled; a restart on Linux stats every file) so nobody
+designs around it. After building: every edit-loop measurement reports results changed, direct
+readers rerun, everything else touched, and the ratio of the last to the first two; a ratio over 1.1
+is a defect with an owner. The compiler's own throughput (type checking, LLVM) has no theoretical
+best and is compared with the best existing tools instead. An outside review of the cost table comes
+before the build (end-state-not-hill-climb).
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
 <!-- End of the generated rules. Hand-written notes follow. -->

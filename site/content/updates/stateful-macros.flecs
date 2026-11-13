@@ -1,5 +1,5 @@
 // Update: wasm proc macros expand in a session per calling crate only when they keep state (#908, PR #918, after #830), in
-// v0.20261028.3. Canary. Extends lesson 3: most expansions stay kept; the few that remember are run in order.
+// v0.20261028.3. Canary. Extends Proc macros: most expansions stay kept; the few that remember are run in order.
 site {
   updates {
     "stateful-macros" : Page {
@@ -8,11 +8,11 @@ site {
       (InTheme, themes.canary)
       (Requires, site.learn.macros)
       Title: {"Macros that keep state"}
-      Description: {"Update to lesson 3: proc macros that keep state between expansions run in a session per crate; the rest stay kept."}
+      Description: {"Update to Proc macros: proc macros that keep state between expansions run in a session per crate; the rest stay kept."}
 
       Step remember("Some macros remember") {
         P pure("Most derives are pure: same input, same output. A few keep state between expansions in a crate: napi-rs registers each constructor it sees, and a later expansion reads the list.")
-        P lost("Expand each one in a fresh instance, as lesson 3 did, and that list is lost.")
+        P lost("Expand each one in a fresh instance, as *Proc macros* had it, and that list is lost.")
       }
 
       Step watch("blaze watches the memory") {

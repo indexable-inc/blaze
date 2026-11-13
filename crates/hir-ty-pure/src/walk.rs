@@ -777,7 +777,12 @@ struct Walk<'a, 'db> {
 fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
-    walk.gather(body);
+    // What is proved dead or unable to fail is not a panic of this body
+    // (docs/v2/plan/design/proved-unreachable.md): asked only of a body with a branch or a check.
+    let reach = crate::reach::worth(body)
+        .then(|| crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[]));
+    let reach = reach.as_ref();
+    walk.gather(body, reach);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.
     if let Def::Body(Body::Fn(func)) = def {
@@ -806,9 +811,17 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         };
         sites.push(EffectSite { instance: instance.clone(), span: site.span, given: site.given }); // clone: reference counts
         let at = at as u32;
+        // A call in a block no path reaches, or of a modeled function proved not to panic
+        // with these arguments, has no panic here; its other effects stay.
+        let discharged = !site.given
+            && site.call.is_some_and(|block| reach.is_some_and(|it| it.discharged_block(block)));
         let memory = match instance.def {
             Def::Leaf(func, leaf) => {
                 let (kinds, does) = effects::leaf_kinds(leaf);
+                let kinds = match discharged {
+                    true => kinds.without(EffectSet::one(Rule::Panic)),
+                    false => kinds,
+                };
                 fold.row(db, func, kinds, EffectSet::EMPTY, at, || {
                     format!("calls {}, which {does}", fn_name(db, func))
                 }); // alloc: a witness's text
@@ -816,7 +829,15 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
             }
             Def::Body(def) => {
                 let callee = summary(db, cx.stored.clone(), instance.clone()); // clone: the query's key, reference counts
-                fold.callee(db, def, instance.args.as_ref(), callee, walk.workspace, at);
+                fold.callee(
+                    db,
+                    def,
+                    instance.args.as_ref(),
+                    callee,
+                    walk.workspace,
+                    at,
+                    discharged,
+                );
                 callee.memory
             }
         };
@@ -959,6 +980,7 @@ impl Fold {
         callee: &Summary,
         workspace: bool,
         at: u32,
+        discharged: bool,
     ) {
         let func = match def {
             Body::Fn(func) => Some(func),
@@ -1014,6 +1036,10 @@ impl Fold {
                 }
             }
             for rule in callee.set(index).without(covers).iter() {
+                // Proved not to panic at this site.
+                if discharged && rule == Rule::Panic {
+                    continue;
+                }
                 let depth = match rule {
                     Rule::Recursion => RECURSION_DEPTH,
                     _ => callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1),
@@ -1487,7 +1513,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// The sites of every block, cleanup blocks too, in block order.
-    fn gather(&mut self, body: &'a MirBody<'db>) {
+    fn gather(&mut self, body: &'a MirBody<'db>, reach: Option<&crate::reach::Reach>) {
         for (id, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
                 (self.span, self.origin) = (Some(statement.span), Origin::Made);
@@ -1529,6 +1555,10 @@ impl<'a, 'db> Walk<'a, 'db> {
                     }
                 }
                 TerminatorKind::Assert { msg, .. } => {
+                    // A check proved to hold, or never reached, is no panic.
+                    if reach.is_some_and(|it| it.discharged_block(id)) {
+                        continue;
+                    }
                     if let Some(rule) = effect_attrs::assert_rule(body, id) {
                         self.observe(EffectSet::one(rule), assertion(msg));
                     }

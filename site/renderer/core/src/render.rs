@@ -3,9 +3,6 @@
 //! renderer's byte for byte, so the order things are computed in follows its template literals where that order is
 //! visible (citation numbers, the block list).
 
-use std::collections::BTreeMap;
-
-use crate::comments::{self, Discussion, PAGE_BLOCK, is_comment};
 use crate::inline::{Refs, esc, inline};
 use crate::js;
 use crate::text::{dedent, prose};
@@ -18,18 +15,6 @@ pub struct Page {
     pub url: String,
     /// The file under dist/: `index.html`, `rfcs.html`, `rfcs/capabilities.html`.
     pub file: String,
-    /// Comments are keyed by this: the URL without its slash (`rfcs/capabilities`).
-    pub doc: String,
-}
-
-/// What a host needs to check a comment on a discussable page: its title and each block's text (the first 280 UTF-16
-/// units), the page itself as `_page`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Blocks {
-    pub doc: String,
-    pub title: String,
-    /// In the order the TS object has them: `_page` first, then each block as it was rendered.
-    pub blocks: Vec<(String, String)>,
 }
 
 pub fn is_page(e: &Entity) -> bool {
@@ -48,8 +33,7 @@ pub fn pages(world: &World, site: Id) -> Vec<Page> {
             let url = if rel == "index" { "/".to_string() } else { format!("/{rel}") };
             let file =
                 if url == "/" { "index.html".to_string() } else { format!("{}.html", &url[1..]) };
-            let doc = if url == "/" { "index".to_string() } else { url[1..].to_string() };
-            out.push(Page { node: c, url, file, doc });
+            out.push(Page { node: c, url, file });
             walk(world, site, c, out);
         }
     }
@@ -129,10 +113,7 @@ struct Ctx<'a, 'w> {
     s: &'a Site<'w>,
     page: &'a Page,
     cited: Vec<Id>,
-    discussable: bool,
-    blocks: Vec<(String, String)>,
     scripts: Vec<&'static str>,
-    discussion: &'a Discussion,
 }
 
 impl Ctx<'_, '_> {
@@ -157,51 +138,6 @@ impl Ctx<'_, '_> {
     }
 }
 
-#[derive(Default)]
-struct Anchor {
-    /// ` data-block=".."` for the block's element.
-    attr: String,
-    /// The count button, inside the element.
-    button: String,
-    /// The thread, after the element (inside it for an li).
-    thread: String,
-}
-
-/// What a block a reader can comment on carries, after checking it has a name. Empty outside a Discussable page.
-fn anchor(n: Id, ctx: &mut Ctx, plain: &str) -> Result<Anchor, String> {
-    if !ctx.discussable {
-        return Ok(Anchor::default());
-    }
-    let e = ctx.e(n);
-    if e.name.starts_with('#') {
-        let parent = e.parent.map(|p| ctx.e(p).path.clone()).unwrap_or_default();
-        return Err(format!(
-            "{}: a block in a Doc needs a name (anonymous child of {parent})",
-            ctx.e(ctx.page.node).path
-        ));
-    }
-    let id = ctx.block_id(n);
-    let short = js::slice_utf16(plain, 280).to_string();
-    match ctx.blocks.iter_mut().find(|(k, _)| *k == id) {
-        Some((_, v)) => *v = short,
-        None => ctx.blocks.push((id.clone(), short)),
-    }
-    let w = ctx.s.world;
-    Ok(Anchor {
-        attr: format!(" data-block=\"{}\"", esc(&id)),
-        button: comments::button(&id, w, n),
-        thread: comments::thread(
-            &id,
-            w,
-            n,
-            &ctx.page.doc,
-            &ctx.page.url,
-            ctx.discussion,
-            ctx.s.served,
-        ),
-    })
-}
-
 /// A superscript per reference the block cites with (Cites, refs.x).
 fn cites(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     let e = ctx.e(n);
@@ -222,10 +158,10 @@ fn cites(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     Ok(out)
 }
 
-fn prosed(n: Id, comp: &str, ctx: &mut Ctx) -> Result<(String, String), String> {
+fn prosed(n: Id, comp: &str, ctx: &mut Ctx) -> Result<String, String> {
     let t = prose(&dedent(&text(ctx.e(n), comp)));
     let path = ctx.e(n).path.clone();
-    Ok((ctx.inline(&t, &path)?, t))
+    ctx.inline(&t, &path)
 }
 
 fn children(n: Id, ctx: &mut Ctx) -> Result<String, String> {
@@ -234,7 +170,7 @@ fn children(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         .children
         .iter()
         .copied()
-        .filter(|c| !is_page(ctx.e(*c)) && !is_comment(ctx.e(*c)))
+        .filter(|c| !is_page(ctx.e(*c)))
         .collect();
     let mut out = Vec::with_capacity(kids.len());
     for c in kids {
@@ -302,49 +238,57 @@ fn highlighted(e: &Entity) -> Option<String> {
     }
 }
 
+/// Every element type a block can be. Two blocks in one scope with the same name are one entity in Flecs, so
+/// `Art daemon(...)` beside `P daemon(...)` is one node carrying both; it is refused rather than half rendered.
+const ELEMENTS: &[&str] = &[
+    "Lede", "P", "Dim", "H3", "Li", "Code", "Command", "Img", "Art", "Section", "Issue", "Goal", "Step", "Quiz",
+    "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table", "Go",
+];
+
 fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let kinds: Vec<&str> = ELEMENTS
+        .iter()
+        .chain(WIDGETS.iter())
+        .copied()
+        .filter(|k| e.has(k) || e.has_tag(k))
+        .collect();
+    if kinds.len() > 1 {
+        return Err(format!(
+            "{}: one block is two elements ({}); two blocks in one scope share this name, so rename one",
+            e.path,
+            kinds.join(", ")
+        ));
+    }
     if let Some(tag) = WIDGETS.iter().find(|t| ctx.e(n).has_tag(t)) {
         return widget(tag, n, ctx);
     }
     let e = ctx.e(n);
     if let Some(comp) = ["Lede", "P", "Dim"].into_iter().find(|c| e.has(c)) {
-        let (html, plain) = prosed(n, comp, ctx)?;
+        let html = prosed(n, comp, ctx)?;
         let cls =
             if comp == "P" { String::new() } else { format!(" class=\"{}\"", comp.to_lowercase()) };
-        let a = anchor(n, ctx, &plain)?;
         let c = cites(n, ctx)?;
-        return Ok(format!("<p{cls}{}>{html}{c}{}</p>{}", a.attr, a.button, a.thread));
+        return Ok(format!("<p{cls}>{html}{c}</p>"));
     }
     if e.has("H3") {
-        let (html, plain) = prosed(n, "H3", ctx)?;
-        let a = anchor(n, ctx, &plain)?;
-        return Ok(format!(
-            "<h3 id=\"{}\"{}>{html}{}</h3>{}",
-            esc(&ctx.block_id(n)),
-            a.attr,
-            a.button,
-            a.thread
-        ));
+        let html = prosed(n, "H3", ctx)?;
+        return Ok(format!("<h3 id=\"{}\">{html}</h3>", esc(&ctx.block_id(n))));
     }
     if e.has("Li") {
-        let (html, plain) = prosed(n, "Li", ctx)?;
+        let html = prosed(n, "Li", ctx)?;
         let nested = children(n, ctx)?;
-        let a = anchor(n, ctx, &plain)?;
         let c = cites(n, ctx)?;
-        return Ok(format!("<li{}>{html}{c}{}{nested}{}</li>", a.attr, a.button, a.thread));
+        return Ok(format!("<li>{html}{c}{nested}</li>"));
     }
     if let Some(c) = e.value("Code") {
         let lang = field(Some(c), "lang");
         let code = dedent(&field(Some(c), "text"));
         // The build highlights rust, toml and bash (highlight.js escapes every text run).
         let html = highlighted(e).unwrap_or_else(|| esc(&code));
-        let a = anchor(n, ctx, &code)?;
         return Ok(format!(
-            "<figure class=\"codeblock code-roles\"{}><pre class=\"hljs\" data-lang=\"{}\"><code>{html}</code></pre>{}</figure>{}",
-            a.attr,
-            esc(&lang),
-            a.button,
-            a.thread
+            "<figure class=\"codeblock code-roles\"><pre class=\"hljs\" data-lang=\"{}\"><code>{html}</code></pre></figure>",
+            esc(&lang)
         ));
     }
     if e.has("Command") {
@@ -360,16 +304,12 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         let alt = field(Some(i), "alt");
         let (src, w, h) =
             (field(Some(i), "src"), js::to_number(i.get("width")), js::to_number(i.get("height")));
-        let a = anchor(n, ctx, &alt)?;
         return Ok(format!(
-            "<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{}\"{} />{}{}",
+            "<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{}\" />",
             esc(&ctx.s.served.href(&src)),
             js::number(w),
             js::number(h),
-            esc(&alt),
-            a.attr,
-            a.button,
-            a.thread
+            esc(&alt)
         ));
     }
     if let Some(v) = e.value("Art") {
@@ -383,58 +323,44 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     if let Some(v) = e.value("Section") {
         let title = field(Some(v), "title");
         let id = esc(&ctx.block_id(n));
-        let a = anchor(n, ctx, &title)?;
         let path = ctx.e(n).path.clone();
         let t = ctx.inline(&title, &path)?;
         let kids = children(n, ctx)?;
         return Ok(format!(
-            "<section id=\"{id}\"><h2{}><a class=\"hash\" href=\"#{id}\">{t}</a>{}</h2>{}\n{kids}\n</section>",
-            a.attr, a.button, a.thread
+            "<section id=\"{id}\"><h2><a class=\"hash\" href=\"#{id}\">{t}</a></h2>\n{kids}\n</section>"
         ));
     }
     if let Some(v) = e.value("Issue") {
         let title = field(Some(v), "title");
         let id = esc(&ctx.block_id(n));
-        let a = anchor(n, ctx, &title)?;
         let path = ctx.e(n).path.clone();
         let t = ctx.inline(&title, &path)?;
         let st = status(ctx.e(n));
         let kids = children(n, ctx)?;
-        return Ok(format!(
-            "<div class=\"issue\" id=\"{id}\"><h3{}>{t} {st}{}</h3>{}\n{kids}\n</div>",
-            a.attr, a.button, a.thread
-        ));
+        return Ok(format!("<div class=\"issue\" id=\"{id}\"><h3>{t} {st}</h3>\n{kids}\n</div>"));
     }
     if let Some(v) = e.value("Goal") {
         // Folded: the title and its one line, and the paragraphs when the reader opens it.
         let (title, line) = (field(Some(v), "title"), field(Some(v), "line"));
         let id = esc(&ctx.block_id(n));
-        let a = anchor(n, ctx, &title)?;
         let path = ctx.e(n).path.clone();
         let (t, l) = (ctx.inline(&title, &path)?, ctx.inline(&line, &path)?);
         let kids = children(n, ctx)?;
         return Ok(format!(
-            "<details class=\"goal\" id=\"{id}\"><summary><span class=\"goal-head\"><h3{}>{t}</h3><span class=\"goal-line\">{l}</span></span>{}</summary>{}{}<div class=\"goal-body\">\n{kids}\n</div></details>",
-            a.attr,
+            "<details class=\"goal\" id=\"{id}\"><summary><span class=\"goal-head\"><h3>{t}</h3><span class=\"goal-line\">{l}</span></span>{}</summary><div class=\"goal-body\">\n{kids}\n</div></details>",
             crate::icons::svg("caret")
                 .unwrap_or_default()
-                .replace("class=\"icon\"", "class=\"icon chev\""),
-            a.button,
-            a.thread
+                .replace("class=\"icon\"", "class=\"icon chev\"")
         ));
     }
     if let Some(v) = e.value("Step") {
         // One screen of a lesson: stacked under each other without JS, one at a time with it (client/learn.ts).
         let title = field(Some(v), "title");
         let id = esc(&ctx.block_id(n));
-        let a = anchor(n, ctx, &title)?;
         let path = ctx.e(n).path.clone();
         let t = ctx.inline(&title, &path)?;
         let kids = children(n, ctx)?;
-        return Ok(format!(
-            "<section id=\"{id}\" class=\"step\"{}><h2>{t}</h2>\n{kids}\n</section>",
-            a.attr
-        ));
+        return Ok(format!("<section id=\"{id}\" class=\"step\"><h2>{t}</h2>\n{kids}\n</section>"));
     }
     if e.has("Quiz") {
         return quiz(n, ctx);
@@ -490,16 +416,14 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             return Err(format!("{path}: a Tap needs a piece and the parts that are right"));
         }
         let id = esc(&ctx.block_id(n));
-        let a = anchor(n, ctx, &prompt)?;
         let p = ctx.inline(&prose(&prompt), &path)?;
         let hint = ctx.inline(&prose(&hint), &path)?;
         let why = ctx.inline(&prose(&why), &path)?;
         let right: Vec<&str> = right.split(',').map(str::trim).filter(|r| !r.is_empty()).collect();
         ctx.script("learn");
         return Ok(format!(
-            "<div class=\"quiz tap\" id=\"{id}\" data-quiz=\"{id}\" data-right=\"{}\"{}><p class=\"prompt\">{p}</p><div class=\"diagram\" data-figure=\"{}\" data-pick=\"\"></div><p class=\"hint\">{hint}</p><details class=\"answer\"><summary>Show the answer</summary><p>{why}</p></details></div>",
+            "<div class=\"quiz tap\" id=\"{id}\" data-quiz=\"{id}\" data-right=\"{}\"><p class=\"prompt\">{p}</p><div class=\"diagram\" data-figure=\"{}\" data-pick=\"\"></div><p class=\"hint\">{hint}</p><details class=\"answer\"><summary>Show the answer</summary><p>{why}</p></details></div>",
             esc(&right.join(",")),
-            a.attr,
             esc(&piece)
         ));
     }
@@ -512,6 +436,9 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         return Ok(format!(
             "<figure class=\"diagram\" data-figure=\"{piece}\"><figcaption>{l}</figcaption></figure>"
         ));
+    }
+    if e.has("Go") {
+        return go(n, ctx);
     }
     if e.has_tag("Ul") || e.has_tag("Ol") {
         let t = if e.has_tag("Ul") { "ul" } else { "ol" };
@@ -529,13 +456,48 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     Err(format!("{}: no element type (tags {tags}; components {comps})", e.path))
 }
 
+/// The page's one big button: a link to another page of the site. When that page is a lesson, the link carries the
+/// lesson's key in the reader's progress and where its course map is, so client/intro.ts can send a reader who has
+/// finished it on to the map instead.
+fn go(n: Id, ctx: &Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let (label, href) = (field(e.value("Go"), "label"), field(e.value("Go"), "href"));
+    let path = &e.path;
+    if label.is_empty() {
+        return Err(format!("{path}: a Go needs a label"));
+    }
+    let to = ctx
+        .s
+        .pages
+        .iter()
+        .find(|p| p.url == href)
+        .ok_or_else(|| format!("{path}: Go {href:?} is not a page of the site (/start)"))?;
+    let target = ctx.e(to.node);
+    let mut lesson = String::new();
+    if target.has("Lesson") {
+        let parent = target.parent.ok_or("a lesson has no parent")?;
+        if let Some((at, c)) = ctx.s.world.course_of(ctx.s.pages, parent)? {
+            let node = c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
+            lesson = format!(
+                " data-lesson=\"{}\" data-course=\"{}\"",
+                esc(&node.key),
+                esc(&ctx.s.served.href(&ctx.s.pages[at].url))
+            );
+        }
+    }
+    Ok(format!(
+        "<p class=\"go\"><a href=\"{}\"{lesson}>{}</a></p>",
+        esc(&ctx.s.served.href(&to.url)),
+        esc(&label)
+    ))
+}
+
 /// A multiple-choice question: the prompt, the choices (each with its one-line why, which client/learn.ts shows once
 /// the reader picks it), and the right one with its why in a fold for a reader without JS.
 fn quiz(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     let path = ctx.e(n).path.clone();
     let prompt = field(ctx.e(n).value("Quiz"), "prompt");
     let id = esc(&ctx.block_id(n));
-    let a = anchor(n, ctx, &prompt)?;
     let p = ctx.inline(&prose(&prompt), &path)?;
     let (mut items, mut answer, mut count) = (String::new(), None, 0);
     for c in ctx.e(n).children.clone() {
@@ -564,8 +526,7 @@ fn quiz(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     }
     ctx.script("learn");
     Ok(format!(
-        "<div class=\"quiz\" id=\"{id}\" data-quiz=\"{id}\"{}><p class=\"prompt\">{p}</p><ol class=\"choices\">{items}</ol><details class=\"answer\"><summary>Show the answer</summary><p>{answer}</p></details></div>",
-        a.attr
+        "<div class=\"quiz\" id=\"{id}\" data-quiz=\"{id}\"><p class=\"prompt\">{p}</p><ol class=\"choices\">{items}</ol><details class=\"answer\"><summary>Show the answer</summary><p>{answer}</p></details></div>"
     ))
 }
 
@@ -812,23 +773,20 @@ fn log_day(date: &str, items: &str) -> String {
     )
 }
 
-/// Every child of the table is a row and every child of a row a cell, comments included, as the TS has it.
+/// Every child of the table is a row and every child of a row a cell.
 fn table(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     let rows: Vec<Id> = ctx.e(n).children.clone();
     let (mut thead, mut tbody) = (String::new(), String::new());
-    let mut plain_rows = Vec::new();
     for r in rows {
         let cells: Vec<Id> = ctx.e(r).children.clone();
         let head = cells.iter().all(|c| ctx.e(*c).has("Th"));
         let mut html = String::from("<tr>");
-        let mut plain = Vec::new();
         for c in cells {
             let comp = if ctx.e(c).has("Th") { "Th" } else { "Td" };
             let tag = comp.to_lowercase();
             let raw = text(ctx.e(c), comp);
             let path = ctx.e(c).path.clone();
             html += &format!("<{tag}>{}</{tag}>", ctx.inline(&prose(&raw), &path)?);
-            plain.push(raw);
         }
         html += "</tr>";
         if head {
@@ -836,14 +794,9 @@ fn table(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         } else {
             tbody += &html
         }
-        plain_rows.push(plain.join(" | "));
     }
-    let a = anchor(n, ctx, &plain_rows.join("\n"))?;
     let thead = if thead.is_empty() { String::new() } else { format!("<thead>{thead}</thead>") };
-    Ok(format!(
-        "<div class=\"ref\"{}><table>{thead}<tbody>{tbody}</tbody></table>{}</div>{}",
-        a.attr, a.button, a.thread
-    ))
+    Ok(format!("<div class=\"ref\"><table>{thead}<tbody>{tbody}</tbody></table></div>"))
 }
 
 fn references_html(ctx: &Ctx) -> String {
@@ -928,7 +881,7 @@ fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     let line = prose(&field(Some(v), "line"));
     let path = e.path.clone();
     let parent = e.parent.ok_or("a lesson has no parent")?;
-    // The course path is on the page whose Course widget lists this page's parent (the home page).
+    // The course path is on the page whose Course widget lists this page's parent (the course map).
     let (course_at, c) = ctx
         .s
         .world
@@ -975,31 +928,10 @@ fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     ))
 }
 
-/// Whether a page takes comments: block by block (`Discussable`, a Doc), or as a whole (any page not `Quiet`).
-pub fn talks(e: &crate::world::Entity) -> bool {
-    e.has_tag("Discussable") || !e.has_tag("Quiet")
-}
-
-/// One page. On a discussable page, comment entities under its blocks are drawn as threads, for `discussion`'s
-/// viewer. Returns the HTML and, for a discussable page, its blocks.
-pub fn render(
-    s: &Site,
-    page: &Page,
-    discussion: &Discussion,
-) -> Result<(String, Option<Blocks>), String> {
+/// One page: its whole HTML.
+pub fn render(s: &Site, page: &Page) -> Result<String, String> {
     let n = s.world.get(page.node);
-    // Comments per block on a Doc; every other page that talks has only the page's own thread.
-    let discussable = n.has_tag("Discussable");
-    let talk = talks(n);
-    let mut ctx = Ctx {
-        s,
-        page,
-        cited: Vec::new(),
-        discussable,
-        blocks: Vec::new(),
-        scripts: Vec::new(),
-        discussion,
-    };
+    let mut ctx = Ctx { s, page, cited: Vec::new(), scripts: Vec::new() };
     let title = text(n, "Title");
     if title.is_empty() {
         return Err(format!("{}: a page needs a Title", n.path));
@@ -1012,31 +944,6 @@ pub fn render(
     } else {
         body + &refs
     };
-    let mut out_blocks = None;
-    if talk {
-        ctx.script("comments");
-        let hint = if discussable {
-            "Comments on the page as a whole. To comment on one paragraph, use the button beside it."
-        } else {
-            "Questions, corrections, ideas: anything about this page."
-        };
-        // The page's own comments, and those whose block is gone, are children of the page entity.
-        body += &format!(
-            "\n<section class=\"discussion\" id=\"discussion\" data-block=\"{PAGE_BLOCK}\"><h2>Discussion</h2><p class=\"dim\">{hint}</p>{}</section>{}",
-            comments::thread(
-                PAGE_BLOCK, s.world, page.node, &page.doc, &page.url, discussion, s.served
-            ),
-            comments::sign_out_form(&page.url, discussion, s.served)
-        );
-        let mut blocks = vec![(PAGE_BLOCK.to_string(), title.clone())];
-        for (k, v) in std::mem::take(&mut ctx.blocks) {
-            match blocks.iter_mut().find(|(x, _)| *x == k) {
-                Some((_, old)) => *old = v,
-                None => blocks.push((k, v)),
-            }
-        }
-        out_blocks = Some(Blocks { doc: page.doc.clone(), title: title.clone(), blocks });
-    }
     let tab = match text(n, "Tab") {
         t if !t.is_empty() => t,
         _ if page.url == "/" => title.clone(),
@@ -1074,10 +981,16 @@ pub fn render(
     } else {
         ""
     };
-    // Every page has the client router (moving between pages without a load) and the sidebar's script (folds, the
-    // phone drawer, search, the outline's scroll spy).
-    ctx.script("nav");
-    ctx.script("side");
+    // The front door (`Hero`) is a page of its own, with no sidebar: only the script that runs it (client/intro.ts).
+    // Every other page has the client router (moving between pages without a load) and the sidebar's script (folds,
+    // the phone drawer, search, the outline's scroll spy).
+    let hero = n.has_tag("Hero");
+    if hero {
+        ctx.script("intro");
+    } else {
+        ctx.script("nav");
+        ctx.script("side");
+    }
     let scripts = ctx
         .scripts
         .iter()
@@ -1089,14 +1002,14 @@ pub fn render(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let doc_attr = if talk { format!(" data-doc=\"{}\"", esc(&page.doc)) } else { String::new() };
-    // The home page's title is the logo, large; every other page has the docs' header: where it sits, the title,
-    // the RFC line.
-    let head = if n.has_tag("Hero") {
+    // The front door's title is the wordmark: the brand's still picture, which is what shows without JS, and the
+    // canvas client/intro.ts draws it live on. Every other page has the docs' header: where it sits, the title, the
+    // RFC line.
+    let head = if hero {
         format!(
-            "<header class=\"hero\"><h1 class=\"hero-logo\"><span class=\"sr\">{}</span>{}</h1></header>",
+            "<h1 class=\"wordmark\"><span class=\"sr\">{}</span>{}<canvas aria-hidden=\"true\"></canvas></h1>",
             esc(&title),
-            crate::side::picture(s.world, s.site, s.served, "logo", "")
+            crate::side::still_picture(s.world, s.site, s.served)
         )
     } else {
         // A lesson's glyph above its title, as on its node on the course path (client/learn.ts moves it to the
@@ -1130,7 +1043,14 @@ pub fn render(
     let icon = esc(&s.served.href("/brand/blaze-icon-dark.svg"));
     let ico = esc(&s.served.href("/brand/favicon.ico"));
     let touch = esc(&s.served.href("/brand/blaze-icon-dark-180.png"));
-    let html = format!(
+    // In <head>, classic and synchronous: the sidebar's shut state and width are set before anything paints. The
+    // front door has no sidebar.
+    let early = if hero {
+        String::new()
+    } else {
+        format!("<script src=\"{}\"></script>\n", esc(&s.served.href("/js/early.js")))
+    };
+    let top = format!(
         "<!doctype html>
 <html lang=\"en\">
 <head>
@@ -1144,16 +1064,37 @@ pub fn render(
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />
-{scripts}
+{early}{scripts}
 </head>
-<body>
+",
+        esc(&tab),
+        css = esc(&s.served.href("/site.css")),
+    );
+    if hero {
+        // No frame, no sidebar, no pager: the wordmark in the middle of the window and the page's blocks under it.
+        return Ok(format!(
+            "{top}<body class=\"front\">
+<main class=\"doc intro\">
+{head}
+<div class=\"intro-after\">
+{body}
+</div>
+</main>
+</body>
+</html>
+"
+        ));
+    }
+    let html = format!(
+        "{top}<body>
 <div class=\"frame\">
 {}
 <script src=\"{keep}\"></script>
 <div class=\"pane\">
 {}
+{}
 <div class=\"grid{width}\">
-<main class=\"doc{width}{lesson_class}\"{doc_attr}{lesson_attr}>
+<main class=\"doc{width}{lesson_class}\"{lesson_attr}>
 {head}
 {body}
 {}
@@ -1165,16 +1106,12 @@ pub fn render(
 </body>
 </html>
 ",
-        esc(&tab),
         crate::side::sidebar(s.nav, page, s.served, s.world, s.site),
         crate::side::mobile_bar(s.served, s.world, s.site),
+        crate::side::topline(),
         crate::side::pager(s.nav, page, s.served),
-        css = esc(&s.served.href("/site.css")),
         // Classic and synchronous on purpose: it runs as soon as the sidebar is parsed, before the first paint.
         keep = esc(&s.served.href("/js/keep.js")),
     );
-    Ok((html, out_blocks))
+    Ok(html)
 }
-
-/// `.gen/discussable.json`'s shape: doc to title and blocks.
-pub type Discussable = BTreeMap<String, Blocks>;

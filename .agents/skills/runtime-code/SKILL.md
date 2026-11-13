@@ -22,7 +22,17 @@ next step run on stale output; a check that could not run is reported as not run
 retry or a default is written down where it happens with what it replaced. A loud error is the good
 outcome: it names the one broken step, costs minutes and gets fixed; the quiet path costs days and
 is found by accident. When you meet a quiet failure, make it loud in the same change
-(`guard-the-cause`).
+(`guard-the-cause`). The same goes for trying again: a step that failed is not run a second time in
+the hope it passes, a missing cache entry that was promised a moment ago is an error naming the key
+rather than a silent recompute, a second slower route to the same result is not taken when the first
+cannot be (make the first work, or stop and name the case), and a check that disagreed is not rerun
+until it agrees. What is not a fallback or a retry: a choice made once, up front, from stated facts
+and reported (which way outputs are placed on this file system, decided when the store opens); a
+bounded protocol that is the design itself and says so (a fetch that asks another source for a range
+after one sent bytes that failed their hash, with the failure counted and shown); a deliberate
+second run that IS the check (running a macro again from a fresh state to learn whether it is
+deterministic), whose negative result is said to the user by name. When in doubt, fail: the person
+can act on an error; they cannot act on a build that was silently slow or silently different.
 
 ## standard-structures (rule 12)
 

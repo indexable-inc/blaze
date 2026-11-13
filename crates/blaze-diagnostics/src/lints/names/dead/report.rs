@@ -136,9 +136,12 @@ impl Report<'_, '_, '_, '_> {
             }
             if !self.live.contains(item) {
                 if !self.live.parent_live(d.parent) {
+                    // Already said of the parent; its own `#[expect]`s are still fulfilled.
+                    self.fulfill_expectations(item, true);
                     continue;
                 }
                 self.check_definition(item);
+                self.fulfill_expectations(item, false);
                 continue;
             }
             if matches!(d.kind, Kind::Struct | Kind::Union | Kind::Enum) {
@@ -150,6 +153,7 @@ impl Report<'_, '_, '_, '_> {
                 for &variant in variants {
                     if !self.live.contains(variant) {
                         dead_variants.push(self.dead_item(variant));
+                        self.fulfill_expectations(variant, false);
                         continue;
                     }
                     let fields = defs.children(variant);
@@ -175,6 +179,53 @@ impl Report<'_, '_, '_, '_> {
                 self.check_definition(item);
             }
         }
+    }
+
+    /// rustc's `fulfill_dead_code_expectations` (Rust 1.100, rust-lang/rust#161005): what is
+    /// dead inside the dead `def` (its variants and their fields, a trait's items), and `def`
+    /// itself when `include`, is covered by the diagnostic of a dead parent and gets none of
+    /// its own, so an `#[expect(dead_code)]` on it is fulfilled here.
+    fn fulfill_expectations(&mut self, def: DefIdx, include: bool) {
+        if self.seen.is_some() || self.lint != Lint::DeadCode {
+            return;
+        }
+        let defs = self.k.defs;
+        if include {
+            self.fulfill_if_expected(def);
+        }
+        match defs[def].kind {
+            Kind::Struct | Kind::Union => {
+                for &field in defs.children(def) {
+                    self.fulfill_if_expected(field);
+                }
+            }
+            Kind::Enum => {
+                for &variant in defs.children(def) {
+                    self.fulfill_if_expected(variant);
+                    for &field in defs.children(variant) {
+                        self.fulfill_if_expected(field);
+                    }
+                }
+            }
+            Kind::Variant | Kind::Trait => {
+                for &child in defs.children(def) {
+                    self.fulfill_if_expected(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The expectation of `dead_code` at the dead `def`, fulfilled with no diagnostic.
+    fn fulfill_if_expected(&mut self, def: DefIdx) {
+        if self.live.contains(def) || self.level(def).expect.is_none() {
+            return;
+        }
+        let Some(at) = self.k.defs[def].node else { return };
+        let Some(span) = self.ident_or_def_span(def) else { return };
+        // alloc: once per `#[expect]` on dead code under a dead parent
+        let diag = Diag::lint(self.lint.name(), String::new(), span);
+        self.found.push(Found::fulfilling(diag, Phase::Late, at));
     }
 
     fn dead_item(&self, def: DefIdx) -> DeadItem {

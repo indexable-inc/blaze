@@ -1,5 +1,5 @@
 // Update: `blaze test` keeps a hermetic test's pass by its code, with no opt-in (#836 in v0.20261028.3; #901, #910 in
-// v0.20261028.9). Canary. Extends lesson 4: sealed inputs, kept results, now for tests too.
+// v0.20261028.9). Canary. Extends Hermetic builds: sealed inputs, kept results, now for tests too.
 site {
   updates {
     "kept-tests" : Page {
@@ -8,10 +8,10 @@ site {
       (InTheme, themes.canary)
       (Requires, site.learn.hermetic)
       Title: {"Kept test passes"}
-      Description: {"Update to lesson 4: blaze test keeps a hermetic test's pass until its code changes."}
+      Description: {"Update to Hermetic builds: blaze test keeps a hermetic test's pass until its code changes."}
 
       Step pass("A pass, kept") {
-        P same("Lesson 4 said an output can be kept when all it depends on is sealed in. A test's pass now works the same way: `blaze test` keeps a hermetic test's pass by its code, with nothing to turn on.")
+        P same("*Hermetic builds* said an output can be kept when all it depends on is sealed in. A test's pass now works the same way: `blaze test` keeps a hermetic test's pass by its code, with nothing to turn on.")
         P again("It runs again only when that code changes.")
       }
 

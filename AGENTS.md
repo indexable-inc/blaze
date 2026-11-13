@@ -20,9 +20,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    builder of blaze (check, build, unit tests), and the tree stays accepted by both; blaze still
    builds blaze as the proof, every verdict about blaze's behaviour comes from a blaze, and when
    blaze fails on blaze that failure is still the work. Skill: `build-and-test`.
-3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
-   with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
-   with an empty result. Skill: `runtime-code`.
+3. **no-fallback**: No fallback and no retry, ever, and failures are loud: when blaze can't do
+   something it stops with an error naming what and where; a failed build is better than one that
+   quietly tried again or took another route; nothing is accepted and ignored, skipped quietly or
+   answered with an empty result. Skill: `runtime-code`.
 4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
    Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
    rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.
@@ -96,10 +97,11 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
     one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
     build at a time. Skill: `build-and-test`.
-35. **fan-out-write-only**: Lanes only write code, all in the one integration directory, and run
-    nothing: no build, no test, no VM call, no waiting shell; when the writing is done the main
-    agent builds the one tree once on the one VM, runs every check at once, and hands each failure
-    back to the lane that owns the file. Skill: `build-and-test`.
+35. **fan-out-write-only**: Lanes only write code in the one integration directory and run nothing; the
+    main agent compiles and tests a lane's crate within minutes of its report, admits pieces one
+    lane at a time onto the last green head (the whole workspace check-compiles, test targets
+    included, or the head does not move), and measures on that green head; nothing is written on top
+    of code that has not compiled. Skill: `build-and-test`.
 36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
     everything is tested at once; a worktree is the exception, for two lanes that must change the
     same file or a variant tree; never `git stash`. Skill: `build-and-test`.
@@ -189,6 +191,19 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     deterministic simulation by default, in process, under many seeds; a real process, daemon or
     kernel is used only for what the simulation cannot model, and a part that cannot run under
     simulation is a sans-IO gap to close. Skill: `testing`.
+65. **granular-caching**: Every cache is keyed per item (a function, a type, an impl, a name), by that
+    item's own content and exactly what it read; a key at crate level is not acceptable, and a crate
+    is only a container entries are packed in. Skill: `compiler-correctness`.
+66. **end-state-not-hill-climb**: Work toward the designed end state, never by climbing from fix to fix:
+    when an area needs a second fix for the same symptom, stop patching, write the end-state design
+    from first principles (with how the best existing systems do it), have it reviewed by someone
+    outside the work, and rebuild that part; a fast path bolted onto a slow default is the sign.
+    Skill: `changing-code`.
+67. **within-ten-percent-of-the-floor**: Design only what is within 10% of the theoretical best in time,
+    memory and disk: a design states the floor of each operation it serves (an oracle that redoes
+    only what changed and its direct readers, plus the I/O nobody avoids) and its own cost against
+    it, and every measurement reports the ratio; what cannot reach the floor is said plainly, not
+    built around. Skill: `changing-code`.
 
 ## Code Review Rules
 

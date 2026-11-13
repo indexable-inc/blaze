@@ -1,56 +1,86 @@
 // The site's pages. Each page is an entity under `site`; its path is its URL (site.index is /).
-// RFCs live in rfcs/, the charter in charter.flecs, /bench in bench.flecs, /install and /usage in their own files,
-// the course's lessons in learn/, its updates and What's new in updates.flecs and updates/.
-// The sidebar's sections are in nav.flecs; a page joins one with Nav, Icon and (InGroup, nav.<section>).
+// The whole site is one course. Its front door, /, is the intro: the wordmark dropping in and catching fire, one line
+// and the way in. Lesson 1 is /start (what blaze is, installing it, the first build), the course map is /learn
+// (learn.flecs), the other lessons are in learn/, the updates in updates.flecs and updates/.
+// Reference pages (install details, benchmarks, the charter, RFCs) sit beside it in the sidebar (nav.flecs).
 site {
   OrderedChildren
-  // https://ix.dev/blaze/ (the worker answers there; blaze.ix.dev and blaze.ix.dev redirect to it).
+  // https://ix.dev/blaze/ (the worker answers there).
   Served: {"https://ix.dev", "/blaze"}
   // The pixel-fire wordmark (docs/brand/fire/gen.py), copied to static/brand/.
   Brand: {"/brand/blaze-dark.webp", "/brand/blaze-light.webp", 688, 368, "/brand/blaze-dark-still.webp", "/brand/blaze-light-still.webp"}
 
-  // Opened here so the course map below can name it; updates.flecs, which runs later, fills it in.
+  // Opened here so the course map can name them; their own files, which run later, fill them in.
+  learn {}
   updates {}
 
-  // The home page is the course: the logo, one line on what blaze is, the install line, then the map of lessons
-  // (learn.flecs and learn/), with the speed numbers and the credits below. What blaze is for is taught by the
-  // lessons rather than listed here.
+  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line and the way into the course.
+  // No sidebar here, so the last line is the way to the course map and the reference pages.
   index : Page {
     Hero
     Title: {"blaze"}
-    Nav: {"Course", 0}
-    Icon: {"path"}
-    (InGroup, nav.learn)
-    Tab: {"blaze: learn how Rust builds in milliseconds"}
-    Description: {"A Rust build with cargo's commands that rebuilds an edit in milliseconds, and a short course on how it works: five lessons, one idea per screen, with questions as you go."}
+    Tab: {"blaze: Rust that rebuilds in milliseconds"}
+    Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
 
-    Lede lede("Rebuild Rust in milliseconds, with the same commands as cargo.")
-    Command install("curl -fsSL https://ix.dev/blaze | sh")
-    Dim then("Then `blaze run` in any Rust project. [Install](/install) has the other ways in and what you need; [Usage](/usage) has the day to day.")
+    Lede is("Builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+    Go start(label: "Start the course", href: "/start")
+    Dim more("[Course map](/learn) · [Install](/install) · [Benchmarks](/bench) · [GitHub](https://github.com/indexable-inc/blaze)")
+  }
 
-    Section course(title: "How blaze works") {
-      P line("Five short lessons, a few minutes each: one idea per screen, and a question now and then to check it landed. No compiler knowledge needed; a little Rust is enough.")
-      P branches("Some lessons build on others, so the path branches. As blaze changes, updates branch off the lesson they extend; [What's new](/updates) lists them all.")
-      Course map {
-        (Lessons, site.learn)
-        (Lessons, site.updates)
-      }
-      Dim kept("Your progress, and when you last came by, stay in this browser. Nothing is sent anywhere.")
+  // Lesson 1: what blaze is, installing it, the first build and the commands you will type.
+  start : Page {
+    Narrow
+    Lesson: {0, "What blaze is, installing it, and your first build.", "start"}
+    (InTheme, themes.basics)
+    Title: {"Start here"}
+    Description: {"What blaze is, how to install it, and your first build: the first lesson of the course, a few minutes long."}
+
+    Step what("Rust, rebuilt in milliseconds") {
+      Lede is("**blaze** builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+      Art art(piece: "incremental", label: "A lattice of functions. One changes, and only it and the few that depend on it light up and settle.")
+      Dim course("A short course, one idea per screen. Press **Continue** or →.")
     }
 
-    Section speed(title: "How fast") {
-      Dim setup("Edit one function, then build. A generated 200-crate workspace on Linux x86-64 with 8 CPUs, median of three, measured once by hand.")
-      Table numbers {
-        Tr head { Th a("Edit"); Th b("cargo"); Th c("blaze") }
-        Tr main_crate { Td a("Function in the main crate"); Td b("1.76 s"); Td c("0.42 s") }
-        Tr deep_crate { Td a("Function in a crate everything depends on"); Td b("6.33 s"); Td c("0.60 s") }
-      }
-      Dim history("[Benchmark history](/bench): every run on real projects, next to plain cargo on the same machine.")
+    Step why("Why it is fast") {
+      Art race(piece: "race", label: "Two lanes over time. cargo: a rustc for each affected crate, each starting by reloading its saved state, then the whole program linked. blaze: one function, then done.")
+      P cargo("`rustc` is incremental, but cargo still starts one per affected crate, each reloading its saved state, then links everything again.")
+      P blaze("blaze keeps your workspace in memory and redoes only **the functions you changed**.")
     }
 
-    Section credits(title: "Credits") {
-      Dim thanks("blaze stands on the shoulders of giants. Thank you to the people who built [rust-analyzer](https://github.com/rust-lang/rust-analyzer), [Cranelift](https://cranelift.dev), [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), [salsa](https://github.com/salsa-rs/salsa), [object](https://github.com/gimli-rs/object), [Rust](https://github.com/rust-lang/rust), and [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes. None of these projects endorses blaze. Made at [ix](https://ix.dev) for den's native app. MIT or Apache-2.0. This site is [Flecs](https://github.com/SanderMertens/flecs) scripts, rendered by a Rust renderer compiled to wasm.")
-      Dim open("Designed in the open: the [charter](/charter) says what blaze holds to, and [the RFCs](/rfcs) are designs still being argued about. Sign in with GitHub to comment on any paragraph.")
+    Step install("Install it") {
+      Command curl("curl -fsSL https://ix.dev/blaze | sh")
+      Dim what("macOS on Apple silicon or Linux. No Rust needed: blaze brings its own. Details: [Install](/install).")
+    }
+
+    Step first("Your first build") {
+      Code run(lang: "bash", text: "blaze run")
+      Art held(piece: "daemon", label: "Your workspace as a block of cells. The first build fills every cell; after that each save changes a single cell.")
+      P daemon("The first build loads everything into a background **daemon**. After that, each save rebuilds one piece:")
+      Code finished(lang: "", text: `Finished \`dev\` profile [blaze] target(s) in 0.02s`)
+    }
+
+    Step daemon_q("Check") {
+      Quiz q(prompt: "Why is the second `blaze run` so much faster?") {
+        Choice cache("It downloaded a prebuilt copy.", "Nothing is downloaded: your code is compiled on your machine.")
+        Choice held("The daemon kept everything in memory and redid only the edit.", "Right: load once, then only what changed.") {
+          Right
+        }
+        Choice skip("It skipped type checking.", "Types are checked on every build.")
+      }
+    }
+
+    Step commands("The commands") {
+      Table cmds {
+        Tr build { Td a("`blaze build` `run` `test` `check` `bench`"); Td b("cargo's commands and flags") }
+        Tr status { Td a("`blaze status`"); Td b("what the daemon holds") }
+        Tr stop { Td a("`blaze stop`"); Td b("save its state and stop") }
+      }
+      Dim watch("Rebuild on save with any watcher: `watchexec -e rs -- blaze build`.")
+    }
+
+    Step next("Next") {
+      P path("Next: how blaze gets its speed, then what it adds to Rust: const generic math, effects, its own std, and proofs in Lean.")
+      Dim map("All lessons: [the course map](/learn).")
     }
   }
 
@@ -59,16 +89,14 @@ site {
     Nav: {"RFCs", 4}
     Icon: {"files"}
     (InGroup, nav.reference)
-    Description: {"Designs for what blaze adds to Rust, open for comment."}
-    Lede lede("Designs for what blaze adds to Rust. Each one is a draft until it is not: sign in with GitHub and comment on any paragraph, or on the RFC as a whole.")
-    P charter("Read the [charter](/charter) first: it says what every RFC has to keep.")
+    Description: {"Designs for what blaze adds to Rust."}
+    Lede lede("Designs for what blaze adds to Rust. Read the [charter](/charter) first: it says what every RFC has to keep.")
     RfcIndex list
     Dim source("Each RFC is a Flecs script in [site/content/rfcs](https://github.com/indexable-inc/blaze/tree/main/site/content/rfcs). To propose one, open a pull request with a new file.")
   }
 
   "404" : Page {
-    Quiet
     Title: {"Not found"}
-    P gone("Nothing here. Try the [home page](/) or [the RFCs](/rfcs).")
+    P gone("Nothing here. [Start the course](/start) or open [the course map](/learn).")
   }
 }

@@ -1,0 +1,20 @@
+{
+ "id": "errsets-1112-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "the session's scratchpad directory; my own method",
+ "what": "For a baseline I ran `git worktree add --detach <scratchpad>/base 136432aa02 > /dev/null 2>&1; cd <scratchpad>/base && cargo test ...`. The scratchpad is one directory for every agent of the session, another agent already had a `base` there, the add failed with its message thrown away, and three baseline runs were made in a tree I had not made and whose commit I never read. I found out only when `git worktree remove` said it was no working tree; by then the directory was being deleted by its owner. I had also removed `<scratchpad>/base-target` (15 GB), which I took to be mine alone and cannot now show was. The baseline was run again in a worktree of 136432aa02 under a directory of this lane's own, its HEAD read back first.",
+ "cost": "30 minutes and a second full baseline build; possibly another agent's build cache",
+ "cause": "a shared directory used as if private, and a command's failure silenced",
+ "whys": [
+  "the baseline ran in a directory another agent owned",
+  "the name `base` was free to both and the add's refusal was sent to /dev/null",
+  "the scratchpad the harness hands each agent is the session's, not the agent's, and nothing says so",
+  "a baseline's tree is named by a path, and a path is not a commit"
+ ],
+ "class": "a measurement on a tree nobody read the commit of",
+ "prevention": "each agent gets its own subdirectory of the scratchpad (named in its brief); a baseline script reads `git rev-parse HEAD` of the tree it runs in into its output's first line and refuses a tree that is no git checkout; not built",
+ "workaround": "mkdir a lane-named directory in the scratchpad first; never redirect a setup command's stderr; print the HEAD of a baseline tree into the result file",
+ "fix": "",
+ "state": "open"
+}

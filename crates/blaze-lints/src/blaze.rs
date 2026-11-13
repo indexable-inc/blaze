@@ -106,6 +106,9 @@ mod proc_macro;
 mod profile_tests;
 mod profiled;
 mod program_lifetime;
+mod proved_unreachable;
+#[cfg(test)]
+mod reach_tests;
 #[cfg(test)]
 mod program_lifetime_tests;
 mod push_without_reserve;
@@ -129,6 +132,7 @@ mod syscall_in_loop;
 #[cfg(test)]
 mod tests;
 mod thread_local_in_waiting_fn;
+mod todo;
 #[cfg(test)]
 mod thread_local_tests;
 mod unbounded_from_input;
@@ -285,6 +289,8 @@ pub enum Lint {
     CouldBeProgramLifetime,
     CouldBeRef32,
     SpanFieldUnrecorded,
+    Unreachable,
+    Todo,
 }
 
 /// Which workspaces a lint is for.
@@ -326,7 +332,17 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::UndeclaredEffect,
     // Fires only on a type declared `#[blaze::program_lifetime]`.
     Lint::ProgramLifetime,
+    // Fires only on a `blaze::unreachable!()`.
+    Lint::Unreachable,
 ];
+
+/// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
+/// attribute, a flag, a manifest table or `--cap-lints` says ([`crate::level::Levels::of`]).
+/// An attribute that names one below `deny` is itself a finding of the lint, at the attribute
+/// (`proved_unreachable::check_waiver`), and a flag that does refuses the crate's check
+/// ([`crate::diag::CheckError::Unwaivable`]). A group or `warnings` that covers one does not
+/// reach it and is no error: only naming the lint is.
+pub(crate) const UNWAIVABLE: &[Lint] = &[Lint::Unreachable];
 
 /// Each lint of [`Kind::Edition`] with whether what its help tells code to move to is in this
 /// blaze, so that it warns by default and not only where a workspace turns `blaze::edition`
@@ -523,6 +539,8 @@ impl Lint {
         Lint::CouldBeProgramLifetime,
         Lint::CouldBeRef32,
         Lint::SpanFieldUnrecorded,
+        Lint::Unreachable,
+        Lint::Todo,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -567,6 +585,10 @@ impl Lint {
             | Lint::BoxLargeNew
             // Fires only on `#[blaze::checkfree]` functions, `deny` there (`DENY_BY_DEFAULT`).
             | Lint::Checkfree
+            // Fires only on a `blaze::unreachable!()`, `deny` there.
+            | Lint::Unreachable
+            // A hole left in code: a warning everywhere, an error where the gate denies it.
+            | Lint::Todo
             // Fire only on functions marked with their attribute, `deny` there.
             | Lint::Nopanic
             | Lint::Noalloc
@@ -763,6 +785,8 @@ impl Lint {
             Lint::BoxLargeNew => "box_large_new",
             Lint::PodSerializedByField => "pod_serialized_by_field",
             Lint::Checkfree => "checkfree",
+            Lint::Unreachable => "unreachable",
+            Lint::Todo => "todo",
             Lint::Nopanic => "nopanic",
             Lint::Noalloc => "noalloc",
             Lint::Nonblocking => "nonblocking",
@@ -881,6 +905,8 @@ impl Lint {
             Lint::BoxLargeNew => concat!(general_docs!(), "#box_large_new"),
             Lint::PodSerializedByField => concat!(general_docs!(), "#pod_serialized_by_field"),
             Lint::Checkfree => concat!(general_docs!(), "#checkfree"),
+            Lint::Unreachable => concat!(general_docs!(), "#unreachable"),
+            Lint::Todo => concat!(general_docs!(), "#todo"),
             Lint::Nopanic => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Noalloc => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Nonblocking => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
@@ -1156,6 +1182,12 @@ impl Lint {
             Lint::Checkfree => {
                 "prove the index or the arithmetic in range before the loop (`assert!(n <= v.len())`, `get`, `checked_*`, iterators), or take `#[blaze::checkfree]` off"
             }
+            Lint::Unreachable => {
+                "add the check that rules the path out (a `match` or `if let` on the value, `is_some`, a comparison with the length or with zero) so that it dominates the site, or write `unreachable!()` for a promise blaze does not check"
+            }
+            Lint::Todo => {
+                "write the expression the hole stands for; a test may keep a `todo!()`"
+            }
             Lint::Nopanic => {
                 "check the index or the arithmetic (`get`, `checked_*`, `wrapping_*`), mark the callee proven by hand `#[blaze::nopanic(trusted = \"why\")]`, or take `#[blaze::nopanic]` off"
             }
@@ -1270,6 +1302,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on_any(crate::lints::On::BLAZE) {
         return;
     }
+    proved_unreachable::check_waiver(cx, node);
     if let Some(ty) = ast::PathType::cast(node)
         && cx.on_blaze(Lint::DefaultHasher)
         && let Some(written) = hashmap::check_type(cx, ty)
@@ -1436,6 +1469,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         box_large_new::check(cx);
         checkfree::check(cx);
         effects::check(cx);
+        proved_unreachable::check(cx);
+        todo::check(cx);
         unmarked_effects::check(cx);
         may::check(cx);
         unbuffered_io::check(cx);
