@@ -15,7 +15,8 @@ use crate::{
     next_solver::{DbInterner, Ty, Tys},
 };
 
-/// The members of `ty`, in canonical order, when it is an error union.
+/// The members of `ty`, in canonical order, when it is an error union. `interner` is of a
+/// crate (`DbInterner::new_with`): the union's struct is a lang item.
 pub fn members<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Option<Tys<'db>> {
     let TyKind::Adt(def, args) = ty.kind() else { return None };
     let union = interner.lang_items().ErrorUnion?;
