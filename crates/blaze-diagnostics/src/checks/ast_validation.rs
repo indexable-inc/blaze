@@ -30,6 +30,7 @@
 mod fns;
 mod generics;
 mod items;
+mod pats;
 mod types;
 
 use std::ops::ControlFlow;
@@ -117,6 +118,7 @@ impl<'db> V<'_, '_, 'db> {
             SyntaxKind::DYN_TRAIT_TYPE => types::dyn_trait(self, node, out),
             SyntaxKind::IMPL_TRAIT_TYPE => types::impl_trait(self, node, out),
             SyntaxKind::ABI => fns::invalid_abi(self, node, out),
+            SyntaxKind::BOX_PAT => pats::box_pat(self, node, out),
             _ => {}
         }
     }

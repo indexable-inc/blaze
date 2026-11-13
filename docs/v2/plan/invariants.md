@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-165 invariants, 23 refinements, 13 reference models.
-By level: 141 tested, 46 simulated, 1 model-checked, 0 proved.
+166 invariants, 23 refinements, 12 reference models.
+By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -59,7 +59,7 @@ By level: 141 tested, 46 simulated, 1 model-checked, 0 proved.
 - **`a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key`** *simulated* (`crates/blaze-cargo/src/serve/unit/tests.rs`): a record's diagnostics kept as places, replayed over any text of the same code text (a comment at a line's end, spaces before one, a comment after the last line added or taken away), point at the very tokens the check pointed at, and over the text they were made of are the diagnostics the check gave, byte for byte, through the record's encoding.
   Controls: `a_diagnostic_rendered_at_stale_offsets`.
 - **`a_build_for_another_client_runs_no_unit_and_shows_what_a_build_from_nothing_shows`** *tested* (`crates/blaze-cargo/src/serve/unit/tests/drawn.rs`): how a client is shown diagnostics is no input of a unit's compile. Two builds of one project that differ only in the client's width (80, 200, none), colour, short or long format and how many refused functions are named: the second runs no unit and misses nothing, and shows what a build from nothing for that client shows, byte for byte, drawn from the record the first one kept.
-  Controls: `the_width_put_back_in_the_key`.
+  Controls: `the_width_put_back_in_the_key`, `a_unit_that_reads_its_clients_width`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 - **`a_chain_blames_only_inputs_that_changed`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): a chain's input is one the build's inputs really changed between the two builds, and it is called trivia exactly when no code changed in it.
@@ -267,6 +267,10 @@ By level: 141 tested, 46 simulated, 1 model-checked, 0 proved.
   Controls: `a_reverse_edge_not_recorded`, `a_stale_edge_after_a_rows_dependencies_change`, `a_changed_reader_that_does_not_pass_the_walk_on`, `a_cutoff_not_applied`, `an_evicted_row_passed_over`, `a_walk_that_runs_a_levels_rows`, `a_walk_that_contains_every_unwind`.
 - **`a_walk_contains_at_most_eight_unwinds_and_marks_the_rest`** *tested* (`crates/blaze-query/src/db/tests/changed.rs`): one walk contains the unwinding of at most 8 verifications (rule 18); the rows it reaches after that are marked, not run, and every row is still named as changed. Of 40 rows whose runs panic, 8 are run and 32 marked.
   Controls: `a_reverse_edge_not_recorded`, `a_stale_edge_after_a_rows_dependencies_change`, `a_changed_reader_that_does_not_pass_the_walk_on`, `a_cutoff_not_applied`, `an_evicted_row_passed_over`, `a_walk_that_runs_a_levels_rows`, `a_walk_that_contains_every_unwind`.
+- **`a_cycle_ends_only_after_a_round_in_which_no_row_read_on_the_stack_moved`** *tested* (`crates/blaze-query/src/db/tests/inner_heads.rs`): a cycle's rows are made final only by a round in which every value a run read from a row of the cycle on the stack is the value that row ended the round with. Every row of the cycle that ends a round with another value than was read from it says so, and the word reaches the outermost head through every head between them, so the answers are the fixpoint a run from scratch reaches, whichever row is asked first and whether the rows were made in this view or verified into it after a write.
+  Controls: `an_inner_head_that_keeps_a_moved_row_to_itself`, `a_kept_head_that_counts_its_rounds_from_one_again`.
+- **`a_kept_head_is_told_the_round_of_its_cycles_outermost_head`** *tested* (`crates/blaze-query/src/db/tests/inner_heads.rs`): the round a row's `cycle_recover` is told is its cycle's outermost head's. A head the cycle keeps from one round to the next is told each round's number in turn, at whatever depth it is nested: its new frame starts at the round of the head that kept it. Rows 0, 3 and 1 are each read on the stack in each of the three rounds; rows 2 and 4 never are, so they recover nothing.
+  Controls: `an_inner_head_that_keeps_a_moved_row_to_itself`, `a_kept_head_that_counts_its_rounds_from_one_again`.
 - **`a_small_loop_runs_every_task_on_its_calling_thread`** *tested* (`crates/blaze-query/src/db/tests/small.rs`): a loop of at most [`SMALL_ITEMS`] tasks whose site predicts under [`SMALL_NS`] runs every task on the calling thread, in order, and submits no job: the site counts it as run here. A site with no run yet predicts no cost, so an edit's first loop is here.
 - **`a_stale_head_of_another_tasks_cycle_is_waited_for_never_run`** *tested* (`crates/blaze-query/src/db/tests/stale_head.rs`): a provisional row is run and written only by the task whose stack holds its cycle's head. A task that comes to hold the flight of a stale inner head of another task's cycle waits for the head instead, so every task gets the fixpoint a single task computes, and no run finds its own row emptied under it.
   Controls: `a_stale_head_run_by_a_task_that_does_not_head_its_cycle`.
@@ -400,6 +404,8 @@ By level: 141 tested, 46 simulated, 1 model-checked, 0 proved.
 
 - **`a_flush_keeps_two_shapes_of_one_base_key`** *tested* (`crates/hir-ty/src/body_store/tests.rs`): every step a flush is given is kept, whatever else the same flush holds; two shapes of one base key take two slots, in a store that shows no put before its driver made it. Until 2026-11-10 the second shape was placed against the store alone, found slot 0 free, and was refused by the put the first had buffered ("keeping the shape of the MIR of StaticId(..): two images were made under .."), which lost everything the build left for the store and its front end with it: every build of ripgrep, whose crates have statics and functions alike but for their names.
   Controls: `a_flush_that_forgets_what_it_placed`.
+- **`a_sets_members_have_one_order_in_every_crate_and_every_build`** *tested* (`crates/hir-ty/src/tests/error_unions.rs`): a set's members have one order, whatever order they are written in, whatever order their items are declared in (which is the order a database numbers them in), whichever crate writes the set and whichever build lowers it; so the set is one type, with one representation, everywhere ((c) of the feature's check, rule `deterministic-output`). Two builds that declare and write the members in opposite orders agree on the order, and the crate that depends on the members' crate has the very type that crate has.
+  Controls: `an_order_by_the_databases_numbering`.
 
 ### hir-ty-codegen
 

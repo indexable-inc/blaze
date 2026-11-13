@@ -471,6 +471,7 @@ pub(crate) fn units(
         config,
         intent: spec.intent,
         lints: spec.lints,
+        lint_levels: &spec.lint_levels,
         build_std: spec.build_std.is_some(),
         ws_root: ws.root(),
         ws_manifest: ws.root_manifest(),

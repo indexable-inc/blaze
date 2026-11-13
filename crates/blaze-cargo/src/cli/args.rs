@@ -62,6 +62,7 @@ impl Clap for Command {
                 GLOBAL,
                 CHECK_ONLY,
                 BASELINES,
+                LEVELS,
                 FUTURE,
                 MESSAGE,
                 SILENT,
@@ -398,6 +399,18 @@ const BASELINES: &[Flag] = &[
     Flag::new("new-baseline", None, Takes::Value, "LINT").many(),
 ];
 
+/// `check`'s lint levels, blaze's, spelled as rustc's long flags: `--deny LINT` sets `LINT`'s
+/// level for every workspace member of the run, after every level the manifests set, any
+/// number of times and in the order given ([`blaze_units::lint_level`]). They go to the
+/// daemon's load with cargo's flags, since a level is an input of the plan. Another command
+/// given one is refused saying so ([`Said::CheckOnly`]).
+const LEVELS: &[Flag] = &[
+    Flag::new("allow", None, Takes::Value, "LINT").many(),
+    Flag::new("warn", None, Takes::Value, "LINT").many(),
+    Flag::new("deny", None, Takes::Value, "LINT").many(),
+    Flag::new("forbid", None, Takes::Value, "LINT").many(),
+];
+
 /// The flags read here and never handed to the daemon's load: blaze's own, which the client
 /// does.
 fn blaze_only(flag: &Flag) -> bool {
@@ -574,6 +587,14 @@ pub fn refused(asked: &Invocation) -> Option<String> {
         Command::Check if !flags.replace.is_empty() && (flags.fix || flags.baselines.is_some()) => {
             Some("`--replace` makes its edits and checks nothing: run `--fix` and `--baselines` apart".to_owned())
         }
+        // A level given to a run that lints nothing would set nothing.
+        Command::Check if !flags.lint_levels.is_empty() && (asked.lock || !flags.replace.is_empty()) => {
+            let what = if asked.lock { "`blaze lock`" } else { "`--replace`" };
+            Some(format!(
+                "{what} checks nothing, so `{}` would set no lint's level: give it to a `blaze check`",
+                flags.lint_levels[0]
+            ))
+        }
         Command::Check if flags.fix && flags.baselines.is_some() => {
             Some("`--fix` changes the findings `--baselines` counts: run them apart".to_owned())
         }
@@ -656,6 +677,10 @@ pub struct Flags {
     pub new_baselines: Vec<String>,
     /// `--no-prebuilt`: no record of this request comes from a pack source.
     pub no_prebuilt: bool,
+    /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
+    /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
+    /// (`Asked::lint_levels` of blaze-units).
+    pub lint_levels: Vec<String>,
 }
 
 impl Flags {
@@ -724,6 +749,10 @@ impl Flags {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));
             }
+            // `check_value` held each to a lint's name first.
+            level @ ("allow" | "warn" | "deny" | "forbid") => {
+                self.lint_levels.extend(value.map(|lint| format!("--{level}={lint}")));
+            }
             _ => {}
         }
     }
@@ -772,11 +801,17 @@ pub enum Said {
         value: String,
         flag: &'static Flag,
     },
-    /// A number clap's `value_parser` refuses, with why (`invalid digit found in string`).
-    NotNumber {
+    /// A value the flag's own parser refuses, with why: a number clap's `value_parser` does
+    /// (`invalid digit found in string`), a lint's level `blaze_units::lint_level` does.
+    Invalid {
         value: String,
         flag: &'static Flag,
         why: String,
+    },
+    /// One of `check`'s lint levels ([`LEVELS`]) given to `command`, which takes none.
+    CheckOnly {
+        flag: &'static Flag,
+        command: Command,
     },
     /// A flag that takes one value, or none, given again.
     Twice {
@@ -983,6 +1018,9 @@ fn command_line_after(
                 None => (long, None),
             };
             let Some(flag) = command.flag(|it| it.long == Some(name)) else {
+                if let Some(flag) = LEVELS.iter().find(|it| it.long == Some(name)) {
+                    return Err(refused(Said::CheckOnly { flag, command }, &[]));
+                }
                 let similar = similar(command, name);
                 if let Some(flag) =
                     similar.and_then(|it| command.flag(|flag| flag.long == Some(it)))
@@ -1163,24 +1201,29 @@ fn run_program(asked: &mut Invocation, words: impl Iterator<Item = OsString>) {
 
 fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
     let Some(value) = value else { return Ok(()) };
-    let not_number = |why: String| Said::NotNumber { value: value.to_owned(), flag, why };
+    let invalid = |why: String| Said::Invalid { value: value.to_owned(), flag, why };
     match flag.long {
+        // A lint's name, and no level below `deny` for `blaze::unreachable`.
+        Some(level @ ("allow" | "warn" | "deny" | "forbid")) => {
+            let refused = blaze_units::lint_level::refused(level, value);
+            return refused.map_or(Ok(()), |why| Err(invalid(why)));
+        }
         Some("ub-seed") => {
-            return value.parse::<u64>().map(drop).map_err(|it| not_number(it.to_string()));
+            return value.parse::<u64>().map(drop).map_err(|it| invalid(it.to_string()));
         }
         Some("refused") if value == "all" => return Ok(()),
         Some("refused") => {
             return value
                 .parse::<u32>()
                 .map(drop)
-                .map_err(|it| not_number(format!("{it}: a count, or `all`")));
+                .map_err(|it| invalid(format!("{it}: a count, or `all`")));
         }
         // `value_parser!(u32).range(1..)`.
         Some("ub-schedules") => {
             return match value.parse::<u32>() {
-                Ok(0) => Err(not_number(format!("0 is not in 1..={}", u32::MAX))),
+                Ok(0) => Err(invalid(format!("0 is not in 1..={}", u32::MAX))),
                 Ok(_) => Ok(()),
-                Err(error) => Err(not_number(error.to_string())),
+                Err(error) => Err(invalid(error.to_string())),
             };
         }
         _ => {}
@@ -1385,10 +1428,14 @@ pub fn refusal(usage: &Usage, color: bool) -> String {
             paint(say::VALID, &flag.shown()),
             usage_line(&[])
         ),
-        Said::NotNumber { value, flag, why } => format!(
+        Said::Invalid { value, flag, why } => format!(
             "{error} invalid value '{}' for '{}': {why}{more}",
             paint(say::WARN, value),
             paint(say::VALID, &flag.shown())
+        ),
+        Said::CheckOnly { flag, command } => format!(
+            "{error} {}{more}",
+            blaze_units::lint_level::check_only(flag.long.unwrap_or_default(), command.name())
         ),
         Said::Twice { flag } => format!(
             "{error} the argument '{}' cannot be used multiple times{}{more}",

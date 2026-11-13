@@ -30,6 +30,9 @@ A bump, in order (each step names itself when it fails, and stops there):
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
     are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
+ 4a. writes blaze's registry of rustc's lints again from rust-lang/rust at the new commit
+    (`lint_table write`, scripts/src/bin/lint_table.rs): crates/blaze-lint-defs/src/rustc.rs.
+    The gate refuses a registry written from another commit than library/UPSTREAM's;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
     commit in site/install.sh, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
@@ -97,6 +100,8 @@ MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 LEXER = ("crates/rustc_lexer/src", "compiler/rustc_lexer/src")
+# What crates/blaze-lint-defs/src/rustc.rs is written from (scripts/src/bin/lint_table.rs).
+LINTS = ("compiler/rustc_lint", "compiler/rustc_lint_defs", "compiler/rustc_feature")
 
 
 class Failed(Exception):
@@ -239,6 +244,18 @@ async def vendor(new):
         replace_tree(os.path.join(repo, theirs), os.path.join(ROOT, ours))
 
 
+async def lints(new):
+    """crates/blaze-lint-defs/src/rustc.rs written again from rust-lang/rust at `new`, which
+    library/UPSTREAM names by now (scripts/src/bin/lint_table.rs refuses any other commit). The
+    gate's `lint_table check` fails a bump that leaves the old one."""
+    repo = await checkout(new, list(LINTS))
+    write = json.dumps({"command": "write", "rust": repo})
+    if shutil.which("blaze"):
+        await run("lints", "blaze", "run", "-q", "-p", "scripts", "--bin", "lint_table", "--", write, bound=1800)
+    else:
+        print(f"note: blaze is not on PATH: run `blaze run -q -p scripts --bin lint_table -- '{write}'` where it is")
+
+
 def move_mentions(old, new):
     (old_name, old_rustc, old_commit), (new_name, new_rustc, new_commit) = old, new
     pairs = [
@@ -307,6 +324,7 @@ async def bump(date):
         bound=1800,
     )
     await library(date)
+    await lints(new[2])
     move_mentions(old, new)
     async with asyncio.TaskGroup() as group:
         if shutil.which("nix"):

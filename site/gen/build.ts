@@ -1,26 +1,20 @@
 /**
- * Builds the site into dist/ with the Rust renderer's two wasm modules (renderer/README.md), so the static pages and
- * the worker's per-request pages come from the same renderer. Nothing here is native: the modules are
- * platform-independent build outputs (`uv run --script renderer/build.py`, or fetched with renderer/fetch.py).
+ * Builds the site into dist/ with the Rust renderer's two wasm modules (renderer/README.md): every page is static.
+ * Nothing here is native: the modules are platform-independent build outputs (`uv run --script renderer/build.py`, or fetched with renderer/fetch.py).
  *
  * 1. Runs content/*.flecs under Flecs (flecs/flecs-doc.wasm, gen/tree.ts) to bake what the renderer leaves to TS:
  *    highlighted code (highlight.js) and lessons' glyphs (gen/glyphs.ts), by entity path; and to write the scripts the content asks for: a BenchHistory
  *    names a directory of benchmark history, which gen/bench/ turns into charts under it, as Flecs script.
  * 2. site-snapshot.wasm runs the same scripts, then the generated ones, with the baked HTML set, and returns the
  *    snapshot.
- * 3. site.wasm loads it and renders every page without comments, anonymous, into dist/; it also lists the pages and
- *    the discussable blocks.
- * 4. Bundles client/*.ts, concatenates styles/, copies static/, builds the code graph page (graph/build.ts: dist/graph.html
- *    and dist/graph/), puts the chat translator's ONNX Runtime in dist/ort/ (`ortFiles`) and the anonymous readers'
- *    animals in dist/animals/<hash>.svg (`animalSprite`). For the worker, under .gen/:
+ * 3. site.wasm loads it and renders every page into dist/.
+ * 4. Bundles client/*.ts, concatenates styles/, copies static/ and builds the code graph page (graph/build.ts:
+ *    dist/graph.html and dist/graph/). For the worker, under .gen/:
  *
- *      site.wasm, site.cbor   the renderer and the snapshot (worker/renderer.ts)
- *      pages.json             every page: [{url, file, doc, discussable}] (what the worker routes)
- *      discussable.json       doc -> title and each block's text (what comments may attach to)
- *      build.json             {hash} of the module, the snapshot and the client scripts (part of the cache key), and
- *                             {assets}, of the client scripts' and styles' sources (client/nav.ts, worker/http.ts),
- *                             and {at}, when it was built (worker/presence.ts tells an old Durable Object by it)
+ *      build.json             {assets}: a hash of the client scripts' and styles' sources (client/nav.ts, worker/http.ts)
  *      site.json              {origin, base}: where the site is served (`Served` on `site` in content/site.flecs)
+ *
+ *    and, for renderer/serve (the wasi:http demo), site.cbor, the snapshot.
  *
  *    and dist/sitemap.xml, every page but the 404 at its full URL (origin + base + path), dist/install.sh, the
  *    repo's installer, and dist/search.json, what the sidebar's search (client/side.ts) looks through.
@@ -31,15 +25,14 @@
  *   bun gen/build.ts --watch   # again on every change under content/, gen/, client/, styles/, static/, graph/
  */
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { buildGraphPage } from '../graph/build';
-import { Site, snapshot, type Page, type SnapshotInput } from '../worker/site-wasm';
-import { ANIMALS, ROBOT, sprite, symbolId } from './animals';
 import { benchScript } from './bench';
+import { raceScript } from './bench/race';
 import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
+import { Site, snapshot, type Page, type SnapshotInput } from './site-wasm';
 import { dedent, load, prose, type Node } from './tree';
 
 const root = path.join(import.meta.dirname, '..');
@@ -56,24 +49,30 @@ function scripts(): string[] {
 }
 
 /** The page's entity path: `/rfcs/capabilities` is `site.rfcs.capabilities`, `/` is `site.index`. */
-const entityOf = (p: Page) => `site.${p.doc.replaceAll('/', '.')}`;
+const entityOf = (p: Page) => (p.url === '/' ? 'site.index' : `site${p.url.replaceAll('/', '.')}`);
 
 /**
  * The scripts the content asks the build to write, run after it: for each `BenchHistory {dir}`, the charts of the
- * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/).
+ * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/); for each
+ * `Race`, the two times it asks that history for, as its `Raced` (gen/bench/race.ts).
  */
 function generated(all: Map<string, Node>): { name: string; code: string }[] {
 	const out: { name: string; code: string }[] = [];
+	const historyDir = (dir: unknown) => (process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(dir ?? '')));
 	for (const n of all.values()) {
 		const h = n.values.get('BenchHistory');
-		if (!h) continue;
-		const dir = process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(h.dir ?? ''));
-		out.push({ name: `${n.path} (generated)`, code: benchScript(dir, n.path) });
+		if (h) out.push({ name: `${n.path} (generated)`, code: benchScript(historyDir(h.dir), n.path) });
+		// A Race's two times, from the same history: the latest run that timed its edit under blaze and cargo.
+		const r = n.values.get('Race');
+		if (r) {
+			const ask = { dir: String(r.dir ?? ''), platform: String(r.platform ?? ''), project: String(r.project ?? ''), edit: String(r.edit ?? '') };
+			out.push({ name: `${n.path} (generated)`, code: raceScript(historyDir(r.dir), n.path, ask) });
+		}
 	}
 	return out;
 }
 
-const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css'];
+const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css', 'intro.css'];
 
 type Baked = SnapshotInput['bakes'];
 
@@ -104,22 +103,6 @@ function bake(all: Map<string, Node>): Baked {
 	return baked;
 }
 
-/**
- * Every discussable page's URL must reach the worker first (wrangler.jsonc `assets.run_worker_first`), or it would be
- * served as the static, comment-less file. `true` sends every request to the worker (it strips the base, worker/base.ts).
- */
-function checkRoutes(urls: string[]) {
-	const config = readFileSync(path.join(root, 'wrangler.jsonc'), 'utf8');
-	if (/"run_worker_first"\s*:\s*true\b/.test(config)) return;
-	const m = /"run_worker_first"\s*:\s*\[([^\]]*)\]/.exec(config);
-	if (!m) throw new Error('wrangler.jsonc: no assets.run_worker_first');
-	const patterns = [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
-	const matches = (p: string, u: string) => (p.endsWith('/*') ? u.startsWith(p.slice(0, -1)) : p === u);
-	for (const u of urls) {
-		if (!patterns.some((p) => matches(p, u))) throw new Error(`wrangler.jsonc: run_worker_first has no pattern for the discussable page ${u}`);
-	}
-}
-
 /** A module from renderer/build.py, or the command that gets it. */
 function wasmModule(file: string): WebAssembly.Module {
 	const p = path.join(modules, file);
@@ -140,7 +123,7 @@ function served(tree: Map<string, Node>): { origin: string; base: string } {
 	return { origin: String(v?.origin ?? ''), base: String(v?.base ?? '') };
 }
 
-/** Text of an HTML fragment: tags (and the comment buttons' markup) out, entities in, spaces collapsed. */
+/** Text of an HTML fragment: tags (and buttons and forms with what is in them) out, entities in, spaces collapsed. */
 function textOf(html: string): string {
 	return html
 		.replace(/<(script|style|svg|button|form)\b[\s\S]*?<\/\1>/g, ' ')
@@ -177,44 +160,6 @@ function searchIndex(pages: Page[], html: Map<string, string>, tree: Map<string,
 
 const xmlEsc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-/**
- * The WebGPU ONNX Runtime the chat translator runs on (client/translate-worker.ts), from the onnxruntime-web that
- * @huggingface/transformers bundles: its loader as `<hash>.mjs` and its wasm (about 27 MB) in ORT_PART-sized pieces
- * `<hash>.<i>.wasm`, since Workers serves no static file over 25 MiB. The worker fetches the pieces and joins them.
- * Named by content, so a browser keeps them until onnxruntime-web changes.
- */
-const ORT_PART = 16 * 1024 * 1024;
-function ortFiles(): { mjs: string; parts: string[] } {
-	const ort = path.dirname(createRequire(createRequire(path.join(root, 'package.json')).resolve('@huggingface/transformers')).resolve('onnxruntime-web/package.json'));
-	const out = path.join(dist, 'ort');
-	rmSync(out, { recursive: true, force: true });
-	mkdirSync(out, { recursive: true });
-	const mjs = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.mjs'));
-	const wasm = readFileSync(path.join(ort, 'dist', 'ort-wasm-simd-threaded.asyncify.wasm'));
-	const id = createHash('sha256').update(mjs).update(wasm).digest('hex').slice(0, 16);
-	writeFileSync(path.join(out, `${id}.mjs`), mjs);
-	const parts: string[] = [];
-	for (let at = 0; at < wasm.length; at += ORT_PART) {
-		const name = `${id}.${parts.length}.wasm`;
-		writeFileSync(path.join(out, name), wasm.subarray(at, at + ORT_PART));
-		parts.push(name);
-	}
-	return { mjs: `${id}.mjs`, parts };
-}
-
-/**
- * The anonymous readers' animals (gen/animals.ts) as one sprite, dist/animals/<hash>.svg, named by its content so a
- * browser may keep it; what the client gets as `BLAZE_ANIMALS` (client/lib/presence.ts): the sprite's path under the
- * base, the names, in order, and the robot's symbol (a bot's face).
- */
-function animalSprite(): { sprite: string; names: string[]; robot: string } {
-	const svg = sprite();
-	const name = `animals/${createHash('sha256').update(svg).digest('hex').slice(0, 16)}.svg`;
-	rmSync(path.join(dist, 'animals'), { recursive: true, force: true });
-	write(path.join(dist, name), svg);
-	return { sprite: name, names: ANIMALS.map((a) => a.name), robot: symbolId(ROBOT.name) };
-}
-
 function write(file: string, data: string | Uint8Array) {
 	mkdirSync(path.dirname(file), { recursive: true });
 	writeFileSync(file, data);
@@ -231,7 +176,8 @@ async function build() {
 	const snap = snapshot(wasmModule('site-snapshot.wasm'), input);
 	const site = Site.load(wasmModule('site.wasm'), snap);
 	const pages = site.pages();
-	checkRoutes(pages.filter((p) => p.discussable).map((p) => p.url));
+	// dist/ and .gen/ hold exactly this build: nothing a page, script or module of an earlier one left behind.
+	for (const d of [dist, gen]) rmSync(d, { recursive: true, force: true });
 
 	const client = readdirSync(path.join(root, 'client')).filter((f) => f.endsWith('.ts')).map((f) => path.join(root, 'client', f));
 	// What the pages run and look with: the client router swaps in a page only when its build had the same (nav.ts).
@@ -242,8 +188,6 @@ async function build() {
 			if (statSync(file).isFile()) assetsHash.update(`${dir}/${f}`).update(readFileSync(file));
 		}
 	}
-	const animals = animalSprite();
-	assetsHash.update(animals.sprite);
 	const assets = assetsHash.digest('hex').slice(0, 16);
 	// `root` keeps the output flat (dist/js/<name>.js).
 	const bundled = await Bun.build({
@@ -252,14 +196,13 @@ async function build() {
 		outdir: path.join(dist, 'js'),
 		minify: true,
 		target: 'browser',
-		define: { BLAZE_ASSETS: JSON.stringify(assets), BLAZE_ORT: JSON.stringify(ortFiles()), BLAZE_ANIMALS: JSON.stringify(animals) },
+		define: { BLAZE_ASSETS: JSON.stringify(assets) },
 	});
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'client bundle failed');
 
-	rmSync(path.join(dist, 'rfcs'), { recursive: true, force: true });
 	const rendered = new Map<string, string>();
 	for (const p of pages) {
-		const html = site.render(p.url, [], { viewer: null, signIn: true });
+		const html = site.render(p.url);
 		rendered.set(p.url, html);
 		write(path.join(dist, p.file), html);
 	}
@@ -272,8 +215,6 @@ async function build() {
 	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));
 
 	write(path.join(gen, 'site.cbor'), snap);
-	cpSync(path.join(modules, 'site.wasm'), path.join(gen, 'site.wasm'));
-	write(path.join(gen, 'pages.json'), JSON.stringify(pages, null, '\t'));
 	const at = served(tree);
 	write(path.join(gen, 'site.json'), JSON.stringify(at, null, '\t'));
 	if (at.origin) {
@@ -281,11 +222,7 @@ async function build() {
 		write(path.join(dist, 'sitemap.xml'), `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join('\n')}\n</urlset>\n`);
 	}
 	write(path.join(dist, 'search.json'), JSON.stringify(searchIndex(pages, rendered, tree, at.base)));
-	write(path.join(gen, 'discussable.json'), JSON.stringify(site.discussable(), null, '\t'));
-	const hash = createHash('sha256');
-	for (const f of ['site.cbor', 'site.wasm']) hash.update(f).update(readFileSync(path.join(gen, f)));
-	for (const f of readdirSync(path.join(dist, 'js')).sort()) hash.update(f).update(readFileSync(path.join(dist, 'js', f)));
-	write(path.join(gen, 'build.json'), JSON.stringify({ hash: hash.digest('hex').slice(0, 16), assets, at: Date.now() }));
+	write(path.join(gen, 'build.json'), JSON.stringify({ assets }));
 	console.log(`built ${pages.length} pages (snapshot ${snap.length} bytes) in ${Math.round(performance.now() - t0)} ms`);
 }
 

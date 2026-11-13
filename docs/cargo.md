@@ -78,6 +78,7 @@ a build first needs it.
 
     blaze build [cargo's flags]                                       (b)
     blaze check [cargo's flags] [--fix [--lint NAME]...]               (c)
+    blaze check [cargo's flags] [--allow|--warn|--deny|--forbid LINT]...
     blaze check [cargo's flags] --replace FROM=TO [--replace FROM=TO ...]
     blaze check --workspace --target TRIPLE --baselines DIR [--bless-baselines] [--new-baseline LINT[,LINT...]]
     blaze run   [cargo's flags] [-- program arguments]                (r)
@@ -1633,6 +1634,15 @@ again up to four times, and writes the files only when no check of it has an err
 did not; `--fix` checks every target when none is named. It edits only the packages the request
 asked for (`-p`, or the default members): a member or a vendored crate that is checked because
 one of those depends on it keeps its files, and the count of its suggestions is said.
+
+`--allow LINT`, `--warn LINT`, `--deny LINT` and `--forbid LINT` (rustc's long flags, any
+number of times) set a lint's level for every workspace package of the run, after the
+workspace's tables, the ratchet and the package's own `[lints]`, so the command line's level
+is the one that holds: `blaze check --deny blaze::todo`. `LINT` is `tool::name` or one of
+rustc's by its plain name; `blaze::name` must be a lint or group blaze has. No other command
+takes them, and `--allow` and `--warn` of `blaze::unreachable` are refused, as a table that
+sets either is ([`unreachable`](lints.md#unreachable)). A level is one of the unit's lint
+flags, which its plan holds and its check's kept results are keyed by.
 
 Once every unit ends, `blaze check` lints each workspace package's items over every
 configuration it checked (the lib, the lib as a test, each bin, test, bench and example):

@@ -480,6 +480,89 @@ fn blazes_own_baselines_read() {
     }
 }
 
+/// blaze's own workspace denies `blaze::general` in its ratchet and holds `blaze::todo`, one
+/// of its lints, at `warn`: a hole warns in a local check, and the merge gate and a release
+/// deny it with `--deny blaze::todo`. The single lint's flag is after its group's, so it wins.
+#[test]
+fn blazes_own_workspace_holds_todo_at_warn_after_general_at_deny() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+    let text = std::fs::read_to_string(root).unwrap_or_else(|error| panic!("{root}: {error}"));
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let metadata = table.get("workspace").and_then(|it| it.get("metadata"));
+    let own = flags::workspace_lints(metadata, Path::new(root)).unwrap();
+    let at = |flag: &str| own.iter().position(|it| it == flag);
+    let (general, todo) = (at("--deny=blaze::general"), at("--warn=blaze::todo"));
+    assert!(general.is_some() && general < todo, "{own:?}");
+    let last = own.iter().rev().find(|it| it.ends_with("=blaze::todo"));
+    assert_eq!(last.map(String::as_str), Some("--warn=blaze::todo"), "{own:?}");
+}
+
+/// The invariant: nothing a workspace or a package writes sets `blaze::unreachable` below
+/// `deny`. `allow` or `warn` of it in any of the three workspace tables or in `[lints.blaze]`,
+/// and a ratchet baseline of it (which holds a crate at `warn`), is an error naming where and
+/// the rule; `deny` and `forbid` are taken.
+#[test]
+fn a_level_of_unreachable_below_deny_is_an_error_naming_where() {
+    use crate::lint_level::FLOOR_RULE;
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| {
+        flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
+    };
+    let tables = [
+        ("[blaze.lints]\n", "[workspace.metadata.blaze.lints]"),
+        ("[blaze.lints-when-ready]\n", "[workspace.metadata.blaze.lints-when-ready]"),
+        ("[blaze.lints-ratchet]\nbaselines = \"b\"\n", "[workspace.metadata.blaze.lints-ratchet]"),
+    ];
+    for (head, name) in tables {
+        for level in ["allow", "warn"] {
+            let error = of(&format!("{head}unreachable = \"{level}\"\n")).unwrap_err();
+            assert_eq!(
+                error.what,
+                format!("{name} in /w/Cargo.toml: `unreachable = \"{level}\"`: {FLOOR_RULE}")
+            );
+            assert_eq!(error.at.as_deref(), Some("/w/Cargo.toml"));
+        }
+    }
+    assert_eq!(
+        of("[blaze.lints]\nunreachable = \"deny\"\n").unwrap(),
+        ["--deny=blaze::unreachable"]
+    );
+    assert_eq!(
+        of("[blaze.lints-ratchet]\nbaselines = \"b\"\nunreachable = \"forbid\"\n").unwrap(),
+        ["--forbid=blaze::unreachable"]
+    );
+
+    let dir = Scratch::new("unreachable-baseline");
+    let root = dir.0.join("Cargo.toml");
+    let ratchet: toml::Value =
+        toml::Value::Table(toml::from_str("[blaze.lints-ratchet]\nbaselines = \"b\"\n").unwrap());
+    let baseline = dir.write("b/blaze.unreachable.txt", "a\t1\n");
+    let error = flags::ratchet_downgrades(&Disk, Some(&ratchet), &root, &dir.0).unwrap_err();
+    assert_eq!(
+        error.what,
+        format!(
+            "[workspace.metadata.blaze.lints-ratchet] in {}: {} is a baseline, which holds each \
+             crate it lists at `warn`: {FLOOR_RULE}",
+            root.display(),
+            baseline.display()
+        )
+    );
+
+    let package = |lints: &str| -> TomlManifest {
+        toml::from_str(&format!(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints.blaze]\n{lints}"
+        ))
+        .unwrap()
+    };
+    let lowered = flags::lints_of("a", &package("unreachable = \"warn\"\n")).unwrap_err();
+    assert_eq!(
+        lowered.what,
+        format!("the `[lints.blaze]` of `a` set `unreachable` to `warn`: {FLOOR_RULE}")
+    );
+    let (kept, _) = flags::lints_of("a", &package("unreachable = \"deny\"\n")).unwrap();
+    assert_eq!(kept, ["--deny=blaze::unreachable"]);
+}
+
 /// A package's `[lints.blaze]` names blaze's lints as the workspace's table does.
 #[test]
 fn a_packages_unknown_blaze_lint_is_an_error_naming_it() {
@@ -1020,7 +1103,21 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
 /// [`plan_app`], under `check`'s lints when `lints`, with a `clippy.toml` at the workspace's
 /// root.
 fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, String) {
-    let named = if lints { "lints-" } else { "" };
+    plan_app_with(target, lints, &[])
+}
+
+/// [`plan_app_as`] with the command line's lint levels `lint_levels` (`--deny=blaze::todo`).
+fn plan_app_with(
+    target: Option<&str>,
+    lints: bool,
+    lint_levels: &[&str],
+) -> (PathBuf, Vec<UnitPlan>, String) {
+    let named = match (lints, lint_levels.is_empty()) {
+        (false, _) => "",
+        (true, true) => "lints-",
+        (true, false) => "levels-",
+    };
+    let lint_levels = strings(lint_levels);
     let dir = Scratch::new(&format!("app-{named}{}", target.unwrap_or("host")));
     let ws = dir.0.join("w");
     if lints {
@@ -1111,6 +1208,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         config: &config,
         intent: if lints { Intent::Check { test: false } } else { Intent::Build },
         lints,
+        lint_levels: &lint_levels,
         build_std: false,
         ws_root: &ws,
         ws_manifest: &app_path,
@@ -1154,6 +1252,28 @@ fn check_lints_the_workspaces_crates_with_their_configuration() {
     let script = &plans[2];
     assert!(script.outputs[0].ends_with("/out/build_script_build"), "{:?}", script.outputs);
     assert!(script.outputs.iter().all(|it| !it.ends_with(".rmeta")), "{:?}", script.outputs);
+}
+
+/// The invariant: a level of `blaze check`'s command line is the last flag of every workspace
+/// member's lints, after the workspace's tables and the package's own `[lints]`, in the order
+/// given, so it is the level that holds; a package outside the workspace gets none.
+#[test]
+fn the_command_lines_levels_come_after_the_packages_own_lints() {
+    let (_, plans, _) = plan_app_with(None, true, &["--deny=blaze::todo", "--allow=unsafe_code"]);
+    for member in [&plans[2], &plans[4], &plans[5], &plans[6]] {
+        assert_eq!(
+            member.lints,
+            [
+                "--warn=blaze::hot_alloc",
+                "--forbid=unsafe_code",
+                "--warn=unexpected_cfgs",
+                "--deny=blaze::todo",
+                "--allow=unsafe_code",
+            ]
+        );
+    }
+    assert!(plans[0].lints.is_empty(), "a registry package takes no level of the command line");
+    assert!(plans[1].lints.is_empty(), "nor a path package outside the workspace");
 }
 
 /// The hex of a plan's `-C extra-filename`.

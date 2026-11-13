@@ -2249,7 +2249,21 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         // Case 1: builtin macros
         let mut helpers_opt = None;
         let expander = if attrs.by_key(sym::rustc_builtin_macro).exists() {
-            if let Some(expander) = find_builtin_macro(&mac_name) {
+            // `#[rustc_builtin_macro(builtin_name)]` names the builtin when it is one a call
+            // expands by, as on a `macro_rules!`: `core::blaze::unreachable` is the builtin
+            // `blaze_unreachable`, not `unreachable`.
+            let explicit =
+                attrs.by_key(sym::rustc_builtin_macro).tt_values().next().and_then(|tt| {
+                    match tt.token_trees().iter().next() {
+                        Some(tt::TtElement::Leaf(tt::Leaf::Ident(name))) => Some(name.as_name()),
+                        _ => None,
+                    }
+                });
+            let builtin = explicit
+                .as_ref()
+                .and_then(find_builtin_macro)
+                .or_else(|| find_builtin_macro(&mac_name));
+            if let Some(expander) = builtin {
                 match expander {
                     Either::Left(it) => MacroExpander::BuiltIn(it),
                     Either::Right(it) => MacroExpander::BuiltInEager(it),

@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 114);
+    assert_eq!(blaze_lints().len(), 117);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -77,6 +77,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
         ("blaze::lossy_as", false),
+        ("blaze::implicit_overflow", false),
         ("blaze::global_state", false),
         ("blaze::async_fn", false),
         ("blaze::unmarked_pure", false),
@@ -106,6 +107,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::undeclared_effect",
         "blaze::unfulfilled_effect",
         "blaze::program_lifetime",
+        "blaze::unreachable",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
@@ -230,11 +232,13 @@ fn group_of_is_the_first_group_without_aliases() {
 
 #[test]
 fn counts_are_rustcs() {
-    // 108 of the builtin passes and `foreign_modules`, 141 hardwired.
-    assert_eq!(lints().len(), 249);
+    // 107 of the builtin passes and `foreign_modules`, 148 hardwired, at the pinned nightly
+    // (rustc 1.101.0-nightly 16d1ffac1), as `rustc.rs` is generated from its source: a bump
+    // that changes a count changes it here, on purpose.
+    assert_eq!(lints().len(), 255);
     assert_eq!(internal_lints().len(), 17);
-    assert_eq!(internal_group().lints.len(), 16);
-    assert_eq!(unregistered().len(), 2);
+    assert_eq!(internal_group().lints.len(), 15);
+    assert_eq!(unregistered().len(), 3);
     let names: Vec<&str> = groups().iter().map(|it| it.name).collect();
     assert_eq!(
         names,
@@ -257,15 +261,18 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]
     );
-    assert_eq!(group("unused").unwrap().lints.len(), 24);
+    // With `repeated_reprs`, since Rust 1.100.
+    assert_eq!(group("unused").unwrap().lints.len(), 25);
     // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
     assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
-    assert_eq!(removed().len(), 67);
+    // With `no_mangle_generic_items` (an error since 1.99) and
+    // `dependency_on_unit_never_type_fallback` (the never type's stabilization, 1.100), and
+    // blaze's own `blaze::unneeded_effect`.
+    assert_eq!(removed().len(), 69);
 }
 
 #[test]
@@ -369,7 +376,7 @@ fn check_lint_name() {
     assert_eq!(store.check("internal", Some("rustc")), Checked::MissingTool);
     let store = Store { internal: true, registered_tools: Vec::new() };
     assert!(
-        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 16)
+        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 15)
     );
     assert_eq!(store.check("default_hash_type", Some("rustc")), Checked::NoLint { suggest: true });
     assert!(store.is_lint_group("warnings"));

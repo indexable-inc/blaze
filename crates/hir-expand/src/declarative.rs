@@ -45,9 +45,9 @@ impl DeclarativeMacroExpander {
             ),
             None => {
                 let marks = MarkCache::new();
-                let call_style = call_id.loc(db).kind.call_style();
+                let call = call_id.loc(db).kind.mbe_call();
                 self.mac
-                    .expand(db, tt, self.marker(db, call_id, &marks), call_style, span)
+                    .expand(db, tt, self.marker(db, call_id, &marks), call, span)
                     .map_err(Into::into)
             }
         }
@@ -73,16 +73,9 @@ impl DeclarativeMacroExpander {
             ),
             None => {
                 let marks = MarkCache::new();
-                let call_style = call_id.loc(db).kind.call_style();
+                let call = call_id.loc(db).kind.mbe_call();
                 self.mac
-                    .expand_making_in(
-                        frame,
-                        db,
-                        tt,
-                        self.marker(db, call_id, &marks),
-                        call_style,
-                        span,
-                    )
+                    .expand_making_in(frame, db, tt, self.marker(db, call_id, &marks), call, span)
                     .map_err(Into::into)
             }
         }

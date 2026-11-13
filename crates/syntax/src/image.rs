@@ -30,7 +30,9 @@ use crate::{
 /// 3: a token is parsed under the extensions of the crate that wrote it (a macro's expansion
 /// reads `&uniq` and `A | B`), `&uniq pat` is a pattern, and a parse made under extensions is
 /// stored and read back under them.
-pub const TREE_VERSION: u32 = 3;
+/// 4: under `#![blaze::error_unions]`, a generic argument that starts with a name goes on to
+/// an error union (`Result<(), A | B>`), which was a syntax error.
+pub const TREE_VERSION: u32 = 4;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"bzp1");
 const HEAD: usize = 12;

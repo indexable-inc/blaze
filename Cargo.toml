@@ -200,6 +200,17 @@ std_use = "deny"
 # cargo builds blaze (decision D25, docs/v2/plan/decisions.json), since no crate cargo builds can
 # say `edition = "blaze-2026.11"`. Removed when the tree moves onto the edition.
 not_latest_edition = "allow"
+# Arithmetic whose meaning is the profile's (docs/lints.md#implicit_overflow,
+# docs/v2/plan/design/explicit-overflow.md), in `edition` above: crates opt in at their root
+# (`#![deny(blaze::implicit_overflow)]`), `blaze-std` and `blaze-mem` first, once a stage-0
+# release knows the lint; the rest of the tree has not said what its overflow means yet.
+implicit_overflow = "allow"
+# A `todo!()` outside test code is a typed hole (docs/v2/plan/design/proved-unreachable.md,
+# "`blaze::todo`: typed holes"), in `general` above and named here: a warning in a local check,
+# so code checks while a hole in it is still open. The merge gate denies it on its command
+# line, `blaze check --deny blaze::todo` (.github/workflows/blaze.yaml, `lint-baselines`): a
+# command line's level comes after this table's.
+todo = "warn"
 # `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
 # hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
 # code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own

@@ -64,6 +64,7 @@ fn type_not_empty<'db>(
         Diag::error(Some("E0004"), format!("non-exhaustive patterns: type `{printed}` is non-empty"), sp.clone());
     let peeled = ty.strip_references();
     if let Some(adt) = peeled.as_adt()
+        && !is_error_union(cx, &peeled)
         && let Some(at) = adt_span(cx, adt, true)
     {
         // clone: the error's parts, for an error hir found
@@ -408,6 +409,14 @@ fn adt_span(cx: &Cx<'_, '_>, adt: Adt, non_local: bool) -> Option<Span> {
     non_local.then(|| cx.span(source.with_value(def_range(source.value.syntax()))))
 }
 
+/// blaze: whether `ty` is an error union (`A | B`, `#![blaze::error_unions]`). It is defined
+/// nowhere a program can go (core's `ErrorUnion` is its representation), so no note points at
+/// its definition: its members are in its name and the witnesses are members.
+fn is_error_union<'db>(cx: &Cx<'_, 'db>, ty: &Type<'db>) -> bool {
+    let interner = hir_ty::next_solver::DbInterner::new_with(cx.db, cx.krate.into());
+    hir_ty::error_union::members(interner, ty.to_next_solver()).is_some()
+}
+
 /// rustc's `AdtDefinedHere`: the ADT a match is on, with the variants its witnesses name.
 pub(super) struct DefinedHere {
     at: Span,
@@ -425,6 +434,9 @@ impl DefinedHere {
         non_local: bool,
     ) -> Option<DefinedHere> {
         let peeled = ty.strip_references();
+        if is_error_union(cx, &peeled) {
+            return None;
+        }
         let at = adt_span(cx, peeled.as_adt()?, non_local)?;
         let variants = variants
             .iter()

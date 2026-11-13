@@ -53,6 +53,9 @@
 //!   of any bytes never panics nor asks its allocator past its limit; fixed vectors.
 //! - [`mp4`]: the muxer's boxes parse back to the packets, in both layouts, the same packets
 //!   give the same bytes, and out-of-order packets are refused by name.
+//! - [`simtest`]: `#[bstd::test]` itself, on a counter kept in two files: its planted bugs
+//!   are caught within the default seeds, the printed seed replays to the same trace, and the
+//!   correct counter passes them all.
 //!
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
@@ -85,6 +88,7 @@ mod own;
 mod paths;
 mod requests;
 mod scopes;
+mod simtest;
 mod world;
 
 use std::{fmt, time::Duration};

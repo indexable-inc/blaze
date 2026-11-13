@@ -926,6 +926,9 @@ define_symbols! {
     // `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
     // (docs/v2/plan/design/contracts.md, part 2).
     contract_test,
+    // `blaze::unreachable!()`, the builtin macro `core::blaze::unreachable`
+    // (docs/v2/plan/design/proved-unreachable.md).
+    blaze_unreachable,
     // `#![blaze::handles]` (docs/v2/plan/design/edition.md, change 1): the lang item nightly's
     // `core::clone::Share` carries, by which the copy of a handle finds it.
     blaze_handle,

@@ -75,6 +75,10 @@ pub(crate) struct Asked {
     pub ignore_rust_version: bool,
     /// `cargo doc --open`.
     pub open: bool,
+    /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
+    /// (`--deny=blaze::todo`), in the order given: the level of a lint for every workspace
+    /// member, after every level its manifests set ([`crate::lint_level`]).
+    pub lint_levels: Vec<String>,
 }
 
 impl Asked {
@@ -123,11 +127,11 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 8");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 9");
 }
 
 impl Versioned for Asked {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 6");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 7");
 }
 
 /// Reads `Cx::config`: the [`BuildConfig`] narrowed.
@@ -136,7 +140,7 @@ pub(crate) struct Invocation;
 impl Query for Invocation {
     const KIND: QueryKind = QueryKind(0x6010);
     const NAME: &'static str = "cargo invocation";
-    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 6");
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 7");
     type Key = ();
     type Value = Cbor<Configured>;
 
@@ -156,7 +160,7 @@ pub(crate) struct Asking;
 impl Query for Asking {
     const KIND: QueryKind = QueryKind(0x6011);
     const NAME: &'static str = "cargo asked";
-    const PRODUCER: ContentId = producer("blaze v2 cargo asked 4");
+    const PRODUCER: ContentId = producer("blaze v2 cargo asked 5");
     type Key = ();
     type Value = Cbor<Result<Asked, LoadError>>;
 
@@ -170,7 +174,7 @@ impl Query for Asking {
 }
 
 impl Versioned for Result<Asked, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 5");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 6");
 }
 
 fn configure(bytes: &[u8]) -> Configured {
@@ -248,6 +252,18 @@ fn configure(bytes: &[u8]) -> Configured {
 enum Takes {
     Flag(fn(&mut Asked)),
     Value(fn(&mut Asked, String) -> Result<(), String>),
+    /// An argument of another command's, with why this one does not take it.
+    Refused(String),
+}
+
+/// `check`'s `--{level} LINT`: the flag kept in [`Asked::lint_levels`], or why it is refused
+/// ([`crate::lint_level::refused`]), naming the flag.
+fn lint_level(asked: &mut Asked, level: &str, lint: String) -> Result<(), String> {
+    if let Some(why) = crate::lint_level::refused(level, &lint) {
+        return Err(format!("--{level} {lint}: {why}")); // alloc: an error, once
+    }
+    asked.lint_levels.push(format!("--{level}={lint}")); // alloc: once per level of the command line
+    Ok(())
 }
 
 /// cargo's arguments of the building commands, by long name; `short` is its letter.
@@ -348,6 +364,13 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
         return common;
     }
     match (command, name) {
+        (Command::Check, "allow") => Some(Takes::Value(|a, v| lint_level(a, "allow", v))),
+        (Command::Check, "warn") => Some(Takes::Value(|a, v| lint_level(a, "warn", v))),
+        (Command::Check, "deny") => Some(Takes::Value(|a, v| lint_level(a, "deny", v))),
+        (Command::Check, "forbid") => Some(Takes::Value(|a, v| lint_level(a, "forbid", v))),
+        (_, level) if crate::lint_level::LEVELS.contains(&level) => {
+            Some(Takes::Refused(crate::lint_level::check_only(level, command.name())))
+        }
         (Command::Test, "doc") => Some(Takes::Flag(|a| a.doc = true)),
         (Command::Test | Command::Bench, "no-run" | "no-fail-fast") => Some(Takes::Flag(|_| {})),
         // Whether the plan reads `doc.browser`; the pages are opened by the CLI.
@@ -438,6 +461,7 @@ fn parse(command: Command, args: &[String], mut asked: Asked) -> Result<Asked, S
                 };
                 set(&mut asked, value)?;
             }
+            Some(Takes::Refused(why)) => return Err(why),
             None => return Err(unexpected(&format!("--{name}"))),
         }
     }
@@ -557,6 +581,43 @@ mod tests {
             "unexpected argument '--no-deps' found"
         );
         assert_eq!(asked(Command::Check, &["-p", "a", "--all-targets"]).unwrap().packages, ["a"]);
+    }
+
+    /// `check` takes a lint's level, any number of times and in the order given; no other
+    /// command does, and what [`crate::lint_level::refused`] refuses is refused naming the flag.
+    #[test]
+    fn check_takes_lint_levels_in_order_and_no_other_command_does() {
+        let it = asked(
+            Command::Check,
+            &["--deny", "blaze::todo", "--workspace", "--warn=clippy::all", "--forbid", "unused"],
+        )
+        .unwrap();
+        assert_eq!(it.lint_levels, ["--deny=blaze::todo", "--warn=clippy::all", "--forbid=unused"]);
+        assert!(it.workspace);
+        assert!(asked(Command::Check, &[]).unwrap().lint_levels.is_empty());
+        for command in [Command::Build, Command::Test, Command::Run, Command::Bench, Command::Doc] {
+            let why = asked(command, &["--deny", "blaze::todo"]).unwrap_err();
+            assert!(why.starts_with("`--deny` sets a lint's level"), "{why}");
+            assert!(why.contains(&format!("`blaze {}`", command.name())), "{why}");
+        }
+        assert_eq!(
+            asked(Command::Check, &["--allow", "blaze::unreachable"]).unwrap_err(),
+            format!("--allow blaze::unreachable: {}", crate::lint_level::FLOOR_RULE)
+        );
+        assert_eq!(
+            asked(Command::Check, &["--deny=blaze::unreachable"]).unwrap().lint_levels.len(),
+            1
+        );
+        assert_eq!(
+            asked(Command::Check, &["--deny", "blaze::nope"]).unwrap_err(),
+            "--deny blaze::nope: `blaze::nope` is no lint or group of blaze's"
+        );
+        assert!(asked(Command::Check, &["--deny"]).unwrap_err().starts_with("a value is required"));
+        assert_eq!(
+            asked(Command::Check, &["-D", "warnings"]).unwrap_err(),
+            "unexpected argument '-D' found",
+            "the long flags only"
+        );
     }
 
     #[test]

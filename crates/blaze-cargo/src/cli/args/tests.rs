@@ -112,6 +112,127 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
     assert_eq!(many.flags.new_baselines, ["clippy::a", "blaze::b", "clippy::c"]);
 }
 
+/// `check` takes a lint's level as rustc's long flags spell it, any number of times, kept in
+/// the order given and handed to the daemon's load as typed (a level is an input of the plan).
+#[test]
+fn check_reads_lint_levels_and_hands_them_to_the_load() {
+    let asked = cargo(&[
+        "check",
+        "--deny",
+        "blaze::todo",
+        "--workspace",
+        "--warn=clippy::all",
+        "--deny",
+        "unused",
+        "--allow",
+        "blaze::hot_alloc",
+        "--forbid=unsafe_code",
+    ]);
+    assert_eq!(
+        asked.flags.lint_levels,
+        [
+            "--deny=blaze::todo",
+            "--warn=clippy::all",
+            "--deny=unused",
+            "--allow=blaze::hot_alloc",
+            "--forbid=unsafe_code",
+        ]
+    );
+    assert_eq!(
+        asked.args,
+        [
+            "--deny",
+            "blaze::todo",
+            "--workspace",
+            "--warn=clippy::all",
+            "--deny",
+            "unused",
+            "--allow",
+            "blaze::hot_alloc",
+            "--forbid=unsafe_code",
+        ],
+        "the load reads them too: they are no flags of the client alone"
+    );
+    assert!(cargo(&["check"]).flags.lint_levels.is_empty());
+    assert_eq!(cargo(&["c", "--deny=blaze::unreachable"]).flags.lint_levels.len(), 1);
+    assert_eq!(cargo(&["check", "--forbid", "blaze::unreachable"]).flags.lint_levels.len(), 1);
+    // With the baselines, as the merge gate runs it.
+    let t = "--target=aarch64-unknown-linux-gnu";
+    let gate = cargo(&["check", "--workspace", t, "--baselines", "b", "--deny", "blaze::todo"]);
+    assert_eq!(super::refused(&gate), None);
+    assert_eq!(gate.args, ["--workspace", t, "--deny", "blaze::todo"]);
+    assert!(help(Command::Check).contains("      --deny <LINT>\n"));
+    assert!(!help(Command::Build).contains("--deny"));
+    assert!(parse(os(&["check", "--deny"])).is_err(), "a level names its lint");
+    assert!(
+        refused(&["check", "-D", "warnings"]).starts_with("error: unexpected argument '-D' found"),
+        "the long flags only"
+    );
+}
+
+/// A level is refused where it would set nothing or what it may not, naming the flag and why:
+/// on a command other than `check`, for a name that is no lint's, and below `deny` for
+/// `blaze::unreachable`.
+#[test]
+fn a_lint_level_is_refused_naming_the_flag_and_why() {
+    for command in ["build", "run", "test", "bench", "doc"] {
+        assert_eq!(
+            refused(&[command, "--deny", "blaze::todo"]),
+            format!(
+                "error: `--deny` sets a lint's level, which `blaze check` alone takes from its command \
+                 line: `blaze {command}` reads each lint's level from `[lints]` and the workspace's \
+                 tables\n\nFor more information, try '--help'.\n"
+            )
+        );
+    }
+    assert!(
+        refused(&["build", "--allow=unused"]).starts_with("error: `--allow` sets a lint's level")
+    );
+    let floor = "`blaze::unreachable` can't be set below `deny`: a `blaze::unreachable!()` compiles \
+                 only where blaze proves no path reaches it";
+    assert_eq!(
+        refused(&["check", "--allow", "blaze::unreachable"]),
+        format!(
+            "error: invalid value 'blaze::unreachable' for '--allow <LINT>': {floor}\n\nFor more \
+             information, try '--help'.\n"
+        )
+    );
+    assert!(refused(&["check", "--warn=blaze::unreachable"]).starts_with(
+        "error: invalid value 'blaze::unreachable' for '--warn <LINT>': `blaze::unreachable` can't"
+    ));
+    for name in ["a::b::c", "blaze::", "unused,dead_code", "not a lint"] {
+        let said = refused(&["check", "--deny", name]);
+        assert!(
+            said.starts_with(&format!(
+                "error: invalid value '{name}' for '--deny <LINT>': `{name}` names no lint: "
+            )),
+            "{said}"
+        );
+    }
+    assert!(
+        refused(&["check", "--deny", "blaze::todos"]).starts_with(
+            "error: invalid value 'blaze::todos' for '--deny <LINT>': `blaze::todos` is no lint or group of blaze's"
+        )
+    );
+    // What checks nothing takes no level.
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    assert_eq!(
+        unhonored(&["check", "--replace", "a::B=c::D", "--deny", "blaze::todo"]).as_deref(),
+        Some(
+            "`--replace` checks nothing, so `--deny=blaze::todo` would set no lint's level: give it \
+             to a `blaze check`"
+        )
+    );
+    assert_eq!(
+        unhonored(&["lock", "--deny", "blaze::todo"]).as_deref(),
+        Some(
+            "`blaze lock` checks nothing, so `--deny=blaze::todo` would set no lint's level: give it \
+             to a `blaze check`"
+        )
+    );
+    assert_eq!(unhonored(&["check", "--fix", "--deny", "blaze::todo"]), None);
+}
+
 /// `check` lints and fixes, so `clippy` and `fix` are no commands of blaze's.
 #[test]
 fn clippy_and_fix_are_no_commands() {

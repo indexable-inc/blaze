@@ -1,5 +1,5 @@
 // Update: const macros, stage 0 (#915, #959; docs/future/const-macros.md), in v0.20261028.9 behind
-// `experimental = ["const-macros"]`. Extends lesson 3: a derive with no proc-macro crate and no wasm.
+// `experimental = ["const-macros"]`. Extends Proc macros: a derive with no proc-macro crate and no wasm.
 site {
   updates {
     "const-macros" : Page {
@@ -8,10 +8,10 @@ site {
       (InTheme, themes.canary)
       (Requires, site.learn.macros)
       Title: {"Const macros"}
-      Description: {"Update to lesson 3, experimental: a derive that is a function in your own package, expanded by blaze's const evaluator."}
+      Description: {"Update to Proc macros, experimental: a derive that is a function in your own package, expanded by blaze's const evaluator."}
 
       Step what("A macro in your own package") {
-        P crate("In lesson 3 a proc macro is a crate of its own, built and run as WebAssembly. A **const macro** is a function in a file of the package that uses it, expanded by blaze's own const evaluator, inside the compiler.")
+        P crate("In *Proc macros* a proc macro is a crate of its own, built and run as WebAssembly. A **const macro** is a function in a file of the package that uses it, expanded by blaze's own const evaluator, inside the compiler.")
         P none("No macro crate, no WebAssembly, no other process.")
       }
 

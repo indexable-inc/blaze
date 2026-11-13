@@ -1,0 +1,68 @@
+// Lesson: generic const expressions, blaze's own gate `blaze_const_exprs` (crates/hir-def/src/unstable_features.rs;
+// tests in crates/hir-ty-mir/src/tests/where_const.rs; ledger row E16). Not rustc's `generic_const_exprs`: concrete
+// arguments are compared by evaluating them, generic ones by a normal form over + - * and literals; nothing is solved
+// for. `where const { .. }` bounds are in docs/v2/plan/design/comptime.md.
+site {
+  learn {
+    const_exprs : Page {
+      Narrow
+      Lesson: {6, "Arithmetic on const generics, the way you always wanted to write it.", "consts"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.incremental)
+      Title: {"Const generic math"}
+      Description: {"blaze's opt-in extension for arithmetic in const generic arguments: Arr<\{ N + M }> that just works."}
+
+      Step wall("A wall in today's Rust") {
+        Code join(lang: "rust", text: `// stable Rust: error
+        fn join<const N: usize, const M: usize>(
+            a: Arr<N>, b: Arr<M>,
+        ) -> Arr<\{ N + M }>`)
+        P generic("Stable Rust won't do arithmetic on const generics in a type. Nightly's `generic_const_exprs` is incomplete.")
+      }
+
+      Step gate("blaze's own gate") {
+        Art sum(piece: "sum", label: "A row of N cells and a row of M cells slide together into one row labelled N + M.")
+        Code on(lang: "rust", text: `#![feature(blaze_const_exprs)]
+
+        fn join<const N: usize, const M: usize>(
+            _: Arr<N>, _: Arr<M>,
+        ) -> Arr<\{ N + M }> \{ Arr }`)
+        Dim opt("Opt-in per crate. Without the feature, nothing changes.")
+      }
+
+      Step equal("When are two types equal?") {
+        Table rules {
+          Tr head { Th a("These"); Th b("Equal?") }
+          Tr lit { Td a("`Arr<\{ 2 + 1 }>` and `Arr<3>`"); Td b("yes: evaluated") }
+          Tr comm { Td a("`Arr<\{ N + M }>` and `Arr<\{ M + N }>`"); Td b("yes: normal form") }
+          Tr dbl { Td a("`Arr<\{ 2 * N }>` and `Arr<\{ N + N }>`"); Td b("yes: normal form") }
+          Tr div { Td a("`Arr<\{ N / 2 }>` and anything else"); Td b("only itself") }
+        }
+        Dim ops("`+`, `-`, `*` and literals have a normal form; the rest equal only themselves.")
+      }
+
+      Step equal_q("Check: same type?") {
+        Quiz q(prompt: "With `blaze_const_exprs` on, which pair is NOT known to be the same type for every `N`?") {
+          Choice add("`Arr<\{ N + 1 }>` and `Arr<\{ 1 + N }>`", "Addition is put in a normal form, so the order doesn't matter: these are equal.")
+          Choice mul("`Arr<\{ 2 * N }>` and `Arr<\{ N + N }>`", "Both normalise to the same sum, so these are equal.")
+          Choice div("`Arr<\{ N / 2 * 2 }>` and `Arr<N>`", "Right: division has no normal form (and `N / 2 * 2` isn't `N` when `N` is odd), so it only equals itself.") {
+            Right
+          }
+        }
+      }
+
+      Step guess("No guessing") {
+        Code bound(lang: "rust", text: `fn split<const N: usize, const K: usize>(
+            a: Arr<N>,
+        ) -> (Arr<K>, Arr<\{ N - K }>)
+        where const \{ K <= N } \{ todo!() }`)
+        P solve("blaze never solves for a parameter, and conditions go in a `where const` bound.")
+      }
+
+      Step status("Where it stands") {
+        P now("Experimental: written and tested inside blaze. Next: [compile-time reflection](/learn/comptime) with `for const`.")
+        Dim design("Design: [comptime.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/comptime.md).")
+      }
+    }
+  }
+}

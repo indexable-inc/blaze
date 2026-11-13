@@ -10,6 +10,7 @@ mod fixture;
 mod fns;
 mod held;
 mod models;
+mod reach_oracle;
 mod scripts;
 mod sealed;
 mod share;

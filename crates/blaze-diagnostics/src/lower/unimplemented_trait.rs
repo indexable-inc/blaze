@@ -30,12 +30,16 @@
 
 use base_db::{CrateOrigin, LangCrateOrigin};
 use hir::{InFile, LangItem};
-use hir_ty::method_resolution::TraitImpls;
+use hir_ty::{
+    method_resolution::TraitImpls,
+    next_solver::{DbInterner, Ty, TyKind},
+};
+use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
     view::{
         self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _,
-        HasGenericArgs as _,
+        HasGenericArgs as _, HasName as _,
     },
 };
 
@@ -78,6 +82,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
     let direct = d.parent_trait_predicates.is_empty() || !main_is_leaf;
 
     let at = cx.syntax_view(d.span.map(|it| it.syntax_node_ptr()));
+    if let Some(diag) = uncovered_failure(cx, d, at) {
+        // alloc: the error's parts, for an error hir found
+        return vec![Found::new(diag, Phase::Bodies)];
+    }
     let cause = Cause::of(cx, at, |ty| {
         root_self.as_ref().is_some_and(|want| ty == want || ty.strip_references() == *want)
     });
@@ -167,6 +175,121 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
     code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
+}
+
+/// blaze, in a crate with error unions (`#![blaze::error_unions]`,
+/// docs/v2/plan/design/error-sets.md, "The check"): a `?` whose failure the function's error
+/// type does not cover. A function's error type is the set of failures it may return, the
+/// members of a union or the one type it is, and `?` on a call adds the call's failures to
+/// what the function returns; the error is that the set lacks one, said as that: the call
+/// that fails with it, the member, the set and whose it is, with the set written where the
+/// signature has it and the fix that adds the member there. `None` for any other unmet bound,
+/// which is said as rustc says it.
+fn uncovered_failure<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::UnimplementedTrait<'db>,
+    at: InFile<ast::Node<'db>>,
+) -> Option<Diag> {
+    if !cx.krate.extensions(cx.db).error_unions() {
+        return None;
+    }
+    let question = ast::TryExpr::cast(at.value)?;
+    let bound = d.trait_predicate.trait_ref();
+    if bound.trait_().name(cx.db).as_str() != "From" {
+        return None;
+    }
+    let (set, failure) = (bound.get_type_argument(0)?, bound.get_type_argument(1)?);
+    let interner = DbInterner::new_with(cx.db, cx.krate.into());
+    // alloc: the error's parts, for an error hir found
+    let members = |ty: &hir::Type<'db>| -> Vec<Ty<'db>> {
+        let ty = ty.to_next_solver();
+        match hir_ty::error_union::members(interner, ty) {
+            Some(members) => members.as_slice().to_vec(), // alloc: as above
+            None => vec![ty],                             // alloc: as above
+        }
+    };
+    let (has, fails_with) = (members(&set), members(&failure));
+    // A set holds named types: a failure that is none (a type parameter, a reference) is
+    // rustc's unmet bound.
+    let named = |ty: &Ty<'db>| matches!(ty.kind(), TyKind::Adt(..));
+    if !has.iter().chain(&fails_with).all(named) {
+        return None;
+    }
+    // alloc: the error's parts, for an error hir found
+    let missing: Vec<String> = fails_with
+        .iter()
+        .filter(|it| !has.contains(it))
+        .map(|it| format!("`{}`", print::solver_ty(cx, *it))) // alloc: the error's text
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let function = question.syntax().ancestors().find_map(ast::Fn::cast);
+    let whose = match function.and_then(|it| it.name()) {
+        Some(name) => format!("`{}`", name.text()), // alloc: the error's text
+        None => "this closure".to_owned(),          // alloc: the error's text
+    };
+    let call = question.expr().map(|it| it.syntax().text().to_string()).unwrap_or_default(); // alloc: the error's text
+    let missing_text = missing.join(" and ");
+    // Where the signature writes the set: the last type argument of its return type
+    // (`Result<T, E>`'s `E`), when the return type has arguments. The set is said as it is
+    // written there, else in its members' canonical order.
+    let written = function
+        .and_then(|it| it.ret_type())
+        .and_then(|it| it.ty())
+        .and_then(|it| match it {
+            ast::Type::PathType(path) => path.path()?.segment()?.generic_arg_list(),
+            _ => None,
+        })
+        .and_then(|it| it.generic_args().last())
+        .and_then(|it| match it {
+            ast::GenericArg::TypeArg(it) => it.ty(),
+            _ => None,
+        });
+    let set_text = match &written {
+        Some(written) => written.syntax().text().to_string(), // alloc: the error's text
+        None => cx.ty(&set),
+    };
+    // alloc: the error's text, for an error hir found
+    let message = format!(
+        "`{call}?` can fail with {missing_text}, which the error set of {whose}, `{set_text}`, \
+         does not have"
+    );
+    let span = cx.span(at.map(|it| it.text_range()));
+    // clone: on the error path, for an error hir found
+    let mut diag = Diag::error(Some("E0277"), message, span.clone());
+    // alloc: the error's text, for an error hir found
+    diag.span_label(span, format!("fails with {missing_text}"));
+    match written {
+        Some(written) => {
+            let written_at = cx.span(at.with_value(written.syntax().text_range()));
+            // clone: on the error path, for an error hir found
+            diag.span_label(written_at.clone(), format!("the error set of {whose}")); // alloc: the error's text
+            // alloc: the error's parts, for an error hir found
+            let added: Vec<String> = fails_with
+                .iter()
+                .filter(|it| !has.contains(it))
+                .map(|it| print::solver_ty(cx, *it))
+                .collect();
+            // alloc: the error's text, for an error hir found
+            let wider = format!("{set_text} | {}", added.join(" | "));
+            diag.suggestion_verbose(
+                written_at,
+                format!("add {missing_text} to the set, or handle it at the call"), // alloc: the error's text
+                wider,
+                Applicability::MaybeIncorrect,
+            );
+        }
+        None => {
+            // alloc: the error's text, for an error hir found
+            diag.help(format!(
+                "add {missing_text} to the error type {whose} returns (`{set_text} | ..`), or \
+                 handle it at the call"
+            ));
+        }
+    }
+    code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
+    Some(diag)
 }
 
 /// blaze: a widening into an error union (`#![blaze::error_unions]`: a coercion, `?` or

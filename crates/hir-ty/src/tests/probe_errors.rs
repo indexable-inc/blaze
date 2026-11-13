@@ -143,6 +143,35 @@ fn a_method_on_a_raw_pointer_to_an_unknown_type_only_lints_in_2015() {
     assert_eq!(lints, 1, "rustc's `tyvar_behind_raw_pointer`, once: {found:?}");
 }
 
+/// Rust 1.99 (rust-lang/rust#156047): the receiver's type is a variable a coercion of `!`
+/// made, so the probe sets it to `!` and finds `!`'s method, with the lint; with no such
+/// coercion the same call is E0282 (the control: `unknown()` in place of `loop {}`).
+#[test]
+fn a_method_on_a_diverging_variable_is_nevers_and_linted() {
+    let source = |init: &str| {
+        format!(
+            "//- minicore: sized\ntrait Tr {{ fn m(&self) -> u8 {{ 1 }} }}\nimpl Tr for ! {{}}\n\
+             fn unknown<T>() -> T {{ loop {{}} }}\nfn f() {{ let x = {init}; let _: u8 = x.m(); }}"
+        )
+    };
+    let lint = |it: &InferenceDiagnostic| {
+        matches!(it, InferenceDiagnostic::MethodCallOnDivergingInferVar { .. })
+    };
+    let found = diagnostics(&source("loop {}"));
+    assert_eq!(found.iter().filter(|it| lint(it)).count(), 1, "the lint, once: {found:?}");
+    assert_eq!(found.len(), 1, "and nothing else: the method is `!`'s: {found:?}");
+
+    let found = diagnostics(&source("unknown()"));
+    assert!(!found.iter().any(lint), "no coercion of `!` made this variable: {found:?}");
+    assert!(
+        found.iter().any(|it| matches!(
+            it,
+            InferenceDiagnostic::TypeMustBeKnown { kind: TypeAnnotationNeeded::E0282, .. }
+        )),
+        "{found:?}",
+    );
+}
+
 #[test]
 fn mut_matching_an_inherited_shared_reference_is_e0308() {
     let found = diagnostics(

@@ -1838,6 +1838,42 @@ enum MyEnum {}
 }
 
 #[test]
+fn macro_rules_attr_with_arguments() {
+    // An `attr(..)` rule's first pattern matches the attribute's arguments, its second the item;
+    // `#[m]` and `#[m()]` give the first no tokens.
+    check(
+        r#"
+
+macro_rules! my_attr {
+    attr($($prefix:ident)?) (fn $name:ident() {}) => { $(fn $prefix() {})? fn $name() {} };
+    attr(not $($tt:tt)*) ($($item:tt)*) => {};
+}
+
+#[my_attr(named)]
+fn plain() {}
+
+#[my_attr]
+fn bare() {}
+
+#[my_attr()]
+fn empty() {}
+
+#[my_attr(not used)]
+fn dropped() {}
+
+"#,
+        &expect![[r#"
+            crate
+            - bare : value
+            - empty : value
+            - named : value
+            - plain : value
+            - (legacy) my_attr : macro#
+        "#]],
+    );
+}
+
+#[test]
 fn macro_2_attr() {
     check(
         r#"

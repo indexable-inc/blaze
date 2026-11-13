@@ -120,6 +120,13 @@ list only shrinks:
   Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
   baseline with no crate left, saying so. That lint is then `deny` everywhere.
 
+Two lints are apart from this. `todo` is named `warn` in the ratchet table, so a hole is a
+warning in a local check and the gate denies it on its command line
+(`blaze check --deny blaze::todo`, [`todo`](#todo)). `unreachable` is never below `deny`: a
+line that sets it to `allow` or `warn` in `[workspace.metadata.blaze.lints]`, the ratchet or a
+package's `[lints.blaze]`, a baseline `blaze.unreachable.txt`, and `--allow` or `--warn` of it
+on the command line are each an error naming it ([`unreachable`](#unreachable)).
+
 A new crate gets no line, so it is held to every lint from the start. Making a lint `warn`
 again for a crate is a change to this section's rule, not to a baseline.
 
@@ -760,6 +767,37 @@ keeps a frame small or a symbol visible to a profiler.
 **Allowing it.** `#[expect(blaze::hot_marked_cold, reason = "..")]`, when the profile's workload
 is not the one the function is cold in.
 
+## `implicit_overflow`
+
+In `blaze::edition`, allowed by default (docs/v2/plan/design/explicit-overflow.md).
+
+**What it catches.** Integer arithmetic whose meaning depends on the profile, wherever blaze
+can't show it fits: `+`, `-`, `*`, `<<`, `>>`, their compound forms, unary `-`, and an `as`
+that can lose an integer's value (to a narrower integer, between signed and unsigned, a float
+to an integer; `usize` and `isize` count as 32 bits on the target side). Also calls whose
+overflow follows the profile (`pow`, `abs`, `next_power_of_two`, integer `Iterator::sum` and
+`product`) or always panics (`strict_*`). The reach prover judges each operation from the
+checks around it (`i < v.len()`, `b <= a`, a mask, a remainder). The message names the fact
+that is missing: `can't show `a + b` fits in `u32` here: nothing bounds `b``.
+
+**Why it matters.** With overflow checks an overflowing `a + b` panics; without them it wraps.
+Plain arithmetic says neither, so the profile decides what the code means. The verdict is the
+same in both profiles.
+
+**How to fix it.** Say what overflow means: `checked_*` with `?` (or a typed error), `wrapping_*`
+or `Wrapping<T>`, `saturating_*`, `overflowing_*`, `T::try_from(x)`. Or add a check blaze can
+see that bounds the operands. `blaze check --fix` does the rewrite where it is clear: in a
+function returning `Option`, `a + b` becomes `a.checked_add(b)?` and `x as u8` becomes
+`u8::try_from(x).ok()?`. In a function returning a `Result` whose error takes a
+`TryFromIntError`, a cast becomes `u8::try_from(x)?`.
+
+**Not found.** `/` and `%`, whose panics are the same in every profile. Floats, except a float
+cast to an integer. Constants, statics and `const { .. }` blocks, where overflow is a
+compile-time error. Test code. Arithmetic that a macro makes up (arithmetic written in a macro
+call's arguments is still found).
+
+**Allowing it.** `#[expect(blaze::implicit_overflow, reason = "..")]`.
+
 ## `intern_candidate`
 
 **What it catches.** A non-generic type of the crate that is `Clone`, `PartialEq` and `Hash`
@@ -984,6 +1022,11 @@ method of an impl of a trait so marked, that may, through any call:
   and the toolchain is trusted for `unsafe`. Calling the `unsafe fn` yourself
   (`unchecked_add`, `NonNull::new_unchecked`, `hint::assert_unchecked`) still counts: the
   precondition is yours to uphold, and the finding names the call.
+  A check blaze proves holds where it is, and a call of `unwrap`, `expect` or a slice's or
+  `Vec`'s index it proves cannot panic there, is not one either (the same proof
+  [`unreachable`](#unreachable) uses: `v[i]` under `if i < v.len()` or in
+  `for i in 0..v.len()`, `o.unwrap()` under `if o.is_some()` or `if let Some(_) = o`, `a / b`
+  under `if b != 0`).
 - `noalloc`: call the global allocator (`Vec::new`, `Box::new`, `to_owned`, `malloc`). An
   allocator the code names (`Vec::new_in(frame)`) is allowed.
 - `nonblocking`: block the thread: std's and `parking_lot`'s locks, condvars and channels,
@@ -1220,9 +1263,67 @@ part. To keep a check that should only run outside unwinding, guard it with
 `if !std::thread::panicking() { .. }`.
 
 **Not found.** Panics in functions `drop` calls (only its own body is read), and arithmetic
-overflow. A `drop` that calls `std::thread::panicking()` anywhere is not checked.
+overflow. A `drop` that calls `std::thread::panicking()` anywhere is not checked. A site blaze
+proves cannot fail where it is (an index under `if i < v.len()`, an `unwrap` under
+`if o.is_some()`, a division under `if b != 0`: see [`unreachable`](#unreachable)) is not
+counted, here or in `unwind_across_ffi`.
 
 **Allowing it.** `#[expect(blaze::panic_in_drop, reason = "..")]` on the `drop` function.
+
+## `unreachable`
+
+**What it catches.** A `blaze::unreachable!()` (a blaze extension, opt-in:
+[the design](v2/plan/design/proved-unreachable.md)) that blaze cannot prove no path reaches.
+An error that no level waives: it fires only where the code wrote the macro. The finding is at
+the site and names the function and what could not be shown:
+
+```text
+error: `get`: can't prove this `blaze::unreachable!()` is never reached: can't show `i < v.len()` here: no check before this branch rules the path out
+```
+
+**What blaze proves.** One pass over the function's own MIR, before any optimization, so the
+answer is the same in every profile. It follows the checks that dominate the site: a `match`,
+`if let`, `is_some`/`is_none`/`is_ok`/`is_err` (the variant is known after), a comparison with
+`len()` or `is_empty()` of a slice, `str`, `Vec` or `String`, `for i in 0..v.len()`, a
+comparison with zero or a `NonZero`'s `get()`, comparisons of integers with constants, and
+code after an expression that never returns. It forgets what it knew of a value when the value
+is reassigned, and of what a `&mut` leads to at every call and write through a pointer. It
+follows linear arithmetic where the sum is shown not to wrap (`v[v.len() - 1]` under
+`!v.is_empty()`, `v[i + 1]` under `i + 1 < v.len()`, `lo + (hi - lo) / 2` under
+`lo < hi && hi <= v.len()`, and a binary search written as a loop), within a small budget of
+facts added up. It does not follow products, a relation between two values that both change
+round a loop, or what a function of your own returns.
+
+**How to fix it.** Add the check that rules the path out so that it dominates the site. Where
+blaze cannot prove it, return a `Result`, or write core's `unreachable!()`, the promise blaze
+does not check, which counts as a panic site (`nopanic`, `panic_in_drop`).
+
+**At run time** the macro is a panic, like `unreachable!()`, never undefined behaviour:
+defence in depth for code whose lints were not run.
+
+**Allowing it.** It can't be. `#[allow(blaze::unreachable)]`, `#[expect(..)]` and `#[warn(..)]`
+are each an error at the attribute; a flag or a line of a manifest's lint table
+(`[lints]`, `[workspace.metadata.blaze.lints]`, its ratchet, a baseline) that sets it below
+`deny` refuses the check, naming the lint; `--cap-lints`, `warnings` and a group that covers
+it do not reach it.
+
+## `todo`
+
+**What it catches.** A `todo!()` in code that is not a test (`#[test]`, `#[cfg(test)]`): a
+hole, as in Agda and Haskell. The finding names the function, the type the expression must
+have there and the bindings in scope that have that type:
+
+```text
+warning: `todo!()` in `open`: needs `Result<Dir, FsError>`; in scope: `cached`
+```
+
+**Levels.** `warn` in every local build, dev and release alike. The merge gate and a build
+for a release are to deny it with `blaze check --deny blaze::todo`; today the gate's
+`lint-baselines` job does, and the steps that run the released blaze wait for a release that
+has the option (docs/v2/plan/design/proved-unreachable.md). The prover
+behind [`unreachable`](#unreachable) never discharges a `todo!()`: it is unfinished, not dead.
+
+**Allowing it.** `#[expect(blaze::todo, reason = "..")]` on the function.
 
 ## `pod_serialized_by_field`
 

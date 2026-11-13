@@ -99,7 +99,7 @@ const BLAZE_PROC_MACRO: On = {
     bits
 };
 /// The group `blaze::edition`: what the blaze edition removes or respells (`lossy_as`,
-/// `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border (`unmarked_*`),
+/// `implicit_overflow`, `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border (`unmarked_*`),
 /// the code blaze cannot analyse (`proc_macro_*`, `build_script_ambient`), what blaze's
 /// standard library replaces (`std_use`) and code written the way the edition wants it
 /// (`could_be_*`), allowed until a workspace or crate turns it on to get ready for the edition,
@@ -303,6 +303,13 @@ impl Levels {
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
     /// their order: rustc's `reveal_actual_level_spec`.
     pub fn of(&self, lint: Lint<'_>, sets: &[Set]) -> Spec {
+        // A lint no level waives is `deny` here whatever is set: not an attribute, a flag,
+        // `warnings` or the cap reaches it ([`blaze::UNWAIVABLE`]).
+        if let Lint::Blaze(it) = lint
+            && blaze::UNWAIVABLE.contains(&it)
+        {
+            return Spec { level: Level::Deny, source: Source::Default };
+        }
         let mut spec = self.probe(lint, sets).unwrap_or_else(|| self.default_spec(lint, sets));
         if spec.level == Level::Warn
             && let Some(warnings) = self.probe(Lint::Warnings, sets)

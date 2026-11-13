@@ -137,6 +137,17 @@ pub mod mem {
     }
 }
 
+pub mod ptr {
+    #[rustc_diagnostic_item = "ptr_drop_in_place"]
+    pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {}
+
+    #[rustc_coherence_is_core]
+    impl<T: ?Sized> *mut T {
+        #[rustc_diagnostic_item = "ptr_drop_in_place_self"]
+        pub unsafe fn drop_in_place(self) {}
+    }
+}
+
 pub mod result {
     use core::convert::Infallible;
     use core::ops::{ControlFlow, FromResidual, Try};

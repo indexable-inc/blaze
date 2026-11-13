@@ -41,7 +41,7 @@ pub(crate) fn ui_bin(name: &str, krate: &str, edition: &str, source: &str) -> St
 
 /// The `.stderr` of a fixture's crates, as [`crate::tests::ui`] writes it: with compiletest's
 /// flags, in `-Z ui-testing` style, normalized.
-fn ui_fixture(fixture: &str) -> String {
+pub(crate) fn ui_fixture(fixture: &str) -> String {
     let options = compiletest(Mode::Other, &Options::default());
     let checked = crate::tests::checked_with(fixture, "$DIR/", &options);
     crate::tests::normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))

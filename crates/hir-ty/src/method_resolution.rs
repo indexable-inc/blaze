@@ -103,6 +103,10 @@ pub struct MethodResolutionContext<'a, 'db> {
     /// Where the probe puts the errors rustc reports as it probes, for inference to report;
     /// `None` silences them, as rustc's `is_suggestion` probes are.
     pub errors: Option<&'a ProbeErrors<'db>>,
+    /// The words of the set of type variables a coercion of `!` made (rustc's
+    /// `diverging_type_vars`), for a probe inside inference: a receiver that is one of them is
+    /// probed as `!`. `None` outside inference, where no variable is one.
+    pub diverging_type_vars: Option<&'a [u64]>,
 }
 
 /// The errors a method probe finds that rustc reports from the probe itself.
@@ -117,6 +121,9 @@ pub struct ProbeErrors<'db> {
     /// `tyvar_behind_raw_pointer`: as `unknown_receiver` through a raw pointer, in edition 2015,
     /// where rustc lints and goes on.
     pub(crate) tyvar_behind_raw_pointer: std::cell::Cell<bool>,
+    /// `method_call_on_diverging_infer_var`: the receiver was a type variable a coercion of `!`
+    /// made, which the probe set to `!` and went on.
+    pub(crate) diverging_receiver: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
@@ -287,6 +294,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             receiver_span,
             frame: self.frame,
             errors: Some(&errors),
+            diverging_type_vars: Some(self.table.diverging_type_var_words()),
         };
         let result = f(&ctx);
         if let Some(ty) = errors.recursion_limit.take() {
@@ -297,6 +305,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         if errors.tyvar_behind_raw_pointer.take() {
             self.lint_tyvar_behind_raw_pointer(call_span);
+        }
+        if errors.diverging_receiver.take() {
+            self.lint_method_call_on_diverging_infer_var(call_span);
         }
         result
     }

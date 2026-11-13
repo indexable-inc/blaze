@@ -83,7 +83,7 @@
 //! | [`record`] | zero-copy records | blaze-format |
 //! | [`report`] | what a program says, as data | blaze-report |
 //! | [`quic`], [`http`] | sans-IO QUIC (WebTransport over HTTP/3) and HTTP/1.1 | blaze-http |
-//! | [`test`] | the simulation, the model checker, allocation counting | blaze-core, blaze-check, blaze-alloc-count |
+//! | [`test`] | `#[bstd::test]` and its runner, the simulation, the model checker, allocation counting | new, blaze-core, blaze-check, blaze-alloc-count |
 //!
 //! bstd is `#![no_std]`; `alloc`'s global allocator is still underneath until S4's runtime: the few global allocations here
 //! are the effects' own buffers (blaze-core's `Effect` owns its bytes) and errors' messages,
@@ -113,6 +113,7 @@
     core_intrinsics,
     custom_inner_attributes,
     generic_atomic,
+    macro_attr,
     marker_trait_attr,
     register_tool,
     rustc_attrs,
@@ -216,6 +217,9 @@ pub mod rng;
 pub(crate) mod rt;
 /// Whom TLS trusts: `Roots`, a set of trust anchors.
 pub mod roots;
+/// `#[bstd::test]`: a test shaped like `main`, run on the simulation under many seeds with its
+/// faults on. Its items are [`test`]'s.
+mod simtest;
 /// Streams to an origin: `Streams`, from the host or a handler.
 pub mod streams;
 pub mod sync;
@@ -351,7 +355,11 @@ pub mod http {
     };
 }
 
-/// Testing: blaze-core's seeded simulation ([`test::Sim`]: a virtual clock, shuffled
+/// Testing. `#[bstd::test]` (the attribute, [`test!`]) is the default test of a bstd program:
+/// a function shaped like `main` run on the simulation under [`test::Seeds`], 256 by default,
+/// with every [`test::Fault`] kind on unless it leaves one out by name, a failure saying its
+/// seed and the line that replays it ([`test::run`]; docs/v2/plan/design/bstd-sim-test.md).
+/// Then blaze-core's seeded simulation itself ([`test::Sim`]: a virtual clock, shuffled
 /// completions, failures, crashes), the model checker for lock-free code ([`test::model`], its
 /// shims in [`test::checked`]), and allocation counting ([`test::Counting`], [`test::measure`]).
 /// Hegel stays a direct dev-dependency: its `#[hegel::test]` expands to `::hegel::` paths,
@@ -359,7 +367,12 @@ pub mod http {
 pub mod test {
     pub use blaze_alloc_count::{Counting, Used, assert_at_most, installed, measure};
     pub use blaze_check::{Builder, MAX_THREADS, model};
-    pub use blaze_core::sim::{Faults, Journal, KILLED, Program, Ran, Sim};
+    pub use blaze_core::sim::{
+        Faults, Journal, KILLED, Program, Ran, Sim,
+        seeds::{Broke, Counts, Ended, Failed, Fault, Given, Passed, Plan, Replay, Run, Seeds},
+    };
+
+    pub use crate::simtest::{BUDGET, Outcome, one, run, seeded};
 
     /// The model checker's shims, with std's API: a crate's code switches to them under
     /// `cfg(blaze_check)`.

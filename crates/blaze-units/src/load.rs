@@ -142,6 +142,8 @@ pub(crate) struct Spec {
     pub run: bool,
     /// `check`: the workspace's crates are linted by rustc's, clippy's and blaze's lints.
     pub lints: bool,
+    /// `check`'s lint levels of the command line ([`invocation::Asked::lint_levels`]).
+    pub lint_levels: Vec<String>,
     pub release: bool,
     pub profile: Option<String>,
     pub host: String,
@@ -256,6 +258,8 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         filter,
         run: asked.command() == Command::Run,
         lints: asked.command() == Command::Check,
+        // clone: the spec owns its levels, once per plan
+        lint_levels: asked.lint_levels.clone(),
         release: asked.release,
         profile: asked.profile.clone(),
         host: asked.host.clone(),
@@ -313,6 +317,7 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         },
         run: false,
         lints: false,
+        lint_levels: Vec::new(),
         release: false,
         profile: None,
         host: ask.host.clone(),
@@ -357,7 +362,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 9");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 10");
     type Key = ();
     type Value = Cbor<Planned>;
 

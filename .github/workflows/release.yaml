@@ -150,6 +150,10 @@ jobs:
       # Linux asks for a glibc newer than RHEL 9's. PGO is off: blaze applies only a profile
       # trained on its own build (tools/pgo/pgo.py), which it cannot make while it refuses
       # `-C profile-generate`; `"pgo": "pinned"` stops with that error (build_release.py).
+      # TODO(stage 0 with --deny): a release is to deny `blaze::todo` (docs/v2/plan/design/
+      # proved-unreachable.md), and a build runs no lints. No step here denies it yet: run
+      # `blaze check --workspace --deny blaze::todo` before this build once
+      # .github/blaze-version's release takes the option (docs/cargo.md#lints).
       - name: blaze build -p blaze-engine --profile dist
         run: |
           uv run --frozen --no-dev python .github/scripts/build_release.py \

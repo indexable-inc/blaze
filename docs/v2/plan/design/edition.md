@@ -39,7 +39,7 @@ it.
 | # | change | deletes | spec | size |
 |---|---|---|---|---|
 | 1 | **Handles copy themselves.** `Handle` marks types whose clone is a second reference to the same thing (`Arc`, `Rc`, channel senders, interned ids). Where a handle would be moved and is used again, it is copied; the last use moves. | `.clone()` on handles, clone-then-move blocks | here | small |
-| 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | here | medium |
+| 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | [error-sets](error-sets.md), here | medium |
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
 | 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | [records](records.md) | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
@@ -75,7 +75,7 @@ features some of them are written with):
 - Observable difference: a value lives until its last copy drops, and `Arc::strong_count`,
   `get_mut` and `try_unwrap` can see copies. So it is edition-only, never on ordinary Rust.
 
-**2. Error unions.**
+**2. Error unions.** (What is built, its cost and bstd's port: [error-sets](error-sets.md).)
 - Members are concrete named types at first; a type parameter in a union is refused (with two
   parameters equal, `T | U` would be ambiguous).
 - Layout is an enum with one variant per member, sorted by the member's type identity, so the
@@ -156,6 +156,7 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 | removed | instead |
 |---|---|
 | lossy `as` casts (truncating, sign-changing, float to int, pointer to int) | `From`, `TryFrom`, the named methods (`wrapping_`, `cast_signed`), `ptr::addr` |
+| integer arithmetic whose overflow is the profile's (`+ - * << >>`, unary `-`) where blaze can't show it fits | `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*`, or a check that bounds it ([explicit-overflow](explicit-overflow.md)) |
 | `async` and `await` | fibers and the inferred may-suspend effect |
 | the ambient file, clock, network, environment, process and thread APIs | capabilities of [bstd](std.md) |
 | the global allocator | an allocator the code was handed |
@@ -177,6 +178,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | lint | flags | fix |
 |---|---|---|
 | `blaze::lossy_as` | an `as` cast that can lose value or sign, or goes between pointer and integer | `T::from(x)` when lossless; else suggests `try_from` or the named method |
+| `blaze::implicit_overflow` | integer `+ - * << >>`, unary `-`, compound forms and value-losing casts the prover can't show fit; `strict_*`, `pow`, `abs`, `sum` | `checked_*` with `?` and `try_from` in an `Option` function, `try_from(x)?` where the error takes `TryFromIntError` |
 | `blaze::global_state` | a `static mut`, a `static` whose type has interior mutability (an atomic, a lock, a cell), a `thread_local!` | none: says where the state is used, so its owner can be chosen |
 | `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until fibers are the runtime of the crate |
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |

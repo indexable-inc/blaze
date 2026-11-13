@@ -80,6 +80,20 @@ pub fn check(
     name_of: NameOf<'_>,
 ) -> Result<Vec<Found>, diag::CheckError> {
     blaze_query::db::attach(db, || {
+        // A flag that names a lint no level waives, below `deny`, refuses the check: it is
+        // never read as if it had not been given.
+        for (name, level) in &setup.command_line.lints.opts {
+            let waived = !matches!(level, Level::Deny | Level::Forbid)
+                && blaze::UNWAIVABLE
+                    .iter()
+                    .any(|it| Target::of(name) == Some(Target::Blaze(it.bit())));
+            if waived {
+                return Err(diag::CheckError::Unwaivable {
+                    lint: name.clone(), // clone: the error's own copy
+                    level: crate::level::flag_of(*level).trim_start_matches("--").to_owned(), // alloc: an error's part
+                });
+            }
+        }
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
         driver.run()?;
@@ -962,6 +976,33 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.on.intersects(lint.bit())
     }
 
+    /// Where the lint attributes on `node` name exactly `lint` at a level below `deny`
+    /// (`allow`, `expect`, `warn`), `cfg_attr`s expanded: each name's range in `node`'s tree,
+    /// with the level as written.
+    pub(crate) fn waivers(
+        &self,
+        node: ast::Node<'_>,
+        lint: blaze::Lint,
+    ) -> Vec<(TextRange, &'static str)> {
+        let Some(owner) = ast::AnyHasAttrs::cast(node) else { return Vec::new() };
+        if owner.attrs().next().is_none() {
+            return Vec::new();
+        }
+        lint_attrs(self.cfg, owner)
+            .into_iter()
+            .filter(|it| it.target == Target::Blaze(lint.bit()))
+            .filter_map(|it| {
+                let level = match it.level {
+                    Level::Allow => "allow",
+                    Level::Expect => "expect",
+                    Level::Warn | Level::ForceWarn => "warn",
+                    Level::Deny | Level::Forbid => return None,
+                };
+                Some((it.range, level))
+            })
+            .collect() // alloc: the waivers on one node, none in almost every crate
+    }
+
     /// Whether the crate's root denies or forbids `lint` (`blaze::hot` counts for its lints)
     /// in its own attributes, `cfg_attr`s expanded: how a lint scoped to hot crates knows one.
     pub(crate) fn root_denies(&self, lint: blaze::Lint) -> bool {
@@ -1013,6 +1054,32 @@ impl<'q: 't, 't> Cx<'q, 't> {
 
     pub(crate) fn original_range(&self, node: ast::Node<'_>) -> Option<TextRange> {
         self.range(node)
+    }
+
+    /// Where `range` of `file` (the walked file or an expansion) is written in the tree of
+    /// [`Cx::text`]: `None` for what a macro made up, or a range of another file. An argument
+    /// of a macro call is written where the call is, so a lint of expressions reaches it: the
+    /// invisible group a `$e:expr` fragment is spliced in, whose tokens carry the macro's
+    /// spans, is trimmed off its ends first.
+    pub(crate) fn written_range(&self, file: HirFileId, range: TextRange) -> Option<TextRange> {
+        let HirFileId::MacroFile(call) = file else { return Some(range) };
+        let map = &call.parse_macro_expansion(self.db).value.1;
+        // alloc: the spans of one expression of an expansion, few
+        let spans: Vec<_> = map.spans_for_range(range).collect();
+        let written = |span: &span::Span| span.ctx.is_root();
+        let start = spans.iter().position(written)?;
+        let end = spans.iter().rposition(written)?;
+        let inner = &spans[start..=end];
+        let first = inner[0];
+        if inner.iter().any(|it| it.anchor != first.anchor || it.ctx != first.ctx)
+            || first.anchor.file_id != self.base.file.span_file_id(self.db)
+        {
+            return None;
+        }
+        let low = inner.iter().map(|it| it.range.start()).min()?;
+        let high = inner.iter().map(|it| it.range.end()).max()?;
+        let anchor = self.base.ast_id_map.try_get_erased(first.anchor.ast_id)?;
+        Some(TextRange::new(low, high) + anchor.text_range().start())
     }
 
     /// Where `token`, of the tree walked or of an expansion, is written in the tree of

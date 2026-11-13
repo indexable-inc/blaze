@@ -283,6 +283,7 @@ diagnostics![AnyDiagnostic<'db> ->
     AutoderefRecursionLimit<'db>,
     MethodOnUnknownRawPointee,
     TyvarBehindRawPointer,
+    MethodCallOnDivergingInferVar,
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
     SelfCtorNotTupleOrUnit<'db>,
@@ -2169,6 +2170,13 @@ pub struct MethodOnUnknownRawPointee {
 /// unknown pointee in edition 2015, a hard error from 2018.
 #[derive(Debug)]
 pub struct TyvarBehindRawPointer {
+    pub site: SpanSyntax,
+}
+
+/// `method_call_on_diverging_infer_var` "method call on a diverging inference variable": a
+/// method called on a value whose type is only known to come from a coercion of `!`.
+#[derive(Debug)]
+pub struct MethodCallOnDivergingInferVar {
     pub site: SpanSyntax,
 }
 
@@ -4974,6 +4982,9 @@ impl<'db> AnyDiagnostic<'db> {
             InferenceDiagnostic::TyvarBehindRawPointer { span } => {
                 TyvarBehindRawPointer { site: span_syntax(*span)? }.into()
             }
+            InferenceDiagnostic::MethodCallOnDivergingInferVar { span } => {
+                MethodCallOnDivergingInferVar { site: span_syntax(*span)? }.into()
+            }
             &InferenceDiagnostic::InheritedRefMutabilityMismatch { pat } => {
                 InheritedRefMutabilityMismatch { pat: pat_syntax(pat)? }.into()
             }
@@ -6076,6 +6087,9 @@ fn unplaced_inference_text<'db>(
         }
         InferenceDiagnostic::TyvarBehindRawPointer { .. } => {
             "type annotations needed: a method call on a raw pointer with an unknown pointee type".to_owned()
+        }
+        InferenceDiagnostic::MethodCallOnDivergingInferVar { .. } => {
+            "method call on a diverging inference variable".to_owned()
         }
         InferenceDiagnostic::InheritedRefMutabilityMismatch { .. } => {
             "E0308: mismatched types: cannot match inherited `&` with `&mut` pattern".to_owned()

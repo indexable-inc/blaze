@@ -1848,8 +1848,7 @@ mod tests {
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
         // The registration is made with this wait; a refusal comes back as its event.
-        let until = Deadline::after(driver.now(), Duration::from_millis(20));
-        driver.poll(&mut out, until);
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(20)));
         assert!(
             out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
             "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \

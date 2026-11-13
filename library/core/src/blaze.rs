@@ -1,4 +1,5 @@
-//! blaze's own attribute macros, the ones the attribute paths `blaze::…` name that expand: blaze's
+//! blaze's own macros, the ones the paths `blaze::…` name that expand (the attribute
+//! `blaze::contract_test`, the call `blaze::unreachable!()`): blaze's
 //! extension, not the Rust project's (`library/UPSTREAM` lists this module among blaze's changes
 //! to the standard library).
 //!
@@ -21,6 +22,20 @@
 #[unstable(feature = "blaze_verify", issue = "none")]
 #[rustc_builtin_macro]
 pub macro contract_test($item:item) {
+    /* compiler built-in */
+}
+
+/// `blaze::unreachable!()` marks a place blaze must prove no path reaches
+/// (docs/v2/plan/design/proved-unreachable.md): the lint `blaze::unreachable` refuses a call
+/// its proof of the function (`hir_ty_pure::reach`: the variants, bounds, lengths and non-zero
+/// divisors the checks that dominate the call establish) does not rule out, naming the
+/// function and what could not be shown. A path `blaze::unreachable` that names no macro of
+/// the crate's own resolves here. It expands to a panic, never to undefined behaviour, so a
+/// build that did not run the check is still sound. rustc has no such builtin, so a program
+/// that uses it is refused there, never built differently.
+#[unstable(feature = "blaze_unreachable", issue = "none")]
+#[rustc_builtin_macro(blaze_unreachable)]
+pub macro unreachable() {
     /* compiler built-in */
 }
 
