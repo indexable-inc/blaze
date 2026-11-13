@@ -691,7 +691,7 @@ fn axioms(p: &Patterns, root: &Path, lake: &Path, package: &str, listed: &Listed
         return (Vec::new(), Said::new());
     }
     let (code, log) = {
-        let tmp = TempDir::new("lean-gate-").unwrap_or_else(|e| fail(SCRIPT, &e));
+        let tmp = TempDir::new("lean-gate-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
         let file = tmp.path().join("Axioms.lean");
         if let Err(e) = std::fs::write(&file, axioms_file(&theorems)) {
             fail(SCRIPT, &blaze_script::os_error(&e, &file.display().to_string()));

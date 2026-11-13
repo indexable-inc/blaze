@@ -486,6 +486,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-cas",
  "blaze-codegen",
+ "blaze-core",
  "blaze-format",
  "blaze-ids",
  "blaze-profile",
@@ -882,6 +883,7 @@ name = "blaze-doc"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-graph",
  "blaze-hash",
  "blaze-query",
@@ -1400,6 +1402,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -1428,6 +1431,7 @@ name = "blaze-kernel"
 version = "0.0.0"
 dependencies = [
  "blaze-cas",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -1613,6 +1617,7 @@ name = "blaze-lower"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
@@ -1812,6 +1817,7 @@ name = "blaze-protocol"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-fuzz",
  "blaze-hash",
  "blaze-ids",
@@ -1931,6 +1937,7 @@ dependencies = [
  "blaze-protocol",
  "serde",
  "sonic-rs",
+ "stdx",
  "toml",
  "unicode-width 0.2.3",
 ]
@@ -1993,6 +2000,7 @@ dependencies = [
 name = "blaze-seed-run"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-wasi",
  "libc",
  "wasmtime",
@@ -2251,6 +2259,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -4117,6 +4126,7 @@ name = "hir-ty-lean"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-ids",
  "blaze-query",
  "cfg",

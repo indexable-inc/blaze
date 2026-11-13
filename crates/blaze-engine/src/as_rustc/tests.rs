@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use blaze_units::stdlib::target;
@@ -22,25 +22,15 @@ fn said(asked: &[&str], stdin: &str) -> Outcome {
 }
 
 /// A directory of its own for a test's outputs, removed when dropped.
-struct Scratch(PathBuf);
+struct Scratch(blaze_core::temp::TempDir);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-as-rustc-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
+        Scratch(blaze_core::temp::TempDir::for_test(&format!("blaze-as-rustc-{name}-")))
     }
 
     fn path(&self) -> &str {
-        self.0.to_str().unwrap()
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        _ = std::fs::remove_dir_all(&self.0);
+        self.0.path().to_str().unwrap()
     }
 }
 

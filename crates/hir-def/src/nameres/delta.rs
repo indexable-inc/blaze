@@ -1337,11 +1337,19 @@ fn cold(
 /// crate a decoded map whose modules are new ids: the rows it held name modules no map of the
 /// crate has. Positions are by `DefMap::modules` order, then by order in the module's scope,
 /// which is the order the impls tables give a crate's modules (`DefMap::module_rank`).
+///
+/// Read from each module's items segment of the crate's pages (`frozen::pages::module_items`):
+/// one read a module, and no module's scope decoded, so a served crate is handed over without
+/// a scope memo of it made. Every crate `frozen::is_served` says is read from pages.
 fn served_delta(db: &Db, krate: Crate) -> CrateDelta {
-    let def_map = crate::nameres::crate_def_map(db, krate);
     let mut items = Items::default();
-    for (rank, (_, module)) in (0u32..).zip(def_map.modules(db)) {
-        items.add(module.scope(db), &Pos::root().child(rank));
+    for module in 0..frozen::pages::modules(db, krate) {
+        let pos = Pos::root().child(module as u32);
+        let frozen::pages::ModuleItems { impls, derive_impls, traits } =
+            frozen::pages::module_items(db, krate, module);
+        items.impls.extend((0u32..).zip(impls).map(|(at, it)| (it, pos.child(at))));
+        items.derive_impls.extend((0u32..).zip(derive_impls).map(|(at, it)| (it, pos.child(at))));
+        items.traits.extend(traits);
     }
     let Items { impls, derive_impls, traits } = items;
     let mut out = empty_delta(krate);

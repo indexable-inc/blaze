@@ -24,6 +24,9 @@
 
 #![deny(unsafe_code)]
 #![cfg_attr(target_os = "macos", feature(link_arg_attribute))]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 #[expect(unsafe_code, reason = "Node-API's C ABI: raw handles in and out, each call's rule stated")]
 pub mod js;

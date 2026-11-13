@@ -11,8 +11,11 @@
 //!   cargo passes it, whether its package is a library's);
 //! - each directory read into the crate's source root ([`dir_key`]): the directory's Merkle
 //!   ID from the tree, with the paths under it that the load skips left out of it;
-//! - each dependency's plan key, in the crate's order, with its name and flags;
-//! - the front end's code identity.
+//! - each dependency's plan key, in the crate's order, with its name and flags.
+//!
+//! The front end's code identity is not in it: the lowering does not know it. The record's
+//! key covers it (`hir_def::deps::found_key(plan, front_end)`), so a record written by one
+//! front end is never asked for by another.
 //!
 //! **Cost.** [`dir_key`] asks the tree for one node ([`blaze_query::Tree::dir`]) when the
 //! load skips nothing under the directory, and otherwise lists only the directories on the
@@ -41,13 +44,16 @@ use span::Edition;
 use crate::{LowerError, files};
 
 /// The domain of a crate's plan key.
-pub(crate) const PLAN_KEY_DOMAIN: &str = "blaze v2 found key 1";
+pub(crate) const PLAN_KEY_DOMAIN: &str = "blaze v2 found key 2";
 /// The domain of a directory's key ([`dir_key`]).
 pub(crate) const DIR_KEY_DOMAIN: &str = "blaze v2 found key directory 1";
 
 /// Why a crate has no plan key: it is lowered by reading its package.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum NoPlanKey {
+pub enum NoPlanKey {
+    /// The crate was made by no plan's unit (a doctest example, a const-macro crate): the
+    /// lowering kept nothing of it to make a key from.
+    Unplanned,
     /// `path`, in a directory listed on the way to a skipped path, is a symlink.
     Symlink { path: String },
     /// The directory `dir` is not a directory of its mount's files.
@@ -64,6 +70,7 @@ pub(crate) enum NoPlanKey {
 impl std::fmt::Display for NoPlanKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NoPlanKey::Unplanned => f.write_str("it was made by no unit of a plan"),
             NoPlanKey::Symlink { path } => write!(
                 f,
                 "`{path}` is a symlink (rule: what a link reaches is not under its directory's ID)"
@@ -189,19 +196,48 @@ pub(crate) struct Said<'a> {
     pub(crate) deps: &'a [Dep<'a>],
     /// The [`dir_key`] of each directory read into its source root, by the directory's path.
     pub(crate) dirs: &'a [ContentId],
-    /// The front end's code identity (`blaze_codegen_code::FRONT_END`, as the image key's
-    /// `build`).
-    pub(crate) front_end: ContentId,
 }
 
 /// The plan key of the crate `said` is of, or why it has none.
 ///
 /// The invariant: two crates of equal plan keys are made of the same package files, the same
-/// settings and dependencies of equal plan keys, by the same front end; and the key is the
+/// settings and dependencies of equal plan keys (the front end is the record key's,
+/// `hir_def::deps::found_key`); and the key is the
 /// same for one crate in two checkouts at different paths (each path is written from the
 /// package's directory or `OUT_DIR`, and a variable holding any other absolute path as one
 /// marker).
 pub(crate) fn plan_key(said: &Said<'_>) -> Result<ContentId, NoPlanKey> {
+    Ok(joined(own_key(said)?, said.deps, said.dirs))
+}
+
+/// The domain of [`joined`].
+pub(crate) const JOINED_DOMAIN: &str = "blaze v2 found key joined 1";
+
+/// A crate's plan key from its [`own_key`], its dependencies' plan keys and its directories'
+/// keys: the half of [`plan_key`] that moves with a file or a dependency, which the lowering
+/// works out again after a write ([`crate::Lowered::plan_key`]) from the own key it kept when
+/// it made the crate.
+pub(crate) fn joined(own: ContentId, deps: &[Dep<'_>], dirs: &[ContentId]) -> ContentId {
+    let mut hasher = Hasher::new(JOINED_DOMAIN);
+    hasher.id(&own);
+    hasher.update(&(deps.len() as u64).to_le_bytes());
+    for dep in deps {
+        hasher
+            .id(&dep.key)
+            .part(dep.name.as_bytes())
+            .update(&[dep.prelude as u8, dep.sysroot as u8, dep.private as u8]);
+    }
+    hasher.update(&(dirs.len() as u64).to_le_bytes());
+    for dir in dirs {
+        hasher.id(dir);
+    }
+    hasher.finish()
+}
+
+/// The key of what the plan says of the crate itself: every field of `said` but `deps` and
+/// `dirs`, which [`joined`] adds. Fixed for a crate of the front end: a crate whose own key
+/// would differ is another crate (`Graph::made`).
+pub(crate) fn own_key(said: &Said<'_>) -> Result<ContentId, NoPlanKey> {
     let Said {
         package_dir,
         out_dir,
@@ -219,9 +255,8 @@ pub(crate) fn plan_key(said: &Said<'_>) -> Result<ContentId, NoPlanKey> {
         workspace,
         cfg,
         env,
-        deps,
-        dirs,
-        front_end,
+        deps: _,
+        dirs: _,
     } = said;
     let ExtraCrateData { version, display_name, potential_cfg_options, built_for, build_script_runs } =
         extra;
@@ -233,18 +268,10 @@ pub(crate) fn plan_key(said: &Said<'_>) -> Result<ContentId, NoPlanKey> {
         }
     }
     let mut hasher = Hasher::new(PLAN_KEY_DOMAIN);
-    hasher.id(front_end);
     base.path(&mut hasher, root);
     base.path(&mut hasher, passed_dir);
     hasher.update(&[*aliased as u8, *library as u8]);
     hasher.update(&(edition.number() as u64).to_le_bytes());
-    hasher.update(&(deps.len() as u64).to_le_bytes());
-    for dep in *deps {
-        hasher
-            .id(&dep.key)
-            .part(dep.name.as_bytes())
-            .update(&[dep.prelude as u8, dep.sysroot as u8, dep.private as u8]);
-    }
     origin.hash_into(&mut hasher);
     hasher.update(&(crate_attrs.len() as u64).to_le_bytes());
     for attr in crate_attrs.iter() {
@@ -281,10 +308,6 @@ pub(crate) fn plan_key(said: &Said<'_>) -> Result<ContentId, NoPlanKey> {
     for (name, value) in env {
         hasher.part(name.as_bytes());
         base.value(&mut hasher, value);
-    }
-    hasher.update(&(dirs.len() as u64).to_le_bytes());
-    for dir in *dirs {
-        hasher.id(dir);
     }
     Ok(hasher.finish())
 }
@@ -492,7 +515,6 @@ mod tests {
             env,
             deps,
             dirs,
-            front_end: ContentId::of("blaze v2 found test", b"front end"),
         }
     }
 
@@ -555,7 +577,6 @@ mod tests {
             ("a dependency", plan_key(&said("/home/a/w/p", "/home/a/w/p/src/lib.rs", &origin, &one, &cfg, &here, &dep, &dirs))),
             ("a dependency's key", plan_key(&said("/home/a/w/p", "/home/a/w/p/src/lib.rs", &origin, &one, &cfg, &here, &dep_edited, &dirs))),
             ("a dependency's name", plan_key(&said("/home/a/w/p", "/home/a/w/p/src/lib.rs", &origin, &one, &cfg, &here, &dep_renamed, &dirs))),
-            ("front end", of(&|it| it.front_end = ContentId::of("blaze v2 found test", b"another front end"))),
             ("workspace", of(&|it| it.workspace = ContentId::of("blaze v2 found test", b"another workspace"))),
             ("how cargo passes the root", of(&|it| it.passed_dir = "/home/a/w/p/src/../src")),
         ];

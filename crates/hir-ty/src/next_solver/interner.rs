@@ -3731,7 +3731,7 @@ mod attached_db {
                 });
                 assert_eq!(held, Ok(round));
                 for _ in 0..2 {
-                    rx.recv().unwrap().unwrap();
+                    rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
                 }
                 for _ in 0..4 {
                     let tx = tx.clone();
@@ -3752,7 +3752,7 @@ mod attached_db {
                     );
                 }
                 for _ in 0..4 {
-                    rx.recv().unwrap().unwrap();
+                    rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
                 }
             }
         }
@@ -3771,7 +3771,7 @@ mod attached_db {
                 pool.submit(None, f, move |it| {
                     _ = tx.send(it.map_err(|_| format!("{what} panicked")))
                 });
-                rx.recv().unwrap().unwrap();
+                rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
             };
             for round in 0..20u32 {
                 let [first, second] = [2 * round, 2 * round + 1].map(|at| {
@@ -3853,7 +3853,7 @@ mod attached_db {
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));
-                let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+                let mut ended = [rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended"), rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended")];
                 ended.sort();
                 assert_eq!(ended, [Ok(0), Ok(1)]);
                 assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
@@ -4405,6 +4405,10 @@ pub(crate) mod table {
     /// it for a push and a walk of the held graces, never a scan of the reclaim slots nor a
     /// free. Typed, not a `blaze_reclaim::Limbo` of boxes: a release of the tables takes out
     /// the retired tables of the indexes it frees by their owner ([`free_retired_of`]).
+    #[expect(
+        blaze::process_static,
+        reason = "retired tables are held only until their grace passes and a release collects them; the interner is process-wide by design"
+    )]
     static RETIRED: Lock<Vec<(Grace, Retired)>> = Lock::new("ty.interner.retired", Vec::new());
 
     /// Takes out of `held` the tables whose grace had passed by `horizon`, for the caller to
@@ -4527,6 +4531,10 @@ pub(crate) mod table {
     /// Every table that has added a row, each once, in the order they first did: what
     /// [`release_all`] releases. A table registers itself as it adds its first row
     /// ([`register`]), so no table can hold a row a release does not see.
+    #[expect(
+        blaze::process_static,
+        reason = "one entry per static table, each registered once: bounded by the interner's fixed set of tables"
+    )]
     static TABLES: Lock<Vec<&'static dyn Table>> = Lock::new("ty.interner.tables", Vec::new());
 
     /// How many releases of the tables there have been: what a cache kept outside them of

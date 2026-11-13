@@ -851,6 +851,13 @@ fn verify_claimed(
     row_node: u32,
     verified: u32,
 ) -> Option<u32> {
+    // A row whose edges a seal pass let go has none to look at: what it read is not known,
+    // so it runs again, named as the read that changed itself (its provenance reads
+    // `Changed` of its own node: its reads were let go, [`super::seal::Seals::let_go`]).
+    // Without this an empty span would prove it unchanged.
+    if storage.seals.let_go(row_node) {
+        return Some(row_node);
+    }
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
     let mut summary = [0; 2];

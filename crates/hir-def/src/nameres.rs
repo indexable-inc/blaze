@@ -347,6 +347,10 @@ struct DiagnosticsByModule {
 }
 
 impl DiagnosticsByModule {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the columns hold u32 indices of a def map's diagnostics; a def map with 2^32 diagnostics needs a typed refusal at collection"
+    )]
     fn of(diagnostics: &[DefDiagnostic]) -> DiagnosticsByModule {
         let len = u32::try_from(diagnostics.len()).expect("a def map has 2^32 diagnostics");
         // alloc: once per def map, when collection is done; the memo's own columns
@@ -1924,6 +1928,9 @@ pub enum NameRead {
     WholeScope(ModuleId),
     /// The modules declared in a module, by name.
     Children(ModuleId),
+    /// The table of every module of a crate (`Modules`' `table`): an iteration of all of
+    /// them, which no one name or scope stands for.
+    AllModules(Crate),
     /// What a crate's `DefMap` holds outside its modules' scopes: its prelude, extern prelude
     /// and `#[macro_use]` prelude, what its root's attributes decide, whether a module of it
     /// shadows a primitive type.
@@ -1988,10 +1995,20 @@ pub fn name_read(
         ("ModuleScope::traits", ReadKind::Function) => NameRead::Traits(scope_module(key)),
         ("scope", ReadKind::TrackedField(_)) => NameRead::WholeScope(scope_module(key)),
         ("children", ReadKind::TrackedField(_)) => NameRead::Children(scope_module(key)),
-        // A module's row or the table of them: its origin, visibility, parent and the id of
-        // its scope. What a name of it means is read through that scope's own rows.
+        // The table of every module: whoever reads it iterates them (a crate's inherent
+        // impls' associated types, a walk of its modules), so it is no handle: what it gives
+        // changes with any module added, removed or moved. A block's table is its one
+        // module, whose scope is the read.
+        ("table", ReadKind::TrackedField(_)) => {
+            let root = <Modules<'_> as FromId>::from_id(key).root(db).to_static();
+            match root.is_block_module(db) {
+                true => NameRead::WholeScope(root),
+                false => NameRead::AllModules(root.krate(db)),
+            }
+        }
+        // A module's row: its origin, visibility, parent and the id of its scope. What a name
+        // of it means is read through that scope's own rows.
         ("Modules::module", ReadKind::Function)
-        | ("table", ReadKind::TrackedField(_))
         | ("Modules" | "ModuleScope", ReadKind::Function)
         | ("crate_local_def_map", ReadKind::Function) => NameRead::Handle,
         // The pair's untracked half is the extern prelude; the `DefMap` holds the preludes

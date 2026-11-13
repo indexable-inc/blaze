@@ -546,6 +546,10 @@ impl Listed {
         self.requests += 1;
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a reference's place is a u32 in the codegen record; a function with 2^32 references needs a typed refusal from lowering"
+    )]
     fn next(&self) -> u32 {
         u32::try_from(self.refs.len()).expect("fewer than 2^32 references")
     }

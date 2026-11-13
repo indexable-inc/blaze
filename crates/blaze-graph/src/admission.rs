@@ -1,43 +1,29 @@
-//! What a task is expected to hold, for the plane's memory admission (docs/v2/plan.md section 4).
+//! What a task is: its kind, the subsystem it charges, and the one record admission forecasts
+//! its memory from (docs/v2/plan/design/end-state/memory.md, section 4.3).
 //!
-//! Every task runs in a bump arena of its own, so what it held at most is measured, not
-//! guessed. [`Estimates`] keeps, for each kind of task (a query kind), what tasks of it held,
-//! and predicts the next one's peak from it: the [`crate::machine::Spec::memory`] a node is
-//! added with. A task over its prediction is let finish and the estimate grows; nothing is
-//! cut short or retried. The estimates are kept across runs, in the daemon's image
-//! ([`Estimates::encode`]).
-//!
-//! The rule, integers only, the same observations giving the same estimates: a peak at or over
-//! the prediction becomes the prediction at once. A peak under it counts toward a window of
-//! [`WINDOW`] of them in a row; once the window is full the prediction comes down half the way
-//! (rounded up) to the most of the window's peaks, and a new window begins. So the prediction is a high
-//! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
-//! halves), never under the last peak seen, never over the most ever seen.
+//! Admission's forecast is for throughput only: a task starts when a thread of its pool is free
+//! and its forecast fits what the gate (`blaze_mem::budget::Budget`) leaves free, and a low
+//! forecast costs a wound, never the ceiling, since every commit passes the gate. So there is
+//! one predictor, [`Peaks`]: the peak a task of a kind and input size class last committed,
+//! written at the task's end, read at its push; one never seen is one quantum. A task at or
+//! under [`STANDING`] (its worker's standing frame) takes no reservation and never waits for
+//! memory.
 //!
 //! A task's peak is everything it held: what its work allocated through the global allocator,
 //! on its own job and on every job of the pool scopes it opened (its memory account,
 //! `arena::account`), never a sample of the whole process, and what its frames held
-//! (`blaze_mem::frame`). Each kind belongs to a
-//! subsystem ([`tag_of`]), and each subsystem has a budget, a share of the machine's
-//! ([`set_budgets`]): the scheduler holds back a task of a subsystem over its budget
-//! (`blaze_mem::tag::over_budget`) before the machine's budget is reached.
+//! (`blaze_mem::frame`). Each kind belongs to a subsystem ([`tag_of`]), the tag its memory is
+//! named by in spans and `blaze explain memory`.
 
 #![forbid(unsafe_code)]
 
-use std::{
-    fmt,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::fmt;
 
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::HashMap;
-use blaze_mem::{Tag, tag};
-use blaze_radix as radix;
+use blaze_mem::{Tag, budget::QUANTUM};
 use serde::{Deserialize, Serialize};
 use std::alloc::Global;
-
-/// How many peaks under a prediction, in a row, bring it down a step.
-pub const WINDOW: u32 = 64;
 
 /// A kind of task whose tasks are alike in what they hold: a query kind's number
 /// (`blaze_query::QueryKind`), or one of the plane's own (a link, a test run).
@@ -66,9 +52,7 @@ pub mod kinds {
     /// `blaze test --ub`: the tests selected, and one test evaluated.
     pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
     pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
-    /// A program's codegen: of a binary, test, bench, example or `cdylib`. One its predictor
-    /// has not measured is predicted the whole budget and runs alone
-    /// ([`super::Predict::measured`]), as [`PROGRAM_LINK`] is.
+    /// A program's codegen: of a binary, test, bench, example or `cdylib`.
     pub const PROGRAM: TaskKind = TaskKind(0x1_0009);
     /// A unit's names: whether its record is kept, its crate's def map, its check's bodies.
     pub const UNIT_NAMES: TaskKind = TaskKind(0x1_000a);
@@ -78,14 +62,13 @@ pub mod kinds {
     pub const UNIT_LINK: TaskKind = TaskKind(0x1_000c);
     /// A unit's outputs hashed, and its record encoded, for the store.
     pub const UNIT_STORE: TaskKind = TaskKind(0x1_000d);
-    /// A program's link, admitted as [`PROGRAM`] is.
+    /// A program's link.
     pub const PROGRAM_LINK: TaskKind = TaskKind(0x1_000e);
     /// What a build left for the store (dependency images, check outcomes, goals) written from
     /// its front end as it is kept, before the build answers.
     pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
-    /// A kept front end's values given back because memory is short
-    /// ([`crate::giveback::Rung::Values`]): swept on a worker, never the loop. Pushed with no
-    /// memory of its own, since it runs because memory is short.
+    /// A kept front end's values given back because memory is short: swept on a worker, never
+    /// the loop. Pushed with no memory of its own, since it runs because memory is short.
     pub const GIVE_BACK: TaskKind = TaskKind(0x1_0010);
     /// A checkout's front-end carry (`blaze_cargo::serve::front_carry`): its kernel session
     /// carried to a build's pin and saved, on a worker after the build, never the loop.
@@ -118,7 +101,7 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
     })
 }
 
-/// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
+/// The subsystem whose memory a task of `kind` holds: the tag it is named by.
 ///
 /// Query kinds go by `blaze_query::kinds`' ranges (inputs, facts `0x1000`, the front end
 /// `0x2000`, codegen and link `0x4000`, user code `0x5000`, the units' loads `0x6000`), the
@@ -153,17 +136,37 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
 /// Runs `f` as a task of `kind`: in a [`blaze_mem::frame::task`] of [`tag_of`]`(kind)`, so
 /// what it allocates from the global heap is charged to that subsystem's line and not to the
 /// heap outside any task, and says the most it held: its global allocations, its fan-out's
-/// included ([`crate::arena::account`]), and its frames' together, the peak [`Estimates`]
-/// learn from.
+/// included ([`crate::arena::account`]), and its frames' together, the peak [`Peaks`] record.
 /// Every runner of tasks (the exec scheduler's, the daemon's plane) runs a task's work through
 /// this, so a task's memory has one home whoever runs it. Says its global-heap churn too
-/// ([`TaskSpent::heap`]), for its `task` span.
+/// ([`TaskSpent::heap`]), for its `task` span. An unranked task ([`blaze_mem::frame::task`]):
+/// one its scheduler does not post again after it gives way; [`run_ranked`] is the other.
 pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, TaskSpent) {
     let tag = tag_of(kind);
     let ((out, heap), frames) = blaze_mem::frame::measure(|| {
         crate::arena::measured(|| blaze_mem::frame::task(tag, |_| f()))
     });
     (out, TaskSpent { peak: heap.peak + frames as u64, heap })
+}
+
+/// [`run_as`] at the gate's rank its scheduler gave it ([`blaze_mem::frame::task_ranked`]: its
+/// band and age, kept when it is posted again after giving way). It never waits to start:
+/// while the gate holds it behind an elder or the room, it says
+/// [`blaze_mem::gate::HeldBack`] at once and `f` does not run; its scheduler tells its plane
+/// it gave way held (`PlaneInput::Yielded { held: true }`) and posts it again once
+/// [`blaze_mem::gate::Gate::take_unheld`] names it (`PlaneInput::Unheld`). A thread is never
+/// spent waiting at the gate.
+pub fn run_ranked<R>(
+    kind: TaskKind,
+    rank: blaze_mem::gate::Ranked,
+    f: impl FnOnce() -> R,
+) -> Result<(R, TaskSpent), blaze_mem::gate::HeldBack> {
+    let tag = tag_of(kind);
+    let ((out, heap), frames) = blaze_mem::frame::measure(|| {
+        crate::arena::measured(|| blaze_mem::frame::task_ranked(tag, rank, |_| f()))
+    });
+    let out = out?;
+    Ok((out, TaskSpent { peak: heap.peak + frames as u64, heap }))
 }
 
 /// What a task spent ([`run_as`]).
@@ -177,436 +180,184 @@ pub struct TaskSpent {
     pub heap: crate::arena::Spent,
 }
 
-/// Each subsystem's budget as a share of the machine's, in 64ths. The shares sum past 64 on
-/// purpose: a build's phases peak at different times (names before bodies, bodies before
-/// code, code before the link), so each subsystem may take a large part of the machine while
-/// the others are small, and the machine's own budget still holds them all. No subsystem but
-/// the frames of every worker together may take more than half, so one that runs away is held
-/// back while the others still fit.
-pub const fn share(tag: Tag) -> u64 {
-    match tag {
-        Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
-        Tag::Mir | Tag::Query => 24,
-        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver | Tag::Pool => 16,
-        Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
-        Tag::Usercode | Tag::Other => 4,
-        Tag::Plane | Tag::Io | Tag::Api | Tag::Profile => 2,
-    }
+/// A worker's standing frame (memory.md 4.1): a task forecast at or under it takes no
+/// reservation, so it never waits for memory (a lookup never sees admission).
+pub const STANDING: u64 = 8 << 20;
+
+/// What admission reserves for a task forecast to hold `bytes`: whole quanta of the gate
+/// ([`QUANTUM`]), and nothing at or under [`STANDING`].
+pub const fn forecast_of(bytes: u64) -> u64 {
+    let whole = bytes.div_ceil(QUANTUM).saturating_mul(QUANTUM);
+    if whole <= STANDING { 0 } else { whole }
 }
 
-/// The memory the daemon may hold in all, as [`set_budgets`] was last given it: `u64::MAX`
-/// until then, which no [`Pressure`] reaches.
-static LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Sets each subsystem's budget ([`tag::set_budget`]) to its [`share`] of `machine` bytes, the
-/// memory the daemon runs under (`blaze_graph::arena::machine_budget`: the least of the
-/// machine's, its cgroup's and the limit it was started with), and keeps `machine` as the
-/// [`limit`] a build's [`Squeeze`] is decided against. One number, so every budget, the frames'
-/// cap and the front end's sweep (`blaze_query::db::budget`, which reads each tag's budget)
-/// follow the same limit.
-pub fn set_budgets(machine: u64) {
-    LIMIT.store(machine, Ordering::Relaxed);
-    for tag in Tag::ALL {
-        tag::set_budget(tag, machine / 64 * share(tag));
-    }
+/// What the gate leaves free for new starts, for [`crate::plane::PlaneInput::Room`]: its limit,
+/// less what it counts committed, less the overdrafts it sets aside for the workers, less
+/// `still_forecast`: what the running tasks are forecast to take past what they hold now (the
+/// sum over them of their forecast less their held quanta, never below 0). Without the last
+/// two a start could be forecast into room an earlier start has not reached yet. An overdraft
+/// in use is counted twice (committed and set aside), so it errs low, never high.
+pub fn free_for_starts(budget: &blaze_mem::budget::Budget, still_forecast: u64) -> u64 {
+    let config = budget.config();
+    let overdrafts = config.overdraft_per_worker.saturating_mul(u64::from(config.workers));
+    budget.limit().saturating_sub(
+        budget.committed().saturating_add(overdrafts).saturating_add(still_forecast),
+    )
 }
 
-/// What the machine's ledger last told this daemon to hold at most for the other daemons'
-/// wants ([`set_yield_to`]); `u64::MAX` for none.
-static YIELD_TO: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// What this daemon is to hold at most so that the other daemons of the machine get what
-/// they want (`crate::ledger::Ledger::yielded`): `u64::MAX` while it yields nothing. The
-/// give-back takes the less of this and [`limit`] as the limit it gives back to.
-pub fn yield_to() -> u64 {
-    YIELD_TO.load(Ordering::Relaxed)
+/// The size class of an input of `size` (whatever its kind counts: a unit's `reached`
+/// functions, a file's bytes): its bit length, so each class is twice the one below.
+pub const fn class_of(size: u64) -> u8 {
+    (u64::BITS - size.leading_zeros()) as u8
 }
 
-/// Says what the ledger's last turn told this daemon to hold at most ([`yield_to`]).
-pub fn set_yield_to(bytes: u64) {
-    YIELD_TO.store(bytes, Ordering::Relaxed);
+/// The first bytes of [`Peaks::encode`]'s bytes.
+const PEAKS_MAGIC: &[u8; 8] = b"blzpeaks";
+/// The layout of [`Peaks::encode`]'s bytes, after the magic.
+pub const PEAKS_LAYOUT: u64 = 1;
+/// The magic of what the daemon's image held before [`Peaks`]: the per-kind estimates, read as
+/// layout 0.
+const ESTIMATES_MAGIC: &[u8; 8] = b"blzest01";
+/// The bytes of one entry: its kind, its class and its peak.
+const ENTRY_BYTES: usize = 8 + 1 + 8;
+
+/// The one predictor of admission (memory.md 4.3): for each kind of task and size class of its
+/// input, the peak bytes the last task of them committed. Keyed per kind and class, never per
+/// crate (rule 65): every crate's tasks of a kind and size teach every other's. Kept across
+/// runs in the daemon's image ([`Peaks::encode`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Peaks {
+    by: HashMap<(u64, u8), u64, Global>, // alloc: the record, kept for the daemon's life and persisted
 }
 
-/// Whether the daemon has nothing left to give back but the work of the tasks under way
-/// ([`set_short`]).
-static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether memory is so short that the daemon is giving back the work of running tasks
-/// (`crate::giveback::Rung::Running`): what a long task reads at a point where it holds
-/// nothing of the front end and little is lost, to give way there (the codegen walk, between
-/// two runs of its worklist). One relaxed load.
-pub fn short() -> bool {
-    SHORT.load(Ordering::Relaxed)
-}
-
-/// Says whether memory is that short ([`short`]): set by the give-back's driver as it gives
-/// the `running tasks` rung, cleared once the footprint is within the limit and no task
-/// waits.
-pub fn set_short(short: bool) {
-    SHORT.store(short, Ordering::Relaxed);
-}
-
-/// [`set_budgets`]' `machine`: the memory the daemon may hold in all; `u64::MAX` before.
-pub fn limit() -> u64 {
-    LIMIT.load(Ordering::Relaxed)
-}
-
-/// Every subsystem's [`share`] summed, in 64ths: over 64, as [`share`] says why.
-pub const SHARES: u64 = {
-    let mut sum = 0;
-    let mut at = 0;
-    while at < Tag::COUNT {
-        sum += share(Tag::ALL[at]);
-        at += 1;
-    }
-    sum
-};
-
-/// `tag`'s part of `limit` when every subsystem must fit in it at once: its [`share`] of
-/// [`SHARES`], so the parts of all of them sum to at most `limit`. What a [`Squeeze`] past its
-/// line holds each subsystem's values to ([`Squeeze::caps`]), where a budget alone lets one
-/// take up to half of the limit.
-pub const fn fair_share(tag: Tag, limit: u64) -> u64 {
-    limit / SHARES * share(tag)
-}
-
-/// The subsystems a build's release lowers (`blaze-cargo`'s `unit::release`): what the front
-/// end's database keeps by bytes and its sweep lets go (parses, expansions, item signatures,
-/// inference) and the MIR the release drops. One of them past its [`fair_share`] makes a
-/// [`Squeeze`] due.
-pub const RELEASED: [Tag; 5] = [Tag::Parse, Tag::Nameres, Tag::Expand, Tag::Infer, Tag::Mir];
-
-/// A [`Squeeze`] past its line is due once blaze holds more than the limit less this part of
-/// it: an eighth, so the release comes before the limit, not at it.
-pub const LINE: u64 = 8;
-
-/// After a release, the next is due only once blaze holds this part of the limit more than it
-/// did as that release ended: a sixteenth. What a release can't let go (another job's front
-/// end, the store, a unit still compiling) stays over the line, and this keeps it from
-/// stopping the build at every unit; at most [`STEP`] stops fit between none held and the limit.
-pub const STEP: u64 = 16;
-
-/// What a release is decided on, read at one moment.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Pressure {
-    /// The process's footprint as the system counts it (`blaze_mem::tag::resident`: what the
-    /// limit is on and the watchdog reads), or, where the system does not say, what blaze itself
-    /// takes of it at most (`blaze_mem::tag::Snapshot::footprint`). coord-108 (B5): counting the
-    /// purged chunks (10 GiB after a burst of frames), a release said "blaze held 48.74 GiB" with
-    /// the process at 43.8. coord-111 (memcap5): counting what mimalloc ever committed, which a
-    /// purge never lowers, every one of 29 releases said "0.00 freed" and "blaze held 59.21 GiB"
-    /// with the process at 47.28.
-    pub held: u64,
-    /// [`limit`].
-    pub limit: u64,
-    /// The first of [`RELEASED`] that holds more than its [`fair_share`] of the limit, in its
-    /// regions and the global heap together: MIR and inference live in the heap, so a budget
-    /// read against regions alone (`blaze_mem::tag::over_budget`) never sees them, and a
-    /// budget (up to half the limit each) is passed only once the whole is too late to save.
-    pub over: Option<Tag>,
-}
-
-impl Pressure {
-    /// Now: one snapshot of the tags, and one read of the process's footprint.
-    pub fn now() -> Pressure {
-        let snapshot = tag::snapshot();
-        let limit = limit();
-        let over = RELEASED.into_iter().find(|&tag| {
-            let it = snapshot.get(tag);
-            it.live.saturating_add(it.heap) > fair_share(tag, limit)
-        });
-        Pressure { held: crate::arena::own_of(&snapshot), limit, over }
+impl Peaks {
+    pub fn new() -> Peaks {
+        Peaks::default()
     }
 
-    /// Whether blaze holds more than the limit less its [`LINE`]th: the release line
-    /// ([`crate::lines::Lines::release`], where the limit's lines are ordered).
-    pub const fn squeezed(&self) -> bool {
-        self.limit != u64::MAX && self.held >= crate::lines::Lines::of(self.limit).release()
-    }
-}
-
-/// When a build stops its readers to let go of what its front end keeps for no task to come
-/// (`blaze-cargo`'s `unit::release`): sans IO, decided on [`Pressure`]s it is given. A release
-/// is due when blaze is past the limit's line or a subsystem it lowers is past its share, and
-/// blaze has grown by a [`STEP`]th of the limit since the last release ended. Without a limit
-/// none is ever due.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Squeeze {
-    /// What blaze held as the last release ended, and a [`STEP`]th of the limit.
-    after: u64,
-}
-
-impl Squeeze {
-    /// Whether a release is due at `now`.
-    pub const fn due(&self, now: Pressure) -> bool {
-        now.limit != u64::MAX && (now.squeezed() || now.over.is_some()) && now.held >= self.after
+    /// The peak the last task of `kind` and `class` committed, if one was recorded.
+    pub fn peak(&self, kind: u64, class: u8) -> Option<u64> {
+        self.by.get(&(kind, class)).copied()
     }
 
-    /// Whether a release is due at `now` for a task the plane holds back for memory the
-    /// process holds besides its tasks (`crate::Plane::short`): under a limit, whatever the
-    /// line, once blaze has grown by a [`STEP`]th of the limit since the last release ended.
-    /// Waiting would never free that memory, and the line (an eighth under the limit) may be
-    /// far above what keeps a task out: 31 GB held of 47 kept out a task predicted 15.78 GB
-    /// with the line at 41 (memadmit).
-    pub const fn short(&self, now: Pressure) -> bool {
-        now.limit != u64::MAX && now.held >= self.after
+    /// A task of `kind` and `class` ended having committed `peak` bytes at most: the record
+    /// from now on, whatever it was.
+    pub fn observe(&mut self, kind: u64, class: u8, peak: u64) {
+        self.by.insert((kind, class), peak);
     }
 
-    /// One that begins where a release of this daemon last left off: `after`, another's
-    /// [`Squeeze::mark`]. A build's squeeze starts from the daemon's last, never from nothing:
-    /// a daemon that sits at its limit's line (a hello-world's front end holding 19 GiB of a
-    /// limit of 21.78, 2026-11-12) otherwise stops every build for a release, whatever the
-    /// last one freed (143 ms on the loop for 0.36 GiB, then one for 0.00).
-    pub const fn starting_after(after: u64) -> Squeeze {
-        Squeeze { after }
+    /// What a task of `kind` and `class` is forecast to hold: the recorded peak, else one
+    /// quantum.
+    pub fn forecast(&self, kind: u64, class: u8) -> u64 {
+        self.peak(kind, class).unwrap_or(QUANTUM)
     }
 
-    /// What blaze must hold again before the next release is due: what it held as the last
-    /// one ended and a [`STEP`]th of the limit; 0 before any.
-    pub const fn mark(&self) -> u64 {
-        self.after
+    pub fn len(&self) -> usize {
+        self.by.len()
     }
 
-    /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.
-    pub fn released(&mut self, now: Pressure) {
-        self.after = now.held.saturating_add(now.limit / STEP);
+    pub fn is_empty(&self) -> bool {
+        self.by.is_empty()
     }
 
-    /// What each subsystem's values may weigh in the sweep of a release that was due at `now`
-    /// (`blaze_query::db::Storage::sweep_values`): each of [`RELEASED`] its [`fair_share`] of the
-    /// limit, what made the release due; past the line every subsystem its own, so together they
-    /// fit in the limit. No cap but its budget for any other.
-    pub fn caps(now: Pressure) -> [u64; Tag::COUNT] {
-        let mut caps = [u64::MAX; Tag::COUNT];
-        for tag in Tag::ALL {
-            if now.squeezed() || RELEASED.contains(&tag) {
-                caps[tag.index()] = fair_share(tag, now.limit);
-            }
-        }
-        caps
-    }
-}
-
-/// What tasks of one kind held: 40 bytes.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Estimate {
-    /// How many were measured.
-    pub seen: u64,
-    /// The most any of them held, in bytes.
-    pub most: u64,
-    /// A high quantile of what they held, in bytes: what a new task is predicted to hold.
-    pub predicted: u64,
-    /// How many peaks under `predicted` came in a row since it last moved: the window.
-    #[serde(default)]
-    pub below: u32,
-    /// The most of the window's peaks.
-    #[serde(default)]
-    pub below_most: u64,
-}
-
-const _: () = assert!(size_of::<Estimate>() == 40);
-
-impl Estimate {
-    /// One more task held `peak` bytes at most: `predicted` rises to a peak at or above it at
-    /// once, and falls halfway to the window's most after [`WINDOW`] peaks below it in a row.
-    pub fn observe(&mut self, peak: u64) {
-        self.seen = self.seen.saturating_add(1);
-        self.most = self.most.max(peak);
-        if peak >= self.predicted {
-            self.predicted = peak;
-            self.below = 0;
-            self.below_most = 0;
-            return;
-        }
-        self.below += 1;
-        self.below_most = self.below_most.max(peak);
-        if self.below >= WINDOW {
-            self.predicted -= (self.predicted - self.below_most).div_ceil(2);
-            self.below = 0;
-            self.below_most = 0;
-        }
-    }
-
-    /// Whether it is one [`Estimate::observe`] can make.
-    fn is_sound(&self) -> bool {
-        self.seen > 0
-            && self.predicted <= self.most
-            && self.below < WINDOW
-            && ((self.below == 0 && self.below_most == 0)
-                || (u64::from(self.below) <= self.seen && self.below_most < self.predicted))
-    }
-}
-
-/// Each kind's [`Estimate`], learned as tasks finish. A predict or an observe is one hash of
-/// the kind's `u32` and one probe; an observe of a kind seen before allocates nothing. Kinds
-/// are written in order of their numbers, by [`Estimates::encode`] and by serde alike.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-pub struct Estimates {
-    #[serde(with = "in_order")]
-    pub by_kind: HashMap<TaskKind, Estimate, Global>, // alloc: the estimates, kept across builds and persisted
-    /// What a task of a kind never measured is predicted to hold.
-    pub unseen: u64,
-}
-
-/// [`Estimates::by_kind`] for serde, its kinds in order, so the same estimates give the same
-/// bytes whatever order their kinds were first seen in.
-mod in_order {
-    use blaze_hash::HashMap;
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::alloc::Global;
-
-    use super::{Estimate, TaskKind};
-
-    pub(super) fn serialize<S: Serializer>(
-        by_kind: &HashMap<TaskKind, Estimate, Global>, // alloc: the estimates, kept across builds and persisted
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(super::sorted(by_kind))
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> {
-        // alloc: the estimates, kept across builds and persisted
-        HashMap::deserialize(deserializer)
-    }
-}
-
-/// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
-fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> {
-    // alloc: the estimates, kept across builds and persisted
-    // alloc: once per encoding of the estimates, as the daemon's image is written
-    let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
-    radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
-    kinds
-}
-
-/// The first bytes of [`Estimates::encode`]'s bytes, its version with them.
-const MAGIC: &[u8; 8] = b"blzest01";
-/// The bytes of one kind in [`Estimates::encode`]'s bytes.
-const KIND_BYTES: usize = 4 + 4 + 8 * 4;
-
-impl Estimates {
-    /// No kind measured yet, each predicted to hold `unseen`.
-    pub fn new(unseen: u64) -> Estimates {
-        Estimates { by_kind: HashMap::new_in(Global), unseen } // alloc: the estimates, kept across builds and persisted
-    }
-
-    /// The peak a task of `kind` is predicted to hold, in bytes.
-    pub fn predict(&self, kind: TaskKind) -> u64 {
-        match self.by_kind.get(&kind) {
-            Some(estimate) if estimate.seen > 0 => estimate.predicted,
-            _ => self.unseen,
-        }
-    }
-
-    /// A task of `kind` finished having held `peak` bytes at most.
-    pub fn observe(&mut self, kind: TaskKind, peak: u64) {
-        self.by_kind.entry(kind).or_default().observe(peak);
-    }
-
-    /// The estimates as bytes for the daemon's image: the same estimates give the same bytes.
-    /// Integers are little-endian: `MAGIC`, `unseen`, the count of kinds, then each kind in
-    /// order: its number, `below`, `seen`, `most`, `predicted`, `below_most`.
+    /// The record as bytes for the daemon's image: the same record gives the same bytes,
+    /// whatever order it was taught in. Little-endian: the magic `blzpeaks`, [`PEAKS_LAYOUT`],
+    /// the count of entries, then each entry by `(kind, class)` ascending: its kind (`u64`),
+    /// class (`u8`) and peak (`u64`).
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(MAGIC.len() + 16 + self.by_kind.len() * KIND_BYTES);
-        bytes.put_bytes(MAGIC);
-        bytes.put_u64(self.unseen);
-        bytes.put_u64(self.by_kind.len() as u64);
-        for (kind, estimate) in sorted(&self.by_kind) {
-            bytes.put_u32(kind.0);
-            bytes.put_u32(estimate.below);
-            for it in [estimate.seen, estimate.most, estimate.predicted, estimate.below_most] {
-                bytes.put_u64(it);
-            }
+        let mut entries: Vec<((u64, u8), u64)> = // alloc: the entries in order, once per encode
+            self.by.iter().map(|(&key, &peak)| (key, peak)).collect();
+        entries.sort_unstable_by_key(|it| it.0);
+        // alloc: the image's bytes, once per encode
+        let mut bytes = Vec::with_capacity(PEAKS_MAGIC.len() + 16 + entries.len() * ENTRY_BYTES);
+        bytes.put_bytes(PEAKS_MAGIC);
+        bytes.put_u64(PEAKS_LAYOUT);
+        bytes.put_u64(entries.len() as u64);
+        for ((kind, class), peak) in entries {
+            bytes.put_u64(kind);
+            bytes.put_u8(class);
+            bytes.put_u64(peak);
         }
         bytes
     }
 
-    /// The estimates [`Estimates::encode`] gave `bytes`, or what is wrong with them: bytes of
-    /// another version, cut short or with more after, kinds out of order, or an estimate no
-    /// run of observations makes.
-    pub fn decode(bytes: &[u8]) -> Result<Estimates, DecodeError> {
+    /// The record [`Peaks::encode`] gave `bytes`, or what is wrong with them, named: another
+    /// file's bytes, another layout's (the estimates before it are layout 0), cut short or with
+    /// more after, or entries out of order.
+    pub fn decode(bytes: &[u8]) -> Result<Peaks, PeaksError> {
         let mut read = Reader::new(bytes);
-        if read.array::<8>()? != MAGIC {
-            return Err(DecodeError::Version);
+        let magic = *read.array::<8>()?;
+        if &magic == ESTIMATES_MAGIC {
+            return Err(PeaksError::Layout { found: 0, reads: PEAKS_LAYOUT });
         }
-        let unseen = read.u64()?;
+        if &magic != PEAKS_MAGIC {
+            return Err(PeaksError::Magic { found: magic });
+        }
+        let layout = read.u64()?;
+        if layout != PEAKS_LAYOUT {
+            return Err(PeaksError::Layout { found: layout, reads: PEAKS_LAYOUT });
+        }
         let count = read.u64()?;
-        if count.checked_mul(KIND_BYTES as u64) != Some(read.left() as u64) {
-            return Err(DecodeError::Length { count, bytes: bytes.len() });
+        if count.checked_mul(ENTRY_BYTES as u64) != Some(read.left() as u64) {
+            return Err(PeaksError::Length { count, bytes: bytes.len() });
         }
-        let mut by_kind = HashMap::new_in(Global); // alloc: the estimates, kept across builds and persisted
-        by_kind.reserve(count as usize);
-        let mut last: Option<u32> = None;
+        let mut by = HashMap::new_in(Global); // alloc: the record, kept for the daemon's life
+        by.reserve(count as usize);
+        let mut last: Option<(u64, u8)> = None;
         for _ in 0..count {
-            let kind = read.u32()?;
-            if last.is_some_and(|it| it >= kind) {
-                return Err(DecodeError::Order { kind });
+            let key = (read.u64()?, read.u8()?);
+            if last.is_some_and(|it| it >= key) {
+                return Err(PeaksError::Order { kind: key.0, class: key.1 });
             }
-            last = Some(kind);
-            let estimate = Estimate {
-                below: read.u32()?,
-                seen: read.u64()?,
-                most: read.u64()?,
-                predicted: read.u64()?,
-                below_most: read.u64()?,
-            };
-            if !estimate.is_sound() {
-                return Err(DecodeError::Unsound { kind });
-            }
-            by_kind.insert(TaskKind(kind), estimate);
+            last = Some(key);
+            by.insert(key, read.u64()?);
         }
-        Ok(Estimates { by_kind, unseen })
+        Ok(Peaks { by })
     }
 }
 
-/// Why bytes are not [`Estimates`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodeError {
-    /// Not of this version of [`Estimates::encode`].
-    Version,
-    Short {
-        at: usize,
-    },
-    /// Not as many bytes as `count` kinds take.
-    Length {
-        count: u64,
-        bytes: usize,
-    },
-    /// A kind not after the one before it.
-    Order {
-        kind: u32,
-    },
-    /// An estimate no observations make.
-    Unsound {
-        kind: u32,
-    },
+/// Why bytes are not a [`Peaks`] record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeaksError {
+    /// Not a peaks record at all.
+    Magic { found: [u8; 8] },
+    /// A peaks record of layout `found`, where this blaze reads layout `reads`: learned again
+    /// from the next tasks' peaks.
+    Layout { found: u64, reads: u64 },
+    Short { at: usize },
+    /// Not as many bytes as `count` entries take.
+    Length { count: u64, bytes: usize },
+    /// An entry not after the one before it.
+    Order { kind: u64, class: u8 },
 }
 
-impl fmt::Display for DecodeError {
+impl fmt::Display for PeaksError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DecodeError::Version => write!(f, "memory estimates of another version"),
-            DecodeError::Short { at } => write!(f, "memory estimates cut short at byte {at}"),
-            DecodeError::Length { count, bytes } => {
-                write!(f, "memory estimates of {count} kinds in {bytes} bytes")
+        match *self {
+            PeaksError::Magic { found } => {
+                write!(f, "memory peaks: the bytes begin {found:02x?}, not `blzpeaks`")
             }
-            DecodeError::Order { kind } => {
-                write!(f, "memory estimates with kind {kind} out of order")
+            PeaksError::Layout { found, reads } => write!(
+                f,
+                "memory peaks of layout {found}, where this blaze reads layout {reads}: they are \
+                 learned again from the next tasks' peaks"
+            ),
+            PeaksError::Short { at } => write!(f, "memory peaks cut short at byte {at}"),
+            PeaksError::Length { count, bytes } => {
+                write!(f, "memory peaks of {count} entries in {bytes} bytes")
             }
-            DecodeError::Unsound { kind } => {
-                write!(f, "memory estimate of kind {kind} that no observations make")
+            PeaksError::Order { kind, class } => {
+                write!(f, "memory peaks with kind {kind:#x} class {class} out of order")
             }
         }
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl std::error::Error for PeaksError {}
 
-impl From<cursor::Error> for DecodeError {
-    fn from(error: cursor::Error) -> DecodeError {
-        DecodeError::Short { at: error.at }
+impl From<cursor::Error> for PeaksError {
+    fn from(error: cursor::Error) -> PeaksError {
+        PeaksError::Short { at: error.at }
     }
 }
 
@@ -651,280 +402,11 @@ pub trait Predict: Send {
     }
 }
 
-/// Today's predictor: peaks by kind, costs left as the specs give them.
-impl Predict for Estimates {
-    fn predict(&self, kind: TaskKind, _key: Option<crate::Key>) -> Prediction {
-        Prediction { cost: None, peak: Estimates::predict(self, kind) }
-    }
-
-    fn observe(&mut self, kind: TaskKind, _key: Option<crate::Key>, _ran_ns: u64, peak: u64) {
-        Estimates::observe(self, kind, peak);
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        Estimates::encode(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use blaze_ids::rng::SplitMix64;
 
     use super::*;
-
-    /// A peak of one of a few sizes, now and then far bigger.
-    fn peak(random: &mut SplitMix64) -> u64 {
-        match random.below(20) {
-            0 => random.below(1 << 34),
-            1..=3 => 0,
-            _ => (1 + random.below(8)) << (10 + random.below(16)),
-        }
-    }
-
-    #[test]
-    fn estimates_predict_peaks_and_keep_the_specs_costs() {
-        // Through the trait, as the scheduler asks: the inherent methods take no key.
-        let mut predict = Estimates::new(64);
-        let key = Some(crate::Key([1; 32]));
-        let peak = Predict::predict(&predict, TaskKind(2), key);
-        assert_eq!(peak, Prediction { cost: None, peak: 64 });
-        Predict::observe(&mut predict, TaskKind(2), key, 5_000, 900);
-        let prediction = Predict::predict(&predict, TaskKind(2), None);
-        assert_eq!(prediction, Prediction { cost: None, peak: 900 });
-        let mut estimates = Estimates::new(64);
-        estimates.observe(TaskKind(2), 900);
-        assert_eq!(Predict::encode(&predict), estimates.encode());
-
-        let mut spec = crate::Spec {
-            id: crate::NodeId(0),
-            kind: blaze_protocol::events::NodeKind::Codegen,
-            name: "f".into(),
-            deps: Vec::new(),
-            pool: crate::Pool::Work,
-            cost: 3,
-            key,
-            memory: 1000,
-        };
-        prediction.apply(&mut spec);
-        assert_eq!((spec.cost, spec.memory), (3, 1000));
-        Prediction { cost: Some(7), peak: 2000 }.apply(&mut spec);
-        assert_eq!((spec.cost, spec.memory), (7, 2000));
-    }
-
-    #[test]
-    fn a_kind_never_measured_is_unseen() {
-        let mut estimates = Estimates::new(7 << 20);
-        assert_eq!(estimates.predict(TaskKind(3)), 7 << 20);
-        estimates.observe(TaskKind(3), 100);
-        assert_eq!(estimates.predict(TaskKind(3)), 100);
-        assert_eq!(estimates.predict(TaskKind(4)), 7 << 20);
-    }
-
-    #[test]
-    fn a_peak_over_the_prediction_is_the_prediction_at_once() {
-        let mut estimates = Estimates::new(0);
-        let kind = TaskKind(1);
-        estimates.observe(kind, 1000);
-        estimates.observe(kind, 10);
-        assert_eq!(estimates.predict(kind), 1000);
-        estimates.observe(kind, 5000);
-        assert_eq!(estimates.predict(kind), 5000);
-        let estimate = estimates.by_kind[&kind];
-        assert_eq!((estimate.seen, estimate.most, estimate.below), (3, 5000, 0));
-    }
-
-    #[test]
-    fn smaller_peaks_bring_it_down_by_halves_a_window_at_a_time() {
-        let mut estimates = Estimates::new(0);
-        let kind = TaskKind(1);
-        estimates.observe(kind, 1 << 20);
-        for _ in 0..WINDOW - 1 {
-            estimates.observe(kind, 1024);
-            assert_eq!(estimates.predict(kind), 1 << 20);
-        }
-        estimates.observe(kind, 1024);
-        assert_eq!(estimates.predict(kind), 1024 + ((1 << 20) - 1024) / 2);
-        let mut windows = 1;
-        while estimates.predict(kind) > 1024 {
-            for _ in 0..WINDOW {
-                estimates.observe(kind, 1024);
-            }
-            windows += 1;
-        }
-        assert_eq!(estimates.predict(kind), 1024);
-        assert!(windows <= 21, "{windows} windows");
-        assert_eq!(estimates.by_kind[&kind].most, 1 << 20);
-    }
-
-    /// Over random runs of peaks of many kinds, after every observation: the prediction is not
-    /// under the peak just seen nor over the most seen, it comes down only at the end of a full
-    /// window of smaller peaks and never under the most of them, and it went up only to a peak.
-    #[test]
-    fn random_peaks_keep_the_rule() {
-        for seed in 0..200u64 {
-            let mut random = SplitMix64::new(seed);
-            let mut estimates = Estimates::new(random.below(1 << 30));
-            let mut smaller_in_a_row = Windows::new();
-            for _ in 0..2000 {
-                let kind = TaskKind(random.below(4) as u32);
-                let peak = peak(&mut random);
-                let before = estimates.by_kind.get(&kind).copied();
-                estimates.observe(kind, peak);
-                let after = estimates.by_kind[&kind];
-                let predicted = estimates.predict(kind);
-                assert_eq!(predicted, after.predicted);
-                assert!(predicted >= peak, "seed {seed}: {predicted} under the last peak {peak}");
-                assert!(predicted <= after.most, "seed {seed}: {predicted} over {}", after.most);
-                assert!(after.is_sound(), "seed {seed}: {after:?}");
-                let window = smaller_in_a_row.entry(kind).or_default();
-                match before {
-                    Some(before) if peak < before.predicted => {
-                        window.0 += 1;
-                        window.1 = window.1.max(peak);
-                        if predicted < before.predicted {
-                            assert_eq!(window.0, WINDOW, "seed {seed}: down after {}", window.0);
-                            assert!(predicted >= window.1, "seed {seed}");
-                            *window = (0, 0);
-                        } else {
-                            assert_eq!(predicted, before.predicted, "seed {seed}");
-                        }
-                    }
-                    _ => {
-                        assert_eq!(predicted, peak, "seed {seed}");
-                        *window = (0, 0);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Per kind: the smaller peaks in a row since its prediction moved, and the most of them.
-    type Windows = BTreeMap<TaskKind, (u32, u64)>;
-
-    #[test]
-    fn the_same_observations_give_the_same_estimates_and_bytes() {
-        for seed in 0..50u64 {
-            let run = || {
-                let mut random = SplitMix64::new(seed);
-                let mut estimates = Estimates::new(1 << 20);
-                for _ in 0..1000 {
-                    let kind = TaskKind(random.below(6) as u32);
-                    estimates.observe(kind, peak(&mut random));
-                }
-                estimates
-            };
-            let (a, b) = (run(), run());
-            assert_eq!(a, b, "seed {seed}");
-            assert_eq!(a.encode(), b.encode(), "seed {seed}");
-        }
-    }
-
-    /// The bytes [`Estimates::encode`] gave while the kinds were a `BTreeMap`: kinds in order.
-    fn encoded(model: &BTreeMap<TaskKind, Estimate>, unseen: u64) -> Vec<u8> {
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&unseen.to_le_bytes());
-        bytes.extend_from_slice(&(model.len() as u64).to_le_bytes());
-        for (kind, estimate) in model {
-            bytes.extend_from_slice(&kind.0.to_le_bytes());
-            bytes.extend_from_slice(&estimate.below.to_le_bytes());
-            for it in [estimate.seen, estimate.most, estimate.predicted, estimate.below_most] {
-                bytes.extend_from_slice(&it.to_le_bytes());
-            }
-        }
-        bytes
-    }
-
-    /// The hashed table predicts what the ordered map it replaced predicted, after every
-    /// observation of kinds far apart (query kinds, the daemon's own, `u32::MAX`), and its
-    /// bytes are the map's.
-    #[test]
-    fn the_hashed_table_says_what_the_ordered_map_said() {
-        let kinds = [0, 1, 7, 300, 0x6000, 0x1_0001, 0x1_0004, u32::MAX];
-        for seed in 0..100u64 {
-            let mut random = SplitMix64::new(seed);
-            let unseen = random.below(1 << 24);
-            let mut estimates = Estimates::new(unseen);
-            let mut model: BTreeMap<TaskKind, Estimate> = BTreeMap::new();
-            for _ in 0..1500 {
-                let kind = TaskKind(kinds[random.index(kinds.len())]);
-                let peak = peak(&mut random);
-                estimates.observe(kind, peak);
-                model.entry(kind).or_default().observe(peak);
-                let asked = TaskKind(kinds[random.index(kinds.len())]);
-                let want =
-                    model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
-                assert_eq!(estimates.predict(asked), want, "seed {seed}");
-            }
-            assert_eq!(estimates.by_kind.len(), model.len(), "seed {seed}");
-            assert_eq!(estimates.encode(), encoded(&model, unseen), "seed {seed}");
-        }
-    }
-
-    /// The same estimates, their kinds first seen in another order, give the same bytes, by
-    /// [`Estimates::encode`] and by serde, and come back from both.
-    #[test]
-    fn the_order_kinds_came_in_changes_no_byte() {
-        for seed in 0..50u64 {
-            let mut random = SplitMix64::new(seed);
-            let runs: Vec<(TaskKind, Vec<u64>)> = (0..1 + random.below(40))
-                .map(|kind| {
-                    let kind = TaskKind((kind as u32).wrapping_mul(0x9e37_79b9));
-                    (kind, (0..1 + random.below(200)).map(|_| peak(&mut random)).collect())
-                })
-                .collect();
-            let mut forward = Estimates::new(5);
-            for (kind, peaks) in &runs {
-                for &peak in peaks {
-                    forward.observe(*kind, peak);
-                }
-            }
-            let mut backward = Estimates::new(5);
-            for (kind, peaks) in runs.iter().rev() {
-                for &peak in peaks {
-                    backward.observe(*kind, peak);
-                }
-            }
-            assert_eq!(forward, backward, "seed {seed}");
-            assert_eq!(forward.encode(), backward.encode(), "seed {seed}");
-            let json = serde_json::to_vec(&forward).unwrap();
-            assert_eq!(json, serde_json::to_vec(&backward).unwrap(), "seed {seed}");
-            assert_eq!(serde_json::from_slice::<Estimates>(&json).unwrap(), forward, "seed {seed}");
-            assert_eq!(Estimates::decode(&forward.encode()), Ok(forward), "seed {seed}");
-        }
-    }
-
-    #[test]
-    fn estimates_come_back_from_their_bytes_and_bad_bytes_are_refused() {
-        let mut random = SplitMix64::new(9);
-        let mut estimates = Estimates::new(123);
-        for _ in 0..500 {
-            estimates.observe(TaskKind(random.below(5) as u32), peak(&mut random));
-        }
-        let bytes = estimates.encode();
-        assert_eq!(Estimates::decode(&bytes).as_ref(), Ok(&estimates));
-        assert_eq!(Estimates::decode(&Estimates::new(5).encode()), Ok(Estimates::new(5)));
-        assert_eq!(Estimates::decode(b"blzest00"), Err(DecodeError::Version));
-        assert_eq!(Estimates::decode(&bytes[..12]), Err(DecodeError::Short { at: 8 }));
-        assert!(matches!(
-            Estimates::decode(&bytes[..bytes.len() - 1]),
-            Err(DecodeError::Length { .. })
-        ));
-        let mut longer = bytes.clone();
-        longer.push(0);
-        assert!(matches!(Estimates::decode(&longer), Err(DecodeError::Length { .. })));
-        // The predicted bytes of the first kind made more than the most.
-        let mut unsound = bytes.clone();
-        let first = MAGIC.len() + 16;
-        unsound[first + 24..first + 32].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(Estimates::decode(&unsound), Err(DecodeError::Unsound { .. })));
-        // The second kind's number made the first's.
-        let mut order = bytes;
-        let kind = order[first..first + 4].to_vec();
-        order[first + KIND_BYTES..first + KIND_BYTES + 4].copy_from_slice(&kind);
-        assert!(matches!(Estimates::decode(&order), Err(DecodeError::Order { .. })));
-    }
 
     /// Each range of `blaze_query::kinds` and each kind in use goes to its subsystem: the
     /// inputs, the facts, name resolution's kinds (`hir-def`'s `0x2200..`), codegen's
@@ -972,96 +454,118 @@ mod tests {
         assert_eq!(tag_of(kinds::WALK), Tag::Query);
     }
 
-    /// Every subsystem has a share; none but the workers' frames together takes more than
-    /// half the machine, and every budget is its share of the machine's.
-    #[test]
-    fn each_subsystem_gets_its_share_of_the_machine() {
-        for tag in Tag::ALL {
-            assert!((1..=32).contains(&share(tag)), "{tag}");
+    /// A record taught in a drawn order: kinds and classes from a small range, so keys repeat
+    /// and the latest peak must win.
+    fn taught(seed: u64, lessons: usize) -> (Peaks, Vec<((u64, u8), u64)>) {
+        let mut random = SplitMix64::new(seed);
+        let mut peaks = Peaks::new();
+        let mut lessons_given = Vec::with_capacity(lessons);
+        for _ in 0..lessons {
+            let key = (random.below(40) + 0x4000, random.below(24) as u8);
+            let peak = random.below(40 << 30);
+            peaks.observe(key.0, key.1, peak);
+            lessons_given.push((key, peak));
         }
-        let machine = 64 << 30;
-        set_budgets(machine);
-        for tag in Tag::ALL {
-            assert_eq!(tag::budget(tag), machine / 64 * share(tag), "{tag}");
-            assert!(tag::budget(tag) <= machine / 2, "{tag}");
-        }
-        assert_eq!(tag::budget(Tag::Infer), 32 << 30);
-        assert_eq!(tag::budget(Tag::Plane), 2 << 30);
+        (peaks, lessons_given)
     }
 
-    const GIB: u64 = 1 << 30;
-
-    fn at(held: u64, over: Option<Tag>) -> Pressure {
-        Pressure { held, limit: 48 * GIB, over }
+    /// The invariant: a record is the latest peak of each kind and class, one never seen is
+    /// forecast one quantum, and admission's forecast is whole quanta, nothing at or under the
+    /// standing frame.
+    #[test]
+    fn the_latest_peak_is_the_forecast_and_unseen_is_one_quantum() {
+        for seed in 0..32 {
+            let (peaks, lessons) = taught(seed, 400);
+            for &((kind, class), _) in &lessons {
+                let latest = lessons.iter().rev().find(|it| it.0 == (kind, class)).map(|it| it.1);
+                assert_eq!(peaks.peak(kind, class), latest, "seed {seed}");
+                assert_eq!(peaks.forecast(kind, class), latest.unwrap_or(0), "seed {seed}");
+            }
+            assert_eq!(peaks.peak(1, 0), None);
+            assert_eq!(peaks.forecast(1, 0), QUANTUM);
+        }
+        assert_eq!(forecast_of(0), 0);
+        assert_eq!(forecast_of(STANDING), 0);
+        assert_eq!(forecast_of(STANDING + 1), STANDING + QUANTUM);
+        assert_eq!(forecast_of(40 << 30), 40 << 30);
+        assert_eq!(class_of(0), 0);
+        assert_eq!(class_of(1), 1);
+        assert_eq!(class_of(1 << 20), 21);
     }
 
-    /// A release is due past the limit's line or with a released subsystem past its share, and
-    /// then not again until blaze grew by a sixteenth of the limit since it ended; with no limit
-    /// never. Pure: the pressures are given, no global is read.
+    /// The invariant (persisted-state-round-trips): a record decoded from its bytes is the
+    /// record, and encodes to the same bytes again, byte for byte; two records taught the same
+    /// lessons in another order give the same bytes.
     #[test]
-    fn a_squeeze_is_due_past_the_line_and_again_only_a_step_later() {
-        let mut squeeze = Squeeze::default();
-        assert!(!squeeze.due(at(41 * GIB, None)), "under 48 less an eighth (42)");
-        assert!(squeeze.due(at(42 * GIB, None)), "at the line");
-        assert!(squeeze.due(at(10 * GIB, Some(Tag::Mir))), "a released subsystem past its share");
-        squeeze.released(at(40 * GIB, None));
-        assert!(
-            !squeeze.due(at(42 * GIB, None)),
-            "past the line, but under 40 + 3 since the release"
+    fn peaks_round_trip_byte_for_byte() {
+        for seed in 0..32 {
+            let (peaks, mut lessons) = taught(seed, 300);
+            let bytes = peaks.encode();
+            let back = Peaks::decode(&bytes).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+            assert_eq!(back, peaks, "seed {seed}");
+            assert_eq!(back.encode(), bytes, "seed {seed}: re-encoded");
+            // The same final peaks, taught key by key in reverse order of last teaching.
+            let mut again = Peaks::new();
+            lessons.reverse();
+            let mut seen = Vec::new();
+            for (key, peak) in lessons {
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    again.observe(key.0, key.1, peak);
+                }
+            }
+            assert_eq!(again.encode(), bytes, "seed {seed}: another order");
+        }
+        let empty = Peaks::new().encode();
+        assert_eq!(Peaks::decode(&empty), Ok(Peaks::new()));
+    }
+
+    /// The invariant: bytes of a previous layout are refused naming both layouts, the per-kind
+    /// estimates the image held before (`blzest01`) as layout 0; bytes of no layout, cut short,
+    /// with more after or out of order are refused by name.
+    #[test]
+    fn a_previous_layout_is_refused_naming_both() {
+        let mut estimates = b"blzest01".to_vec();
+        estimates.extend_from_slice(&[0; 16]);
+        let refused = Peaks::decode(&estimates);
+        assert_eq!(refused, Err(PeaksError::Layout { found: 0, reads: PEAKS_LAYOUT }));
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains("layout 0") && said.contains("layout 1"), "{said}");
+
+        let mut peaks = Peaks::new();
+        peaks.observe(0x4000, 3, 1 << 30);
+        peaks.observe(0x4000, 4, 2 << 30);
+        let bytes = peaks.encode();
+        let mut next = bytes.clone();
+        next[8..16].copy_from_slice(&(PEAKS_LAYOUT + 1).to_le_bytes());
+        assert_eq!(
+            Peaks::decode(&next),
+            Err(PeaksError::Layout { found: PEAKS_LAYOUT + 1, reads: PEAKS_LAYOUT })
         );
-        assert!(!squeeze.due(at(42 * GIB, Some(Tag::Infer))), "past a share, still under the step");
-        assert!(squeeze.due(at(43 * GIB, None)), "a sixteenth (3 GiB) past what the release left");
-        squeeze.released(at(20 * GIB, None));
-        assert!(
-            squeeze.due(at(23 * GIB, Some(Tag::Infer))),
-            "a release that freed much lowers the step's floor"
-        );
-        let unlimited = Pressure { held: u64::MAX - 1, limit: u64::MAX, over: Some(Tag::Mir) };
-        assert!(!Squeeze::default().due(unlimited), "no limit: never due");
+        assert!(matches!(Peaks::decode(b"not peaks at all"), Err(PeaksError::Magic { .. })));
+        assert!(matches!(Peaks::decode(&bytes[..bytes.len() - 1]), Err(PeaksError::Length { .. })));
+        assert!(matches!(Peaks::decode(&bytes[..4]), Err(PeaksError::Short { .. })));
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(matches!(Peaks::decode(&longer), Err(PeaksError::Length { .. })));
+        let mut swapped = bytes.clone();
+        let first = 24;
+        let (a, b) = swapped[first..].split_at_mut(ENTRY_BYTES);
+        a.swap_with_slice(&mut b[..ENTRY_BYTES]);
+        assert_eq!(Peaks::decode(&swapped), Err(PeaksError::Order { kind: 0x4000, class: 3 }));
     }
 
-    /// A due release caps each released subsystem at its share of the shares' sum; past the
-    /// line every subsystem, so the caps fit in the limit together.
+    /// Admission forecasts every node it pushes and records every task that ends: once each
+    /// kind and class has been seen, neither allocates.
     #[test]
-    fn a_squeeze_past_the_line_caps_every_subsystem_to_fit_the_limit_together() {
-        const { assert!(SHARES > 64, "the budgets overlap on purpose") };
-        let caps = Squeeze::caps(at(30 * GIB, Some(Tag::Mir)));
-        for tag in Tag::ALL {
-            let fair = match RELEASED.contains(&tag) {
-                true => 48 * GIB / SHARES * share(tag),
-                false => u64::MAX,
-            };
-            assert_eq!(caps[tag.index()], fair, "under the line: {tag}");
-        }
-        let caps = Squeeze::caps(at(46 * GIB, None));
-        assert!(caps.iter().sum::<u64>() <= 48 * GIB, "{caps:?}");
-        for tag in Tag::ALL {
-            assert_eq!(caps[tag.index()], 48 * GIB / SHARES * share(tag), "{tag}");
-        }
-        assert!(
-            caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer),
-            "tighter than the budget"
-        );
-    }
-
-    /// The plane predicts every node it admits and observes every task that ends: once each
-    /// kind has been seen, neither allocates.
-    #[test]
-    fn warm_predictions_and_observations_allocate_nothing() {
+    fn warm_forecasts_and_observations_allocate_nothing() {
         assert!(blaze_alloc_count::installed(), "the tests count allocations");
-        let mut estimates = Estimates::new(64);
-        let kinds: Vec<TaskKind> = (0..32).map(TaskKind).collect();
-        let mut random = SplitMix64::new(11);
-        for &kind in &kinds {
-            estimates.observe(kind, peak(&mut random));
-        }
-        let peaks: Vec<u64> = (0..1024).map(|_| peak(&mut random)).collect();
-        blaze_alloc_count::assert_at_most(0, "warm predictions and observations", || {
+        let (mut peaks, lessons) = taught(11, 512);
+        blaze_alloc_count::assert_at_most(0, "warm forecasts and observations", || {
             let mut held = 0u64;
-            for (at, &most) in peaks.iter().enumerate() {
-                let kind = kinds[at % kinds.len()];
-                held = held.wrapping_add(Predict::predict(&estimates, kind, None).peak);
-                Predict::observe(&mut estimates, kind, None, 0, most);
+            for &((kind, class), peak) in &lessons {
+                held = held.wrapping_add(peaks.forecast(kind, class));
+                peaks.observe(kind, class, peak / 2);
             }
             std::hint::black_box(held)
         });

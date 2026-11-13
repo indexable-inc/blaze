@@ -245,7 +245,7 @@ mod tests {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()
         };
-        let config = PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: 1 };
         let mut plane = Plane::with_memo(config, memo).unwrap();
         let mut at = 0;
         let mut run = |plane: &mut Plane<_>, request: RequestId, specs: Vec<Spec>| {
@@ -275,6 +275,7 @@ mod tests {
                         PlaneOutput::Finished { ok, .. } => finished = Some(ok),
                         PlaneOutput::Said { .. } => {}
                         PlaneOutput::Yield { .. } => unreachable!("no request is idle"),
+                        PlaneOutput::Dropped { .. } => unreachable!("no task gives way"),
                     }
                 }
                 if let Some(ok) = finished {

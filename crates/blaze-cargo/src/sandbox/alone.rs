@@ -8,10 +8,7 @@
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::path::PathBuf;
 
 use blaze_core::exit::Exit;
 use blaze_usercode::confine;
@@ -131,15 +128,11 @@ fn alone(job: Job) -> Result<i32, String> {
 
 /// [`alone`], and what it and the sandbox wrote.
 fn said(job: Job) -> (Result<i32, String>, String) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     // Once per sandbox a test makes: where its answer goes, and the job, for the process that
     // makes it.
+    let made = blaze_core::temp::TempDir::for_test("blaze-sandbox-alone-");
     // alloc: as above.
-    let answer = std::env::temp_dir().join(format!(
-        "blaze-sandbox-alone-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let answer = made.join("answer");
     // clone: as above.
     let asked = serde_json::to_string(&Asked { job, answer: answer.clone() }).unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())

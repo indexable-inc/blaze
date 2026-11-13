@@ -24,9 +24,8 @@ max_written = 400
 max_ran = { file_item_tree = 1, crate_local_def_map = 1 }
 
 [revision.known]
-max_executed = "a restart resolves every workspace crate from source (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"
-max_written = "a restart writes every file of every package of the plan as an input (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
-max_ran = "as max_executed: four crates' item trees and def maps are made, not one's"
+max_executed = "a unit's record is found only by an identity made from its crate's texts, read and parsed at each restart (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece F: waits for content-keys-1112's record key)"
+max_written = "a restart still writes every file of every package of the plan as an input: a source root is not yet declared from its found record (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece D)"
 
 [[revision]]
 steps = ["kill", "edit"]
@@ -42,4 +41,3 @@ max_ran = { file_item_tree = 2, crate_local_def_map = 1 }
 [revision.known]
 max_executed = "as rev3"
 max_written = "as rev3"
-max_ran = "as rev3"

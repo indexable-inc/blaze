@@ -19,6 +19,9 @@
 
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod blocked;
 pub mod calls;

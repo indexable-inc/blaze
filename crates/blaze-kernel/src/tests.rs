@@ -306,8 +306,8 @@ impl Put for Memory {
 /// fails here.
 #[test]
 fn a_kept_entry_comes_back_after_a_restart() {
-    let root = std::env::temp_dir().join(format!("blaze-kernel-restart-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-kernel-restart-");
+    let root = held.path();
     let kernel = kernel();
     let world = Facts::of(&[(1, 2), (2, 3), (3, 1)]);
     let (chased, constant) = {
@@ -334,7 +334,6 @@ fn a_kept_entry_comes_back_after_a_restart() {
     assert_eq!(got.value(), constant);
     assert_eq!(got.value(), fresh::<Constant>(&world, 7));
     drop(driven);
-    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// Two values under one identity and set of reads are refused, naming the step, the input

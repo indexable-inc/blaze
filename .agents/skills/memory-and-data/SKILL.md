@@ -9,13 +9,21 @@ description: "How blaze holds memory and keeps what it computes: an owner per li
 
 ## bump-allocate (rule 11)
 
-Allocate by lifetime, never from the global heap by default: a collection that lives within one task
-(a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` /
-`Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request,
-revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`,
-`Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces
-this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a
-call reaches.
+First, don't allocate where a borrow, a fixed buffer or the caller's buffer does: borrow instead of
+`to_owned`, `clone` or `to_vec`; write into the caller's buffer with `blaze_mem::format_into!` or
+`write!` instead of `format!` or `to_string`; use an array for a small `vec![..]`; pass an iterator
+on instead of `collect()`. Where an allocation is needed, allocate by lifetime and name the
+allocator: a collection that lives within one task (a query run, a codegen unit, a maintainer pass)
+uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, longer
+lifetimes use the request, revision or image allocator, and the global heap is named `Global` where
+it is used (`Vec::new_in(Global)`, `Box::new_in(x, Global)`). An allocator is never implied
+(`Vec::new`, `vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`,
+`to_vec`, a `clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps
+nothing, and an item that must keep an implied allocator says why with
+`#[expect(blaze::implicit_allocator, reason = "..")]`. `blaze::implicit_allocator` enforces this,
+with a fix to the explicit `Global` form, and `blaze::hot_alloc` for what a call reaches;
+`scripts/src/bin/allocs.rs` holds each crate's `// alloc:` lines left to convert, its `expect`s and
+its lines naming `Global` to a list that only shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
@@ -74,7 +82,7 @@ Every byte has an owner chosen by how long it lives, and what outlives a task is
 | A long task's scratch, item by item (a function in a codegen unit, a body in MIR) | one item | the task's frame, reset to a marker after each item, so the peak is one item's scratch |
 | A task's output: a query result, a compiled function, object code | past the task | a blaze-format record appended to the store's pack, read through the store's buffer pool |
 | Names, types, paths | the daemon | the interner's tables (`u32` IDs), regions blaze-mem owns |
-| Small, long-lived, rare | the daemon | the global heap (mimalloc), with `// alloc: <why>` |
+| Small, long-lived, rare | the daemon | the global heap (mimalloc), named where it is used: `Vec::new_in(Global)` |
 | Constant text | the program | a `&'static str` (`concat!`, const_format), not `format!` into a `String` |
 
 Why the gap between footprint and live happens: memory goes back to the kernel a page at a time,

@@ -45,13 +45,17 @@ fn key(n: u64) -> Key {
 }
 
 /// The value put under key `n`, and its kind: one in four of [`MAP_FROM`] bytes or more,
-/// mapped; one in four cold text, which the store may compress; the rest short noise. Its last
-/// byte is never zero, so a run read one byte short shows.
+/// mapped; one in four cold text, which the store may compress; one in eight an output past
+/// [`crate::CHUNK_FROM`], kept in chunks (two or more: a chunk is at most `chunk::MAX`); one in
+/// eight machine code, kept as a file of its own; the rest short noise. Its last byte is never
+/// zero, so a run read one byte short shows.
 fn value(n: u64) -> (Kind, Vec<u8>) {
     let mut rng = Rng::new(n ^ 0x5eed_d1ec);
-    let (kind, len, text) = match n % 4 {
-        0 => (Kind::Query, MAP_FROM + rng.below(40 << 10), false),
-        1 => (Kind::Debug, 1 + rng.below(1500), true),
+    let (kind, len, text) = match n % 8 {
+        0 | 4 => (Kind::Query, MAP_FROM + rng.below(40 << 10), false),
+        1 | 5 => (Kind::Debug, 1 + rng.below(1500), true),
+        3 => (Kind::Output, crate::CHUNK_FROM as u64 + 1 + rng.below(300 << 10), false),
+        7 => (Kind::Machine, 1 + rng.below(4000), false),
         _ => (Kind::Query, 1 + rng.below(1500), false),
     };
     let mut bytes: Vec<u8> = match text {
@@ -350,8 +354,12 @@ fn map_one(sim: &mut Sim, direct: &mut Direct, model: &BTreeMap<u64, State>, n: 
     match direct.map(sim, &key(n)) {
         Ok(Some(mapped)) => check(model, n, Answer::Found(&mapped), faulty),
         Ok(None) => check(model, n, Answer::Absent, faulty),
+        // A short value, one in a writer's segment, and a chunked one (made whole in memory)
+        // are read, not mapped.
         Err(Failed::NotMappable { .. })
-            if (value(n).1.len() as u64) < MAP_FROM || model.get(&n) != Some(&State::Durable) =>
+            if (value(n).1.len() as u64) < MAP_FROM
+                || model.get(&n) != Some(&State::Durable)
+                || value(n).0 == Kind::Output =>
         {
             Ok(())
         }
@@ -386,8 +394,51 @@ fn the_oracle_catches_a_batch_placed_back_in_disk_order() {
 
 #[test]
 fn the_oracle_catches_a_read_with_no_check() {
-    // Key 2's value is short noise, kept raw: a rotted byte decodes, and only the hash sees it.
+    // Key 2's value is short noise, kept raw: a payload byte rotted under an intact header
+    // decodes, and only the record's CRC (format 9's, over the payload) sees it.
     control(&[Op::Put(2), Op::Flush, Op::Rot(2)], Plant::NoCheck);
+}
+
+#[test]
+fn the_oracle_catches_chunks_put_together_out_of_order() {
+    // Key 3's value is an output kept in two chunks or more: durable, and still in its
+    // writer's segment.
+    control(&[Op::Put(3), Op::Flush, Op::Read(3)], Plant::ChunkOrder);
+    control(&[Op::Put(3), Op::ReadMany(vec![2, 3, 2])], Plant::ChunkOrder);
+}
+
+/// The invariant: a store's format-8 records (CRC over the header only) read right through
+/// the direct reader, each hashed as format 8 was read, beside format-9 records; a format-8
+/// record's payload byte rotted is refused by that hash, as a format-9 record's is by its CRC.
+#[test]
+fn the_direct_reader_reads_format_8_records() {
+    let mut sim = Sim::new(5, Faults::default());
+    let mut store = open(&mut sim);
+    crate::disk::WRITE_FORMAT_8.set(true);
+    for n in [2, 3, 6] {
+        let (kind, bytes) = value(n);
+        store.put(key(n), kind, &bytes).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    crate::disk::WRITE_FORMAT_8.set(false);
+    for n in [10, 11] {
+        let (kind, bytes) = value(n);
+        store.put(key(n), kind, &bytes).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let mut direct = Direct::new(store.reader(), DIRECT_TAGS);
+    let model: BTreeMap<u64, State> = [2, 3, 6, 10, 11].into_iter().map(|n| (n, State::Durable)).collect();
+    let keys: Vec<u64> = model.keys().copied().collect();
+    read_batch(&mut sim, &mut direct, &model, &keys, b"before", false).unwrap();
+    for n in [2, 10] {
+        let (file, payload, _) = direct.where_of(&key(n)).unwrap();
+        let byte = sim.contents(&file)[payload as usize];
+        sim.rot(&file, payload, &[!byte]);
+        let mut into = Vec::new();
+        let read = direct.read(&mut sim, &key(n), &mut into);
+        sim.rot(&file, payload, &[byte]);
+        assert!(matches!(read, Read::Failed(Failed::Corrupt { .. })), "key {n}'s rotted byte: {read:?}");
+    }
 }
 
 #[test]

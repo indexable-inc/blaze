@@ -14,13 +14,14 @@ const CORE_PRELUDE: &str = "        pub use crate::option::Option::{self, None, 
 
 /// What std's prelude has of `non_fmt_panic/std.rs`, as `library/std/src/prelude/v1.rs` writes
 /// it: `format!`, `String`, and `panic!` without the module `panic`.
-const STD_PRELUDE: &str = "        pub use crate::format;\n\
-     \x20       pub use crate::string::String;\n\
-     \x20       mod ambiguous_macros_only {\n\
-     \x20           mod panic {}\n\
-     \x20           pub use crate::*;\n\
-     \x20       }\n\
-     \x20       pub use self::ambiguous_macros_only::panic;\n";
+const STD_PRELUDE: &str = r"        pub use crate::format;
+        pub use crate::string::String;
+        mod ambiguous_macros_only {
+            mod panic {}
+            pub use crate::*;
+        }
+        pub use self::ambiguous_macros_only::panic;
+";
 
 fn library<'a>(aux: &'a [(&'a str, &'a str, &'a str)]) -> Library<'a> {
     Library {

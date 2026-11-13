@@ -64,6 +64,10 @@ pub struct Reaped<'a> {
 pub const MOST_LABELS: usize = 4096;
 
 /// The labels no reap has taken yet, oldest first: each a field update under the lock.
+#[expect(
+    blaze::process_static,
+    reason = "capped at MOST_LABELS, each taken by its reap; the process's one reaper owns the children it labels"
+)]
 static LABELS: Lock<Vec<(Tag, Label)>> = Lock::new("core.reaped.labels", Vec::new());
 
 /// Where a reaped child goes, and what says the build and span a label is asked inside.

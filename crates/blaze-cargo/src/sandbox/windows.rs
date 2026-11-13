@@ -525,7 +525,8 @@ fn temporary(spec: &Spec) -> Result<PathBuf, String> {
         _ = write!(name, "{byte:02x}");
     }
     // alloc: once per sandbox, its temporary directory's path.
-    Ok(std::env::temp_dir().join(format!("blaze-sandbox-{name}")))
+    // Not a `TempDir`: the same spec must see the same path, so the name is the spec's.
+    Ok(blaze_core::temp::base().join(format!("blaze-sandbox-{name}")))
 }
 
 /// `text` as UTF-16 ending in NUL, or why not when it has a NUL of its own.
@@ -1625,6 +1626,10 @@ impl Drop for Granted {
 
 /// The jobs of the runs in progress, for the console's interrupt to end.
 // alloc: none: an empty `Vec` in a static, which grows once per sandbox.
+#[expect(
+    blaze::process_static,
+    reason = "the job handles of the runs in progress, each removed as its run ends: the console's interrupt handler can reach no owner but a static"
+)]
 static JOBS: blaze_core::lock::Lock<Vec<usize>> =
     blaze_core::lock::Lock::new("sandbox.windows.jobs", Vec::new());
 
@@ -1757,9 +1762,8 @@ mod tests {
         let root = std::env::var_os("SystemRoot")
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         let cmd = root.join("System32").join("cmd.exe");
-        let base =
-            std::env::temp_dir().join(format!("blaze-windows-sandbox-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-test-");
+        let base = tmp.path().to_path_buf();
         let (written, denied) = (base.join("w"), base.join("d"));
         std::fs::create_dir_all(&denied).unwrap();
         let spec = |args: &[&OsStr]| Spec {
@@ -1804,9 +1808,8 @@ mod tests {
             eprintln!("no sandbox can be made here, so this is not run: {why}");
             return;
         }
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-covered-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-covered-");
+        let base = tmp.path().to_path_buf();
         let (dir, file) = (base.join("d"), base.join("f.txt"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
@@ -1849,9 +1852,8 @@ mod tests {
             eprintln!("no sandbox can be made here, so this is not run: {why}");
             return;
         }
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-handle-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-handle-");
+        let base = tmp.path().to_path_buf();
         let (dir, file, missing) =
             (base.join("d"), base.join("f.txt"), base.join("gone").join("x"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1883,9 +1885,8 @@ mod tests {
             eprintln!("no sandbox can be made here, so this is not run: {why}");
             return;
         }
-        let base =
-            std::env::temp_dir().join(format!("blaze-windows-sandbox-made-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-made-");
+        let base = tmp.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         let made = make(false, Given::own()).unwrap();
         let run = made.run.sid();
@@ -1921,9 +1922,8 @@ mod tests {
 
     #[test]
     fn a_directory_is_told_as_by_path() {
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-directory-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-directory-");
+        let base = tmp.path().to_path_buf();
         let (dir, file) = (base.join("d"), base.join("f.txt"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
@@ -1942,12 +1942,13 @@ mod tests {
     }
 
     /// A process that runs for a minute unless it is ended, put in `job`.
-    fn in_job(job: &Handle) -> std::process::Child {
+    fn in_job(job: &Handle) -> stdx::JodChild {
         use std::os::windows::io::AsRawHandle as _;
         let child = std::process::Command::new("ping")
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         // SAFETY: both handles are open and owned for the call, which reads no memory.
         assert_ne!(unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) }, 0);
@@ -1974,10 +1975,15 @@ mod tests {
             .args(["/c", "ping -n 2 127.0.0.1 >nul & start /b ping -n 60 127.0.0.1 >nul"])
             .stdout(std::process::Stdio::null())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         // SAFETY: both handles are open and owned for the call, which reads no memory.
         assert_ne!(unsafe { AssignProcessToJobObject(job.0, parent.as_raw_handle()) }, 0);
-        parent.wait().unwrap();
+        stdx::child::exit_within(
+            &mut parent,
+            "the `cmd` that starts a ping in the job",
+            std::time::Duration::from_secs(60),
+        );
         assert_eq!(listed(&job).unwrap().1, 1, "the child runs on in the job");
         let started = Instant::now();
         end(&job, 7);
@@ -2076,9 +2082,8 @@ mod tests {
         let root = std::env::var_os("SystemRoot")
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         let cmd = root.join("System32").join("cmd.exe");
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-handed-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-handed-");
+        let base = tmp.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         let out = base.join("stdout.txt");
         let file = std::fs::File::create(&out).unwrap();

@@ -71,6 +71,10 @@ pub(crate) struct Finish {
 /// The children [`start`] made that [`reap`] has not reaped, in the order they started: a few
 /// hundred at most (the spawns in flight), each a field update under the lock, which no wait
 /// is made under.
+#[expect(
+    blaze::process_static,
+    reason = "the unreaped children of this process, removed as each is reaped: bounded by the spawns in flight"
+)]
 static CHILDREN: Lock<Vec<Child>> = Lock::new("core.process.children", Vec::new());
 
 /// A child as [`CHILDREN`] lists it.

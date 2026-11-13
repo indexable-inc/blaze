@@ -318,6 +318,13 @@ pub fn describe(effect: &Effect) -> String {
         Effect::ReadInto { file, at, into, .. } => {
             format!("read {} bytes of {file} at {at} into memory", into.len)
         }
+        Effect::ReadMany { parts, .. } => {
+            let parts: Vec<String> = parts
+                .iter()
+                .map(|it| format!("{} bytes of {} at {}", it.into.len, it.file, it.at))
+                .collect();
+            format!("read into memory, in one batch: {}", parts.join(", "))
+        }
         Effect::WriteFrom { file, at, from, .. } => {
             format!("write {} bytes of {file} at {at} from memory", from.len)
         }
@@ -328,13 +335,30 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Prewarm { file, .. } => format!("prewarm {file}"),
         Effect::Seal { file, .. } => format!("seal {file}"),
         Effect::Remove { file, .. } => format!("remove {file}"),
-        Effect::Map { file, .. } => format!("map {file}"),
+        Effect::Map { file, extent: blaze_core::Extent::Whole, .. } => format!("map {file}"),
+        Effect::Map { file, extent: blaze_core::Extent::Range { at, len }, .. } => {
+            format!("map {len} bytes of {file} at {at}")
+        }
         Effect::Stat { file, .. } => format!("stat {file}"),
         Effect::Lstat { file, .. } => format!("lstat {file}"),
         Effect::List { dir, .. } => format!("list {dir}"),
         Effect::Entries { dir, .. } => format!("entries of {dir}"),
         other => format!("{other:?}"),
     }
+}
+
+/// One read into memory of `into.len` bytes at `at` of `file`, as the model reads it: what an
+/// [`Effect::ReadInto`] ends with, and each part of an [`Effect::ReadMany`].
+fn read_part(
+    files: &Files,
+    file: &FileName,
+    at: u64,
+    into: &blaze_core::Span,
+    cache: blaze_core::Cache,
+) -> Result<u32, IoError> {
+    let bytes = files.contents(file);
+    let from = (at as usize).min(bytes.len());
+    spans::read_into(into, file, at, cache, &bytes[from..])
 }
 
 fn missing(file: &FileName) -> Done {
@@ -650,6 +674,7 @@ impl Files {
             | Effect::ReadAll { .. }
             | Effect::Read { .. }
             | Effect::ReadInto { .. }
+            | Effect::ReadMany { .. }
             | Effect::Map { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }
@@ -854,14 +879,42 @@ impl CrashFs {
                 Done::Read(bytes[at..at.saturating_add(*len).min(bytes.len())].to_vec())
             }
             Effect::ReadInto { file, at, into, cache, .. } => {
-                let bytes = files.contents(file);
-                let from = (*at as usize).min(bytes.len());
-                match spans::read_into(into, file, *at, *cache, &bytes[from..]) {
+                match read_part(files, file, *at, into, *cache) {
                     Ok(len) => Done::ReadInto { len },
                     Err(refused) => Done::Failed(refused),
                 }
             }
-            Effect::Map { file, .. } => Done::Mapped(Mapping::copy(&files.contents(file))),
+            // Each part as its own read into memory, with its own result: one that fails
+            // fails only itself, naming its file and offset.
+            Effect::ReadMany { parts, cache, .. } => Done::ReadMany(
+                parts
+                    .iter()
+                    .map(|part| {
+                        let got = match read_part(files, &part.file, part.at, &part.into, *cache) {
+                            Ok(len) => blaze_core::Got::Read(len),
+                            Err(refused) => blaze_core::Got::Failed(refused),
+                        };
+                        // clone: the part handed back, a refcount and a span.
+                        blaze_core::ReadPart { got, ..part.clone() }
+                    })
+                    // alloc: the parts, which the completion carries.
+                    .collect(),
+            ),
+            Effect::Map { file, extent, .. } => {
+                let bytes = files.contents(file);
+                match *extent {
+                    blaze_core::Extent::Whole => Done::Mapped(Mapping::copy(&bytes)),
+                    blaze_core::Extent::Range { at, len } => {
+                        match at.checked_add(len).filter(|end| *end <= bytes.len() as u64) {
+                            Some(end) => Done::Mapped(Mapping::copy(&bytes[at as usize..end as usize])),
+                            None => Done::Failed(IoError(format!(
+                                "{file}: a mapping of {len} bytes at {at} runs past the file's end at {}",
+                                bytes.len()
+                            ))),
+                        }
+                    }
+                }
+            }
             // One look at each name, as the store asks before it renames a placed file.
             Effect::Stamp { files: names, .. } => Done::Stamped(
                 names

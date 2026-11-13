@@ -108,6 +108,10 @@ impl Encoded {
 const LIST_AT: usize = 16 + 2 + 2 + 4;
 
 /// The entry of `identity` whose run made `trace` (which has reads) and `value`.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the entry holds its read-list's length in u32 and nothing caps the names a run reads: a list past 4 GiB needs a typed refusal from encode"
+)]
 pub(crate) fn encode(identity: &Identity, trace: &Trace, value: &[u8]) -> Encoded {
     let names: usize = trace.names().map(|name| 4 + name.len()).sum();
     let digests: usize = trace.seen().map(|seen| 1 + hash_len(seen)).sum();

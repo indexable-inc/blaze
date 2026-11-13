@@ -19,8 +19,9 @@
 //! sender dropped, a thread returned), so a waker that ends silently still ends the wait; a
 //! deadline that is `None` only at run time; a raw kernel wait, which `.clippy.toml` bans
 //! outside `crates/blaze-core/src/wait*`. `blaze_core::wait` itself, where the deadline is
-//! applied, and tests are not linted. There is no fix: the deadline and what to do when it
-//! passes are the caller's.
+//! applied, is not linted; test code (a `#[test]`, `#[cfg(test)]`, an integration test's crate)
+//! is `unbounded_test_wait`'s, which finds these waits there too and takes no `// wakes:`.
+//! There is no fix: the deadline and what to do when it passes are the caller's.
 
 use base_db::Db;
 use hir_def::{
@@ -30,7 +31,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 
-use super::{Finding, Lint, alloc::written_callee, exempt, facts};
+use super::{Finding, Lint, alloc::written_callee, exempt, facts, unbounded_test_wait};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::UnboundedWait;
@@ -49,7 +50,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let Some(analysis) = cx.analysis() else { return found };
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let db = cx.db();
-    if in_wait(db, hir::Module::from(def.module(db))) || cx.is_in_test(cx.root()) {
+    if in_wait(db, hir::Module::from(def.module(db))) || unbounded_test_wait::in_test(cx) {
         return found;
     }
     let body = analysis.body();
@@ -88,7 +89,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// Whether `module` is `blaze_core::wait` or a module under it: where the one deadline wait is
 /// written.
-fn in_wait(db: &Db, module: hir::Module) -> bool {
+pub(super) fn in_wait(db: &Db, module: hir::Module) -> bool {
     facts::crate_is(db, module.krate(db), "blaze_core")
         && module
             .path_to_root(db)
@@ -97,7 +98,7 @@ fn in_wait(db: &Db, module: hir::Module) -> bool {
 }
 
 /// `f` as a message names it: with its type when it is a method.
-fn name_of(db: &Db, f: FunctionId) -> String {
+pub(super) fn name_of(db: &Db, f: FunctionId) -> String {
     let name = FunctionSignature::of(db, f).name.as_str();
     // alloc: a message's part
     match facts::impl_adt(db, f) {
@@ -107,7 +108,7 @@ fn name_of(db: &Db, f: FunctionId) -> String {
 }
 
 /// What a call of `f` is, when it waits with no deadline whatever it is given.
-fn unbounded(db: &Db, f: FunctionId) -> Option<String> {
+pub(super) fn unbounded(db: &Db, f: FunctionId) -> Option<String> {
     let module = hir::Function::from(f).module(db);
     let krate = module.krate(db);
     let is = |name: &str| facts::crate_is(db, krate, name);
@@ -137,7 +138,7 @@ fn unbounded(db: &Db, f: FunctionId) -> Option<String> {
 }
 
 /// Whether an argument of the call `id` is `None`, written out.
-fn deadline_is_none(
+pub(super) fn deadline_is_none(
     cx: &Cx<'_, '_>,
     analysis: &hir::BodyAnalysis<'_>,
     body: &Body,

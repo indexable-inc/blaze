@@ -158,18 +158,30 @@ impl HirFrontend<'_> {
     }
 
     /// The span tables `built`'s code names, as a change of the tables kept from the link
-    /// before it ([`LinkInputs`]). What is kept is memory of this process beside the
-    /// database, found by the build's id or its base's ([`Built::delta`]): a function the
-    /// build did not change is not read, a body of library inputs alone is not asked again
-    /// while no library input was written, and a table is encoded only when its body's
-    /// positions are other than they were.
+    /// before it ([`LinkInputs`]). What is kept is held by the database's owner beside it
+    /// ([`super::Walks`], given by [`HirFrontend::with_walks`]), found by the build's id or its
+    /// base's ([`Built::delta`]): a function the build did not change is not read, a body of
+    /// library inputs alone is not asked again while no library input was written, and a
+    /// table is encoded only when its body's positions are other than they were. A front end
+    /// given no walks keeps nothing: each of its links makes every table, said in
+    /// [`InputsWork::whole`].
+    #[blaze::renders_positions]
     pub fn link_inputs(&self, built: &Built) -> Result<LinkInputs, CodegenError> {
-        self.with(|db| inputs(db, &self.hashes, built, Plant::None)).map_err(error)
+        let none;
+        let links = match self.walks {
+            Some(walks) => walks.links(),
+            None => {
+                none = Links::new();
+                &none
+            }
+        };
+        self.with(|db| inputs(db, &self.hashes, built, Plant::None, links)).map_err(error)
     }
 
     /// Every span table `built`'s code names, by anchor, sorted, encoded: made whole, with
     /// nothing kept and nothing read from what is. What a link with no base, a test binary's
     /// table and a test's selection take, and what [`Self::link_inputs`] is checked against.
+    #[blaze::renders_positions]
     pub fn span_tables(&self, built: &Built) -> Result<Vec<(ContentId, Vec<u8>)>, CodegenError> {
         self.with(|db| {
             let mut work = InputsWork::default();
@@ -304,18 +316,31 @@ pub fn span_table_id(bytes: &[u8]) -> ContentId {
     ContentId::of(TABLE_DOMAIN, bytes)
 }
 
-/// How many programs' link inputs a process keeps of one database ([`KEPT`]): the least
-/// recently linked of that database goes when one more is made. Each holds hashes and counts,
-/// no table: about 300 bytes a function.
+/// How many programs' link inputs a database's [`Links`] keep: the least recently linked goes
+/// when one more is made. Each holds hashes and counts, no table: about 300 bytes a function.
 const KEPT_LINKS: usize = 4;
 
-/// How many a process keeps in all: a daemon has one database; a test process has one a
-/// test, and those of a database nothing links any more go when this many are held.
-const KEPT_ALL: usize = 64;
+/// The link inputs kept of one database, the last linked last: owned with its kept walks
+/// ([`super::Walks`]), so they leave with the database. Until 2026-11-13 they were a process
+/// static of up to 64 programs of any database, which a database let go left behind until 64
+/// more links pushed them out (lane F6 of the memory wave, read from code).
+pub(super) struct Links {
+    // alloc: none until a link, then up to [`KEPT_LINKS`] programs' link inputs
+    kept: Lock<Vec<Kept>>,
+}
 
-/// The link inputs kept, the last linked last.
-// alloc: none until a link, then a few programs' link inputs for the process's life
-static KEPT: Lock<Vec<Kept>> = Lock::new("codegen.linked.kept", Vec::new());
+impl Links {
+    pub(super) fn new() -> Links {
+        Links { kept: Lock::new("codegen.linked.kept", Vec::new()) }
+    }
+
+    /// Lets go of every program's link inputs: the next link of each makes every table.
+    /// How many programs' were held.
+    pub(super) fn let_go(&self) -> usize {
+        let kept = std::mem::take(&mut *self.kept.lock());
+        kept.len()
+    }
+}
 
 /// The next [`LinkInputs::serial`]; 0 is no snapshot's.
 static SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -459,6 +484,7 @@ fn is_durable(db: &Db, owner: Owner) -> bool {
 }
 
 /// The table of `source`, encoded.
+#[blaze::renders_positions]
 fn encoded(
     db: &Db,
     hashes: &HashSource,
@@ -507,6 +533,7 @@ impl Kept {
 
     /// The link inputs of `built` made with nothing kept: every item resolved, every
     /// function and static read, every table the code names encoded.
+    #[blaze::renders_positions]
     fn whole(
         db: &Db,
         hashes: &HashSource,
@@ -623,6 +650,7 @@ impl Kept {
     /// Encodes the table of each of `wanted` (sorted, each once) and keeps its id, watching
     /// its owner where its positions are not of library inputs alone. An anchor of no table
     /// found is an error naming it and what names it.
+    #[blaze::renders_positions]
     fn make(
         &mut self,
         db: &Db,
@@ -713,6 +741,7 @@ impl Kept {
     /// the database's view now: the tables new or changed, and the anchors gone. `Ok(Err)`
     /// says why what is kept can't be brought there, and every table is to be made; what is
     /// kept is then of no use. `plant` is a control's bug ([`Plant`]).
+    #[blaze::renders_positions]
     fn advance(
         &mut self,
         db: &Db,
@@ -813,6 +842,7 @@ impl Kept {
     /// tables are encoded again and found the same, a cost of that file. Until 2026-11-11 it asked a
     /// stamp memo of each watched owner each link, 4,590 memos verified for a one-line edit
     /// of hello world. An owner none of whose tables is kept is no longer watched.
+    #[blaze::renders_positions]
     fn verify(
         &mut self,
         db: &Db,
@@ -874,12 +904,19 @@ impl Kept {
     }
 }
 
-/// [`HirFrontend::link_inputs`] over `db`.
-fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: Plant) -> Result<LinkInputs, String> {
+/// [`HirFrontend::link_inputs`] over `db`, bringing forward what `links` keep of it.
+#[blaze::renders_positions]
+fn inputs(
+    db: &Db,
+    hashes: &HashSource,
+    built: &Built,
+    plant: Plant,
+    links: &Links,
+) -> Result<LinkInputs, String> {
     let (database, _) = db.nonce_and_revision();
     let tests = by_id(hashes);
     let taken = {
-        let mut kept = KEPT.lock();
+        let mut kept = links.kept.lock();
         let of = |it: &Kept, id: BuiltId| it.database == database && it.by_id == tests && it.built == id;
         let found = kept.iter().position(|it| of(it, built.id)).or_else(|| {
             built.delta.base.and_then(|base| kept.iter().position(|it| of(it, base)))
@@ -916,13 +953,8 @@ fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: Plant) -> Result<L
             (kept, inputs)
         }
     };
-    let mut all = KEPT.lock();
-    let same = |it: &Kept| it.database == kept.database;
-    if all.iter().filter(|it| same(it)).count() >= KEPT_LINKS {
-        let oldest = all.iter().position(same).expect("counted above");
-        all.remove(oldest);
-    }
-    if all.len() >= KEPT_ALL {
+    let mut all = links.kept.lock();
+    if all.len() >= KEPT_LINKS {
         all.remove(0);
     }
     all.push(kept);
@@ -932,6 +964,7 @@ fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: Plant) -> Result<L
 /// The span tables of `items` that `named` lists, encoded as the linker's `SpanTable::decode`
 /// reads them: for code loaded in process with no [`Built`] to read the anchors from. An
 /// anchor of no table found is an error naming it.
+#[blaze::renders_positions]
 pub fn span_tables_of(
     db: &Db,
     hashes: &HashSource,
@@ -965,6 +998,7 @@ pub(super) struct Positions {
 /// binding, [`MirSpan::Unknown`]) is where its owner is. Memoized, so a link after an edit
 /// finds again only the bodies it changed.
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 pub(super) fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
     let store = BodyStore::of(db, owner);
     let at_owner = owner_location(db, owner);
@@ -1010,6 +1044,7 @@ pub(super) fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, Stri
 }
 
 /// Where a body's owner is declared.
+#[blaze::renders_positions]
 fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
     use hir_ty_mir::mir::location::{location_of, written_range};
     let source = match owner {

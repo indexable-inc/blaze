@@ -822,12 +822,17 @@ pub fn sealed_in_graph(db: &Db, krate: Crate) -> bool {
 /// one in a body's block that a relaxed impl there leans on (an impl in a block with a sealed
 /// bound, [`sealed_bounds`]; a block's trait no impl outside the block can name). Reads each
 /// module-level trait's attributes and the crate's impl table ([`TraitImpls::for_crate`],
-/// which holds the impls of bodies' blocks too).
+/// which holds the impls of bodies' blocks too). A crate read from impl table pages has the
+/// answer in their header, written by this query when the pages were: one read, no module
+/// scope and no table decoded.
 ///
 /// [`TraitImpls::for_crate`]: crate::method_resolution::TraitImpls::for_crate
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn declares_sealed(db: &Db, krate: Crate) -> bool {
     let _p = tracing::info_span!(target: "blaze", "declares_sealed", ?krate).entered();
+    if crate::method_resolution::frozen::served(db, krate) {
+        return crate::method_resolution::frozen::pages::declares_sealed(db, krate);
+    }
     let in_modules = hir_def::nameres::crate_def_map(db, krate).modules(db).any(|(_, module)| {
         module.scope(db).declarations().any(|def| {
             matches!(def, hir_def::ModuleDefId::TraitId(it)

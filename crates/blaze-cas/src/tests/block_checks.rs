@@ -531,8 +531,8 @@ fn a_read_at_the_pinned_bound_waits_its_ticks_and_is_refused_naming_the_bound() 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_store_with_a_loader_loads_what_is_read_and_again_once_it_is_given_back() {
-    let root = std::env::temp_dir().join(format!("blaze-cas-loader-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-cas-loader-");
+    let root = held.path().to_path_buf();
     let loader = || Loader::Thread { root: root.clone() };
     {
         let mut driven = Driven::open_with(&root, loader()).unwrap();
@@ -568,5 +568,4 @@ fn a_store_with_a_loader_loads_what_is_read_and_again_once_it_is_given_back() {
         );
     }
     drop(driven);
-    _ = std::fs::remove_dir_all(&root);
 }

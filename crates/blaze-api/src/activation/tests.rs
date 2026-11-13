@@ -107,10 +107,8 @@ fn passed_owns_its_descriptor() {
 
     use super::{Manager, Passed};
 
-    let dir = std::env::temp_dir().join(format!("blaze-activation-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test_socket("blaze-activation-");
     let path = dir.join("s");
-    _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
     let passed = Passed::new(OwnedFd::from(listener), Manager::Systemd);
     assert!(passed.fd() >= 0);
@@ -121,5 +119,4 @@ fn passed_owns_its_descriptor() {
         std::os::unix::net::UnixStream::connect(&path).is_err(),
         "the socket is closed with it"
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -991,6 +991,10 @@ struct Left {
 
 /// Each `OUT_DIR` this process left files in ([`left`], [`restore`]), by its path: a few
 /// dozen a build, scanned. In memory only: a restarted daemon restores each once.
+#[expect(
+    blaze::process_static,
+    reason = "one row per OUT_DIR the daemon left files in, replaced per directory but never capped: the daemon should own it"
+)]
 static LEFT: blaze_core::lock::Lock<Vec<(PathBuf, Left)>> =
     blaze_core::lock::Lock::new("usercode.run.left", Vec::new());
 
@@ -1624,8 +1628,9 @@ mod tests {
 
     #[test]
     fn an_out_dir_is_collected_and_restored_and_kept_inside() {
-        let dir = std::env::temp_dir().join(format!("blaze-out-dir-test-{}", std::process::id()));
-        empty(&dir).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-out-dir-test-");
+        let dir = tmp.path();
+        empty(dir).unwrap();
         restore(&dir, &value().files).unwrap();
         assert_eq!(collect(&dir, None).unwrap(), value().files);
         let bad = [OutFile {
@@ -1648,7 +1653,6 @@ mod tests {
                     .any(|it| it.path == "in" && it.bytes.as_deref() == Some(b"x".as_slice()))
             );
         }
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A link a run left in its `OUT_DIR` into its own package (gmp-mpfr-sys links its bundled
@@ -1659,8 +1663,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_into_the_runs_own_package_is_kept_as_a_link_and_any_other_is_refused() {
-        let top = std::env::temp_dir().join(format!("blaze-out-dir-link-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&top);
+        let top = blaze_core::temp::TempDir::for_test("blaze-out-dir-link-");
         let (package, out, sibling) = (top.join("pkg"), top.join("out"), top.join("sibling"));
         for dir in [package.join("vendor"), out.join("build"), sibling.clone()] {
             std::fs::create_dir_all(dir).unwrap();
@@ -1726,7 +1729,6 @@ mod tests {
         std::fs::remove_file(out.join("away")).unwrap();
         let refused = collect(&out, None).unwrap_err();
         assert!(refused.contains("build/src is a link to") && refused.contains("it has none"));
-        _ = std::fs::remove_dir_all(&top);
     }
 
     /// A value with no link is the bytes it was before a link could be kept (the previous
@@ -1770,8 +1772,9 @@ mod tests {
     /// directory listed after a file in it, and a file's mode set on its descriptor.
     #[test]
     fn a_restore_makes_each_directory_once_and_collect_reads_it_back() {
-        let dir = std::env::temp_dir().join(format!("blaze-out-dir-once-{}", std::process::id()));
-        let file = |path: &str, executable: bool, bytes: &[u8]| OutFile {
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-out-dir-once-");
+        let dir = tmp.path();
+        let file =|path: &str, executable: bool, bytes: &[u8]| OutFile {
             path: path.into(),
             executable,
             bytes: Some(bytes.into()),
@@ -1809,6 +1812,5 @@ mod tests {
         // Restored again over what is there: emptied first, the same files.
         restore(&dir, &expected).unwrap();
         assert_eq!(collect(&dir, None).unwrap(), expected);
-        _ = std::fs::remove_dir_all(&dir);
     }
 }

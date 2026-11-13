@@ -196,6 +196,10 @@ fn sorted(hashes: &[CodeHash]) -> Vec<CodeHash> {
 /// Code hashes are uniform, so their first four bytes already order all but a few: a radix
 /// sort on that prefix, linear where a comparison sort of 32-byte keys is `n log n`
 /// compares, then the rare runs of one prefix by the whole hash.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the order packs an index into the low 32 bits of a word, and nothing caps the functions a test reaches: 2^32 of them needs a typed refusal where the set is read"
+)]
 fn set_order(hashes: &[CodeHash], order: &mut Vec<u64>) {
     let count = u32::try_from(hashes.len()).expect("a test reaches fewer than 2^32 functions");
     order.extend(

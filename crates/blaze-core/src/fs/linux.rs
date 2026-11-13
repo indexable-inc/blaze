@@ -240,11 +240,8 @@ mod tests {
 
     use super::*;
 
-    fn dir(what: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-core-fs-linux-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn dir(what: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-core-fs-linux-{what}-"))
     }
 
     /// The real kernel, made to move at most `most` bytes a call and to interrupt every
@@ -305,7 +302,8 @@ mod tests {
     /// Writes `bytes` at 0 of a new file in `what`'s directory through a kernel that writes
     /// three bytes a call and interrupts every other call, with `plant`.
     fn short_write(what: &str, bytes: &[u8], plant: Plant) -> Result<(), String> {
-        let path = dir(what).join("file");
+        let held = dir(what);
+        let path = held.join("file");
         std::fs::write(&path, b"").unwrap();
         let file = open(&path, OpenFlags::WRITE, Plant::None).unwrap();
         let stingy = Stingy { most: 3, every: 2, calls: Cell::new(0) };
@@ -329,7 +327,8 @@ mod tests {
 
     #[test]
     fn a_short_read_is_continued_to_the_files_end() {
-        let path = dir("short-read").join("file");
+        let held = dir("short-read");
+        let path = held.join("file");
         let bytes: Vec<u8> = (0..=255).cycle().take(700).collect();
         std::fs::write(&path, &bytes).unwrap();
         let file = open(&path, OpenFlags::READ, Plant::None).unwrap();
@@ -341,7 +340,8 @@ mod tests {
 
     #[test]
     fn a_call_always_interrupted_ends_with_the_interruption() {
-        let path = dir("storm").join("file");
+        let held = dir("storm");
+        let path = held.join("file");
         std::fs::write(&path, b"x").unwrap();
         let file = open(&path, OpenFlags::WRITE, Plant::None).unwrap();
         let storm = Stingy { most: 1, every: 1, calls: Cell::new(0) };
@@ -354,7 +354,8 @@ mod tests {
     /// directory (`making_parent`) and what an empty `ReadAll` reads. The oracle is
     /// `std::fs`'s error for the same path.
     fn missing_is_not_found(what: &str, plant: Plant) -> Result<(), String> {
-        let path = dir(what).join("no/such/file");
+        let held = dir(what);
+        let path = held.join("no/such/file");
         let ours = open(&path, OpenFlags::READ, plant).expect_err("a missing file opened");
         let stds = std::fs::File::open(&path).expect_err("a missing file opened");
         match (ours.kind(), ours.raw_os_error()) == (stds.kind(), stds.raw_os_error()) {

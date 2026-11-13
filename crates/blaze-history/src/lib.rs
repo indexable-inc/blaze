@@ -1,17 +1,19 @@
 //! Scheduling from history (docs/v2/plan/design/compile-time.md change 11,
 //! docs/v2/plan/design/compile-time.md): what each task took and held, by its kind and
-//! its key, predicts what the next task of that kind and key will, for the plane's critical
-//! path (a node's cost, in nanoseconds of run time) and its memory admission (a node's peak).
+//! its key, predicts what the next task of that kind and key will take, for the plane's
+//! critical path (a node's cost, in nanoseconds of run time). Memory admission forecasts from
+//! one record of its own, `blaze_graph::admission::Peaks` (memory.md 4.3), not from here: a
+//! key's record keeps its last peak only for a reader of that key ([`History::record`]).
 //!
 //! - **By key** ([`table`]): a task key (`blaze_query::QueryKey::task_key`, a content hash)
 //!   has a record of 64 bytes of its last runs' times and its peak, in a table of fixed size
 //!   indexed by the key's own bytes. Keys not seen lately are dropped for newer ones; any
 //!   thread reads it with no lock ([`History::reader`]).
-//! - **By kind** ([`kinds`]): every kind keeps a mean of its run times beside the plane's own
-//!   [`Estimates`] of its peaks, never dropped. A task with no key, or a key with no record, is
-//!   predicted by its kind, and a kind never seen by [`Config`]'s defaults: that is the
-//!   prediction for something not seen yet, not a fallback (no other way is taken; nothing is
-//!   built differently, only ordered and admitted by the best guess there is).
+//! - **By kind** ([`kinds`]): every kind keeps a mean of its run times, never dropped. A task
+//!   with no key, or a key with no record, is predicted by its kind, and a kind never seen by
+//!   [`Config`]'s default: that is the prediction for something not seen yet, not a fallback
+//!   (no other way is taken; nothing is built differently, only ordered by the best guess
+//!   there is).
 //!
 //! The rules are integers only, so the same observations in the same order give the same
 //! predictions and the same bytes ([`History::encode`]), which the daemon keeps in its image.
@@ -35,7 +37,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use blaze_graph::{
     Key,
-    admission::{Estimates, Predict, Prediction, TaskKind},
+    admission::{Predict, Prediction, TaskKind},
 };
 
 pub use crate::{
@@ -52,21 +54,17 @@ pub struct Config {
     pub slots: usize,
     /// The run time of a task of a kind never seen, in nanoseconds.
     pub unseen_ns: u64,
-    /// The peak of a task of a kind never seen, in bytes ([`Estimates::unseen`]).
-    pub unseen_bytes: u64,
 }
 
 impl Default for Config {
-    /// 65,536 keys (4 MiB); a millisecond and 64 MiB for a kind never seen, as the daemon's
-    /// estimates take.
+    /// 65,536 keys (4 MiB); a millisecond for a kind never seen.
     fn default() -> Config {
-        Config { slots: 1 << 16, unseen_ns: 1_000_000, unseen_bytes: 64 << 20 }
+        Config { slots: 1 << 16, unseen_ns: 1_000_000 }
     }
 }
 
-/// What each kind and each key of the tasks a daemon ran took and held.
+/// What each kind and each key of the tasks a daemon ran took, and each key's last peak.
 pub struct History {
-    estimates: Estimates,
     times: Times,
     keys: Writer,
     unseen_ns: u64,
@@ -85,28 +83,13 @@ impl History {
     ///
     /// When `config.slots` is not a power of two of at least [`table::WAYS`].
     pub fn new(config: Config) -> History {
-        History::with_estimates(config, Estimates::new(config.unseen_bytes))
-    }
-
-    /// A history whose kinds' peaks start from `estimates`, the daemon's from before it kept a
-    /// history; their `unseen` becomes `config`'s.
-    ///
-    /// # Panics
-    ///
-    /// As [`History::new`].
-    pub fn with_estimates(config: Config, mut estimates: Estimates) -> History {
-        estimates.unseen = config.unseen_bytes;
-        History {
-            estimates,
-            times: Times::default(),
-            keys: Writer::new(config.slots),
-            unseen_ns: config.unseen_ns,
-        }
+        History { times: Times::default(), keys: Writer::new(config.slots), unseen_ns: config.unseen_ns }
     }
 
     /// What a task of `kind` with `key` is predicted to take: its key's record where there is
     /// one, else its kind's. The cost is in nanoseconds for every task, so a request's costs
-    /// are of one unit.
+    /// are of one unit. The peak is the key's last, 0 with no record of the key: admission
+    /// does not read it (`blaze_graph::admission::Peaks` is its record).
     pub fn predict(&self, kind: TaskKind, key: Option<&Key>) -> Prediction {
         if let Some(record) = key.and_then(|key| self.keys.get(kind, key)) {
             return Prediction {
@@ -115,13 +98,12 @@ impl History {
             };
         }
         let cost = self.times.get(kind).map_or(self.unseen_ns, |it| it.mean_ns);
-        Prediction { cost: Some(cost), peak: self.estimates.predict(kind) }
+        Prediction { cost: Some(cost), peak: 0 }
     }
 
     /// A task of `kind` with `key` ran for `ran_ns` (its own run, not its wait) and held
-    /// `peak` bytes at most, measured: its kind and its key learn it.
+    /// `peak` bytes at most, measured: its kind learns the time, its key the time and peak.
     pub fn observe(&mut self, kind: TaskKind, key: Option<&Key>, ran_ns: u64, peak: u64) {
-        self.estimates.observe(kind, peak);
         self.times.observe(kind, ran_ns);
         if let Some(key) = key {
             self.keys.observe(kind, key, micros(ran_ns), peak);
@@ -131,11 +113,6 @@ impl History {
     /// The record of `kind`'s `key`, if the history holds one.
     pub fn record(&self, kind: TaskKind, key: &Key) -> Option<Record> {
         self.keys.get(kind, key)
-    }
-
-    /// The kinds' peaks.
-    pub fn estimates(&self) -> &Estimates {
-        &self.estimates
     }
 
     /// The kinds' run times.
@@ -186,7 +163,7 @@ impl Predict for History {
     fn measured(&self, kind: TaskKind, key: Option<Key>) -> bool {
         match key {
             Some(key) => self.keys.get(kind, &key).is_some(),
-            None => self.estimates.by_kind.get(&kind).is_some_and(|it| it.seen > 0),
+            None => self.times.get(kind).is_some_and(|it| it.seen > 0),
         }
     }
 }

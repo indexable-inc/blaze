@@ -105,6 +105,11 @@ struct ViewFile<'a> {
 }
 
 impl<'a> ViewFiles<'a> {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "view files are u32 indices: a view of 2^32 files needs a typed refusal from \
+                  the intent's builder"
+    )]
     fn new(
         mounted: &'a Mounted,
         paths: &'a std::collections::HashMap<FileId, String>,

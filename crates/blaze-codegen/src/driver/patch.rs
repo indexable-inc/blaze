@@ -171,6 +171,13 @@ pub(super) struct Walked<I, S> {
     closes: bool,
 }
 
+impl<I, S> Walked<I, S> {
+    /// How many functions the walk holds: the describes it keeps, one a node.
+    pub(super) fn functions(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 /// What a whole walk hands the build beside its result, for the walk to be kept
 /// ([`Build::keep_of`]): made only by a walk with no error.
 pub(super) struct Side<I, S> {
@@ -554,12 +561,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 false => None,
                 true => match self.frontend.redescribe(&it.asked.0, &it.asked.1, &it.described) {
                     Ok(None) => None,
-                    Ok(Some(now)) => {
-                        // alloc: once per describe, shared by the walk's node and the walk kept
-                        let now = Arc::new(now);
-                        kept.keep(0, &it.asked, now.clone()); // clone: a reference count
-                        Some(now)
-                    }
+                    // alloc: once per describe, the patched walk's node's: its one holder
+                    Ok(Some(now)) => Some(Arc::new(now)),
                     Err(_) => return Err("a describe failed"),
                 },
             };
@@ -722,7 +725,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // The functions an edit brought in: a few, run here where that is cheaper.
             static NEW: par::Small = par::Small::new("codegen walk: describe new functions");
             let described = par::map_small(&NEW, &functions, |(_, asked)| {
-                let described = self.described(asked, 0, &counts)?;
+                let described = self.described(asked, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));
                 let each_build = self.frontend.each_build(&asked.0, &asked.1);
@@ -1189,11 +1192,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         else {
             return Err("a kept walk holds no item of a root");
         };
-        let (described, verified) = counts.get();
         let visited = touched.functions.len() + touched.statics.len();
         let walk = Walk {
-            described: redescribed + described,
-            verified: asks.len() - redescribed + verified,
+            described: redescribed + counts.described_so_far(),
+            verified: asks.len() - redescribed,
             found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,

@@ -152,6 +152,12 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
 /// bound through a short directory of this process's own under `/tmp`, made with mode 0700, whose
 /// one entry links to `path`'s directory: the socket is still made in that directory, so its
 /// rename into place stays atomic.
+#[expect(
+    blaze::tmp_path,
+    reason = "the real /tmp is the policy here: the short directory a too-long socket name is bound through must \
+              be under a short base, checked to be one nobody else can replace entries of, and lives only for the \
+              bind; TMPDIR is the long name this exists to avoid"
+)]
 fn bind(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 

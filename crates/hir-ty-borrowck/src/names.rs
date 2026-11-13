@@ -118,6 +118,12 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// The place as rustc writes it in a message, or `None` for a temporary. Asked only while
     /// an error is drafted, never to decide one: it reads the body's source map
     /// ([`Self::from_external_macro`]), and a body with an error has no verdict kept.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the check words its errors inside the query, so naming a place asks the source map whether a \
+                  macro wrote it: the check must record the place and leave its wording to a reporter marked \
+                  `#[blaze::renders_positions]` outside the borrow check"
+    )]
     pub(super) fn describe(
         &self,
         body: &MirBody<'db>,
@@ -177,6 +183,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// trace out of the item store), so only [`Self::describe`], which renders an error,
     /// calls it; what decides whether there is an error reads facts of the lowered body
     /// ([`hir_def::expr_store::ExpressionStore::is_synthesized`]).
+    #[blaze::renders_positions]
     fn from_external_macro(&self, binding: BindingId) -> bool {
         let InferBodyId::DefWithBodyId(def) = self.owner else { return false };
         let source_map = Body::unmoved_source_map(self.db, def);

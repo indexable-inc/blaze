@@ -81,11 +81,9 @@ fn store(dir: &Path) -> &'static blaze_cas::Handle {
     Box::leak(Box::new(driven.handle()))
 }
 
-fn temporary(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-registry-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory for `name`, removed with all it holds when the guard drops.
+fn temporary(name: &str) -> blaze_core::temp::TempDir {
+    blaze_core::temp::TempDir::for_test(&format!("blaze-registry-{name}-"))
 }
 
 /// A `.crate` of `entries`, paths under `<name>-<version>/` as `cargo package` writes them.
@@ -116,6 +114,8 @@ struct Fixture {
     store: &'static blaze_cas::Handle,
     home: PathBuf,
     source: SourceId,
+    /// The directory `home` is, removed with all it holds when the fixture drops.
+    _tmp: blaze_core::temp::TempDir,
 }
 
 impl Fixture {
@@ -127,8 +127,9 @@ impl Fixture {
             "c1",
         );
         let source = blaze_registry::registry_source(&format!("sparse+{BASE}")).unwrap();
-        let home = temporary(name);
-        Fixture { server, store: store(&home.join("store")), home, source }
+        let tmp = temporary(name);
+        let home = tmp.path().to_path_buf();
+        Fixture { server, store: store(&home.join("store")), home, source, _tmp: tmp }
     }
 
     fn registry(&self, offline: bool) -> Registry {

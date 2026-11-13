@@ -9,6 +9,9 @@
     reason = "the program `blaze`: stdout is its output, stderr is where it speaks"
 )]
 #![deny(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 mod as_rustc;
 #[cfg(feature = "native")]

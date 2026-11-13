@@ -13,8 +13,18 @@
 //! | head | the crate's data, its module tree (origin, visibility, children), preludes | with the header |
 //! | a module's name table | open-addressed slots: a name's hash and where its entry is | a name is looked up in the module |
 //! | a name's entry | the name and what it means in each namespace ([`PerNs`]) | that name is looked up |
-//! | a module's scope | the whole `ItemScope`, as [`Enc::scope`] writes it | something lists the scope (impls, globs, traits in scope) |
+//! | a module's traits | the traits in scope in it, named or not (`ItemScope::traits`) | method resolution asks for the traits in scope |
+//! | a module's textual macro table, and an entry a name | slots as a name table's; the name and the `macro_rules!` it means textually | a textual macro name is looked up |
+//! | a module's items | its impls, built-in derive impls and declared traits | the impls maintainer is handed a served crate whose impls have no tables |
+//! | a module's scope | the rest of its `ItemScope` ([`Enc::scope_rest`]), each entry's length in its run, and each namespace's names by their entry's position | something lists the whole scope (globs, a walk of every item): with the runs of its name entries and its textual macro entries, three reads |
 //! | tail | name records, diagnostics, derive helpers | a lint or a diagnostic asks |
+//!
+//! What each lookup reads (rule 67; the floor is one read of the bytes the answer is in): a
+//! name, a textual macro: the window of four slots (64 bytes) and the entry, two reads, one
+//! where the record is mapped; the traits in scope, the items: one read of their segment.
+//! Nothing a lookup reads is kept by this module past the read: the answer is the memo's, and
+//! the record is the driver's (a `blaze_cas::direct` mapping, or a read into the reader's
+//! frame), so name resolution holds no state of a crate read from pages.
 //!
 //! Every offset is from the record's start and every number little-endian, so the record
 //! means the same wherever it is read and nothing is fixed up after a read. A segment is the
@@ -36,8 +46,11 @@
 //! driver's is the store's pool, whose pages go back when nothing reads them. Bytes that do
 //! not read are [`Unreadable`], naming the crate, never a crate resolved instead.
 //!
-//! Not yet: a module's names are written twice (in its scope segment and as entries). The
-//! scope segment without them, with each entry's place in its namespace, is the next layout.
+//!
+//! A module's names are written once: as entries, one after another in one run (and its
+//! textual macros in a run of their own). The name table points into the run; the scope
+//! segment names each entry by its position there, so a whole scope is decoded from the same
+//! bytes a lookup reads, and no name is in the record twice.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -52,7 +65,8 @@ use triomphe::Arc as TArc;
 
 use super::{Dec, Enc, R, Unreadable, closure};
 use crate::{
-    ExternCrateId, FxIndexMap, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
+    BuiltinDeriveImplId, ExternCrateId, FxIndexMap, ImplId, MacroId, ModuleDefId, ModuleId,
+    TraitId, UseId,
     builtin_type::BuiltinType,
     item_scope::ItemScope,
     nameres::{
@@ -73,12 +87,16 @@ const MAGIC: [u8; 8] = *b"blzdmpg\0";
 /// The layout of a record: it changes with every change to the header, the rows, the slots or
 /// which segments there are. What a segment holds is [`super::ENCODING`]'s, which the header
 /// names as well.
-pub const LAYOUT: u32 = 1;
+/// Layout 1 had no traits, textual macro or items segment: its readers of those decoded the
+/// module's whole scope. Refused by the header like any other.
+/// Layout 2 wrote a module's names twice, in its scope segment and as entries, and had no
+/// runs of entries in its rows.
+pub const LAYOUT: u32 = 3;
 
 /// Bytes of the header.
 const HEADER: usize = 56;
 /// Bytes of a module's row.
-const ROW: usize = 24;
+const ROW: usize = 64;
 /// Bytes of a name table's slot.
 pub(super) const SLOT: usize = 16;
 /// The slots a lookup reads at once: a name is in the first of them unless that many names
@@ -252,30 +270,86 @@ impl Header {
     }
 }
 
-/// A module's row: where its whole scope is, and its name table.
+/// One open-addressed table of a module's: where its slots are, how many (a power of two, or
+/// 0 for a table with no key) and how many keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Table {
+    at: u32,
+    slots: u32,
+    keys: u32,
+}
+
+/// A module's row: where its segments are, and its two tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Row {
     scope: (u32, u32),
-    slots_at: u32,
-    /// The slots of the name table: a power of two, or 0 for a module with no name.
-    slots: u32,
-    /// The names in the table.
-    names: u32,
+    /// Its names in the three namespaces.
+    names: Table,
+    traits: (u32, u32),
+    /// Its textual (`macro_rules!`) macros, by name.
+    legacy: Table,
+    items: (u32, u32),
+    /// Its name entries, one after another: what `names` points into and `scope` names by
+    /// position.
+    entries: (u32, u32),
+    /// Its textual macro entries, one after another: what `legacy` points into.
+    textual: (u32, u32),
 }
 
 impl Row {
     fn write(&self, out: &mut Vec<u8>) {
-        for it in [self.scope.0, self.scope.1, self.slots_at, self.slots, self.names, 0] {
+        for it in [
+            self.scope.0,
+            self.scope.1,
+            self.names.at,
+            self.names.slots,
+            self.names.keys,
+            self.traits.0,
+            self.traits.1,
+            self.legacy.at,
+            self.legacy.slots,
+            self.legacy.keys,
+            self.items.0,
+            self.items.1,
+            self.entries.0,
+            self.entries.1,
+            self.textual.0,
+            self.textual.1,
+        ] {
             out.extend_from_slice(&it.to_le_bytes());
         }
     }
 
     fn parse(bytes: &[u8]) -> Row {
+        let pair = |at: usize| (u32_at(bytes, at), u32_at(bytes, at + 4));
+        let table = |at: usize| Table {
+            at: u32_at(bytes, at),
+            slots: u32_at(bytes, at + 4),
+            keys: u32_at(bytes, at + 8),
+        };
         Row {
-            scope: (u32_at(bytes, 0), u32_at(bytes, 4)),
-            slots_at: u32_at(bytes, 8),
-            slots: u32_at(bytes, 12),
-            names: u32_at(bytes, 16),
+            scope: pair(0),
+            names: table(8),
+            traits: pair(20),
+            legacy: table(28),
+            items: pair(40),
+            entries: pair(48),
+            textual: pair(56),
+        }
+    }
+
+    /// The row with every place moved by `base`: from the body's start to the record's.
+    fn moved(self, base: u32) -> Row {
+        let pair = |(at, len): (u32, u32)| (at + base, len);
+        let table = |it: Table| Table { at: it.at + base, ..it };
+        Row {
+            scope: pair(self.scope),
+            names: table(self.names),
+            traits: pair(self.traits),
+            legacy: table(self.legacy),
+            items: pair(self.items),
+            entries: pair(self.entries),
+            textual: pair(self.textual),
         }
     }
 }
@@ -669,25 +743,39 @@ pub(in crate::nameres) fn name_now(db: &Db, paged: blaze_query::db::Id, name: &N
     }
 }
 
-fn look_up(db: &Db, krate: Crate, module: usize, name: &Name) -> R<PerNs> {
-    let (source, head) = source_of(db, krate)?;
-    let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
-    if row.slots == 0 {
-        return Ok(PerNs::none());
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a name's lookup serves the entry of the module's first name in
+    /// slot order, whatever name it holds: an entry of another name served.
+    pub(crate) static SERVES_ANOTHER_NAMES_ENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The entry of `table` whose slot has `hash` and of which `entry` gives `Some`: `entry`
+/// reads an entry's bytes, gives `None` for another key of the same hash. `None` when the
+/// walk from the hash's slot ends at an empty one: the key is not in the table, known from
+/// the one window read. Reads a window of [`WINDOW`] slots, then each entry of the hash.
+// dyn: the crate's one source
+fn find<T>(
+    source: &dyn PageSource,
+    table: Table,
+    hash: u64,
+    mut entry: impl FnMut(&[u8]) -> R<Option<T>>,
+) -> R<Option<T>> {
+    if table.slots == 0 {
+        return Ok(None);
     }
-    if !row.slots.is_power_of_two() {
+    if !table.slots.is_power_of_two() {
         // alloc: error path
-        return Err(format!("a name table of {} slots", row.slots));
+        return Err(format!("a table of {} slots", table.slots));
     }
-    let hash = hash_of(name);
-    let mask = row.slots - 1;
+    let mask = table.slots - 1;
     let mut at = hash as u32 & mask;
     let mut probed = 0;
     // The bound: every slot once. A table is at most half full, so a walk ends at an empty
     // slot long before; one that does not is a table this did not write.
-    while probed < row.slots {
-        let run = WINDOW.min(row.slots - at);
-        let slots = read(source, row.slots_at + at * SLOT as u32, run * SLOT as u32, |bytes| {
+    while probed < table.slots {
+        let run = WINDOW.min(table.slots - at);
+        let slots = read(source, table.at + at * SLOT as u32, run * SLOT as u32, |bytes| {
             let mut slots = [Slot::default(); WINDOW as usize];
             for (slot, bytes) in slots.iter_mut().zip(bytes.chunks_exact(SLOT)) {
                 *slot = Slot::parse(bytes);
@@ -696,29 +784,134 @@ fn look_up(db: &Db, krate: Crate, module: usize, name: &Name) -> R<PerNs> {
         })?;
         for slot in &slots[..run as usize] {
             if slot.hash == 0 {
-                return Ok(PerNs::none());
+                return Ok(None);
             }
             if slot.hash != hash {
                 continue;
             }
-            let found = read(source, slot.at, slot.len, |bytes| {
-                let mut dec = segment(db, krate, &head.files, &head.own, bytes);
-                if dec.name()? != *name {
-                    return Ok(None);
-                }
-                let found = dec.per_ns()?;
-                dec.finish()?;
-                Ok(Some(found))
-            })?;
-            if let Some(found) = found {
-                return Ok(found);
+            if let Some(found) = read(source, slot.at, slot.len, &mut entry)? {
+                return Ok(Some(found));
             }
         }
         probed += run;
         at = (at + run) & mask;
     }
     // alloc: error path
-    Err(format!("a name table of {} slots with none empty", row.slots))
+    Err(format!("a table of {} slots with none empty", table.slots))
+}
+
+fn look_up(db: &Db, krate: Crate, module: usize, name: &Name) -> R<PerNs> {
+    let (source, head) = source_of(db, krate)?;
+    let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
+    #[cfg(test)]
+    if SERVES_ANOTHER_NAMES_ENTRY.get() && row.names.slots != 0 {
+        let len = row.names.slots * SLOT as u32;
+        let first = read(source, row.names.at, len, |bytes| {
+            Ok(bytes.chunks_exact(SLOT).map(Slot::parse).find(|it| it.hash != 0))
+        })?;
+        if let Some(slot) = first {
+            return read(source, slot.at, slot.len, |bytes| {
+                let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+                dec.name()?;
+                let found = dec.per_ns()?;
+                dec.finish()?;
+                Ok(found)
+            });
+        }
+    }
+    let found = find(source, row.names, hash_of(name), |bytes| {
+        let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+        if dec.name()? != *name {
+            return Ok(None);
+        }
+        let found = dec.per_ns()?;
+        dec.finish()?;
+        Ok(Some(found))
+    })?;
+    Ok(found.unwrap_or_else(PerNs::none))
+}
+
+/// The `macro_rules!` that `name` means textually at the end of the module `module` of
+/// `krate`: its textual macro table's window and the name's entry, nothing else.
+fn look_up_legacy(
+    db: &Db,
+    krate: Crate,
+    module: usize,
+    name: &Name,
+) -> R<Option<Box<[MacroId]>>> {
+    let (source, head) = source_of(db, krate)?;
+    let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
+    find(source, row.legacy, hash_of(name), |bytes| {
+        let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+        if dec.name()? != *name {
+            return Ok(None);
+        }
+        let ids = dec.many(Dec::macro_id)?;
+        dec.finish()?;
+        // alloc: the memo's value, once per textual macro name looked up
+        Ok(Some(ids.into_boxed_slice()))
+    })
+}
+
+/// The traits in scope in the module `module` of `krate`, from their segment alone.
+fn read_traits(db: &Db, krate: Crate, module: usize) -> R<Box<[TraitId]>> {
+    let (source, head) = source_of(db, krate)?;
+    let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
+    read(source, row.traits.0, row.traits.1, |bytes| {
+        let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+        let traits = dec.many(trait_of)?;
+        dec.finish()?;
+        // alloc: the memo's value, once per module whose traits are asked for
+        Ok(traits.into_boxed_slice())
+    })
+}
+
+fn trait_of(dec: &mut Dec<'_>) -> R<TraitId> {
+    match dec.def()? {
+        ModuleDefId::TraitId(it) => Ok(it),
+        // alloc: error path
+        _ => Err("a trait in scope that is no trait".to_owned()),
+    }
+}
+
+/// What the impls maintainer is handed of one module of a crate read from pages: its impls,
+/// its built-in derive impls and the traits it declares, in its scope's order
+/// (`delta::diff::Items::add`'s reads of a scope).
+pub(in crate::nameres) struct ModuleItems {
+    pub(in crate::nameres) impls: Vec<ImplId>,
+    pub(in crate::nameres) derive_impls: Vec<BuiltinDeriveImplId>,
+    pub(in crate::nameres) traits: Vec<TraitId>,
+}
+
+/// How many modules the crate read from pages `krate` has: its head's.
+pub(in crate::nameres) fn modules(db: &Db, krate: Crate) -> usize {
+    head(db, krate).rows.len()
+}
+
+/// The items of the module at `module` of the crate read from pages `krate`: one read of its
+/// items segment, and no scope decoded. Not a memo: its one reader, the hand-over of a served
+/// crate to the impls maintainer, reads each module once and keeps nothing.
+pub(in crate::nameres) fn module_items(db: &Db, krate: Crate, module: usize) -> ModuleItems {
+    let read_items = || {
+        let (source, head) = source_of(db, krate)?;
+        let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
+        read(source, row.items.0, row.items.1, |bytes| {
+            let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+            let impls = dec.many(Dec::impl_id)?;
+            let derive_impls = dec.many(Dec::builtin_derive_impl)?;
+            let traits = dec.many(trait_of)?;
+            dec.finish()?;
+            Ok(ModuleItems { impls, derive_impls, traits })
+        })
+    };
+    match read_items() {
+        Ok(items) => items,
+        Err(why) => {
+            // alloc: error path
+            let why = format!("the items of module {module}: {why}");
+            Unreadable::of(db, krate, KIND, why).throw()
+        }
+    }
 }
 
 /// What `name` means in the module `paged` names, kept: for a reader that has the module's
@@ -742,13 +935,74 @@ fn scope_memo(db: &Db, paged: PagedScope) -> ItemScope {
     blaze_query::db::report_stored_read(db);
     let (krate, module) = (paged.krate(db), paged.module(db) as usize);
     let scope = source_of(db, krate).and_then(|(source, head)| {
-        let row = head.rows.get(module).ok_or("a module the pages have no row of")?;
-        read(source, row.scope.0, row.scope.1, |bytes| {
-            let mut dec = segment(db, krate, &head.files, &head.own, bytes);
-            let scope = dec.scope()?;
-            dec.finish()?;
-            Ok(scope)
-        })
+        let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
+        let mut scope = ItemScope::default();
+        // The scope segment: each entry's length in its run, each namespace's names by their
+        // entry's position, and the rest of the scope.
+        let (lens, [types, values, macros], textual) =
+            read(source, row.scope.0, row.scope.1, |bytes| {
+                let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+                // alloc: decoding a whole scope, once per module whose whole scope is asked for
+                let lens = dec.many(Dec::u32)?;
+                let columns = [dec.many(Dec::u32)?, dec.many(Dec::u32)?, dec.many(Dec::u32)?];
+                let textual = dec.many(Dec::u32)?;
+                dec.scope_rest(&mut scope, false)?;
+                dec.finish()?;
+                Ok((lens, columns, textual))
+            })?;
+        // The name entries, in one read of their run.
+        let entries = read(source, row.entries.0, row.entries.1, |bytes| {
+            // alloc: as above
+            let mut entries = Vec::with_capacity(lens.len());
+            let mut at = 0;
+            for &len in &lens {
+                let bytes = in_run(bytes, &mut at, len)?;
+                let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+                let name = dec.name()?;
+                let found = dec.per_ns()?;
+                dec.finish()?;
+                entries.push((name, found));
+            }
+            run_ends(bytes, at)?;
+            Ok(entries)
+        })?;
+        let entry = |at: u32| {
+            // alloc: error path
+            entries.get(at as usize).ok_or_else(|| format!("entry {at} of {}", entries.len()))
+        };
+        // alloc: error path
+        let none = |name: &Name, ns: &str| format!("`{}` named in {ns} by an entry with none", name.as_str());
+        scope.types.reserve(types.len());
+        for &at in &types {
+            let (name, found) = entry(at)?;
+            scope.types.push_unindexed(*name, found.types.ok_or_else(|| none(name, "types"))?);
+        }
+        scope.values.reserve(values.len());
+        for &at in &values {
+            let (name, found) = entry(at)?;
+            scope.values.push_unindexed(*name, found.values.ok_or_else(|| none(name, "values"))?);
+        }
+        scope.macros.reserve(macros.len());
+        for &at in &macros {
+            let (name, found) = entry(at)?;
+            scope.macros.push_unindexed(*name, found.macros.ok_or_else(|| none(name, "macros"))?);
+        }
+        // The textual macro entries, in one read of theirs.
+        read(source, row.textual.0, row.textual.1, |bytes| {
+            scope.legacy_macros.reserve(textual.len());
+            let mut at = 0;
+            for &len in &textual {
+                let bytes = in_run(bytes, &mut at, len)?;
+                let mut dec = segment(db, krate, &head.files, &head.own, bytes);
+                let name = dec.name()?;
+                let ids = dec.small(Dec::macro_id)?;
+                dec.finish()?;
+                scope.legacy_macros.push_unindexed(name, ids);
+            }
+            run_ends(bytes, at)
+        })?;
+        scope.seal().map_err(str::to_owned)?;
+        Ok(scope)
     });
     match scope {
         Ok(scope) => scope,
@@ -760,6 +1014,25 @@ fn scope_memo(db: &Db, paged: PagedScope) -> ItemScope {
     }
 }
 
+/// The `len` bytes of a run at `at`, which moves past them.
+fn in_run<'b>(run: &'b [u8], at: &mut usize, len: u32) -> R<&'b [u8]> {
+    let end = at.checked_add(len as usize).filter(|&end| end <= run.len());
+    // alloc: error path
+    let end = end.ok_or_else(|| format!("an entry of {len} bytes at {at} of a run of {}", run.len()))?;
+    let bytes = &run[*at..end];
+    *at = end;
+    Ok(bytes)
+}
+
+/// A run read to `at` is read to its end: no bytes after its last entry.
+fn run_ends(run: &[u8], at: usize) -> R {
+    match at == run.len() {
+        true => Ok(()),
+        // alloc: error path
+        false => Err(format!("a run of {} bytes whose entries end at {at}", run.len())),
+    }
+}
+
 pub(in crate::nameres) fn scope(db: &Db, paged: blaze_query::db::Id) -> &ItemScope {
     scope_memo(db, key_of(db, paged).0)
 }
@@ -768,8 +1041,15 @@ pub(in crate::nameres) fn scope(db: &Db, paged: blaze_query::db::Id) -> &ItemSco
 fn legacy_macro_memo(db: &Db, paged: PagedScope, name: Name) -> Option<Box<[MacroId]>> {
     // The value is the record's, found by content: told to the engine (`row::STORED`).
     blaze_query::db::report_stored_read(db);
-    // alloc: the memo's value, once per name looked up
-    scope_memo(db, paged).get_legacy_macro(&name).map(Box::from)
+    let (krate, module) = (paged.krate(db), paged.module(db) as usize);
+    match look_up_legacy(db, krate, module, &name) {
+        Ok(found) => found,
+        Err(why) => {
+            // alloc: error path
+            let why = format!("textual macro `{}` in module {module}: {why}", name.as_str());
+            Unreadable::of(db, krate, KIND, why).throw()
+        }
+    }
 }
 
 pub(in crate::nameres) fn legacy_macro(
@@ -784,8 +1064,15 @@ pub(in crate::nameres) fn legacy_macro(
 fn traits_memo(db: &Db, paged: PagedScope) -> Box<[TraitId]> {
     // The value is the record's, found by content: told to the engine (`row::STORED`).
     blaze_query::db::report_stored_read(db);
-    // alloc: the memo's value, once per module scope
-    scope_memo(db, paged).traits().collect()
+    let (krate, module) = (paged.krate(db), paged.module(db) as usize);
+    match read_traits(db, krate, module) {
+        Ok(traits) => traits,
+        Err(why) => {
+            // alloc: error path
+            let why = format!("the traits in scope in module {module}: {why}");
+            Unreadable::of(db, krate, KIND, why).throw()
+        }
+    }
 }
 
 pub(in crate::nameres) fn traits(db: &Db, paged: blaze_query::db::Id) -> &[TraitId] {
@@ -899,6 +1186,37 @@ fn names_of(scope: &ItemScope) -> Vec<Name> {
     names
 }
 
+/// One namespace of a scope segment: how many names, then each one's entry's position in its
+/// module's run, in the namespace's order.
+fn positions<'n>(
+    enc: &mut Enc<'_>,
+    position: &HashMap<Name, u32, Global>,
+    names: impl ExactSizeIterator<Item = &'n Name>,
+) -> R {
+    enc.usize(names.len())?;
+    for name in names {
+        // alloc: error path
+        let at = position.get(name).ok_or_else(|| format!("`{}` with no entry", name.as_str()))?;
+        enc.u32(*at);
+    }
+    Ok(())
+}
+
+/// Where the segments written to `body` since `from` are, as one run: from the body's start.
+fn run_from(from: usize, body: &[u8]) -> R<(u32, u32)> {
+    let at = u32::try_from(from).map_err(|_| "pages over 4 GiB")?;
+    let len = u32::try_from(body.len() - from).map_err(|_| "a run over 4 GiB")?;
+    Ok((at, len))
+}
+
+/// The table of `entries` ([`table_of`]) added to `body`: where it is, from the body's start.
+fn table_in(body: &mut Vec<u8>, entries: &[(u64, (u32, u32))]) -> R<Table> {
+    let (slots, bytes) = table_of(entries);
+    let at = u32::try_from(body.len()).map_err(|_| "pages over 4 GiB")?;
+    body.extend_from_slice(&bytes);
+    Ok(Table { at, slots, keys: entries.len() as u32 })
+}
+
 /// [`encode`]; `without` leaves that name out of every name table: a test's planted bug.
 fn encode_maps(
     db: &Db,
@@ -923,23 +1241,86 @@ fn encode_maps(
     let mut rows: Vec<Row> = Vec::with_capacity(table.len());
     for (_, data) in table.iter() {
         let scope = data.scope(db);
-        let whole = write_segment(&mut enc, &mut body, |enc| enc.scope(scope))?;
+        let names_here = names_of(scope);
+        // Each name's entry, once, one after another: the name table points at it and the
+        // scope segment names it by its position in the run.
         // alloc: encoding, as above
-        let mut entries: Vec<(u64, (u32, u32))> = Vec::new();
-        for name in names_of(scope) {
+        let mut position: HashMap<Name, u32, Global> = HashMap::new_in(Global);
+        // alloc: encoding, as above
+        let mut entry_lens: Vec<u32> = Vec::with_capacity(names_here.len());
+        // alloc: encoding, as above
+        let mut entries: Vec<(u64, (u32, u32))> = Vec::with_capacity(names_here.len());
+        let entries_from = body.len();
+        for name in &names_here {
+            let at = write_segment(&mut enc, &mut body, |enc| {
+                enc.name(name)?;
+                enc.per_ns(scope.get(name))
+            })?;
+            position.insert(*name, entry_lens.len() as u32);
+            entry_lens.push(at.1);
+            // The plant leaves the name out of the table only: its entry is the scope's too.
             if without.is_some_and(|it| it == name.as_str()) {
                 continue;
             }
-            let at = write_segment(&mut enc, &mut body, |enc| {
-                enc.name(&name)?;
-                enc.per_ns(scope.get(&name))
-            })?;
-            entries.push((hash_of(&name), at));
+            entries.push((hash_of(name), at));
         }
-        let (slots, bytes) = table_of(&entries);
-        let slots_at = u32::try_from(body.len()).map_err(|_| "pages over 4 GiB")?;
-        body.extend_from_slice(&bytes);
-        rows.push(Row { scope: whole, slots_at, slots, names: entries.len() as u32 });
+        let entries_run = run_from(entries_from, &body)?;
+        // alloc: encoding, as above
+        let mut legacy: Vec<(u64, (u32, u32))> = Vec::new();
+        // alloc: encoding, as above
+        let mut textual_lens: Vec<u32> = Vec::new();
+        // In the order of the names' text: a table's slots are placed in the order of their
+        // entries, which must be no database's.
+        let mut textual: Vec<(&Name, &[MacroId])> = scope.legacy_macros().collect(); // alloc: encoding, as above
+        textual.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
+        let textual_from = body.len();
+        for (name, ids) in textual {
+            let at = write_segment(&mut enc, &mut body, |enc| {
+                enc.name(name)?;
+                enc.usize(ids.len())?;
+                ids.iter().try_for_each(|&it| enc.macro_id(it))
+            })?;
+            textual_lens.push(at.1);
+            legacy.push((hash_of(name), at));
+        }
+        let textual_run = run_from(textual_from, &body)?;
+        let whole = write_segment(&mut enc, &mut body, |enc| {
+            enc.usize(entry_lens.len())?;
+            entry_lens.iter().for_each(|&it| enc.u32(it));
+            positions(enc, &position, scope.types.iter().map(|(name, _)| name))?;
+            positions(enc, &position, scope.values.iter().map(|(name, _)| name))?;
+            positions(enc, &position, scope.macros.iter().map(|(name, _)| name))?;
+            enc.usize(textual_lens.len())?;
+            textual_lens.iter().for_each(|&it| enc.u32(it));
+            enc.scope_rest(scope, false)
+        })?;
+        let names = table_in(&mut body, &entries)?;
+        let traits = write_segment(&mut enc, &mut body, |enc| {
+            let traits: Vec<TraitId> = scope.traits().collect(); // alloc: encoding, as above
+            enc.usize(traits.len())?;
+            traits.into_iter().try_for_each(|it| enc.def(ModuleDefId::TraitId(it)))
+        })?;
+        let legacy = table_in(&mut body, &legacy)?;
+        let items = write_segment(&mut enc, &mut body, |enc| {
+            enc.usize(scope.impls().len())?;
+            scope.impls().try_for_each(|it| enc.impl_id(it))?;
+            enc.usize(scope.builtin_derive_impls().len())?;
+            scope.builtin_derive_impls().try_for_each(|it| enc.builtin_derive_impl(it))?;
+            let declared: Vec<ModuleDefId> = (scope.declarations())
+                .filter(|it| matches!(it, ModuleDefId::TraitId(_)))
+                .collect(); // alloc: encoding, as above
+            enc.usize(declared.len())?;
+            declared.into_iter().try_for_each(|it| enc.def(it))
+        })?;
+        rows.push(Row {
+            scope: whole,
+            names,
+            traits,
+            legacy,
+            items,
+            entries: entries_run,
+            textual: textual_run,
+        });
     }
 
     // The files every segment names, then the segments: `Enc::finish` writes the first before
@@ -971,14 +1352,14 @@ fn encode_maps(
     header.write(&mut out);
     debug_assert_eq!(out.len(), HEADER);
     for row in &rows {
-        Row { scope: moved(row.scope), slots_at: row.slots_at + base, ..*row }.write(&mut out);
+        row.moved(base).write(&mut out);
     }
     debug_assert_eq!(out.len(), files_at);
     // The slots' own places, in the body: each entry's, moved as the rows' are.
     let mut named = named;
-    for row in &rows {
-        let slots_at = files_len + row.slots_at as usize;
-        for slot in 0..row.slots as usize {
+    for table in rows.iter().flat_map(|row| [row.names, row.legacy]) {
+        let slots_at = files_len + table.at as usize;
+        for slot in 0..table.slots as usize {
             let at = slots_at + slot * SLOT;
             if u64_at(&named, at) == 0 {
                 continue;

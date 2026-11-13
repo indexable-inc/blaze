@@ -225,6 +225,14 @@ mod tests {
     /// the driver the process chose: a sleep, a poll that times out and one that is ready, a
     /// child's exit, and a park another thread ends.
     #[allow(clippy::disallowed_methods, reason = "a test's child and a test's thread")]
+    #[expect(
+        blaze::untied_child,
+        reason = "blaze-core is below stdx and cannot name `stdx::JodChild`; the child is `exit 7` and waited for at the end; moves to the guard once it lives in blaze-core"
+    )]
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the `Child::wait` reaps a child `exited` saw exit within its deadline just before; blaze-core is below `stdx::child`"
+    )]
     fn every_public_wait(waits: Waits) -> String {
         let clock = Monotonic::new();
         let soon = |clock: &Monotonic| Deadline::after(clock.now(), ms(20));
@@ -278,6 +286,10 @@ mod tests {
     }
 
     /// A wait with no end: a park nothing unparks, with no deadline.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the case is the wait with no end; it runs in a child process its test ends after 2 s"
+    )]
     fn a_park_nothing_ends(_: Waits) -> String {
         let clock = Monotonic::new();
         Parker::new().park("a filtered test's park that nothing ends", None, &clock).unwrap();

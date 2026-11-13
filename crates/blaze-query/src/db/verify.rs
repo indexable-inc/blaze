@@ -40,6 +40,11 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
     if storage.holds(node, row, meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
         return mark(storage, header, word, row);
     }
+    // No edges to walk: a seal pass let them go, and an empty span proves nothing
+    // ([`super::seal::Seals::let_go`]). The claimed path runs it.
+    if storage.seals.let_go(node) {
+        return false;
+    }
     local::with(|local| {
         let base = local.walk.len();
         let proved = walk(storage, &mut local.walk, base, header, word, node);
@@ -150,6 +155,10 @@ fn walk(
                 // A row behind a seal not yet checked in this view: the claimed path checks
                 // its group once, where this walk would prove its rows one by one.
                 if storage.seals.suspect_of(dep).is_some() {
+                    return false;
+                }
+                // A row whose edges were let go has none to walk: it runs again.
+                if storage.seals.let_go(dep) {
                     return false;
                 }
                 if stack.len() - base > depth {

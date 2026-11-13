@@ -11,6 +11,10 @@
 //! gives [`Program`] each build's start, the launchers' messages and the pieces their first
 //! calls want, and writes the frames it hands back.
 
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 pub mod bind;
 pub mod program;
 pub mod record;

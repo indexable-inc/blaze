@@ -40,6 +40,10 @@ pub fn enter(frame: String) -> PanicContext {
 }
 
 fn with_ctx(f: impl FnOnce(&mut Vec<String>)) {
+    #[expect(
+        blaze::process_static,
+        reason = "a per-thread stack of panic context frames, each popped as its guard drops: as deep as the nesting"
+    )]
     thread_local! {
         static CTX: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }

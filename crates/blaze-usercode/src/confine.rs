@@ -709,10 +709,8 @@ mod tests {
 
     #[test]
     fn the_launcher_is_given_its_spec_and_the_report_is_read_back() {
-        let scratch =
-            std::env::temp_dir().join(format!("blaze-confine-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-confine-test-");
+        let scratch = tmp.path();
         let launcher = Launcher { program: "/bin/blaze".into() };
         let confined = launcher.confine(&command(true), &scratch).unwrap();
         assert_eq!(confined.program, PathBuf::from("/bin/blaze"));
@@ -740,7 +738,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(launcher.traced(&command(true), &scratch), Ok(traced));
-        _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

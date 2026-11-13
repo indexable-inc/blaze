@@ -45,7 +45,7 @@ use blaze_vfs::{DisksUnused, ImageUse, Outside, Ticket, Vfs};
 
 use super::{
     heads::{Heads, Out},
-    image::{ImageFailed, Images, Parts, Unlearned, on_pool},
+    image::{ImageFailed, Images, Parts, PeaksFault, Unlearned, Unpeaked, on_pool},
     job::{Jobs, Said, Setup, Step, Value, WaitedOn, World, doing},
     mounts::Mounts,
     observe::{Observe, Profiling},
@@ -70,8 +70,10 @@ const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 /// The shared standard library's store ([`Options::std`]).
 const STD_STORE: u64 = 8 << 32;
 const STD_STORE_END: u64 = 9 << 32;
-/// The reads the store's buffer pool loads its pages with (`blaze_cas::Config::load_tags`), and
-/// the shared standard library's store's.
+/// The loads of the store's buffer pool (`blaze_cas::Config::load_tags`, made in
+/// [`super::direct::pool`]), and the shared standard library's store's: the pool stays for the
+/// stores' own commits, opens and collections and the reads not yet on `direct`. A task's
+/// direct reads ask with `direct::HOME_TAGS` and up, past `RUNS_END`.
 const LOADS: u64 = 9 << 32;
 const STD_LOADS: u64 = 10 << 32;
 const STD_LOADS_END: u64 = 11 << 32;
@@ -486,6 +488,7 @@ macro_rules! world {
             steps: &$daemon.steps,
             effects: &mut $daemon.effects,
             said: &mut $said,
+            reads: super::direct::Lender::of(&mut $daemon.driver, &mut $daemon.done),
         }
     };
 }
@@ -536,12 +539,11 @@ pub struct Options {
     pub sources: FileName,
     /// The daemon as a writer of that store: one per state directory.
     pub writer: ContentId,
-    /// How its stores load the pages of their packs a read finds not in memory
-    /// ([`blaze_cas::Loader`]): by a thread of each store's own on the target's native
-    /// driver, over the root of the driver the daemon runs on (`blaze serve`); or, where the
-    /// daemon's driver is the simulation and its files are in no file system, as effects of
-    /// the store's that the daemon's driver completes.
-    pub store_loader: blaze_cas::Loader,
+    /// How its tasks read its stores ([`super::direct::Reads`]): each worker on a native driver
+    /// of its own over the root of the driver the daemon runs on (`blaze serve`); or, where the
+    /// daemon's driver is the simulation and its files are in no file system, on the loop's
+    /// own driver, lent to the tasks it runs in line.
+    pub reads: super::direct::Reads,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -550,10 +552,11 @@ pub struct Options {
     /// The daemon's ceiling: the most its plane grants, never above the machine budget
     /// ([`super::machine::Joined::ceiling`]).
     pub budget: Option<Budget>,
-    /// Its place in the machine's memory ledger, joined as its engine started
-    /// (docs/memory-budget.md, section 7): its plane admits against the allowance each turn of
-    /// it gives, under `budget`. `None` admits against `budget` alone: the simulation's daemons,
-    /// and where blaze keeps no ledger ([`super::Machine`]).
+    /// Its seat in the machine's ledger, joined as its engine started
+    /// (docs/v2/plan/design/end-state/memory.md, section 4.5): its gate's room is what its slot
+    /// holds, grown and given back as its tasks need ([`super::machine::Machine::fit`]), under
+    /// `budget`. `None` admits against `budget` alone: the simulation's daemons, and where blaze
+    /// keeps no ledger ([`super::Machine`]).
     pub machine: Option<super::Machine>,
     /// Workers of the plane: the cores.
     pub threads: usize,
@@ -881,8 +884,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// between requests waits for [`QUIET_BEFORE_BETWEEN`] of them ([`Daemon::between`]).
     quiet_turns: u32,
     failed: Option<Failed>,
-    /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
-    /// daemon drops, and turned only where there is a ledger (native unix).
+    /// Its seat in the machine's ledger ([`Options::machine`]); held so it leaves as the daemon
+    /// drops, and fitted to the gate only where there is a ledger (native unix).
     #[cfg_attr(not(all(unix, feature = "native")), allow(dead_code))]
     machine: Option<super::Machine>,
     pid: u32,
@@ -956,9 +959,6 @@ pub struct Daemon<D: Driver, S: Steps> {
     unheld: Option<super::unheld::Unheld>,
     /// It stopped because nothing held it for its grace ([`Daemon::ended_unheld`]).
     ended_unheld: bool,
-    /// When this stretch with nothing to do last gave the stores' pool pages back: again
-    /// each [`super::idle::POOL_AFTER`] of it.
-    pool_idle: super::idle::Idle,
     /// The take of the solo answers' kept rows in `<state>/solo-rows`, one look at a time.
     solo: blaze_certify::kept::Take,
     /// When the last look for them began: `None` until the first turn's, at the start.
@@ -1016,6 +1016,8 @@ pub struct Started {
     pub heads_dropped: usize,
     /// Why the plane's history started empty.
     pub unlearned: Option<Unlearned>,
+    /// Why admission's peaks started empty.
+    pub unpeaked: Option<Unpeaked>,
     /// Why the journal's marks of front-end carry sessions, or some of them, were not used
     /// ([`Jobs::restore_carries`]): each such checkout seeds its session on its next build.
     pub carries: Option<String>,
@@ -1031,6 +1033,7 @@ impl Started {
             && self.journal_cut == 0
             && self.heads_dropped == 0
             && self.unlearned.is_none()
+            && self.unpeaked.is_none()
             && self.carries.is_none()
     }
 }
@@ -1073,6 +1076,10 @@ impl fmt::Display for Started {
         }
         if let Some(unlearned) = &self.unlearned {
             write!(f, "{sep}the plane's history starts empty: {unlearned}")?;
+            sep = "; ";
+        }
+        if let Some(unpeaked) = &self.unpeaked {
+            write!(f, "{sep}admission's peaks start empty: {unpeaked}")?;
             sep = "; ";
         }
         if let Some(why) = &self.carries {
@@ -1381,6 +1388,8 @@ pub enum ImageFault {
     /// Not an image, cut short, or a spine that is not the one its hash names.
     Open(OpenError),
     History(HistoryError),
+    /// Admission's peaks section is corrupt or does not decode.
+    Peaks(PeaksFault),
     Vfs(VfsFault),
 }
 
@@ -1389,6 +1398,7 @@ impl fmt::Display for ImageFault {
         match self {
             ImageFault::Open(error) => write!(f, "{error}"),
             ImageFault::History(error) => write!(f, "{error}"),
+            ImageFault::Peaks(error) => write!(f, "{error}"),
             ImageFault::Vfs(fault) => write!(f, "{fault}"),
         }
     }
@@ -1443,8 +1453,9 @@ pub enum Failed {
     Stalled(String),
     /// A store stopped (a file of it could not be read or written), named.
     Store(String),
-    /// The machine's memory ledger could not be locked, read or written, or no longer has this
-    /// daemon's record: admitting on would be admitting against no machine budget.
+    /// The machine's ledger refused an operation by name ([`blaze_graph::ledger::Why`]): this
+    /// process's slot was freed under it, a word is corrupt, or a pid could not be looked at.
+    /// Admitting on would be admitting against no machine budget.
     Ledger(String),
     /// The VFS could not settle on the image just mapped ([`blaze_vfs::Vfs::settle`]).
     Settle(blaze_vfs::Unsettled),
@@ -1457,7 +1468,7 @@ impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failed::Server(why) | Failed::Stalled(why) | Failed::Store(why) => f.write_str(why),
-            Failed::Ledger(why) => write!(f, "the machine's memory ledger: {why}"),
+            Failed::Ledger(why) => write!(f, "the machine's ledger: {why}"),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             Failed::Image(failed) => write!(f, "{failed}"),
             Failed::Settle(unsettled) => write!(f, "{unsettled}"),
@@ -1503,6 +1514,25 @@ fn disks_used(unused: Option<DisksUnused>) -> Result<Option<Refused>, VfsFault> 
             fault @ (DisksUnused::Corrupt(_) | DisksUnused::Outside | DisksUnused::Malformed(_)),
         ) => Err(VfsFault::Disks(fault)),
     }
+}
+
+/// The machine's ledger fitted to the process's gate (docs/v2/plan/design/end-state/memory.md,
+/// sections 4.3 and 4.5): the gate says what its tasks commit and what its held tasks wait for
+/// past that ([`Plane::gate_needs`]); the slot moves to cover them ([`super::machine::Machine::fit`],
+/// one try, never a wait); the bytes the slot holds after are the gate's room
+/// ([`Plane::set_room`]), which wounds the youngest holders when it shrinks under what is
+/// committed and tells the plane what is free. The floor is the gate's two reads and, only when
+/// the slot moves a grain, one add and one pass of the ledger's slots.
+#[cfg(all(unix, feature = "native"))]
+fn fit_room<W: super::plane::Work, P: blaze_graph::admission::Predict>(
+    machine: &mut super::Machine,
+    plane: &mut Plane<W, P>,
+    at: Duration,
+) -> anyhow::Result<()> {
+    let (committed, wanted) = plane.gate_needs();
+    let held = machine.fit(committed, wanted)?;
+    plane.set_room(at, held);
+    Ok(())
 }
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
@@ -1604,8 +1634,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 layers: vec![layer], // alloc: once per daemon started, one name
                 tags: STORE,
                 load_tags: LOADS,
-                // clone: once per daemon started, a path
-                loader: options.store_loader.clone(),
+                loader: super::direct::pool::loader(&options.reads),
             };
         let mut store_config = Some(store_config);
         let mut store: Option<Store> = None;
@@ -1614,8 +1643,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             writer: options.writer,
             tags: STD_STORE,
             load_tags: STD_LOADS,
-            // clone: once per daemon started, a path
-            loader: options.store_loader.clone(),
+            loader: super::direct::pool::loader(&options.reads),
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1693,7 +1721,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     (READ_JOURNAL, Done::Read(bytes)) => read.journal = Some(bytes),
                     (STAT_IMAGE, Done::Stat(None)) => read.image = Some(None),
                     (STAT_IMAGE, Done::Stat(Some(_))) => {
-                        effects.push(Effect::Map { file: image.clone(), tag: MAP_IMAGE })
+                        effects.push(Effect::Map { file: image.clone(), extent: blaze_core::Extent::Whole, tag: MAP_IMAGE })
                     }
                     (MAP_IMAGE, Done::Mapped(mapping)) => {
                         read.image = Some(Some(mapping));
@@ -1811,43 +1839,54 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let learning =
             tracing::info_span!(target: "blaze", "daemon start: restore the plane's history")
                 .entered();
-        let history = match opened.as_ref() {
-            None => History::new(HistoryConfig::default()),
+        // Admission's peaks (memory.md 4.3) are learned history too: `without.history` leaves
+        // both unused.
+        let (history, peaks) = match opened.as_ref() {
+            None => (History::new(HistoryConfig::default()), blaze_graph::admission::Peaks::new()),
             Some(_) if options.without.history => {
                 started.unlearned = Some(Unlearned::Asked);
-                History::new(HistoryConfig::default())
+                started.unpeaked = Some(Unpeaked::Asked);
+                (History::new(HistoryConfig::default()), blaze_graph::admission::Peaks::new())
             }
             Some(opened) => {
                 let (history, unlearned) = super::image::history(opened, HistoryConfig::default())
                     .map_err(|error| StartError::image(&image, ImageFault::History(error)))?;
                 started.unlearned = unlearned;
-                history
+                let (peaks, unpeaked) = super::image::peaks(opened)
+                    .map_err(|error| StartError::image(&image, ImageFault::Peaks(error)))?;
+                started.unpeaked = unpeaked;
+                (history, peaks)
             }
         };
         drop(learning);
         drop(opened);
-        // The limit the daemon runs under (`blaze serve --memory-gb`, `BLAZE_DAEMON_MEMORY_GB`, or
-        // the machine's) made every subsystem's budget and the limit a build's release is decided
-        // against (`admission::Squeeze`), before any job. The plane only carries the budget: a
-        // daemon that set nothing here ran with no limit, so no release was ever due and the
-        // front end's sweep weighed against no budget (B5, coord-105). The frames' cap stays the
-        // exec scheduler's: the plane does not run again a task the cap cancels.
-        // Releases and the plane's admission weigh the process's footprint as the system counts
-        // it, what the limit is on and the watchdog reads, not the allocators' counts, which a
-        // purge never lowers (memcap5, coord-111: "blaze held 59.21 GiB" at a footprint of 47.28).
+        // The process's footprint as the system counts it: the gate's audit (memory.md 4.2, rule
+        // one-memory-measure: `footprint - counted` under a stated slack), never a decision's input.
         blaze_mem::tag::resident_by(crate::raw::memory::own_footprint);
-        if let Some(budget) = &options.budget {
-            blaze_graph::admission::set_budgets(budget.bytes);
-        }
-        let plane_config = PlaneConfig {
-            io: options.io,
-            work: options.threads.max(1),
-            budget: options.budget,
-            starve_after: 8,
-        };
+        let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1) };
         let mut observe = Observe::new(options.profiling);
         let mut plane = Plane::new(plane_config, history, runner)
             .map_err(|error| format!("the plane: {error}"))?;
+        plane.restore_peaks(peaks);
+        // Admission under the process's one gate (memory.md 4.1): installed by `serve` under
+        // the daemon's ceiling before this, else sized from the machine. The ceiling it was
+        // installed under is what a stall and `blaze status` name.
+        let gate = blaze_mem::gate::process();
+        let ceiling = options.budget.unwrap_or_else(|| Budget {
+            bytes: gate.ceiling(),
+            from: "7/8 of the machine's memory (blaze_mem::gate::machine_config)".to_owned(), // alloc: once a daemon
+            kept_back: 0,
+        });
+        if ceiling.bytes != gate.ceiling() {
+            return Err(format!(
+                "the daemon's memory ceiling {} bytes ({}) is not the gate's {} bytes: the gate was installed under another (rule one-memory-measure)",
+                ceiling.bytes,
+                ceiling.from,
+                gate.ceiling()
+            )
+            .into());
+        }
+        plane.admit_under(gate, ceiling);
         plane.number(observe.numbering());
         // The explorer's task table: every node and move the plane says, on the profile's clock.
         #[cfg(feature = "native")]
@@ -1855,18 +1894,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             plane.publish_tasks(observe.tasks());
             observe.clock_tasks(driver.now());
         }
-        // The first turn of the machine's memory ledger, before any request: until one, the
-        // plane would grant up to its ceiling whatever the other daemons hold.
+        // The gate's first room from the machine's ledger, before any request: until one the
+        // plane is told no room, and memory holds no task back.
         #[cfg_attr(not(all(unix, feature = "native")), allow(unused_mut))]
         let mut machine = options.machine;
         #[cfg(all(unix, feature = "native"))]
         if let Some(machine) = &mut machine {
             plane.poll(driver.now());
-            if let Some(bytes) =
-                machine.first_turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
-            {
-                blaze_graph::admission::set_budgets(bytes);
-            }
+            fit_room(machine, &mut plane, driver.now()).map_err(|why| format!("{why:#}"))?;
         }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
@@ -1920,6 +1955,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             runs_end: RUNS_END,
             slots: format!("/{state}/slots"),
             premises: options.premises.clone(), // clone: the jobs' own copy, once a start
+            stores: super::direct::Stores::new(store.reader(), std.reader(), options.reads.clone()), // clone: a path's refcount, once a start
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
         // The front end's carry sessions the journal marks: each checkout's next build opens
@@ -2020,7 +2056,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
             idle: super::idle::Idle::default(),
-            pool_idle: super::idle::Idle::every(super::idle::POOL_AFTER),
             solo: blaze_certify::kept::Take::new(SOLO_ROWS),
             solo_looked: None,
             pressure_watched: true,
@@ -2385,6 +2420,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 vfs: &mut self.vfs,
                 store: &mut self.store,
                 predict: self.plane.predict(),
+                peaks: self.plane.peaks(),
                 effects: &mut self.effects,
             };
         match waited {
@@ -2473,7 +2509,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.submit();
         let mut done = std::mem::take(&mut self.done);
         let (until, woken) = wait;
-        if until.passed(now) {
+        // Completions a task's store read on the lent driver was handed (`step_plane`) are
+        // ready already: the turn only looks for more.
+        if !done.is_empty() {
+            self.driver.poll(&mut done, Deadline::PASSED);
+        } else if until.passed(now) {
             self.driver.poll(&mut done, until);
         } else {
             // The loop's time between its turns, said as a wait on what ends it (rule 15).
@@ -2541,6 +2581,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let _dispatch = piece("dispatch of one completion");
             self.dispatch(completion);
         }
+        // What the loop's own store reads were handed as they dispatched (`World::reads`) is
+        // kept for the next turn, which takes it without a wait.
+        done.append(&mut self.done);
         self.done = done;
         // What the completions' requests were answered with goes to the driver now: a reply
         // made as its request was read (the no-op lane's, a status) is written in this turn
@@ -2598,6 +2641,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 vfs: &mut self.vfs,
                 store: &mut self.store,
                 predict: self.plane.predict(),
+                peaks: self.plane.peaks(),
                 effects: &mut self.effects,
             };
             let was = self.images.done();
@@ -2923,28 +2967,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.fail(Failed::Stalled(said));
     }
 
-    /// What the system says of memory, on [`PRESSURE`] (docs/memory-budget.md section 7,
-    /// "Pressure"). An event acts as the soft ceiling does: the plane admits nothing past what
-    /// the process holds now until 10 s pass with no event ([`super::plane::Plane::pressed`]),
-    /// the front ends are asked for a release (once a [`blaze_graph::pressure::HOLD_NS`] of a
-    /// run of events), the heaps give back their free pages (once a [`GIVE_BACK_EVERY`]), and
-    /// the stores' pools are asked for every page no task pins, a slice a loop turn for as long
-    /// as the pressure stands ([`Jobs::ask_pools`]): never swept here, in line, where one event's
-    /// sweep of both stores once held the loop for minutes (2026-11-12).
+    /// What the system says of memory, on [`PRESSURE`] (memory.md 4.5). Admission does not
+    /// move for it: the gate holds the process to its ceiling and the machine's ledger holds
+    /// every blaze process together under the machine's budget, so what the system's pressure
+    /// adds is memory outside blaze, which no admission rule of blaze's can give back. What
+    /// can is given: the heaps' free pages (once a [`GIVE_BACK_EVERY`]). Deleted 2026-11-13: the 10 s hold of
+    /// admission at the footprint (`Plane::pressed`, `blaze_graph::pressure`) and the front
+    /// ends' release it asked, which the gate's wounds replace.
     /// A system with no source the daemon can watch says so once, in the log: the daemon admits
-    /// by its budget alone, which is no error.
+    /// by its gate alone, which is no error.
     fn pressure(&mut self, completion: Completion) {
         match completion.done {
             Done::Pressed { critical } => {
                 let now = self.driver.now();
-                let release = self.plane.pressed(now);
                 let _span =
-                    tracing::info_span!(target: "blaze", "memory pressure", critical, release)
-                        .entered();
-                if release {
-                    self.jobs.pressed();
-                }
-                self.jobs.ask_pools(now, Duration::from_nanos(blaze_graph::pressure::HOLD_NS));
+                    tracing::info_span!(target: "blaze", "memory pressure", critical).entered();
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                     self.given_back = now;
                     crate::raw::memory::purger().ask();
@@ -3033,20 +3070,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
     }
 
-    /// An idle daemon's stores' buffer pools give back to the kernel what nothing read again
-    /// since the sweep last came by (`Store::trim_pool`, one lap), on the loop (which alone
-    /// writes the stores), each [`super::idle::POOL_AFTER`] of a stretch of idleness: no build
-    /// runs then, so no turn waits on the lap. A daemon short of memory never sweeps here: its
-    /// pools give a slice a turn ([`Jobs::ask_pools`], `Jobs::sweep_pools`). Records are
-    /// immutable, so nothing is written and a page given back is a read when it is next asked
-    /// for (docs/v2/plan/design/restore.md, "Memory: a bounded cache over records").
-    fn trim_idle_pools(&mut self) {
-        let freed = self.store.trim_pool() + self.std.trim_pool();
-        if freed != 0 {
-            tracing::info!(target: "blaze", freed, "the stores' pools gave back what nothing read again");
-        }
-    }
-
     /// A look for the solo answers' kept rows (`<state>/solo-rows`, `blaze_certify::kept`)
     /// begun: at the first turn, which is the start's, and then each [`SOLO_LOOK_EVERY`] while
     /// the daemon has nothing to do; one look at a time. A daemon that keeps no history leaves
@@ -3117,21 +3140,22 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             blaze_profile::plot(Plot::Footprint, bytes);
             let kept = blaze_graph::arena::kept_of(&memory, bytes);
             blaze_profile::plot(Plot::AllocatorKeptBytes, kept);
-            let limit = blaze_graph::admission::limit();
-            let pressure = blaze_graph::admission::Pressure { held: bytes, limit, over: None };
-            // Past the limit's line, or keeping more than a quarter of the budget freed (the
-            // high water): the purger's thread gives it back, never the loop, since a purge
-            // waits for each worker's heaps ([`crate::raw::memory::purge`]).
+            // What this process may commit now: the gate's ceiling, or the machine's room under
+            // it (`blaze_mem::budget::Budget::limit`).
+            let (committed, ceiling, room) = self.plane.memory();
+            let limit = room.or(ceiling).unwrap_or(u64::MAX);
+            // Keeping more than a quarter of the limit freed (the high water): the purger's
+            // thread gives it back, never the loop, since a purge waits for each worker's heaps
+            // ([`crate::raw::memory::purge`]). Past the limit, measured (the gate's audit: what
+            // it does not count), the pools are asked too, a slice a turn until two looks from
+            // now: said again by each look that still finds it so.
             let high_water = kept > limit / KEPT_HIGH_WATER;
-            if (pressure.squeezed() || high_water)
-                && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY
-            {
+            let past = bytes > limit;
+            if (past || high_water) && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
-                // Past the release line the pools are asked too, a slice a turn until two
-                // looks from now: said again by each look that still finds it so.
-                if pressure.squeezed() {
-                    self.jobs.ask_pools(now, 2 * GIVE_BACK_EVERY);
+                if past {
+                    tracing::warn!(target: "blaze", footprint = bytes, committed, limit, "the process's footprint is past what its gate allows: memory the gate does not count");
                 }
             }
         }
@@ -3144,10 +3168,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             blaze_mem::frame::ask_spare_trim();
             crate::raw::memory::purger().ask();
             self.jobs.say_what_the_kept_front_ends_hold();
-        }
-        // Longer still: the stores' pools give back the pages nothing read again.
-        if self.pool_idle.look(now, working) {
-            self.trim_idle_pools();
+            // The stores' pools (kept for the stores' own commits and the reads not yet on
+            // `direct`, `super::direct::pool`) give back what nothing read again since the
+            // sweep last came by, one lap, on the loop, which alone owns the stores. A task's
+            // direct read keeps nothing past its task: the kernel's page cache holds those.
+            let freed = self.store.trim_pool() + self.std.trim_pool();
+            if freed > 0 {
+                tracing::info!(target: "blaze", freed, "idle: the stores' pools gave back what nothing read again");
+            }
         }
         // Longest: a daemon in no edit loop exits, once nothing it holds is undurable and no
         // client or launcher is connected; a run with nothing changed is answered by its
@@ -3170,7 +3198,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.stopping.is_none()
             && super::idle::exit_due(
                 idle_for,
-                self.worked,
+                self.jobs.exit_wait(self.worked),
                 self.server.connections() + self.steps.launchers_connected(),
                 undurable,
             )
@@ -3178,9 +3206,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             tracing::info!(target: "blaze", "the daemon exits: no edit loop is live");
             self.stop();
         }
-        // What an idle daemon holds past its budget with nothing more it may give
-        // ([`super::idle::BUDGET`], `Jobs::idle_over`): 0 is the budget held.
-        blaze_profile::plot(Plot::IdleOverBytes, self.jobs.idle_over());
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
@@ -3302,8 +3327,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     }
                 }
             }
-            // The store's own effects, and its pool's reads (a commit loading the page a pack's
-            // committed bytes end in).
+            // The store's own effects, and its pool's loads (a commit loading the page a pack's
+            // index is on, or one of the reads not yet on `direct`).
             STORE..FLUSHES | LOADS..STD_LOADS => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.job_effects += 1;
@@ -3358,6 +3383,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.complete(&mut world!(self, said), completion);
                 self.said(said);
+            }
+            // A task's store read on the lent driver (`direct::lend`) that ended after its
+            // read gave up waiting: the read failed then (`direct::Failed::Stalled`), naming
+            // the record, and gave its buffer up to the kernel; nothing waits for this.
+            super::direct::HOME_TAGS.. => {
+                tracing::info!(target: "blaze", tag = completion.tag.0, "a store read's late completion, its read already failed as stalled");
             }
             _ => {}
         }
@@ -3768,9 +3799,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
         self.tell_paused();
         loop {
-            self.plane.poll(self.driver.now());
+            // The tasks the simulation's runner runs in line here read the stores on the
+            // loop's driver ([`super::direct::lend`]); the completions of the loop's own
+            // effects their reads were handed are dispatched next turn.
+            let now = self.driver.now();
+            let (plane, driver, done) = (&mut self.plane, &mut self.driver, &mut self.done);
+            super::direct::lend(driver, done, || plane.poll(now));
             #[cfg(all(unix, feature = "native"))]
-            self.ledger_turn();
+            self.ledger_room();
             self.plane.happened(&mut happened);
             if happened.is_empty() {
                 break;
@@ -3784,21 +3820,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.spare.happened = happened;
     }
 
-    /// A turn of the machine's memory ledger, when one is due ([`super::machine::Machine::due`]):
-    /// the plane told its allowance, which it admits against, and the subsystems' budgets set to
-    /// it when it moved ([`blaze_graph::admission::set_budgets`]: what a release is decided
-    /// against). A turn that fails stops the daemon.
+    /// The machine's ledger fitted to the gate ([`fit_room`]) every step of the plane: no turn and
+    /// no due, as a fit is a handful of atomics on the shared words, and only when the slot must
+    /// move. A refusal by name stops the daemon.
     #[cfg(all(unix, feature = "native"))]
-    fn ledger_turn(&mut self) {
+    fn ledger_room(&mut self) {
         let at = self.driver.now();
         let Some(machine) = &mut self.machine else { return };
-        if !machine.due(at, &self.plane) {
-            return;
-        }
-        match machine.turn(at, &mut self.plane) {
-            Ok(Some(bytes)) => blaze_graph::admission::set_budgets(bytes),
-            Ok(None) => {}
-            Err(why) => self.fail(Failed::Ledger(format!("{why:#}"))),
+        if let Err(why) = fit_room(machine, &mut self.plane, at) {
+            self.fail(Failed::Ledger(format!("{why:#}")));
         }
     }
 

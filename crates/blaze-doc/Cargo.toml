@@ -33,6 +33,7 @@ stdx.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

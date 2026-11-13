@@ -12,14 +12,13 @@ mod path {
 
     use crate::{Command, Sandbox};
 
-    struct Dir(PathBuf);
+    /// The test's directory, and the guard that removes it when the test ends.
+    struct Dir(PathBuf, crate::temp::TempDir);
 
     impl Dir {
         fn new(name: &str) -> Dir {
-            let dir = std::env::temp_dir()
-                .join(format!("blaze-spawn-path-{name}-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Dir(dir)
+            let held = crate::temp::TempDir::for_test(&format!("blaze-spawn-path-{name}-"));
+            Dir(held.path().to_path_buf(), held)
         }
 
         fn tool(&self, name: &str, says: &str) -> PathBuf {
@@ -28,12 +27,6 @@ mod path {
             std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{says}'\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -179,10 +172,8 @@ mod held {
     /// A program in a directory of the test's own, executable: a file this process wrote, as
     /// the daemon writes a program it built. On Linux a copy of the system's shell; elsewhere a
     /// script of it, since macOS kills a copy of a platform binary as it starts.
-    fn written(what: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("blaze-busy-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn written(what: &str) -> (crate::temp::TempDir, PathBuf) {
+        let dir = crate::temp::TempDir::for_test(&format!("blaze-busy-{what}-"));
         let program = dir.join("sh");
         #[cfg(target_os = "linux")]
         std::fs::copy("/bin/sh", &program).unwrap();
@@ -214,7 +205,7 @@ mod held {
             blaze_spin::busy(held);
             drop(file);
         });
-        open.recv().unwrap();
+        open.recv_timeout(Duration::from_secs(60)).expect("the holder opened the program for writing");
         holder
     }
 
@@ -233,7 +224,7 @@ mod held {
         std::fs::File::from(started.stderr).read_to_end(&mut stderr).unwrap();
         let exit = started.finish.exited(started.pid, stdout, stderr).unwrap();
         assert_eq!((exit.code, exit.signal), (Some(7), None), "{exit:?}");
-        _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// Held past the bound, the spawn fails naming the program and why, after about the
@@ -256,7 +247,7 @@ mod held {
         assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy, "{said}");
         let bound = Duration::from_nanos(super::busy::MOST_NS);
         assert!(took >= bound && took < bound + Duration::from_millis(400), "{took:?}");
-        _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 }
 

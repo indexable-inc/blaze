@@ -57,6 +57,10 @@ const VERSION: u8 = 4;
 /// ([`named_env`]). The process's, not a job's: a name another checkout's record read is a
 /// variable more compared, never one missed. A few names (the variables crates read at
 /// compile time), each once.
+#[expect(
+    blaze::process_static,
+    reason = "each variable name a record read, once: a few names, never pruned; the daemon should own it"
+)]
 static NAMED: blaze_core::lock::Lock<Vec<String>> =
     blaze_core::lock::Lock::new("serve.unit.reads.named", Vec::new());
 

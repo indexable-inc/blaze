@@ -822,6 +822,10 @@ pub fn counters(counts: &[Counter]) -> Vec<Counter> {
 /// The build the daemon ran between `t0` and `t1` on the history's clock, as a [`Run`] with
 /// its rows. No build there, or more than one, is an error: the measurement needs its daemon
 /// to itself, and never guesses which build was its own.
+#[expect(
+    blaze::retry,
+    reason = "polls the history up to ROW_TRIES times for a build's end row written after its client exits: the daemon must make the row durable before it answers, or offer a wait for it"
+)]
 fn facts(run: u32, wall_ms: f64, t0: i64, t1: i64, ours: &str) -> Result<Built, String> {
     let sql = format!(
         "SELECT CAST(build_id AS UBIGINT) AS build_id, CAST(max(dur_ns) AS BIGINT) AS dur_ns, \

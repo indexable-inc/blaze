@@ -51,9 +51,10 @@ const LAYOUT_7_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
 
-/// What holds the bytes of an image or a crate's reads as the store gave them: the store's own
-/// mapping, held in place (`blaze_cas::Reader::pinned`, through the driver's adapter), or a
-/// buffer of its own. The bytes start at a multiple of [`blaze_format::ALIGN`] (an image whose
+/// What holds the bytes of an image or a crate's reads as the store gave them: a mapping of
+/// the store's file (`blaze_cas::direct::map`, through the driver's adapter), read in place
+/// with the kernel's page cache the one copy and nothing pinned in a pool, or, for a value
+/// `direct` reads rather than maps, one aligned copy of its own. The bytes start at a multiple of [`blaze_format::ALIGN`] (an image whose
 /// parts are not aligned does not open) and neither move nor change while it lives.
 pub trait Held: Send + Sync + 'static {
     fn bytes(&self) -> &[u8];

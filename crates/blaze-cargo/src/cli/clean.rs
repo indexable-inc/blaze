@@ -712,20 +712,17 @@ mod tests {
         assert_eq!(size(3 << 20), "3.0MiB");
     }
 
-    /// A fresh directory of this test's own under the system's temporary directory.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "blaze-clean-{name}-{}-{}",
-            std::process::id(),
-            blaze_gc::record::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(&dir).unwrap()
+    /// A fresh directory of this test's own, removed when the guard drops, and its canonical
+    /// path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-clean-{name}-"));
+        let dir = std::fs::canonicalize(made.path()).unwrap();
+        (made, dir)
     }
 
     #[test]
     fn clean_refuses_dotdot_and_a_symlinked_checkout() {
-        let top = scratch("guard");
+        let (_made, top) = scratch("guard");
         let repo = top.join("repo");
         std::fs::create_dir_all(repo.join("target")).unwrap();
         let kept = protected(Some(&repo), &top.join("elsewhere"), &top.join("build"))
@@ -753,7 +750,7 @@ mod tests {
     /// nothing in it goes (review N13).
     #[test]
     fn clean_never_removes_a_tagged_dir_inside_cargo_home_or_the_daemons_state() {
-        let top = scratch("protected");
+        let (_made, top) = scratch("protected");
         let builds = top.join("build");
         let cargo_git = top.join("cargo").join("git");
         let state = top.join("v2").join("store");
@@ -786,7 +783,7 @@ mod tests {
     /// the error names the dir inside (review round 5, B1).
     #[test]
     fn clean_refuses_a_tree_holding_another_builds_lease() {
-        let top = scratch("nested");
+        let (_made, top) = scratch("nested");
         let builds = top.join("build");
         let workspace = builds.join("ws-1");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -832,7 +829,7 @@ mod tests {
 
     #[test]
     fn clean_refuses_an_unmarked_dir() {
-        let top = scratch("marks");
+        let (_made, top) = scratch("marks");
         let builds = top.join("build");
         let plain = top.join("photos");
         std::fs::create_dir_all(&plain).unwrap();
@@ -862,7 +859,7 @@ mod tests {
 
     #[test]
     fn clean_refuses_an_unleased_target_inside_the_checkout_unless_forced() {
-        let top = scratch("inside");
+        let (_made, top) = scratch("inside");
         let repo = top.join("repo");
         let target = repo.join("target");
         std::fs::create_dir_all(&target).unwrap();

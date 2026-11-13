@@ -85,7 +85,8 @@ fn add_with_attrs(
         CrateOrigin::Local { repo: None, name: None },
         attrs.iter().map(|it| it.to_string()).collect(),
         TargetKind::Lib { is_proc_macro: false },
-        Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+        // No proc macro runs here: the cwd is only hashed, so the crate's own directory.
+        Arc::new(AbsPathBuf::assert_utf8(env!("CARGO_MANIFEST_DIR").into())),
         Arc::new(CrateWorkspaceData {
             target: Err("no target in tests".into()),
             toolchain: None,
@@ -458,7 +459,8 @@ fn a_crate_attr_is_one_attribute_or_rustcs_error() {
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
 fn checkout(db: &mut Db) -> (AbsPathBuf, FileSetConfig) {
-    let base = AbsPathBuf::assert_utf8(std::env::temp_dir().join("blaze-base-db-view"));
+    // A view is held in memory and its base is never read from disk: a path that is not there.
+    let base = AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-base-db-view"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
     for root in [0, 1] {
@@ -520,6 +522,49 @@ fn setting_a_view_twice_writes_nothing() {
     assert_eq!(second, ViewChange::default());
     assert_eq!(revision(&db), then);
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
+}
+
+/// The invariant: a view read from a tree, whose IDs are taken without hashing, writes the
+/// same inputs, file IDs and source roots as the same view checked against its bytes.
+/// Control: the checked entry refuses a lying ID, so the two differ only by the hash.
+#[test]
+fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
+    let mut checked = Db::for_tests();
+    let mut from_tree = Db::for_tests();
+    let (base, partition) = checkout(&mut checked);
+    checkout(&mut from_tree);
+    let bytes: Vec<blaze_vfs::Bytes> = VIEW.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
+    let files: Vec<ViewFile<'_>> =
+        VIEW.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
+    let view = ViewRoot {
+        base: &base,
+        built: &[],
+        partition: &partition,
+        other: SourceRootId(1),
+        files: &files,
+    };
+    let a = checked.set_view_root(view).unwrap();
+    let b = from_tree.set_view_root_from_tree(view).unwrap();
+    assert_eq!(a, b);
+    for &(path, text) in VIEW {
+        let x = file_at(&checked, &base, path).unwrap();
+        let y = file_at(&from_tree, &base, path).unwrap();
+        assert_eq!(x, y, "{path}");
+        assert_eq!(checked.file_text(x).text(&checked).as_bytes(), text, "{path}");
+        assert_eq!(from_tree.file_text(y).text(&from_tree).as_bytes(), text, "{path}");
+        assert_eq!(checked.file_content(x), from_tree.file_content(y), "{path}");
+    }
+    let then = revision(&from_tree);
+    assert_eq!(from_tree.set_view_root_from_tree(view).unwrap(), ViewChange::default());
+    assert_eq!(revision(&from_tree), then);
+
+    // Control: an ID that is not its bytes' is refused where IDs are checked (a new ID, so the
+    // file is not skipped as unchanged before its bytes are hashed).
+    let edited = vfs_bytes(b"fn g() {}");
+    let other = ContentId::of(blaze_vfs::FILE_DOMAIN, b"fn h() {}");
+    let lying = [files[0], ViewFile { path: "src/a.rs", id: other, bytes: &edited }, files[2]];
+    let lie = ViewRoot { files: &lying, ..view };
+    assert!(matches!(checked.set_view_root(lie), Err(ViewError::Mismatch { .. })));
 }
 
 #[test]
@@ -1018,7 +1063,8 @@ fn what_queries_note_is_kept_once_and_sorted() {
     assert_eq!(db.files().env_read(), expected);
     assert_eq!(db.files().env_unset(), vec![(a, "X".to_owned())]);
 
-    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-included-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let (x, y) = (dir.join("blaze-base-db-x.rs"), dir.join("blaze-base-db-y.rs"));
     for (path, krate) in [(&y, a), (&x, c), (&y, a), (&y, c)] {
         db.files().include_source(path, SourceRootId(0), krate);
@@ -1041,9 +1087,9 @@ fn an_unreadable_included_file_keeps_its_error() {
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let a = graph.set_in_db(&mut db)[&a];
-    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-unreadable-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let missing = dir.join("blaze-base-db-unreadable-include.rs");
-    let _ = std::fs::remove_file(&missing);
     let read = |path: &AbsPathBuf| {
         let file = db.files().included_file(&db, a, path, Durability::LOW);
         (file.read(&db).clone(), file.content(&db))
@@ -1419,8 +1465,8 @@ fn disk_module_runs() -> usize {
 /// is read again.
 #[test]
 fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns_the_reader() {
-    let dir = std::env::temp_dir().join(format!("blaze-base-db-module-{}", std::process::id()));
-    let dir = AbsPathBuf::assert_utf8(dir);
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-module-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let (src, shared) = (dir.join("member/src"), dir.join("shared"));
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&shared).unwrap();
@@ -1466,7 +1512,6 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
     assert!(db.reload_included_files(Trigger::named("a test's removal"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), None);
     assert_eq!(disk_module_runs(), runs + 3);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

@@ -2288,6 +2288,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// A `&'static Location<'static>` of `span` in `owner`, under the name the build gives its
     /// file, which rustc's `Location::file` says.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the evaluator places `Location::caller` off the body's source map moved into its file, so a \
+                  constant that reads it is evaluated again on an edit above it: place it from the body's \
+                  anchor (`Body::relative`, as hir-ty-codegen's `places` does) plus the anchor's place"
+    )]
     fn location_of(
         &mut self,
         (span, owner): (MirSpan, InferBodyId<'db>),

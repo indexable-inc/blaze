@@ -126,21 +126,25 @@ fn reading_relative(relative: &str) -> String {
 
 /// A workspace whose member `pkg` holds `data/a.txt`, with `secret.txt` in its root outside
 /// the member, in a fresh directory of its own: its real path.
-struct Workspace(std::path::PathBuf);
+struct Workspace {
+    top: std::path::PathBuf,
+    /// The directory `top` is (canonicalized), removed with it when this drops.
+    _held: blaze_core::temp::TempDir,
+}
 
 impl Workspace {
     fn new(name: &str) -> Workspace {
-        let top = std::env::temp_dir()
-            .join(format!("blaze-macro-eval-wasm-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&top);
+        let held = blaze_core::temp::TempDir::for_test(&format!("blaze-macro-eval-wasm-{name}-"));
+        let top = held.path();
         std::fs::create_dir_all(top.join("pkg/data")).unwrap();
         std::fs::write(top.join("pkg/data/a.txt"), "hello, macro").unwrap();
         std::fs::write(top.join("secret.txt"), "not yours").unwrap();
-        Workspace(std::fs::canonicalize(&top).unwrap())
+        let top = std::fs::canonicalize(top).unwrap();
+        Workspace { top, _held: held }
     }
 
     fn path(&self, rel: &str) -> String {
-        let top = self.0.to_str().unwrap();
+        let top = self.top.to_str().unwrap();
         if rel.is_empty() { top.to_owned() } else { format!("{top}/{rel}") }
     }
 
@@ -150,12 +154,6 @@ impl Workspace {
         env.set("CARGO_MANIFEST_DIR", self.path("pkg"));
         env.set("OUT_DIR", self.path("pkg/target/out"));
         env
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -602,7 +600,7 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
     let (library, _) = Library::load_with(&modules(), &binary(&reading_a()), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let first = env("1", "/tmp/blaze-lanes/profile-1855");
+    let first = env("1", "/profiles/blaze-lanes/profile-1855");
     let ran = library.expand(&db, &first, &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert_eq!(
         ran.seen,
@@ -632,11 +630,11 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
         matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }))
     };
     assert!(
-        found(&env("1", "/tmp/blaze-profile-1910")),
+        found(&env("1", "/profiles/blaze-profile-1910")),
         "a variable it never read made it miss"
     );
     assert!(
-        !found(&env("2", "/tmp/blaze-profile-1855")),
+        !found(&env("2", "/profiles/blaze-profile-1855")),
         "the variable it read changed and it was found"
     );
 }

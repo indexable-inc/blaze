@@ -341,6 +341,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// What the abort of a broken `clause` says: the function, the clause as written, and
     /// where.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a broken contract's abort message carries the clause's file, line and column into the \
+                  lowered MIR, so the body's MIR changes on an edit above it: the place must come from a \
+                  `Location` the link fills, as `line!()`'s does (`location::slots_lines`)"
+    )]
     fn broken_message(&self, func: FunctionId, kind: SpecClauseKind, clause: ExprId) -> String {
         let path = self.fn_path(func);
         let text = hir_def::expr_store::pretty::print_expr_hir(

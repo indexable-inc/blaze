@@ -724,8 +724,7 @@ mod tests {
     /// would name them, allocating nothing once its buffers are grown.
     #[test]
     fn a_walk_finds_what_read_dir_finds() {
-        let root = std::env::temp_dir().join(format!("blaze-walk-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let root = crate::temp::TempDir::for_test("blaze-walk-");
         for file in ["top/a", "top/b/c", "top/b/d/e", "top/f/g"] {
             let path = root.join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

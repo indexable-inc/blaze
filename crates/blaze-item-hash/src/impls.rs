@@ -24,6 +24,11 @@ pub fn install(db: &mut Db) {
 /// identity: a solver tells them apart by nothing, and a set hash counts each it holds, so adding
 /// or removing either changes it. An impl whose signature has no hash is of a program rustc
 /// rejects (the build stops at it); it is by its key and its text, so any edit of it changes it.
+#[expect(
+    blaze::reads_positions,
+    reason = "an unhashable impl is identified by its text off the live tree (`HasSource::source`), so its \
+              identity reruns on any edit of the file: read the text off the outline (`signatures::outline_item`)"
+)]
 pub fn impl_identity(db: &Db, imp: ImplId) -> ContentId {
     let item = ItemId::Impl(imp);
     let mut h = Hasher::new(IMPL_DOMAIN);

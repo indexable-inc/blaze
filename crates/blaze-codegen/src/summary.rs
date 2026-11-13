@@ -244,6 +244,11 @@ impl Arg {
     }
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "a summary's list lengths are read back as u32: a list of 2^32 entries needs a typed \
+              refusal from the summary encoder"
+)]
 fn put_count(out: &mut Vec<u8>, len: usize) {
     out.put_uleb(u64::from(u32::try_from(len).expect("a summary's lists are under 2^32 long")));
 }
@@ -422,6 +427,10 @@ impl Imports {
     /// The store's key of the code compiled for `key` with these imports: one BLAKE3 over
     /// every field laid out in a buffer the thread reuses.
     pub fn blob_key(&self, key: InstanceKey) -> ContentId {
+        #[expect(
+            blaze::process_static,
+            reason = "a per-thread encode buffer cleared on each use, uncapped: it keeps the largest imports encoded on the thread"
+        )]
         thread_local! {
             static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) }; // alloc: empty, the buffer the thread reuses
         }

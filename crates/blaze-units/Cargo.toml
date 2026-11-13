@@ -39,6 +39,7 @@ url.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-core.workspace = true
 blaze-vfs.workspace = true
 
 [lints]

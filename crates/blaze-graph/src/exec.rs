@@ -215,6 +215,10 @@ where
 /// The pools no [`drive`] is using, each kept for the next build of its size, so a build
 /// starts no thread once one of its size has run. Taken only to take or give back a pool.
 // alloc: empty, allocates nothing; a pool's entry is pushed once per pool size
+#[expect(
+    blaze::process_static,
+    reason = "one idle pool per pool size built, uncapped: the daemon should own its spare pools"
+)]
 static SPARE: Lock<Vec<Workers>> = Lock::new("graph.exec.spare_pools", Vec::new());
 
 /// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
@@ -430,11 +434,6 @@ const RUNS: usize = blaze_mem::pool::BATCH;
 /// owner itself never sends to it ([`Owner::later`]), so it always drains.
 const MAILBOX: usize = 1 << 12;
 
-/// The most messages the owner takes, without waiting, between two readings of what blaze
-/// holds ([`arena::own`] reads every subsystem's counters, lines the workers keep writing): so
-/// a reading costs a run 1/64 of it, and a stream of messages never holds it back for long.
-const HELD_EVERY: usize = 64;
-
 /// A run under way in the owner's [`Table`]: its slot, and what holding it back needs.
 struct Slot<R: Runner> {
     run: Pooled<'static, Run<R>>,
@@ -550,8 +549,8 @@ struct Waiting {
 /// the subsystem under its budget again, or once none of it runs. So a subsystem whose memory
 /// sits in tables its tasks do not free still has its tasks run, one at a time, and nothing
 /// waits for an end that never comes. Runs of one subsystem start in the order the plane
-/// started them. The plane counts a held run as running, with its memory granted: holding it
-/// back never lets the plane grant more.
+/// started them. The plane counts a held run as running, with its forecast: holding it back
+/// never lets the plane start more.
 struct Throttle {
     running: [u32; MemTag::COUNT],
     queues: [Queue; MemTag::COUNT],
@@ -763,11 +762,8 @@ impl<W> Handle<W> {
 /// A task's work runs in a frame of its own ([`blaze_mem::frame::task`], tagged with its
 /// subsystem: a pool worker's chunks are on its NUMA node, and the frame is freed when the task
 /// ends) inside [`arena::account`] and [`blaze_mem::frame::measure`], and its `Done` gives the
-/// plane the peak it held in both and the group it ran on. With a budget, the frames grow
-/// under its [`admission::share`] for [`MemTag::Frames`] ([`blaze_mem::frame::Cap`]); a task
-/// the cap cancels is posted again, as one that gives way. With a budget, the plane hears
-/// what blaze holds ([`arena::own`]) after the `Done`s the owner took without waiting, at
-/// most [`HELD_EVERY`] messages apart, and before it waits again. The scheduler's
+/// plane the peak it held in both and the group it ran on. It has no memory gate of its own:
+/// the daemon's driver owns the one gate (`blaze_mem::budget::Budget`). The scheduler's
 /// [`Predict`] gives each task added or found its cost and memory before the plane sees it,
 /// and learns the peak and own run time of each run that ends with a result (a run that gave
 /// way and one that panicked teach it nothing), under the task's kind and its spec's key. A
@@ -825,14 +821,6 @@ impl<W: Send + 'static> Scheduler<W> {
         M: Memo + Send + 'static,
     {
         let io_threads = config.io;
-        if let Some(budget) = &config.budget {
-            admission::set_budgets(budget.bytes);
-            // The frames' share of the budget is their hard backstop. Nothing spills frame
-            // memory (a frame is freed when its task ends), so the spills go unheard.
-            let limit = budget.bytes / 64 * admission::share(MemTag::Frames);
-            let (cap, _spills) = frame::Cap::new(limit, limit);
-            frame::set_cap(Some(cap));
-        }
         let plane = Plane::with_memo(config, memo)?;
         let (tx, rx) = bounded::<Msg<W>>(MAILBOX);
         // Each message is a run under way or the stop of one thread, so a send never waits.
@@ -882,7 +870,6 @@ impl<W: Send + 'static> Scheduler<W> {
             io_threads,
             said: Vec::new(), // alloc: none, empty; the owner's buffer, kept across steps
             new: Vec::new(),  // alloc: none, empty; the owner's buffer, kept across adds
-            held_due: false,
         };
         let owner = thread::Builder::new()
             // alloc: a thread's name, once per scheduler
@@ -964,9 +951,6 @@ struct Owner<R: Runner, P, M> {
     /// The nodes of an add whose work is new, kept empty between adds: an add the plane
     /// refuses takes their work back out.
     new: Vec<NodeId>,
-    /// A run ended since the plane last heard what blaze holds: with a budget, it hears before
-    /// the owner next waits. Without one the plane reads no holding, so it is never told.
-    held_due: bool,
 }
 
 impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
@@ -981,24 +965,16 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             }
         }
         let _stop_io = StopIo(self.ctx, self.io_threads);
-        // The owner's one wait. What is already in the mailbox is taken before the plane hears
-        // what blaze holds, up to `HELD_EVERY` messages, and it hears before the next wait.
+        // The owner's one wait.
         'serve: while let Ok(msg) = recv_said(&rx, "the scheduler's mailbox") {
-            let mut next = Some(msg);
-            let mut taken = 0;
-            while let Some(msg) = next {
+            if !self.take(msg) {
+                break 'serve;
+            }
+            while let Some(msg) = self.later.pop_front() {
                 if !self.take(msg) {
                     break 'serve;
                 }
-                while let Some(msg) = self.later.pop_front() {
-                    if !self.take(msg) {
-                        break 'serve;
-                    }
-                }
-                taken += 1;
-                next = if taken < HELD_EVERY { rx.try_recv().ok() } else { None };
             }
-            self.hear_held();
         }
         // A run held back is under way to the plane: it runs, its budget aside, so that the
         // table empties.
@@ -1109,7 +1085,6 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                         PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
-                self.held_due = self.plane.config().budget.is_some();
                 while let Some(at) = self.throttle.next(blaze_mem::tag::over_budget) {
                     self.start(at);
                 }
@@ -1127,17 +1102,6 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
         let mut said = std::mem::take(&mut self.said);
         let taken = self.plane.step_into(input, &mut said);
         self.outputs(request, taken, said)
-    }
-
-    /// Tells the plane what blaze holds now, if a run ended since it was last told. The plane
-    /// takes every `Held`, so no opener hears of it.
-    fn hear_held(&mut self) {
-        if !self.held_due {
-            return;
-        }
-        self.held_due = false;
-        let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::own() };
-        self.step(RequestId(u32::MAX), held);
     }
 
     /// Hands on what the plane appended to `said` (nothing when it refused), then keeps `said`,
@@ -1184,6 +1148,9 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
             PlaneOutput::Run { id, pool, near, critical } => self.run(id, pool, near, critical),
             PlaneOutput::Yield { id } => {
                 unreachable!("node {id} asked to give way: the scheduler opens no idle request")
+            }
+            PlaneOutput::Dropped { age } => {
+                unreachable!("task {age} dropped after giving way: no task here gives way")
             }
             PlaneOutput::Finished { request, ok } => {
                 // Work found by a task that then gave way, and never added.
@@ -1359,7 +1326,7 @@ mod tests {
     };
     use crate::{
         Cancelled, Key,
-        admission::{Estimates, Predict, Prediction, TaskKind},
+        admission::{Predict, Prediction, TaskKind},
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
@@ -1410,7 +1377,26 @@ mod tests {
 
     /// A scheduler on a pool of `topology`'s shape, and the pool.
     fn scheduler_on(topology: &Topology) -> ((Scheduler<Work>, Db), &'static Workers) {
-        scheduler_with(topology, Estimates::default())
+        scheduler_with(topology, Counting::default())
+    }
+
+    /// A predictor that predicts nothing and counts the runs it is taught: its estimates are
+    /// the count, little-endian.
+    #[derive(Default)]
+    struct Counting(u64);
+
+    impl Predict for Counting {
+        fn predict(&self, _kind: TaskKind, _key: Option<Key>) -> Prediction {
+            Prediction { cost: None, peak: 0 }
+        }
+
+        fn observe(&mut self, _kind: TaskKind, _key: Option<Key>, _ran_ns: u64, _peak: u64) {
+            self.0 += 1;
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            self.0.to_le_bytes().to_vec()
+        }
     }
 
     fn scheduler_with(
@@ -1419,7 +1405,7 @@ mod tests {
     ) -> ((Scheduler<Work>, Db), &'static Workers) {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
-        let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: workers };
         let db: Db = Arc::new(Lock::new("graph.test.exec.db", HashMap::default()));
         let memo = {
             let db = Arc::clone(&db);
@@ -1584,11 +1570,11 @@ mod tests {
         let seen: Arc<Lock<Vec<u32>>> = Arc::new(Lock::new("graph.test.exec.seen", Vec::new()));
         let pool = Workers::new(&Topology::flat(2), false).unwrap();
         let pool: &'static Workers = Box::leak(Box::new(pool));
-        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 4 };
+        let config = PlaneConfig { io: 1, work: 2 };
         let runner = Squares(Arc::clone(&seen));
         let memo = crate::plane::NoMemo;
         let scheduler =
-            Scheduler::with_pool(config, runner, Estimates::default(), memo, pool).unwrap();
+            Scheduler::with_pool(config, runner, Counting::default(), memo, pool).unwrap();
         let opened = scheduler.open(1, false);
         let tasks = (0..20u32)
             .map(|id| {
@@ -1809,8 +1795,7 @@ mod tests {
                 .any(|it| matches!(it.event, Event::Moved { id: 7, state: NodeState::Built }))
         );
         // Measured once: the tries that gave way taught nothing.
-        let estimates = Estimates::decode(&scheduler.estimates()).unwrap();
-        assert_eq!(estimates.by_kind.get(&TaskKind(1)).map(|it| it.seen), Some(1));
+        assert_eq!(scheduler.estimates(), 1u64.to_le_bytes());
     }
 
     /// Nodes a task finds, their work given through a handle, run after it once the request is

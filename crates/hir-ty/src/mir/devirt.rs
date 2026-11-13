@@ -171,6 +171,10 @@ impl fmt::Debug for World {
 
 /// The worlds given and still held, by ID: a handful a process (one a final binary being
 /// built), so a list.
+#[expect(
+    blaze::process_static,
+    reason = "a handful of worlds per process held by Weak; dead entries must be pruned or the code generator must own the list"
+)]
 static GIVEN: Lock<Vec<(DevirtWorld, Weak<World>)>> = Lock::new("ty.devirt.given", Vec::new());
 
 /// A world [`given`] hands out while this is held: the code generator holds it for as long as

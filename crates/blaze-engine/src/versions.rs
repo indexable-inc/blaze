@@ -588,8 +588,8 @@ mod tests {
     /// leaves the archive out, or no list at all is refused and nothing is unpacked.
     #[test]
     fn a_pinned_release_is_checked_by_every_sum_it_publishes() {
-        let root = std::env::temp_dir().join(format!("blaze-versions-sums-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-sums-");
+        let root = tmp.path();
         let host = "x86_64-unknown-linux-gnu";
         let top = format!("blaze-v0.1.0-{host}");
         let archive = format!("{top}.tar.gz");
@@ -672,7 +672,6 @@ mod tests {
             })
         });
         assert!(format!("{:#}", got.unwrap_err()).contains("SHA256SUMS names no"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A release dated after `B3SUMS` began that lacks it is refused, naming it, rather than
@@ -682,9 +681,8 @@ mod tests {
         assert!(
             !has_b3sums("0.20261030.1") && has_b3sums("0.20261031.0") && has_b3sums("0.20270101.3")
         );
-        let exe = std::env::temp_dir()
-            .join(format!("blaze-versions-b3-{}", std::process::id()))
-            .join("versions/0.20261102.0/blaze");
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-b3-");
+        let exe = tmp.join("versions/0.20261102.0/blaze");
         let got = fetched("0.20261102.0", "x86_64-unknown-linux-gnu", &exe, |name| {
             Ok((name == "SHA256SUMS")
                 .then(|| b"00  blaze-v0.20261102.0-x86_64-unknown-linux-gnu.tar.gz\n".to_vec()))
@@ -699,8 +697,8 @@ mod tests {
 
     #[test]
     fn a_release_from_a_directory_is_checked_and_unpacked() {
-        let root = std::env::temp_dir().join(format!("blaze-versions-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-versions-");
+        let root = tmp.path();
         let top = format!("blaze-v0.1.0-{}", hir_ty_codegen::Target::host());
         let mut archive = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -727,6 +725,5 @@ mod tests {
             "{error:#}"
         );
         assert!(!elsewhere.exists());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -100,6 +100,10 @@ For more information about this error, try `rustc --explain E0748`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_mismatched_closing_delimiter_names_what_it_left_open() {
     // tests/ui/parser/issues/issue-10636-1.rs
     let source = "struct Obj {
@@ -127,6 +131,10 @@ error: aborting due to 1 previous error
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_unclosed_delimiter_points_at_the_block_indented_otherwise() {
     // tests/ui/parser/issues/issue-2354.rs
     let source = "fn foo() { //~ NOTE unclosed delimiter
@@ -166,6 +174,10 @@ error: aborting due to 1 previous error
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_unclosed_delimiter_with_blocks_indented_alike_names_only_itself() {
     // tests/ui/parser/mismatched-braces/missing-close-brace-in-struct.rs
     let source = "pub(crate) struct Bar<T> {
@@ -198,6 +210,10 @@ error: aborting due to 1 previous error
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_missing_semicolon_is_added_and_parsing_goes_on() {
     // tests/ui/parser/issues/issue-3036.rs
     let source = "//@ run-rustfix

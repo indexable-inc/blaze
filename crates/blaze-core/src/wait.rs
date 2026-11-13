@@ -26,6 +26,10 @@
 //! (`wait/macos.rs`: `os_sync_wait_on_address_with_deadline` to an absolute Mach time and
 //! `os_sync_wake_by_address_any`; docs/macos.md).
 //!
+//! A wait on a word other processes map too ([`wait_shared`], [`wake_shared`]: the shared
+//! ledger's file, [`crate::shared`]) is the same futex or address wait without its private
+//! flag, so the kernel keys it by the mapping rather than the address.
+//!
 //! A process inside blaze's sandbox, whose seccomp filter refuses io_uring, makes the same
 //! waits with direct system calls instead (`wait/direct.rs`: `futex`, `ppoll`, `pidfd_open`,
 //! `waitid`, `clock_nanosleep`), over the same cores. Which of the two a process uses is chosen
@@ -172,6 +176,46 @@ pub fn until<T>(
     let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
     drop(registered);
     waited
+}
+
+/// Sleeps while the low 32 bits of `word` hold `expected`, until a [`wake_shared`] of it from
+/// any process that maps the same memory (a file mapped shared, [`crate::shared`]) or
+/// `deadline` on `clock`. `Ready` when woken or when the word no longer held `expected`
+/// (the caller looks at it again either way), `Deadline` once it passed. The kernel compares
+/// the word in the same step as it blocks, so a wake between the caller's look and its wait is
+/// not lost. The word is little-endian, its low half at its address.
+///
+/// - Linux: on the thread's wait ring, `IORING_OP_FUTEX_WAIT` of `FUTEX2_SIZE_U32` without
+///   `FUTEX2_PRIVATE`; on the direct driver ([`choose`]) `futex(FUTEX_WAIT_BITSET)` to an
+///   absolute time without `FUTEX_PRIVATE_FLAG`. Either keys the wait by the mapped page.
+/// - macOS: `os_sync_wait_on_address_with_deadline` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED`, to an
+///   absolute Mach time (`wait/macos.rs`): keyed by the shared mapping's object.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn wait_shared(
+    what: &'static str,
+    word: &std::sync::atomic::AtomicU64,
+    expected: u32,
+    deadline: Deadline,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    #[cfg(target_os = "linux")]
+    return match choice::chosen() {
+        Waits::Ring => ring::wait_shared(what, word, expected, deadline, clock),
+        Waits::Direct => direct::wait_shared(what, word, expected, deadline, clock),
+    };
+    #[cfg(target_os = "macos")]
+    return macos::wait_shared(what, word, expected, deadline, clock);
+}
+
+/// Wakes every thread of every process sleeping in [`wait_shared`] on `word`. One
+/// `futex(FUTEX_WAKE)` without `FUTEX_PRIVATE_FLAG` on Linux (from either driver: a wake does
+/// not block), `os_sync_wake_by_address_all` with `OS_SYNC_WAKE_BY_ADDRESS_SHARED` on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn wake_shared(word: &std::sync::atomic::AtomicU64) {
+    #[cfg(target_os = "linux")]
+    direct::wake_shared(word);
+    #[cfg(target_os = "macos")]
+    macos::wake_shared(word);
 }
 
 /// One thread's park, woken from any thread: a token, as std's `thread::park` is (an unpark

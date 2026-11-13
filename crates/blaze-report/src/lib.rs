@@ -45,6 +45,10 @@
 //! said, from the global heap.
 
 #![forbid(unsafe_code)]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// The field order promised above, held by `blaze::cbor_field_order`.
+#![blaze::canonical_cbor]
 
 pub mod out;
 pub mod palette;

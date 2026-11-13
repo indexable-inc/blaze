@@ -35,7 +35,33 @@ fn setup(runs: u64, runs_end: u64) -> Setup {
         runs_end,
         slots: "/s/slots".into(),
         premises: crate::serve::daemon::Premises { engine: "/s/blaze-engine".into(), library: None },
+        stores: stores(),
     }
+}
+
+/// A daemon's stores as its tasks read them (`serve::direct`), of an empty store opened on
+/// the simulation: these tests run no task that reads one.
+fn stores() -> Arc<crate::serve::direct::Stores> {
+    use blaze_core::sim::{Faults, Sim};
+    let mut sim = Sim::new(1, Faults::default());
+    let config = blaze_cas::Config {
+        dir: blaze_core::FileName::new("store").unwrap(),
+        layers: Vec::new(),
+        tags: 1 << 40,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
+    };
+    let mut effects = Vec::new();
+    let mut store = blaze_cas::Store::open(config, &mut effects);
+    blaze_core::run_until_idle(&mut sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+    })
+    .expect("the effects end");
+    let reader = store.reader();
+    // clone: a count of the store's reader
+    crate::serve::direct::Stores::new(reader.clone(), reader, crate::serve::direct::Reads::Lent)
 }
 
 fn opened(root: u8) -> Opened {
@@ -482,7 +508,7 @@ fn an_answered_jobs_placement_is_its_settlings_and_keeps_its_path_busy() {
 
 #[test]
 fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
-    let mut paths = Paths::<Real>::new(u64::MAX);
+    let mut paths = Paths::<Real>::new();
     let a = paths.intern("/w/target/debug/a");
     let b = paths.intern("/w/target/debug/b");
     assert_eq!(paths.intern("/w/target/debug/a"), a);
@@ -508,7 +534,9 @@ fn a_link_takes_its_kept_image_before_the_budget_evicts() {
         path: path.into(),
         kept: FakeImage { held, live: false },
     };
-    let mut paths = Paths::<Fake>::new(u64::MAX);
+    // The kept images' budget is the memory gate's now (`Paths::budget`), past these 130
+    // bytes; the takes below name their own.
+    let mut paths = Paths::<Fake>::new();
     paths.keep_one(&[], image("/w/target/debug/a", 60), true);
     paths.keep_one(&[], image("/w/target/debug/b", 30), true);
     paths.keep_one(&[], image("/w/target/debug/c", 40), true);

@@ -13,8 +13,11 @@
 //! The tokens name no file, no crate and no syntax context: every span of a kept definition
 //! is of the root context of the file it is written in and relative to the definition's own
 //! ast id, so a span is two numbers and the reader gives the rest. A definition that is not
-//! so (one a macro wrote, one whose spans have a wider anchor, one whose transparency read a
-//! `cfg_attr`) is not kept and is made from its source, as before.
+//! so (one a macro wrote, one whose spans have a wider anchor) is not kept and is made from
+//! its source, as before. A definition whose text names `cfg` (a `cfg_attr` deciding its
+//! transparency) is keyed by its crate's cfg too ([`cfg_part`]). Its content hash
+//! ([`def_hash`]) is read from its expansion's index where a macro wrote it and the expansion
+//! has a key ([`expansion`]).
 //!
 //! The invariant: equal keys are equal bytes; the tokens are a function of the definition's
 //! tree and its ast id alone.
@@ -35,10 +38,13 @@ use crate::{AstId, HirFileId, hygiene::Transparency, tt};
 
 type R<T = ()> = Result<T, String>;
 
+pub mod expansion;
 pub mod index;
 
-/// The layout of both entries. Part of their keys, and the first word of the tokens.
-pub const LAYOUT: u32 = 1;
+/// The layout of both entries. Part of their keys, and the first word of the tokens. 2: the
+/// defining crate's cfg in the tokens' key where the definition's text names `cfg`, so a
+/// definition whose transparency a `cfg_attr` decides is kept too.
+pub const LAYOUT: u32 = 2;
 
 /// The family of a definition's tokens.
 pub const TOKENS: &str = "macro def tokens";
@@ -134,26 +140,63 @@ pub fn file_set(db: &Db, file: EditionedFileId) -> ContentId {
     hasher.finish()
 }
 
+/// The set the entries of an item written in `file` are packed in, and how its text is read:
+/// a file's [`file_set`] and [`read_as`], or an expansion's key ([`expansion::key`]) and
+/// [`expansion::EXPANDED`]. The one home of both for every per-item entry. `None` for an
+/// expansion with no key.
+pub fn set_of(db: &Db, file: HirFileId) -> Option<(ContentId, u8)> {
+    match file {
+        HirFileId::FileId(file) => Some((file_set(db, file), read_as(db, file))),
+        HirFileId::MacroFile(call) => Some((expansion::key(db, call)?, expansion::EXPANDED)),
+    }
+}
+
 /// The key of the tokens of the definition whose tree hashes to `hash`, with ast id `ast`,
-/// read as `read_as` and compiled for a defining crate of `def_edition`.
-pub fn tokens_key(hash: u128, ast: ErasedFileAstId, read_as: u8, def_edition: Edition) -> ContentId {
+/// read as `read_as` and compiled for a defining crate of `def_edition`, with that crate's cfg
+/// `cfg` where the definition's text names `cfg` ([`cfg_part`]).
+pub fn tokens_key(
+    hash: u128,
+    ast: ErasedFileAstId,
+    read_as: u8,
+    def_edition: Edition,
+    cfg: Option<&ContentId>,
+) -> ContentId {
     let mut hasher = Hasher::new(TOKENS_DOMAIN);
     hasher
         .update(&LAYOUT.to_le_bytes())
         .update(&hash.to_le_bytes())
         .update(&ast.into_raw().to_le_bytes())
         .update(&[read_as, def_edition as u8]);
+    match cfg {
+        Some(cfg) => hasher.update(&[1]).id(cfg),
+        None => hasher.update(&[0]),
+    };
     hasher.finish()
+}
+
+/// The cfg of `def_crate` where the text of the definition `ast` of `file` names `cfg` (its
+/// row's `attrs_cfg` or `header_cfg`): what a `cfg_attr` on it reads, so its tokens' key takes
+/// it. `None` where the text names no `cfg`, whose tokens are the same under every cfg.
+pub(super) fn cfg_part(
+    db: &Db,
+    file: EditionedFileId,
+    ast: ErasedFileAstId,
+    def_crate: Crate,
+) -> Option<ContentId> {
+    let source = index::of(db, file, def_crate).get(ast)?;
+    (source.attrs_cfg || source.header_cfg)
+        .then(|| base_db::cfg_options_content(def_crate.cfg_options(db)))
 }
 
 /// The content hash of the macro definition `id` of `def_crate`: what a key that depends on
 /// which definition a call expanded covers (a body's `MACRO_DEF` fact). The `header` of the
-/// definition's [`index::ItemSource`]: from its file's index, with no parse where the index is
-/// kept; of a definition a macro wrote, or in a database that keeps no entries, from its
-/// tree, the same value.
+/// definition's [`index::ItemSource`]: from its file's index, or its expansion's where a macro
+/// wrote it and the expansion has a key ([`expansion::key`]), with no parse or expansion where
+/// the index is kept; of a definition an expansion with no key wrote, or in a database that
+/// keeps no entries, from its tree, the same value.
 pub fn def_hash(db: &Db, id: AstId<ast::Macro>, def_crate: Crate) -> u128 {
-    if let (HirFileId::FileId(file), Some(_)) = (id.file_id, of(db))
-        && let Some(source) = index::of(db, file, def_crate).get(id.value.erase())
+    if of(db).is_some()
+        && let Some(source) = index::source(db, id.file_id, id.value.erase(), def_crate)
     {
         return source.header;
     }
@@ -176,7 +219,8 @@ pub(super) fn find(
 ) -> Option<Def> {
     let set = file_set(db, file);
     let def_edition = def_crate.data(db).edition;
-    let key = tokens_key(hash, ast, read_as(db, file), def_edition);
+    let cfg = cfg_part(db, file, ast, def_crate);
+    let key = tokens_key(hash, ast, read_as(db, file), def_edition, cfg.as_ref());
     let place = Place::of(db, file, ast);
     let mut def = None;
     kept.get(db, def_crate, TOKENS, &set, key, &mut |bytes| {
@@ -199,7 +243,9 @@ pub(super) fn keep(
 ) {
     if let Some(bytes) = written.finish() {
         let set = file_set(db, file);
-        let key = tokens_key(hash, ast, read_as(db, file), def_crate.data(db).edition);
+        let cfg = cfg_part(db, file, ast, def_crate);
+        let edition = def_crate.data(db).edition;
+        let key = tokens_key(hash, ast, read_as(db, file), edition, cfg.as_ref());
         kept.put(db, def_crate, TOKENS, &set, key, &bytes);
     }
 }
@@ -692,11 +738,17 @@ mod tests {
     #[test]
     fn the_tokens_key_covers_the_definition_and_how_it_is_read() {
         let ast = ErasedFileAstId::from_raw(11);
-        let key = tokens_key(1, ast, 2, Edition::Edition2021);
-        assert_eq!(key, tokens_key(1, ast, 2, Edition::Edition2021));
-        assert_ne!(key, tokens_key(2, ast, 2, Edition::Edition2021));
-        assert_ne!(key, tokens_key(1, ErasedFileAstId::from_raw(12), 2, Edition::Edition2021));
-        assert_ne!(key, tokens_key(1, ast, 3, Edition::Edition2021));
-        assert_ne!(key, tokens_key(1, ast, 2, Edition::Edition2018));
+        let e21 = Edition::Edition2021;
+        let key = tokens_key(1, ast, 2, e21, None);
+        assert_eq!(key, tokens_key(1, ast, 2, e21, None));
+        assert_ne!(key, tokens_key(2, ast, 2, e21, None));
+        assert_ne!(key, tokens_key(1, ErasedFileAstId::from_raw(12), 2, e21, None));
+        assert_ne!(key, tokens_key(1, ast, 3, e21, None));
+        assert_ne!(key, tokens_key(1, ast, 2, Edition::Edition2018, None));
+        // A definition whose text names `cfg` is keyed by its crate's cfg too: two cfgs, two
+        // keys, and neither the key of the same text read as naming none.
+        let (a, b) = (ContentId([1; 32]), ContentId([2; 32]));
+        assert_ne!(key, tokens_key(1, ast, 2, e21, Some(&a)));
+        assert_ne!(tokens_key(1, ast, 2, e21, Some(&a)), tokens_key(1, ast, 2, e21, Some(&b)));
     }
 }

@@ -1,71 +1,101 @@
-//! The machine's memory ledger (docs/memory-budget.md, section 7): one fixed record for each
-//! blaze daemon of the user on the host, so every daemon admits against one machine budget
-//! rather than each against its own.
+//! The machine's ledger as shared memory (docs/v2/plan/design/end-state/memory.md, section
+//! 4.5): one small file of atomic words, mapped shared by every blaze process of the user, in
+//! which each process holds a slot and counts its memory and its work threads' cores. There is
+//! no daemon and there are no turns, leases or allowances: a process that wants memory adds it
+//! to its own slot and sums every live slot, and one that wants cores does the same with core
+//! tokens, so the many processes of one machine (agents' commands in their own checkouts, and
+//! their workers) together never admit past the machine's memory budget, nor run more work
+//! threads than it has cores (one each past them at most, the floor below).
 //!
-//! A daemon joins at start, rewrites its charge (`max(held, granted)` and its lease) at each
-//! turn, and leaves at exit; whoever holds the file's lock next prunes a record whose process
-//! is gone or whose start time differs (its pid reused). A daemon's [`Allowance`] is the least
-//! of its ceiling and the machine budget less every other live daemon's charge, and its plane
-//! admits against that ([`crate::plane::PlaneInput::Allowance`]).
+//! This is the core: it takes the mapping as a `&[AtomicU64]` it does not own, which processes
+//! run (and since when) through [`Alive`], and nothing else. The driver (`blaze_core::shared`)
+//! makes and maps the file `/tmp/blaze-<uid>/machine.<LAYOUT>` ([`file_name`]) and waits and
+//! wakes on its [`EPOCH`] word across processes.
 //!
-//! The lease is the headroom a daemon with work takes at its turn and may grant with no turn
-//! ([`crate::plane::Plane::lease`]): it is part of the daemon's charge, so every other daemon's
-//! allowance is less by it, and what the daemons may grant between their turns never sums past
-//! the machine budget.
+//! # The file
 //!
-//! This is the core: the file's bytes in, the file's bytes out, and the arithmetic. It owns no
-//! file, lock or clock. The driver (blaze-cargo's `serve::machine`) opens
-//! `/tmp/blaze-<uid>/machine`, takes its `flock`, reads it whole, applies one op here
-//! ([`Ledger::join`], [`Ledger::turn`], [`Ledger::leave`]), writes it whole back in place and
-//! lets go of the lock, so each op is one atomic read-modify-write of the file. What the core
-//! needs of the processes (whether pid P runs, and since when) comes through [`Alive`]; what it
-//! needs of the plane, through [`Admits`].
+//! [`WORDS`] little-endian `u64` words: a header of [`HEADER`] words, then [`SLOTS`] slots of
+//! [`SLOT`] words each (one 64-byte cache line a slot, so two processes' counting never shares a
+//! line). All zeros past the header is a ledger with no process.
 //!
-//! The file is [`LEN`] bytes, always written whole: a 32-byte header (magic, format, record
-//! size, record count, an FNV-1a checksum of the rest) and [`MOST`] records of [`RECORD`]
-//! bytes, little-endian, a free slot all zeros. An empty file is an empty ledger (a new one);
-//! anything else that does not decode is [`Why`]'s corrupt kinds, an error naming the file,
-//! never a ledger started empty (`persisted-state-round-trips`): starting empty would drop
-//! every other daemon's charge.
+//! | header word | what                                                                     |
+//! |-------------|--------------------------------------------------------------------------|
+//! | 0           | [`MAGIC`]                                                                |
+//! | 1           | [`LAYOUT`]                                                               |
+//! | 2           | the machine's memory budget in bytes (only ever lowered: [`Machine::narrow`]) |
+//! | 3           | its cores: the work threads every process together may run               |
+//! | 4           | [`EPOCH`]: bumped after every lowering; waiters wait on its low 32 bits  |
+//! | 5           | how many threads sleep on the epoch, so a lowering wakes only when one does |
+//! | 6, 7        | 0                                                                        |
 //!
-//! A record (offsets in bytes):
+//! | slot word | what                                                                       |
+//! |-----------|----------------------------------------------------------------------------|
+//! | 0         | owner: generation (30 bits), pid (32), state (2: free, claiming, live)      |
+//! | 1         | the process's start time, in [`Process::start`]'s unit                    |
+//! | 2         | bytes reserved                                                             |
+//! | 3         | bytes it wants and was refused: what another process's pool may give it    |
+//! | 4         | cores held                                                                 |
+//! | 5         | cores it wants past those                                                  |
+//! | 6         | its beat: when it last said it lives, by its own clock (no decision reads it) |
+//! | 7         | 0                                                                          |
 //!
-//! | at  | what                                                                 |
-//! |-----|----------------------------------------------------------------------|
-//! | 0   | pid (`u32`, 0 only in a free slot)                                   |
-//! | 4   | flags (`u8`: bit 0 the version was cut, bit 1 the home was cut)      |
-//! | 5   | bytes of the version kept (`u8`, at most 24)                         |
-//! | 6   | bytes of the home kept (`u8`, at most 24)                            |
-//! | 7   | 0                                                                    |
-//! | 8   | process start time (`u64`, the driver's unit)                        |
-//! | 16  | the machine budget this daemon brought                               |
-//! | 24  | its ceiling                                                          |
-//! | 32  | held, as its plane last measured                                     |
-//! | 40  | granted to its running tasks                                         |
-//! | 48  | when it was written (the writer's wall clock; no decision reads it)  |
-//! | 56  | the version's hash                                                   |
-//! | 64  | the home's hash                                                      |
-//! | 72  | the version's first 16 bytes                                         |
-//! | 88  | what it wants: the bytes its plane holds work back for               |
-//! | 96  | its lease: what it may grant past `max(held, granted)` with no turn  |
-//! | 104 | what it gives: the bytes it could give back and keep its floor       |
-//! | 112 | the home's last 16 bytes                                             |
+//! Only a slot's owner writes its words 1 to 7, and only while the slot is live or it claims it;
+//! the owner word moves by compare-and-swap alone. A free slot's other words are whatever its
+//! last owner left: nothing reads them, and the next claimer zeroes them before it is live.
 //!
-//! Sharing by need. The allowance already counts what each daemon holds, not how many there
-//! are: an idle daemon that holds 0.2 GiB takes 0.2 GiB of the machine. What it did not do is
-//! make a daemon that holds a lot and does nothing give it back for one that builds: on
-//! 2026-11-12 a hello-world's daemon had 21.78 GiB of a 96 GiB Mac to build in, beside
-//! daemons idle at 22.6, 9.7 and 6.1 GiB. So each record says what its daemon wants (what
-//! its plane holds work back for) and what it gives (what it could give back and keep the
-//! floor its next edit needs), and at its turn a daemon with no work is told what to hold
-//! at most ([`Ledger::yielded`]): what it holds less its part of what the others want, the
-//! idle daemons each giving in proportion to what they can. Its give-back
-//! (`crate::giveback`) then returns that memory in its own order, and the building daemon's
-//! allowance grows by it at its next turn. A daemon with work yields nothing.
+//! # Memory: store, then load
 //!
-//! The machine budget is the least that any live daemon brought: each computes its own at
-//! start (or is told it, `BLAZE_MACHINE_MEMORY_GB`), and the least is the one that holds for
-//! all, so no daemon admits past a bound another was given.
+//! [`Reserve`] adds the bytes to its own slot, then loads every live slot and sums them. Over
+//! the budget, it takes the add back and is refused ([`Reserved::Refused`]). Every word is
+//! accessed sequentially consistent, so of two reservers whose adds together pass the budget at
+//! least one sees the other's add: each adds before it loads, and in the one order of all the
+//! operations one of the two adds comes before the other's load. So at most one passes (both may
+//! be refused; the take-back wakes the other, which tries again). The general form: among the
+//! reservations granted and still held, the one whose add came last saw every other in its sum,
+//! so their bytes sum to at most the budget. `tests.rs` proves it by simulation, interleaving the
+//! processes at every atomic operation, and plants the sum-then-add order to see it caught.
+//!
+//! A refused process sets its want and sleeps on [`EPOCH`] ([`Acquire`], [`Sleep`]): it read the
+//! epoch before its add, and sleeps only while the epoch still holds that value, with the kernel
+//! comparing the word in the same step as it blocks (a futex, `os_sync_wait_on_address`). Every
+//! lowering (a release, a take-back, a slot freed by a leave or a prune, cores given) lowers first,
+//! then bumps the epoch, then wakes the sleepers if the count of them is not 0; a sleeper counts
+//! itself before it looks at the epoch. Either the lowerer's bump comes before the sleeper's look
+//! (the sleeper sees it moved and tries again) or the sleeper's count comes before the lowerer's
+//! load of it (the lowerer wakes it). No wake is lost.
+//!
+//! # Cores
+//!
+//! [`TakeCores`] is the same shape for core tokens: add what is wanted, sum the live slots' cores,
+//! and keep what fits. A process always ends with at least its floor (1: a command can always run
+//! one work thread, so nothing waits on a token another process may never give back: rule
+//! bounded-progress), so the cores held can pass the machine's cores, by at most the floor of
+//! each process that was given its floor beyond what fit: 44 commands on 18 cores run 44 work
+//! threads, not 704. That is the right trade: the alternative is a process that cannot start
+//! while others hold every core, a wait with no bound behind processes that may be stopped.
+//! A process sizes its pool by what it holds, and grows it by taking again after the epoch moves.
+//!
+//! # Liveness
+//!
+//! Whoever sums looks at each slot's owner and start: a live slot whose pid no longer runs, or
+//! runs with another start time (the pid given to another process), and a claiming slot whose pid
+//! no longer runs, is freed with one compare-and-swap of its owner word, which keeps the
+//! generation, so a slot freed and claimed again in between is never freed by a stale look. Its
+//! bytes and cores stop counting at that swap. A process that dies at any instant leaves a slot
+//! the next sum of any other frees, and none of its words are counted again. A live process that
+//! stops beating keeps its charge: it may still hold the memory, and freeing its slot would let
+//! another process admit past the budget. A sleeper's wait is bounded by the driver's deadline,
+//! after which it sums again (which frees the slots of the dead, and wakes the others).
+//!
+//! The one window that keeps a slot taken with no charge: a claimer that dies between its claim
+//! and its live swap, whose pid is then given to another process, keeps its slot claiming until
+//! that process exits (its start word may not be written, so its start cannot tell it from the new
+//! process). The slot counts nothing; 64 slots are not exhausted by this in practice, and a full
+//! ledger is a typed refusal naming the bound, never a wait.
+//!
+//! Every operation is a state machine ([`Op`]) whose every [`Op::step`] makes at most one access
+//! of a shared word, so the simulation can run another process between any two. A driver runs
+//! one to its end with [`finish`] (or [`run`], for the one that sleeps).
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -74,42 +104,11 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering::SeqCst},
 };
 
 #[cfg(test)]
 mod tests;
-
-/// The file's first 8 bytes.
-pub const MAGIC: [u8; 8] = *b"blzledgr";
-/// The layout this module reads and writes; a file of another is refused, naming both.
-/// Layout 2 added the lease, in 8 of the bytes layout 1 kept of the home. Layout 3 added what
-/// a daemon wants and what it gives, in 8 bytes each of the version's and the home's.
-pub const FORMAT: u32 = 3;
-/// The most daemons one machine budget is shared by: joining past it is refused.
-pub const MOST: usize = 64;
-/// The bytes of one record.
-pub const RECORD: usize = 128;
-/// The bytes of the header.
-pub const HEADER: usize = 32;
-/// The bytes of the whole file.
-pub const LEN: usize = HEADER + MOST * RECORD;
-
-const VERSION: usize = 16;
-const HOME: usize = 16;
-/// Where a record's wants, lease and gives are, and where its home's bytes start.
-const WANTS_AT: usize = 88;
-const LEASE_AT: usize = 96;
-const GIVES_AT: usize = 104;
-const HOME_AT: usize = 112;
-const _: () = assert!(
-    72 + VERSION == WANTS_AT
-        && WANTS_AT + 8 == LEASE_AT
-        && LEASE_AT + 8 == GIVES_AT
-        && GIVES_AT + 8 == HOME_AT
-        && HOME_AT + HOME == RECORD
-);
-const VERSION_CUT: u8 = 1;
-const HOME_CUT: u8 = 2;
 
 /// A process, as the ledger tells one from another: its pid and when it started, so a pid the
 /// system gave again is not taken for the process that had it.
@@ -121,650 +120,42 @@ pub struct Process {
     pub start: u64,
 }
 
-/// A text a record names (a version, a home), kept in `N` bytes: its hash (the driver's: the
-/// build's id, an FNV-1a of a path) and as much of it as fits, its head or its tail.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Label<const N: usize> {
-    hash: u64,
-    kept: u8,
-    cut: bool,
-    bytes: [u8; N],
-}
-
-impl<const N: usize> Label<N> {
-    pub const EMPTY: Label<N> = Label { hash: 0, kept: 0, cut: false, bytes: [0; N] };
-
-    /// `text` by its first `N` bytes.
-    pub fn head(text: &[u8], hash: u64) -> Label<N> {
-        let kept = text.len().min(N);
-        Label::of(&text[..kept], text.len() > kept, hash)
-    }
-
-    /// `text` by its last `N` bytes: a path, whose end says the most.
-    pub fn tail(text: &[u8], hash: u64) -> Label<N> {
-        let kept = text.len().min(N);
-        Label::of(&text[text.len() - kept..], text.len() > kept, hash)
-    }
-
-    fn of(kept: &[u8], cut: bool, hash: u64) -> Label<N> {
-        let mut bytes = [0; N];
-        bytes[..kept.len()].copy_from_slice(kept);
-        Label { hash, kept: kept.len() as u8, cut, bytes }
-    }
-
-    pub fn hash(&self) -> u64 {
-        self.hash
-    }
-
-    /// The bytes kept of the text.
-    pub fn kept(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.kept)]
-    }
-
-    /// Whether the text was longer than what is kept.
-    pub fn cut(&self) -> bool {
-        self.cut
-    }
-}
-
-/// One daemon's record.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Record {
-    pub process: Process,
-    /// The machine budget this daemon computed, or was told, at start.
-    pub budget: u64,
-    /// The most it may ever grant (`BLAZE_DAEMON_MEMORY_GB`, never above `budget`).
-    pub ceiling: u64,
-    pub held: u64,
-    pub granted: u64,
-    /// The headroom it took at its last turn: what it may grant past `max(held, granted)`
-    /// until its next ([`crate::plane::Plane::lease`]); 0 for a daemon with no work.
-    pub lease: u64,
-    /// What it wants: the bytes its plane holds work back for, as its last turn left it; 0
-    /// for a daemon nothing of which waits for memory.
-    pub wants: u64,
-    /// What it gives: the bytes it could give back now and keep the floor its next edit
-    /// needs; 0 for a daemon with work, which gives nothing to another.
-    pub gives: u64,
-    /// When it was last written, by the writer's wall clock: for a person reading the file.
-    pub at_ns: u64,
-    pub version: Label<VERSION>,
-    pub home: Label<HOME>,
-}
-
-impl Record {
-    /// What the ledger counts against the machine for it: what it holds, or what it granted
-    /// if more (a task granted memory may not have taken it yet), and its lease, which it may
-    /// grant before any other daemon reads the ledger again.
-    pub fn charge(&self) -> u64 {
-        self.held.max(self.granted).saturating_add(self.lease)
-    }
-}
-
-/// What a daemon may grant now, and what that came from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Allowance {
-    /// The least of its ceiling and `machine` less `others`.
-    pub bytes: u64,
-    /// The machine budget: the least any live daemon brought.
-    pub machine: u64,
-    /// Every other live daemon's charge, summed.
-    pub others: u64,
-    /// The other live daemons.
-    pub daemons: u32,
-    pub ceiling: u64,
-}
-
-/// Which processes run, as the driver found them just before the op: `Some(start)` when a
-/// process has `pid` now, started at `start`, in [`Process::start`]'s unit.
+/// Which processes run, as the driver finds them when a sum looks at a slot: `Some(start)` when
+/// a process has `pid` now, started at `start`, in [`Process::start`]'s unit; `None` when none
+/// has it; [`Unseen`] when the system could not say (the driver keeps why, and the operation
+/// ends naming the pid, [`Why::Unseen`]).
 pub trait Alive {
-    fn started(&self, pid: u32) -> Option<u64>;
+    fn started(&self, pid: u32) -> Result<Option<u64>, Unseen>;
 }
 
-/// The plane a [`Ledger::turn`] admits against.
-pub trait Admits {
-    /// Takes `allowance` as the most it may grant: it admits what now fits, and until the next
-    /// call grants no more than what it then holds and its lease
-    /// ([`crate::plane::PlaneInput::Allowance`]).
-    fn allow(&mut self, allowance: &Allowance);
-    /// The headroom past `max(held, granted)` it may grant until the next
-    /// [`Admits::allow`], as the last one left it ([`crate::plane::Plane::lease`]). The ledger
-    /// records it in this daemon's charge: one recorded smaller is room two daemons grant.
-    fn lease(&self) -> u64;
-    /// What the process holds, as last measured.
-    fn held(&self) -> u64;
-    /// What its running tasks were granted.
-    fn granted(&self) -> u64;
-    /// The bytes it holds work back for ([`Record::wants`]); 0 for a plane that does not say.
-    fn wants(&self) -> u64 {
-        0
-    }
-    /// The bytes it could give back and keep its floor ([`Record::gives`]); 0 for a plane
-    /// that does not say.
-    fn gives(&self) -> u64 {
-        0
-    }
-}
-
-/// What a [`Ledger::turn`] did.
+/// The system could not say whether a pid runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Turn {
-    pub allowance: Allowance,
-    /// The records pruned: processes gone, or pids now another process's.
-    pub pruned: u32,
-    /// The charge recorded for this daemon after its plane admitted, its lease in it.
-    pub charge: u64,
-    /// The lease in `charge`.
-    pub lease: u64,
-    /// What this daemon is to hold at most for the others' wants ([`Ledger::yielded`]);
-    /// `u64::MAX` for one that yields nothing.
-    pub yield_to: u64,
+pub struct Unseen;
+
+/// A process's core tokens on the machine's ledger, as its pools take and give them back
+/// ([`TakeCores`], [`GiveCores`] run by the process's driver, which owns the mapping and the
+/// slot). A process registers its one driver at start (`crate::pool::set_tokens`); every pool
+/// of it sizes itself by what it holds, so the process never runs more work threads than it
+/// holds tokens for.
+pub trait Tokens: Send + Sync {
+    /// Takes `want` more, ending with at least `floor` held in all: what the take came to.
+    /// An error names the ledger and why (a lost slot, a corrupt word): the caller stops.
+    fn take(&self, want: u64, floor: u64) -> Result<Cores, MachineError>;
+    /// Gives `cores` back: what the process holds after.
+    fn give(&self, cores: u64) -> Result<u64, MachineError>;
+    /// The ledger's epoch now: a pool that holds fewer than it wants takes again once it moved
+    /// (another process gave some back).
+    fn epoch(&self) -> u64;
 }
 
-/// What went wrong, and in which ledger file.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct LedgerError {
-    pub path: PathBuf,
-    pub why: Why,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Why {
-    /// The file is neither empty nor [`LEN`] bytes.
-    Length { len: usize },
-    Magic,
-    /// Written by a blaze whose ledger has another layout.
-    Format { found: u32 },
-    /// The header says records of another size, or another count.
-    Shape { record: u32, most: u32 },
-    Reserved,
-    Checksum { stored: u64, computed: u64 },
-    /// A slot with pid 0 that is not all zeros.
-    FreeSlot { slot: usize },
-    /// A record with bits set no layout has, or kept bytes past what a label holds.
-    Fields { slot: usize },
-    /// Two records of one process.
-    Twice { slot: usize, pid: u32, start: u64 },
-    /// A daemon joined that has a record already.
-    Joined { pid: u32, start: u64 },
-    /// Every slot holds a live daemon.
-    Full,
-    /// An op of a daemon with no record (pruned, or never joined).
-    NotJoined { pid: u32, start: u64 },
-    /// A record with pid 0, which marks a free slot.
-    NoPid,
-}
-
-impl Why {
-    /// Whether the file itself is bad, rather than the op asked of it.
-    pub fn corrupt(&self) -> bool {
-        matches!(
-            self,
-            Why::Length { .. }
-                | Why::Magic
-                | Why::Format { .. }
-                | Why::Shape { .. }
-                | Why::Reserved
-                | Why::Checksum { .. }
-                | Why::FreeSlot { .. }
-                | Why::Fields { .. }
-                | Why::Twice { .. }
-        )
-    }
-}
-
-impl fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = self.path.display();
-        let what = match self.why {
-            Why::Length { len } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: {len} bytes, where a ledger is \
-                     empty or {LEN}; {}",
-                    REMOVE
-                );
-            }
-            Why::Magic => "its first 8 bytes are not `blzledgr`",
-            Why::Format { found } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is of layout {found}, and this blaze reads \
-                     layout {FORMAT}: a daemon of another blaze version runs, or ran; stop every \
-                     blaze daemon of this user, then remove {path}"
-                );
-            }
-            Why::Shape { record, most } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: its header says {most} \
-                     records of {record} bytes, where layout {FORMAT} has {MOST} of {RECORD}; {}",
-                    REMOVE
-                );
-            }
-            Why::Reserved => "a reserved field of its header is not 0",
-            Why::Checksum { stored, computed } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: its checksum is {stored:#018x} \
-                     and its bytes sum to {computed:#018x} (a write torn, or another program's); {}",
-                    REMOVE
-                );
-            }
-            Why::FreeSlot { slot } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: slot {slot} has pid 0 and is \
-                     not all zeros; {REMOVE}"
-                );
-            }
-            Why::Fields { slot } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: the record in slot {slot} has \
-                     flags or label lengths no layout {FORMAT} record has; {REMOVE}"
-                );
-            }
-            Why::Twice { slot, pid, start } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} is corrupt: slot {slot} holds pid {pid} \
-                     (started at {start}) a second time; {REMOVE}"
-                );
-            }
-            Why::Joined { pid, start } => {
-                return write!(
-                    f,
-                    "pid {pid} (started at {start}) joined the machine's memory ledger {path} a \
-                     second time: a daemon joins once, at start"
-                );
-            }
-            Why::Full => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} has a live daemon in each of its {MOST} \
-                     slots, the most that share one machine budget: stop a blaze daemon of this \
-                     user (`blaze stop` in its home) and start this one again"
-                );
-            }
-            Why::NotJoined { pid, start } => {
-                return write!(
-                    f,
-                    "the machine's memory ledger {path} has no record of this daemon, pid {pid} \
-                     (started at {start}): it never joined, or another daemon pruned it as gone"
-                );
-            }
-            Why::NoPid => {
-                return write!(
-                    f,
-                    "a record of pid 0 was to join the machine's memory ledger {path}, where pid 0 \
-                     marks a free slot"
-                );
-            }
-        };
-        write!(f, "the machine's memory ledger {path} is corrupt: {what}; {REMOVE}")
-    }
-}
-
-const REMOVE: &str = "no blaze daemon starts while it is: once no blaze daemon of this user runs, \
-                      remove it";
-
-impl std::error::Error for LedgerError {}
-
-/// A planted bug the ledger's DST must catch (`testing` skill): each is caught by the oracle in
-/// one of the seeded plans its control searches.
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Plant {
-    None,
-    /// The driver reads the ledger, lets other daemons run their turns, then writes what it
-    /// read back with its own change: a read-modify-write with no lock (the simulation's).
-    UnlockedRmw,
-    /// [`Ledger::prune`] keeps a record whose pid runs, whatever its start time: a dead
-    /// daemon's charge kept by a process that reused its pid.
-    PruneIgnoresStart,
-    /// [`Ledger::allowance`] leaves the first other live daemon's charge out.
-    AllowanceSkipsOne,
-    /// [`Ledger::turn`] records no lease, whatever room the plane was given: the room past
-    /// its charge is what another daemon is told is free.
-    LeaseUnrecorded,
-    /// [`Ledger::yielded`] yields nothing, whatever the others want: the rule before layout 3,
-    /// under which an idle daemon keeps what it holds while one that builds is short.
-    NoYield,
-}
-
-/// The ledger, decoded: one slot a daemon, `None` free.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Ledger<'p> {
-    path: &'p Path,
-    slots: [Option<Record>; MOST],
-    #[cfg(test)]
-    pub(crate) plant: Plant,
-}
-
-impl<'p> Ledger<'p> {
-    /// The ledger with no record: a file that was empty.
-    pub fn empty(path: &'p Path) -> Ledger<'p> {
-        Ledger {
-            path,
-            slots: [None; MOST],
-            #[cfg(test)]
-            plant: Plant::None,
-        }
-    }
-
-    /// The ledger the file `path` holds, `bytes` all of it.
-    pub fn decode(path: &'p Path, bytes: &[u8]) -> Result<Ledger<'p>, LedgerError> {
-        let mut ledger = Ledger::empty(path);
-        if bytes.is_empty() {
-            return Ok(ledger);
-        }
-        if bytes.len() != LEN {
-            return Err(ledger.error(Why::Length { len: bytes.len() }));
-        }
-        if bytes[..8] != MAGIC {
-            return Err(ledger.error(Why::Magic));
-        }
-        let found = u32_at(bytes, 8);
-        if found != FORMAT {
-            return Err(ledger.error(Why::Format { found }));
-        }
-        let (record, most) = (u32_at(bytes, 12), u32_at(bytes, 16));
-        if record as usize != RECORD || most as usize != MOST {
-            return Err(ledger.error(Why::Shape { record, most }));
-        }
-        if u32_at(bytes, 20) != 0 {
-            return Err(ledger.error(Why::Reserved));
-        }
-        let (stored, computed) = (u64_at(bytes, 24), checksum(bytes));
-        if stored != computed {
-            return Err(ledger.error(Why::Checksum { stored, computed }));
-        }
-        for slot in 0..MOST {
-            let at = HEADER + slot * RECORD;
-            let row = &bytes[at..at + RECORD];
-            let pid = u32_at(row, 0);
-            if pid == 0 {
-                if row.iter().any(|&it| it != 0) {
-                    return Err(ledger.error(Why::FreeSlot { slot }));
-                }
-                continue;
-            }
-            let (flags, version_kept, home_kept) = (row[4], row[5], row[6]);
-            let fields = flags & !(VERSION_CUT | HOME_CUT) == 0
-                && row[7] == 0
-                && usize::from(version_kept) <= VERSION
-                && usize::from(home_kept) <= HOME
-                && row[72 + usize::from(version_kept)..WANTS_AT].iter().all(|&it| it == 0)
-                && row[HOME_AT + usize::from(home_kept)..RECORD].iter().all(|&it| it == 0);
-            if !fields {
-                return Err(ledger.error(Why::Fields { slot }));
-            }
-            let process = Process { pid, start: u64_at(row, 8) };
-            if ledger.find(process).is_some() {
-                return Err(ledger.error(Why::Twice { slot, pid, start: process.start }));
-            }
-            let mut version = [0; VERSION];
-            version.copy_from_slice(&row[72..WANTS_AT]);
-            let mut home = [0; HOME];
-            home.copy_from_slice(&row[HOME_AT..RECORD]);
-            ledger.slots[slot] = Some(Record {
-                process,
-                budget: u64_at(row, 16),
-                ceiling: u64_at(row, 24),
-                held: u64_at(row, 32),
-                granted: u64_at(row, 40),
-                lease: u64_at(row, LEASE_AT),
-                wants: u64_at(row, WANTS_AT),
-                gives: u64_at(row, GIVES_AT),
-                at_ns: u64_at(row, 48),
-                version: Label {
-                    hash: u64_at(row, 56),
-                    kept: version_kept,
-                    cut: flags & VERSION_CUT != 0,
-                    bytes: version,
-                },
-                home: Label {
-                    hash: u64_at(row, 64),
-                    kept: home_kept,
-                    cut: flags & HOME_CUT != 0,
-                    bytes: home,
-                },
-            });
-        }
-        Ok(ledger)
-    }
-
-    /// The file's bytes: what [`Ledger::decode`] reads back as this ledger, byte for byte.
-    pub fn encode(&self, out: &mut [u8; LEN]) {
-        out.fill(0);
-        out[..8].copy_from_slice(&MAGIC);
-        put_u32(out, 8, FORMAT);
-        put_u32(out, 12, RECORD as u32);
-        put_u32(out, 16, MOST as u32);
-        for (slot, record) in self.slots.iter().enumerate() {
-            let Some(record) = record else { continue };
-            let row = &mut out[HEADER + slot * RECORD..HEADER + (slot + 1) * RECORD];
-            put_u32(row, 0, record.process.pid);
-            row[4] = if record.version.cut { VERSION_CUT } else { 0 }
-                | if record.home.cut { HOME_CUT } else { 0 };
-            row[5] = record.version.kept;
-            row[6] = record.home.kept;
-            put_u64(row, 8, record.process.start);
-            put_u64(row, 16, record.budget);
-            put_u64(row, 24, record.ceiling);
-            put_u64(row, 32, record.held);
-            put_u64(row, 40, record.granted);
-            put_u64(row, 48, record.at_ns);
-            put_u64(row, 56, record.version.hash);
-            put_u64(row, 64, record.home.hash);
-            row[72..WANTS_AT].copy_from_slice(&record.version.bytes);
-            put_u64(row, WANTS_AT, record.wants);
-            put_u64(row, LEASE_AT, record.lease);
-            put_u64(row, GIVES_AT, record.gives);
-            row[HOME_AT..RECORD].copy_from_slice(&record.home.bytes);
-        }
-        let sum = checksum(&out[..]);
-        put_u64(out, 24, sum);
-    }
-
-    pub fn path(&self) -> &'p Path {
-        self.path
-    }
-
-    /// The records, in slot order.
-    pub fn records(&self) -> impl Iterator<Item = &Record> {
-        self.slots.iter().flatten()
-    }
-
-    pub fn record(&self, me: Process) -> Option<&Record> {
-        self.find(me).and_then(|slot| self.slots[slot].as_ref())
-    }
-
-    /// The machine budget: the least any recorded daemon brought; `None` with no record.
-    pub fn machine(&self) -> Option<u64> {
-        self.records().map(|it| it.budget).min()
-    }
-
-    /// Records `record` in the first free slot. Prune first ([`Ledger::prune`]): a dead
-    /// daemon's slot is free only once pruned.
-    pub fn join(&mut self, record: Record) -> Result<(), LedgerError> {
-        let Process { pid, start } = record.process;
-        if pid == 0 {
-            return Err(self.error(Why::NoPid));
-        }
-        if self.find(record.process).is_some() {
-            return Err(self.error(Why::Joined { pid, start }));
-        }
-        let Some(free) = self.slots.iter().position(Option::is_none) else {
-            return Err(self.error(Why::Full));
-        };
-        self.slots[free] = Some(record);
-        Ok(())
-    }
-
-    /// Takes `me`'s record out: a clean exit.
-    pub fn leave(&mut self, me: Process) -> Result<Record, LedgerError> {
-        let slot = self.joined(me)?;
-        Ok(self.slots[slot].take().expect("a joined slot holds a record"))
-    }
-
-    /// Rewrites what `me` holds, was granted and leases, at `at_ns` by the writer's clock.
-    pub fn charge(
-        &mut self,
-        me: Process,
-        held: u64,
-        granted: u64,
-        lease: u64,
-        at_ns: u64,
-    ) -> Result<(), LedgerError> {
-        let slot = self.joined(me)?;
-        let record = self.slots[slot].as_mut().expect("a joined slot holds a record");
-        record.held = held;
-        record.granted = granted;
-        record.lease = lease;
-        record.at_ns = at_ns;
-        Ok(())
-    }
-
-    /// Rewrites what `me` wants and what it gives ([`Record::wants`], [`Record::gives`]).
-    pub fn need(&mut self, me: Process, wants: u64, gives: u64) -> Result<(), LedgerError> {
-        let slot = self.joined(me)?;
-        let record = self.slots[slot].as_mut().expect("a joined slot holds a record");
-        record.wants = wants;
-        record.gives = gives;
-        Ok(())
-    }
-
-    /// What `me` is to hold at most so that the others get what they want (the module's
-    /// "Sharing by need"); `u64::MAX` when it yields nothing: it has work (a grant, a lease or
-    /// a want of its own), it can give nothing, or no other daemon wants anything.
-    ///
-    /// The idle daemons share what is wanted in proportion to what each can give, each at
-    /// most all it can: `me`'s part is `wanted x me.gives / every idle daemon's gives`,
-    /// rounded up, and it is to hold what it holds less that. Rounded up, the parts sum to at
-    /// least what is wanted where the idle daemons can give it, so no want is left for a
-    /// rounding's sake; a daemon is never asked below `held - gives`, its floor.
-    pub fn yielded(&self, me: Process) -> Result<u64, LedgerError> {
-        let mine = self.slots[self.joined(me)?].expect("a joined slot holds a record");
-        #[cfg(test)]
-        if self.plant == Plant::NoYield {
-            return Ok(u64::MAX);
-        }
-        let idle = |it: &Record| it.granted == 0 && it.lease == 0 && it.wants == 0;
-        if !idle(&mine) || mine.gives == 0 {
-            return Ok(u64::MAX);
-        }
-        let wanted = self
-            .records()
-            .filter(|it| it.process != me)
-            .fold(0u64, |sum, it| sum.saturating_add(it.wants));
-        if wanted == 0 {
-            return Ok(u64::MAX);
-        }
-        let givable = self
-            .records()
-            .filter(|it| idle(it))
-            .fold(0u128, |sum, it| sum + u128::from(it.gives));
-        let part = (u128::from(wanted) * u128::from(mine.gives)).div_ceil(givable);
-        let part = u64::try_from(part).unwrap_or(u64::MAX).min(mine.gives);
-        Ok(mine.held.saturating_sub(part))
-    }
-
-    /// Frees the slot of each record whose process is gone, or whose pid another process has
-    /// now (its start time differs): how many.
-    pub fn prune(&mut self, alive: &impl Alive) -> u32 {
-        let mut pruned = 0;
-        for slot in &mut self.slots {
-            let Some(record) = slot else { continue };
-            let started = alive.started(record.process.pid);
-            #[cfg(test)]
-            let lives = match self.plant {
-                Plant::PruneIgnoresStart => started.is_some(),
-                _ => started == Some(record.process.start),
-            };
-            #[cfg(not(test))]
-            let lives = started == Some(record.process.start);
-            if !lives {
-                *slot = None;
-                pruned += 1;
-            }
-        }
-        pruned
-    }
-
-    /// What `me` may grant now: the least of its ceiling and the machine budget less every
-    /// other recorded daemon's charge. Prune first: a dead daemon's charge counts until it is.
-    pub fn allowance(&self, me: Process) -> Result<Allowance, LedgerError> {
-        let mine = self.slots[self.joined(me)?].expect("a joined slot holds a record");
-        let machine = self.machine().expect("a ledger with a record has a machine budget");
-        let (mut others, mut daemons) = (0u64, 0u32);
-        #[cfg(test)]
-        let mut skip = self.plant == Plant::AllowanceSkipsOne;
-        for record in self.records().filter(|it| it.process != me) {
-            #[cfg(test)]
-            if std::mem::take(&mut skip) {
-                continue;
-            }
-            others = others.saturating_add(record.charge());
-            daemons += 1;
-        }
-        Ok(Allowance {
-            bytes: mine.ceiling.min(machine.saturating_sub(others)),
-            machine,
-            others,
-            daemons,
-            ceiling: mine.ceiling,
-        })
-    }
-
-    /// One turn of `me` under the lock: prune, tell `plane` its allowance (it admits what
-    /// fits), and record the charge it is left with: what it holds or granted, and the lease
-    /// it took of the allowance, all it may grant until its next turn.
-    pub fn turn(
-        &mut self,
-        me: Process,
-        at_ns: u64,
-        alive: &impl Alive,
-        plane: &mut impl Admits,
-    ) -> Result<Turn, LedgerError> {
-        let pruned = self.prune(alive);
-        let allowance = self.allowance(me)?;
-        plane.allow(&allowance);
-        let (held, granted, lease) = (plane.held(), plane.granted(), plane.lease());
-        #[cfg(test)]
-        let lease = if self.plant == Plant::LeaseUnrecorded { 0 } else { lease };
-        self.charge(me, held, granted, lease, at_ns)?;
-        self.need(me, plane.wants(), plane.gives())?;
-        let yield_to = self.yielded(me)?;
-        Ok(Turn {
-            allowance,
-            pruned,
-            charge: held.max(granted).saturating_add(lease),
-            lease,
-            yield_to,
-        })
-    }
-
-    fn find(&self, me: Process) -> Option<usize> {
-        self.slots.iter().position(|it| it.is_some_and(|it| it.process == me))
-    }
-
-    fn joined(&self, me: Process) -> Result<usize, LedgerError> {
-        self.find(me).ok_or_else(|| self.error(Why::NotJoined { pid: me.pid, start: me.start }))
-    }
-
-    fn error(&self, why: Why) -> LedgerError {
-        // alloc: the path an error names, once an error
-        LedgerError { path: self.path.to_path_buf(), why }
-    }
-}
-
-/// FNV-1a, 64 bits: the home's hash a driver records, and the file's checksum.
+/// FNV-1a, 64 bits.
 pub const fn fnv1a(bytes: &[u8]) -> u64 {
     fnv1a_from(0xcbf2_9ce4_8422_2325, bytes)
 }
 
+/// FNV-1a from `hash` on. The first function blaze proves in Lean: hir-ty-lean's fixture reads
+/// it from this file by its text (`fnv1a_fixture`) and its model lives at
+/// `lean/BlazeModel/blaze_graph/ledger/fnv1a_from.lean`, so its body stays byte for byte.
 const fn fnv1a_from(mut hash: u64, bytes: &[u8]) -> u64 {
     let mut at = 0;
     while at < bytes.len() {
@@ -775,23 +166,1353 @@ const fn fnv1a_from(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The checksum of a whole file's `bytes`: FNV-1a of everything but the checksum's own field.
-fn checksum(bytes: &[u8]) -> u64 {
-    fnv1a_from(fnv1a(&bytes[..24]), &bytes[HEADER..])
+/// The file's first word: `blzmachn`, little-endian.
+pub const MAGIC: u64 = u64::from_le_bytes(*b"blzmachn");
+/// The layout this module reads and writes; it is in the file's name ([`file_name`]), so a blaze
+/// of another layout keeps a ledger of its own, and in the file, which a driver checks.
+pub const LAYOUT: u64 = 1;
+/// The most blaze processes of one user that share one machine's ledger. A process past them is
+/// refused, naming the bound ([`Why::Full`]): 64 is past what one machine runs at once (44
+/// processes were seen on 2026-11-13), and a slot is one cache line, so the whole file is a page.
+pub const SLOTS: usize = 64;
+/// Words of the header.
+pub const HEADER: usize = 8;
+/// Words of a slot.
+pub const SLOT: usize = 8;
+/// Words of the whole file.
+pub const WORDS: usize = HEADER + SLOTS * SLOT;
+/// The header's words a file must hold exactly to be this ledger: its magic and layout.
+pub const IDENTITY: usize = 2;
+/// The word waiters wait on (its low 32 bits) and every lowering bumps.
+pub const EPOCH: usize = 4;
+
+const AT_MAGIC: usize = 0;
+const AT_LAYOUT: usize = 1;
+const AT_BUDGET: usize = 2;
+const AT_CORES: usize = 3;
+const AT_SLEEPERS: usize = 5;
+
+const OWNER: usize = 0;
+const START: usize = 1;
+const RESERVED: usize = 2;
+const WANT: usize = 3;
+const CORES: usize = 4;
+const CORES_WANT: usize = 5;
+const BEAT: usize = 6;
+
+/// The words a claimer zeroes before its slot is live.
+const ZEROED: [usize; 5] = [RESERVED, WANT, CORES, CORES_WANT, BEAT];
+
+/// The most steps of an operation that does not sleep: two passes of every slot at a few
+/// accesses each, and its own handful. An operation past it is a bug, named ([`Why::Stuck`]).
+pub const MOST_STEPS: usize = 4 * SLOTS * SLOT + 64;
+/// The most rounds an [`Acquire`] tries again with no sleep between, the epoch having moved
+/// each time; past it the machine is churning and the acquire ends naming it ([`Why::Churn`]).
+pub const CHURN: u32 = 1024;
+
+/// The file's name in the user's directory (`/tmp/blaze-<uid>/`).
+pub fn file_name() -> String {
+    // alloc: a file name, once a process opens the ledger
+    format!("machine.{LAYOUT}")
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+const FREE: u64 = 0;
+const CLAIMING: u64 = 1;
+const LIVE: u64 = 2;
+const GEN_SHIFT: u32 = 34;
+const GEN_MASK: u64 = (1 << 30) - 1;
+
+const fn owner(generation: u64, pid: u32, state: u64) -> u64 {
+    ((generation & GEN_MASK) << GEN_SHIFT) | ((pid as u64) << 2) | state
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+const fn state_of(owner: u64) -> u64 {
+    owner & 3
 }
 
-fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+const fn pid_of(owner: u64) -> u32 {
+    ((owner >> 2) & 0xffff_ffff) as u32
 }
 
-fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+const fn generation_of(owner: u64) -> u64 {
+    owner >> GEN_SHIFT
 }
+
+/// The owner word of the slot `owner` held, freed: its generation kept, so a look at the old
+/// owner fails its swap.
+const fn freed(owner: u64) -> u64 {
+    self::owner(generation_of(owner), 0, FREE)
+}
+
+const fn at(slot: usize, field: usize) -> usize {
+    HEADER + slot * SLOT + field
+}
+
+/// A planted bug the DST must catch (`testing` skill): each is caught by an oracle in one of the
+/// seeded plans its control searches.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plant {
+    None,
+    /// [`Reserve`] sums the slots, then adds its own bytes if the sum and they fit: two reservers
+    /// that each sum before the other adds both pass.
+    SumThenAdd,
+    /// [`Release`] bumps the epoch and wakes before it lowers its slot: a sleeper woken tries,
+    /// is refused by what is not yet lowered, and sleeps on through the lowering.
+    WakeBeforeLower,
+    /// A sum counts the slot of a dead process it frees.
+    PrunedStillCounted,
+    /// A slot's process is taken as alive when its pid runs, whatever its start time: a dead
+    /// process's charge kept by the process that was given its pid.
+    PidWithoutStart,
+}
+
+/// Whether `$machine` carries the plant `$plant`: false outside tests.
+macro_rules! planted {
+    ($machine:expr, $plant:ident) => {{
+        #[cfg(test)]
+        let planted = $machine.plant == Plant::$plant;
+        #[cfg(not(test))]
+        let planted = false;
+        planted
+    }};
+}
+
+/// The ledger's words, checked: the mapping a driver made, and the path every error names.
+pub struct Machine<'m> {
+    path: &'m Path,
+    words: &'m [AtomicU64],
+    #[cfg(test)]
+    pub(crate) plant: Plant,
+}
+
+/// A process's place in the ledger: which slot, and the owner word it holds there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slot {
+    index: usize,
+    owner: u64,
+    process: Process,
+}
+
+impl Slot {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn process(&self) -> Process {
+        self.process
+    }
+}
+
+impl<'m> Machine<'m> {
+    /// The header a new file is stamped with: the first process's budget and cores.
+    pub fn header(budget: u64, cores: u64) -> [u64; HEADER] {
+        [MAGIC, LAYOUT, budget, cores, 0, 0, 0, 0]
+    }
+
+    /// The ledger in `words`, the file `path` mapped: refused, naming the file, when it is not
+    /// [`WORDS`] long, or its header is not this layout's.
+    pub fn new(path: &'m Path, words: &'m [AtomicU64]) -> Result<Machine<'m>, MachineError> {
+        let machine = Machine {
+            path,
+            words,
+            #[cfg(test)]
+            plant: Plant::None,
+        };
+        if words.len() != WORDS {
+            return Err(machine.error(Why::Length { words: words.len() }));
+        }
+        let magic = machine.load(AT_MAGIC);
+        if magic != MAGIC {
+            return Err(machine.error(Why::Magic { found: magic }));
+        }
+        let layout = machine.load(AT_LAYOUT);
+        if layout != LAYOUT {
+            return Err(machine.error(Why::Layout { found: layout }));
+        }
+        for word in [AT_BUDGET, AT_CORES] {
+            if machine.load(word) == 0 {
+                return Err(machine.error(Why::Header { word, found: 0 }));
+            }
+        }
+        for word in 6..HEADER {
+            let found = machine.load(word);
+            if found != 0 {
+                return Err(machine.error(Why::Header { word, found }));
+            }
+        }
+        Ok(machine)
+    }
+
+    pub fn path(&self) -> &'m Path {
+        self.path
+    }
+
+    /// The machine's memory budget now.
+    pub fn budget(&self) -> u64 {
+        self.load(AT_BUDGET)
+    }
+
+    /// The machine's cores.
+    pub fn cores(&self) -> u64 {
+        self.load(AT_CORES)
+    }
+
+    /// The epoch now: a driver's [`Sleep`] waits while it holds this.
+    pub fn epoch(&self) -> u64 {
+        self.load(EPOCH)
+    }
+
+    /// Lowers the machine budget to `budget` if that is less (a process told a smaller one,
+    /// `BLAZE_MACHINE_MEMORY_GB`): the least any process brought holds for all, as in today's
+    /// ledger. Never raised: a budget a process was told is never passed by another's. The budget
+    /// now. Lowering it frees nothing, so no one is woken.
+    pub fn narrow(&self, budget: u64) -> u64 {
+        let budget = budget.max(1);
+        self.words[AT_BUDGET].fetch_min(budget, SeqCst).min(budget)
+    }
+
+    /// Says `slot`'s process lives, at `at_ns` by its own clock: for whoever reads the ledger.
+    /// No decision reads it (a live process's charge stays, beating or not).
+    pub fn beat(&self, slot: Slot, at_ns: u64) -> Result<(), MachineError> {
+        self.own(slot)?;
+        self.store(at(slot.index, BEAT), at_ns);
+        Ok(())
+    }
+
+    /// Takes back what `slot` wants of memory and cores: a driver whose acquire ended without a
+    /// grant (its deadline) says it no longer waits.
+    pub fn withdraw(&self, slot: Slot) -> Result<(), MachineError> {
+        self.own(slot)?;
+        self.store(at(slot.index, WANT), 0);
+        self.store(at(slot.index, CORES_WANT), 0);
+        Ok(())
+    }
+
+    fn load(&self, word: usize) -> u64 {
+        self.words[word].load(SeqCst)
+    }
+
+    fn store(&self, word: usize, value: u64) {
+        self.words[word].store(value, SeqCst);
+    }
+
+    fn add(&self, word: usize, value: u64) -> u64 {
+        self.words[word].fetch_add(value, SeqCst)
+    }
+
+    fn sub(&self, word: usize, value: u64) -> u64 {
+        self.words[word].fetch_sub(value, SeqCst)
+    }
+
+    fn swap(&self, word: usize, from: u64, to: u64) -> bool {
+        self.words[word].compare_exchange(from, to, SeqCst, SeqCst).is_ok()
+    }
+
+    /// Whether a live slot's process runs: its pid runs, and started when the slot says.
+    fn lives(&self, started: Option<u64>, start: u64) -> bool {
+        if planted!(self, PidWithoutStart) {
+            return started.is_some();
+        }
+        started == Some(start)
+    }
+
+    /// `slot` is still its process's: a slot freed under a live process is a bug, named.
+    fn own(&self, slot: Slot) -> Result<(), MachineError> {
+        if self.load(at(slot.index, OWNER)) == slot.owner {
+            return Ok(());
+        }
+        let Process { pid, start } = slot.process;
+        Err(self.error(Why::Lost { slot: slot.index, pid, start }))
+    }
+
+    fn error(&self, why: Why) -> MachineError {
+        // alloc: the path an error names, once an error
+        MachineError { path: self.path.to_path_buf(), why }
+    }
+}
+
+/// What one step of an operation asks of its driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step<T> {
+    /// Step again.
+    Next,
+    /// Wake every thread sleeping on [`EPOCH`] (a futex wake of all, an
+    /// `os_sync_wake_by_address_all`), then step again.
+    Wake,
+    /// Sleep while [`EPOCH`]'s low 32 bits hold `expected`, until a wake or the driver's deadline
+    /// for one wait, then step again either way.
+    Block { expected: u32 },
+    Done(T),
+}
+
+impl<T> Step<T> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Step<U> {
+        match self {
+            Step::Next => Step::Next,
+            Step::Wake => Step::Wake,
+            Step::Block { expected } => Step::Block { expected },
+            Step::Done(out) => Step::Done(f(out)),
+        }
+    }
+}
+
+/// One operation on the ledger, stepped: each step makes at most one access of a shared word.
+pub trait Op {
+    type Out;
+    /// What it is, for an error.
+    const NAME: &'static str;
+
+    fn step<A: Alive>(
+        &mut self,
+        machine: &Machine<'_>,
+        alive: &A,
+    ) -> Result<Step<Self::Out>, MachineError>;
+}
+
+/// Runs `op` to its end, `wake` doing each wake it asks for. For the operations that never
+/// sleep: one that asks to is a bug, named, as is one past [`MOST_STEPS`].
+pub fn finish<O: Op, A: Alive>(
+    op: &mut O,
+    machine: &Machine<'_>,
+    alive: &A,
+    mut wake: impl FnMut(),
+) -> Result<O::Out, MachineError> {
+    for _ in 0..MOST_STEPS {
+        match op.step(machine, alive)? {
+            Step::Next => {}
+            Step::Wake => wake(),
+            Step::Block { .. } => return Err(machine.error(Why::Blocks { op: O::NAME })),
+            Step::Done(out) => return Ok(out),
+        }
+    }
+    Err(machine.error(Why::Stuck { op: O::NAME, steps: MOST_STEPS }))
+}
+
+/// What a driver does for an operation that may sleep: its wakes and its waits.
+pub trait Host {
+    type Error;
+    /// Wakes every thread sleeping on [`EPOCH`].
+    fn wake(&mut self);
+    /// Sleeps while [`EPOCH`]'s low 32 bits hold `expected`, until a wake or the end of one wait
+    /// (the driver's recheck, after which the operation sums again and frees the slots of the
+    /// dead); an error ends the operation (the driver's whole deadline passed).
+    fn block(&mut self, expected: u32) -> Result<(), Self::Error>;
+}
+
+/// How a [`run`] failed: the ledger's error, or the host's.
+#[derive(Debug)]
+pub enum Ran<E> {
+    Machine(MachineError),
+    Host(E),
+}
+
+/// Runs `op` to its end, sleeping through `host` where it asks. The steps between two sleeps are
+/// bounded by [`MOST_STEPS`]; the sleeps by the host's deadline.
+pub fn run<O: Op, A: Alive, H: Host>(
+    op: &mut O,
+    machine: &Machine<'_>,
+    alive: &A,
+    host: &mut H,
+) -> Result<O::Out, Ran<H::Error>> {
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        if steps > MOST_STEPS {
+            return Err(Ran::Machine(machine.error(Why::Stuck { op: O::NAME, steps: MOST_STEPS })));
+        }
+        match op.step(machine, alive).map_err(Ran::Machine)? {
+            Step::Next => {}
+            Step::Wake => host.wake(),
+            Step::Block { expected } => {
+                host.block(expected).map_err(Ran::Host)?;
+                steps = 0;
+            }
+            Step::Done(out) => return Ok(out),
+        }
+    }
+}
+
+// --- The sum ---------------------------------------------------------------------------------
+
+/// A pass over every slot that sums `fields` of the live ones and frees the slots of the dead.
+#[derive(Clone, Copy, Debug)]
+struct Scan {
+    fields: &'static [usize],
+    slot: usize,
+    at: ScanAt,
+    sums: [u64; 4],
+    live: u32,
+    pruned: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScanAt {
+    Owner,
+    Start { owner: u64 },
+    Field { owner: u64, k: usize, prune: bool },
+    Prune { owner: u64 },
+    Sleepers,
+    End,
+}
+
+enum Scanned {
+    Next,
+    Wake,
+    Done,
+}
+
+impl Scan {
+    fn new(fields: &'static [usize]) -> Scan {
+        debug_assert!(fields.len() <= 4);
+        Scan { fields, slot: 0, at: ScanAt::Owner, sums: [0; 4], live: 0, pruned: 0 }
+    }
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, alive: &A) -> Result<Scanned, MachineError> {
+        match self.at {
+            ScanAt::Owner => {
+                if self.slot == SLOTS {
+                    if self.pruned == 0 {
+                        self.at = ScanAt::End;
+                        return Ok(Scanned::Done);
+                    }
+                    // Slots were freed: their charge no longer counts, so a sleeper may fit.
+                    m.add(EPOCH, 1);
+                    self.at = ScanAt::Sleepers;
+                    return Ok(Scanned::Next);
+                }
+                let owner = m.load(at(self.slot, OWNER));
+                match state_of(owner) {
+                    LIVE | CLAIMING => self.at = ScanAt::Start { owner },
+                    FREE => self.slot += 1,
+                    _ => return Err(m.error(Why::Owner { slot: self.slot, word: owner })),
+                }
+                Ok(Scanned::Next)
+            }
+            ScanAt::Start { owner } => {
+                let start = m.load(at(self.slot, START));
+                let pid = pid_of(owner);
+                // A pid the system could not be asked about is neither live nor dead: the sum
+                // stops, naming it, rather than free a charge that may still be held.
+                let started = alive.started(pid).map_err(|Unseen| m.error(Why::Unseen { pid }))?;
+                let live = state_of(owner) == LIVE;
+                // A claimer's start may not be written yet: it is dead only once its pid is.
+                let dead = if live { !m.lives(started, start) } else { started.is_none() };
+                self.at = match (dead, live) {
+                    (true, _) if planted!(m, PrunedStillCounted) => {
+                        ScanAt::Field { owner, k: 0, prune: true }
+                    }
+                    (true, _) => ScanAt::Prune { owner },
+                    (false, true) => ScanAt::Field { owner, k: 0, prune: false },
+                    (false, false) => {
+                        self.slot += 1;
+                        ScanAt::Owner
+                    }
+                };
+                Ok(Scanned::Next)
+            }
+            ScanAt::Field { owner, k, prune } => {
+                let value = m.load(at(self.slot, self.fields[k]));
+                self.sums[k] = self.sums[k].saturating_add(value);
+                self.at = if k + 1 < self.fields.len() {
+                    ScanAt::Field { owner, k: k + 1, prune }
+                } else if prune {
+                    ScanAt::Prune { owner }
+                } else {
+                    self.live += 1;
+                    self.slot += 1;
+                    ScanAt::Owner
+                };
+                Ok(Scanned::Next)
+            }
+            ScanAt::Prune { owner } => {
+                // Fails when another freed it first, or it was freed and claimed again since the
+                // look: the generation moved.
+                if m.swap(at(self.slot, OWNER), owner, freed(owner)) {
+                    self.pruned += 1;
+                }
+                self.slot += 1;
+                self.at = ScanAt::Owner;
+                Ok(Scanned::Next)
+            }
+            ScanAt::Sleepers => {
+                self.at = ScanAt::End;
+                Ok(if m.load(AT_SLEEPERS) > 0 { Scanned::Wake } else { Scanned::Next })
+            }
+            ScanAt::End => Ok(Scanned::Done),
+        }
+    }
+}
+
+// --- Joining and leaving ---------------------------------------------------------------------
+
+/// Takes a free slot for `me`: a first pass for a free one; when there is none, a sum that frees
+/// the slots of the dead, and a second pass. None then: [`Why::Full`].
+pub struct Join {
+    me: Process,
+    at: JoinAt,
+    slot: usize,
+    second: bool,
+    scan: Scan,
+    claimed: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum JoinAt {
+    Look,
+    Claim { free: u64 },
+    Start,
+    Zero { k: usize },
+    Live,
+    Scan,
+}
+
+impl Join {
+    pub fn new(me: Process) -> Join {
+        Join {
+            me,
+            at: JoinAt::Look,
+            slot: 0,
+            second: false,
+            scan: Scan::new(&[RESERVED]),
+            claimed: 0,
+        }
+    }
+}
+
+impl Op for Join {
+    type Out = Slot;
+    const NAME: &'static str = "a join of the machine's ledger";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, alive: &A) -> Result<Step<Slot>, MachineError> {
+        if self.me.pid == 0 {
+            return Err(m.error(Why::NoPid));
+        }
+        match self.at {
+            JoinAt::Look => {
+                if self.slot == SLOTS {
+                    if self.second {
+                        return Err(m.error(Why::Full));
+                    }
+                    self.second = true;
+                    self.slot = 0;
+                    self.at = JoinAt::Scan;
+                    return Ok(Step::Next);
+                }
+                let owner = m.load(at(self.slot, OWNER));
+                if state_of(owner) == FREE {
+                    self.at = JoinAt::Claim { free: owner };
+                } else {
+                    self.slot += 1;
+                }
+            }
+            JoinAt::Claim { free } => {
+                let claimed = owner(generation_of(free) + 1, self.me.pid, CLAIMING);
+                if m.swap(at(self.slot, OWNER), free, claimed) {
+                    self.claimed = claimed;
+                    self.at = JoinAt::Start;
+                } else {
+                    self.slot += 1;
+                    self.at = JoinAt::Look;
+                }
+            }
+            JoinAt::Start => {
+                m.store(at(self.slot, START), self.me.start);
+                self.at = JoinAt::Zero { k: 0 };
+            }
+            JoinAt::Zero { k } => {
+                m.store(at(self.slot, ZEROED[k]), 0);
+                self.at = if k + 1 < ZEROED.len() { JoinAt::Zero { k: k + 1 } } else { JoinAt::Live };
+            }
+            JoinAt::Live => {
+                let live = owner(generation_of(self.claimed), self.me.pid, LIVE);
+                // A claimer is freed only once its pid no longer runs: it runs, so the swap holds.
+                if !m.swap(at(self.slot, OWNER), self.claimed, live) {
+                    let Process { pid, start } = self.me;
+                    return Err(m.error(Why::Lost { slot: self.slot, pid, start }));
+                }
+                return Ok(Step::Done(Slot { index: self.slot, owner: live, process: self.me }));
+            }
+            JoinAt::Scan => match self.scan.step(m, alive)? {
+                Scanned::Next => {}
+                Scanned::Wake => return Ok(Step::Wake),
+                Scanned::Done => self.at = JoinAt::Look,
+            },
+        }
+        Ok(Step::Next)
+    }
+}
+
+/// Frees `slot`: a clean exit. Its charge stops counting at the swap; sleepers are woken.
+pub struct Leave {
+    slot: Slot,
+    at: Lowering,
+}
+
+/// The tail every lowering shares: bump the epoch, then wake if anyone sleeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lowering {
+    Own,
+    Check,
+    Lower,
+    Bump,
+    Sleepers,
+    End,
+}
+
+impl Leave {
+    pub fn new(slot: Slot) -> Leave {
+        Leave { slot, at: Lowering::Lower }
+    }
+}
+
+impl Op for Leave {
+    type Out = ();
+    const NAME: &'static str = "a leave of the machine's ledger";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, _: &A) -> Result<Step<()>, MachineError> {
+        match self.at {
+            Lowering::Lower => {
+                if !m.swap(at(self.slot.index, OWNER), self.slot.owner, freed(self.slot.owner)) {
+                    let Process { pid, start } = self.slot.process;
+                    return Err(m.error(Why::Lost { slot: self.slot.index, pid, start }));
+                }
+                self.at = Lowering::Bump;
+            }
+            Lowering::Bump => {
+                m.add(EPOCH, 1);
+                self.at = Lowering::Sleepers;
+            }
+            Lowering::Sleepers => {
+                self.at = Lowering::End;
+                if m.load(AT_SLEEPERS) > 0 {
+                    return Ok(Step::Wake);
+                }
+            }
+            Lowering::End => return Ok(Step::Done(())),
+            Lowering::Own | Lowering::Check => unreachable!("a leave starts at its swap"),
+        }
+        Ok(Step::Next)
+    }
+}
+
+// --- Memory ----------------------------------------------------------------------------------
+
+/// What a [`Reserve`] came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reserved {
+    /// The bytes are the process's. `counted`: the live slots' bytes the sum saw, these in it.
+    Granted { counted: u64, budget: u64 },
+    /// Over the budget by `over_by`: the add was taken back and the want set. `epoch`: what to
+    /// sleep on ([`Sleep`]): the epoch read before the add, or one past it when this reserve's
+    /// own take-back was the only bump since.
+    Refused { over_by: u64, counted: u64, budget: u64, epoch: u64 },
+}
+
+/// One try at `bytes` more for `slot`: add, sum, and keep or take back.
+pub struct Reserve {
+    slot: Slot,
+    bytes: u64,
+    at: ReserveAt,
+    epoch: u64,
+    scan: Scan,
+    out: Option<Reserved>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReserveAt {
+    Own,
+    Epoch,
+    Add,
+    Scan,
+    Budget,
+    TakeBack,
+    Bump,
+    Sleepers,
+    Want,
+}
+
+impl Reserve {
+    pub fn new(slot: Slot, bytes: u64) -> Reserve {
+        Reserve {
+            slot,
+            bytes,
+            at: ReserveAt::Own,
+            epoch: 0,
+            scan: Scan::new(&[RESERVED]),
+            out: None,
+        }
+    }
+}
+
+impl Op for Reserve {
+    type Out = Reserved;
+    const NAME: &'static str = "a reserve of the machine's memory";
+
+    fn step<A: Alive>(
+        &mut self,
+        m: &Machine<'_>,
+        alive: &A,
+    ) -> Result<Step<Reserved>, MachineError> {
+        let slot = self.slot.index;
+        match self.at {
+            ReserveAt::Own => {
+                m.own(self.slot)?;
+                self.at = ReserveAt::Epoch;
+            }
+            ReserveAt::Epoch => {
+                // Before the add: a lowering after this read is one the sleep sees.
+                self.epoch = m.load(EPOCH);
+                self.at =
+                    if planted!(m, SumThenAdd) { ReserveAt::Scan } else { ReserveAt::Add };
+            }
+            ReserveAt::Add => {
+                m.add(at(slot, RESERVED), self.bytes);
+                self.at =
+                    if planted!(m, SumThenAdd) { ReserveAt::Want } else { ReserveAt::Scan };
+            }
+            ReserveAt::Scan => match self.scan.step(m, alive)? {
+                Scanned::Next => {}
+                Scanned::Wake => return Ok(Step::Wake),
+                Scanned::Done => self.at = ReserveAt::Budget,
+            },
+            ReserveAt::Budget => {
+                let budget = m.load(AT_BUDGET);
+                let counted = self.scan.sums[0];
+                let total = if planted!(m, SumThenAdd) {
+                    counted.saturating_add(self.bytes)
+                } else {
+                    counted
+                };
+                if total <= budget {
+                    self.out = Some(Reserved::Granted { counted, budget });
+                    self.at =
+                        if planted!(m, SumThenAdd) { ReserveAt::Add } else { ReserveAt::Want };
+                } else {
+                    let over_by = total - budget;
+                    let epoch = self.epoch;
+                    self.out = Some(Reserved::Refused { over_by, counted, budget, epoch });
+                    self.at =
+                        if planted!(m, SumThenAdd) { ReserveAt::Want } else { ReserveAt::TakeBack };
+                }
+            }
+            ReserveAt::TakeBack => {
+                m.sub(at(slot, RESERVED), self.bytes);
+                self.at = ReserveAt::Bump;
+            }
+            ReserveAt::Bump => {
+                // The take-back is a lowering: another reserver refused for this add may now fit.
+                let was = m.add(EPOCH, 1);
+                // Only this bump since the read: sleeping on the epoch it made loses no other
+                // lowering, and does not wake this reserve at once for its own.
+                if was == self.epoch
+                    && let Some(Reserved::Refused { epoch, .. }) = &mut self.out
+                {
+                    *epoch = was.wrapping_add(1);
+                }
+                self.at = ReserveAt::Sleepers;
+            }
+            ReserveAt::Sleepers => {
+                self.at = ReserveAt::Want;
+                if m.load(AT_SLEEPERS) > 0 {
+                    return Ok(Step::Wake);
+                }
+            }
+            ReserveAt::Want => {
+                let out = self.out.expect("a reserve decides before it sets its want");
+                let want = match out {
+                    Reserved::Granted { .. } => 0,
+                    Reserved::Refused { .. } => self.bytes,
+                };
+                m.store(at(slot, WANT), want);
+                return Ok(Step::Done(out));
+            }
+        }
+        Ok(Step::Next)
+    }
+}
+
+/// Gives `bytes` of `slot`'s reservation back: lowers the slot, then bumps the epoch and wakes.
+pub struct Release {
+    slot: Slot,
+    bytes: u64,
+    charge: Charge,
+    at: Lowering,
+    holds: u64,
+}
+
+impl Release {
+    pub fn new(slot: Slot, bytes: u64) -> Release {
+        Release { slot, bytes, charge: Charge::Bytes, at: Lowering::Own, holds: 0 }
+    }
+}
+
+impl Op for Release {
+    /// What the slot holds after.
+    type Out = u64;
+    const NAME: &'static str = "a release of the machine's memory";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, _: &A) -> Result<Step<u64>, MachineError> {
+        lower(m, self.slot, self.bytes, self.charge, &mut self.at, &mut self.holds)
+    }
+}
+
+/// A lowering of `slot`'s `charge` by `by`, stepped: own, check, lower, bump, wake.
+fn lower(
+    m: &Machine<'_>,
+    slot: Slot,
+    by: u64,
+    charge: Charge,
+    state: &mut Lowering,
+    holds: &mut u64,
+) -> Result<Step<u64>, MachineError> {
+    let word = at(slot.index, charge.field());
+    // The plant's order: bump and wake, then lower.
+    let early = charge == Charge::Bytes && planted!(m, WakeBeforeLower);
+    match *state {
+        Lowering::Own => {
+            m.own(slot)?;
+            *state = Lowering::Check;
+        }
+        Lowering::Check => {
+            // Only the owner writes its slot's counts while it is live: what it loads stays.
+            *holds = m.load(word);
+            if *holds < by {
+                return Err(m.error(Why::Over {
+                    slot: slot.index,
+                    charge,
+                    holds: *holds,
+                    gives: by,
+                }));
+            }
+            *state = if early { Lowering::Bump } else { Lowering::Lower };
+        }
+        Lowering::Lower => {
+            m.sub(word, by);
+            if early {
+                return Ok(Step::Done(*holds - by));
+            }
+            *state = Lowering::Bump;
+        }
+        Lowering::Bump => {
+            m.add(EPOCH, 1);
+            *state = Lowering::Sleepers;
+        }
+        Lowering::Sleepers => {
+            *state = if early { Lowering::Lower } else { Lowering::End };
+            if m.load(AT_SLEEPERS) > 0 {
+                return Ok(Step::Wake);
+            }
+        }
+        Lowering::End => return Ok(Step::Done(*holds - by)),
+    }
+    Ok(Step::Next)
+}
+
+/// What an [`Acquire`] came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Acquired {
+    /// What the granting sum saw, these bytes in it.
+    pub counted: u64,
+    pub budget: u64,
+    /// How many times it was refused first.
+    pub refusals: u32,
+}
+
+/// `bytes` more for `slot`, sleeping on the epoch between refusals until they fit. A refusal of
+/// more than the whole budget is an error, naming both: no release makes it fit.
+pub struct Acquire {
+    slot: Slot,
+    bytes: u64,
+    at: AcquireAt,
+    refusals: u32,
+    awake: u32,
+    last: Option<Reserved>,
+}
+
+enum AcquireAt {
+    Reserve(Reserve),
+    Sleep(Sleep),
+}
+
+impl Acquire {
+    pub fn new(slot: Slot, bytes: u64) -> Acquire {
+        Acquire {
+            slot,
+            bytes,
+            at: AcquireAt::Reserve(Reserve::new(slot, bytes)),
+            refusals: 0,
+            awake: 0,
+            last: None,
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The last refusal, for a driver whose deadline passed to name what held the memory.
+    pub fn refused(&self) -> Option<Reserved> {
+        self.last
+    }
+}
+
+impl Op for Acquire {
+    type Out = Acquired;
+    const NAME: &'static str = "an acquire of the machine's memory";
+
+    fn step<A: Alive>(
+        &mut self,
+        m: &Machine<'_>,
+        alive: &A,
+    ) -> Result<Step<Acquired>, MachineError> {
+        match &mut self.at {
+            AcquireAt::Reserve(reserve) => match reserve.step(m, alive)? {
+                Step::Done(Reserved::Granted { counted, budget }) => Ok(Step::Done(Acquired {
+                    counted,
+                    budget,
+                    refusals: self.refusals,
+                })),
+                Step::Done(refused @ Reserved::Refused { budget, epoch, .. }) => {
+                    if self.bytes > budget {
+                        return Err(m.error(Why::TooBig { bytes: self.bytes, budget }));
+                    }
+                    self.refusals += 1;
+                    self.last = Some(refused);
+                    self.at = AcquireAt::Sleep(Sleep::new(epoch as u32));
+                    Ok(Step::Next)
+                }
+                other => Ok(other.map(|_| unreachable!("matched above"))),
+            },
+            AcquireAt::Sleep(sleep) => match sleep.step(m, alive)? {
+                Step::Done(slept) => {
+                    if slept {
+                        self.awake = 0;
+                    } else {
+                        self.awake += 1;
+                        if self.awake > CHURN {
+                            return Err(m.error(Why::Churn { rounds: CHURN }));
+                        }
+                    }
+                    self.at = AcquireAt::Reserve(Reserve::new(self.slot, self.bytes));
+                    Ok(Step::Next)
+                }
+                other => Ok(other.map(|_| unreachable!("matched above"))),
+            },
+        }
+    }
+}
+
+/// A sleep on the epoch while it holds `expected`: counted among the sleepers first, so a
+/// lowering that bumps after the look wakes it.
+pub struct Sleep {
+    expected: u32,
+    at: SleepAt,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SleepAt {
+    Count,
+    Look,
+    Blocked,
+    Uncount,
+}
+
+impl Sleep {
+    pub fn new(expected: u32) -> Sleep {
+        Sleep { expected, at: SleepAt::Count }
+    }
+}
+
+impl Op for Sleep {
+    /// Whether it blocked: false when the epoch had moved already.
+    type Out = bool;
+    const NAME: &'static str = "a sleep on the machine's ledger";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, _: &A) -> Result<Step<bool>, MachineError> {
+        match self.at {
+            SleepAt::Count => {
+                m.add(AT_SLEEPERS, 1);
+                self.at = SleepAt::Look;
+                Ok(Step::Next)
+            }
+            SleepAt::Look => {
+                if m.load(EPOCH) as u32 != self.expected {
+                    self.at = SleepAt::Uncount;
+                    return Ok(Step::Next);
+                }
+                self.at = SleepAt::Blocked;
+                Ok(Step::Block { expected: self.expected })
+            }
+            SleepAt::Blocked => {
+                m.sub(AT_SLEEPERS, 1);
+                Ok(Step::Done(true))
+            }
+            SleepAt::Uncount => {
+                m.sub(AT_SLEEPERS, 1);
+                Ok(Step::Done(false))
+            }
+        }
+    }
+}
+
+// --- Cores -----------------------------------------------------------------------------------
+
+/// What a [`TakeCores`] came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cores {
+    /// The cores given now.
+    pub granted: u64,
+    /// All the process holds now: what its pool runs.
+    pub held: u64,
+    /// By how much the sum passed the machine's cores, this take's whole want in it.
+    pub over: u64,
+    /// What the sum saw of every live slot's cores, this take's whole want in it.
+    pub counted: u64,
+    pub cores: u64,
+    /// What to sleep on to take again once some are given back.
+    pub epoch: u64,
+}
+
+/// `want` more cores for `slot`, ending with at least `floor` held: add, sum, keep what fits (or
+/// the floor) and give the rest back at once.
+pub struct TakeCores {
+    slot: Slot,
+    want: u64,
+    floor: u64,
+    at: TakeAt,
+    epoch: u64,
+    old: u64,
+    scan: Scan,
+    out: Option<Cores>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TakeAt {
+    Own,
+    Epoch,
+    Add,
+    Scan,
+    Decide,
+    Back,
+    Bump,
+    Sleepers,
+    Want,
+}
+
+impl TakeCores {
+    pub fn new(slot: Slot, want: u64, floor: u64) -> TakeCores {
+        TakeCores {
+            slot,
+            want,
+            floor,
+            at: TakeAt::Own,
+            epoch: 0,
+            old: 0,
+            scan: Scan::new(&[CORES]),
+            out: None,
+        }
+    }
+
+    pub fn want(&self) -> u64 {
+        self.want
+    }
+}
+
+impl Op for TakeCores {
+    type Out = Cores;
+    const NAME: &'static str = "a take of the machine's cores";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, alive: &A) -> Result<Step<Cores>, MachineError> {
+        let slot = self.slot.index;
+        match self.at {
+            TakeAt::Own => {
+                m.own(self.slot)?;
+                self.at = TakeAt::Epoch;
+            }
+            TakeAt::Epoch => {
+                self.epoch = m.load(EPOCH);
+                self.at = TakeAt::Add;
+            }
+            TakeAt::Add => {
+                self.old = m.add(at(slot, CORES), self.want);
+                self.at = TakeAt::Scan;
+            }
+            TakeAt::Scan => match self.scan.step(m, alive)? {
+                Scanned::Next => {}
+                Scanned::Wake => return Ok(Step::Wake),
+                Scanned::Done => self.at = TakeAt::Decide,
+            },
+            TakeAt::Decide => {
+                let cores = m.load(AT_CORES);
+                let counted = self.scan.sums[0];
+                let over = counted.saturating_sub(cores);
+                let fit = self.want.saturating_sub(over);
+                let granted = fit.max(self.floor.saturating_sub(self.old)).min(self.want);
+                self.out = Some(Cores {
+                    granted,
+                    held: self.old + granted,
+                    over,
+                    counted,
+                    cores,
+                    epoch: self.epoch,
+                });
+                self.at = if granted < self.want { TakeAt::Back } else { TakeAt::Want };
+            }
+            TakeAt::Back => {
+                let out = self.out.expect("a take decides before it gives back");
+                m.sub(at(slot, CORES), self.want - out.granted);
+                self.at = TakeAt::Bump;
+            }
+            TakeAt::Bump => {
+                let was = m.add(EPOCH, 1);
+                if was == self.epoch
+                    && let Some(out) = &mut self.out
+                {
+                    out.epoch = was.wrapping_add(1);
+                }
+                self.at = TakeAt::Sleepers;
+            }
+            TakeAt::Sleepers => {
+                self.at = TakeAt::Want;
+                if m.load(AT_SLEEPERS) > 0 {
+                    return Ok(Step::Wake);
+                }
+            }
+            TakeAt::Want => {
+                let out = self.out.expect("a take decides before it sets its want");
+                m.store(at(slot, CORES_WANT), self.want - out.granted);
+                return Ok(Step::Done(out));
+            }
+        }
+        Ok(Step::Next)
+    }
+}
+
+/// Gives `cores` of `slot`'s back: a pool that shrank.
+pub struct GiveCores {
+    slot: Slot,
+    cores: u64,
+    at: Lowering,
+    holds: u64,
+}
+
+impl GiveCores {
+    pub fn new(slot: Slot, cores: u64) -> GiveCores {
+        GiveCores { slot, cores, at: Lowering::Own, holds: 0 }
+    }
+}
+
+impl Op for GiveCores {
+    /// What the slot holds after.
+    type Out = u64;
+    const NAME: &'static str = "a give of the machine's cores";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, _: &A) -> Result<Step<u64>, MachineError> {
+        lower(m, self.slot, self.cores, Charge::Cores, &mut self.at, &mut self.holds)
+    }
+}
+
+// --- Reading it ------------------------------------------------------------------------------
+
+/// The live slots, summed (the dead freed on the way): for a status line, and for a process with
+/// memory it could give back to see what the others want.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Counted {
+    pub processes: u32,
+    pub pruned: u32,
+    pub reserved: u64,
+    pub wanted: u64,
+    pub cores_held: u64,
+    pub cores_wanted: u64,
+    pub budget: u64,
+    pub cores: u64,
+}
+
+pub struct Census {
+    scan: Scan,
+    budget: Option<u64>,
+}
+
+impl Census {
+    pub fn new() -> Census {
+        Census { scan: Scan::new(&[RESERVED, WANT, CORES, CORES_WANT]), budget: None }
+    }
+}
+
+impl Default for Census {
+    fn default() -> Census {
+        Census::new()
+    }
+}
+
+impl Op for Census {
+    type Out = Counted;
+    const NAME: &'static str = "a census of the machine's ledger";
+
+    fn step<A: Alive>(&mut self, m: &Machine<'_>, alive: &A) -> Result<Step<Counted>, MachineError> {
+        if !matches!(self.scan.at, ScanAt::End) {
+            return Ok(match self.scan.step(m, alive)? {
+                Scanned::Wake => Step::Wake,
+                Scanned::Next | Scanned::Done => Step::Next,
+            });
+        }
+        let Some(budget) = self.budget else {
+            self.budget = Some(m.load(AT_BUDGET));
+            return Ok(Step::Next);
+        };
+        let [reserved, wanted, cores_held, cores_wanted] = self.scan.sums;
+        Ok(Step::Done(Counted {
+            processes: self.scan.live,
+            pruned: self.scan.pruned,
+            reserved,
+            wanted,
+            cores_held,
+            cores_wanted,
+            budget,
+            cores: m.load(AT_CORES),
+        }))
+    }
+}
+
+// --- Errors ----------------------------------------------------------------------------------
+
+/// Which count of a slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Charge {
+    Bytes,
+    Cores,
+}
+
+impl Charge {
+    fn field(self) -> usize {
+        match self {
+            Charge::Bytes => RESERVED,
+            Charge::Cores => CORES,
+        }
+    }
+}
+
+impl fmt::Display for Charge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Charge::Bytes => "bytes",
+            Charge::Cores => "cores",
+        })
+    }
+}
+
+/// What went wrong, and in which ledger file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MachineError {
+    pub path: PathBuf,
+    pub why: Why,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Why {
+    /// The mapping is not [`WORDS`] words.
+    Length { words: usize },
+    Magic { found: u64 },
+    Layout { found: u64 },
+    /// A header word that is 0 where it may not be (budget, cores), or not 0 where it must be.
+    Header { word: usize, found: u64 },
+    /// An owner word in a state no layout has.
+    Owner { slot: usize, word: u64 },
+    /// A process of pid 0 joined.
+    NoPid,
+    /// Every one of the [`SLOTS`] slots holds a live process.
+    Full,
+    /// A process's slot is no longer its: a bug, as a live process is never freed.
+    Lost { slot: usize, pid: u32, start: u64 },
+    /// A process gave back more than its slot holds.
+    Over { slot: usize, charge: Charge, holds: u64, gives: u64 },
+    /// An acquire of more than the whole machine budget.
+    TooBig { bytes: u64, budget: u64 },
+    /// An operation that did not end in its bound of steps.
+    Stuck { op: &'static str, steps: usize },
+    /// An operation that sleeps run where none may.
+    Blocks { op: &'static str },
+    /// An acquire that tried again this many times in a row, the epoch moving each time.
+    Churn { rounds: u32 },
+    /// The system could not say whether the process of a slot runs.
+    Unseen { pid: u32 },
+}
+
+impl fmt::Display for MachineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = self.path.display();
+        match self.why {
+            Why::Length { words } => write!(
+                f,
+                "the machine's ledger {path} is {words} words, where layout {LAYOUT} is {WORDS}: \
+                 another program's file, or a bug of the driver that mapped it"
+            ),
+            Why::Magic { found } => write!(
+                f,
+                "the machine's ledger {path} starts with {found:#018x}, not blaze's magic \
+                 {MAGIC:#018x}: another program's file; once no blaze of this user runs, remove it"
+            ),
+            Why::Layout { found } => write!(
+                f,
+                "the machine's ledger {path} is of layout {found}, and this blaze reads layout \
+                 {LAYOUT}: its name says the layout, so the file was written by another program or \
+                 renamed; once no blaze of this user runs, remove it"
+            ),
+            Why::Header { word, found } => write!(
+                f,
+                "the machine's ledger {path} is corrupt: its header word {word} is {found}, which \
+                 layout {LAYOUT} never writes there; once no blaze of this user runs, remove it"
+            ),
+            Why::Owner { slot, word } => write!(
+                f,
+                "the machine's ledger {path} is corrupt: slot {slot}'s owner word {word:#018x} is in \
+                 no state layout {LAYOUT} has; once no blaze of this user runs, remove it"
+            ),
+            Why::NoPid => {
+                write!(f, "a process of pid 0 was to join the machine's ledger {path}, where no process has pid 0")
+            }
+            Why::Full => write!(
+                f,
+                "every one of the {SLOTS} slots of the machine's ledger {path} holds a running blaze \
+                 process of this user (the bound, `SLOTS`): this one is refused rather than run \
+                 uncounted; let one of them end, then start this again"
+            ),
+            Why::Lost { slot, pid, start } => write!(
+                f,
+                "slot {slot} of the machine's ledger {path} is no longer this process's (pid {pid}, \
+                 started at {start}): another process freed it as dead, which a running process \
+                 never is"
+            ),
+            Why::Over { slot, charge, holds, gives } => write!(
+                f,
+                "slot {slot} of the machine's ledger {path} holds {holds} {charge}, and its process \
+                 gave back {gives}"
+            ),
+            Why::TooBig { bytes, budget } => write!(
+                f,
+                "{bytes} bytes were asked of the machine's ledger {path}, past its whole budget of \
+                 {budget}: no release makes them fit"
+            ),
+            Why::Stuck { op, steps } => write!(
+                f,
+                "{op} on the machine's ledger {path} did not end in {steps} steps, its bound"
+            ),
+            Why::Blocks { op } => {
+                write!(f, "{op} on the machine's ledger {path} asked to sleep, where none may")
+            }
+            Why::Churn { rounds } => write!(
+                f,
+                "an acquire of the machine's memory in {path} was refused {rounds} times in a row \
+                 with the ledger changing each time, and never slept: its bound"
+            ),
+            Why::Unseen { pid } => write!(
+                f,
+                "the system could not say whether pid {pid}, a process of the machine's ledger \
+                 {path}, runs: its slot is neither counted out nor freed, and the operation stops"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MachineError {}

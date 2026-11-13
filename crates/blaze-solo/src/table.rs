@@ -190,6 +190,10 @@ impl Table {
 }
 
 /// The bytes of a table of `rows` looked at from `instant_ns` on, without a [`Table`] made.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the table's layout holds its row count and each path's length in u32; a row's path is a file path, far under 4 GiB, and a table past 2^32 rows needs a typed refusal from encode"
+)]
 pub fn encode(instant_ns: u64, rows: &[Row]) -> Vec<u8> {
     let size = HEAD
         + CHECK

@@ -19,6 +19,8 @@
 //! - a recovered VFS, used and settled, recovers to exactly its heads and their sequences.
 
 #![forbid(unsafe_code)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::time::Duration;
 
@@ -341,6 +343,11 @@ impl Run {
     /// Completes the effect in flight, as the disk would or as a failure (a failed append
     /// leaving as many of its bytes as two input bytes say, a failed sync dropping what was not
     /// synced when an input byte is odd).
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a truncate's u64 length is at most this in-memory file's length, a usize: the \
+                  journal only cuts back to bytes it appended"
+    )]
     fn finish(&mut self, input: &mut Input<'_>, ok: bool) {
         if self.asked.is_empty() {
             return;

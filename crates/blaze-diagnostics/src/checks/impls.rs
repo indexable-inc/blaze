@@ -87,6 +87,11 @@ impl<'db> Origin<'db> {
 }
 
 /// `scopes` is `defs::scopes`, made once per check.
+#[expect(
+    blaze::narrowed_len,
+    reason = "trait slots are u32: a crate implementing 2^32 distinct traits needs a typed \
+              refusal from this check"
+)]
 pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     let db = cx.db;
     let frame = cx.frame();

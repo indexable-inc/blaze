@@ -20,6 +20,12 @@
 //! sleeps on its own futex word (a [`blaze_core::wait::Parker`]: `IORING_OP_FUTEX_WAIT` on its
 //! thread's io_uring on Linux), not a shared condvar; nothing signals it.
 //!
+//! In a process that joined the machine's ledger ([`set_tokens`]), a pool with threads runs no
+//! more of its workers at once than it holds core tokens: a worker takes a job only on a permit
+//! of them, taken as it wakes and given back as it sleeps; one that finds none parks though work
+//! is queued, the permits' holders running it. The pool takes more as other processes give
+//! some back, and gives back all but one as it goes idle (`pool/tokens.rs`).
+//!
 //! A worker that cannot park (the kernel refused its wait) or whose loop panicked stops the
 //! pool for that error ([`Broken`], [`Pool::broken`]): it is said once on standard error, the
 //! pool's workers run what is queued and end without parking again, and every scope on the
@@ -96,6 +102,51 @@ const ROUNDS: u32 = 4;
 /// How many pairs a [`Victims::TwoChoices`] thief draws in a group before it walks the group.
 const CHOICES: u32 = 2;
 
+#[cfg(not(blaze_check))]
+mod tokens;
+
+/// The process's core tokens on the machine's ledger, registered once by its driver
+/// ([`set_tokens`]).
+// dyn: the one driver of the process, whose type this crate does not know
+static TOKENS: OnceLock<&'static dyn crate::ledger::Tokens> = OnceLock::new();
+/// A pool with threads of its own was made with no tokens registered ([`Pool::new`]): a
+/// registration after it is refused, since that pool would run past the process's tokens for
+/// its whole life. A plain `std` atomic: written once a pool, never in a modelled interleaving.
+static MADE_UNTOKENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Registers the process's core tokens on the machine's ledger: what its driver (blaze-cargo)
+/// calls once at start, before the first pool is made. From then on every pool with threads of
+/// its own takes a token per worker it may run ([`tokens()`]), so the process never runs more work
+/// threads than it holds tokens for.
+///
+/// # Panics
+///
+/// On a second registration: two drivers of one process's slot would each count the other's
+/// pools as none of theirs, a bug in the driver. And when a pool with threads was made before
+/// it: that pool would run untokened for its life, past what the machine's ledger lets this
+/// process run (rule no-fallback: refused, never left to run).
+// dyn: the process's one driver
+pub fn set_tokens(tokens: &'static dyn crate::ledger::Tokens) {
+    assert!(
+        !MADE_UNTOKENED.load(std::sync::atomic::Ordering::Acquire),
+        "the process's core tokens were registered (`pool::set_tokens`) after a worker pool was made without them: \
+         its driver joins the machine's ledger before anything of its start runs on a pool"
+    );
+    assert!(
+        TOKENS.set(tokens).is_ok(),
+        "the process's core tokens were registered twice (`pool::set_tokens`): a process has one driver of its \
+         ledger slot, registered once at its start"
+    );
+}
+
+/// The process's core tokens, if its driver registered them ([`set_tokens`]). `None` in a
+/// process that did not join the machine's ledger (test binaries, benches, tools): its pools
+/// run a worker per CPU of their [`Topology`], all at once.
+// dyn: the process's one driver
+pub fn tokens() -> Option<&'static dyn crate::ledger::Tokens> {
+    TOKENS.get().copied()
+}
+
 /// Whether the target starts threads: a pool on one without ([`Pool::new`] there) is driven by
 /// the thread that made it ([`Pool::driven`]). wasm without the atomics feature is such a target
 /// (the seed); once the seed has threads, its pools start them as native ones do.
@@ -115,6 +166,10 @@ pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 /// The pools whose workers run threads of their own, while they live: what a heap give-back
 /// wakes ([`wake_for_give_back`]). Pushed as such a pool starts, pruned of dropped ones then.
 #[cfg(not(blaze_check))]
+#[expect(
+    blaze::process_static,
+    reason = "weak handles of the live pools, pruned of dropped ones as a pool starts: bounded by the pools alive at once"
+)]
 static LIVE: Lock<Vec<std::sync::Weak<Shared>>> = Lock::new("graph.pool.live", Vec::new());
 
 /// Wakes every idle worker of every live pool, so it gives back the free pages its heaps keep
@@ -835,6 +890,12 @@ struct Shared {
     park_plant: AtomicU32,
     #[cfg(test)]
     critical: AtomicUsize,
+    /// Its core tokens and the permits its workers run on ([`tokens::Gate`]): `Some` for a pool
+    /// with threads of its own made while the process's tokens are registered ([`set_tokens`]).
+    /// A worker runs jobs only while it holds a permit, so no more of them run at once than
+    /// the pool holds tokens.
+    #[cfg(not(blaze_check))]
+    gate: Option<tokens::Gate>,
 }
 
 /// How soon a job is taken, by what waits on it.
@@ -911,6 +972,10 @@ unsafe impl Send for Drivers {}
 unsafe impl Sync for Drivers {}
 
 #[cfg(not(blaze_check))]
+#[expect(
+    blaze::process_static,
+    reason = "the pools this thread drives, each removed by its pool's drop: bounded by the pools alive on the thread"
+)]
 thread_local! {
     /// The pools this thread drives ([`Drivers`]), in the order they were made.
     static DRIVEN: RefCell<Vec<*const Drivers>> = const { RefCell::new(Vec::new()) };
@@ -974,7 +1039,21 @@ impl Pool {
     /// As [`Pool::new`], its workers stealing as `stealing` says: for a bench that compares
     /// [`Victims`], or a run that replays a seed.
     pub fn with_stealing(topology: &Topology, bind: bool, stealing: Stealing) -> io::Result<Pool> {
-        Pool::make(topology, bind, stealing, THREADS)
+        let tokens = tokens();
+        if tokens.is_none() && THREADS {
+            MADE_UNTOKENED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Pool::make(topology, bind, stealing, THREADS, tokens)
+    }
+
+    /// As [`Pool::new`], on `tokens` rather than the process's: a test's ledger.
+    #[cfg(all(test, not(blaze_check)))]
+    // dyn: a test's ledger
+    pub(crate) fn with_tokens(
+        topology: &Topology,
+        tokens: &'static dyn crate::ledger::Tokens,
+    ) -> io::Result<Pool> {
+        Pool::make(topology, false, Stealing::DEFAULT, true, Some(tokens))
     }
 
     /// A pool that starts no thread: a worker per CPU of `topology`, each running the loop every
@@ -989,17 +1068,23 @@ impl Pool {
     /// thread's next wait, which the queueing unparks.
     #[cfg(not(blaze_check))]
     pub fn driven(topology: &Topology) -> io::Result<Pool> {
-        Pool::make(topology, false, Stealing::DEFAULT, false)
+        Pool::make(topology, false, Stealing::DEFAULT, false, None)
     }
 
     /// A pool whose workers have threads of their own when `threaded`, else are driven by the
-    /// calling thread ([`Pool::driven`]).
+    /// calling thread ([`Pool::driven`]). One with threads runs at most as many workers at once
+    /// as it holds of `tokens`, when given ([`tokens::Gate`]); a driven pool runs one job at a
+    /// time on its driving thread, and takes none.
+    // dyn: the process's one driver of its ledger slot
     fn make(
         topology: &Topology,
         bind: bool,
         stealing: Stealing,
         threaded: bool,
+        tokens: Option<&'static dyn crate::ledger::Tokens>,
     ) -> io::Result<Pool> {
+        #[cfg(blaze_check)]
+        let _ = tokens;
         radix::set_ambient(ambient);
         if !threaded && bind {
             return Err(io::Error::new(
@@ -1090,6 +1175,10 @@ impl Pool {
             park_plant: AtomicU32::new(park_plant::PARKS),
             #[cfg(test)]
             critical: AtomicUsize::new(0),
+            #[cfg(not(blaze_check))]
+            gate: tokens
+                .filter(|_| threaded)
+                .map(|tokens| tokens::Gate::start(tokens, topology.cpus.len() as u64)),
         });
         #[cfg(not(blaze_check))]
         shared.member.store(
@@ -1281,6 +1370,13 @@ impl Pool {
         self.shared.slots.len()
     }
 
+    /// How many of its workers it may run at once now: the core tokens it holds, where the
+    /// process joined the machine's ledger ([`set_tokens`]), else every worker. What a loop
+    /// splits its work by ([`crate::par::threads`]).
+    pub fn threads(&self) -> usize {
+        self.shared.allowed()
+    }
+
     /// This thread's index among this pool's workers, if it is one of them: for tables kept
     /// by worker, read and written without a lock. A job that waits may resume on another
     /// worker, and another job runs on this one meanwhile, so such a table's entry must not be
@@ -1457,9 +1553,9 @@ pub(crate) fn scope_here<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> R {
     }
 }
 
-/// The workers of the pool [`scope_here`] runs on.
+/// The workers the pool [`scope_here`] runs on may run at once now ([`Pool::threads`]).
 pub(crate) fn threads_here() -> usize {
-    with_local(|local| local.shared.slots.len()).unwrap_or_else(|| crate::exec::shared().workers())
+    with_local(|local| local.shared.allowed()).unwrap_or_else(|| crate::exec::shared().threads())
 }
 
 /// [`Pool::scope`] on the pool `shared` is of, which outlives the call. The caller's job opens
@@ -1567,7 +1663,7 @@ fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
 // has run (a job's panic is caught and given to its `done`).
 unsafe impl radix::Workers for Pool {
     fn threads(&self) -> usize {
-        self.workers()
+        self.shared.allowed()
     }
 
     // dyn: the trait's signature, as for `run_jobs`
@@ -1583,7 +1679,7 @@ struct Here<'a>(&'a Shared);
 // every job of it has run; the worker's `Local` keeps the pool's `Shared` for as long as it works.
 unsafe impl radix::Workers for Here<'_> {
     fn threads(&self) -> usize {
-        self.0.slots.len()
+        self.0.allowed()
     }
 
     // dyn: the trait's signature, as for `run_jobs`
@@ -1682,6 +1778,13 @@ impl Pool {
             if handle.thread().id() != me {
                 _ = handle.join();
             }
+        }
+        // Its workers ended (but the one running this, when `own`, which finds no permit after
+        // its job): its tokens go back to the machine. A stop that gave up returned above with
+        // its workers alive, its tokens held until the process's slot is freed.
+        #[cfg(not(blaze_check))]
+        if let Some(gate) = &shared.gate {
+            gate.give_all();
         }
         #[cfg(not(blaze_check))]
         if !own {
@@ -2037,6 +2140,16 @@ fn take(next: &AtomicPtr<Header>) -> Option<Job> {
 }
 
 impl Shared {
+    /// The workers it may run at once now: its tokens held ([`tokens::Gate`]), else all.
+    fn allowed(&self) -> usize {
+        #[cfg(not(blaze_check))]
+        if let Some(gate) = &self.gate {
+            // At least one: a pool holds one token from its start to its end.
+            return gate.held().clamp(1, self.slots.len());
+        }
+        self.slots.len()
+    }
+
     fn unpark_workers(&self) {
         for slot in &self.slots {
             slot.parker.unpark();
@@ -2445,13 +2558,19 @@ impl Local {
     /// sleeps wakes it. Whether it was woken to search, as its waker counted it. `park` is how:
     /// [`Local::park`] for a worker of its own thread, a turn given back for a driven one.
     fn sleep(&self, ended: &impl Fn() -> bool, park: impl FnOnce()) -> bool {
+        self.sleep_unless(&|| ended() || self.shared.any_work(), park)
+    }
+
+    /// As [`Local::sleep`], but parks unless `ready`, looked at once marked asleep: a worker
+    /// with no permit ([`tokens::Gate`]) parks though work is queued, unless a permit is free.
+    fn sleep_unless(&self, ready: &impl Fn() -> bool, park: impl FnOnce()) -> bool {
         let shared = &*self.shared;
         let (slot, group) = (&shared.slots[self.index], &shared.groups[self.group]);
         slot.sleeping.store(true, Ordering::SeqCst);
         group.sleepers.fetch_add(1, Ordering::SeqCst);
         shared.idle.0.fetch_add(SLEEPING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        if !ended() && !shared.any_work() {
+        if !ready() {
             park();
         }
         if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok()
@@ -2664,6 +2783,11 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     // The span of this worker's search, open from a job's end (or a wake) to the next job's
     // start: closed before a job runs, as the job's fiber would take it along.
     let mut search: Option<DriverSpan> = None;
+    // The pool's tokens, if it runs on some, and whether this worker holds a permit of them.
+    #[cfg(not(blaze_check))]
+    let gate = shared.gate.as_ref();
+    #[cfg(not(blaze_check))]
+    let mut holding = false;
     loop {
         // Its park was refused: it cannot wait, so the pool stops for it, and no thread is
         // left waiting on jobs a worker that ended unheard would have run.
@@ -2677,6 +2801,54 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
         }
         #[cfg(blaze_check)]
         let _ = refused.take();
+        // A worker takes a job only on a permit of its pool's tokens ([`tokens::Gate`]): one it
+        // takes as it wakes, or, every permit taken while work is queued, on a token the pool
+        // takes once the ledger's epoch moved. One with none parks, though work is queued.
+        //
+        // No job is left queued with no one to run it (the wake that came here found every
+        // permit taken). This worker stops counting as a searcher, then marks itself asleep and
+        // only then looks once more for a free permit. Every permit's holder gives it back
+        // before it marks itself asleep and looks at the queues, the order `sleep` keeps. So a
+        // job queued before a holder's look is seen by that holder, who then takes a permit
+        // again, or by another who did; a job queued after it finds no searcher (this worker
+        // stopped counting first) and the holder marked asleep, so its submit wakes a sleeper,
+        // who finds the holder's permit free: this worker, if it is the one woken, or it sees
+        // that permit free in its own last look and parks not at all. The pool always holds a
+        // token, so where none runs, a permit is free.
+        #[cfg(not(blaze_check))]
+        if let Some(gate) = gate
+            && !holding
+        {
+            holding = gate.enter() || {
+                let granted = gate.grow(|| shared.any_work());
+                // Each token taken beyond this worker's own is a sleeper woken to run on it.
+                for _ in 1..granted {
+                    shared.wake(local.group);
+                }
+                granted > 0 && gate.enter()
+            };
+            if !holding {
+                if searching {
+                    local.end_search(false);
+                    searching = false;
+                }
+                search = None;
+                // A broken pool's workers with permits run what is left, and end.
+                if shared.broken.get().is_some() {
+                    break;
+                }
+                if shared.stop.load(Ordering::SeqCst)
+                    && !shared.any_work()
+                    && (shared.parked.load(Ordering::Acquire) == 0
+                        || shared.abandoned.load(Ordering::SeqCst))
+                {
+                    break;
+                }
+                let free = || gate.free();
+                searching = local.sleep_unless(&free, || park(&free, &mut runner));
+                continue;
+            }
+        }
         search.get_or_insert_with(|| DriverSpan::open(Driving::Search));
         #[cfg(not(blaze_check))]
         crate::sched::fire_due(&shared.sched);
@@ -2692,6 +2864,14 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
         }
         if searching || local.begin_search() {
             searching = false;
+            // Out of jobs of its own: where the pool holds fewer tokens than workers and the
+            // ledger's epoch moved, it takes more for what is queued, a sleeper woken for each.
+            #[cfg(not(blaze_check))]
+            if let Some(gate) = gate {
+                for _ in 0..gate.grow(|| shared.any_work()) {
+                    shared.wake(local.group);
+                }
+            }
             if let Some(job) = local.search(ROUNDS) {
                 search = None;
                 local.run(&mut runner, job);
@@ -2737,6 +2917,12 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
             {
                 shared.unpark_stopper();
                 search = None;
+                #[cfg(not(blaze_check))]
+                if let Some(gate) = gate
+                    && std::mem::take(&mut holding)
+                {
+                    gate.leave();
+                }
                 let drained = || {
                     shared.parked.load(Ordering::Acquire) == 0
                         || shared.abandoned.load(Ordering::SeqCst)
@@ -2747,8 +2933,25 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
             break;
         }
         search = None;
+        // Its permit goes back before it marks itself asleep and looks at the queues (the
+        // order the argument above rests on). The last to sleep with nothing queued leaves the
+        // pool idle: it gives back all but one token.
+        #[cfg(not(blaze_check))]
+        if let Some(gate) = gate
+            && std::mem::take(&mut holding)
+            && gate.leave()
+            && !shared.any_work()
+        {
+            gate.shrink();
+        }
         let ended = || shared.stop.load(Ordering::SeqCst);
         searching = local.sleep(&ended, || park(&ended, &mut runner));
+    }
+    #[cfg(not(blaze_check))]
+    if let Some(gate) = gate
+        && holding
+    {
+        gate.leave();
     }
     drop(search);
     drop(runner);

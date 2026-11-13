@@ -239,7 +239,7 @@ impl<B: Prepare> Build<'_, B> {
         // alloc: per start, its roots' handles
         let asks: Vec<(FrontInstance<B>, Origin)> = roots.to_vec();
         let described = self.until_stopped(asks, errors, |asked| {
-            let node = self.described(&asked, 0, counts).and_then(|it| self.node(&asked.0, asked.1, it));
+            let node = self.described(&asked, counts).and_then(|it| self.node(&asked.0, asked.1, it));
             (asked, node)
         });
         // alloc (each): per start, sized by its roots
@@ -317,7 +317,7 @@ impl<B: Prepare> Build<'_, B> {
                 let nears = self.until_stopped(std::mem::take(&mut functions_next), errors, |begin| match begin {
                     Begin::Node(node) => self.near_from(node, counts),
                     Begin::Asked(asked) => self
-                        .described(&asked, 0, counts)
+                        .described(&asked, counts)
                         .and_then(|it| self.node(&asked.0, asked.1, it))
                         .and_then(|node| self.near_from(node, counts)),
                 });

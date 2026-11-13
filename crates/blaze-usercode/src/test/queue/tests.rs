@@ -51,7 +51,7 @@ fn binary(name: &str, jobs: Vec<Job>) -> Binary {
         env: vec![("PATH".into(), "/usr/bin".into())],
         dir: "/ws".into(),
         read: vec!["/ws".into()],
-        write: vec!["/tmp/t".into()],
+        write: vec!["/scratch/t".into()],
         network: false,
         memory: None,
         mode: Mode::Process,
@@ -369,7 +369,7 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     assert!(
         read.contains(&PathBuf::from("/root/req/1/t0")) && read.contains(&PathBuf::from("/ws"))
     );
-    assert_eq!(write, &vec![PathBuf::from("/tmp/t")]);
+    assert_eq!(write, &vec![PathBuf::from("/scratch/t")]);
     let conn = fake.hello(0, &["a", "b", "c"]);
     // Two cores: b and c, the longest.
     let runs = fake.runs(conn);

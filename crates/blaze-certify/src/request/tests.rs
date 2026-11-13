@@ -18,7 +18,7 @@ use crate::testing::{GRANULE_NS, Shelf, stamp_at, the_base};
 
 const FILES: [&str; 6] = ["a/lib.rs", "a/build.rs", "b/lib.rs", "Cargo.toml", "Cargo.lock", "README"];
 const VARS: [&str; 3] = ["CC", "BLAZE_OPT", "SHLVL"];
-const OUTSIDE: [&str; 2] = ["/usr/z.h", "/tmp/x"];
+const OUTSIDE: [&str; 2] = ["/usr/z.h", "/opt/x"];
 const OUTPUT: &str = "debug/app";
 
 #[derive(Clone, Copy, Debug)]
@@ -439,7 +439,7 @@ fn a_miss_names_what_moved_and_nothing_else_misses() {
         Op::File("a/lib.rs", Some(1)),
         Op::File("README", Some(2)),
         Op::Env("SHLVL", Some(2)),
-        Op::Outside("/tmp/x", Some(1)),
+        Op::Outside("/opt/x", Some(1)),
         Op::Wait(3 * GRANULE_NS),
         REQUEST,
         Op::Restart,

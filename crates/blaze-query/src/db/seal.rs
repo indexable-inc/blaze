@@ -70,9 +70,23 @@
 //! ([`super::reverse::Plan::suspects`]). They are dropped when the index is next made
 //! ([`Storage::shed_sealed_readers`]) and made again from the group's own rows when it opens
 //! ([`Storage::seal_open`]): the cost of an unseal is the group's rows and their edges, never
-//! another group's. Forward edges are kept: an opened group's rows verify by them, with no
-//! run. (Letting go of the forward edges of a library's rows is the next step, not built: a
-//! row without edges has to run again when its group opens.)
+//! another group's. Forward edges are kept for a local group: its opened rows verify by them,
+//! with no run. A library's group ([`SealKind::lets_go_edges`]) lets go of its rows' forward
+//! edges as they go behind its seal (memory.md 4.4), once the seal's imports are listed: a
+//! library's inputs are written almost never, and its rows are most of a build's. Such a row
+//! ([`Seals::let_go`]) is proved by its seal, its durability or its summary, none of which
+//! reads an edge, and by nothing else: no reverse edge reaches it, so the walk's reach and
+//! end say nothing of it, and a verify that would walk its edges runs it again. When its
+//! group stops holding (opened by a write, or its seal broken), each such row is queued
+//! ([`Seals::assume`]) and every walk names it as changed and sets it apart until it has
+//! run again; a pass seals it again only after it has (`sealable`).
+//!
+//! # The order of a walk (end-state.md, rule 2 of the rebuild)
+//!
+//! A walk checks every seal a write may have reached, in dependency order
+//! ([`resolve_all`]), and indexes the groups whose seal broke, before it traverses a row and
+//! before it works out its reach: no seal changes state while rows are traversed, so what
+//! the walk gathers of a group is gathered once, from the group's final state in the view.
 //!
 //! # What sealing must not break
 //!
@@ -99,7 +113,7 @@ use super::{
     function::Verified,
     ingredient,
     reverse::{Reverse, Seen},
-    row::{DURABILITY, PROVISIONAL, RUNNING, STORED, UNTRACKED, VIEW_MASK, span},
+    row::{CYCLE, DURABILITY, HEAD, PROVISIONAL, RUNNING, STORED, UNTRACKED, VIEW_MASK, span},
     storage::{
         FIELD, LOOSE, NODES, NodeRow, Restamp, Storage, Summary, input_bits, key_parts, loose, or,
     },
@@ -108,6 +122,11 @@ use super::{
 
 /// A node's word: its group's number, 0 for none.
 const GROUP: u32 = 0xffff;
+/// A row's word: its forward edges were let go when it went behind a library group's seal
+/// ([`SealKind::lets_go_edges`]). Such a row is proved only by its seal while that holds;
+/// otherwise it runs again ([`Seals::let_go`]). Cleared by its next run, which stores edges
+/// again (its word is made anew as the run ends, [`Seals::derived`]).
+const LET_GO: u32 = 1 << 16;
 /// A node's word: some sealed group imports the node, or did. A gain of its summary looks for
 /// the groups that do ([`Storage::seal_open_for_gain`]); never cleared, so it may say more.
 const IMPORTED: u32 = 1 << 28;
@@ -155,6 +174,11 @@ pub enum SealKind {
     /// A crate of the workspace, or a path dependency: sealed by the pass that ends the
     /// second build in a row with no write to its inputs.
     Local,
+    /// A test's crate that stands for a [`SealKind::Local`] one with its quiet builds
+    /// skipped: sealed by the first pass that finds rows of it, its rows' edges kept. No host
+    /// makes one.
+    #[cfg(test)]
+    LocalAtOnce,
 }
 
 impl SealKind {
@@ -162,7 +186,21 @@ impl SealKind {
         match self {
             SealKind::Library => 0,
             SealKind::Local => 2,
+            #[cfg(test)]
+            SealKind::LocalAtOnce => 0,
         }
+    }
+
+    /// Whether the rows put behind a seal of this kind let go of their forward edges: a
+    /// library's, which nobody edits. Such a row is proved by its seal, or by its durability
+    /// or summary (neither reads an edge), never by an edge or the walk; when its group opens
+    /// or its seal breaks and neither of those proves it, it runs again (with its value kept,
+    /// so an equal result is backdated and its readers stop there). Right for a library, whose group opens only
+    /// when the toolchain or a registry package changes under the build; wrong for a local
+    /// crate, whose rows an edit verifies one by one by their edges (restore.md, "Sealed
+    /// crates").
+    pub fn lets_go_edges(self) -> bool {
+        matches!(self, SealKind::Library)
     }
 }
 
@@ -232,8 +270,10 @@ struct Group {
     runs: Vec<Run>,
     /// The OR of the summaries of its loose imports.
     wild: Summary,
-    /// The edges of the rows behind its seal.
+    /// The edges of the rows behind its seal that are kept.
     edges: u64,
+    /// The edges of the rows behind its seal that were let go ([`LET_GO`]).
+    let_go: u64,
     /// Whether the reverse index names every row behind its seal as a reader. False once the
     /// index was made without them.
     indexed: bool,
@@ -265,6 +305,7 @@ impl Group {
             runs: Vec::new(),
             wild: [0; 2],
             edges: 0,
+            let_go: 0,
             indexed: true,
             overlay: AtomicPtr::new(std::ptr::null_mut()),
             shadow: AtomicBool::new(false),
@@ -312,6 +353,16 @@ pub(crate) struct Seals {
     checks: AtomicU64,
     breaks: AtomicU64,
     opens: u64,
+    /// Rows whose edges a pass let go, over the storage's life ([`LET_GO`]): 0 lets a proof
+    /// pass over the word's load.
+    let_go_rows: u64,
+    /// Rows whose edges were let go and whose group stopped holding (opened, or its seal
+    /// broke): no reverse edge reaches them, so the next walk starts from each as changed,
+    /// and every walk after it until the row has run again ([`super::frontier`]'s `shed`).
+    assumed: SegQueue<u32>,
+    /// [`Plant::LetGoRowsNotAssumed`]: a group that stops holding queues none of its rows
+    /// without edges. False outside that control.
+    forgets_assumed: bool,
 }
 
 impl Drop for Seals {
@@ -339,7 +390,54 @@ impl Seals {
             checks: AtomicU64::new(0),
             breaks: AtomicU64::new(0),
             opens: 0,
+            let_go_rows: 0,
+            assumed: SegQueue::new(),
+            forgets_assumed: false,
         }
+    }
+
+    /// Whether the row of `node` let go of its edges behind a library's seal and has not run
+    /// since: it is proved by nothing but a seal that holds ([`Seals::proves`]), never by its
+    /// edges (it has none), its summary, the floor or a walk's reach (no reverse edge reaches
+    /// it). Its callers run it again instead.
+    #[inline]
+    pub(crate) fn let_go(&self, node: u32) -> bool {
+        self.let_go_rows != 0 && self.word(node) & LET_GO != 0
+    }
+
+    /// The group of the row of `node`, a row that [`Seals::let_go`] says let go of its edges:
+    /// the library group whose seal it is behind.
+    #[inline]
+    pub(crate) fn sealed_group(&self, node: u32) -> SealGroup {
+        let group = self.word(node) & GROUP;
+        assert!(group != 0, "a row that let go of its edges is in no seal group");
+        SealGroup(group as u16)
+    }
+
+    /// The rows of `members` whose edges were let go, for the next walk to start from as
+    /// changed: what a group that stops holding does (opened, or its seal broken). A row that
+    /// ran meanwhile is passed over by the walk.
+    fn assume(&self, group: &Group, members: &[u32]) {
+        if group.let_go == 0 || self.forgets_assumed {
+            return;
+        }
+        for &node in members {
+            if self.word(node) & LET_GO != 0 {
+                self.assumed.push(node); // alloc: a word a row of a library group that opened
+            }
+        }
+    }
+
+    /// Takes the rows [`Seals::assume`] queued, into `out`.
+    pub(crate) fn take_assumed(&self, out: &mut Vec<u32>) {
+        while let Some(node) = self.assumed.pop() {
+            out.push(node); // alloc: the walk's list of rows without edges
+        }
+    }
+
+    /// Whether rows are queued by [`Seals::assume`] for the next walk.
+    pub(crate) fn any_assumed(&self) -> bool {
+        !self.assumed.is_empty()
     }
 
     /// The bytes its column of words has committed.
@@ -417,6 +515,12 @@ impl Seals {
         self.second_claims = admit;
     }
 
+    /// Plants or takes out [`Plant::LetGoRowsNotAssumed`].
+    #[cfg(test)]
+    pub(crate) fn forget_assumed(&mut self, forget: bool) {
+        self.forgets_assumed = forget;
+    }
+
     /// Whether a group is suspect, being checked or broken.
     #[inline]
     pub(crate) fn unsettled(&self) -> bool {
@@ -430,6 +534,13 @@ impl Seals {
     /// the reach proves only a row of a group, not loose, with no unsettled group below it:
     /// what such a row reads is its group's and the groups' below (the module's rule), and
     /// every one of those is held, or open and so in the index.
+    ///
+    /// A row of a group that is not open is no group's for this proof (end-state.md, rule 3
+    /// of the rebuild): one behind the seal is its group's to answer for, and one made after
+    /// the seal is in neither the seal nor, while the reach does not enter the group, the
+    /// reach. Until 2026-11-13 such a row was proved as a row of its group, and a walk whose
+    /// reach was worked out before the group's seal broke proved it with its old value (the
+    /// third stale answer the refinement found, [`Plant::ReachBeforeSealsChecked`]).
     #[inline]
     pub(crate) fn reach_proves(&self, storage: &Storage, node: u32) -> bool {
         if self.unsettled.load(Ordering::Acquire) == 0 {
@@ -441,7 +552,9 @@ impl Seals {
             return false;
         }
         let of = &self.groups[group as usize];
-        if word & SEALED != 0 && of.state.load(Ordering::Acquire) != OPEN {
+        let open = of.state.load(Ordering::Acquire) == OPEN;
+        let planted = storage.frontier.plant == Plant::ReachBeforeSealsChecked;
+        if !open && (word & SEALED != 0 || !planted) {
             return false;
         }
         !of.shadow.load(Ordering::Acquire)
@@ -636,17 +749,6 @@ impl Seals {
             .collect() // alloc: the groups whose seal broke in this view, few
     }
 
-    /// Gives `each` the rows behind the broken seal of `group` that read `dep`, from the
-    /// group's own index; returns how many. Nothing for a group not indexed.
-    pub(crate) fn readers_in_group(&self, group: u16, dep: u32, each: impl FnMut(u32)) -> u64 {
-        let overlay = self.groups[group as usize].overlay.load(Ordering::Acquire);
-        if overlay.is_null() {
-            return 0;
-        }
-        // SAFETY: as in `Seals::readers_in_broken`: live until a `&mut` of the storage.
-        unsafe { &*overlay }.readers(dep, each)
-    }
-
     /// Gives `each` the rows behind a broken seal that read `dep`, from the groups' own
     /// indexes ([`Seals::index_broken`]); returns how many. One load for a node that is
     /// neither behind a seal nor imported by one.
@@ -737,6 +839,8 @@ pub struct SealPass {
     pub excluded: u64,
     /// What the groups it sealed or added to read from outside themselves.
     pub imports: u64,
+    /// Forward edges it let go, of the rows it put behind a library's seal.
+    pub let_go: u64,
     /// Open groups with rows that are not quiet long enough yet.
     pub waiting: u32,
     /// Whether it made the reverse index again without the rows behind seals, and the
@@ -780,8 +884,12 @@ pub struct SealGroupCensus {
     pub behind_seal: u64,
     /// What the rows behind its seal read from outside it.
     pub imports: u64,
-    /// The edges of the rows behind its seal.
+    /// The edges of the rows behind its seal, kept.
     pub edges: u64,
+    /// The edges its rows let go of as they went behind its seal (a library's,
+    /// [`SealKind::lets_go_edges`]): no longer in the edge array, 4 bytes each freed once
+    /// the edges are compacted.
+    pub edges_let_go: u64,
     /// Whether the reverse index holds the rows behind its seal as readers.
     pub indexed: bool,
     /// How many times it was opened, and one.
@@ -820,13 +928,18 @@ impl SealCensus {
         self.groups.iter().filter(|it| it.state != SealState::Open).map(|it| it.edges).sum()
     }
 
-    /// Of [`SealCensus::edges_behind_seals`], those of groups whose rows the reverse index
-    /// still names as readers (not yet made again without them): as many readers there.
+    /// The forward edges let go by the rows behind seals ([`SealGroupCensus::edges_let_go`]).
+    pub fn edges_let_go(&self) -> u64 {
+        self.groups.iter().filter(|it| it.state != SealState::Open).map(|it| it.edges_let_go).sum()
+    }
+
+    /// Of the edges behind seals, kept or let go, those of groups whose rows the reverse
+    /// index still names as readers (not yet made again without them): as many readers there.
     pub fn edges_behind_seals_indexed(&self) -> u64 {
         self.groups
             .iter()
             .filter(|it| it.state != SealState::Open && it.indexed)
-            .map(|it| it.edges)
+            .map(|it| it.edges + it.edges_let_go)
             .sum()
     }
 
@@ -843,14 +956,15 @@ impl std::fmt::Display for SealCensus {
         writeln!(
             f,
             "seal groups: {} of {} sealed ({} waiting for a check, {} broken), {} rows behind \
-             seals ({} forward edges kept, {} of them still in the reverse index) of {} in \
-             groups, {} rows in no group; {} checks, {} seals broken, {} opened",
+             seals ({} forward edges kept, {} let go, {} still in the reverse index) of {} \
+             in groups, {} rows in no group; {} checks, {} seals broken, {} opened",
             self.sealed_groups(),
             self.groups.len(),
             count(SealState::Suspect),
             count(SealState::Broken),
             self.rows_behind_seals(),
             self.edges_behind_seals(),
+            self.edges_let_go(),
             self.edges_behind_seals_indexed(),
             self.grouped_rows(),
             self.ungrouped,
@@ -863,13 +977,15 @@ impl std::fmt::Display for SealCensus {
         for it in most.into_iter().take(20) {
             writeln!(
                 f,
-                "  group {} ({:?}, {:?}): {} rows, {} behind its seal ({} edges), {} imports{}",
+                "  group {} ({:?}, {:?}): {} rows, {} behind its seal ({} edges, {} let go), {} \
+                 imports{}",
                 it.name,
                 it.kind,
                 it.state,
                 it.rows,
                 it.behind_seal,
                 it.edges,
+                it.edges_let_go,
                 it.imports,
                 if it.indexed { "" } else { ", no reverse edges" },
             )?;
@@ -1137,6 +1253,10 @@ impl Storage {
         if !indexed {
             span.record("edges", self.index_rows(&members));
         }
+        // Its rows that let go of their edges are reached by no reverse edge: the next walk
+        // starts from each ([`Seals::assume`]). A check that broke the seal queued them
+        // already; twice costs a duplicate the walk drops.
+        self.seals.assume(&self.seals.groups[at], &members);
         let seals = &mut self.seals;
         let of = &mut seals.groups[at];
         *of.state.get_mut() = OPEN;
@@ -1148,6 +1268,7 @@ impl Storage {
         of.runs = Vec::new();
         of.wild = [0; 2];
         of.edges = 0;
+        of.let_go = 0;
         let overlay = std::mem::replace(of.overlay.get_mut(), std::ptr::null_mut());
         if !overlay.is_null() {
             // SAFETY: from `Box::into_raw` in `Seals::index_broken`, taken out here under
@@ -1219,6 +1340,12 @@ impl Storage {
         let word = header.verified.load(Ordering::Relaxed);
         let meta = header.meta.load(Ordering::Relaxed);
         if word & (RUNNING | PROVISIONAL) != 0 || word & VIEW_MASK == 0 || meta & UNTRACKED != 0 {
+            return false;
+        }
+        // A row whose edges an earlier pass let go and that has not run since (proved by its
+        // summary, say): what it reads is not known, so no import of the seal would stand
+        // for it. It goes behind the seal once it has run and has edges again.
+        if self.seals.let_go(node) {
             return false;
         }
         word & VIEW_MASK == self.view_bits()
@@ -1384,6 +1511,28 @@ impl Storage {
             imports.extend(keyed.iter().map(|it| it.1)); // alloc: within what `imports` held
             imports.shrink_to_fit();
             pass.imports += imports.len() as u64;
+            // A library's rows let go of their forward edges now that its imports are listed
+            // (memory.md 4.4: edges of a sealed group are not resident). A cycle's rows keep
+            // theirs (a member's one edge is its head, which the cycle's own rules read), and
+            // so do rows answered from a store or with an untracked read (never behind a seal).
+            let mut let_go = 0u64;
+            if self.seals.groups[at].kind.lets_go_edges()
+                && self.frontier.plant != Plant::WalkEntersSealedGroups
+            {
+                for &node in &behind {
+                    let Some((header, _, _)) = frontier::row_of(self, node) else { continue };
+                    if header.meta.load(Ordering::Relaxed) & (CYCLE | HEAD | STORED | UNTRACKED) != 0 {
+                        continue;
+                    }
+                    let kept = header.edges.swap(0, Ordering::Relaxed);
+                    let_go += span::len(kept);
+                    self.forget_edges(kept);
+                    let word = self.seals.word(node);
+                    self.seals.set_word(node, word | LET_GO);
+                    self.seals.let_go_rows += 1;
+                }
+                pass.let_go += let_go;
+            }
             let group = &mut self.seals.groups[at];
             if group.members.is_empty() {
                 group.members = behind;
@@ -1393,13 +1542,17 @@ impl Storage {
             group.imports = imports;
             group.runs = runs;
             group.wild = wild;
-            group.edges += edges;
+            group.edges += edges - let_go;
+            group.let_go += let_go;
             group.sealed_at = view;
         }
-        // The readers behind seals, once they are half the index, leave it.
+        // The readers behind seals, once they are half the index, leave it: those of rows
+        // that let go of their edges too, which the index names until it is made again.
         let behind: u64 = self.seals.groups[1..]
             .iter_mut()
-            .filter_map(|group| (*group.state.get_mut() != OPEN && group.indexed).then_some(group.edges))
+            .filter_map(|group| {
+                (*group.state.get_mut() != OPEN && group.indexed).then_some(group.edges + group.let_go)
+            })
             .sum();
         // (Not under the plant that has a walk enter sealed groups: its control needs the
         // readers there to enter by.)
@@ -1480,6 +1633,15 @@ impl Storage {
                 }
             }
         }
+        // The rows that let go of their edges read, from outside, nothing but what the seal
+        // listed as its imports when they went behind it: the list stands for their edges.
+        if of.let_go != 0 {
+            for &read in &of.imports {
+                if outside(seals.word(read)) {
+                    nodes.push(read); // alloc: as above
+                }
+            }
+        }
         nodes.sort_unstable();
         nodes.dedup();
         // alloc: the caller's answer
@@ -1513,7 +1675,10 @@ impl Storage {
                 continue;
             };
             let meta = header.meta.load(Ordering::Relaxed);
-            if header.verified.load(Ordering::Relaxed) & VIEW_MASK == 0 {
+            // A row whose edges a pass let go, in a group whose import list no longer stands
+            // for them (it opened since): no edges, as an emptied row.
+            let shed = of.let_go == 0 && seals.let_go(node);
+            if header.verified.load(Ordering::Relaxed) & VIEW_MASK == 0 || shed {
                 emptied += 1;
             } else if meta & UNTRACKED != 0 {
                 untracked += 1;
@@ -1548,6 +1713,7 @@ impl Storage {
                 behind_seal: 0,
                 imports: group.imports.len() as u64,
                 edges: group.edges,
+                edges_let_go: group.let_go,
                 indexed: group.indexed,
                 generation: group.generation,
             }); // alloc: as above
@@ -1667,7 +1833,10 @@ pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Optio
     span.record("held", held);
     if !held {
         // From checking, or from broken where a walk gave up waiting for this check.
-        _ = of.state.compare_exchange(CHECKING, BROKEN, Ordering::AcqRel, Ordering::Acquire);
+        if of.state.compare_exchange(CHECKING, BROKEN, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            // Its rows without edges are reached by no reverse edge: the walk starts from them.
+            seals.assume(of, &of.members);
+        }
         seals.breaks.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -1689,13 +1858,24 @@ pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Optio
 /// task is still checking when the walk gets there (a broken seal is always sound: its rows
 /// are verified one by one). When it returns no group is suspect or being checked. Returns
 /// the checks run and the seals broken meanwhile, by any task.
+///
+/// In dependency order (end-state.md, rule 2 of the rebuild): a group is checked after every
+/// group it depends on, so what its imports behind those seals say is settled before it is
+/// read, and the walk calls this before any row is traversed, so no seal changes state while
+/// rows are. A group's dependencies are transitive, so one that depends on another has more
+/// of them: ordering by their count is a topological order.
 pub(crate) fn resolve_all(db: *const (), storage: &Storage, apart: &Seen) -> (u64, u64) {
     let seals = &storage.seals;
     let before =
         (seals.checks.load(Ordering::Relaxed), seals.breaks.load(Ordering::Relaxed));
-    for group in 1..seals.groups.len() {
-        if seals.groups[group].state.load(Ordering::Acquire) == SUSPECT {
-            resolve(db, storage, group as u16, Some(apart));
+    let mut order: Vec<(u32, u16)> = (1..seals.groups.len()) // alloc: the groups waiting for their check, a word each
+        .filter(|&at| seals.groups[at].state.load(Ordering::Acquire) == SUSPECT)
+        .map(|at| (seals.groups[at].below.iter().map(|it| it.count_ones()).sum(), at as u16))
+        .collect();
+    order.sort_unstable();
+    for (_, group) in order {
+        if seals.groups[group as usize].state.load(Ordering::Acquire) == SUSPECT {
+            resolve(db, storage, group, Some(apart));
         }
     }
     for group in &seals.groups[1..] {
@@ -1704,6 +1884,7 @@ pub(crate) fn resolve_all(db: *const (), storage: &Storage, apart: &Seen) -> (u6
             .compare_exchange(CHECKING, BROKEN, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            seals.assume(group, &group.members);
             seals.breaks.fetch_add(1, Ordering::Relaxed);
         }
     }

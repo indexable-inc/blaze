@@ -43,6 +43,11 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
         Side { slot: HashMap::new_in(Global), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "row handles are u32 and freed rows are reused first: 2^32 live owners at once \
+                  needs a typed refusal from the index"
+    )]
     fn intern(&mut self, a: A) -> u32 {
         if let Some(&at) = self.slot.get(&a) {
             return at;

@@ -5,7 +5,13 @@
 //!
 //! - the chain from it is `collect`ed into a `Vec`, `VecDeque` or `String` that is returned,
 //!   stored in a field or a place, or handed to a call, itself or through the local it is bound
-//!   to (a local some `sort*` method is called on is sorted);
+//!   to (a local some `sort*` method is called on is sorted); or whose local, never sorted,
+//!   has an element picked by its place (`first`, `last`, `get`, `pop`) or is looped over as
+//!   below;
+//! - the chain ends in a method that picks one element by its place in the order (`next`,
+//!   `last`, `nth`, `find`, `find_map`, `position`, `max_by`, `min_by` and their `_key` forms,
+//!   which keep the first or last of a tie);
+//! - the chain is `extend`ed into a `Vec`, `VecDeque` or `String` that is not sorted after;
 //! - a `for` loop over it pushes into a `Vec` or `String` that is not sorted after (`push`,
 //!   `push_back`, `push_str`, `extend`), writes (`write!`, `write_str`, `write_all`) or hashes
 //!   (`hash`, a `Hasher`'s `write_*`).
@@ -46,6 +52,24 @@ const ITERATE: &[&str] = &[
     "drain",
 ];
 
+/// The methods that end a chain by picking one element by its place in the order: the first,
+/// the last, the n-th, the first that matches, or the greatest or least by a key that can tie.
+const PICK: &[&str] = &[
+    "next",
+    "last",
+    "nth",
+    "find",
+    "find_map",
+    "position",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+];
+
+/// The methods of a collected `Vec` that pick an element by its place.
+const PICK_PLACE: &[&str] = &["first", "last", "get", "pop", "first_mut", "last_mut"];
+
 /// How many methods a chain from an iteration is followed through to its `collect`.
 const CHAIN: usize = 16;
 /// How many expressions up a collected value is followed to where it goes.
@@ -67,6 +91,7 @@ enum Sink {
     Pushed(String),
     Written,
     Hashed,
+    Picked(String),
 }
 
 impl Sink {
@@ -78,6 +103,7 @@ impl Sink {
             Sink::Pushed(name) => format!("the order of `{name}`, never sorted after"),
             Sink::Written => "what the loop writes".to_owned(),
             Sink::Hashed => "what the loop hashes".to_owned(),
+            Sink::Picked(name) => format!("the element `{name}` picks by its place"),
         }
     }
 }
@@ -171,11 +197,20 @@ impl<'db> Walk<'_, 'db> {
                 {
                     return self.for_loop(parent);
                 }
+                // `out.extend(map.keys())`: the order goes into `out`.
+                Expr::MethodCall { receiver, args, .. }
+                    if args.contains(&child) && self.method_name(parent) == Some("extend") =>
+                {
+                    return self.pushed(receiver);
+                }
                 _ => return None,
             }
             let name = self.method_name(parent)?;
             if name.starts_with("sorted") {
                 return None;
+            }
+            if PICK.contains(&name) {
+                return Some(Sink::Picked(name.to_owned()));
             }
             if name == "collect" {
                 let ty = self.analysis.ty(self.infer.expr_ty(parent));
@@ -259,7 +294,9 @@ impl<'db> Walk<'_, 'db> {
         if self.sorted(&uses) {
             return None;
         }
-        uses.into_iter().find_map(|it| self.sink_of(it))
+        uses.iter()
+            .find_map(|&it| self.sink_of(it))
+            .or_else(|| uses.iter().find_map(|&it| self.used_in_order(it)))
     }
 
     /// Where the `for` loop whose `IntoIterator::into_iter` call is `id` takes its order, if to
@@ -281,21 +318,52 @@ impl<'db> Walk<'_, 'db> {
                 "hash" => return Some(Sink::Hashed),
                 _ if name.starts_with("write_") => return Some(Sink::Hashed),
                 "push" | "push_back" | "push_str" | "extend" => {
-                    let ty = self.analysis.ty(self.infer.expr_ty(receiver)).strip_references();
-                    if !ty.as_adt().is_some_and(|it| self.ordered.contains(&Some(it))) {
-                        continue;
-                    }
-                    let Some(local) = local_of(self.db, self.def, self.body, receiver) else {
-                        return Some(Sink::Stored);
-                    };
-                    if !self.sorted(&self.uses(local)) {
-                        return Some(Sink::Pushed(self.body[local].name.as_str().to_owned()));
+                    if let Some(sink) = self.pushed(receiver) {
+                        return Some(sink);
                     }
                 }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Where an order pushed into `receiver` goes, if to output: a `Vec`, `VecDeque` or
+    /// `String` that is a local never sorted, or a place.
+    fn pushed(&self, receiver: ExprId) -> Option<Sink> {
+        let ty = self.analysis.ty(self.infer.expr_ty(receiver)).strip_references();
+        if !ty.as_adt().is_some_and(|it| self.ordered.contains(&Some(it))) {
+            return None;
+        }
+        let Some(local) = local_of(self.db, self.def, self.body, receiver) else {
+            return Some(Sink::Stored);
+        };
+        (!self.sorted(&self.uses(local)))
+            .then(|| Sink::Pushed(self.body[local].name.as_str().to_owned()))
+    }
+
+    /// Where a use `it` of a collected, never sorted local takes its order past [`Walk::sink_of`]:
+    /// a method that picks an element by its place, or a `for` loop over it, by value or by
+    /// reference, that writes, hashes or pushes.
+    fn used_in_order(&self, it: ExprId) -> Option<Sink> {
+        let mut child = it;
+        let mut parent = self.parents.of_expr(child)?;
+        if matches!(self.body.expr(parent), Expr::Ref { .. }) {
+            child = parent;
+            parent = self.parents.of_expr(child)?;
+        }
+        match self.body.expr(parent) {
+            Expr::MethodCall { receiver, .. } if receiver == child => {
+                let name = self.method_name(parent)?;
+                PICK_PLACE.contains(&name).then(|| Sink::Picked(name.to_owned()))
+            }
+            Expr::Call { args: [arg], .. }
+                if *arg == child && self.method_name(parent) == Some("into_iter") =>
+            {
+                self.for_loop(parent)
+            }
+            _ => None,
+        }
     }
 }
 

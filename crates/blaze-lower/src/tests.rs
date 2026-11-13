@@ -1444,9 +1444,9 @@ fn a_units_identity_leaves_out_the_process_environment() {
                 .unwrap();
         [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
     };
-    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-profile-0101"), ("SHLVL", "1")]);
+    let first = identities(&[("BLAZE_PROFILE", "/profiles/blaze-profile-0101"), ("SHLVL", "1")]);
     let second = identities(&[
-        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
+        ("BLAZE_PROFILE", "/profiles/blaze-profile-0242"),
         ("OLDPWD", "/elsewhere"),
         ("SHLVL", "3"),
     ]);
@@ -1485,6 +1485,60 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
     );
     assert_eq!(built.lowered.identity(CORE), core, "nothing of the library changed");
     assert_ne!(built.lowered.identity(LIB), lib);
+}
+
+/// The invariant of [`Lowered::plan_keys`]: a crate's plan key is the same in two databases
+/// of the same plan and tree (no database ID is in it), and after a refresh it moved exactly
+/// for the crates whose package's files moved and the crates above them; every other crate's
+/// found record is still asked for under the key it was written under.
+#[test]
+fn a_plan_key_moves_with_its_packages_files_and_those_below_and_no_other() {
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let again = lowered(&units).unwrap();
+    let crates: Vec<Crate> = [CORE, LIB, MACRO, BIN].map(|unit| krate(&built, unit)).to_vec();
+    let keys_of = |lowered: &Lowered, crates: &[Crate]| {
+        let keys = lowered.plan_keys(crates);
+        crates.iter().map(|it| keys[it].clone()).collect::<Vec<_>>()
+    };
+    let before = keys_of(&built.lowered, &crates);
+    for (unit, key) in [CORE, LIB, MACRO, BIN].into_iter().zip(&before) {
+        assert!(key.is_ok(), "unit {unit}: {key:?}");
+    }
+    let other: Vec<Crate> = [CORE, LIB, MACRO, BIN].map(|unit| krate(&again, unit)).to_vec();
+    assert_eq!(keys_of(&again.lowered, &other), before, "two databases of one plan and tree");
+
+    // The planted bug of the control: a key that leaves the dependencies out.
+    let planted = |lowered: &Lowered, krate: Crate| {
+        let planned = &lowered.graph.planned[&krate];
+        let mut dirs: Vec<(&str, ContentId)> = (lowered.loads.iter())
+            .filter(|it| it.set == planned.set)
+            .map(|it| (it.dir.as_str(), it.key.clone().unwrap()))
+            .collect();
+        dirs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let dirs: Vec<ContentId> = dirs.into_iter().map(|(_, key)| key).collect();
+        crate::found::joined(planned.own.clone().unwrap(), &[], &dirs)
+    };
+    let planted_before = planted(&built.lowered, crates[3]);
+
+    // An edit of the proc macro's package: `m` moves, and `b` above it; `a` and `core` not.
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("m/src/lib.rs", Some(b"extern crate proc_macro; // edited\n"))]);
+    let config = config(root, library(&MemTree::default()));
+    let refreshed = built.lowered.refresh(
+        Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) },
+        &base_db::Looks::none(),
+        |_| Ok(()),
+    );
+    assert_eq!(refreshed, Ok(true));
+    let after = keys_of(&built.lowered, &crates);
+    assert_eq!(after[0], before[0], "core: nothing of the library moved");
+    assert_eq!(after[1], before[1], "a: none of its files moved, nor any below it");
+    assert_ne!(after[2], before[2], "m: its root moved");
+    assert_ne!(after[3], before[3], "b: a crate below it moved");
+    // The oracle catches the planted bug: `b`'s own files did not move, so a key without its
+    // dependencies would find `b`'s record of the macro before the edit.
+    assert_eq!(planted(&built.lowered, crates[3]), planted_before, "the planted key did not move");
 }
 
 #[test]
@@ -2344,9 +2398,8 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
 
     let units = units();
     let mut built = lowered(&units).unwrap();
-    let dir = std::env::temp_dir().join(format!("blaze-lower-included-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = AbsPathBuf::assert_utf8(dir);
+    let held = blaze_core::temp::TempDir::for_test("blaze-lower-included-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let (moving, still) = (dir.join("moving.bin"), dir.join("still.bin"));
     std::fs::write(&moving, b"old").unwrap();
     std::fs::write(&still, b"same").unwrap();
@@ -2379,7 +2432,6 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     std::fs::remove_file(&moving).unwrap();
     assert_eq!(refresh(&mut built), unmoved + 1);
     assert!(read(&built, &moving).0.is_err(), "a file gone is a moved read: its error");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The unit with a root outside its package ([`outside_root`]), and std's build of the same

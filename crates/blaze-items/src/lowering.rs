@@ -25,6 +25,7 @@ use span::{FileId, TextRange};
 
 /// `error` in words, written to `out`. Types print through the attached database, so this
 /// attaches `db`.
+#[blaze::renders_positions]
 pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
     match error {
         MirLowerError::MissingFunctionDefinition(owner, call) => {
@@ -50,6 +51,7 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
 /// (`file:line:column`, in a macro's output where the macro was called) and the item whose body
 /// has it, so a crate whose own diagnostics a build does not show (std, for a program) still
 /// says what failed in words.
+#[blaze::renders_positions]
 fn unresolved_name(
     db: &Db,
     owner: ExpressionStoreOwnerId,
@@ -76,6 +78,7 @@ fn unresolved_name(
 /// The call `call` of `owner`'s body, which lowering found no function for: its callee as
 /// written, where the call is, and why inference resolved the callee to nothing. The caller
 /// attaches `db`.
+#[blaze::renders_positions]
 pub fn missing_function(db: &Db, owner: InferBodyId<'_>, call: ExprId, out: &mut String) {
     let store_owner = owner.expression_store_owner(db);
     let store = ExpressionStore::of(db, store_owner);
@@ -153,6 +156,7 @@ pub fn body_path(db: &Db, def: DefWithBodyId) -> String {
 
 /// Where `span` of `owner`'s body was written, `file:line:column`; in a macro's output, where
 /// the macro was called.
+#[blaze::renders_positions]
 pub fn place(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> String {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
     let source: Option<InFile<TextRange>> = match span {

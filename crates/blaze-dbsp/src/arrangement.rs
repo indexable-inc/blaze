@@ -153,6 +153,11 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S,
         }
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "key rows are u32 handles and emptied rows are reused first: 2^32 live keys at \
+                  once needs a typed refusal from the arrangement"
+    )]
     fn intern(&mut self, key: K) -> u32 {
         if let Some(&at) = self.slot.get(&key) {
             return at;

@@ -113,6 +113,10 @@ static USES: AtomicU64 = AtomicU64::new(0);
 /// Whether a collector in this process takes [`take_used`]; until then nothing is queued.
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// The directories leased in this process since the collector last took them.
+#[expect(
+    blaze::process_static,
+    reason = "filled only while a collector takes it, and drained by each take: bounded by the leases between two takes"
+)]
 static USED: SegQueue<PathBuf> = SegQueue::new();
 /// Leases let go in this process so far: what one held may be collected now.
 static RELEASED: AtomicU64 = AtomicU64::new(0);
@@ -189,6 +193,10 @@ pub struct Lease {
 impl Lease {
     /// Holds `dir`'s lease shared, making `dir` and its lease when they are not there. Waits at
     /// most [`SHARED_WAIT`] for the collector's one rename, then fails naming `dir`.
+    #[expect(
+        blaze::retry,
+        reason = "the take is redone up to ATTEMPTS times when the collector renamed the directory under it, a race and not failed IO: a lease made atomically with its directory would need one take"
+    )]
     pub fn hold(dir: &Path) -> Result<Lease, String> {
         // Counted and queued before the lock: a collector that checks the count once it holds
         // the lock exclusively sees this use, or locked before it and is waited for.
@@ -234,6 +242,10 @@ impl Lease {
     /// Holds `dir`'s lease shared as [`Lease::hold`] does, but never waits: a [`Wait`] when it
     /// cannot be taken now, for the caller to give way and try again through its scheduler, for
     /// at most [`GIVE_WAY`], then fail naming the state. For a pool thread, which must not spin.
+    #[expect(
+        blaze::retry,
+        reason = "the take is redone up to ATTEMPTS times when the collector renamed the directory under it, a race and not failed IO: a lease made atomically with its directory would need one take"
+    )]
     pub fn try_hold(dir: &Path) -> Result<Result<Lease, Wait>, String> {
         note_use();
         if COLLECTING.load(Ordering::SeqCst) {

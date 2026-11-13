@@ -174,6 +174,10 @@ fn hash_files(files: Vec<(PathBuf, String)>) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread read buffer, uncapped: it keeps the largest file the thread read whole; a cap or a caller-owned buffer must replace it"
+)]
 thread_local! {
     // alloc: once a thread, grown to the largest file it reads whole
     static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };

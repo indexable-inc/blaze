@@ -1,0 +1,14 @@
+{
+ "id": "baselines-dir-refuses-a-list-beside-the-lints",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), allocs ratchet lane, int-1112",
+ "where": "crates/blaze-lints/src/baseline.rs read; crates/blaze-lints/baselines/alloc-sites.txt",
+ "what": "blaze_lints::baseline::read refuses every file of crates/blaze-lints/baselines that is not TARGET or `<tool>.<lint>.txt` of a known lint, so the `// alloc:` ratchet's list, kept beside the allocator lints' baselines, makes `blaze check --baselines crates/blaze-lints/baselines` fail with BaselineError::Lint until read skips it.",
+ "cost": "a lane outside crates/blaze-lints/src could not land the list without breaking the lint-baselines job; a hand-off to the main agent",
+ "cause": "the directory has one reader that assumes it holds only per-lint count files, and the names it may also hold (TARGET) are special-cased in that reader",
+ "class": "a directory shared by several ratchets whose reader knows only one of them",
+ "prevention": "name every file the directory may hold in one place (TARGET, the lint baselines by pattern, alloc-sites.txt), read by both baseline::read and the scripts",
+ "workaround": "baseline::read skips `alloc-sites.txt` as it skips TARGET (a const beside TARGET_FILE)",
+ "fix": "not yet",
+ "state": "open"
+}

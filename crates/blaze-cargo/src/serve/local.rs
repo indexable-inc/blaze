@@ -233,6 +233,11 @@ impl BodiesMark {
 }
 
 impl LaunchMark {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the mark's layout holds the program path's length as a u32: a path of 4 GiB \
+                  needs a typed refusal where the mark is made"
+    )]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let runs_as = self.runs_as.as_bytes();
         // alloc: the mark's value, which the VFS keeps.
@@ -268,6 +273,11 @@ impl LaunchMark {
 }
 
 impl LibraryMark {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the mark's layout holds each text's length as a u32: a fingerprint or place of \
+                  4 GiB needs a typed refusal where the mark is made"
+    )]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let (fingerprint, at) = (self.fingerprint.as_bytes(), self.at.as_bytes());
         // alloc: the mark's value, which the VFS keeps.

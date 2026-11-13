@@ -42,6 +42,8 @@
 //! - round trip: an undamaged image is used as written, and restores to the tree that wrote it.
 
 #![forbid(unsafe_code)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::{sync::Arc, time::Duration};
 
@@ -331,6 +333,11 @@ fn header(tree: &[u8]) -> [u64; WORDS] {
 }
 
 /// Where each column is in the tree section, `tree_len` long: its start and its length in bytes.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a column's u64 count comes from an image this target just wrote from an in-memory \
+              tree, so it fits usize; the assert below checks it against the section"
+)]
 fn columns(header: &[u64; WORDS], tree_len: usize) -> [(usize, usize); COLUMNS] {
     std::array::from_fn(|column| {
         let (count, size) = LAYOUT[column];
@@ -406,6 +413,11 @@ fn rebuilt(sections: &[(Section, Vec<u8>)]) -> Vec<u8> {
 
 /// Completes every effect the journal asks for, as a disk holding `file` would, until it asks
 /// for none.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a truncate's u64 length is at most this in-memory file's length, a usize: the \
+              journal only cuts back to bytes it appended"
+)]
 fn settle(vfs: &mut Vfs, file: &mut Vec<u8>) {
     let mut effects = Vec::new();
     vfs.flush(&mut effects);

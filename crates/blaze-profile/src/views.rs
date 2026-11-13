@@ -754,7 +754,7 @@ mod tests {
             two.contains("read_parquet(['/p/schema.samples.parquet'], union_by_name = true)"),
             "outside build 2's window"
         );
-        let error = prelude(Path::new("/tmp/a*b"), &manifest, Scope::All).unwrap_err();
+        let error = prelude(Path::new("/p/a*b"), &manifest, Scope::All).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
         let mut old = Manifest::new();
         old.insert("1-00000001.spans.parquet", Entry { version: 1, ..entry(None, None) }).unwrap();

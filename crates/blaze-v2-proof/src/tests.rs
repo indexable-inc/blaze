@@ -170,8 +170,7 @@ fn a_trace_round_trips_in_deterministic_cbor() {
 
 #[test]
 fn an_empty_file_maps_to_no_bytes() {
-    let dir = std::env::temp_dir().join(format!("blaze-v2-proof-empty-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-v2-proof-empty-");
     let (a, b) = (dir.join("a"), dir.join("b"));
     std::fs::write(&a, b"").unwrap();
     std::fs::write(&b, b"x").unwrap();
@@ -179,13 +178,11 @@ fn an_empty_file_maps_to_no_bytes() {
     assert_eq!(bytes::first_file_difference(&a, &a).unwrap(), None);
     assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some(0));
     assert!(bytes::first_file_difference(&a, &dir.join("missing")).is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn files_are_compared_across_buffer_boundaries() {
-    let dir = std::env::temp_dir().join(format!("blaze-v2-proof-bytes-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-v2-proof-bytes-");
     let (a, b) = (dir.join("a"), dir.join("b"));
     let body: Vec<u8> = (0..(3 << 20) + 5).map(|i: u32| (i % 251) as u8).collect();
     std::fs::write(&a, &body).unwrap();
@@ -197,7 +194,6 @@ fn files_are_compared_across_buffer_boundaries() {
     assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some((2 << 20) + 3));
     std::fs::write(&b, &body[..1 << 20]).unwrap();
     assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some(1 << 20));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

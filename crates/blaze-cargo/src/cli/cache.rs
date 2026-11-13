@@ -395,9 +395,8 @@ mod tests {
     /// under `--dry-run`); a derived value's file and any other name are left.
     #[test]
     fn verify_removes_the_placed_files_that_are_not_what_their_names_say() {
-        let dir = std::env::temp_dir().join(format!("blaze-store-verify-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let made = blaze_core::temp::TempDir::for_test("blaze-store-verify-");
+        let dir = made.path().to_path_buf();
         let name_of = |bytes: &[u8]| format!("{:x}", blaze_cas::content_of(bytes));
         let (good, torn, linked) = (b"a whole output".to_vec(), b"another output".to_vec(), b"a third".to_vec());
         std::fs::write(dir.join(name_of(&good)), &good).unwrap();

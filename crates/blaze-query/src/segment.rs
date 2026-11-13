@@ -37,6 +37,10 @@ struct LaneIds {
 /// The lane indices of the process: a thread takes one when it first copies in and gives it
 /// back when it ends, so the lanes in use stay as many as the threads.
 // alloc: none: an empty `Vec` in a static; it grows by one a thread.
+#[expect(
+    blaze::process_static,
+    reason = "free lane numbers, given back as threads end: at most the most threads alive at once"
+)]
 static LANE_IDS: ShortLock<LaneIds> = ShortLock::new("query.segment.lane_ids", LaneIds { next: 0, free: Vec::new() });
 
 struct Lane(u32);

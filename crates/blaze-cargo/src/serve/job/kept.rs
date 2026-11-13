@@ -13,11 +13,12 @@
 
 #![forbid(unsafe_code)]
 
-/// The part of the daemon's limit the kept images may hold together: a 32nd (1.47 GiB under
+/// The part of the gate's ceiling the kept images may hold together: a 32nd (1.47 GiB under
 /// coord-111's 47 GiB). They are a cache, there only so a relink patches rather than lays out
 /// whole, and what they hold is Link's at rest; the links running now are Link's too and need
-/// room under the same [`blaze_graph::admission::fair_share`] (32 of 304 parts, 4.95 GiB at 47).
-/// coord-111 (memcap5): with that whole share as the budget the kept images reached it, Link
+/// room under the same ceiling. coord-111 (memcap5): with Link's whole fair share of the limit
+/// (32 of 304 parts, 4.95 GiB at 47, a proportion the gate deleted) as the budget, the kept
+/// images reached it, Link
 /// held 4.99 GiB of regions and 2.69 of heap with every link done, and the footprint the 48 GB
 /// cap stopped at was 47.28.
 pub(super) const LIMIT_PART: u64 = 32;
@@ -198,15 +199,13 @@ mod tests {
         assert!(!kept.take(0), "a path kept within the budget was not let go");
     }
 
-    /// The kept images' budget leaves the links running now room under Link's fair share of the
-    /// limit: a 32nd of the limit, under a third of that share. coord-111's 47 GiB gives
-    /// 1.47 GiB, where the whole share (4.95) let Link reach 7.68 GiB with no link running.
+    /// The kept images' budget is a 32nd of the gate's ceiling: coord-111's 47 GiB gives
+    /// 1.47 GiB, where Link's whole fair share of the limit (4.95, a proportion the gate
+    /// deleted on 2026-11-13) let Link reach 7.68 GiB with no link running.
     #[test]
-    fn the_kept_images_budget_leaves_the_running_links_most_of_links_share() {
+    fn the_kept_images_budget_is_a_32nd_of_the_ceiling() {
         const GIB: u64 = 1 << 30;
         let limit = 47 * GIB;
-        let share = blaze_graph::admission::fair_share(blaze_mem::Tag::Link, limit);
         assert_eq!(budget(limit), limit / 32);
-        assert!(budget(limit) * 3 < share, "{} of a share of {share}", budget(limit));
     }
 }

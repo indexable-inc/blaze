@@ -57,6 +57,13 @@ mod home;
     not(test),
     allow(dead_code, reason = "docs/v2/plan/design/store-pool.md: a pinned read through a pump (`Hot::pin_pack`) is a test's on the simulation; the index slots and files of their own are not on the pool yet")
 )]
+#[cfg_attr(
+    not(test),
+    expect(
+        blaze::unwired,
+        reason = "partly unwired until the index slots and files of their own move onto the pool (docs/v2/plan/design/store-pool.md)"
+    )
+)]
 mod hot;
 mod index;
 #[cfg(all(test, blaze_check))]
@@ -92,7 +99,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Stamp, Tag};
+use blaze_core::{Cache, Completion, Done, Durable, Effect, Extent, FileName, Mapping, Stamp, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
@@ -140,8 +147,12 @@ use crate::table::{Held, Table};
 /// ([`disk::ForgottenRef`], [`forget`]): a head of format 4 to 6 is read with none. Format 8
 /// added a placed output's whole file as the home of its value's record
 /// ([`disk::ExternalRef::placed`], [`Store::home_placed`]): a head of format 4 to 7 is read
-/// with none.
-pub(crate) const FORMAT: u32 = 8;
+/// with none. Format 9 made each record's CRC-32C cover its payload as well as its header
+/// ([`disk::Seal::Whole`], magic `BLZW`), so a read checks the record for a CRC instead of a
+/// BLAKE3 of its value: a record of format 8 (magic `BLZR`) is read forward, its header's CRC
+/// checked and its value hashed as before, and a store mixes the two until a settle or the
+/// collector rewrites its packs. A blaze of format 8 refuses a store of format 9 by name.
+pub(crate) const FORMAT: u32 = 9;
 
 /// The oldest format read ([`FORMAT`]).
 pub(crate) const FORMAT_READ: u32 = 4;
@@ -3682,6 +3693,14 @@ impl Store {
                     why = Some(format!("the record at {offset} runs past the pack"));
                     break;
                 };
+                // Checked whole before it is rewritten: a rotted record is not carried into
+                // a new pack under a fresh check.
+                let checked = pack.bytes(look, offset, RECORD_HEADER).map(|head| RecordHeader::check(head, payload));
+                if let Some(Err(what)) = checked {
+                    // alloc: a problem reported
+                    why = Some(format!("the record at {offset}: {what}"));
+                    break;
+                }
                 // alloc: a settle (idle) rewriting a half-dead pack; `rehome` takes `&mut self` while this borrows it
                 live.push((header, payload.to_vec()));
             }
@@ -4929,6 +4948,10 @@ impl Store {
     /// The look through `placed/` failed with `done`: asked again from the start, until it has
     /// failed [`FAILURES_MOST`] times (its own count, `look_tries`), which breaks the store
     /// naming the directory, what the look was for and the last error.
+    #[expect(
+        blaze::retry,
+        reason = "a failed look of the placed directory is asked again up to FAILURES_MOST times: the first failure must break the store naming the directory"
+    )]
     fn placed_look_failed(&mut self, done: &Done, effects: &mut Vec<Effect>) {
         self.look_tries += 1;
         match self.look_tries < FAILURES_MOST {
@@ -6072,7 +6095,7 @@ impl Store {
                 // clones it. Nothing of it was synced, so a crash may have left any part.
                 self.files.insert(content, PlacedFile::Checking(waiting));
                 let tag = self.tags.ask(Op::Check { content });
-                effects.push(Effect::Map { file, tag });
+                effects.push(Effect::Map { file, extent: Extent::Whole, tag });
             }
             (Op::Probe { .. }, PlacedFile::Probing(waiting), Done::Stat(Some(meta))) => {
                 // A write this run saw end is whole, so this is what a crash left of one (it
@@ -6563,7 +6586,7 @@ impl Store {
                     // clone: the effect and the op each own the name; once per refused rename
                     let file = to.clone();
                     let tag = self.tags.ask(Op::Verify { asked, to, staged, bytes, why });
-                    effects.push(Effect::Map { file, tag });
+                    effects.push(Effect::Map { file, extent: Extent::Whole, tag });
                 }
             },
             Op::Verify { asked, to, staged, bytes, why } => {
@@ -6851,7 +6874,7 @@ impl Store {
         }
         let pack = &mut self.tiers[0].packs[at];
         let offset = pack.end;
-        pack.memory.extend_from_slice(&header.encode());
+        pack.memory.extend_from_slice(&header.encode(payload));
         pack.memory.extend_from_slice(payload);
         pack.memory.resize(pack.memory.len() + (span - RECORD_HEADER - header.stored) as usize, 0);
         pack.end += span;
@@ -8003,6 +8026,10 @@ impl Store {
     /// What a commit does once a step of it has answered and none is in flight: after a
     /// failure, the commit again (or, [`FAILURES_MOST`] in a row, the store stopped); else the
     /// head, once everything it names is durable.
+    #[expect(
+        blaze::retry,
+        reason = "a failed commit is started again up to FAILURES_MOST times: the first failure must break the store naming the file"
+    )]
     fn commit_moves(&mut self, effects: &mut Vec<Effect>) -> Vec<Ticket> {
         // alloc: empty, allocates nothing
         let Some(commit) = self.commit.as_mut() else { return Vec::new() };
@@ -8273,6 +8300,10 @@ impl Store {
     }
 
     /// Whether to ask again after IO failed.
+    #[expect(
+        blaze::retry,
+        reason = "failed IO is asked again up to FAILURES_MOST times, the bug that prompted the lint: every caller must take the first failure as the store's typed error"
+    )]
     fn retry(&mut self, file: &FileName, done: &Done) -> bool {
         self.failures += 1;
         if self.failures >= FAILURES_MOST {
@@ -8286,7 +8317,7 @@ impl Store {
     fn ask_map(&mut self, tier: usize, file: FileName, what: Mapped, effects: &mut Vec<Effect>) {
         // clone: the op keeps the name to match `Store::mapped` and to ask again; once per file mapped
         let tag = self.tags.ask(Op::Map { tier, file: file.clone(), what });
-        effects.push(Effect::Map { file, tag });
+        effects.push(Effect::Map { file, extent: Extent::Whole, tag });
     }
 
     /// Asks for the block checks of pack `pack` of tier `tier`, whole: 1/1024 of their pack,

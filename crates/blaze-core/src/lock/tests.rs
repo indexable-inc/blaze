@@ -835,3 +835,73 @@ fn a_contended_lock_on_two_threads_records_one_wait_behind_its_holder() {
     assert_eq!(probe.began.load(Ordering::Relaxed), 1);
     assert_eq!(probe.ended.load(Ordering::Relaxed), 1);
 }
+
+// --- The memory gate's lock depth ---------------------------------------------------------------
+
+/// Where a task the memory gate told to give way unwound: inside the lock, or after it.
+#[derive(Debug, PartialEq, Eq)]
+enum Unwound {
+    InTheLock,
+    AfterTheLock,
+}
+
+/// A task holding 8 MiB under a 64 MiB gate takes a named lock, the gate's room falls under
+/// what it holds (so it is told to give way), and it allocates inside the lock, then after.
+/// `counted`: whether the guard's count reaches the gate; the control takes it off for the
+/// lock's span, which removes the cause.
+fn give_way_around_a_lock(counted: bool) -> Unwound {
+    use blaze_mem::{budget::Config, frame, gate};
+    const MIB: u64 = 1 << 20;
+    let config = Config {
+        ceiling: 64 * MIB,
+        core: 8 * MIB,
+        overdraft_per_worker: 4 * MIB,
+        workers: 1,
+        ungated: 0,
+    };
+    let gate = gate::Gate::new(config).unwrap_or_else(|why| panic!("the test's gate: {why}"));
+    let lock = Lock::new(if counted { "gate.depth.counted" } else { "gate.depth.uncounted" }, 0u8);
+    let in_lock = std::cell::Cell::new(false);
+    let unwound = gate::scoped(gate, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame::task(blaze_mem::Tag::Other, |frame| {
+                let held = frame.alloc_slice_fill_with((8 * MIB) as usize, |i| i as u8);
+                let mut guard = lock.lock();
+                if !counted {
+                    blaze_mem::gate::lock_released();
+                }
+                in_lock.set(true);
+                // Room for 2 quanta of tasks: the task, holding 4 or more, is told.
+                gate.room(16 * MIB);
+                // Past what the task's first chunk has left, so it reaches a safe point, and
+                // within one overdraft (4 MiB), which a task told inside a lock may spend.
+                let inside = frame.alloc_slice_fill_with((3 * MIB) as usize, |i| i as u8);
+                *guard = inside[1] ^ held[1];
+                if !counted {
+                    blaze_mem::gate::lock_taken();
+                }
+                drop(guard);
+                in_lock.set(false);
+                frame.alloc_slice_fill_with((8 * MIB) as usize, |i| i as u8).len()
+            })
+        }))
+    });
+    let payload = unwound.expect_err("a task told to give way unwinds at a safe point");
+    assert!(payload.is::<frame::Cancelled>(), "it gives way with `Cancelled`");
+    if in_lock.get() { Unwound::InTheLock } else { Unwound::AfterTheLock }
+}
+
+/// The invariant: a task told to give way while it holds a named lock goes on to the lock's
+/// release, and unwinds at its first safe point after it, never inside the lock.
+#[test]
+fn a_task_holding_a_named_lock_gives_way_only_after_its_release() {
+    assert_eq!(give_way_around_a_lock(true), Unwound::AfterTheLock);
+    assert!(!blaze_mem::gate::in_lock(), "every guard's count went with it");
+}
+
+/// The control: with the guard's count kept from the gate, the same task unwinds inside the
+/// lock, so the count is what defers it.
+#[test]
+fn the_control_unwinds_inside_a_lock_the_gate_does_not_know() {
+    assert_eq!(give_way_around_a_lock(false), Unwound::InTheLock);
+}

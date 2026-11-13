@@ -875,6 +875,10 @@ pub(crate) fn split(read: Read<'_>) -> Option<(&[u8], Which<'_>)> {
 
 /// Appends the name of a read of `kind` of the step keyed `step`: for [`ReadKind::PART`] the
 /// step's key behind its length (two bytes), then `part`; for any other, the step's key.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a read's name holds the step's key length in two bytes and nothing checks a step's key is at most 65535 bytes: that needs a typed refusal where a step is keyed"
+)]
 pub(crate) fn name(kind: ReadKind, step: &[u8], part: &[u8], out: &mut Vec<u8>) {
     entry::name_kind(kind, out);
     if kind == ReadKind::PART {

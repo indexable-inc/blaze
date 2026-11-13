@@ -22,6 +22,10 @@
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
 //! (`bstd::data`) and these become bstd's (`blaze::std_use` moves the callers).
 
+// `#[expect(blaze::..)]` names a blaze lint; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 pub mod engine;
 pub mod input;
 pub mod pyfmt;
@@ -51,6 +55,10 @@ pub fn fail(script: &str, message: &str) -> ! {
 
 /// Directories to remove at exit when they are empty (`atexit.register(os.rmdir...)`).
 #[allow(clippy::disallowed_types, reason = "blaze-script depends on no crate of crates/ (blaze_core::lock is blaze's)")]
+#[expect(
+    blaze::process_static,
+    reason = "a script process's directories to remove at exit: a handful per run, and the process is one script's run"
+)]
 static AT_EXIT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// `path` removed by [`exit`] if it is empty then, as storelib's `work_dir` registers it.
@@ -311,34 +319,9 @@ unsafe extern "C" {
 }
 
 /// A new empty directory under the system's temporary directory, removed with all it holds
-/// when this is dropped: Python's `tempfile.TemporaryDirectory(prefix=...)`.
-#[derive(Debug)]
-pub struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    /// A directory named `<prefix><pid>-<n>`; `Err` names the directory that could not be made.
-    pub fn new(prefix: &str) -> Result<TempDir, String> {
-        static MADE: AtomicU32 = AtomicU32::new(0);
-        let n = MADE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("{prefix}{}-{n}", std::process::id()));
-        // A directory left by a process of the same id that was killed is not this one's.
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).map_err(|e| format!("{} could not be made: {e}", path.display()))?;
-        Ok(TempDir { path })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+/// when this is dropped: Python's `tempfile.TemporaryDirectory(prefix=...)`. blaze's one
+/// (`blaze_core::temp`, rule `blaze::tmp_path`); `new`'s `Err` names the directory.
+pub use blaze_core::temp::TempDir;
 
 #[cfg(test)]
 mod tests {
@@ -400,15 +383,5 @@ mod tests {
         assert_eq!(utc_of(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc_of(1_762_819_200 + 3_661), "2025-11-11T01:01:01Z");
         assert_eq!(utc_of(951_782_400), "2000-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn a_temp_dir_is_new_and_goes_when_dropped() {
-        let (a, b) = (TempDir::new("blaze-script-t-").unwrap(), TempDir::new("blaze-script-t-").unwrap());
-        assert_ne!(a.path(), b.path());
-        std::fs::write(a.path().join("x"), "1").unwrap();
-        let held = a.path().to_owned();
-        drop(a);
-        assert!(!held.exists() && b.path().is_dir());
     }
 }

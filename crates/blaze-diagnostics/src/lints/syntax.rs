@@ -285,6 +285,11 @@ impl<'db> Walk<'db> {
     /// piece's probe, `root` is the piece's own tree, and the first expansion, `#[expect]` or
     /// checked `cfg` met stops the probe ([`Cx::note_beyond`]): no `cx.vsema` is asked of a
     /// tree it did not hand out.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "open nodes are u32 indices into `nodes`: one file's tree with its expansions \
+                  past 2^32 nodes needs a typed refusal from the walk"
+    )]
     fn add(
         &mut self,
         cx: &Cx<'_, 'db>,

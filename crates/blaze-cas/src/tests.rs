@@ -2021,7 +2021,7 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     store.put(key(1), Kind::Code, &[1]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    assert_eq!((FORMAT_READ, FORMAT), (4, 8));
+    assert_eq!((FORMAT_READ, FORMAT), (4, 9));
     let head = name("store/head");
     let mut bytes = sim.contents(&head);
     assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
@@ -2033,7 +2033,52 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     assert!(!store.ready());
     let broken = store.broken().unwrap();
     assert_eq!(broken.file, head);
-    assert!(broken.what.contains("store format 3, not 8"), "{broken}");
+    assert!(broken.what.contains("store format 3, not 9"), "{broken}");
+}
+
+/// The invariant: a store a blaze of format 8 left (records whose CRC covers their header
+/// only, head and index stamped 8) opens, reads every value right (each hashed, as format 8
+/// read them), takes format-9 records beside them, and goes on as format 9 across a reopen,
+/// with nothing the scrub finds. Rule 26: read forward, never refused.
+#[test]
+fn a_store_of_format_8_records_is_read_forward() {
+    let mut sim = Sim::new(31, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = INDEX_AFTER as u64 + 4;
+    disk::WRITE_FORMAT_8.set(true);
+    for n in 0..count {
+        store.put(key(n), Kind::Code, &text(n, 300)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    disk::WRITE_FORMAT_8.set(false);
+    let slot = store.tiers[0].head.index.expect("past `INDEX_AFTER` records an index is written").slot;
+    drop(store);
+    let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
+    let mut table = sim.contents(&index);
+    table[8..12].copy_from_slice(&8u32.to_le_bytes());
+    sim.change(&index, &table);
+    let mut written = Head::decode(&sim.contents(&head)).unwrap();
+    written.index.as_mut().unwrap().check = crc::crc32c(&table);
+    sim.change(&head, &written.encode_as(8));
+    let mut store = open(&mut sim, "store");
+    let look = store.look();
+    let old = look.find(&key(0)).unwrap().unwrap();
+    assert_eq!(look.record_sealed(old, &key(0)).unwrap().2, disk::Sealed::Header, "a format-8 record");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} of format 8");
+    }
+    store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
+    flush(&mut sim, &mut store);
+    let look = store.look();
+    let new = look.find(&key(count)).unwrap().unwrap();
+    assert_eq!(look.record_sealed(new, &key(count)).unwrap().2, disk::Sealed::Whole, "a format-9 record beside them");
+    assert_eq!(sim.contents(&head)[8..12], 9u32.to_le_bytes(), "the next head is of format 9");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..=count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} after a reopen");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }
 
 /// Format 5 added a head's whole files to remove, format 6 each pack's time of use. A store
@@ -3146,8 +3191,8 @@ fn the_store_and_its_files_are_the_users_alone() {
     let chmod = |path: &std::path::Path, mode| {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     };
-    let root = std::env::temp_dir().join(format!("blaze-cas-private-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-cas-private-");
+    let root = held.path();
     let dir = root.join("store");
     {
         let mut driven = Driven::open(&root).unwrap();
@@ -3169,7 +3214,6 @@ fn the_store_and_its_files_are_the_users_alone() {
     chmod(&dir, 0o777);
     let refused = Driven::open(&root).err().unwrap();
     assert!(refused.contains("store: can be written to by other users"), "{refused}");
-    _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -3288,14 +3332,68 @@ fn a_record_header_of_a_length_no_record_has_is_refused() {
         key: key(1),
         content: content_of(b""),
     };
+    // Format 8's header: its CRC covers the header alone, so a header of any length is made.
     for stored in [0, 1 << 40, u64::MAX - RECORD_HEADER - 15] {
-        let decoded = RecordHeader::decode(&header(stored).encode()).unwrap();
+        let decoded = RecordHeader::decode(&header(stored).encode_format8()).unwrap();
         assert_eq!(decoded.span(), (RECORD_HEADER + stored).next_multiple_of(disk::ALIGN));
     }
     for stored in [u64::MAX - RECORD_HEADER - 14, u64::MAX - RECORD_HEADER + 1, u64::MAX] {
-        assert!(RecordHeader::decode(&header(stored).encode()).is_err(), "{stored}");
+        assert!(RecordHeader::decode(&header(stored).encode_format8()).is_err(), "{stored}");
         assert_eq!(disk::span_of(stored), None);
     }
+}
+
+/// The invariant: a format-9 record reads back as it was written, its header and payload
+/// checked whole by its CRC-32C, and any one byte of its payload or header changed is refused
+/// by that check with its header still decoding (the rot a BLAKE3 of the value found before
+/// format 9). A format-8 record (CRC over its header only) still reads, its payload left to
+/// the BLAKE3 of the value. Control: the rotted payload byte; with the CRC not taken over the
+/// payload (format 8's header on format 9's magic) the rot is not seen, which the last
+/// assertion shows of format 8.
+#[test]
+fn a_format_9_record_checks_its_payload_and_a_format_8_record_reads_forward() {
+    use disk::Sealed;
+    let payload: Vec<u8> = (0..300u32).map(|n| (n * 7) as u8).collect();
+    let header = RecordHeader {
+        kind: Kind::Code,
+        form: Form::Raw,
+        dictionary: NO_DICTIONARY,
+        stored: payload.len() as u64,
+        raw: payload.len() as u64,
+        key: key(3),
+        content: content_of(&payload),
+    };
+    let bytes = header.encode(&payload);
+    assert_eq!(RecordHeader::check(&bytes, &payload), Ok((header, Sealed::Whole)), "round trip");
+    let record = disk::record(&header, &payload);
+    let (head, rest) = record.split_at(RECORD_HEADER as usize);
+    assert_eq!(RecordHeader::check(head, &rest[..payload.len()]), Ok((header, Sealed::Whole)), "a whole record");
+    for at in [0, 1, 150, payload.len() - 1] {
+        let mut rotted = payload.clone();
+        rotted[at] ^= 0x10;
+        assert_eq!(RecordHeader::decode(&bytes), Ok(header), "the header is intact");
+        assert!(RecordHeader::check(&bytes, &rotted).is_err(), "payload byte {at} rotted is refused");
+    }
+    for at in (16..RECORD_HEADER as usize).step_by(13) {
+        let mut rotted = bytes;
+        rotted[at] ^= 0x01;
+        assert!(
+            RecordHeader::check(&rotted, &payload).is_err(),
+            "header byte {at} rotted is refused"
+        );
+    }
+    assert!(RecordHeader::check(&bytes, &payload[1..]).is_err(), "a payload of another length");
+    // Format 8: the header's CRC is checked, the payload is the BLAKE3's to check.
+    let old = header.encode_format8();
+    assert_eq!(RecordHeader::check(&old, &payload), Ok((header, Sealed::Header)), "format 8 reads forward");
+    let mut rotted = payload.clone();
+    rotted[9] ^= 0x10;
+    assert_eq!(
+        RecordHeader::check(&old, &rotted),
+        Ok((header, Sealed::Header)),
+        "format 8's CRC does not cover its payload: the BLAKE3 of the value must"
+    );
+    assert_ne!(content_of(&rotted), header.content, "which it does");
 }
 
 #[test]
@@ -4857,8 +4955,8 @@ fn a_handle_reads_and_puts_beside_the_store_and_its_puts_are_durable_with_a_flus
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_driven_store_keeps_machine_code_as_a_file_on_disk() {
-    let root = std::env::temp_dir().join(format!("blaze-cas-driven-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-cas-driven-");
+    let root = held.path();
     let code = noise(70_000, 37);
     {
         let mut driven = Driven::open(&root).unwrap();
@@ -4877,7 +4975,6 @@ fn a_driven_store_keeps_machine_code_as_a_file_on_disk() {
     assert_eq!(std::fs::read(handle.path_of(pinned.file().unwrap())).unwrap(), code);
     assert_eq!(handle.read(&key(2), |it| it.bytes.to_vec()).unwrap().unwrap(), b"a query's result");
     drop((pinned, handle, driven));
-    _ = std::fs::remove_dir_all(&root);
 }
 
 /// What a test's fetches let in: everything that hashes as sent.

@@ -69,6 +69,7 @@ unsafe extern "C" {
         deadline: u64,
     ) -> libc::c_int;
     fn os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
+    fn os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
 }
 
 /// `OS_CLOCK_MACH_ABSOLUTE_TIME` (<os/clock.h>): the one clock a deadline may be on.
@@ -176,6 +177,69 @@ impl Futex for Addresses {
         // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
         _ = unsafe { os_sync_wake_by_address_any(word.as_ptr().cast(), WORD, PRIVATE) };
     }
+}
+
+/// `OS_SYNC_WAIT_ON_ADDRESS_SHARED` and `OS_SYNC_WAKE_BY_ADDRESS_SHARED`: a word other processes
+/// map too. The kernel keys the wait by the shared mapping's object, not the address, so
+/// processes that map one file meet on one word (the documented face of the private
+/// `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED`; the header's flags win over XNU's
+/// operation numbers, as for the park above).
+const SHARED: u32 = 1;
+
+/// The shared-address wait of [`super::wait_shared`]: one
+/// `os_sync_wait_on_address_with_deadline` with [`SHARED`] per call, to the absolute Mach time
+/// of what is left of `deadline` on `clock` now (never a length carried across a retry), on
+/// the low half of `word`.
+pub(crate) fn wait_shared(
+    what: &'static str,
+    word: &AtomicU64,
+    expected: u32,
+    deadline: Deadline,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    // The low half of a little-endian word is at its address (`super::wait_shared`'s contract).
+    let addr = word.as_ptr().cast::<c_void>();
+    until(what, clock, Some(deadline), |left| {
+        let at = mach_after(left.unwrap_or_default())?;
+        // SAFETY: `word` is alive and aligned for the call, which only reads its low four
+        // bytes; the thread blocks until a wake of the word from any process that maps it, a
+        // signal or `at`.
+        let got = unsafe {
+            os_sync_wait_on_address_with_deadline(
+                addr,
+                u64::from(expected),
+                WORD,
+                SHARED,
+                OS_CLOCK_MACH_ABSOLUTE_TIME,
+                at,
+            )
+        };
+        // Woken, or the word no longer held `expected`: the caller looks again.
+        if got >= 0 {
+            return Ok(Once::Ready(()));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            // The header's transient returns under low memory: waited for again.
+            Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
+            // alloc: an error.
+            _ => Err(io::Error::new(
+                error.kind(),
+                format!("os_sync_wait_on_address_with_deadline, shared: {error}"),
+            )),
+        }
+    })
+}
+
+/// The wake of [`super::wake_shared`]: every thread of every process waiting on `word`'s low
+/// half.
+pub(crate) fn wake_shared(word: &AtomicU64) {
+    // `ENOENT`, nobody waits on the word, is not an error of a wake; nothing else can fail a
+    // wake of a live aligned word.
+    // SAFETY: a wake of a word of a shared mapping; the kernel reads no memory of it.
+    _ = unsafe { os_sync_wake_by_address_all(word.as_ptr().cast(), WORD, SHARED) };
 }
 
 /// One `kevent` on `kq`: the `nchanges` changes at `changes` made, then up to `room` events
@@ -311,6 +375,21 @@ mod tests {
                 !found.is_null(),
                 "{name:?} is gone from this macOS (it is there from 14.4): wait::Parker \
                  needs it, and there is no other park"
+            );
+        }
+    }
+
+    /// The calls the shared-address wait is built on resolve at run time (rule
+    /// macos-private-apis): a macOS without one fails here, naming it.
+    #[test]
+    fn the_shared_address_waits_resolve() {
+        for name in [c"os_sync_wait_on_address_with_deadline", c"os_sync_wake_by_address_all"] {
+            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
+            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            assert!(
+                !found.is_null(),
+                "{name:?} is gone from this macOS (it is there from 14.4): wait::wait_shared \
+                 needs it, and there is no other cross-process wait"
             );
         }
     }

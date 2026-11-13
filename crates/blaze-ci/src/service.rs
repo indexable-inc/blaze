@@ -1000,6 +1000,10 @@ struct Report {
 }
 
 impl Report {
+    #[expect(
+        blaze::retry,
+        reason = "not a retry: `failures_count` counts the failed tests listed in the report, capped at MOST_LISTED"
+    )]
     fn add(&mut self, response: Response) {
         match response {
             Response::Diagnostic(diagnostic) => match diagnostic.level {

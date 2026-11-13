@@ -385,6 +385,10 @@ fn send(
     }
 }
 
+#[expect(
+    blaze::retry,
+    reason = "posts to GitHub are tried GITHUB_RETRIES + 1 times with backoff, GitHub's API failing transiently: the CI service must report the first failure and let its next turn post again"
+)]
 fn retry<T>(
     backoff: Duration,
     mut attempt: impl FnMut() -> Result<T, GitHubError>,

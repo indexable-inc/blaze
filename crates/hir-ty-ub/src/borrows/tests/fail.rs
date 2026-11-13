@@ -894,8 +894,7 @@ fn write_during_2phase() {
 mod reserved {
     use super::*;
 
-    const CELL_PROTECTED_WRITE_TREE: &str = "\
-──────────────────────────────────────────────────
+    const CELL_PROTECTED_WRITE_TREE: &str = r"──────────────────────────────────────────────────
 Warning: this tree is indicative only. Some tags may have been hidden.
 0..   1
 | Unq |    └─┬──<TAG=root of the allocation>
@@ -951,8 +950,7 @@ Warning: this tree is indicative only. Some tags may have been hidden.
         expect_protected_write_error(&e, accessed, protected);
     }
 
-    const INT_PROTECTED_WRITE_TREE: &str = "\
-──────────────────────────────────────────────────
+    const INT_PROTECTED_WRITE_TREE: &str = r"──────────────────────────────────────────────────
 Warning: this tree is indicative only. Some tags may have been hidden.
 0..   1
 | Unq |    └─┬──<TAG=root of the allocation>

@@ -240,6 +240,10 @@ impl Reads {
 
     /// The names, as a slot keeps them: the variables, then the expansions' names, each
     /// framed by its length.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the slot frames its counts as u32; a crate with 2^32 reads needs a typed refusal before it is imaged"
+    )]
     pub fn encode(&self) -> Vec<u8> {
         let len = self.env.iter().map(|it| it.len() + 4).sum::<usize>()
             + self.macros.iter().map(|it| it.0.len() + 4).sum::<usize>();

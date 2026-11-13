@@ -14,6 +14,10 @@ use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// last finisher sees every write any claimer made to its chunk before finishing it. A claim
 /// and a finish are one read-modify-write each, on two words.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the io_uring driver's alone"))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(blaze::unwired, reason = "wired on Linux; kept elsewhere for its model-checked tests")
+)]
 pub(crate) struct Claims {
     chunks: usize,
     /// The next chunk to claim.
@@ -23,6 +27,10 @@ pub(crate) struct Claims {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "the io_uring driver's alone"))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(blaze::unwired, reason = "wired on Linux; kept elsewhere for its model-checked tests")
+)]
 impl Claims {
     pub(crate) fn new(chunks: usize) -> Claims {
         Claims { chunks, next: AtomicUsize::new(0), finished: AtomicUsize::new(0) }
@@ -59,6 +67,10 @@ impl Claims {
     not(any(windows, target_os = "macos")),
     allow(dead_code, reason = "the IOCP and kqueue drivers' alone")
 )]
+#[cfg_attr(
+    not(any(windows, target_os = "macos")),
+    expect(blaze::unwired, reason = "wired on Windows and macOS; kept elsewhere for its model-checked tests")
+)]
 pub(crate) struct Wake {
     woken: AtomicBool,
 }
@@ -66,6 +78,10 @@ pub(crate) struct Wake {
 #[cfg_attr(
     not(any(windows, target_os = "macos")),
     allow(dead_code, reason = "the IOCP and kqueue drivers' alone")
+)]
+#[cfg_attr(
+    not(any(windows, target_os = "macos")),
+    expect(blaze::unwired, reason = "wired on Windows and macOS; kept elsewhere for its model-checked tests")
 )]
 impl Wake {
     pub(crate) const fn new() -> Wake {

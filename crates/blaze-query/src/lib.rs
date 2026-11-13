@@ -532,6 +532,10 @@ impl Stacks {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "STACKS and BUFFERS are per-thread spares reused by every run, uncapped: they keep the deepest run's stacks and largest values on the thread"
+)]
 thread_local! {
     /// Whether this thread's task runs a query. Carried with a job on a fiber: another job
     /// the thread runs while it waits is a task of its own, free to ask the database.
@@ -608,6 +612,10 @@ fn try_with_stacks<R>(f: impl FnOnce(&RefCell<Stacks>) -> R) -> Option<R> {
 
 /// Empty stacks threads left when a job's were put on them, for the next job to switch out.
 // alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
+#[expect(
+    blaze::process_static,
+    reason = "empty stacks only, grown to the most jobs switched out at once and never capped; a cap like SPARES_KEPT must bound it"
+)]
 static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> =
     ShortLock::new("query.fiber.spare_stacks", Vec::new());
 
@@ -2103,7 +2111,7 @@ impl Database {
         match (pending, completion.done) {
             (Pending::ColdWrite { file, entries }, Done::Written) => {
                 let tag = io.tag(self.config.tags);
-                effects.push(Effect::Map { file: file.clone(), tag }); // clone: a name, once an I/O
+                effects.push(Effect::Map { file: file.clone(), extent: blaze_core::Extent::Whole, tag }); // clone: a name, once an I/O
                 io.pending.insert(tag, Pending::ColdMap { file, entries });
             }
             (Pending::ColdMap { file, entries }, Done::Mapped(mapping)) => {

@@ -132,6 +132,11 @@ fn interposer() -> Result<PathBuf, String> {
 }
 
 /// The directories that are the sandbox's own: the kernel's views and the empty ones.
+#[expect(
+    blaze::tmp_path,
+    reason = "the sandbox mounts its own empty /tmp and /var/tmp in its namespace: the real \
+              directories by name are the policy"
+)]
 const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp", "/run"];
 
 /// The directories a confined sandbox has as its own besides its `TMPDIR`: the kernel's
@@ -152,6 +157,11 @@ enum Around {
 /// The directories the sandbox mounts empty besides `/tmp`, where they are: the machine's
 /// sockets live in `/run` (`/var/run` is a link to it, or one more), and the Nix daemon's,
 /// through which a program could have the store build or keep what it likes, in its own.
+#[expect(
+    blaze::tmp_path,
+    reason = "the machine's /var/tmp is one of the directories the sandbox mounts empty, so the \
+              mount table names it"
+)]
 const EMPTIED: &[&str] =
     &["/var/tmp", "/dev/shm", "/run", "/var/run", "/nix/var/nix/daemon-socket"];
 
@@ -511,29 +521,21 @@ pub(super) fn run_as(
     // empty `/tmp`.
     let scratch = match unshared {
         Some(_) => {
-            // alloc: once per sandbox, its temporary directory's name.
-            let dir = std::env::temp_dir().join(format!(
-                "blaze-sandbox-tmp-{}-{}",
-                std::process::id(),
-                unique()
-            ));
-            // alloc: the error, once, and no sandbox is made.
-            std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
-            Some(dir)
+            // alloc: once per sandbox, its temporary directory, removed when the run is done.
+            let made = blaze_core::temp::TempDir::new("blaze-sandbox-tmp-");
+            // alloc: the error, once, naming the directory, and no sandbox is made.
+            Some(made.map_err(|it| it.to_string())?)
         }
         None => None,
     };
-    let ran = run_in(spec, program, scratch.as_deref(), also, interposer.as_deref(), provider);
-    if let Some(dir) = &scratch {
-        _ = std::fs::remove_dir_all(dir);
-    }
-    ran
-}
-
-/// A number no other run of this process has.
-fn unique() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    run_in(
+        spec,
+        program,
+        scratch.as_ref().map(blaze_core::temp::TempDir::path),
+        also,
+        interposer.as_deref(),
+        provider,
+    )
 }
 
 /// Whether this user may make a user namespace and map itself in it, which a sandbox in
@@ -1334,6 +1336,12 @@ impl Passed {
 /// Puts the machine's file system in place for a sandbox without a view: every mount
 /// read-only, the overlays, the writable and the readable entries (each a directory or a file)
 /// and the empty directories on it.
+#[expect(
+    blaze::tmp_path,
+    reason = "the sandbox's mount namespace stages its overlays on the machine's /tmp, mounts it \
+              empty and keeps a TMPDIR found under the emptied directories: the real /tmp is the \
+              mount table here"
+)]
 fn machine(spec: &Spec) -> Result<(), String> {
     let root = c(Path::new("/"));
     let opened = |at: &Path| -> Result<std::os::fd::OwnedFd, String> {
@@ -1601,6 +1609,11 @@ fn overlay(dir: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), St
 
 /// Where a view's root is put together before it becomes `/`: the machine's `/tmp`, which the
 /// view's tmpfs hides in the mount namespace.
+#[expect(
+    blaze::tmp_path,
+    reason = "a view's root is put together on the machine's /tmp inside the mount namespace, \
+              which its tmpfs then hides: the real directory is the policy"
+)]
 const VIEW_ROOT: &str = "/tmp";
 
 /// The machine's devices a view's `/dev` has: those that hold nothing of the machine's.
@@ -1667,6 +1680,11 @@ fn check_view(spec: &Spec, view: &View) -> Result<(), String> {
 /// group `gid`, with the directory of `env`'s `TMPDIR` made when it is in its `/tmp` or
 /// `/dev/shm`. The first process of the PID namespace mounts its `/proc` and makes it `/`
 /// ([`enter_view`]).
+#[expect(
+    blaze::tmp_path,
+    reason = "a TMPDIR under the view's own /tmp is made inside the view: the view's /tmp by name \
+              is the policy"
+)]
 fn put_view(
     view: &View,
     uid: libc::uid_t,
@@ -3479,7 +3497,8 @@ mod tests {
 
     #[test]
     fn a_unix_socket_is_where_its_links_lead() {
-        let dir = std::env::temp_dir().join(format!("blaze-resolved-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-resolved-");
+        let dir = made.path().to_owned();
         let real = dir.join("real");
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, dir.join("abs")).unwrap();
@@ -3712,7 +3731,7 @@ mod tests {
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("interposer");
+        let (_made, dir) = scratch("interposer");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("a"), "").unwrap();
@@ -3764,7 +3783,7 @@ for it in "$OUT"/*; do :; done
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("who-read-random");
+        let (_made, dir) = scratch("who-read-random");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         // The fixture script: a child reads four bytes of randomness, and nothing else does
@@ -3834,7 +3853,7 @@ for it in "$OUT"/*; do :; done
             eprintln!("skipped: {why}");
             return None;
         }
-        let dir = scratch(name);
+        let (_made, dir) = scratch(name);
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
@@ -3990,7 +4009,7 @@ head -c 24 /dev/urandom | od -An -tx1
         let given: Vec<(OsString, OsString)> = vec![
             ("A".into(), OsString::from_vec(b"\xff".to_vec())),
             ("LD_PRELOAD".into(), "".into()),
-            ("TMPDIR".into(), "/tmp".into()),
+            ("TMPDIR".into(), "/given".into()),
         ];
         let tmp = ("TMPDIR".to_owned(), "/own".to_owned());
         let env = super::environment(&given, Some(&tmp), Some(lib)).unwrap();
@@ -4032,6 +4051,11 @@ head -c 24 /dev/urandom | od -An -tx1
     /// and what it leaves running is killed as it ends. Skipped where the kernel has no
     /// Landlock, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "the run is given the machine's real /tmp as its TMPDIR to show the confined \
+                  sandbox replaces it with one of its own"
+    )]
     fn a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing() {
         if let Err(why) = super::landlock::abi() {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
@@ -4045,7 +4069,7 @@ head -c 24 /dev/urandom | od -An -tx1
             eprintln!("skipped: no bash on PATH");
             return;
         };
-        let dir = scratch("confined");
+        let (_made, dir) = scratch("confined");
         let (out, outside) = (dir.join("out"), dir.join("outside"));
         std::fs::create_dir_all(&out).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
@@ -4174,7 +4198,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("busy");
+        let (_made, dir) = scratch("busy");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let spec = Spec {
@@ -4222,11 +4246,11 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         alone::run(&spec, Some(&program))
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-view-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A test's directory, removed when the guard drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-view-{name}-"));
+        let dir = made.path().to_owned();
+        (made, dir)
     }
 
     const FAIL: &str = "fail() { echo \"$*\" >&2; exit 1; }\n";
@@ -4250,7 +4274,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             eprintln!("skipped: no bash on PATH");
             return;
         };
-        let dir = scratch("readable-file");
+        let (_made, dir) = scratch("readable-file");
         let (given, beside, out) = (dir.join("given"), dir.join("beside"), dir.join("out"));
         std::fs::write(&given, "given alone\n").unwrap();
         std::fs::write(&beside, "not given\n").unwrap();
@@ -4327,7 +4351,7 @@ echo hi > "$OUT/written" || fail "it could not write $OUT"
     #[test]
     fn an_entry_is_a_directory_a_file_or_a_socket_to_read_and_nothing_else() {
         use super::{Given, Passed};
-        let dir = scratch("entry-kinds");
+        let (_made, dir) = scratch("entry-kinds");
         let (file, linked, pipe, socket) =
             (dir.join("file"), dir.join("linked"), dir.join("pipe"), dir.join("socket"));
         std::fs::write(&file, "").unwrap();
@@ -4362,7 +4386,7 @@ echo hi > "$OUT/written" || fail "it could not write $OUT"
     #[test]
     fn each_entry_is_written_or_read_only_as_given_wherever_it_is() {
         let Some(bash) = namespaced_bash() else { return };
-        let dir = scratch("nested-entries");
+        let (_made, dir) = scratch("nested-entries");
         let at = |it: &str| dir.join(it);
         for it in ["w/ro", "r/out", "out"] {
             std::fs::create_dir_all(at(it)).unwrap();
@@ -4439,7 +4463,7 @@ true
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("confined-entries");
+        let (_made, dir) = scratch("confined-entries");
         let at = |it: &str| dir.join(it);
         std::fs::create_dir_all(at("out")).unwrap();
         std::fs::write(at("written"), "before\n").unwrap();
@@ -4608,9 +4632,14 @@ if connect other; then fail "a socket not given was reached"; fi"#,
     }
 
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "a view's root is put together on the machine's /tmp, and the record must name \
+                  nothing under it: the real directory is what the test checks against"
+    )]
     fn a_view_shows_its_binds_and_nothing_of_the_machine() {
         let Some((bash, closure)) = store_bash() else { return };
-        let dir = scratch("binds");
+        let (_made, dir) = scratch("binds");
         let (out, src) = (dir.join("out"), dir.join("src"));
         for it in [&out, &src.join("gen"), &dir.join("gen")] {
             std::fs::create_dir_all(it).unwrap();
@@ -4706,7 +4735,7 @@ echo hi > /out/written
     #[test]
     fn a_view_binds_a_store_path_from_anywhere() {
         let Some((bash, closure)) = store_bash() else { return };
-        let dir = scratch("relocated");
+        let (_made, dir) = scratch("relocated");
         let (out, copy) = (dir.join("out"), dir.join("copy"));
         std::fs::create_dir_all(&out).unwrap();
         std::fs::create_dir_all(&copy).unwrap();
@@ -4737,7 +4766,7 @@ echo hi > /out/written
 
     #[test]
     fn a_view_that_cannot_be_made_says_why_before_anything_runs() {
-        let dir = scratch("refused");
+        let (_made, dir) = scratch("refused");
         let missing = dir.join("missing");
         let made = |binds: Vec<Bind>, overlays: Vec<PathBuf>| {
             let spec =

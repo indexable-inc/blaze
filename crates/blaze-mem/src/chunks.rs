@@ -17,6 +17,11 @@
 //! chunk taken on a node is the node's for good, and goes back to its own space whichever
 //! thread gives it, so a worker's frames are on its node with no system call per chunk.
 //!
+//! Every chunk no task holds is the memory gate's core ([`crate::gate`]): carving commits on
+//! core's grant, a purge gives its count back and a cold take asks for it again (both in
+//! [`Region`]). A task's frame moves the chunk it takes out of core and back as it gives it
+//! ([`gate_of`]); a core short of room purges the warm cache ([`trim`]) before it refuses.
+//!
 //! Cost: a take or give is one compare-and-swap on the stack's head; carving is one
 //! `fetch_add`, plus a commit system call every quarter of what is committed.
 
@@ -194,6 +199,13 @@ impl Chunk {
     pub(crate) fn from_index(index: u32) -> Chunk {
         Chunk(index)
     }
+}
+
+/// The gate whose core counts `chunk` while no task holds it: its space's. A task's frame moves
+/// a chunk out of it as it takes one and back as it gives it ([`crate::gate::Gate::core_release`],
+/// [`crate::gate::Gate::core_take`]).
+pub(crate) fn gate_of(chunk: &Chunk) -> &'static crate::gate::Gate {
+    made(place_of(chunk.0)).region.gate()
 }
 
 /// Takes a chunk for `owner`, in the calling thread's place: a warm one if any was given back

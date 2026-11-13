@@ -481,32 +481,22 @@ pub(crate) mod macos {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use std::{collections::BTreeSet, fs};
 
     use super::{Cpu, Topology};
 
     /// A fake `/sys/devices/system/cpu`, removed when dropped.
-    struct Tree(PathBuf);
+    struct Tree(blaze_core::temp::TempDir);
 
     impl Tree {
         fn new(name: &str) -> Tree {
-            let dir =
-                std::env::temp_dir().join(format!("blaze-topology-{}-{name}", std::process::id()));
-            _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Tree(dir)
+            Tree(blaze_core::temp::TempDir::for_test(&format!("blaze-topology-{name}-")))
         }
 
         fn file(&self, path: &str, text: &str) {
             let path = self.0.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, format!("{text}\n")).unwrap();
-        }
-    }
-
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -538,7 +528,7 @@ mod tests {
             tree.file(&format!("{at}/topology/cluster_cpus_list"), &siblings);
             tree.file(&format!("{at}/topology/core_cpus_list"), &siblings);
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         assert_eq!(topology.cpus.len(), 128);
         assert_eq!(topology.groups(), 8);
         for cpu in &topology.cpus {
@@ -567,7 +557,7 @@ mod tests {
             );
             tree.file(&format!("{at}/topology/core_cpus_list"), &cpu.to_string());
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         assert_eq!(topology.groups(), 16);
         assert!(topology.cpus.iter().all(|it| it.group == it.id / 4 && it.socket == 0));
         assert_eq!(topology.steal_order(3)[..7], [3, 2, 4, 1, 5, 0, 6]);
@@ -577,7 +567,7 @@ mod tests {
     fn a_machine_that_says_nothing_is_one_group() {
         let tree = Tree::new("silent");
         tree.file("online", "0-3");
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         assert_eq!(topology, Topology::flat(4));
         assert_eq!(topology.steal_order(0), [0]);
     }
@@ -594,7 +584,7 @@ mod tests {
                 if cpu < 4 { "0-3" } else { "4-7" },
             );
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         let ids: Vec<u32> = topology.cpus.iter().map(|it| it.id).collect();
         assert_eq!(ids, [0, 1, 2, 3, 4, 5, 7]);
         assert_eq!(groups(&topology), [0, 0, 0, 0, 1, 1, 1]);
@@ -603,7 +593,7 @@ mod tests {
         let only = topology.only(&BTreeSet::from([0, 5]));
         assert_eq!(groups(&only), [0, 1]);
         tree.file("online", "0-3,x");
-        assert!(Topology::from_sysfs(&tree.0).is_err());
+        assert!(Topology::from_sysfs(tree.0.path()).is_err());
     }
 
     /// Arm big.LITTLE: the cores of the largest capacity are the fast ones.
@@ -619,7 +609,7 @@ mod tests {
                 if cpu < 4 { "0-3" } else { "4-7" },
             );
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         let fast: Vec<bool> = topology.cpus.iter().map(|it| it.fast).collect();
         assert_eq!(fast, [false, false, false, false, true, true, true, true]);
         assert_eq!(groups(&topology), [0, 0, 0, 0, 1, 1, 1, 1]);
@@ -662,7 +652,7 @@ mod tests {
             // The kernel's is a symlink to the node's directory; only the name is read.
             fs::create_dir_all(tree.0.join(format!("{at}/node{}", cpu / 4))).unwrap();
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         let nodes: Vec<u32> = topology.cpus.iter().map(|it| it.node).collect();
         assert_eq!(nodes, [0, 0, 0, 0, 1, 1, 1, 1]);
         assert_eq!(groups(&topology), [0, 0, 0, 0, 1, 1, 1, 1]);
@@ -682,7 +672,7 @@ mod tests {
             tree.file(&format!("{at}/topology/physical_package_id"), &(cpu / 8).to_string());
             fs::create_dir_all(tree.0.join(format!("{at}/node{}", cpu / 4))).unwrap();
         }
-        let topology = Topology::from_sysfs(&tree.0).unwrap();
+        let topology = Topology::from_sysfs(tree.0.path()).unwrap();
         assert_eq!(topology.groups(), 8);
         assert_eq!(topology.nodes(), [0, 0, 1, 1, 2, 2, 3, 3]);
         assert_eq!(topology.steal_order(2), [2, 3, 1, 0, 4, 5, 6, 7]);

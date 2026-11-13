@@ -13,6 +13,10 @@ pub mod vec {
         }
         pub fn push(&mut self, _value: T) {}
         pub fn sort(&mut self) {}
+        pub fn extend<I: core::iter::IntoIterator<Item = T>>(&mut self, _iter: I) {}
+        pub fn first(&self) -> Option<&T> {
+            None
+        }
     }
     impl<T> core::iter::FromIterator<T> for Vec<T> {
         fn from_iter<I: core::iter::IntoIterator<Item = T>>(_iter: I) -> Vec<T> {
@@ -62,7 +66,9 @@ pub mod collections {
 
 /// A hash map's order collected into a `Vec` that is returned, stored or handed on, or pushed by
 /// a `for` loop into a `Vec` never sorted, is a finding, under a renamed map type and in a
-/// macro's loop; a sorted `Vec`, an ordered set and a loop that only counts are none.
+/// macro's loop; so is an element picked by its place in the order (`next`, a collected `Vec`'s
+/// `first`) and an `extend` of a `Vec` never sorted; a sorted `Vec`, an ordered set and a loop
+/// that only counts are none.
 #[test]
 fn hash_order_output() {
     check_in(
@@ -129,6 +135,27 @@ pub fn by_macro(map: &Table<u32, u32>) -> Vec<u32> {
     let mut out = Vec::new();
     gather!(map, out); //~ hash_order_output
     out
+}
+pub fn picked(map: &Table<u32, u32>) -> Option<&u32> {
+    map.keys().next() //~ hash_order_output
+}
+pub fn extended(map: &Table<u32, u32>) -> Vec<&u32> {
+    let mut out = Vec::new();
+    out.extend(map.keys()); //~ hash_order_output
+    out
+}
+pub fn extended_then_sorted(map: &Table<u32, u32>) -> Vec<&u32> {
+    let mut out = Vec::new();
+    out.extend(map.keys());
+    out.sort();
+    out
+}
+pub fn first_of_collected(map: &Table<u32, u32>) -> u32 {
+    let keys: Vec<&u32> = map.keys().collect(); //~ hash_order_output
+    match keys.first() {
+        Some(key) => **key,
+        None => 0,
+    }
 }
 "#,
         "-A clippy::all --warn=blaze::hash_order_output",

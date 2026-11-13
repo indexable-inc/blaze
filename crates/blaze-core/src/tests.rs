@@ -2,13 +2,13 @@
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use crate::{
     Completion, Done, Driver, Effect, FileName, Tag, run_until_idle,
     sim::{Faults, Sim},
+    temp::TempDir,
     threads::Threads,
     wait::Deadline,
 };
@@ -17,21 +17,17 @@ fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
 }
 
-fn dir(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-core-{what}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A new empty directory for the test `what`, removed when the guard drops: hold it for as long
+/// as a driver works in it.
+fn dir(what: &str) -> TempDir {
+    TempDir::for_test(&format!("blaze-core-{what}-"))
 }
 
 /// As [`dir`], under `/tmp`: a Unix socket's whole path must fit in its address (about 104
 /// bytes), which a long temporary directory (a Nix shell's) leaves no room for.
 #[cfg(unix)]
-fn socket_dir(what: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/blaze-core-{what}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn socket_dir(what: &str) -> TempDir {
+    TempDir::for_test_socket(&format!("blaze-core-{what}-"))
 }
 
 /// What became of each step, by its tag. A clone is either done or refused for the file
@@ -131,17 +127,20 @@ fn every_driver_ends_the_script_the_same() {
     let mut sim = Sim::new(1, Faults::default());
     let simulated = script(&mut sim);
     let root = dir("threads");
+    let root = root.path();
     let threads = script(&mut Threads::new(&root, 2));
     assert_eq!(simulated, threads);
     #[cfg(target_os = "macos")]
     {
         let root = dir("kqueue");
+        let root = root.path();
         let kqueue = script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
         assert_eq!(simulated, kqueue);
     }
     #[cfg(windows)]
     {
         let root = dir("iocp");
+        let root = root.path();
         let iocp = script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
         assert_eq!(simulated, iocp);
     }
@@ -170,6 +169,7 @@ fn every_driver_ends_the_script_the_same() {
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");
+        let root = root.path();
         let ring = script(&mut crate::uring::Uring::new(&root).unwrap());
         assert_eq!(simulated, ring);
     }
@@ -223,22 +223,26 @@ fn every_driver_writes_and_renames_without_a_sync_the_same() {
     let mut sim = Sim::new(1, Faults::default());
     let simulated = unsynced_script(&mut sim);
     let root = dir("unsynced-threads");
+    let root = root.path();
     assert_eq!(simulated, unsynced_script(&mut Threads::new(&root, 2)));
     #[cfg(target_os = "macos")]
     {
         let root = dir("unsynced-kqueue");
+        let root = root.path();
         let kqueue = unsynced_script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
         assert_eq!(simulated, kqueue);
     }
     #[cfg(windows)]
     {
         let root = dir("unsynced-iocp");
+        let root = root.path();
         let iocp = unsynced_script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
         assert_eq!(simulated, iocp);
     }
     #[cfg(target_os = "linux")]
     {
         let root = dir("unsynced-uring");
+        let root = root.path();
         let ring = unsynced_script(&mut crate::uring::Uring::new(&root).unwrap());
         assert_eq!(simulated, ring);
     }
@@ -257,8 +261,10 @@ fn every_driver_writes_and_renames_without_a_sync_the_same() {
 #[test]
 fn the_native_driver_runs_the_shared_script_as_threads_does() {
     let root = dir("native-script");
+    let root = root.path();
     let threads = script(&mut Threads::new(&root, 2));
     let root = dir("native-script-native");
+    let root = root.path();
     assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
 }
 
@@ -376,11 +382,11 @@ fn digest(bytes: &[u8]) -> (usize, u32) {
 #[test]
 fn every_driver_reads_into_and_writes_from_memory_the_same() {
     let simulated = memory_script(&mut Sim::new(5, Faults::default()));
-    let threads = memory_script(&mut Threads::new(&dir("memory-threads"), 2));
+    let threads = memory_script(&mut Threads::new(dir("memory-threads").path(), 2));
     assert_eq!(simulated, threads);
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        let native = memory_script(&mut crate::native(&dir("memory-native"), 2).unwrap());
+        let native = memory_script(&mut crate::native(dir("memory-native").path(), 2).unwrap());
         assert_eq!(simulated, native);
     }
     // The read cut at the end of the file says how far it read.
@@ -401,7 +407,8 @@ fn every_driver_reads_into_and_writes_from_memory_the_same() {
 fn a_read_around_the_page_cache_reads_the_file() {
     use crate::{Cache, Priority};
     let block = crate::DIRECT_ALIGN;
-    let mut driver = crate::native(&dir("memory-bypassed"), 2).unwrap();
+    let root = dir("memory-bypassed");
+    let mut driver = crate::native(root.path(), 2).unwrap();
     let mut memory = script_memory();
     memory.fill(0, memory.len(), 0xEE);
     let pack = name("pool/pack-2");
@@ -465,8 +472,8 @@ fn locks(driver: &mut impl Driver) -> Vec<Done> {
 fn a_lock_excludes_another_until_it_is_let_go_of() {
     let want = vec![Done::Locked, Done::Contended, Done::Unlocked, Done::Locked, Done::Unlocked];
     assert_eq!(locks(&mut Sim::new(1, Faults::default())), want, "simulated");
-    assert_eq!(locks(&mut Threads::new(&dir("locks-threads"), 1)), want, "threads");
-    assert_eq!(locks(&mut crate::native(&dir("locks-native"), 1).unwrap()), want, "native");
+    assert_eq!(locks(&mut Threads::new(dir("locks-threads").path(), 1)), want, "threads");
+    assert_eq!(locks(&mut crate::native(dir("locks-native").path(), 1).unwrap()), want, "native");
 }
 
 /// A lock let go of is free at once though another descriptor of its open file is still open,
@@ -478,6 +485,7 @@ fn a_lock_excludes_another_until_it_is_let_go_of() {
 #[test]
 fn a_lock_let_go_of_is_free_though_a_copy_of_its_descriptor_is_open() {
     let root = dir("locks-copied");
+    let root = root.path();
     let file = name("history/lock");
     let mut locks = crate::locks::Locks::new();
     let taken = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(1)).unwrap();
@@ -565,22 +573,23 @@ fn every_driver_sets_a_files_times_as_asked() {
     // A rename keeps the inode, and with it the time.
     assert_eq!(simulated[&10], format!("stat 33 bytes {TIME}"));
     let root = dir("times-threads");
+    let root = root.path();
     assert_eq!(times(&mut Threads::new(&root, 2)), simulated, "threads");
     #[cfg(target_os = "linux")]
     assert_eq!(
-        times(&mut crate::uring::Uring::new(dir("times-uring")).unwrap()),
+        times(&mut crate::uring::Uring::new(dir("times-uring").path()).unwrap()),
         simulated,
         "io_uring"
     );
     #[cfg(target_os = "macos")]
     assert_eq!(
-        times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue"), 2).unwrap()),
+        times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue").path(), 2).unwrap()),
         simulated,
         "kqueue"
     );
     #[cfg(windows)]
     assert_eq!(
-        times(&mut crate::iocp::Iocp::new(&dir("times-iocp"), 2).unwrap()),
+        times(&mut crate::iocp::Iocp::new(dir("times-iocp").path(), 2).unwrap()),
         simulated,
         "IOCP"
     );
@@ -631,6 +640,7 @@ fn a_warm_times_set_allocates_nothing() {
         "the simulation: {used} allocations over {ROUNDS} warm sets of times; its journal's entries and growth are {journal}"
     );
     let root = dir("budget-times");
+    let root = root.path();
     let mut threads = Threads::new(&root, 1);
     write(&mut threads);
     times_rounds(&mut threads, WARM);
@@ -649,6 +659,7 @@ fn a_warm_times_set_allocates_nothing() {
     #[cfg(target_os = "linux")]
     {
         let root = dir("budget-times-uring");
+        let root = root.path();
         let mut ring = crate::uring::Uring::new(&root).unwrap();
         write(&mut ring);
         times_rounds(&mut ring, WARM);
@@ -663,6 +674,7 @@ fn a_warm_times_set_allocates_nothing() {
     #[cfg(windows)]
     {
         let root = dir("budget-times-iocp");
+        let root = root.path();
         let mut iocp = crate::iocp::Iocp::new(&root, 1).unwrap();
         write(&mut iocp);
         times_rounds(&mut iocp, WARM);
@@ -708,13 +720,13 @@ fn every_driver_fires_timers_in_their_order() {
     }
     let want = vec![1, 3, 5, 2, 6, 0, 4];
     assert_eq!(run(&mut Sim::new(3, Faults::default())), want);
-    assert_eq!(run(&mut Threads::new(&dir("timers-threads"), 1)), want);
+    assert_eq!(run(&mut Threads::new(dir("timers-threads").path(), 1)), want);
     #[cfg(target_os = "macos")]
-    assert_eq!(run(&mut crate::kqueue::Kqueue::new(dir("timers-kqueue"), 1).unwrap()), want);
+    assert_eq!(run(&mut crate::kqueue::Kqueue::new(dir("timers-kqueue").path(), 1).unwrap()), want);
     #[cfg(windows)]
-    assert_eq!(run(&mut crate::iocp::Iocp::new(&dir("timers-iocp"), 1).unwrap()), want);
+    assert_eq!(run(&mut crate::iocp::Iocp::new(dir("timers-iocp").path(), 1).unwrap()), want);
     #[cfg(target_os = "linux")]
-    assert_eq!(run(&mut crate::uring::Uring::new(dir("timers-uring")).unwrap()), want);
+    assert_eq!(run(&mut crate::uring::Uring::new(dir("timers-uring").path()).unwrap()), want);
 }
 
 /// A file written under a watched directory is heard of, on the drivers that watch.
@@ -761,10 +773,12 @@ fn watches_hear_a_file_written_under_them() {
         heard
     }
     let root = dir("watch-threads");
-    let heard = run(&mut Threads::new(&root, 2), Some(&root));
+    let root = root.path();
+    let heard = run(&mut Threads::new(root, 2), Some(root));
     assert!(heard.contains(&name("src/keep")), "{heard:?}");
     let root = dir("watch-uring");
-    let heard = run(&mut crate::uring::Uring::new(&root).unwrap(), Some(&root));
+    let root = root.path();
+    let heard = run(&mut crate::uring::Uring::new(root).unwrap(), Some(root));
     assert!(heard.contains(&name("src/keep")), "{heard:?}");
 }
 
@@ -825,10 +839,12 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
 #[test]
 fn every_watching_driver_tells_a_flush_after_the_changes_before_it() {
     let root = dir("flush-threads");
+    let root = root.path();
     flushes_follow_the_changes_before_them(&mut Threads::new(&root, 2), &root);
     #[cfg(target_os = "linux")]
     {
         let root = dir("flush-uring");
+        let root = root.path();
         flushes_follow_the_changes_before_them(
             &mut crate::uring::Uring::new(&root).unwrap(),
             &root,
@@ -865,7 +881,11 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
         match (done.tag.0, done.done) {
             (1, Done::Written) => {
                 seen.push("written".to_owned());
-                effects.push(Effect::Map { file: name("store/pack"), tag: Tag(2) });
+                effects.push(Effect::Map {
+                    file: name("store/pack"),
+                    extent: crate::Extent::Whole,
+                    tag: Tag(2),
+                });
                 effects.push(Effect::Connect { at: at.clone(), tag: Tag(5) });
             }
             (2, Done::Mapped(it)) => seen.push(format!("mapped {:?}", it.bytes())),
@@ -939,16 +959,19 @@ fn every_driver_runs_processes_and_sockets_the_same() {
         ]
     );
     let root = socket_dir("threads-processes");
+    let root = root.path();
     assert_eq!(simulated, processes_and_sockets(&mut Threads::new(&root, 2)));
     #[cfg(target_os = "linux")]
     {
         let root = socket_dir("uring-processes");
+        let root = root.path();
         let ring = processes_and_sockets(&mut crate::uring::Uring::new(&root).unwrap());
         assert_eq!(simulated, ring);
     }
     #[cfg(target_os = "macos")]
     {
         let root = socket_dir("kqueue-processes");
+        let root = root.path();
         let kqueue = processes_and_sockets(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
         assert_eq!(simulated, kqueue);
     }
@@ -1022,6 +1045,7 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
         assert!(!root.join(".blaze-spawn").read_dir().is_ok_and(|mut it| it.next().is_some()));
     };
     let root = dir("unconfined");
+    let root = root.path();
     check(
         &root,
         run(&mut Threads::new(&root, 1)),
@@ -1030,6 +1054,7 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring-unconfined");
+        let root = root.path();
         check(
             &root,
             run(&mut crate::uring::Uring::new(&root).unwrap()),
@@ -1039,6 +1064,7 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
     #[cfg(target_os = "macos")]
     {
         let root = dir("kqueue-unconfined");
+        let root = root.path();
         check(
             &root,
             run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap()),
@@ -1092,13 +1118,226 @@ fn an_answer_is_its_bytes_and_a_confine_hands_nothing_unless_it_says() {
 fn a_mapping_is_the_file() {
     let mut sim = Sim::new(7, Faults::default());
     sim.change(&name("store/pack"), b"packed");
-    let mut effects = vec![Effect::Map { file: name("store/pack"), tag: Tag(1) }];
-    let mut mapped = None;
-    run_until_idle(&mut sim, &mut effects, |done, _| match done.done {
-        Done::Mapped(it) => mapped = Some(it),
+    let mut effects = vec![
+        Effect::Map { file: name("store/pack"), extent: crate::Extent::Whole, tag: Tag(1) },
+        Effect::Map {
+            file: name("store/pack"),
+            extent: crate::Extent::Range { at: 2, len: 3 },
+            tag: Tag(2),
+        },
+        Effect::Map {
+            file: name("store/pack"),
+            extent: crate::Extent::Range { at: 4, len: 3 },
+            tag: Tag(3),
+        },
+    ];
+    let mut seen = std::collections::BTreeMap::new();
+    run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
+    match &seen[&1] {
+        Done::Mapped(it) => assert_eq!(it.bytes(), b"packed"),
         other => panic!("{other:?}"),
-    }).expect("the effects end");
-    assert_eq!(mapped.expect("mapped").bytes(), b"packed");
+    }
+    // A range sees its bytes and nothing past its length.
+    match &seen[&2] {
+        Done::Mapped(it) => assert_eq!((it.bytes(), it.slack()), (&b"cke"[..], 0)),
+        other => panic!("{other:?}"),
+    }
+    // A range past the file's end fails, naming the file and the range.
+    match &seen[&3] {
+        Done::Failed(why) => assert!(why.0.contains("store/pack") && why.0.contains("3 bytes at 4"), "{why:?}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `n` reads into memory of `file`, each run to its end before the next, every one ending in
+/// a read of `want` bytes.
+fn read_often(driver: &mut impl Driver, memory: &crate::Memory, file: &FileName, n: usize, want: u32) {
+    use crate::{Cache, Priority};
+    for at in 0..n {
+        let mut effects = vec![Effect::ReadInto {
+            file: file.clone(),
+            at: (at % 4) as u64,
+            into: memory.span(0, 16),
+            cache: Cache::Kept,
+            priority: Priority::Demand,
+            tag: Tag(at as u64),
+        }];
+        let mut ended = None;
+        run_until_idle(driver, &mut effects, |done, _| ended = Some(done.done))
+            .expect("the effects end");
+        assert_eq!(ended, Some(Done::ReadInto { len: want }), "read {at} of {file}");
+    }
+}
+
+/// A thousand reads into memory of one file open it once, counted by the driver's table, and
+/// a write to it closes that descriptor. The control plants the bug the table removes (every
+/// read opens its file) and the count catches it.
+///
+/// The invariant: after its first read, a file a driver's table keeps costs no open.
+#[test]
+fn a_thousand_reads_open_a_file_once() {
+    let memory = script_memory();
+    let pack = name("pool/pack-often");
+    let write = || vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }];
+
+    let often_threads = dir("often-threads");
+    let mut threads = Threads::new(often_threads.path(), 1);
+    run_until_idle(&mut threads, &mut write(), |_, _| {}).expect("the effects end");
+    read_often(&mut threads, &memory, &pack, 1000, 16);
+    assert_eq!(threads.opens(), crate::Opens { opened: 1, closed: 0 });
+    // The driver's own write changes the file: its kept descriptor closes.
+    run_until_idle(&mut threads, &mut write(), |_, _| {}).expect("the effects end");
+    assert_eq!(threads.opens(), crate::Opens { opened: 1, closed: 1 });
+    read_often(&mut threads, &memory, &pack, 10, 16);
+    assert_eq!(threads.opens().opened, 2, "a read after the write opens the file anew");
+
+    // The control: a table bypassed opens the file a thousand times, and the count says so.
+    let often_bypassed = dir("often-bypassed");
+    let mut bypassed = Threads::new(often_bypassed.path(), 1);
+    bypassed.descriptors().bypass();
+    run_until_idle(&mut bypassed, &mut write(), |_, _| {}).expect("the effects end");
+    read_often(&mut bypassed, &memory, &pack, 1000, 16);
+    assert_eq!(bypassed.opens().opened, 1000, "the planted bug is caught");
+
+    // The simulation models the same table.
+    let mut sim = Sim::new(8, Faults::default());
+    sim.change(&pack, &pack_bytes());
+    read_often(&mut sim, &memory, &pack, 1000, 16);
+    assert_eq!(sim.opens(), crate::Opens { opened: 1, closed: 0 });
+
+    #[cfg(target_os = "macos")]
+    {
+        let often_kqueue = dir("often-kqueue");
+        let mut kqueue = crate::kqueue::Kqueue::new(often_kqueue.path(), 1).unwrap();
+        run_until_idle(&mut kqueue, &mut write(), |_, _| {}).expect("the effects end");
+        read_often(&mut kqueue, &memory, &pack, 1000, 16);
+        assert_eq!(kqueue.opens(), crate::Opens { opened: 1, closed: 0 });
+    }
+}
+
+/// One batch of reads into memory, what each part got and the bytes each read part landed:
+/// two adjacent parts of a pack into memory apart, a part of a missing file, a part at an odd
+/// offset, a span past its region and a part cut at the file's end.
+fn batch_script(driver: &mut impl Driver) -> Vec<String> {
+    use crate::{Cache, Got, Priority, ReadPart};
+    let block = crate::DIRECT_ALIGN;
+    let memory = script_memory();
+    let pack = name("pool/pack-3");
+    let missing = name("pool/missing");
+    run_until_idle(
+        driver,
+        &mut vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }],
+        |_, _| {},
+    )
+    .expect("the effects end");
+    let parts = vec![
+        ReadPart::asked(pack.clone(), 0, memory.span(0, block as u32)),
+        ReadPart::asked(pack.clone(), block, memory.span(3 * block, block as u32)),
+        ReadPart::asked(missing.clone(), 0, memory.span(5 * block, 16)),
+        ReadPart::asked(pack.clone(), 1, memory.span(6 * block + 3, 10)),
+        ReadPart::asked(pack.clone(), 2 * block, memory.span(8 * block - 10, 100)),
+        ReadPart::asked(pack.clone(), 3 * block, memory.span(7 * block, 200)),
+    ];
+    let mut effects =
+        vec![Effect::ReadMany { parts, cache: Cache::Kept, priority: Priority::Demand, tag: Tag(5) }];
+    let mut ended = Vec::new();
+    run_until_idle(driver, &mut effects, |done, _| ended.push(done)).expect("the effects end");
+    let [ended] = ended.as_slice() else { panic!("one completion for the batch: {ended:?}") };
+    assert_eq!(ended.tag, Tag(5));
+    let Done::ReadMany(parts) = &ended.done else { panic!("{:?}", ended.done) };
+    assert_eq!(parts.len(), 6, "every part comes back, in the order asked");
+    let file = pack_bytes();
+    parts
+        .iter()
+        .map(|part| match &part.got {
+            Got::Read(len) => {
+                // The bytes landed where the part asked, and are the file's at its offset.
+                let mut held = vec![0; *len as usize];
+                memory.read(part.into.offset as usize, &mut held);
+                let at = part.at as usize;
+                assert_eq!(held, file[at..at + *len as usize], "{} at {}", part.file, part.at);
+                format!("read {len}")
+            }
+            Got::Failed(why) => {
+                // A failed part names its file and offset.
+                assert!(why.0.contains(part.file.as_str()), "{why:?}");
+                assert!(why.0.contains(&format!("at {}", part.at)), "{why:?}");
+                if why.0.contains("past the region's end") {
+                    "refused: past the region".to_owned()
+                } else {
+                    "failed".to_owned()
+                }
+            }
+            Got::Asked => panic!("{} at {} came back unread", part.file, part.at),
+        })
+        .collect()
+}
+
+/// A batch's parts land where asked on every driver alike, and a failed part fails only
+/// itself: the parts around it, of the same file and of others, read.
+#[test]
+fn a_batchs_parts_land_where_asked_and_fail_alone() {
+    let block = crate::DIRECT_ALIGN;
+    let want = vec![
+        format!("read {block}"),
+        format!("read {block}"),
+        "failed".to_owned(),
+        "read 10".to_owned(),
+        "refused: past the region".to_owned(),
+        "read 100".to_owned(),
+    ];
+    assert_eq!(batch_script(&mut Sim::new(9, Faults::default())), want, "simulated");
+    assert_eq!(batch_script(&mut Threads::new(dir("batch-threads").path(), 2)), want, "threads");
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    assert_eq!(batch_script(&mut crate::native(dir("batch-native").path(), 2).unwrap()), want, "native");
+}
+
+/// The simulation's table at its bound closes the least recently read descriptor, never
+/// failing a read; a descriptor kept of a file another process unlinked reads the bytes the
+/// file held, and the driver's own Remove closes it, so a read after fails.
+#[test]
+fn the_simulated_table_closes_past_its_bound_and_never_fails_a_read() {
+    let memory = script_memory();
+    let mut sim = Sim::new(10, Faults::default());
+    sim.bound_descriptors(2);
+    let files: Vec<FileName> = (0..5).map(|n| name(&format!("pool/pack-{n}"))).collect();
+    for file in &files {
+        sim.change(file, &pack_bytes());
+    }
+    for _ in 0..3 {
+        for file in &files {
+            read_often(&mut sim, &memory, file, 1, 16);
+            assert!(sim.descriptors_kept() <= 2, "{} kept past the bound", sim.descriptors_kept());
+        }
+    }
+    // Round-robin over five files with room for two: every read opens, and all but the two
+    // kept closed.
+    assert_eq!(sim.opens(), crate::Opens { opened: 15, closed: 13 });
+
+    // Another process unlinks a file kept open: the descriptor still reads its old bytes.
+    read_often(&mut sim, &memory, &files[4], 1, 16);
+    sim.delete(&files[4]);
+    read_often(&mut sim, &memory, &files[4], 1, 16);
+    let mut held = vec![0; 16];
+    memory.read(0, &mut held);
+    assert_eq!(held, pack_bytes()[..16], "the unlinked file's bytes, through its descriptor");
+
+    // The driver's own Remove closes its descriptor: a read after finds no file.
+    let mut effects = vec![Effect::Remove { file: files[3].clone(), tag: Tag(1) }];
+    run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
+    let mut effects = vec![Effect::ReadInto {
+        file: files[3].clone(),
+        at: 0,
+        into: memory.span(0, 16),
+        cache: crate::Cache::Kept,
+        priority: crate::Priority::Demand,
+        tag: Tag(2),
+    }];
+    let mut ended = None;
+    run_until_idle(&mut sim, &mut effects, |done, _| ended = Some(done.done))
+        .expect("the effects end");
+    assert!(matches!(ended, Some(Done::Failed(_))), "{ended:?}");
 }
 
 /// Rounds that grow a driver's slabs, queues and buffers (and its threads') to a cycle's
@@ -1172,6 +1411,7 @@ fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
         "the simulation: {used} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only"
     );
     let root = dir("budget-files");
+    let root = root.path();
     let mut threads = Threads::new(&root, 1);
     write(&mut threads);
     file_rounds(&mut threads, WARM);
@@ -1215,6 +1455,7 @@ fn a_warm_timer_arm_and_fire_allocates_nothing() {
         "the simulation: warm timers armed and fired"
     );
     let root = dir("budget-timers");
+    let root = root.path();
     let mut threads = Threads::new(&root, 1);
     timer_rounds(&mut threads, WARM);
     threads.off_thread();
@@ -1284,6 +1525,7 @@ fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let root = dir("budget-watch");
+        let root = root.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         let path = root.join("src/edit");
         let edit = |_: &mut Threads| std::fs::write(&path, b"edited").unwrap();
@@ -1451,6 +1693,7 @@ fn a_warm_send_and_receive_allocates_nothing() {
     assert_eq!(used, 0, "the simulation: {ROUNDS} warm sends and receives, their buffers reused");
     hung_up_conns_name_nothing(&mut sim, &at, conns);
     let root = dir("budget-conn");
+    let root = root.path();
     let mut threads = Threads::new(&root, 1);
     let conns = connected(&mut threads, &at, Tag(2), true);
     let mut buffers = Default::default();
@@ -1475,6 +1718,7 @@ fn a_warm_send_and_receive_allocates_nothing() {
 #[test]
 fn a_copied_mapping_reads_as_the_file_mapped() {
     let root = dir("mapping");
+    let root = root.path();
     for len in [0usize, 1, 15, 16, 17, 31, 4097] {
         let bytes: Vec<u8> = (0..len).map(|at| (at * 7 + 3) as u8).collect();
         let path = root.join(len.to_string());
@@ -1641,25 +1885,25 @@ fn host_wanted(sockets_and_streams: bool) -> BTreeMap<u64, String> {
 fn every_driver_runs_the_host_s_effects_or_refuses_them_naming_why() {
     assert_eq!(host(&mut Sim::new(5, Faults::default()), false), host_wanted(true), "sim");
     assert_eq!(
-        host(&mut Threads::new(&dir("host-threads"), 2), true),
+        host(&mut Threads::new(dir("host-threads").path(), 2), true),
         host_wanted(cfg!(unix)),
         "threads"
     );
     #[cfg(target_os = "macos")]
     assert_eq!(
-        host(&mut crate::kqueue::Kqueue::new(dir("host-kqueue"), 2).unwrap(), true),
+        host(&mut crate::kqueue::Kqueue::new(dir("host-kqueue").path(), 2).unwrap(), true),
         host_wanted(true),
         "kqueue"
     );
     #[cfg(target_os = "linux")]
     assert_eq!(
-        host(&mut crate::uring::Uring::new(dir("host-uring")).unwrap(), true),
+        host(&mut crate::uring::Uring::new(dir("host-uring").path()).unwrap(), true),
         host_wanted(true),
         "io_uring"
     );
     #[cfg(windows)]
     assert_eq!(
-        host(&mut crate::iocp::Iocp::new(&dir("host-iocp"), 2).unwrap(), true),
+        host(&mut crate::iocp::Iocp::new(dir("host-iocp").path(), 2).unwrap(), true),
         host_wanted(false),
         "iocp"
     );
@@ -1670,7 +1914,8 @@ fn every_driver_runs_the_host_s_effects_or_refuses_them_naming_why() {
 #[cfg(any(unix, windows))]
 #[test]
 fn a_host_effect_that_fails_names_what_it_is_about() {
-    let mut driver = crate::native(&dir("host-errors"), 1).unwrap();
+    let root = dir("host-errors");
+    let mut driver = crate::native(root.path(), 1).unwrap();
     let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut answers = Vec::new();
     let mut effects = vec![Effect::Bind { at: loopback, tag: Tag(1) }];

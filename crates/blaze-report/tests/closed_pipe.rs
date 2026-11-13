@@ -34,6 +34,7 @@ fn ended(role: &str) -> (Option<i32>, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(stdx::JodChild)
         .unwrap();
     let mut out = BufReader::new(child.stdout.take().unwrap());
     // Lines until the child's own: libtest writes `running 1 test` first.
@@ -43,7 +44,11 @@ fn ended(role: &str) -> (Option<i32>, String) {
         assert!(out.read_line(&mut line).unwrap() > 0, "the child said nothing");
     }
     drop(out);
-    let done = child.wait_with_output().unwrap();
+    let done = stdx::child::output_within(
+        child.into_inner(),
+        "the child whose stdout reader closed",
+        std::time::Duration::from_secs(60),
+    );
     (done.status.code(), String::from_utf8_lossy(&done.stderr).into_owned())
 }
 

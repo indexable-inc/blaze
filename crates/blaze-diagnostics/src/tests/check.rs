@@ -80,15 +80,14 @@ fn main() {}
 /// by its path there, never `<file N>`, so its text can be found to write it from.
 #[test]
 fn a_diagnostic_in_a_file_included_from_outside_every_root_names_its_path() {
-    let dir = std::env::temp_dir().join(format!("blaze-diagnostic-outside-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let dir = blaze_core::temp::TempDir::for_test("blaze-diagnostic-outside-");
     let code = dir.join("code.rs");
     std::fs::write(&code, "fn more() {}\n").expect("code.rs");
     let path = code.to_str().expect("a UTF-8 temporary path").to_owned();
     let checked = checked(&format!(
         "\n//- minicore: include\n//- /main.rs crate:other:main\ninclude!({path:?});\nfn main() {{}}\n"
     ));
-    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    drop(dir);
     assert_eq!(checked.messages(), ["dead_code: function `more` is never used"]);
     let span = checked.diags[0].span.primary_span().expect("the lint's span");
     assert_eq!(span.file, path);

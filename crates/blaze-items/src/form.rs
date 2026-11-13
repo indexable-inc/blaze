@@ -823,6 +823,7 @@ impl<'db> Cx<'db> {
     /// a closure or coroutine written in it, in the order `body` meets them. For the error a
     /// build stops with at [`Missed::NoMir`]; `None` when each lowers (the MIR that failed is
     /// elsewhere in the item, an anonymous constant of a type).
+    #[blaze::renders_positions]
     pub(crate) fn mir_error(&self, id: ItemId) -> Option<String> {
         let (within, error) = self.mir_lowering_error(id)?;
         // alloc: the error a build stops with, once
@@ -1634,6 +1635,11 @@ impl<'db> Cx<'db> {
 
     /// A macro by its rules: tokens with their text and whether each is joint with the next,
     /// without trivia and without its name.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the rules' token trees are read off the live tree (`AstId::to_view`), so the form reruns on \
+                  any edit of the file: read them off the outline (`signatures::outline_item`)"
+    )]
     fn macro_(&self, f: &mut Form, id: MacroId) {
         let db = self.db;
         self.visibility(f, id.module(db), item_visibility(db, ItemId::Macro(id)));

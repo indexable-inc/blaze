@@ -33,6 +33,7 @@ span.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 blaze-items.workspace = true
 hegeltest.workspace = true
 

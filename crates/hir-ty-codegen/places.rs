@@ -37,6 +37,7 @@ pub(crate) enum Place {
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
+#[blaze::renders_positions]
 pub(crate) fn source_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -50,6 +51,7 @@ pub(crate) fn source_location(
 }
 
 /// File, line and column of a place in a body for a debugger: [`row_location_in_file`].
+#[blaze::renders_positions]
 pub(crate) fn row_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -146,6 +148,7 @@ fn call_node<'db>(db: &'db Db, syntax: &BodySyntax, call: MacroCallId) -> CallNo
 
 /// The file a place in a body is written in, and where in it rustc has the place begin: in
 /// the tree of [`BodySyntax::tree`] when that file is the body's own.
+#[blaze::renders_positions]
 fn source_range(
     db: &Db,
     owner: DefWithBodyId,
@@ -200,6 +203,7 @@ fn source_range(
 }
 
 /// The [`Place`] of [`source_location_in_file`].
+#[blaze::renders_positions]
 fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
         let (file, line, column) = source_location_in_file(db, owner, span)?;
@@ -210,6 +214,7 @@ fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
 }
 
 /// The [`Place`] of [`row_location_in_file`].
+#[blaze::renders_positions]
 fn row_place(
     db: &Db,
     owner: DefWithBodyId,

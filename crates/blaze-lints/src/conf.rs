@@ -150,6 +150,18 @@ fn checked(table: &toml::Table) -> Result<(), String> {
             }
         }
     }
+    // A list of module paths (`blaze::env_read`): anything else is refused, never read as none.
+    match table.get(crate::blaze::ENV_READ_ALLOWED_KEY) {
+        None => {}
+        Some(toml::Value::Array(items)) if items.iter().all(toml::Value::is_str) => {}
+        Some(other) => {
+            return Err(format!(
+                "error reading Clippy's configuration file: invalid type: {}, expected a list of module paths for `{}`",
+                other.type_str(),
+                crate::blaze::ENV_READ_ALLOWED_KEY
+            ));
+        }
+    }
     for kind in Kind::ALL {
         disallowed(table, kind)?;
     }
@@ -486,7 +498,7 @@ mod tests {
 
     #[test]
     fn msrv_from_the_file_before_the_manifest() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-conf-{}", std::process::id()));
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-conf-");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("clippy.toml"), "msrv = \"1.60\"\nallow-dbg-in-tests = true\n")
             .unwrap();
@@ -497,16 +509,13 @@ mod tests {
         assert!(!conf.meets(Version(1, 70, 0)));
         let conf = Conf::load(None, Some("1.80")).unwrap();
         assert!(conf.meets(Version(1, 70, 0)));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A value of the wrong type, a negative count or a version that does not read is the
     /// load's error, never the default.
     #[test]
     fn a_value_of_the_wrong_type_is_an_error() {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-lints-conf-types-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-conf-types-");
         let path = dir.join("clippy.toml");
         for (text, says) in [
             ("too-large-for-stack = -1\n", "integer `-1`"),
@@ -520,7 +529,6 @@ mod tests {
         }
         std::fs::write(&path, "too-large-for-stack = 10\nallow-dbg-in-tests = true\n").unwrap();
         assert_eq!(Conf::load(Some(path), None).unwrap().int("too-large-for-stack", 200), 10);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

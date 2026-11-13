@@ -201,6 +201,11 @@ impl DefMap {
                         // docs/v2/plan/design/facts.md). `Acyclic` has no attribute: it is
                         // derived by reflection (docs/v2/plan/design/ownership.md).
                         | "program_lifetime"
+                        // `#![blaze::canonical_cbor]` and `#[blaze::renders_positions]`, from
+                        // `AttrFlags::CANONICAL_CBOR` and `AttrFlags::RENDERS_POSITIONS`
+                        // (blaze-lints' `blaze::cbor_field_order` and `blaze::reads_positions`).
+                        | "canonical_cbor"
+                        | "renders_positions"
                 )
             {
                 return true;

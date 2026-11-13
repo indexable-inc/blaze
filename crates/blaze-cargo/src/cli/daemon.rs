@@ -13,6 +13,10 @@
         reason = "the daemon's start and its helpers are not in the seed"
     )
 )]
+#![cfg_attr(
+    not(feature = "native"),
+    expect(blaze::unwired, reason = "wired under `native`; the wasm seed has no daemon to start")
+)]
 
 use std::{
     io,

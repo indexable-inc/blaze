@@ -1,7 +1,7 @@
 //! The driver on real directories, each test in a fresh one under the system's temporary
 //! directory: what it refuses to touch, and the lease races it must lose.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{
     fs::{self, TRASH_MARK},
@@ -9,15 +9,9 @@ use crate::{
     plan::{Class, Swept, TRASH},
 };
 
-/// A fresh directory of this test's own.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "blaze-gc-{name}-{}-{}",
-        std::process::id(),
-        crate::record::now_ns()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory of this test's own, removed when it drops.
+fn scratch(name: &str) -> blaze_core::temp::TempDir {
+    blaze_core::temp::TempDir::for_test(&format!("blaze-gc-{name}-"))
 }
 
 fn names(area: &Path) -> Vec<String> {
@@ -35,7 +29,8 @@ fn names(area: &Path) -> Vec<String> {
 
 #[test]
 fn trash_ignores_foreign_entries_and_an_unmarked_trash() {
-    let area = scratch("foreign");
+    let held = scratch("foreign");
+    let area = held.path();
     let trash = area.join(TRASH);
     // Without blaze's marker nothing in it is listed.
     std::fs::create_dir_all(trash.join("00000000000000000001-abcdef-x")).unwrap();
@@ -52,14 +47,14 @@ fn trash_ignores_foreign_entries_and_an_unmarked_trash() {
     assert!(fs::unlink(&area.join("00000000000000000001-abcdef-x"), Vec::new()).is_err());
     assert!(trash.join("notes.txt").is_file() && trash.join("photos").is_dir());
     assert!(fs::unlink(&trash.join("00000000000000000001-abcdef-x"), Vec::new()).is_ok());
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 /// A collector that opened a directory's lease, then lost the race to someone who renamed the
 /// directory and made it again, does not rename the new one (review C4).
 #[test]
 fn a_recreated_lease_is_not_renamed() {
-    let area = scratch("recreated");
+    let scratched = scratch("recreated");
+    let area = scratched.path();
     let dir = area.join("build").join("w-1");
     drop(Lease::hold(&dir).unwrap_or_else(|why| panic!("{why}")));
     let mut old = std::fs::File::open(lease::lease_of(&dir)).unwrap();
@@ -72,12 +67,12 @@ fn a_recreated_lease_is_not_renamed() {
     );
     // The new directory's own lease is taken as its own.
     assert!(matches!(lease::take_exclusive(&dir).unwrap(), Taken::Exclusive(_)));
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 #[test]
 fn a_held_lease_is_not_trashed() {
-    let area = scratch("held");
+    let scratched = scratch("held");
+    let area = scratched.path();
     let dir = area.join("build").join("w-1");
     let held = Lease::hold(&dir).unwrap_or_else(|why| panic!("{why}"));
     let to = fs::trash_dir(&area).unwrap().join("00000000000000000001-000001-w-1");
@@ -86,7 +81,6 @@ fn a_held_lease_is_not_trashed() {
     drop(held);
     assert_eq!(fs::trash(&dir, &to, Class::Workspace, None), Swept::Moved);
     assert!(!dir.exists() && to.is_dir());
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 /// A build dir with another build's leased dir inside it (a `--target-dir` named there) is not
@@ -94,7 +88,8 @@ fn a_held_lease_is_not_trashed() {
 /// round 5, B1).
 #[test]
 fn a_build_dir_holding_another_builds_leased_dir_is_not_trashed() {
-    let area = scratch("nested");
+    let scratched = scratch("nested");
+    let area = scratched.path();
     let dir = area.join("build").join("w-1");
     let inner = dir.join("debug").join("other-target");
     std::fs::create_dir_all(&inner).unwrap();
@@ -106,7 +101,6 @@ fn a_build_dir_holding_another_builds_leased_dir_is_not_trashed() {
     assert!(inner.is_dir() && !to.exists());
     drop(held);
     assert_eq!(fs::trash(&dir, &to, Class::Workspace, None), Swept::Moved);
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 /// The child's side of the tests below: set, it names the dir whose lease this process takes and
@@ -137,7 +131,8 @@ fn child_side() -> bool {
 
 /// A child process (this test binary, running `test` alone) that holds `dir`'s lease.
 struct Holder {
-    child: std::process::Child,
+    /// Killed and reaped on drop, so a test that fails between its steps leaves no holder.
+    child: stdx::JodChild,
     /// The child's stdout, a line at a time, from a reader thread: waited on with a timeout.
     lines: crossbeam_channel::Receiver<String>,
 }
@@ -153,6 +148,7 @@ impl Holder {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let out = std::io::BufReader::new(child.stdout.take().unwrap());
         let (send, lines) = crossbeam_channel::unbounded();
@@ -191,7 +187,8 @@ impl Holder {
                     );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    let status = self.child.wait();
+                    let status =
+                        stdx::child::exit_within(&mut self.child, "the lease holder whose output ended", CHILD_WAIT);
                     panic!(
                         "waiting for {step}: the child's output ended ({status:?}); it printed {seen:?}"
                     );
@@ -219,7 +216,11 @@ impl Holder {
                 }
             }
         }
-        let status = self.child.wait().unwrap();
+        let status = stdx::child::exit_within(
+            &mut self.child,
+            "the lease holder whose output ended after its stdin closed",
+            CHILD_WAIT,
+        );
         assert!(status.success(), "the lease holder ended {status:?}");
     }
 }
@@ -235,7 +236,8 @@ fn a_lease_taken_between_the_walk_and_the_lock_moves_the_tree_back() {
     if child_side() {
         return;
     }
-    let area = scratch("window");
+    let scratched = scratch("window");
+    let area = scratched.path();
     let dir = area.join("build").join("w-1");
     let inner = dir.join("debug").join("other-target");
     std::fs::create_dir_all(&dir).unwrap();
@@ -255,7 +257,6 @@ fn a_lease_taken_between_the_walk_and_the_lock_moves_the_tree_back() {
     );
     holder.expect("the child ran").release();
     assert_eq!(fs::trash(&dir, &to, Class::Workspace, None), Swept::Moved);
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 /// When the tree cannot be renamed back (its path made again meanwhile), it is said as left in
@@ -267,7 +268,8 @@ fn a_tree_that_cannot_go_back_stays_in_trash_and_is_not_unlinked_while_leased() 
     if child_side() {
         return;
     }
-    let area = scratch("not-back");
+    let scratched = scratch("not-back");
+    let area = scratched.path();
     let dir = area.join("build").join("w-1");
     let inner = dir.join("debug").join("other-target");
     std::fs::create_dir_all(&dir).unwrap();
@@ -295,7 +297,6 @@ fn a_tree_that_cannot_go_back_stays_in_trash_and_is_not_unlinked_while_leased() 
     holder.expect("the child ran").release();
     fs::unlink(&to, Vec::new()).unwrap_or_else(|why| panic!("{why}"));
     assert!(!to.exists());
-    std::fs::remove_dir_all(&area).unwrap();
 }
 
 /// One list refuses what neither `blaze clean` nor a build's mark may touch (review N13): a
@@ -305,7 +306,8 @@ fn a_tree_that_cannot_go_back_stays_in_trash_and_is_not_unlinked_while_leased() 
 /// and a project's own target are not.
 #[test]
 fn a_target_dir_inside_cargo_home_or_the_daemons_state_is_never_removed_or_marked() {
-    let top = std::fs::canonicalize(scratch("protected")).unwrap();
+    let scratched = scratch("protected");
+    let top = std::fs::canonicalize(scratched.path()).unwrap();
     let (home, root, machine) = (top.join("home"), top.join("root"), top.join("machine"));
     let cargo = home.join(".cargo");
     for dir in [cargo.join("git"), root.join("v2"), machine.join("std"), root.join("build")] {
@@ -333,5 +335,4 @@ fn a_target_dir_inside_cargo_home_or_the_daemons_state_is_never_removed_or_marke
     }
     assert_eq!(refused(&root.join("build/ws-1")), None);
     assert_eq!(refused(&home.join("src/project/target")), None);
-    std::fs::remove_dir_all(&top).unwrap();
 }

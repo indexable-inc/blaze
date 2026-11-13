@@ -2,6 +2,12 @@
 # blaze-hashcons, blaze-history, blaze-mem) have a `clippy.toml` of their own, which clippy reads
 # instead of this one: these rules and a ban on locks (docs/v2/plan/design/concurrency.md). A
 # change here is made in theirs too.
+
+# The modules that read the process's environment (`blaze::env_read`, docs/lints.md#env_read):
+# each a module path from its crate's name, allowed itself and not the modules below it. The
+# hot crates' own clippy.toml has none, so they read none.
+env-read-allowed = ["base_db::settings", "blaze_core::home", "blaze_std::rt"]
+
 disallowed-types = [
     # docs/v2/plan/design/profile-names.md: the flight recorder names per thread, sharing nothing.
     { path = "blaze_profile::flight::Names", replacement = "blaze_profile::flight::names::Local", reason = "one process-wide name table shared cache lines across every recording thread: a thread names into its own table, defined in its own ring (docs/v2/plan/design/profile-names.md)", allow-invalid = true },
@@ -125,6 +131,8 @@ disallowed-methods = [
     { path = "windows_sys::Win32::System::Threading::Sleep", reason = "a wait on a Windows handle has no deadline wait of its own yet: the IO driver's completions go through `blaze_core::wait`, a child's exit moves to the driver (step 5), and a call that remains says why with #[expect(clippy::disallowed_methods, reason = ..)] (rule deadline-waits, docs/v2/plan/design/deadline-waits.md)", allow-invalid = true },
     { path = "std::env::var", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
     { path = "std::env::var_os", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
+    { path = "std::env::vars", reason = "the whole environment is a hidden input to whatever reads it (AGENTS.md rule keys-cover-every-input): configuration is typed and read once at the entry point; a process that hands its environment on (a client to its daemon, a runner to a child) says so with #[expect(clippy::disallowed_methods, reason = ..)]" },
+    { path = "std::env::vars_os", reason = "the whole environment is a hidden input to whatever reads it (AGENTS.md rule keys-cover-every-input): configuration is typed and read once at the entry point; a process that hands its environment on (a client to its daemon, a runner to a child) says so with #[expect(clippy::disallowed_methods, reason = ..)]" },
     { path = "std::env::home_dir", reason = "one answer to where the user's home is (AGENTS.md rule 30, one-concept-one-home): call `blaze_core::home::user()`, which is `HOME` when set and not empty, else the system's record of the user (`getpwuid_r`, the Windows profile), else a typed `NoHome` saying what was tried; a core takes the path, or `blaze_core::home::decide`'s two inputs, from its driver. Reading `HOME` or `USERPROFILE` by `std::env::var_os` is the same copy, banned above. No machine fix: `user()` returns a `Result`, not an `Option`" },
     { path = "blaze_manifest::user_config::user_home", reason = "one answer to where the user's home is (AGENTS.md rule 30): it read `HOME` alone and gave nothing in a unit, a CI runner or cron; call `blaze_core::home::user()`. No machine fix: that returns a `Result`, not an `Option`", allow-invalid = true },
     { path = "std::process::exit", reason = "return a typed error from `main`, so destructors and the profile's flush run" },

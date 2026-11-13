@@ -419,6 +419,11 @@ struct Keywords {
 static KEYWORDS: LazyLock<Keywords> = LazyLock::new(Keywords::new);
 
 impl Keywords {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the keyword places are u8 and the keywords are SyntaxKind's fixed list, well \
+                  under 256: a grammar with more keywords fails here on the first parse"
+    )]
     fn new() -> Keywords {
         // alloc: built once, for the process.
         let mut texts: Vec<&'static str> = SyntaxKind::keyword_texts().collect();

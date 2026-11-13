@@ -601,6 +601,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
-// The whole file mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix. Windows
-// refuses to replace or cut a file a view of which is open.
-pub(crate) use crate::fs::map;
+// The file, or a range of it, mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix,
+// a range from its offset rounded down to the 64 KiB allocation granularity. Windows refuses
+// to replace or cut a file a view of which is open.
+pub(crate) use crate::fs::map_extent;

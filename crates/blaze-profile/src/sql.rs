@@ -157,6 +157,10 @@ struct Scratch {
 }
 
 impl Scratch {
+    #[expect(
+        blaze::tmp_path,
+        reason = "a failed query's directory is kept so its script can be read, and TempDir always removes its directory when it drops"
+    )]
     fn new() -> Result<Scratch, SqlError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -526,16 +530,16 @@ mod tests {
             Path::new("/h"),
             &listed,
             Scope::All,
-            Path::new("/tmp/it's"),
+            Path::new("/w/it's"),
         )
         .unwrap();
         assert!(script.starts_with("SET autoinstall_known_extensions = false;"));
-        assert!(script.contains("SET threads = 8;\nSET memory_limit = '4GB';\nSET temp_directory = '/tmp/it''s/spill';\n"), "{script}");
+        assert!(script.contains("SET threads = 8;\nSET memory_limit = '4GB';\nSET temp_directory = '/w/it''s/spill';\n"), "{script}");
         assert!(script.contains("read_parquet(['/h/schema.spans.parquet', '/h/1-00000001.spans.parquet'], union_by_name = true)"));
         assert!(
             script.ends_with(
-                "COPY (\nSELECT 1\n) TO '/tmp/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n\
-                 \nCOPY (\nSELECT 2\n) TO '/tmp/it''s/answer-1.parquet' (FORMAT parquet, COMPRESSION zstd);\n"
+                "COPY (\nSELECT 1\n) TO '/w/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n\
+                 \nCOPY (\nSELECT 2\n) TO '/w/it''s/answer-1.parquet' (FORMAT parquet, COMPRESSION zstd);\n"
             ),
             "{script}"
         );
@@ -544,8 +548,8 @@ mod tests {
     #[test]
     fn a_stopped_query_kills_duckdb_and_says_so() {
         // A stand-in for DuckDB that never answers; the query must end anyway.
-        let dir = std::env::temp_dir().join(format!("blaze-sql-stop-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-sql-stop-");
+        let dir = tmp.path().to_path_buf();
         let fake = dir.join("duckdb");
         fs::write(&fake, "#!/bin/sh\nexec sleep 600\n").unwrap();
         #[cfg(unix)]
@@ -566,18 +570,17 @@ mod tests {
         assert!(matches!(error, SqlError::Stopped), "{error}");
         assert_eq!(error.kind(), "cancelled");
         assert!(started.elapsed() < Duration::from_secs(5), "stopped at its stop, not a limit");
-        _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_query_that_ends_is_heard_at_its_exit_and_a_dropped_stop_stops() {
         let started = std::time::Instant::now();
-        let mut child = Command::new("/bin/sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let mut child = Command::new("/bin/sh").args(["-c", "exit 3"]).spawn().map(stdx::JodChild).unwrap();
         let status = ended_or_stopped(&mut child, &crossbeam_channel::never()).unwrap().unwrap();
         assert_eq!(status.code(), Some(3));
         assert!(started.elapsed() < Duration::from_secs(5), "heard after {:?}", started.elapsed());
-        let mut child = Command::new("/bin/sh").args(["-c", "exec sleep 600"]).spawn().unwrap();
+        let mut child = Command::new("/bin/sh").args(["-c", "exec sleep 600"]).spawn().map(stdx::JodChild).unwrap();
         let (stopper, stop) = crossbeam_channel::bounded::<()>(1);
         drop(stopper);
         assert!(ended_or_stopped(&mut child, &stop).unwrap().is_none());
@@ -589,15 +592,15 @@ mod tests {
     }
 
     /// A history as a blaze from before `events` and `query_counts` left it: every schema file
-    /// but theirs.
-    fn old_history(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-sql-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+    /// but theirs. The guard returned beside the path removes it when it drops.
+    fn old_history(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-sql-{name}-"));
+        let dir = tmp.path().to_path_buf();
         drop(History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap());
         for table in ["events", "query_counts"] {
             fs::remove_file(dir.join(format!("schema.{table}.parquet"))).unwrap();
         }
-        dir
+        (tmp, dir)
     }
 
     /// A stand-in for DuckDB that runs nothing and answers nothing: a query that reaches it got
@@ -617,7 +620,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_query_over_a_history_older_than_a_table_writes_its_schema_file_first() {
-        let dir = old_history("old");
+        let (_tmp, dir) = old_history("old");
         let fake = silent_duckdb(&dir);
         let error = run(&Query {
             duckdb: &fake,
@@ -629,9 +632,7 @@ mod tests {
         assert!(matches!(error, SqlError::Duckdb { .. }), "the query reached DuckDB: {error}");
         for table in schema::TABLES {
             assert!(dir.join(format!("schema.{}.parquet", table.name)).exists(), "{}", table.name);
-        }
-        _ = fs::remove_dir_all(&dir);
-    }
+        }    }
 
     /// Where the missing schema files can't be written, the query is refused naming them and
     /// the directory. A directory where the file's hidden name goes blocks the write as any
@@ -639,7 +640,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_history_whose_missing_schema_files_cant_be_written_is_refused_naming_them() {
-        let dir = old_history("blocked");
+        let (_tmp, dir) = old_history("blocked");
         fs::create_dir(dir.join(format!(".schema.events.parquet.{}.tmp", std::process::id())))
             .unwrap();
         let fake = silent_duckdb(&dir);
@@ -657,9 +658,7 @@ mod tests {
         assert!(
             said.contains("events, query_counts") && said.contains(&dir.display().to_string()),
             "{said}"
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// Over a history older than `events` and `query_counts`, both views read as empty.
     #[test]
@@ -668,7 +667,7 @@ mod tests {
         let duckdb = PathBuf::from(
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
-        let dir = old_history("newer");
+        let (_tmp, dir) = old_history("newer");
         for table in ["events", "query_counts"] {
             let sql = format!("SELECT count(*) AS n FROM {table}");
             let batches =
@@ -679,9 +678,7 @@ mod tests {
                 0,
                 "{table}"
             );
-        }
-        _ = fs::remove_dir_all(&dir);
-    }
+        }    }
 
     #[test]
     fn a_duckdb_not_named_by_an_absolute_path_is_an_error() {
@@ -724,8 +721,8 @@ mod tests {
         })
         .join()
         .unwrap();
-        let dir = std::env::temp_dir().join(format!("blaze-sql-test-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-sql-test-");
+        let dir = tmp.path().to_path_buf();
         let mut history = History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap();
         history.build_ended(BuildRow {
             build_id: 77,
@@ -849,8 +846,8 @@ mod tests {
         let duckdb = PathBuf::from(
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
-        let dir = std::env::temp_dir().join(format!("blaze-sql-critical-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-sql-critical-");
+        let dir = tmp.path().to_path_buf();
         History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap();
         let fixture = format!(
             "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
@@ -908,9 +905,7 @@ mod tests {
                 (1, "job 1".to_owned(), "compile a".to_owned(), 0, 60),
                 (0, "job 2".to_owned(), "unit b".to_owned(), 60, 100),
             ]
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// Two workers of a build from 0 to 100 ns. Worker 10 begins job 1 at 0, which joins the
     /// graph as it parks at 40; it searches under a `worker` span and resumes the job at 60 to
@@ -924,8 +919,8 @@ mod tests {
         let duckdb = PathBuf::from(
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
-        let dir = std::env::temp_dir().join(format!("blaze-sql-uncovered-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-sql-uncovered-");
+        let dir = tmp.path().to_path_buf();
         History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap();
         let fixture = format!(
             "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
@@ -963,9 +958,7 @@ mod tests {
             let pct = batch.column(1).as_primitive::<arrow_array::types::Float64Type>().clone();
             workers.extend((0..batch.num_rows()).map(|i| (thread.value(i), pct.value(i))));
         }
-        assert_eq!(workers, [(10, 0.0), (11, 50.0)]);
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(workers, [(10, 0.0), (11, 50.0)]);    }
 
     #[test]
     fn the_critical_path_fixture_names_only_columns_of_the_schema() {

@@ -167,6 +167,11 @@ impl<'db> SourceToDefCache<'db> {
         None
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "expansions are numbered u32 within one `Semantics`, and nothing bounds the \
+                  expansions it caches below 2^32: a larger cache needs a typed refusal"
+    )]
     pub(super) fn get_or_insert_expansion(
         &mut self,
         db: &'db Db,

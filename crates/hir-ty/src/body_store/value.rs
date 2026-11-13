@@ -19,6 +19,10 @@ const MIR_DOMAIN: &str = "blaze v2 item store step value 1 MIR";
 /// items through the store's [`BodyFacts`]) and for [`Step::Borrowck`], whose verdict no later
 /// step reads.
 ///
+/// [`Step::Lower`]'s value is [`super::Lowered::value`], the digest of what the lowering read
+/// (its base key, then each fact's value its shape lists), `None` when the lowering's run was
+/// refused: a step that read it is then refused too, as a fact with no value.
+///
 /// [`Step::Mir`] covers, in this order, the body's built MIR and that of every closure and
 /// coroutine written in it, reached or not, in the order of their expressions; each by its kind
 /// and expression. A `const { .. }` block's MIR is not in it.
@@ -26,6 +30,8 @@ pub fn step_value(db: &Db, def: DefWithBodyId, step: Step) -> Option<ContentId> 
     match step {
         Step::Infer => inference_value(db, def),
         Step::Mir => mir_value(db, def),
+        // Not the hash of the answer: the digest of what the lowering read (`super::lower`).
+        Step::Lower => super::lowering(db, def).value,
         // A reader of a constant reads its `ConstValue` fact, not its step.
         Step::Borrowck | Step::Const => None,
     }

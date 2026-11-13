@@ -423,7 +423,8 @@ impl Inspector {
             Err(why) => (Vec::new(), Some(why)),
         };
         let footprint = crate::raw::memory::own_footprint_now();
-        let limit = blaze_graph::admission::limit();
+        // The memory gate's ceiling: what the daemon may commit in all (`blaze_mem::gate`).
+        let limit = blaze_mem::gate::process().ceiling();
         // alloc: an answer, on demand
         let snapshot = blaze_mem::tag::snapshot();
         let mut tags: Vec<(String, u64)> = blaze_mem::Tag::ALL

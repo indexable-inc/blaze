@@ -13,6 +13,9 @@
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 // Unsafe code is in `memo` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 

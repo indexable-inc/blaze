@@ -86,8 +86,11 @@ pub use crate::spine::{
 pub struct SectionId(pub u32);
 
 impl SectionId {
-    /// The plane's history: what tasks of each kind held (`blaze-graph`).
+    /// The plane's history: what tasks of each kind and key took (`blaze-history`).
     pub const PLANE_HISTORY: SectionId = SectionId(0x0400);
+    /// Admission's peaks: each task kind and size class's peak, its memory forecast
+    /// (`blaze_graph::admission::Peaks`).
+    pub const ADMISSION_PEAKS: SectionId = SectionId(0x0401);
     /// Ids no blaze writes any more and none may take again: an image of the layout before still
     /// holds them, and its owner's start reads around them (a restart restores no engine state,
     /// docs/v2/plan/design/end-state.md). `0x0100..=0x0104` held the old database's memos,
@@ -128,6 +131,7 @@ impl SectionId {
     pub fn name(self) -> &'static str {
         match self {
             SectionId::PLANE_HISTORY => "the plane's history",
+            SectionId::ADMISSION_PEAKS => "admission's peaks",
             SectionId(0x0100) => "the database's memos, a section no blaze writes now",
             SectionId(0x0101) => "the database's edges, a section no blaze writes now",
             SectionId(0x0102) => "the database's key table, a section no blaze writes now",

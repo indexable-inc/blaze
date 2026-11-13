@@ -763,6 +763,10 @@ fn keyer<S: Ask>() -> Box<dyn Any + Send + Sync> {
 /// The digest of a registry: every step's number, name and code, whether it may be asked
 /// for, whether its value is a table and whether it is maintained, in the order of the
 /// numbers.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a step's name is a short identifier written in the source of a registration, never near 4 GiB, so its length fits the digest's u32"
+)]
 fn registry_of<W: ?Sized>(steps: &blaze_hash::HashMap<StepId, Registered<W>, Global>) -> ContentId {
     // alloc: once a registration, the steps in the order of their numbers
     let mut sorted: Vec<(StepId, &Registered<W>)> = steps.iter().map(|(step, it)| (*step, it)).collect();

@@ -827,7 +827,7 @@ impl Own {
         // left room for `span` bytes.
         unsafe { tail.write(at, &frame) };
         // SAFETY: as above, for the header after the frame.
-        unsafe { tail.write(body, &header.encode()) };
+        unsafe { tail.write(body, &header.encode(payload)) };
         // SAFETY: as above, for the payload after the header.
         unsafe { tail.write(body + RECORD_HEADER as usize, payload) };
         // SAFETY: as above, for the zeros up to `at + span`.

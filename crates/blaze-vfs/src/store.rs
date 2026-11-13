@@ -407,6 +407,10 @@ impl Names {
     /// # Safety
     ///
     /// As [`Column::push`]: the caller is the one writer.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a name's span length is a u32 in the store's columns; a single path name of 4 GiB needs a typed refusal before it reaches the store"
+    )]
     unsafe fn intern(&self, name: &str) -> u32 {
         let len = u32::try_from(name.len()).expect("a name under 4 GiB");
         // SAFETY: the caller is the one writer.

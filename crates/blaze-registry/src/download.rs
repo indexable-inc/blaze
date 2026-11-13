@@ -212,6 +212,10 @@ impl Registry {
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
+    #[expect(
+        blaze::tmp_path,
+        reason = "a download's scratch must be made new at mode 0700 and never be a name another user took; `blaze_core::temp::TempDir` clears a taken name and makes it at the default mode, so it needs a private, create-new constructor before this moves onto it"
+    )]
     fn new() -> anyhow::Result<PrivateDir> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         // The name only has to be new: a name already taken is refused, not shared, and the

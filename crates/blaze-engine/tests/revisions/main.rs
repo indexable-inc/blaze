@@ -13,6 +13,9 @@
 //! Every case builds std, which only a blaze with LLVM can: in the seed profile (no
 //! `native`) this target is empty.
 #![cfg(all(unix, feature = "native"))]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,

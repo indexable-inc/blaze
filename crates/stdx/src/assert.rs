@@ -144,6 +144,10 @@ pub mod reported {
 
     /// Each site that reported, in the order each first did: a few at most in a healthy
     /// process, so a list.
+    #[expect(
+        blaze::process_static,
+        reason = "one row per assertion site that reported, bounded by the sites compiled into the program"
+    )]
     static SITES: Lock<Vec<Site>> = Lock::new("stdx.assert.sites", Vec::new());
 
     /// Whether this process's exit is left as it is when it reported bugs ([`keep_exit_status`]).

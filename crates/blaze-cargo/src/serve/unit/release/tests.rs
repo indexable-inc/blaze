@@ -1,8 +1,8 @@
-use blaze_graph::admission::Pressure;
-use blaze_mem::Tag;
 use blaze_query::db::MemoryUsage;
 
-use super::{EDIT_CRATES, Finished, Holders, Plan, Release, Rows, Said};
+use super::{Core, EDIT_CRATES, Finished, Holders, Plan, Release, Rows, Said};
+
+const GIB: u64 = 1 << 30;
 
 /// A crate is finished once every unit of it compiled, never before, and once; a unit is open
 /// from its first task to its compile's end, and a build script's run (no crate) or a unit
@@ -40,24 +40,22 @@ fn a_crate_is_finished_once_its_last_unit_compiled_and_open_units_are_counted() 
 /// release taken is not due again.
 #[test]
 fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_only_then() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
-    let short = || Pressure { held: 47 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
     // Units 0 and 1 of crate 7, 2 of crate 9.
     let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
     release.began(0);
     release.began(2);
-    release.compiled_under(2, fine);
+    release.compiled(2);
     assert!(!release.due(), "crate 9 is finished but unit 0 is open and memory is fine");
     release.began(1);
-    release.compiled_under(0, short);
+    release.compiled(0);
+    release.pressed();
     assert!(release.due(), "memory is short");
     assert_eq!(
         release.plan(),
         Some(Plan { crates: vec![9], mir: true, pressed: true, ended: false })
     );
     assert!(!release.due() && release.plan().is_none(), "taken");
-    release.compiled_under(1, fine);
+    release.compiled(1);
     assert!(release.due(), "no unit is open and crate 7 is finished");
     assert_eq!(
         release.plan(),
@@ -67,7 +65,7 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     let mut open = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
     open.began(0);
     open.began(1);
-    open.compiled_under(1, fine);
+    open.compiled(1);
     assert_eq!(
         open.plan(),
         Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }),
@@ -77,12 +75,12 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     let mut check = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     check.began(0);
     check.began(1);
-    check.compiled_under(0, fine);
+    check.compiled(0);
     assert!(
         !check.due() && check.plan().is_none(),
         "a check lets go of nothing while memory is fine"
     );
-    check.compiled_under(1, fine);
+    check.compiled(1);
     assert!(
         !check.due() && check.plan().is_none(),
         "nor once no unit is open: the next check reads its inference"
@@ -90,7 +88,8 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     let mut pressed = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     pressed.began(0);
     pressed.began(1);
-    pressed.compiled_under(0, short);
+    pressed.compiled(0);
+    pressed.pressed();
     assert!(pressed.due(), "memory is short in a check too");
     assert_eq!(
         pressed.plan(),
@@ -100,7 +99,7 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     assert!(!pressed.due() && pressed.plan().is_none(), "taken");
     let mut ended = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     ended.began(0);
-    ended.compiled_under(0, fine);
+    ended.compiled(0);
     assert!(!ended.due(), "a check under way lets go of nothing while memory is fine");
     ended.end();
     assert!(ended.due(), "a check's end lets go of its MIR, under no pressure");
@@ -113,7 +112,7 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     let mut built = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
     built.began(0);
     built.began(1);
-    built.compiled_under(1, fine);
+    built.compiled(1);
     assert_eq!(
         built.plan(),
         Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false })
@@ -124,22 +123,21 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
         Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
         "a build's end lets go of every MIR though a unit (one that panicked) is still open"
     );
-    let mut held_back = Release::of(Finished::new(vec![Some(7u32)]), false);
-    held_back.began(0);
-    held_back.short_under(short);
+    let mut core_over = Release::of(Finished::new(vec![Some(7u32)]), false);
+    core_over.began(0);
+    core_over.pressed();
     assert_eq!(
-        held_back.plan(),
+        core_over.plan(),
         Some(Plan { crates: vec![], mir: true, pressed: true, ended: false }),
-        "the plane holding a task back for memory makes it due too"
+        "memory made due while a unit is open, as the give-back makes it (`job::giving`)"
     );
 }
 
-/// Each release says one line naming why it ran, what went, what blaze held before and after,
-/// and the limit, so a run's log shows every release (B5, coord-105 showed none), then what the
+/// Each release says one line naming why it ran, what went, what the gate's core held before
+/// and after, and its size, so a run's log shows every release (B5, coord-105 showed none), then what the
 /// query storage holds: its largest holders on a release memory made due, its total on another.
 #[test]
 fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
-    const GIB: u64 = 1 << 30;
     let dropped = hir::evict::Dropped {
         bodies: 40,
         inference: 30,
@@ -148,8 +146,8 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
         solver_caches: 5,
         intern_tables: 3,
     };
-    let before = Pressure { held: 44 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
-    let after = Pressure { held: 38 * GIB, limit: 48 * GIB, over: None };
+    let before = Core { used: 44 * GIB, size: 48 * GIB };
+    let after = Core { used: 38 * GIB, size: 48 * GIB };
     let unread = blaze_query::db::Unread::default();
     // A release memory made due says the storage's holders.
     let infer = MemoryUsage {
@@ -175,12 +173,13 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     .to_string();
     assert_eq!(
         said,
-        "front end release (memory: blaze is past the limit's line of 42.00 GiB): let go of 30 inference results of 40 \
-         bodies in 2 crates, 900 MIR bodies, 7 constant values and 5 trait solver caches, and swept the front end's \
-         values to their fair shares; blaze held 44.00 GiB, now 38.00 GiB (6.00 freed), of a limit of 48.00 GiB; the \
+        "front end release (memory: blaze's core is past its line of 42.00 GiB): let go of 30 inference results of 40 \
+         bodies in 2 crates, 900 MIR bodies, 7 constant values and 5 trait solver caches, and swept every value the \
+         front end keeps by bytes; blaze's core held 44.00 GiB, now 38.00 GiB (6.00 freed), of a core of 48.00 GiB; the \
          query storage holds 0.50 GiB: infer 0.50 (2.0k rows made, 1.5k used)"
     );
-    let early = Pressure { held: 20 * GIB, ..before };
+    // Under its line: the system said memory is short.
+    let early = Core { used: 20 * GIB, ..before };
     let storage = Holders::of(Vec::new());
     let said = Said {
         crates: 1,
@@ -195,14 +194,14 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
         storage,
     }
     .to_string();
-    assert!(said.starts_with("front end release (memory: mir is past its share of "), "{said}");
+    assert!(said.starts_with("front end release (memory: the system is short of it)"), "{said}");
     assert!(
         !said.contains("MIR bodies") && said.contains("in 1 crates and 5 trait solver caches"),
         "{said}"
     );
     assert!(said.contains("(0.00 freed)"), "{said}");
     // A release memory did not make due says the storage's total alone, read from counters.
-    let idle = Pressure { held: GIB, limit: u64::MAX, over: None };
+    let idle = Core { used: GIB, size: u64::MAX };
     let storage = Holders::total(3 << 29);
     let said = Said {
         crates: 1,
@@ -218,7 +217,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     }
     .to_string();
     assert!(said.starts_with("front end release (no unit is open)"), "{said}");
-    assert!(said.ends_with(", under no limit; the query storage holds 1.50 GiB"), "{said}");
+    assert!(said.ends_with(", of no core size; the query storage holds 1.50 GiB"), "{said}");
     assert!(!said.contains("did not read"), "{said}");
     // A build's end says what two builds left unread, when anything went.
     let said = Said {
@@ -333,8 +332,6 @@ fn a_count_of_rows_is_said_in_the_unit_it_rounds_to() {
 /// no unit kept makes a release due as its first crate finishes.
 #[test]
 fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_the_next() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
     // Units 0 and 1 of crate 7, a dependency found kept; units 2.. of crates 10.., made.
     let made_crates = EDIT_CRATES as u32 + 1;
     let mut of = vec![Some(7u32), Some(7)];
@@ -343,20 +340,20 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
     for unit in [0, 1] {
         release.began(unit);
         release.kept(unit);
-        release.compiled_under(unit, fine);
+        release.compiled(unit);
     }
     assert!(!release.due(), "no unit is open, and the one crate finished was found kept");
     release.began(2);
     assert!(!release.due(), "a unit is open");
     for unit in 2..2 + EDIT_CRATES {
         release.began(unit);
-        release.compiled_under(unit, fine);
+        release.compiled(unit);
         assert!(!release.due(), "so far an edit's build: what it made stays");
         assert!(release.plan().is_none());
     }
     let last = 2 + EDIT_CRATES;
     release.began(last);
-    release.compiled_under(last, fine);
+    release.compiled(last);
     assert!(release.due(), "one crate more than an edit makes: a rebuild, and no unit is open");
     let mut crates = vec![7];
     crates.extend((0..made_crates).map(|at| 10 + at));
@@ -369,9 +366,9 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
 
     let mut cold = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
     cold.began(0);
-    cold.compiled_under(0, fine);
+    cold.compiled(0);
     cold.began(1);
-    cold.compiled_under(1, fine);
+    cold.compiled(1);
     assert!(cold.due(), "no unit was found kept: crate 7, made and finished, is due");
     assert_eq!(
         cold.plan(),
@@ -384,7 +381,7 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
     for unit in [0, 1] {
         kept.began(unit);
         kept.kept(unit);
-        kept.compiled_under(unit, fine);
+        kept.compiled(unit);
     }
     assert!(!kept.due());
     kept.end();
@@ -401,22 +398,22 @@ fn a_crate_whose_units_were_all_found_kept_makes_no_release_due_and_goes_with_th
 /// lowers only what changed; memory short takes everything, as of any build.
 #[test]
 fn an_edit_s_build_keeps_what_it_made_until_memory_is_short() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
-    let short = || Pressure { held: 47 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
-    let edit = |now: fn() -> Pressure| {
+    let edit = |short: bool| {
         // Units 0 and 1 of crate 7, found kept; unit 2 of crate 9, the crate edited.
         let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
         for unit in [0, 1] {
             release.began(unit);
             release.kept(unit);
-            release.compiled_under(unit, fine);
+            release.compiled(unit);
         }
         release.began(2);
-        release.compiled_under(2, now);
+        release.compiled(2);
+        if short {
+            release.pressed();
+        }
         release
     };
-    let mut release = edit(fine);
+    let mut release = edit(false);
     assert!(!release.due(), "the crate the edit made is finished, and nothing of it goes");
     assert!(release.plan().is_none());
     release.end();
@@ -428,7 +425,7 @@ fn an_edit_s_build_keeps_what_it_made_until_memory_is_short() {
     );
     assert!(!release.due() && release.plan().is_none(), "taken");
 
-    let mut pressed = edit(short);
+    let mut pressed = edit(true);
     assert!(pressed.due(), "memory is short");
     assert_eq!(
         pressed.plan(),
@@ -443,12 +440,10 @@ fn an_edit_s_build_keeps_what_it_made_until_memory_is_short() {
 /// the oracle's plans are not those of every build.
 #[test]
 fn the_oracle_catches_a_release_that_lets_go_of_what_an_edit_made() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
     let mut release = Release::of(Finished::new(vec![Some(7u32), Some(7), Some(9)]), true);
     for unit in [0, 1, 2] {
         release.began(unit);
-        release.compiled_under(unit, fine);
+        release.compiled(unit);
     }
     assert!(release.due(), "a build that is no edit's is due as its crates finish");
     assert_eq!(
@@ -471,9 +466,6 @@ fn the_oracle_catches_a_release_that_lets_go_of_what_an_edit_made() {
 /// short takes the held ones with the rest. The MIR goes as before.
 #[test]
 fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_finished_last() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
-    let short = || Pressure { held: 47 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
     // Crates under 100 are dependencies; 100 and up are the workspace's.
     let member = |krate: &u32| *krate >= 100;
     // Unit 0 of dependency 7, then a unit each of workspace crates 100.., two more than held.
@@ -485,7 +477,7 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     };
     let mut release = cold();
     release.began(0);
-    release.compiled_under(0, fine);
+    release.compiled(0);
     assert!(release.due(), "no unit is open and a dependency this build made is finished");
     assert_eq!(
         release.plan_of(member),
@@ -496,7 +488,7 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     for at in 0..EDIT_CRATES {
         let unit = 1 + at;
         release.began(unit);
-        release.compiled_under(unit, fine);
+        release.compiled(unit);
         assert!(release.due(), "no unit is open: the MIR goes");
         assert_eq!(
             release.plan_of(member),
@@ -509,7 +501,7 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     // One more: the first held goes, as `EDIT_CRATES` workspace crates finished after it.
     let unit = 1 + EDIT_CRATES;
     release.began(unit);
-    release.compiled_under(unit, fine);
+    release.compiled(unit);
     assert_eq!(
         release.plan_of(member),
         Some(Plan { crates: vec![100], mir: true, pressed: false, ended: false }),
@@ -532,12 +524,13 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     let mut pressed = cold();
     for unit in 0..3 {
         pressed.began(unit);
-        pressed.compiled_under(unit, fine);
+        pressed.compiled(unit);
         assert!(pressed.plan_of(member).is_some());
     }
     assert_eq!(pressed.held(), &[100, 101][..]);
     pressed.began(3);
-    pressed.compiled_under(3, short);
+    pressed.compiled(3);
+    pressed.pressed();
     assert!(pressed.due(), "memory is short");
     assert_eq!(
         pressed.plan_of(member),
@@ -549,7 +542,7 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     // A check names no crate and holds none; an edit's build holds none: it names none.
     let mut check = Release::of(Finished::new(vec![Some(100u32)]), false);
     check.began(0);
-    check.compiled_under(0, fine);
+    check.compiled(0);
     check.end();
     assert_eq!(
         check.plan_of(member),
@@ -559,9 +552,9 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
     let mut edit = Release::of(Finished::new(vec![Some(7u32), Some(100)]), true);
     edit.began(0);
     edit.kept(0);
-    edit.compiled_under(0, fine);
+    edit.compiled(0);
     edit.began(1);
-    edit.compiled_under(1, fine);
+    edit.compiled(1);
     edit.end();
     assert_eq!(
         edit.plan_of(member),
@@ -578,13 +571,11 @@ fn a_build_that_is_no_edit_s_holds_the_inference_of_the_workspace_crates_it_fini
 /// oracle's plans are not those of every release.
 #[test]
 fn the_oracle_catches_a_release_that_holds_no_workspace_crate() {
-    const GIB: u64 = 1 << 30;
-    let fine = || Pressure { held: GIB, limit: 48 * GIB, over: None };
     let none = |_: &u32| false;
     let mut release = Release::of(Finished::new(vec![Some(7u32), Some(100), Some(101)]), true);
     for (unit, krate) in [(0, 7), (1, 100), (2, 101)] {
         release.began(unit);
-        release.compiled_under(unit, fine);
+        release.compiled(unit);
         assert_eq!(
             release.plan_of(none),
             Some(Plan { crates: vec![krate], mir: true, pressed: false, ended: false }),

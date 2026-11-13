@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn inherited_from_the_workspace() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-manifest-{}", std::process::id()));
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-manifest-");
         std::fs::create_dir_all(dir.join("member")).unwrap();
         let root = dir.join("Cargo.toml");
         std::fs::write(
@@ -124,15 +124,13 @@ mod tests {
                 ("clippy".to_owned(), "empty_enums".to_owned(), Level::Warn, 0),
             ]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// What cargo's `TomlLints` does not deserialize is the manifest's error, never a lint
     /// left out or a priority of 0.
     #[test]
     fn a_lint_cargo_does_not_read_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-refused-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-refused-");
         let manifest = dir.join("Cargo.toml");
         for (table, says) in [
             ("[lints.clippy]\nall = \"loud\"\n", "unknown variant `loud`"),
@@ -148,13 +146,11 @@ mod tests {
             let error = lints(&manifest, &manifest).expect_err(table);
             assert!(error.contains(says), "{table}: {error}");
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn blazes_table_becomes_blaze_flags() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-blaze-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-blaze-");
         let manifest = dir.join("Cargo.toml");
         std::fs::write(
             &manifest,
@@ -166,6 +162,5 @@ mod tests {
             flags(&found),
             ["--deny=blaze::hot", "--warn=clippy::all", "--warn=blaze::std_hashmap"]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -47,6 +47,10 @@ use crate::{
 /// What [`Resolver::names_in_scope`] returns: each name with its meanings, innermost first.
 pub type NamesInScope = FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>;
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest prelude it held, uncapped"
+)]
 thread_local! {
     /// The `macro_use` prelude of [`Resolver::names_in_scope_into`], put in name order.
     static MACRO_USE_PRELUDE: RefCell<Scratch<(Name, MacroId)>> =

@@ -18,6 +18,9 @@
 //! Every case builds std, which is compiled at opt-level 3, so only a blaze with LLVM can build
 //! one: in the seed profile (no `native`) this target is empty.
 #![cfg(all(unix, feature = "native"))]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::{
     fs,
@@ -48,6 +51,10 @@ const SOCKET_MOST: usize = 104;
 /// own, and these agree on it without talking to each other. Under `/tmp`, not `TMPDIR`: the
 /// daemon's socket, `<home>/v2.sock`, must stay under [`SOCKET_MOST`] bytes, and a `TMPDIR` such
 /// as nix-shell's is most of that already.
+#[expect(
+    blaze::tmp_path,
+    reason = "the shared root is one fixed path every test process of the run finds by itself and outlives each of them (swept by `sweep_past_runs`), so no process's TempDir can own it; under `/tmp` for the daemon socket's length"
+)]
 fn shared_root() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let meta = fs::metadata(&exe).unwrap();
@@ -70,6 +77,10 @@ const PAST_RUN_KEPT: Duration = Duration::from_secs(60 * 60);
 /// listens at its socket) and whose `cases` has not changed for [`PAST_RUN_KEPT`]. Each build of
 /// the test binary has a root of its own, which holds a built std, so without this every build
 /// would leave one. Once a process.
+#[expect(
+    blaze::tmp_path,
+    reason = "lists the real `/tmp`, where `shared_root` puts every run's shared root, to remove the past runs' ones"
+)]
 fn sweep_past_runs(current: &Path) {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {
@@ -146,6 +157,10 @@ impl Case {
 
     /// A case with a `BLAZE_HOME` and machine cache of its own, so a daemon of its own: for a
     /// test of the daemon's own life, or of what one daemon built before.
+    #[expect(
+        blaze::tmp_path,
+        reason = "a case's root is kept when its test panics, for the failure to be read, which a TempDir (removed on every drop) cannot do; under `/tmp` for the daemon socket's length"
+    )]
     fn own(property: &str) -> Case {
         // The daemon's socket is `<home>/v2.sock`, and a Unix socket's path is at most 104 bytes
         // on macOS: a `TMPDIR` such as nix-shell's is already most of that.
@@ -200,6 +215,7 @@ impl Case {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let stdout = drain(child.stdout.take().unwrap());
         let stderr = drain(child.stderr.take().unwrap());

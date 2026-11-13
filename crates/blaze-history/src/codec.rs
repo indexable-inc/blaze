@@ -2,16 +2,16 @@
 //! bytes read back predict what the history they came from predicted.
 //!
 //! Little-endian: [`MAGIC`]; the table's slots, its clock and the records it dropped; the
-//! kinds' peaks as [`Estimates::encode`] gives them, after their length; the kinds' times in
-//! order of their numbers, [`KIND_BYTES`] each (kind, 4 zero bytes, seen, mean); then the
-//! records in slot order, each bucket's from its first way with no gap, [`RECORD_BYTES`] each
-//! (slot, kind, seen, 4 zero bytes, stamp, the key's halves, peak, the four runs).
+//! kinds' times in order of their numbers, [`KIND_BYTES`] each (kind, 4 zero bytes, seen,
+//! mean); then the records in slot order, each bucket's from its first way with no gap,
+//! [`RECORD_BYTES`] each (slot, kind, seen, 4 zero bytes, stamp, the key's halves, peak, the
+//! four runs).
 
 use std::fmt;
 
 use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_format::cursor::{self, Put as _, Reader};
-use blaze_graph::admission::{self, Estimates, TaskKind};
+use blaze_graph::admission::TaskKind;
 use blaze_ids::radix;
 
 use crate::{
@@ -20,6 +20,10 @@ use crate::{
     table::{self, RUNS, Record, WAYS, Writer},
 };
 
+/// `04`: no kinds' peaks (`Estimates` deleted 2026-11-13; admission's one peak record is
+/// `blaze_graph::admission::Peaks`, in a section of its own). A `03` history is of another
+/// blaze: an image of it starts its history empty and says so, as one of `02` or `01` does.
+///
 /// `03`: peaks as charged to each task's memory account (`blaze_graph::arena::account`): what
 /// its work allocated less what it freed, on its own job and on every job of the pool scopes
 /// it opened, never another task's bytes. A `02` history's peaks were the job's own count
@@ -28,7 +32,7 @@ use crate::{
 /// ended on, against the base it took on the thread it began on (a daemon's whole heap, 121.59
 /// GB for a build script, nftest2). Neither is what this blaze predicts by, so an image of
 /// either starts its history empty and says so (the daemon's restore names the section and why).
-pub const MAGIC: &[u8; 8] = b"blzhis03";
+pub const MAGIC: &[u8; 8] = b"blzhis04";
 pub const KIND_BYTES: usize = 24;
 pub const RECORD_BYTES: usize = 64;
 /// The most slots bytes may say a table had: 1 GiB of records. More is not a table this
@@ -43,8 +47,6 @@ pub enum DecodeError {
     Short {
         at: usize,
     },
-    /// The kinds' peaks are not [`Estimates`]' bytes.
-    Estimates(admission::DecodeError),
     /// Not as many bytes as `count` records take after the kinds.
     Length {
         count: u64,
@@ -84,9 +86,6 @@ impl fmt::Display for DecodeError {
         match self {
             DecodeError::Version => write!(f, "a task history of another version"),
             DecodeError::Short { at } => write!(f, "a task history cut short at byte {at}"),
-            DecodeError::Estimates(error) => {
-                write!(f, "a task history's memory estimates: {error}")
-            }
             DecodeError::Length { count, bytes } => {
                 write!(f, "a task history of {count} records in {bytes} bytes")
             }
@@ -119,24 +118,16 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 pub(crate) fn encode(history: &History) -> Vec<u8> {
-    let estimates = history.estimates.encode();
     let kinds = history.times.sorted();
     // The table's every slot is the records' room: one allocation, never grown, whose pages
     // past the records are never touched.
     let mut out = Vec::with_capacity(
-        MAGIC.len()
-            + 32
-            + estimates.len()
-            + 8
-            + kinds.len() * KIND_BYTES
-            + 8
-            + history.keys.slots() * RECORD_BYTES,
+        MAGIC.len() + 24 + 8 + kinds.len() * KIND_BYTES + 8 + history.keys.slots() * RECORD_BYTES,
     );
     out.put_bytes(MAGIC);
     out.put_u64(history.keys.slots() as u64);
     out.put_u64(history.keys.clock());
     out.put_u64(history.keys.evicted());
-    out.put_bytes_u64(&estimates);
     out.put_u64(kinds.len() as u64);
     for (kind, time) in kinds {
         out.put_u32(kind.0);
@@ -206,8 +197,6 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
     }
     let slots = slots as usize;
     let (clock, evicted) = (read.u64()?, read.u64()?);
-    let mut estimates = Estimates::decode(read.bytes_u64()?).map_err(DecodeError::Estimates)?;
-    estimates.unseen = config.unseen_bytes;
 
     let kind_count = read.count_u64(KIND_BYTES)?;
     let mut kinds = Vec::with_capacity(kind_count);
@@ -267,5 +256,5 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
         // Oldest first, so where a bucket of the new size is full the newest stay.
         keys.place_all(stamps.iter().map(|&(_, at)| records[at].1));
     }
-    Ok(History { estimates, times: Times::from_sorted(kinds), keys, unseen_ns: config.unseen_ns })
+    Ok(History { times: Times::from_sorted(kinds), keys, unseen_ns: config.unseen_ns })
 }

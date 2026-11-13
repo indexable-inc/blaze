@@ -284,6 +284,9 @@ pub enum Malformed {
     NoSuchArg { op: Op, at: usize },
     /// Argument `at` of an `op` node is a `found`, and the operation takes the other sort there.
     Sort { op: Op, at: usize, found: Sort },
+    /// The graph already holds `len` nodes, and a node id is a `u32`: an `op` node past that
+    /// is refused.
+    TooManyNodes { op: Op, len: usize },
 }
 
 impl std::fmt::Display for Malformed {
@@ -297,6 +300,9 @@ impl std::fmt::Display for Malformed {
                     f,
                     "argument {at} of `{op}` is a {found:?}, which `{op}` does not take there"
                 )
+            }
+            Malformed::TooManyNodes { op, len } => {
+                write!(f, "a `{op}` node does not fit: the graph holds {len} nodes, ids are u32")
             }
         }
     }
@@ -374,7 +380,8 @@ impl Graph {
         if let Some(&id) = self.index.get(&node) {
             return Ok(id);
         }
-        let id = Id(u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes"));
+        let len = self.nodes.len();
+        let id = Id(u32::try_from(len).map_err(|_| Malformed::TooManyNodes { op: node.op, len })?);
         self.nodes.push(node);
         self.index.insert(node, id);
         Ok(id)

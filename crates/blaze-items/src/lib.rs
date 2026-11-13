@@ -35,7 +35,9 @@
 //! the item it names, so hashing nests as deep as the graph of refs, past the frames a worker
 //! keeps warm. Preimages are written into the worker's scratch buffers.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 mod bound;

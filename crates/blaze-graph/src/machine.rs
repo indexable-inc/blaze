@@ -54,7 +54,8 @@ pub struct Spec {
     /// single flight; `None` for work that is not a pure function of its inputs.
     #[serde(default)]
     pub key: Option<Key>,
-    /// Its predicted peak memory in bytes ([`crate::admission`]), for the plane's admission.
+    /// Its predicted peak memory in bytes ([`crate::admission::Peaks`]): the plane's forecast,
+    /// for throughput only ([`crate::plane::Plane::fits`]).
     #[serde(default)]
     pub memory: u64,
 }
@@ -193,12 +194,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(config: Config) -> Result<Machine, Error> {
-        let mut plane = Plane::new(PlaneConfig {
-            io: config.io,
-            work: config.work,
-            budget: None,
-            starve_after: u32::MAX,
-        })?;
+        let mut plane = Plane::new(PlaneConfig { io: config.io, work: config.work })?;
         let opened = plane.step(PlaneInput::Open {
             at_ns: 0,
             request: BUILD,
@@ -257,6 +253,9 @@ impl Machine {
                 }
                 PlaneOutput::Yield { id } => {
                     unreachable!("node {id} asked to give way: the machine opens no idle request")
+                }
+                PlaneOutput::Dropped { age } => {
+                    unreachable!("task {age} dropped after giving way: the machine has no gate")
                 }
             }));
         }
