@@ -15,14 +15,20 @@
 //! compiling one large function burns CPU in one span for minutes and is never flagged). A task
 //! that has not moved for the bound of what it waits on is [`Stuck`]:
 //!
-//! | waits on | stuck when | why that bound |
-//! |---|---|---|
-//! | nothing, or a named wait with no deadline | still [`STUCK_AFTER`] (or the task's own bound) | nothing names when it ends; 120 s is the daemon's global stall bound, far past any signal handover |
-//! | a named wait with a deadline | still since before the deadline, [`DEADLINE_SLACK`] past it | the wait ends by itself at its deadline; two looks later it has not |
-//! | a store read | still [`STORE_AFTER`] | a read of local disk through the buffer pool; a minute is past any disk |
-//! | a lock, a task it joins, a child | its chain's end is stuck, and it is still [`BEHIND_AFTER`] | a waiter runs again when its holder does; a moving holder (LLVM) never makes its waiters stuck |
-//! | a lock or join whose holder is not a task seen | still [`STUCK_AFTER`] | nothing can be said of the holder; the waiter's own bound stands |
-//! | a cycle of waits | every member still [`CYCLE_AFTER`] | a cycle never ends by itself; one look rules out a snapshot torn mid-handover |
+//! - Waiting on nothing, or on a named wait with no deadline: still [`STUCK_AFTER`] (or the
+//!   task's own bound). Nothing names when it ends; 120 s is the daemon's global stall bound,
+//!   far past any signal handover.
+//! - A named wait with a deadline: still since before the deadline, and [`DEADLINE_SLACK`]
+//!   past it. The wait ends by itself at its deadline; two looks later it has not.
+//! - A store read: still [`STORE_AFTER`]. A read of local disk through the buffer pool; a
+//!   minute is past any disk.
+//! - A lock, a task it joins, a child: its chain's end is stuck, and it has been still
+//!   [`BEHIND_AFTER`]. A waiter runs again when its holder does, so a moving holder (LLVM)
+//!   never makes its waiters stuck.
+//! - A lock or join whose holder is no task seen: still [`STUCK_AFTER`]. Nothing can be said of
+//!   the holder, so the waiter's own bound stands.
+//! - A cycle of waits: every member still [`CYCLE_AFTER`]. A cycle never ends by itself; one
+//!   look rules out a snapshot torn mid-handover.
 //!
 //! A cycle is returned once, as one [`Stuck`] naming every edge; a task is returned once until it
 //! moves again. The cost against the floor: a look that finds nothing allocates nothing once its
@@ -33,7 +39,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::time::Duration;
+use std::{alloc::Global, time::Duration};
 
 #[cfg(test)]
 mod tests;
@@ -153,7 +159,7 @@ pub struct Stuck {
     pub held_by: Option<Task>,
     pub why: Why,
     /// For [`Why::Cycle`], every edge of the cycle, starting at `task`; empty otherwise.
-    pub cycle: Vec<Edge>,
+    pub cycle: Vec<Edge, Global>,
 }
 
 /// A planted bug, for the oracle's controls.
@@ -194,15 +200,16 @@ const TO_CYCLE: u32 = u32::MAX - 2;
 #[derive(Debug)]
 pub struct Watch {
     /// By task, sorted.
-    tracks: Vec<Track>,
+    tracks: Vec<Track, Global>,
     looks: u64,
     /// Scratch, by index into the look's `seen`: sorted order, the edge target, the chain's end,
-    /// the cycle a chain ends in, and the walk's marks.
-    order: Vec<u32>,
-    next: Vec<u32>,
-    end: Vec<u32>,
-    cycle_of: Vec<u32>,
-    mark: Vec<u32>,
+    /// the cycle a chain ends in, and the walk's marks. The watchdog lives as long as the daemon,
+    /// so the global heap is its lifetime's allocator; each grows to the most tasks seen once.
+    order: Vec<u32, Global>,
+    next: Vec<u32, Global>,
+    end: Vec<u32, Global>,
+    cycle_of: Vec<u32, Global>,
+    mark: Vec<u32, Global>,
     #[cfg(test)]
     pub(crate) flaw: Flaw,
 }
@@ -214,15 +221,17 @@ impl Default for Watch {
 }
 
 impl Watch {
-    pub const fn new() -> Self {
+    /// Built at run time, once a daemon or a test run: its tables start empty and grow to the
+    /// most tasks one look saw, which the threads, parked jobs and children alive bound.
+    pub fn new() -> Self {
         Self {
-            tracks: Vec::new(),
+            tracks: Vec::new_in(Global),
             looks: 0,
-            order: Vec::new(),
-            next: Vec::new(),
-            end: Vec::new(),
-            cycle_of: Vec::new(),
-            mark: Vec::new(),
+            order: Vec::new_in(Global),
+            next: Vec::new_in(Global),
+            end: Vec::new_in(Global),
+            cycle_of: Vec::new_in(Global),
+            mark: Vec::new_in(Global),
             #[cfg(test)]
             flaw: Flaw::None,
         }
@@ -230,7 +239,7 @@ impl Watch {
 
     /// Looks at every task seen at `now_ns` and returns those newly stuck: each once until it
     /// moves, a cycle once with all its edges. A task not in `seen` is forgotten.
-    pub fn look(&mut self, now_ns: u64, seen: &[TaskSeen]) -> Vec<Stuck> {
+    pub fn look(&mut self, now_ns: u64, seen: &[TaskSeen]) -> Vec<Stuck, Global> {
         self.looks += 1;
         let look = self.looks;
         self.index(seen);
@@ -240,8 +249,8 @@ impl Watch {
         }
         self.tracks.retain(|it| it.seen == look);
         self.graph(seen);
-        // alloc: grows only when a task is stuck
-        let mut out = Vec::new();
+        // Empty, so unallocated, unless a task is stuck.
+        let mut out = Vec::new_in(Global);
         for k in 0..self.order.len() {
             let i = self.order[k] as usize;
             let it = self.flawed(seen[i]);
@@ -257,8 +266,7 @@ impl Watch {
             let still_ns = now_ns.saturating_sub(track.still_since_ns);
             let Some(why) = self.verdict(now_ns, seen, i) else { continue };
             if why == Why::Cycle {
-                // alloc: a cycle's edges, once
-                let mut cycle = Vec::new();
+                let mut cycle = Vec::new_in(Global);
                 let mut at = i;
                 loop {
                     let here = self.flawed(seen[at]);
@@ -291,7 +299,7 @@ impl Watch {
                 waits: it.waits,
                 held_by: it.waits.on(),
                 why,
-                cycle: Vec::new(),
+                cycle: Vec::new_in(Global),
             });
         }
         out
@@ -505,21 +513,11 @@ impl Watch {
             return self.own(now_ns, seen, i);
         }
         let end = self.end[i];
-        if end == IN_CYCLE {
-            let least = self.cycle_of[i] as usize;
-            if !self.cycle_still(now_ns, seen, least) {
+        if end == IN_CYCLE || end == TO_CYCLE {
+            if !self.cycle_still(now_ns, seen, self.cycle_of[i] as usize) {
                 return None;
             }
-            let on_cycle = {
-                let mut c = self.next[least] as usize;
-                let mut found = c == i;
-                while c != least && !found {
-                    c = self.next[c] as usize;
-                    found = c == i;
-                }
-                found || i == least
-            };
-            if on_cycle {
+            if end == IN_CYCLE {
                 return Some(Why::Cycle);
             }
             return (self.still(now_ns, seen, i) >= BEHIND_AFTER.as_nanos() as u64)
@@ -532,6 +530,20 @@ impl Watch {
         self.own(now_ns, seen, end)?;
         (self.still(now_ns, seen, i) >= BEHIND_AFTER.as_nanos() as u64)
             .then_some(Why::Behind { end: seen[end].task })
+    }
+
+    /// Whether any member of the cycle through `least` was not yet said since it last moved.
+    fn cycle_unsaid(&self, seen: &[TaskSeen], least: usize) -> bool {
+        let mut c = least;
+        loop {
+            if !self.track_of(seen[c].task).said {
+                return true;
+            }
+            c = self.next[c] as usize;
+            if c == least {
+                return false;
+            }
+        }
     }
 
     /// Whether every member of the cycle through `least` has been still [`CYCLE_AFTER`].

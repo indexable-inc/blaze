@@ -38,6 +38,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // Kept with `#[expect(..)]`: where a function reads a thread-local is its own choice.
         | Lint::ThreadLocalInWaitingFn
         | Lint::LockAcrossQuery
+        // Kept with `#[expect(..)]` on the function: what a turn, an answer or a lock order may
+        // reach is the function's choice, not one line's.
+        | Lint::LoopTurnEffects
+        | Lint::SyncOnAnswerPath
+        | Lint::LockOrder
+        | Lint::LockAcrossWait
         | Lint::LockHeldAcrossSlow
         | Lint::BlockingOnPool
         | Lint::UnnamedWait

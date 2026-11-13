@@ -84,7 +84,37 @@ struct Child {
     run: u64,
     program: PathBuf,
     waiter: Waiter,
+    /// The thread mark ([`crate::lock::graph::thread_mark`]) of the thread that started it:
+    /// the task watchdog's edge from that thread to the child it waits for.
+    starter: u64,
     started: Instant,
+}
+
+/// Each child started and not reaped, with the thread mark of the thread that waits for it in
+/// place ([`Waiter::Starter`]), if one does: the task watchdog's look at which thread waits on
+/// which child. Allocates nothing.
+pub fn each_child(mut each: impl FnMut(libc::pid_t, Option<u64>)) {
+    for child in CHILDREN.lock().iter() {
+        let waiter = matches!(child.waiter, Waiter::Starter(_)).then_some(child.starter);
+        each(child.pid, waiter);
+    }
+}
+
+/// Kills `pid` (SIGKILL) if it is a child still listed: one not reaped, so its pid is no one
+/// else's. The task watchdog's end of a child that used no CPU for its bound: whoever waits for
+/// it wakes to its exit, and the job that started it fails. `false` when it is not listed (it
+/// was reaped since the watchdog looked).
+pub fn kill_listed(pid: libc::pid_t) -> bool {
+    let children = CHILDREN.lock();
+    if !children.iter().any(|it| it.pid == pid) {
+        return false;
+    }
+    // Under the list's lock, so no unlisted pid is signalled. A reap takes the child out of the
+    // list just after `wait4` returns ([`reap`]), so a pid could be reused in that window, of
+    // microseconds, by a child the kernel numbered meanwhile; a child the watchdog kills used no
+    // CPU for minutes, so its reaper is not in that window unless it exited just now.
+    crate::raw::kill(pid);
+    true
 }
 
 /// What waits for a child's exit, and so reaps it.
@@ -201,6 +231,7 @@ impl Listed {
             run,
             program,
             waiter: Waiter::Starter(std::thread::current().id()),
+            starter: crate::lock::graph::thread_mark(),
             started: Instant::now(),
         };
         CHILDREN.lock().push(child); // alloc: the list grows to the most children in flight at once

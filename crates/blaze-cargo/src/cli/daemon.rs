@@ -1643,6 +1643,24 @@ pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Resu
     anyhow::bail!("blaze daemon: {NO_DAEMON}")
 }
 
+/// Each task the daemon's task watchdog found stuck in a build under way, with that build's
+/// id, as one line each (`#3 stuck 4 min: codegen of seq-macro 0.3.6 waits on ...`); empty when
+/// nothing is stuck. What `blaze status` says first, and the doctor's "is anything stuck".
+pub fn stuck_lines(status: &Status) -> Vec<String> {
+    let (mut lines, mut said) = (Vec::new(), Vec::new());
+    for build in &status.builds {
+        for stuck in &build.now.stuck {
+            // A task of no build is in every build's model: said once, at the first.
+            if said.contains(&stuck) {
+                continue;
+            }
+            said.push(stuck);
+            lines.push(format!("#{} {stuck}", build.id)); // alloc: a stuck task, once a status
+        }
+    }
+    lines
+}
+
 /// The daemon's [`Status`] for people.
 pub fn status_lines(status: &Status) -> String {
     let ids: Vec<String> = status.requests.iter().map(u64::to_string).collect();
@@ -1650,7 +1668,16 @@ pub fn status_lines(status: &Status) -> String {
         true => "0".to_owned(),
         false => format!("{} ({})", ids.len(), ids.join(", ")),
     };
-    let mut lines = format!(
+    // What is stuck, first: a stuck task fails its build, and is why the rest looks as it does.
+    let stuck = stuck_lines(status);
+    let mut lines = String::new();
+    if !stuck.is_empty() {
+        lines.push_str(&format!("stuck: {}\n", stuck.len()));
+        for line in &stuck {
+            lines.push_str(&format!("  {line}\n"));
+        }
+    }
+    lines += &format!(
         "pid: {}\nrequests: {requests}\nviews: {}\nmemory: {} of {}\n",
         status.pid,
         status.views,

@@ -75,6 +75,8 @@ pub(crate) mod signals;
 mod still;
 #[cfg(all(unix, feature = "native"))]
 mod stop;
+#[cfg(all(unix, feature = "native"))]
+mod stuck;
 #[cfg(test)]
 mod tests;
 // A daemon that exits once no connection holds it (`BLAZE_DAEMON_EXIT_UNHELD`).
@@ -1614,6 +1616,9 @@ fn listen(
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
+    // The task watchdog: a task that makes no progress for its bound is named, with what it
+    // waits on and who holds it, and its job fails (`stuck`).
+    let tasks_watch = stuck::arm(daemon.pulse(), blaze_graph::exec::shared().workers())?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
     #[cfg(unix)]
@@ -1656,6 +1661,7 @@ fn listen(
             break;
         }
     }
+    tasks_watch.disarm();
     guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),

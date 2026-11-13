@@ -414,7 +414,7 @@ fn reach(
     reason = "the effects query keeps its refusal with each step's file, line and column: it must keep the \
               spans, placed where the refusal is shown"
 )]
-fn refusal(
+pub(crate) fn refusal(
     cx: &Cx<'_>,
     def: &EffectDef,
     index: usize,
@@ -498,7 +498,7 @@ const CHAIN: usize = 64;
 /// Where `span` of `instance`'s body is written: the body's own source when the span is of a
 /// body inlined into it.
 #[blaze::renders_positions]
-fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
+pub(crate) fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     let db = cx.db;
     // Read once, for a refusal's text, and dropped with it.
     let body = body_once(db, &cx.stored, instance)?.ok()?;
@@ -515,7 +515,7 @@ fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
 }
 
 /// An instance by path, as a refusal names it: `kernel::compute`, `kernel::compute::{closure}`.
-fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
+pub(crate) fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
     let owner = |owner: InferBodyId<'_>| match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => fn_path(db, func, &[]),
         InferBodyId::DefWithBodyId(_) | InferBodyId::AnonConstId(_) => "a constant".into(),

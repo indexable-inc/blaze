@@ -63,6 +63,9 @@ pub struct Look<'a> {
     /// loop watchdog last named ([`crate::serve::pulse::Pulse::stall`]), the same for every
     /// build's model ([`now::Now::stall`]).
     pub stall: Option<&'a str>,
+    /// The tasks the task watchdog found stuck while builds are under way, each with its build
+    /// (0 for none): a build's model says its own and those of none ([`now::Now::stuck`]).
+    pub stuck: &'a [crate::serve::pulse::StuckSaid],
 }
 
 impl<S: Steps> Jobs<S> {
@@ -227,7 +230,7 @@ impl<'a> Seen<'a> {
             expanders: &expanders,
             expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads()).unwrap_or(u32::MAX),
         };
-        match job.request {
+        let mut now = match job.request {
             Some(request) => folds.look(request, look.now, &model).unwrap_or_else(|| {
                 // The plane makes a request's fold as it opens and drops it only as its job
                 // ends, so a job looked at holds one: one missing is a daemon bug, said, and
@@ -241,7 +244,16 @@ impl<'a> Seen<'a> {
             }),
             // Before its plane request: no task yet, the build is starting.
             None => Fold::new().look(&model),
-        }
+        };
+        // The watchdog's stuck tasks of this build and of none: a stuck task is what a person
+        // watching the build needs before anything it does.
+        now.stuck = look
+            .stuck
+            .iter()
+            .filter(|it| it.build == build || it.build == 0)
+            .map(|it| it.said.clone()) // clone: a stuck task's line, a look while it lasts
+            .collect(); // alloc: a look, empty while nothing is stuck
+        now
     }
 
     /// The job as `blaze status` lists it, `now` its live model.

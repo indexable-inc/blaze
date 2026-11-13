@@ -131,6 +131,10 @@ impl DefMap {
                         | "nopanic"
                         | "noalloc"
                         | "nonblocking"
+                        // `hir-ty-pure`'s roles, from `AttrFlags::role_attr`
+                        // (docs/v2/plan/design/effect-summary.md).
+                        | "bounded_turn"
+                        | "answers_request"
                         | "expect"
                         // `#[blaze::may(..)]`, the deleted spelling of `expect`: inert here so
                         // that it is refused by name, with the fix that respells it

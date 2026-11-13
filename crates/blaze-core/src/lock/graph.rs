@@ -94,16 +94,19 @@ impl Drop for Registered {
     }
 }
 
-/// Registers the calling thread's wait on `on` from `since_ns`.
+/// Registers the calling thread's wait on `on` from `since_ns`, ending by itself at
+/// `deadline_ns` if it has one (both on the probe's clock).
 pub(crate) fn register(
     on: Blocked,
     span: u64,
     since_ns: u64,
+    deadline_ns: Option<u64>,
     site: Option<&'static Location<'static>>,
     owner: Option<&AtomicU64>,
 ) -> Registered {
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
-    let row = WaitRow { thread: thread_mark(), span, since_ns, on, holder: None, site };
+    let row =
+        WaitRow { thread: thread_mark(), span, since_ns, deadline_ns, on, holder: None, site };
     // alloc: the registry grows to the most waits at once, once.
     WAITS.lock().push(Entry { token, row, owner: owner.map(|it| Owner(ptr::from_ref(it))) });
     Registered(token)
@@ -111,21 +114,22 @@ pub(crate) fn register(
 
 /// Every wait in progress now, each lock wait with its lock's holder.
 pub fn snapshot() -> Snapshot {
+    let mut waits = Vec::new(); // alloc: a watchdog's check
+    snapshot_into(&mut waits);
+    Snapshot { waits }
+}
+
+/// [`snapshot`] into `into` (cleared first), reusing its capacity: the task watchdog's look,
+/// which allocates nothing once `into` has grown to the most waits at once.
+pub fn snapshot_into(into: &mut Vec<WaitRow>) {
+    into.clear();
     let waits = WAITS.lock();
-    Snapshot {
-        waits: waits
-            .iter()
-            .map(|it| {
-                let mut row = it.row;
-                row.holder = it
-                    .owner
-                    .as_ref()
-                    .map(Owner::load)
-                    .filter(|&holder| holder != 0 && holder != row.thread);
-                row
-            })
-            .collect(), // alloc: a watchdog's check
-    }
+    into.extend(waits.iter().map(|it| {
+        let mut row = it.row;
+        row.holder =
+            it.owner.as_ref().map(Owner::load).filter(|&holder| holder != 0 && holder != row.thread);
+        row
+    }));
 }
 
 /// The stalls among the waits in progress older than `threshold_ns` at `now_ns` (on the

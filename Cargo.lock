@@ -653,6 +653,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cast"
+version = "0.0.0"
+dependencies = [
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-certify"
 version = "0.0.0"
 dependencies = [

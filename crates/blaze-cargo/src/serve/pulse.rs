@@ -35,7 +35,32 @@ pub struct Pulse {
     /// on, which nothing it runs after its wait may do (`Daemon::turn_after_wait`). A queue
     /// has no holder to wait for. At most [`STALLS_KEPT`] are kept: the guard drops the oldest.
     stalls: SegQueue<Option<String>>,
+    /// The task watchdog's word to the loop (`serve::stuck`): each task it found stuck, once,
+    /// for the loop to put in its build's live model and, for a thread nothing can unwind, to
+    /// fail its plane node ([`StuckSaid::lost`]). A queue, as `stalls` is: the loop never
+    /// parks on the watchdog. At most [`STUCK_KEPT`]: the watchdog drops the oldest.
+    stuck: SegQueue<StuckSaid>,
+    /// Each job's write that waits, as the loop last looked (`Daemon::doing`, once a second
+    /// while a build runs), for `blaze debug inspect`. The loop only tries it, so it never
+    /// parks on a reader; a look it could not take is taken at the next.
+    writes: blaze_core::lock::Lock<Vec<super::work::WriteWaiting>>,
 }
+
+/// A task the watchdog found stuck, as it tells the loop.
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: a stuck task, once
+pub struct StuckSaid {
+    /// The build its thread works for; 0 for none (it is said in every build's model).
+    pub build: u32,
+    /// The plane node of the daemon `task` span it is inside, if any.
+    pub node: Option<u64>,
+    /// A thread stuck where nothing can unwind it: its node is failed at the plane with
+    /// `said`'s line and the late end of its task, if one ever comes, is dropped.
+    pub lost: bool,
+    pub said: blaze_protocol::now::Stuck,
+}
+
+/// The most stuck tasks the queue holds for the loop: more than a 128-core pool's convoy.
+const STUCK_KEPT: usize = 512;
 
 /// The most stall lines the queue holds for the loop: a loop that builds nothing takes none,
 /// and the guard says one each look while a stall lasts.
@@ -43,11 +68,47 @@ const STALLS_KEPT: usize = 4;
 
 impl Default for Pulse {
     fn default() -> Pulse {
-        Pulse { moved: AtomicU64::new(0), turns: AtomicU64::new(0), stalls: SegQueue::new() }
+        Pulse {
+            moved: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+            stalls: SegQueue::new(),
+            stuck: SegQueue::new(),
+            writes: blaze_core::lock::Lock::new("serve.pulse.writes", Vec::new()),
+        }
     }
 }
 
 impl Pulse {
+    /// On the loop: the writes that wait now. Never waits: a reader holding the lock leaves
+    /// the last look in place.
+    pub fn set_writes(&self, writes: Vec<super::work::WriteWaiting>) {
+        if let Some(mut it) = self.writes.try_lock() {
+            *it = writes;
+        }
+    }
+
+    /// The writes that waited at the loop's last look; waits for the loop's swap at most.
+    pub fn writes(&self) -> Vec<super::work::WriteWaiting> {
+        self.writes.lock().clone() // clone: an answer, on demand
+    }
+
+    /// The task watchdog found `said` stuck. Never waits: past [`STUCK_KEPT`] untaken, the
+    /// oldest goes (it was logged and recorded as it was said).
+    pub fn say_stuck(&self, said: StuckSaid) {
+        if self.stuck.len() >= STUCK_KEPT {
+            drop(self.stuck.pop());
+        }
+        self.stuck.push(said);
+    }
+
+    /// On the loop: each stuck task said since the last take, oldest first. Never waits;
+    /// bounded by [`STUCK_KEPT`] and what the watchdog says meanwhile, a look every few seconds.
+    pub fn take_stuck(&self, mut each: impl FnMut(StuckSaid)) {
+        while let Some(said) = self.stuck.pop() {
+            each(said);
+        }
+    }
+
     /// The guard's latest stall line, `None` once none lasts. Never waits: the oldest line
     /// the loop has not taken goes when [`STALLS_KEPT`] are queued, and the last said stays.
     pub fn set_stall(&self, line: Option<String>) {
@@ -394,8 +455,15 @@ mod tests {
     fn convoy(head: u64, waiters: usize) -> Stall {
         use blaze_core::lock::stall::{Blocked, WaitRow};
         let on = Blocked::Signal("test.gate");
-        let oldest =
-            WaitRow { thread: head + 100, span: 0, since_ns: 0, on, holder: Some(head), site: None };
+        let oldest = WaitRow {
+            thread: head + 100,
+            span: 0,
+            since_ns: 0,
+            deadline_ns: None,
+            on,
+            holder: Some(head),
+            site: None,
+        };
         Stall::Convoy { head, head_wait: None, holds: on, waiters, oldest }
     }
 
@@ -407,6 +475,7 @@ mod tests {
                 thread,
                 span: 0,
                 since_ns: 0,
+                deadline_ns: None,
                 on: Blocked::Signal("test.gate"),
                 holder: None,
                 site: None,

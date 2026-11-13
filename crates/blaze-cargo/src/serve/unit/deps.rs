@@ -29,9 +29,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
-use blaze_core::lock::Lock;
 use blaze_diagnostics::{Diag, cache};
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{HashMap, HashSet, SharedByHash};
 use blaze_ids::ContentId;
 use blaze_lower::Lowered;
 use blaze_units::query::EnvReads;
@@ -1440,25 +1439,90 @@ struct Images {
     /// out again.
     macros: Arc<blaze_macro_eval::Macros>,
     /// What it asked to keep; a write path, once per crate it images and per goal and body's
-    /// step a flush writes.
-    puts: Lock<Puts>,
+    /// step a flush writes (on the pool, [`ImageStore::for_each`]), taken stage by stage.
+    puts: Asked,
     /// The per-item entries it was asked to keep ([`hir_def::nameres::frozen::entries`]), apart
     /// from `puts`: an entry is kept by whichever query made it, during a serve or a build's
-    /// tasks, where `puts` is written only by a flush and taken stage by stage.
-    entries: Lock<Puts>,
+    /// tasks, and every task asks into it at once.
+    entries: Asked,
 }
 
-/// What an [`Images`] was asked to keep since the last take: the puts in the order asked, and
-/// where each key's is. A flush asks a put for the shape and the answer of every goal and
-/// body's step a build offered (a few hundred thousand of a real workspace), and each put
-/// looks for its key among those asked before: by the index, never a scan of them all.
+/// Values asked to be kept since the last take ([`Images::puts`], [`Images::entries`]), by
+/// key: a lock-free table ([`SharedByHash`]) every task asks into at once.
 ///
-/// A get does not read them: a value is in the store once the loop put it, after the flush
-/// that asked. A flush that writes two values of one family of keys in turn (two shapes of
-/// one base key) keeps what it placed itself (`goal_store::slots`).
-struct Puts {
-    list: Vec<Put>,
-    at: HashMap<ContentId, usize, Global>,
+/// Until 2026-11-13 each was a `Lock` of a list and an index (`serve.deps.images.puts`,
+/// `serve.deps.images.entries`), and every task that resolves a file or reads a macro
+/// definition queued on the entries' one: `blaze check --workspace` of blaze on a 128-core VM
+/// logged `stall: convoy: 55 behind thread T on lock serve.deps.images.entries (oldest 2 to 6
+/// s)` (a run on a machine loaded past its cores, so the length of each hold there is not a
+/// measure). Each ask held that lock across a copy of the value's bytes into the global heap
+/// (`lock_held_across_slow`), a push that could grow a list of every entry the build asked,
+/// and an insert that could rehash an index as large: one holder descheduled, or growing,
+/// held every other asker. Here an ask is one lookup and, for a new key, one insert of bytes
+/// copied before it: no ask holds anything another waits for.
+///
+/// A take lists the keys, removes each, and hands back the bytes sorted by key, so what the
+/// store is given does not depend on which thread asked first (deterministic-output), where
+/// the list was in the order of the asks. An ask that races a take is in this take or the
+/// next; one made after its key was removed asks it into the next take again, with the same
+/// bytes, as a value asked for again before the store holds it always was ([`Images::ask`]).
+/// Taking moves no value out of the table (papaya lends its values): each is copied out once,
+/// by the take, outside any lock.
+#[derive(Default)]
+struct Asked {
+    by_key: SharedByHash<ContentId, Box<[u8]>>,
+}
+
+impl Asked {
+    /// Asks the next take for `value` under `key`: nothing when an ask since the last take
+    /// holds these bytes under it, an error naming the key and how the two differ when it
+    /// holds others (two values under one key: the key misses an input). A borrowed value's
+    /// bytes are copied only when the key is new.
+    fn ask(&self, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+        let asked = self.by_key.pin();
+        if let Some(held) = asked.get(&key) {
+            return same(key, held, &value);
+        }
+        let owned: Box<[u8]> = match value {
+            // alloc: none, or a shrink of the value's own spare capacity
+            std::borrow::Cow::Owned(it) => it.into_boxed_slice(),
+            // alloc: the value's bytes, until the loop writes them; made before the insert,
+            // which takes no lock
+            std::borrow::Cow::Borrowed(it) => Box::from(it),
+        };
+        match asked.try_insert(key, owned) {
+            Ok(_) => Ok(()),
+            // Another task asked it between the look and the insert.
+            Err(occupied) => same(key, occupied.current, &occupied.not_inserted),
+        }
+    }
+
+    /// What was asked since the last take, each key once, sorted by key.
+    fn take(&self) -> Vec<Put> {
+        let asked = self.by_key.pin();
+        // alloc: once a take, one key per value asked since the last
+        let mut keys: Vec<ContentId> = asked.keys().copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter()
+            .filter_map(|key| {
+                let bytes = asked.remove(&key)?;
+                // alloc: the value's bytes, until the loop writes them
+                Some(Put { key: Key(key), kind: Kind::Query, bytes: bytes.to_vec() })
+            })
+            .collect() // alloc: as `keys`
+    }
+}
+
+/// `given` is `held`, asked under `key` before it; else the error naming the key and how the
+/// two differ (`entries::differ`).
+fn same(key: ContentId, held: &[u8], given: &[u8]) -> Result<(), String> {
+    if held == given {
+        return Ok(());
+    }
+    let differ = hir_def::nameres::frozen::entries::differ(held, given);
+    // alloc: error path
+    Err(format!("two values were made under {key:?} in this build: {differ}"))
 }
 
 impl Images {
@@ -1467,79 +1531,51 @@ impl Images {
         stores: Arc<crate::serve::direct::Stores>,
         macros: Arc<blaze_macro_eval::Macros>,
     ) -> Images {
-        let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
-        let entries = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
-        Images {
-            store,
-            stores,
-            macros,
-            puts: Lock::new("serve.deps.images.puts", puts),
-            entries: Lock::new("serve.deps.images.entries", entries),
-        }
+        Images { store, stores, macros, puts: Asked::default(), entries: Asked::default() }
     }
 
-    /// What it was asked to keep since the last take, in the order asked.
+    /// What it was asked to keep since the last take, sorted by key ([`Asked::take`]).
     fn take_puts(&self) -> Vec<Put> {
-        let mut puts = self.puts.lock();
-        puts.at.clear();
-        std::mem::take(&mut puts.list)
+        self.puts.take()
     }
 
-    /// The per-item entries it was asked to keep since the last take, in the order asked.
+    /// The per-item entries it was asked to keep since the last take, sorted by key
+    /// ([`Asked::take`]).
     fn take_entries(&self) -> Vec<Put> {
-        let mut puts = self.entries.lock();
-        puts.at.clear();
-        std::mem::take(&mut puts.list)
+        self.entries.take()
     }
-}
 
-impl Images {
-    /// Asks the loop, in `into`, to keep `value` under `key` as a query's record: nothing when the store
-    /// or an earlier ask of this flush holds these bytes under it, and an error naming the
-    /// key when either holds other bytes (two values under one key: the key misses an input),
-    /// saying how the two differ (`entries::differ`).
-    /// The bytes are copied only when the put is new.
-    fn ask(
-        &self,
-        into: &Lock<Puts>,
-        key: ContentId,
-        value: std::borrow::Cow<'_, [u8]>,
-    ) -> Result<(), String> {
+    /// Asks the loop, in `into`, to keep `value` under `key` as a query's record: nothing when
+    /// the store or an ask since the last take holds these bytes under it, and an error naming
+    /// the key when either holds other bytes (two values under one key: the key misses an
+    /// input), saying how the two differ (`entries::differ`).
+    ///
+    /// A get does not read what was asked: a value is in the store once the loop put it, after
+    /// the flush that asked. A flush that writes two values of one family of keys in turn (two
+    /// shapes of one base key) keeps what it placed itself (`goal_store::slots`).
+    fn ask(&self, into: &Asked, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+        if self.held(key, &value)? {
+            return Ok(());
+        }
+        into.ask(key, value)
+    }
+
+    /// Whether the store holds `value` under `key`: read into the task's frame (or mapped) and
+    /// compared in the scope; an error naming the key when it holds other bytes.
+    fn held(&self, key: ContentId, value: &[u8]) -> Result<bool, String> {
         use crate::serve::direct::{self, Which};
-        use hir_def::nameres::frozen::entries::differ;
-        // What the store holds under it, read into the task's frame (or mapped) and compared
-        // in the scope.
-        let held = blaze_mem::frame::current(|frame| {
+        blaze_mem::frame::current(|frame| {
             match direct::value(&self.stores, Which::Home, &Key(key), frame) {
                 Ok(Some(entry)) if entry[..] == *value => Ok(true),
                 Ok(Some(entry)) => {
-                    let differ = differ(&entry[..], &value);
+                    let differ = hir_def::nameres::frozen::entries::differ(&entry[..], value);
                     // alloc: error path
                     Err(format!("the store holds other bytes under {key:?}: {differ}"))
                 }
                 Ok(None) => Ok(false),
                 Err(failed) => Err(failed.to_string()),
             }
-        })?;
-        if held {
-            return Ok(());
-        }
-        let mut puts = into.lock();
-        let Puts { list, at } = &mut *puts;
-        match at.get(&key).copied() {
-            Some(asked) if list[asked].bytes[..] == *value => {}
-            Some(asked) => {
-                let differ = differ(&list[asked].bytes[..], &value);
-                // alloc: error path
-                return Err(format!("two values were made under {key:?} in this build: {differ}"));
-            }
-            None => {
-                at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
-                // alloc: the put's bytes, until the loop writes them
-                list.push(Put { key: Key(key), kind: Kind::Query, bytes: value.into_owned() });
-            }
-        }
-        Ok(())
+        })
     }
 }
 

@@ -74,9 +74,9 @@ pub(crate) use host::{
     stop_pool, swap_core, until_due, until_due_any, waits_of,
 };
 pub use host::{
-    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here,
-    key_done, now, observed, open_scope, release, stall_while_quiet, stuck_while_quiet, wait,
-    waits_now,
+    Event, EventWait, claim, claim_for, close_scope, count_towards, fail_stuck, innermost_scope,
+    job_here, key_done, now, observed, open_scope, release, stall_while_quiet, stuck_while_quiet,
+    wait, waits_now, waits_now_into,
 };
 pub(crate) use host::{before_claim, gave_way_on, set_give_way_aside};
 
@@ -280,6 +280,10 @@ pub enum StopReason {
     /// The pool's drop waited `waited_ns` with jobs parked and none ending, the bound of its
     /// stop ([`crate::pool::Pool::stop`]): what is still parked fails, so the stop ends.
     Bound { waited_ns: u64 },
+    /// The daemon's task watchdog (`blaze_profile::stuck`) found the job parked and still for
+    /// `still_ns`, past the bound of its wait, and the wait's end nowhere in sight: it fails,
+    /// alone, so its build ends with the error and every other job goes on.
+    Stuck { still_ns: u64 },
 }
 
 /// A parked job of a pool that stops can never wake: its wait ends with this, for the job to
@@ -295,7 +299,10 @@ pub struct Stopped {
 
 impl fmt::Display for Stopped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pool stopped: job {} can never wake, so it fails: ", self.job.0)?;
+        match self.reason {
+            StopReason::Stuck { .. } => write!(f, "stuck: job {} fails: ", self.job.0)?,
+            _ => write!(f, "pool stopped: job {} can never wake, so it fails: ", self.job.0)?,
+        }
         say_waits(f, std::slice::from_ref(&(self.job, self.wait)))?;
         match self.reason {
             StopReason::Dropper { dropper, panicking } => {
@@ -313,6 +320,11 @@ impl fmt::Display for Stopped {
                 f,
                 "; its pool's drop waited {:.1} s with jobs parked and none ending, the bound of its stop",
                 waited_ns as f64 / 1e9
+            ),
+            StopReason::Stuck { still_ns } => write!(
+                f,
+                "; it was parked and still for {:.0} s, past the task watchdog's bound for its wait",
+                still_ns as f64 / 1e9
             ),
         }
     }
@@ -1504,6 +1516,11 @@ impl World {
         Waits(waits)
     }
 
+    /// Each job that waits in the graph and what on, given to `each`; allocates nothing.
+    pub(crate) fn waits_each(&self, each: impl FnMut(JobId, StallWait)) {
+        self.graph.waiting_each(each);
+    }
+
     /// Whether no job is live here but clients' that wait for nothing ([`Graph::at_rest`]).
     pub(crate) fn at_rest(&self) -> bool {
         self.graph.at_rest()
@@ -1543,6 +1560,8 @@ impl World {
             // The thread dropping the pool is no live job: no wait leads to it.
             StopReason::Dropper { .. } => return 0,
             StopReason::Bound { .. } => None,
+            // One job, not a pool: [`World::fail_stuck`].
+            StopReason::Stuck { .. } => return 0,
         };
         let mut unwaited = Vec::new(); // alloc: a pool's stop, once per round of it
         self.graph.unwait_member(member, dropper, &mut unwaited);
@@ -1556,6 +1575,22 @@ impl World {
         self.woken = woken;
         self.split(None);
         count
+    }
+
+    /// `job`, parked, wakes to fail with a [`Stopped`] of [`StopReason::Stuck`]
+    /// ([`World::take_failed`] at its wait's end, a safe point): the task watchdog found it
+    /// still for `still_ns`. Whether it woke: not where waking it is unsafe
+    /// ([`Graph::unwait_one`]).
+    pub(crate) fn fail_stuck(&mut self, job: JobId, still_ns: u64) -> bool {
+        let Some(wait) = self.graph.unwait_one(job) else { return false };
+        let reason = StopReason::Stuck { still_ns };
+        self.stopped.push(Stopped { job, wait, reason, cycle: None });
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        woken.push(job.0);
+        self.woken = woken;
+        self.split(None);
+        true
     }
 
     /// `job` (live, waiting for nothing: the thread that stops the pool of `member`, of another

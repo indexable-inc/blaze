@@ -94,9 +94,9 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
-        Library, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
-        applying_fallible,
+        Asks, Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb,
+        KeptPut, Library, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps,
+        WriteWait, Writer, applying, applying_fallible,
     },
 };
 
@@ -1285,6 +1285,21 @@ impl Writer<Real> for UnitWriter {
         !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
     }
 
+    fn idle(&self) -> bool {
+        Arc::strong_count(&self.front) == 1
+    }
+
+    fn write_wait(&self) -> WriteWait {
+        let count = |it: usize| u32::try_from(it).unwrap_or(u32::MAX);
+        WriteWait {
+            runs: count(self.runs.len()),
+            macros: count(self.macros.len()),
+            msls: count(self.msls.len()),
+            release: self.release.due(),
+            readers: count(Arc::strong_count(&self.front).saturating_sub(1)),
+        }
+    }
+
     fn began(&mut self, unit: usize) {
         self.release.began(unit);
     }
@@ -1787,18 +1802,41 @@ impl<T> Drop for Held<T> {
 fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError> {
     // The narrowed identities first: a reader that finds the identity set finds them set.
     if let Some(slot) = job.narrowed.get(unit as usize) {
-        let _span = tracing::info_span!(target: "blaze", "unit narrowed identity", unit).entered();
+        // On the loop (`UnitWriter::apply`): each part a span of its own, with how many
+        // library crates were read from the store and how many parsed in full for want of a
+        // narrowed identity there (rule slow-is-p0-traced: a turn stuck 60 s in this span
+        // named neither, 2026-11-13).
+        let span = tracing::info_span!(
+            target: "blaze",
+            "unit narrowed identity",
+            unit,
+            read = tracing::field::Empty,
+            parsed = tracing::field::Empty,
+        )
+        .entered();
         let front_end = deps::front_end()?;
+        let mut read = 0_u64;
         // One direct read into the identity's own few bytes, which the front end keeps.
         let kept = |key: &ContentId| {
+            read += 1;
+            let _read =
+                tracing::info_span!(target: "blaze", "unit narrowed identity: a store read").entered();
             match super::direct::owned(&job.input.reads, super::direct::Which::Home, &blaze_cas::Key(*key)) {
                 // alloc: a narrowed identity's few bytes, once per library crate per front end
                 Ok(found) => Ok(found),
                 Err(failed) => Err(failed.to_string()), // alloc: error path
             }
         };
+        let library = tracing::info_span!(
+            target: "blaze",
+            "unit narrowed identity: its library crates (store reads, parses where the store has none)"
+        )
+        .entered();
         lowered.library_narrows(unit as usize, &front_end, kept).map_err(lower_error)?;
+        drop(library);
         let made = lowered.take_library_narrows();
+        span.record("read", read);
+        span.record("parsed", made.len() as u64);
         if !made.is_empty() {
             job.library_narrows.lock().extend(made.into_iter().map(|(key, bytes)| Put {
                 key: blaze_cas::Key(key),
@@ -1806,9 +1844,17 @@ fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError>
                 bytes,
             }));
         }
+        let own = tracing::info_span!(
+            target: "blaze",
+            "unit narrowed identity: its closure's texts (each crate's files parsed once a revision)"
+        )
+        .entered();
         let _ = slot.set(lowered.narrowed(unit as usize));
+        drop(own);
+        drop(span);
     }
     if let Some(slot) = job.identities.get(unit as usize) {
+        let _span = tracing::info_span!(target: "blaze", "unit identity", unit).entered();
         let _ = slot.set(lowered.identity(unit as usize));
     }
     Ok(())
@@ -2625,7 +2671,7 @@ impl Runs<Real> for UnitRuns {
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2648,7 +2694,7 @@ impl Runs<Real> for UnitRuns {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

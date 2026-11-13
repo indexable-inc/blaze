@@ -378,6 +378,7 @@ impl<'a> Waiting<'a> {
             graph::lock(meta.name, mode, ptr::from_ref(meta).addr()),
             span,
             start_ns,
+            None,
             Some(site),
             Some(&meta.owner),
         ));
@@ -828,14 +829,21 @@ impl Signal {
         self.name
     }
 
-    fn span<R>(&self, wait: impl FnOnce() -> R) -> R {
+    /// Runs `wait` inside the signal's span and wait-graph row; `left` is the time from now to
+    /// its deadline (`None`: it has none), which the row says on the probe's clock.
+    fn span<R>(&self, left: Option<Duration>, wait: impl FnOnce() -> R) -> R {
         let probe = installed();
         let token = probe.map(|it| it.wait_begin(Awaits::Signal(self.name)));
         let registered = probe.map(|probe| {
+            let now_ns = probe.now_ns();
+            let deadline_ns = left.map(|it| {
+                now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX))
+            });
             graph::register(
                 stall::Blocked::Signal(self.name),
                 probe.span(),
-                probe.now_ns(),
+                now_ns,
+                deadline_ns,
                 None,
                 None,
             )
@@ -850,7 +858,7 @@ impl Signal {
 
     /// Waits for a notify, letting `guard`'s lock go meanwhile.
     pub fn wait<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>) {
-        self.span(|| self.raw.wait(&mut guard.inner));
+        self.span(None, || self.raw.wait(&mut guard.inner));
     }
 
     /// Waits while `condition` holds.
@@ -859,17 +867,18 @@ impl Signal {
         guard: &mut LockGuard<'_, T>,
         condition: impl FnMut(&mut T) -> bool,
     ) {
-        self.span(|| self.raw.wait_while(&mut guard.inner, condition));
+        self.span(None, || self.raw.wait_while(&mut guard.inner, condition));
     }
 
     /// Waits for a notify by `deadline`: whether the deadline passed first.
     pub fn wait_until<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, deadline: Instant) -> bool {
-        self.span(|| self.raw.wait_until(&mut guard.inner, deadline).timed_out())
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.span(Some(left), || self.raw.wait_until(&mut guard.inner, deadline).timed_out())
     }
 
     /// Waits for a notify for at most `most`: whether it passed first.
     pub fn wait_for<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, most: Duration) -> bool {
-        self.span(|| self.raw.wait_for(&mut guard.inner, most).timed_out())
+        self.span(Some(most), || self.raw.wait_for(&mut guard.inner, most).timed_out())
     }
 
     /// Waits while `condition` holds, by `deadline`: whether the deadline passed first.
@@ -879,7 +888,10 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         deadline: Instant,
     ) -> bool {
-        self.span(|| self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out())
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.span(Some(left), || {
+            self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out()
+        })
     }
 
     /// Waits while `condition` holds, for at most `most`: whether it passed first.
@@ -889,7 +901,9 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         most: Duration,
     ) -> bool {
-        self.span(|| self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out())
+        self.span(Some(most), || {
+            self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out()
+        })
     }
 
     pub fn notify_one(&self) -> bool {

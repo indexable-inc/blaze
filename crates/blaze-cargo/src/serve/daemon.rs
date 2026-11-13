@@ -50,10 +50,14 @@ use super::{
     mounts::Mounts,
     observe::{Observe, Profiling},
     plane::{Happened, Plane, Runner, ns},
-    pulse::Pulse,
+    pulse::{Pulse, StuckSaid},
     still::{Facts, STILL_FOR, Stillness, Turn, Why},
     work::Steps,
 };
+
+/// The most stuck tasks the loop keeps for the builds' live models ([`Daemon::take_stuck`]):
+/// the first lines of a convoy name it; the rest are in the daemon's log and its recording.
+const STUCK_SHOWN: usize = 16;
 
 /// The tags of each part: `2^32` each, the watchers' and the runs' ranges of `2^32` after.
 const OWN: u64 = 0;
@@ -290,6 +294,11 @@ pub struct Still {
     /// never started is held back by admission, and the stall says by which of its rules.
     /// `None` with no budget.
     pub admission: Option<String>,
+    /// Each job's write that waits, longest first ([`Jobs::write_waits`]): what it waits with
+    /// and the tasks the loop holds for it.
+    pub writes: Vec<super::work::WriteWaiting>,
+    /// The proc macros' expansion threads, `None` when their lock was held as the loop looked.
+    pub expansion: Option<blaze_macro_eval::ExpansionCounts>,
 }
 
 pub struct StillWait {
@@ -329,6 +338,40 @@ impl fmt::Display for Still {
                 "\n  {tasks} tasks posted to the worker pool wait on {parked} parked jobs, and no wait of the wait graph \
                  can end with the loop still; they were failed with the stall"
             )?,
+            Why::WriteWaits { tasks, parked, waited_ns } => write!(
+                f,
+                "\n  a job's write of its front end waited {:.1} s for readers that nothing moves ({tasks} tasks \
+                 posted to the worker pool, {parked} jobs parked), while the loop holds back every task of the job \
+                 a reader could be waiting on (rule: a write waits only on readers that end on their own)",
+                waited_ns as f64 / 1e9
+            )?,
+        }
+        for it in self.writes.iter().take(STILL_NAMED) {
+            let wait = &it.wait;
+            write!(
+                f,
+                "\n  the write of `{}`: waited {} ms with {} build-script runs, {} proc-macro loads and {} MSL builds \
+                 asked{}, {} readers alive, {} tasks held",
+                it.root,
+                it.waited_ms,
+                wait.runs,
+                wait.macros,
+                wait.msls,
+                if wait.release { " and a release due" } else { "" },
+                wait.readers,
+                it.held
+            )?;
+            if let Some(node) = it.applying {
+                write!(f, ", applying on node {node}")?;
+            }
+        }
+        if let Some(it) = &self.expansion {
+            write!(
+                f,
+                "\n  expansion threads: {} alive of a cap of {}, {} idle, {} expansions queued, {} waiting on \
+                 `macro.thread.replied`",
+                it.alive, it.cap, it.idle, it.queued, it.asking
+            )?;
         }
         if !self.graph.0.is_empty() {
             write!(f, "\n  {}", self.graph)?;
@@ -927,6 +970,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The top stall's line as the guard last said it ([`Pulse::take_stall`]), the loop's own
     /// copy: taken from the guard's queue once a look at the builds, with no lock.
     stall: Option<String>,
+    /// The tasks the task watchdog found stuck (`serve::stuck`, through [`Pulse::take_stuck`])
+    /// while a build is under way, the latest [`STUCK_SHOWN`]: each build's live model says
+    /// those of its build and those of none (`Now::stuck`). Cleared once no build is.
+    stuck: Vec<StuckSaid>,
     /// The effects that end on their own that ended ([`ends_alone`]: writes, reads and runs,
     /// never a client's connect or request, which a stuck daemon still takes).
     completions: u64,
@@ -2045,6 +2092,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             working: 0,
             pulse: Arc::default(), // alloc: once a daemon
             stall: None,
+            stuck: Vec::new(),
             completions: 0,
             plotted: Duration::ZERO,
             worked: false,
@@ -2305,6 +2353,25 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
+    /// Each thread task that runs now, with its request, least node first: what a test plants
+    /// the task watchdog's verdict on ([`Pulse::say_stuck`]).
+    #[cfg(test)]
+    pub(super) fn running_thread_tasks_for_test(
+        &self,
+    ) -> Vec<(blaze_graph::plane::RequestId, blaze_graph::machine::NodeId)> {
+        let plane = &self.plane;
+        let mut found = Vec::new();
+        plane.unsettled(|it| {
+            if matches!(it.state, blaze_protocol::events::NodeState::Running)
+                && !plane.loop_runs(it.id)
+            {
+                found.push((it.request, it.id));
+            }
+        });
+        found.sort_by_key(|it| it.1.0);
+        found
+    }
+
     /// The standard library's store, shared with this build's other daemons.
     pub fn std_store(&self) -> &Store {
         &self.std
@@ -2539,7 +2606,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// through and refuses this function; the checker is fixed in 02b092913b. Put the attribute
     /// back when `.github/blaze-version` names a blaze with that fix. Until then the loop is
     /// held at run time by the `loop stalled` span (`Stalled`) and harness/v2/loop_syscalls.py.
+    ///
+    /// `#[blaze::bounded_turn]` (`blaze::loop_turn_effects`, docs/v2/plan/design/effect-summary.md)
+    /// holds the turn to more than that: no IO, no sync and no lock either, through any call. The
+    /// released blaze does not know the word and leaves it inert (`register_tool(blaze)`).
     // #[blaze::nonblocking]
+    #[blaze::bounded_turn]
     fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
         let mut step = Stalled::begin("completions");
         for completion in &done {
@@ -2882,10 +2954,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// The loop's stall: a request has nodes not settled and nothing can move them (the loop has
-    /// nothing ready, pending or in flight, no job's write waits for readers, no IO task runs,
-    /// and the worker pool runs and queues nothing, while any task posted to it either has no
-    /// job there, lost, or waits on what no wait of the graph will end: [`Stillness`]). Held
-    /// for [`STILL_FOR`], every job with a plane request under way fails with [`Still`], naming
+    /// nothing ready, pending or in flight, no IO task or expansion thread runs, and the worker
+    /// pool runs and queues nothing, while any task posted to it either has no job there, lost,
+    /// or waits on what no wait of the graph will end, or a job's write has waited past
+    /// [`super::still::WRITE_STILL_FOR`] on readers: [`Stillness`]). Held for [`STILL_FOR`], every job with a plane request under way fails with [`Still`], naming
     /// what each node waits on and every wait of the graph, and the daemon stops, as on a stall
     /// the watchdog finds.
     fn still(&mut self) {
@@ -2895,11 +2967,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // idle has sent every end it will, and the loop sees it ready below.
         let (pool_idle, parked) = (pool.idle(), pool.parked());
         let on_pool = self.plane.running_on_pool();
+        let expansion = blaze_macro_eval::expansion_counts();
         let facts = Facts {
             loop_moves: self.plane.ready()
                 || self.effects.iter().any(ends_alone)
-                || !self.ending.is_empty()
-                || self.jobs.writes_waiting(),
+                || !self.ending.is_empty(),
+            write_waited_ns: self
+                .jobs
+                .write_waited(self.driver.now())
+                .map(|it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)),
+            // A lock held as the loop looks is an expansion thread at work. A thread asking
+            // waits on its job, which is the pool's, so it is no movement of its own.
+            expanding: expansion.map_or(1, |it| {
+                it.alive.saturating_sub(it.idle).saturating_sub(it.asking) + it.queued
+            }),
             off_pool: self.plane.running() - on_pool,
             on_pool,
             pool_idle,
@@ -2914,8 +2995,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let (quiet_ns, why) =
             match self.stillness.tick(now, &facts, blaze_graph::sched::stuck_while_quiet, open) {
                 Turn::Moves | Turn::Holds => return,
-                Turn::Began => {
-                    self.effects.push(Effect::Timer { after: STILL_FOR, tag: STILL_TIMER });
+                Turn::Began { after } => {
+                    self.effects.push(Effect::Timer { after, tag: STILL_TIMER });
                     return;
                 }
                 Turn::Still { quiet_ns, why } => (quiet_ns, why),
@@ -2945,7 +3026,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // end. Any other stretch names the graph's waits as they are.
         let graph = match why {
             Why::Stuck { .. } => blaze_graph::sched::stall_while_quiet(),
-            Why::NoTask | Why::Lost { .. } => None,
+            // A write's readers wait on what the graph cannot call stuck: named as they are,
+            // each parked job by what it waits on and who claimed it.
+            Why::NoTask | Why::Lost { .. } | Why::WriteWaits { .. } => None,
         };
         let still = Still {
             quiet_ns,
@@ -2956,6 +3039,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             waits,
             lowerings: self.jobs.held_lowerings(),
             admission: self.plane.admission_says(),
+            writes: self.jobs.write_waits(self.driver.now()),
+            expansion,
         };
         let said = still.to_string();
         tracing::error!("{said}");
@@ -3016,6 +3101,29 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
     }
 
+    /// The task watchdog's word since the last look: each stuck task kept for the live models,
+    /// and the plane node of each lost thread failed with its line ([`Plane::abandon`]), so its
+    /// build ends with that error and the daemon serves the next. Never waits.
+    fn take_stuck(&mut self, now: Duration) {
+        let (plane, stuck) = (&mut self.plane, &mut self.stuck);
+        self.pulse.take_stuck(|said| {
+            if said.lost
+                && let Some(node) = said.node.and_then(|it| u32::try_from(it).ok())
+            {
+                // alloc: a stuck task, once
+                let why = format!(
+                    "blaze: {}; nothing can unwind its thread, so its task fails and the thread is lost to the daemon",
+                    said.said
+                );
+                plane.abandon(now, blaze_graph::machine::NodeId(node), why);
+            }
+            if stuck.len() >= STUCK_SHOWN {
+                stuck.remove(0);
+            }
+            stuck.push(said); // alloc: grows to STUCK_SHOWN once
+        });
+    }
+
     /// What each build is doing, looked at once each [`doing::EVERY`] of the driver's clock
     /// while a job runs ([`Jobs::doing`]): said to its client as `Response::Doing`, and kept in
     /// `builds` for `blaze status`. Reads the plane's running nodes, the recorder's open spans
@@ -3028,7 +3136,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.looked = now;
         self.builds.clear();
+        self.take_stuck(now);
+        // What `blaze debug inspect` says of each job's waiting write, once a look.
+        self.pulse.set_writes(self.jobs.write_waits(now));
         if self.jobs.under_way() == 0 {
+            self.stuck.clear();
             return;
         }
         #[cfg(feature = "native")]
@@ -3062,6 +3174,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             fetching: &fetching,
             memory: &memory,
             stall,
+            stuck: &self.stuck,
         };
         let mut said = self.spare.said.pop().unwrap_or_default();
         let mut builds = std::mem::take(&mut self.builds);
@@ -3397,7 +3510,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// `reply` handed to the server to send. A request's `Done` ends its `request: read to
-    /// reply` span ([`Daemon::arrive`]).
+    /// reply` span ([`Daemon::arrive`]). An answer path: nothing under it syncs a file
+    /// (`blaze::sync_on_answer_path`).
+    #[blaze::answers_request]
     fn reply(&mut self, reply: &Reply) {
         // A reply to the daemon's own request is the core's and no client's: what a build
         // ahead says is shown to nobody ([`super::ahead`]).
@@ -3793,7 +3908,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// The plane's thread tasks that ended taken, and what it did given to the jobs, until it
-    /// does nothing more.
+    /// does nothing more. A part of the loop's turn (`blaze::loop_turn_effects`): the capture
+    /// of 2026-11-12 held the loop 60 s in "unit narrowed identity" beneath it.
+    #[blaze::bounded_turn]
     fn step_plane(&mut self) {
         let mut happened = std::mem::take(&mut self.spare.happened);
         let mut said = self.spare.said.pop().unwrap_or_default();

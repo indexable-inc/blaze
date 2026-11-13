@@ -66,6 +66,12 @@ thread_local! {
     /// The planted bug of `serve::tests`' certificate control: a build's certificate is written
     /// as it ends ([`Jobs::heard`]), before what it left to settle after its answer is durable.
     pub(super) static CERTIFY_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a front-end write's task runs [`Writer::apply`] ([`Does::Write`]) on this
+    /// thread: what a test's writer reads to tell an apply on a task from one on the loop.
+    pub(super) static IN_WRITE_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' write-on-a-task control: [`Jobs::apply_writes`]
+    /// applies a job's write on the loop, in its turn, as before 2026-11-13.
+    pub(super) static PLANT_WRITE_ON_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -168,7 +174,7 @@ use super::{
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
         Linking, LocalRead, Made, Phase, Readers, RunPuts, Runs, Selection, Shared, Source, Steps,
-        Writer,
+        WriteWait, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -233,6 +239,11 @@ pub enum Value<S: Steps> {
     /// A front-end carry's pass ran ([`Does::FrontCarry`]): what it gave is in its
     /// [`CarryHand`], which the loop finds by the node ([`Jobs::front_carried`]).
     FrontCarried,
+    /// A job's front-end write ran on its task ([`Does::Write`]): the writer given back, with
+    /// what its [`Writer::apply`] came to. No writer when the task found none, or the write
+    /// panicked outside what [`super::work::applying`] catches, which leaves the front end
+    /// half written: the job then fails with the error.
+    Wrote(Option<S::Writer>, Result<bool, ApiError>),
 }
 
 /// What jobs tell the session, in order.
@@ -550,6 +561,18 @@ pub(super) enum Does<S: Steps> {
         bytes: u64,
         wanted: Arc<AtomicBool>,
     },
+    /// A job's front-end write ([`Writer::apply`]: its proc macros' loads, build scripts' runs
+    /// and device builds' MSL; the harnesses; the units made ready identified; their
+    /// dependencies served), on a worker, never the loop. Posted once no task reads the front
+    /// end ([`Writer::idle`]), the writer taken by the task and given back in its value
+    /// ([`Value::Wrote`]), as the tables' and the documentation's tasks take it; meanwhile
+    /// the loop keeps what is asked of the writer ([`Writing`]) and holds every reading task.
+    /// Shared with the loop so a task the plane refuses, or one that settles unrun, gives the
+    /// writer back ([`Jobs::write_settled`]). `asked`: what the write applies, for its span.
+    Write {
+        slot: Arc<Lock<Option<S::Writer>>>,
+        asked: WriteWait,
+    },
     /// One pass of checkout `checkout`'s front-end carry ([`super::front_carry::Carry::run`]):
     /// the pass and the session taken from `hand`, the tree read through `files`, the store
     /// through `store` under the task's guard, every write kept for the loop to put.
@@ -641,6 +664,14 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
             Does::GiveValues { checkout, bytes, .. } => tracing::info_span!(target: "blaze", "give back a kept front end's values", checkout = %checkout, bytes = *bytes),
+            Does::Write { asked, .. } => tracing::info_span!(
+                target: "blaze",
+                "front end write",
+                runs = asked.runs,
+                macros = asked.macros,
+                msls = asked.msls,
+                release = asked.release,
+            ),
             Does::FrontCarry { checkout, .. } => tracing::info_span!(target: "blaze", "front end carry pass", checkout = %checkout),
         }
         .entered();
@@ -1003,6 +1034,40 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                 };
                 self.settle(Ok::<(), Failed>(()), |_| Value::GaveValues(front, gave))
+            }
+            Does::Write { slot, .. } => {
+                let taken = slot.lock().take();
+                let Some(mut writer) = taken else {
+                    let error = ApiError::new(
+                        "the job's front-end writer was taken before its write's task ran",
+                        None,
+                    );
+                    return self.settle(Err::<bool, _>(Failed::Error(error)), |it| {
+                        Value::Wrote(None, it)
+                    });
+                };
+                #[cfg(test)]
+                IN_WRITE_TASK.set(true);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.apply()));
+                #[cfg(test)]
+                IN_WRITE_TASK.set(false);
+                match caught {
+                    // The write's own outcome is the loop's to judge ([`Jobs::wrote`]): the
+                    // node is built either way, and the job fails on a writer's error.
+                    Ok(applied) => {
+                        self.settle(Ok::<(), Failed>(()), |_| Value::Wrote(Some(writer), applied))
+                    }
+                    Err(payload) => {
+                        let panic = plane::panicked(&*payload);
+                        drop(writer);
+                        // alloc: a panic, once
+                        let what = format!(
+                            "blaze {panic}, writing the front end outside any one unit's write; it is dropped, as it may be half written"
+                        );
+                        let error = ApiError::new(what, None);
+                        self.settle(Ok::<(), Failed>(()), |_| Value::Wrote(None, Err(error)))
+                    }
+                }
             }
             Does::FrontCarry { hand, files, store, .. } => {
                 let (state, pass, crates) = {
@@ -2851,11 +2916,19 @@ struct Fetching {
 struct Build<S: Steps> {
     input: JobInput,
     front: Arc<S::Front>,
-    /// The front end, written only here, on the loop: each task that reads it is posted with
-    /// a reader made from it then, and a write waits for those readers to end.
-    writer: S::Writer,
+    /// The front end's writer: each task that reads it is posted with a reader made from it
+    /// then, and a write waits for those readers to end, then runs on a task of its own that
+    /// holds the writer ([`Does::Write`]), never on the loop.
+    writer: Writing<S>,
     /// Reading tasks the plane asked to post while a write waited, posted once it is applied.
     held: Vec<(Posting, bool)>,
+    /// Since when, on the loop's clock, a write has waited ([`Writer::waiting`]) and not been
+    /// applied: for the loop's status and the bound of a write nothing can end
+    /// ([`super::still::WRITE_STILL_FOR`]). None while none waits.
+    write_since: Option<Duration>,
+    /// The build's end, heard while its write's task held the writer: done as the writer
+    /// comes back ([`Jobs::wrote`]), since every step of an end reads the front end.
+    after_write: Option<AfterWrite>,
     /// Node `first + at` is of unit `units[at]`: one node a phase of its compile, a unit's
     /// nodes one after another ([`Phase`]), and one for a build script's run.
     first: NodeId,
@@ -2897,6 +2970,215 @@ struct Build<S: Steps> {
     /// this stretch of a body edit of `rg::main` was 650 ms that no span named
     /// (slow-is-p0-traced); the unit tasks inside it are its children by time.
     made_wait: Option<tracing::Span>,
+}
+
+/// The end of a build heard while its write's task held the writer ([`Build::after_write`]).
+#[derive(Clone, Copy)]
+enum AfterWrite {
+    /// Its plane request finished ([`Jobs::plane_finished`]).
+    Finished { request: RequestId, ok: bool, stats: RequestStats },
+    /// Its last node of a build of the units a view's front end applies settled
+    /// ([`Jobs::units_applied`]).
+    Applied { ok: bool },
+}
+
+/// What the loop is asked of a job's writer while its write's task holds it, in the order
+/// asked: handed to the writer, in that order, as it comes back ([`Writing::back`]).
+enum Ask {
+    Ran(usize, blaze_lower::Ran),
+    Macros(usize, blaze_lower::ProcMacroLoadResult),
+    Msl(usize, Vec<u8>),
+    Began(usize),
+    FoundKept(usize),
+    Compiled(usize),
+    Pressed,
+}
+
+/// A job's writer ([`Build::writer`]): on the loop, or away on its write's task
+/// ([`Does::Write`]). Away, what the loop is asked of it is kept ([`Ask`]) and handed to it as
+/// it comes back, so nothing the loop hears (a unit's start or end, a proc macro's load, a run
+/// of a build script) waits for the write; no reading task is posted (there is no reader to
+/// make) and every write asked is one for the next apply.
+enum Writing<S: Steps> {
+    Here(S::Writer),
+    /// Its write's task gave no writer back (it panicked outside any unit's write, or never
+    /// ran): the front end is gone, and its job failed saying so ([`Jobs::wrote`]).
+    Lost,
+    Away {
+        /// The write's node, of a plane request of its own.
+        node: NodeId,
+        /// What it was posted to apply, for the status.
+        asked: WriteWait,
+        /// What was asked of the writer since, in order.
+        kept: Vec<Ask>,
+        /// The writer's slot, shared with the task ([`Does::Write`]).
+        slot: Arc<Lock<Option<S::Writer>>>,
+    },
+}
+
+impl<S: Steps> Writing<S> {
+    fn here(&self) -> Option<&S::Writer> {
+        match self {
+            Writing::Here(it) => Some(it),
+            Writing::Lost | Writing::Away { .. } => None,
+        }
+    }
+
+    fn here_mut(&mut self) -> Option<&mut S::Writer> {
+        match self {
+            Writing::Here(it) => Some(it),
+            Writing::Lost | Writing::Away { .. } => None,
+        }
+    }
+
+    /// The writer, for a build's end; none while its write's task holds it.
+    fn into_here(self) -> Option<S::Writer> {
+        match self {
+            Writing::Here(it) => Some(it),
+            Writing::Lost | Writing::Away { .. } => None,
+        }
+    }
+
+    /// The node of the write whose task holds the writer, if one does.
+    fn away(&self) -> Option<NodeId> {
+        match self {
+            Writing::Here(_) | Writing::Lost => None,
+            Writing::Away { node, .. } => Some(*node),
+        }
+    }
+
+    fn reader(&self) -> Option<S::Reader> {
+        self.here().and_then(|it| it.reader())
+    }
+
+    /// A write waits: asked and not applied, or applying on its task.
+    fn waiting(&self) -> bool {
+        self.here().is_none_or(|it| it.waiting())
+    }
+
+    /// What the write waits with; a write on its task, what it was posted to apply.
+    fn write_wait(&self) -> WriteWait {
+        match self {
+            Writing::Here(it) => it.write_wait(),
+            Writing::Away { asked, .. } => *asked,
+            Writing::Lost => WriteWait::default(),
+        }
+    }
+
+    /// `ask` of the writer: handed to it here, kept while its write's task holds it. A lost
+    /// writer's job failed already; what it is asked now is refused, naming that.
+    fn ask(&mut self, ask: Ask) -> Result<(), ApiError> {
+        match self {
+            Writing::Here(it) => asked::<S>(it, ask),
+            Writing::Away { kept, .. } => {
+                kept.push(ask);
+                Ok(())
+            }
+            Writing::Lost => Err(ApiError::new(
+                "the job's front end was lost to a write that failed, and nothing more is applied to it",
+                None,
+            )),
+        }
+    }
+
+    fn macros(
+        &mut self,
+        unit: usize,
+        macros: blaze_lower::ProcMacroLoadResult,
+    ) -> Result<(), ApiError> {
+        self.ask(Ask::Macros(unit, macros))
+    }
+
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError> {
+        self.ask(Ask::Msl(unit, msl))
+    }
+
+    // The four below are refused only by a lost writer, whose job failed with it.
+    fn began(&mut self, unit: usize) {
+        _ = self.ask(Ask::Began(unit));
+    }
+
+    fn found_kept(&mut self, unit: usize) {
+        _ = self.ask(Ask::FoundKept(unit));
+    }
+
+    fn compiled(&mut self, unit: usize) {
+        _ = self.ask(Ask::Compiled(unit));
+    }
+
+    fn pressed(&mut self) {
+        _ = self.ask(Ask::Pressed);
+    }
+
+    /// The writer taken for its write's task, node `node`: its slot, which the task takes it
+    /// from; none when a task holds it already.
+    fn send(&mut self, node: NodeId) -> Option<Arc<Lock<Option<S::Writer>>>> {
+        let Writing::Here(writer) = self else { return None };
+        let asked = writer.write_wait();
+        // alloc: once a write, shared with its task
+        let slot = Arc::new(Lock::new("serve.job.write.writer", None));
+        let away = Writing::Away {
+            node,
+            asked,
+            kept: Vec::new(), // alloc: none until something is asked while the write runs
+            slot: Arc::clone(&slot), // clone: a refcount, once a write
+        };
+        if let Writing::Here(writer) = std::mem::replace(self, away) {
+            *slot.lock() = Some(writer);
+        }
+        Some(slot)
+    }
+
+    /// The writer back from its write's task, what was asked of it meanwhile handed to it in
+    /// order: the errors of those it refused (a run, a proc macro's load, a device build's MSL
+    /// that its check refuses), each the job's.
+    fn back(&mut self, writer: S::Writer) -> Vec<ApiError> {
+        let mut refused = Vec::new(); // alloc: none unless an ask is refused
+        let kept = match std::mem::replace(self, Writing::Here(writer)) {
+            Writing::Away { kept, .. } => kept,
+            // Not away: nothing kept. The loop takes a writer back only for the write it sent
+            // ([`Jobs::wrote`]).
+            Writing::Here(_) | Writing::Lost => Vec::new(), // alloc: none
+        };
+        let Writing::Here(writer) = self else { return refused };
+        for ask in kept {
+            if let Err(error) = asked::<S>(writer, ask) {
+                refused.push(error);
+            }
+        }
+        refused
+    }
+}
+
+/// `ask` handed to `writer`.
+fn asked<S: Steps>(writer: &mut S::Writer, ask: Ask) -> Result<(), ApiError> {
+    match ask {
+        Ask::Ran(run, ran) => writer.ran(run, ran),
+        Ask::Macros(unit, macros) => writer.macros(unit, macros),
+        Ask::Msl(unit, msl) => writer.gpu_msl(unit, msl),
+        Ask::Began(unit) => {
+            writer.began(unit);
+            Ok(())
+        }
+        Ask::FoundKept(unit) => {
+            writer.found_kept(unit);
+            Ok(())
+        }
+        Ask::Compiled(unit) => {
+            writer.compiled(unit);
+            Ok(())
+        }
+        Ask::Pressed => {
+            writer.pressed();
+            Ok(())
+        }
+    }
+}
+
+impl<S: Steps> super::work::Asks for Writing<S> {
+    fn ran(&mut self, run: usize, ran: blaze_lower::Ran) -> Result<(), ApiError> {
+        self.ask(Ask::Ran(run, ran))
+    }
 }
 
 /// A build of the units a view's front end applies, made in the job's one plane request
@@ -4195,9 +4477,11 @@ impl<S: Steps> Job<S> {
         // Its front end's run log, named with its database in hand, before the front end is
         // kept or dropped: why each of its queries ran again.
         let provenance = match (&self.stage, logs) {
-            (Stage::Units(build), true) => {
-                super::observe::provenance_rows(build_id, build.writer.run_log())
-            }
+            (Stage::Units(build), true) => match build.writer.here() {
+                Some(writer) => super::observe::provenance_rows(build_id, writer.run_log()),
+                // A build whose write was lost has no database to name its run log with.
+                None => Vec::new(), // alloc: none
+            },
             _ => Vec::new(), // alloc: none
         };
         Ended {
@@ -5945,12 +6229,16 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// Each job's waiting writes applied where no reader of its front end is left, and the
-    /// tasks held for them posted with readers of what they made. Asking a job whose readers
-    /// still run costs one load of its reference count. Called as the loop winds up each
-    /// step: a reader is dropped as its task's work returns, before the plane hears the task
-    /// ended, so the step that hears the last one applies the write. The daemon calls it
-    /// once a turn as well, for a reader that outlives its task.
+    /// Each job's waiting write sent to a task of its own where no reader of its front end is
+    /// left ([`Jobs::send_write`]), and the tasks held while none waits posted with readers of
+    /// what the last made. Asking a job whose readers still run costs one load of its
+    /// reference count. Called as the loop winds up each step: a reader is dropped as its
+    /// task's work returns, before the plane hears the task ended, so the step that hears the
+    /// last one sends the write. The daemon calls it once a turn as well, for a reader that
+    /// outlives its task. The loop applies no write itself: until 2026-11-13 it did, here, and
+    /// a proc macro's load with its harnesses, identities and dependencies' serve ran whole in
+    /// one loop turn (the `unit narrowed identity` of blaze's own check, seconds a crate under
+    /// a fresh store), every other job and client waiting behind it.
     pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
         // The core past its line is answered by the give-back rule: the allocator's freed
         // pages first, a kept front end last and never while anything cheaper covers it
@@ -5958,17 +6246,213 @@ impl<S: Steps> Jobs<S> {
         self.give_back(w);
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
+        let mut sends = Vec::new(); // alloc: none unless a write is sent this step
+        #[cfg(test)]
+        let mut on_loop = Vec::new(); // alloc: a test's planted bug
         for &id in &order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             let Stage::Units(build) = &mut job.stage else { continue };
-            if !build.writer.waiting() && build.held.is_empty() {
+            // Its write's task holds the writer: its end posts what is held ([`Jobs::wrote`]).
+            if build.writer.away().is_some() {
                 continue;
             }
-            let applied = build.writer.apply();
+            if !build.writer.waiting() {
+                build.write_since = None;
+                posts.append(&mut build.held);
+                continue;
+            }
+            build.write_since.get_or_insert(w.now);
+            if !build.writer.here().is_some_and(|it| it.idle()) {
+                continue;
+            }
+            #[cfg(test)]
+            if PLANT_WRITE_ON_LOOP.get() {
+                on_loop.push(id);
+                continue;
+            }
+            sends.push(id);
+        }
+        self.order = order;
+        for (task, again) in posts.drain(..) {
+            self.post(w, task, again);
+        }
+        self.posts = posts;
+        for id in sends {
+            self.send_write(w, id);
+        }
+        #[cfg(test)]
+        for id in on_loop {
+            let applied = match self.jobs.get_mut(key_of(id)).map(|job| &mut job.stage) {
+                Some(Stage::Units(build)) => build.writer.here_mut().map(|it| it.apply()),
+                _ => None,
+            };
+            if let Some(applied) = applied {
+                self.after_write(w, id, applied);
+            }
+        }
+    }
+
+    /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
+    /// holding the writer ([`Does::Write`]), as a kept front end's store and give-back are;
+    /// pushed free of admission, since every reading task of the job waits for it. Its value
+    /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
+    /// job fails naming the refusal.
+    fn send_write(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        if build.writer.here().is_none() {
+            return;
+        }
+        let request = w.plane.open(w.now, false, false);
+        let name = named("the front end's write of ", &build.input.config.invocation.root);
+        let mut fresh = w.plane.fresh(1, name.len(), 0);
+        let write = w.plane.push_free(
+            &mut fresh,
+            node(NodeKind::Names, &name, &[], Pool::Work, None),
+            one(kinds::FRONT_WRITE),
+        );
+        let asked = build.writer.write_wait();
+        let Some(slot) = build.writer.send(write) else { return };
+        let does = Does::Write { slot: Arc::clone(&slot), asked }; // clone: a refcount, once a write
+        // Nothing cancels the write but its own end: its writer always comes back, and a
+        // cancelled job is ended as it does.
+        let never = Arc::new(AtomicBool::new(false)); // alloc: once a write
+        let work = Step::of(&never, does);
+        // No job looks at this request: marked so its finish is forgotten as a store's is.
+        self.store_requests.insert(request);
+        let refused = w.plane.add(w.now, request, fresh, Some(work), false).err();
+        w.plane.close(w.now, request);
+        let Some(error) = refused else { return };
+        let writer = slot.lock().take();
+        if let Some(writer) = writer {
+            // Nothing was asked of it yet: the send and the refusal are one step.
+            drop(build.writer.back(writer));
+        }
+        // alloc: an error, once
+        let what = format!("the plane refused the task of the front end's write: {error}");
+        let why = what.clone(); // clone: an error, once
+        for (task, _) in build.held.drain(..) {
+            w.plane.refuse(w.now, task, why.clone()); // clone: a refused write, once per task it held
+        }
+        self.end(w, id, false, Some(ApiError::new(what, None)));
+    }
+
+    /// The job whose write's task is node `node`, while it holds the writer.
+    fn writing(&self, node: NodeId) -> Option<JobId> {
+        self.order.iter().copied().find(|id| {
+            self.jobs.get(key_of(*id)).is_some_and(|job| {
+                matches!(&job.stage, Stage::Units(build) if build.writer.away() == Some(node))
+            })
+        })
+    }
+
+    /// The write of node `node` ran on its task ([`Value::Wrote`]): its writer back in its
+    /// build, what was asked of it meanwhile handed to it, and what the write came to judged as
+    /// an apply's is ([`Jobs::after_write`]); then the build's end, if it was heard meanwhile.
+    /// A write whose job is gone drops its writer here. One that gave no writer back fails its
+    /// job: its front end may be half written.
+    fn wrote(
+        &mut self,
+        w: &mut World<'_, S>,
+        node: NodeId,
+        writer: Option<S::Writer>,
+        applied: Result<bool, ApiError>,
+    ) {
+        let Some(id) = self.writing(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        let after = build.after_write.take();
+        let Some(writer) = writer else {
+            build.writer = Writing::Lost;
+            let error = match applied {
+                Err(error) => error,
+                Ok(_) => ApiError::new("the front end's write gave its writer back to no one", None),
+            };
+            self.lost_write(w, id, error);
+            self.after(w, id, after);
+            return;
+        };
+        let cancelled = job.cancelled.load(Ordering::Acquire);
+        for error in build.writer.back(writer) {
+            if !cancelled {
+                job.over.get_or_insert((false, Some(error)));
+            }
+        }
+        let applied = match applied {
+            // Posted with no reader alive, and none made while its task held the writer.
+            Ok(false) => Err(ApiError::new(
+                "the front end's write found a reader of it alive, though none was as it was posted",
+                None,
+            )),
+            it => it,
+        };
+        self.after_write(w, id, applied);
+        self.after(w, id, after);
+    }
+
+    /// A build's end heard while its write's task held the writer, done now.
+    fn after(&mut self, w: &mut World<'_, S>, id: JobId, after: Option<AfterWrite>) {
+        match after {
+            None => {}
+            Some(AfterWrite::Finished { request, ok, stats }) => {
+                self.plane_finished(w, request, ok, stats)
+            }
+            Some(AfterWrite::Applied { ok }) => self.units_applied(w, id, ok),
+        }
+    }
+
+    /// Job `id`'s write gave no writer back, `error` why: every task it held is refused and
+    /// the job fails, its front end gone.
+    fn lost_write(&mut self, w: &mut World<'_, S>, id: JobId, error: ApiError) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        // alloc: an error, once
+        let why = format!("the front end's write failed: {}", error.what);
+        for (task, _) in build.held.drain(..) {
+            w.plane.refuse(w.now, task, why.clone()); // clone: a lost write, once per task it held
+        }
+        if !job.cancelled.load(Ordering::Acquire) {
+            job.over.get_or_insert((false, Some(error)));
+        }
+        self.end(w, id, false, None);
+    }
+
+    /// Node `node` settled: if it is a job's write whose value never came (its task refused or
+    /// cancelled before it ran, or its run gave none), the job fails naming it, its writer
+    /// back where the task never took it. Nothing waits on a write that can no longer end.
+    fn write_settled(&mut self, w: &mut World<'_, S>, node: NodeId, why: Option<&str>) {
+        let Some(id) = self.writing(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        let after = build.after_write.take();
+        let taken = match &build.writer {
+            Writing::Away { slot, .. } => slot.lock().take(),
+            Writing::Here(_) | Writing::Lost => None,
+        };
+        let why = why.unwrap_or("it settled with no value");
+        // alloc: an error, once
+        let what = format!("the front end's write ended without running: {why}");
+        match taken {
+            Some(writer) => drop(build.writer.back(writer)),
+            None => build.writer = Writing::Lost,
+        }
+        self.lost_write(w, id, ApiError::new(what, None));
+        self.after(w, id, after);
+    }
+
+    /// What job `id`'s write came to, `applied` as [`Writer::apply`] says it, on the loop as
+    /// its writer comes back: each write that broke said, and refuses the units after it; the
+    /// tasks it held posted, or, when it failed (or broke under fail-fast), refused and the job
+    /// ended.
+    fn after_write(&mut self, w: &mut World<'_, S>, id: JobId, applied: Result<bool, ApiError>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        build.write_since = None;
+        {
             // The first write that broke in this apply, for the held tasks a job that fails fast
             // refuses.
             let mut first: Option<String> = None;
-            while let Some(broke) = build.writer.broke() {
+            while let Some(broke) = build.writer.here_mut().and_then(|it| it.broke()) {
                 let error = build.refuse_after(&broke);
                 first.get_or_insert_with(|| error.what.clone()); // clone: an error, once
                 // A write that was part of making its unit (its harness or wasm macro glue)
@@ -6008,22 +6492,23 @@ impl<S: Steps> Jobs<S> {
                 (Ok(_), Some(broke)) if !keeps_going(&job.work) => {
                     format!("{broke}, and the build fails fast under --fail-fast") // alloc: an error, once
                 }
-                (Ok(true), _) => {
+                (Ok(_), _) => {
+                    // Posted now: a write asked meanwhile holds them again as each is posted
+                    // ([`Jobs::post`]), for the next write to apply first.
+                    let mut posts = std::mem::take(&mut self.posts);
                     posts.append(&mut build.held);
-                    continue;
+                    for (task, again) in posts.drain(..) {
+                        self.post(w, task, again);
+                    }
+                    self.posts = posts;
+                    return;
                 }
-                (Ok(false), _) => continue,
             };
             for (task, _) in build.held.drain(..) {
                 w.plane.refuse(w.now, task, why.clone()); // clone: a write that broke, once per task it held
             }
             self.end(w, id, false, None);
         }
-        self.order = order;
-        for (task, again) in posts.drain(..) {
-            self.post(w, task, again);
-        }
-        self.posts = posts;
     }
 
     /// What the plane did.
@@ -6218,6 +6703,7 @@ impl<S: Steps> Jobs<S> {
             }
             Value::GaveValues(front, gave) => self.gave_values(w, node, front, gave),
             Value::FrontCarried => self.front_carried(w, node, true),
+            Value::Wrote(writer, applied) => self.wrote(w, node, writer, applied),
             value => {
                 if let Some(job) =
                     self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
@@ -6239,6 +6725,9 @@ impl<S: Steps> Jobs<S> {
         // A give-back of a kept front end's values, which is no job's: its value came before
         // this ([`Jobs::gave_values`]), or never will ([`Jobs::give_settled`]).
         self.give_settled(w, node);
+        // A job's front-end write: its value came before this ([`Jobs::wrote`]), or never
+        // will ([`Jobs::write_settled`]), and its job fails saying so.
+        self.write_settled(w, node, why.as_deref());
         // A front-end carry's pass, which is no job's: its value came before this
         // ([`Jobs::front_carried`]), or never will, and the carry fails saying so.
         self.front_carried(w, node, false);
@@ -7951,8 +8440,10 @@ impl<S: Steps> Jobs<S> {
         job.stage = Stage::Units(Box::new(Build {
             input,
             front,
-            writer,
+            writer: Writing::Here(writer),
             held: Vec::new(), // alloc: none until a write holds a task
+            write_since: None,
+            after_write: None,
             first,
             units: units_of,
             package_of,
@@ -8211,6 +8702,7 @@ impl<S: Steps> Jobs<S> {
             }
         };
         let mut out = std::mem::take(&mut self.out);
+        // The writer, or what keeps the run's ask while a write's task holds it.
         let ended = runs.start(w.store, Some(&mut build.writer), w.effects, &mut out);
         let puts = runs.take_puts();
         self.run_put(w, id, puts);
@@ -8955,7 +9447,8 @@ impl<S: Steps> Jobs<S> {
             self.run_over(run);
             return;
         };
-        let writer = match (&mut job.stage, node) {
+        let writer: Option<&mut dyn super::work::Asks> = match (&mut job.stage, node) {
+            // dyn: the writer, or what keeps the run's ask while a write's task holds it
             (Stage::Units(build), Some(_)) => Some(&mut build.writer),
             _ => None,
         };
@@ -9078,6 +9571,17 @@ impl<S: Steps> Jobs<S> {
         if self.store_requests.remove(&request) {
             // No job looks at a store's request: its live model goes as it finishes.
             w.plane.forget(request);
+            return;
+        }
+        // Every step of a build's end reads its front end: one whose write's task holds the
+        // writer ends as the writer comes back ([`Jobs::wrote`]).
+        if let Some(id) = self.order.iter().copied().find(|id| {
+            self.jobs.get(key_of(*id)).is_some_and(|it| it.request == Some(request))
+        }) && let Some(job) = self.jobs.get_mut(key_of(id))
+            && let Stage::Units(build) = &mut job.stage
+            && build.writer.away().is_some()
+        {
+            build.after_write = Some(AfterWrite::Finished { request, ok, stats });
             return;
         }
         blaze_profile::built(blaze_profile::Built {
@@ -9213,7 +9717,17 @@ impl<S: Steps> Jobs<S> {
             });
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
+        let Build { input, front, writer, artifacts, evaluation, root, units, .. } = *build;
+        // Here unless a write lost it: a build whose write's task held the writer as its
+        // request finished ends as it comes back (above, [`Jobs::wrote`]).
+        let Some(mut writer) = writer.into_here() else {
+            let error = ApiError::new(
+                "the build's front end was lost to a write that failed, so its end reads none",
+                None,
+            );
+            self.end(w, id, false, Some(error));
+            return;
+        };
         // A lint over every configuration denied (`blaze::dead` at `deny`) fails the build as
         // a unit's denied lint does.
         let mut denied = false;
@@ -9484,8 +9998,24 @@ impl<S: Steps> Jobs<S> {
     /// view handed to [`Jobs::applied`].
     fn units_applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // Its end reads its front end: with its write's task holding the writer, it ends as
+        // the writer comes back ([`Jobs::wrote`]).
+        if let Stage::Units(build) = &mut job.stage
+            && build.writer.away().is_some()
+        {
+            build.after_write = Some(AfterWrite::Applied { ok });
+            return;
+        }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, mut writer, root, units, .. } = *build;
+        let Build { input, front, writer, root, units, .. } = *build;
+        let Some(mut writer) = writer.into_here() else {
+            let error = ApiError::new(
+                "the build's front end was lost to a write that failed, so its end reads none",
+                None,
+            );
+            self.end(w, id, false, Some(error));
+            return;
+        };
         match writer.finished(ok, &units) {
             Ok(warnings) => {
                 for warning in warnings {
@@ -9631,17 +10161,45 @@ impl<S: Steps> Jobs<S> {
         job.worked = Some(worked);
     }
 
-    /// The daemon's tasks stalled ([`blaze_profile::Stall`]): every job with a plane request
-    /// under way ends now, failed with `error`, its request cancelled and its build written
-    /// to the history as stalled. Nothing of it is waited for: the daemon stops after this.
-    /// Whether a job's write waits for readers of its front end: held by tasks, or by whoever
-    /// took one that outlives its task, each of which ends on its own.
-    pub fn writes_waiting(&self) -> bool {
-        self.order.iter().any(|id| {
-            self.jobs.get(key_of(*id)).is_some_and(
-                |job| matches!(&job.stage, Stage::Units(build) if build.writer.waiting()),
-            )
-        })
+    /// How long the longest-waiting write of any job has waited at `now`, on the loop's clock:
+    /// for its readers to end, or on its task. None while no write waits. A write waiting is
+    /// no movement of its own: its readers' tasks and its own are the plane's, and a stretch
+    /// with them all parked and nothing else moving is still once it is past
+    /// [`super::still::WRITE_STILL_FOR`] ([`super::still::Facts::write_waited_ns`]).
+    pub fn write_waited(&self, now: Duration) -> Option<Duration> {
+        self.order
+            .iter()
+            .filter_map(|id| match &self.jobs.get(key_of(*id))?.stage {
+                Stage::Units(build) => build.write_since.map(|since| now.saturating_sub(since)),
+                _ => None,
+            })
+            .max()
+    }
+
+    /// Each job's write that waits at `now`, longest first: what `blaze debug inspect` and a
+    /// stall say of the writer ([`WriteWaiting`]). Read only: no query, one reference count
+    /// load a job.
+    pub fn write_waits(&self, now: Duration) -> Vec<super::work::WriteWaiting> {
+        let mut waits: Vec<super::work::WriteWaiting> = self
+            .order
+            .iter()
+            .filter_map(|id| {
+                let job = self.jobs.get(key_of(*id))?;
+                let Stage::Units(build) = &job.stage else { return None };
+                let since = build.write_since?;
+                Some(super::work::WriteWaiting {
+                    // clone: a report's line, once a waiting write
+                    root: build.input.config.invocation.root.clone(),
+                    waited_ms: u64::try_from(now.saturating_sub(since).as_millis())
+                        .unwrap_or(u64::MAX),
+                    wait: build.writer.write_wait(),
+                    held: u32::try_from(build.held.len()).unwrap_or(u32::MAX),
+                    applying: build.writer.away().map(|node| node.0),
+                })
+            })
+            .collect(); // alloc: a report, off every hot path
+        waits.sort_by(|a, b| b.waited_ms.cmp(&a.waited_ms).then_with(|| a.root.cmp(&b.root)));
+        waits
     }
 
     /// The request frame of the newest slot this daemon wrote whose answer has a launcher at
@@ -9724,6 +10282,9 @@ impl<S: Steps> Jobs<S> {
         format!("{}: {what}; job {id} is {}", run_named(job, node), stage_name(&job.stage))
     }
 
+    /// The daemon's tasks stalled ([`blaze_profile::Stall`]): every job with a plane request
+    /// under way ends now, failed with `error`, its request cancelled and its build written
+    /// to the history as stalled. Nothing of it is waited for: the daemon stops after this.
     pub fn stalled(&mut self, w: &mut World<'_, S>, error: &ApiError) {
         let jobs = &self.jobs;
         let stalled: Vec<JobId> = self

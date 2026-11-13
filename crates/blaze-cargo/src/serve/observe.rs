@@ -2330,6 +2330,9 @@ fn never_explained(oldest: Option<u64>) -> ApiError {
     ApiError::new(what, Some("blaze why".to_owned())) // alloc: error path
 }
 
+/// An answer path: nothing under it syncs a file (`blaze::sync_on_answer_path`,
+/// docs/v2/plan/design/effect-summary.md).
+#[blaze::answers_request]
 fn answer(out: &mut Vec<Reply>, to: RequestRef, response: Response) {
     out.push(Reply { to, response });
     out.push(Reply { to, response: Response::Done { ok: true } });

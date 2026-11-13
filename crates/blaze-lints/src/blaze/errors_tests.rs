@@ -79,6 +79,9 @@ fn lint_of(message: &str) -> Option<&'static str> {
         Some("error_debug")
     } else if message.starts_with("this `Err` arm throws away")
         || (message.starts_with("`.") && message.contains("` throws away the "))
+        || message.starts_with("`let _ =` throws away this `Result`")
+        || message.starts_with("this `if let Ok(..)` has no `else`")
+        || message.starts_with("`.filter_map(Result::ok)` throws away")
     {
         Some("dropped_error")
     } else if message.ends_with(": an error the caller can't match on") {

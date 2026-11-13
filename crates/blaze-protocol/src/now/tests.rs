@@ -377,6 +377,14 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
             "convoy: 61 behind thread 7 on lock flight.intern (oldest 2400 ms); the head is running"
                 .into(),
         ),
+        stuck: vec![Stuck {
+            what: "codegen of seq-macro 0.3.6".into(),
+            cycle: Vec::new(),
+            waits: "lock store.packs".into(),
+            for_ms: 240_000,
+            inside: Some("write the pack (240.0 s)".into()),
+            held_by: Some("thread blaze-worker-9 (tid 41)".into()),
+        }],
         tally: Tally { waiting: 81, ready: 2, running: 1, done: 488, failed: 3, total: 575 },
         workers: 16,
         busy: vec![Busy {
@@ -543,4 +551,32 @@ fn every_task_off_the_frontier_is_held_by_a_blocker(tc: hegel::TestCase) {
     }
     let holds: u32 = now.blockers.iter().map(|it| it.holds).sum();
     assert!(holds as usize >= off.len(), "{holds} held of {} off the frontier", off.len());
+}
+
+/// A stuck task is said with what it does, what it waits on, who holds that and what the
+/// holder is inside; a cycle with every edge.
+#[test]
+fn a_stuck_task_says_its_wait_and_its_holder() {
+    let stuck = Stuck {
+        what: "codegen of seq-macro 0.3.6".into(),
+        cycle: Vec::new(),
+        waits: "lock store.packs".into(),
+        for_ms: 240_000,
+        inside: Some("write the pack (240.0 s)".into()),
+        held_by: Some("thread blaze-worker-9 (tid 41)".into()),
+    };
+    assert_eq!(
+        stuck.to_string(),
+        "stuck 4 min: codegen of seq-macro 0.3.6 waits on lock store.packs, held by thread \
+         blaze-worker-9 (tid 41) inside write the pack (240.0 s)"
+    );
+    let cycle = Stuck {
+        cycle: vec!["a waits on lock x, held by b".into(), "b waits on lock y, held by a".into()],
+        for_ms: 6_000,
+        ..Stuck::default()
+    };
+    assert_eq!(
+        cycle.to_string(),
+        "stuck 6 s: a cycle of waits: a waits on lock x, held by b; b waits on lock y, held by a"
+    );
 }

@@ -101,6 +101,8 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::nopanic",
         "blaze::noalloc",
         "blaze::nonblocking",
+        "blaze::loop_turn_effects",
+        "blaze::sync_on_answer_path",
         "blaze::pure",
         "blaze::capabilities",
         "blaze::undeclared_effect",

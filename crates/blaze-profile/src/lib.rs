@@ -56,9 +56,12 @@ pub mod span;
 pub mod sql;
 mod stack;
 pub mod starting;
+pub mod stuck;
 pub mod supervise;
 mod symbols;
 pub mod tables;
+#[cfg(unix)]
+pub mod tasks;
 pub mod time;
 pub mod views;
 pub mod watchdog;

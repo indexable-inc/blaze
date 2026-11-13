@@ -830,6 +830,9 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node whose task replays what was kept, so its run teaches nothing
     /// ([`Plane::replays`]), until it ends or settles.
     replays: HashSet<NodeId, Global>,
+    /// Each thread task failed while its thread still runs it, stuck where nothing can unwind
+    /// it ([`Plane::abandon`]): its late end, if one ever comes, is dropped.
+    abandoned: HashSet<NodeId, Global>,
     /// The one predictor of memory (memory.md 4.3): the latest peak a task of each kind and
     /// size class held, read at push as its forecast (one quantum when never recorded), written
     /// as a task ends. Throughput only: a forecast too low costs a wound, never the ceiling.
@@ -968,6 +971,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             now_ns: 0,
             loops: BTreeMap::new(),
             replays: HashSet::new_in(Global), // alloc: the plane's, once
+            abandoned: HashSet::new_in(Global),
             peaks: admission::Peaks::new(),
             gate: None,
             room: None,
@@ -1573,6 +1577,38 @@ impl<W: Work, P: Predict> Plane<W, P> {
         });
     }
 
+    /// The thread task of node `id` is failed with `why` while its thread still runs it: the
+    /// task watchdog found that thread stuck where nothing can unwind it (a lock or a signal
+    /// that never comes, `serve::stuck`). Its request goes on without it and ends failed with
+    /// `why`; its task's end, if the thread ever comes back, is dropped ([`Plane::poll`]).
+    /// `false`, doing nothing, when `id` is no thread task that runs now (it ended since the
+    /// watchdog looked, or is a loop task, which the loop's own guard bounds).
+    pub fn abandon(&mut self, at: Duration, id: NodeId, why: String) -> bool {
+        if !matches!(self.task(id), Some((_, Task::Thread { .. }))) || self.abandoned.contains(&id)
+        {
+            return false;
+        }
+        let mut running = false;
+        self.graph.unsettled(|it| {
+            running |= it.id == id && matches!(it.state, NodeState::Running);
+        });
+        if !running {
+            return false;
+        }
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id,
+            outcome: Outcome::Failed { why },
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input)
+            .unwrap_or_else(|error| panic!("the plane refused the end of stuck task {id}: {error}"));
+        self.abandoned.insert(id);
+        true
+    }
+
     /// Takes the thread tasks that ended into the plane: a task done teaches its peak to
     /// [`admission::Peaks`]; one the gate wounded is ready again, keeping its rank. Nothing is
     /// measured on a timer and nothing purged: the gate counts every committed page as it is
@@ -1583,6 +1619,15 @@ impl<W: Work, P: Predict> Plane<W, P> {
         for Ran { task, ended, peak, ran_ns, puts } in ran.drain(..) {
             let id = task.id;
             self.walks(task.kind, false);
+            // Failed already, as its thread was found stuck: its late end is of nothing now.
+            if self.abandoned.remove(&id) {
+                if let Some(rank) = task.rank {
+                    self.forecasts.remove(&rank.task.0);
+                    self.unheld_early.remove(&rank.task.0);
+                }
+                self.replays.remove(&id);
+                continue;
+            }
             if !puts.is_empty() {
                 self.happened.push(Happened::Kept { id, puts });
             }

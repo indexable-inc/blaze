@@ -149,11 +149,14 @@ pub(crate) struct Summary {
     /// The functions trusted for some effect it calls with no site of their own, sorted, each
     /// once: foreign functions, and methods of a trusted trait called through `dyn`.
     pub(crate) trusted_calls: Box<[FunctionId]>,
+    /// The lock classes it takes, the lock order it makes and the guards it holds across a
+    /// wait (crate::locks).
+    pub(crate) locks: crate::locks::Locks,
 }
 
 /// A set of kinds per effect of [`EFFECTS`], inline: as many as there are effects.
-pub(crate) type Sets = SmallVec<[EffectSet; 8]>;
-const _: () = assert!(EFFECTS.len() <= 8, "`Sets` keeps one set per effect inline");
+pub(crate) type Sets = SmallVec<[EffectSet; 10]>;
+const _: () = assert!(EFFECTS.len() <= 10, "`Sets` keeps one set per effect inline");
 
 /// The depth of every witness of [`Rule::Recursion`]: the calls around a cycle have no fewest,
 /// so a depth that grew by one per call (as every other kind's does) would grow each round of
@@ -217,6 +220,7 @@ impl Default for Summary {
             sites: Box::default(),
             memory: MemoryEffects::RECURSIVE,
             trusted_calls: Box::default(),
+            locks: crate::locks::Locks::default(),
         }
     }
 }
@@ -628,6 +632,8 @@ fn unlowered(db: &Db, instance: &Instance, error: &MirLowerError<'_>) -> Summary
         sets,
         witnesses,
         memory: MemoryEffects::UNKNOWN,
+        // What it takes is not known (crate::locks).
+        locks: crate::locks::Locks { wide: true, ..crate::locks::Locks::default() },
         ..Summary::default()
     }
 }
@@ -936,11 +942,27 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     let memory = memory::infer(body, &pointerless, &walk.calls, &facts, !refused.is_empty());
     let (kinds, sets, witnesses) = fold.finish();
     walk.trusted_calls.sort();
+    let lock_sites: Vec<crate::locks::LockSite<'_>> = walk
+        .sites
+        .iter()
+        .map(|site| {
+            let instance = match &site.reached {
+                Reached::Walk(instance, _) | Reached::Leaf(instance, _) => instance,
+            };
+            crate::locks::LockSite { instance, call: site.call, given: site.given }
+        })
+        .collect(); // alloc: a view of the body's sites, once per instance
+    let locks = crate::locks::of(cx, body, &lock_sites, &|instance| match instance.def {
+        // clone: the query's key, reference counts
+        Def::Body(_) => Some(cx.summary(instance.clone())),
+        Def::Leaf(..) => None,
+    });
     Summary {
         kinds,
         sets,
         witnesses,
         sites: sites.into_boxed_slice(),
+        locks,
         memory,
         trusted_calls: walk.trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
         ..out.finish(ret, callees.into_boxed_slice())
@@ -1336,7 +1358,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
 /// The path to `item` a user writes: the shortest from its crate's root that reaches it, the
 /// crate's name first; the modules it is written in when no path from the root reaches it (a
 /// private item).
-fn item_path(db: &Db, item: ModuleDefId) -> String {
+pub(crate) fn item_path(db: &Db, item: ModuleDefId) -> String {
     let Some(module) = item.module(db) else { return String::new() }; // alloc: empty
     let krate = module.krate(db);
     let crate_name = krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().as_str());

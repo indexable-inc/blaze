@@ -1041,6 +1041,44 @@ proof. Or take the attribute off.
 
 These three are the old spellings of `#[blaze::expect(..)]`, next.
 
+## `loop_turn_effects`, `sync_on_answer_path`
+
+**What they catch.** A function marked with its role (blaze extensions, opt-in; they change
+diagnostics, never code) that may, through any call:
+
+- `loop_turn_effects`, on `#[blaze::bounded_turn]` (a loop thread's turn): block the thread, do
+  IO, sync a file to the disk or take a lock;
+- `sync_on_answer_path`, on `#[blaze::answers_request]` (the path that answers a request):
+  sync a file to the disk (`fsync`, `File::sync_all`, `blaze_sys`'s `fsync`).
+
+What the walk can't see (a call it can't resolve, a foreign function no table knows) is refused
+by name. The finding says the shortest call chain, each step with its file and line. The
+design is [v2/plan/design/effect-summary.md](v2/plan/design/effect-summary.md).
+
+**Why it matters.** A turn that waits stalls every client of the loop; an answer that waits
+for the disk makes every request as slow as the slowest sync.
+
+**How to fix it.** Hand the work to a worker or the driver, or mark a callee checked by hand
+`#[blaze::bounded_turn(trusted = "why")]` (an accessor of a lock only the loop takes).
+
+## `lock_order`, `lock_across_wait`
+
+**What they catch.** Over every function, through any call, with a lock named by its receiver
+(`Type.field`, a static's path, else the lock's type):
+
+- `lock_order`: the crate's functions take two locks in both orders, A then B and B then A. The
+  finding prints both chains. A function whose locks are more than a summary keeps is refused
+  where that starts.
+- `lock_across_wait`: a guard held across a call that blocks the thread (a condvar it is not
+  handed, a channel, a sleep, a join, a blocking syscall). A fiber's park is
+  `held_across_wait`'s, IO and allocation `lock_held_across_slow`'s.
+
+They are `deny` by default: a cycle is a deadlock and a guard across a wait a convoy.
+
+**How to fix it.** Take the locks in one order everywhere; drop the guard before the call.
+
+**Allowing it.** `#[expect(blaze::lock_order, reason = "..")]` on the function.
+
 ## `undeclared_effect`, `unfulfilled_effect`, `negative_effect`
 
 `#[blaze::expect(panic, alloc, block, diverge)]` (a blaze extension, opt-in; it changes

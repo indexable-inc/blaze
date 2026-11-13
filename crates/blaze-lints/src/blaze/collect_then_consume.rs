@@ -24,7 +24,10 @@
 //! chain is plain: std's `iter`/`into_iter`/`chars`/... at its root and `Iterator`'s adaptors
 //! (`map`, `filter`, `chain`, ...) above it. `.count()` runs every adaptor's closure once per
 //! item, as `collect` did; `.next().is_none()` stops at the first item, so it is offered only
-//! when the adaptors' closures call nothing and assign nothing. Every other finding gets help.
+//! when the adaptors' closures call nothing and assign nothing. On the same plain chain whose
+//! closures call and assign nothing, a `Vec` collected only to be iterated by value (`for x in
+//! it.collect::<Vec<_>>()`, `.collect::<Vec<_>>().into_iter()`) has the `collect` dropped: the
+//! loop gets the same items in the same order. Every other finding gets help.
 
 use base_db::Db;
 use hir_def::{
@@ -106,8 +109,9 @@ enum Made {
 enum Use {
     /// `.len()`, `.is_empty()`, `.first()`, `.contains(..)`: the call.
     Ask(&'static str, ExprId),
-    /// `.iter()`, `.into_iter()`, a `for` loop over it.
-    Iterate,
+    /// `.iter()`, `.into_iter()`, a `for` loop over it; `owned` when it yields the collected
+    /// items themselves (`.into_iter()`, a `for` over the value, not over `&` of it).
+    Iterate { owned: bool },
     /// Handed to the function named, whose parameter is `impl IntoIterator`.
     Passed(String),
 }
@@ -231,7 +235,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
             Use::Ask(name, _) => {
                 (format!("for its `.{name}(..)`"), "`.any(|it| ..)` stops at the first match")
             }
-            Use::Iterate => ("to be iterated once".to_owned(), "iterate the iterator itself"),
+            Use::Iterate { .. } => {
+                ("to be iterated once".to_owned(), "iterate the iterator itself")
+            }
             Use::Passed(f) => (
                 format!("to be handed to `{f}`, which takes `impl IntoIterator`"),
                 "hand it the iterator itself",
@@ -251,6 +257,17 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
                 fix(analysis, receiver, *call, name).map(|(range, receiver, suffix)| {
                     (range, format!("{}{suffix}", cx.snippet(receiver)))
                 })
+            }
+            // `for x in it.collect::<Vec<_>>()`, `.collect::<Vec<_>>().into_iter()`: the loop
+            // gets the same items in the same order from the iterator. Collecting ran every
+            // closure before the loop's first turn and iterating runs them between its turns,
+            // so the closures must call and assign nothing; `read_again` above already kept
+            // out a loop that touches what the chain reads.
+            (Use::Iterate { owned: true }, Made::Seq, true)
+                if cx.in_file() && walk.plain(receiver, false, 0) =>
+            {
+                drop_collect(analysis, receiver, id)
+                    .map(|(range, receiver)| (range, cx.snippet(receiver).to_owned()))
             }
             _ => None,
         };
@@ -308,6 +325,23 @@ fn fix(
         _ => ".next().is_none()",
     };
     Some((analysis.expr_range(call)?, analysis.expr_range(receiver)?, suffix))
+}
+
+/// Where the fix that drops the `collect` at `collect`, of the chain `receiver`, goes: the
+/// `collect`'s range and the receiver's, whose text takes its place. `None` unless both are
+/// written in the file.
+fn drop_collect(
+    analysis: &hir::BodyAnalysis<'_>,
+    receiver: ExprId,
+    collect: ExprId,
+) -> Option<(TextRange, TextRange)> {
+    let file = analysis.tree().1;
+    let source_map = analysis.source_map();
+    let written = |it: ExprId| source_map.expr_syntax(it).is_ok_and(|it| it.file_id == file);
+    if !written(receiver) || !written(collect) {
+        return None;
+    }
+    Some((analysis.expr_range(collect)?, analysis.expr_range(receiver)?))
 }
 
 impl Walk<'_, '_> {
@@ -374,11 +408,13 @@ impl Walk<'_, '_> {
     fn use_at(&self, at: ExprId) -> Option<Use> {
         let mut child = at;
         let mut parent = self.parents.of_expr(child)?;
+        let mut by_ref = false;
         if let Expr::Ref { expr, .. } = self.body.expr(parent)
             && expr == child
         {
             child = parent;
             parent = self.parents.of_expr(child)?;
+            by_ref = true;
         }
         match self.body.expr(parent) {
             Expr::MethodCall { receiver, .. } if receiver == child => match self.name(parent)? {
@@ -386,7 +422,8 @@ impl Walk<'_, '_> {
                 "is_empty" => Some(Use::Ask("is_empty", parent)),
                 "first" => Some(Use::Ask("first", parent)),
                 "contains" => Some(Use::Ask("contains", parent)),
-                "iter" | "into_iter" => Some(Use::Iterate),
+                "iter" => Some(Use::Iterate { owned: false }),
+                "into_iter" => Some(Use::Iterate { owned: !by_ref }),
                 _ => None,
             },
             Expr::Call { args, .. } => {
@@ -394,7 +431,7 @@ impl Walk<'_, '_> {
                 let (f, _) = written_callee(self.infer, self.body, parent)?;
                 let name = FunctionSignature::of(self.db, f).name.as_str();
                 if name == "into_iter" && self.for_loop(parent) {
-                    return Some(Use::Iterate);
+                    return Some(Use::Iterate { owned: !by_ref });
                 }
                 self.takes_into_iterator(f, at).then(|| Use::Passed(name.to_owned())) // alloc: a message's part
             }
