@@ -92,7 +92,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     }
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.offers = offers;
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     if io.offers() != offers {
         return Err(format!("the world offers {:?}, not the {offers:?} it was made with", io.offers()));
     }
@@ -142,8 +142,8 @@ fn the_oracle_catches_accessors_that_ignore_the_offers() {
 
 #[test]
 fn sim_offers_everything_and_sim_with_withholds() {
-    assert_eq!(Io::sim(1).offers(), Offers::ALL);
-    let io = Io::sim_with(1, Offers { net: false, ..Offers::ALL });
+    assert_eq!(Io::sim(1).expect("a simulated world").offers(), Offers::ALL);
+    let io = Io::sim_with(1, Offers { net: false, ..Offers::ALL }).expect("a simulated world");
     assert!(io.net().is_none());
     assert!(io.fs().is_some());
     let missing = io.need_net().expect_err("net is withheld");

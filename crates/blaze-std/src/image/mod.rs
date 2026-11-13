@@ -19,8 +19,9 @@
 pub(crate) mod png;
 pub(crate) mod zlib;
 
-use alloc::vec::Vec;
 use core::{alloc::Allocator, fmt};
+
+use crate::mem::{ByteLen, Named, OutOfMemory, Vec};
 
 /// The most a PNG's width or height may be (2^31 - 1, the PNG spec's).
 pub const MAX_SIDE: u32 = (1 << 31) - 1;
@@ -93,8 +94,10 @@ impl<A: Allocator> Image<A> {
         if !(1..=MAX_SIDE).contains(&height) {
             return Err(ImageError::Header { field: "height", value: height });
         }
-        let expected =
-            u64::from(width) * u64::from(height) * u64::from(color.channels()) * u64::from(depth.bytes());
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|n| n.checked_mul(u64::from(color.channels() * depth.bytes())))
+            .ok_or(ImageError::TooLarge { width, height, color, depth })?;
         if expected != pixels.len() as u64 {
             return Err(ImageError::Pixels { width, height, color, depth, expected, got: pixels.len() as u64 });
         }
@@ -137,7 +140,7 @@ impl<A: Allocator, B: Allocator> PartialEq<Image<B>> for Image<A> {
             && self.height == other.height
             && self.color == other.color
             && self.depth == other.depth
-            && self.pixels[..] == other.pixels[..]
+            && self.pixels.as_slice() == other.pixels.as_slice()
     }
 }
 
@@ -154,12 +157,12 @@ pub struct Limits {
     pub height: u32,
     /// Every byte decode asks of the allocator, together: the inflated rows with their filter
     /// bytes, plus one (see [`decode_bytes`]). The pixels are made in place in that buffer.
-    pub bytes: usize,
+    pub bytes: ByteLen,
 }
 
 impl Limits {
     /// 16384 x 16384, and 1 GiB.
-    pub const DEFAULT: Limits = Limits { width: 16_384, height: 16_384, bytes: 1 << 30 };
+    pub const DEFAULT: Limits = Limits { width: 16_384, height: 16_384, bytes: ByteLen::new(1 << 30) };
 }
 
 /// The bytes [`decode`] asks of its allocator for an image of this size and kind: every row
@@ -172,12 +175,12 @@ pub fn decode_bytes(width: u32, height: u32, color: Color, depth: Depth) -> u64 
 
 /// A PNG's pixels, in `alloc`. Width, height and bytes are checked against `limits` before
 /// anything is allocated; any input ends in an image or an [`ImageError`], never a panic.
-pub fn decode<A: Allocator>(bytes: &[u8], alloc: A, limits: Limits) -> Result<Image<A>, ImageError> {
+pub fn decode<A: Allocator + Named>(bytes: &[u8], alloc: A, limits: Limits) -> Result<Image<A>, ImageError> {
     png::decode(bytes, alloc, limits)
 }
 
 /// `image` as a PNG, in `alloc`. The same image always gives the same bytes.
-pub fn encode<A: Allocator + Clone, B: Allocator>(image: &Image<B>, alloc: A) -> Result<Vec<u8, A>, ImageError> {
+pub fn encode<A: Allocator + Clone + Named, B: Allocator>(image: &Image<B>, alloc: A) -> Result<Vec<u8, A>, ImageError> {
     png::encode(image, alloc)
 }
 
@@ -238,6 +241,17 @@ pub enum ImageError {
     Pixels { width: u32, height: u32, color: Color, depth: Depth, expected: u64, got: u64 },
     /// The allocator handed in could not give `asked` bytes for `what`.
     OutOfMemory { what: &'static str, asked: usize },
+    /// A `width` x `height` image of `color` at `depth` has more bytes than a `u64` (or, where
+    /// they are laid out in memory, a `usize`) counts.
+    TooLarge { width: u32, height: u32, color: Color, depth: Depth },
+    /// Inside the codec, `index` into `what` is past its length `len`: a bug in bstd::image,
+    /// said where it is found rather than read out of bounds.
+    Internal { what: &'static str, index: usize, len: usize },
+}
+
+/// The error a growth in `what` that found no room is, for `map_err`.
+pub(crate) fn out_of_memory(what: &'static str) -> impl Fn(OutOfMemory) -> ImageError {
+    move |error| ImageError::OutOfMemory { what, asked: error.asked }
 }
 
 impl fmt::Display for ImageError {
@@ -274,6 +288,13 @@ impl fmt::Display for ImageError {
             ),
             ImageError::OutOfMemory { what, asked } => {
                 write!(f, "image: the allocator could not give {asked} bytes for {what}")
+            }
+            ImageError::TooLarge { width, height, color, depth } => write!(
+                f,
+                "image: a {width}x{height} {color:?} {depth:?} image has more bytes than this target counts"
+            ),
+            ImageError::Internal { what, index, len } => {
+                write!(f, "image: index {index} into {what} is past its length {len} (a bug in bstd::image)")
             }
         }
     }

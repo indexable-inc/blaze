@@ -31,14 +31,14 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     // Every one but UNSET is set.
     world.env = VARS[..4].iter().map(|name| ((*name).to_owned(), format!("{name} value"))).collect();
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     let mut env = io.need_env().map_err(|e| format!("harness: {e}"))?;
     let names: Vec<VarName> = VARS.iter().map(|raw| VarName::new(raw).expect("a test's variable name")).collect();
     let mut allowed: u64 = (1 << VARS.len()) - 1;
     for (at, &mask) in plan.chain.iter().enumerate() {
         let kept: Vec<VarName> =
             (0..VARS.len()).filter(|i| mask & (1 << i) != 0).map(|i| names[i].clone()).collect();
-        env = env.only(&kept);
+        env = env.only(&kept).expect("room for the narrowed environment");
         allowed &= mask;
         for (i, name) in names.iter().enumerate() {
             let may = allowed & (1 << i) != 0;

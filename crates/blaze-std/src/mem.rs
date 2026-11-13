@@ -40,7 +40,7 @@ pub use blaze_mem::Arena as RequestArena;
 use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.
-pub const TASK_FRAME: usize = 64 << 20;
+pub const TASK_FRAME: ByteLen = ByteLen::new(64 << 20);
 
 /// Bytes in an allocator its owner handed in: a frame's or an arena's.
 pub struct Bytes<'a> {
@@ -124,13 +124,18 @@ impl Mem {
     }
 
     /// An arena named `name` that hands out at most `limit` bytes, alignment included.
-    pub fn arena(&self, name: &'static str, limit: usize) -> Result<Arena, Stopped> {
+    /// [`Stopped::OutOfMemory`] when its reserve cannot be made, and when `limit` is more than
+    /// this target's memory can address (`asked` is then `usize::MAX`).
+    pub fn arena(&self, name: &'static str, limit: ByteLen) -> Result<Arena, Stopped> {
         let reserve = match self.io.plant() {
             Plant::ArenaUnlimited => TASK_FRAME,
             _ => limit,
         };
+        let reserve = reserve
+            .in_memory()
+            .map_err(|_| Stopped::OutOfMemory { arena: name, asked: usize::MAX })?;
         let frame = Frame::named(name, reserve, Tag::Other)
-            .map_err(|_| Stopped::OutOfMemory { arena: name, asked: limit })?;
+            .map_err(|_| Stopped::OutOfMemory { arena: name, asked: reserve })?;
         Ok(Arena { name, limit, frame })
     }
 }
@@ -140,7 +145,7 @@ impl Mem {
 /// one is not a mistake the checker should refuse.
 pub struct Arena {
     name: &'static str,
-    limit: usize,
+    limit: ByteLen,
     frame: Frame,
 }
 
@@ -149,13 +154,13 @@ impl Arena {
         self.name
     }
 
-    pub fn limit(&self) -> usize {
+    pub fn limit(&self) -> ByteLen {
         self.limit
     }
 
     /// Bytes handed out so far, alignment included: never more than [`Arena::limit`].
-    pub fn used(&self) -> usize {
-        self.frame.used()
+    pub fn used(&self) -> ByteLen {
+        ByteLen::of_memory(self.frame.used())
     }
 
     /// Empty bytes in the arena.

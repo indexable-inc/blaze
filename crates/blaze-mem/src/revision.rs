@@ -20,7 +20,7 @@ use std::{
 
 use blaze_reclaim::{Grace, Guard};
 
-use crate::{Arena, ArenaLocal, Tag};
+use crate::{Arena, ArenaLocal, OutOfMemory, Tag};
 
 /// What one revision is: the type of its value, which borrows the revision's arena.
 pub trait Built: 'static {
@@ -35,6 +35,9 @@ pub trait Built: 'static {
 /// Why a publish did not happen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PublishError {
+    /// The arena had no room for the revision's record: nothing was published, and the
+    /// current revision stays current.
+    OutOfMemory(OutOfMemory),
     /// A task that began before the last publish may still read the revision before it, whose
     /// arena the next revision would reuse: publish again after that task's boundary.
     Readers,
@@ -45,6 +48,9 @@ pub enum PublishError {
 impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            PublishError::OutOfMemory(error) => {
+                return write!(f, "publishing a revision: {error}");
+            }
             PublishError::Readers => {
                 "the revision before the current one may still be read by a task"
             }
@@ -146,8 +152,11 @@ impl<B: Built> Revisions<B> {
         let _unlock = Unlock(&self.publishing);
 
         let current = self.state.load(Ordering::Acquire);
-        let next_slot = if current == 0 { 0 } else { 1 - (current & 1) as usize };
-        let slot = &self.slots[next_slot];
+        // The slot after the current one (the first before any publish), and the current one,
+        // which becomes the revision before.
+        let [zero, one] = &self.slots;
+        let (next_slot, slot, before) =
+            if current != 0 && current & 1 == 0 { (1u64, one, zero) } else { (0u64, zero, one) };
         // SAFETY: only the publisher (this thread, by `publishing`) reads or writes `retired`.
         let retired = unsafe { &mut *slot.retired.get() };
         if let Some(grace) = *retired {
@@ -171,7 +180,12 @@ impl<B: Built> Revisions<B> {
         let local = arena.local();
         let number = (current >> 1) + 1;
         let value = build(&local);
-        let placed: *mut Placed<'_, B> = local.alloc(Placed { number, value });
+        let placed: *mut Placed<'_, B> = match local.alloc(Placed { number, value }) {
+            Ok(placed) => placed,
+            // The slot holds no record now (taken above), so a later publish builds in it
+            // again; the value just built is dropped with the failed placement.
+            Err(error) => return Err(PublishError::OutOfMemory(error.out_of_memory())),
+        };
         drop(local);
         // The record borrows the arena, which lives as long as `self`; it is stored with its
         // lifetime erased and handed out again only through `read`, shortened to a guard's.
@@ -180,9 +194,8 @@ impl<B: Built> Revisions<B> {
 
         // Release: the record's bytes are seen by a reader that loads the pointer.
         self.current.store(placed, Ordering::Release);
-        self.state.store((number << 1) | next_slot as u64, Ordering::Release);
+        self.state.store((number << 1) | next_slot, Ordering::Release);
         if current != 0 {
-            let before = &self.slots[(current & 1) as usize];
             // SAFETY: the publisher alone touches `retired`.
             unsafe { *before.retired.get() = Some(Grace::start()) };
         }

@@ -912,7 +912,7 @@ impl Session {
     /// A slot of the table for `job`, a freed one before a new one ([`JobId`]): an index, no
     /// hash, and no allocation once the table has grown to the jobs under way at once.
     fn job(&mut self, job: Job) -> JobId {
-        let handle = self.jobs.insert(job);
+        let handle = self.jobs.insert(job).unwrap_or_else(|error| panic!("{error}"));
         JobId { slot: handle.index(), generation: handle.generation() }
     }
 

@@ -11,6 +11,7 @@
 //! | [`RootPath`] | `NativeWorld::root`, which blaze-core's drivers take as a `std::path::Path` | a `Dir` handle from the start block, when the drivers open beneath a handle |
 //! | [`process_id`] | `Host`'s pid on a native `Io` | `blaze_sys`'s `getpid` |
 //! | [`exit`] | `Host::exit` on a native `Io` | `blaze_sys`'s `exit_group` |
+//! | [`DriverError`] | `io::OpenWhy::Driver`, what `blaze_core::native` returns | the driver's own error, when it has one |
 //! | [`catch_unwind`], [`resume_unwind`] | a task's panic failing only its task; the simulated exit's unwind | bstd's own unwinder entry (on `library/unwind`) |
 //! | [`LazyLock`], [`OnceLock`] | `bstd::sync`'s `Lazy` and `Once` | the same two on bstd's one wait |
 //! | `Owns` for `HashMap`, `HashSet`, `Mutex`, `RwLock`, `OnceLock`, `LazyLock` | `bstd::own`'s reachability walk, for code that still holds one of Rust std's | nothing: gone with the last use of those types |
@@ -18,6 +19,7 @@
 extern crate std;
 
 pub use std::{
+    io::Error as DriverError,
     panic::{catch_unwind, resume_unwind},
     path::Path as RootPath,
     sync::{LazyLock, OnceLock},
@@ -29,6 +31,11 @@ pub(crate) fn process_id() -> u32 {
 }
 
 /// Ends the process with `status`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`Host::exit` is the capability to end the process: a program asks for it by name, \
+              and this is std's one call for it until `blaze_sys`'s `exit_group` replaces it"
+)]
 pub(crate) fn exit(status: i32) -> ! {
     std::process::exit(status)
 }

@@ -19,7 +19,7 @@ use std::{
     mem::{self, MaybeUninit},
 };
 
-use crate::{MemError, RegionVec, Tag, error::fail};
+use crate::{MemError, RegionVec, Tag};
 
 /// A `T` in a [`Slab<T>`]: its slot and the generation the slot had when the value went in.
 #[repr(C)]
@@ -145,17 +145,29 @@ impl<T> Slab<T> {
         self.entries.tag()
     }
 
-    /// Places the value `make` builds from its own handle.
-    pub fn try_insert_with(
+    /// Places the value `make` builds from its own handle; when the slab is full or memory
+    /// cannot be had, the error names its tag, `make` is not called and the slab is as it was.
+    pub fn insert_with(
         &mut self,
         make: impl FnOnce(Handle<T>) -> T,
     ) -> Result<Handle<T>, MemError> {
         if self.free != NONE {
             let index = self.free;
-            let generation = self.entries[index as usize].generation + 1;
+            let tag = self.tag();
+            let Some(entry) = self.entries.get_mut(index as usize) else {
+                // Only `remove` and `clear` link a slot in, each one it just emptied, so the
+                // head is always one of its slots; one that is not is refused, never followed.
+                return Err(MemError::Refused {
+                    tag,
+                    what: "a slab's free-list head past its slots (rule: the free list links \
+                           only slots the slab emptied)",
+                });
+            };
+            // A free entry's generation is even and below `u32::MAX` (a slot whose next would
+            // wrap is retired, never linked), so this is odd and does not wrap.
+            let generation = entry.generation + 1;
             let handle = Handle { index, generation, _of: PhantomData };
             let value = make(handle);
-            let entry = &mut self.entries[index as usize];
             self.free = entry.next;
             entry.value.write(value);
             entry.generation = generation;
@@ -172,26 +184,16 @@ impl<T> Slab<T> {
         let handle = Handle { index, generation: 1, _of: PhantomData };
         self.entries.reserve(1)?;
         let value = make(handle);
-        self.entries.push(Entry { generation: 1, next: NONE, value: MaybeUninit::new(value) });
+        // Room for it was reserved above, so this push commits nothing and cannot fail; one
+        // that did would say so.
+        self.entries.push(Entry { generation: 1, next: NONE, value: MaybeUninit::new(value) })?;
         self.len += 1;
         Ok(handle)
     }
 
-    #[track_caller]
-    pub fn insert_with(&mut self, make: impl FnOnce(Handle<T>) -> T) -> Handle<T> {
-        match self.try_insert_with(make) {
-            Ok(handle) => handle,
-            Err(error) => fail(&error),
-        }
-    }
-
-    #[track_caller]
-    pub fn insert(&mut self, value: T) -> Handle<T> {
+    /// Places `value`; as [`Slab::insert_with`].
+    pub fn insert(&mut self, value: T) -> Result<Handle<T>, MemError> {
         self.insert_with(|_| value)
-    }
-
-    pub fn try_insert(&mut self, value: T) -> Result<Handle<T>, MemError> {
-        self.try_insert_with(|_| value)
     }
 
     fn entry(&self, handle: Handle<T>) -> Option<&Entry<T>> {
@@ -273,13 +275,25 @@ impl<T> Slab<T> {
 
     /// Removes every value; every handle becomes stale.
     pub fn clear(&mut self) {
-        for index in 0..self.entries.len() {
-            let entry = &self.entries[index];
-            if entry.occupied() {
-                let handle =
-                    Handle { index: index as u32, generation: entry.generation, _of: PhantomData };
-                drop(self.remove(handle));
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if !entry.occupied() {
+                continue;
             }
+            // SAFETY: the entry is occupied, so it holds a value; its generation moves on
+            // below, before the value drops, so it is read out once and a panicking drop
+            // leaves the slot free, never holding a dropped value.
+            let value = unsafe { entry.value.assume_init_read() };
+            if entry.generation == u32::MAX {
+                // As in `remove`: its next generation would wrap, so the slot is retired.
+                entry.generation = 0;
+            } else {
+                entry.generation += 1;
+                entry.next = self.free;
+                // A slab holds at most `NONE` slots, so every index fits a `u32`.
+                self.free = index as u32;
+            }
+            self.len -= 1;
+            drop(value);
         }
     }
 }

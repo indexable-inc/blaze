@@ -46,7 +46,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     let cx = root(&io);
     let dir = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
     let file = match dir.create(&cx, &path("f")) {
@@ -79,7 +79,7 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
         let start = op.at as usize;
         if op.write {
             let bytes: Vec<u8> = (0..op.len).map(|i| (at * 31 + i) as u8 | 1).collect();
-            let pending = file.write_from(&bytes, op.at);
+            let pending = file.write_from(&bytes, crate::mem::Offset::new(op.at));
             let ended = if op.cancel { pending.cancel(cx, give_up(io, cx)) } else { pending.wait(cx) };
             if ended.is_ok() {
                 if model.len() < start + bytes.len() {
@@ -89,9 +89,9 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
             }
         } else {
             let mut buf = [0u8; 16];
-            let pending = file.read_into(&mut buf[..op.len], op.at);
+            let pending = file.read_into(&mut buf[..op.len], crate::mem::Offset::new(op.at));
             let ended = if op.cancel { pending.cancel(cx, give_up(io, cx)) } else { pending.wait(cx) };
-            if let Ok(read) = ended {
+            if let Ok(read) = ended.map(|read| read.get() as usize) {
                 let want = model.get(start..).map_or(&[][..], |rest| &rest[..rest.len().min(op.len)]);
                 if buf[..read] != *want {
                     return Err(format!("op {at} ({op:?}): read {:?}, but the file holds {want:?} there", &buf[..read]));
@@ -108,7 +108,7 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
         }
         // The world moves on: whatever was still in flight would land now.
         io.with_sim(|sim| sim.advance(Duration::from_secs(1)));
-        io.poll(Deadline::PASSED);
+        io.poll(Deadline::PASSED).expect("a poll of the driver");
         let later = contents(io, file);
         if later != now {
             return Err(format!("op {at} ({op:?}): after it returned the file went from {now:?} to {later:?}"));

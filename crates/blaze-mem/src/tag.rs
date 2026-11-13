@@ -148,12 +148,71 @@ impl Tag {
 }
 
 const _: () = {
+    let mut rest: &[Tag] = &Tag::ALL;
     let mut i = 0;
-    while i < Tag::COUNT {
-        assert!(Tag::ALL[i] as usize == i, "Tag::ALL is in discriminant order");
+    while let [tag, tail @ ..] = rest {
+        assert!(*tag as usize == i, "Tag::ALL is in discriminant order");
+        rest = tail;
         i += 1;
     }
 };
+
+/// `tag`'s entry of `table`, a table in [`Tag::ALL`]'s order: a match over every tag, each to
+/// its place by name, so no tag can reach past the table (a tag added without its place does
+/// not compile) and no bound is checked at run time.
+#[inline]
+fn of<T>(table: &[T; Tag::COUNT], tag: Tag) -> &T {
+    let [
+        parse,
+        nameres,
+        expand,
+        infer,
+        mir,
+        codegen,
+        link,
+        store,
+        vfs,
+        usercode,
+        diagnostics,
+        query,
+        plane,
+        io,
+        intern,
+        frames,
+        chunks,
+        api,
+        fuzz,
+        profile,
+        other,
+        solver,
+        pool,
+    ] = table;
+    match tag {
+        Tag::Parse => parse,
+        Tag::Nameres => nameres,
+        Tag::Expand => expand,
+        Tag::Infer => infer,
+        Tag::Mir => mir,
+        Tag::Codegen => codegen,
+        Tag::Link => link,
+        Tag::Store => store,
+        Tag::Vfs => vfs,
+        Tag::Usercode => usercode,
+        Tag::Diagnostics => diagnostics,
+        Tag::Query => query,
+        Tag::Plane => plane,
+        Tag::Io => io,
+        Tag::Intern => intern,
+        Tag::Frames => frames,
+        Tag::Chunks => chunks,
+        Tag::Api => api,
+        Tag::Fuzz => fuzz,
+        Tag::Profile => profile,
+        Tag::Other => other,
+        Tag::Solver => solver,
+        Tag::Pool => pool,
+    }
+}
 
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -486,7 +545,7 @@ pub fn heap_churned(holder: Option<Tag>, allocated: u64, freed: u64) {
 }
 
 fn line(tag: Tag) -> &'static Line {
-    &LINES[tag.index()]
+    of(&LINES, tag)
 }
 
 fn as_u64(bytes: usize) -> u64 {
@@ -577,7 +636,7 @@ impl Gathered {
     /// `bytes` more handed out to `tag`: what to add to its line now (0 while gathered).
     #[inline]
     pub(crate) fn allocated(&self, tag: Tag, bytes: u64) -> u64 {
-        let gathered = &self.allocated[tag.index()];
+        let gathered = of(&self.allocated, tag);
         let sum = gathered.get() + bytes;
         if sum < FOLD_AT {
             gathered.set(sum);
@@ -590,7 +649,7 @@ impl Gathered {
     /// `bytes` of `tag` freed: what to take off its line now (0 while gathered).
     #[inline]
     pub(crate) fn freed(&self, tag: Tag, bytes: usize) -> usize {
-        let gathered = &self.freed[tag.index()];
+        let gathered = of(&self.freed, tag);
         let sum = gathered.get() + bytes;
         if sum < FREES_FOLD_AT {
             gathered.set(sum);
@@ -820,7 +879,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn get(&self, tag: Tag) -> Counters {
-        self.tags[tag.index()]
+        *of(&self.tags, tag)
     }
 
     /// What every tag holds, summed.

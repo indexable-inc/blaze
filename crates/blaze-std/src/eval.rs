@@ -9,12 +9,19 @@
 //! fn layout(_: &mut Nested<'_>, (ty, target): (&Type, &Target)) -> Layout { .. }
 //!
 //! #[blaze::memo]
-//! fn size_of(points: &mut Nested<'_>, (s, target): (&Struct, &Target)) -> u64 {
-//!     s.fields.iter().map(|f| points.call(layout, (&f.ty, target)).size).sum()
+//! fn size_of(
+//!     points: &mut Nested<'_>,
+//!     (s, target): (&Struct, &Target),
+//! ) -> Result<u64, EvalError> {
+//!     let mut size = 0;
+//!     for f in &s.fields {
+//!         size += points.call(layout, (&f.ty, target))?.size;
+//!     }
+//!     Ok(size)
 //! }
 //!
 //! let eval = Eval::memo(&io.need_mem()?, MemoLimit { entries: 1 << 16, bytes: 64 << 20 })?;
-//! let size = eval.call(cx, size_of, (&s, &target));
+//! let size = eval.call(cx, size_of, (&s, &target))??;
 //! ```
 //!
 //! - **A memo point** is a function marked `#[blaze::memo]`, which the compiler holds to
@@ -27,7 +34,10 @@
 //!   `hir_ty_identity::fn_code_id`), over everything it can run. A changed body, here or three
 //!   calls down, is another point (rule keys-cover-every-input). Never its name.
 //! - **[`Key`]** is the arguments' content ID ([`EvalKey`]) under [`KEY_DOMAIN`]. It is made
-//!   only when a provider needs it: [`Eval::direct`] makes none.
+//!   once per call, before any provider but [`Eval::direct`] is handed it: `direct` makes none.
+//! - **A call that cannot be answered is an [`EvalError`]**, never a panic: a value of the
+//!   wrong type under a point and key ([`Mistyped`]), a handler that left no value, a
+//!   generation whose frame was still held when it was to be emptied.
 //! - **One type with providers** (std.md, "Capabilities are layered, and each has providers"):
 //!   [`Eval::direct`] calls the body, [`Eval::memo`] remembers results in arenas of [`Mem`],
 //!   [`Eval::handler`] hands every call to a [`Handler`] of the caller's. Code takes `&Eval` and
@@ -103,7 +113,7 @@ use crate::{
     cx::Cx,
     id::{ContentHasher, ContentId},
     map::Map,
-    mem::{Arena, Mem, Vec},
+    mem::{Arena, ByteLen, Mem, Vec},
     sync::{LocalLock, LocalShared},
 };
 
@@ -428,14 +438,55 @@ impl fmt::Display for Mistyped {
 
 impl core::error::Error for Mistyped {}
 
+/// Why a call of a memo point has no value: what [`Eval::call`] and [`Nested::call`] answer
+/// in place of one. Each names the point or the arena it is about and the rule that refused it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EvalError {
+    /// A value given for the call is not of the point's result type.
+    Mistyped(Mistyped),
+    /// `handler`'s [`Handler::run`] ended with no value in `next` for a call of `point`.
+    NoValue { point: Point, handler: &'static str },
+    /// A generation of [`Eval::memo`] in the arena `arena` was to be emptied while something
+    /// other than its map and entries still held its frame.
+    Held { arena: &'static str },
+}
+
+impl From<Mistyped> for EvalError {
+    fn from(mistyped: Mistyped) -> EvalError {
+        EvalError::Mistyped(mistyped)
+    }
+}
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalError::Mistyped(mistyped) => write!(f, "{mistyped}"),
+            EvalError::NoValue { point, handler } => write!(
+                f,
+                "{handler} returned with no value for memo point {point}: a handler's `run` \
+                 ends with a value in `next` (`compute`, `through` or `supply`)"
+            ),
+            EvalError::Held { arena } => write!(
+                f,
+                "a generation of the arena `{arena}` was to be emptied while its frame was \
+                 still held: a generation's frame is held by its map and its entries alone"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for EvalError {}
+
 /// A user's evaluator: it is handed every call of the [`Eval`] made from it, nested ones too,
 /// and decides where each value comes from. It must leave `next` with a value: by running the
 /// body ([`Next::compute`]), by handing the call to another evaluator ([`Next::through`]: so
 /// behaviours stack, provenance over a memo, counting over a direct one), or by giving a value
-/// it kept ([`Next::supply`]). Returning without one fails the call, naming the handler and the
-/// point. As the function is pure, nothing a handler does changes an answer.
+/// it kept ([`Next::supply`]). Returning without one fails the call with
+/// [`EvalError::NoValue`], naming the handler and the point; an error of the evaluator it
+/// passed the call to ([`Next::through`]) is returned as it is. As the function is pure,
+/// nothing a handler does changes an answer.
 pub trait Handler {
-    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>);
+    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>) -> Result<(), EvalError>;
 
     /// What an error calls it.
     fn name(&self) -> &'static str {
@@ -455,9 +506,10 @@ impl Next<'_> {
         self.call.compute();
     }
 
-    /// Hands the call to `eval`: its provider computes, looks up or passes it on.
-    pub fn through(&mut self, cx: &Cx, eval: &Eval<'_>) {
-        eval.dispatch(cx, self.call);
+    /// Hands the call to `eval`: its provider computes, looks up or passes it on, or says why
+    /// it could not.
+    pub fn through(&mut self, cx: &Cx, eval: &Eval<'_>) -> Result<(), EvalError> {
+        eval.dispatch(cx, self.call)
     }
 
     /// Gives the call `value`, a clone of which becomes its result: [`Mistyped`] when it is
@@ -528,8 +580,9 @@ impl<'a> Eval<'a> {
     /// Remembers results by point and key, within `limit`, in two arenas of `mem` named
     /// `eval.memo`. [`Stopped::OutOfMemory`] when the arenas cannot be made.
     pub fn memo(mem: &Mem, limit: MemoLimit) -> Result<Eval<'static>, Stopped> {
-        let young = Generation::new(mem.arena(MEMO_ARENA, limit.bytes / 2)?);
-        let old = Generation::new(mem.arena(MEMO_ARENA, limit.bytes / 2)?);
+        let half = ByteLen::of_memory(limit.bytes / 2);
+        let young = Generation::new(mem.arena(MEMO_ARENA, half)?)?;
+        let old = Generation::new(mem.arena(MEMO_ARENA, half)?)?;
         let memo = Memo {
             limit,
             kept: LocalLock::new(Generations { young, old }),
@@ -550,8 +603,9 @@ impl<'a> Eval<'a> {
     ///
     /// `F` is a function marked `#[blaze::memo]` ([`MemoPoint`]) of the shape
     /// `fn(&mut Nested<'_>, A) -> R`. `A` is its arguments, a tuple for more than one, each an
-    /// [`EvalKey`]. `R: Clone + 'static`: see the module's doc for why by value.
-    pub fn call<F, A, R>(&self, cx: &Cx, f: F, args: A) -> R
+    /// [`EvalKey`]. `R: Clone + 'static`: see the module's doc for why by value. An
+    /// [`EvalError`] when the provider could not give one.
+    pub fn call<F, A, R>(&self, cx: &Cx, f: F, args: A) -> Result<R, EvalError>
     where
         F: MemoPoint + Fn(&mut Nested<'_>, A) -> R,
         A: EvalKey,
@@ -569,7 +623,13 @@ impl<'a> Eval<'a> {
     }
 
     /// [`Eval::call`] made by the body of `parent`.
-    fn call_under<F, A, R>(&self, cx: &Cx, parent: Option<Called>, f: F, args: A) -> R
+    fn call_under<F, A, R>(
+        &self,
+        cx: &Cx,
+        parent: Option<Called>,
+        f: F,
+        args: A,
+    ) -> Result<R, EvalError>
     where
         F: MemoPoint + Fn(&mut Nested<'_>, A) -> R,
         A: EvalKey,
@@ -578,39 +638,32 @@ impl<'a> Eval<'a> {
         if let Provider::Direct = self.provider {
             // A plain call: no point, no key, no erased call.
             let mut running = Running { eval: self, cx, parent: None };
-            return f(&mut Nested { door: &mut running }, args);
+            return Ok(f(&mut Nested { door: &mut running }, args));
         }
         let point = Point::of_type::<F>();
-        let mut typed = Typed {
-            top: self,
-            cx,
-            point,
-            parent,
-            f,
-            args: Some(args),
-            key: None,
-            out: None,
-            ran: false,
-        };
-        self.dispatch(cx, &mut typed);
+        // Every provider but `direct` keys the call, so the key is made here, once, while the
+        // arguments are surely here.
+        let key = Key::written(&args, cx.plant() == Plant::KeyIgnoresLast);
+        let mut typed =
+            Typed { top: self, cx, point, parent, f, args: Some(args), key, out: None, ran: false };
+        self.dispatch(cx, &mut typed)?;
         match typed.out {
-            Some(value) => value,
-            None => panic!(
-                "bstd::eval: {} returned with no value for memo point {point}: a handler's \
-                 `run` ends with a value in `next` (`compute`, `through` or `supply`)",
-                self.says()
-            ),
+            Some(value) => Ok(value),
+            None => Err(EvalError::NoValue { point, handler: self.says() }),
         }
     }
 
-    /// Gives `call` its value, as this evaluator's provider does.
-    fn dispatch(&self, cx: &Cx, call: &mut dyn Call) {
+    /// Gives `call` its value, as this evaluator's provider does, or says why it could not.
+    fn dispatch(&self, cx: &Cx, call: &mut dyn Call) -> Result<(), EvalError> {
         match &self.provider {
-            Provider::Direct => call.compute(),
+            Provider::Direct => {
+                call.compute();
+                Ok(())
+            }
             Provider::Memo(memo) => memo.run(cx, call),
             Provider::Handler(handler) => {
                 let at = At { point: call.point(), key: call.key(), parent: call.parent() };
-                handler.run(cx, at, &mut Next { call });
+                handler.run(cx, at, &mut Next { call })
             }
         }
     }
@@ -646,11 +699,11 @@ pub struct Nested<'a> {
 
 impl Nested<'_> {
     /// The value of the memo point `f` of `args`, as [`Eval::call`] gives it, recorded as an
-    /// input of the point that is running.
+    /// input of the point that is running; an [`EvalError`] when no value could be given.
     #[blaze::pure(
         trusted = "the value is `f`'s of `args` whichever evaluator computes, remembers or records it: `f` is a memo point, held pure where it is written, and a handler cannot supply a value of another call unseen (`Mistyped`)"
     )]
-    pub fn call<F, A, R>(&mut self, f: F, args: A) -> R
+    pub fn call<F, A, R>(&mut self, f: F, args: A) -> Result<R, EvalError>
     where
         F: MemoPoint + Fn(&mut Nested<'_>, A) -> R,
         A: EvalKey,
@@ -703,8 +756,8 @@ impl Door for Running<'_> {
 /// implementation, [`Typed`], keeps the value typed.
 trait Call {
     fn point(&self) -> Point;
-    /// The key of the arguments, made once.
-    fn key(&mut self) -> Key;
+    /// The key of the arguments, made with the call.
+    fn key(&self) -> Key;
     fn parent(&self) -> Option<Called>;
     /// Runs the body, unless the call has its value already.
     fn compute(&mut self);
@@ -726,7 +779,7 @@ struct Typed<'c, 'e, F, A, R> {
     f: F,
     /// The arguments, until the body takes them.
     args: Option<A>,
-    key: Option<Key>,
+    key: Key,
     out: Option<R>,
     ran: bool,
 }
@@ -741,17 +794,8 @@ where
         self.point
     }
 
-    fn key(&mut self) -> Key {
-        if let Some(key) = self.key {
-            return key;
-        }
-        let args = self.args.as_ref().expect(
-            "bstd::eval: a call's key is made before its body takes the arguments: every \
-             provider that keys asks for it first",
-        );
-        let key = Key::written(args, self.cx.plant() == Plant::KeyIgnoresLast);
-        self.key = Some(key);
-        key
+    fn key(&self) -> Key {
+        self.key
     }
 
     fn parent(&self) -> Option<Called> {
@@ -764,7 +808,7 @@ where
         }
         // The arguments leave only as the value arrives, so they are here.
         let Some(args) = self.args.take() else { return };
-        let this = self.key.map(|key| Called { point: self.point, key });
+        let this = Some(Called { point: self.point, key: self.key });
         let parent = match self.cx.plant() {
             Plant::NestedUnderGrandparent => self.parent,
             _ => this,
@@ -840,10 +884,11 @@ struct Generation {
 }
 
 impl Generation {
-    fn new(arena: Arena) -> Generation {
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the frame's owner.
+    fn new(arena: Arena) -> Result<Generation, Stopped> {
         // alloc: once per generation of an evaluator, the owner of its arena's frame.
-        let alloc = LocalShared::new(arena.into_frame());
-        Generation { entries: Some(Map::new_in(LocalShared::clone(&alloc))), alloc }
+        let alloc = LocalShared::new(arena.into_frame())?;
+        Ok(Generation { entries: Some(Map::new_in(LocalShared::clone(&alloc))), alloc })
     }
 
     fn get(&self, slot: &Called) -> Option<&Kept> {
@@ -859,17 +904,20 @@ impl Generation {
     }
 
     /// Drops every entry and gives the arena's bytes back; how many entries there were.
-    fn empty(&mut self) -> usize {
+    /// [`EvalError::Held`] when something else still holds the frame: the generation is then
+    /// empty, and its arena's bytes are not given back.
+    fn empty(&mut self) -> Result<usize, EvalError> {
         // The map and its entries go first: each holds the frame.
         let dropped = self.entries.take().map_or(0, |entries| entries.len());
-        LocalShared::get_mut(&mut self.alloc)
-            .expect(
-                "bstd::eval: a generation's frame is held by its map and its entries alone, \
-                 which were dropped",
-            )
-            .reset();
+        let reset = match LocalShared::get_mut(&mut self.alloc) {
+            Some(frame) => {
+                frame.reset();
+                Ok(dropped)
+            }
+            None => Err(EvalError::Held { arena: MEMO_ARENA }),
+        };
         self.entries = Some(Map::new_in(LocalShared::clone(&self.alloc)));
-        dropped
+        reset
     }
 
     /// Keeps a clone of `call`'s value under `slot`, if the arena has room for it.
@@ -900,7 +948,8 @@ impl Memo {
     }
 
     /// Gives `call` its value: its entry's, or the body's, which is then kept.
-    fn run(&self, cx: &Cx, call: &mut dyn Call) {
+    /// [`EvalError::Mistyped`] when its entry is of another type.
+    fn run(&self, cx: &Cx, call: &mut dyn Call) -> Result<(), EvalError> {
         let plant = cx.plant();
         let point = match plant {
             Plant::MemoSharesPoints => Point::none(),
@@ -914,53 +963,56 @@ impl Memo {
                 match call.supply(&**entry) {
                     Ok(()) => {
                         self.hits.set(self.hits.get() + 1);
-                        return;
+                        return Ok(());
                     }
                     // Two values of two types under one point and key: refused, never
                     // recomputed over (rule keys-cover-every-input).
-                    Err(mistyped) => panic!("bstd::eval: {mistyped}"),
+                    Err(mistyped) => return Err(EvalError::Mistyped(mistyped)),
                 }
             }
         }
         // No borrow is held here: the body's nested calls come back through this evaluator.
         call.compute();
         self.computed.set(self.computed.get() + 1);
-        self.keep(plant, slot, call);
+        self.keep(plant, slot, call)
     }
 
     /// Keeps `call`'s value under `slot`, dropping the old generation first when the young
-    /// one is at its half of a limit.
-    fn keep(&self, plant: Plant, slot: Called, call: &dyn Call) {
+    /// one is at its half of a limit. [`EvalError::Held`] when a generation could not be
+    /// emptied.
+    fn keep(&self, plant: Plant, slot: Called, call: &dyn Call) -> Result<(), EvalError> {
         let half = self.limit.entries / 2;
         let evicts = plant != Plant::MemoNeverEvicts;
         let mut kept = self.kept.borrow_mut();
         if half == 0 {
             self.uncached.set(self.uncached.get() + 1);
-            return;
+            return Ok(());
         }
         if kept.young.len() >= half && evicts {
-            self.rotate(&mut kept);
+            self.rotate(&mut kept)?;
         }
         if kept.young.keep(slot, call) {
-            return;
+            return Ok(());
         }
         // The young arena is full. Emptied, it has its whole half: a value that does not fit
         // then is over the limit by itself.
         if evicts && kept.young.len() > 0 {
-            self.rotate(&mut kept);
+            self.rotate(&mut kept)?;
             if kept.young.keep(slot, call) {
-                return;
+                return Ok(());
             }
         }
         self.uncached.set(self.uncached.get() + 1);
+        Ok(())
     }
 
     /// Drops the old generation whole; the young one becomes the old, and the emptied one
     /// the young.
-    fn rotate(&self, kept: &mut Generations) {
-        let dropped = kept.old.empty();
+    fn rotate(&self, kept: &mut Generations) -> Result<(), EvalError> {
+        let dropped = kept.old.empty()?;
         self.evicted.set(self.evicted.get() + dropped as u64);
         core::mem::swap(&mut kept.young, &mut kept.old);
+        Ok(())
     }
 }
 
@@ -1097,9 +1149,9 @@ impl<'a, 'm> Provenance<'a, 'm> {
 }
 
 impl Handler for Provenance<'_, '_> {
-    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>) {
+    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>) -> Result<(), EvalError> {
         self.graph.record(at.parent, at.called());
-        next.through(cx, self.inner);
+        next.through(cx, self.inner)
     }
 
     fn name(&self) -> &'static str {

@@ -78,7 +78,7 @@
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
 
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec as HeapVec};
 use core::{fmt, marker::PhantomData, num::NonZero};
 
 use blaze_core::{Done, Effect, FileName};
@@ -90,8 +90,9 @@ use crate::{
     cx::Cx,
     disk::dir_of,
     io::{Ends, Io},
-    mem::Bytes,
-    path::Path,
+    mem::{ByteLen, Bytes, Offset, OutOfMemory, Overflow, Vec, heap},
+    name::Excerpt,
+    path::{Path, PathWhy, name_of, push_decimal},
     pending::{self, Pending},
 };
 
@@ -128,7 +129,7 @@ impl Rights for ReadWrite {
 /// What a file or directory is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
-    pub len: u64,
+    pub len: ByteLen,
     pub dir: bool,
 }
 
@@ -215,7 +216,7 @@ impl How {
 /// past its end making the file longer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Patch<'a> {
-    pub at: u64,
+    pub at: Offset,
     pub bytes: &'a [u8],
 }
 
@@ -315,6 +316,7 @@ pub enum FsOp {
     SyncNames,
     Close,
     List,
+    Quota,
 }
 
 impl FsOp {
@@ -337,6 +339,7 @@ impl FsOp {
             FsOp::SyncNames => "sync_names",
             FsOp::Close => "close",
             FsOp::List => "list",
+            FsOp::Quota => "quota",
         }
     }
 }
@@ -367,8 +370,16 @@ pub enum FsKind {
     Stale { flushed_at: u64, changed_at: u64 },
     /// The driver failed it, saying this.
     Driver(String),
-    /// The driver answered with a completion of another kind: a driver's bug.
-    Answered(String),
+    /// The driver answered with a completion of another kind, or one that does not fit what
+    /// was asked: a driver's bug. The start of what it answered, kept in the error.
+    Answered(Excerpt),
+    /// An offset or a length does not fit its type: a read or write that would end past
+    /// `u64::MAX` bytes, or a length this target's memory cannot hold. Nothing was done.
+    Overflow(Overflow),
+    /// A name made from the file's (a path beneath it, a publish's temporary file) is no
+    /// blaze-core file name: bstd's path rule and blaze-core's disagree, a bug. `made` is the
+    /// start of the name.
+    NoName { made: Excerpt },
 }
 
 /// A file call that failed: the call, the file (under the driver's root) and how.
@@ -410,6 +421,12 @@ impl fmt::Display for FsError {
             FsKind::Answered(done) => {
                 write!(f, "bstd::fs {op} of {path}: the driver answered {done} (a driver's bug)")
             }
+            FsKind::Overflow(overflow) => write!(f, "bstd::fs {op} of {path}: {overflow}"),
+            FsKind::NoName { made } => write!(
+                f,
+                "bstd::fs {op} of {path}: the name {made:?} made from it is no blaze-core file name \
+                 (bstd's path rule and blaze-core's disagree: a bug)"
+            ),
         }
     }
 }
@@ -431,15 +448,31 @@ impl FsError {
     }
 }
 
-/// `done`, which was not what `op` expects, as its error.
+/// `done`, which was not what `op` expects, as its error. Nothing is allocated: a driver's
+/// message is moved, and another answer is kept as the start of its `Debug` form.
 fn unexpected(op: FsOp, path: &FileName, done: Done) -> FsError {
     let kind = match done {
-        // alloc: an error's message.
         Done::Failed(error) => FsKind::Driver(error.0),
-        // alloc: an error's message.
-        done => FsKind::Answered(format!("{done:?}")),
+        done => FsKind::Answered(Excerpt::debug(&done)),
     };
     FsError::new(op, path, kind)
+}
+
+/// What `op` on `path` says when a growth found no room.
+fn no_room(op: FsOp, path: &FileName) -> impl FnOnce(OutOfMemory) -> FsError + '_ {
+    move |error| FsError::new(op, path, FsKind::Stopped(Stopped::from(error)))
+}
+
+/// What `op` on `path` says when an offset or a length does not fit.
+fn overflow(op: FsOp, path: &FileName) -> impl FnOnce(Overflow) -> FsError + '_ {
+    move |error| FsError::new(op, path, FsKind::Overflow(error))
+}
+
+/// A copy of `bytes` for an effect of `op` on `path`: blaze-core's `Effect` owns its bytes as
+/// a std `Vec`, made fallibly here.
+fn owned(op: FsOp, path: &FileName, bytes: &[u8]) -> Result<HeapVec<u8>, FsError> {
+    // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+    heap::bytes(bytes).map_err(no_room(op, path))
 }
 
 /// One call of `op` on `path`: the effect `effect` makes, waited for.
@@ -470,11 +503,12 @@ fn flush_wait(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<(), FsError
 /// A flush of `name` handed to the driver and not waited for: its end, and its failure, are
 /// dropped as they arrive. Only [`Plant::FlushedBeforeFlush`] does this: a flush in flight
 /// makes its file where it is missing, so nothing sound leaves one behind.
-fn flush_start(io: &Io, name: &FileName) {
+fn flush_start(io: &Io, op: FsOp, name: &FileName) -> Result<(), FsError> {
     // clone: the effect's name, a refcount.
     let file = name.clone();
-    let tag = io.submit(|tag| Effect::Sync { file, tag });
-    io.forget(tag, Ends::Once);
+    let stopped = |stopped| FsError::new(op, name, FsKind::Stopped(stopped));
+    let tag = io.submit(|tag| Effect::Sync { file, tag }).map_err(stopped)?;
+    io.forget(tag, Ends::Once).map_err(stopped)
 }
 
 /// What an `_unsynced` call does once its change to `name`'s bytes is made:
@@ -482,14 +516,15 @@ fn flush_start(io: &Io, name: &FileName) {
 /// write-back ([`Effect::WriteBack`]) and waits for nothing. The write-back's end, and its
 /// failure (the file removed meanwhile; a write-back makes no file), are dropped as they
 /// arrive: `Started` promises only that the bytes are on their way.
-fn started(io: &Io, name: &FileName, unsynced: Unsynced) {
+fn started(io: &Io, op: FsOp, name: &FileName, unsynced: Unsynced) -> Result<(), FsError> {
     match unsynced {
-        Unsynced::No => {}
+        Unsynced::No => Ok(()),
         Unsynced::Started => {
             // clone: the effect's name, a refcount.
             let file = name.clone();
-            let tag = io.submit(|tag| Effect::WriteBack { file, tag });
-            io.forget(tag, Ends::Once);
+            let stopped = |stopped| FsError::new(op, name, FsKind::Stopped(stopped));
+            let tag = io.submit(|tag| Effect::WriteBack { file, tag }).map_err(stopped)?;
+            io.forget(tag, Ends::Once).map_err(stopped)
         }
     }
 }
@@ -497,13 +532,14 @@ fn started(io: &Io, name: &FileName, unsynced: Unsynced) {
 /// What an `_unsynced` call does once its change to a name (a rename, a remove) is made:
 /// for [`Unsynced::Started`] the sync of `name`'s directory is begun ([`Effect::SyncDir`])
 /// and not waited for. The names of the driver's root, which no effect can name, are left.
-fn names_started(io: &Io, name: &FileName, unsynced: Unsynced) {
+fn names_started(io: &Io, op: FsOp, name: &FileName, unsynced: Unsynced) -> Result<(), FsError> {
     match (unsynced, FileName::new(dir_of(name))) {
         (Unsynced::Started, Some(dir)) => {
-            let tag = io.submit(|tag| Effect::SyncDir { dir, tag });
-            io.forget(tag, Ends::Once);
+            let stopped = |stopped| FsError::new(op, name, FsKind::Stopped(stopped));
+            let tag = io.submit(|tag| Effect::SyncDir { dir, tag }).map_err(stopped)?;
+            io.forget(tag, Ends::Once).map_err(stopped)
         }
-        (Unsynced::Started, None) | (Unsynced::No, _) => {}
+        (Unsynced::Started, None) | (Unsynced::No, _) => Ok(()),
     }
 }
 
@@ -542,7 +578,7 @@ fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &FileName, dir: &str) -> Result<()
 }
 
 /// `bytes` added at the end of `name`, making it; not flushed.
-fn append(io: &Io, cx: &Cx, op: FsOp, name: &FileName, bytes: Vec<u8>) -> Result<(), FsError> {
+fn append(io: &Io, cx: &Cx, op: FsOp, name: &FileName, bytes: HeapVec<u8>) -> Result<(), FsError> {
     // clone: the effect's name, a refcount.
     let file = name.clone();
     match call(io, cx, op, name, |tag| Effect::Append { file, bytes, tag })? {
@@ -552,9 +588,10 @@ fn append(io: &Io, cx: &Cx, op: FsOp, name: &FileName, bytes: Vec<u8>) -> Result
 }
 
 /// `name` cut or grown to `len`, made if missing; not flushed.
-fn truncate(io: &Io, cx: &Cx, op: FsOp, name: &FileName, len: u64) -> Result<(), FsError> {
+fn truncate(io: &Io, cx: &Cx, op: FsOp, name: &FileName, len: ByteLen) -> Result<(), FsError> {
     // clone: the effect's name, a refcount.
     let file = name.clone();
+    let len = len.get();
     match call(io, cx, op, name, |tag| Effect::Truncate { file, len, tag })? {
         Done::Truncated => Ok(()),
         done => Err(unexpected(op, name, done)),
@@ -601,38 +638,55 @@ fn copy_file(
     of: &FileName,
     to: &FileName,
     chunk: NonZero<usize>,
-) -> Result<u64, FsError> {
-    truncate(io, cx, FsOp::CopyTo, to, 0)?;
-    let mut at = 0;
+) -> Result<ByteLen, FsError> {
+    truncate(io, cx, FsOp::CopyTo, to, ByteLen::ZERO)?;
+    let mut at = Offset::START;
     loop {
         // clone: the effect's name, a refcount.
         let file = of.clone();
-        let read = match call(io, cx, FsOp::CopyTo, of, |tag| Effect::Read { file, at, len: chunk.get(), tag })? {
+        let from = at.get();
+        let read = match call(io, cx, FsOp::CopyTo, of, |tag| Effect::Read { file, at: from, len: chunk.get(), tag })? {
             Done::Read(read) => read,
             done => return Err(unexpected(FsOp::CopyTo, of, done)),
         };
         let len = read.len();
         if len > 0 {
-            within(io, quota, FsOp::CopyTo, to, len as u64, || append(io, cx, FsOp::CopyTo, to, read))?;
-            at += len as u64;
+            let bytes = ByteLen::of_memory(len);
+            at = at.after(bytes).map_err(overflow(FsOp::CopyTo, of))?;
+            within(io, quota, FsOp::CopyTo, to, bytes, || append(io, cx, FsOp::CopyTo, to, read))?;
         }
         if len < chunk.get() {
-            return Ok(at);
+            return Ok(at.from_start());
         }
     }
 }
 
 /// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
-fn beside(io: &Io, name: &FileName) -> FileName {
+/// publish's temporary file, `.<leaf>.<n>.bstd-new`. With no room for it,
+/// [`FsKind::Stopped`].
+fn beside(io: &Io, op: FsOp, name: &FileName) -> Result<FileName, FsError> {
     let fresh = io.fresh();
-    let joined = match name.as_str().rsplit_once('/') {
-        // alloc: once per publish, its temporary file's name.
-        Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
-        // alloc: once per publish, its temporary file's name.
-        None => format!(".{name}.{fresh}.bstd-new"),
+    let (dir, leaf) = match name.as_str().rsplit_once('/') {
+        Some((dir, leaf)) => (Some(dir), leaf),
+        None => (None, name.as_str()),
     };
-    FileName::new(&joined).expect("a name beside a name is a name")
+    // alloc: once per publish, its temporary file's name.
+    let made = name_of(|text| {
+        if let Some(dir) = dir {
+            text.push_str(dir)?;
+            text.push('/')?;
+        }
+        text.push('.')?;
+        text.push_str(leaf)?;
+        text.push('.')?;
+        push_decimal(text, fresh)?;
+        text.push_str(".bstd-new")
+    })
+    .map_err(no_room(op, name))?;
+    made.ok_or_else(|| {
+        let made = Excerpt::of_parts(&[dir.unwrap_or(""), "/.", leaf, ".<n>.bstd-new"]);
+        FsError::new(op, name, FsKind::NoName { made })
+    })
 }
 
 /// What is at `name`, or `None`.
@@ -640,7 +694,7 @@ fn stat(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<Option<Meta>, FsE
     // clone: the effect's name, a refcount.
     let file = name.clone();
     match call(io, cx, op, name, |tag| Effect::Stat { file, tag })? {
-        Done::Stat(meta) => Ok(meta.map(|it| Meta { len: it.len, dir: it.dir })),
+        Done::Stat(meta) => Ok(meta.map(|it| Meta { len: ByteLen::new(it.len), dir: it.dir })),
         done => Err(unexpected(op, name, done)),
     }
 }
@@ -655,7 +709,7 @@ fn within(
     quota: Option<&Budget>,
     op: FsOp,
     name: &FileName,
-    bytes: u64,
+    bytes: ByteLen,
     write: impl FnOnce() -> Result<(), FsError>,
 ) -> Result<(), FsError> {
     let Some(quota) = quota else { return write() };
@@ -738,20 +792,26 @@ impl Dir<ReadWrite> {
     /// publishes of bytes never hold more than the quota; bytes held on the disk are the
     /// driver's to bound, with an effect blaze-core does not have yet.
     ///
+    /// With no room for the budget it is [`FsKind::Stopped`], op [`FsOp::Quota`].
+    ///
     /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
-    pub fn quota(&self, bytes: u64) -> (r: Dir<ReadWrite>)
-        ensures match r.quota_left() {
-            Some(left) => left <= bytes,
-            None => false,
+    pub fn quota(&self, bytes: ByteLen) -> (r: Result<Dir<ReadWrite>, FsError>)
+        ensures match &r {
+            Ok(dir) => match dir.quota_left() {
+                Some(left) => left <= bytes,
+                None => false,
+            },
+            Err(_) => true,
         }
     {
-        // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
-        let quota = Some(Budget::new(bytes, self.quota.clone()));
-        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }
+        // clone: the budget this one is inside, a refcount.
+        let budget = Budget::new(bytes, self.quota.clone()).map_err(no_room(FsOp::Quota, &self.base))?;
+        // clone: authority held, narrowed: a refcount each.
+        Ok(Dir { io: self.io.clone(), base: self.base.clone(), quota: Some(budget), rights: PhantomData })
     }
 
     /// The bytes that may still be written through it; `None` with no quota.
-    pub fn quota_left(&self) -> Option<u64> {
+    pub fn quota_left(&self) -> Option<ByteLen> {
         self.quota.as_deref().map(Budget::left)
     }
 }
@@ -762,15 +822,16 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         &self.base
     }
 
-    /// The directory `path` beneath this one, with the same rights or fewer.
-    pub fn subdir(&self, path: &Path) -> Dir<P> {
+    /// The directory `path` beneath this one, with the same rights or fewer. With no room for
+    /// its name, [`FsKind::Stopped`], op [`FsOp::OpenDir`].
+    pub fn subdir(&self, path: &Path) -> Result<Dir<P>, FsError> {
         let base = match self.io.plant() {
             // clone: the planted bug keeps the parent's name, a refcount.
             Plant::SubdirKeepsParent => self.base.clone(),
-            _ => self.beneath(path),
+            _ => self.beneath(FsOp::OpenDir, path)?,
         };
         // clone: the quota shared, a refcount.
-        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
+        Ok(Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData })
     }
 
     /// The same directory, read only.
@@ -786,13 +847,14 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
 
     /// `path` beneath this directory, as a path under the driver's root: for a capability
     /// that names a socket beneath a directory ([`crate::local::Local`]).
-    pub(crate) fn path_beneath(&self, path: &Path) -> Path {
-        Path::of(self.beneath(path))
+    pub(crate) fn path_beneath(&self, path: &Path) -> Result<Path, FsError> {
+        Ok(Path::of(self.beneath(FsOp::Open, path)?))
     }
 
     /// Every file beneath this directory, at any depth, sorted by name, in `frame`: each one's
     /// path relative to this directory, and what it is. A directory that is not there yet (no
-    /// file was made under it) has none.
+    /// file was made under it) has none. With no room in `frame`, [`FsKind::Stopped`] naming
+    /// the frame, and nothing of the list kept.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<(Path, Meta), &'a Frame>, FsError> {
         let mut found = Vec::new_in(frame);
         match stat(&self.io, cx, FsOp::List, &self.base)? {
@@ -811,24 +873,28 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             let rest = name.is_under(&self.base).then(|| name.as_str().get(start..)).flatten();
             let beneath = rest.and_then(|rest| Path::new(rest).ok());
             let Some(path) = beneath else {
-                // alloc: an error's message.
-                let said = format!("a listing with {name}, which is no path beneath it");
+                let said = Excerpt::of_parts(&["a listing with ", name.as_str(), ", which is no path beneath it"]);
                 return Err(FsError::new(FsOp::List, &self.base, FsKind::Answered(said)));
             };
-            found.try_reserve(1).map_err(|_| {
-                let stopped = Stopped::OutOfMemory { arena: "bstd::fs list", asked: size_of::<(Path, Meta)>() };
-                FsError::new(FsOp::List, &self.base, FsKind::Stopped(stopped))
-            })?;
-            found.push((path, Meta { len: meta.len, dir: false }));
+            found
+                .push((path, Meta { len: ByteLen::new(meta.len), dir: false }))
+                .map_err(no_room(FsOp::List, &self.base))?;
         }
         Ok(found)
     }
 
-    /// The name of `path` beneath this directory.
-    fn beneath(&self, path: &Path) -> FileName {
-        // alloc: once per name joined.
-        let joined = format!("{}/{}", self.base, path.as_str());
-        FileName::new(&joined).expect("a directory's name and a path joined are a name")
+    /// The name of `path` beneath this directory, for the call `op`: [`Path::join`], so one
+    /// rule joins names. With no room for it, [`FsKind::Stopped`].
+    fn beneath(&self, op: FsOp, path: &Path) -> Result<FileName, FsError> {
+        // clone: the directory's name as a path, a refcount.
+        let joined = Path::of(self.base.clone()).join(path).map_err(|error| {
+            let kind = match error.why {
+                PathWhy::OutOfMemory(error) => FsKind::Stopped(Stopped::from(error)),
+                _ => FsKind::NoName { made: error.path },
+            };
+            FsError::new(op, &self.base, kind)
+        })?;
+        Ok(joined.into_name())
     }
 
     /// The name `raw` would have beneath this directory if its `..` were resolved by text:
@@ -836,7 +902,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     #[cfg(test)]
     pub(crate) fn beneath_by_text(&self, raw: &str) -> Option<FileName> {
         // alloc: a test's planted join.
-        let mut parts: Vec<&str> = self.base.as_str().split('/').collect();
+        let mut parts: HeapVec<&str> = self.base.as_str().split('/').collect();
         for part in raw.split('/') {
             match part {
                 ".." => _ = parts.pop(),
@@ -850,7 +916,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
 
     /// What is at `path`, or `None`.
     pub fn stat(&self, cx: &Cx, path: &Path) -> Result<Option<Meta>, FsError> {
-        stat(&self.io, cx, FsOp::Stat, &self.beneath(path))
+        stat(&self.io, cx, FsOp::Stat, &self.beneath(FsOp::Stat, path)?)
     }
 
     /// That a file, not a directory, is at `name`, for an open. A missing one is
@@ -864,7 +930,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
                     // clone: the planted bug's effect's name, a refcount.
                     let file = name.clone();
                     // alloc: none, an empty file.
-                    call(&self.io, cx, FsOp::Open, name, |tag| Effect::Write { file, bytes: Vec::new(), tag })?;
+                    call(&self.io, cx, FsOp::Open, name, |tag| Effect::Write { file, bytes: HeapVec::new(), tag })?;
                 }
                 Err(FsError::new(FsOp::Open, name, FsKind::NotFound))
             }
@@ -874,13 +940,13 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// The file at `path`, read only, whatever this directory's rights. A missing one is
     /// [`FsKind::NotFound`]: an open never makes a file.
     pub fn open_read(&self, cx: &Cx, path: &Path) -> Result<File<ReadOnly>, FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Open, path)?;
         self.found(cx, &name)?;
         Ok(File { io: self.io.clone(), name, quota: None, made: false, rights: ReadOnly })
     }
 
     /// The whole file at `path` added to `into`; how many bytes it added.
-    pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+    pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<ByteLen, FsError> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
 }
@@ -896,7 +962,7 @@ impl Dir<ReadWrite> {
     /// The file at `path`, read and write: finished with one of [`File::close`]'s forms. A
     /// missing one is [`FsKind::NotFound`]: an open never makes a file.
     pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Open, path)?;
         self.found(cx, &name)?;
         // clone: the quota shared, a refcount.
         Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: false, rights: ReadWrite(()) })
@@ -907,8 +973,8 @@ impl Dir<ReadWrite> {
     /// durable, its name included, until its close says so: finished with one of
     /// [`File::close`]'s forms. To replace a file all at once, [`Dir::publish`].
     pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
-        let name = self.beneath(path);
-        truncate(&self.io, cx, FsOp::Create, &name, 0)?;
+        let name = self.beneath(FsOp::Create, path)?;
+        truncate(&self.io, cx, FsOp::Create, &name, ByteLen::ZERO)?;
         // clone: the quota shared, a refcount.
         Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: true, rights: ReadWrite(()) })
     }
@@ -924,15 +990,16 @@ impl Dir<ReadWrite> {
     /// A temporary file beside `name` made to hold `content`, not flushed: its name, and how
     /// it was made. A failure leaves the temporary file where it is; the error names it.
     fn place(&self, cx: &Cx, name: &FileName, content: Content<'_>) -> Result<(FileName, How), FsError> {
-        let temp = beside(&self.io, name);
+        let temp = beside(&self.io, FsOp::Publish, name)?;
         let quota = self.quota.as_deref();
         let how = match content.kind {
             Kind::Bytes(bytes) => {
-                truncate(&self.io, cx, FsOp::Publish, &temp, 0)?;
+                truncate(&self.io, cx, FsOp::Publish, &temp, ByteLen::ZERO)?;
                 if !bytes.is_empty() {
-                    within(&self.io, quota, FsOp::Publish, &temp, bytes.len() as u64, || {
-                        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-                        append(&self.io, cx, FsOp::Publish, &temp, bytes.to_vec())
+                    // Copied before the quota is taken: with no room for the copy, nothing is.
+                    let owned = owned(FsOp::Publish, &temp, bytes)?;
+                    within(&self.io, quota, FsOp::Publish, &temp, ByteLen::of(bytes), || {
+                        append(&self.io, cx, FsOp::Publish, &temp, owned)
                     })?;
                 }
                 How::Written
@@ -953,11 +1020,14 @@ impl Dir<ReadWrite> {
                 remove(&self.io, cx, FsOp::Publish, &temp)?;
                 clone_file(&self.io, cx, FsOp::Publish, base.name(), &temp)?;
                 for patch in patches {
-                    within(&self.io, quota, FsOp::Publish, &temp, patch.bytes.len() as u64, || {
+                    let len = ByteLen::of(patch.bytes);
+                    patch.at.after(len).map_err(overflow(FsOp::Publish, &temp))?;
+                    // Copied before the quota is taken: with no room for the copy, nothing is.
+                    let bytes = owned(FsOp::Publish, &temp, patch.bytes)?;
+                    within(&self.io, quota, FsOp::Publish, &temp, len, || {
                         // clone: the effect's name, a refcount.
                         let file = temp.clone();
-                        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-                        let (at, bytes) = (patch.at, patch.bytes.to_vec());
+                        let at = patch.at.get();
                         match call(&self.io, cx, FsOp::Publish, &temp, |tag| Effect::WriteAt { file, at, bytes, tag })? {
                             Done::Written => Ok(()),
                             done => Err(unexpected(FsOp::Publish, &temp, done)),
@@ -977,8 +1047,9 @@ impl Dir<ReadWrite> {
         if self.io.plant() == Plant::PublishBeforeRename {
             // clone: the effect's names, refcounts.
             let (from, to) = (temp.clone(), name.clone());
-            let tag = self.io.submit(|tag| Effect::Rename { from, to, tag });
-            self.io.forget(tag, Ends::Once);
+            let stopped = |stopped| FsError::new(FsOp::Publish, name, FsKind::Stopped(stopped));
+            let tag = self.io.submit(|tag| Effect::Rename { from, to, tag }).map_err(stopped)?;
+            self.io.forget(tag, Ends::Once).map_err(stopped)?;
             return Ok(());
         }
         rename(&self.io, cx, FsOp::Publish, temp, name)
@@ -1019,11 +1090,11 @@ impl Dir<ReadWrite> {
         content: Content<'_>,
         unsynced: Unsynced,
     ) -> Result<Published<Written>, FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Publish, path)?;
         let (temp, how) = self.place(cx, &name, content)?;
         self.swap_in(cx, &temp, &name)?;
-        started(&self.io, &name, unsynced);
-        names_started(&self.io, &name, unsynced);
+        started(&self.io, FsOp::Publish, &name, unsynced)?;
+        names_started(&self.io, FsOp::Publish, &name, unsynced)?;
         cx.event(how.says());
         Ok(Published { file: Written::of(&self.io, name), how })
     }
@@ -1033,7 +1104,7 @@ impl Dir<ReadWrite> {
     /// new, never a part. It waits for the device twice: the new file's bytes are flushed
     /// before it is renamed over `path`, and the directory's names synced after.
     pub fn publish_synced(&self, cx: &Cx, path: &Path, content: Content<'_>) -> Result<Published<Flushed>, FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Publish, path)?;
         let (temp, how) = self.place(cx, &name, content)?;
         let flushed = Written::of(&self.io, temp).flush(cx)?;
         self.swap_in(cx, flushed.name(), &name)?;
@@ -1057,15 +1128,15 @@ impl Dir<ReadWrite> {
     /// The file at `path` gone, with nothing synced: a crash may bring it back. Gone already
     /// is done.
     pub fn remove_unsynced(&self, cx: &Cx, path: &Path, unsynced: Unsynced) -> Result<(), FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Remove, path)?;
         remove(&self.io, cx, FsOp::Remove, &name)?;
-        names_started(&self.io, &name, unsynced);
+        names_started(&self.io, FsOp::Remove, &name, unsynced)?;
         Ok(())
     }
 
     /// The file at `path` gone, and its directory's names synced: a crash keeps it gone.
     pub fn remove_synced(&self, cx: &Cx, path: &Path) -> Result<(), FsError> {
-        let name = self.beneath(path);
+        let name = self.beneath(FsOp::Remove, path)?;
         remove(&self.io, cx, FsOp::Remove, &name)?;
         sync_names(&self.io, cx, FsOp::Remove, &name, false)
     }
@@ -1091,10 +1162,10 @@ impl Dir<ReadWrite> {
         to: &Path,
         unsynced: Unsynced,
     ) -> Result<(), FsError> {
-        let (from, to) = (self.beneath(from), self.beneath(to));
+        let (from, to) = (self.beneath(FsOp::Rename, from)?, self.beneath(FsOp::Rename, to)?);
         rename(&self.io, cx, FsOp::Rename, &from, &to)?;
-        started(&self.io, &to, unsynced);
-        names_started(&self.io, &to, unsynced);
+        started(&self.io, FsOp::Rename, &to, unsynced)?;
+        names_started(&self.io, FsOp::Rename, &to, unsynced)?;
         Ok(())
     }
 
@@ -1104,7 +1175,7 @@ impl Dir<ReadWrite> {
     /// yet flushed: where that matters, flush the file first ([`Written::flush`]) or publish
     /// it ([`Dir::publish_synced`]).
     pub fn rename_replacing_synced(&self, cx: &Cx, from: &Path, to: &Path) -> Result<(), FsError> {
-        let (from, to) = (self.beneath(from), self.beneath(to));
+        let (from, to) = (self.beneath(FsOp::Rename, from)?, self.beneath(FsOp::Rename, to)?);
         rename(&self.io, cx, FsOp::Rename, &from, &to)?;
         flush_wait(&self.io, cx, FsOp::Rename, &to)?;
         sync_names(&self.io, cx, FsOp::Rename, &to, true)
@@ -1187,7 +1258,7 @@ impl Written {
         // flush may not cover, and makes the `Flushed` stale.
         let seen = file.io.generation(&file.name);
         if file.io.plant() == Plant::FlushedBeforeFlush {
-            flush_start(&file.io, &file.name);
+            flush_start(&file.io, FsOp::Flush, &file.name)?;
             return Ok(Flushed { file, seen });
         }
         flush_wait(&file.io, cx, FsOp::Flush, &file.name)?;
@@ -1252,7 +1323,7 @@ impl Flushed {
     /// clones.
     pub fn clone_to(&self, cx: &Cx, dir: &Dir<ReadWrite>, path: &Path) -> Result<Written, FsError> {
         self.not_stale(FsOp::CloneTo)?;
-        let to = dir.beneath(path);
+        let to = dir.beneath(FsOp::CloneTo, path)?;
         dir.absent(cx, FsOp::CloneTo, &to)?;
         clone_file(&dir.io, cx, FsOp::CloneTo, &self.file.name, &to)?;
         Ok(Written::of(&dir.io, to))
@@ -1278,7 +1349,7 @@ fn copy_to(
     path: &Path,
     chunk: NonZero<usize>,
 ) -> Result<Written, FsError> {
-    let to = dir.beneath(path);
+    let to = dir.beneath(FsOp::CopyTo, path)?;
     dir.absent(cx, FsOp::CopyTo, &to)?;
     copy_file(&dir.io, cx, dir.quota.as_deref(), &of.name, &to, chunk)?;
     Ok(Written::of(&dir.io, to))
@@ -1326,7 +1397,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 
     /// Its length now.
-    pub fn len(&self, cx: &Cx) -> Result<u64, FsError> {
+    pub fn len(&self, cx: &Cx) -> Result<ByteLen, FsError> {
         match stat(&self.io, cx, FsOp::Stat, &self.name)? {
             Some(meta) => Ok(meta.len),
             None => Err(FsError::new(FsOp::Stat, &self.name, FsKind::NotFound)),
@@ -1334,19 +1405,28 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 
     /// A read of up to `into.len()` bytes at `at` into `into`, in flight: its outcome, once
-    /// waited for, is how many bytes it read, fewer at the end of the file.
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, Result<usize, FsError>> {
-        // clone: the effect's name, a refcount.
-        let file = self.name.clone();
+    /// waited for, is how many bytes it read, fewer at the end of the file. A read that would
+    /// end past the last offset is refused before it starts ([`FsKind::Overflow`]).
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: Offset) -> Pending<'buf, Result<ByteLen, FsError>> {
         let len = into.len();
         let name = &self.name;
+        if let Err(error) = at.after(ByteLen::of_memory(len)) {
+            return pending::refused(&self.io, "bstd::fs read_into", Err(overflow(FsOp::Read, name)(error)));
+        }
+        // clone: the effect's name, a refcount.
+        let file = self.name.clone();
+        let at = at.get();
         let effect = |tag| Effect::Read { file, at, len, tag };
         pending::start(&self.io, "bstd::fs read_into", into, effect, move |into: &mut [u8], done| {
             match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
-                    into[..bytes.len()].copy_from_slice(&bytes);
-                    Ok(bytes.len())
-                }
+                // A driver that read more than was asked is answered as its bug.
+                Ok(Done::Read(bytes)) => match into.get_mut(..bytes.len()) {
+                    Some(slot) => {
+                        slot.copy_from_slice(&bytes);
+                        Ok(ByteLen::of(&bytes))
+                    }
+                    None => Err(unexpected(FsOp::Read, name, Done::Read(bytes))),
+                },
                 Ok(done) => Err(unexpected(FsOp::Read, name, done)),
                 Err(stopped) => Err(FsError::new(FsOp::Read, name, FsKind::Stopped(stopped))),
             }
@@ -1354,16 +1434,22 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 
     /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many. Its
-    /// [`File::read_into`], waited for.
-    pub fn read_at(&self, cx: &Cx, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+    /// [`File::read_into`], waited for. A `len` this target's memory cannot hold is
+    /// [`FsKind::Overflow`].
+    pub fn read_at(&self, cx: &Cx, at: Offset, len: ByteLen, into: &mut Bytes<'_>) -> Result<ByteLen, FsError> {
         let stopped = |stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped));
         cx.stopped_by(self.io.now()).map_err(stopped)?;
+        let room = len.in_memory().map_err(overflow(FsOp::Read, &self.name))?;
         let start = into.len();
-        let slot = into.grow_zeroed(len).map_err(stopped)?;
+        let slot = into.grow_zeroed(room).map_err(stopped)?;
         let read = self.read_into(slot, at).wait(cx);
-        match read {
-            Ok(read) => {
-                into.truncate(start + read);
+        let kept = read.and_then(|read| match read.in_memory() {
+            Ok(held) => Ok((read, held)),
+            Err(error) => Err(overflow(FsOp::Read, &self.name)(error)),
+        });
+        match kept {
+            Ok((read, held)) => {
+                into.truncate(start + held);
                 Ok(read)
             }
             Err(error) => {
@@ -1374,7 +1460,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 
     /// The whole file added to `into`; how many bytes.
-    pub fn read_all(&self, cx: &Cx, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+    pub fn read_all(&self, cx: &Cx, into: &mut Bytes<'_>) -> Result<ByteLen, FsError> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::ReadAll { file, tag })?;
@@ -1382,7 +1468,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
             Done::Read(bytes) => {
                 into.extend(&bytes)
                     .map_err(|stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped)))?;
-                Ok(bytes.len())
+                Ok(ByteLen::of(&bytes))
             }
             done => Err(unexpected(FsOp::Read, &self.name, done)),
         }
@@ -1390,11 +1476,12 @@ impl<#[blaze::linear] P: Rights> File<P> {
 }
 
 impl File<ReadWrite> {
-    /// The bytes handed to the driver at the file's end, within the quota.
+    /// The bytes handed to the driver at the file's end, within the quota. They are copied
+    /// for the effect before the quota is taken: with no room for the copy, nothing is.
     fn append_bytes(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
-        within(&self.io, self.quota.as_deref(), FsOp::Append, &self.name, bytes.len() as u64, || {
-            // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-            append(&self.io, cx, FsOp::Append, &self.name, bytes.to_vec())
+        let owned = owned(FsOp::Append, &self.name, bytes)?;
+        within(&self.io, self.quota.as_deref(), FsOp::Append, &self.name, ByteLen::of(bytes), || {
+            append(&self.io, cx, FsOp::Append, &self.name, owned)
         })
     }
 
@@ -1411,7 +1498,7 @@ impl File<ReadWrite> {
     /// keeps a prefix of them until a later [`File::flush`] has returned.
     pub fn append_unsynced(&self, cx: &Cx, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
         self.append_bytes(cx, bytes)?;
-        started(&self.io, &self.name, unsynced);
+        started(&self.io, FsOp::Append, &self.name, unsynced)?;
         Ok(())
     }
 
@@ -1423,10 +1510,20 @@ impl File<ReadWrite> {
     }
 
     /// A write of `from` at `at`, past the end making it longer, in flight; not flushed. The
-    /// bytes are copied as it starts (see [`crate::pending`]), and stay lent until it ends.
-    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
+    /// bytes are copied as it starts (see [`crate::pending`]), and stay lent until it ends. A
+    /// write that would end past the last offset ([`FsKind::Overflow`]), or with no room for
+    /// the copy ([`FsKind::Stopped`]), is refused before anything is taken from the quota.
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: Offset) -> Pending<'buf, Result<(), FsError>> {
         let name = &self.name;
-        let asked = from.len() as u64;
+        let asked = ByteLen::of(from);
+        let refuse = |error: FsError| pending::refused(&self.io, "bstd::fs write_from", Err(error));
+        if let Err(error) = at.after(asked) {
+            return refuse(overflow(FsOp::WriteAt, name)(error));
+        }
+        let bytes = match owned(FsOp::WriteAt, name, from) {
+            Ok(bytes) => bytes,
+            Err(error) => return refuse(error),
+        };
         let over = move |over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over));
         // The planted bug of the budget tests: the quota is looked at once the bytes are written.
         let after = self.io.plant() == Plant::BudgetCheckedAfter;
@@ -1436,12 +1533,11 @@ impl File<ReadWrite> {
             _ => None,
         };
         if let Some(short) = short {
-            return pending::refused(&self.io, "bstd::fs write_from", Err(over(short)));
+            return refuse(over(short));
         }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
-        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = from.to_vec();
+        let at = at.get();
         let effect = |tag| Effect::WriteAt { file, at, bytes, tag };
         pending::start(&self.io, "bstd::fs write_from", &mut [], effect, move |_: &mut [u8], done| {
             match done {
@@ -1457,7 +1553,7 @@ impl File<ReadWrite> {
 
     /// `bytes` written at `at`, past the end making it longer, as durably as `durable`
     /// says: [`File::write_at_unsynced`] or [`File::write_at_synced`], chosen at run time.
-    pub fn write_at(&self, cx: &Cx, at: u64, bytes: &[u8], durable: Durable) -> Result<(), FsError> {
+    pub fn write_at(&self, cx: &Cx, at: Offset, bytes: &[u8], durable: Durable) -> Result<(), FsError> {
         match durable.unsynced() {
             Some(unsynced) => self.write_at_unsynced(cx, at, bytes, unsynced),
             None => self.write_at_synced(cx, at, bytes),
@@ -1466,23 +1562,23 @@ impl File<ReadWrite> {
 
     /// `bytes` written at `at`, not flushed: its [`File::write_from`], waited for. It never
     /// waits for the device.
-    pub fn write_at_unsynced(&self, cx: &Cx, at: u64, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
+    pub fn write_at_unsynced(&self, cx: &Cx, at: Offset, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
         cx.stopped_by(self.io.now())
             .map_err(|stopped| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped)))?;
         self.write_from(bytes, at).wait(cx)?;
-        started(&self.io, &self.name, unsynced);
+        started(&self.io, FsOp::WriteAt, &self.name, unsynced)?;
         Ok(())
     }
 
     /// `bytes` written at `at`, then the file flushed: once this returns a crash keeps them.
-    pub fn write_at_synced(&self, cx: &Cx, at: u64, bytes: &[u8]) -> Result<(), FsError> {
+    pub fn write_at_synced(&self, cx: &Cx, at: Offset, bytes: &[u8]) -> Result<(), FsError> {
         self.write_at_unsynced(cx, at, bytes, Unsynced::No)?;
         self.flush(cx)
     }
 
     /// The file cut or grown to `len`, as durably as `durable` says: [`File::set_len_unsynced`]
     /// or [`File::set_len_synced`], chosen at run time.
-    pub fn set_len(&self, cx: &Cx, len: u64, durable: Durable) -> Result<(), FsError> {
+    pub fn set_len(&self, cx: &Cx, len: ByteLen, durable: Durable) -> Result<(), FsError> {
         match durable.unsynced() {
             Some(unsynced) => self.set_len_unsynced(cx, len, unsynced),
             None => self.set_len_synced(cx, len),
@@ -1490,16 +1586,16 @@ impl File<ReadWrite> {
     }
 
     /// The file cut or grown to `len`, not flushed: it never waits for the device.
-    pub fn set_len_unsynced(&self, cx: &Cx, len: u64, unsynced: Unsynced) -> Result<(), FsError> {
+    pub fn set_len_unsynced(&self, cx: &Cx, len: ByteLen, unsynced: Unsynced) -> Result<(), FsError> {
         within(&self.io, self.quota.as_deref(), FsOp::SetLen, &self.name, len, || {
             truncate(&self.io, cx, FsOp::SetLen, &self.name, len)
         })?;
-        started(&self.io, &self.name, unsynced);
+        started(&self.io, FsOp::SetLen, &self.name, unsynced)?;
         Ok(())
     }
 
     /// The file cut or grown to `len`, then flushed: once this returns a crash keeps it so.
-    pub fn set_len_synced(&self, cx: &Cx, len: u64) -> Result<(), FsError> {
+    pub fn set_len_synced(&self, cx: &Cx, len: ByteLen) -> Result<(), FsError> {
         self.set_len_unsynced(cx, len, Unsynced::No)?;
         self.flush(cx)
     }
@@ -1528,13 +1624,13 @@ impl File<ReadWrite> {
 
     /// The file finished with nothing synced: a [`Written`], whose bytes a crash may lose or
     /// tear. It takes no `Cx`: it cannot wait. Told [`Unsynced::Started`] it begins the
-    /// file's write-back and waits for nothing. It cannot fail today; the `Result` is the
-    /// shape every close has.
+    /// file's write-back and waits for nothing; that start fails only when the effect finds no
+    /// room ([`FsKind::Stopped`]).
     #[blaze::consumes]
     pub fn close_unsynced(self, unsynced: Unsynced) -> Result<Written, FsError> {
         let File { io, name, quota: _, made: _, rights } = self;
         crate::consume(rights);
-        started(&io, &name, unsynced);
+        started(&io, FsOp::Close, &name, unsynced)?;
         Ok(Written::of(&io, name))
     }
 
@@ -1564,7 +1660,7 @@ pub enum Pushed {
     Held,
     /// The buffer had no room: this many bytes (what was held, and the push's own where they
     /// are as long as the buffer) were appended to the file, each append waited for.
-    Wrote(usize),
+    Wrote(ByteLen),
 }
 
 /// A buffer of appends to one file: bytes pushed are kept until the buffer is full, written
@@ -1623,8 +1719,9 @@ impl Buffered<'_, '_> {
         }
         let mut wrote = self.write_out(cx)?;
         if bytes.len() >= self.capacity {
+            let total = wrote.plus(ByteLen::of(bytes)).map_err(overflow(FsOp::Append, &self.file.name))?;
             self.file.append_unsynced(cx, bytes, Unsynced::No)?;
-            wrote += bytes.len();
+            wrote = total;
         } else {
             self.keep(bytes)?;
         }
@@ -1640,26 +1737,26 @@ impl Buffered<'_, '_> {
 
     /// What is held appended to the file now, unsynced, and the buffer emptied: how many
     /// bytes. On an error they stay held.
-    pub fn write_out(&mut self, cx: &Cx) -> Result<usize, FsError> {
+    pub fn write_out(&mut self, cx: &Cx) -> Result<ByteLen, FsError> {
         let held = self.held.len();
         if held > 0 {
             self.file.append_unsynced(cx, self.held.as_slice(), Unsynced::No)?;
             self.held.clear();
         }
-        Ok(held)
+        Ok(ByteLen::of_memory(held))
     }
 
     /// The writer finished: what it held appended to the file, unsynced; how many bytes. On
     /// an error they are lost with the writer, and the error says so by being returned. The
     /// one way a `Buffered` ends.
     #[blaze::consumes]
-    pub fn finish(self, cx: &Cx) -> Result<usize, FsError> {
+    pub fn finish(self, cx: &Cx) -> Result<ByteLen, FsError> {
         let Buffered { file, held, capacity: _ } = self;
         if held.is_empty() {
-            return Ok(0);
+            return Ok(ByteLen::ZERO);
         }
         file.append_unsynced(cx, held.as_slice(), Unsynced::No)?;
-        Ok(held.len())
+        Ok(ByteLen::of(held.as_slice()))
     }
 }
 

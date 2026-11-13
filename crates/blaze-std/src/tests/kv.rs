@@ -63,7 +63,7 @@ fn agrees(cx: &Cx, kv: &Kv<ReadWrite>, model: &BTreeMap<usize, Vec<u8>>, at: usi
     for (index, name) in KEYS.iter().enumerate() {
         let mut into = cx.bytes();
         let got = kv.get(cx, &key(index), &mut into).map_err(|e| format!("harness: act {at}: {e}"))?;
-        let held = got.map(|read| &into.as_slice()[into.len() - read..]);
+        let held = got.map(|read| &into.as_slice()[into.len() - read.get() as usize..]);
         if held != model.get(&index).map(Vec::as_slice) {
             return Err(format!(
                 "act {at} ({when}): key {name} holds {:?}, and the model {:?}",
@@ -89,7 +89,7 @@ fn agrees(cx: &Cx, kv: &Kv<ReadWrite>, model: &BTreeMap<usize, Vec<u8>>, at: usi
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     let cx = root(&io);
     let fs = io.need_fs().map_err(|e| format!("harness: {e}"))?;
     let dir = fs.open_dir(&cx, &path("store")).map_err(|e| format!("harness: {e}"))?;

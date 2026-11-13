@@ -10,7 +10,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 
-use crate::{Plant, name::Authority, narrow::Allowed};
+use crate::{Plant, Stopped, name::Authority, narrow::Allowed};
 
 /// One trust anchor: an authority and its certificate.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: refcounts
@@ -23,25 +23,28 @@ pub struct Anchor {
 /// A set of trust anchors: from [`crate::Io::roots`], or [`Roots::none`].
 #[derive(Clone)]
 pub struct Roots {
-    anchors: Arc<[Anchor]>,
+    /// The host's anchors; `None` for the empty set, which so needs no allocation.
+    anchors: Option<Arc<Vec<Anchor>>>,
     allowed: Allowed<Authority>,
     plant: Plant,
 }
 
 impl Roots {
-    pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
-        Roots { anchors, allowed: Allowed::Any, plant }
+    pub(crate) fn new(anchors: Arc<Vec<Anchor>>, plant: Plant) -> Roots {
+        Roots { anchors: Some(anchors), allowed: Allowed::Any, plant }
     }
 
     /// The empty set: trusts no one. Not authority, so anyone may make it.
     pub fn none() -> Roots {
-        // alloc: once per empty set, its count.
-        Roots { anchors: Arc::from(Vec::new()), allowed: Allowed::nothing(), plant: Plant::None }
+        Roots { anchors: None, allowed: Allowed::nothing(), plant: Plant::None }
     }
 
     /// Only the authorities of `names` this trusts already: never one more.
-    pub fn only(&self, names: &[Authority]) -> Roots {
-        Roots { anchors: Arc::clone(&self.anchors), allowed: self.allowed.only(names, self.plant), plant: self.plant }
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the narrowed set.
+    pub fn only(&self, names: &[Authority]) -> Result<Roots, Stopped> {
+        // clone: the anchors, a refcount.
+        let anchors = self.anchors.clone();
+        Ok(Roots { anchors, allowed: self.allowed.only(names, self.plant)?, plant: self.plant })
     }
 
     /// Whether `name` is trusted.
@@ -51,7 +54,7 @@ impl Roots {
 
     /// Each anchor trusted, in the host's order.
     pub fn each(&self) -> impl Iterator<Item = &Anchor> {
-        self.anchors.iter().filter(|anchor| self.allowed.allows(&anchor.name))
+        self.anchors.iter().flat_map(|anchors| anchors.iter()).filter(|anchor| self.allowed.allows(&anchor.name))
     }
 
     /// Whether it trusts no one.

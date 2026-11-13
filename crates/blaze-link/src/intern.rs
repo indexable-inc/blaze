@@ -162,7 +162,7 @@ impl Index {
             });
         }
         self.slots.reserve(want - old)?;
-        self.slots.extend(std::iter::repeat_n(0, want - old));
+        self.slots.extend(std::iter::repeat_n(0, want - old))?;
         self.slots[..old].fill(0);
         for entry in 0..entries {
             self.put(hash_of(entry), entry);
@@ -229,7 +229,7 @@ impl Shard<SymKey> for KeyShard {
             Probe::Found(entry) => return entry,
             Probe::Empty(at) => at,
         };
-        let entry = keys.try_push(key).unwrap_or_else(|error| stop(&error)) as u32;
+        let entry = keys.push(key).unwrap_or_else(|error| stop(&error)) as u32;
         let keys = keys.as_slice();
         if let Err(error) = index.insert(at, hash, entry, |at| hash_key(keys[at as usize])) {
             stop(&error)
@@ -305,11 +305,11 @@ impl<'k> Shard<&'k str> for NameShard {
             Probe::Found(entry) => return entry,
             Probe::Empty(at) => at,
         };
-        if let Err(error) = bytes.try_extend_from_slice(name.as_bytes()) {
+        if let Err(error) = bytes.extend_from_slice(name.as_bytes()) {
             stop(&error)
         }
         let end = bytes.len() as u32;
-        let entry = ends.try_push(end).unwrap_or_else(|error| stop(&error)) as u32;
+        let entry = ends.push(end).unwrap_or_else(|error| stop(&error)) as u32;
         let (bytes, ends) = (bytes.as_slice(), ends.as_slice());
         if let Err(error) = index.insert(at, hash, entry, |at| hash_name(name_at(bytes, ends, at)))
         {
@@ -364,7 +364,7 @@ impl<'k> Shard<&'k ContentId> for IdShard {
             Probe::Found(entry) => return entry,
             Probe::Empty(at) => at,
         };
-        let entry = ids.try_push(*id).unwrap_or_else(|error| stop(&error)) as u32;
+        let entry = ids.push(*id).unwrap_or_else(|error| stop(&error)) as u32;
         let ids = ids.as_slice();
         if let Err(error) = index.insert(at, hash, entry, |at| hash_id(&ids[at as usize])) {
             stop(&error)

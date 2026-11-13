@@ -260,7 +260,7 @@ struct Defs<'f> {
 
 impl<'f> Defs<'f> {
     fn of(body: &MirBody<'_>, frame: &'f Frame) -> Defs<'f> {
-        let slots = frame.alloc_slice_fill_with(body.locals.len(), |_| Slot::default());
+        let slots = frame.alloc_slice_fill_with(body.locals.len(), |_| Slot::default()).unwrap_or_else(|error| panic!("{error}"));
         let mut defs = Defs { slots };
         // Values the body starts with, which no statement assigns: its parameters, an `async`
         // body's captures, and the constants the code generator gives promoted locals.

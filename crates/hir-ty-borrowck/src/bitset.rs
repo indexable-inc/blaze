@@ -22,7 +22,7 @@ pub(super) type BitMatrix<'f> = shared::BitMatrix<usize, &'f mut [u64]>;
 
 /// An empty set of `len` bits in `frame`.
 pub(super) fn bits(frame: &Frame, len: usize) -> BitSet<'_> {
-    Bits::from_words(frame.alloc_slice_fill_with(words_for(len), |_| 0))
+    Bits::from_words(frame.alloc_slice_fill_with(words_for(len), |_| 0).unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// The set of every bit below `len`, in `frame`.
@@ -34,7 +34,7 @@ pub(super) fn filled_bits(frame: &Frame, len: usize) -> BitSet<'_> {
 
 /// An empty matrix of `rows` rows of `columns` bits in `frame`.
 pub(super) fn matrix(frame: &Frame, rows: usize, columns: usize) -> BitMatrix<'_> {
-    let data = frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0);
+    let data = frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0).unwrap_or_else(|error| panic!("{error}"));
     shared::BitMatrix::from_words(rows, columns, data)
 }
 

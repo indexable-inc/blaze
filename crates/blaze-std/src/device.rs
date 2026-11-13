@@ -18,7 +18,7 @@
 //! has just the operations one test needs, a scripted value in and a recorded value out.
 //! blaze-core has no effect for any of them.
 
-use alloc::{borrow::ToOwned, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt;
 
 use blaze_mem::Frame;
@@ -28,7 +28,7 @@ use crate::{
     cx::Cx,
     hosted::{self, Refused, SimHost},
     io::Io,
-    mem::Bytes,
+    mem::{self as bmem, Bytes, heap},
     name::{DeviceName, ServiceName},
     narrow::Allowed,
     window::WindowId,
@@ -134,8 +134,7 @@ fn write(
         return Err(refuse(Refused::NotAllowed));
     }
     hosted::call(io, cx, |host| {
-        device(host, kind, name)?.output.extend_from_slice(bytes);
-        Ok(())
+        hosted::record_all(&mut device(host, kind, name)?.output, bytes)
     })
     .map_err(refuse)
 }
@@ -306,16 +305,13 @@ impl Bluetooth {
     }
 
     /// The devices in range that this reaches, in `frame`.
-    pub fn scan<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<DeviceName, &'a Frame>, DeviceError> {
-        let mut found = Vec::new_in(frame);
+    pub fn scan<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<bmem::Vec<DeviceName, &'a Frame>, DeviceError> {
+        let mut found = bmem::Vec::new_in(frame);
         let scanned = hosted::call(&self.io, cx, |host| {
             let near = host.devices.iter().filter(|it| it.kind == DeviceKind::Bluetooth);
             for it in near.filter(|it| self.devices.allows(&it.name)) {
-                found
-                    .try_reserve(1)
-                    .map_err(|_| Stopped::OutOfMemory { arena: "bstd::device scan", asked: size_of::<DeviceName>() })?;
                 // clone: the device's name, a refcount.
-                found.push(it.name.clone());
+                found.push(it.name.clone()).map_err(Stopped::from)?;
             }
             Ok(())
         });
@@ -336,8 +332,8 @@ impl Bluetooth {
         hosted::call(&self.io, cx, |host| {
             self::device(host, DeviceKind::Bluetooth, device)?;
             // clone: the simulated host's record: refcounts, and alloc: the bytes written.
-            host.bluetooth_sent.push((device.clone(), service.clone(), bytes.to_vec()));
-            Ok(())
+            let sent = heap::bytes(bytes).map_err(Stopped::from)?;
+            hosted::record(&mut host.bluetooth_sent, (device.clone(), service.clone(), sent))
         })
         .map_err(refuse)
     }
@@ -427,8 +423,9 @@ impl Clipboard {
             return Err(refuse(Refused::NotAllowed));
         }
         hosted::call(&self.io, cx, |host| {
-            host.clipboard.clear();
-            host.clipboard.extend_from_slice(bytes);
+            // alloc: the simulated clipboard, made whole before it replaces what was there, so
+            // a copy that finds no room leaves it as it was.
+            host.clipboard = heap::bytes(bytes).map_err(Stopped::from)?;
             Ok(())
         })
         .map_err(refuse)
@@ -457,8 +454,8 @@ impl Notify {
     pub fn post(&self, cx: &Cx, notice: &Notice<'_>) -> Result<(), DeviceError> {
         hosted::call(&self.io, cx, |host| {
             // alloc: the simulated host's record of what was posted.
-            host.notices.push((notice.title.to_owned(), notice.body.to_owned()));
-            Ok(())
+            let posted = (heap::string(notice.title).map_err(Stopped::from)?, heap::string(notice.body).map_err(Stopped::from)?);
+            hosted::record(&mut host.notices, posted)
         })
         .map_err(|kind| DeviceError { capability: "Notify", op: DeviceOp::Post, device: None, kind })
     }

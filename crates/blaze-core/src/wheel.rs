@@ -155,7 +155,7 @@ impl<T> Wheel<T> {
                 wanted: self.timers.len() + 1,
             });
         }
-        let id = self.timers.try_insert(Timer {
+        let id = self.timers.insert(Timer {
             deadline,
             prev: NONE,
             next: NONE,

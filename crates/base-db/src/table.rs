@@ -69,7 +69,7 @@ impl<T: AsId + FromId + Copy> Column<T> {
         }
         let len = self.words.len();
         if len <= raw {
-            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU32::new(0));
+            self.words.writer().unwrap_or_else(|error| panic!("{error}")).extend_with((raw - len + 1) as usize, |_| AtomicU32::new(0)).unwrap_or_else(|error| panic!("{error}"));
         }
         self.words.as_slice()[raw as usize].store(bits, Ordering::Release);
     }
@@ -193,7 +193,7 @@ impl<T> Table<T> {
         let raw = self.values.push((hash, make()));
         let hash_of =
             |raw: u32| probe_hash(self.values.get(raw).expect("a table entry before its value").0);
-        shard.index.insert(*count as usize, probe_hash(hash), raw, hash_of);
+        shard.index.insert(*count as usize, probe_hash(hash), raw, hash_of).unwrap_or_else(|error| panic!("{error}"));
         *count += 1;
         (raw, true)
     }

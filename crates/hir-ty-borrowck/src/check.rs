@@ -116,7 +116,7 @@ impl<'f> Draft<'f> {
         labels: &[(PartSpan, &'f str)],
     ) {
         let (spans, labels) =
-            (self.frame.alloc_slice_copy(spans), self.frame.alloc_slice_copy(labels));
+            (self.frame.alloc_slice_copy(spans).unwrap_or_else(|error| panic!("{error}")), self.frame.alloc_slice_copy(labels).unwrap_or_else(|error| panic!("{error}")));
         self.children.push(DraftChild { level, message, spans, labels });
     }
 
@@ -127,7 +127,7 @@ impl<'f> Draft<'f> {
         applicability: Applicability,
         verbose: bool,
     ) {
-        let parts = self.frame.alloc_slice_copy(parts);
+        let parts = self.frame.alloc_slice_copy(parts).unwrap_or_else(|error| panic!("{error}"));
         self.suggestions.push(DraftSuggestion { message, parts, applicability, verbose });
     }
 
@@ -985,7 +985,7 @@ struct Checker<'a, 'f, 'o, 'db> {
 impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
     /// `place` as a key the checker keeps: its projection copied into the body's frame.
     fn kept(&self, place: PlaceRef<'_>) -> PlaceKey<'f> {
-        let projection: &'f [PlaceElem] = self.ctx.frame.alloc_slice_copy(place.projection);
+        let projection: &'f [PlaceElem] = self.ctx.frame.alloc_slice_copy(place.projection).unwrap_or_else(|error| panic!("{error}"));
         (place.local, projection)
     }
 

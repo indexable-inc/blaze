@@ -313,7 +313,7 @@ impl Reach {
         // gone as it returns (a bit per node from the global heap for each root asked was the
         // build's nodes squared, in bits, allocated and freed).
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let seen = frame.alloc_slice_fill_with(nodes.div_ceil(64), |_| 0u64);
+            let seen = frame.alloc_slice_fill_with(nodes.div_ceil(64), |_| 0u64).unwrap_or_else(|error| panic!("{error}"));
             let mut stack = Vec::new_in(frame);
             stack.push(root);
             seen[root as usize / 64] |= 1 << (root % 64);

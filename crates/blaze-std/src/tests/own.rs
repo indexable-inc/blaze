@@ -47,7 +47,7 @@ fn derived_properties_hold_of_plain_types() {
 /// An ordinary value in a handle is what it was in an `Arc`: cloned, compared, counted.
 #[test]
 fn a_handle_to_an_ordinary_value_is_cloned_and_dropped() {
-    let first = Shared::new(vec![1u8, 2]);
+    let first = Shared::new(vec![1u8, 2]).expect("room for a share");
     let second = first.clone();
     assert!(Shared::ptr_eq(&first, &second));
     assert_eq!(Shared::handles(&first), 2);
@@ -73,7 +73,10 @@ fn the_last_release_gives_the_value_back() {
 #[test]
 fn shares_split_join_and_give_the_whole_back() {
     let total = Token::scope(|token| {
-        let all: Shares<Tree, _, 4, 4> = Shares::new(token, Tree { kids: Vec::new(), name: "root".to_owned() });
+        let all: Shares<Tree, _, 4, 4> = match Shares::new(token, Tree { kids: Vec::new(), name: "root".to_owned() }) {
+            Ok(all) => all,
+            Err(crate::own::Refused { value: _, error }) => panic!("room for the shares: {error}"),
+        };
         let (one, three) = all.split::<1, 3>();
         let (two, last) = three.split::<2, 1>();
         assert_eq!((one.name.as_str(), two.name.as_str(), last.kids.len()), ("root", "root", 0));

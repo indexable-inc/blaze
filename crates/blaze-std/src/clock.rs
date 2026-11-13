@@ -2,7 +2,6 @@
 //! simulation's is virtual), deadlines on it, and sleeps that end by the task's deadline. Wall
 //! time needs an effect blaze-core does not have, so there is none yet.
 
-use alloc::{format, string::String};
 use core::time::Duration;
 
 use blaze_core::{Done, Effect, wait::Deadline};
@@ -47,11 +46,12 @@ pub struct Clock {
 }
 
 /// What a sleep's timer said other than that it fired.
-#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+#[derive(PartialEq, Eq, Debug)]
 pub enum SleepError {
     Stopped(Stopped),
-    /// The driver answered the timer with something else, or failed it.
-    Driver { span: &'static str, said: String },
+    /// The driver answered the timer with something else, or failed it: what it answered,
+    /// kept as it came (formatted by `Display`, so nothing is allocated for the error).
+    Driver { span: &'static str, said: Done },
 }
 
 impl core::fmt::Display for SleepError {
@@ -59,7 +59,7 @@ impl core::fmt::Display for SleepError {
         match self {
             SleepError::Stopped(stopped) => write!(f, "bstd::clock sleep: {stopped}"),
             SleepError::Driver { span, said } => {
-                write!(f, "bstd::clock sleep of {span}: the driver said {said}")
+                write!(f, "bstd::clock sleep of {span}: the driver said {said:?}")
             }
         }
     }
@@ -92,11 +92,7 @@ impl Clock {
         let after = at.left(self.io.now());
         match self.io.call(cx, |tag| Effect::Timer { after, tag })? {
             Done::Fired => Ok(()),
-            done => Err(SleepError::Driver {
-                span: cx.name(),
-                // alloc: an error's message.
-                said: format!("{done:?}"),
-            }),
+            done => Err(SleepError::Driver { span: cx.name(), said: done }),
         }
     }
 

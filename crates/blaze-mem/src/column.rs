@@ -142,11 +142,22 @@ impl<T> Column<T> {
     }
 
     /// Publishes `value` at `block`'s next index, readable by every thread from now on, and
-    /// returns that index. Stops when `block` is spent or another column's.
-    #[track_caller]
+    /// returns that index. Refused ([`MemError::Refused`]), `block` and the column as they
+    /// were, when `block` is spent or another column's.
     pub fn fill(&self, block: &mut Block, value: T) -> Result<u32, MemError> {
-        assert!(block.column == self.id, "a block fills only the column that claimed it");
-        assert!(!block.is_spent(), "a spent block fills nothing");
+        if block.column != self.id {
+            return Err(MemError::Refused {
+                tag: self.values.tag(),
+                what: "a block claimed from another column (rule: a block fills only the \
+                       column that claimed it)",
+            });
+        }
+        if block.is_spent() {
+            return Err(MemError::Refused {
+                tag: self.values.tag(),
+                what: "a spent block (rule: a block fills only the indices it claimed)",
+            });
+        }
         let index = block.next as usize;
         block.next += 1;
         self.publish(index, value)
@@ -164,17 +175,24 @@ impl<T> Column<T> {
     fn publish(&self, index: usize, value: T) -> Result<u32, MemError> {
         self.values.ensure((index + 1) * Self::SIZE)?;
         self.ready.ensure(index + 1)?;
+        // Looked up before the value is written, so a byte the commit did not cover refuses
+        // the push with `value` dropped, not written where no reader can see it.
+        let Some(ready) = self.ready(index) else {
+            return Err(MemError::Refused {
+                tag: self.ready.tag(),
+                what: "a ready byte past what its commit covered (rule: `ensure` commits \
+                       every byte below the length it is given)",
+            });
+        };
         let slot = self.values.at(index * Self::SIZE).cast::<T>();
         // SAFETY: the slot is committed, aligned, and claimed by this thread alone (`push`'s
         // `fetch_add`, or the block of `fill`, which no other holder has: `Block` is not
         // `Clone` and names its column); no reader reaches it before its ready byte is set below.
         unsafe { slot.write(value) };
-        let Some(ready) = self.ready(index) else {
-            unreachable!("the ready byte was committed above")
-        };
         // Release: the value's bytes are seen by a reader that sees the byte. The byte is this
         // pusher's alone, so a plain store publishes it.
         ready.store(READY, Ordering::Release);
+        // `index < max <= u32::MAX` (`push`'s and `claim`'s bounds), so it fits.
         Ok(index as u32)
     }
 

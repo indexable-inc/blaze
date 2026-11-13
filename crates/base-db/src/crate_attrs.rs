@@ -196,7 +196,7 @@ impl Files {
             let mut writer = self.lock();
             let data = krate.data(&*db);
             let attrs: &[Box<str>] = if gone { &[] } else { &data.crate_attrs };
-            let old = frame.alloc_slice_copy(krate.crate_attr_files(&*db));
+            let old = frame.alloc_slice_copy(krate.crate_attr_files(&*db)).unwrap_or_else(|error| panic!("{error}"));
             if attrs.is_empty() && old.is_empty() {
                 return;
             }
@@ -257,7 +257,7 @@ impl Files {
         old: &[FileId],
         frame: &'f Frame,
     ) -> CrateAttrPlan<'f> {
-        let kept = frame.alloc_slice_fill_with(old.len(), |_| false);
+        let kept = frame.alloc_slice_fill_with(old.len(), |_| false).unwrap_or_else(|error| panic!("{error}"));
         let files = frame.alloc_slice_fill_with(attrs.len(), |at| {
             let has = |file: FileId| {
                 self.text_input(file).is_some_and(|input| **input.text(db) == *attrs[at])
@@ -265,7 +265,7 @@ impl Files {
             let found = (0..old.len()).find(|&slot| !kept[slot] && has(old[slot]))?;
             kept[found] = true;
             Some(old[found])
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         let mut spare = (0..old.len()).filter(|&slot| !kept[slot]).map(|slot| old[slot]);
         let mut rewrite = Vec::new_in(frame);
         for (at, file) in files.iter_mut().enumerate() {
@@ -290,7 +290,7 @@ impl Files {
         let mut gone = Vec::new_in(frame);
         gone.extend(spare);
         let files = frame
-            .alloc_slice_from_iter(files.iter().map(|it| it.expect("every attribute has a file")));
+            .alloc_slice_from_iter(files.iter().map(|it| it.expect("every attribute has a file"))).unwrap_or_else(|error| panic!("{error}"));
         CrateAttrPlan { files, rewrite, gone }
     }
 

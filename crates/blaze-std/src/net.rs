@@ -17,8 +17,11 @@
 //! There is no UDP socket ([`Net`]'s `Datagrams`) yet: blaze-core's `Effect` has no datagram
 //! effects (a bind of a UDP socket, a send to an address, a receive with its sender).
 
-use alloc::{borrow::ToOwned, format, string::String, sync::Arc, vec::Vec};
-use core::{fmt, net::SocketAddr};
+use alloc::{alloc::Global, string::String, sync::Arc, vec::Vec};
+use core::{
+    fmt::{self, Write as _},
+    net::SocketAddr,
+};
 
 use blaze_core::{Address, Done, Effect, Tag};
 
@@ -27,7 +30,8 @@ use crate::{
     budget::{Budget, Over},
     cx::Cx,
     io::{Ends, Io},
-    mem::Bytes,
+    mem::{ByteLen, Bytes, OutOfMemory, Overflow, heap},
+    name::Excerpt,
     path::Path,
     pending::{self, Pending},
     resolver::Resolver,
@@ -76,15 +80,16 @@ pub const HOST_MOST: usize = 253;
 /// [`crate::host!`] as the crate compiles.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)] // clone: a refcount and a copy
 pub struct HostPort {
-    host: Arc<str>,
+    host: Arc<String>,
     port: u16,
 }
 
 /// What [`HostPort::new`] or [`HostPort::parse`] refused.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct HostPortError {
-    /// What was given: `host:port`, or the host and port joined so.
-    pub given: String,
+    /// What was given: `host:port`, or the host and port joined so; its start when it is
+    /// long, kept in the error, which allocates nothing.
+    pub given: Excerpt,
     pub why: HostPortWhy,
 }
 
@@ -103,6 +108,8 @@ pub enum HostPortWhy {
     NoPort,
     /// The port is not a number from 1 to 65535.
     BadPort,
+    /// It passed, and the global heap had no room to keep its host.
+    OutOfMemory(OutOfMemory),
 }
 
 impl HostPortWhy {
@@ -121,13 +128,18 @@ impl HostPortWhy {
             }
             HostPortWhy::NoPort => "has no `:port` after its host",
             HostPortWhy::BadPort => "has a port that is not a number from 1 to 65535",
+            HostPortWhy::OutOfMemory(_) => "could not be kept: the global heap had no room",
         }
     }
 }
 
 impl fmt::Display for HostPortError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "host and port {:?} {}", self.given, self.why.says())
+        write!(f, "host and port {:?} {}", self.given, self.why.says())?;
+        match self.why {
+            HostPortWhy::OutOfMemory(error) => write!(f, " ({error})"),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -144,55 +156,79 @@ pub const fn refused_host(host: &str) -> Option<HostPortWhy> {
     if bytes.len() > HOST_MOST {
         return Some(HostPortWhy::HostTooLong);
     }
-    if bytes[0] == b'[' {
-        if bytes.len() < 3 || bytes[bytes.len() - 1] != b']' {
-            return Some(HostPortWhy::BadBrackets);
-        }
-        let mut at = 1;
-        while at < bytes.len() - 1 {
-            let byte = bytes[at];
+    if let Some((&b'[', inner)) = bytes.split_first() {
+        let mut inside = match inner.split_last() {
+            Some((&b']', inside)) if !inside.is_empty() => inside,
+            _ => return Some(HostPortWhy::BadBrackets),
+        };
+        while let Some((&byte, rest)) = inside.split_first() {
             if !(byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
                 return Some(HostPortWhy::BadBrackets);
             }
-            at += 1;
+            inside = rest;
         }
         return None;
     }
-    // Each `.`-separated label, from `start` to the dot (or the end) at `at`.
-    let (mut start, mut at) = (0, 0);
-    while at <= bytes.len() {
-        if at == bytes.len() || bytes[at] == b'.' {
-            let len = at - start;
-            if len == 0 || len > 63 || bytes[start] == b'-' || bytes[at - 1] == b'-' {
-                return Some(HostPortWhy::BadLabel);
+    // Each `.`-separated label: its length so far, its first byte and its last.
+    let (mut rest, mut len, mut first, mut last) = (bytes, 0usize, 0u8, 0u8);
+    loop {
+        match rest.split_first() {
+            Some((&b'.', more)) => {
+                if bad_label(len, first, last) {
+                    return Some(HostPortWhy::BadLabel);
+                }
+                len = 0;
+                rest = more;
             }
-            start = at + 1;
-        } else if !(bytes[at].is_ascii_alphanumeric() || bytes[at] == b'-') {
-            return Some(HostPortWhy::BadByte);
+            Some((&byte, more)) => {
+                if !(byte.is_ascii_alphanumeric() || byte == b'-') {
+                    return Some(HostPortWhy::BadByte);
+                }
+                if len == 0 {
+                    first = byte;
+                }
+                last = byte;
+                len += 1;
+                rest = more;
+            }
+            None if bad_label(len, first, last) => return Some(HostPortWhy::BadLabel),
+            None => return None,
         }
-        at += 1;
     }
-    None
 }
 
-/// Where `raw` (`host:port`) splits: the index of the `:` before the port, or why there is
-/// none. The port is after the last `:`, so `[::1]:443` splits after its `]`.
-const fn split(raw: &str) -> Result<usize, HostPortWhy> {
+/// Whether a label of `len` bytes, from `first` to `last`, is none: empty, longer than 63
+/// bytes, or starting or ending with `-`.
+const fn bad_label(len: usize, first: u8, last: u8) -> bool {
+    len == 0 || len > 63 || first == b'-' || last == b'-'
+}
+
+/// `raw` (`host:port`) split at the `:` before the port: the host's bytes and the port's
+/// digits, or why there is no such `:`. The port is after the last `:`, so `[::1]:443` splits
+/// after its `]`.
+const fn split(raw: &str) -> Result<(&[u8], &[u8]), HostPortWhy> {
     let bytes = raw.as_bytes();
-    let mut at = bytes.len();
-    while at > 0 {
-        at -= 1;
-        match bytes[at] {
+    let bracketed = matches!(bytes.first(), Some(&b'['));
+    let mut rest = bytes;
+    while let Some((&byte, before)) = rest.split_last() {
+        match byte {
             b':' => {
                 // A `:` inside brackets is the address's, not the port's.
-                if bytes[0] == b'[' && (at == 0 || bytes[at - 1] != b']') {
+                if bracketed && !matches!(before.last(), Some(&b']')) {
                     return Err(HostPortWhy::NoPort);
                 }
-                return Ok(at);
+                return match bytes.split_at_checked(before.len()) {
+                    Some((host, colon_port)) => match colon_port.split_first() {
+                        Some((_, digits)) => Ok((host, digits)),
+                        None => Err(HostPortWhy::NoPort),
+                    },
+                    None => Err(HostPortWhy::NoPort),
+                };
             }
             b']' => return Err(HostPortWhy::NoPort),
             _ => {}
         }
+        rest = before;
     }
     Err(HostPortWhy::NoPort)
 }
@@ -202,13 +238,14 @@ const fn port_of(digits: &[u8]) -> Result<u16, HostPortWhy> {
     if digits.is_empty() || digits.len() > 5 {
         return Err(HostPortWhy::BadPort);
     }
-    let (mut port, mut at) = (0u32, 0);
-    while at < digits.len() {
-        if !digits[at].is_ascii_digit() {
+    let (mut port, mut rest) = (0u32, digits);
+    while let Some((&digit, more)) = rest.split_first() {
+        if !digit.is_ascii_digit() {
             return Err(HostPortWhy::BadPort);
         }
-        port = port * 10 + (digits[at] - b'0') as u32;
-        at += 1;
+        // At most five digits: at most 99999, within a `u32`.
+        port = port * 10 + (digit - b'0') as u32;
+        rest = more;
     }
     if port == 0 || port > u16::MAX as u32 {
         return Err(HostPortWhy::BadPort);
@@ -216,32 +253,91 @@ const fn port_of(digits: &[u8]) -> Result<u16, HostPortWhy> {
     Ok(port as u16)
 }
 
-/// Why `raw` (`host:port`) is none, if it is not: [`HostPort::parse`]'s rule, as a `const fn`.
-pub const fn refused(raw: &str) -> Option<HostPortWhy> {
-    let colon = match split(raw) {
-        Ok(colon) => colon,
-        Err(why) => return Some(why),
+/// `raw` (`host:port`) as its host and port, or why it is none: [`HostPort::parse`]'s one
+/// rule, as a `const fn`.
+const fn parts(raw: &str) -> Result<(&str, u16), HostPortWhy> {
+    let (host, digits) = match split(raw) {
+        Ok(parts) => parts,
+        Err(why) => return Err(why),
     };
-    let (host, port) = raw.as_bytes().split_at(colon);
     let host = match core::str::from_utf8(host) {
         Ok(host) => host,
-        Err(_) => return Some(HostPortWhy::BadByte),
+        Err(_) => return Err(HostPortWhy::BadByte),
     };
     if let Some(why) = refused_host(host) {
-        return Some(why);
+        return Err(why);
     }
-    let (_, digits) = port.split_at(1);
     match port_of(digits) {
+        Ok(port) => Ok((host, port)),
+        Err(why) => Err(why),
+    }
+}
+
+/// Why `raw` (`host:port`) is none, if it is not: [`HostPort::parse`]'s rule, as a `const fn`.
+pub const fn refused(raw: &str) -> Option<HostPortWhy> {
+    match parts(raw) {
         Ok(_) => None,
         Err(why) => Some(why),
     }
 }
 
-/// [`refused`], as a compile-time panic: what [`crate::host!`] evaluates in a `const`.
+/// [`refused`], as a compile-time error: what [`crate::host!`] evaluates in a `const`, where a
+/// refused literal stops the crate's compilation saying why. It is for that `const` alone.
+#[doc(hidden)]
 pub const fn check_literal(raw: &str) {
-    if let Some(why) = refused(raw) {
-        panic!("{}", why.says());
+    let why = refused(raw);
+    let says = match why {
+        Some(why) => why.says(),
+        None => "",
+    };
+    assert!(why.is_none(), "{}", says);
+}
+
+/// The error of the host and port `given` (joined as `host:port`) refused for `why`.
+fn refuse(given: Excerpt, why: HostPortWhy) -> HostPortError {
+    HostPortError { given, why }
+}
+
+/// `host` and `port` joined as `host:port`, kept in an [`Excerpt`] (which takes every write).
+fn given_of(host: &str, port: u16) -> Excerpt {
+    let mut given = Excerpt::EMPTY;
+    if write!(given, "{host}:{port}").is_err() {
+        // A `str` and a `u16` write without fail; said so if one ever did not.
+        given = Excerpt::of_parts(&[host, ":", "(its port did not write)"]);
     }
+    given
+}
+
+/// `host:port` as text on the global heap, the port's digits written by hand so that nothing
+/// but the heap can fail.
+fn joined(host: &str, port: u16) -> Result<String, OutOfMemory> {
+    let mut digits = [0u8; 5];
+    let (mut left, mut count) = (port, 0usize);
+    for slot in digits.iter_mut().rev() {
+        *slot = b'0' + (left % 10) as u8;
+        left /= 10;
+        count += 1;
+        if left == 0 {
+            break;
+        }
+    }
+    // alloc: the text, which its caller hands on as a std `String`.
+    let mut text = crate::mem::String::new_in(Global);
+    text.push_str(host)?;
+    text.push(':')?;
+    for &digit in digits.iter().skip(digits.len() - count) {
+        text.push(char::from(digit))?;
+    }
+    Ok(text.into_std())
+}
+
+/// `host` kept once per name on the global heap, or why not: no room, naming `given`.
+fn kept(host: &str, given: impl FnOnce() -> Excerpt) -> Result<Arc<String>, HostPortError> {
+    let kept = || -> Result<Arc<String>, OutOfMemory> {
+        // alloc: once per name, its host, and the handle its clones share.
+        heap::shared(heap::string(host)?)
+    };
+    kept().map_err(|error| refuse(given(), HostPortWhy::OutOfMemory(error)))
 }
 
 impl HostPort {
@@ -253,33 +349,30 @@ impl HostPort {
             None => None,
         };
         if let Some(why) = why {
-            // alloc: an error's message.
-            return Err(HostPortError { given: format!("{host}:{port}"), why });
+            return Err(refuse(given_of(host, port), why));
         }
-        // alloc: once per name, its host.
-        Ok(HostPort { host: Arc::from(host), port })
+        Ok(HostPort { host: kept(host, || given_of(host, port))?, port })
     }
 
     /// `host:port`, checked: `api.stripe.com:443`, `127.0.0.1:8080`, `[::1]:443`.
     pub fn parse(raw: &str) -> Result<HostPort, HostPortError> {
-        // alloc: an error's message.
-        let refuse = |why| HostPortError { given: raw.to_owned(), why };
-        if let Some(why) = refused(raw) {
-            return Err(refuse(why));
-        }
-        let colon = split(raw).map_err(refuse)?;
-        let port = port_of(&raw.as_bytes()[colon + 1..]).map_err(refuse)?;
-        // alloc: once per name, its host.
-        Ok(HostPort { host: Arc::from(&raw[..colon]), port })
+        let (host, port) = parts(raw).map_err(|why| refuse(Excerpt::of(raw), why))?;
+        Ok(HostPort { host: kept(host, || Excerpt::of(raw))?, port })
     }
 
     /// The host, an IPv6 address with its brackets.
     pub fn host(&self) -> &str {
-        &self.host
+        self.host.as_str()
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// `host:port` as its `Display` writes it, as a std `String` on the global heap (for an
+    /// interface that owns one, as blaze-http's h1 does its `Host`).
+    pub(crate) fn joined(&self) -> Result<String, OutOfMemory> {
+        joined(self.host(), self.port)
     }
 
     /// The socket address it names when its host is an IP address; `None` for a DNS name,
@@ -313,13 +406,14 @@ impl TryFrom<&str> for HostPort {
 }
 
 /// A [`HostPort`] from a string literal, checked as the crate compiles:
-/// `host!("api.stripe.com:443")`. A bad literal (`host!("a..b:443")`) is a compile error
-/// saying why.
+/// `host!("api.stripe.com:443")?`. A bad literal (`host!("a..b:443")`) is a compile error
+/// saying why. It is a `Result` all the same: keeping the host takes the global heap, which
+/// may have no room ([`HostPortWhy::OutOfMemory`]), the one error it can still be.
 #[macro_export]
 macro_rules! host {
     ($raw:literal) => {{
         const _: () = $crate::net::check_literal($raw);
-        $crate::net::HostPort::parse($raw).expect("a host! literal was checked as the crate compiled")
+        $crate::net::HostPort::parse($raw)
     }};
 }
 
@@ -380,10 +474,16 @@ pub enum NetKind {
     /// world's [`crate::io::Limits::close_most`]), and stopped waiting for the listen's end.
     Unending { accepted: usize, most: usize },
     Stopped(Stopped),
+    /// A count of bytes that does not fit where it goes.
+    Overflow(Overflow),
     /// The driver failed it, saying this.
     Driver(String),
-    /// The driver answered with a completion of another kind: a driver's bug.
-    Answered(String),
+    /// The driver answered with a completion of another kind (a driver's bug): the start of
+    /// its `Debug` form, kept in the error, which allocates nothing.
+    Answered(Excerpt),
+    /// A local socket's path could not be put beneath its directory
+    /// ([`crate::local::Local`]): why, as the directory said.
+    Socket(crate::fs::FsError),
 }
 
 /// A network call that failed: the call, the address and how.
@@ -417,10 +517,12 @@ impl fmt::Display for NetError {
                  (rule bounded-progress)"
             ),
             NetKind::Stopped(stopped) => write!(f, "bstd::net {op:?} to {addr}: {stopped}"),
+            NetKind::Overflow(overflow) => write!(f, "bstd::net {op:?} to {addr}: {overflow}"),
             NetKind::Driver(said) => write!(f, "bstd::net {op:?} to {addr}: {said}"),
             NetKind::Answered(done) => {
                 write!(f, "bstd::net {op:?} to {addr}: the driver answered {done} (a driver's bug)")
             }
+            NetKind::Socket(error) => write!(f, "bstd::net {op:?} to {addr}: the socket's path: {error}"),
         }
     }
 }
@@ -436,8 +538,7 @@ fn unexpected(op: NetOp, addr: &Addr, done: Done) -> NetError {
     let kind = match done {
         Done::Failed(failed) => NetKind::Driver(failed.0),
         Done::Broken { error: broken, .. } => NetKind::Driver(broken.0),
-        // alloc: an error's message.
-        done => NetKind::Answered(format!("{done:?}")),
+        done => NetKind::Answered(Excerpt::debug(&done)),
     };
     error(op, addr, kind)
 }
@@ -486,16 +587,18 @@ impl Net {
     /// by bstd. A send or receive with no room left ends in [`NetKind::OverLimit`], and
     /// nothing of it is sent. A limit set on a `Net` that has one is inside it: both count,
     /// so it never raises what is left (docs/v2/plan/design/std.md, "Budgets ride the same
-    /// way"). A rate limit is not written yet.
-    pub fn limit(&self, bytes: u64) -> Net {
+    /// way"). A rate limit is not written yet. [`Stopped::OutOfMemory`] when the global heap
+    /// has no room for the limit's count.
+    pub fn limit(&self, bytes: ByteLen) -> Result<Net, Stopped> {
         // clone: authority held, narrowed: refcounts or copies.
         let (connect, listen) = (self.connect.clone(), self.listen.clone());
         // clone: the budget this one is inside, a refcount.
-        Net { io: self.io.clone(), connect, listen, budget: Some(Budget::new(bytes, self.budget.clone())) }
+        let budget = Budget::new(bytes, self.budget.clone())?;
+        Ok(Net { io: self.io.clone(), connect, listen, budget: Some(budget) })
     }
 
     /// The bytes its connections may still send and receive; `None` with no limit.
-    pub fn limit_left(&self) -> Option<u64> {
+    pub fn limit_left(&self) -> Option<ByteLen> {
         self.budget.as_deref().map(Budget::left)
     }
 
@@ -524,7 +627,10 @@ impl Net {
         }
         cx.check().map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
         let address = at.reach(NetOp::Listen)?;
-        let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
+        let tag = self
+            .io
+            .submit(|tag| Effect::Listen { at: address, tag })
+            .map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
         let listening = Listening { io: self.io.clone(), tag, open: true };
         // clone: the listener's address, for its errors; the budget shared, a refcount.
         Ok(Listener { listening, at: at.clone(), budget: self.budget.clone() })
@@ -554,8 +660,12 @@ impl Drop for Listening {
     fn drop(&mut self) {
         if self.open {
             let tag = self.tag;
-            self.io.forget(tag, Ends::Stream);
-            let _ = self.io.submit(|_| Effect::Unlisten { tag });
+            // A drop has no caller to tell: a forget or an unlisten that finds no room is
+            // left undone (the listen's completions are then kept unclaimed), and the
+            // `Stopped` it would carry has nowhere to go. `Listener::close` is the path that
+            // reports it.
+            let _unclaimed: Result<(), Stopped> = self.io.forget(tag, Ends::Stream);
+            let _unlisten: Result<Tag, Stopped> = self.io.submit(|_| Effect::Unlisten { tag });
         }
     }
 }
@@ -588,30 +698,32 @@ impl Listener {
         if !listening.open {
             return Ok(());
         }
-        listening.open = false;
         let (io, tag) = (listening.io.clone(), listening.tag);
-        let _ = io.submit(|_| Effect::Unlisten { tag });
+        let stopped = |stopped| error(NetOp::Close, &self.at, NetKind::Stopped(stopped));
+        // The unlisten's own tag brings nothing: its end is the listen's `Unlistened`.
+        let _unlisten: Tag = io.submit(|_| Effect::Unlisten { tag }).map_err(stopped)?;
+        listening.open = false;
         let most = io.limits().close_most;
         let mut accepted = 0;
         while accepted <= most {
             let done = match cx.wait(&io, tag, Ends::Stream) {
                 Ok(done) => done,
-                Err(stopped) => {
-                    io.forget(tag, Ends::Stream);
-                    return Err(error(NetOp::Close, &self.at, NetKind::Stopped(stopped)));
+                Err(waited) => {
+                    io.forget(tag, Ends::Stream).map_err(stopped)?;
+                    return Err(stopped(waited));
                 }
             };
             match done {
                 Done::Unlistened => return Ok(()),
                 Done::Accepted { conn } => {
                     accepted += 1;
-                    let hangup = io.submit(|tag| Effect::Hangup { conn, tag });
-                    io.forget(hangup, Ends::Once);
+                    let hangup = io.submit(|tag| Effect::Hangup { conn, tag }).map_err(stopped)?;
+                    io.forget(hangup, Ends::Once).map_err(stopped)?;
                 }
                 done => return Err(unexpected(NetOp::Close, &self.at, done)),
             }
         }
-        io.forget(tag, Ends::Stream);
+        io.forget(tag, Ends::Stream).map_err(stopped)?;
         Err(error(NetOp::Close, &self.at, NetKind::Unending { accepted, most }))
     }
 }
@@ -639,8 +751,12 @@ impl Drop for Link {
     fn drop(&mut self) {
         if self.open {
             let conn = self.conn;
-            let tag = self.io.submit(|tag| Effect::Hangup { conn, tag });
-            self.io.forget(tag, Ends::Once);
+            // A drop has no caller to tell: a hangup or a forget that finds no room is left
+            // undone, and the `Stopped` it would carry has nowhere to go. `Conn::finish` is
+            // the path that reports it.
+            if let Ok(tag) = self.io.submit(|tag| Effect::Hangup { conn, tag }) {
+                let _unclaimed: Result<(), Stopped> = self.io.forget(tag, Ends::Once);
+            }
         }
     }
 }
@@ -661,8 +777,17 @@ impl Conn {
     pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, Result<(), NetError>> {
         let conn = self.link.conn;
         let peer = &self.peer;
-        let asked = from.len() as u64;
+        let asked = ByteLen::of(from);
         let over = move |over| error(NetOp::Send, peer, NetKind::OverLimit(over));
+        // Copied before the limit is looked at, so a copy that finds no room takes nothing.
+        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+        let bytes = match heap::bytes(from) {
+            Ok(bytes) => bytes,
+            Err(full) => {
+                let stopped = error(NetOp::Send, peer, NetKind::Stopped(Stopped::from(full)));
+                return pending::refused(&self.link.io, "bstd::net write_from", Err(stopped));
+            }
+        };
         // The planted bug of the budget tests: the limit is looked at once the bytes are gone.
         let after = self.link.io.plant() == Plant::BudgetCheckedAfter;
         let budget = self.budget.as_deref();
@@ -673,8 +798,6 @@ impl Conn {
         if let Some(short) = short {
             return pending::refused(&self.link.io, "bstd::net write_from", Err(over(short)));
         }
-        // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-        let bytes = from.to_vec();
         let effect = |tag| Effect::Send { conn, bytes, tag };
         pending::start(&self.link.io, "bstd::net write_from", &mut [], effect, move |_: &mut [u8], done| {
             match done {
@@ -702,43 +825,51 @@ impl Conn {
     /// byte limit ([`Net::limit`]) it asks for no more than the limit has left, takes that
     /// much from it as it starts and gives back what did not come; with nothing left the
     /// receive never starts, and its outcome is [`NetKind::OverLimit`].
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, NetError>> {
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<ByteLen, NetError>> {
         let conn = self.link.conn;
         let peer = &self.peer;
         let budget = self.budget.as_deref();
         let mut most = into.len();
         if let Some(budget) = budget {
-            most = most.min(usize::try_from(budget.left()).unwrap_or(usize::MAX));
+            // What is left past this target's `usize` is no bound below `into.len()`.
+            most = most.min(budget.left().in_memory().unwrap_or(usize::MAX));
             let short = match most {
-                0 if !into.is_empty() => Some(budget.over(into.len() as u64)),
-                _ => budget.take(most as u64).err(),
+                0 if !into.is_empty() => Some(budget.over(ByteLen::of(into))),
+                _ => budget.take(ByteLen::of_memory(most)).err(),
             };
             if let Some(short) = short {
                 let over = error(NetOp::Recv, peer, NetKind::OverLimit(short));
                 return pending::refused(&self.link.io, "bstd::net read_into", Err(over));
             }
         }
-        // What was taken from the limit and did not come is given back.
-        let unused = move |came: usize| {
+        // What was taken from the limit and did not come (`rest` of it) is given back.
+        let unused = move |rest: usize| {
             if let Some(budget) = budget {
-                budget.give_back((most - came) as u64);
+                budget.give_back(ByteLen::of_memory(rest));
             }
         };
-        // alloc: the effect's buffer, which blaze-core's `Effect` owns.
+        // alloc: the effect's buffer, which blaze-core's `Effect` owns; empty, so nothing yet.
         let effect = |tag| Effect::Recv { conn, most, into: Vec::new(), tag };
         pending::start(&self.link.io, "bstd::net read_into", into, effect, move |into: &mut [u8], done| {
             match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= most => {
-                    into[..bytes.len()].copy_from_slice(&bytes);
-                    unused(bytes.len());
-                    Ok(bytes.len())
-                }
+                Ok(Done::Read(bytes)) => match (most.checked_sub(bytes.len()), into.get_mut(..bytes.len())) {
+                    (Some(rest), Some(slot)) => {
+                        slot.copy_from_slice(&bytes);
+                        unused(rest);
+                        Ok(ByteLen::of(&bytes))
+                    }
+                    // More than was asked for: a driver's bug.
+                    _ => {
+                        unused(most);
+                        Err(unexpected(NetOp::Recv, peer, Done::Read(bytes)))
+                    }
+                },
                 Ok(done) => {
-                    unused(0);
+                    unused(most);
                     Err(unexpected(NetOp::Recv, peer, done))
                 }
                 Err(stopped) => {
-                    unused(0);
+                    unused(most);
                     Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped)))
                 }
             }
@@ -747,15 +878,19 @@ impl Conn {
 
     /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how
     /// many, 0 once the peer has hung up. Its [`Conn::read_into`], waited for.
-    pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, NetError> {
+    pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<ByteLen, NetError> {
         let stopped = |stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped));
         cx.stopped_by(self.link.io.now()).map_err(stopped)?;
         let start = into.len();
         let slot = into.grow_zeroed(most).map_err(stopped)?;
         let read = self.read_into(slot).wait(cx);
-        match read {
-            Ok(read) => {
-                into.truncate(start + read);
+        // At most `most` came, which `into` already holds room for past `start`.
+        let came = read.and_then(|read| {
+            read.in_memory().map(|came| (read, came)).map_err(|overflow| error(NetOp::Recv, &self.peer, NetKind::Overflow(overflow)))
+        });
+        match came {
+            Ok((read, came)) => {
+                into.truncate(start + came);
                 Ok(read)
             }
             Err(error) => {

@@ -490,7 +490,7 @@ impl<R: Runner> Table<R> {
     ) -> Result<u64, MemError> {
         let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
-        let run = self.cache.try_alloc(Run {
+        let run = self.cache.alloc(Run {
             header,
             ctx,
             at: u64::MAX,
@@ -499,7 +499,7 @@ impl<R: Runner> Table<R> {
             build: AtomicU32::new(0),
             creator: AtomicU64::new(0),
         })?;
-        let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
+        let handle = self.live.insert(Slot { run, tag, pool, near })?;
         let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
         slot.run.at = handle.to_bits();
         Ok(handle.to_bits())
@@ -572,7 +572,7 @@ impl Throttle {
     fn admit(&mut self, tag: MemTag, run: u64, over: impl Fn(MemTag) -> bool) -> bool {
         let at = tag.index();
         if self.running[at] > 0 && (self.queues[at].head != NO_RUN || over(tag)) {
-            let waiting = self.waiting.insert(Waiting { run, next: NO_RUN }).to_bits();
+            let waiting = self.waiting.insert(Waiting { run, next: NO_RUN }).unwrap_or_else(|error| panic!("{error}")).to_bits();
             let queue = &mut self.queues[at];
             match queue.tail {
                 NO_RUN => queue.head = waiting,
@@ -1547,7 +1547,7 @@ mod tests {
     /// Every task's work runs in a frame of its own, under `drive` and the scheduler both.
     #[test]
     fn work_runs_in_a_task_frame() {
-        let in_frame = || frame::in_task() && frame::current(|frame| *frame.alloc(7u64)) == 7;
+        let in_frame = || frame::in_task() && frame::current(|frame| *frame.alloc(7u64).expect("room")) == 7;
 
         let mut machine = Machine::new(Config { io: 1, work: 2, keep_going: false }).unwrap();
         let nodes = vec![spec(0, &[], Pool::Io, None), spec(1, &[0], Pool::Work, None)];

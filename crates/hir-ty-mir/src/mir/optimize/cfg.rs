@@ -69,7 +69,7 @@ struct CfgSimplifier<'a, 'f> {
 
 impl<'a, 'f> CfgSimplifier<'a, 'f> {
     fn new(blocks: &'a mut [BasicBlock], start: usize, frame: &'f Frame) -> Self {
-        let pred_count = frame.alloc_slice_fill_with(blocks.len(), |_| 0u32);
+        let pred_count = frame.alloc_slice_fill_with(blocks.len(), |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         pred_count[start] = 1;
         let mut order = Vec::with_capacity_in(blocks.len(), frame);
         reachable_into(blocks, start, &mut order, frame);
@@ -234,7 +234,7 @@ fn remove_dead_blocks(body: &mut MirBody<'_>, start: usize, frame: &Frame) {
                 Some(TerminatorKind::Unreachable)
             )
     };
-    let map = frame.alloc_slice_fill_with(count, |_| None::<usize>);
+    let map = frame.alloc_slice_fill_with(count, |_| None::<usize>).unwrap_or_else(|error| panic!("{error}"));
     let mut kept = 0;
     let mut kept_unreachable = None;
     for (index, block) in blocks.iter().enumerate() {
@@ -358,7 +358,7 @@ pub(super) fn remove_unneeded_drops<'db>(
 /// rustc's `AddCallGuards::CriticalCallEdges`: a call that may unwind and returns to a block
 /// with more than one predecessor returns to a new block that only jumps there.
 pub(super) fn critical_call_edges(body: &mut MirBody<'_>, frame: &Frame) {
-    let pred_count = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32);
+    let pred_count = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     for (_, block) in body.basic_blocks.iter() {
         if let Some(terminator) = &block.terminator {
             for target in terminator.kind.all_successors() {

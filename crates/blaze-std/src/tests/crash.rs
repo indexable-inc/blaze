@@ -55,7 +55,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     let cx = root(&io);
     let dir = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
     // The file is linear: the acts run in a function of their own, then it is closed whatever

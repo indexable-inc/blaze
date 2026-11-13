@@ -1087,7 +1087,7 @@ impl<'a> Stage<'a> {
         }
         // Each relaid region's pieces, in id order, one run each in `members`: counted, then
         // placed.
-        let ends = arena.alloc_slice_fill_with(relay.len(), |_| 0usize);
+        let ends = arena.alloc_slice_fill_with(relay.len(), |_| 0usize).unwrap_or_else(|error| panic!("{error}"));
         for piece in self.new.live_pieces() {
             if let Ok(at) = relay.binary_search(&(piece.region as usize)) {
                 ends[at] += 1;
@@ -1098,8 +1098,8 @@ impl<'a> Stage<'a> {
             total += *end;
             *end = total;
         }
-        let members = arena.alloc_slice_fill_with(total, |_| 0 as PieceId);
-        let next = arena.alloc_slice_fill_with(relay.len(), |_| 0usize);
+        let members = arena.alloc_slice_fill_with(total, |_| 0 as PieceId).unwrap_or_else(|error| panic!("{error}"));
+        let next = arena.alloc_slice_fill_with(relay.len(), |_| 0usize).unwrap_or_else(|error| panic!("{error}"));
         for (at, start) in next.iter_mut().enumerate() {
             *start = if at == 0 { 0 } else { ends[at - 1] };
         }

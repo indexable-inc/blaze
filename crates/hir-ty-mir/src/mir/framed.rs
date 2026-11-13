@@ -12,7 +12,7 @@ use super::{BasicBlockId, LocalId};
 pub(crate) type Bits<'f, I = usize> = BitSliceMut<'f, I>;
 
 pub(crate) fn bits_in<'f, I>(len: usize, frame: &'f Frame) -> Bits<'f, I> {
-    Bits::from_words(frame.alloc_slice_fill_with(len.div_ceil(64), |_| 0))
+    Bits::from_words(frame.alloc_slice_fill_with(len.div_ceil(64), |_| 0).unwrap_or_else(|error| panic!("{error}")))
 }
 
 pub(crate) use hir_ty::{FrameMap, FrameSet, frame_map as map_in, frame_set as set_in};

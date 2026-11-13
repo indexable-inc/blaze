@@ -73,7 +73,7 @@ type Set<'f> = BitSliceMut<'f>;
 
 /// The empty set of `domain` locals in `frame`.
 fn empty_in(frame: &Frame, domain: usize) -> Set<'_> {
-    Bits::from_words(frame.alloc_slice_fill_with(words_for(domain), |_| 0))
+    Bits::from_words(frame.alloc_slice_fill_with(words_for(domain), |_| 0).unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// The set of all `domain` locals in `frame`.
@@ -85,7 +85,7 @@ fn filled_in(frame: &Frame, domain: usize) -> Set<'_> {
 
 /// A copy of `set` in `frame`.
 fn copy_in<'g>(set: &Set<'_>, frame: &'g Frame) -> Set<'g> {
-    Bits::from_words(frame.alloc_slice_copy(set.words()))
+    Bits::from_words(frame.alloc_slice_copy(set.words()).unwrap_or_else(|error| panic!("{error}")))
 }
 
 fn local_index(local: LocalId) -> usize {
@@ -164,7 +164,7 @@ fn edges<'a>(body: &MirBody<'_>, terminator: &'a Terminator, mut each: impl FnMu
 /// The blocks control reaches from the start.
 fn reachable<'f>(frame: &'f Frame, body: &MirBody<'_>) -> &'f [bool] {
     let blocks = body.basic_blocks.len();
-    let reached = frame.alloc_slice_fill_with(blocks, |_| false);
+    let reached = frame.alloc_slice_fill_with(blocks, |_| false).unwrap_or_else(|error| panic!("{error}"));
     let mut stack = Vec::with_capacity_in(blocks, frame);
     stack.push(body.start_block);
     while let Some(id) = stack.pop() {
@@ -342,7 +342,7 @@ impl MirBody<'_> {
         locals.extend(
             self.locals.iter().map(|(local, _)| local).filter(|&it| any.contains(local_index(it))),
         );
-        let saved: &[usize] = frame.alloc_slice_from_iter(locals.iter().map(|&it| local_index(it)));
+        let saved: &[usize] = frame.alloc_slice_from_iter(locals.iter().map(|&it| local_index(it))).unwrap_or_else(|error| panic!("{error}"));
         // alloc: the result's yield points, one block at its size
         let mut yields = Vec::with_capacity(at_yields.len());
         yields.extend(at_yields.iter().map(|(resume, drop, live)| {
@@ -409,8 +409,8 @@ impl MirBody<'_> {
                     .map(|(local, _)| local)
                     .filter(|&it| live.contains(local_index(it))),
             );
-            &*frame.alloc_slice_copy(&held)
-        })
+            &*frame.alloc_slice_copy(&held).unwrap_or_else(|error| panic!("{error}"))
+        }).unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// `always_storage_live_locals`: the locals no `StorageLive` or `StorageDead` mentions.
@@ -491,8 +491,8 @@ impl MirBody<'_> {
         let count = self.locals.len();
         let blocks = self.basic_blocks.len();
         let mut forward = Forward {
-            borrowed: frame.alloc_slice_fill_with(blocks, |_| None),
-            requires: frame.alloc_slice_fill_with(blocks, |_| None),
+            borrowed: frame.alloc_slice_fill_with(blocks, |_| None).unwrap_or_else(|error| panic!("{error}")),
+            requires: frame.alloc_slice_fill_with(blocks, |_| None).unwrap_or_else(|error| panic!("{error}")),
         };
         let mut start_requires = empty_in(frame, count);
         for &param in params {
@@ -537,8 +537,8 @@ impl MirBody<'_> {
     fn liveness<'f>(&self, frame: &'f Frame, reached: &[bool]) -> &'f [Set<'f>] {
         let count = self.locals.len();
         let blocks = self.basic_blocks.len();
-        let live_in = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count));
-        let live_out = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count));
+        let live_in = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count)).unwrap_or_else(|error| panic!("{error}"));
+        let live_out = frame.alloc_slice_fill_with(blocks, |_| empty_in(frame, count)).unwrap_or_else(|error| panic!("{error}"));
         // Scratch states, reused by every block and edge; a changed block's state is swapped
         // into `live_in` and its old one becomes the next scratch.
         let mut state = empty_in(frame, count);
@@ -647,7 +647,7 @@ impl<'a> Conflicts<'a> {
         saved: &[usize],
     ) -> Conflicts<'a> {
         let n = saved.len();
-        let position = frame.alloc_slice_fill_with(count, |_| NOT_HELD);
+        let position = frame.alloc_slice_fill_with(count, |_| NOT_HELD).unwrap_or_else(|error| panic!("{error}"));
         let mut ineligible = empty_in(frame, n);
         for (at, &local) in saved.iter().enumerate() {
             position[local] = at as u32;
@@ -655,7 +655,7 @@ impl<'a> Conflicts<'a> {
                 ineligible.insert(at);
             }
         }
-        let together = frame.alloc_slice_fill_with(n, |_| copy_in(&ineligible, frame));
+        let together = frame.alloc_slice_fill_with(n, |_| copy_in(&ineligible, frame)).unwrap_or_else(|error| panic!("{error}"));
         Conflicts {
             held,
             position,

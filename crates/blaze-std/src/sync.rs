@@ -36,7 +36,7 @@ pub use core::{
     sync::atomic::{Atomic, Ordering},
 };
 
-pub use crate::own::{LocalShared, Released, Shared};
+pub use crate::own::{LocalShared, Refused, Released, Shared};
 
 // The two that wait on first use are Rust std's until bstd's own wait is under them (S4's
 // ban list, `crates/blaze-std/src/rt.rs`).

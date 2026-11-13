@@ -85,11 +85,11 @@ pub fn meter(
     let heads = blaze_mem::frame::task(
         blaze_mem::Tag::Codegen,
         |temp| -> Result<SmallVec<[ir::Block; 8]>, String> {
-            let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX);
+            let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX).unwrap_or_else(|error| panic!("{error}"));
             for (at, block) in func.layout.blocks().enumerate() {
                 order[block.as_u32() as usize] = at as u32;
             }
-            let head = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| false);
+            let head = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| false).unwrap_or_else(|error| panic!("{error}"));
             for block in func.layout.blocks() {
                 let Some(last) = func.layout.last_inst(block) else { continue };
                 let from = order[block.as_u32() as usize];

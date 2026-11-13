@@ -620,7 +620,7 @@ impl<'a> Stage<'a> {
             .map(|slot| abs(exec::log_word(slot), stubs, log_stubs + (slot * stride) as i64));
         let fixups = self
             .fixup_slice(always.into_iter().chain(log.into_iter().filter(|_| logged)).chain(words));
-        let header: &'a mut [u8] = self.arena.alloc_slice_fill_with(exec::HEADER as usize, |_| 0);
+        let header: &'a mut [u8] = self.arena.alloc_slice_fill_with(exec::HEADER as usize, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         header[exec::SLOTS as usize..][..4].copy_from_slice(&capacity.to_le_bytes());
         let stride_field = if logged { stride as u32 } else { 0 };
         header[exec::STRIDE as usize..][..4].copy_from_slice(&stride_field.to_le_bytes());
@@ -632,7 +632,7 @@ impl<'a> Stage<'a> {
         self.make(&piece, Content::Zero);
         let log_len = if logged { table::log_size(arch, slots) } else { 0 };
         let code: &'a mut [u8] =
-            self.arena.alloc_slice_fill_with((slots * size + log_len) as usize, |_| 0);
+            self.arena.alloc_slice_fill_with((slots * size + log_len) as usize, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         let (slot_code, log_code) = code.split_at_mut((slots * size) as usize);
         table::stubs(arch, slot_code);
         if logged {
@@ -852,7 +852,7 @@ impl<'a> Stage<'a> {
         todo.sort_unstable_by_key(|it| it.key);
         let counts = collect_in(todo.iter().map(|it| key_count(it)), arena);
         let keys: &mut [Wide<'a>] =
-            arena.alloc_slice_fill_with(counts.iter().sum(), |_| Wide::Key(SymKey::Generation));
+            arena.alloc_slice_fill_with(counts.iter().sum(), |_| Wide::Key(SymKey::Generation)).unwrap_or_else(|error| panic!("{error}"));
         let mut parts: FrameVec<'_, &mut [Wide<'a>]> = Vec::with_capacity_in(todo.len(), arena);
         let mut rest = &mut keys[..];
         for count in counts.iter() {
@@ -1108,7 +1108,7 @@ impl<'a> Stage<'a> {
                         addend: 0,
                         minus: None,
                     }));
-                    let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice());
+                    let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice()).unwrap_or_else(|error| panic!("{error}"));
                     let piece = self.piece(
                         cie_sym,
                         &Class::EhFrame,
@@ -1164,7 +1164,7 @@ impl<'a> Stage<'a> {
                     },
                     Field::Personality => unreachable!("a CIE's field"),
                 }));
-                let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice());
+                let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice()).unwrap_or_else(|error| panic!("{error}"));
                 let mut piece =
                     self.piece(sym, &Class::EhFrame, 4, bytes.len() as u64, fixups, What::Fde);
                 piece.rank = 1;
@@ -1181,7 +1181,7 @@ impl<'a> Stage<'a> {
                 let targets = handler.into_iter().chain(lsda);
                 let size =
                     padded + 4 * (usize::from(handler.is_some()) + usize::from(lsda.is_some()));
-                let out: &'a mut [u8] = self.arena.alloc_slice_fill_with(size, |_| 0);
+                let out: &'a mut [u8] = self.arena.alloc_slice_fill_with(size, |_| 0).unwrap_or_else(|error| panic!("{error}"));
                 out[..bytes.len()].copy_from_slice(bytes);
                 let fixups = self.fixup_slice(targets.enumerate().map(|(n, target)| Fixup {
                     at: (padded + 4 * n) as u64,
@@ -1325,7 +1325,7 @@ impl<'a> Stage<'a> {
             ));
         }
         let (class, rank) = self.sancov_class(SANCOV_PCS, function.key)?;
-        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(covered.pcs.len() * 16, |_| 0);
+        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(covered.pcs.len() * 16, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         for (out, (_, flags)) in bytes.chunks_exact_mut(16).zip(&covered.pcs) {
             out[8..].copy_from_slice(&flags.to_le_bytes());
         }
@@ -1514,7 +1514,7 @@ impl<'a> Stage<'a> {
         // alloc: error path
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
         let len = crate::wasm::STATICS_HEADER + crate::wasm::STATICS_RECORD * targets.len();
-        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0);
+        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         bytes[4..36].copy_from_slice(&it.item.0.0);
         bytes[36..40].copy_from_slice(&(targets.len() as u32).to_le_bytes());
         for (at, &(_, size)) in targets.iter().enumerate() {
@@ -1658,16 +1658,16 @@ impl<'a> Stage<'a> {
         };
         let name = table.file(at.file);
         let record: &'a [u8] = match self.arch() {
-            Arch::Wasm32 => arena.alloc_slice_copy(&position::wasm32_location(name.len(), at)),
+            Arch::Wasm32 => arena.alloc_slice_copy(&position::wasm32_location(name.len(), at)).unwrap_or_else(|error| panic!("{error}")),
             // wasm64's is the native 64-bit layout, its pointer an address in linear memory.
             Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => {
-                arena.alloc_slice_copy(&position::location(name.len(), at))
+                arena.alloc_slice_copy(&position::location(name.len(), at)).unwrap_or_else(|error| panic!("{error}"))
             }
         };
         let file_name = self.symbols.name(name);
         let file = self.symbols.intern(SymKey::FileName(file_name));
         let bytes: Option<&'a [u8]> = self.new.home(file).is_none().then(|| {
-            let out = arena.alloc_slice_fill_with(name.len() + 1, |_| 0);
+            let out = arena.alloc_slice_fill_with(name.len() + 1, |_| 0).unwrap_or_else(|error| panic!("{error}"));
             out[..name.len()].copy_from_slice(name.as_bytes());
             &*out
         });
@@ -1851,7 +1851,7 @@ impl<'a> Stage<'a> {
                 continue;
             };
             // Copied out of the table it is interned into.
-            let name: &str = arena.alloc_str(name);
+            let name: &str = arena.alloc_str(name).unwrap_or_else(|error| panic!("{error}"));
             let target = self.symbols.sym_name(name);
             cells.push((GotKind::Address, target));
         }

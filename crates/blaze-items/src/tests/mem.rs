@@ -39,7 +39,7 @@ fn keys(count: usize, seed: u64, prefix: [u8; 9]) -> Vec<ItemKey> {
 
 fn index_of(rows: &[Row<u32>]) -> KeyIndex<u32> {
     let mut column = key::key_rows("a test's index");
-    column.extend_from_slice(rows);
+    column.extend_from_slice(rows).expect("room");
     KeyIndex::new(column)
 }
 
@@ -155,7 +155,7 @@ fn an_append_past_the_high_water_mark_allocates_nothing() {
     let committed = column.capacity();
     assert_at_most(0, "appending to a key index's rows", || {
         for (n, &key) in rows.iter().enumerate() {
-            column.push((key, n as u32));
+            column.push((key, n as u32)).expect("room");
         }
     });
     assert!(column.capacity() > committed, "the appends committed past the first step");

@@ -218,7 +218,7 @@ pub(super) fn heap_to_stack<'db>(
         }
         return Ok(());
     }
-    let mentions = frame.alloc_slice_fill_with(body.locals.len(), |_| 0u32);
+    let mentions = frame.alloc_slice_fill_with(body.locals.len(), |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     visit_body(body, |local, mention, _| {
         if mention != Mention::Storage {
             mentions[local_index(local)] += 1;

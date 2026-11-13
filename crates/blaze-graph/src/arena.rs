@@ -1996,7 +1996,7 @@ mod tests {
     #[test]
     fn blaze_holds_what_blaze_mem_committed_too() {
         let mut column = blaze_mem::RegionVec::<u64>::new(4 * MB, blaze_mem::Tag::Plane).unwrap();
-        column.extend_from_slice(&vec![7u64; MB]);
+        column.extend_from_slice(&vec![7u64; MB]).expect("room");
         let committed = blaze_mem::tag::snapshot().committed;
         assert!(committed >= 8 * MB as u64, "{committed}");
         assert!(own() >= 8 * MB as u64, "{}", own());

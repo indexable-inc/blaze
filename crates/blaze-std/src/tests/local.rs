@@ -92,7 +92,7 @@ fn acts(
                 let (end, pipe) = if by_first { (first, &mut *back) } else { (second, &mut *forth) };
                 let wanted = most.min(pipe.len());
                 let mut into = short.bytes();
-                match end.read(&short, most, &mut into) {
+                match end.read(&short, most, &mut into).map(|read| read.get() as usize) {
                     Ok(read) if read == wanted && (wanted > 0 || most == 0) => {
                         let model: Vec<u8> = pipe.drain(..read).collect();
                         if into.as_slice() != &model[..] {
@@ -117,7 +117,7 @@ fn drained(cx: &Cx, end: &End, pipe: &VecDeque<u8>) -> Result<(), String> {
     let mut into = cx.bytes();
     // One read past the last byte: the 0 that says the peer finished. Bounded by the bytes.
     for _ in 0..=pipe.len() {
-        match end.read(cx, 64, &mut into) {
+        match end.read(cx, 64, &mut into).map(|read| read.get()) {
             Ok(0) => break,
             Ok(_) => {}
             Err(error) => return Err(format!("a read after the peer finished: {error}")),
@@ -130,7 +130,7 @@ fn drained(cx: &Cx, end: &End, pipe: &VecDeque<u8>) -> Result<(), String> {
             into.as_slice()
         ));
     }
-    match end.read(cx, 64, &mut into) {
+    match end.read(cx, 64, &mut into).map(|read| read.get()) {
         Ok(0) => Ok(()),
         Ok(read) => Err(format!("a read past the end of a finished peer's bytes gave {read} more")),
         Err(error) => Err(format!("a read past the end of a finished peer's bytes: {error}")),
@@ -142,7 +142,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let cx = root(&io);
     let (mut forth, mut back) = (VecDeque::new(), VecDeque::new());
     // The ends are linear: the acts borrow them, then each is finished whatever they found.
-    let Pair { first, second } = pair("test", plan.capacity);
+    let Pair { first, second } = pair("test", plan.capacity).expect("a pair");
     let acted = acts(plan, &io, &cx, &first, &second, &mut forth, &mut back);
     first.finish(&cx);
     let left = match acted {

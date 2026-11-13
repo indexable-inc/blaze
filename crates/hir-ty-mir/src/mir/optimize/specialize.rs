@@ -448,8 +448,8 @@ struct Uses<'f> {
 impl<'f> Uses<'f> {
     fn of(body: &MirBody<'_>, frame: &'f Frame) -> Uses<'f> {
         let count = body.locals.len();
-        let assigned = frame.alloc_slice_fill_with(count, |_| 0u32);
-        let at = frame.alloc_slice_fill_with(count, |_| None);
+        let assigned = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
+        let at = frame.alloc_slice_fill_with(count, |_| None).unwrap_or_else(|error| panic!("{error}"));
         let mut touched: Bits<'f> = bits_in(count, frame);
         visit_body(body, |local, mention, location| {
             let index = local_index(local);
@@ -544,7 +544,7 @@ impl<'f> Analysis<'f> {
     fn of<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &'f Frame) -> Analysis<'f> {
         let uses = Uses::of(body, frame);
         let views: &'f mut [Option<View>] =
-            frame.alloc_slice_fill_with(body.locals.len(), |_| None);
+            frame.alloc_slice_fill_with(body.locals.len(), |_| None).unwrap_or_else(|error| panic!("{error}"));
         let mut candidates: Vec<Candidate<'f>, &Frame> = Vec::new_in(frame);
         for (index, &local) in body.param_locals.iter().enumerate() {
             if !uses.untouched(local) {
@@ -596,7 +596,7 @@ impl<'f> Analysis<'f> {
         }
         // The branches, and what each compares with.
         let switches: &'f mut [Option<View>] =
-            frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| None);
+            frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| None).unwrap_or_else(|error| panic!("{error}"));
         for (at, block) in body.basic_blocks.iter() {
             let Some(Terminator { kind: TerminatorKind::SwitchInt { discr, targets }, .. }) =
                 &block.terminator
@@ -979,8 +979,8 @@ fn reachable<'f>(
 fn in_cycles<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Bits<'f> {
     const UNSEEN: u32 = u32::MAX;
     let count = body.basic_blocks.len();
-    let index = frame.alloc_slice_fill_with(count, |_| UNSEEN);
-    let low = frame.alloc_slice_fill_with(count, |_| 0u32);
+    let index = frame.alloc_slice_fill_with(count, |_| UNSEEN).unwrap_or_else(|error| panic!("{error}"));
+    let low = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     let mut on_stack: Bits<'_> = bits_in(count, frame);
     let mut looped: Bits<'f> = bits_in(count, frame);
     let mut stack: Vec<usize, &Frame> = Vec::new_in(frame);

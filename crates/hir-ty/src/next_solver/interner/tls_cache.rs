@@ -28,7 +28,10 @@ use super::DbInterner;
 use base_db::{Crate, Db, Nonce};
 use blaze_core::lock::Lock;
 use blaze_hash::FixedState;
-use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
+use blaze_mem::{
+    Cache, Pool, Pooled, Tag,
+    pool::{Limbo, NotHeld},
+};
 use blaze_query::db::View;
 use blaze_reclaim::Horizon;
 use rustc_type_ir::search_graph::{GlobalCache, Sharing};
@@ -401,7 +404,7 @@ where
             Generation { key, state, referenced: AtomicBool::new(true), value: T::default() };
         let mut slots = self.slots.lock();
         let scans = blaze_reclaim::scans();
-        let made = slots.cache.alloc(generation).into_raw();
+        let made = slots.cache.alloc(generation).unwrap_or_else(|error| panic!("{error}")).into_raw();
         if let Err(won) = self.generations[at].compare_exchange(
             held,
             made.as_ptr(),
@@ -420,7 +423,13 @@ where
             // pool, and the swap above unlinked `held`: one swap alone can, so this is the one
             // place that takes it back; the limbo lets it go only after every task that may
             // have loaded it has ended.
-            slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
+            if let Err(NotHeld { pooled, error }) =
+                slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) })
+            {
+                // Not held: a reader may still hold it, so it is leaked, never dropped.
+                std::mem::forget(pooled);
+                panic!("{error}");
+            }
             slots.limbo.take_passed::<PASSED>(horizon)
         });
         held_for_field_updates(scans);
@@ -467,7 +476,13 @@ where
             // of this table's pool, and the store above, under the lock, unlinked `held`; a
             // generation is unlinked once, under the lock, so this is the one place that takes
             // it back.
-            slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
+            if let Err(NotHeld { pooled, error }) =
+                slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) })
+            {
+                // Not held: a reader may still hold it, so it is leaked, never dropped.
+                std::mem::forget(pooled);
+                panic!("{error}");
+            }
             retired += 1;
         }
         drop(slots);

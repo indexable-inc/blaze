@@ -1533,7 +1533,7 @@ impl Sim {
     }
 
     fn new_end(&mut self, peer: Option<EndId>) -> Conn {
-        Conn(self.ends.insert(End { peer, ..End::default() }).to_bits())
+        Conn(self.ends.insert(End { peer, ..End::default() }).unwrap_or_else(|error| panic!("{error}")).to_bits())
     }
 
     /// The sends held on `conn` ([`Sim::hold_sends`]) end, failed: its end hung up.

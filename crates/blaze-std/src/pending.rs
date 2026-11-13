@@ -22,7 +22,7 @@
 //! cannot ask the driver to stop the op: it waits for it to end, which is why it never
 //! returns before the op is done.
 
-use alloc::boxed::Box;
+use alloc::{alloc::Global, boxed::Box};
 use core::{fmt, marker::PhantomData};
 
 use blaze_core::{Done, Effect, Tag, wait::Deadline};
@@ -31,12 +31,30 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     io::{Ends, Io},
+    mem::Named,
     trace::RecordKind,
 };
 
 /// What a `Pending` makes of its op's end: its outcome, given the lent buffer and the
 /// completion or why the wait stopped.
 type Finish<'buf, T> = Box<dyn FnOnce(&mut [u8], Result<Done, Stopped>) -> T + 'buf>;
+
+/// A `Pending`'s outcome: made once its op ends, or made already (an op refused before it
+/// started, which reads no completion).
+enum Outcome<'buf, T> {
+    Later(Finish<'buf, T>),
+    Ready(T),
+}
+
+impl<T> Outcome<'_, T> {
+    /// The outcome, given the lent buffer and the op's end.
+    fn finish(self, into: &mut [u8], done: Result<Done, Stopped>) -> T {
+        match self {
+            Outcome::Later(finish) => finish(into, done),
+            Outcome::Ready(outcome) => outcome,
+        }
+    }
+}
 
 /// An op in flight, borrowing its buffer for as long as it runs: finished by
 /// [`Pending::wait`] or [`Pending::cancel`] (see the module's doc for why it is linear and
@@ -48,7 +66,7 @@ pub struct Pending<'buf, T> {
     into: &'buf mut [u8],
     /// A write's bytes stay lent until it ends, so the caller cannot change them meanwhile.
     from: PhantomData<&'buf [u8]>,
-    finish: Finish<'buf, T>,
+    outcome: Outcome<'buf, T>,
     settle: Settle,
 }
 
@@ -78,20 +96,50 @@ impl Drop for Settle {
     }
 }
 
-/// `effect` handed to the driver now, its outcome made by `finish` once it ends.
-pub(crate) fn start<'buf, T>(
+/// `effect` handed to the driver now, its outcome made by `finish` once it ends. When the
+/// global heap has no room to keep `finish`, or the driver's queue no room for the effect,
+/// the effect is not handed to the driver and the outcome is `finish` of that
+/// [`Stopped::OutOfMemory`], made now.
+pub(crate) fn start<'buf, T, F>(
     io: &Io,
     span: &'static str,
     into: &'buf mut [u8],
     effect: impl FnOnce(Tag) -> Effect,
-    finish: impl FnOnce(&mut [u8], Result<Done, Stopped>) -> T + 'buf,
-) -> Pending<'buf, T> {
-    let tag = io.submit(effect);
+    finish: F,
+) -> Pending<'buf, T>
+where
+    F: FnOnce(&mut [u8], Result<Done, Stopped>) -> T + 'buf,
+{
+    let ready = |into: &'buf mut [u8], outcome: T| Pending {
+        into,
+        from: PhantomData,
+        outcome: Outcome::Ready(outcome),
+        settle: Settle { io: io.clone(), tag: None, span, armed: true },
+    };
+    // alloc: once per op, its outcome's maker (bounded: freed when the op is finished). The
+    // block is made before `finish` moves into it, so a refusal still has `finish` to call.
+    let slot = match Box::<F>::try_new_uninit() {
+        Ok(slot) => slot,
+        Err(_) => {
+            let stopped = Stopped::OutOfMemory { arena: Global.name(), asked: size_of::<F>() };
+            let outcome = finish(&mut *into, Err(stopped));
+            return ready(into, outcome);
+        }
+    };
+    let kept = Box::write(slot, finish);
+    let tag = match io.submit(effect) {
+        Ok(tag) => tag,
+        Err(stopped) => {
+            let finish = *kept;
+            let outcome = finish(&mut *into, Err(stopped));
+            return ready(into, outcome);
+        }
+    };
+    let finish: Finish<'buf, T> = kept;
     Pending {
         into,
         from: PhantomData,
-        // alloc: once per op, its outcome's maker (bounded: freed when the op is finished).
-        finish: Box::new(finish),
+        outcome: Outcome::Later(finish),
         settle: Settle { io: io.clone(), tag: Some(tag), span, armed: true },
     }
 }
@@ -102,8 +150,7 @@ pub(crate) fn refused<'buf, T: 'buf>(io: &Io, span: &'static str, outcome: T) ->
     Pending {
         into: &mut [],
         from: PhantomData,
-        // alloc: once per op, its outcome's holder (freed when the op is finished).
-        finish: Box::new(move |_: &mut [u8], _| outcome),
+        outcome: Outcome::Ready(outcome),
         settle: Settle { io: io.clone(), tag: None, span, armed: true },
     }
 }
@@ -114,14 +161,14 @@ impl<T> Pending<'_, T> {
     /// does, so nothing it does lands later).
     #[blaze::consumes]
     pub fn wait(self, cx: &Cx) -> T {
-        let Pending { into, from: _, finish, mut settle } = self;
+        let Pending { into, from: _, outcome, mut settle } = self;
         settle.armed = false;
         let done = match settle.tag {
             Some(tag) => cx.wait(&settle.io, tag, Ends::Once),
             // Refused before it started: its outcome is made already and reads no completion.
             None => Err(Stopped::Cancelled { span: settle.span }),
         };
-        finish(into, done)
+        outcome.finish(into, done)
     }
 
     /// The op given up: blaze-core cannot cancel an effect in flight, so this waits, heeding
@@ -132,18 +179,21 @@ impl<T> Pending<'_, T> {
     /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]
     pub fn cancel(self, cx: &Cx, give_up: Deadline) -> T {
-        let Pending { into, from: _, finish, mut settle } = self;
+        let Pending { into, from: _, outcome, mut settle } = self;
         settle.armed = false;
         let Some(tag) = settle.tag else {
             // Refused before it started: nothing is in flight to wait for.
-            return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
+            return outcome.finish(into, Err(Stopped::Cancelled { span: cx.name() }));
         };
         if cx.plant() == Plant::CancelSkipsWait {
-            settle.io.forget(tag, Ends::Once);
-            return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
+            let stopped = match settle.io.forget(tag, Ends::Once) {
+                Ok(()) => Stopped::Cancelled { span: cx.name() },
+                Err(stopped) => stopped,
+            };
+            return outcome.finish(into, Err(stopped));
         }
         let done = settle.io.settle(tag, give_up, cx.name());
-        finish(into, done)
+        outcome.finish(into, done)
     }
 }
 

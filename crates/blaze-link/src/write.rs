@@ -1086,12 +1086,12 @@ impl<'a> Stage<'a> {
                         (has_bytes(space) && piece.what() != What::Cells).then_some(piece.size)
                     })
                     .sum();
-                scratch = arena.alloc_slice_fill_with(len as usize, |_| 0);
+                scratch = arena.alloc_slice_fill_with(len as usize, |_| 0).unwrap_or_else(|error| panic!("{error}"));
             }
             let mut rest = collect_in(buffers.iter_mut().map(Vec::as_mut_slice), arena);
-            let taken = arena.alloc_slice_fill_with(state.spaces.len(), |_| 0u64);
+            let taken = arena.alloc_slice_fill_with(state.spaces.len(), |_| 0u64).unwrap_or_else(|error| panic!("{error}"));
             // The piece written last in each region: what an overlap names.
-            let written = arena.alloc_slice_fill_with(state.spaces.len(), |_| None::<PieceId>);
+            let written = arena.alloc_slice_fill_with(state.spaces.len(), |_| None::<PieceId>).unwrap_or_else(|error| panic!("{error}"));
             let mut free: &mut [u8] = &mut *scratch;
             let mut used = 0usize;
             let mut jobs: Vec<Job<'_, '_>> = Vec::with_capacity(ids.len());
@@ -2084,7 +2084,7 @@ impl<'a> Stage<'a> {
             }); // alloc: as above
         let rows: &mut [crate::dwarf::Row] = self.arena.alloc_slice_fill_with(total, |_| {
             crate::dwarf::Row { at: 0, file: 0, line: 0, column: 0 }
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         // Each task's files, (anchor, file in its table) and name, in the order it met them.
         type Met<'s> = Vec<((IdNo, u32), &'s str)>;
         let met: Vec<Result<Met<'_>, LinkError>> = par::map(

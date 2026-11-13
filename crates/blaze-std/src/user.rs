@@ -13,8 +13,8 @@ use blaze_core::FileName;
 use crate::{
     fs::{Dir, ReadWrite},
     io::Io,
-    name::UserName,
-    path::Path,
+    name::{NameError, UserName},
+    path::{Path, PathError},
 };
 
 /// What a host says of its user.
@@ -29,16 +29,35 @@ pub struct UserFacts {
 
 impl UserFacts {
     /// The simulation's unless a test says otherwise: `sim`, user and group 1000, at
-    /// `home/sim`.
-    pub fn simulated() -> UserFacts {
-        UserFacts {
-            name: UserName::new("sim").expect("sim is a name"),
+    /// `home/sim`. Its name and home are kept on the global heap: an error of no room when it
+    /// has none (the name and the path themselves pass).
+    pub fn simulated() -> Result<UserFacts, UserFactsError> {
+        Ok(UserFacts {
+            name: UserName::new("sim").map_err(UserFactsError::Name)?,
             uid: 1000,
             gid: 1000,
-            home: Path::new("home/sim").expect("home/sim is a relative path"),
+            home: Path::new("home/sim").map_err(UserFactsError::Home)?,
+        })
+    }
+}
+
+/// Why [`UserFacts::simulated`] made none: its name or its home was refused.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum UserFactsError {
+    Name(NameError),
+    Home(PathError),
+}
+
+impl fmt::Display for UserFactsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserFactsError::Name(error) => write!(f, "bstd::user the simulated user's name: {error}"),
+            UserFactsError::Home(error) => write!(f, "bstd::user the simulated user's home: {error}"),
         }
     }
 }
+
+impl core::error::Error for UserFactsError {}
 
 /// The user: from [`Io::user`].
 #[derive(Clone)]

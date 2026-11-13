@@ -26,9 +26,11 @@
 //! name change made before the last of those, in any directory (a journal commits in order);
 //! a crash keeps a prefix of the changes after and undoes the rest, newest first.
 
-use alloc::vec::Vec;
+use alloc::{alloc::Global, vec::Vec as HeapVec};
 use blaze_core::{Completion, Done, Effect, FileName, Tag, sim::Sim};
 use blaze_rng::SplitMix64;
+
+use crate::{Stopped, mem::Vec};
 
 /// What the simulated disk was asked to do, counted since the world was made
 /// ([`crate::Io::disk`]). Every field only grows.
@@ -61,9 +63,9 @@ enum NameChange {
     /// `name` came to be.
     Created { name: FileName },
     /// `from` was renamed over `to`, which held `before` (or was not there).
-    Renamed { from: FileName, to: FileName, before: Option<Vec<u8>> },
+    Renamed { from: FileName, to: FileName, before: Option<HeapVec<u8>> },
     /// `name`, which held `before`, was removed.
-    Removed { name: FileName, before: Vec<u8> },
+    Removed { name: FileName, before: HeapVec<u8> },
 }
 
 impl NameChange {
@@ -88,20 +90,23 @@ pub(crate) fn dir_of(name: &FileName) -> &str {
 /// the world's seed.
 const DISK_SALT: u64 = 0x6273_7464_2e64_736b;
 
-/// The ledger of one simulated world.
+/// The ledger of one simulated world. Its lists are on the global heap and grow fallibly: a
+/// growth with no room is [`Stopped::OutOfMemory`] from the call that grew it, with the
+/// ledger as it was before that call (each call reserves what it adds before it changes
+/// anything).
 pub(crate) struct Disk {
     counts: DiskCounts,
     /// Bytes written to each file and not yet flushed: what a clone of it would force out.
-    dirty: Vec<(FileName, u64)>,
+    dirty: Vec<(FileName, u64), Global>,
     /// Name changes no name sync covers yet, oldest first.
-    names: Vec<NameChange>,
+    names: Vec<NameChange, Global>,
     /// Name changes whose effect is in flight: one joins `names` when its effect completes
     /// having done it, and is dropped when the effect fails or a crash loses it.
-    naming: Vec<(Tag, NameChange)>,
+    naming: Vec<(Tag, NameChange), Global>,
     /// Flushes in flight: the tag, the file, and how many of its dirty bytes the flush covers.
-    flushing: Vec<(Tag, FileName, u64)>,
+    flushing: Vec<(Tag, FileName, u64), Global>,
     /// File reads in flight.
-    reading: Vec<Tag>,
+    reading: Vec<Tag, Global>,
     rng: SplitMix64,
 }
 
@@ -109,16 +114,17 @@ impl Disk {
     pub(crate) fn new(seed: u64) -> Disk {
         Disk {
             counts: DiskCounts::default(),
-            // alloc: none until a file is written.
-            dirty: Vec::new(),
+            // alloc: none until a file is written; the simulated world's ledger lives as long
+            // as the world.
+            dirty: Vec::new_in(Global),
             // alloc: none until a name changes.
-            names: Vec::new(),
+            names: Vec::new_in(Global),
             // alloc: none until a name changes.
-            naming: Vec::new(),
+            naming: Vec::new_in(Global),
             // alloc: none until a flush is asked.
-            flushing: Vec::new(),
+            flushing: Vec::new_in(Global),
             // alloc: none until a file is read.
-            reading: Vec::new(),
+            reading: Vec::new_in(Global),
             rng: SplitMix64::new(seed ^ DISK_SALT),
         }
     }
@@ -136,43 +142,60 @@ impl Disk {
         self.dirty.iter().find(|(it, _)| it == file).map_or(0, |(_, bytes)| *bytes)
     }
 
-    /// The dirty bytes of `file`, which it no longer has.
+    /// The dirty bytes of `file`, which it no longer has: none when it had none.
     fn take_dirty(&mut self, file: &FileName) -> u64 {
-        match self.dirty.iter().position(|(it, _)| it == file) {
-            Some(at) => self.dirty.swap_remove(at).1,
-            None => 0,
-        }
+        let Some(at) = self.dirty.iter().position(|(it, _)| it == file) else { return 0 };
+        self.dirty.swap_remove(at).map_or(0, |(_, bytes)| bytes)
     }
 
-    fn wrote(&mut self, file: &FileName, bytes: u64) {
-        self.counts.written += bytes;
+    /// `bytes` written to `file`. With no room for a new file's entry nothing is counted.
+    fn wrote(&mut self, file: &FileName, bytes: u64) -> Result<(), Stopped> {
         match self.dirty.iter_mut().find(|(it, _)| it == file) {
             Some((_, dirty)) => *dirty += bytes,
             // clone: the ledger's name of the file, a refcount.
-            None => self.dirty.push((file.clone(), bytes)),
+            None => self.dirty.push((file.clone(), bytes))?,
         }
+        self.counts.written += bytes;
+        Ok(())
     }
 
     /// The effect of `tag` makes `file`, if it is not there: a name no sync covers, once
     /// the effect has completed.
-    fn made(&mut self, sim: &Sim, tag: Tag, file: &FileName) {
+    fn made(&mut self, sim: &Sim, tag: Tag, file: &FileName) -> Result<(), Stopped> {
         if !sim.exists(file) {
             // clone: the ledger's name of the file, a refcount.
-            self.naming.push((tag, NameChange::Created { name: file.clone() }));
+            self.naming.push((tag, NameChange::Created { name: file.clone() }))?;
         }
+        Ok(())
     }
 
-    /// `effect` is handed to the driver now.
-    pub(crate) fn submitted(&mut self, sim: &Sim, effect: &Effect) {
+    /// `effect` is handed to the driver now. With no room in the ledger for what it records,
+    /// [`Stopped::OutOfMemory`] and the ledger as it was: room for every entry the effect may
+    /// add (at most one in each list) is reserved before anything is recorded, so no push
+    /// below can fail halfway.
+    pub(crate) fn submitted(&mut self, sim: &Sim, effect: &Effect) -> Result<(), Stopped> {
+        // The entries the effect may add: (dirty, naming, flushing, reading).
+        let (dirty, naming, flushing, reading) = match effect {
+            Effect::Append { .. } | Effect::Truncate { .. } | Effect::Rename { .. } => (1, 1, 0, 0),
+            Effect::WriteAt { .. } => (1, 0, 0, 0),
+            Effect::Sync { .. } | Effect::WriteBack { .. } => (0, 0, 1, 0),
+            Effect::Read { .. } | Effect::ReadAll { .. } => (0, 0, 0, 1),
+            Effect::Remove { .. } | Effect::Clone { .. } | Effect::Link { .. } => (0, 1, 0, 0),
+            _ => (0, 0, 0, 0),
+        };
+        self.dirty.reserve(dirty)?;
+        self.naming.reserve(naming)?;
+        self.flushing.reserve(flushing)?;
+        self.reading.reserve(reading)?;
         match effect {
             Effect::Append { file, bytes, tag } => {
-                self.made(sim, *tag, file);
-                self.wrote(file, bytes.len() as u64);
+                self.made(sim, *tag, file)?;
+                self.wrote(file, bytes.len() as u64)?;
             }
-            Effect::WriteAt { file, bytes, .. } => self.wrote(file, bytes.len() as u64),
+            Effect::WriteAt { file, bytes, .. } => self.wrote(file, bytes.len() as u64)?,
             Effect::Truncate { file, tag, .. } => {
-                self.made(sim, *tag, file);
-                self.wrote(file, 0);
+                self.made(sim, *tag, file)?;
+                self.wrote(file, 0)?;
             }
             // blaze-core's whole-file write is durable when it completes, its name too.
             Effect::Write { file, bytes, .. } => {
@@ -184,7 +207,7 @@ impl Disk {
                 self.counts.flushes += 1;
                 let covered = self.dirty_of(file);
                 // clone: the ledger's name of the file, a refcount.
-                self.flushing.push((*tag, file.clone(), covered));
+                self.flushing.push((*tag, file.clone(), covered))?;
             }
             // A write-back cleans what a flush cleans (a clone after it forces nothing out)
             // and makes nothing durable: the simulation still tears the file at a crash.
@@ -192,55 +215,66 @@ impl Disk {
                 self.counts.writebacks += 1;
                 let covered = self.dirty_of(file);
                 // clone: the ledger's name of the file, a refcount.
-                self.flushing.push((*tag, file.clone(), covered));
+                self.flushing.push((*tag, file.clone(), covered))?;
             }
-            Effect::Read { tag, .. } | Effect::ReadAll { tag, .. } => self.reading.push(*tag),
+            Effect::Read { tag, .. } | Effect::ReadAll { tag, .. } => self.reading.push(*tag)?,
             Effect::Rename { from, to, tag } => {
-                // alloc: a simulated crash's undo, the bytes the rename replaces.
+                // alloc: a simulated crash's undo, the bytes the rename replaces, which
+                // blaze-core's simulation copies out infallibly.
                 let before = sim.exists(to).then(|| sim.contents(to));
                 // clone: the ledger's names of the files, refcounts.
-                self.naming.push((*tag, NameChange::Renamed { from: from.clone(), to: to.clone(), before }));
-                // A file's unflushed bytes go where it goes.
+                self.naming.push((*tag, NameChange::Renamed { from: from.clone(), to: to.clone(), before }))?;
+                // A file's unflushed bytes go where it goes: the entry `from` had, taken out
+                // first, is the room the one for `to` is put back in.
                 let moved = self.take_dirty(from);
                 self.take_dirty(to);
                 if moved > 0 {
                     // clone: the ledger's name of the file, a refcount.
-                    self.dirty.push((to.clone(), moved));
+                    self.dirty.push((to.clone(), moved))?;
                 }
             }
             Effect::Remove { file, tag } => {
                 if sim.exists(file) {
-                    // alloc: a simulated crash's undo, the bytes the remove drops.
+                    // alloc: a simulated crash's undo, the bytes the remove drops, which
+                    // blaze-core's simulation copies out infallibly.
                     let before = sim.contents(file);
                     // clone: the ledger's name of the file, a refcount.
-                    self.naming.push((*tag, NameChange::Removed { name: file.clone(), before }));
+                    self.naming.push((*tag, NameChange::Removed { name: file.clone(), before }))?;
                 }
                 self.take_dirty(file);
             }
             Effect::Clone { from, to, tag } => {
-                self.counts.clones += 1;
                 // The kernel writes a source's unflushed bytes out before it shares its blocks.
+                self.made(sim, *tag, to)?;
+                self.counts.clones += 1;
                 let forced = self.take_dirty(from);
                 self.counts.forced_writeback += forced;
-                self.made(sim, *tag, to);
             }
-            Effect::Link { to, tag, .. } => self.made(sim, *tag, to),
+            Effect::Link { to, tag, .. } => self.made(sim, *tag, to)?,
             _ => {}
         }
+        Ok(())
     }
 
-    /// `completion` was polled, for its waiter or for none.
-    pub(crate) fn completed(&mut self, completion: &Completion) {
+    /// `completion` was polled, for its waiter or for none. With no room for the name change
+    /// it completes, [`Stopped::OutOfMemory`] and the ledger as it was.
+    pub(crate) fn completed(&mut self, completion: &Completion) -> Result<(), Stopped> {
         let tag = completion.tag;
         if let Some(at) = self.naming.iter().position(|(it, _)| *it == tag) {
-            let (_, change) = self.naming.remove(at);
             // An effect that failed changed no name.
-            if !matches!(completion.done, Done::Failed(_)) {
-                self.names.push(change);
+            let done = !matches!(completion.done, Done::Failed(_));
+            if done {
+                self.names.reserve(1)?;
+            }
+            if let Some((_, change)) = self.naming.remove(at)
+                && done
+            {
+                self.names.push(change)?;
             }
         }
-        if let Some(at) = self.flushing.iter().position(|(it, _, _)| *it == tag) {
-            let (_, file, covered) = self.flushing.swap_remove(at);
+        if let Some(at) = self.flushing.iter().position(|(it, _, _)| *it == tag)
+            && let Some((_, file, covered)) = self.flushing.swap_remove(at)
+        {
             if matches!(completion.done, Done::Synced | Done::WrittenBack) {
                 if let Some((_, dirty)) = self.dirty.iter_mut().find(|(it, _)| *it == file) {
                     // What was written after the flush was asked is still unflushed.
@@ -249,12 +283,13 @@ impl Disk {
                 self.dirty.retain(|(_, dirty)| *dirty > 0);
             }
         }
-        if let Some(at) = self.reading.iter().position(|it| *it == tag) {
-            self.reading.swap_remove(at);
-            if let Done::Read(bytes) = &completion.done {
-                self.counts.read += bytes.len() as u64;
-            }
+        if let Some(at) = self.reading.iter().position(|it| *it == tag)
+            && self.reading.swap_remove(at).is_some()
+            && let Done::Read(bytes) = &completion.done
+        {
+            self.counts.read += bytes.len() as u64;
         }
+        Ok(())
     }
 
     /// The names of the directory `dir` synced: every change in it, and every change before
@@ -262,7 +297,13 @@ impl Disk {
     pub(crate) fn sync_names(&mut self, dir: &str) {
         self.counts.name_syncs += 1;
         if let Some(last) = self.names.iter().rposition(|change| dir_of(change.name()) == dir) {
-            self.names.drain(..=last);
+            // The changes up to `last`, oldest first, are durable now: dropped from the list.
+            let mut at = 0;
+            self.names.retain(|_| {
+                let keep = at > last;
+                at += 1;
+                keep
+            });
         }
     }
 
@@ -271,7 +312,9 @@ impl Disk {
     /// first. Nothing is in flight and nothing is unflushed after.
     pub(crate) fn crashed(&mut self, sim: &mut Sim) {
         let kept = self.rng.below(self.names.len() as u64 + 1) as usize;
-        for change in self.names.drain(kept..).rev() {
+        // Newest first, down to the `kept` oldest.
+        while self.names.len() > kept {
+            let Some(change) = self.names.pop() else { break };
             match change {
                 NameChange::Created { name } => sim.delete(&name),
                 NameChange::Renamed { from, to, before } => {

@@ -129,7 +129,7 @@ impl<'f, 'db> MoveData<'f, 'db> {
     ) -> Self {
         let mut data = MoveData {
             paths: Vec::new_in(frame),
-            locals: frame.alloc_slice_fill_with(body.locals.len(), |_| None),
+            locals: frame.alloc_slice_fill_with(body.locals.len(), |_| None).unwrap_or_else(|error| panic!("{error}")),
             frame,
             subtree_start: Vec::new_in(frame),
             subtree_all: Vec::new_in(frame),
@@ -729,7 +729,7 @@ pub(super) struct Effects<'f> {
 impl<'f> Effects<'f> {
     pub(super) fn new_in(blocks: usize, frame: &'f Frame) -> Self {
         Effects {
-            block_start: frame.alloc_slice_fill_with(blocks, |_| u32::MAX),
+            block_start: frame.alloc_slice_fill_with(blocks, |_| u32::MAX).unwrap_or_else(|error| panic!("{error}")),
             starts: Vec::new_in(frame),
             all: Vec::new_in(frame),
             added: Vec::new_in(frame),

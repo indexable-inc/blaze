@@ -86,9 +86,9 @@ fn host_ports_by_example() {
 
 #[test]
 fn literals_are_checked_as_the_crate_compiles() {
-    assert_eq!(crate::path!("data/log"), Path::new("data/log").expect("a path"));
+    assert_eq!(crate::path!("data/log").expect("a test path"), Path::new("data/log").expect("a path"));
     assert_eq!(crate::var!("HOME"), VarName::new("HOME").expect("a variable name"));
-    assert_eq!(crate::host!("api.stripe.com:443"), HostPort::new("api.stripe.com", 443).expect("a host"));
+    assert_eq!(crate::host!("api.stripe.com:443").expect("a test host"), HostPort::new("api.stripe.com", 443).expect("a host"));
     let why = |raw: &str| VarName::new(raw).err().map(|error| error.why);
     assert_eq!((why(""), why("A=B"), why("A\0")), (Some(VarNameWhy::Empty), Some(VarNameWhy::Equals), Some(VarNameWhy::Nul)));
 }

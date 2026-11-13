@@ -40,7 +40,7 @@ pub fn instrument(func: &mut ir::Function) -> Result<(), Error> {
         tls: false,
     });
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |temp| -> Result<(), Error> {
-        let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX);
+        let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX).unwrap_or_else(|error| panic!("{error}"));
         for (at, block) in func.layout.blocks().enumerate() {
             order[block.as_u32() as usize] = at as u32;
         }

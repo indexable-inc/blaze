@@ -31,7 +31,6 @@ use blaze_reclaim::{Grace, Horizon};
 
 use crate::{
     MemError, Region, RegionVec, Tag,
-    error::fail,
     stack::{LinkTable, Stack},
     sync::atomic::{AtomicU32, Ordering},
     tag,
@@ -39,8 +38,6 @@ use crate::{
 
 /// Objects moved between a cache and the pool at once.
 pub const BATCH: usize = 64;
-
-const CACHE: usize = 2 * BATCH;
 
 /// Empty batch descriptors a cache keeps, so moving a batch costs the one compare-and-swap of
 /// the full stack: a refill keeps the descriptor it emptied, a spill fills one it keeps.
@@ -143,7 +140,7 @@ impl<T> Pool<T> {
 
     /// A worker's cache into this pool.
     pub fn cache(&self) -> Cache<'_, T> {
-        Cache { pool: self, items: [0; CACHE], len: 0, stash: [0; STASH], stashed: 0 }
+        Cache { pool: self, items: [[0; BATCH]; 2], len: 0, stash: [[0; MOVE]; 2], stashed: 0 }
     }
 
     /// Batch descriptors made so far.
@@ -160,7 +157,8 @@ impl<T> Pool<T> {
         self.batches.at(index as usize * mem::size_of::<Batch>()).cast::<Batch>()
     }
 
-    /// Up to `BATCH` new slots, committed, their links made; their first index and count.
+    /// Up to `BATCH` new slots, committed, their links made; their first and last index (at
+    /// least one slot: `first <= last`).
     fn carve(&self) -> Result<(u32, u32), MemError> {
         let start = self.carved.fetch_add(Self::CARVE, Ordering::Relaxed);
         if start >= self.max {
@@ -179,7 +177,8 @@ impl<T> Pool<T> {
             unsafe { self.slot_links.init(index) }?;
         }
         tag::allocated(self.tag, (end - start) as usize * Self::SIZE);
-        Ok((start, end - start))
+        // `start < max` (checked above) and `CARVE >= 1`, so `end > start`.
+        Ok((start, end - 1))
     }
 
     /// A new batch descriptor of the caller's own, when the empty stack has none.
@@ -226,11 +225,22 @@ impl<T> fmt::Debug for Pool<T> {
 /// at a time.
 pub struct Cache<'p, T> {
     pool: &'p Pool<T>,
-    items: [u32; CACHE],
+    /// Free slot indices: the first `len` of `items` read flat. Two halves of a batch each, so
+    /// a full cache gives its upper half back whole and a refill fills the lower one whole.
+    items: [[u32; BATCH]; 2],
     len: usize,
-    /// Empty batch descriptors this cache holds: `stash[..stashed]`.
-    stash: [u32; STASH],
+    /// Empty batch descriptors this cache holds: the first `stashed` of `stash` read flat, in
+    /// halves of [`MOVE`] that move to and from the pool's empty stack whole.
+    stash: [[u32; MOVE]; 2],
     stashed: usize,
+}
+
+/// The first `n` of `items`, or all of them when it holds fewer: a slice's `take(n)`.
+fn prefix(items: &[u32], n: usize) -> &[u32] {
+    match items.split_at_checked(n) {
+        Some((head, _)) => head,
+        None => items,
+    }
 }
 
 impl<'p, T> Cache<'p, T> {
@@ -243,14 +253,11 @@ impl<'p, T> Cache<'p, T> {
         self.len
     }
 
-    /// Places `value` in a slot of the pool.
+    /// Places `value` in a slot of the pool; when the pool is full or memory cannot be had,
+    /// `value` is dropped and the error names the pool's tag.
     #[inline]
-    pub fn try_alloc(&mut self, value: T) -> Result<Pooled<'p, T>, MemError> {
-        if self.len == 0 {
-            self.refill()?;
-        }
-        self.len -= 1;
-        let index = self.items[self.len];
+    pub fn alloc(&mut self, value: T) -> Result<Pooled<'p, T>, MemError> {
+        let index = self.take_free()?;
         let ptr = self.pool.slot(index);
         // SAFETY: a free slot is committed, aligned for `T`, holds no value and is held by
         // this cache alone; the `Pooled` made here becomes its one owner.
@@ -258,14 +265,17 @@ impl<'p, T> Cache<'p, T> {
         Ok(Pooled { pool: self.pool, index, ptr })
     }
 
-    /// Places `value` in a slot of the pool; stops when the pool is full.
+    /// A free slot, now this caller's: the top of the cache, or one a refill brings.
     #[inline]
-    #[track_caller]
-    pub fn alloc(&mut self, value: T) -> Pooled<'p, T> {
-        match self.try_alloc(value) {
-            Ok(pooled) => pooled,
-            Err(error) => fail(&error),
+    fn take_free(&mut self) -> Result<u32, MemError> {
+        // An empty cache's `len - 1` wraps past every index, so `get` misses it: one compare
+        // says both "holds one" and "in bounds".
+        let top = self.len.wrapping_sub(1);
+        if let Some(&index) = self.items.as_flattened().get(top) {
+            self.len = top;
+            return Ok(index);
         }
+        self.refill()
     }
 
     /// Takes the value out and keeps its slot for the next allocation.
@@ -288,78 +298,111 @@ impl<'p, T> Cache<'p, T> {
 
     #[inline]
     fn keep(&mut self, index: u32) {
-        if self.len == CACHE {
-            self.spill();
+        if let Some(slot) = self.items.as_flattened_mut().get_mut(self.len) {
+            *slot = index;
+            self.len += 1;
+            return;
         }
-        self.items[self.len] = index;
-        self.len += 1;
+        self.keep_full(index);
     }
 
+    /// [`Cache::keep`] into a full cache: its upper half goes back to the pool first.
     #[cold]
-    fn refill(&mut self) -> Result<(), MemError> {
+    fn keep_full(&mut self, index: u32) {
+        let [_, upper] = self.items;
+        self.give_batch(upper);
+        let [_, upper] = &mut self.items;
+        let [first, ..] = upper;
+        *first = index;
+        self.len = BATCH + 1;
+    }
+
+    /// Refills the empty cache and takes one slot of the refill: a full batch from the pool,
+    /// else strays, else newly carved slots.
+    #[cold]
+    fn refill(&mut self) -> Result<u32, MemError> {
         let pool = self.pool;
         if let Some(batch) = pool.full.pop(&pool.batch_links) {
             // SAFETY: the batch was popped, so this cache holds it alone; its pusher wrote it
             // before the release push this pop synchronized with.
             let items = unsafe { pool.batch(batch).as_ref() }.items;
-            self.items[..BATCH].copy_from_slice(&items);
-            self.len = BATCH;
+            let [.., last] = items;
+            let [lower, _] = &mut self.items;
+            *lower = items;
+            self.len = BATCH - 1;
             self.stash_descriptor(batch);
-            return Ok(());
+            return Ok(last);
         }
-        while self.len < BATCH {
-            match pool.stray.pop(&pool.slot_links) {
-                Some(index) => {
-                    self.items[self.len] = index;
-                    self.len += 1;
-                }
-                None => break,
-            }
-        }
-        if self.len > 0 {
-            return Ok(());
-        }
-        let (start, count) = pool.carve()?;
-        for (slot, index) in self.items.iter_mut().zip(start..start + count) {
+        let [lower, _] = &mut self.items;
+        let mut popped = 0;
+        let mut last = None;
+        for slot in lower.iter_mut() {
+            let Some(index) = pool.stray.pop(&pool.slot_links) else { break };
             *slot = index;
+            popped += 1;
+            last = Some(index);
         }
-        self.len = count as usize;
-        Ok(())
+        if let Some(index) = last {
+            // The last one popped is taken; those before it stay cached.
+            self.len = popped - 1;
+            return Ok(index);
+        }
+        let (first, last) = pool.carve()?;
+        let mut kept = 0;
+        for (slot, index) in lower.iter_mut().zip(first..last) {
+            *slot = index;
+            kept += 1;
+        }
+        self.len = kept;
+        Ok(last)
     }
 
-    /// Keeps the empty descriptor `batch`; a full stash first gives [`MOVE`] of its own back
-    /// to the pool's empty stack, with one compare-and-swap.
+    /// Keeps the empty descriptor `batch`; a full stash first gives its upper half ([`MOVE`])
+    /// back to the pool's empty stack, with one compare-and-swap.
     fn stash_descriptor(&mut self, batch: u32) {
-        if self.stashed == STASH {
-            let pool = self.pool;
-            pool.empty.push_all(&self.stash[STASH - MOVE..], &pool.batch_links);
+        let pool = self.pool;
+        if self.stashed >= STASH {
+            let [_, upper] = &self.stash;
+            pool.empty.push_all(upper, &pool.batch_links);
             self.stashed = STASH - MOVE;
         }
-        self.stash[self.stashed] = batch;
-        self.stashed += 1;
+        match self.stash.as_flattened_mut().get_mut(self.stashed) {
+            Some(slot) => {
+                *slot = batch;
+                self.stashed += 1;
+            }
+            // Past a stash it just halved: never, and the descriptor still goes to the pool.
+            None => pool.empty.push(batch, &pool.batch_links),
+        }
     }
 
     /// An empty descriptor of this cache's own: from its stash, refilled with up to [`MOVE`]
     /// from the pool's empty stack in one compare-and-swap, else a new one.
     fn take_descriptor(&mut self) -> Result<u32, MemError> {
-        if self.stashed == 0 {
-            let pool = self.pool;
-            self.stashed = pool.empty.pop_some(&pool.batch_links, &mut self.stash[..MOVE]);
-            if self.stashed == 0 {
-                return pool.new_descriptor();
-            }
+        // As in `take_free`: an empty stash's `stashed - 1` wraps past every index.
+        let top = self.stashed.wrapping_sub(1);
+        if let Some(&batch) = self.stash.as_flattened().get(top) {
+            self.stashed = top;
+            return Ok(batch);
         }
-        self.stashed -= 1;
-        Ok(self.stash[self.stashed])
+        let pool = self.pool;
+        let [lower, _] = &mut self.stash;
+        let got = pool.empty.pop_some(&pool.batch_links, lower);
+        let top = got.wrapping_sub(1);
+        if let Some(&batch) = lower.get(top) {
+            self.stashed = top;
+            return Ok(batch);
+        }
+        self.stashed = 0;
+        pool.new_descriptor()
     }
 
+    /// Gives `items`, a batch of free slots this cache held, back to the pool's full stack.
     #[cold]
-    fn spill(&mut self) {
+    fn give_batch(&mut self, items: [u32; BATCH]) {
         let pool = self.pool;
         match self.take_descriptor() {
             Ok(batch) => {
-                let mut items = [0; BATCH];
-                items.copy_from_slice(&self.items[self.len - BATCH..self.len]);
                 // SAFETY: the descriptor is this cache's alone (popped or carved), committed
                 // and aligned; the push below publishes it with a release store.
                 unsafe { pool.batch(batch).write(Batch { items }) };
@@ -367,26 +410,34 @@ impl<'p, T> Cache<'p, T> {
             }
             // Every descriptor is in use: the slots still go back, one at a time.
             Err(_) => {
-                for &index in &self.items[self.len - BATCH..self.len] {
+                for &index in &items {
                     pool.give_one(index);
                 }
             }
         }
-        self.len -= BATCH;
     }
 }
 
 impl<T> Drop for Cache<'_, T> {
     fn drop(&mut self) {
-        while self.len >= BATCH {
-            self.spill();
-        }
-        for &index in &self.items[..self.len] {
-            self.pool.give_one(index);
-        }
+        let len = self.len;
         self.len = 0;
-        self.pool.empty.push_all(&self.stash[..self.stashed], &self.pool.batch_links);
+        // Each half it holds whole goes back as a batch, the rest one slot at a time.
+        let [lower, upper] = self.items;
+        for (half, items) in [lower, upper].into_iter().enumerate() {
+            let held = len.saturating_sub(half * BATCH);
+            if held >= BATCH {
+                self.give_batch(items);
+            } else {
+                for &index in prefix(&items, held) {
+                    self.pool.give_one(index);
+                }
+            }
+        }
+        let stashed = self.stashed;
         self.stashed = 0;
+        let pool = self.pool;
+        pool.empty.push_all(prefix(self.stash.as_flattened(), stashed), &pool.batch_links);
     }
 }
 
@@ -485,36 +536,30 @@ pub struct Counted<T> {
 const MAX_OWNERS: u32 = i32::MAX as u32;
 
 impl<'p, T> Cache<'p, Counted<T>> {
-    /// Places `value` in a slot of the pool with one owner.
+    /// Places `value` in a slot of the pool with one owner; as [`Cache::alloc`] when the pool
+    /// is full.
     #[inline]
-    pub fn try_share(&mut self, value: T) -> Result<Shared<'p, T>, MemError> {
-        let pooled = self.try_alloc(Counted { owners: AtomicU32::new(1), value })?;
+    pub fn share(&mut self, value: T) -> Result<Shared<'p, T>, MemError> {
+        let pooled = self.alloc(Counted { owners: AtomicU32::new(1), value })?;
         let pooled = mem::ManuallyDrop::new(pooled);
         Ok(Shared { pool: pooled.pool, index: pooled.index, ptr: pooled.ptr })
-    }
-
-    /// Places `value` in a slot of the pool with one owner; stops when the pool is full.
-    #[inline]
-    #[track_caller]
-    pub fn share(&mut self, value: T) -> Shared<'p, T> {
-        match self.try_share(value) {
-            Ok(shared) => shared,
-            Err(error) => fail(&error),
-        }
     }
 }
 
 impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
     /// Places `head`, then clones of `fill` up to `N` elements, in a slot with one owner. Each
     /// element is written in place: the array never passes through the stack, so a slot of
-    /// megabytes works, and a copy (`head` a whole array) is one pass over the slot.
-    pub fn try_share_from(&mut self, head: &[E], fill: &E) -> Result<Shared<'p, [E; N]>, MemError> {
-        assert!(head.len() <= N, "{} elements for a slot of {N}", head.len());
-        if self.len == 0 {
-            self.refill()?;
+    /// megabytes works, and a copy (`head` a whole array) is one pass over the slot. A `head`
+    /// longer than `N` is refused, as a full pool is, with nothing taken.
+    pub fn share_from(&mut self, head: &[E], fill: &E) -> Result<Shared<'p, [E; N]>, MemError> {
+        if head.len() > N {
+            return Err(MemError::TooLarge {
+                tag: self.pool.tag,
+                what: "the head of a shared array slot, in elements, against the slot's length",
+                wanted: head.len(),
+            });
         }
-        self.len -= 1;
-        let index = self.items[self.len];
+        let index = self.take_free()?;
         let ptr = self.pool.slot(index);
         let slot = ptr.as_ptr();
         // SAFETY: a free slot is committed, aligned for `Counted<[E; N]>`, holds no value and is
@@ -535,22 +580,14 @@ impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
             unsafe { items.wrapping_add(written.len).write(fill.clone()) }; // clone: the copy into the slot is this call's work
             written.len += 1;
         }
-        mem::forget(written);
+        // Every element is written: the slot is the `Shared`'s now, so the guard lets go of it
+        // without dropping them or returning the slot.
+        let _done = mem::ManuallyDrop::new(written);
         Ok(Shared { pool: self.pool, index, ptr })
-    }
-
-    /// As [`Cache::try_share_from`]; stops when the pool is full.
-    #[inline]
-    #[track_caller]
-    pub fn share_from(&mut self, head: &[E], fill: &E) -> Shared<'p, [E; N]> {
-        match self.try_share_from(head, fill) {
-            Ok(shared) => shared,
-            Err(error) => fail(&error),
-        }
     }
 }
 
-/// The elements a `try_share_from` has written: dropped, and the slot returned, if a clone
+/// The elements a `share_from` has written: dropped, and the slot returned, if a clone
 /// panics.
 struct Written<'p, E, T> {
     pool: &'p Pool<T>,
@@ -616,20 +653,24 @@ impl<'p, T> Shared<'p, T> {
     }
 
     /// The value to change in place: first copied into a fresh slot from `cache` while other
-    /// owners share it, which then keep the old one.
+    /// owners share it, which then keep the old one. When `cache`'s pool has no slot for the
+    /// copy, the error names it and `this` still shares the old one.
     #[inline]
-    #[track_caller]
-    pub fn make_mut<'s>(this: &'s mut Self, cache: &mut Cache<'p, Counted<T>>) -> &'s mut T
+    pub fn make_mut<'s>(
+        this: &'s mut Self,
+        cache: &mut Cache<'p, Counted<T>>,
+    ) -> Result<&'s mut T, MemError>
     where
         T: Clone,
     {
         if Shared::owners(this) != 1 {
-            *this = cache.share(T::clone(this));
+            *this = cache.share(T::clone(this))?;
         }
-        match Shared::get_mut(this) {
-            Some(value) => value,
-            None => unreachable!("a value just placed has one owner"),
-        }
+        // SAFETY: `this` is the value's one owner: its count read 1 above, or it was just
+        // placed with one; only cloning an owner adds one, and `this`, the only owner, is
+        // borrowed uniquely, so none can be made meanwhile. The acquire load in `owners`
+        // ordered every former owner's reads before this write.
+        Ok(unsafe { &mut (*this.ptr.as_ptr()).value })
     }
 }
 
@@ -676,13 +717,37 @@ struct Retired {
     index: u32,
 }
 
+/// A [`Pooled`] a [`Limbo`] did not take ([`Limbo::hold`]), given back with why. Dropping it
+/// drops the value, which a reader may still hold: the caller keeps it linked, or leaks it.
+pub struct NotHeld<'p, T> {
+    pub pooled: Pooled<'p, T>,
+    pub error: MemError,
+}
+
+impl<T> fmt::Debug for NotHeld<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NotHeld")
+            .field("index", &self.pooled.index)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<T> fmt::Display for NotHeld<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "slot {} was not retired: {}", self.pooled.index, self.error)
+    }
+}
+
+impl<T> std::error::Error for NotHeld<'_, T> {}
+
 /// Objects of one pool that were unlinked while readers may still hold them, each kept in its
 /// slot until its grace has passed (docs/v2/plan/design/concurrency.md "Task boundaries
 /// reclaim memory"), then dropped and its slot returned through the limbo's own cache. For
 /// one owner (a writer of the table they were unlinked from).
 ///
-/// Graces are held in start order, so the passed ones are a prefix and [`Limbo::collect`]
-/// finds it with a binary search. Its list sits in a reserved column as long as the pool, so
+/// Graces are held in start order, so the passed ones are a prefix, which [`Limbo::collect`]
+/// walks as it drops them and stops at the first not passed. Its list sits in a reserved column as long as the pool, so
 /// it never allocates; a drained prefix is reused in place.
 pub struct Limbo<'p, T> {
     cache: Cache<'p, T>,
@@ -715,16 +780,24 @@ impl<'p, T> Limbo<'p, T> {
     }
 
     /// Retires `pooled`, which the caller has unlinked (its release stores done): it is
-    /// dropped once every task that may have read it has ended.
-    pub fn retire(&mut self, pooled: Pooled<'p, T>) {
-        self.hold(Grace::start(), pooled);
+    /// dropped once every task that may have read it has ended. As [`Limbo::hold`] when it
+    /// cannot be held.
+    pub fn retire(&mut self, pooled: Pooled<'p, T>) -> Result<(), NotHeld<'p, T>> {
+        self.hold(Grace::start(), pooled)
     }
 
     /// Retires `pooled` under a grace the caller started after unlinking it (one grace for a
     /// batch). A grace older than one held already is held as the newer one: later, never
-    /// sooner.
-    pub fn hold(&mut self, grace: Grace, pooled: Pooled<'p, T>) {
-        assert!(std::ptr::eq(pooled.pool, self.cache.pool), "a Pooled of another pool");
+    /// sooner. A `pooled` of another pool, or one the limbo's list has no room for, is given
+    /// back in the error, undropped: a reader may still hold it.
+    pub fn hold(&mut self, grace: Grace, pooled: Pooled<'p, T>) -> Result<(), NotHeld<'p, T>> {
+        if !std::ptr::eq(pooled.pool, self.cache.pool) {
+            let error = MemError::Refused {
+                tag: self.cache.pool.tag,
+                what: "a Pooled of another pool (rule: a limbo returns slots to its own pool)",
+            };
+            return Err(NotHeld { pooled, error });
+        }
         let pooled = mem::ManuallyDrop::new(pooled);
         let grace = match self.held.last() {
             Some(last) if self.head < self.held.len() => grace.max(last.grace),
@@ -735,30 +808,37 @@ impl<'p, T> Limbo<'p, T> {
             self.head = 0;
         } else if self.head > 0
             && (self.head * 2 >= self.held.len() || self.held.len() == self.held.max_len())
+            && let Some(live) = self.held.len().checked_sub(self.head)
         {
-            let live = self.held.len() - self.head;
+            // `head <= len` (just checked), so the live entries `head..` move to the front
+            // within the list.
             self.held.copy_within(self.head.., 0);
             self.held.truncate(live);
             self.head = 0;
         }
         // Each entry owns a distinct slot and `pooled` owns one more, so the entries fit in a
-        // column as long as the pool.
-        self.held.push(Retired { grace, index: pooled.index });
+        // column as long as the pool; committing its page can still be refused.
+        if let Err(error) = self.held.push(Retired { grace, index: pooled.index }) {
+            return Err(NotHeld { pooled: mem::ManuallyDrop::into_inner(pooled), error });
+        }
+        Ok(())
     }
 
     /// Drops every object whose grace has passed and keeps its slot for the pool. Returns how
     /// many it freed.
     pub fn collect(&mut self) -> usize {
         let horizon = Horizon::now();
-        let passed =
-            self.held[self.head..].partition_point(|retired| horizon.passed(retired.grace));
-        for at in self.head..self.head + passed {
-            let index = self.held[at].index;
+        let mut passed = 0;
+        for retired in self.held.iter().skip(self.head) {
+            if !horizon.passed(retired.grace) {
+                break;
+            }
             // SAFETY: the slot holds the value its `Pooled` owned when it was retired (the
             // `Pooled` was forgotten), no reader can reach it once its grace has passed, and the
             // head moves past it below, so it is dropped once.
-            unsafe { self.cache.pool.slot(index).drop_in_place() };
-            self.cache.keep(index);
+            unsafe { self.cache.pool.slot(retired.index).drop_in_place() };
+            self.cache.keep(retired.index);
+            passed += 1;
         }
         self.head += passed;
         passed
@@ -769,18 +849,18 @@ impl<'p, T> Limbo<'p, T> {
     /// behind a lock other threads wait on, so it does neither slow step under it: an object's
     /// drop takes as long as the object is big (a trait solver's cache of a whole crate is
     /// hundreds of megabytes of maps), and the scan of every reclaim slot that says which graces
-    /// passed is the caller's, taken before it locks ([`Horizon::now`]); here it is a binary
-    /// search of the held graces. [`Limbo::collect`] is for an owner no other thread waits on.
+    /// passed is the caller's, taken before it locks ([`Horizon::now`]); here it is a walk of
+    /// at most `N + 1` held graces. [`Limbo::collect`] is for an owner no other thread waits on.
     pub fn take_passed<const N: usize>(&mut self, horizon: Horizon) -> Passed<'p, T, N> {
-        let passed =
-            self.held[self.head..].partition_point(|retired| horizon.passed(retired.grace)).min(N);
         let mut taken = Passed { pool: self.cache.pool, indices: [0; N], len: 0, dropped: 0 };
-        for at in self.head..self.head + passed {
-            taken.indices[taken.len] = self.held[at].index;
+        let passed =
+            self.held.iter().skip(self.head).take_while(|retired| horizon.passed(retired.grace));
+        for (slot, retired) in taken.indices.iter_mut().zip(passed) {
+            *slot = retired.index;
             taken.len += 1;
         }
         // The head moves past them: the limbo never drops them, `taken` does.
-        self.head += passed;
+        self.head += taken.len;
         taken
     }
 }
@@ -808,8 +888,9 @@ impl<T, const N: usize> Passed<'_, T, N> {
 
 impl<T, const N: usize> Drop for Passed<'_, T, N> {
     fn drop(&mut self) {
-        while self.dropped < self.len {
-            let index = self.indices[self.dropped];
+        while self.dropped < self.len
+            && let Some(&index) = self.indices.get(self.dropped)
+        {
             self.dropped += 1;
             // SAFETY: the limbo handed the slot over with the value retired into it, past its
             // grace (no reader can reach it), and moved its head past it, so only this drops it,
@@ -824,12 +905,11 @@ impl<T> Drop for Limbo<'_, T> {
     fn drop(&mut self) {
         // As `blaze_reclaim::Limbo`: its owner drops it only once no reader can reach what it
         // holds, so everything goes at once.
-        for at in self.head..self.held.len() {
-            let index = self.held[at].index;
+        for retired in self.held.iter().skip(self.head) {
             // SAFETY: the slot holds the value retired into it, dropped once: the limbo is
             // going away and its owner says no reader is left.
-            unsafe { self.cache.pool.slot(index).drop_in_place() };
-            self.cache.keep(index);
+            unsafe { self.cache.pool.slot(retired.index).drop_in_place() };
+            self.cache.keep(retired.index);
         }
         self.head = self.held.len();
     }

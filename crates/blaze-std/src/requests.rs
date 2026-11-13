@@ -26,7 +26,7 @@
 //! connection nor an answer's error can be dropped unseen. [`Http::request`] is the two
 //! together.
 
-use alloc::{borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{alloc::Global, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
 use blaze_http::h1;
@@ -36,7 +36,8 @@ use crate::{
     clock::Clock,
     cx::Cx,
     io::Io,
-    mem::Bytes,
+    mem::{self as bmem, Bytes, Named, OutOfMemory, heap},
+    name::Excerpt,
     narrow::Allowed,
     net::{Addr, Conn, Net, NetError},
     roots::Roots,
@@ -92,20 +93,32 @@ impl Method {
 /// `Transfer-Encoding`, `Connection`), which are the client's to say.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: refcounts
 pub struct Header {
-    name: Arc<str>,
-    value: Arc<str>,
+    name: Arc<String>,
+    value: Arc<String>,
 }
 
-/// What [`Header::new`] refused: the header's name and why.
+/// What [`Header::new`] refused: the header's name and why, or that it could not be kept.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
-pub struct HeaderError {
-    pub name: String,
-    pub why: String,
+pub enum HeaderError {
+    /// The header is none: its name (its start when it is long, kept in the error, which
+    /// allocates nothing), and why, as blaze-http's h1 says.
+    Refused { name: Excerpt, why: String },
+    /// The global heap had no room to keep the header, or its error's name.
+    Stopped(Stopped),
 }
 
 impl fmt::Display for HeaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "header {:?}: {}", self.name, self.why)
+        match self {
+            HeaderError::Refused { name, why } => write!(f, "header {name:?}: {why}"),
+            HeaderError::Stopped(stopped) => write!(f, "a header could not be kept: {stopped}"),
+        }
+    }
+}
+
+impl From<OutOfMemory> for HeaderError {
+    fn from(full: OutOfMemory) -> HeaderError {
+        HeaderError::Stopped(Stopped::from(full))
     }
 }
 
@@ -114,19 +127,19 @@ impl core::error::Error for HeaderError {}
 impl Header {
     pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
         if let Some(why) = h1::refuse_header(name, value) {
-            // alloc: an error's message.
-            return Err(HeaderError { name: name.to_owned(), why });
+            return Err(HeaderError::Refused { name: Excerpt::of(name), why });
         }
-        // alloc: once per header, its name and value.
-        Ok(Header { name: Arc::from(name), value: Arc::from(value) })
+        // alloc: once per header, its name and value, and the handles their clones share.
+        let (name, value) = (heap::shared(heap::string(name)?)?, heap::shared(heap::string(value)?)?);
+        Ok(Header { name, value })
     }
 
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     pub fn value(&self) -> &str {
-        &self.value
+        self.value.as_str()
     }
 }
 
@@ -186,6 +199,9 @@ pub enum HttpKind {
     TooBig { most: usize },
     /// Its [`Wire::reads_most`], `reads` receives, did not bring the answer's end.
     Unending { reads: usize },
+    /// A [`Http::handler`] left fewer bytes in the caller's [`Bytes`] than it was handed:
+    /// `had` before it ran, `left` after. It may add to them, never take away.
+    Shrank { had: usize, left: usize },
 }
 
 /// A request that failed: the call, the URL and how.
@@ -217,6 +233,11 @@ impl fmt::Display for HttpError {
             HttpKind::Unending { reads } => {
                 write!(f, "{reads} receives did not bring its answer's end (rule bounded-progress)")
             }
+            HttpKind::Shrank { had, left } => write!(
+                f,
+                "its handler left {left} bytes in the caller's bytes, which held {had} before it \
+                 ran: a handler adds to them and never takes away"
+            ),
         }
     }
 }
@@ -226,6 +247,12 @@ impl core::error::Error for HttpError {}
 impl From<Stopped> for HttpKind {
     fn from(stopped: Stopped) -> HttpKind {
         HttpKind::Stopped(stopped)
+    }
+}
+
+impl From<OutOfMemory> for HttpKind {
+    fn from(full: OutOfMemory) -> HttpKind {
+        HttpKind::Stopped(Stopped::from(full))
     }
 }
 
@@ -242,12 +269,19 @@ pub struct SimRoute {
 }
 
 /// The simulated host's requests ([`crate::Io::http`]).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SimHttp {
     /// What it answers; a URL with no route is answered 404 with no body.
     pub routes: Vec<SimRoute>,
     /// Every request it was asked, in order.
-    pub asked: Vec<(Method, Url)>,
+    // alloc: the simulated host's record, which lives as long as the world.
+    pub asked: bmem::Vec<(Method, Url), Global>,
+}
+
+impl Default for SimHttp {
+    fn default() -> SimHttp {
+        SimHttp { routes: Vec::new(), asked: bmem::Vec::new_in(Global) }
+    }
 }
 
 /// Who answers.
@@ -288,11 +322,13 @@ impl Http {
     }
 
     /// Requests answered by `handler`: a fake for a test, a cache, a proxy.
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the handler.
     pub fn handler(
         handler: impl Fn(&Cx, &Request<'_>, &mut Bytes<'_>) -> Result<u16, Stopped> + Send + Sync + 'static,
-    ) -> Http {
+    ) -> Result<Http, Stopped> {
         // alloc: once per capability, its handler.
-        Http { provider: Provider::Handler(Arc::new(handler)), allowed: Allowed::Any, plant: Plant::None }
+        let handler: Arc<Handler> = heap::shared(handler)?;
+        Ok(Http { provider: Provider::Handler(handler), allowed: Allowed::Any, plant: Plant::None })
     }
 
     /// Requests the host makes for the program.
@@ -333,21 +369,7 @@ impl Http {
         if origin.scheme().as_str() == "https" {
             return Err(refuse(HttpKind::NoTls));
         }
-        // The core's input: blaze-http's h1 writes a request's head into a `Vec`.
-        let host = match origin.scheme().default_port() == Some(origin.at().port()) {
-            // alloc: once per request, its `Host`.
-            true => origin.at().host().to_owned(),
-            // alloc: once per request, its `Host`.
-            false => origin.at().to_string(),
-        };
-        // alloc: once per request, its headers as the core takes them.
-        let headers: Vec<(String, String)> =
-            request.headers.iter().map(|it| (it.name().to_owned(), it.value().to_owned())).collect();
-        // alloc: once per request, its head and body as sent.
-        let mut sent = Vec::new();
-        let method = request.method.of_core();
-        h1::write_request(&mut sent, &method, request.url.target(), &host, wire.user_agent, false, &headers, request.body.len(), None);
-        sent.extend_from_slice(request.body);
+        let sent = sent_bytes(origin, request, wire).map_err(|full| refuse(HttpKind::from(full)))?;
         // clone: the address connected to, a refcount.
         let conn = match net.connect(cx, &Addr::Tcp(origin.at().clone())) {
             Ok(conn) => conn,
@@ -420,7 +442,14 @@ impl Exchange<'_> {
             }
         };
         match answered {
-            Ok(status) => Ok(Response { status, body: into.len() - start }),
+            Ok(status) => match into.len().checked_sub(start) {
+                Some(body) => Ok(Response { status, body }),
+                None => {
+                    // clone: an error's name of its URL, refcounts.
+                    let kind = HttpKind::Shrank { had: start, left: into.len() };
+                    Err(HttpError { op: HttpOp::Finish, url: request.url.clone(), kind })
+                }
+            },
             Err(kind) => {
                 into.truncate(start);
                 // clone: an error's name of its URL, refcounts.
@@ -441,7 +470,7 @@ fn hosted(io: &Io, cx: &Cx, request: &Request<'_>, into: &mut Bytes<'_>) -> Resu
     cx.stopped_by(io.now())?;
     let answered = io.script(|host| {
         // clone: the simulated host's record, refcounts.
-        host.http.asked.push((request.method, request.url.clone()));
+        host.http.asked.push((request.method, request.url.clone()))?;
         match host.http.routes.iter().find(|route| &route.url == request.url) {
             Some(route) => into.extend(&route.body).map(|()| route.status),
             None => Ok(404),
@@ -450,6 +479,72 @@ fn hosted(io: &Io, cx: &Cx, request: &Request<'_>, into: &mut Bytes<'_>) -> Resu
     match answered {
         Some(answered) => Ok(answered?),
         None => Err(HttpKind::NoProvider),
+    }
+}
+
+/// The bytes a request is sent as: its head as blaze-http's h1 writes it, then its body.
+/// They are reserved whole before the core writes the head, so the core's own growth of its
+/// `Vec` (which cannot fail by its signature) never allocates: [`HEAD_MOST_FIXED`] bounds what
+/// it adds around the request's own text.
+fn sent_bytes(origin: &Origin, request: &Request<'_>, wire: Wire) -> Result<Vec<u8>, OutOfMemory> {
+    // The core's input: blaze-http's h1 takes the `Host` and the headers as std `String`s.
+    let host = match origin.scheme().default_port() == Some(origin.at().port()) {
+        // alloc: once per request, its `Host`.
+        true => heap::string(origin.at().host())?,
+        // alloc: once per request, its `Host`.
+        false => origin.at().joined()?,
+    };
+    // alloc: once per request, its headers as the core takes them.
+    let mut headers = bmem::Vec::with_capacity_in(request.headers.len(), Global)?;
+    for header in request.headers {
+        headers.push((heap::string(header.name())?, heap::string(header.value())?))?;
+    }
+    let headers = headers.into_std();
+    // A sum past `usize` saturates, and the reservation of it is refused.
+    let target = request.url.target();
+    let own = [target.len(), host.len(), wire.user_agent.len(), request.body.len(), HEAD_MOST_FIXED];
+    let each = headers.iter().map(|(name, value)| name.len().saturating_add(value.len()).saturating_add(HEADER_MOST_FIXED));
+    let room = own.into_iter().chain(each).fold(0usize, usize::saturating_add);
+    // alloc: once per request, its head and body as sent, freed once they are.
+    let mut sent = bmem::Vec::with_capacity_in(room, Global)?.into_std();
+    let method = request.method.of_core();
+    h1::write_request(&mut sent, &method, target, &host, wire.user_agent, false, &headers, request.body.len(), None);
+    let mut sent = bmem::Vec::from_std(sent);
+    sent.extend_from_slice(request.body)?;
+    Ok(sent.into_std())
+}
+
+/// The most bytes blaze-http's h1 writes around a request's target, host and user agent:
+/// `PATCH ` and ` HTTP/1.1\r\n` (17), `host: ` and its line end (8), `user-agent: ` and its
+/// (14), `content-length: ` with twenty digits and its (38), and the blank line (2), rounded up.
+const HEAD_MOST_FIXED: usize = 128;
+
+/// The most bytes it writes around one header's name and value: `: ` and the line end.
+const HEADER_MOST_FIXED: usize = 4;
+
+/// What a growth on the global heap that found no room says, for `asked` more bytes.
+fn global_full(asked: usize) -> HttpKind {
+    HttpKind::Stopped(Stopped::OutOfMemory { arena: Global.name(), asked })
+}
+
+/// The first `took` bytes of `unread` dropped, the rest moved to its start; a `took` past its
+/// end is the core's error.
+fn consume(unread: &mut bmem::Vec<u8, Global>, took: usize) -> Result<(), HttpKind> {
+    let Some(left) = unread.len().checked_sub(took) else {
+        // alloc: an error's message, which `HttpKind::Protocol` owns as a std `String`.
+        return Err(said("blaze-http's h1 said it took more bytes than it was given"));
+    };
+    unread.as_mut_slice().copy_within(took.., 0);
+    unread.truncate(left);
+    Ok(())
+}
+
+/// [`HttpKind::Protocol`] saying `text`, or [`HttpKind::Stopped`] if the global heap has no
+/// room for it.
+fn said(text: &str) -> HttpKind {
+    match heap::string(text) {
+        Ok(said) => HttpKind::Protocol(said),
+        Err(full) => HttpKind::from(full),
     }
 }
 
@@ -467,14 +562,14 @@ fn read_answer(
     let start = into.len();
     // alloc: the core's input and output: blaze-http's h1 parses a head from, and decodes a
     // body into, a `Vec`. Freed as this returns.
-    let (mut unread, mut decoded): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+    let (mut unread, mut decoded) = (bmem::Vec::new_in(Global), Vec::new());
     let mut received = cx.bytes();
     let mut head: Option<h1::Head> = None;
     for _ in 0..wire.reads_most {
         if head.is_none() {
             match h1::parse_head(&unread, request.method == Method::Head).map_err(HttpKind::Protocol)? {
                 Some(parsed) => {
-                    unread.drain(..parsed.len);
+                    consume(&mut unread, parsed.len)?;
                     // An informational answer (1xx) is not the answer: the next head is.
                     if (100..200).contains(&parsed.status) {
                         continue;
@@ -485,11 +580,15 @@ fn read_answer(
             }
         }
         if let Some(head) = &mut head {
+            // A body decodes to no more bytes than it came in, so with this room the core's
+            // own growth of `decoded` never allocates.
+            decoded.clear();
+            decoded.try_reserve(unread.len()).map_err(|_| global_full(unread.len()))?;
             let (took, ended) = head.body.decode(&unread, &mut decoded).map_err(HttpKind::Protocol)?;
-            unread.drain(..took);
+            consume(&mut unread, took)?;
             into.extend(&decoded)?;
             decoded.clear();
-            if into.len() - start > wire.body_most {
+            if into.len().saturating_sub(start) > wire.body_most {
                 return Err(HttpKind::TooBig { most: wire.body_most });
             }
             if ended {
@@ -498,15 +597,14 @@ fn read_answer(
         }
         received.clear();
         let got = conn.recv(&cx, RECV, &mut received).map_err(HttpKind::Net)?;
-        if got == 0 {
+        if got.is_zero() {
             // The peer closed: that ends a body framed by the close, and nothing else.
             return match &head {
                 Some(head) => head.body.closed().map(|()| head.status).map_err(HttpKind::Protocol),
-                // alloc: an error's message.
-                None => Err(HttpKind::Protocol("the connection closed before an answer's head was whole".to_owned())),
+                None => Err(said("the connection closed before an answer's head was whole")),
             };
         }
-        unread.extend_from_slice(received.as_slice());
+        unread.extend_from_slice(received.as_slice())?;
     }
     Err(HttpKind::Unending { reads: wire.reads_most })
 }

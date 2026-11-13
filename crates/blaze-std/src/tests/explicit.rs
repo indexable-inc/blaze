@@ -20,7 +20,7 @@ use crate::{
     io::{Io, Limits, SimWorld},
     kv::{Key, Kv},
     local::{Pair, pair},
-    mem::TASK_FRAME,
+    mem::{ByteLen, Offset, TASK_FRAME},
     trace::RecordKind,
 };
 
@@ -109,15 +109,15 @@ fn no_unsynced_call_waits_for_the_device_and_each_synced_one_does() {
     dir.rename_replacing_unsynced(&cx, &path("a"), &path("b"), Unsynced::No).expect("a rename");
     let file = create(&cx, &dir, "log");
     file.append_unsynced(&cx, b"0123456789", Unsynced::No).expect("an append");
-    file.write_at_unsynced(&cx, 2, b"xx", Unsynced::No).expect("a write");
-    file.set_len_unsynced(&cx, 6, Unsynced::No).expect("a cut");
+    file.write_at_unsynced(&cx, Offset::new(2), b"xx", Unsynced::No).expect("a write");
+    file.set_len_unsynced(&cx, ByteLen::new(6), Unsynced::No).expect("a cut");
     let written = file.close_unsynced(Unsynced::No).expect("a close");
     assert_eq!(held(&cx, &dir, "log").as_deref(), Some(&b"01xx45"[..]));
     dir.remove_unsynced(&cx, &path("b"), Unsynced::No).expect("a remove");
-    let kv = Kv::beneath(&dir.subdir(&path("kv")));
+    let kv = Kv::beneath(&dir.subdir(&path("kv")).expect("a subdirectory"));
     kv.put_unsynced(&cx, &Key::new("k").expect("a key"), b"v", Unsynced::No).expect("a put");
     kv.delete_unsynced(&cx, &Key::new("k").expect("a key"), Unsynced::No).expect("a delete");
-    let blobs = Blobs::beneath(&dir.subdir(&path("blobs")));
+    let blobs = Blobs::beneath(&dir.subdir(&path("blobs")).expect("a subdirectory"));
     let id = blobs.put_unsynced(&cx, b"blob", Unsynced::No).expect("a put");
     blobs.delete_unsynced(&cx, &id, Unsynced::No).expect("a delete");
     let counts = io.disk().expect("a simulated disk");
@@ -271,7 +271,7 @@ fn a_publish_says_how_it_was_made_in_its_result_and_its_span() {
     assert_eq!(base.how, How::Written);
     let cloned = dir.publish_synced(&cx, &path("same"), Content::file(&base.file)).expect("a clone");
     assert_eq!(cloned.how, How::Cloned);
-    let patches = [crate::fs::Patch { at: 2, bytes: b"xx" }, crate::fs::Patch { at: 9, bytes: b"yz" }];
+    let patches = [crate::fs::Patch { at: Offset::new(2), bytes: b"xx" }, crate::fs::Patch { at: Offset::new(9), bytes: b"yz" }];
     let derived = dir.publish_synced(&cx, &path("near"), Content::patch_of(&base.file, &patches)).expect("a derive");
     assert_eq!(derived.how, How::Derived);
     assert_eq!(held(&cx, &dir, "same").as_deref(), Some(&b"0123456789"[..]));
@@ -341,7 +341,7 @@ fn a_blob_torn_by_a_crash_is_refused_not_handed_back() {
         let mut into = cx.bytes();
         match blobs.get(&cx, &id, &mut into) {
             Ok(None) => {}
-            Ok(Some(read)) => assert_eq!((read, into.as_slice()), (200, &[5u8; 200][..]), "seed {seed}"),
+            Ok(Some(read)) => assert_eq!((read, into.as_slice()), (ByteLen::new(200), &[5u8; 200][..]), "seed {seed}"),
             Err(error) => {
                 assert!(matches!(error.kind, BlobsKind::Corrupt { .. }), "seed {seed}: {error}");
                 assert!(into.is_empty(), "seed {seed}: bytes of a torn blob were handed back");
@@ -356,9 +356,9 @@ fn a_blob_torn_by_a_crash_is_refused_not_handed_back() {
 fn an_env_says_not_allowed_apart_from_not_set() {
     let mut sim = SimWorld::new(13, Limits::USUAL);
     sim.env = vec![("HOME".to_owned(), "/home/sim".to_owned()), ("SECRET".to_owned(), "s3".to_owned())];
-    let io = Io::simulated(sim);
+    let io = Io::simulated(sim).expect("a simulated world");
     let name = |raw: &str| VarName::new(raw).expect("a test's variable");
-    let env = io.need_env().expect("an environment").only(&[name("HOME"), name("UNSET")]);
+    let env = io.need_env().expect("an environment").only(&[name("HOME"), name("UNSET")]).expect("room for the narrowed environment");
     assert_eq!(env.get(&name("HOME")), Ok(Some("/home/sim")));
     assert_eq!(env.get(&name("UNSET")), Ok(None));
     let refused = env.get(&name("SECRET")).expect_err("narrowed away");
@@ -370,8 +370,8 @@ fn an_env_says_not_allowed_apart_from_not_set() {
 fn a_task_gets_the_scratch_its_spawn_names() {
     let io = world(14, Plant::None);
     let cx = root(&io);
-    let scope = cx.scope();
-    let small = scope.spawn("small", 64 << 10, |cx| -> Result<(), Stopped> { cx.bytes().extend(&vec![0; 8 << 20]) });
+    let scope = cx.scope().expect("a scope");
+    let small = scope.spawn("small", ByteLen::new(64 << 10), |cx| -> Result<(), Stopped> { cx.bytes().extend(&vec![0; 8 << 20]) });
     let roomy = scope.spawn("roomy", TASK_FRAME, |cx| -> Result<(), Stopped> { cx.bytes().extend(&vec![0; 1 << 20]) });
     let (small, roomy) = (small.join(&cx), roomy.join(&cx));
     let joined = scope.join(&cx);
@@ -380,7 +380,7 @@ fn a_task_gets_the_scratch_its_spawn_names() {
     assert!(failed.to_string().contains("more bytes would pass its limit"), "{failed}");
     assert!(joined.is_err(), "the scope fails with its task");
     // The root's frame is said too.
-    let tight = io.cx(Duration::from_secs(1), 64 << 10).expect("a root context");
+    let tight = io.cx(Duration::from_secs(1), ByteLen::new(64 << 10)).expect("a root context");
     assert!(matches!(tight.bytes().extend(&vec![0; 8 << 20]), Err(Stopped::OutOfMemory { .. })));
 }
 
@@ -389,12 +389,12 @@ fn a_local_pair_has_the_capacity_it_was_given_and_write_all_says_how_far_it_got(
     let io = world(15, Plant::None);
     let cx = root(&io);
     let clock = io.need_clock().expect("a clock");
-    let Pair { first, second } = pair("explicit", NonZero::new(4).expect("a capacity"));
+    let Pair { first, second } = pair("explicit", NonZero::new(4).expect("a capacity")).expect("a pair");
     let short = cx.until(clock.after(Duration::from_millis(1)));
     let stopped = first.write_all(&short, b"0123456").expect_err("seven bytes do not fit four");
     assert_eq!(stopped.moved, 4);
     let mut into = cx.bytes();
-    assert_eq!(second.read(&cx, 16, &mut into).expect("a read"), 4);
+    assert_eq!(second.read(&cx, 16, &mut into).expect("a read"), ByteLen::new(4));
     assert_eq!(into.as_slice(), b"0123");
     first.finish(&cx);
     second.finish(&cx);
@@ -425,11 +425,11 @@ fn a_buffered_writer_holds_bytes_until_it_is_full_or_finished_and_says_which() {
     let closed = file.close_unsynced(Unsynced::No);
     assert_eq!(first, (Ok(Pushed::Held), 0, 3));
     assert_eq!(second, (Ok(Pushed::Held), 0, 6));
-    assert_eq!(third, (Ok(Pushed::Wrote(6)), 6, 3));
-    assert_eq!(fourth, (Ok(Pushed::Wrote(13)), 19, 0));
+    assert_eq!(third, (Ok(Pushed::Wrote(ByteLen::new(6))), 6, 3));
+    assert_eq!(fourth, (Ok(Pushed::Wrote(ByteLen::new(13))), 19, 0));
     assert_eq!(fifth, (Ok(Pushed::Held), 19, 2));
     assert_eq!(before_finish.as_deref(), Some(&b"abcdefghi0123456789"[..]), "held bytes are not in the file");
-    assert_eq!(finished, Ok(2));
+    assert_eq!(finished, Ok(ByteLen::new(2)));
     assert_eq!(after_finish.as_deref(), Some(&b"abcdefghi0123456789xy"[..]));
     assert!(closed.is_ok());
     // An append with no buffer is in the file when its call returns.
@@ -446,7 +446,7 @@ fn a_worlds_limits_are_the_ones_its_maker_said() {
         close_most: 4,
         trace_most: 2,
     };
-    let io = Io::simulated(SimWorld::new(21, limits));
+    let io = Io::simulated(SimWorld::new(21, limits)).expect("a simulated world");
     assert_eq!(io.limits(), limits);
     let cx = root(&io);
     for what in ["one", "two", "three", "four"] {
@@ -469,7 +469,7 @@ fn a_streams_inbox_is_bounded_by_what_its_opener_said() {
     let origin = origin.origin().expect("an origin");
     let echo = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
         reply.extend(sent)
-    });
+    }).expect("room for a handler");
     let mut heard = cx.bytes();
     // A stream is linear: finished whatever it carried, and checked after.
     let outcome = match echo.open(&cx, origin, 8) {
@@ -483,7 +483,7 @@ fn a_streams_inbox_is_bounded_by_what_its_opener_said() {
         }
         Err(error) => panic!("a stream to a handler: {error}"),
     };
-    assert_eq!(outcome, (true, Err(Refused::InboxFull { held: 5, most: 8 }), Ok(5), true, true));
+    assert_eq!(outcome, (true, Err(Refused::InboxFull { held: 5, most: 8 }), Ok(ByteLen::new(5)), true, true));
     assert_eq!(heard.as_slice(), b"12345", "the refused reply left nothing behind");
 }
 

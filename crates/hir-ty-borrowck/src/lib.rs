@@ -1292,7 +1292,7 @@ fn normalized_env<'db>(interner: DbInterner<'db>, env: ParamEnv<'db>) -> ParamEn
         }
     });
     blaze_mem::frame::current(|frame| {
-        ParamEnv::new(Clauses::new_from_slice(frame.alloc_slice_from_iter(clauses)))
+        ParamEnv::new(Clauses::new_from_slice(frame.alloc_slice_from_iter(clauses).unwrap_or_else(|error| panic!("{error}"))))
     })
 }
 

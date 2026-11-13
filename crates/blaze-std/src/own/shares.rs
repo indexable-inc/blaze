@@ -25,11 +25,17 @@
 //!   with the path. And a part put anywhere is still a linear value its holder must hand
 //!   back: the whole cannot be taken while it is missing.
 
-use alloc::boxed::Box;
-use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
+use alloc::{alloc::Global, boxed::Box};
+use core::{alloc::AllocError, marker::PhantomData, ops::Deref, ptr::NonNull};
 
-use super::reach::{Acyclic, Jointly, Owns};
-use crate::cell::Token;
+use super::{
+    Refused,
+    reach::{Acyclic, Jointly, Owns},
+};
+use crate::{
+    cell::Token,
+    mem::{Named, OutOfMemory},
+};
 
 /// `N` of the `D` parts of a `T`, of the kind `K`. See the module's doc.
 #[blaze::linear]
@@ -42,16 +48,25 @@ pub struct Shares<#[blaze::linear] T, K, const N: usize, const D: usize> {
 
 impl<#[blaze::linear] T: Acyclic, K, const D: usize> Shares<T, K, D, D> {
     /// All `D` parts of `value`, of the kind of `token`, which is used up: a kind has one
-    /// value.
+    /// value. With no room on the global heap the value comes back in the [`Refused`] (the
+    /// token is used up either way).
     #[blaze::consumes]
-    pub fn new(token: Token<K>, value: T) -> Shares<T, K, D, D>
+    pub fn new(token: Token<K>, value: T) -> Result<Shares<T, K, D, D>, Refused<T>>
     where
         const { D >= 1 },
     {
         let _used: Token<K> = token;
-        // alloc: the one allocation of the value its parts share; freed by `whole`.
-        let value = NonNull::from(Box::leak(Box::new(value)));
-        Shares { value, kind: PhantomData, owns: PhantomData }
+        // alloc: the one allocation of the value its parts share; freed by `whole`. The block
+        // is made before the value moves, so a refusal still has it to give back.
+        let slot = match Box::<T>::try_new_uninit() {
+            Ok(slot) => slot,
+            Err(AllocError) => {
+                let error = OutOfMemory { arena: Global.name(), asked: size_of::<T>() };
+                return Err(Refused { value, error });
+            }
+        };
+        let value = NonNull::from(Box::leak(Box::write(slot, value)));
+        Ok(Shares { value, kind: PhantomData, owns: PhantomData })
     }
 }
 

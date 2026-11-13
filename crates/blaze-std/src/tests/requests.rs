@@ -236,7 +236,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let cx = root(&io);
     let net = io.need_net().map_err(|e| format!("harness: {e}"))?;
     let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
-    let fake = Http::handler(|_: &Cx, request: &Request<'_>, into: &mut Bytes<'_>| application(request, into));
+    let fake = Http::handler(|_: &Cx, request: &Request<'_>, into: &mut Bytes<'_>| application(request, into)).expect("room for a handler");
     let real = Http::over(&net, &clock, &Roots::none(), WIRE);
     let (fake, real) = match plan.only {
         Some(only) => {

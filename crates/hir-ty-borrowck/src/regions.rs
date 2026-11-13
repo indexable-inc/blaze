@@ -7023,7 +7023,7 @@ impl<'f> Universes<'f> {
     ) -> Self {
         Universes {
             fresh: frame
-                .alloc_slice_fill_with(universes as usize, |_| ctx.infcx.create_next_universe()),
+                .alloc_slice_fill_with(universes as usize, |_| ctx.infcx.create_next_universe()).unwrap_or_else(|error| panic!("{error}")),
             of_var: in_universe,
         }
     }

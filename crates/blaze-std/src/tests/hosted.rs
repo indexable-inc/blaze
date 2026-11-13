@@ -111,7 +111,7 @@ fn roots_none_trusts_no_one_and_narrows_to_nothing() {
     assert!(none.is_empty());
     let name = crate::name::Authority::new("anyone").expect("a name");
     assert!(!none.trusts(&name));
-    assert!(none.only(std::slice::from_ref(&name)).is_empty());
+    assert!(none.only(std::slice::from_ref(&name)).expect("room for the narrowed set").is_empty());
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn the_locale_and_the_user_are_the_hosts() {
     let io = sim();
     let cx = root(&io);
     let locale = io.need_locale().expect("the simulation has a locale");
-    assert_eq!(locale, crate::locale::Locale::simulated());
+    assert_eq!(locale, crate::locale::Locale::simulated().expect("the simulated locale"));
     let user = io.need_user().expect("the simulation has a user");
     assert_eq!((user.name().as_str(), user.uid(), user.gid()), ("sim", 1000, 1000));
     // The home is a directory, with a directory's authority: a file written through it is
@@ -344,7 +344,7 @@ fn blobs_are_kept_under_what_they_are_and_checked_as_they_are_read() {
     let id = blobs.put_synced(&cx, b"some bytes").expect("a put");
     assert_eq!(id, BlobId::of(b"some bytes"));
     let mut read = cx.bytes();
-    assert_eq!(blobs.get(&cx, &id, &mut read).expect("a get"), Some(10));
+    assert_eq!(blobs.get(&cx, &id, &mut read).expect("a get"), Some(crate::mem::ByteLen::new(10)));
     assert_eq!(read.as_slice(), b"some bytes");
     assert!(blobs.has(&cx, &id).expect("a has"));
     assert_eq!(blobs.list(&cx, cx.frame()).expect("a list").as_slice(), [id]);
@@ -409,7 +409,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     let origin = url.origin().expect("an origin");
     let shout = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
         reply.extend(&sent.to_ascii_uppercase())
-    });
+    }).expect("room for a handler");
     let mut heard = cx.bytes();
     // A stream is linear: finished whatever it carried, and checked after.
     let carried = match shout.open(&cx, origin, 1 << 16) {
@@ -419,7 +419,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
             let rest = stream.recv(&cx, 64, &mut heard);
             let end = stream.recv(&cx, 64, &mut heard);
             let finished = stream.finish(&cx);
-            sent.is_ok() && first == Ok(3) && rest == Ok(2) && end == Ok(0) && finished.is_ok()
+            sent.is_ok() && first == Ok(crate::mem::ByteLen::new(3)) && rest == Ok(crate::mem::ByteLen::new(2)) && end == Ok(crate::mem::ByteLen::new(0)) && finished.is_ok()
         }
         Err(_) => false,
     };
@@ -434,7 +434,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
             let sent = stream.send_all(&cx, b"hi");
             let received = stream.recv(&cx, 64, &mut greeted);
             let finished = stream.finish(&cx);
-            sent.is_ok() && received == Ok(7) && finished.is_ok()
+            sent.is_ok() && received == Ok(crate::mem::ByteLen::new(7)) && finished.is_ok()
         }
         Err(_) => false,
     };

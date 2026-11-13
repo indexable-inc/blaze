@@ -63,8 +63,7 @@ impl Automation {
                 return Err(Refused::NotFound);
             }
             // clone: the simulated host's record, a refcount.
-            host.pressed.push((app.clone(), key));
-            Ok(())
+            hosted::record(&mut host.pressed, (app.clone(), key))
         })
         .map_err(refuse)
     }

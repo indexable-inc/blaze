@@ -45,7 +45,7 @@ mod tests {
             let mut ids: FrameVec<'_, u32> = Vec::new_in(frame);
             ids.extend(0..100_000);
             let doubled = collect_in(ids.iter().map(|it| u64::from(*it) * 2), frame);
-            let bytes = frame.alloc_slice_fill_with(4096, |_| 0xccu8);
+            let bytes = frame.alloc_slice_fill_with(4096, |_| 0xccu8).expect("room");
             let kept: &[u32] =
                 collect_in(ids.iter().copied().filter(|it| it % 3 == 0), frame).leak();
             (doubled[99_999], bytes[4095], kept.len())

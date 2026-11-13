@@ -13,7 +13,7 @@
 //! waits. The callback's refcon is the outbox, which the session holds until after it is
 //! invalidated (field order: [`Live`] drops first), after which VideoToolbox calls no more.
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{alloc::Global, sync::Arc, vec::Vec};
 use core::{alloc::Allocator, ffi::c_void, ptr::NonNull};
 
 use blaze_core::lock::Lock;
@@ -46,7 +46,10 @@ use objc2_video_toolbox::{
 };
 
 use super::{Colour, EncoderConfig, Frame, Packet, PixelFormat, VideoError};
-use crate::gpu::Gpu;
+use crate::{
+    gpu::Gpu,
+    mem::{self, Named, OutOfMemory, heap},
+};
 
 /// Frames handed to the encoder and not yet back, past which [`Session::send`] has the encoder
 /// finish the oldest first: each holds a pool buffer (25 MB at 4K in P010).
@@ -60,12 +63,52 @@ struct Done(CFRetained<CMSampleBuffer>);
 // receiving thread uses it.
 unsafe impl Send for Done {}
 
+/// One callback's outcome: its sample buffer, or why there is none.
+type Outcome = Result<Done, VideoError>;
+
 /// What the callback leaves for [`Session::receive`].
 struct Outbox {
-    /// Each finished frame, in decode order (the order VideoToolbox calls back in).
-    ready: VecDeque<Result<Done, VideoError>>,
+    /// Each finished frame, in decode order (the order VideoToolbox calls back in); those
+    /// before `head` are taken (`None`), and go once they are half of it.
+    // alloc: the outbox's queue, on the global heap: the encoder's threads have no caller's
+    // allocator.
+    ready: mem::Vec<Option<Outcome>, Global>,
+    head: usize,
     /// Frames finished, dropped or failed: every callback.
     done: u64,
+    /// The first growth of `ready` that found no room. The frame it held is lost, so every
+    /// receive after it says so (rule no-fallback: the stream is not quietly short a frame).
+    lost: Option<OutOfMemory>,
+}
+
+impl Outbox {
+    /// `outcome` at the end of the queue; when the queue has no room, it is lost, and said.
+    fn put(&mut self, outcome: Outcome) {
+        if let Err(error) = self.ready.push(Some(outcome)) {
+            self.lost.get_or_insert(error);
+        }
+    }
+
+    /// The oldest outcome not yet taken, or `None`; the error once one was lost.
+    fn take(&mut self) -> Result<Option<Outcome>, VideoError> {
+        if let Some(lost) = self.lost {
+            return Err(VideoError::OutOfMemory {
+                what: "the encoder's outbox (a finished frame was lost)",
+                asked: lost.asked,
+            });
+        }
+        let next = self.ready.get_mut(self.head).and_then(Option::take);
+        if next.is_some() {
+            self.head += 1;
+        }
+        // The taken slots go once they are half the queue: each outcome moves at most once
+        // per halving, so a take is constant time over a run.
+        if self.head > 0 && self.head * 2 >= self.ready.len() {
+            self.ready.retain(Option::is_some);
+            self.head = 0;
+        }
+        Ok(next)
+    }
 }
 
 /// The session, invalidated when it drops: after that VideoToolbox makes no more callbacks.
@@ -106,8 +149,7 @@ unsafe extern "C-unwind" fn encoded(
         }
     };
     let mut outbox = outbox.lock();
-    // alloc: the outbox's ring, on the encoder's thread, which has no caller's allocator.
-    outbox.ready.push_back(result);
+    outbox.put(result);
     outbox.done += 1;
 }
 
@@ -179,9 +221,8 @@ pub(super) struct Session {
     config: EncoderConfig,
     /// CoreVideo's names for the config's colour, for each frame's attachments.
     colour: [&'static CFString; 3],
-    /// The times of the last frames sent, oldest first, at most [`IN_FLIGHT`].
-    // alloc: IN_FLIGHT times, made once with the session.
-    recent: VecDeque<i64>,
+    /// The times of the last [`IN_FLIGHT`] frames sent: frame `n`'s at `n % IN_FLIGHT`.
+    recent: [i64; IN_FLIGHT],
     sent: u64,
     last_time: Option<i64>,
     finished: bool,
@@ -228,12 +269,13 @@ impl Session {
             );
             (spec, attrs)
         };
+        let out_of_memory = |error: OutOfMemory| VideoError::OutOfMemory { what: "the encoder's outbox", asked: error.asked };
+        // alloc: the outbox's queue, on the global heap, which the encoder's threads share.
+        let ready = mem::Vec::with_capacity_in(IN_FLIGHT + 1, Global).map_err(out_of_memory)?;
+        let outbox = Lock::new("bstd.video.videotoolbox.outbox", Outbox { ready, head: 0, done: 0, lost: None });
         // Declared before the session, so it drops after it on every return below.
-        // alloc: the outbox's ring, shared with the encoder's threads.
-        let outbox = Arc::new(Lock::new(
-            "bstd.video.videotoolbox.outbox",
-            Outbox { ready: VecDeque::new(), done: 0 },
-        ));
+        // alloc: the outbox, shared with the encoder's threads.
+        let outbox = heap::shared(outbox).map_err(out_of_memory)?;
         let mut out: *mut VTCompressionSession = core::ptr::null_mut();
         // SAFETY: the dictionaries hold the value types VideoToolbox documents for their keys
         // (CFBoolean, CFNumber, CFDictionary); the callback matches VTCompressionOutputCallback;
@@ -274,7 +316,7 @@ impl Session {
             outbox,
             config: *config,
             colour,
-            recent: VecDeque::with_capacity(IN_FLIGHT + 1),
+            recent: [0; IN_FLIGHT],
             sent: 0,
             last_time: None,
             finished: false,
@@ -319,14 +361,18 @@ impl Session {
             )
         };
         checked("VTCompressionSessionEncodeFrame", status)?;
+        let n = self.sent;
         self.sent += 1;
         self.last_time = Some(at);
-        self.recent.push_back(at);
+        // Frame `n`'s slot held frame `n - IN_FLIGHT`'s time: the one sent IN_FLIGHT frames ago.
+        let slot = (n % IN_FLIGHT as u64) as usize;
+        let Some(cell) = self.recent.get_mut(slot) else {
+            return Err(VideoError::Internal { what: "the recent frames' times", index: slot, len: IN_FLIGHT });
+        };
+        let oldest = core::mem::replace(cell, at);
         // The bound on pool buffers held: when more than IN_FLIGHT frames are still inside,
         // have the encoder finish every frame up to the one sent IN_FLIGHT frames ago.
-        if self.recent.len() > IN_FLIGHT
-            && let Some(oldest) = self.recent.pop_front()
-        {
+        if n >= IN_FLIGHT as u64 {
             let done = self.outbox.lock().done;
             if self.sent - done > IN_FLIGHT as u64 {
                 // SAFETY: a live session; a numeric time completes the frames up to it.
@@ -362,7 +408,7 @@ impl Session {
             CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags(0))
         })?;
         let mut copied = Ok(());
-        for (index, (plane, rows)) in frame.planes().iter().zip(rows).enumerate() {
+        'planes: for (index, (plane, rows)) in frame.planes().iter().zip(rows).enumerate() {
             let base = CVPixelBufferGetBaseAddressOfPlane(buffer, index).cast::<u8>();
             let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, index);
             if base.is_null() || stride < row || CVPixelBufferGetHeightOfPlane(buffer, index) < rows {
@@ -370,8 +416,13 @@ impl Session {
                 break;
             }
             for r in 0..rows {
-                // Frame::new checked the plane holds every row: stride * (rows - 1) + row bytes.
-                let source = &plane.bytes[r * plane.stride..r * plane.stride + row];
+                // Frame::new checked the plane holds every row (stride * (rows - 1) + row bytes,
+                // which fits a usize), so this is never out of range; were it, it is an error.
+                let start = r * plane.stride;
+                let Some(source) = plane.bytes.get(start..start + row) else {
+                    copied = Err(VideoError::Frame { time: at, why: "a plane's bytes are fewer than its rows" });
+                    break 'planes;
+                };
                 // SAFETY: `base` is the locked plane, at least `rows` rows of `stride` bytes (just
                 // checked), so row `r`'s start is in it.
                 let target = unsafe { base.add(r * stride) };
@@ -387,8 +438,8 @@ impl Session {
     }
 
     /// The next finished packet, in `alloc`, or `None`; never waits.
-    pub(super) fn receive<A: Allocator>(&mut self, alloc: A) -> Result<Option<Packet<A>>, VideoError> {
-        let next = self.outbox.lock().ready.pop_front();
+    pub(super) fn receive<A: Allocator + Named>(&mut self, alloc: A) -> Result<Option<Packet<A>>, VideoError> {
+        let next = self.outbox.lock().take()?;
         let Some(next) = next else { return Ok(None) };
         let Done(sample) = next?;
         if self.hvcc.is_none() {
@@ -415,12 +466,12 @@ impl Session {
         if len == 0 {
             return Err(VideoError::Missing { what: "the packet's bytes" });
         }
-        let mut data = Vec::new_in(alloc);
-        data.try_reserve_exact(len).map_err(|_| VideoError::OutOfMemory { what: "a packet's bytes", asked: len })?;
-        data.resize(len, 0);
-        // SAFETY: `data` is `len` writable bytes, the length the block buffer reports; the copy
+        let out_of_memory = |error: OutOfMemory| VideoError::OutOfMemory { what: "a packet's bytes", asked: error.asked };
+        let mut data = mem::Vec::with_capacity_in(len, alloc).map_err(out_of_memory)?;
+        let bytes = data.extend_filled(len, 0).map_err(out_of_memory)?;
+        // SAFETY: `bytes` is `len` writable bytes, the length the block buffer reports; the copy
         // reads only the block buffer.
-        let status = unsafe { block.copy_data_bytes(0, len, NonNull::from(&mut data[..]).cast()) };
+        let status = unsafe { block.copy_data_bytes(0, len, NonNull::from(bytes).cast()) };
         checked("CMBlockBufferCopyDataBytes", status)?;
         Ok(Some(Packet { data, pts, dts, duration, timescale, key: is_key(&sample) }))
     }
@@ -579,14 +630,21 @@ fn hvcc_of(sample: &CMSampleBuffer) -> Result<Vec<u8>, VideoError> {
     let payload = payload.downcast::<CFData>().map_err(|_| missing)?;
     // SAFETY: a CFData the format description owns and nothing mutates while it is read here.
     let bytes = unsafe { payload.as_bytes_unchecked() };
-    // alloc: the stream's hvcC, once, kept for the muxer's track.
-    Ok(bytes.to_vec())
+    heap::bytes(bytes) // alloc: the stream's hvcC, once, kept for the muxer's track.
+        .map_err(|error| VideoError::OutOfMemory { what: "the stream's hvcC", asked: error.asked })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::video::{Encoder, Layout, Muxer, Plane, Track};
+
+    /// `len` bytes of `value`, as a plane holds them.
+    fn filled(len: usize, value: u8) -> mem::Vec<u8, Global> {
+        let mut bytes = mem::Vec::new_in(Global);
+        bytes.resize(len, value).expect("room for a plane");
+        bytes
+    }
 
     /// The provider's whole path on this Mac's media engine: frames in, an `hvcC` and packets
     /// (the first a key frame, decode times rising) out, muxed into an MP4. Needs the hardware
@@ -608,8 +666,8 @@ mod tests {
         let mut packets = Vec::new();
         for i in 0..10i64 {
             let shade = (i * 20) as u8;
-            let luma = Plane { stride: 128, bytes: vec![shade; 128 * 64] };
-            let chroma = Plane { stride: 128, bytes: vec![128; 128 * 32] };
+            let luma = Plane { stride: 128, bytes: filled(128 * 64, shade) };
+            let chroma = Plane { stride: 128, bytes: filled(128 * 32, 128) };
             let frame = Frame::new(PixelFormat::Nv12, (128, 64), [luma, chroma], (i * 20, 20, 600)).expect("a frame");
             encoder.send(&frame).expect("the encoder takes the frame");
             while let Some(p) = encoder.receive(std::alloc::Global).expect("a packet") {

@@ -30,7 +30,7 @@ fn track(colour: Colour) -> Track<'static> {
 }
 
 fn packet(data: Vec<u8>, dts: i64, pts: i64, duration: u32, key: bool) -> Packet<Global> {
-    Packet { data, pts, dts, duration, timescale: TIMESCALE, key }
+    Packet { data: crate::mem::Vec::from_std(data), pts, dts, duration, timescale: TIMESCALE, key }
 }
 
 /// A run of packets as an encoder with B-frames gives them, in decode order: decode times
@@ -145,7 +145,7 @@ fn expected(packets: &[Packet<Global>]) -> Vec<Got> {
         .iter()
         .enumerate()
         .map(|(i, p)| Got {
-            data: p.data.clone(),
+            data: p.data.to_vec(),
             dt: p.dts - d0,
             offset: p.pts - p.dts,
             duration: match packets.get(i + 1) {

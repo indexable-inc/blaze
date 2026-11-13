@@ -108,7 +108,7 @@ pub(crate) mod tagged {
         /// now.
         pub(crate) fn insert(&mut self, tag: Tag, value: T) -> (Id<T>, Option<T>) {
             let old = self.remove(tag);
-            let id = self.slab.insert(Entry { tag, value });
+            let id = self.slab.insert(Entry { tag, value }).unwrap_or_else(|error| panic!("{error}"));
             self.by_tag.insert(tag, id);
             (id, old)
         }
@@ -672,7 +672,7 @@ impl Threads {
     fn connection(&mut self, socket: crate::net::Socket) -> crate::Conn {
         // alloc: once per connection, shared with the errands that read and write it.
         let socket = Arc::new(socket);
-        crate::Conn(self.conns.insert(Connection { socket }).to_bits())
+        crate::Conn(self.conns.insert(Connection { socket }).unwrap_or_else(|error| panic!("{error}")).to_bits())
     }
 
     #[cfg(unix)]

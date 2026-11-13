@@ -378,7 +378,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         else {
             return Default::default();
         };
-        let legacy_const_generics_indices = frame.alloc_slice_copy(legacy_const_generics_indices);
+        let legacy_const_generics_indices = frame.alloc_slice_copy(legacy_const_generics_indices).unwrap_or_else(|error| panic!("{error}"));
 
         // only use legacy const generics if the param count matches with them
         if data.params.len() + legacy_const_generics_indices.len() != args.len() {

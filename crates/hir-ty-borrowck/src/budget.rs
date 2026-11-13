@@ -263,7 +263,7 @@ fn composing_solving_and_reading_a_large_body_allocates_nothing() {
     for shape in [Shape::Loops, Shape::Mixed] {
         frame::task(Tag::Mir, |frame| {
             let case = differential::large_case(frame, &mut rng, shape);
-            let row = frame.alloc_slice_fill_with(case.words(), |_| 0);
+            let row = frame.alloc_slice_fill_with(case.words(), |_| 0).expect("room");
             let want = differential::solve(frame, &case, row);
             let got = assert_at_most(0, &format!("solving a {shape:?} body"), || {
                 differential::solve(frame, &case, row)

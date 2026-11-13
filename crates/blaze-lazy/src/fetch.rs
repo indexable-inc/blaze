@@ -198,7 +198,7 @@ impl Fetcher {
         };
         match waiters.entry(lazy) {
             Entry::Vacant(ends) => {
-                let at = waiting.try_insert(Waiting { to, next: None }).map_err(full)?;
+                let at = waiting.insert(Waiting { to, next: None }).map_err(full)?;
                 ends.insert((at, at));
             }
             Entry::Occupied(mut ends) => {
@@ -211,7 +211,7 @@ impl Fetcher {
                     }
                     at = waiter.next;
                 }
-                let new = waiting.try_insert(Waiting { to, next: None }).map_err(full)?;
+                let new = waiting.insert(Waiting { to, next: None }).map_err(full)?;
                 waiting
                     .get_mut(ends.get().1)
                     .expect("a function's waiters are live in the slab")

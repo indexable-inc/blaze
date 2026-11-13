@@ -310,7 +310,7 @@ impl SignatureTree {
         frame: &Frame,
     ) -> SignatureTree {
         let tree = copy_without(node, elided, None);
-        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(|&it| ast::ptr(it)));
+        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(|&it| ast::ptr(it))).unwrap_or_else(|error| panic!("{error}"));
         let ast_id_map =
             source.ast_id_map.relative_without_view(node, ast::Node::root(&tree), ptrs);
         let span_map = source.span_map.within(TextRange::new(node.text_range().start(), spans_end));
@@ -626,8 +626,8 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             }
         });
         let outline = copy_without(root, &bodies, Some(CUT));
-        let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it)));
-        let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
+        let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it))).unwrap_or_else(|error| panic!("{error}"));
+        let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range)).unwrap_or_else(|error| panic!("{error}"));
         let mut cut = TextSize::new(0);
         let cuts = ptrs
             .iter()

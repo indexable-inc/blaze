@@ -1194,7 +1194,7 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
         let mut place: hashbrown::HashMap<Crate, u32, FixedState, &Frame> =
             hashbrown::HashMap::with_capacity_and_hasher_in(all.len(), FixedState, frame);
         place.extend(all.iter().enumerate().map(|(at, &krate)| (krate, at as u32)));
-        let starts = frame.alloc_slice_fill_with(all.len() + 1, |_| 0u32);
+        let starts = frame.alloc_slice_fill_with(all.len() + 1, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         for &from in all.iter() {
             for dep in &from.data(db).dependencies {
                 starts[place[&dep.crate_id] as usize + 1] += 1;
@@ -1203,8 +1203,8 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
         for at in 1..starts.len() {
             starts[at] += starts[at - 1];
         }
-        let next = frame.alloc_slice_copy(&starts[..all.len()]);
-        let edges = frame.alloc_slice_fill_with(starts[all.len()] as usize, |_| krate);
+        let next = frame.alloc_slice_copy(&starts[..all.len()]).unwrap_or_else(|error| panic!("{error}"));
+        let edges = frame.alloc_slice_fill_with(starts[all.len()] as usize, |_| krate).unwrap_or_else(|error| panic!("{error}"));
         for &from in all.iter() {
             for dep in &from.data(db).dependencies {
                 let to = place[&dep.crate_id] as usize;
@@ -1212,7 +1212,7 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
                 next[to] += 1;
             }
         }
-        let seen = frame.alloc_slice_fill_with(all.len(), |_| false);
+        let seen = frame.alloc_slice_fill_with(all.len(), |_| false).unwrap_or_else(|error| panic!("{error}"));
         let mut order = Vec::new_in(frame);
         let mut worklist = Vec::new_in(frame);
         worklist.push(krate);
@@ -1619,7 +1619,7 @@ impl CrateGraphBuilder {
                 all: FxIndexSet::with_capacity_and_hasher(len, FixedState),
                 visited: HashMap::with_capacity_in(len, Global),
                 root_files: HashSet::with_capacity_in(len, Global),
-                done: frame.alloc_slice_fill_with(len, |_| None),
+                done: frame.alloc_slice_fill_with(len, |_| None).unwrap_or_else(|error| panic!("{error}")),
                 frame,
             };
             for krate in self.iter() {

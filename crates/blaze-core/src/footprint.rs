@@ -71,7 +71,7 @@ impl Watch {
             Ok(slab) => slab,
             Err(error) => panic!("{error}"),
         });
-        let id = slab.insert(Entry { pid, limit, seen: 0, done: false });
+        let id = slab.insert(Entry { pid, limit, seen: 0, done: false }).unwrap_or_else(|error| panic!("{error}"));
         drop(entries);
         SAMPLER.wake.notify_one();
         Watch { id, pid }

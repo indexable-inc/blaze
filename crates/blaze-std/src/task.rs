@@ -1,7 +1,7 @@
 //! Structured tasks (docs/v2/plan/design/std.md, "Tasks and waiting"): a scope is a value.
 //!
 //! ```text
-//! let scope = cx.scope();
+//! let scope = cx.scope()?;
 //! let a = scope.spawn("a", TASK_FRAME, |cx| read(cx, &dir));
 //! let b = scope.spawn("b", TASK_FRAME, |cx| read(cx, &dir));
 //! let (a, b) = (a.join(cx), b.join(cx));
@@ -33,7 +33,7 @@
 //! `Inline` and is refused at run time with [`TaskWhy::CannotOverlap`] (the spec makes it a
 //! compile error; that check does not exist yet).
 
-use alloc::{borrow::ToOwned, string::{String, ToString}};
+use alloc::{borrow::Cow, boxed::Box, string::String};
 use core::{
     any::Any,
     cell::{Cell, RefCell},
@@ -50,6 +50,7 @@ use crate::{
     rt::{catch_unwind, resume_unwind},
     cx::Cx,
     host::Exit,
+    mem::{ByteLen, FormatError, heap},
 };
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
@@ -65,17 +66,46 @@ pub const LAYOUT: Layout = Layout::Inline;
 /// How a task failed.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub enum TaskWhy {
-    /// It returned this error.
-    Failed(String),
-    /// It panicked, saying this.
-    Panicked(String),
+    /// It returned this error: its `Display`, or why that could not be kept (no room on the
+    /// global heap for the text, or a `Display` that returned an error).
+    Failed(Cow<'static, str>),
+    /// It panicked, saying this: the panic's own text, moved out of its payload (no copy).
+    Panicked(Cow<'static, str>),
     /// Its frame could not be made.
     OutOfMemory(Stopped),
+    /// The scope itself could not be made ([`Cx::scope_with`]): no room for its cancellation.
+    /// Its task is the span the scope was asked for in.
+    NoScope(Stopped),
     /// It was spawned to overlap what follows, and the layout cannot overlap: it never ran.
     CannotOverlap { layout: Layout },
     /// The scope was joined with this many tasks still running, after its wait for them
     /// stopped so.
     Unended { running: usize, stopped: Stopped },
+}
+
+impl TaskWhy {
+    /// A second copy (the scope's, beside its task's), whose text is copied fallibly: a
+    /// message that finds no room for the copy says so in it.
+    fn copied(&self) -> TaskWhy {
+        match self {
+            TaskWhy::Failed(said) => TaskWhy::Failed(copy(said)),
+            TaskWhy::Panicked(said) => TaskWhy::Panicked(copy(said)),
+            // clone: the other reasons hold no text on the heap.
+            other => other.clone(),
+        }
+    }
+}
+
+/// `said` again: a borrowed text as it is, an owned one copied on the global heap.
+fn copy(said: &Cow<'static, str>) -> Cow<'static, str> {
+    match said {
+        Cow::Borrowed(text) => Cow::Borrowed(text),
+        // alloc: an error's message, on the global heap as the first copy is.
+        Cow::Owned(text) => match heap::string(text) {
+            Ok(text) => Cow::Owned(text),
+            Err(_) => Cow::Borrowed("a message that found no room on the global heap for the scope's copy"),
+        },
+    }
 }
 
 /// The first task of a scope that failed: the scope (its task's span), the task and how.
@@ -96,6 +126,9 @@ impl fmt::Display for TaskError {
             }
             TaskWhy::OutOfMemory(stopped) => {
                 write!(f, "bstd::task {task} of a scope in {scope} got no frame: {stopped}")
+            }
+            TaskWhy::NoScope(stopped) => {
+                write!(f, "bstd::task a scope in {scope} could not be made: {stopped}")
             }
             TaskWhy::CannotOverlap { layout } => write!(
                 f,
@@ -154,8 +187,8 @@ impl Live {
         let error = TaskError { scope: self.cx.name(), task, why };
         let mut failed = self.failed.borrow_mut();
         if failed.is_none() {
-            // clone: an error, kept for the scope and returned to its task.
-            *failed = Some(error.clone());
+            // A second copy, kept for the scope beside the one returned to its task.
+            *failed = Some(TaskError { scope: error.scope, task: error.task, why: error.why.copied() });
         }
         error
     }
@@ -217,36 +250,34 @@ impl<'p> Scope<'p> {
     ///
     /// `scratch` is the most bytes the task's frame (`cx.frame()`) hands out: an allocation
     /// past it is the task's [`Stopped::OutOfMemory`], naming the task. It is reserved as
-    /// address space here and committed as it is used.
+    /// address space here and committed as it is used. A `scratch` more than this target's
+    /// memory can address is that out-of-memory too (`asked` is then `usize::MAX`).
     pub fn spawn<T, E: fmt::Display>(
         &self,
         name: &'static str,
-        scratch: usize,
+        scratch: ByteLen,
         task: impl FnOnce(&Cx) -> Result<T, E>,
     ) -> Task<'_, T> {
         let live = &self.live;
         live.last.set(name);
-        let frame = match Frame::named(name, scratch, blaze_mem::Tag::Frames) {
-            Ok(frame) => frame,
-            Err(_) => {
-                let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
+        let cx = match task_cx(live, name, scratch) {
+            Ok(cx) => cx,
+            Err(stopped) => {
                 let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
                 return Task { name, outcome: Err(error), scope: PhantomData };
             }
         };
-        let cx = live.cx.task(name, frame);
         live.running.set(live.running.get() + 1);
         let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
         live.running.set(live.running.get() - 1);
         drop(cx);
         let outcome = match ran {
             Ok(Ok(made)) => Ok(made),
-            // alloc: an error's message.
-            Ok(Err(error)) => Err(live.fail(name, TaskWhy::Failed(error.to_string()))),
+            Ok(Err(error)) => Err(live.fail(name, TaskWhy::Failed(message(&error)))),
             Err(payload) => match payload.downcast::<Exit>() {
                 // The process exits: not this task's failure, so it is passed on.
                 Ok(exit) => resume_unwind(exit),
-                Err(payload) => Err(live.fail(name, TaskWhy::Panicked(said(&*payload)))),
+                Err(payload) => Err(live.fail(name, TaskWhy::Panicked(said(payload)))),
             },
         };
         Task { name, outcome, scope: PhantomData }
@@ -259,12 +290,12 @@ impl<'p> Scope<'p> {
     pub fn spawn_concurrent<T, E: fmt::Display>(
         &self,
         name: &'static str,
-        scratch: usize,
+        scratch: ByteLen,
         task: impl FnOnce(&Cx) -> Result<T, E>,
     ) -> Task<'_, T> {
         match LAYOUT {
             Layout::Inline => {
-                let _: usize = scratch;
+                let _: ByteLen = scratch;
                 drop(task);
                 self.live.last.set(name);
                 let error = self.live.fail(name, TaskWhy::CannotOverlap { layout: LAYOUT });
@@ -324,16 +355,36 @@ impl<T> Task<'_, T> {
     }
 }
 
-/// What a panic said.
-fn said(payload: &(dyn Any + Send)) -> String {
-    match payload.downcast_ref::<&'static str>() {
-        // alloc: an error's message.
-        Some(said) => (*said).to_owned(),
-        None => match payload.downcast_ref::<String>() {
-            // clone: an error's message.
-            Some(said) => said.clone(),
-            // alloc: an error's message.
-            None => "a payload that is not text".to_owned(),
+/// The context of the task `name` of `live`'s scope, in a frame of `scratch` bytes, or the
+/// task's [`Stopped::OutOfMemory`].
+fn task_cx(live: &Live, name: &'static str, scratch: ByteLen) -> Result<Cx, Stopped> {
+    let bytes = scratch
+        .in_memory()
+        .map_err(|_| Stopped::OutOfMemory { arena: name, asked: usize::MAX })?;
+    let frame = Frame::named(name, bytes, blaze_mem::Tag::Frames)
+        .map_err(|_| Stopped::OutOfMemory { arena: name, asked: bytes })?;
+    live.cx.task(name, frame)
+}
+
+/// What a task's error said, as its `Display` writes it, or why that text could not be kept.
+fn message(error: &impl fmt::Display) -> Cow<'static, str> {
+    // alloc: an error's message, on the global heap because the task's frame is gone.
+    match heap::format(format_args!("{error}")) {
+        Ok(said) => Cow::Owned(said),
+        Err(FormatError::Full(_)) => {
+            Cow::Borrowed("an error whose message found no room on the global heap")
+        }
+        Err(FormatError::Trait) => Cow::Borrowed("an error whose `Display` returned an error"),
+    }
+}
+
+/// What a panic said: its text moved out of the payload, which copies nothing.
+fn said(payload: Box<dyn Any + Send>) -> Cow<'static, str> {
+    match payload.downcast::<&'static str>() {
+        Ok(said) => Cow::Borrowed(*said),
+        Err(payload) => match payload.downcast::<String>() {
+            Ok(said) => Cow::Owned(*said),
+            Err(_) => Cow::Borrowed("a payload that is not text"),
         },
     }
 }

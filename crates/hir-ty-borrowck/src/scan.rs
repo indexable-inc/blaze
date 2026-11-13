@@ -229,7 +229,7 @@ impl<'f, 'db> Scan<'f, 'db> {
             }
         }
         if !spelled_paths.is_empty() {
-            let parent = frame.alloc_slice_fill_with(count, |_| NONE);
+            let parent = frame.alloc_slice_fill_with(count, |_| NONE).unwrap_or_else(|error| panic!("{error}"));
             for expr in store.expr_ids() {
                 store.walk_child_exprs(expr, |child| parent[raw(child)] = raw(expr) as u32);
             }

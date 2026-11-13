@@ -19,7 +19,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use core::time::Duration;
+use core::{alloc::Allocator, time::Duration};
+
+use crate::mem::{Named, OutOfMemory, Vec};
 
 pub use blaze_http::h3::{
     ALPN, ClientConfig, Closed, ConnId, Direction, Endpoint, Error, Event, Identity, LINGER,
@@ -31,12 +33,26 @@ pub use blaze_http::h3::{
 /// order it made them; then when it next needs [`Endpoint::advance_clock`], on its epoch's
 /// scale (`None`: not until a datagram or an ask comes). A driver calls it after each call into
 /// the core; the containers, and so their allocator, are the caller's.
-pub fn drain(
+///
+/// Room for each is made before it is taken from the endpoint, so when a container has no
+/// room ([`OutOfMemory`]) nothing is lost: what was not taken stays in the endpoint for the
+/// next drain, and what was taken is in the containers.
+pub fn drain<A: Allocator + Named, B: Allocator + Named>(
     endpoint: &mut Endpoint,
-    transmits: &mut impl Extend<Transmit>,
-    events: &mut impl Extend<Event>,
-) -> Option<Duration> {
-    transmits.extend(core::iter::from_fn(|| endpoint.next_transmit()));
-    events.extend(core::iter::from_fn(|| endpoint.next_event()));
-    endpoint.next_deadline()
+    transmits: &mut Vec<Transmit, A>,
+    events: &mut Vec<Event, B>,
+) -> Result<Option<Duration>, OutOfMemory> {
+    loop {
+        transmits.reserve(1)?;
+        let Some(transmit) = endpoint.next_transmit() else { break };
+        // Within the room just made: it does not grow.
+        transmits.push(transmit)?;
+    }
+    loop {
+        events.reserve(1)?;
+        let Some(event) = endpoint.next_event() else { break };
+        // Within the room just made: it does not grow.
+        events.push(event)?;
+    }
+    Ok(endpoint.next_deadline())
 }

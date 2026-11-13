@@ -19,7 +19,7 @@
 //! the bytes or the room are there already; under a fiber layout the other end's task wakes
 //! it.
 
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{alloc::Global, sync::Arc};
 use core::{fmt, num::NonZero};
 
 use blaze_core::lock::Lock;
@@ -28,7 +28,7 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     fs::{Dir, ReadOnly, Rights},
-    mem::Bytes,
+    mem::{self as bmem, ByteLen, Bytes, heap},
     narrow::Allowed,
     net::{self, Addr, Conn, Listener, Net, NetError, NetKind, NetOp},
     path::Path,
@@ -73,9 +73,12 @@ impl fmt::Display for LocalError {
 
 impl core::error::Error for LocalError {}
 
-/// One direction of a pair: the bytes written and not yet read.
+/// One direction of a pair: the bytes written and not yet read, oldest first. Its room is
+/// reserved as the pair is made and it never holds more than `capacity`, so a write never
+/// grows it; a read moves what is left to its start.
 struct Pipe {
-    bytes: VecDeque<u8>,
+    // alloc: once per pair, a direction's buffer, never grown past its capacity.
+    bytes: bmem::Vec<u8, Global>,
     capacity: usize,
     /// The writing end was finished: a read of what is left, then 0.
     writer_gone: bool,
@@ -144,19 +147,20 @@ pub struct Pair {
 /// A connected pair in memory named `name`, each direction holding at most `capacity` bytes
 /// written and not yet read: the pair's one buffer, sized by its maker and never grown. A
 /// capacity of zero cannot be asked for (it was once raised to one unsaid). The two buffers
-/// are made in the global heap, once, here.
-pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
+/// are made in the global heap, once, here: [`Stopped::OutOfMemory`] when it has no room.
+pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Result<Pair, Stopped> {
     let capacity = capacity.get();
-    let pipe = |lock: &'static str| {
+    let pipe = |lock: &'static str| -> Result<Lock<Pipe>, Stopped> {
         // alloc: once per pair, a direction's buffer, never grown past its capacity.
-        let bytes = VecDeque::with_capacity(capacity);
-        Lock::new(lock, Pipe { bytes, capacity, writer_gone: false, reader_gone: false })
+        let bytes = bmem::Vec::with_capacity_in(capacity, Global)?;
+        Ok(Lock::new(lock, Pipe { bytes, capacity, writer_gone: false, reader_gone: false }))
     };
+    let (forth, back) = (pipe("bstd.local.forth")?, pipe("bstd.local.back")?);
     // alloc: once per pair, what its two ends share.
-    let link = Arc::new(Link { name, forth: pipe("bstd.local.forth"), back: pipe("bstd.local.back") });
+    let link = heap::shared(Link { name, forth, back })?;
     let first = End { half: Half { link: Arc::clone(&link), first: true, open: true } };
     let second = End { half: Half { link, first: false, open: true } };
-    Pair { first, second }
+    Ok(Pair { first, second })
 }
 
 impl End {
@@ -175,20 +179,25 @@ impl End {
         cx.stopped_by(io.now()).map_err(|stopped| refuse(LocalKind::Stopped(stopped), 0))?;
         let cx = cx.span("bstd::local write_all: room in the pipe");
         let drops = cx.plant() == Plant::LocalDropsChunk;
-        let mut moved = 0;
+        let (mut moved, mut rest) = (0, bytes);
         let waited = cx.wait_for(io, || {
             let mut pipe = self.half.out().lock();
             if pipe.reader_gone {
                 return Some(Err(LocalKind::Closed));
             }
-            let room = pipe.capacity - pipe.bytes.len();
-            let take = room.min(bytes.len() - moved);
+            let room = pipe.capacity.saturating_sub(pipe.bytes.len());
+            // At most `room` bytes of what is left: all of it when it is shorter.
+            let (chunk, after) = rest.split_at_checked(room).unwrap_or((rest, &[]));
             // The planted bug: a chunk written behind unread bytes is said written and lost.
             if !(drops && !pipe.bytes.is_empty()) {
-                pipe.bytes.extend(&bytes[moved..moved + take]);
+                // Within the room reserved as the pair was made: it never grows.
+                if let Err(full) = pipe.bytes.extend_from_slice(chunk) {
+                    return Some(Err(LocalKind::Stopped(Stopped::from(full))));
+                }
             }
-            moved += take;
-            (moved == bytes.len()).then_some(Ok(()))
+            moved += chunk.len();
+            rest = after;
+            rest.is_empty().then_some(Ok(()))
         });
         match waited {
             Ok(Ok(())) => Ok(()),
@@ -200,31 +209,36 @@ impl End {
     /// The bytes the other end wrote and this has not read, at most `most`, added to `into`;
     /// how many, 0 once the other end was finished and everything it wrote is read. Where the
     /// pipe is empty it waits for the other end to write, until `cx`'s deadline.
-    pub fn read(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, LocalError> {
+    pub fn read(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<ByteLen, LocalError> {
         let name = self.half.link.name;
         let refuse = |stopped| LocalError { op: LocalOp::Read, pair: name, kind: LocalKind::Stopped(stopped), moved: 0 };
         let io = cx.io();
         cx.stopped_by(io.now()).map_err(refuse)?;
         if most == 0 {
-            return Ok(0);
+            return Ok(ByteLen::ZERO);
         }
         // Room is made before the pipe's lock is taken: nothing allocates under it.
         into.reserve(most).map_err(refuse)?;
         let cx = cx.span("bstd::local read: bytes in the pipe");
         let waited = cx.wait_for(io, || {
             let mut pipe = self.half.inward().lock();
-            let take = most.min(pipe.bytes.len());
+            let held = pipe.bytes.len();
+            let take = most.min(held);
             if take == 0 {
-                return pipe.writer_gone.then_some(Ok(0));
+                return pipe.writer_gone.then_some(Ok(ByteLen::ZERO));
             }
             let slot = match into.grow_zeroed(take) {
                 Ok(slot) => slot,
                 Err(stopped) => return Some(Err(stopped)),
             };
-            for (to, byte) in slot.iter_mut().zip(pipe.bytes.drain(..take)) {
-                *to = byte;
+            for (to, byte) in slot.iter_mut().zip(pipe.bytes.iter()) {
+                *to = *byte;
             }
-            Some(Ok(take))
+            // What was read leaves the pipe; what is left moves to its start. `take` is at
+            // most what it holds.
+            pipe.bytes.as_mut_slice().copy_within(take.., 0);
+            pipe.bytes.truncate(held - take);
+            Some(Ok(ByteLen::of_memory(take)))
         });
         match waited {
             Ok(Ok(read)) => Ok(read),
@@ -278,13 +292,19 @@ impl Local {
     }
 
     /// The socket at `path` as an address, and the network that reaches only it.
-    fn socket(&self, path: &Path) -> (Addr, Net) {
-        (Addr::Unix(self.dir.path_beneath(path)), Net::new(self.dir.io().clone()))
+    /// A path that cannot be put beneath the directory is [`NetKind::Socket`], at the path
+    /// as given.
+    fn socket(&self, op: NetOp, path: &Path) -> Result<(Addr, Net), NetError> {
+        match self.dir.path_beneath(path) {
+            Ok(beneath) => Ok((Addr::Unix(beneath), Net::new(self.dir.io().clone()))),
+            // clone: an error's address, a refcount.
+            Err(error) => Err(net::error(op, &Addr::Unix(path.clone()), NetKind::Socket(error))),
+        }
     }
 
     /// A connection to the socket at `path`: finished with [`Conn::finish`].
     pub fn connect(&self, cx: &Cx, path: &Path) -> Result<Conn, NetError> {
-        let (addr, net) = self.socket(path);
+        let (addr, net) = self.socket(NetOp::Connect, path)?;
         if !self.allowed.allows(path) {
             return Err(net::error(NetOp::Connect, &addr, NetKind::NotAllowed));
         }
@@ -293,7 +313,7 @@ impl Local {
 
     /// Listens on the socket at `path`, making it: finished with [`Listener::close`].
     pub fn listen(&self, cx: &Cx, path: &Path) -> Result<Listener, NetError> {
-        let (addr, net) = self.socket(path);
+        let (addr, net) = self.socket(NetOp::Listen, path)?;
         if !self.listens || !self.allowed.allows(path) {
             return Err(net::error(NetOp::Listen, &addr, NetKind::NotAllowed));
         }

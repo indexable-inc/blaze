@@ -263,3 +263,9 @@ disallowed-methods = [
     { path = "blaze_hash::Set::with_capacity_in", reason = "infallible growth: over an allocator with no room it reaches alloc's handle_alloc_error, which ends the process (decision D29, docs/v2/plan/design/fallible-bstd.md): bstd's Map and Set insert fallibly; a queue is a blaze_mem::Vec or a ring of fixed size", allow-invalid = true },
     { path = "blaze_hash::Set::from_iter_in", reason = "infallible growth: over an allocator with no room it reaches alloc's handle_alloc_error, which ends the process (decision D29, docs/v2/plan/design/fallible-bstd.md): bstd's Map and Set insert fallibly; a queue is a blaze_mem::Vec or a ring of fixed size", allow-invalid = true },
 ]
+
+# Decision D29: a bstd error keeps the text it names inline (`name::Excerpt`, 64 bytes) rather
+# than in a `String` it would have to allocate, and so cannot fail, where it is made; an error
+# with an address or a nested error of that kind passes clippy's default of 128 bytes. The
+# bound stays, raised to what those errors take, so a larger one is still refused.
+large-error-threshold = 256

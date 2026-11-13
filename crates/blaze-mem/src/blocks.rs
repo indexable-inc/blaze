@@ -221,12 +221,12 @@ enum Free {
 /// Folds the thread's gathered counts of every class in ([`tag::Gathered`]), trimming none:
 /// at a [`snapshot`] and when the thread ends.
 pub(crate) fn fold_thread(gathered: &tag::Gathered) {
-    for slot in 0..CLASSES {
-        let (warm, cold) = (gathered.warm[slot].replace(0), gathered.cold[slot].replace(0));
+    for ((warm, cold), class) in gathered.warm.iter().zip(&gathered.cold).zip(&CLASS) {
+        let (warm, cold) = (warm.replace(0), cold.replace(0));
         if warm == 0 && cold == 0 {
             continue;
         }
-        if let Some(Ok(class)) = CLASS[slot].get() {
+        if let Some(Ok(class)) = class.get() {
             class.fold(Free::Warm, warm, false);
             class.fold(Free::Cold, cold, false);
         }
@@ -242,7 +242,9 @@ struct Trimmed {
     busy: bool,
 }
 
-static CLASS: [OnceLock<Result<Class, String>>; CLASSES] = [const { OnceLock::new() }; CLASSES];
+/// Each class, made at its first take; a class that could not be reserved keeps its error, and
+/// every later take of it returns that error again ([`MemError::again`]).
+static CLASS: [OnceLock<Result<Class, MemError>>; CLASSES] = [const { OnceLock::new() }; CLASSES];
 
 impl Class {
     /// A class of `size`-byte blocks over `space` bytes of address space, at `slot` of
@@ -385,10 +387,13 @@ impl Class {
     #[inline]
     fn gather_in(&self, gathered: &tag::Gathered, free: Free, blocks: i32) -> i32 {
         let Some(slot) = self.slot else { return blocks };
-        let cell = match free {
-            Free::Warm => &gathered.warm[slot],
-            Free::Cold => &gathered.cold[slot],
+        let cells = match free {
+            Free::Warm => &gathered.warm,
+            Free::Cold => &gathered.cold,
         };
+        // `slot` is the class's index in `CLASS`, which has as many entries as `cells`; a slot
+        // past them would be a class of no table's, which gathers nothing.
+        let Some(cell) = cells.get(slot) else { return blocks };
         let now = cell.get() + blocks;
         if now.unsigned_abs() < self.gather {
             cell.set(now);
@@ -456,61 +461,67 @@ impl Class {
         // SAFETY: the scratch holds `TRIM_MOST` `u32`s, committed when the class was made and
         // aligned to a page; the `trimming` flag, swapped to true above, makes this thread the
         // one that touches it until the flag is cleared below.
-        let held = unsafe {
-            std::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
-        };
+        let scratch = self.scratch.base().cast::<u32>().as_ptr();
         let goal = (KEEP / 2) as i64;
         let mut taken = 0;
         let mut warm = self.counts.warm.load(Ordering::Relaxed);
         while taken < TRIM_MOST && warm > goal {
             let step = TRIM_STEP.min(TRIM_MOST - taken);
-            let popped = self.warm.pop_some(&self.links, &mut held[taken..taken + step]);
+            // SAFETY: `taken + step <= TRIM_MOST`, so the `step` slots past the `taken` filled
+            // ones are inside the scratch, which holds `TRIM_MOST` `u32`s, committed when the
+            // class was made and aligned to a page; the `trimming` flag, swapped to true above,
+            // makes this thread the one that touches it until the flag is cleared below, and no
+            // other slice of it lives across this one.
+            let slots = unsafe { std::slice::from_raw_parts_mut(scratch.add(taken), step) };
+            let popped = self.warm.pop_some(&self.links, slots);
             if popped == 0 {
                 break;
             }
             taken += popped;
             warm -= (popped * self.size) as i64;
         }
-        let held = &mut held[..taken];
+        // SAFETY: as above: the first `taken <= TRIM_MOST` slots of the scratch, every one
+        // written by a pop above, and this thread's alone while it trims.
+        let held = unsafe { std::slice::from_raw_parts_mut(scratch, taken) };
         held.sort_unstable();
         let mut trimmed = Trimmed::default();
-        // Cold blocks are packed to the front of `held` as each run is read.
-        let mut cold = 0;
-        let mut run = 0;
-        // The blocks that stay warm, chained through their links: (top, bottom).
+        let mut cold_blocks = 0;
+        // The blocks given back and the blocks that stay warm, each chained through their
+        // links: (top, bottom).
+        let mut cold: Option<(u32, u32)> = None;
         let mut stays: Option<(u32, u32)> = None;
-        for at in 1..=taken {
-            if at < taken && held[at] == held[at - 1] + 1 {
-                continue;
-            }
-            let (first, len) = (held[run], at - run);
+        for run in held.chunk_by(|a, b| a.checked_add(1) == Some(*b)) {
+            let Some(&first) = run.first() else { continue };
+            let len = run.len();
             // SAFETY: every block of the run came off the warm stack in this trim, so it is this
             // thread's alone and holds nothing anyone reads; it is touched again only through a
             // take off a stack, which `reuse`s a cold block first. `purge` gives back only pages
             // inside the run, none a neighbor's.
             let given = unsafe { self.region.purge(first as usize * self.size, len * self.size) };
-            if given > 0 {
-                held.copy_within(run..at, cold);
-                cold += len;
+            let chain = if given > 0 {
+                cold_blocks += len;
                 trimmed.given_back += given;
+                &mut cold
             } else {
-                for &block in &held[run..at] {
-                    match &mut stays {
-                        Some((top, _)) => {
-                            self.links.link(block).store(*top, Ordering::Relaxed);
-                            *top = block;
-                        }
-                        None => {
-                            self.links.link(block).store(NONE, Ordering::Relaxed);
-                            stays = Some((block, block));
-                        }
+                &mut stays
+            };
+            for &block in run {
+                match *chain {
+                    Some((ref mut top, _)) => {
+                        self.links.link(block).store(*top, Ordering::Relaxed);
+                        *top = block;
+                    }
+                    None => {
+                        self.links.link(block).store(NONE, Ordering::Relaxed);
+                        *chain = Some((block, block));
                     }
                 }
             }
-            run = at;
         }
-        let bytes = (cold * self.size) as i64;
-        self.cold.push_all(&held[..cold], &self.links);
+        let bytes = (cold_blocks * self.size) as i64;
+        if let Some((top, bottom)) = cold {
+            self.cold.push_chain(top, bottom, &self.links);
+        }
         self.counts.cold.fetch_add(bytes, Ordering::Relaxed);
         self.counts.warm.fetch_sub(bytes, Ordering::Relaxed);
         if let Some((top, bottom)) = stays {
@@ -652,18 +663,15 @@ fn class_of(bytes: usize, align: usize, tag: Tag) -> Result<usize, MemError> {
 }
 
 fn class(index: usize) -> Result<&'static Class, MemError> {
-    let class = CLASS[index].get_or_init(|| {
-        // alloc: once, when a class cannot be reserved
-        Class::new(class_size(index), CLASS_BYTES, Some(index), Tag::Chunks)
-            .map_err(|error| error.to_string())
-    });
+    let Some(cell) = CLASS.get(index) else {
+        let what = "a block class's index";
+        return Err(MemError::TooLarge { tag: Tag::Chunks, what, wanted: index });
+    };
+    let class = cell
+        .get_or_init(|| Class::new(class_size(index), CLASS_BYTES, Some(index), Tag::Chunks));
     match class {
         Ok(class) => Ok(class),
-        Err(message) => Err(MemError::Reserve {
-            tag: Tag::Chunks,
-            bytes: CLASS_BYTES,
-            os: std::io::Error::other(message.as_str()),
-        }),
+        Err(error) => Err(error.again()),
     }
 }
 
@@ -873,7 +881,10 @@ unsafe impl std::alloc::Allocator for Kept {
         if layout.size() == 0 {
             return;
         }
-        let class = self.class(layout).expect("a block's class, made when the block was taken");
+        // SAFETY: the caller's contract: `ptr` was taken through this allocator with `layout`,
+        // so `class_of` accepted `layout` and the class it names was made (`made` took the block
+        // from it), and a made class's cell holds it for good.
+        let class = unsafe { self.class(layout).unwrap_unchecked() };
         let warm = i32::from(class.give(ptr));
         let size = class.size();
         // The tag's freed bytes and the class's warm blocks, gathered in one thread-local
@@ -935,9 +946,10 @@ impl Kept {
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         if layout.size() == 0 {
             // A dangling pointer aligned to `layout`: the contract's zero-size block.
-            let at = NonNull::<u8>::without_provenance(
-                std::num::NonZeroUsize::new(layout.align()).expect("an alignment is not zero"),
-            );
+            let Some(align) = std::num::NonZeroUsize::new(layout.align()) else {
+                return Err(std::alloc::AllocError);
+            };
+            let at = NonNull::<u8>::without_provenance(align);
             return Ok(NonNull::slice_from_raw_parts(at, 0));
         }
         let class = self.class(layout).map_err(|_| std::alloc::AllocError)?;

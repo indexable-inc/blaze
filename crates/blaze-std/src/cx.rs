@@ -32,8 +32,8 @@ use blaze_mem::Frame;
 use crate::{
     Plant, Stopped,
     io::{Ends, Io},
-    mem::Bytes,
-    task::{Scope, TaskError},
+    mem::{Bytes, heap},
+    task::{Scope, TaskError, TaskWhy},
     trace::RecordKind,
 };
 
@@ -56,9 +56,9 @@ struct Cancel {
 }
 
 impl Cancel {
-    fn new(outer: Option<Arc<Cancel>>) -> Arc<Cancel> {
+    fn new(outer: Option<Arc<Cancel>>) -> Result<Arc<Cancel>, Stopped> {
         // alloc: once per scope, its cancellation.
-        Arc::new(Cancel { set: AtomicBool::new(false), outer })
+        Ok(heap::shared(Cancel { set: AtomicBool::new(false), outer })?)
     }
 
     fn is_set(&self) -> bool {
@@ -73,22 +73,23 @@ impl Cancel {
     }
 }
 
-/// `frame` shared by a task's contexts.
-#[expect(
-    clippy::arc_with_non_send_sync,
-    reason = "a task's contexts share its frame on the task's thread; `Cx` is not `Send` on purpose"
-)]
-fn shared(frame: Frame) -> Arc<Frame> {
+/// `frame` shared by a task's contexts: an `Arc` though the frame is not `Sync`, because a
+/// task's contexts share it on the task's thread and `Cx` is not `Send` on purpose.
+fn shared(frame: Frame) -> Result<Arc<Frame>, Stopped> {
     // alloc: once per task, the owner of its frame.
-    Arc::new(frame)
+    Ok(heap::shared(frame)?)
 }
 
 impl Cx {
     /// The root context of `world`: `deadline`, never cancelled, named `main`.
-    pub(crate) fn root(deadline: Deadline, frame: Frame, world: Io) -> Cx {
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for its cancellation or the
+    /// owner of its frame.
+    pub(crate) fn root(deadline: Deadline, frame: Frame, world: Io) -> Result<Cx, Stopped> {
         let plant = world.plant();
+        let cancel = Cancel::new(None)?;
+        let frame = shared(frame)?;
         world.record_trace("main", RecordKind::Opened { parent: "main" });
-        Cx { deadline, cancel: Cancel::new(None), span: "main", frame: shared(frame), world, plant }
+        Ok(Cx { deadline, cancel, span: "main", frame, world, plant })
     }
 
     /// A child whose deadline is the earlier of this one's and `deadline`: never later.
@@ -168,14 +169,21 @@ impl Cx {
     /// [`Scope::join`] it, which returns once each has ended, with the first that failed. A
     /// task may borrow from the frame that holds the scope. The scope is linear: leaving it
     /// unjoined is a compile error (docs/v2/plan/design/std.md, "Tasks and waiting").
-    pub fn scope(&self) -> Scope<'_> {
-        Scope::new(self.scoped())
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the scope's cancellation.
+    pub fn scope(&self) -> Result<Scope<'_>, Stopped> {
+        Ok(Scope::new(self.scoped()?))
     }
 
     /// `body` run with a scope of tasks inside this one, which is then joined: its result,
-    /// or the first of its tasks that failed. The convenience over [`Cx::scope`].
+    /// or the first of its tasks that failed. The convenience over [`Cx::scope`]; a scope that
+    /// could not be made is [`TaskWhy::NoScope`], and `body` does not run.
     pub fn scope_with<'p, R>(&'p self, body: impl FnOnce(&Scope<'p>) -> R) -> Result<R, TaskError> {
-        let scope = self.scope();
+        let scope = match self.scope() {
+            Ok(scope) => scope,
+            Err(stopped) => {
+                return Err(TaskError { scope: self.span, task: self.span, why: TaskWhy::NoScope(stopped) });
+            }
+        };
         let made = body(&scope);
         match scope.join(self) {
             Ok(()) => Ok(made),
@@ -219,12 +227,12 @@ impl Cx {
                     match settles {
                         // Ended or given up: either way its tag is no longer waited on.
                         true => _ = io.settle(tag, deadline, self.span),
-                        false => io.forget(tag, Ends::Once),
+                        false => io.forget(tag, Ends::Once)?,
                     }
                 }
                 return Err(stopped);
             }
-            match io.poll(deadline) {
+            match io.poll(deadline)? {
                 0 => idle += 1,
                 _ => idle = 0,
             }
@@ -258,7 +266,7 @@ impl Cx {
             if idle == io.limits().poll_fuel {
                 return Err(Stopped::Stalled { span: self.span, polls: idle });
             }
-            match io.poll(deadline) {
+            match io.poll(deadline)? {
                 0 => idle += 1,
                 _ => idle = 0,
             }
@@ -277,15 +285,17 @@ impl Cx {
     }
 
     /// The context of a scope inside this task: its own cancellation, under this one's.
-    pub(crate) fn scoped(&self) -> Cx {
-        Cx { cancel: Cancel::new(Some(Arc::clone(&self.cancel))), ..self.child() }
+    pub(crate) fn scoped(&self) -> Result<Cx, Stopped> {
+        Ok(Cx { cancel: Cancel::new(Some(Arc::clone(&self.cancel)))?, ..self.child() })
     }
 
     /// The context of a task of the scope `self` is: the scope's deadline and cancellation,
-    /// its own name and frame.
-    pub(crate) fn task(&self, name: &'static str, frame: Frame) -> Cx {
+    /// its own name and frame. [`Stopped::OutOfMemory`] when the global heap has no room for
+    /// the owner of its frame.
+    pub(crate) fn task(&self, name: &'static str, frame: Frame) -> Result<Cx, Stopped> {
+        let frame = shared(frame)?;
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        Cx { span: name, frame: shared(frame), ..self.child() }
+        Ok(Cx { span: name, frame, ..self.child() })
     }
 
     /// Cancels the scope this context's cancellation is: every context sharing it, and every

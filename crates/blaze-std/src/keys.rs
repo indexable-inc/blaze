@@ -16,7 +16,7 @@ use crate::{
     cx::Cx,
     hosted::{self, Refused},
     io::Io,
-    mem::Bytes,
+    mem::{Bytes, heap},
     name::KeyName,
     narrow::Allowed,
 };
@@ -81,14 +81,13 @@ impl core::error::Error for KeysError {}
 /// The length of a signature.
 pub const SIGNATURE_LEN: usize = 32;
 
-/// The simulation's signature of `message` under `material`.
+/// The simulation's signature of `message` under `material`: the BLAKE3 of the material's
+/// length (eight bytes, little-endian), the material and the message, hashed as they stream
+/// in (BLAKE3's hash of the three joined, with nothing joined).
 fn simulated_signature(material: &[u8], message: &[u8]) -> [u8; SIGNATURE_LEN] {
-    // alloc: the simulated digest's input, freed as this returns.
-    let mut input = Vec::with_capacity(8 + material.len() + message.len());
-    input.extend_from_slice(&(material.len() as u64).to_le_bytes());
-    input.extend_from_slice(material);
-    input.extend_from_slice(message);
-    blaze_ids::b3::hash(&input)
+    let mut hasher = blaze_ids::b3::official::Hasher::new();
+    hasher.update(&(material.len() as u64).to_le_bytes()).update(material).update(message);
+    hasher.finalize()
 }
 
 /// The keychain: from [`Io::keys`].
@@ -103,9 +102,10 @@ impl Keys {
         Keys { io, allowed: Allowed::Any }
     }
 
-    /// Only the keys of `names` this reaches already: never one more.
-    pub fn only(&self, names: &[KeyName]) -> Keys {
-        Keys { io: self.io.clone(), allowed: self.allowed.only(names, self.io.plant()) }
+    /// Only the keys of `names` this reaches already: never one more. [`Stopped::OutOfMemory`]
+    /// when the global heap has no room for the narrowed set.
+    pub fn only(&self, names: &[KeyName]) -> Result<Keys, Stopped> {
+        Ok(Keys { io: self.io.clone(), allowed: self.allowed.only(names, self.io.plant())? })
     }
 
     /// `f` on the key `key`, if this reaches it and the keychain has it.
@@ -137,7 +137,7 @@ impl Keys {
 
     /// Whether `signature` is `key`'s of `message`.
     pub fn verify(&self, cx: &Cx, key: &KeyName, message: &[u8], signature: &[u8]) -> Result<bool, KeysError> {
-        self.with_key(cx, KeysOp::Verify, key, |found| Ok(simulated_signature(&found.material, message)[..] == *signature))
+        self.with_key(cx, KeysOp::Verify, key, |found| Ok(simulated_signature(&found.material, message).as_slice() == signature))
     }
 
     /// `sealed` decrypted under `key`, added to `into`; how many bytes.
@@ -147,12 +147,12 @@ impl Keys {
             if found.material.is_empty() {
                 return Err(Refused::Host("the key has no material"));
             }
-            let start = into.len();
             let slot = into.grow_zeroed(sealed.len()).map_err(|_| Stopped::OutOfMemory { arena, asked: sealed.len() })?;
-            for (at, (out, byte)) in slot.iter_mut().zip(sealed).enumerate() {
-                *out = byte ^ found.material[at % found.material.len()];
+            // The material repeats over the sealed bytes: it is not empty, said above.
+            for ((out, byte), key) in slot.iter_mut().zip(sealed).zip(found.material.iter().cycle()) {
+                *out = byte ^ key;
             }
-            Ok(into.len() - start)
+            Ok(sealed.len())
         })
     }
 
@@ -161,7 +161,7 @@ impl Keys {
         self.with_key(cx, KeysOp::Fetch, key, |found| match found.hardware {
             true => Err(Refused::Host("the key is in hardware and never leaves it")),
             // alloc: the secret's bytes, zeroed and freed when it is dropped.
-            false => Ok(Secret { bytes: found.material.clone() }),
+            false => Ok(Secret { bytes: heap::bytes(&found.material).map_err(Stopped::from)? }),
         })
     }
 }

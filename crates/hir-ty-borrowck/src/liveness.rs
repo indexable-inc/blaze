@@ -121,9 +121,9 @@ fn live_ranges<'f, 'e>(
     let entry = backward(frame, cfg, &transfer, &edge);
     let mut ranges = filled(frame, locals, IntervalSet::new(frame));
     // Where the run of points each live local is live at ends, walking backwards.
-    let run_end = frame.alloc_slice_fill_with(locals, |_| 0usize);
+    let run_end = frame.alloc_slice_fill_with(locals, |_| 0usize).unwrap_or_else(|error| panic!("{error}"));
     let mut live = bits(frame, locals);
-    let along = frame.alloc_slice_fill_with(live.words().len(), |_| 0u64);
+    let along = frame.alloc_slice_fill_with(live.words().len(), |_| 0u64).unwrap_or_else(|error| panic!("{error}"));
     for &block in cfg.order.iter() {
         live.clear();
         for &successor in cfg.successors(block) {
@@ -251,7 +251,7 @@ pub(super) fn region_liveness<'a, 'db>(
     // What dropping each local uses, found in the order a walk of the blocks in reverse
     // postorder, each from its end, first meets the local at a point it is drop live at only:
     // finding it may normalize, which makes region variables.
-    let rank = frame.alloc_slice_fill_with(cfg.points, |_| usize::MAX);
+    let rank = frame.alloc_slice_fill_with(cfg.points, |_| usize::MAX).unwrap_or_else(|error| panic!("{error}"));
     let mut next = 0;
     for &block in cfg.order.iter() {
         for point in (cfg.block_start(block)..=cfg.block_end(body, block)).rev() {
@@ -267,7 +267,7 @@ pub(super) fn region_liveness<'a, 'db>(
         let local = dropped[at];
         let first = least_rank(&drop_live[local], rank, cfg.points, block_end);
         radix::pack_64(first as u64, local as u64)
-    });
+    }).unwrap_or_else(|error| panic!("{error}"));
     keys.sort_unstable();
     for (local, &key) in dropped.iter_mut().zip(keys.iter()) {
         *local = key as u64 as usize;
@@ -324,7 +324,7 @@ pub(super) fn maybe_initialized_at_drops<'f>(
     let calls = cfg.order.iter().filter(|&&block| returns[index(block)] != NONE).count();
     let mut on_return = Effects::new(frame, calls, paths);
     // Per block, its call's row.
-    let call_of: &'f mut [u32] = frame.alloc_slice_fill_with(blocks, |_| NONE);
+    let call_of: &'f mut [u32] = frame.alloc_slice_fill_with(blocks, |_| NONE).unwrap_or_else(|error| panic!("{error}"));
     let mut call = 0;
     for &block in cfg.order.iter() {
         let end = cfg.block_end(body, block);

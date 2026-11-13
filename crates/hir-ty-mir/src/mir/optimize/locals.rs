@@ -47,7 +47,7 @@ impl<'f> UsedLocals<'f> {
         for local in kept.chain(body.upvars_in_place.iter().map(|it| it.0)) {
             always.insert(local_index(local));
         }
-        let count = frame.alloc_slice_fill_with(body.locals.len(), |_| 0u32);
+        let count = frame.alloc_slice_fill_with(body.locals.len(), |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         let mut used = UsedLocals { count, always };
         visit_body(body, |local, mention, at| used.mention(body, local, mention, at, 1));
         used
@@ -145,7 +145,7 @@ pub(super) fn simplify_locals(body: &mut MirBody<'_>, frame: &Frame) {
     if kept == body.locals.len() {
         return;
     }
-    let map = frame.alloc_slice_fill_with(body.locals.len(), |_| None::<LocalId>);
+    let map = frame.alloc_slice_fill_with(body.locals.len(), |_| None::<LocalId>).unwrap_or_else(|error| panic!("{error}"));
     // The kept locals moved, in their order, into an arena of exactly their number.
     let mut new_locals = Arena::with_capacity(kept);
     for (local, decl) in std::mem::take(&mut body.locals).into_iter() {

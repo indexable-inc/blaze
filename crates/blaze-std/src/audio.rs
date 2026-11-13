@@ -183,8 +183,7 @@ impl AudioOut {
                 if !host.audio.outputs.contains(device) {
                     return Err(Refused::NotFound);
                 }
-                host.audio.played.extend_from_slice(&period);
-                Ok(())
+                hosted::record_all(&mut host.audio.played, &period)
             })
             .map_err(&refuse)?;
             played += PERIOD;

@@ -4728,7 +4728,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.end_storage(dropped, &mut storage, span);
                 self.set_goto(dropped, at, span);
                 let frame = self.frame;
-                let key = (at, local, &*frame.alloc_slice_copy(&ended));
+                let key = (at, local, &*frame.alloc_slice_copy(&ended).unwrap_or_else(|error| panic!("{error}")));
                 self.exit_nodes.insert(key, node);
                 at = node;
             }

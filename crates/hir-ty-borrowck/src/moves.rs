@@ -663,7 +663,7 @@ impl<'f> InitFlow<'f> {
         let mut returned_uninit = Effects::new(frame, calls, paths);
         let mut returned_ever = Effects::new(frame, calls, locals);
         // Per block, its call's row.
-        let call_of: &'f mut [u32] = frame.alloc_slice_fill_with(blocks, |_| NONE);
+        let call_of: &'f mut [u32] = frame.alloc_slice_fill_with(blocks, |_| NONE).unwrap_or_else(|error| panic!("{error}"));
         let mut call = 0;
         for &block in cfg.order.iter() {
             let (start, end) = (cfg.block_start(block), cfg.block_end(body, block));

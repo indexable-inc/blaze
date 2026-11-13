@@ -8,7 +8,7 @@
 //!
 //! [`Refused`] is how a call on any of them fails, the one shape their per-area errors share.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{fmt, net::IpAddr};
 
 use crate::{
@@ -19,7 +19,8 @@ use crate::{
     io::Io,
     keys::SimKey,
     locale::Locale,
-    name::{AppName, DeviceName, ModuleName, ServiceName},
+    mem::{OutOfMemory, heap},
+    name::{AppName, DeviceName, ModuleName, NameError, ServiceName},
     power::Battery,
     procs::{ProcId, Signal, SimProc},
     requests::SimHttp,
@@ -27,7 +28,7 @@ use crate::{
     streams::SimStreams,
     term::{KeyEvent, SimTerm},
     url::Url,
-    user::UserFacts,
+    user::{UserFacts, UserFactsError},
     window::SimWindow,
 };
 
@@ -76,6 +77,30 @@ impl From<Stopped> for Refused {
     }
 }
 
+/// Why [`SimHost::new`] made no host: the facts it starts with were refused (each is a fixed
+/// literal that passes its rule, so in practice only for want of room on the global heap).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum SimHostError {
+    /// [`Locale::simulated`] was refused.
+    Locale(NameError),
+    /// [`UserFacts::simulated`] was refused.
+    User(UserFactsError),
+    /// The global heap had no room for its tables.
+    OutOfMemory(OutOfMemory),
+}
+
+impl fmt::Display for SimHostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SimHostError::Locale(error) => write!(f, "bstd::SimHost::new its locale: {error}"),
+            SimHostError::User(error) => write!(f, "bstd::SimHost::new its user: {error}"),
+            SimHostError::OutOfMemory(error) => write!(f, "bstd::SimHost::new its tables: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for SimHostError {}
+
 /// The simulated host: what its devices will say (scripted) and what was done to them
 /// (recorded). Made by [`SimHost::new`] with every simulated world; changed and read by a test
 /// through [`Io::script`].
@@ -84,8 +109,9 @@ pub struct SimHost {
     pub term: SimTerm,
     /// The keychain.
     pub keys: Vec<SimKey>,
-    /// The machine's trust anchors: what [`Io::roots`] hands out.
-    pub roots: Vec<Anchor>,
+    /// The machine's trust anchors: what [`Io::roots`] hands out, shared with each `Roots`
+    /// it made (a test changes them with `Arc::make_mut`, which leaves those as they were).
+    pub roots: Arc<Vec<Anchor>>,
     pub locale: Locale,
     pub user: UserFacts,
     /// The other processes.
@@ -130,14 +156,15 @@ impl SimHost {
     /// A quiet host: a terminal of 80 by 24, the user `sim`, the locale of
     /// [`Locale::simulated`], a full battery, and nothing else (no keys, anchors, processes,
     /// windows, devices or names).
-    pub fn new() -> SimHost {
-        SimHost {
+    pub fn new() -> Result<SimHost, SimHostError> {
+        Ok(SimHost {
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).
             keys: Vec::new(),
-            roots: Vec::new(),
-            locale: Locale::simulated(),
-            user: UserFacts::simulated(),
+            // alloc: once per simulated host, the anchors' count.
+            roots: heap::shared(Vec::new()).map_err(SimHostError::OutOfMemory)?,
+            locale: Locale::simulated().map_err(SimHostError::Locale)?,
+            user: UserFacts::simulated().map_err(SimHostError::User)?,
             procs: Vec::new(),
             signals: Vec::new(),
             modules: Vec::new(),
@@ -158,14 +185,25 @@ impl SimHost {
             names: Vec::new(),
             http: SimHttp::default(),
             streams: SimStreams::default(),
-        }
+        })
     }
 }
 
-impl Default for SimHost {
-    fn default() -> SimHost {
-        SimHost::new()
-    }
+/// Records `item` at the end of `list`, a simulated host's record a test reads as a std `Vec`:
+/// grown fallibly, and as it was when the growth finds no room.
+pub(crate) fn record<T>(list: &mut Vec<T>, item: T) -> Result<(), Refused> {
+    let mut grown = crate::mem::Vec::from_std(core::mem::take(list));
+    let pushed = grown.push(item);
+    *list = grown.into_std();
+    pushed.map_err(|full| Refused::Stopped(Stopped::from(full)))
+}
+
+/// Records each of `items` at the end of `list`, as [`record`] does one: all or none.
+pub(crate) fn record_all<T: Copy>(list: &mut Vec<T>, items: &[T]) -> Result<(), Refused> {
+    let mut grown = crate::mem::Vec::from_std(core::mem::take(list));
+    let pushed = grown.extend_from_slice(items);
+    *list = grown.into_std();
+    pushed.map_err(|full| Refused::Stopped(Stopped::from(full)))
 }
 
 /// One call on the simulated host under `cx`: `f` on it, at once. A `cx` that stopped already

@@ -10,7 +10,7 @@
 //! [`Host`]: crate::host::Host
 //! [`Host::procs`]: crate::host::Host::procs
 
-use alloc::vec::Vec;
+use crate::mem::Vec;
 use core::fmt;
 
 use blaze_mem::Frame;
@@ -107,10 +107,7 @@ impl Procs {
         let mut found = Vec::new_in(frame);
         let listed = hosted::call(&self.io, cx, |host| {
             for it in host.procs.iter().filter(|it| self.allowed.allows(&it.id)) {
-                found
-                    .try_reserve(1)
-                    .map_err(|_| Stopped::OutOfMemory { arena: "bstd::procs list", asked: size_of::<ProcInfo>() })?;
-                found.push(ProcInfo { id: it.id, parent: it.parent, alive: it.alive });
+                found.push(ProcInfo { id: it.id, parent: it.parent, alive: it.alive }).map_err(Stopped::from)?;
             }
             Ok(())
         });
@@ -151,8 +148,13 @@ impl Procs {
                 it.alive = false;
             }
         })?;
-        let _ = self.io.script(|host| host.signals.push((proc, signal)));
-        Ok(())
+        let recorded = self.io.script(|host| hosted::record(&mut host.signals, (proc, signal)));
+        // The process was found under the same host just above, so a world with no host
+        // (`None`) cannot be here; a record with no room is the call's error.
+        match recorded {
+            Some(Err(kind)) => Err(ProcsError { op: ProcsOp::Signal, proc: Some(proc), kind }),
+            Some(Ok(())) | None => Ok(()),
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use crate::{
     Cx, Plant,
     fs::{Content, Dir, FsKind, ReadWrite, Unsynced},
     io::Io,
+    mem::ByteLen,
     net::{Addr, Conn, HostPort, Listener, NetKind},
 };
 
@@ -89,7 +90,7 @@ fn flows(plan: &NetPlan, io: &Io, cx: &Cx, conn: &Conn, peer: blaze_core::Conn, 
                 unread += sends;
                 let left = limit - used;
                 let mut into = cx.bytes();
-                match conn.recv(cx, most, &mut into) {
+                match conn.recv(cx, most, &mut into).map(|read| read.get() as usize) {
                     Ok(read) if left > 0 && read >= 1 && read as u64 <= left && read <= most.min(unread) => {
                         used += read as u64;
                         received += read as u64;
@@ -133,12 +134,12 @@ fn net_run(plan: &NetPlan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
     let at = Addr::Tcp(HostPort::parse(AT).expect("a test's address"));
-    let net = io.need_net().map_err(|e| format!("harness: {e}"))?.limit(plan.limit);
+    let net = io.need_net().map_err(|e| format!("harness: {e}"))?.limit(ByteLen::new(plan.limit)).map_err(|e| format!("harness: {e}"))?;
     let (net, limit) = match plan.inner {
-        Some(inner) => (net.limit(inner), plan.limit.min(inner)),
+        Some(inner) => (net.limit(ByteLen::new(inner)).map_err(|e| format!("harness: {e}"))?, plan.limit.min(inner)),
         None => (net, plan.limit),
     };
-    if net.limit_left() != Some(limit) {
+    if net.limit_left() != Some(ByteLen::new(limit)) {
         return Err(format!("a Net limited to {limit} says it has {:?} left", net.limit_left()));
     }
     // The listener is linear: closed whatever the flows found.
@@ -225,7 +226,7 @@ fn quota_run(plan: &QuotaPlan, plant: Plant) -> Result<(), String> {
     let cx = root(&io);
     let fs = io.need_fs().map_err(|e| format!("harness: {e}"))?;
     let dir = fs.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
-    let limited = dir.quota(plan.quota);
+    let limited = dir.quota(ByteLen::new(plan.quota)).map_err(|e| format!("harness: {e}"))?;
     let mut used: u64 = 0;
     for (at, &change) in plan.changes.iter().enumerate() {
         let (file, len, changed) = match change {
@@ -245,7 +246,7 @@ fn quota_run(plan: &QuotaPlan, plant: Plant) -> Result<(), String> {
                 ));
             }
         }
-        if limited.quota_left() != Some(plan.quota - used) {
+        if limited.quota_left() != Some(ByteLen::new(plan.quota - used)) {
             return Err(format!(
                 "change {at}: the directory says {:?} of its quota is left, and the model {}",
                 limited.quota_left(),
@@ -256,7 +257,7 @@ fn quota_run(plan: &QuotaPlan, plant: Plant) -> Result<(), String> {
         let mut held: u64 = 0;
         for name in FILES {
             let meta = dir.stat(&cx, &path(name)).map_err(|e| format!("harness: {e}"))?;
-            held += meta.map_or(0, |meta| meta.len);
+            held += meta.map_or(0, |meta| meta.len.get());
         }
         if held > plan.quota {
             return Err(format!(

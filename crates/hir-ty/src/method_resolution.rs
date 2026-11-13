@@ -1113,7 +1113,7 @@ impl CratesThatName {
         self_crate: Option<Crate>,
     ) -> Ones<'f> {
         let Some(row) = self.row(trait_crate) else { return Ones::new(&[]) };
-        let holders = frame.alloc_slice_copy(row);
+        let holders = frame.alloc_slice_copy(row).unwrap_or_else(|error| panic!("{error}"));
         if let Some(self_crate) = self_crate {
             match self.row(self_crate) {
                 Some(row) => holders.iter_mut().zip(row).for_each(|(it, row)| *it &= row),
@@ -1160,7 +1160,7 @@ pub fn crates_that_name(db: &Db, krate: Crate) -> CratesThatName {
         let n = order.len();
         // Row `p`: `order[p]` and what it depends on, by place in `order`.
         let mut reach: BitMatrix<usize, &mut [u64]> =
-            BitMatrix::from_words(n, n, frame.alloc_slice_fill_with(n * words_for(n), |_| 0u64));
+            BitMatrix::from_words(n, n, frame.alloc_slice_fill_with(n * words_for(n), |_| 0u64).unwrap_or_else(|error| panic!("{error}")));
         for (p, &at) in order.iter().enumerate() {
             reach.insert(p, p);
             for dep in &at.data(db).dependencies {
@@ -1170,7 +1170,7 @@ pub fn crates_that_name(db: &Db, krate: Crate) -> CratesThatName {
         let mut sorted = Vec::with_capacity_in(n, frame);
         sorted.extend(order.iter().enumerate().map(|(p, &it)| (it, p as u32)));
         sorted.sort_unstable();
-        let rank = frame.alloc_slice_fill_with(n, |_| 0u32);
+        let rank = frame.alloc_slice_fill_with(n, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         for (r, &(_, p)) in sorted.iter().enumerate() {
             rank[p as usize] = r as u32;
         }
@@ -1843,7 +1843,7 @@ impl<V: Copy> Runs<V> {
     /// the order they come. Counted first, so each column is allocated once at its size.
     fn from_groups(frame: &Frame, rank: &[u32], values: &[(u32, V)]) -> Self {
         u32::try_from(values.len()).expect("more than 2^32 impls in a crate");
-        let ends = frame.alloc_slice_fill_with(rank.len() + 1, |_| 0u32);
+        let ends = frame.alloc_slice_fill_with(rank.len() + 1, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         for &(group, _) in values {
             ends[rank[group as usize] as usize + 1] += 1;
         }
@@ -1855,7 +1855,7 @@ impl<V: Copy> Runs<V> {
             return Runs { starts, values: Box::default() };
         };
         // `ends[run]` is now where run `run` starts, and is moved past each value placed.
-        let placed = frame.alloc_slice_fill_with(values.len(), |_| first);
+        let placed = frame.alloc_slice_fill_with(values.len(), |_| first).unwrap_or_else(|error| panic!("{error}"));
         for &(group, value) in values {
             let next = &mut ends[rank[group as usize] as usize];
             placed[*next as usize] = value;
@@ -1871,7 +1871,7 @@ impl<V: Copy> Runs<V> {
 
 /// Where each group goes: `rank[order[i]] == i`.
 fn ranks<'f>(frame: &'f Frame, order: &[u32]) -> &'f mut [u32] {
-    let rank = frame.alloc_slice_fill_with(order.len(), |_| 0u32);
+    let rank = frame.alloc_slice_fill_with(order.len(), |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     for (at, &group) in order.iter().enumerate() {
         rank[group as usize] = at as u32;
     }
@@ -1892,7 +1892,7 @@ fn trait_number(
 
 /// The traits `trait_ids` in the order [`TraitImpls::traits`] holds them, as indices.
 fn order_by_trait_id<'f>(frame: &'f Frame, trait_ids: &[TraitId]) -> &'f mut [u32] {
-    let order = frame.alloc_slice_fill_with(trait_ids.len(), |t| t as u32);
+    let order = frame.alloc_slice_fill_with(trait_ids.len(), |t| t as u32).unwrap_or_else(|error| panic!("{error}"));
     order.sort_unstable_by_key(|&t| trait_ids[t as usize].as_id().as_u32());
     order
 }
@@ -1955,7 +1955,7 @@ fn group_of<'db>(
 /// The groups sorted by the hash of their type; types of equal hash stay in the order they
 /// were first seen.
 fn order_by_hash<'f>(frame: &'f Frame, self_tys: &[(u64, SimplifiedType<'_>)]) -> &'f mut [u32] {
-    let order = frame.alloc_slice_fill_with(self_tys.len(), |group| group as u32);
+    let order = frame.alloc_slice_fill_with(self_tys.len(), |group| group as u32).unwrap_or_else(|error| panic!("{error}"));
     order.sort_unstable_by_key(|&group| (self_tys[group as usize].0, group));
     order
 }
@@ -2229,13 +2229,13 @@ impl<'db, 'f> TraitImplsBuilder<'db, 'f> {
         let trait_order = order_by_trait_id(frame, trait_ids);
         let trait_rank = ranks(frame, trait_order);
         let row_keys = &self.row_keys;
-        let row_order = frame.alloc_slice_fill_with(row_keys.len(), |r| r as u32);
+        let row_order = frame.alloc_slice_fill_with(row_keys.len(), |r| r as u32).unwrap_or_else(|error| panic!("{error}"));
         row_order.sort_unstable_by_key(|&r| {
             let (t, (hash, _)) = row_keys[r as usize];
             (trait_rank[t as usize], hash, r)
         });
         let row_rank = ranks(frame, row_order);
-        let trait_rows = frame.alloc_slice_fill_with(trait_ids.len() + 1, |_| 0u32);
+        let trait_rows = frame.alloc_slice_fill_with(trait_ids.len() + 1, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         for &(t, _) in row_keys.iter() {
             trait_rows[trait_rank[t as usize] as usize + 1] += 1;
         }

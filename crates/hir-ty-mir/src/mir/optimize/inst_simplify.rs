@@ -254,11 +254,11 @@ pub(super) fn single_use_consts(body: &mut MirBody<'_>, frame: &Frame) {
         ineligible.insert(local_index(local));
     }
     ineligible.insert(local_index(crate::mir::return_slot()));
-    let init = frame.alloc_slice_fill_with(count, |_| None::<Location>);
-    let uses = frame.alloc_slice_fill_with(count, |_| None::<Location>);
+    let init = frame.alloc_slice_fill_with(count, |_| None::<Location>).unwrap_or_else(|error| panic!("{error}"));
+    let uses = frame.alloc_slice_fill_with(count, |_| None::<Location>).unwrap_or_else(|error| panic!("{error}"));
     // What `visit_body` says of a local that is not its constant assignment or a read of the
     // whole of it as an operand makes it ineligible.
-    let whole_reads = frame.alloc_slice_fill_with(count, |_| 0u32);
+    let whole_reads = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     for (block, data) in body.basic_blocks.iter() {
         for (index, statement) in data.statements.iter().enumerate() {
             let at = Location { block, index };
@@ -281,7 +281,7 @@ pub(super) fn single_use_consts(body: &mut MirBody<'_>, frame: &Frame) {
             });
         }
     }
-    let mentions = frame.alloc_slice_fill_with(count, |_| 0u32);
+    let mentions = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     visit_body(body, |local, mention, _| {
         if mention != Mention::Storage {
             mentions[local_index(local)] += 1;

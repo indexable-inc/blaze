@@ -47,9 +47,9 @@ impl Corpus {
     pub(crate) fn add(&mut self, input: &[u8], new_features: usize) -> Result<(), MemError> {
         let weight = new_features as u64 * (self.ends.len() as u64 + 1);
         let sum = self.sums.last().copied().unwrap_or(0) + weight.max(1);
-        self.bytes.try_extend_from_slice(input)?;
-        self.ends.try_push(self.bytes.len() as u64)?;
-        self.sums.try_push(sum)?;
+        self.bytes.extend_from_slice(input)?;
+        self.ends.push(self.bytes.len() as u64)?;
+        self.sums.push(sum)?;
         Ok(())
     }
 

@@ -18,9 +18,14 @@
 //! one table built on them here: `u32`s naming a column the caller keeps, which every
 //! interner keyed by an index (`blaze_ids::Sharded`, the hash-conser, base-db's tables) uses.
 
-use crate::sync::{
-    OnceLock,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+use std::{alloc::Global, fmt};
+
+use crate::{
+    OutOfMemory,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 /// The tag of an empty slot.
@@ -117,6 +122,12 @@ impl Slots {
     #[inline]
     pub fn any(self) -> bool {
         self.0 != 0
+    }
+
+    /// Whether slot `slot` is in the set; a slot past the word's eight is not.
+    #[inline]
+    pub fn has(self, slot: usize) -> bool {
+        slot < 8 && self.0 & (0x80 << (slot * 8)) != 0
     }
 
     #[inline]
@@ -225,14 +236,99 @@ struct Group {
 #[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<Group>() == 32 && align_of::<Group>() == 32);
 
-fn new_table(len: usize) -> Box<[Group]> {
-    (0..len)
-        .map(|_| Group {
-            ctrl: AtomicU64::new(0),
-            values: std::array::from_fn(|_| AtomicU32::new(0)),
-        })
-        // alloc: growth, one table per doubling of the values, over the inserts that filled the last
-        .collect()
+/// One level's table: `1 << level` groups, at least one. Made only by [`Table::new`], which is
+/// what [`Groups::at`] relies on.
+struct Table {
+    groups: crate::Vec<Group, Global>,
+}
+
+impl Table {
+    /// The empty table of level `level` (`level < LEVELS`), or the global heap's refusal.
+    fn new(level: usize) -> Result<Table, OutOfMemory> {
+        // On the global heap, as an `Index` names no arena of its own.
+        let groups = crate::Vec::from_iter_in( // alloc: growth, one table per doubling of the values, over the inserts that filled the last
+            (0..1usize << level).map(|_| Group {
+                ctrl: AtomicU64::new(0),
+                values: std::array::from_fn(|_| AtomicU32::new(0)),
+            }),
+            Global,
+        )?;
+        Ok(Table { groups })
+    }
+
+    #[inline]
+    fn groups(&self) -> Groups<'_> {
+        Groups { groups: &self.groups, mask: self.groups.len().wrapping_sub(1) }
+    }
+}
+
+/// A table's groups, addressed by any `usize` folded into them: a probe's group is its hash
+/// (or the next group) masked by the table's size, so every address is one of its groups.
+#[derive(Clone, Copy)]
+struct Groups<'t> {
+    groups: &'t [Group],
+    /// `groups.len() - 1`: a table's length is a power of two, at least one ([`Table::new`]).
+    mask: usize,
+}
+
+impl<'t> Groups<'t> {
+    #[inline]
+    fn len(self) -> usize {
+        self.groups.len()
+    }
+
+    /// Group `index & mask`.
+    #[inline]
+    fn at(self, index: usize) -> &'t Group {
+        // SAFETY: only `Table::groups` makes a `Groups`, with `mask = len - 1` of a table of at
+        // least one group (`Table::new` made `1 << level` of them, and a `Table` is never
+        // shrunk), so `index & mask <= len - 1` is in bounds.
+        unsafe { self.groups.get_unchecked(index & self.mask) }
+    }
+}
+
+/// Why [`Index::insert`] did not publish its value; the index is as it was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexError {
+    /// The next level's table could not be had from the global heap.
+    OutOfMemory(OutOfMemory),
+    /// Every one of the index's levels is in use: it holds more than `2^32` values.
+    Full,
+    /// Level `level` was published by another writer meanwhile: the caller let two inserts
+    /// in at once, where an index takes one writer at a time.
+    TwoWriters { level: usize },
+    /// A probe named slot `slot` of a group of six. A control word's answers hold only its
+    /// slots, so none does; refused rather than written past.
+    NoSuchSlot { slot: usize },
+}
+
+impl fmt::Display for IndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IndexError::OutOfMemory(error) => write!(f, "swiss::Index growth: {error}"),
+            IndexError::Full => f.write_str(
+                "swiss::Index: every level is in use (more than 2^32 values; rule: an index \
+                 names values by u32)",
+            ),
+            IndexError::TwoWriters { level } => write!(
+                f,
+                "swiss::Index: level {level} published by two writers at once (rule: inserts are \
+                 serialized by the caller)"
+            ),
+            IndexError::NoSuchSlot { slot } => write!(
+                f,
+                "swiss::Index: a probe named slot {slot} of a group of {INDEX_SLOTS}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IndexError {}
+
+impl From<OutOfMemory> for IndexError {
+    fn from(error: OutOfMemory) -> IndexError {
+        IndexError::OutOfMemory(error)
+    }
 }
 
 /// A SwissTable of `u32`s, each naming a value in a column the caller keeps, found by a hash
@@ -251,7 +347,7 @@ fn new_table(len: usize) -> Box<[Group]> {
 pub struct Index {
     /// How many levels are published; the last is in use.
     level: AtomicUsize,
-    tables: [OnceLock<Box<[Group]>>; LEVELS],
+    tables: [OnceLock<Table>; LEVELS],
 }
 
 impl Default for Index {
@@ -265,9 +361,12 @@ impl Index {
         Index { level: AtomicUsize::new(0), tables: std::array::from_fn(|_| OnceLock::new()) }
     }
 
-    fn at_level(&self, level: usize) -> Option<&[Group]> {
+    /// The table of the `level`s published (the last one's), if any. A level is published
+    /// with a release store after its table is set, so a loaded level's table is there; one
+    /// that is not reads as no table, as before the first insert.
+    fn at_level(&self, level: usize) -> Option<Groups<'_>> {
         let level = level.checked_sub(1)?;
-        Some(self.tables[level].get().expect("a published index level holds its table"))
+        Some(self.tables.get(level)?.get()?.groups())
     }
 
     /// The value inserted under `hash` that `is` accepts. `is` is asked only of values whose
@@ -275,10 +374,12 @@ impl Index {
     #[inline]
     pub fn find(&self, hash: u64, mut is: impl FnMut(u32) -> bool) -> Option<u32> {
         let groups = self.at_level(self.level.load(Ordering::Acquire))?;
-        let ctrl = |at: usize| Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Acquire));
+        let ctrl = |at: usize| Ctrl::<INDEX_SLOTS>(groups.at(at).ctrl.load(Ordering::Acquire));
         find(hash, tag(hash), groups.len(), ctrl, |at| {
+            // A matched slot is one of the group's six (a control word's answers hold only its
+            // slots), so `get` finds it; one past them would be no value of this group.
             // Relaxed: the tag's `Acquire` ordered the slot's store before us.
-            let value = groups[at.group].values[at.slot].load(Ordering::Relaxed);
+            let value = groups.at(at.group).values.get(at.slot)?.load(Ordering::Relaxed);
             is(value).then_some(value)
         })
     }
@@ -286,40 +387,60 @@ impl Index {
     /// Publishes `value` under `hash`, for the one writer at a time the caller lets in. `len` is
     /// how many values the index held before this one, and `hash_of` the hash a held value was
     /// inserted under, which growing asks for. Whatever `find`'s `is` reads of `value` must be
-    /// written before this call.
-    pub fn insert(&self, len: usize, hash: u64, value: u32, hash_of: impl Fn(u32) -> u64) {
-        let groups = self.table_for_one_more(len, hash_of);
-        put(groups, hash, value, Ordering::Release);
+    /// written before this call. When the index cannot grow, the error says why and nothing is
+    /// published.
+    pub fn insert(
+        &self,
+        len: usize,
+        hash: u64,
+        value: u32,
+        hash_of: impl Fn(u32) -> u64,
+    ) -> Result<(), IndexError> {
+        let groups = self.table_for_one_more(len, hash_of)?;
+        put(groups, hash, value, Ordering::Release)
     }
 
     /// The table to insert one more value into, at most three quarters full after it.
-    fn table_for_one_more(&self, len: usize, hash_of: impl Fn(u32) -> u64) -> &[Group] {
+    fn table_for_one_more(
+        &self,
+        len: usize,
+        hash_of: impl Fn(u32) -> u64,
+    ) -> Result<Groups<'_>, IndexError> {
         // Relaxed: only the one writer stores `level`.
         let level = self.level.load(Ordering::Relaxed);
         let current = self.at_level(level);
         if let Some(groups) = current
             && (len + 1) * 4 <= groups.len() * INDEX_SLOTS * 3
         {
-            return groups;
+            return Ok(groups);
         }
-        assert!(level < LEVELS, "an index of more than 2^32 values");
-        let grown = new_table(1 << level);
+        let Some(cell) = self.tables.get(level) else {
+            return Err(IndexError::Full);
+        };
+        let grown = Table::new(level)?;
         if let Some(old) = current {
+            let into = grown.groups();
             // Relaxed: every write to the table was the writer's, and so ours.
-            for group in old {
-                for slot in Ctrl::<INDEX_SLOTS>(group.ctrl.load(Ordering::Relaxed)).full() {
-                    let value = group.values[slot].load(Ordering::Relaxed);
-                    put(&grown, hash_of(value), value, Ordering::Relaxed);
+            for group in old.groups {
+                let full = Ctrl::<INDEX_SLOTS>(group.ctrl.load(Ordering::Relaxed)).full();
+                for (slot, value) in group.values.iter().enumerate() {
+                    if full.has(slot) {
+                        let value = value.load(Ordering::Relaxed);
+                        put(into, hash_of(value), value, Ordering::Relaxed)?;
+                    }
                 }
             }
         }
-        if self.tables[level].set(grown).is_err() {
-            unreachable!("index level {level} published twice");
+        if cell.set(grown).is_err() {
+            return Err(IndexError::TwoWriters { level });
         }
+        let Some(table) = cell.get() else {
+            return Err(IndexError::TwoWriters { level });
+        };
         // Release: a reader that loads the new level sees the table's slots and, through the
         // caller's order, the values they name.
         self.level.store(level + 1, Ordering::Release);
-        self.at_level(level + 1).expect("the level just published")
+        Ok(table.groups())
     }
 
     /// How many values the table in use holds at most before it grows: 0 before the first insert.
@@ -331,20 +452,24 @@ impl Index {
     /// Frees the tables the index outgrew. With `&mut`, no reader is probing one.
     pub fn release_outgrown(&mut self) {
         let level = self.level.load(Ordering::Relaxed);
-        for table in &mut self.tables[..level.saturating_sub(1)] {
+        for table in self.tables.iter_mut().take(level.saturating_sub(1)) {
             *table = OnceLock::new();
         }
     }
 }
 
 /// Fills the first empty slot from `hash`'s home group of `groups`, for the one writer.
-fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
+fn put(groups: Groups<'_>, hash: u64, value: u32, publish: Ordering) -> Result<(), IndexError> {
     let at = vacant(hash, groups.len(), |at: usize| {
-        Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Relaxed))
+        Ctrl::<INDEX_SLOTS>(groups.at(at).ctrl.load(Ordering::Relaxed))
     });
-    let group = &groups[at.group];
-    group.values[at.slot].store(value, Ordering::Relaxed);
+    let group = groups.at(at.group);
+    let Some(cell) = group.values.get(at.slot) else {
+        return Err(IndexError::NoSuchSlot { slot: at.slot });
+    };
+    cell.store(value, Ordering::Relaxed);
     group.ctrl.store(at.tagged(tag(hash)).0, publish);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -586,9 +711,11 @@ mod tests {
                 if found.is_none() {
                     let value = keys.len() as u32;
                     keys.push(key);
-                    index.insert(model.len(), hash_of(key), value, |value| {
-                        hash_of(keys[value as usize])
-                    });
+                    index
+                        .insert(model.len(), hash_of(key), value, |value| {
+                            hash_of(keys[value as usize])
+                        })
+                        .expect("room");
                     model.insert(key, value);
                 }
                 if step % 10_000 == 0 {
@@ -631,9 +758,11 @@ mod tests {
             }
             let value = *len as u32;
             column[value as usize].store(key, Ordering::Relaxed);
-            index.insert(*len, hash_of(key), value, |value| {
-                hash_of(column[value as usize].load(Ordering::Relaxed))
-            });
+            index
+                .insert(*len, hash_of(key), value, |value| {
+                    hash_of(column[value as usize].load(Ordering::Relaxed))
+                })
+                .expect("room");
             *len += 1;
             value
         };
@@ -666,12 +795,14 @@ mod tests {
         let index = Index::new();
         let keys: Vec<u64> = (0..5_000).collect();
         for (len, &key) in keys.iter().enumerate() {
-            index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
+            index
+                .insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]))
+                .expect("room");
         }
         let levels = index.level.load(Ordering::Relaxed);
         assert!(levels > 5);
         for table in index.tables[..levels].iter().filter_map(OnceLock::get) {
-            for group in table.iter() {
+            for group in table.groups.iter() {
                 let at = std::ptr::from_ref(group).addr();
                 assert_eq!(at / 64, (at + size_of::<Group>() - 1) / 64, "a group in one line");
             }
@@ -684,7 +815,9 @@ mod tests {
         let index = blaze_alloc_count::assert_at_most(0, "a new index", Index::new);
         let keys: Vec<u64> = (0..1_000).collect();
         for (len, &key) in keys.iter().enumerate() {
-            index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
+            index
+                .insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]))
+                .expect("room");
         }
         blaze_alloc_count::assert_at_most(0, "an index's finds", || {
             for &key in &keys {
@@ -731,7 +864,7 @@ mod model {
         blaze_check::model(|| {
             let index = Arc::new(Index::new());
             for value in 0..4u32 {
-                index.insert(value as usize, HASH, value, |_| HASH);
+                index.insert(value as usize, HASH, value, |_| HASH).expect("room");
             }
             assert_eq!(index.capacity(), 4);
             let reader = {
@@ -740,8 +873,8 @@ mod model {
                     (index.find(HASH, |it| it == 0), index.find(HASH, |it| it == 4))
                 })
             };
-            index.insert(4, HASH, 4, |_| HASH);
-            index.insert(5, HASH, 5, |_| HASH);
+            index.insert(4, HASH, 4, |_| HASH).expect("room");
+            index.insert(5, HASH, 5, |_| HASH).expect("room");
             let (zero, four) = reader.join().unwrap();
             assert_eq!(zero, Some(0), "a value from before the growth is found");
             assert!(four.is_none() || four == Some(4), "a value is found whole or not at all");

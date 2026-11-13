@@ -692,7 +692,7 @@ impl<M: Default> Slots<M> {
     }
 
     pub(crate) fn take(&mut self) -> Handle<M> {
-        self.slab.insert(M::default())
+        self.slab.insert(M::default()).unwrap_or_else(|error| panic!("{error}"))
     }
 
     pub(crate) fn live(&self, handle: Handle<M>) -> bool {
@@ -1538,7 +1538,7 @@ impl<M: Memo> Plane<M> {
                 let handle = self.request_slots.take();
                 let r = handle.index();
                 if r as usize == self.requests.len() {
-                    self.requests.push(Request::empty());
+                    self.requests.push(Request::empty()).unwrap_or_else(|error| panic!("{error}"));
                 }
                 let vclock = if idle { self.idle_vclock } else { self.vclock };
                 self.requests[r as usize].open(request, seq, weight, keep_going, idle, vclock);
@@ -1986,7 +1986,7 @@ impl<M: Memo> Plane<M> {
                 first_out: NONE,
                 last_out: NONE,
                 task: NO_TASK,
-            });
+            }).unwrap_or_else(|error| panic!("{error}"));
             self.cold.push(NodeCold {
                 memory: 0,
                 done_at: 0,
@@ -2001,9 +2001,9 @@ impl<M: Memo> Plane<M> {
                 pool,
                 flags: 0,
                 kind,
-            });
-            self.states.push(NodeState::Waiting);
-            self.keys.push(Key([0; 32]));
+            }).unwrap_or_else(|error| panic!("{error}"));
+            self.states.push(NodeState::Waiting).unwrap_or_else(|error| panic!("{error}"));
+            self.keys.push(Key([0; 32])).unwrap_or_else(|error| panic!("{error}"));
         }
         debug_assert_eq!(self.rows.len(), self.node_slots.made());
         let request = &mut self.requests[r as usize];
@@ -3011,8 +3011,8 @@ fn new_task(
     let key = key.unwrap_or(Key([0; 32]));
     let task = slots.take();
     if row_of(task) == tasks.len() {
-        tasks.push(row);
-        task_keys.push(key);
+        tasks.push(row).unwrap_or_else(|error| panic!("{error}"));
+        task_keys.push(key).unwrap_or_else(|error| panic!("{error}"));
     } else {
         tasks[row_of(task)] = row;
         task_keys[row_of(task)] = key;

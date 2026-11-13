@@ -90,7 +90,7 @@ struct Space {
     cold_count: AtomicU32,
 }
 
-static SPACES: [OnceLock<Result<Space, String>>; PLACES] = [const { OnceLock::new() }; PLACES];
+static SPACES: [OnceLock<Result<Space, MemError>>; PLACES] = [const { OnceLock::new() }; PLACES];
 
 thread_local! {
     /// Where the calling thread's chunks are carved: 0 unplaced, `n + 1` NUMA node `n`.
@@ -125,7 +125,11 @@ pub fn thread_node() -> Option<u32> {
 }
 
 fn space(place: usize) -> Result<&'static Space, MemError> {
-    let space = SPACES[place].get_or_init(|| {
+    let Some(cell) = SPACES.get(place) else {
+        let what = "a chunk space's place";
+        return Err(MemError::TooLarge { tag: Tag::Chunks, what, wanted: place });
+    };
+    let space = cell.get_or_init(|| {
         let region = match place {
             0 => Region::reserve_huge(SPACE_BYTES, Tag::Chunks),
             node => Region::reserve_huge_on(SPACE_BYTES, node as u32 - 1, Tag::Chunks),
@@ -143,23 +147,31 @@ fn space(place: usize) -> Result<&'static Space, MemError> {
                 cold_count: AtomicU32::new(0),
             })
         });
-        made.map_err(|error| error.to_string()) // alloc: once, when a space cannot be reserved
+        made
     });
     match space {
         Ok(space) => Ok(space),
-        Err(message) => Err(MemError::Reserve {
-            tag: Tag::Chunks,
-            bytes: SPACE_BYTES,
-            os: std::io::Error::other(message.as_str()),
-        }),
+        // A space that could not be reserved keeps its error; every later take in its place
+        // returns it again.
+        Err(error) => Err(error.again()),
     }
 }
 
 /// The space a chunk exists in: made before the chunk was carved.
-fn made(place: usize) -> &'static Space {
-    match SPACES[place].get() {
+///
+/// # Safety
+///
+/// `place` is the place of a chunk index that [`take`] returned: `take` returns an index only
+/// from a space it made in that place, and a made space's cell holds it for good. A [`Chunk`]
+/// holds such an index by construction ([`take`] and the `unsafe` [`Chunk::from_index`] are
+/// the only ways one is made); a raw index is such a one by its caller's own contract
+/// ([`give_all`], [`link`]).
+unsafe fn made(place: usize) -> &'static Space {
+    match SPACES.get(place).and_then(OnceLock::get) {
         Some(Ok(space)) => space,
-        _ => unreachable!("a chunk outlived its space"),
+        // SAFETY: the caller's contract: the place's space was made, and a `OnceLock` once
+        // set stays set, so this arm is never reached.
+        _ => unsafe { std::hint::unreachable_unchecked() },
     }
 }
 
@@ -186,12 +198,17 @@ impl Chunk {
 
     /// The chunk's first byte; the chunk is `CHUNK` bytes, committed, aligned to `CHUNK`.
     pub(crate) fn ptr(&self) -> NonNull<u8> {
-        made(place_of(self.0)).region.at(local_of(self.0) as usize * CHUNK)
+        // SAFETY: a `Chunk` holds an index `take` returned (the type's invariant).
+        unsafe { made(place_of(self.0)) }.region.at(local_of(self.0) as usize * CHUNK)
     }
 
-    /// The chunk `index` names, which the caller holds (it took it and linked it in a list
-    /// of its own).
-    pub(crate) fn from_index(index: u32) -> Chunk {
+    /// The chunk `index` names.
+    ///
+    /// # Safety
+    ///
+    /// `index` is one [`take`] returned (through [`Chunk::index`]) and the caller holds that
+    /// chunk now: it took it, kept the index in a list of its own, and has not given it back.
+    pub(crate) unsafe fn from_index(index: u32) -> Chunk {
         Chunk(index)
     }
 }
@@ -230,7 +247,8 @@ fn carve(space: &Space) -> Result<u32, MemError> {
 )]
 pub(crate) fn give(chunk: Chunk, owner: Tag) {
     let Chunk(chunk) = chunk;
-    let space = made(place_of(chunk));
+    // SAFETY: a `Chunk` holds an index `take` returned (the type's invariant).
+    let space = unsafe { made(place_of(chunk)) };
     tag::transfer(owner, Tag::Chunks, CHUNK);
     space.give(&[local_of(chunk)]);
 }
@@ -240,21 +258,19 @@ pub(crate) const GIVE_RUN: usize = 64;
 
 /// As [`give`] for every chunk of `chunks` (at most [`GIVE_RUN`] of them): each run of one
 /// place goes back to its space with one compare-and-swap, its bytes counted with one transfer.
-pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
+///
+/// # Safety
+///
+/// Every index of `chunks` is one [`take`] returned and the caller holds that chunk, as for
+/// [`Chunk::from_index`]; none is used by it afterwards.
+pub(crate) unsafe fn give_all(chunks: &[u32], owner: Tag) {
     debug_assert!(chunks.len() <= GIVE_RUN);
-    let mut locals = [0u32; GIVE_RUN];
-    let mut at = 0;
-    while at < chunks.len() {
-        let place = place_of(chunks[at]);
-        let mut run = 0;
-        while at < chunks.len() && place_of(chunks[at]) == place {
-            locals[run] = local_of(chunks[at]);
-            run += 1;
-            at += 1;
-        }
-        let space = made(place);
-        tag::transfer(owner, Tag::Chunks, run * CHUNK);
-        space.give(&locals[..run]);
+    for run in chunks.chunk_by(|a, b| place_of(*a) == place_of(*b)) {
+        let Some(&first) = run.first() else { continue };
+        // SAFETY: `first` is an index `take` returned (the caller's contract).
+        let space = unsafe { made(place_of(first)) };
+        tag::transfer(owner, Tag::Chunks, run.len() * CHUNK);
+        space.give_by(run, local_of);
     }
 }
 
@@ -266,15 +282,21 @@ pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
 )]
 pub(crate) fn give_cold(chunk: Chunk, owner: Tag) {
     let Chunk(chunk) = chunk;
-    let space = made(place_of(chunk));
+    // SAFETY: a `Chunk` holds an index `take` returned (the type's invariant).
+    let space = unsafe { made(place_of(chunk)) };
     tag::transfer(owner, Tag::Chunks, CHUNK);
     space.purge_cold(local_of(chunk));
 }
 
 /// The link of a held chunk, for its owner's list of the chunks it holds (a chunk is on one
 /// list at a time: an owner's or its space's cache).
-pub(crate) fn link(chunk: u32) -> &'static AtomicU32 {
-    made(place_of(chunk)).links.link(local_of(chunk))
+///
+/// # Safety
+///
+/// `chunk` is an index [`take`] returned, as for [`Chunk::from_index`].
+pub(crate) unsafe fn link(chunk: u32) -> &'static AtomicU32 {
+    // SAFETY: the caller's contract.
+    unsafe { made(place_of(chunk)) }.links.link(local_of(chunk))
 }
 
 /// Lets the kernel take the pages of every warm cached chunk of every place; they stay
@@ -314,7 +336,11 @@ pub fn carved_on(node: Option<u32>) -> usize {
         Some(node) if node < MAX_NODES => node as usize + 1,
         Some(_) => return 0,
     };
-    SPACES[place].get().and_then(|space| space.as_ref().ok()).map_or(0, Space::carved_bytes)
+    SPACES
+        .get(place)
+        .and_then(OnceLock::get)
+        .and_then(|space| space.as_ref().ok())
+        .map_or(0, Space::carved_bytes)
 }
 
 impl Space {
@@ -353,9 +379,15 @@ impl Space {
     /// Caches `locals`, chunks no owner holds, warm (one compare-and-swap); past `most` warm,
     /// trims the cache down to `keep`.
     fn give(&self, locals: &[u32]) {
-        let given = locals.len() as u32;
+        self.give_by(locals, |local| local);
+    }
+
+    /// As [`Space::give`] for `chunks`, whose index in the space `local` gives (`local_of`
+    /// for indices numbered across places).
+    fn give_by(&self, chunks: &[u32], local: impl Fn(u32) -> u32) {
+        let given = chunks.len() as u32;
         let now = self.warm_count.fetch_add(given, Ordering::Relaxed) + given;
-        self.warm.push_all(locals, &self.links);
+        self.warm.push_all_by(chunks, local, &self.links);
         self.trim_past_most(now);
     }
 

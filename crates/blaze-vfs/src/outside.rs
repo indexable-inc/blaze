@@ -355,7 +355,7 @@ impl Dirs {
             "more than {PATH_BYTES} bytes of directories watched outside every view"
         );
         for &byte in key {
-            self.paths.append(byte);
+            self.paths.append(byte).unwrap_or_else(|error| panic!("{error}"));
         }
         // Published before the index names it, and the index before `len` counts it.
         let at = self.entries.append(Entry {
@@ -364,7 +364,7 @@ impl Dirs {
             subsumed_by: AtomicU32::new(0),
             start,
             len: key.len() as u32,
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         debug_assert_eq!(at, raw);
         let mut level = self.level.load(Ordering::Relaxed) as usize;
         if (raw as usize + 1) * 2 > TABLE << level {
@@ -415,7 +415,7 @@ impl Dirs {
     fn table(&self, level: usize) -> &[AtomicU64] {
         let span = span(level);
         while (self.places.len() as usize) < span.end {
-            self.places.append(AtomicU64::new(0));
+            self.places.append(AtomicU64::new(0)).unwrap_or_else(|error| panic!("{error}"));
         }
         &self.places.as_slice()[span]
     }
@@ -674,7 +674,7 @@ impl<'d> Outside<'d> {
                 retired: false,
                 retry: 0,
                 backoff: 1,
-            });
+            }).unwrap_or_else(|error| panic!("{error}"));
         }
         // A directory that covers one added with it comes after it: all are in first.
         for at in first..len {

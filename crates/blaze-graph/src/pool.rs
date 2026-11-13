@@ -316,7 +316,7 @@ fn take_cell<const N: usize>(
     cache: &mut Cache<'static, JobCell<N>>,
     room: fn(Pooled<'static, JobCell<N>>) -> Room,
 ) -> (Room, NonNull<u8>) {
-    let mut cell = cache.alloc(JobCell::EMPTY);
+    let mut cell = cache.alloc(JobCell::EMPTY).unwrap_or_else(|error| panic!("{error}"));
     let at = NonNull::from(&mut *cell).cast::<u8>();
     (room(cell), at)
 }
@@ -3536,7 +3536,7 @@ mod tests {
                         move || {
                             frame::task(Tag::Plane, |mine| {
                                 let before = super::with_local(|local| local.index).unwrap();
-                                *mine.alloc(1u64) += 1;
+                                *mine.alloc(1u64).expect("room") += 1;
                                 let used = mine.used();
                                 MARK.set(round as usize + 1);
                                 waiting.store(1, Ordering::SeqCst);
@@ -3549,7 +3549,7 @@ mod tests {
                                         std::ptr::eq(now, mine),
                                         "the job resumed in another frame"
                                     );
-                                    *now.alloc(2u64) += 1;
+                                    *now.alloc(2u64).expect("room") += 1;
                                 });
                                 assert!(
                                     mine.used() > used,
@@ -3633,22 +3633,22 @@ mod tests {
                         None,
                         move || {
                             frame::task(Tag::Plane, |outer| {
-                                *outer.alloc(1u64) += 1;
+                                *outer.alloc(1u64).expect("room") += 1;
                                 let before = super::with_local(|local| local.index).unwrap();
                                 frame::task(Tag::Plane, |inner| {
-                                    *inner.alloc(2u64) += 1;
+                                    *inner.alloc(2u64).expect("room") += 1;
                                     waiting.store(1, Ordering::SeqCst);
                                     assert_eq!(flights.get_or_run(at, || panic!("the client runs the key")), Ok(round));
                                     frame::current(|now| {
                                         assert!(std::ptr::eq(now, inner), "the job resumed in another frame");
-                                        let value: *const u64 = now.alloc(3u64);
+                                        let value: *const u64 = now.alloc(3u64).expect("room");
                                         assert!(inner.contains(value.cast()), "the job allocated outside its own frame");
                                     });
                                 });
                                 frame::task(Tag::Plane, |after| {
                                     frame::current(|now| {
                                         assert!(std::ptr::eq(now, after), "a task opened after the switch is not current");
-                                        let values = now.alloc_slice_fill_with(64, |at| at as u64 + u64::from(round));
+                                        let values = now.alloc_slice_fill_with(64, |at| at as u64 + u64::from(round)).expect("room");
                                         assert!(
                                             outer.contains(values.as_ptr().cast()),
                                             "a task opened after the switch did not start in its own job's frame"
@@ -3656,7 +3656,7 @@ mod tests {
                                         assert_eq!(values[63], 63 + u64::from(round));
                                     });
                                 });
-                                assert_eq!(*outer.alloc(4u64), 4, "the outer frame took its chunk back");
+                                assert_eq!(*outer.alloc(4u64).expect("room"), 4, "the outer frame took its chunk back");
                                 let after = super::with_local(|local| local.index).unwrap();
                                 Some((before, after))
                             })
@@ -3674,7 +3674,7 @@ mod tests {
                         || {
                             assert!(!frame::in_task(), "a job began inside a parked job's frame task");
                             frame::task(Tag::Plane, |mine| {
-                                let filled = mine.alloc_slice_fill_with(1024, |at| at as u64);
+                                let filled = mine.alloc_slice_fill_with(1024, |at| at as u64).expect("room");
                                 frame::task(Tag::Plane, |_| crate::spin::busy(Duration::from_millis(5)));
                                 assert_eq!(filled[1023], 1023, "another job wrote into this job's frame");
                             });

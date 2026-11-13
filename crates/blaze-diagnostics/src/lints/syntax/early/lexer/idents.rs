@@ -276,7 +276,7 @@ fn confusables<'f>(frame: &'f Frame, symbols: &[Symbol<'_>]) -> Vec<(usize, usiz
                 }
             }
             None => {
-                by_skeleton.insert(frame.alloc_str(&buf), (index, is_ascii));
+                by_skeleton.insert(frame.alloc_str(&buf).unwrap_or_else(|error| panic!("{error}")), (index, is_ascii));
             }
         }
     }

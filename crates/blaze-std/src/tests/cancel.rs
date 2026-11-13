@@ -118,7 +118,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         (None, Ok(())) => Ok(()),
         (Some(at), Err(TaskError { scope: "main", task, why })) if task == NAMES[at] => {
             let fits = match plan.tasks[at] {
-                Kind::Fails => why == TaskWhy::Failed("this task fails".to_owned()),
+                Kind::Fails => why == TaskWhy::Failed("this task fails".into()),
                 Kind::Panics => matches!(why, TaskWhy::Panicked(_)),
                 Kind::Waits => false,
             };

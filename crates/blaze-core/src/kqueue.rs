@@ -223,7 +223,7 @@ impl Owners {
     }
 
     fn own(&mut self, owner: Owner) -> u64 {
-        self.slab.insert(owner).to_bits()
+        self.slab.insert(owner).unwrap_or_else(|error| panic!("{error}")).to_bits()
     }
 
     fn get(&self, id: u64) -> Option<Owner> {
@@ -649,7 +649,7 @@ impl Kqueue {
             // clone: one count per watch made, only when no spare one is left; never per event.
             None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)))?,
         };
-        let id = self.watches.insert(watch);
+        let id = self.watches.insert(watch).unwrap_or_else(|error| panic!("{error}"));
         let watch = self.watches.get_mut(id).expect("inserted above");
         let mut first = None;
         let started = match since {
@@ -722,7 +722,7 @@ impl Kqueue {
             failed: None,
             finish,
             ids: Ids::default(),
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         match self.follow(spawn) {
             Ok(()) => {
                 // A spawn of `tag` already runs on, followed by its own handle.
@@ -874,7 +874,7 @@ impl Kqueue {
         let listener = net::listen(&self.root, at).map_err(context)?;
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
-        let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER });
+        let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER }).unwrap_or_else(|error| panic!("{error}"));
         let id = self.register(Owner::Listen(listen), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
         self.listens.get_mut(listen).expect("inserted above").id = id;
         // A listen of `tag` already ends, as the one it is replaced by begins.
@@ -935,7 +935,7 @@ impl Kqueue {
             sends: VecDeque::new(),
             read: TRIGGER,
             write: TRIGGER,
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         let read = self.owners.own(Owner::Read(conn));
         let write = self.owners.own(Owner::Write(conn));
         let connection = self.conns.get_mut(conn).expect("inserted above");
@@ -966,7 +966,7 @@ impl Kqueue {
         }
         let ident = fd.as_raw_fd() as usize;
         let flags = libc::EV_ADD | libc::EV_ONESHOT;
-        let connecting = self.connecting.insert(Connecting { tag, fd, at, unix });
+        let connecting = self.connecting.insert(Connecting { tag, fd, at, unix }).unwrap_or_else(|error| panic!("{error}"));
         self.register(Owner::Connecting(connecting), ident, libc::EVFILT_WRITE, flags, 0);
         Ok(())
     }
@@ -1779,7 +1779,7 @@ mod tests {
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
         // The registration is made with this wait; a refusal comes back as its event.
-        driver.poll(&mut out, Duration::from_millis(20));
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(20)));
         assert!(
             out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
             "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \
@@ -2365,6 +2365,7 @@ mod tests {
                 at: Address::Unix(name("x")),
                 unix: true,
             })
+            .expect("room")
         };
         let first = connecting(&mut driver, Tag(1));
         let ended = driver.owners.own(Owner::Connecting(first));

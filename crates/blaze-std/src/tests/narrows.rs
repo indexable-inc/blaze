@@ -160,7 +160,7 @@ impl Narrows for KeysCase {
     }
 
     fn narrow(cap: &Keys, step: usize) -> Keys {
-        cap.only(&subset(&three(|raw| KeyName::new(raw).expect("a test's key name")), step))
+        cap.only(&subset(&three(|raw| KeyName::new(raw).expect("a test's key name")), step)).expect("room for the narrowed keys")
     }
 
     fn keeps(step: usize) -> u64 {
@@ -183,14 +183,14 @@ impl Narrows for RootsCase {
     fn whole(io: &Io, _: &Cx) -> Result<Roots, String> {
         scripted(io, |host| {
             for name in three(|raw| Authority::new(raw).expect("a test's authority")) {
-                host.roots.push(Anchor { name, der: std::sync::Arc::from(vec![0x30]) });
+                std::sync::Arc::make_mut(&mut host.roots).push(Anchor { name, der: std::sync::Arc::from(vec![0x30]) });
             }
         })?;
         io.need_roots().map_err(|e| format!("harness: {e}"))
     }
 
     fn narrow(cap: &Roots, step: usize) -> Roots {
-        cap.only(&subset(&three(|raw| Authority::new(raw).expect("a test's authority")), step))
+        cap.only(&subset(&three(|raw| Authority::new(raw).expect("a test's authority")), step)).expect("room for the narrowed roots")
     }
 
     fn keeps(step: usize) -> u64 {

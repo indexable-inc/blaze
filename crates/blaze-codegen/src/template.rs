@@ -912,14 +912,14 @@ impl Template {
             align: self.align,
             code: &self.code,
             relocs: self.relocs.view(),
-            data: frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view()),
+            data: frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view()).unwrap_or_else(|error| panic!("{error}")),
             inlined: &self.inlined,
             side: self.side,
             unwind: self.unwind.as_ref().map(TemplateUnwind::view),
             lines: &self.lines,
             refs: self.refs,
             externs: frame
-                .alloc_slice_fill_with(self.externs.len(), |at| self.externs[at].as_str()),
+                .alloc_slice_fill_with(self.externs.len(), |at| self.externs[at].as_str()).unwrap_or_else(|error| panic!("{error}")),
             // clone: the function made of the view takes it
             coverage: self.coverage.clone(),
             profile: self.profile,
@@ -1060,7 +1060,7 @@ impl StaticTemplate {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
         let (data, init) = frame::task(Tag::Codegen, |frame| {
-            let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view());
+            let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view()).unwrap_or_else(|error| panic!("{error}"));
             let data = instantiate_data(views, refs, NO_EXTERNS, &item.0, None, frame)?;
             let init = match &self.init {
                 TemplateInit::Bytes { bytes, relocs } => Init::Bytes {

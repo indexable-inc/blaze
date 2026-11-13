@@ -210,7 +210,7 @@ where
     P: Pools<[E; N]>,
     E: Clone + 'static,
 {
-    <P as Pools<[E; N]>>::with(|cache| cache.share_from(head, fill))
+    <P as Pools<[E; N]>>::with(|cache| cache.share_from(head, fill).unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// The slot to write: first copied into a fresh one while other owners share it, which keep

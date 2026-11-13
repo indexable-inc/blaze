@@ -32,7 +32,7 @@ impl<'f> WorkQueue<'f> {
     fn new(frame: &'f Frame, blocks: usize, initial: impl Iterator<Item = BasicBlockId>) -> Self {
         let mut out = WorkQueue {
             queue: FDeque::with_capacity_in(blocks, frame),
-            queued: frame.alloc_slice_fill_with(blocks, |_| false),
+            queued: frame.alloc_slice_fill_with(blocks, |_| false).unwrap_or_else(|error| panic!("{error}")),
         };
         for it in initial {
             out.push(it);
@@ -66,7 +66,7 @@ struct Marks<'f> {
 impl<'f> Marks<'f> {
     fn new(frame: &'f Frame, rows: usize, lines: usize) -> Self {
         let per = lines.div_ceil(64);
-        Marks { per, bits: frame.alloc_slice_fill_with(rows * per, |_| 0) }
+        Marks { per, bits: frame.alloc_slice_fill_with(rows * per, |_| 0).unwrap_or_else(|error| panic!("{error}")) }
     }
 
     #[inline]
@@ -212,7 +212,7 @@ pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
     }
     let mut pending = S::new(frame, count, words);
     let mut marks = Marks::new(frame, count, lines);
-    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64);
+    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64).unwrap_or_else(|error| panic!("{error}"));
     for line in 0..lines {
         let bits = line_of(boundary, line);
         if bits != ZERO_LINE {
@@ -221,7 +221,7 @@ pub(super) fn forward_in<'f, 'e, S: Store<'f>>(
             marks.mark(index(start), line);
         }
     }
-    let visited = frame.alloc_slice_fill_with(count, |_| false);
+    let visited = frame.alloc_slice_fill_with(count, |_| false).unwrap_or_else(|error| panic!("{error}"));
     let mut out: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
     let mut queue = WorkQueue::new(frame, count, cfg.order.iter().copied());
     while let Some(at) = queue.pop() {
@@ -285,8 +285,8 @@ pub(super) fn backward_in<'f, 'e, S: Store<'f>>(
     // What has reached each block's exit and not yet been through it.
     let mut pending = S::new(frame, count, words);
     let mut marks = Marks::new(frame, count, lines);
-    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64);
-    let visited = frame.alloc_slice_fill_with(count, |_| false);
+    let now = frame.alloc_slice_fill_with(marks.per, |_| 0u64).unwrap_or_else(|error| panic!("{error}"));
+    let visited = frame.alloc_slice_fill_with(count, |_| false).unwrap_or_else(|error| panic!("{error}"));
     let mut into: FVec<'_, (BasicBlockId, Along<'e>)> = FVec::new_in(frame);
     let mut queue = WorkQueue::new(frame, count, cfg.order.iter().rev().copied());
     while let Some(at) = queue.pop() {

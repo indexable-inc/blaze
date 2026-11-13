@@ -28,12 +28,14 @@ pub mod mp4;
 )]
 mod videotoolbox;
 
-use alloc::vec::Vec;
 use core::{alloc::Allocator, fmt};
 
 pub use mp4::{Layout, MuxError, Muxer, Track};
 
-use crate::gpu::Gpu;
+use crate::{
+    gpu::Gpu,
+    mem::{Named, Vec},
+};
 
 /// How a frame's pixels are laid out: 4:2:0, a luma plane and an interleaved CbCr plane at
 /// half width and half height, limited range.
@@ -94,13 +96,22 @@ impl<A: Allocator> Frame<A> {
             return Err(VideoError::Frame { time, why: "its timescale is 0" });
         }
         // Both planes' rows are `width` samples wide: luma one a pixel, CbCr two a pair of pixels.
-        let row = width as usize * format.sample_bytes();
-        let rows = [height as usize, height as usize / 2];
-        for (plane, rows) in planes.iter().zip(rows) {
+        let too_large = || VideoError::Frame { time, why: "its planes have more bytes than this target counts" };
+        let row = usize::try_from(width)
+            .ok()
+            .and_then(|w| w.checked_mul(format.sample_bytes()))
+            .ok_or_else(too_large)?;
+        let luma_rows = usize::try_from(height).map_err(|_| too_large())?;
+        // The height is at least 2, so each plane has at least one row.
+        for (plane, rows) in planes.iter().zip([luma_rows, luma_rows / 2]) {
             if plane.stride < row {
                 return Err(VideoError::Frame { time, why: "a plane's stride is shorter than its row" });
             }
-            let need = plane.stride * (rows - 1) + row;
+            let need = plane
+                .stride
+                .checked_mul(rows.saturating_sub(1))
+                .and_then(|before_last| before_last.checked_add(row))
+                .ok_or_else(too_large)?;
             if plane.bytes.len() < need {
                 return Err(VideoError::Frame { time, why: "a plane's bytes are fewer than its rows" });
             }
@@ -186,15 +197,18 @@ impl Mastering {
     /// The 24 bytes, big-endian, that the `mdcv` box and VideoToolbox's
     /// `MasteringDisplayColorVolume` both hold.
     pub fn to_bytes(&self) -> [u8; 24] {
+        let [(gx, gy), (bx, by), (rx, ry)] = self.primaries;
+        let (wx, wy) = self.white;
+        // Each u32 is its two halves, high first: big-endian either way.
+        let halves = |v: u32| [(v >> 16) as u16, v as u16];
+        let [max_hi, max_lo] = halves(self.max_luminance);
+        let [min_hi, min_lo] = halves(self.min_luminance);
+        let words = [gx, gy, bx, by, rx, ry, wx, wy, max_hi, max_lo, min_hi, min_lo];
         let mut out = [0u8; 24];
-        for (i, (x, y)) in self.primaries.iter().enumerate() {
-            out[i * 4..i * 4 + 2].copy_from_slice(&x.to_be_bytes());
-            out[i * 4 + 2..i * 4 + 4].copy_from_slice(&y.to_be_bytes());
+        let (pairs, _) = out.as_chunks_mut::<2>();
+        for (pair, word) in pairs.iter_mut().zip(words) {
+            *pair = word.to_be_bytes();
         }
-        out[12..14].copy_from_slice(&self.white.0.to_be_bytes());
-        out[14..16].copy_from_slice(&self.white.1.to_be_bytes());
-        out[16..20].copy_from_slice(&self.max_luminance.to_be_bytes());
-        out[20..24].copy_from_slice(&self.min_luminance.to_be_bytes());
         out
     }
 }
@@ -337,7 +351,7 @@ impl Encoder {
     /// The next packet the encoder has finished, in decode order, made in `alloc`; `None` when
     /// none is ready yet. Never waits.
     #[cfg_attr(not(target_os = "macos"), expect(unused_variables, reason = "no provider here: no Encoder exists"))]
-    pub fn receive<A: Allocator>(&mut self, alloc: A) -> Result<Option<Packet<A>>, VideoError> {
+    pub fn receive<A: Allocator + Named>(&mut self, alloc: A) -> Result<Option<Packet<A>>, VideoError> {
         match self.provider {
             #[cfg(target_os = "macos")]
             Provider::VideoToolbox(ref mut session) => session.receive(alloc),
@@ -380,6 +394,9 @@ pub enum VideoError {
     Missing { what: &'static str },
     /// The allocator handed in could not give `asked` bytes for `what`.
     OutOfMemory { what: &'static str, asked: usize },
+    /// Inside the provider, `index` into `what` is past its length `len`: a bug in bstd::video,
+    /// said where it is found rather than read out of bounds.
+    Internal { what: &'static str, index: usize, len: usize },
 }
 
 impl fmt::Display for VideoError {
@@ -395,6 +412,9 @@ impl fmt::Display for VideoError {
             VideoError::Missing { what } => write!(f, "video: the platform gave no {what}"),
             VideoError::OutOfMemory { what, asked } => {
                 write!(f, "video: the allocator could not give {asked} bytes for {what}")
+            }
+            VideoError::Internal { what, index, len } => {
+                write!(f, "video: index {index} into {what} is past its length {len} (a bug in bstd::video)")
             }
         }
     }

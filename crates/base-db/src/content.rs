@@ -107,7 +107,7 @@ pub(crate) fn hash_many<'f>(
     IDS.with_borrow_mut(|ids| {
         let ids = ids.take();
         ContentId::of_many_into(domain, inputs, ids);
-        &*frame.alloc_slice_copy(ids)
+        &*frame.alloc_slice_copy(ids).unwrap_or_else(|error| panic!("{error}"))
     })
 }
 
@@ -119,6 +119,6 @@ pub(crate) fn hash_ranges<'f>(
     frame: &'f Frame,
 ) -> &'f [ContentId] {
     let inputs =
-        frame.alloc_slice_from_iter(ranges.iter().map(|range| &buf[range.start..range.end]));
+        frame.alloc_slice_from_iter(ranges.iter().map(|range| &buf[range.start..range.end])).unwrap_or_else(|error| panic!("{error}"));
     hash_many(domain, inputs, frame)
 }

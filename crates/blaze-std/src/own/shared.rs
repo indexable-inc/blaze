@@ -14,7 +14,7 @@
 //! The count is alloc's: `release` is `Arc::into_inner`, which gives the value to exactly one of
 //! the handles released together, where `try_unwrap` could give it to none.
 
-use alloc::{rc::Rc, sync::Arc};
+use alloc::{alloc::Global, rc::Rc, sync::Arc};
 use core::{
     alloc::{AllocError, Allocator, Layout},
     borrow::Borrow,
@@ -26,6 +26,7 @@ use core::{
 };
 
 use super::reach::{Acyclic, Jointly, Owns};
+use crate::mem::{Named, OutOfMemory};
 
 /// What releasing a handle gave.
 pub enum Released<#[blaze::linear] T> {
@@ -34,6 +35,19 @@ pub enum Released<#[blaze::linear] T> {
     Last(T),
     /// Other handles remain.
     NotLast,
+}
+
+/// A [`Shared::holding`] or [`LocalShared::holding`] the global heap had no room for: the
+/// value comes back, so a linear one is still the caller's to finish.
+pub struct Refused<#[blaze::linear] T> {
+    pub value: T,
+    pub error: OutOfMemory,
+}
+
+/// What the global heap's refusal of a handle's block for a `T` says.
+#[cold]
+fn refused<T>() -> OutOfMemory {
+    OutOfMemory { arena: Global.name(), asked: core::mem::size_of::<T>() }
 }
 
 macro_rules! shared {
@@ -47,17 +61,30 @@ macro_rules! shared {
         impl<T> $name<T> {
             /// A handle to `value`, which is not of a linear type (one that is goes in through
             /// [`holding`](Self::holding)).
-            pub fn new(value: T) -> $name<T> {
-                $name { inner: $inner::new(value) }
+            pub fn new(value: T) -> Result<$name<T>, OutOfMemory> {
+                match $inner::try_new(value) {
+                    Ok(inner) => Ok($name { inner }),
+                    Err(AllocError) => Err(refused::<T>()),
+                }
             }
         }
 
         impl<#[blaze::linear] T: Acyclic> $name<T> {
             /// A handle to `value`, whose type may be linear: the handle is then linear, and
-            /// the value comes back from the last [`release`](Self::release).
+            /// the value comes back from the last [`release`](Self::release). With no room on
+            /// the global heap the value comes back in the [`Refused`].
             #[blaze::consumes]
-            pub fn holding(value: T) -> $name<T> {
-                $name { inner: $inner::new(value) }
+            pub fn holding(value: T) -> Result<$name<T>, Refused<T>> {
+                // The block is made before the value moves, so a refusal still has it to give.
+                let mut slot = match $inner::<T>::try_new_uninit() {
+                    Ok(slot) => slot,
+                    Err(AllocError) => return Err(Refused { value, error: refused::<T>() }),
+                };
+                // SAFETY: `slot` was made on the line above and no other handle to it exists,
+                // so this is its only reference.
+                unsafe { $inner::get_mut_unchecked(&mut slot) }.write(value);
+                // SAFETY: the value was written into the block on the line above.
+                Ok($name { inner: unsafe { slot.assume_init() } })
             }
 
             /// Ends this handle. The last one gives the value back.
@@ -119,18 +146,6 @@ macro_rules! shared {
             }
         }
 
-        impl<T: Default> Default for $name<T> {
-            fn default() -> $name<T> {
-                $name::new(T::default())
-            }
-        }
-
-        impl<T> From<T> for $name<T> {
-            fn from(value: T) -> $name<T> {
-                $name::new(value)
-            }
-        }
-
         impl<#[blaze::linear] T: ?Sized + fmt::Debug> fmt::Debug for $name<T> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 fmt::Debug::fmt(&*self.inner, f)
@@ -157,7 +172,7 @@ macro_rules! shared {
         unsafe impl<T: ?Sized> Owns<Jointly> for $name<T> {}
 
         /// The handle names the arena its allocator does.
-        impl<A: crate::mem::Named + ?Sized> crate::mem::Named for $name<A> {
+        impl<A: Named + ?Sized> Named for $name<A> {
             fn name(&self) -> &'static str {
                 (**self).name()
             }

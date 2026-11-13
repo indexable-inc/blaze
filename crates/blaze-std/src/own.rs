@@ -49,7 +49,7 @@ pub use reach::{
     Acyclic, Ask, Cycle, Find, Inline, Jointly, Mutably, Nothing, Owns, Question, Reason, Solely,
     Through, Verdict, none, reaches,
 };
-pub use shared::{LocalShared, Released, Shared};
+pub use shared::{LocalShared, Refused, Released, Shared};
 pub use shares::Shares;
 
 // SAFETY: the walk for `Cycle` cleared `T`: from a `T`, through everything it owns, no

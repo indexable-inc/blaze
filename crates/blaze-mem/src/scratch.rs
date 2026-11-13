@@ -43,27 +43,27 @@ impl<B: Shelved, const N: usize> Shelf<B, N> {
 
     /// The top buffer, if the shelf has one.
     pub fn take(&mut self) -> Option<B> {
-        if self.free == 0 {
-            return None;
-        }
-        self.free -= 1;
-        self.buffers[self.free].take()
+        let top = self.free.checked_sub(1)?;
+        let slot = self.buffers.get_mut(top)?;
+        self.free = top;
+        slot.take()
     }
 
     /// Shelves `buffer` on top. A full shelf (a buffer lent on another thread coming back
     /// here) keeps its `N` largest and frees the smallest.
     pub fn give(&mut self, buffer: B) {
-        if self.free < N {
-            self.buffers[self.free] = Some(buffer);
+        // A slot past the top is there while the shelf holds fewer than `N`.
+        if let Some(slot) = self.buffers.get_mut(self.free) {
+            *slot = Some(buffer);
             self.free += 1;
             return;
         }
         let held = |slot: &Option<B>| slot.as_ref().map_or(0, Shelved::held);
-        let Some(smallest) = (0..N).min_by_key(|&at| held(&self.buffers[at])) else {
+        let Some(smallest) = self.buffers.iter_mut().min_by_key(|slot| held(&**slot)) else {
             return;
         };
-        if buffer.held() > held(&self.buffers[smallest]) {
-            self.buffers[smallest] = Some(buffer);
+        if buffer.held() > held(&*smallest) {
+            *smallest = Some(buffer);
         }
     }
 }
@@ -264,9 +264,17 @@ impl<T> Scratch<T> {
         self.buffer.capacity()
     }
 
-    /// Frees the buffer: after a burst, so it grows again only to the next working set.
+    /// Frees the buffer past room for `keep` elements: after a burst, so it grows again only to
+    /// the next working set. The smaller buffer is reserved before the old one goes, so a
+    /// reserve the allocator refuses leaves the old one, emptied: memory held, nothing broken.
     pub fn shrink(&mut self, keep: usize) {
         self.buffer.clear();
-        self.buffer.shrink_to(keep);
+        if self.buffer.capacity() <= keep {
+            return;
+        }
+        let mut smaller = Vec::new(); // alloc: none until reserved, the buffer's smaller room
+        if smaller.try_reserve_exact(keep).is_ok() {
+            self.buffer = smaller;
+        }
     }
 }

@@ -58,8 +58,7 @@ impl Opener {
         }
         hosted::call(&self.io, cx, |host| {
             // clone: the simulated host's record, refcounts.
-            host.opened.push(url.clone());
-            Ok(())
+            hosted::record(&mut host.opened, url.clone())
         })
         .map_err(refuse)
     }

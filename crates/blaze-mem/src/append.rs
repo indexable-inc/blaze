@@ -20,7 +20,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use crate::{MemError, Region, Tag, error::fail};
+use crate::{MemError, Region, Tag};
 
 pub struct AppendVec<T> {
     region: Region,
@@ -95,57 +95,35 @@ impl<T> AppendVec<T> {
     }
 
     /// The column's one writer until it is dropped: appends through it take no atomic
-    /// read-modify-write, only the value's store and the length's release store. Stops when
-    /// another writer or append is running.
-    #[track_caller]
-    pub fn writer(&self) -> Writer<'_, T> {
-        assert!(
-            !self.writing.swap(true, Ordering::Acquire),
-            "two threads appended to one AppendVec at once; its appends must be serialized"
-        );
-        Writer { column: self }
+    /// read-modify-write, only the value's store and the length's release store. Refused
+    /// ([`MemError::Refused`]) while another writer or append is running: its appends must be
+    /// serialized, and a second writer at once is refused rather than racing.
+    pub fn writer(&self) -> Result<Writer<'_, T>, MemError> {
+        if self.writing.swap(true, Ordering::Acquire) {
+            return Err(MemError::Refused {
+                tag: self.tag(),
+                what: "a second writer of an AppendVec while one runs (rule: its appends are \
+                       serialized, one writer at a time)",
+            });
+        }
+        Ok(Writer { column: self })
     }
 
     /// Appends `value` and returns its index, readable by every thread from now on. One writer
     /// at a time: the caller serializes its appends (its own lock or a single owner); a second
-    /// append while one runs stops. Many appends in a row are cheaper through
+    /// append while one runs is refused. Many appends in a row are cheaper through
     /// [`AppendVec::writer`].
-    #[track_caller]
-    pub fn try_append(&self, value: T) -> Result<u32, MemError> {
-        self.writer().try_append(value)
+    #[inline]
+    pub fn append(&self, value: T) -> Result<u32, MemError> {
+        self.writer()?.append(value)
     }
 
     /// Appends every value of `values` with one publish and returns the first one's index.
-    #[track_caller]
-    pub fn try_extend_from_slice(&self, values: &[T]) -> Result<u32, MemError>
+    pub fn extend_from_slice(&self, values: &[T]) -> Result<u32, MemError>
     where
         T: Copy,
     {
-        self.writer().try_extend_from_slice(values)
-    }
-
-    /// As [`AppendVec::try_extend_from_slice`]; stops when the reservation is used up or memory
-    /// cannot be had.
-    #[track_caller]
-    pub fn extend_from_slice(&self, values: &[T]) -> u32
-    where
-        T: Copy,
-    {
-        match self.try_extend_from_slice(values) {
-            Ok(first) => first,
-            Err(error) => fail(&error),
-        }
-    }
-
-    /// Appends `value` and returns its index; stops when the reservation is used up or memory
-    /// cannot be had.
-    #[inline]
-    #[track_caller]
-    pub fn append(&self, value: T) -> u32 {
-        match self.try_append(value) {
-            Ok(index) => index,
-            Err(error) => fail(&error),
-        }
+        self.writer()?.extend_from_slice(values)
     }
 
     /// The published elements.
@@ -216,9 +194,11 @@ impl<T> Writer<'_, T> {
         self.column.len.store(len, Ordering::Release);
     }
 
-    /// Appends `value` and returns its index, readable by every thread from now on.
+    /// Appends `value` and returns its index, readable by every thread from now on; when the
+    /// reservation is used up or memory cannot be had, the error names the column's tag and
+    /// nothing is published.
     #[inline]
-    pub fn try_append(&mut self, value: T) -> Result<u32, MemError> {
+    pub fn append(&mut self, value: T) -> Result<u32, MemError> {
         let len = self.room(1)?;
         // SAFETY: the slot is committed (`room`), aligned (a page-aligned base plus a multiple
         // of `size_of::<T>()`), past the published length so no reader reaches it, and written
@@ -228,19 +208,8 @@ impl<T> Writer<'_, T> {
         Ok(len as u32)
     }
 
-    /// Appends `value` and returns its index; stops when the reservation is used up or memory
-    /// cannot be had.
-    #[inline]
-    #[track_caller]
-    pub fn append(&mut self, value: T) -> u32 {
-        match self.try_append(value) {
-            Ok(index) => index,
-            Err(error) => fail(&error),
-        }
-    }
-
     /// Appends every value of `values` with one copy and one publish; the first one's index.
-    pub fn try_extend_from_slice(&mut self, values: &[T]) -> Result<u32, MemError>
+    pub fn extend_from_slice(&mut self, values: &[T]) -> Result<u32, MemError>
     where
         T: Copy,
     {
@@ -253,44 +222,21 @@ impl<T> Writer<'_, T> {
         Ok(len as u32)
     }
 
-    /// As [`Writer::try_extend_from_slice`]; stops when the reservation is used up or memory
-    /// cannot be had.
-    #[track_caller]
-    pub fn extend_from_slice(&mut self, values: &[T]) -> u32
-    where
-        T: Copy,
-    {
-        match self.try_extend_from_slice(values) {
-            Ok(first) => first,
-            Err(error) => fail(&error),
-        }
-    }
-
     /// Appends `make(0)`, `make(1)`, ... `make(count - 1)` with one publish; the first one's
     /// index. If `make` panics, none is published and those made so far are leaked (the next
     /// append writes over them).
-    pub fn try_extend_with(
+    pub fn extend_with(
         &mut self,
         count: usize,
         mut make: impl FnMut(usize) -> T,
     ) -> Result<u32, MemError> {
         let len = self.room(count)?;
         for at in 0..count {
-            // SAFETY: as in `try_append`, for each slot of the room `room` committed.
+            // SAFETY: as in `append`, for each slot of the room `room` committed.
             unsafe { self.slot(len + at).write(make(at)) };
         }
         self.publish(len + count);
         Ok(len as u32)
-    }
-
-    /// As [`Writer::try_extend_with`]; stops when the reservation is used up or memory cannot
-    /// be had.
-    #[track_caller]
-    pub fn extend_with(&mut self, count: usize, make: impl FnMut(usize) -> T) -> u32 {
-        match self.try_extend_with(count, make) {
-            Ok(first) => first,
-            Err(error) => fail(&error),
-        }
     }
 }
 

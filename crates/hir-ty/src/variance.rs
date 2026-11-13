@@ -69,7 +69,7 @@ fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
         return VariancesOf::empty().store();
     }
     blaze_mem::frame::current(|frame| {
-        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant).unwrap_or_else(|error| panic!("{error}"));
         VariancesOf::new_from_slice(Context { generics, variances, db }.solve()).store()
     })
 }
@@ -96,7 +96,7 @@ fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
         return VariancesOf::empty().store();
     }
     blaze_mem::frame::current(|frame| {
-        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant).unwrap_or_else(|error| panic!("{error}"));
         let mut cx = Context { generics, variances, db };
         let callable = match ctor {
             VariantId::StructId(s) => CallableDefId::StructId(s),

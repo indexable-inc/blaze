@@ -33,13 +33,7 @@
 //! them ([`Offers::NATIVE`]) and a simulated one answers them from its
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{alloc::Global, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{fmt, time::Duration};
 
 use blaze_core::{
@@ -65,10 +59,11 @@ use crate::{
     fs::Fs,
     gpu::Gpu,
     host::{Exit, Host, HostFacts},
-    hosted::SimHost,
+    hosted::{SimHost, SimHostError},
     keys::Keys,
     locale::Locale,
-    mem::Mem,
+    map::Map,
+    mem::{self, ByteLen, FormatError, Mem, Named, OutOfMemory, heap},
     net::Net,
     opener::Opener,
     power::Power,
@@ -203,31 +198,37 @@ pub(crate) enum Ends {
 struct World {
     driver: Backend,
     next: u64,
-    /// Effects made and not yet handed to the driver.
+    /// Effects made and not yet handed to the driver: std's `Vec`, the driver's interface,
+    /// grown only through [`push_std`].
     effects: Vec<Effect>,
-    /// What the last poll moved, before it is sorted into `got`.
+    /// What the last poll moved, before it is sorted into `got` (std's `Vec`, which the
+    /// driver fills).
     polled: Vec<Completion>,
     /// Completions polled and not yet taken by their waiter.
-    got: Vec<Completion>,
+    got: mem::Vec<Completion, Global>,
     /// Tags whose waiter stopped: their completions are dropped as they arrive.
-    abandoned: Vec<(Tag, Ends)>,
+    abandoned: mem::Vec<(Tag, Ends), Global>,
     /// The generator [`Io::rng`] forks from.
     rng: SplitMix64,
     /// Every file an effect named, and whether the effect changes it, while `record` is on: a
     /// test's view of where its capabilities reached.
-    touched: Vec<(FileName, bool)>,
+    touched: mem::Vec<(FileName, bool), Global>,
     record: bool,
     /// For each file whose bytes or name an effect of this world changed, the number of the
     /// last effect that did (its tag, plus one): the file's generation, which a
     /// [`crate::fs::Flushed`] carries and its clone compares. A file removed or renamed away
     /// has no entry, so the table holds one entry a file that is there and was changed here.
     // alloc: one entry a live file changed through this world.
-    changed: BTreeMap<FileName, u64>,
+    changed: Map<FileName, u64, Global>,
     /// What the world's tasks recorded through their contexts.
     trace: Trace,
     host: HostFacts,
     /// The status the simulated process exited with.
     exited: Option<i32>,
+    /// The payload of the simulated exit's unwind, made with the world so that the first
+    /// exit needs no room; a later one (after a test caught the first) makes its own.
+    // alloc: once per world, the exit's payload.
+    exit: Option<Box<Exit>>,
     /// The simulated host behind the capabilities blaze-core has no effect for: `None` in a
     /// real world, which has no provider for them.
     // alloc: once per simulated world.
@@ -243,8 +244,8 @@ struct World {
 #[derive(Clone)]
 pub struct Io {
     world: Arc<Lock<World>>,
-    env: Arc<[(String, String)]>,
-    args: Arc<[String]>,
+    env: Arc<Vec<(String, String)>>,
+    args: Arc<Vec<String>>,
     offers: Offers,
     limits: Limits,
 }
@@ -443,43 +444,102 @@ struct Start {
 /// The target's driver could not be made over a root.
 #[derive(Debug)]
 pub struct OpenError {
+    /// The root, as its `Display` writes it; empty when even that found no room
+    /// ([`OpenWhy::OutOfMemory`]).
     pub root: String,
-    pub why: String,
+    pub why: OpenWhy,
+}
+
+/// Why a native world could not be made.
+#[derive(Debug)]
+pub enum OpenWhy {
+    /// The machine's cores could not be counted.
+    Cores(blaze_core::cores::CoresError),
+    /// The target's driver refused to start over the root.
+    Driver(crate::rt::DriverError),
+    /// The global heap had no room for the world, or for this error's text.
+    OutOfMemory(Stopped),
 }
 
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "bstd::Io::native over {}: the target's driver: {}", self.root, self.why)
+        let root = &self.root;
+        match &self.why {
+            OpenWhy::Cores(error) => {
+                write!(f, "bstd::Io::native over {root}: counting the machine's cores: {error}")
+            }
+            OpenWhy::Driver(error) => write!(f, "bstd::Io::native over {root}: the target's driver: {error}"),
+            OpenWhy::OutOfMemory(stopped) => write!(f, "bstd::Io::native over {root:?}: {stopped}"),
+        }
     }
 }
 
 impl core::error::Error for OpenError {}
 
+/// Why a simulated world could not be made ([`Io::sim`] and the constructors beside it).
+#[derive(Debug)]
+pub enum SimError {
+    /// The global heap had no room for the world.
+    Stopped(Stopped),
+    /// Its simulated host could not be made ([`SimHost::new`]).
+    Host(SimHostError),
+}
+
+impl fmt::Display for SimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SimError::Stopped(stopped) => write!(f, "bstd::Io::sim: {stopped}"),
+            SimError::Host(error) => write!(f, "bstd::Io::sim: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for SimError {}
+
+impl From<Stopped> for SimError {
+    fn from(stopped: Stopped) -> SimError {
+        SimError::Stopped(stopped)
+    }
+}
+
+impl From<OutOfMemory> for SimError {
+    fn from(error: OutOfMemory) -> SimError {
+        SimError::Stopped(Stopped::from(error))
+    }
+}
+
+impl From<SimHostError> for SimError {
+    fn from(error: SimHostError) -> SimError {
+        SimError::Host(error)
+    }
+}
+
 impl Io {
     /// A whole simulated world from `seed`: an in-memory file tree, a virtual clock, a seeded
     /// generator, no faults beyond the simulation's latency and no environment, with
     /// [`Limits::USUAL`]: a test's world, whose seed is said. A world with other bounds is
-    /// [`Io::simulated`] of a [`SimWorld`].
-    pub fn sim(seed: u64) -> Io {
+    /// [`Io::simulated`] of a [`SimWorld`]. [`SimError::Stopped`] when the global heap
+    /// has no room for the world (so for each constructor below).
+    pub fn sim(seed: u64) -> Result<Io, SimError> {
         Io::simulated(SimWorld::new(seed, Limits::USUAL))
     }
 
     /// [`Io::sim`] offering only what `offers` says: a test of a host that withholds some.
-    pub fn sim_with(seed: u64, offers: Offers) -> Io {
+    pub fn sim_with(seed: u64, offers: Offers) -> Result<Io, SimError> {
         let mut world = SimWorld::new(seed, Limits::USUAL);
         world.offers = offers;
         Io::simulated(world)
     }
 
-    pub fn simulated(world: SimWorld) -> Io {
+    pub fn simulated(world: SimWorld) -> Result<Io, SimError> {
         Io::planted(world, Plant::None)
     }
 
     /// `world` with `plant` planted: [`Plant::None`] but for the tests' controls.
-    pub(crate) fn planted(world: SimWorld, plant: Plant) -> Io {
-        Io::over(Start {
+    pub(crate) fn planted(world: SimWorld, plant: Plant) -> Result<Io, SimError> {
+        Ok(Io::over(Start {
             // alloc: once per simulated world.
-            driver: Backend::Sim(Box::new(Sim::new(world.seed, world.faults))),
+            driver: Backend::Sim(heap::boxed(Sim::new(world.seed, world.faults))?),
             seed: world.seed ^ RNG_SALT,
             env: world.env,
             args: world.args,
@@ -487,28 +547,36 @@ impl Io {
             offers: world.offers,
             limits: world.limits,
             // alloc: once per simulated world, its host.
-            hosted: Some(Box::new(SimHost::new())),
+            hosted: Some(heap::boxed(SimHost::new()?)?),
             // alloc: once per simulated world, its disk's ledger.
-            disk: Some(Box::new(Disk::new(world.seed))),
+            disk: Some(heap::boxed(Disk::new(world.seed))?),
             plant,
-        })
+        })?)
     }
 
     /// The target's own driver over `world.root`.
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     pub fn native(world: NativeWorld<'_>) -> Result<Io, OpenError> {
-        let refused = |why: String| OpenError {
-            // alloc: an error's message.
-            root: world.root.display().to_string(),
-            why,
+        let refused = |why: OpenWhy| {
+            // alloc: an error's name of its root, on the global heap as the error is.
+            match heap::format(format_args!("{}", world.root.display())) {
+                Ok(root) => OpenError { root, why },
+                Err(FormatError::Full(error)) => {
+                    OpenError { root: String::new(), why: OpenWhy::OutOfMemory(Stopped::from(error)) }
+                }
+                // A path's `Display` writes what it holds and never fails; if it did, the
+                // error still says why the world was not made, with no root.
+                Err(FormatError::Trait) => OpenError { root: String::new(), why },
+            }
         };
-        // alloc: an error's message.
-        let cores = blaze_core::cores::machine().map_err(|error| refused(error.to_string()))?;
-        // alloc: an error's message.
-        let driver = blaze_core::native(world.root, world.threads).map_err(|error| refused(error.to_string()))?;
-        Ok(Io::over(Start {
-            // alloc: once per process, the driver.
-            driver: Backend::Native(Box::new(driver)),
+        let cores = blaze_core::cores::machine().map_err(|error| refused(OpenWhy::Cores(error)))?;
+        let driver =
+            blaze_core::native(world.root, world.threads).map_err(|error| refused(OpenWhy::Driver(error)))?;
+        let out_of_memory = |stopped: Stopped| refused(OpenWhy::OutOfMemory(stopped));
+        // alloc: once per process, the driver.
+        let driver = heap::boxed(driver).map_err(|error| out_of_memory(Stopped::from(error)))?;
+        Io::over(Start {
+            driver: Backend::Native(driver),
             seed: world.seed,
             env: world.env,
             args: world.args,
@@ -518,10 +586,11 @@ impl Io {
             hosted: None,
             disk: None,
             plant: Plant::None,
-        }))
+        })
+        .map_err(out_of_memory)
     }
 
-    fn over(start: Start) -> Io {
+    fn over(start: Start) -> Result<Io, Stopped> {
         let Start { driver, seed, env, args, host, offers, limits, hosted, disk, plant } = start;
         let world = World {
             driver,
@@ -531,32 +600,33 @@ impl Io {
             // alloc: the poll's buffer, grown once to the most a poll moves.
             polled: Vec::new(),
             // alloc: the completions kept for their waiters.
-            got: Vec::new(),
+            got: mem::Vec::new_in(Global),
             // alloc: the tags of waits that stopped.
-            abandoned: Vec::new(),
+            abandoned: mem::Vec::new_in(Global),
             rng: SplitMix64::new(seed),
             // alloc: none until a test records.
-            touched: Vec::new(),
+            touched: mem::Vec::new_in(Global),
             record: false,
             // alloc: none until a file is changed.
-            changed: BTreeMap::new(),
+            changed: Map::new_in(Global),
             trace: Trace::new(limits.trace_most),
             host,
             exited: None,
+            exit: Some(heap::boxed(Exit { status: 0 })?),
             hosted,
             disk,
             plant,
         };
-        Io {
+        Ok(Io {
             // alloc: once per world.
-            world: Arc::new(Lock::new("bstd.io.world", world)),
-            // alloc: once per world, its environment.
-            env: env.into(),
-            // alloc: once per world, its command line.
-            args: args.into(),
+            world: heap::shared(Lock::new("bstd.io.world", world))?,
+            // alloc: once per world, its environment (the list moves in; nothing is copied).
+            env: heap::shared(env)?,
+            // alloc: once per world, its command line (moved in too).
+            args: heap::shared(args)?,
             offers,
             limits,
-        }
+        })
     }
 
     /// The bounds this world was made with.
@@ -570,11 +640,15 @@ impl Io {
     /// The root context: named `main`, never cancelled, ending `budget` from now on the
     /// driver's clock, with a frame of its own that hands out at most `scratch` bytes
     /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
-    /// assumed). Every wait under it ends by `budget`.
-    pub fn cx(&self, budget: Duration, scratch: usize) -> Result<Cx, Stopped> {
+    /// assumed). Every wait under it ends by `budget`. A `scratch` more than this target's
+    /// memory can address is [`Stopped::OutOfMemory`] (`asked` is then `usize::MAX`).
+    pub fn cx(&self, budget: Duration, scratch: ByteLen) -> Result<Cx, Stopped> {
+        let scratch = scratch
+            .in_memory()
+            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: usize::MAX })?;
         let frame = Frame::named("main's frame", scratch, blaze_mem::Tag::Frames)
             .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: scratch })?;
-        Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
+        Cx::root(Deadline::after(self.now(), budget), frame, self.clone())
     }
 
     /// What the host offers: fixed when this `Io` was made.
@@ -693,8 +767,8 @@ impl Io {
         if !self.offered(|it| it.roots) {
             return None;
         }
-        // clone: the anchors handed out, refcounts; alloc: once per call, their list.
-        let anchors: Arc<[crate::roots::Anchor]> = self.script(|host| host.roots.iter().cloned().collect())?;
+        // clone: the anchors handed out, a refcount.
+        let anchors = self.script(|host| host.roots.clone())?;
         Some(Roots::new(anchors, self.plant()))
     }
 
@@ -944,8 +1018,21 @@ impl Io {
         if !simulated {
             crate::rt::exit(status);
         }
-        // alloc: once, the unwind's payload.
-        crate::rt::resume_unwind(Box::new(Exit { status }))
+        let made = self.world.lock().exit.take();
+        let payload = match made {
+            Some(mut payload) => {
+                payload.status = status;
+                payload
+            }
+            // alloc: a later exit's payload, the first one's having been caught already.
+            None => match heap::boxed(Exit { status }) {
+                Ok(payload) => payload,
+                // `-> !` has no error to return and the unwind needs its payload: this is
+                // the process out of memory, as alloc would end it.
+                Err(_) => alloc::alloc::handle_alloc_error(core::alloc::Layout::new::<Exit>()),
+            },
+        };
+        crate::rt::resume_unwind(payload)
     }
 
     /// The driver's clock.
@@ -967,34 +1054,45 @@ impl Io {
     #[cfg(test)]
     pub(crate) fn touched(&self) -> Vec<(FileName, bool)> {
         // clone: a test's copy of the record.
-        self.world.lock().touched.clone()
+        self.world.lock().touched.clone_in_place().expect("a test's copy of the record").into_std()
     }
 
     /// `effect` of a fresh tag, handed to the driver, then waited for under `cx`: one call.
     /// A `cx` that stopped already asks nothing of the driver.
     pub(crate) fn call(&self, cx: &Cx, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
         cx.stopped_by(self.now())?;
-        let tag = self.submit(effect);
+        let tag = self.submit(effect)?;
         cx.wait(self, tag, Ends::Once)
     }
 
-    /// `effect` of a fresh tag, handed to the driver now.
-    pub(crate) fn submit(&self, effect: impl FnOnce(Tag) -> Effect) -> Tag {
+    /// `effect` of a fresh tag, handed to the driver now. [`Stopped::OutOfMemory`] when the
+    /// world's tables or the driver's queue have no room for it: then nothing is handed to
+    /// the driver and no table changes.
+    pub(crate) fn submit(&self, effect: impl FnOnce(Tag) -> Effect) -> Result<Tag, Stopped> {
         let mut world = self.world.lock();
-        let tag = Tag(world.next);
-        world.next += 1;
-        let effect = effect(tag);
+        // Room first, for the one entry each table may gain and the queue's one effect: past
+        // these nothing below grows.
+        reserve_std(&mut world.effects)?;
+        world.changed.reserve(1)?;
         if world.record {
-            touch(&mut world.touched, &effect);
+            world.touched.reserve(2)?;
         }
-        change(&mut world.changed, &effect, tag.0 + 1);
-        let World { driver, effects, disk, .. } = &mut *world;
+        let tag = Tag(world.next);
+        let effect = effect(tag);
+        let World { driver, effects, disk, touched, changed, record, next, .. } = &mut *world;
+        // The disk's ledger first: it is the one table here whose growth was not reserved
+        // above, and it is as it was when it refuses.
         if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
-            disk.submitted(sim, &effect);
+            disk.submitted(sim, &effect)?;
         }
-        effects.push(effect);
+        if *record {
+            touch(touched, &effect)?;
+        }
+        change(changed, &effect, tag.0 + 1)?;
+        push_std(effects, effect)?;
+        *next += 1;
         driver.submit(effects);
-        tag
+        Ok(tag)
     }
 
     /// The generation of `name`: the number of the last effect of this world that changed
@@ -1075,10 +1173,10 @@ impl Io {
                 None
             };
             if let Some(stopped) = stopped {
-                self.forget(tag, Ends::Once);
+                self.forget(tag, Ends::Once)?;
                 return Err(stopped);
             }
-            match self.poll(until) {
+            match self.poll(until)? {
                 0 => idle += 1,
                 _ => idle = 0,
             }
@@ -1086,55 +1184,96 @@ impl Io {
     }
 
     /// The tag's waiter is gone: its completions are dropped as they arrive.
-    pub(crate) fn forget(&self, tag: Tag, ends: Ends) {
-        self.world.lock().abandoned.push((tag, ends));
+    /// [`Stopped::OutOfMemory`] when the table of such tags has no room: then a completion of
+    /// `tag` that arrives is kept unclaimed, as if its waiter were still to come.
+    pub(crate) fn forget(&self, tag: Tag, ends: Ends) -> Result<(), Stopped> {
+        Ok(self.world.lock().abandoned.push((tag, ends))?)
     }
 
     /// The next completion of `tag`, if one was polled: taken for its waiter.
     pub(crate) fn take(&self, tag: Tag) -> Option<Done> {
         let mut world = self.world.lock();
         let at = world.got.iter().position(|it| it.tag == tag)?;
-        Some(world.got.remove(at).done)
+        Some(world.got.remove(at)?.done)
     }
 
     /// One poll of the driver, waiting at most until `until`: what it brought kept for each
     /// waiter (or dropped, a stopped waiter's), and how many completions it moved. A poll that
     /// moved nothing moves the simulation's clock to `until`, as a real wait sleeps to it. The
-    /// step of [`Cx::wait`], the one wait.
-    pub(crate) fn poll(&self, until: Deadline) -> usize {
+    /// step of [`Cx::wait`], the one wait. [`Stopped::OutOfMemory`] when what it brought has
+    /// no room to be kept: then those completions stay polled, for the next poll to keep.
+    pub(crate) fn poll(&self, until: Deadline) -> Result<usize, Stopped> {
         let mut world = self.world.lock();
         let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
         let moved = driver.poll(polled, until);
-        for completion in polled.drain(..) {
-            if let Some(disk) = disk.as_deref_mut() {
-                disk.completed(&completion);
+        // Room for every completion before any is moved (with any an earlier poll found no
+        // room for, still polled), so none is lost.
+        got.reserve(polled.len())?;
+        // The disk's ledger takes each completion in order; the ones it took are then kept
+        // (room for them was made above), and one it found no room for stays polled with
+        // those after it, for the next poll.
+        let mut taken = 0;
+        let mut ledger = Ok(());
+        for completion in polled.iter() {
+            if let Some(disk) = disk.as_deref_mut()
+                && let Err(stopped) = disk.completed(completion)
+            {
+                ledger = Err(stopped);
+                break;
             }
-            keep(got, abandoned, completion);
+            taken += 1;
         }
+        for completion in polled.drain(..taken) {
+            keep(got, abandoned, completion)?;
+        }
+        ledger?;
         if moved == 0 {
             driver.idle_until(until);
         }
-        moved
+        Ok(moved)
     }
 }
 
 /// `completion` kept for its waiter, or dropped when its waiter stopped.
-fn keep(got: &mut Vec<Completion>, abandoned: &mut Vec<(Tag, Ends)>, completion: Completion) {
-    let Some(at) = abandoned.iter().position(|(tag, _)| *tag == completion.tag) else {
-        got.push(completion);
-        return;
+fn keep(
+    got: &mut mem::Vec<Completion, Global>,
+    abandoned: &mut mem::Vec<(Tag, Ends), Global>,
+    completion: Completion,
+) -> Result<(), OutOfMemory> {
+    let found = abandoned.iter().enumerate().find(|(_, (tag, _))| *tag == completion.tag);
+    let Some((at, &(_, ends))) = found else {
+        return got.push(completion);
     };
-    let last = match abandoned[at].1 {
+    let last = match ends {
         Ends::Once => true,
         Ends::Stream => matches!(completion.done, Done::Unlistened | Done::Failed(_)),
     };
     if last {
-        abandoned.swap_remove(at);
+        // The entry was found at `at` just above: removing it gives it back.
+        let _removed: Option<(Tag, Ends)> = abandoned.swap_remove(at);
+    }
+    Ok(())
+}
+
+/// Room for one more value in `items`, a std `Vec` the driver's interface takes: what
+/// [`push_std`] then fills. [`OutOfMemory`] with `items` as they were.
+fn reserve_std<T>(items: &mut Vec<T>) -> Result<(), OutOfMemory> {
+    items.try_reserve(1).map_err(|_| OutOfMemory { arena: Global.name(), asked: size_of::<T>() })
+}
+
+/// `value` added at the end of `items`, a std `Vec` the driver's interface takes, without
+/// growing past what [`reserve_std`] made room for. [`OutOfMemory`] with `items` as they were.
+fn push_std<T>(items: &mut Vec<T>, value: T) -> Result<(), OutOfMemory> {
+    reserve_std(items)?;
+    match items.push_within_capacity(value) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(OutOfMemory { arena: Global.name(), asked: size_of::<T>() }),
     }
 }
 
-/// The files `effect` names, recorded for a test.
-fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
+/// The files `effect` names, recorded for a test. [`OutOfMemory`] when the record has no
+/// room for one (a name is a refcount: nothing else is allocated).
+fn touch(touched: &mut mem::Vec<(FileName, bool), Global>, effect: &Effect) -> Result<(), OutOfMemory> {
     // clone: a test's record of names, refcounts.
     let mut named = |file: &FileName, changes: bool| touched.push((file.clone(), changes));
     match effect {
@@ -1162,8 +1301,8 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::RenameUnsynced { from, to, .. }
         | Effect::Clone { from, to, .. }
         | Effect::Link { from, to, .. } => {
-            named(from, true);
-            named(to, true);
+            named(from, true)?;
+            named(to, true)
         }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
         Effect::Private { dir, .. }
@@ -1194,14 +1333,15 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
-        | Effect::Random { .. } => {}
+        | Effect::Random { .. } => Ok(()),
     }
 }
 
 /// Records in `changed` what `effect`, numbered `stamp`, does to the files it names: a file
 /// whose bytes it changes or that it makes is stamped; one it removes or renames away loses
 /// its entry.
-fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
+/// [`OutOfMemory`] when the table has no room for the entry, with the table as it was.
+fn change(changed: &mut Map<FileName, u64, Global>, effect: &Effect, stamp: u64) -> Result<(), OutOfMemory> {
     match effect {
         Effect::Append { file, .. }
         | Effect::Truncate { file, .. }
@@ -1209,23 +1349,27 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         | Effect::WriteAt { file, .. }
         | Effect::WriteFrom { file, .. } => {
             // clone: the table's key, a refcount.
-            changed.insert(file.clone(), stamp);
+            changed.insert(file.clone(), stamp)?;
         }
         Effect::Remove { file, .. } => {
             changed.remove(file);
         }
         Effect::Rename { from, to, .. } => {
-            changed.remove(from);
+            // The new name's entry first, so a refusal leaves the old one in place.
             // clone: the table's key, a refcount.
-            changed.insert(to.clone(), stamp);
+            changed.insert(to.clone(), stamp)?;
+            if from != to {
+                changed.remove(from);
+            }
         }
         Effect::Clone { to, .. } | Effect::Link { to, .. } => {
             // clone: the table's key, a refcount.
-            changed.insert(to.clone(), stamp);
+            changed.insert(to.clone(), stamp)?;
         }
         // Everything else leaves every file's bytes and names as they were.
         _ => {}
     }
+    Ok(())
 }
 
 impl fmt::Debug for Io {

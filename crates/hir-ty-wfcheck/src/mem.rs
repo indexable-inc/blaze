@@ -2,10 +2,21 @@
 //! when the task that runs the check ends. What a check returns to the database is owned instead.
 //! The borrow checker's frame collections are these.
 
-pub use blaze_mem::frame::{Frame, collect};
+pub use blaze_mem::frame::Frame;
 pub use hir_ty::{FrameMap as FMap, FrameSet as FSet, frame_map as map, frame_set as set};
 
 pub type FVec<'f, T> = Vec<T, &'f Frame>;
+
+/// The items of `items` in `frame`, sized once ([`blaze_mem::frame::collect`]). A frame that
+/// cannot hold them stops the check with the error naming why: its job fails, no other.
+#[inline]
+#[track_caller]
+pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> FVec<'f, T> {
+    match blaze_mem::frame::collect(frame, items) {
+        Ok(items) => items.into_std(),
+        Err(error) => panic!("{error}"),
+    }
+}
 
 /// The items of `iter`, which says its length, as an owned vector of exactly that length: a
 /// memoized result built from frame values.

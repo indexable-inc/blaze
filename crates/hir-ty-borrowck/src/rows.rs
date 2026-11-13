@@ -71,7 +71,7 @@ pub(super) struct Dense<'f> {
 
 impl<'f> Store<'f> for Dense<'f> {
     fn new(frame: &'f Frame, rows: usize, words: usize) -> Self {
-        Dense { words, data: frame.alloc_slice_fill_with(rows * words, |_| 0) }
+        Dense { words, data: frame.alloc_slice_fill_with(rows * words, |_| 0).unwrap_or_else(|error| panic!("{error}")) }
     }
 
     #[inline]
@@ -142,7 +142,7 @@ impl<'f> Store<'f> for Lined<'f> {
         Lined {
             words,
             lines,
-            slots: frame.alloc_slice_fill_with(rows * lines, |_| ZEROS),
+            slots: frame.alloc_slice_fill_with(rows * lines, |_| ZEROS).unwrap_or_else(|error| panic!("{error}")),
             pool,
             free: Vec::new_in(frame),
         }
@@ -249,10 +249,10 @@ impl<'f> Effects<'f> {
         let words = crate::bitset::words_for(domain);
         Effects {
             words,
-            rows: frame.alloc_slice_fill_with(rows, |_| (0, 0)),
+            rows: frame.alloc_slice_fill_with(rows, |_| (0, 0)).unwrap_or_else(|error| panic!("{error}")),
             word: Vec::with_capacity_in(rows, frame),
             bits: Vec::with_capacity_in(rows, frame),
-            scratch: frame.alloc_slice_fill_with(words, |_| [0; 2]),
+            scratch: frame.alloc_slice_fill_with(words, |_| [0; 2]).unwrap_or_else(|error| panic!("{error}")),
             touched: Vec::with_capacity_in(LINE.min(words), frame),
         }
     }

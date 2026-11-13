@@ -490,7 +490,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         }
         let hash_of =
             |raw: u32| probe_hash(&self.slot(raw).expect("an index entry before its value").0);
-        shard.index.insert(len as usize, probe_hash(&id), raw, hash_of);
+        shard.index.insert(len as usize, probe_hash(&id), raw, hash_of).unwrap_or_else(|error| panic!("{error}"));
         shard.len.store(len + 1, Ordering::Relaxed);
         Idx::from_raw(raw)
     }

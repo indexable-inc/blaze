@@ -30,9 +30,10 @@ use crate::{
     Plant,
     cx::Cx,
     eval::{
-        At, Called, Eval, Graph, Handler, Key, MemoLimit, Nested, Next, Point, Provenance,
+        At, Called, Eval, EvalError, Graph, Handler, Key, MemoLimit, Nested, Next, Point, Provenance,
     },
     id::ContentId,
+    mem::ByteLen,
 };
 
 /// Room for every entry a plan can make: only the entry limit evicts.
@@ -66,8 +67,8 @@ fn asked(d: &mut impl Draw, most: u64) -> Asked {
 
 fn ask(eval: &Eval<'_>, cx: &Cx, (is_sum, a, b): Asked) -> u64 {
     match is_sum {
-        true => eval.call(cx, sum, (a, b)),
-        false => eval.call(cx, mix, (a, b)),
+        true => eval.call(cx, sum, (a, b)).expect("a call of sum"),
+        false => eval.call(cx, mix, (a, b)).expect("a call of mix"),
     }
 }
 
@@ -158,8 +159,8 @@ struct Count<'a> {
 }
 
 impl Handler for Count<'_> {
-    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>) {
-        next.through(cx, self.inner);
+    fn run(&self, cx: &Cx, at: At, next: &mut Next<'_>) -> Result<(), EvalError> {
+        next.through(cx, self.inner)?;
         if next.ran() {
             let mut runs = self.runs.borrow_mut();
             match runs.iter_mut().find(|(call, _)| *call == at.called()) {
@@ -167,6 +168,7 @@ impl Handler for Count<'_> {
                 None => runs.push((at.called(), 1)),
             }
         }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -280,7 +282,7 @@ fn mid(points: &mut Nested<'_>, (shape, row): (u64, u64)) -> u64 {
     let mut total = row;
     for col in 0..4 {
         if wants(shape, row, col) {
-            total = total.wrapping_add(points.call(leaf, (col,)));
+            total = total.wrapping_add(points.call(leaf, (col,)).expect("a nested call of leaf"));
         }
     }
     total
@@ -291,7 +293,7 @@ fn top(points: &mut Nested<'_>, (shape,): (u64,)) -> u64 {
     let mut total = 0u64;
     for row in 0..4 {
         if wants(shape, 4, row) {
-            total = total.wrapping_add(points.call(mid, (shape, row)));
+            total = total.wrapping_add(points.call(mid, (shape, row)).expect("a nested call of mid"));
         }
     }
     total
@@ -339,7 +341,7 @@ fn run_traced(plan: &Traced, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
     let mem = io.need_mem().map_err(harness)?;
-    let arena = mem.arena("test provenance", ROOMY).map_err(harness)?;
+    let arena = mem.arena("test provenance", ByteLen::of_memory(ROOMY)).map_err(harness)?;
     let graph = Graph::new_in(&arena);
     let inner = match plan.memo {
         true => Eval::memo(&mem, MemoLimit { entries: 64, bytes: ROOMY }).map_err(harness)?,
@@ -354,7 +356,7 @@ fn run_traced(plan: &Traced, plant: Plant) -> Result<(), String> {
     let mut model: Vec<(Called, Vec<Called>)> = Vec::new();
     let mut roots: Vec<Called> = Vec::new();
     for (at, &shape) in plan.shapes.iter().enumerate() {
-        let got = eval.call(&cx, top, (shape,));
+        let got = eval.call(&cx, top, (shape,)).map_err(|e| format!("call {at} of top({shape:#x}): {e}"))?;
         if got != top_of(shape) {
             return Err(format!("call {at} of top({shape:#x}) gave {got}, not {}", top_of(shape)));
         }
@@ -408,13 +410,14 @@ fn the_oracle_catches_calls_put_under_the_grandparent() {
 struct Wrong;
 
 impl Handler for Wrong {
-    fn run(&self, _: &Cx, at: At, next: &mut Next<'_>) {
+    fn run(&self, _: &Cx, at: At, next: &mut Next<'_>) -> Result<(), EvalError> {
         let refused = next.supply(&"not a u64").expect_err("a `&str` is no `u64`");
         assert_eq!(refused.point, at.point);
         assert!(next.value().is_none(), "a refused value is not the call's");
         next.compute();
         assert!(next.ran());
         assert_eq!(next.value().and_then(|it| it.downcast_ref::<u64>()), Some(&mix_of(2, 5)));
+        Ok(())
     }
 }
 
@@ -422,7 +425,7 @@ impl Handler for Wrong {
 fn a_handler_cannot_supply_a_value_of_another_type() {
     let io = world(0, Plant::None);
     let cx = root(&io);
-    assert_eq!(Eval::handler(&Wrong).call(&cx, mix, (2, 5)), mix_of(2, 5));
+    assert_eq!(Eval::handler(&Wrong).call(&cx, mix, (2, 5)).expect("a call through Wrong"), mix_of(2, 5));
 }
 
 // Keys.

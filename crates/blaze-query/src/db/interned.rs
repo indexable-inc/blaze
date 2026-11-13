@@ -246,7 +246,7 @@ fn insert<F, K>(
     row.made.store(1, Ordering::Relaxed);
     shard.index.insert(*len, hash, id.as_u32(), |at| {
         table.row(Id::from_u32(at)).hash.load(Ordering::Relaxed)
-    });
+    }).unwrap_or_else(|error| panic!("{error}"));
     *len += 1;
     drop(len);
     storage.event(|| EventKind::DidInternValue { key: DatabaseKeyIndex::new(index, id) });

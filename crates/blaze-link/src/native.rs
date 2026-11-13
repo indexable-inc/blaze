@@ -2296,7 +2296,7 @@ impl<'a> Stage<'a> {
                 let arena: &'a blaze_mem::Frame = self.arena;
                 let start = range.start as usize;
                 Content::Bytes(
-                    arena.alloc_slice_copy(&object.made[start + within.start..start + within.end]),
+                    arena.alloc_slice_copy(&object.made[start + within.start..start + within.end]).unwrap_or_else(|error| panic!("{error}")),
                 )
             }
             Data::Input(range) => {
@@ -2309,7 +2309,7 @@ impl<'a> Stage<'a> {
             }
             Data::Bytes(bytes) => {
                 let arena: &'a blaze_mem::Frame = self.arena;
-                Content::Bytes(arena.alloc_slice_copy(&bytes[within]))
+                Content::Bytes(arena.alloc_slice_copy(&bytes[within]).unwrap_or_else(|error| panic!("{error}")))
             }
             Data::Zero(_) => Content::Zero,
         }
@@ -3992,7 +3992,7 @@ impl<'a> Stage<'a> {
                 None => {
                     // Copied out of the table it is interned into.
                     let arena: &'a blaze_mem::Frame = self.arena;
-                    let target: &str = arena.alloc_str(target);
+                    let target: &str = arena.alloc_str(target).unwrap_or_else(|error| panic!("{error}"));
                     self.symbols.sym_name(target)
                 }
             };

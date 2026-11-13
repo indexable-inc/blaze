@@ -201,7 +201,7 @@ impl<T: Consed> HashCons<T> {
             (shard.node(local).expect("an index entry before its node").content.fingerprint().0
                 >> 64) as u64
         };
-        shard.index.insert(local as usize, key.hash, local, hash_of);
+        shard.index.insert(local as usize, key.hash, local, hash_of).unwrap_or_else(|error| panic!("{error}"));
         shard.len.store(local + 1, Ordering::Release);
         node
     }

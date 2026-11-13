@@ -94,7 +94,7 @@ fn opaque_variances_query<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> 
     }
     let root = opaque.loc(db);
     blaze_mem::frame::current(|frame| {
-        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Invariant);
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Invariant).unwrap_or_else(|error| panic!("{error}"));
         for (variance, (param, _)) in variances.iter_mut().zip(params.iter()) {
             if let GenericParamId::LifetimeParamId(_) = param {
                 *variance = Variance::Bivariant;

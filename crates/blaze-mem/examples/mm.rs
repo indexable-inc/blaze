@@ -93,14 +93,14 @@ fn main() {
                             let piece = Layout::from_size_align(256, 8).expect("a layout");
                             let mut got = 0u64;
                             for _ in 0..TASK_BYTES / 256 {
-                                let ptr = frame.alloc_layout(piece);
+                                let ptr = frame.alloc_layout(piece).expect("the frame has room");
                                 // SAFETY: 256 fresh bytes of the frame.
                                 unsafe { ptr.as_ptr().write(1) };
                                 got += 1;
                             }
                             if span {
                                 let big = Layout::from_size_align(SPAN_BYTES, 64).expect("a layout");
-                                let ptr = frame.alloc_layout(big);
+                                let ptr = frame.alloc_layout(big).expect("the frame has room");
                                 // SAFETY: fresh bytes of the frame; one write a page.
                                 for page in (0..SPAN_BYTES).step_by(4096) {
                                     unsafe { ptr.as_ptr().add(page).write(1) };

@@ -12,7 +12,7 @@
 //! **Finishing.** A [`Stream`] is linear, finished with [`Stream::finish`], which tells the
 //! peer no more will be sent.
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{alloc::Global, collections::VecDeque, sync::Arc, vec::Vec};
 use core::fmt;
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
     cx::Cx,
     hosted::{self, Refused},
     io::Io,
-    mem::Bytes,
+    mem::{self as bmem, ByteLen, Bytes, heap},
     narrow::Allowed,
     url::Origin,
 };
@@ -88,11 +88,13 @@ impl Streams {
     }
 
     /// Streams whose peer is `handler`: each send is answered by what it adds.
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the handler.
     pub fn handler(
         handler: impl Fn(&Cx, &Origin, &[u8], &mut Bytes<'_>) -> Result<(), Stopped> + Send + Sync + 'static,
-    ) -> Streams {
+    ) -> Result<Streams, Stopped> {
         // alloc: once per capability, its handler.
-        Streams { provider: Provider::Handler(Arc::new(handler)), allowed: Allowed::Any, plant: crate::Plant::None }
+        let handler: Arc<StreamHandler> = heap::shared(handler)?;
+        Ok(Streams { provider: Provider::Handler(handler), allowed: Allowed::Any, plant: crate::Plant::None })
     }
 
     /// Only streams to `origin`, if this reaches it already.
@@ -120,7 +122,8 @@ impl Streams {
             Provider::Handler(_) => {}
         }
         // clone: the stream's provider and origin, refcounts; alloc: none, an empty inbox.
-        Ok(Stream { provider: self.provider.clone(), origin: origin.clone(), inbox: VecDeque::new(), inbox_most })
+        let inbox = bmem::Vec::new_in(Global);
+        Ok(Stream { provider: self.provider.clone(), origin: origin.clone(), inbox, inbox_most })
     }
 }
 
@@ -141,8 +144,9 @@ impl fmt::Debug for Streams {
 pub struct Stream {
     provider: Provider,
     origin: Origin,
-    /// What a handler replied and a receive has not taken yet.
-    inbox: VecDeque<u8>,
+    /// What a handler replied and a receive has not taken yet, oldest first.
+    // alloc: the stream's inbox, at most `inbox_most` bytes, freed as it is received.
+    inbox: bmem::Vec<u8, Global>,
     /// The most bytes `inbox` holds: said by [`Streams::open`]'s caller.
     inbox_most: usize,
 }
@@ -162,8 +166,8 @@ impl Stream {
         let sent = match &self.provider {
             Provider::Host(io) => hosted::call(io, cx, |host| {
                 // clone: the simulated host's record: refcounts, and alloc: the bytes sent.
-                host.streams.sent.push((self.origin.clone(), bytes.to_vec()));
-                Ok(())
+                let sent = heap::bytes(bytes).map_err(Stopped::from)?;
+                hosted::record(&mut host.streams.sent, (self.origin.clone(), sent))
             }),
             Provider::Handler(handler) => {
                 let mut reply = cx.bytes();
@@ -173,10 +177,8 @@ impl Stream {
                         match held.saturating_add(reply.as_slice().len()) > self.inbox_most {
                             true => Err(Refused::InboxFull { held, most: self.inbox_most }),
                             false => {
-                                // alloc: the stream's inbox, at most `inbox_most` bytes, freed
-                                // as it is received.
-                                self.inbox.extend(reply.as_slice());
-                                Ok(())
+                                // The inbox as it was when there is no room for the reply.
+                                self.inbox.extend_from_slice(reply.as_slice()).map_err(|full| Refused::Stopped(Stopped::from(full)))
                             }
                         }
                     }
@@ -190,13 +192,16 @@ impl Stream {
     /// The bytes the peer sent and this has not received, at most `most`, added to `into`; how
     /// many. From the host it waits for the peer's next send until `cx`'s deadline; from a
     /// handler, whose replies are all there once its send returned, 0 says there is no more.
-    pub fn recv(&mut self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, StreamsError> {
+    pub fn recv(&mut self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<ByteLen, StreamsError> {
         let received = match &self.provider {
             Provider::Host(io) => hosted::wait(io, cx, "bstd::streams recv", |host| {
                 let reply = host.streams.replies.front_mut()?;
-                let take = most.min(reply.len());
-                let taken = into.extend(&reply[..take]).map(|()| take).map_err(Refused::Stopped);
+                // At most `most` of it: all of it when it is shorter.
+                let front = reply.get(..most).unwrap_or(reply.as_slice());
+                let take = front.len();
+                let taken = into.extend(front).map(|()| ByteLen::of_memory(take)).map_err(Refused::Stopped);
                 if taken.is_ok() {
+                    // `take` is at most its length, so the range is within it.
                     reply.drain(..take);
                     if reply.is_empty() {
                         host.streams.replies.pop_front();
@@ -205,13 +210,18 @@ impl Stream {
                 Some(taken)
             }),
             Provider::Handler(_) => {
-                let take = most.min(self.inbox.len());
-                let (front, _) = self.inbox.as_slices();
-                let take = take.min(front.len());
-                match into.extend(&front[..take]) {
+                let held: &[u8] = &self.inbox;
+                // At most `most` of it: all of it when it holds less.
+                let front = held.get(..most).unwrap_or(held);
+                let take = front.len();
+                match into.extend(front) {
                     Ok(()) => {
-                        self.inbox.drain(..take);
-                        Ok(take)
+                        // `take` is at most its length: what was received moves out of the
+                        // inbox, what is left moves to its start.
+                        let left = self.inbox.len() - take;
+                        self.inbox.as_mut_slice().rotate_left(take);
+                        self.inbox.truncate(left);
+                        Ok(ByteLen::of_memory(take))
                     }
                     Err(stopped) => Err(Refused::Stopped(stopped)),
                 }

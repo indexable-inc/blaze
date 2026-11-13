@@ -141,9 +141,9 @@ fn find<'f, 'db>(
 ) -> Vec<Site, &'f Frame> {
     let mut sites = Vec::new_in(frame);
     let count = body.locals.len();
-    let built = frame.alloc_slice_fill_with(count, |_| 0u32);
-    let read = frame.alloc_slice_fill_with(count, |_| 0u32);
-    let other = frame.alloc_slice_fill_with(count, |_| 0u32);
+    let built = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
+    let read = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
+    let other = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     visit_body(body, |local, mention, _| {
         let at = local_index(local);
         match mention {
@@ -154,7 +154,7 @@ fn find<'f, 'db>(
         }
     });
     let blocks = body.basic_blocks.len();
-    let preds = frame.alloc_slice_fill_with(blocks, |_| 0u32);
+    let preds = frame.alloc_slice_fill_with(blocks, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     for (_, data) in body.basic_blocks.iter() {
         if let Some(terminator) = &data.terminator {
             for target in terminator.kind.all_successors() {
@@ -175,7 +175,7 @@ fn find<'f, 'db>(
             && !body.upvars_in_place.iter().any(|it| it.0 == local)
     };
     // A block is rewritten for one site at most.
-    let taken = frame.alloc_slice_fill_with(blocks, |_| false);
+    let taken = frame.alloc_slice_fill_with(blocks, |_| false).unwrap_or_else(|error| panic!("{error}"));
     for (block, data) in body.basic_blocks.iter() {
         if data.is_cleanup {
             continue;

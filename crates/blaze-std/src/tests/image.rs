@@ -15,7 +15,7 @@
 
 use std::alloc::Global;
 
-use blaze_mem::{Frame, Tag};
+use blaze_mem::{ByteLen, Frame, Tag};
 use hegel::{TestCase, generators as gs};
 
 use super::{Draw, Drawn, Seeds};
@@ -56,7 +56,7 @@ fn draw_image(d: &mut impl Draw) -> Image<Global> {
     let height = d.int(1, 24) as u32;
     let len = (width * height * color.channels() * depth.bytes()) as usize;
     let pixels = content(d.int(0, u64::MAX), len, d.int(0, 2));
-    Image::new(width, height, color, depth, pixels).expect("a drawn image's pixels are its size")
+    Image::new(width, height, color, depth, crate::mem::Vec::from_std(pixels)).expect("a drawn image's pixels are its size")
 }
 
 #[hegel::test(test_cases = 300)]
@@ -93,7 +93,7 @@ fn fix_crcs(bytes: &mut [u8]) {
             return;
         }
         let mut sum = Crc::new();
-        sum.update(&bytes[at + 4..end]);
+        sum.update(&bytes[at + 4..end]).expect("a CRC over a chunk");
         bytes[end..end + 4].copy_from_slice(&sum.finish().to_be_bytes());
         at = end + 4;
     }
@@ -109,7 +109,7 @@ fn hostile(d: &mut impl Draw) -> Vec<u8> {
         }
         _ => {
             let image = draw_image(d);
-            let mut bytes = encode(&image, Global).expect("a drawn image encodes");
+            let mut bytes = encode(&image, Global).expect("a drawn image encodes").into_std();
             for _ in 0..d.int(1, 8) {
                 if bytes.is_empty() {
                     break;
@@ -134,8 +134,8 @@ fn hostile(d: &mut impl Draw) -> Vec<u8> {
 fn decode_of_any_bytes_never_panics_nor_passes_its_limit(tc: TestCase) {
     let mut d = Drawn(&tc);
     let bytes = hostile(&mut d);
-    let limits = Limits { width: d.int(1, 64) as u32, height: d.int(1, 64) as u32, bytes: d.int(1, 20_000) as usize };
-    let frame = Frame::with_reserve(4 * limits.bytes + (1 << 16), Tag::Other).expect("a test frame is made");
+    let limits = Limits { width: d.int(1, 64) as u32, height: d.int(1, 64) as u32, bytes: ByteLen::new(d.int(1, 20_000)) };
+    let frame = Frame::with_reserve(4 * limits.bytes.get() as usize + (1 << 16), Tag::Other).expect("a test frame is made");
     match decode(&bytes, &frame, limits) {
         Ok(image) => {
             assert!(
@@ -146,7 +146,7 @@ fn decode_of_any_bytes_never_panics_nor_passes_its_limit(tc: TestCase) {
         Err(_) => {}
     }
     assert!(
-        frame.peak() <= limits.bytes + ALIGN_SLACK,
+        frame.peak() <= limits.bytes.get() as usize + ALIGN_SLACK,
         "decode of {} bytes asked its allocator for {} bytes at once, past its limit {limits:?}",
         bytes.len(),
         frame.peak()
@@ -220,7 +220,7 @@ const PALETTE: [u8; 82] = [
 ];
 
 fn image(width: u32, height: u32, color: Color, depth: Depth, pixels: &[u8]) -> Image<Global> {
-    Image::new(width, height, color, depth, pixels.to_vec()).expect("a fixed vector's pixels are its size")
+    Image::new(width, height, color, depth, crate::mem::Vec::from_std(pixels.to_vec())).expect("a fixed vector's pixels are its size")
 }
 
 #[test]
@@ -273,9 +273,9 @@ fn refusals_name_what_they_refuse() {
 #[test]
 fn the_byte_limit_is_exact() {
     let need = decode_bytes(2, 4, Color::Rgb, Depth::Eight) as usize;
-    let exact = Limits { bytes: need, ..Limits::DEFAULT };
+    let exact = Limits { bytes: ByteLen::new(need as u64), ..Limits::DEFAULT };
     assert!(decode(&RGB_2X4, Global, exact).is_ok(), "RGB_2X4 does not decode within exactly the {need} bytes it needs");
-    let short = Limits { bytes: need - 1, ..Limits::DEFAULT };
+    let short = Limits { bytes: ByteLen::new(need as u64 - 1), ..Limits::DEFAULT };
     assert_eq!(
         decode(&RGB_2X4, Global, short).map(|_| ()),
         Err(ImageError::Limit { limit: "bytes", asked: need as u64, most: need as u64 - 1 })

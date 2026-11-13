@@ -26,7 +26,6 @@
 //! crash is never listed), and a delete is a remove. A host that offers a store directly (a
 //! wasm worker's) would be a second provider; none exists yet.
 
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::fmt;
 
 use blaze_mem::Frame;
@@ -35,8 +34,9 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     fs::{Content, Dir, Durable, FsError, FsKind, ReadOnly, ReadWrite, Rights, Unsynced},
-    mem::Bytes,
-    path::Path,
+    mem::{ByteLen, Bytes, Vec},
+    name::Excerpt,
+    path::{Path, PathWhy},
 };
 
 /// The most bytes in a key.
@@ -50,7 +50,9 @@ pub struct Key(Path);
 /// What [`Key::new`] refused.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct KeyError {
-    pub key: String,
+    /// The text refused, or its start when it is long: kept in the error, which allocates
+    /// nothing.
+    pub key: Excerpt,
     pub why: KeyWhy,
 }
 
@@ -63,6 +65,8 @@ pub enum KeyWhy {
     Hidden,
     /// A byte that is no letter, digit, `-`, `_` or `.`.
     BadByte,
+    /// It passed the key's rule and is no [`Path`]: the two rules disagree, a bug.
+    Path(PathWhy),
 }
 
 impl KeyWhy {
@@ -72,6 +76,7 @@ impl KeyWhy {
             KeyWhy::TooLong => "is longer than 128 bytes",
             KeyWhy::Hidden => "starts with a `.`",
             KeyWhy::BadByte => "holds a byte that is no letter, digit, `-`, `_` or `.`",
+            KeyWhy::Path(why) => why.says(),
         }
     }
 }
@@ -93,15 +98,15 @@ pub const fn refused(raw: &str) -> Option<KeyWhy> {
     if bytes.len() > KEY_MOST {
         return Some(KeyWhy::TooLong);
     }
-    if bytes[0] == b'.' {
+    if let [b'.', ..] = bytes {
         return Some(KeyWhy::Hidden);
     }
-    let mut at = 0;
-    while at < bytes.len() {
-        if !(bytes[at].is_ascii_alphanumeric() || bytes[at] == b'-' || bytes[at] == b'_' || bytes[at] == b'.') {
+    let mut rest = bytes;
+    while let [byte, tail @ ..] = rest {
+        if !(byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_' || *byte == b'.') {
             return Some(KeyWhy::BadByte);
         }
-        at += 1;
+        rest = tail;
     }
     None
 }
@@ -116,11 +121,12 @@ impl Key {
             Err(_) => true,
         }
     {
+        let refuse = |why| KeyError { key: Excerpt::of(raw), why };
         if let Some(why) = refused(raw) {
-            // alloc: an error's message.
-            return Err(KeyError { key: raw.to_owned(), why });
+            return Err(refuse(why));
         }
-        Ok(Key(Path::new(raw).expect("a key is one part of a relative path")))
+        // A key is one part of a relative path: a refusal here is the rules disagreeing.
+        Path::new(raw).map(Key).map_err(|error| refuse(KeyWhy::Path(error.why)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -227,7 +233,7 @@ impl<#[blaze::linear] P: Rights> Kv<P> {
 
     /// The value of `key` added to `into`: how many bytes, or `None` when the store has no
     /// such key (then `into` is as it was).
-    pub fn get(&self, cx: &Cx, key: &Key, into: &mut Bytes<'_>) -> Result<Option<usize>, KvError> {
+    pub fn get(&self, cx: &Cx, key: &Key, into: &mut Bytes<'_>) -> Result<Option<ByteLen>, KvError> {
         match self.dir.read_all(cx, key.path(), into) {
             Ok(read) => Ok(Some(read)),
             Err(error) if error.kind == FsKind::NotFound => Ok(None),
@@ -245,19 +251,21 @@ impl<#[blaze::linear] P: Rights> Kv<P> {
 
     /// Every key of the store, sorted, in `frame`. A file beneath the directory that is no
     /// key's (in a directory of its own, or with a name no [`Key`] has) is not the store's
-    /// and is not listed.
+    /// and is not listed. With no room in `frame`, [`FsKind::Stopped`] naming the frame.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<Key, &'a Frame>, KvError> {
         let files = self.dir.list(cx, frame).map_err(|error| Self::refuse(KvOp::List, None, error))?;
         let mut keys = Vec::new_in(frame);
         for (path, _) in &files {
             let Ok(key) = Key::new(path.as_str()) else { continue };
-            keys.try_reserve(1).map_err(|_| {
-                let stopped = Stopped::OutOfMemory { arena: "bstd::kv list", asked: size_of::<Key>() };
+            keys.push(key).map_err(|error| {
                 // clone: an error's name of the store's directory, a refcount.
-                let under = FsError { op: crate::fs::FsOp::List, path: self.dir.name().clone(), kind: FsKind::Stopped(stopped) };
+                let under = FsError {
+                    op: crate::fs::FsOp::List,
+                    path: self.dir.name().clone(),
+                    kind: FsKind::Stopped(Stopped::from(error)),
+                };
                 Self::refuse(KvOp::List, None, under)
             })?;
-            keys.push(key);
         }
         Ok(keys)
     }

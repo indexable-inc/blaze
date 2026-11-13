@@ -6,18 +6,33 @@
 //! stored"): checked as it is made, by [`VarName::new`] or, for a literal, by
 //! [`crate::var!`] as the crate compiles.
 
-use alloc::{borrow::ToOwned, string::String, sync::Arc};
-use core::fmt;
+use alloc::{alloc::Global, string::String, sync::Arc};
+use core::{
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+};
 
-use crate::Plant;
+use crate::{
+    Plant, Stopped,
+    mem::{Vec, heap},
+};
 
 /// An environment variable's name: not empty, with no `=` and no NUL.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)] // clone: a refcount, no allocation
-pub struct VarName(Arc<str>);
+#[derive(Clone)] // clone: a refcount or a pointer, no allocation
+pub struct VarName(Text);
+
+/// A name's text: a literal's ([`crate::var!`]), which needs no copy, or one made at run time.
+#[derive(Clone)] // clone: a refcount or a pointer, no allocation
+enum Text {
+    Literal(&'static str),
+    Made(Arc<String>),
+}
 
 /// What [`VarName::new`] refused.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct VarNameError {
+    /// The name refused; empty when its copy found no room ([`VarNameWhy::OutOfMemory`]).
     pub name: String,
     pub why: VarNameWhy,
 }
@@ -29,6 +44,8 @@ pub enum VarNameWhy {
     Equals,
     /// It holds a NUL, which ends the environment block's entry.
     Nul,
+    /// The global heap had no room for its text (`asked` bytes), as a name or in this error.
+    OutOfMemory { asked: usize },
 }
 
 impl VarNameWhy {
@@ -37,13 +54,21 @@ impl VarNameWhy {
             VarNameWhy::Empty => "is empty",
             VarNameWhy::Equals => "holds a `=`, which would end the name in the environment block",
             VarNameWhy::Nul => "holds a NUL, which would end its entry in the environment block",
+            VarNameWhy::OutOfMemory { .. } => "found no room on the global heap for its text",
         }
     }
 }
 
 impl fmt::Display for VarNameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "environment variable name {:?} {}", self.name, self.why.says())
+        match self.why {
+            VarNameWhy::OutOfMemory { asked } => write!(
+                f,
+                "an environment variable name of {asked} bytes {}",
+                self.why.says()
+            ),
+            why => write!(f, "environment variable name {:?} {}", self.name, why.says()),
+        }
     }
 }
 
@@ -56,37 +81,85 @@ pub const fn refused(raw: &str) -> Option<VarNameWhy> {
     if bytes.is_empty() {
         return Some(VarNameWhy::Empty);
     }
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
+    let mut rest = bytes;
+    while let [byte, more @ ..] = rest {
+        match *byte {
             b'=' => return Some(VarNameWhy::Equals),
             0 => return Some(VarNameWhy::Nul),
             _ => {}
         }
-        at += 1;
+        rest = more;
     }
     None
 }
 
-/// [`refused`], as a compile-time panic: what [`crate::var!`] evaluates in a `const`.
-pub const fn check_literal(raw: &str) {
-    if let Some(why) = refused(raw) {
-        panic!("{}", why.says());
-    }
-}
 
 impl VarName {
     pub fn new(raw: &str) -> Result<VarName, VarNameError> {
+        let out_of_memory = || VarNameError {
+            name: String::new(),
+            why: VarNameWhy::OutOfMemory { asked: raw.len() },
+        };
         if let Some(why) = refused(raw) {
-            // alloc: an error's message.
-            return Err(VarNameError { name: raw.to_owned(), why });
+            // alloc: an error's name of what it refused.
+            let name = heap::string(raw).map_err(|_| out_of_memory())?;
+            return Err(VarNameError { name, why });
         }
         // alloc: once per name, its text.
-        Ok(VarName(Arc::from(raw)))
+        let text = heap::string(raw).map_err(|_| out_of_memory())?;
+        let text = heap::shared(text).map_err(|_| out_of_memory())?;
+        Ok(VarName(Text::Made(text)))
+    }
+
+    /// A literal checked by the rule, or why it is none: what [`crate::var!`] evaluates in a
+    /// `const`, where a refusal is the compile error that says why. A [`Literal`] is `Copy`,
+    /// so the `const` drops nothing.
+    #[doc(hidden)]
+    pub const fn literal(raw: &'static str) -> Result<Literal, &'static str> {
+        match refused(raw) {
+            Some(why) => Err(why.says()),
+            None => Ok(Literal(raw)),
+        }
+    }
+
+    /// The name of a checked literal: it keeps the literal itself, so it allocates nothing.
+    #[doc(hidden)]
+    pub const fn of_literal(literal: Literal) -> VarName {
+        VarName(Text::Literal(literal.0))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            Text::Literal(text) => text,
+            Text::Made(text) => text.as_str(),
+        }
+    }
+}
+
+/// Names are equal, ordered and hashed by their text, however it is held.
+impl PartialEq for VarName {
+    fn eq(&self, other: &VarName) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for VarName {}
+
+impl PartialOrd for VarName {
+    fn partial_cmp(&self, other: &VarName) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VarName {
+    fn cmp(&self, other: &VarName) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for VarName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state)
     }
 }
 
@@ -102,6 +175,11 @@ impl fmt::Debug for VarName {
     }
 }
 
+/// A literal [`VarName::literal`] checked: the one way to [`VarName::of_literal`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Literal(&'static str);
+
 impl TryFrom<&str> for VarName {
     type Error = VarNameError;
 
@@ -115,8 +193,11 @@ impl TryFrom<&str> for VarName {
 #[macro_export]
 macro_rules! var {
     ($raw:literal) => {{
-        const _: () = $crate::env::check_literal($raw);
-        $crate::env::VarName::new($raw).expect("a var! literal was checked as the crate compiled")
+        const NAME: $crate::env::VarName = match $crate::env::VarName::literal($raw) {
+            Ok(literal) => $crate::env::VarName::of_literal(literal),
+            Err(why) => panic!("{}", why),
+        };
+        NAME
     }};
 }
 
@@ -138,14 +219,14 @@ impl core::error::Error for NotAllowed {}
 /// The variables a holder may read.
 #[derive(Clone)]
 pub struct Env {
-    vars: Arc<[(String, String)]>,
+    vars: Arc<alloc::vec::Vec<(String, String)>>,
     /// The names it may read; `None` for every one.
-    allowed: Option<Arc<[VarName]>>,
+    allowed: Option<Arc<Vec<VarName, Global>>>,
     plant: Plant,
 }
 
 impl Env {
-    pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
+    pub(crate) fn new(vars: Arc<alloc::vec::Vec<(String, String)>>, plant: Plant) -> Env {
         Env { vars, allowed: None, plant }
     }
 
@@ -170,14 +251,15 @@ impl Env {
     }
 
     /// Only the variables of `names` this may read already: never one more.
-    pub fn only(&self, names: &[VarName]) -> Env {
+    /// [`Stopped::OutOfMemory`] when the global heap has no room for the names kept.
+    pub fn only(&self, names: &[VarName]) -> Result<Env, Stopped> {
         let kept = names.iter().filter(|name| match self.plant {
             Plant::EnvOnlyReplaces => true,
             _ => self.may_read(name),
         });
         // alloc: once per narrowing, the names kept (each a refcount).
-        let allowed: Arc<[VarName]> = kept.cloned().collect();
-        Env { vars: Arc::clone(&self.vars), allowed: Some(allowed), plant: self.plant }
+        let allowed = heap::shared(Vec::from_iter_in(kept.cloned(), Global)?)?;
+        Ok(Env { vars: Arc::clone(&self.vars), allowed: Some(allowed), plant: self.plant })
     }
 
     /// Each variable this may read that is set, in the world's order.

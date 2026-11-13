@@ -20,10 +20,15 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
 use core::{alloc::Allocator, fmt};
 
 use super::{Colour, Packet};
+use crate::mem::{Named, OutOfMemory, Vec};
+
+/// The error a growth in `what` that found no room is, for `map_err`.
+fn out_of_memory(what: &'static str) -> impl Fn(OutOfMemory) -> MuxError {
+    move |error| MuxError::OutOfMemory { what, asked: error.asked }
+}
 
 /// How the container is laid out (module docs).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -76,7 +81,7 @@ struct Sample {
 
 /// Packets in, the bytes of an MP4 out (module docs). Every buffer is in the allocator handed
 /// to [`Muxer::new`].
-pub struct Muxer<A: Allocator + Clone> {
+pub struct Muxer<A: Allocator + Clone + Named> {
     layout: Layout,
     width: u16,
     height: u16,
@@ -103,7 +108,7 @@ pub struct Muxer<A: Allocator + Clone> {
     alloc: A,
 }
 
-impl<A: Allocator + Clone> Muxer<A> {
+impl<A: Allocator + Clone + Named> Muxer<A> {
     /// A muxer of `track` laid out as `layout`, every buffer in `alloc`.
     pub fn new(track: &Track<'_>, layout: Layout, alloc: A) -> Result<Muxer<A>, MuxError> {
         let width = u16::try_from(track.width)
@@ -118,13 +123,10 @@ impl<A: Allocator + Clone> Muxer<A> {
             return Err(MuxError::Config { field: "timescale", why: "is 0" });
         }
         // configurationVersion 1, and the fixed header before the arrays (23 bytes).
-        if track.hvcc.len() < 23 || track.hvcc[0] != 1 {
+        if track.hvcc.len() < 23 || track.hvcc.first() != Some(&1) {
             return Err(MuxError::Config { field: "hvcc", why: "is not an HEVCDecoderConfigurationRecord (version 1, 23 bytes or more)" });
         }
-        let mut hvcc = Vec::new_in(alloc.clone());
-        hvcc.try_reserve_exact(track.hvcc.len())
-            .map_err(|_| MuxError::OutOfMemory { what: "the track's hvcC", asked: track.hvcc.len() })?;
-        hvcc.extend_from_slice(track.hvcc);
+        let hvcc = Vec::from_slice_in(track.hvcc, alloc.clone()).map_err(out_of_memory("the track's hvcC"))?;
         Ok(Muxer {
             layout,
             width,
@@ -188,14 +190,13 @@ impl<A: Allocator + Clone> Muxer<A> {
         if self.layout == Layout::Fragmented && packet.key && !self.samples.is_empty() {
             self.fragment(Some(dt))?;
         }
+        // Room for both first, so a refusal leaves the muxer as it was.
+        self.samples.reserve(1).map_err(out_of_memory("the sample table"))?;
+        self.data.reserve(packet.data.len()).map_err(out_of_memory("the samples' bytes"))?;
         self.samples
-            .try_reserve(1)
-            .map_err(|_| MuxError::OutOfMemory { what: "the sample table", asked: size_of::<Sample>() })?;
-        self.data
-            .try_reserve(packet.data.len())
-            .map_err(|_| MuxError::OutOfMemory { what: "the samples' bytes", asked: packet.data.len() })?;
-        self.samples.push(Sample { size, dt, offset, duration: packet.duration, key: packet.key });
-        self.data.extend_from_slice(&packet.data);
+            .push(Sample { size, dt, offset, duration: packet.duration, key: packet.key })
+            .map_err(out_of_memory("the sample table"))?;
+        self.data.extend_from_slice(&packet.data).map_err(out_of_memory("the samples' bytes"))?;
         self.first = Some((d0, p0));
         self.last_dts = packet.dts;
         self.end = self.end.max(shown_end);
@@ -226,20 +227,25 @@ impl<A: Allocator + Clone> Muxer<A> {
     /// Each held sample's duration: the next one's decode time less its own; the last one's is
     /// `next` less its own, or its packet's.
     fn durations(&mut self, next: Option<i64>) -> Result<(), MuxError> {
-        let first = self.count - self.samples.len() as u64;
-        for i in 0..self.samples.len() {
-            let following = match self.samples.get(i + 1) {
-                Some(s) => Some(s.dt),
+        let mut sample = self.count - self.samples.len() as u64;
+        let mut rest = self.samples.as_mut_slice();
+        while let Some((s, after)) = core::mem::take(&mut rest).split_first_mut() {
+            let following = match after.first() {
+                Some(t) => Some(t.dt),
                 None => next,
             };
             if let Some(following) = following {
-                let delta = following - self.samples[i].dt;
-                self.samples[i].duration = u32::try_from(delta).map_err(|_| MuxError::Range {
-                    sample: first + i as u64,
+                let delta = following
+                    .checked_sub(s.dt)
+                    .ok_or(MuxError::Range { sample, what: "sample duration", value: following })?;
+                s.duration = u32::try_from(delta).map_err(|_| MuxError::Range {
+                    sample,
                     what: "sample duration",
                     value: delta,
                 })?;
             }
+            sample += 1;
+            rest = after;
         }
         Ok(())
     }
@@ -369,7 +375,7 @@ impl<A: Allocator + Clone> Muxer<A> {
         w.u16(0x0018)?; // depth
         w.u16(0xFFFF)?; // pre_defined -1
         let hvcc_box = w.open(b"hvcC")?;
-        w.put(&hvcc[..])?;
+        w.put(hvcc.as_slice())?;
         w.close(hvcc_box, *b"hvcC")?;
         let colr = w.open(b"colr")?;
         w.put(b"nclx")?;
@@ -391,43 +397,15 @@ impl<A: Allocator + Clone> Muxer<A> {
         w.close(hvc1, *b"hvc1")?;
         w.close(stsd, *b"stsd")?;
 
-        let held: &[Sample] = if progressive { &samples[..] } else { &[] };
+        let held: &[Sample] = if progressive { samples.as_slice() } else { &[] };
         // stts: runs of equal durations.
         let stts = w.full(b"stts", 0, 0)?;
-        let count_at = w.here();
-        w.u32(0)?;
-        let mut runs = 0u32;
-        let mut i = 0;
-        while i < held.len() {
-            let mut j = i + 1;
-            while j < held.len() && held[j].duration == held[i].duration {
-                j += 1;
-            }
-            w.u32((j - i) as u32)?;
-            w.u32(held[i].duration)?;
-            runs += 1;
-            i = j;
-        }
-        w.patch(count_at, runs);
+        w.runs(held, |s| s.duration)?;
         w.close(stts, *b"stts")?;
         // ctts: runs of equal composition offsets, when any is not 0.
         if held.iter().any(|s| s.offset != 0) {
             let ctts = w.full(b"ctts", 0, 0)?;
-            let count_at = w.here();
-            w.u32(0)?;
-            let mut runs = 0u32;
-            let mut i = 0;
-            while i < held.len() {
-                let mut j = i + 1;
-                while j < held.len() && held[j].offset == held[i].offset {
-                    j += 1;
-                }
-                w.u32((j - i) as u32)?;
-                w.u32(held[i].offset)?;
-                runs += 1;
-                i = j;
-            }
-            w.patch(count_at, runs);
+            w.runs(held, |s| s.offset)?;
             w.close(ctts, *b"ctts")?;
         }
         // stss: the key frames, when not every sample is one.
@@ -505,7 +483,7 @@ impl<A: Allocator + Clone> Muxer<A> {
         let data_at = self.taken + self.out.len() as u64;
         if let Some(at) = chunk_at {
             let offset = u32::try_from(data_at).map_err(|_| MuxError::TooLarge { kind: *b"stco", size: data_at })?;
-            Out(&mut self.out).patch(at, offset);
+            Out(&mut self.out).patch(at, offset)?;
         }
         Out(&mut self.out).put(&self.data)?;
         self.samples.clear();
@@ -553,7 +531,7 @@ impl<A: Allocator + Clone> Muxer<A> {
         let moof_len = w.here() - moof;
         let header = if large { 16 } else { 8 };
         let offset = u32::try_from(moof_len + header).map_err(|_| MuxError::TooLarge { kind: *b"moof", size: moof_len as u64 })?;
-        w.patch(offset_at, offset);
+        w.patch(offset_at, offset)?;
         let data_len = data.len() as u64;
         if large {
             w.u32(1)?;
@@ -563,23 +541,22 @@ impl<A: Allocator + Clone> Muxer<A> {
             w.u32((data_len + 8) as u32)?;
             w.put(b"mdat")?;
         }
-        w.put(&data[..])?;
+        w.put(data.as_slice())?;
         samples.clear();
         data.clear();
         Ok(())
     }
 }
 
-/// Big-endian writes onto a byte vector, each growing it through `try_reserve`.
-struct Out<'v, A: Allocator>(&'v mut Vec<u8, A>);
+/// What the container's bytes are, when the allocator has no room for them.
+const CONTAINER: &str = "the container's bytes";
 
-impl<A: Allocator> Out<'_, A> {
+/// Big-endian writes onto a byte vector, each growing it fallibly.
+struct Out<'v, A: Allocator + Named>(&'v mut Vec<u8, A>);
+
+impl<A: Allocator + Named> Out<'_, A> {
     fn put(&mut self, bytes: &[u8]) -> Result<(), MuxError> {
-        self.0
-            .try_reserve(bytes.len())
-            .map_err(|_| MuxError::OutOfMemory { what: "the container's bytes", asked: bytes.len() })?;
-        self.0.extend_from_slice(bytes);
-        Ok(())
+        self.0.extend_from_slice(bytes).map_err(out_of_memory(CONTAINER))
     }
 
     fn u8(&mut self, v: u8) -> Result<(), MuxError> {
@@ -599,14 +576,24 @@ impl<A: Allocator> Out<'_, A> {
     }
 
     fn zeros(&mut self, n: usize) -> Result<(), MuxError> {
-        const ZEROS: [u8; 32] = [0; 32];
-        let mut left = n;
-        while left > 0 {
-            let take = left.min(ZEROS.len());
-            self.put(&ZEROS[..take])?;
-            left -= take;
-        }
+        self.0.extend_filled(n, 0).map_err(out_of_memory(CONTAINER))?;
         Ok(())
+    }
+
+    /// A table of runs (`stts`, `ctts`): their count, then each run's length and value, a run
+    /// being consecutive samples with the same `value`.
+    fn runs(&mut self, held: &[Sample], value: impl Fn(&Sample) -> u32) -> Result<(), MuxError> {
+        let count_at = self.here();
+        self.u32(0)?;
+        let mut runs = 0u32;
+        for run in held.chunk_by(|a, b| value(a) == value(b)) {
+            // `chunk_by` gives no empty run.
+            let Some(first) = run.first() else { continue };
+            self.u32(run.len() as u32)?;
+            self.u32(value(first))?;
+            runs += 1;
+        }
+        self.patch(count_at, runs)
     }
 
     /// Creation and modification time (0: times are data, never the wall clock), the timescale
@@ -647,12 +634,17 @@ impl<A: Allocator> Out<'_, A> {
     fn close(&mut self, at: usize, kind: [u8; 4]) -> Result<(), MuxError> {
         let size = self.here() - at;
         let size = u32::try_from(size).map_err(|_| MuxError::TooLarge { kind, size: size as u64 })?;
-        self.patch(at, size);
-        Ok(())
+        self.patch(at, size)
     }
 
-    fn patch(&mut self, at: usize, v: u32) {
-        self.0[at..at + 4].copy_from_slice(&v.to_be_bytes());
+    /// `v` over the four bytes at `at`, a field written before.
+    fn patch(&mut self, at: usize, v: u32) -> Result<(), MuxError> {
+        let len = self.0.len();
+        let Some(field) = self.0.get_mut(at..).and_then(|rest| rest.first_chunk_mut::<4>()) else {
+            return Err(MuxError::Field { at, len });
+        };
+        *field = v.to_be_bytes();
+        Ok(())
     }
 }
 
@@ -674,6 +666,9 @@ pub enum MuxError {
     Empty,
     /// The allocator handed in could not give `asked` bytes for `what`.
     OutOfMemory { what: &'static str, asked: usize },
+    /// A field to fill in at byte `at` is past the `len` bytes written: a bug in the muxer,
+    /// said where it is found rather than written out of bounds.
+    Field { at: usize, len: usize },
 }
 
 impl fmt::Display for MuxError {
@@ -693,6 +688,9 @@ impl fmt::Display for MuxError {
             MuxError::Empty => write!(f, "mp4: finished with no packet; an MP4 needs one"),
             MuxError::OutOfMemory { what, asked } => {
                 write!(f, "mp4: the allocator could not give {asked} bytes for {what}")
+            }
+            MuxError::Field { at, len } => {
+                write!(f, "mp4: a field to fill in at byte {at} is past the {len} bytes written (a bug in the muxer)")
             }
         }
     }

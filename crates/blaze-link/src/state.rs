@@ -371,7 +371,7 @@ impl<'s> PieceRef<'s> {
         if let Some(it) = space.bytes.slice(at, len) {
             return it;
         }
-        let out = arena.alloc_slice_fill_with(len, |_| 0);
+        let out = arena.alloc_slice_fill_with(len, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         space.bytes.copy_to(at, out);
         out
     }

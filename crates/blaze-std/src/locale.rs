@@ -6,7 +6,7 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::locale`]): blaze-core has no
 //! effect that asks the system for its locale.
 
-use crate::name::{Language, ZoneName};
+use crate::name::{Language, NameError, ZoneName};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Weekday {
@@ -36,15 +36,16 @@ pub struct Locale {
 
 impl Locale {
     /// The simulation's unless a test says otherwise: UTC, `en`, a 24-hour clock, `.`, weeks
-    /// from Monday.
-    pub fn simulated() -> Locale {
-        Locale {
-            zone: ZoneName::new("UTC").expect("UTC is a name"),
+    /// from Monday. Its names are kept on the global heap: a [`NameError`] of
+    /// [`crate::name::NameWhy::OutOfMemory`] when it has no room (the names themselves pass).
+    pub fn simulated() -> Result<Locale, NameError> {
+        Ok(Locale {
+            zone: ZoneName::new("UTC")?,
             utc_offset_minutes: 0,
-            language: Language::new("en").expect("en is a name"),
+            language: Language::new("en")?,
             hour24: true,
             decimal: '.',
             first_day: Weekday::Monday,
-        }
+        })
     }
 }

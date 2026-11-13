@@ -284,10 +284,7 @@ impl<T, A: Allocator + Named> Vec<T, A> {
             self.inner.truncate(len);
             return Ok(());
         };
-        self.reserve(more)?;
-        for _ in 0..more {
-            self.push(value.clone())?;
-        }
+        self.extend_filled(more, value)?;
         Ok(())
     }
 
@@ -299,12 +296,18 @@ impl<T, A: Allocator + Named> Vec<T, A> {
     {
         self.reserve(more)?;
         let before = self.inner.len();
-        for _ in 0..more {
-            self.push(value.clone())?;
+        // SAFETY: room for `more` elements past `before` was just reserved, so every slot
+        // written is inside the vector's block and holds no value. The length counts each
+        // element as it is written, so a `clone` that panics leaves only whole elements
+        // counted. For a byte this loop is one fill of the block.
+        unsafe {
+            let tail = self.inner.as_mut_ptr().add(before);
+            for at in 0..more {
+                tail.add(at).write(value.clone());
+                self.inner.set_len(before + at + 1);
+            }
+            Ok(slice::from_raw_parts_mut(tail, more))
         }
-        // SAFETY: the `more` pushes above put initialized elements at `before..before + more`
-        // of the vector's block; the slice borrows the vector mutably for as long as it lives.
-        Ok(unsafe { slice::from_raw_parts_mut(self.inner.as_mut_ptr().add(before), more) })
     }
 
     /// A copy of it in the same allocator.

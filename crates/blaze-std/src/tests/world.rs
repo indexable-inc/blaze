@@ -21,7 +21,7 @@ fn args_and_host_are_the_worlds() {
     let mut world = SimWorld::new(7, Limits::USUAL);
     world.args = vec!["prog".to_owned(), "--flag".to_owned()];
     world.host = HostFacts { pid: 42, cores: NonZero::<usize>::MIN.saturating_add(7), name: Arc::from("box") };
-    let io = Io::simulated(world);
+    let io = Io::simulated(world).expect("a simulated world");
     let args = io.args().expect("Io::sim offers args");
     assert_eq!(args.each().collect::<Vec<_>>(), ["prog", "--flag"]);
     assert_eq!(args.get(1), Some("--flag"));
@@ -32,7 +32,7 @@ fn args_and_host_are_the_worlds() {
 
 #[test]
 fn a_simulated_exit_unwinds_its_task_and_the_world_remembers_it() {
-    let io = Io::sim(1);
+    let io = Io::sim(1).expect("a simulated world");
     let cx = root(&io);
     let host = io.host().expect("Io::sim offers host");
     let ended = catch_unwind(AssertUnwindSafe(|| {
@@ -49,7 +49,7 @@ fn a_simulated_exit_unwinds_its_task_and_the_world_remembers_it() {
 
 #[test]
 fn spans_and_events_go_to_the_worlds_trace() {
-    let io = Io::sim(2);
+    let io = Io::sim(2).expect("a simulated world");
     let cx = root(&io);
     let child = cx.span("load");
     child.event("cache missed");
@@ -63,13 +63,13 @@ fn spans_and_events_go_to_the_worlds_trace() {
         ]
     );
     // Another world's trace is its own: nothing is global.
-    let other = Io::sim(2);
+    let other = Io::sim(2).expect("a simulated world");
     assert!(other.trace(|trace| trace.records().is_empty()));
 }
 
 #[test]
 fn spawn_concurrent_is_refused_under_inline_and_its_task_never_runs() {
-    let io = Io::sim(3);
+    let io = Io::sim(3).expect("a simulated world");
     let cx = root(&io);
     let mut ran = false;
     let result = cx.scope_with(|s| {

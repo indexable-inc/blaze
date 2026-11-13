@@ -10,13 +10,15 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::term`]): blaze-core has no
 //! effect for a terminal's size, its modes or its input, so a native `Io` does not offer one.
 
-use alloc::{borrow::ToOwned, collections::VecDeque, string::String, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::fmt;
 
 use crate::{
+    Stopped,
     cx::Cx,
     hosted::{self, Refused},
     io::Io,
+    mem::heap,
 };
 
 /// A terminal's size in cells.
@@ -176,7 +178,8 @@ impl Term {
         hosted::call(&self.io, cx, |host| {
             for piece in text {
                 // alloc: the simulated terminal's record of what was written.
-                host.term.written.push((piece.text.to_owned(), piece.style));
+                let text = heap::string(piece.text).map_err(Stopped::from)?;
+                hosted::record(&mut host.term.written, (text, piece.style))?;
             }
             Ok(())
         })

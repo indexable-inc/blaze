@@ -57,7 +57,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                     write_synced(&cx, &jail, &made, b"x").map_err(|e| format!("harness: {e}"))?;
                 }
                 Err(refused) => {
-                    if refused.path != *raw {
+                    if refused.path != crate::name::Excerpt::of(raw) {
                         return Err(format!("Path::new refused {raw:?} naming {:?}", refused.path));
                     }
                 }

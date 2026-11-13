@@ -272,7 +272,7 @@ pub(super) fn infer<'f>(
         universals.insert(at, index);
     }
     let members = Csr::build(frame, sccs, scc.iter().enumerate().map(|(rv, &at)| (at, rv as u32)));
-    let seen = frame.alloc_slice_fill_with(sccs, |_| u32::MAX);
+    let seen = frame.alloc_slice_fill_with(sccs, |_| u32::MAX).unwrap_or_else(|error| panic!("{error}"));
     for at in 0..sccs {
         for &rv in members.of(at) {
             for &sub in edges.of(rv as usize) {
@@ -337,8 +337,8 @@ fn outlives_edges<'f>(frame: &'f Frame, regions: &Regions<'_, '_>, count: usize)
 fn strongly_connected<'f>(frame: &'f Frame, edges: &Csr<'_>) -> (FVec<'f, u32>, usize) {
     let count = edges.nodes();
     const NONE: u32 = u32::MAX;
-    let index = frame.alloc_slice_fill_with(count, |_| NONE);
-    let low = frame.alloc_slice_fill_with(count, |_| 0u32);
+    let index = frame.alloc_slice_fill_with(count, |_| NONE).unwrap_or_else(|error| panic!("{error}"));
+    let low = frame.alloc_slice_fill_with(count, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
     let mut on_stack = bits(frame, count);
     let mut scc = filled(frame, count, NONE);
     // Each node is on each stack at most once, so `count` bounds both.

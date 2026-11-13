@@ -194,12 +194,12 @@ impl<'f> Facts<'f> {
                 nodes += domain as u32;
             }
             here
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         let base = &*base;
         let node = |fact: &Fact| (base[fact.kind as usize] + fact.a) as usize;
-        let start = frame.alloc_slice_fill_with(nodes as usize + 1, |_| 0u32);
+        let start = frame.alloc_slice_fill_with(nodes as usize + 1, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         let total = starts(start, self.rows.iter().map(node));
-        let items = frame.alloc_slice_fill_with(total, |_| 0u32);
+        let items = frame.alloc_slice_fill_with(total, |_| 0u32).unwrap_or_else(|error| panic!("{error}"));
         for fact in &self.rows {
             let at = &mut start[node(fact)];
             items[*at as usize] = fact.b;

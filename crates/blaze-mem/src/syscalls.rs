@@ -69,6 +69,21 @@ static COUNTERS: [Counter; KINDS.len()] = [const {
     Counter { calls: AtomicU64::new(0), ns: AtomicU64::new(0), max_ns: AtomicU64::new(0) }
 }; KINDS.len()];
 
+/// The counter of `kind`: [`COUNTERS`] in [`KINDS`]' order, matched by name, so no kind reaches
+/// past the table and no bound is checked at run time.
+fn counter(kind: Kind) -> &'static Counter {
+    let [reserve, map_fixed, munmap, mprotect, purge, populate, advise] = &COUNTERS;
+    match kind {
+        Kind::Reserve => reserve,
+        Kind::MapFixed => map_fixed,
+        Kind::Munmap => munmap,
+        Kind::Mprotect => mprotect,
+        Kind::Purge => purge,
+        Kind::Populate => populate,
+        Kind::Advise => advise,
+    }
+}
+
 /// What one kind of call came to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Calls {
@@ -83,7 +98,7 @@ pub(crate) fn timed<R>(kind: Kind, call: impl FnOnce() -> R) -> R {
     let start = Instant::now();
     let got = call();
     let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let counter = &COUNTERS[kind as usize];
+    let counter = counter(kind);
     counter.calls.fetch_add(1, Ordering::Relaxed);
     counter.ns.fetch_add(ns, Ordering::Relaxed);
     counter.max_ns.fetch_max(ns, Ordering::Relaxed);
@@ -93,7 +108,7 @@ pub(crate) fn timed<R>(kind: Kind, call: impl FnOnce() -> R) -> R {
 /// The counts so far, one per [`KINDS`] entry.
 pub fn snapshot() -> [(Kind, Calls); KINDS.len()] {
     KINDS.map(|kind| {
-        let counter = &COUNTERS[kind as usize];
+        let counter = counter(kind);
         (
             kind,
             Calls {

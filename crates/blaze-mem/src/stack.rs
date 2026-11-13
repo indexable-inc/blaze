@@ -88,14 +88,25 @@ impl Stack {
     }
 
     /// Pushes `items` (none on any stack, held by the caller alone) with one compare-and-swap,
-    /// `items[0]` on top.
+    /// the first on top.
     pub(crate) fn push_all(&self, items: &[u32], links: &impl Links) {
-        let Some((&last, _)) = items.split_last() else { return };
-        for pair in items.windows(2) {
-            debug_assert_ne!(pair[0], NONE);
-            links.link(pair[0]).store(pair[1], Ordering::Relaxed);
+        self.push_all_by(items, |item| item, links);
+    }
+
+    /// [`Stack::push_all`] of the indices `index` gives for `items` (a chunk's index within
+    /// its space, for one numbered across spaces), the first on top.
+    pub(crate) fn push_all_by(
+        &self,
+        items: &[u32],
+        index: impl Fn(u32) -> u32,
+        links: &impl Links,
+    ) {
+        let (Some(&first), Some(&last)) = (items.first(), items.last()) else { return };
+        for (&item, &next) in items.iter().zip(items.iter().skip(1)) {
+            debug_assert_ne!(index(item), NONE);
+            links.link(index(item)).store(index(next), Ordering::Relaxed);
         }
-        self.push_chain(items[0], last, links);
+        self.push_chain(index(first), index(last), links);
     }
 
     /// Pushes the chain from `first` to `last` with one compare-and-swap, `first` on top: items
@@ -135,11 +146,14 @@ impl Stack {
             // A link only ever holds `NONE` or an index pushed before, so every one read here
             // names a live link, stale or not; a stale walk leaves the tag moved, and the
             // compare-and-swap below fails. `out.len()` bounds a walk through a stale cycle.
-            out[0] = top;
-            let mut taken = 1;
-            let mut next = links.link(top).load(Ordering::Relaxed);
-            while taken < out.len() && next != NONE {
-                out[taken] = next;
+            // `out` is not empty and `top` is an item, so at least `top` is taken.
+            let mut taken = 0;
+            let mut next = top;
+            for slot in out.iter_mut() {
+                if next == NONE {
+                    break;
+                }
+                *slot = next;
                 taken += 1;
                 next = links.link(next).load(Ordering::Relaxed);
             }

@@ -343,7 +343,7 @@ impl Files {
         }
 
         let bytes =
-            frame.alloc_slice_from_iter(plan.writes.iter().map(|it| &view.files[it.at].bytes[..]));
+            frame.alloc_slice_from_iter(plan.writes.iter().map(|it| &view.files[it.at].bytes[..])).unwrap_or_else(|error| panic!("{error}"));
         let ids = content::hash_many(blaze_vfs::FILE_DOMAIN, bytes, frame);
         for (write, &bytes) in plan.writes.iter().zip(ids) {
             let file = &view.files[write.at];
@@ -501,7 +501,7 @@ impl Files {
     ) {
         let mut keys = Vec::with_capacity_in(plan.added.len(), frame);
         keys.extend(plan.added.iter().map(|(_, _, path)| content::path_key(path)));
-        let key_bytes = frame.alloc_slice_from_iter(keys.iter().map(|key| &**key));
+        let key_bytes = frame.alloc_slice_from_iter(keys.iter().map(|key| &**key)).unwrap_or_else(|error| panic!("{error}"));
         let path_hashes = content::hash_many(SourceRoot::PATH_DOMAIN, key_bytes, frame);
         let mut keys: Vec<Option<(Box<[u8]>, ContentId)>, &Frame> = {
             let mut placed = Vec::with_capacity_in(keys.len(), frame);

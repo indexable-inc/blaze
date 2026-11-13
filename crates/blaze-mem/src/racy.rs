@@ -37,26 +37,30 @@ fn head(at: *const u8, len: usize) -> usize {
 /// ([`zero`], [`copy_in`]) or the kernel's.
 #[inline]
 pub unsafe fn copy_out(from: *const u8, out: &mut [u8]) {
-    let len = out.len();
-    let head = head(from, len);
+    let head = head(from, out.len());
     let mut at = 0;
-    while at < head {
+    let mut rest = out;
+    for _ in 0..head {
+        let Some((slot, tail)) = std::mem::take(&mut rest).split_first_mut() else { break };
         // SAFETY: `from + at` is inside the range the caller says is mapped readable and
-        // writable; every racing write to it is atomic or the kernel's.
-        out[at] = unsafe { AtomicU8::from_ptr(from.add(at).cast_mut()) }.load(Ordering::Relaxed);
+        // writable (`at` counts the bytes of `out` written so far); every racing write to it is
+        // atomic or the kernel's.
+        *slot = unsafe { AtomicU8::from_ptr(from.add(at).cast_mut()) }.load(Ordering::Relaxed);
+        rest = tail;
         at += 1;
     }
-    while at + WORD <= len {
+    let (words, tail) = rest.as_chunks_mut::<WORD>();
+    for slot in words {
         // SAFETY: as above, and `from + at` is 8-byte aligned (past `head`), so it is a valid
         // place for an `AtomicU64`.
         let word = unsafe { AtomicU64::from_ptr(from.add(at).cast_mut().cast::<u64>()) }
             .load(Ordering::Relaxed);
-        out[at..at + WORD].copy_from_slice(&word.to_ne_bytes());
+        *slot = word.to_ne_bytes();
         at += WORD;
     }
-    while at < len {
+    for slot in tail {
         // SAFETY: as for the head.
-        out[at] = unsafe { AtomicU8::from_ptr(from.add(at).cast_mut()) }.load(Ordering::Relaxed);
+        *slot = unsafe { AtomicU8::from_ptr(from.add(at).cast_mut()) }.load(Ordering::Relaxed);
         at += 1;
     }
 }
@@ -70,25 +74,27 @@ pub unsafe fn copy_out(from: *const u8, out: &mut [u8]) {
 /// a plain reference to it (a pinned `&[u8]`) meanwhile.
 #[inline]
 pub unsafe fn copy_in(to: *mut u8, bytes: &[u8]) {
-    let len = bytes.len();
-    let head = head(to, len);
+    let head = head(to, bytes.len());
     let mut at = 0;
-    while at < head {
-        // SAFETY: `to + at` is inside the range the caller says is mapped and unreferenced.
-        unsafe { AtomicU8::from_ptr(to.add(at)) }.store(bytes[at], Ordering::Relaxed);
+    let mut rest = bytes;
+    for _ in 0..head {
+        let Some((&byte, tail)) = rest.split_first() else { break };
+        // SAFETY: `to + at` is inside the range the caller says is mapped and unreferenced
+        // (`at` counts the bytes of `bytes` written so far).
+        unsafe { AtomicU8::from_ptr(to.add(at)) }.store(byte, Ordering::Relaxed);
+        rest = tail;
         at += 1;
     }
-    while at + WORD <= len {
-        let mut word = [0; WORD];
-        word.copy_from_slice(&bytes[at..at + WORD]);
+    let (words, tail) = rest.as_chunks::<WORD>();
+    for &word in words {
         // SAFETY: as above, and `to + at` is 8-byte aligned (past `head`).
         unsafe { AtomicU64::from_ptr(to.add(at).cast::<u64>()) }
             .store(u64::from_ne_bytes(word), Ordering::Relaxed);
         at += WORD;
     }
-    while at < len {
+    for &byte in tail {
         // SAFETY: as for the head.
-        unsafe { AtomicU8::from_ptr(to.add(at)) }.store(bytes[at], Ordering::Relaxed);
+        unsafe { AtomicU8::from_ptr(to.add(at)) }.store(byte, Ordering::Relaxed);
         at += 1;
     }
 }

@@ -50,7 +50,7 @@ impl<T> Tagged<T> {
                 wanted,
             });
         }
-        let handle = self.slab.try_insert(value)?;
+        let handle = self.slab.insert(value)?;
         Ok((handle, self.pack(handle)))
     }
 

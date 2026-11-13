@@ -228,7 +228,7 @@ pub(super) fn elaborate_drops<'db>(
         body,
         data: &data,
         frame,
-        flags: frame.alloc_slice_fill_with(len, |_| None),
+        flags: frame.alloc_slice_fill_with(len, |_| None).unwrap_or_else(|error| panic!("{error}")),
         flag_count: 0,
         state: InitState::bottom(len, frame),
         span: MirSpan::Unknown,

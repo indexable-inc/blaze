@@ -96,13 +96,13 @@ fn act(cx: &Cx, kind: Kind, clock: &Clock, file: &File<ReadWrite>) -> Result<(),
         }
         Kind::Writes { cancel } => {
             let bytes = [7u8; 8];
-            let pending = file.write_from(&bytes, 0);
+            let pending = file.write_from(&bytes, crate::mem::Offset::new(0));
             let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(Limits::USUAL.abandon_wait))) } else { pending.wait(cx) };
             Ok(())
         }
         Kind::Reads { cancel } => {
             let mut buf = [0u8; 8];
-            let pending = file.read_into(&mut buf, 0);
+            let pending = file.read_into(&mut buf, crate::mem::Offset::new(0));
             let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(Limits::USUAL.abandon_wait))) } else { pending.wait(cx) };
             Ok(())
         }
@@ -132,7 +132,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) -> Result<(), String> {
     let log = Log { started: RefCell::new(Vec::new()), ended: RefCell::new(Vec::new()), did: RefCell::new(Vec::new()) };
     let mut wrong: Vec<String> = Vec::new();
-    let scope = cx.scope();
+    let scope = cx.scope().expect("a scope");
     for (at, &kind) in plan.tasks.iter().enumerate() {
         if plan.cancel_at == Some(at as u64) {
             scope.cancel();

@@ -15,7 +15,7 @@ use std::{
     slice,
 };
 
-use crate::{MemError, Region, Tag, error::fail};
+use crate::{MemError, Region, Tag};
 
 /// A growable array over a reserved region: `Vec<T>`'s API for what a column needs, with no
 /// move on growth. `max_len` is fixed at creation; pushing past it is an error naming the tag.
@@ -121,9 +121,10 @@ impl<T> RegionVec<T> {
         Ok(())
     }
 
-    /// Appends `value` and returns its index.
+    /// Appends `value` and returns its index; when the column's reservation is used up or
+    /// memory cannot be had, the error names its tag and the column is as it was.
     #[inline]
-    pub fn try_push(&mut self, value: T) -> Result<usize, MemError> {
+    pub fn push(&mut self, value: T) -> Result<usize, MemError> {
         if self.len == self.capacity {
             self.grow(self.len + 1)?;
         }
@@ -135,29 +136,24 @@ impl<T> RegionVec<T> {
         Ok(index)
     }
 
-    /// Appends `value` and returns its index; stops with the error when the column's
-    /// reservation is used up or memory cannot be had.
+    /// Appends `value` and returns its index as a `u32` ID; refused, the column as it was,
+    /// when its next index does not fit a `u32`.
     #[inline]
-    #[track_caller]
-    pub fn push(&mut self, value: T) -> usize {
-        match self.try_push(value) {
-            Ok(index) => index,
-            Err(error) => fail(&error),
-        }
+    pub fn push_id(&mut self, value: T) -> Result<u32, MemError> {
+        let Ok(id) = u32::try_from(self.len) else {
+            return Err(MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: self.len });
+        };
+        self.push(value)?;
+        Ok(id)
     }
 
-    /// Appends `value` and returns its index as a `u32` ID; stops when the column holds
-    /// `u32::MAX` elements.
-    #[inline]
-    #[track_caller]
-    pub fn push_id(&mut self, value: T) -> u32 {
-        let index = self.push(value);
-        match u32::try_from(index) {
-            Ok(id) => id,
-            Err(_) => {
-                fail(&MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: index })
-            }
+    /// Appends each item of `items`. On an error the items before it are kept and the rest
+    /// of the iterator is dropped unread.
+    pub fn extend(&mut self, items: impl IntoIterator<Item = T>) -> Result<(), MemError> {
+        for value in items {
+            self.push(value)?;
         }
+        Ok(())
     }
 
     pub fn pop(&mut self) -> Option<T> {
@@ -244,21 +240,19 @@ impl<T> RegionVec<T> {
 }
 
 impl<T: Copy> RegionVec<T> {
-    pub fn try_extend_from_slice(&mut self, values: &[T]) -> Result<(), MemError> {
+    /// Appends a copy of each of `values`, or none of them.
+    pub fn extend_from_slice(&mut self, values: &[T]) -> Result<(), MemError> {
         self.reserve(values.len())?;
         let spare = self.spare_capacity_mut();
+        let mut written = 0;
         for (slot, value) in spare.iter_mut().zip(values) {
             slot.write(*value);
+            written += 1;
         }
-        self.len += values.len();
+        // `reserve` made room for all of them, so `written == values.len()`; only what was
+        // written is counted either way.
+        self.len += written;
         Ok(())
-    }
-
-    #[track_caller]
-    pub fn extend_from_slice(&mut self, values: &[T]) {
-        if let Err(error) = self.try_extend_from_slice(values) {
-            fail(&error)
-        }
     }
 }
 
@@ -281,15 +275,6 @@ impl<T> Deref for RegionVec<T> {
 impl<T> DerefMut for RegionVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
-    }
-}
-
-impl<T> Extend<T> for RegionVec<T> {
-    #[track_caller]
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        for value in iter {
-            self.push(value);
-        }
     }
 }
 

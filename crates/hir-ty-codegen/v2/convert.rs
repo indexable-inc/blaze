@@ -320,7 +320,7 @@ impl OwnData {
         resolve: &impl Resolver,
         named: impl Iterator<Item = usize>,
     ) -> Result<Vec<Option<Target>, &'f Frame>, String> {
-        let used: &mut [bool] = frame.alloc_slice_fill_with(requests.datas.len(), |_| false);
+        let used: &mut [bool] = frame.alloc_slice_fill_with(requests.datas.len(), |_| false).unwrap_or_else(|error| panic!("{error}"));
         for index in named {
             *used
                 .get_mut(index)

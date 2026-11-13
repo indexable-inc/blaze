@@ -503,7 +503,7 @@ impl Watcher {
     }
 
     fn tag(&mut self, pending: Pending) -> Tag {
-        Tag(self.tags + FIRST + u64::from(self.pending.insert(pending).index()))
+        Tag(self.tags + FIRST + u64::from(self.pending.insert(pending).unwrap_or_else(|error| panic!("{error}")).index()))
     }
 
     /// The look `tag` was asked for, out of its slot: each tag completes once.

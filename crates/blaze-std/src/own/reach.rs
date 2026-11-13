@@ -121,6 +121,44 @@ pub const NODES: usize = 192;
 /// No entry.
 const NONE: usize = !0;
 
+/// The entry `at` of `items`, or `None` past the end: a lookup that cannot panic, written
+/// with a slice pattern alone (no method of `core`'s slices), so the front end's fixture
+/// evaluates it too. Linear in `at`; every walk already scans its entries once per `add`.
+pub(crate) const fn entry<T>(items: &[T], at: usize) -> Option<&T> {
+    let mut rest = items;
+    let mut left = at;
+    loop {
+        match rest {
+            [first, more @ ..] => {
+                if left == 0 {
+                    return Some(first);
+                }
+                left -= 1;
+                rest = more;
+            }
+            [] => return None,
+        }
+    }
+}
+
+/// [`entry`], to write.
+const fn entry_mut<T>(items: &mut [T], at: usize) -> Option<&mut T> {
+    let mut rest = items;
+    let mut left = at;
+    loop {
+        match rest {
+            [first, more @ ..] => {
+                if left == 0 {
+                    return Some(first);
+                }
+                left -= 1;
+                rest = more;
+            }
+            [] => return None,
+        }
+    }
+}
+
 /// Why a walk refused, as text: the field path to what it found.
 #[derive(Clone, Copy)]
 pub struct Reason {
@@ -141,18 +179,25 @@ impl Reason {
             return;
         }
         if self.len + text.len() + 3 > TEXT {
+            // Every push that fit left room for the dots, so they always fit.
             let mut dots = 0;
             while dots < 3 {
-                self.bytes[self.len + dots] = b'.';
+                if let Some(byte) = entry_mut(&mut self.bytes, self.len + dots) {
+                    *byte = b'.';
+                }
                 dots += 1;
             }
             self.len = NONE;
             return;
         }
         let mut at = 0;
-        while at < text.len() {
-            self.bytes[self.len + at] = text[at];
+        let mut rest = text;
+        while let [first, more @ ..] = rest {
+            if let Some(byte) = entry_mut(&mut self.bytes, self.len + at) {
+                *byte = *first;
+            }
             at += 1;
+            rest = more;
         }
         self.len += text.len();
     }
@@ -169,8 +214,11 @@ impl Reason {
         let len = if self.len == NONE {
             // Cut short: the bytes up to the dots, which follow the last whole piece.
             let mut end = TEXT;
-            while end > 0 && self.bytes[end - 1] == 0 {
-                end -= 1;
+            while end > 0 {
+                match entry(&self.bytes, end - 1) {
+                    Some(&0) => end -= 1,
+                    _ => break,
+                }
             }
             end
         } else {
@@ -215,36 +263,54 @@ struct Walk {
     len: usize,
     /// Whether an entry did not fit.
     full: bool,
+    /// Whether a lookup of one of its own entries found none: a bug in this walk, which is a
+    /// refusal ([`lost`]), never a pass.
+    lost: bool,
 }
 
 impl Walk {
     const fn new(start: TypeId) -> Walk {
         let first = Node { ty: start, cell: NONE, from: NONE, step: Step::Start };
-        Walk { nodes: [first; NODES], len: 1, full: false }
+        Walk { nodes: [first; NODES], len: 1, full: false, lost: false }
+    }
+
+    /// The entry `at`, or `None` (and the walk marked lost) when it has none.
+    const fn node(&mut self, at: usize) -> Option<Node> {
+        if at < self.len {
+            if let Some(node) = entry(&self.nodes, at) {
+                return Some(*node);
+            }
+        }
+        self.lost = true;
+        None
     }
 
     /// Adds `ty`, reached from `from` by `step`, unless the walk has been at it in the same
     /// position (behind a cell or not): the key is the instance's `TypeId`, never its name.
     const fn add(&mut self, ty: TypeId, cell: usize, from: usize, step: Step) {
+        // One pass: the entries so far, then the free slot after them.
         let mut at = 0;
-        while at < self.len {
-            let seen = &self.nodes[at];
+        let mut rest: &mut [Node] = &mut self.nodes;
+        while let [seen, more @ ..] = rest {
+            if at == self.len {
+                *seen = Node { ty, cell, from, step };
+                self.len += 1;
+                return;
+            }
             if raw::same(seen.ty, ty) && (seen.cell == NONE) == (cell == NONE) {
                 return;
             }
             at += 1;
+            rest = more;
         }
-        if self.len == NODES {
-            self.full = true;
-            return;
-        }
-        self.nodes[self.len] = Node { ty, cell, from, step };
-        self.len += 1;
+        self.full = true;
     }
 
     /// Adds every type argument of the holder at `at`.
     const fn add_args(&mut self, at: usize, cell: usize) {
-        let ty = self.nodes[at].ty;
+        let Some(Node { ty, .. }) = self.node(at) else {
+            return;
+        };
         let mut arg = 0;
         while arg < raw::args(ty) {
             if let Some(inner) = raw::arg(ty, arg) {
@@ -256,7 +322,9 @@ impl Walk {
 
     /// Adds every field of every variant of the struct, enum or tuple at `at`.
     const fn add_fields(&mut self, at: usize, cell: usize) {
-        let ty = self.nodes[at].ty;
+        let Some(Node { ty, .. }) = self.node(at) else {
+            return;
+        };
         let mut variant = 0;
         while variant < raw::variants(ty) {
             let mut field = 0;
@@ -270,43 +338,44 @@ impl Walk {
 
     /// The named steps from the start to the entry `at`, as `` `Owner.field` `` (an enum's as
     /// `` `Owner::Variant.field` ``), with the field's type when `typed`, joined by `, then `.
-    /// Whether one was written.
-    const fn push_path(&self, out: &mut Reason, at: usize, typed: bool) -> bool {
-        // The entries from the start to `at`: found backwards, written forwards.
-        let mut chain = [NONE; NODES];
-        let mut count = 0;
-        let mut entry = at;
-        while entry != NONE {
-            chain[count] = entry;
-            count += 1;
-            entry = self.nodes[entry].from;
-        }
-        let mut written = false;
-        while count > 0 {
-            count -= 1;
-            let node = &self.nodes[chain[count]];
-            if let Step::Field { variant, field } = node.step {
-                let owner = self.nodes[node.from].ty;
-                if written {
-                    out.push(", then ");
-                }
-                out.push("`");
-                out.push(raw::name(owner));
-                if raw::variants(owner) > 1 {
-                    out.push("::");
-                    out.push(raw::variant_name(owner, variant));
-                }
-                out.push(".");
-                out.push(raw::field_name(owner, variant, field));
-                if typed {
-                    out.push(": ");
-                    out.push(raw::name(node.ty));
-                }
-                out.push("`");
-                written = true;
+    /// Whether one was written, or `None` when an entry on the way is missing.
+    const fn push_path(&self, out: &mut Reason, at: usize, typed: bool) -> Option<bool> {
+        // Written from the start: the entry `from` is always one added before `at`, so the
+        // recursion is as deep as the path and ends at the start.
+        let Some(node) = entry(&self.nodes, at) else {
+            return None;
+        };
+        let written = if node.from == NONE {
+            false
+        } else {
+            match self.push_path(out, node.from, typed) {
+                Some(written) => written,
+                None => return None,
             }
+        };
+        let Step::Field { variant, field } = node.step else {
+            return Some(written);
+        };
+        let Some(&Node { ty: owner, .. }) = entry(&self.nodes, node.from) else {
+            return None;
+        };
+        if written {
+            out.push(", then ");
         }
-        written
+        out.push("`");
+        out.push(raw::name(owner));
+        if raw::variants(owner) > 1 {
+            out.push("::");
+            out.push(raw::variant_name(owner, variant));
+        }
+        out.push(".");
+        out.push(raw::field_name(owner, variant, field));
+        if typed {
+            out.push(": ");
+            out.push(raw::name(node.ty));
+        }
+        out.push("`");
+        Some(true)
     }
 }
 
@@ -355,6 +424,9 @@ pub const fn walk(start: TypeId, ask: &Ask) -> Verdict {
         if let Some(reason) = visit(&mut walk, at, start, ask) {
             return Verdict::Refused(reason);
         }
+        if walk.lost {
+            return Verdict::Refused(lost(start));
+        }
         at += 1;
     }
     if walk.full {
@@ -371,9 +443,21 @@ const fn too_large(start: TypeId) -> Reason {
     out
 }
 
+/// The refusal of a walk that looked up one of its own entries and found none: a bug in
+/// this walk, said as one rather than taken for a pass.
+const fn lost(start: TypeId) -> Reason {
+    let mut out = Reason::new();
+    out.push("the walk from ");
+    out.push_ty(start);
+    out.push(" looked up an entry it does not hold (a bug in bstd's reachability walk)");
+    out
+}
+
 /// Expands the entry `at`: adds what it holds, or gives the refusal it is.
 const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<Reason> {
-    let Node { ty, cell, .. } = walk.nodes[at];
+    let Some(Node { ty, cell, .. }) = walk.node(at) else {
+        return Some(lost(start));
+    };
     let found = match ask.find {
         Find::Cycle => false,
         Find::Type(what) => raw::same(ty, what),
@@ -381,8 +465,10 @@ const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<R
     };
     if found {
         let mut out = Reason::new();
-        if walk.push_path(&mut out, at, true) {
-            out.push(": ");
+        match walk.push_path(&mut out, at, true) {
+            Some(true) => out.push(": "),
+            Some(false) => {}
+            None => return Some(lost(start)),
         }
         out.push_ty(ty);
         out.push(" is ");
@@ -465,14 +551,19 @@ const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<R
                     return None;
                 }
                 let mut out = Reason::new();
-                if walk.push_path(&mut out, at, false) {
-                    out.push(": ");
+                match walk.push_path(&mut out, at, false) {
+                    Some(true) => out.push(": "),
+                    Some(false) => {}
+                    None => return Some(lost(start)),
                 }
                 out.push("a ");
                 out.push_ty(ty);
                 if matches!(shape, Shape::Dyn) && cell != NONE {
+                    let Some(Node { ty: holder, .. }) = walk.node(cell) else {
+                        return Some(lost(start));
+                    };
                     out.push(" behind ");
-                    out.push_ty(walk.nodes[cell].ty);
+                    out.push_ty(holder);
                     out.push(", whose hidden type could hold a pointer back");
                 } else {
                     out.push(unseen(shape));
@@ -486,15 +577,19 @@ const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<R
 /// Whether a pointee of the counted pointer at `at`, which is behind a cell, leads back to
 /// `start` through anything it owns: the refusal naming the path, or `None`. A type on the way
 /// that is not seen into is a refusal too: it could.
-const fn leads_back(outer: &Walk, at: usize, start: TypeId) -> Option<Reason> {
-    let pointer = outer.nodes[at];
+const fn leads_back(outer: &mut Walk, at: usize, start: TypeId) -> Option<Reason> {
+    let Some(pointer) = outer.node(at) else {
+        return Some(lost(start));
+    };
     let mut arg = 0;
     while arg < raw::args(pointer.ty) {
         if let Some(pointee) = raw::arg(pointer.ty, arg) {
             let mut back = Walk::new(pointee);
             let mut next = 0;
             while next < back.len {
-                let ty = back.nodes[next].ty;
+                let Some(Node { ty, .. }) = back.node(next) else {
+                    return Some(lost(start));
+                };
                 let mut hidden = None;
                 if raw::same(ty, start) {
                     return Some(cycle(outer, at, &back, next, start, None));
@@ -518,6 +613,9 @@ const fn leads_back(outer: &Walk, at: usize, start: TypeId) -> Option<Reason> {
                 if let Some(shape) = hidden {
                     return Some(cycle(outer, at, &back, next, start, Some(shape)));
                 }
+                if back.lost {
+                    return Some(lost(start));
+                }
                 next += 1;
             }
             if back.full {
@@ -540,17 +638,29 @@ const fn cycle(
     start: TypeId,
     hidden: Option<Shape>,
 ) -> Reason {
-    let pointer = outer.nodes[at];
+    let Some(&pointer) = entry(&outer.nodes, at) else {
+        return lost(start);
+    };
+    let Some(&Node { ty: holder, .. }) = entry(&outer.nodes, pointer.cell) else {
+        return lost(start);
+    };
+    let Some(&Node { ty: last, .. }) = entry(&back.nodes, end) else {
+        return lost(start);
+    };
     let mut out = Reason::new();
-    if !outer.push_path(&mut out, at, false) {
-        out.push_ty(start);
+    match outer.push_path(&mut out, at, false) {
+        Some(true) => {}
+        Some(false) => out.push_ty(start),
+        None => return lost(start),
     }
     out.push(": a ");
     out.push_ty(pointer.ty);
     out.push(" behind ");
-    out.push_ty(outer.nodes[pointer.cell].ty);
+    out.push_ty(holder);
     out.push(" reaches ");
-    let named = back.push_path(&mut out, end, true);
+    let Some(named) = back.push_path(&mut out, end, true) else {
+        return lost(start);
+    };
     match hidden {
         None => {
             if named {
@@ -563,7 +673,7 @@ const fn cycle(
                 out.push(", then ");
             }
             out.push("a ");
-            out.push_ty(back.nodes[end].ty);
+            out.push_ty(last);
             out.push(unseen(shape));
             out.push(", so it could reach ");
             out.push_ty(start);
@@ -579,7 +689,8 @@ pub const fn reaches<T: ?Sized, Q: Question>() -> Verdict {
 
 /// `true` when nothing `Q` asks about is reachable from `T`; otherwise a panic whose message
 /// is the path. Written as a `where const { none::<T, Q>() }` condition: the bound that fails
-/// shows the message.
+/// shows the message. The panic is the bound's message at compile time, and the one panic
+/// this walk keeps: a `where const` condition has no error value to return.
 pub const fn none<T: ?Sized, Q: Question>() -> bool {
     match reaches::<T, Q>() {
         Verdict::Clear => true,

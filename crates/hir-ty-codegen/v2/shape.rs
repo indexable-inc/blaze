@@ -301,7 +301,7 @@ impl<'f> Data<'f> {
                 own += 1;
                 UserExternalName::new(namespace::OWN, own - 1)
             }
-        }));
+        })).unwrap_or_else(|error| panic!("{error}"));
         Ok(Data { names })
     }
 

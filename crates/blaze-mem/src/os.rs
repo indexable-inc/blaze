@@ -33,6 +33,219 @@ use std::{io, ptr::NonNull, sync::atomic};
 #[cfg(unix)]
 use crate::syscalls::{Kind, timed};
 
+/// Why the kernel or the system refused a step, with every value it names kept typed and put
+/// into words only when shown: the payload of the `io::Error`s this module returns (the
+/// `io::Error` boxes it, once per refusal).
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// A writable reservation refused where Linux charges it whole to the commit limit
+    /// (`vm.overcommit_memory = 2`, read into `mode`).
+    #[cfg(unix)]
+    Overcommitted { bytes: usize, why: io::Error, mode: io::Result<Text<32>> },
+    /// Linear memory that would not grow for a reservation (`memory.grow`).
+    #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+    Grow { pages: usize, bytes: usize },
+    /// A NUMA placement refused: `doing` `bytes` bytes `prep` node `node` through `call`.
+    #[cfg(any(target_os = "linux", windows))]
+    Placement {
+        doing: &'static str,
+        prep: &'static str,
+        call: &'static str,
+        bytes: usize,
+        node: u32,
+        why: io::Error,
+    },
+    /// A node past the `nodes` a placement mask names.
+    #[cfg(target_os = "linux")]
+    PastMask { node: u32, nodes: usize },
+    /// Windows places memory on a node only when it is reserved.
+    #[cfg(windows)]
+    PlacedAtReserve { node: u32 },
+    /// A system of one memory node asked for another.
+    #[cfg(not(any(target_os = "linux", windows)))]
+    OneNode { node: u32 },
+    /// `BLAZE_HUGE_PAGES=reserved` with no 2 MiB pages in the hugetlb pool.
+    #[cfg(target_os = "linux")]
+    NoPool,
+    /// `BLAZE_HUGE_PAGES=reserved` on a system without hugetlbfs for anonymous memory.
+    #[cfg(not(target_os = "linux"))]
+    PoolLinuxOnly,
+    /// A step of a commit on reserved 2 MiB pages refused, and what to do about it.
+    #[cfg(target_os = "linux")]
+    Hugetlb { step: &'static str, bytes: usize, why: io::Error, hint: &'static str },
+    /// The probe of giving pages back gave back `given` of its `bytes`.
+    #[cfg(any(unix, windows, target_arch = "wasm64"))]
+    EvictShort { given: usize, bytes: usize, why: io::Error },
+    /// The probe's pages, said to be given back, still held what was written (`kept`).
+    #[cfg(any(unix, windows, target_arch = "wasm64"))]
+    EvictKept { bytes: usize, kept: [u8; 2] },
+    /// A value of `BLAZE_HUGE_PAGES` that names no pages (its first bytes, [`Text::of`]).
+    Misspelled { value: Text<64> },
+    /// A decommit of a sparse region, whose owner reads past what it committed.
+    Sparse { tag: crate::Tag, reserved: usize },
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            Refused::Overcommitted { bytes, why, mode } => {
+                write!(
+                    f,
+                    "reserving {bytes} bytes of address space readable and writable (mmap \
+                     MAP_NORESERVE): {why}; vm.overcommit_memory is "
+                )?;
+                match mode {
+                    Ok(mode) => write!(f, "{mode}")?,
+                    Err(read) => write!(f, "unreadable: {read}")?,
+                }
+                f.write_str(", and blaze needs 0 or 1 (2 charges every reservation whole)")
+            }
+            #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+            Refused::Grow { pages, bytes } => write!(
+                f,
+                "growing linear memory by {pages} pages of 64 KiB for a {bytes}-byte reservation \
+                 (memory.grow) failed"
+            ),
+            #[cfg(any(target_os = "linux", windows))]
+            Refused::Placement { doing, prep, call, bytes, node, why } => {
+                write!(f, "{doing} {bytes} bytes {prep} NUMA node {node} ({call}): {why}")
+            }
+            #[cfg(target_os = "linux")]
+            Refused::PastMask { node, nodes } => {
+                write!(f, "NUMA node {node} is past the {nodes} nodes a mask names")
+            }
+            #[cfg(windows)]
+            Refused::PlacedAtReserve { node } => write!(
+                f,
+                "Windows places memory on a NUMA node only when it is reserved: reserve this \
+                 range on node {node} (Region::reserve_on) rather than binding it after"
+            ),
+            #[cfg(not(any(target_os = "linux", windows)))]
+            Refused::OneNode { node } => write!(
+                f,
+                "{} has one memory node and no NUMA node {node}",
+                std::env::consts::OS
+            ),
+            #[cfg(target_os = "linux")]
+            Refused::NoPool => write!(
+                f,
+                "{}=reserved, but the kernel reserves no 2 MiB pages ({POOL} is 0 or missing): \
+                 reserve them first (`sysctl vm.nr_hugepages=4096` holds 8 GiB), or unset it \
+                 for transparent huge pages",
+                crate::huge::VAR,
+            ),
+            #[cfg(not(target_os = "linux"))]
+            Refused::PoolLinuxOnly => write!(
+                f,
+                "{}=reserved: reserved huge pages (hugetlbfs) are Linux's, and {} has none for \
+                 anonymous memory; unset it",
+                crate::huge::VAR,
+                std::env::consts::OS
+            ),
+            #[cfg(target_os = "linux")]
+            Refused::Hugetlb { step, bytes, why, hint } => write!(
+                f,
+                "{step} {bytes} bytes on reserved 2 MiB pages (MAP_HUGETLB): {why}; {hint}"
+            ),
+            #[cfg(any(unix, windows, target_arch = "wasm64"))]
+            Refused::EvictShort { given, bytes, why } => write!(
+                f,
+                "{EVICT_CALL} gave back {given} of {bytes} bytes of this process's own sparse \
+                 pages: {why}; {EVICT_NEEDS} (this is {System})"
+            ),
+            #[cfg(any(unix, windows, target_arch = "wasm64"))]
+            Refused::EvictKept { bytes, kept } => write!(
+                f,
+                "{EVICT_CALL} said it gave back {bytes} bytes of this process's own pages, but \
+                 they still hold what was written ({kept:?}): the pages did not leave ({System})"
+            ),
+            Refused::Misspelled { value } => write!(
+                f,
+                "{}={value:?} names no pages: use `transparent` (the default), `reserved` \
+                 (Linux's hugetlb pool) or `off`",
+                crate::huge::VAR,
+            ),
+            Refused::Sparse { tag, reserved } => write!(
+                f,
+                "a sparse {tag:?} region of {reserved} bytes is never decommitted: its owner \
+                 reads past what it committed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Up to `N` bytes of text kept inline, for an error that names a file's contents or a value
+/// it was given; shown with each invalid UTF-8 sequence as U+FFFD and ASCII whitespace at its
+/// ends trimmed.
+#[derive(Clone, Copy)]
+pub(crate) struct Text<const N: usize> {
+    bytes: [u8; N],
+    /// How many of `bytes` hold the text: at most `N`.
+    len: usize,
+}
+
+impl<const N: usize> Text<N> {
+    /// The first `N` bytes of `bytes` (all of them when there are no more).
+    pub(crate) fn of(bytes: impl IntoIterator<Item = u8>) -> Text<N> {
+        let mut text = Text { bytes: [0; N], len: 0 };
+        for (slot, byte) in text.bytes.iter_mut().zip(bytes) {
+            *slot = byte;
+            text.len += 1;
+        }
+        text
+    }
+
+    /// The first `N` bytes of the file at `path`, read with one `read`: the whole of a small
+    /// sysfs or procfs file, which the kernel hands over in one call.
+    #[cfg(unix)]
+    fn read(path: &str) -> io::Result<Text<N>> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        let mut text = Text { bytes: [0; N], len: 0 };
+        text.len = file.read(&mut text.bytes)?.min(N);
+        Ok(text)
+    }
+
+    /// The bytes of the text, ASCII whitespace at their ends trimmed.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        let held = match self.bytes.split_at_checked(self.len) {
+            Some((held, _)) => held,
+            // `len` counts bytes written into `bytes`, so it is at most `N`; were it more,
+            // every byte is the text.
+            None => &self.bytes,
+        };
+        held.trim_ascii()
+    }
+}
+
+impl<const N: usize> std::fmt::Display for Text<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for chunk in self.as_bytes().utf8_chunks() {
+            f.write_str(chunk.valid())?;
+            if !chunk.invalid().is_empty() {
+                f.write_str("\u{FFFD}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> std::fmt::Debug for Text<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
+        for chunk in self.as_bytes().utf8_chunks() {
+            write!(f, "{}", chunk.valid().escape_debug())?;
+            for byte in chunk.invalid() {
+                write!(f, "\\x{byte:02x}")?;
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
 /// Alignment of every reservation: a huge page on Unix (so a huge region starts on one);
 /// Windows' allocation granularity, which `VirtualAlloc` always gives.
 #[cfg(unix)]
@@ -182,17 +395,9 @@ fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::E
     {
         return why;
     }
-    let mode = std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
-        .map(|it| it.trim().to_owned()) // alloc: the error of a refused reservation, once
-        .unwrap_or_else(|read| format!("unreadable: {read}")); // alloc: as above
-    // alloc: the error of a refused reservation, once
-    io::Error::new(
-        why.kind(),
-        format!(
-            "reserving {bytes} bytes of address space readable and writable (mmap MAP_NORESERVE): {why}; \
-             vm.overcommit_memory is {mode}, and blaze needs 0 or 1 (2 charges every reservation whole)"
-        ),
-    )
+    let mode = Text::read("/proc/sys/vm/overcommit_memory");
+    // alloc: the error of a refused reservation, once (`io::Error` boxes its payload)
+    io::Error::new(why.kind(), Refused::Overcommitted { bytes, why, mode })
 }
 
 /// Tells Linux which pages `[ptr, ptr + bytes)` is made of: with `huge`, transparent huge
@@ -293,10 +498,8 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     if old == usize::MAX {
         return Err(io::Error::new(
             io::ErrorKind::OutOfMemory,
-            // alloc: the error of a reservation refused, once
-            format!(
-                "growing linear memory by {pages} pages of 64 KiB for a {bytes}-byte reservation (memory.grow) failed"
-            ),
+            // alloc: the error of a reservation refused, once (`io::Error` boxes its payload)
+            Refused::Grow { pages, bytes },
         ));
     }
     // The pages are the module's own memory at `old` pages in: an address, with nothing to
@@ -436,10 +639,17 @@ pub(crate) fn reserve_on(bytes: usize, _huge: bool, node: u32) -> io::Result<Non
     };
     NonNull::new(base.cast::<u8>()).ok_or_else(|| {
         let why = io::Error::last_os_error();
-        // alloc: the error of a reservation refused, once
+        // alloc: the error of a reservation refused, once (`io::Error` boxes its payload)
         io::Error::new(
             why.kind(),
-            format!("reserving {bytes} bytes on NUMA node {node} (VirtualAllocExNuma): {why}"),
+            Refused::Placement {
+                doing: "reserving",
+                prep: "on",
+                call: "VirtualAllocExNuma",
+                bytes,
+                node,
+                why,
+            },
         )
     })
 }
@@ -469,8 +679,8 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     let Some(word) = mask.get_mut(at / bits) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            // alloc: an error naming the node, once
-            format!("NUMA node {node} is past the {} nodes a mask names", MASK_WORDS * bits),
+            // alloc: an error naming the node, once (`io::Error` boxes its payload)
+            Refused::PastMask { node, nodes: MASK_WORDS * bits },
         ));
     };
     *word |= 1 << (at % bits);
@@ -495,10 +705,10 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     let why = io::Error::last_os_error();
     match why.raw_os_error() {
         Some(libc::ENOSYS) if node == 0 => Ok(()),
-        // alloc: the error of a placement refused, once
+        // alloc: the error of a placement refused, once (`io::Error` boxes its payload)
         _ => Err(io::Error::new(
             why.kind(),
-            format!("binding {bytes} bytes to NUMA node {node} (mbind): {why}"),
+            Refused::Placement { doing: "binding", prep: "to", call: "mbind", bytes, node, why },
         )),
     }
 }
@@ -517,11 +727,8 @@ pub(crate) unsafe fn bind(_ptr: NonNull<u8>, _bytes: usize, node: u32) -> io::Re
     }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        // alloc: an error naming the node, once
-        format!(
-            "Windows places memory on a NUMA node only when it is reserved: reserve this range on \
-             node {node} (Region::reserve_on) rather than binding it after"
-        ),
+        // alloc: an error naming the node, once (`io::Error` boxes its payload)
+        Refused::PlacedAtReserve { node },
     ))
 }
 
@@ -538,8 +745,8 @@ fn one_node(node: u32) -> io::Result<()> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        // alloc: an error naming the node, once
-        format!("{} has one memory node and no NUMA node {node}", std::env::consts::OS),
+        // alloc: an error naming the node, once (`io::Error` boxes its payload)
+        Refused::OneNode { node },
     ))
 }
 
@@ -605,9 +812,9 @@ const POOL: &str = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
 /// setting is `always` or `madvise`, not `never`, and the kernel has them at all.
 #[cfg(target_os = "linux")]
 pub(crate) fn transparent_offered() -> bool {
-    // alloc: the setting's few bytes, read once per process
-    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
-        Ok(setting) => !setting.contains("[never]"),
+    // The setting is a line such as `always [madvise] never`: under 64 bytes.
+    match Text::<64>::read("/sys/kernel/mm/transparent_hugepage/enabled") {
+        Ok(setting) => !setting.as_bytes().windows(b"[never]".len()).any(|it| it == b"[never]"),
         Err(_) => false,
     }
 }
@@ -621,20 +828,17 @@ pub(crate) fn transparent_offered() -> bool {
 /// would fail the first one.
 #[cfg(target_os = "linux")]
 pub(crate) fn reserved_pool() -> io::Result<()> {
-    // alloc: the pool's size, read once per process
-    let pages = std::fs::read_to_string(POOL).ok().and_then(|text| text.trim().parse::<u64>().ok());
+    // The pool's size: a decimal count of pages, at most 20 digits.
+    let pages = Text::<32>::read(POOL)
+        .ok()
+        .and_then(|text| std::str::from_utf8(text.as_bytes()).ok()?.parse::<u64>().ok());
     if pages.is_some_and(|pages| pages > 0) {
         return Ok(());
     }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        // alloc: the error of a pool not set up, once
-        format!(
-            "{}=reserved, but the kernel reserves no 2 MiB pages ({POOL} is 0 or missing): \
-             reserve them first (`sysctl vm.nr_hugepages=4096` holds 8 GiB), or unset it for \
-             transparent huge pages",
-            crate::huge::VAR,
-        ),
+        // alloc: the error of a pool not set up, once (`io::Error` boxes its payload)
+        Refused::NoPool,
     ))
 }
 
@@ -642,13 +846,9 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
 pub(crate) fn reserved_pool() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        // alloc: the error of a setting this system cannot honor, once
-        format!(
-            "{}=reserved: reserved huge pages (hugetlbfs) are Linux's, and {} has none for \
-             anonymous memory; unset it",
-            crate::huge::VAR,
-            std::env::consts::OS
-        ),
+        // alloc: the error of a setting this system cannot honor, once (`io::Error` boxes
+        // its payload)
+        Refused::PoolLinuxOnly,
     ))
 }
 
@@ -694,12 +894,12 @@ pub(crate) unsafe fn commit_reserved(
         )
     });
     if got == libc::MAP_FAILED {
-        return Err(on_reserved(bytes, "mapping", &io::Error::last_os_error()));
+        return Err(on_reserved(bytes, "mapping", io::Error::last_os_error()));
     }
     let made = (|| {
         // SAFETY: the range just mapped, ours alone; the advice changes what `fork` copies.
         if timed(Kind::Advise, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) }) != 0 {
-            return Err(on_reserved(bytes, "excluding from fork", &io::Error::last_os_error()));
+            return Err(on_reserved(bytes, "excluding from fork", io::Error::last_os_error()));
         }
         if let Some(node) = node {
             // SAFETY: the range just mapped, holding no page yet; the fresh mapping has the
@@ -709,7 +909,7 @@ pub(crate) unsafe fn commit_reserved(
         // SAFETY: the range just mapped, readable and writable; populating writes zero pages
         // that nothing has read.
         if timed(Kind::Populate, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE) }) != 0 {
-            return Err(on_reserved(bytes, "making the pages of", &io::Error::last_os_error()));
+            return Err(on_reserved(bytes, "making the pages of", io::Error::last_os_error()));
         }
         Ok(())
     })();
@@ -725,7 +925,7 @@ pub(crate) unsafe fn commit_reserved(
 /// Names a refused hugetlb step and what to do about it.
 #[cfg(target_os = "linux")]
 #[cold]
-fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
+fn on_reserved(bytes: usize, step: &'static str, why: io::Error) -> io::Error {
     let hint = match why.raw_os_error() {
         Some(libc::EINVAL) if step.starts_with("making") => {
             "populating needs Linux 5.14 (`MADV_POPULATE_WRITE`)"
@@ -735,11 +935,8 @@ fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
         }
         _ => "unset BLAZE_HUGE_PAGES for transparent huge pages",
     };
-    // alloc: the error of a commit refused, once
-    io::Error::new(
-        why.kind(),
-        format!("{step} {bytes} bytes on reserved 2 MiB pages (MAP_HUGETLB): {why}; {hint}"),
-    )
+    // alloc: the error of a commit refused, once (`io::Error` boxes its payload)
+    io::Error::new(why.kind(), Refused::Hugetlb { step, bytes, why, hint })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1157,23 +1354,14 @@ fn probe_evict() -> io::Result<()> {
     if let Some(why) = why {
         return Err(io::Error::new(
             why.kind(),
-            // alloc: the error of a kernel that cannot give pages back, once
-            format!(
-                "{EVICT_CALL} gave back {given} of {bytes} bytes of this process's own sparse pages: {why}; \
-                 {EVICT_NEEDS} (this is {})",
-                system_release()
-            ),
+            // alloc: the error of a kernel that cannot give pages back, once (`io::Error`
+            // boxes its payload)
+            Refused::EvictShort { given, bytes, why },
         ));
     }
     if kept != [0, 0] {
-        return Err(io::Error::other(
-            // alloc: as above
-            format!(
-                "{EVICT_CALL} said it gave back {bytes} bytes of this process's own pages, but they still \
-                 hold what was written ({kept:?}): the pages did not leave ({})",
-                system_release()
-            ),
-        ));
+        // alloc: as above
+        return Err(io::Error::other(Refused::EvictKept { bytes, kept }));
     }
     Ok(())
 }
@@ -1203,28 +1391,38 @@ const EVICT_CALL: &str = "giving pages back";
 #[cfg(all(any(unix, windows, target_arch = "wasm64"), not(target_os = "linux")))]
 const EVICT_NEEDS: &str = "the store's pool cannot give its pages back on this system";
 
-/// The kernel's name and release, for an error: `uname`'s `sysname` and `release`.
+/// The kernel's name and release, for an error, read when it is shown: on Unix `uname`'s
+/// `sysname` and `release`.
+#[cfg(any(unix, windows, target_arch = "wasm64"))]
+struct System;
+
 #[cfg(unix)]
-#[cold]
-fn system_release() -> std::string::String {
-    // SAFETY: `utsname` is plain bytes, valid zeroed.
-    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: `uname` writes the live struct it is given.
-    if unsafe { libc::uname(&mut name) } != 0 {
-        return "a kernel uname does not name".to_owned(); // alloc: an error's text, once
+impl std::fmt::Display for System {
+    #[cold]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SAFETY: `utsname` is plain bytes, valid zeroed.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: `uname` writes the live struct it is given.
+        if unsafe { libc::uname(&mut name) } != 0 {
+            return f.write_str("a kernel uname does not name");
+        }
+        // A field is at most 256 bytes (macOS's `_SYS_NAMELEN`; Linux's is 65), up to its NUL.
+        let field = |field: &[libc::c_char], f: &mut std::fmt::Formatter<'_>| {
+            let bytes = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
+            write!(f, "{}", Text::<256>::of(bytes))
+        };
+        field(&name.sysname, f)?;
+        f.write_str(" ")?;
+        field(&name.release, f)
     }
-    let text = |field: &[libc::c_char]| {
-        let bytes = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
-        let bytes: Vec<u8> = bytes.collect(); // alloc: an error's text, once
-        std::string::String::from_utf8_lossy(&bytes).into_owned()
-    };
-    format!("{} {}", text(&name.sysname), text(&name.release)) // alloc: as above
 }
 
 #[cfg(any(windows, all(not(unix), target_arch = "wasm64")))]
-#[cold]
-fn system_release() -> std::string::String {
-    std::env::consts::OS.to_owned() // alloc: an error's text, once
+impl std::fmt::Display for System {
+    #[cold]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(std::env::consts::OS)
+    }
 }
 
 /// Releases a whole reservation.

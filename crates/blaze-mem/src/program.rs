@@ -158,15 +158,22 @@ impl ProgramArena {
         if end > self.region.reserved() || start >= self.region.reserved() {
             return Err(exhausted(end));
         }
+        // `start >= UNIT` (`next` starts there and only grows) and `start < reserved <=
+        // MAX_RESERVED`, whose units fit a `u32`; taken before the write, so an offset that
+        // somehow did not fit is refused with the arena as it was.
+        let Some(units) = u32::try_from(start / UNIT).ok().and_then(NonZeroU32::new) else {
+            return Err(MemError::TooLarge {
+                tag: self.region.tag(),
+                what: "a program-arena offset as a nonzero 32-bit count of 8-byte units",
+                wanted: start,
+            });
+        };
         self.region.ensure(end)?;
         // SAFETY: `[start, end)` is committed (`ensure`), inside the reservation, aligned for
         // `T` (`start` is a multiple of its alignment and the base is page-aligned), and
         // nothing else names it: `next` only grows, and `&mut self` is the one writer.
         unsafe { self.region.at(start).as_ptr().cast::<T>().write(value) };
         self.next = end.next_multiple_of(UNIT);
-        // `start / UNIT` fits: `start < reserved <= MAX_RESERVED`; it is not zero: `start >=
-        // UNIT`.
-        let units = NonZeroU32::new((start / UNIT) as u32).expect("an offset past the first unit");
         Ok(Ref32 { units, _of: PhantomData })
     }
 }

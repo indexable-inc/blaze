@@ -6,7 +6,7 @@
 pub use core::any::TypeId;
 use core::mem::type_info::{self, Generic, TypeKind};
 
-use super::reach::Shape;
+use super::reach::{Shape, entry};
 
 /// The id of `T`, which need not outlive `'static`: an instance is its own id.
 pub const fn id<T: ?Sized>() -> TypeId {
@@ -77,8 +77,8 @@ pub const fn args(id: TypeId) -> usize {
 
 /// The generic argument at `at`, when it is a type.
 pub const fn arg(id: TypeId, at: usize) -> Option<TypeId> {
-    match &id.generics()[at] {
-        Generic::Type(it) => Some(it.ty),
+    match entry(id.generics(), at) {
+        Some(Generic::Type(it)) => Some(it.ty),
         _ => None,
     }
 }

@@ -501,7 +501,7 @@ fn region_vec_matches_vec_on_random_operations() {
         match rng.below(10) {
             0..=5 => {
                 let value = rng.next_u64();
-                assert_eq!(column.push(value), model.len());
+                assert_eq!(column.push(value).expect("room"), model.len());
                 model.push(value);
             }
             6 => assert_eq!(column.pop(), model.pop()),
@@ -512,7 +512,7 @@ fn region_vec_matches_vec_on_random_operations() {
             }
             8 => {
                 let values: Vec<u64> = (0..rng.below(100)).map(|_| rng.next_u64()).collect();
-                column.extend_from_slice(&values);
+                column.extend_from_slice(&values).expect("room");
                 model.extend_from_slice(&values);
             }
             _ => {
@@ -532,10 +532,10 @@ fn region_vec_matches_vec_on_random_operations() {
 #[test]
 fn region_vec_addresses_are_stable_across_growth() {
     let mut column = RegionVec::<[u8; 24]>::new(1 << 22, Tag::Other).expect("reserve");
-    column.push([1; 24]);
+    column.push([1; 24]).expect("room");
     let first = column.as_ptr_at(0).expect("pushed");
     for i in 0..1_000_000u32 {
-        column.push([i as u8; 24]);
+        column.push([i as u8; 24]).expect("room");
     }
     assert_eq!(column.as_ptr_at(0), Some(first), "growth never moves an element");
     assert_eq!(column[0], [1; 24]);
@@ -546,7 +546,7 @@ fn region_vec_drops_each_value_once() {
     let drops = Rc::new(Cell::new(0));
     let mut column = RegionVec::new(1000, Tag::Other).expect("reserve");
     for value in 0..100 {
-        column.push(Counted { value, drops: Rc::clone(&drops) });
+        column.push(Counted { value, drops: Rc::clone(&drops) }).expect("room");
     }
     column.truncate(60);
     assert_eq!(drops.get(), 40);
@@ -563,9 +563,9 @@ fn region_vec_full_is_an_error() {
     let mut column = RegionVec::<u64>::new(8, Tag::Other).expect("reserve");
     let max = column.max_len();
     for i in 0..max {
-        column.try_push(i as u64).expect("room");
+        column.push(i as u64).expect("room");
     }
-    assert!(matches!(column.try_push(0), Err(MemError::Exhausted { .. })));
+    assert!(matches!(column.push(0), Err(MemError::Exhausted { .. })));
 }
 
 #[test]
@@ -573,7 +573,7 @@ fn region_vec_push_allocates_nothing() {
     let mut column = RegionVec::<u64>::new(1 << 24, Tag::Other).expect("reserve");
     let (_, used) = measure(|| {
         for i in 0..1_000_000 {
-            column.push(i);
+            column.push(i).expect("room");
         }
     });
     assert_eq!(used.allocations, 0, "a region grows by committing pages, not by the allocator");
@@ -631,12 +631,16 @@ fn column_blocks_fill_in_order_and_leave_holes_unreadable() {
 }
 
 #[test]
-#[should_panic(expected = "only the column that claimed it")]
 fn column_block_fills_only_its_column() {
     let one = Column::<u64>::new(64, Tag::Other).expect("reserve");
     let two = Column::<u64>::new(64, Tag::Other).expect("reserve");
     let mut block = one.claim(4).expect("room");
-    let _ = two.fill(&mut block, 1);
+    assert!(matches!(two.fill(&mut block, 1), Err(MemError::Refused { tag: Tag::Other, .. })));
+    assert_eq!(block.remaining(), 4, "a refused fill takes no index");
+    assert_eq!(two.get(0), None);
+    let mut spent = one.claim(1).expect("room");
+    one.fill(&mut spent, 2).expect("room");
+    assert!(matches!(one.fill(&mut spent, 3), Err(MemError::Refused { .. })), "a spent block");
 }
 
 #[test]
@@ -740,12 +744,12 @@ fn append_vec_matches_vec_and_never_moves() {
     let mut model = Vec::new();
     for _ in 0..200_000 {
         let value = rng.next_u64();
-        assert_eq!(column.append(value) as usize, model.len());
+        assert_eq!(column.append(value).expect("room") as usize, model.len());
         model.push(value);
     }
     let first = column.as_slice().as_ptr();
     for i in 0..100_000 {
-        column.append(i);
+        column.append(i).expect("room");
         model.push(i);
     }
     assert_eq!(column.as_slice().as_ptr(), first, "growth never moves an element");
@@ -778,7 +782,7 @@ fn append_vec_readers_see_a_written_prefix_while_one_writer_appends() {
             })
             .collect();
         for i in 0..100_000u64 {
-            column.append([i, !i]);
+            column.append([i, !i]).expect("room");
         }
         for reader in readers {
             reader.join().expect("reader");
@@ -791,9 +795,9 @@ fn append_vec_full_is_an_error_and_drops_each_value_once() {
     let drops = Rc::new(Cell::new(0));
     let column = AppendVec::new(8, Tag::Vfs).expect("reserve");
     for value in 0..8 {
-        column.try_append(Counted { value, drops: Rc::clone(&drops) }).expect("room");
+        column.append(Counted { value, drops: Rc::clone(&drops) }).expect("room");
     }
-    let refused = column.try_append(Counted { value: 8, drops: Rc::clone(&drops) });
+    let refused = column.append(Counted { value: 8, drops: Rc::clone(&drops) });
     assert!(matches!(refused, Err(MemError::Exhausted { tag: Tag::Vfs, .. })));
     assert_eq!(drops.get(), 1, "the refused value is dropped");
     drop(column);
@@ -805,7 +809,7 @@ fn append_vec_appends_and_reads_allocate_nothing() {
     let column = AppendVec::<u64>::new(1 << 22, Tag::Vfs).expect("reserve");
     let (sum, used) = measure(|| {
         for i in 0..1_000_000 {
-            column.append(i);
+            column.append(i).expect("room");
         }
         column.iter().sum::<u64>()
     });
@@ -824,51 +828,54 @@ fn append_vec_writer_and_bulk_appends_match_vec() {
     let mut scratch: Vec<u32> = Vec::new();
     let mut first = None;
     for _ in 0..1_000 {
-        let mut writer = column.writer();
+        let mut writer = column.writer().expect("one writer");
         for _ in 0..rng.below(8) {
             match rng.below(3) {
                 0 => {
                     let value = rng.next_u64() as u32;
-                    assert_eq!(writer.append(value) as usize, model.len());
+                    assert_eq!(writer.append(value).expect("room") as usize, model.len());
                     model.push(value);
                 }
                 1 => {
                     scratch.clear();
                     scratch.extend((0..rng.below(100)).map(|_| rng.next_u64() as u32));
-                    assert_eq!(writer.extend_from_slice(&scratch) as usize, model.len());
+                    let at = writer.extend_from_slice(&scratch).expect("room");
+                    assert_eq!(at as usize, model.len());
                     model.extend_from_slice(&scratch);
                 }
                 _ => {
                     let count = rng.below(100) as usize;
                     let base = rng.next_u64() as u32;
-                    let at = writer.extend_with(count, |i| base ^ i as u32);
+                    let at = writer.extend_with(count, |i| base ^ i as u32).expect("room");
                     assert_eq!(at as usize, model.len());
                     model.extend((0..count).map(|i| base ^ i as u32));
                 }
             }
         }
         drop(writer);
-        assert_eq!(column.extend_from_slice(&[7, 8]) as usize, model.len());
+        assert_eq!(column.extend_from_slice(&[7, 8]).expect("room") as usize, model.len());
         model.extend_from_slice(&[7, 8]);
         first.get_or_insert(column.as_slice().as_ptr());
     }
     assert_eq!(column.as_slice(), model.as_slice());
     assert_eq!(Some(column.as_slice().as_ptr()), first, "growth never moves an element");
     let left = column.max_len() - model.len();
-    let mut writer = column.writer();
-    let refused = writer.try_extend_with(left + 1, |i| i as u32);
+    let mut writer = column.writer().expect("one writer");
+    let refused = writer.extend_with(left + 1, |i| i as u32);
     assert!(matches!(refused, Err(MemError::Exhausted { tag: Tag::Vfs, .. })));
-    assert!(writer.try_extend_from_slice(&vec![0; left + 1]).is_err());
+    assert!(writer.extend_from_slice(&vec![0; left + 1]).is_err());
     drop(writer);
     assert_eq!(column.len() as usize, model.len(), "a refused append publishes nothing");
 }
 
 #[test]
-#[should_panic(expected = "appends must be serialized")]
-fn append_vec_second_writer_at_once_stops() {
+fn append_vec_second_writer_at_once_is_refused() {
     let column = AppendVec::<u64>::new(16, Tag::Vfs).expect("reserve");
-    let _writer = column.writer();
-    column.append(1);
+    let writer = column.writer().expect("one writer");
+    assert!(matches!(column.append(1), Err(MemError::Refused { tag: Tag::Vfs, .. })));
+    assert!(matches!(column.writer(), Err(MemError::Refused { tag: Tag::Vfs, .. })));
+    drop(writer);
+    assert_eq!(column.append(1).expect("the writer let go"), 0, "a refused append publishes nothing");
 }
 
 #[test]
@@ -876,14 +883,14 @@ fn append_vec_writer_appends_allocate_nothing() {
     let column = AppendVec::<u64>::new(1 << 22, Tag::Vfs).expect("reserve");
     let bytes = [3u64; 1000];
     let (_, used) = measure(|| {
-        let mut writer = column.writer();
+        let mut writer = column.writer().expect("one writer");
         for i in 0..1_000_000 {
-            writer.append(i);
+            writer.append(i).expect("room");
         }
         for _ in 0..1000 {
-            writer.extend_from_slice(&bytes);
+            writer.extend_from_slice(&bytes).expect("room");
         }
-        writer.extend_with(1000, |i| i as u64);
+        writer.extend_with(1000, |i| i as u64).expect("room");
     });
     assert_eq!(used.allocations, 0);
     assert_eq!(column.len(), 2_001_000);
@@ -1044,7 +1051,7 @@ fn frame_values_are_aligned_and_disjoint() {
     for _ in 0..10_000 {
         let size = rng.below(300) as usize;
         let align = 1 << rng.below(13);
-        let ptr = frame.alloc_layout(Layout::from_size_align(size, align).expect("layout"));
+        let ptr = frame.alloc_layout(Layout::from_size_align(size, align).expect("layout")).expect("room");
         assert_eq!(ptr.as_ptr() as usize % align, 0);
         blocks.push((ptr.as_ptr() as usize, size));
     }
@@ -1057,39 +1064,42 @@ fn frame_values_are_aligned_and_disjoint() {
 #[test]
 fn frame_marker_rolls_back_and_reset_frees_all() {
     let mut frame = Frame::new(Tag::Codegen).expect("reserve");
-    let kept = frame.alloc_slice_copy(&[1u8; 100]).as_ptr();
+    let kept = frame.alloc_slice_copy(&[1u8; 100]).expect("room").as_ptr();
     let marker = frame.mark();
     let used = frame.used();
     for _ in 0..1000 {
-        frame.alloc(0u64);
+        frame.alloc(0u64).expect("room");
     }
     assert!(frame.used() > used);
-    frame.reset_to(marker);
+    frame.reset_to(marker).expect("its own marker");
     assert_eq!(frame.used(), used);
-    let again = frame.alloc(5u64) as *mut u64 as usize;
+    let again = frame.alloc(5u64).expect("room") as *mut u64 as usize;
     assert!(again >= kept as usize + 100, "a rollback keeps what came before the marker");
     frame.reset();
     assert_eq!(frame.used(), 0);
-    let text = frame.alloc_str("frame");
+    let text = frame.alloc_str("frame").expect("room");
     assert_eq!(text, "frame");
 }
 
 #[test]
-#[should_panic(expected = "a marker of another frame")]
-fn frame_marker_of_another_frame_stops() {
+fn frame_marker_of_another_frame_is_refused() {
     let one = Frame::new(Tag::Codegen).expect("reserve");
     let mut two = Frame::new(Tag::Codegen).expect("reserve");
-    let marker = one.mark();
-    two.reset_to(marker);
+    two.alloc(7u64).expect("room");
+    let (marker, used) = (one.mark(), two.used());
+    let refused = two.reset_to(marker).expect_err("a marker of another frame");
+    assert!(matches!(refused, MemError::Marker { tag: Tag::Codegen, .. }), "{refused}");
+    assert!(refused.to_string().contains("another frame"), "{refused}");
+    assert_eq!(two.used(), used, "a refused reset leaves the frame as it was");
 }
 
 #[test]
 fn frame_scope_frees_what_it_allocated() {
     let mut frame = Frame::new(Tag::Parse).expect("reserve");
-    frame.alloc(1u64);
+    frame.alloc(1u64).expect("room");
     let before = frame.used();
     let sum = frame.scope(|frame| {
-        let values = frame.alloc_slice_fill_with(1000, |i| i as u64);
+        let values = frame.alloc_slice_fill_with(1000, |i| i as u64).expect("room");
         values.iter().sum::<u64>()
     });
     assert_eq!(sum, (0..1000).sum());
@@ -1099,10 +1109,10 @@ fn frame_scope_frees_what_it_allocated() {
 #[test]
 fn frame_tasks_nest_with_frames_of_their_own() {
     frame::task(Tag::Infer, |outer| {
-        let kept = outer.alloc_slice_copy(&[9u8; 64]);
+        let kept = outer.alloc_slice_copy(&[9u8; 64]).expect("room");
         let inner_used = frame::task(Tag::Mir, |inner| {
             assert!(!std::ptr::eq(inner, outer), "a nested task gets another frame");
-            inner.alloc_slice_copy(&[1u8; 4096]);
+            inner.alloc_slice_copy(&[1u8; 4096]).expect("room");
             inner.used()
         });
         assert!(inner_used >= 4096);
@@ -1121,7 +1131,7 @@ fn frame_current_is_the_innermost_task_and_comes_back_to_the_outer() {
         frame::task(Tag::Mir, |inner| {
             frame::current(|frame| {
                 assert!(std::ptr::eq(frame, inner), "a nested task's own");
-                frame.alloc_slice_copy(&[3u32; 16]);
+                frame.alloc_slice_copy(&[3u32; 16]).expect("room");
             });
             assert!(inner.used() >= 64, "what current allocated is the inner task's");
         });
@@ -1140,7 +1150,7 @@ fn frame_current_outside_a_task_stops() {
 fn frame_task_counts_its_peak_to_its_tag() {
     let before = tag::snapshot().get(Tag::Expand).allocated;
     frame::task(Tag::Expand, |frame| {
-        frame.alloc_slice_copy(&[0u8; 10_000]);
+        frame.alloc_slice_copy(&[0u8; 10_000]).expect("room");
     });
     let after = tag::snapshot().get(Tag::Expand);
     assert!(after.allocated >= before + 10_000);
@@ -1154,7 +1164,7 @@ fn frame_past_its_reservation_is_an_alloc_error_not_a_crash() {
     let too_big = Layout::from_size_align(4 << 20, 8).expect("layout");
     assert!(frame.allocate(too_big).is_err());
     assert!(matches!(
-        frame.try_alloc_layout(too_big),
+        frame.alloc_layout(too_big),
         Err(MemError::Exhausted { tag: Tag::Codegen, .. })
     ));
 }
@@ -1167,7 +1177,7 @@ fn frame_task_allocates_nothing_once_warm() {
             for i in 0..100_000 {
                 types.push(i);
             }
-            let names = frame.alloc_str("a name");
+            let names = frame.alloc_str("a name").expect("room");
             types.len() + names.len()
         })
     };
@@ -1182,12 +1192,12 @@ fn nest(depth: usize) {
     frame::task(Tag::Infer, |_| {
         let pattern = |i: usize| (depth ^ i) as u8;
         let kept =
-            frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(1024, pattern)));
+            frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(1024, pattern).expect("room")));
         if depth > 1 {
             nest(depth - 1);
         }
         frame::current(|frame| {
-            frame.alloc_slice_fill_with(64, |_| 0xAA);
+            frame.alloc_slice_fill_with(64, |_| 0xAA).expect("room");
         });
         // SAFETY: the bytes are in this task's frame, alive until the task ends, and nothing
         // else refers to them.
@@ -1219,13 +1229,13 @@ fn frame_300_nested_tasks_keep_their_bytes_and_cost_nothing_once_warm() {
 #[test]
 fn frame_inner_task_starts_in_the_rest_of_the_outer_chunk() {
     frame::task(Tag::Infer, |outer| {
-        outer.alloc(1u64);
+        outer.alloc(1u64).expect("room");
         let held = outer.committed();
         frame::task(Tag::Mir, |inner| {
-            let value = inner.alloc(2u64);
+            let value = inner.alloc(2u64).expect("room");
             assert_eq!(inner.committed(), 0, "a small inner task takes no block of its own");
             assert!(inner.contains(std::ptr::from_ref(value).cast()));
-            let pushed = outer.alloc(3u64);
+            let pushed = outer.alloc(3u64).expect("room");
             assert!(
                 outer.committed() > held,
                 "the outer frame takes another block, not the lent bytes"
@@ -1241,12 +1251,12 @@ fn frame_outer_task_grows_while_an_inner_task_allocates() {
         let mut types: Vec<u64, &Frame> = Vec::with_capacity_in(16, outer);
         types.extend(0..16);
         frame::task(Tag::Mir, |inner| {
-            let mine = inner.alloc_slice_fill_with(4096, |i| i as u32);
+            let mine = inner.alloc_slice_fill_with(4096, |i| i as u32).expect("room");
             for i in 16..100_000 {
                 types.push(i);
             }
             let more = frame::current(|frame| {
-                std::ptr::from_mut(frame.alloc_slice_fill_with(4096, |i| !(i as u32)))
+                std::ptr::from_mut(frame.alloc_slice_fill_with(4096, |i| !(i as u32)).expect("room"))
             });
             assert!(
                 mine.iter().enumerate().all(|(i, &v)| v == i as u32),
@@ -1257,7 +1267,7 @@ fn frame_outer_task_grows_while_an_inner_task_allocates() {
             assert!(more.iter().enumerate().all(|(i, &v)| v == !(i as u32)));
         });
         assert!(types.iter().copied().eq(0..100_000));
-        let after = outer.alloc_slice_fill_with(4096, |i| i as u16);
+        let after = outer.alloc_slice_fill_with(4096, |i| i as u16).expect("room");
         assert!(types.iter().copied().eq(0..100_000), "what the outer frame takes back is free");
         assert!(after.iter().enumerate().all(|(i, &v)| v == i as u16));
     });
@@ -1302,9 +1312,9 @@ fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
                 // Small allocations first, in chunks, as a task's other scratch is; then one
                 // past a chunk, in a span.
                 for _ in 0..64 {
-                    frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+                    frame.alloc_slice_fill_with(100 << 10, |i| i as u8).expect("room");
                 }
-                let big = frame.alloc_slice_fill_with(HELD, |i| i as u8);
+                let big = frame.alloc_slice_fill_with(HELD, |i| i as u8).expect("room");
                 assert!(frame.committed() >= HELD);
                 assert_eq!(big[HELD - 1], (HELD - 1) as u8);
             });
@@ -1334,7 +1344,7 @@ fn a_thread_gives_its_warm_frames_back_once_an_idle_daemon_asked() {
     fn warm() -> usize {
         frame::task(Tag::Codegen, |frame| {
             for _ in 0..64 {
-                frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+                frame.alloc_slice_fill_with(100 << 10, |i| i as u8).expect("room");
             }
         });
         frame::spare_bytes()
@@ -1370,7 +1380,7 @@ fn build_task(rng: &mut SplitMix64, depth: u32) -> usize {
     };
     let tag = if rng.below(2) == 0 { Tag::Mir } else { Tag::Codegen };
     frame::task(tag, |frame| {
-        let scratch = frame.alloc_slice_fill_with(bytes, |i| i as u8);
+        let scratch = frame.alloc_slice_fill_with(bytes, |i| i as u8).expect("room");
         let mut most = bytes;
         for _ in 0..(if depth == 0 { 0 } else { rng.below(3) }) {
             most = most.max(build_task(rng, depth - 1));
@@ -1397,7 +1407,7 @@ fn frames_after_a_build_hold_at_most_the_warm_shelf_a_worker() {
     const WORKERS: u64 = 4;
     const TASKS: usize = 24;
     let mut cache = Frame::new(Tag::Query).expect("the cache's frame");
-    cache.alloc_slice_fill_with(3 << 20, |i| i as u8);
+    cache.alloc_slice_fill_with(3 << 20, |i| i as u8).expect("room");
     let cached = cache.committed();
     let workers: Vec<_> = (0..WORKERS)
         .map(|worker| {
@@ -1408,14 +1418,14 @@ fn frames_after_a_build_hold_at_most_the_warm_shelf_a_worker() {
                         (0..TASKS).map(|_| build_task(&mut rng, 2)).max().expect("some tasks");
                     // One task past the bound whatever was drawn, so the control is of it.
                     frame::task(Tag::Mir, |frame| {
-                        frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+                        frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8).expect("room");
                     });
                     drawn.max(2 * frame::WARM)
                 });
                 // The directed case.
                 fn nested(depth: usize) {
                     frame::task(Tag::Codegen, |frame| {
-                        let span = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
+                        let span = frame.alloc_slice_fill_with(8 << 20, |i| i as u8).expect("room");
                         if depth > 1 {
                             nested(depth - 1);
                         }
@@ -1455,8 +1465,8 @@ fn the_oracle_catches_a_shelf_that_keeps_what_its_task_held() {
     thread::spawn(|| {
         let ((), peak) = frame::measure(|| {
             frame::task(Tag::Mir, |frame| {
-                frame.alloc_slice_fill_with(1024, |i| i as u8);
-                frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8);
+                frame.alloc_slice_fill_with(1024, |i| i as u8).expect("room");
+                frame.alloc_slice_fill_with(2 * frame::WARM, |i| i as u8).expect("room");
             });
         });
         assert!(peak > frame::WARM, "kept whole, the task's {peak} bytes are past the bound");
@@ -1558,7 +1568,7 @@ fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
                 let at = rng.below(marks.len() as u64) as usize;
                 let (marker, count) = marks[at];
                 marks.truncate(at + 1);
-                frame.reset_to(marker);
+                frame.reset_to(marker).expect("its own marker");
                 live.truncate(count);
                 if let Some(last) = live.last() {
                     check(&frame, last);
@@ -1635,13 +1645,13 @@ fn frame_peak_folded_lazily_is_the_most_used_after_every_operation() {
                 let at = rng.below(marks.len() as u64) as usize;
                 let (marker, count) = marks[at];
                 marks.truncate(at + 1);
-                frame.reset_to(marker);
+                frame.reset_to(marker).expect("its own marker");
                 live.truncate(count);
             }
             14 => {
                 let mut inner = 0;
                 frame.scope(|frame| {
-                    frame.alloc_slice_fill_with(rng.below(4000) as usize, |i| i as u8);
+                    frame.alloc_slice_fill_with(rng.below(4000) as usize, |i| i as u8).expect("room");
                     inner = frame.used();
                 });
                 model = model.max(inner);
@@ -1664,10 +1674,10 @@ fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
     let run = || {
         frame::measure(|| {
             frame::task(Tag::Infer, |outer| {
-                outer.alloc_slice_copy(&[0u8; 10_000]);
+                outer.alloc_slice_copy(&[0u8; 10_000]).expect("room");
                 let ((), inner) = frame::measure(|| {
                     frame::task(Tag::Mir, |inner| {
-                        inner.alloc_slice_copy(&[0u8; 50_000]);
+                        inner.alloc_slice_copy(&[0u8; 50_000]).expect("room");
                     })
                 });
                 assert!(
@@ -1768,7 +1778,7 @@ fn frame_task_past_the_thread_shelf_reserves_from_the_cap() {
     let capped = thread::spawn(move || {
         frame::set_cap(Some(cap));
         frame::task(Tag::Codegen, |frame| {
-            let big = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
+            let big = frame.alloc_slice_fill_with(8 << 20, |i| i as u8).expect("room");
             assert!(frame::capped() >= 8 << 20, "a span's pages are reserved from the cap");
             assert!(cap.held() >= 8 << 20);
             assert_eq!(big[12_345], 12_345usize as u8);
@@ -1832,10 +1842,10 @@ fn arena_values_from_many_threads_live_until_reset() {
                     let local = arena.local();
                     let mut kept: Vec<&u64> = Vec::new();
                     for i in 0..20_000u64 {
-                        kept.push(local.alloc(t * 1_000_000 + i));
+                        kept.push(local.alloc(t * 1_000_000 + i).expect("room"));
                     }
-                    let big = local.alloc_slice_copy(&vec![t as u8; 100_000]);
-                    let huge = local.alloc_slice_copy(&vec![t as u16; 3 << 20]);
+                    let big = local.alloc_slice_copy(&vec![t as u8; 100_000]).expect("room");
+                    let huge = local.alloc_slice_copy(&vec![t as u16; 3 << 20]).expect("room");
                     (kept, big, huge)
                 })
             })
@@ -1859,14 +1869,14 @@ fn arena_vec_matches_vec_and_keep_freezes_it() {
     let arena = Arena::new(Tag::Nameres);
     let local = arena.local();
     let mut rng = SplitMix64::new(4);
-    let mut vec: Vec<u32, _> = Vec::new_in(&local);
+    let mut vec: crate::Vec<u32, _> = crate::Vec::new_in(&local);
     let mut model = Vec::new();
     for _ in 0..100_000 {
         if rng.below(5) == 0 {
             assert_eq!(vec.pop(), model.pop());
         } else {
             let value = rng.next_u64() as u32;
-            vec.push(value);
+            vec.push(value).expect("room");
             model.push(value);
         }
     }
@@ -1881,7 +1891,7 @@ fn arena_gives_chunks_back_and_takes_them_again_warm() {
     {
         let local = first.local();
         for i in 0..100_000u64 {
-            local.alloc(i);
+            local.alloc(i).expect("room");
         }
     }
     let held = first.held();
@@ -1894,7 +1904,7 @@ fn arena_gives_chunks_back_and_takes_them_again_warm() {
     let local = second.local();
     let values: Vec<&u64> = (0..100_000u64)
         .map(|i| {
-            let value: &u64 = local.alloc(i);
+            let value: &u64 = local.alloc(i).expect("room");
             value
         })
         .collect();
@@ -1930,7 +1940,7 @@ fn arena_reset_gives_back_every_chunk_in_runs() {
         let local = arena.local();
         let mut starts = [0usize; HELD];
         for start in &mut starts {
-            *start = local.alloc_layout(whole).as_ptr() as usize;
+            *start = local.alloc_layout(whole).expect("room").as_ptr() as usize;
         }
         starts
     };
@@ -1962,7 +1972,7 @@ fn arena_allocates_nothing_from_the_global_allocator() {
         let local = arena.local();
         let mut total = 0;
         for i in 0..50_000u64 {
-            total += *local.alloc(i);
+            total += *local.alloc(i).expect("room");
         }
         let mut list: Vec<u64, _> = Vec::new_in(&local);
         list.extend(0..10_000);
@@ -1989,11 +1999,11 @@ fn build_names<'a>(local: &crate::ArenaLocal<'a>, names: &[&str]) -> &'a [&'a st
     let names: Vec<&'a str> = names
         .iter()
         .map(|name| {
-            let name: &'a str = local.alloc_str(name);
+            let name: &'a str = local.alloc_str(name).expect("room");
             name
         })
         .collect();
-    local.alloc_slice_copy(&names)
+    local.alloc_slice_copy(&names).expect("room")
 }
 
 /// One test, so no other test's task guard (the reclaim epoch is process-wide) holds a grace
@@ -2012,23 +2022,23 @@ fn limbo_keeps_a_retired_object_until_its_readers_end() {
     let pool = Pool::<DropCount>::new(1024, Tag::Infer).expect("reserve");
     let mut cache = pool.cache();
     let mut limbo = pool::Limbo::new(&pool).expect("reserve");
-    let first = cache.alloc(DropCount(Arc::clone(&drops)));
+    let first = cache.alloc(DropCount(Arc::clone(&drops))).expect("room");
     let index = first.index();
     let reader = blaze_reclaim::enter();
-    limbo.retire(first);
+    limbo.retire(first).expect("room");
     assert_eq!(limbo.collect(), 0, "a task that began before the retirement may still read it");
     assert_eq!(drops.load(Ordering::Relaxed), 0);
     drop(reader);
     assert_eq!(limbo.collect(), 1);
     assert_eq!(drops.load(Ordering::Relaxed), 1, "dropped once its grace passed");
     assert!(limbo.is_empty());
-    let second = cache.alloc(DropCount(Arc::clone(&drops)));
-    limbo.retire(second);
+    let second = cache.alloc(DropCount(Arc::clone(&drops))).expect("room");
+    limbo.retire(second).expect("room");
     drop(limbo);
     assert_eq!(drops.load(Ordering::Relaxed), 2, "a dropped limbo drops what it held");
     drop(cache);
     let mut again = pool.cache();
-    let reused = again.alloc(DropCount(Arc::clone(&drops)));
+    let reused = again.alloc(DropCount(Arc::clone(&drops))).expect("room");
     assert!(reused.index() <= index + 2 * 128, "collected slots go back to the pool");
 }
 
@@ -2044,7 +2054,7 @@ fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
             if rng.below(3) == 0 {
                 collected += limbo.collect();
             } else {
-                limbo.retire(cache.alloc([rng.next_u64(); 4]));
+                limbo.retire(cache.alloc([rng.next_u64(); 4]).expect("room")).expect("room");
                 retired += 1;
             }
         }
@@ -2141,7 +2151,7 @@ fn pool_matches_box_on_random_operations() {
         match rng.below(6) {
             0..=2 => {
                 let value = [rng.next_u64(); 4];
-                live.push(cache.alloc(value));
+                live.push(cache.alloc(value).expect("room"));
                 model.push(Box::new(value));
                 peak = peak.max(live.len());
             }
@@ -2179,9 +2189,9 @@ fn pool_drops_each_value_once() {
     let drops = Rc::new(Cell::new(0));
     let pool = Pool::<Counted>::new(1024, Tag::Plane).expect("reserve");
     let mut cache = pool.cache();
-    let a = cache.alloc(Counted { value: 1, drops: Rc::clone(&drops) });
-    let b = cache.alloc(Counted { value: 2, drops: Rc::clone(&drops) });
-    let c = cache.alloc(Counted { value: 3, drops: Rc::clone(&drops) });
+    let a = cache.alloc(Counted { value: 1, drops: Rc::clone(&drops) }).expect("room");
+    let b = cache.alloc(Counted { value: 2, drops: Rc::clone(&drops) }).expect("room");
+    let c = cache.alloc(Counted { value: 3, drops: Rc::clone(&drops) }).expect("room");
     cache.recycle(a);
     assert_eq!(drops.get(), 1);
     drop(b);
@@ -2204,7 +2214,7 @@ fn pool_caches_on_many_threads_share_slots_in_batches() {
                 let mut held = Vec::with_capacity(1000);
                 for round in 0..200u64 {
                     for i in 0..1000 {
-                        held.push(cache.alloc(t << 40 | round << 20 | i));
+                        held.push(cache.alloc(t << 40 | round << 20 | i).expect("room"));
                     }
                     for (i, pooled) in held.drain(..).enumerate() {
                         assert_eq!(*pooled, t << 40 | round << 20 | i as u64);
@@ -2235,7 +2245,7 @@ fn pool_a_producer_and_a_consumer_move_batches_and_reuse_descriptors() {
         scope.spawn(move || {
             let mut cache = pool.cache();
             for round in 0..ROUNDS {
-                let held: Vec<_> = (0..EACH).map(|i| cache.alloc(round * EACH + i)).collect();
+                let held: Vec<_> = (0..EACH).map(|i| cache.alloc(round * EACH + i).expect("room")).collect();
                 send.send(held).expect("the consumer is there");
             }
         });
@@ -2320,7 +2330,7 @@ fn pool_raw_round_trip_keeps_the_slot_and_drops_once() {
     let drops = Rc::new(Cell::new(0));
     let pool = Pool::<Counted>::new(64, Tag::Infer).expect("reserve");
     let mut cache = pool.cache();
-    let made = cache.alloc(Counted { value: 5, drops: Rc::clone(&drops) });
+    let made = cache.alloc(Counted { value: 5, drops: Rc::clone(&drops) }).expect("room");
     let first = made.index();
     let raw = made.into_raw();
     assert_eq!(drops.get(), 0, "the raw value is kept");
@@ -2329,7 +2339,7 @@ fn pool_raw_round_trip_keeps_the_slot_and_drops_once() {
     assert_eq!((back.index(), back.value), (first, 5));
     cache.recycle(back);
     assert_eq!(drops.get(), 1);
-    let again = cache.alloc(Counted { value: 6, drops: Rc::clone(&drops) });
+    let again = cache.alloc(Counted { value: 6, drops: Rc::clone(&drops) }).expect("room");
     assert_eq!(again.index(), first, "the slot is the cache's next");
     let (_, used) = measure(|| {
         // SAFETY: as above, for `again`'s pointer.
@@ -2342,8 +2352,8 @@ fn pool_raw_round_trip_keeps_the_slot_and_drops_once() {
 fn pool_full_is_an_error() {
     let pool = Pool::<u64>::new(10, Tag::Io).expect("reserve");
     let mut cache = pool.cache();
-    let held: Vec<_> = (0..10).map(|i| cache.alloc(i)).collect();
-    assert!(matches!(cache.try_alloc(10), Err(MemError::Exhausted { tag: Tag::Io, .. })));
+    let held: Vec<_> = (0..10).map(|i| cache.alloc(i).expect("room")).collect();
+    assert!(matches!(cache.alloc(10), Err(MemError::Exhausted { tag: Tag::Io, .. })));
     drop(held);
 }
 
@@ -2354,7 +2364,7 @@ fn pool_allocates_nothing_once_warm() {
     let mut held = Vec::with_capacity(10_000);
     let mut round = || {
         for i in 0..10_000 {
-            held.push(cache.alloc([i; 8]));
+            held.push(cache.alloc([i; 8]).expect("room"));
         }
         for pooled in held.drain(..) {
             cache.recycle(pooled);
@@ -2378,7 +2388,7 @@ fn shared_matches_arc_on_random_operations() {
         match rng.below(5) {
             0 => {
                 let value = [rng.next_u64(); 4];
-                live.push(cache.share(value));
+                live.push(cache.share(value).expect("room"));
                 model.push(Arc::new(value));
             }
             1 if !live.is_empty() => {
@@ -2394,7 +2404,7 @@ fn shared_matches_arc_on_random_operations() {
             3 if !live.is_empty() => {
                 let i = rng.below(live.len() as u64) as usize;
                 let value = rng.next_u64();
-                pool::Shared::make_mut(&mut live[i], &mut cache)[1] = value;
+                pool::Shared::make_mut(&mut live[i], &mut cache).expect("room")[1] = value;
                 Arc::make_mut(&mut model[i])[1] = value;
             }
             _ if !live.is_empty() => {
@@ -2417,7 +2427,7 @@ fn shared_drops_each_value_once_when_its_last_owner_goes() {
     let drops = Rc::new(Cell::new(0));
     let pool = Pool::<pool::Counted<Counted>>::new(64, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
-    let a = cache.share(Counted { value: 1, drops: Rc::clone(&drops) });
+    let a = cache.share(Counted { value: 1, drops: Rc::clone(&drops) }).expect("room");
     let b = a.clone();
     let c = b.clone();
     assert_eq!(pool::Shared::owners(&a), 3);
@@ -2433,12 +2443,12 @@ fn shared_drops_each_value_once_when_its_last_owner_goes() {
 fn shared_make_mut_copies_only_while_shared() {
     let pool = Pool::<pool::Counted<Vec<u32>>>::new(64, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
-    let mut a = cache.share(vec![1, 2, 3]);
+    let mut a = cache.share(vec![1, 2, 3]).expect("room");
     let at = pool::Shared::index(&a);
-    pool::Shared::make_mut(&mut a, &mut cache).push(4);
+    pool::Shared::make_mut(&mut a, &mut cache).expect("room").push(4);
     assert_eq!(pool::Shared::index(&a), at, "one owner changes in place");
     let b = a.clone();
-    pool::Shared::make_mut(&mut a, &mut cache).push(5);
+    pool::Shared::make_mut(&mut a, &mut cache).expect("room").push(5);
     assert_ne!(pool::Shared::index(&a), at, "a shared value is copied first");
     assert_eq!(*a, [1, 2, 3, 4, 5]);
     assert_eq!(*b, [1, 2, 3, 4], "the other owner keeps the old value");
@@ -2449,7 +2459,7 @@ fn shared_make_mut_copies_only_while_shared() {
 fn shared_owners_on_many_threads_drop_it_once() {
     let pool = Pool::<pool::Counted<[u64; 2]>>::new(1 << 12, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
-    let values: Vec<_> = (0..256u64).map(|i| cache.share([i, !i])).collect();
+    let values: Vec<_> = (0..256u64).map(|i| cache.share([i, !i]).expect("room")).collect();
     thread::scope(|scope| {
         for _ in 0..8 {
             let owned: Vec<_> = values.iter().cloned().collect();
@@ -2469,7 +2479,7 @@ fn shared_owners_on_many_threads_drop_it_once() {
     drop(values);
     drop(cache);
     let mut cache = pool.cache();
-    let again: Vec<_> = (0..256u64).map(|i| cache.share([i, i])).collect();
+    let again: Vec<_> = (0..256u64).map(|i| cache.share([i, i]).expect("room")).collect();
     assert!(pool.carved() <= 256 + 2 * 128, "the freed slots are reused");
     drop(again);
 }
@@ -2482,7 +2492,7 @@ fn shared_from_matches_share_for_every_head_length() {
         let head: Vec<u32> = (1..=len as u32).collect();
         let mut whole = [9u32; 8];
         whole[..len].copy_from_slice(&head);
-        assert_eq!(*cache.share_from(&head, &9), *cache.share(whole), "head of {len}");
+        assert_eq!(*cache.share_from(&head, &9).expect("room"), *cache.share(whole).expect("room"), "head of {len}");
     }
     let pool = Pool::<pool::Counted<[String; 5]>>::new(64, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
@@ -2490,7 +2500,7 @@ fn shared_from_matches_share_for_every_head_length() {
         let head: Vec<String> = (0..len).map(|i| format!("item {i}")).collect();
         let whole: [String; 5] =
             std::array::from_fn(|i| head.get(i).cloned().unwrap_or_else(|| "fill".to_owned()));
-        let made = cache.share_from(&head, &"fill".to_owned());
+        let made = cache.share_from(&head, &"fill".to_owned()).expect("room");
         assert_eq!(*made, whole, "head of {len}");
     }
 }
@@ -2503,8 +2513,8 @@ fn shared_from_makes_a_megabyte_slot_on_a_small_stack() {
             .stack_size(64 << 10)
             .spawn_scoped(scope, || {
                 let mut cache = pool.cache();
-                let a = cache.share_from(&[], &7);
-                let b = cache.share_from(&a[..], &0);
+                let a = cache.share_from(&[], &7).expect("room");
+                let b = cache.share_from(&a[..], &0).expect("room");
                 assert!(a.iter().chain(b.iter()).all(|&byte| byte == 7));
                 assert!(!pool::Shared::ptr_eq(&a, &b), "a copy is its own slot");
             })
@@ -2520,8 +2530,8 @@ fn shared_from_allocates_nothing_once_warm() {
     let pool = Pool::<pool::Counted<[u64; 64]>>::new(1 << 10, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
     let mut round = || {
-        let first = cache.share_from(&[1, 2, 3], &0);
-        let copy = cache.share_from(&first[..], &0);
+        let first = cache.share_from(&[1, 2, 3], &0).expect("room");
+        let copy = cache.share_from(&first[..], &0).expect("room");
         drop((first, copy));
     };
     round();
@@ -2558,12 +2568,12 @@ fn shared_from_a_panicking_clone_drops_what_it_wrote_and_returns_the_slot() {
     let fill =
         Bomb { drops: Rc::clone(&drops), clones: Rc::clone(&clones), armed: Rc::clone(&armed) };
     let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(cache.share_from(&[], &fill));
+        drop(cache.share_from(&[], &fill).expect("room"));
     }));
     assert!(made.is_err());
     assert_eq!(drops.get(), 4, "the four written are dropped once each");
     armed.set(false);
-    let again = cache.try_share_from(&[], &fill);
+    let again = cache.share_from(&[], &fill);
     assert!(again.is_ok(), "the pool's one slot came back");
     assert_eq!(pool.carved(), 1);
 }
@@ -2575,12 +2585,12 @@ fn shared_allocates_nothing_once_warm() {
     let mut held = Vec::with_capacity(2_000);
     let mut round = || {
         for i in 0..1_000 {
-            let shared = cache.share([i; 8]);
+            let shared = cache.share([i; 8]).expect("room");
             held.push(shared.clone());
             held.push(shared);
         }
         for shared in held.iter_mut().step_by(2) {
-            pool::Shared::make_mut(shared, &mut cache)[0] += 1;
+            pool::Shared::make_mut(shared, &mut cache).expect("room")[0] += 1;
         }
         held.clear();
     };
@@ -2601,7 +2611,7 @@ fn slab_matches_a_model_and_detects_stale_handles() {
         match rng.below(5) {
             0..=1 => {
                 let value = rng.next_u64();
-                let handle = slab.insert(value);
+                let handle = slab.insert(value).expect("room");
                 model.push((handle, value));
             }
             2 if !model.is_empty() => {
@@ -2638,15 +2648,15 @@ fn slab_matches_a_model_and_detects_stale_handles() {
 #[test]
 fn slab_reuses_slots_with_new_generations() {
     let mut slab = Slab::<&str>::new(16, Tag::Io).expect("reserve");
-    let a = slab.insert("a");
+    let a = slab.insert("a").expect("room");
     slab.remove(a);
-    let b = slab.insert("b");
+    let b = slab.insert("b").expect("room");
     assert_eq!(a.index(), b.index(), "the freed slot is reused first");
     assert_ne!(a.generation(), b.generation());
     assert_eq!(slab.get(a), None);
     assert_eq!(slab.get(b), Some(&"b"));
     assert_eq!(Handle::<&str>::from_bits(b.to_bits()), b);
-    let c = slab.insert_with(|handle| if handle.index() == 1 { "c at 1" } else { "c" });
+    let c = slab.insert_with(|handle| if handle.index() == 1 { "c at 1" } else { "c" }).expect("room");
     assert_eq!(slab.get(c), Some(&"c at 1"));
     slab.clear();
     assert!(slab.is_empty());
@@ -2657,7 +2667,7 @@ fn slab_reuses_slots_with_new_generations() {
 #[test]
 fn slab_refuses_a_made_up_even_generation() {
     let mut slab = Slab::<String>::new(16, Tag::Io).expect("reserve");
-    let old = slab.insert("moved out".to_owned());
+    let old = slab.insert("moved out".to_owned()).expect("room");
     assert_eq!(slab.remove(old).as_deref(), Some("moved out"));
     let free = Handle::<String>::from_bits(old.to_bits() + (1 << 32));
     assert_eq!(free.generation() & 1, 0, "the free slot's generation");
@@ -2672,11 +2682,11 @@ fn slab_refuses_a_made_up_even_generation() {
 #[test]
 fn slab_handle_at_names_the_slot_s_current_value_only() {
     let mut slab = Slab::<u64>::new(16, Tag::Io).expect("reserve");
-    let first = slab.insert(1);
+    let first = slab.insert(1).expect("room");
     assert_eq!(slab.handle_at(first.index()), Some(first));
     assert_eq!(slab.remove(first), Some(1));
     assert_eq!(slab.handle_at(first.index()), None, "a free slot has no handle");
-    let second = slab.insert(2);
+    let second = slab.insert(2).expect("room");
     assert_eq!(second.index(), first.index(), "the slot is reused");
     assert_eq!(slab.handle_at(second.index()), Some(second), "with its new generation");
     assert_eq!(slab.get(first), None, "the old handle stays stale");
@@ -2688,7 +2698,7 @@ fn slab_drops_each_value_once() {
     let drops = Rc::new(Cell::new(0));
     let mut slab = Slab::new(64, Tag::Io).expect("reserve");
     let handles: Vec<_> =
-        (0..10).map(|value| slab.insert(Counted { value, drops: Rc::clone(&drops) })).collect();
+        (0..10).map(|value| slab.insert(Counted { value, drops: Rc::clone(&drops) }).expect("room")).collect();
     drop(slab.remove(handles[3]));
     assert_eq!(drops.get(), 1);
     drop(slab);
@@ -2701,7 +2711,7 @@ fn slab_allocates_nothing_once_warm() {
     let mut handles = Vec::with_capacity(10_000);
     let mut round = |slab: &mut Slab<[u64; 4]>| {
         for i in 0..10_000 {
-            handles.push(slab.insert([i; 4]));
+            handles.push(slab.insert([i; 4]).expect("room"));
         }
         for handle in handles.drain(..) {
             assert!(slab.get(handle).is_some());

@@ -79,8 +79,7 @@ impl Code {
             return Err(refuse(Refused::NotAllowed));
         }
         hosted::call(&self.io, cx, |host| {
-            host.executable.push(code.len());
-            Ok(())
+            hosted::record(&mut host.executable, code.len())
         })
         .map_err(refuse)
     }
@@ -97,7 +96,7 @@ impl Code {
                 return Err(Refused::NotFound);
             }
             // clone: the simulated host's record and the module's name, refcounts.
-            host.loaded.push(module.clone());
+            hosted::record(&mut host.loaded, module.clone())?;
             Ok(Module { name: module.clone() })
         })
         .map_err(refuse)

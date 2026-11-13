@@ -26,7 +26,6 @@ use std::{
 use crate::{
     MemError, Region, Tag,
     chunks::{self, CHUNK, Chunk},
-    error::fail,
     stack::{Links, NONE, Stack},
     tag,
 };
@@ -53,7 +52,10 @@ struct ChunkLinks;
 
 impl Links for ChunkLinks {
     fn link(&self, index: u32) -> &crate::sync::atomic::AtomicU32 {
-        chunks::link(index)
+        // SAFETY: the only indices linked through `ChunkLinks` are those of the arena's own
+        // chunk list, each pushed there from a `Chunk` that `chunks::take` returned and
+        // held until the arena's reset gives it back.
+        unsafe { chunks::link(index) }
     }
 }
 
@@ -131,7 +133,9 @@ impl Arena {
                 ) {
                     Ok(_) => {
                         self.taken(n as usize * BLOCK);
-                        let base = Chunk::from_index(chunk).ptr();
+                        // SAFETY: `chunk` is the arena's current chunk, an index
+                        // `chunks::take` returned for it and held until its reset.
+                        let base = unsafe { Chunk::from_index(chunk) }.ptr();
                         return Ok(offset(base, next as usize * BLOCK));
                     }
                     Err(now) => {
@@ -216,18 +220,28 @@ impl Arena {
         // `&mut self`: no local takes a chunk meanwhile, so the held list is walked with plain
         // loads and given back up to `GIVE_RUN` chunks per compare-and-swap.
         let mut run = [NONE; chunks::GIVE_RUN];
-        let mut len = 0;
         let mut next = self.held.take_all();
         while next != NONE {
-            run[len] = next;
-            len += 1;
-            next = ChunkLinks.link(next).load(Ordering::Relaxed);
-            if len == run.len() {
-                chunks::give_all(&run, self.tag);
-                len = 0;
+            // Fill the run from the list, then give back the part filled.
+            let mut filled = 0;
+            for slot in &mut run {
+                if next == NONE {
+                    break;
+                }
+                *slot = next;
+                filled += 1;
+                next = ChunkLinks.link(next).load(Ordering::Relaxed);
             }
+            // The first `filled` of the run: `filled` counts slots of `run` written, so it is
+            // at most its length, and the whole run when it is that long.
+            let given = match run.split_at_checked(filled) {
+                Some((given, _)) => given,
+                None => &run,
+            };
+            // SAFETY: the run is filled from the arena's own chunk list, whose indices
+            // `chunks::take` returned for it; the list is emptied as they are given back.
+            unsafe { chunks::give_all(given, self.tag) };
         }
-        chunks::give_all(&run[..len], self.tag);
         let mut node = *self.large.get_mut();
         *self.large.get_mut() = ptr::null_mut();
         while !node.is_null() {
@@ -286,9 +300,10 @@ impl<'a> ArenaLocal<'a> {
         self.arena
     }
 
-    /// Takes `layout`'s bytes, aligned, for as long as the arena lives.
+    /// Takes `layout`'s bytes, aligned, for as long as the arena lives; when no memory can be
+    /// had, the error names the arena's tag and nothing is taken.
     #[inline]
-    pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
+    pub fn alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
         if let Some(block) = NonNull::new(self.block.get()) {
             let at = block.as_ptr() as usize + self.used.get();
             let from = crate::align::align_up(at, layout.align()) - block.as_ptr() as usize;
@@ -299,6 +314,12 @@ impl<'a> ArenaLocal<'a> {
             }
         }
         self.refill(layout)
+    }
+
+    /// What an arena slice too long for the address space says.
+    #[cold]
+    fn too_long(&self, len: usize) -> MemError {
+        MemError::TooLarge { tag: self.arena.tag, what: "an arena slice", wanted: len }
     }
 
     #[cold]
@@ -322,81 +343,66 @@ impl<'a> ArenaLocal<'a> {
         self.arena.large(layout)
     }
 
-    #[inline]
-    #[track_caller]
-    pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
-        match self.try_alloc_layout(layout) {
-            Ok(ptr) => ptr,
-            Err(error) => fail(&error),
-        }
-    }
-
     /// Places `value` in the arena. Its destructor never runs: the arena forgets it at reset.
+    /// When no memory can be had, `value` is dropped and the error names the arena.
     #[inline]
-    #[track_caller]
-    pub fn alloc<T>(&self, value: T) -> &'a mut T {
-        let ptr = self.alloc_layout(Layout::new::<T>()).cast::<T>();
+    pub fn alloc<T>(&self, value: T) -> Result<&'a mut T, MemError> {
+        let ptr = self.alloc_layout(Layout::new::<T>())?.cast::<T>();
         // SAFETY: fresh memory of the arena, sized and aligned for `T`, handed out once; it is
         // valid until the arena resets, which takes `&mut Arena` and so outlives `'a`.
         unsafe { ptr.write(value) };
         // SAFETY: just initialized, and no other reference to it exists.
-        unsafe { &mut *ptr.as_ptr() }
+        Ok(unsafe { &mut *ptr.as_ptr() })
     }
 
     #[inline]
-    #[track_caller]
-    pub fn alloc_uninit_slice<T>(&self, len: usize) -> &'a mut [MaybeUninit<T>] {
-        let layout = match Layout::array::<T>(len) {
-            Ok(layout) => layout,
-            Err(_) => fail(&MemError::TooLarge {
-                tag: self.arena.tag,
-                what: "an arena slice",
-                wanted: len,
-            }),
+    pub fn alloc_uninit_slice<T>(
+        &self,
+        len: usize,
+    ) -> Result<&'a mut [MaybeUninit<T>], MemError> {
+        let Ok(layout) = Layout::array::<T>(len) else {
+            return Err(self.too_long(len));
         };
-        let ptr = self.alloc_layout(layout).cast::<MaybeUninit<T>>();
+        let ptr = self.alloc_layout(layout)?.cast::<MaybeUninit<T>>();
         // SAFETY: fresh memory for `len` elements, aligned, handed out once, valid for `'a`.
-        unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len) }
+        Ok(unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len) })
     }
 
     #[inline]
-    #[track_caller]
-    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &'a mut [T] {
-        let slots = self.alloc_uninit_slice::<T>(values.len());
+    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> Result<&'a mut [T], MemError> {
+        let slots = self.alloc_uninit_slice::<T>(values.len())?;
         for (slot, value) in slots.iter_mut().zip(values) {
             slot.write(*value);
         }
-        // SAFETY: every element was just written.
-        unsafe { slots.assume_init_mut() }
+        // SAFETY: every element was just written: `slots` is `values.len()` long.
+        Ok(unsafe { slots.assume_init_mut() })
     }
 
     #[inline]
-    #[track_caller]
     pub fn alloc_slice_fill_with<T>(
         &self,
         len: usize,
         mut f: impl FnMut(usize) -> T,
-    ) -> &'a mut [T] {
-        let slots = self.alloc_uninit_slice::<T>(len);
+    ) -> Result<&'a mut [T], MemError> {
+        let slots = self.alloc_uninit_slice::<T>(len)?;
         for (i, slot) in slots.iter_mut().enumerate() {
             slot.write(f(i));
         }
         // SAFETY: every element was just written.
-        unsafe { slots.assume_init_mut() }
+        Ok(unsafe { slots.assume_init_mut() })
     }
 
     #[inline]
-    #[track_caller]
-    pub fn alloc_str(&self, text: &str) -> &'a mut str {
-        let bytes = self.alloc_slice_copy(text.as_bytes());
+    pub fn alloc_str(&self, text: &str) -> Result<&'a mut str, MemError> {
+        let bytes = self.alloc_slice_copy(text.as_bytes())?;
         // SAFETY: a copy of a `str`'s bytes, so UTF-8.
-        unsafe { str::from_utf8_unchecked_mut(bytes) }
+        Ok(unsafe { str::from_utf8_unchecked_mut(bytes) })
     }
 
     /// Keeps what `vec` holds for the arena's life, as a slice: a vector built in the arena
-    /// and then frozen.
-    pub fn keep<T>(&self, vec: Vec<T, &ArenaLocal<'a>>) -> &'a mut [T] {
-        let mut vec = ManuallyDrop::new(vec);
+    /// and then frozen. It cannot fail: the elements stay where the vector put them.
+    pub fn keep<T>(&self, vec: crate::Vec<T, &ArenaLocal<'a>>) -> &'a mut [T] {
+        let mut vec = ManuallyDrop::new(vec.into_std());
         let len = vec.len();
         let ptr = vec.as_mut_ptr();
         // SAFETY: the vector's buffer is a block of an arena that lives for `'a` (its
@@ -435,7 +441,7 @@ impl crate::Named for ArenaLocal<'_> {
 unsafe impl Allocator for ArenaLocal<'_> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = self.try_alloc_layout(layout).map_err(|_| AllocError)?;
+        let ptr = self.alloc_layout(layout).map_err(|_| AllocError)?;
         Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
     }
 
@@ -460,7 +466,7 @@ unsafe impl Allocator for ArenaLocal<'_> {
             self.used.set(self.offset_in_block(ptr) + new.size());
             return Ok(NonNull::slice_from_raw_parts(ptr, new.size()));
         }
-        let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+        let to = self.alloc_layout(new).map_err(|_| AllocError)?;
         // SAFETY: the caller says `ptr` is a live block of `old.size()` bytes; `to` is fresh
         // and at least as big, so they do not overlap.
         unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
@@ -491,7 +497,7 @@ unsafe impl Allocator for ArenaLocal<'_> {
         new: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         if ptr.as_ptr().align_offset(new.align()) != 0 {
-            let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+            let to = self.alloc_layout(new).map_err(|_| AllocError)?;
             // SAFETY: `ptr` is a live block of at least `new.size()` bytes, `to` a fresh one.
             unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), new.size()) };
             return Ok(NonNull::slice_from_raw_parts(to, new.size()));

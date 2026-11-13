@@ -26,7 +26,7 @@ fn plan(d: &mut impl Draw) -> Plan {
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
-    let arena = io.need_mem().map_err(|e| format!("harness: {e}"))?.arena("test arena", plan.limit).map_err(|e| format!("harness: {e}"))?;
+    let arena = io.need_mem().map_err(|e| format!("harness: {e}"))?.arena("test arena", crate::mem::ByteLen::of_memory(plan.limit)).map_err(|e| format!("harness: {e}"))?;
     let mut bytes = arena.bytes();
     let mut model: Vec<u8> = Vec::new();
     for (at, &len) in plan.appends.iter().enumerate() {
@@ -36,7 +36,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             Err(Stopped::OutOfMemory { arena: "test arena", asked }) if asked >= len => {}
             Err(other) => return Err(format!("append {at} of {len} bytes stopped with {other}")),
         }
-        if arena.used() > plan.limit {
+        if arena.used() > crate::mem::ByteLen::of_memory(plan.limit) {
             return Err(format!(
                 "after append {at} of {len} bytes the arena uses {} bytes, past its limit {}",
                 arena.used(),

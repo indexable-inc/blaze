@@ -447,7 +447,7 @@ impl<T: Keyed> Table<T> {
                 recycle.held.truncate(live);
                 recycle.head = 0;
             }
-            recycle.held.push((grace, self.values.index_of(old)));
+            recycle.held.push((grace, self.values.index_of(old))).unwrap_or_else(|error| panic!("{error}"));
             // SAFETY: unlinked just now, it stays in its slot until a collect after its grace,
             // which the store runs only under `&mut` of itself, so not while `Held` lives.
             Ok(unsafe { &*old })
@@ -466,7 +466,7 @@ impl<T: Keyed> Table<T> {
                 // SAFETY: the slot holds the value swapped out of it, which no reader can reach
                 // once its grace has passed; the head moves past it below, so it is dropped once.
                 unsafe { self.values.slot(index as usize).drop_in_place() };
-                recycle.free.push(index);
+                recycle.free.push(index).unwrap_or_else(|error| panic!("{error}"));
             }
             recycle.head += passed;
             passed

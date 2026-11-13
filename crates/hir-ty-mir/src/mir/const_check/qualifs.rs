@@ -507,7 +507,7 @@ fn matrix_in<'f>(rows: usize, columns: usize, frame: &'f Frame) -> Matrix<'f> {
     BitMatrix::from_words(
         rows,
         columns,
-        frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0),
+        frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0).unwrap_or_else(|error| panic!("{error}")),
     )
 }
 

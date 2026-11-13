@@ -132,7 +132,7 @@ impl Stage<'_> {
         };
         let sym = self.symbols.find(SymKey::Descriptor).ok_or_else(missing)?;
         let (piece, _) = self.new.home(sym).ok_or_else(missing)?;
-        let bytes = self.arena.alloc_slice_copy(&descriptor.encode());
+        let bytes = self.arena.alloc_slice_copy(&descriptor.encode()).unwrap_or_else(|error| panic!("{error}"));
         self.contents.insert(piece, Content::Bytes(bytes));
         self.write.insert(piece);
         Ok(())
@@ -234,7 +234,7 @@ impl Stage<'_> {
                     let bytes = piece.bytes_in(arena);
                     // alloc: the function's name, once per function the patch changes, for the
                     // program's refusal of code that differs; the list borrows the arena's copy
-                    let name: &str = arena.alloc_str(&self.symbols.describe(piece.sym));
+                    let name: &str = arena.alloc_str(&self.symbols.describe(piece.sym)).unwrap_or_else(|error| panic!("{error}"));
                     code.push(CodeRef {
                         at: piece.addr,
                         len: bytes.len() as u64,

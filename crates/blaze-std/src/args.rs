@@ -2,16 +2,16 @@
 //! when it was made (handed in by the entry until `bstd::rt` reads the start block). There is
 //! no arguments function: a holder of `Args` reads them, no one else.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 /// The command line, the program's own name first.
 #[derive(Clone)] // clone: a refcount
 pub struct Args {
-    args: Arc<[String]>,
+    args: Arc<Vec<String>>,
 }
 
 impl Args {
-    pub(crate) fn new(args: Arc<[String]>) -> Args {
+    pub(crate) fn new(args: Arc<Vec<String>>) -> Args {
         Args { args }
     }
 

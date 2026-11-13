@@ -970,7 +970,7 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref], frame: &Fram
         }
     };
     // One bit a callee, in the frame.
-    let words = frame.alloc_slice_fill_with(stencil.dfg.ext_funcs.len().div_ceil(64), |_| 0);
+    let words = frame.alloc_slice_fill_with(stencil.dfg.ext_funcs.len().div_ceil(64), |_| 0).unwrap_or_else(|error| panic!("{error}"));
     let mut addressed: Bits<&mut [u64]> = Bits::from_words(words);
     for block in stencil.layout.blocks() {
         for inst in stencil.layout.block_insts(block) {

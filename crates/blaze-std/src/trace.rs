@@ -3,10 +3,13 @@
 //! every context reaches from the root one. There is no global recorder.
 //!
 //! The recorder is bounded: past [`crate::io::Limits::trace_most`] records, said where the
-//! `Io` is made, it counts what it drops rather than grow (rule bounded-progress).
+//! `Io` is made, it counts what it drops rather than grow (rule bounded-progress). A record
+//! the global heap has no room for is counted as dropped too: the recorder never stops a task.
 
-use alloc::vec::Vec;
+use alloc::alloc::Global;
 use core::time::Duration;
+
+use crate::mem::Vec;
 
 /// One thing a task said, on the driver's clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,7 +31,7 @@ pub enum RecordKind {
 /// What a world's tasks recorded: from [`crate::Io::trace`].
 #[derive(Debug)]
 pub struct Trace {
-    records: Vec<Record>,
+    records: Vec<Record, Global>,
     dropped: u64,
     /// The most records kept ([`crate::io::Limits::trace_most`]).
     most: usize,
@@ -37,13 +40,14 @@ pub struct Trace {
 impl Trace {
     pub(crate) fn new(most: usize) -> Trace {
         // alloc: the world's recorder, grown up to `most`.
-        Trace { records: Vec::new(), dropped: 0, most }
+        Trace { records: Vec::new_in(Global), dropped: 0, most }
     }
 
+    /// Keeps `record`, or counts it dropped: past `most`, or when the global heap has no room
+    /// for it (the records kept are as they were).
     pub(crate) fn push(&mut self, record: Record) {
-        if self.records.len() < self.most {
-            self.records.push(record);
-        } else {
+        let kept = self.records.len() < self.most && self.records.push(record).is_ok();
+        if !kept {
             self.dropped += 1;
         }
     }

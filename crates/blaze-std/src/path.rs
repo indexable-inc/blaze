@@ -2,10 +2,17 @@
 //! a root or `..`, so every open is beneath the [`crate::fs::Dir`] it is joined to. There is no
 //! current directory. A path is refused as it is made, with a [`PathError`] naming it and why.
 
-use alloc::{format, borrow::ToOwned, string::String};
+#[cfg(test)]
+use alloc::{borrow::ToOwned, string::String};
+use alloc::alloc::Global;
 use core::fmt;
 
 use blaze_core::FileName;
+
+use crate::{
+    mem::{self, OutOfMemory},
+    name::Excerpt,
+};
 
 /// A relative path: `/`-separated parts, each non-empty and none `.` or `..`, with no root, no
 /// `\` and no NUL.
@@ -15,7 +22,9 @@ pub struct Path(FileName);
 /// What [`Path::new`] refused.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct PathError {
-    pub path: String,
+    /// The text refused, or its start when it is long: kept in the error, which allocates
+    /// nothing. For a [`Path::join`], the path joined to.
+    pub path: Excerpt,
     pub why: PathWhy,
 }
 
@@ -30,91 +39,156 @@ pub enum PathWhy {
     NotCanonical,
     /// A `\` (Windows' other separator) or a NUL.
     Forbidden,
+    /// It passed bstd's rule and blaze-core's `FileName` refused it: the two rules disagree,
+    /// which is a bug of one of them.
+    NoName,
+    /// There was no room for the joined text ([`Path::join`]).
+    OutOfMemory(OutOfMemory),
 }
 
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "path {:?} {}", self.path, self.why.says())
+        write!(f, "path {:?} {}", self.path, self.why.says())?;
+        match self.why {
+            PathWhy::OutOfMemory(error) => write!(f, " ({error})"),
+            _ => Ok(()),
+        }
     }
 }
 
 impl core::error::Error for PathError {}
 
 impl PathWhy {
-    const fn says(self) -> &'static str {
+    pub(crate) const fn says(self) -> &'static str {
         match self {
             PathWhy::Empty => "is empty",
             PathWhy::Rooted => "starts at a root: a bstd path is relative to its directory",
             PathWhy::Parent => "has a `..`: a bstd path never leaves its directory",
             PathWhy::NotCanonical => "has a `.` or an empty part: write it as one relative path",
             PathWhy::Forbidden => "has a `\\` or a NUL",
+            PathWhy::NoName => {
+                "passed bstd's path rule and is no blaze-core file name (the two rules disagree: a bug)"
+            }
+            PathWhy::OutOfMemory(_) => "could not be joined: the global heap had no room",
         }
     }
 }
 
 /// Why `raw` is no path, if it is not. `parent` lets `..` through, for the test that plants it.
 /// A `const fn`, so [`crate::path!`] checks a literal as the crate compiles by the same rule
-/// [`Path::new`] checks at run time.
+/// [`Path::new`] checks at run time. It walks the bytes by slice patterns, so no index can
+/// fall outside them; each turn of each loop takes at least one byte.
 const fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
         return Some(PathWhy::Empty);
     }
-    if bytes[0] == b'/' || (bytes.len() > 1 && bytes[1] == b':') {
+    if let [b'/', ..] | [_, b':', ..] = bytes {
         return Some(PathWhy::Rooted);
     }
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'\\' || bytes[at] == 0 {
+    let mut rest = bytes;
+    while let [byte, tail @ ..] = rest {
+        if *byte == b'\\' || *byte == 0 {
             return Some(PathWhy::Forbidden);
         }
-        at += 1;
+        rest = tail;
     }
-    // Each `/`-separated part, from `start` to the separator (or the end) at `at`.
-    let (mut start, mut at) = (0, 0);
-    while at <= bytes.len() {
-        if at == bytes.len() || bytes[at] == b'/' {
-            let len = at - start;
-            if len == 2 && bytes[start] == b'.' && bytes[start + 1] == b'.' {
-                if !parent {
-                    return Some(PathWhy::Parent);
-                }
-            } else if len == 0 || (len == 1 && bytes[start] == b'.') {
-                return Some(PathWhy::NotCanonical);
+    // Each `/`-separated part: `rest` starts with it, and `len` bytes long it ends where
+    // `scan` starts, at a separator or the end.
+    let mut rest = bytes;
+    loop {
+        let mut len = 0;
+        let mut scan = rest;
+        while let [byte, tail @ ..] = scan {
+            if *byte == b'/' {
+                break;
             }
-            start = at + 1;
+            len += 1;
+            scan = tail;
         }
-        at += 1;
+        if len == 2 && matches!(rest, [b'.', b'.', ..]) {
+            if !parent {
+                return Some(PathWhy::Parent);
+            }
+        } else if len == 0 || (len == 1 && matches!(rest, [b'.', ..])) {
+            return Some(PathWhy::NotCanonical);
+        }
+        match scan {
+            // Past the separator: the next part, empty when the path ends with one.
+            [_, tail @ ..] => rest = tail,
+            [] => return None,
+        }
     }
-    None
 }
 
-/// [`Path::new`]'s check, as a compile-time panic: what [`crate::path!`] evaluates in a
-/// `const`.
-pub const fn check_literal(raw: &str) {
-    if let Some(why) = refused(raw, false) {
-        panic!("{}", why.says());
+/// [`Path::new`]'s check of a literal, what [`crate::path!`] evaluates in a `const`: why the
+/// literal is no path, or `None`. The macro turns a refusal into a compile error saying it.
+pub const fn literal_refused(raw: &str) -> Option<&'static str> {
+    match refused(raw, false) {
+        Some(why) => Some(why.says()),
+        None => None,
     }
 }
 
 /// A [`Path`] from a string literal, checked as the crate compiles: `path!("data/log")`. A bad
-/// literal (`path!("../x")`) is a compile error saying why.
+/// literal (`path!("../x")`) is a compile error saying why. What it gives is [`Path::new`]'s
+/// `Result`: a checked literal is refused only by [`PathWhy::NoName`], a bug, which is still
+/// said rather than panicked on.
 #[macro_export]
 macro_rules! path {
     ($raw:literal) => {{
-        const _: () = $crate::path::check_literal($raw);
-        $crate::path::Path::new($raw).expect("a path! literal was checked as the crate compiled")
+        const _: () = if let Some(why) = $crate::path::literal_refused($raw) {
+            panic!("{}", why)
+        };
+        $crate::path::Path::new($raw)
     }};
+}
+
+/// The text `write` makes, as a name under the driver's root: `Ok(None)` when it is none.
+/// The text is made on the global heap and dropped once blaze-core's `FileName` has its own
+/// copy; growing it is the one failure, [`OutOfMemory`].
+pub(crate) fn name_of(
+    write: impl FnOnce(&mut mem::String<Global>) -> Result<(), OutOfMemory>,
+) -> Result<Option<FileName>, OutOfMemory> {
+    // alloc: once per name made, its text, until blaze-core's `FileName` copies it.
+    let mut text = mem::String::new_in(Global);
+    write(&mut text)?;
+    // alloc: blaze-core's `FileName` copies the text into its own `Arc<str>`, which it makes
+    // infallibly (blaze-core is not ported to fallible allocation).
+    Ok(FileName::new(text.as_str()))
+}
+
+/// `n` in decimal at the end of `text`.
+pub(crate) fn push_decimal(text: &mut mem::String<Global>, n: u64) -> Result<(), OutOfMemory> {
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    let mut rest = n;
+    for slot in &mut digits {
+        *slot = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    for digit in digits.iter().take(count).rev() {
+        text.push(char::from(*digit))?;
+    }
+    Ok(())
 }
 
 impl Path {
     pub fn new(raw: &str) -> Result<Path, PathError> {
+        let refuse = |why| PathError { path: Excerpt::of(raw), why };
         if let Some(why) = refused(raw, false) {
-            // alloc: an error's message.
-            return Err(PathError { path: raw.to_owned(), why });
+            return Err(refuse(why));
         }
-        let name = FileName::new(raw).expect("a path is a name of blaze-core's");
-        Ok(Path(name))
+        // alloc: once per path, blaze-core's `FileName`, which it makes infallibly
+        // (blaze-core is not ported to fallible allocation).
+        match FileName::new(raw) {
+            Some(name) => Ok(Path(name)),
+            None => Err(refuse(PathWhy::NoName)),
+        }
     }
 
     /// `raw` with `..` let through, for the test that plants [`crate::Plant::LexicalParent`]:
@@ -122,8 +196,7 @@ impl Path {
     #[cfg(test)]
     pub(crate) fn with_parents(raw: &str) -> Result<String, PathError> {
         match refused(raw, true) {
-            // alloc: an error's message.
-            Some(why) => Err(PathError { path: raw.to_owned(), why }),
+            Some(why) => Err(PathError { path: Excerpt::of(raw), why }),
             // alloc: a test's planted path.
             None => Ok(raw.to_owned()),
         }
@@ -133,15 +206,27 @@ impl Path {
         self.0.as_str()
     }
 
-    /// `self` then `more`: two paths beneath a directory make one beneath it.
-    pub fn join(&self, more: &Path) -> Path {
-        // alloc: once per path joined.
-        let joined = format!("{}/{}", self.as_str(), more.as_str());
-        Path(FileName::new(&joined).expect("two paths joined are a path"))
+    /// `self` then `more`: two paths beneath a directory make one beneath it. With no room
+    /// for the joined text it is [`PathWhy::OutOfMemory`], naming the two.
+    pub fn join(&self, more: &Path) -> Result<Path, PathError> {
+        let (head, tail) = (self.as_str(), more.as_str());
+        let refuse = |why| PathError { path: Excerpt::of_parts(&[head, "/", tail]), why };
+        let joined = name_of(|text| {
+            text.reserve(head.len() + 1 + tail.len())?;
+            text.push_str(head)?;
+            text.push('/')?;
+            text.push_str(tail)
+        })
+        .map_err(|error| refuse(PathWhy::OutOfMemory(error)))?;
+        joined.map(Path).ok_or_else(|| refuse(PathWhy::NoName))
     }
 
     pub(crate) fn name(&self) -> &FileName {
         &self.0
+    }
+
+    pub(crate) fn into_name(self) -> FileName {
+        self.0
     }
 
     pub(crate) fn of(name: FileName) -> Path {

@@ -1290,7 +1290,7 @@ fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
     const WHAT: &str = "a crate's index of keys inside bodies";
     let mut rows = key_rows(WHAT);
     for &inner in crate_items(db, krate).inner.iter() {
-        if let Err(error) = rows.try_extend_from_slice(inner_items(db, inner, ())) {
+        if let Err(error) = rows.extend_from_slice(inner_items(db, inner, ())) {
             stop(WHAT, &error)
         }
     }
@@ -1338,13 +1338,13 @@ const CRATE_STORES: &str = "a crate's list of stores";
 
 impl Sink for CrateRows {
     fn add(&mut self, key: ItemKey, resolved: Resolved) {
-        if let Err(error) = self.rows.try_push((key, resolved)) {
+        if let Err(error) = self.rows.push((key, resolved)) {
             stop(CRATE_KEYS, &error)
         }
     }
 
     fn inner(&mut self, inner: Inner) {
-        if let Err(error) = self.inner.try_push(inner) {
+        if let Err(error) = self.inner.push(inner) {
             stop(CRATE_STORES, &error)
         }
     }

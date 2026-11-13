@@ -155,21 +155,20 @@ pub unsafe fn keep_base_pages(ptr: std::ptr::NonNull<u8>, bytes: usize) {
 /// The pages `value` of `BLAZE_HUGE_PAGES` chooses on this system.
 #[cold]
 pub(crate) fn choose(value: Option<&OsStr>) -> io::Result<Pages> {
-    match value.map(OsStr::to_str) {
-        None | Some(Some("" | "transparent")) => Ok(transparent()),
-        Some(Some("reserved")) => {
+    let Some(value) = value else { return Ok(transparent()) };
+    match value.to_str() {
+        Some("" | "transparent") => Ok(transparent()),
+        Some("reserved") => {
             crate::os::reserved_pool()?;
             Ok(Pages::Reserved)
         }
-        Some(Some("off")) => Ok(Pages::Base),
-        Some(_) => Err(io::Error::new(
+        Some("off") => Ok(Pages::Base),
+        _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            // alloc: the error of a misspelled setting, once
-            format!(
-                "{VAR}={:?} names no pages: use `transparent` (the default), `reserved` (Linux's \
-                 hugetlb pool) or `off`",
-                value.unwrap_or_default()
-            ),
+            // alloc: the error of a misspelled setting, once (`io::Error` boxes its payload)
+            crate::os::Refused::Misspelled {
+                value: crate::os::Text::of(value.as_encoded_bytes().iter().copied()),
+            },
         )),
     }
 }

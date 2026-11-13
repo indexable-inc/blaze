@@ -485,7 +485,7 @@ impl<'a> Stage<'a> {
             }
             let sym = self.synthetic(OPTION, name.as_bytes());
             if self.new.home(sym).is_none() {
-                let bytes: &'a [u8] = self.arena.alloc_slice_copy(&value.to_le_bytes());
+                let bytes: &'a [u8] = self.arena.alloc_slice_copy(&value.to_le_bytes()).unwrap_or_else(|error| panic!("{error}"));
                 let (class, rank) = self.core_class(&Class::Rodata);
                 let piece = NewPiece { rank, ..piece_of(sym, class, 4, 4, &[]) };
                 self.make(&piece, Content::Bytes(bytes));
@@ -551,9 +551,9 @@ impl<'a> Stage<'a> {
             align: MIN_REDZONE,
             size: size + redzone(size),
             zero: piece.zero(),
-            fixups: arena.alloc_slice_copy(piece.fixups()),
-            weak: arena.alloc_slice_copy(piece.weak()),
-            defines: arena.alloc_slice_copy(piece.defines()),
+            fixups: arena.alloc_slice_copy(piece.fixups()).unwrap_or_else(|error| panic!("{error}")),
+            weak: arena.alloc_slice_copy(piece.weak()).unwrap_or_else(|error| panic!("{error}")),
+            defines: arena.alloc_slice_copy(piece.defines()).unwrap_or_else(|error| panic!("{error}")),
             what: piece.what(),
         };
         let content = self.contents.get(id).unwrap_or(Content::Zero);
@@ -744,7 +744,7 @@ impl<'a> Stage<'a> {
         }
         let calls = calls(self.output.format, self.arch())?;
         let len = calls.prologue.len() + kinds * calls.call.len() + calls.epilogue.len();
-        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0);
+        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         bytes[..calls.prologue.len()].copy_from_slice(calls.prologue);
         bytes[len - calls.epilogue.len()..].copy_from_slice(calls.epilogue);
         let mut fixups: FrameVec<'a, Fixup> =
@@ -894,7 +894,7 @@ impl<'a> Stage<'a> {
 
         let module = self.module_name();
         let size = HEADER + GLOBAL * entries.len() as u64;
-        let bytes: &'a mut [u8] = arena.alloc_slice_fill_with(size as usize, |_| 0);
+        let bytes: &'a mut [u8] = arena.alloc_slice_fill_with(size as usize, |_| 0).unwrap_or_else(|error| panic!("{error}"));
         bytes[..8].copy_from_slice(&(entries.len() as u64).to_le_bytes());
         let mut fixups: FrameVec<'a, Fixup> = Vec::with_capacity_in(4 * entries.len(), arena);
         for (n, &(sym, size)) in entries.iter().enumerate() {
@@ -949,7 +949,7 @@ impl<'a> Stage<'a> {
     fn entry_key(&mut self, sym: Sym) -> &'a [u8] {
         self.scratch.clear();
         self.symbols.write_key(sym, &mut *self.scratch);
-        self.arena.alloc_slice_copy(self.scratch.as_slice())
+        self.arena.alloc_slice_copy(self.scratch.as_slice()).unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// An entry's name, NUL-terminated (`static ` or `data ` and the first 8 bytes of its id
@@ -970,7 +970,7 @@ impl<'a> Stage<'a> {
                 }
             };
             let id = self.symbols.content(id).0;
-            let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(prefix.len() + 17, |_| 0);
+            let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(prefix.len() + 17, |_| 0).unwrap_or_else(|error| panic!("{error}"));
             bytes[..prefix.len()].copy_from_slice(prefix);
             for (at, byte) in id[..8].iter().enumerate() {
                 bytes[prefix.len() + 2 * at] = HEX[usize::from(byte >> 4)];
@@ -994,7 +994,7 @@ impl<'a> Stage<'a> {
         let sym = self.synthetic(MODULE, &[]);
         if self.new.home(sym).is_none() {
             let name = self.name.as_bytes();
-            let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(name.len() + 1, |_| 0);
+            let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(name.len() + 1, |_| 0).unwrap_or_else(|error| panic!("{error}"));
             bytes[..name.len()].copy_from_slice(name);
             let (class, rank) = self.core_class(&Class::Rodata);
             let piece = NewPiece { rank, ..piece_of(sym, class, 1, bytes.len() as u64, &[]) };

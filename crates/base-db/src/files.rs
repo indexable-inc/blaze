@@ -1610,7 +1610,7 @@ impl RootContent {
                 }
             }
         }
-        let keys = frame.alloc_slice_from_iter(hash.iter().map(|&at| &*files[at].1));
+        let keys = frame.alloc_slice_from_iter(hash.iter().map(|&at| &*files[at].1)).unwrap_or_else(|error| panic!("{error}"));
         let hashes = content::hash_many(SourceRoot::PATH_DOMAIN, keys, frame);
         for (&at, &path) in hash.iter().zip(hashes) {
             paths[at] = path;

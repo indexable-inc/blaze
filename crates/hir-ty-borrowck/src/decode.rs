@@ -67,7 +67,7 @@ struct Building<'f, T> {
 impl<'f, T> Building<'f, T> {
     fn new(frame: &'f Frame, points: usize, room: usize) -> Self {
         Building {
-            at: frame.alloc_slice_fill_with(points, |_| (0, 0)),
+            at: frame.alloc_slice_fill_with(points, |_| (0, 0)).unwrap_or_else(|error| panic!("{error}")),
             items: Vec::with_capacity_in(room, frame),
             open: 0,
         }
@@ -235,14 +235,14 @@ impl<'f> Decoded<'f> {
             uses: Building::new(frame, points, points * 2),
             defs: Building::new(frame, points, points),
             two_phase: Building::new(frame, points, points),
-            dead: frame.alloc_slice_fill_with(points, |_| NONE),
-            returns: frame.alloc_slice_fill_with(blocks, |_| NONE),
-            terminated: frame.alloc_slice_fill_with(blocks, |_| false),
-            dropped: frame.alloc_slice_fill_with(blocks, |_| NONE),
-            certain: frame.alloc_slice_fill_with(blocks, |_| NONE),
+            dead: frame.alloc_slice_fill_with(points, |_| NONE).unwrap_or_else(|error| panic!("{error}")),
+            returns: frame.alloc_slice_fill_with(blocks, |_| NONE).unwrap_or_else(|error| panic!("{error}")),
+            terminated: frame.alloc_slice_fill_with(blocks, |_| false).unwrap_or_else(|error| panic!("{error}")),
+            dropped: frame.alloc_slice_fill_with(blocks, |_| NONE).unwrap_or_else(|error| panic!("{error}")),
+            certain: frame.alloc_slice_fill_with(blocks, |_| NONE).unwrap_or_else(|error| panic!("{error}")),
             borrows: Vec::with_capacity_in(points / 8, frame),
             constants: Vec::new_in(frame),
-            temps: frame.alloc_slice_fill_with(roots, |_| Temp::Undefined),
+            temps: frame.alloc_slice_fill_with(roots, |_| Temp::Undefined).unwrap_or_else(|error| panic!("{error}")),
             temp_locals: Vec::new_in(frame),
         };
         for &block in cfg.order.iter() {

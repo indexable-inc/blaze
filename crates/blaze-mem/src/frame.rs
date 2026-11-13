@@ -61,7 +61,6 @@ use crate::{
     MemError, Named, OutOfMemory, Region, Tag,
     align::align_up,
     chunks::{self, CHUNK, Chunk},
-    error::fail,
     tag,
 };
 
@@ -364,7 +363,7 @@ impl Frame {
     /// Takes `layout`'s bytes, aligned; `MemError` when the frame's limit is reached or memory
     /// cannot be had. A task the cap cancels unwinds with [`Cancelled`] from here.
     #[inline]
-    pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
+    pub fn alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
         let cursor = self.cursor.get();
         let at = align_up(cursor.addr(), layout.align());
         match at.checked_add(layout.size()) {
@@ -390,7 +389,7 @@ impl Frame {
         }
         self.cursor.set(cursor.with_addr(end));
         self.peak.set(self.peak.get().max(end.wrapping_add(self.bias.get())));
-        // SAFETY: as in `try_alloc_layout`: `at` is within the block `make_room` made current.
+        // SAFETY: as in `alloc_layout`: `at` is within the block `make_room` made current.
         Ok(unsafe { NonNull::new_unchecked(cursor.with_addr(at)) })
     }
 
@@ -419,8 +418,10 @@ impl Frame {
         let current = self.current.get();
         if !current.is_null() {
             let at = align_up(self.cursor.get().addr(), align);
-            if header(current).span.is_some() && at.saturating_add(size) <= header(current).end {
-                return self.commit_span(current, at + size);
+            if let Some(region) = header(current).span.as_deref()
+                && at.saturating_add(size) <= header(current).end
+            {
+                return self.commit_span(current, region, at + size);
             }
             let mut ahead = header(current).next;
             while !ahead.is_null() {
@@ -443,19 +444,18 @@ impl Frame {
 
     /// Commits what `layout` needs at the cursor of the span `block`, just made current.
     fn reach(&self, block: *mut Block, layout: Layout) -> Result<(), MemError> {
-        if header(block).span.is_some() {
+        if let Some(region) = header(block).span.as_deref() {
             let at = align_up(self.cursor.get().addr(), layout.align());
-            return self.commit_span(block, at + layout.size());
+            return self.commit_span(block, region, at + layout.size());
         }
         Ok(())
     }
 
-    /// Commits the current span `block` up to address `end` (reserving the pages from the cap
-    /// first, for a task's frame) and moves the bump's end there.
-    fn commit_span(&self, block: *mut Block, end: usize) -> Result<(), MemError> {
-        let Some(region) = header(block).span.as_deref() else {
-            unreachable!("a chunk has no pages to commit")
-        };
+    /// Commits the current span `block`, whose region is `region`, up to address `end`
+    /// (reserving the pages from the cap first, for a task's frame) and moves the bump's end
+    /// there. The caller passes the region it found in the block's header, so a chunk, which
+    /// has none, never gets here.
+    fn commit_span(&self, block: *mut Block, region: &Region, end: usize) -> Result<(), MemError> {
         let len = end - region.base().addr().get();
         let before = region.committed();
         let more = region.committed_after(len)? - before;
@@ -625,12 +625,16 @@ impl Frame {
             let index = head.chunk;
             let given = self.task
                 && SHELF_OF
-                    .try_with(|shelf| shelf.give_chunk(Chunk::from_index(index), cold))
+                    // SAFETY: `index` is this block's chunk, taken for it by `take_chunk` and
+                    // held by the frame until here, where the block is given up.
+                    .try_with(|shelf| shelf.give_chunk(unsafe { Chunk::from_index(index) }, cold))
                     .is_ok();
             if !given {
+                // SAFETY: as above: the shelf did not take it, so the frame still holds it.
+                let chunk = unsafe { Chunk::from_index(index) };
                 match cold {
-                    true => chunks::give_cold(Chunk::from_index(index), Tag::Frames),
-                    false => chunks::give(Chunk::from_index(index), Tag::Frames),
+                    true => chunks::give_cold(chunk, Tag::Frames),
+                    false => chunks::give(chunk, Tag::Frames),
                 }
             }
             return;
@@ -647,69 +651,60 @@ impl Frame {
         drop_span(block);
     }
 
-    /// Stops with the error when memory cannot be had.
-    #[inline]
-    #[track_caller]
-    pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
-        match self.try_alloc_layout(layout) {
-            Ok(ptr) => ptr,
-            Err(error) => fail(&error),
-        }
-    }
-
     /// Places `value` in the frame. Its destructor never runs: the frame forgets it at reset.
+    /// `MemError` when the frame has no room for it (`value` is dropped then).
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc<T>(&self, value: T) -> &mut T {
-        let ptr = self.alloc_layout(Layout::new::<T>()).cast::<T>();
+    pub fn alloc<T>(&self, value: T) -> Result<&mut T, MemError> {
+        let ptr = self.alloc_layout(Layout::new::<T>())?.cast::<T>();
         // SAFETY: `ptr` is fresh memory of this frame, sized and aligned for `T`, handed out
         // once; it stays valid until a reset, which takes `&mut self` and so outlives this
         // borrow.
         unsafe { ptr.write(value) };
         // SAFETY: just initialized, and no other reference to it exists.
-        unsafe { &mut *ptr.as_ptr() }
+        Ok(unsafe { &mut *ptr.as_ptr() })
     }
 
     /// Copies `values` into the frame.
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &mut [T] {
-        let slots = self.alloc_uninit_slice::<T>(values.len());
+    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> Result<&mut [T], MemError> {
+        let slots = self.alloc_uninit_slice::<T>(values.len())?;
         for (slot, value) in slots.iter_mut().zip(values) {
             slot.write(*value);
         }
         // SAFETY: every element was just written.
-        unsafe { slots.assume_init_mut() }
+        Ok(unsafe { slots.assume_init_mut() })
     }
 
     /// `len` values made by `f(0)`, `f(1)`, ... in the frame. If `f` panics, the values made
     /// so far are forgotten with the frame, as every frame value is.
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc_slice_fill_with<T>(&self, len: usize, mut f: impl FnMut(usize) -> T) -> &mut [T] {
-        let slots = self.alloc_uninit_slice::<T>(len);
+    pub fn alloc_slice_fill_with<T>(
+        &self,
+        len: usize,
+        mut f: impl FnMut(usize) -> T,
+    ) -> Result<&mut [T], MemError> {
+        let slots = self.alloc_uninit_slice::<T>(len)?;
         for (i, slot) in slots.iter_mut().enumerate() {
             slot.write(f(i));
         }
         // SAFETY: every element was just written.
-        unsafe { slots.assume_init_mut() }
+        Ok(unsafe { slots.assume_init_mut() })
     }
 
     /// The items of `iter`, which says its length, in the frame.
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc_slice_from_iter<T, I>(&self, iter: I) -> &mut [T]
+    pub fn alloc_slice_from_iter<T, I>(&self, iter: I) -> Result<&mut [T], MemError>
     where
         I: IntoIterator<Item = T>,
         I::IntoIter: ExactSizeIterator,
     {
         let mut iter = iter.into_iter();
         let len = iter.len();
-        let slots = self.alloc_uninit_slice::<T>(len);
+        let slots = self.alloc_uninit_slice::<T>(len)?;
         let mut filled = 0;
         for slot in slots.iter_mut() {
             match iter.next() {
@@ -720,36 +715,37 @@ impl Frame {
                 None => break,
             }
         }
-        // SAFETY: the first `filled` elements were written; an iterator that said more than it
-        // gave leaves the rest out of the slice.
-        unsafe { slots[..filled].assume_init_mut() }
+        // SAFETY: `slots` is `len` places of this frame, and its first `filled <= len` were
+        // written just now, so they are initialized `T`s, aligned and in bounds; an iterator
+        // that said more than it gave leaves the rest out of the slice. The slice borrows the
+        // frame as `slots` did, and nothing else names those places.
+        Ok(unsafe { slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<T>(), filled) })
     }
 
     /// Room for `len` values of `T`, uninitialized.
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc_uninit_slice<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
-        let layout = match Layout::array::<T>(len) {
-            Ok(layout) => layout,
-            Err(_) => {
-                fail(&MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len })
-            }
-        };
-        let ptr = self.alloc_layout(layout).cast::<MaybeUninit<T>>();
+    pub fn alloc_uninit_slice<T>(&self, len: usize) -> Result<&mut [MaybeUninit<T>], MemError> {
+        let Ok(layout) = Layout::array::<T>(len) else { return Err(self.slice_too_large(len)) };
+        let ptr = self.alloc_layout(layout)?.cast::<MaybeUninit<T>>();
         // SAFETY: fresh memory of this frame for `len` elements, aligned, handed out once and
         // valid until a reset (which takes `&mut self`); `MaybeUninit` needs no initialization.
-        unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len) }
+        Ok(unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len) })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slice_too_large(&self, len: usize) -> MemError {
+        MemError::TooLarge { tag: self.tag(), what: "a frame slice's length", wanted: len }
     }
 
     /// Copies `text` into the frame.
     #[inline]
-    #[track_caller]
     #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
-    pub fn alloc_str(&self, text: &str) -> &mut str {
-        let bytes = self.alloc_slice_copy(text.as_bytes());
+    pub fn alloc_str(&self, text: &str) -> Result<&mut str, MemError> {
+        let bytes = self.alloc_slice_copy(text.as_bytes())?;
         // SAFETY: the bytes are a copy of a `str`'s, so UTF-8.
-        unsafe { str::from_utf8_unchecked_mut(bytes) }
+        Ok(unsafe { str::from_utf8_unchecked_mut(bytes) })
     }
 
     /// The point to roll back to.
@@ -758,15 +754,19 @@ impl Frame {
     }
 
     /// Frees everything allocated since `marker` was taken; the blocks taken since stay the
-    /// frame's, for what comes next. Stops when the marker is another frame's or from after a
-    /// rollback past it.
-    #[track_caller]
-    pub fn reset_to(&mut self, marker: Marker) {
-        assert_eq!(marker.frame, self.id, "a marker of another frame");
-        assert!(
-            self.roll_back(marker.at),
-            "a marker taken after a point the frame was already rolled back past"
-        );
+    /// frame's, for what comes next. [`MemError::Marker`], the frame left as it was, when the
+    /// marker is another frame's or from after a rollback past it.
+    pub fn reset_to(&mut self, marker: Marker) -> Result<(), MemError> {
+        if marker.frame != self.id {
+            return Err(MemError::Marker { tag: self.tag(), rule: "the marker is another frame's" });
+        }
+        if !self.roll_back(marker.at) {
+            return Err(MemError::Marker {
+                tag: self.tag(),
+                rule: "the marker was taken after a point the frame was already rolled back past",
+            });
+        }
+        Ok(())
     }
 
     /// Moves the cursor back to address `at`, in the current block or one before it. Whether
@@ -891,13 +891,17 @@ impl Frame {
     fn grow_top(&self, end: usize) -> Result<bool, MemError> {
         if end > self.end.get() {
             let current = self.current.get();
-            if current.is_null() || header(current).span.is_none() || end > header(current).end {
+            if current.is_null() {
+                return Ok(false);
+            }
+            let Some(region) = header(current).span.as_deref() else { return Ok(false) };
+            if end > header(current).end {
                 return Ok(false);
             }
             if self.used().saturating_add(end - self.cursor.get().addr()) > self.limit {
                 return Ok(false);
             }
-            self.commit_span(current, end)?;
+            self.commit_span(current, region, end)?;
             if end > self.end.get() {
                 return Ok(false);
             }
@@ -933,10 +937,12 @@ fn span_reserve(need: usize) -> usize {
     need
 }
 
-/// Gives a span's region back to the kernel, its header with it.
+/// Gives a span's region back to the kernel, its header with it. Only a span's header reaches
+/// here (`release` and the shelf's span list hold no chunk), and a chunk's holds no region, so
+/// there is nothing of one to drop.
 fn drop_span(block: *mut Block) {
     let head = header_mut(block);
-    let Some(region) = head.span.take() else { unreachable!("a span holds its region") };
+    let Some(region) = head.span.take() else { return };
     // The header is inside the region: nothing reads it once the region goes.
     drop(ManuallyDrop::into_inner(region));
 }
@@ -990,7 +996,7 @@ impl Named for Frame {
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = self.try_alloc_layout(layout).map_err(|_| AllocError)?;
+        let ptr = self.alloc_layout(layout).map_err(|_| AllocError)?;
         Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
     }
 
@@ -1016,7 +1022,7 @@ unsafe impl Allocator for Frame {
         {
             return Ok(NonNull::slice_from_raw_parts(ptr, new.size()));
         }
-        let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+        let to = self.alloc_layout(new).map_err(|_| AllocError)?;
         // SAFETY: the caller says `ptr` is a live block of `old.size()` bytes; `to` is a fresh
         // block of at least as many, so the two do not overlap.
         unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
@@ -1049,7 +1055,7 @@ unsafe impl Allocator for Frame {
         new: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         if ptr.as_ptr().align_offset(new.align()) != 0 {
-            let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+            let to = self.alloc_layout(new).map_err(|_| AllocError)?;
             // SAFETY: `ptr` is a live block of at least `new.size()` bytes and `to` a fresh one.
             unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), new.size()) };
             return Ok(NonNull::slice_from_raw_parts(to, new.size()));
@@ -1092,10 +1098,13 @@ impl Shelf {
     /// A chunk for a task's frame: the shelf's top, else one from the cache, reserved from the
     /// cap when the thread holds [`SHELF`] already.
     fn take_chunk(&self, tag: Tag) -> Result<Chunk, MemError> {
-        let len = self.len.get();
-        if len > 0 {
-            self.len.set(len - 1);
-            return Ok(Chunk::from_index(self.chunks[len - 1].get()));
+        if let Some(top) = self.len.get().checked_sub(1)
+            && let Some(slot) = self.chunks.get(top)
+        {
+            self.len.set(top);
+            // SAFETY: a shelf's slots below `len` hold indices of chunks given to it
+            // (`give_chunk`), each from a `Chunk`; taking the top one moves the hold out.
+            return Ok(unsafe { Chunk::from_index(slot.get()) });
         }
         let capped = match self.held.get() >= SHELF {
             true => cap::frame_reserve(CHUNK).map_err(|why| refused(why, tag, CHUNK))?,
@@ -1121,8 +1130,9 @@ impl Shelf {
     /// (to the kernel's pages with `cold`).
     fn give_chunk(&self, chunk: Chunk, cold: bool) {
         let len = self.len.get();
-        if len < SHELF && !cold {
-            self.chunks[len].set(chunk.index());
+        // A slot past the top is there while the shelf holds fewer than `SHELF`.
+        if !cold && let Some(slot) = self.chunks.get(len) {
+            slot.set(chunk.index());
             self.len.set(len + 1);
             return;
         }
@@ -1183,10 +1193,13 @@ impl Shelf {
     fn trim(&self, keep: usize) {
         let keep_chunks = (keep / CHUNK).min(SHELF);
         while self.len.get() > keep_chunks {
-            let len = self.len.get() - 1;
-            self.len.set(len);
-            let chunk = Chunk::from_index(self.chunks[len].get());
-            self.give_chunk(chunk, true);
+            let top = self.len.get() - 1;
+            // The shelf's length never passes its slots: `give_chunk` fills one only when it is
+            // there.
+            let Some(slot) = self.chunks.get(top) else { break };
+            self.len.set(top);
+            // SAFETY: as in `take_chunk`: the slot held a chunk given to the shelf.
+            self.give_chunk(unsafe { Chunk::from_index(slot.get()) }, true);
         }
         let mut left = keep - keep_chunks * CHUNK;
         let mut prev: *mut Block = ptr::null_mut();
@@ -1236,8 +1249,10 @@ impl Shelf {
 
 impl Drop for Shelf {
     fn drop(&mut self) {
-        for at in 0..self.len.get() {
-            chunks::give(Chunk::from_index(self.chunks[at].get()), Tag::Frames);
+        for slot in self.chunks.iter().take(self.len.get()) {
+            // SAFETY: as in `take_chunk`: each slot below `len` holds a chunk given to the
+            // shelf, which gives it up here.
+            chunks::give(unsafe { Chunk::from_index(slot.get()) }, Tag::Frames);
         }
         self.len.set(0);
         let mut span = self.spans.get();
@@ -1366,10 +1381,9 @@ fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! 
             on if on == here => "ended on this thread",
             _ => "ended on another thread",
         };
-        // alloc: once, for the panic's message
-        format!(" Task {owner} was opened at {opened_at} and {ended}.")
+        Owner(Some((owner, opened_at, ended)))
     } else {
-        String::new()
+        Owner(None)
     };
     panic!(
         "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
@@ -1382,20 +1396,50 @@ fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! 
     )
 }
 
+/// Who owned a dropped frame, for [`refuse_outer`]'s message: its task's id, where it was
+/// opened and where it ended; nothing for bytes that are no frame's. Written as the message is,
+/// with nothing allocated for it.
+struct Owner(Option<(u32, &'static Location<'static>, &'static str)>);
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some((owner, opened_at, ended)) => {
+                write!(f, " Task {owner} was opened at {opened_at} and {ended}.")
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// Where a frame's address lies against the calling thread's stack pointer ([`whereabouts`]),
+/// written as a panic's message is, with nothing allocated for it.
+struct Whereabouts {
+    by: usize,
+    side: &'static str,
+    sp: usize,
+}
+
+impl std::fmt::Display for Whereabouts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Whereabouts { by, side, sp } = self;
+        write!(f, "{by:#x} bytes {side} this thread's stack pointer {sp:#x}")
+    }
+}
+
 /// Where `at` lies against the calling thread's stack pointer: the frame of a call still under
 /// way on this stack is above it, by less than the stack's size; one below it is of a call
 /// that returned, and one far either way is on another stack (another fiber's, a segment
 /// `stdx::ensure_sufficient_stack` grew) or not on a stack.
 #[inline(never)]
-fn whereabouts(at: *const Frame) -> String {
+fn whereabouts(at: *const Frame) -> Whereabouts {
     let here = 0u8;
     let sp = ptr::from_ref(&here).addr();
     let (by, side) = match at.addr().checked_sub(sp) {
         Some(above) => (above, "above"),
         None => (sp - at.addr(), "below"),
     };
-    // alloc: once, for a panic's message
-    format!("{by:#x} bytes {side} this thread's stack pointer {sp:#x}")
+    Whereabouts { by, side, sp }
 }
 
 /// The seal and the owner's id in the frame-sized, aligned bytes at `at`, as the memory holds

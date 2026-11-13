@@ -10,7 +10,7 @@
 //!
 //! **Provider.** Real, over [`Dir`], as [`Kv`]'s.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::alloc::Global;
 use core::fmt;
 
 use blaze_mem::Frame;
@@ -19,8 +19,8 @@ use crate::{
     Stopped,
     cx::Cx,
     fs::{Dir, Durable, ReadOnly, ReadWrite, Rights, Unsynced},
-    kv::{Key, Kv, KvError},
-    mem::Bytes,
+    kv::{Key, KeyError, Kv, KvError},
+    mem::{ByteLen, Bytes, String, Vec},
 };
 
 /// What a blob is: the BLAKE3 of its bytes.
@@ -49,16 +49,33 @@ impl BlobId {
             _ => None,
         };
         let mut id = [0u8; 32];
-        for (at, pair) in hex.chunks_exact(2).enumerate() {
-            id[at] = digit(pair[0])? << 4 | digit(pair[1])?;
+        for (byte, pair) in id.iter_mut().zip(hex.chunks_exact(2)) {
+            let [high, low] = pair else { return None };
+            *byte = digit(*high)? << 4 | digit(*low)?;
         }
         Some(BlobId(id))
     }
 
-    /// The key that spells it in hex.
-    fn key(&self) -> Key {
-        // alloc: once per call, the id's hex.
-        Key::new(&self.to_string()).expect("64 hex digits are a key")
+    /// The key that spells it in hex: 64 hex digits, which every key's rule takes. With no
+    /// room for the hex, [`BlobsKind::Stopped`]; a key's rule refusing it would be
+    /// [`BlobsKind::Key`], the two rules disagreeing.
+    fn key(&self) -> Result<Key, BlobsKind> {
+        let stopped = |error| BlobsKind::Stopped(Stopped::from(error));
+        // alloc: once per call, the id's hex, until the key copies it.
+        let mut hex = String::with_capacity_in(64, Global).map_err(stopped)?;
+        for byte in self.0 {
+            hex.push(nibble(byte >> 4)).map_err(stopped)?;
+            hex.push(nibble(byte & 0xf)).map_err(stopped)?;
+        }
+        Key::new(hex.as_str()).map_err(BlobsKind::Key)
+    }
+}
+
+/// The hex digit of `half`, a value below 16.
+fn nibble(half: u8) -> char {
+    match half {
+        0..=9 => char::from(b'0' + half),
+        _ => char::from(b'a' + (half & 0xf) - 10),
     }
 }
 
@@ -93,8 +110,12 @@ pub enum BlobsKind {
     Store(KvError),
     /// The bytes stored under the id are not its: they hash to `found`.
     Corrupt { found: BlobId },
-    /// The list had no room.
+    /// There was no room: for the list, or for the hex of the blob's id.
     Stopped(Stopped),
+    /// The hex of the blob's id is no key: the id's rule and the key's disagree, a bug.
+    Key(KeyError),
+    /// The store said it added bytes from `start` and `into` holds only `held`.
+    Short { start: usize, held: usize },
 }
 
 /// A blob call that failed: the call, the blob (none for a list) and how.
@@ -108,15 +129,19 @@ pub struct BlobsError {
 impl fmt::Display for BlobsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let op = self.op;
-        match (&self.blob, &self.kind) {
-            (Some(blob), BlobsKind::Corrupt { found }) => {
-                write!(f, "bstd::blobs {op:?} of blob {blob}: the bytes stored under it hash to {found}")
-            }
-            (Some(blob), BlobsKind::Store(under)) => write!(f, "bstd::blobs {op:?} of blob {blob}: {under}"),
-            (Some(blob), BlobsKind::Stopped(stopped)) => write!(f, "bstd::blobs {op:?} of blob {blob}: {stopped}"),
-            (None, BlobsKind::Store(under)) => write!(f, "bstd::blobs {op:?} of the store: {under}"),
-            (None, BlobsKind::Stopped(stopped)) => write!(f, "bstd::blobs {op:?} of the store: {stopped}"),
-            (None, BlobsKind::Corrupt { found }) => write!(f, "bstd::blobs {op:?} of the store: bytes that hash to {found}"),
+        match &self.blob {
+            Some(blob) => write!(f, "bstd::blobs {op:?} of blob {blob}: ")?,
+            None => write!(f, "bstd::blobs {op:?} of the store: ")?,
+        }
+        match &self.kind {
+            BlobsKind::Corrupt { found } => write!(f, "the bytes stored under it hash to {found}"),
+            BlobsKind::Store(under) => write!(f, "{under}"),
+            BlobsKind::Stopped(stopped) => write!(f, "{stopped}"),
+            BlobsKind::Key(error) => write!(f, "its hex is no key ({error}): the id's rule and the key's disagree"),
+            BlobsKind::Short { start, held } => write!(
+                f,
+                "the store said it read bytes from {start} of the buffer, which holds {held} (a store's bug)"
+            ),
         }
     }
 }
@@ -154,13 +179,17 @@ impl<#[blaze::linear] P: Rights> Blobs<P> {
 
     /// The blob `id` added to `into`, checked against `id`: how many bytes, or `None` when
     /// the store has no such blob. On an error `into` is as it was.
-    pub fn get(&self, cx: &Cx, id: &BlobId, into: &mut Bytes<'_>) -> Result<Option<usize>, BlobsError> {
+    pub fn get(&self, cx: &Cx, id: &BlobId, into: &mut Bytes<'_>) -> Result<Option<ByteLen>, BlobsError> {
         let refuse = |kind| BlobsError { op: BlobsOp::Get, blob: Some(*id), kind };
         let start = into.len();
-        let Some(read) = self.kv.get(cx, &id.key(), into).map_err(|error| refuse(BlobsKind::Store(error)))? else {
+        let key = id.key().map_err(refuse)?;
+        let Some(read) = self.kv.get(cx, &key, into).map_err(|error| refuse(BlobsKind::Store(error)))? else {
             return Ok(None);
         };
-        let found = BlobId::of(&into.as_slice()[start..]);
+        let Some((_, got)) = into.as_slice().split_at_checked(start) else {
+            return Err(refuse(BlobsKind::Short { start, held: into.len() }));
+        };
+        let found = BlobId::of(got);
         if found != *id {
             into.truncate(start);
             return Err(refuse(BlobsKind::Corrupt { found }));
@@ -170,9 +199,9 @@ impl<#[blaze::linear] P: Rights> Blobs<P> {
 
     /// Whether the store has the blob `id`.
     pub fn has(&self, cx: &Cx, id: &BlobId) -> Result<bool, BlobsError> {
-        self.kv
-            .has(cx, &id.key())
-            .map_err(|error| BlobsError { op: BlobsOp::Has, blob: Some(*id), kind: BlobsKind::Store(error) })
+        let refuse = |kind| BlobsError { op: BlobsOp::Has, blob: Some(*id), kind };
+        let key = id.key().map_err(refuse)?;
+        self.kv.has(cx, &key).map_err(|error| refuse(BlobsKind::Store(error)))
     }
 
     /// The id of every blob in the store, sorted, in `frame`.
@@ -181,10 +210,7 @@ impl<#[blaze::linear] P: Rights> Blobs<P> {
         let keys = self.kv.list(cx, frame).map_err(|error| refuse(BlobsKind::Store(error)))?;
         let mut ids = Vec::new_in(frame);
         for id in keys.iter().filter_map(BlobId::from_key) {
-            ids.try_reserve(1).map_err(|_| {
-                refuse(BlobsKind::Stopped(Stopped::OutOfMemory { arena: "bstd::blobs list", asked: size_of::<BlobId>() }))
-            })?;
-            ids.push(id);
+            ids.push(id).map_err(|error| refuse(BlobsKind::Stopped(Stopped::from(error))))?;
         }
         Ok(ids)
     }
@@ -204,9 +230,11 @@ impl Blobs<ReadWrite> {
     /// may lose the blob or tear it, and a get of a torn one is [`BlobsKind::Corrupt`].
     pub fn put_unsynced(&self, cx: &Cx, bytes: &[u8], unsynced: Unsynced) -> Result<BlobId, BlobsError> {
         let id = BlobId::of(bytes);
-        match self.kv.put_unsynced(cx, &id.key(), bytes, unsynced) {
+        let refuse = |kind| BlobsError { op: BlobsOp::Put, blob: Some(id), kind };
+        let key = id.key().map_err(refuse)?;
+        match self.kv.put_unsynced(cx, &key, bytes, unsynced) {
             Ok(()) => Ok(id),
-            Err(error) => Err(BlobsError { op: BlobsOp::Put, blob: Some(id), kind: BlobsKind::Store(error) }),
+            Err(error) => Err(refuse(BlobsKind::Store(error))),
         }
     }
 
@@ -214,9 +242,11 @@ impl Blobs<ReadWrite> {
     /// the store has already is written again as the same bytes. It waits for the device.
     pub fn put_synced(&self, cx: &Cx, bytes: &[u8]) -> Result<BlobId, BlobsError> {
         let id = BlobId::of(bytes);
-        match self.kv.put_synced(cx, &id.key(), bytes) {
+        let refuse = |kind| BlobsError { op: BlobsOp::Put, blob: Some(id), kind };
+        let key = id.key().map_err(refuse)?;
+        match self.kv.put_synced(cx, &key, bytes) {
             Ok(()) => Ok(id),
-            Err(error) => Err(BlobsError { op: BlobsOp::Put, blob: Some(id), kind: BlobsKind::Store(error) }),
+            Err(error) => Err(refuse(BlobsKind::Store(error))),
         }
     }
 
@@ -231,15 +261,15 @@ impl Blobs<ReadWrite> {
 
     /// The blob `id` gone from the store, with nothing synced: a crash may bring it back.
     pub fn delete_unsynced(&self, cx: &Cx, id: &BlobId, unsynced: Unsynced) -> Result<(), BlobsError> {
-        self.kv
-            .delete_unsynced(cx, &id.key(), unsynced)
-            .map_err(|error| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind: BlobsKind::Store(error) })
+        let refuse = |kind| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind };
+        let key = id.key().map_err(refuse)?;
+        self.kv.delete_unsynced(cx, &key, unsynced).map_err(|error| refuse(BlobsKind::Store(error)))
     }
 
     /// The blob `id` gone from the store, and a crash keeps it gone. It waits for the device.
     pub fn delete_synced(&self, cx: &Cx, id: &BlobId) -> Result<(), BlobsError> {
-        self.kv
-            .delete_synced(cx, &id.key())
-            .map_err(|error| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind: BlobsKind::Store(error) })
+        let refuse = |kind| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind };
+        let key = id.key().map_err(refuse)?;
+        self.kv.delete_synced(cx, &key).map_err(|error| refuse(BlobsKind::Store(error)))
     }
 }

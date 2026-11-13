@@ -184,7 +184,7 @@ fn took(act: Act, how: How, wanted: How) -> Result<(), String> {
 fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut world = SimWorld::new(plan.seed, Limits::USUAL);
     world.faults = Faults { max_latency: Duration::from_micros(plan.latency_us), ..Faults::default() };
-    let io = Io::planted(world, plant);
+    let io = Io::planted(world, plant).expect("a planted world");
     let cx = root(&io);
     let fs = io.need_fs().map_err(|e| format!("harness: {e}"))?;
     let dir = fs.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
@@ -246,7 +246,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                     content.resize(end, 0);
                 }
                 content[start..end].copy_from_slice(&bytes);
-                let patches = [Patch { at: offset, bytes: &bytes }];
+                let patches = [Patch { at: crate::mem::Offset::new(offset), bytes: &bytes }];
                 let published =
                     dir.publish_synced(&cx, &path(PATHS[at]), Content::patch_of(&base, &patches)).map_err(harness)?;
                 took(act, published.how, How::Derived)?;

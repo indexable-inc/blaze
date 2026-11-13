@@ -9469,7 +9469,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 members.push((temp, slot));
             }
         }
-        let locals: &[LocalId] = frame.alloc_slice_from_iter(members.iter().map(|it| it.0));
+        let locals: &[LocalId] = frame.alloc_slice_from_iter(members.iter().map(|it| it.0)).unwrap_or_else(|error| panic!("{error}"));
         // A debugger reads a named local's slot all through its scope (`note_variables`), so it
         // keeps the slot to itself there, not only until its last read.
         let mut named: FrameHashSet<'_, LocalId> = frame_map::hash_set(frame);

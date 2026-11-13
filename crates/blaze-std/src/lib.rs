@@ -131,10 +131,12 @@
     core_intrinsics,
     custom_inner_attributes,
     generic_atomic,
+    get_mut_unchecked,
     marker_trait_attr,
     register_tool,
     type_info,
-    unsize
+    unsize,
+    vec_push_within_capacity
 )]
 #![allow(
     internal_features,

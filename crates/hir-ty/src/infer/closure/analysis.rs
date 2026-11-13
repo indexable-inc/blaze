@@ -658,7 +658,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     self.types.regions.erased,
                 )
             },
-        ))
+        )).unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Adjusts the closure capture information to ensure that the operations aren't unsafe,

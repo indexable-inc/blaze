@@ -447,7 +447,7 @@ fn univariant_of(
     fields: &[&Layout],
     kind: StructKind,
 ) -> Result<Layout, LayoutError> {
-    let fields: &[&&Layout] = frame.alloc_slice_from_iter(fields.iter());
+    let fields: &[&&Layout] = frame.alloc_slice_from_iter(fields.iter()).unwrap_or_else(|error| panic!("{error}"));
     Ok(cx.calc.layout_of_univariant(
         IndexSlice::<RustcFieldIdx, _>::from_raw(fields),
         &ReprOptions::default(),
@@ -701,8 +701,8 @@ fn layout_of_ty_in(
             let mut prefix =
                 IndexVec::<RustcFieldIdx, _>::with_capacity(upvars.len() + 1 + locals.len());
             prefix.extend(upvars.iter());
-            let locals: &[&Layout] = frame.alloc_slice_from_iter(locals.iter());
-            let locals: &[&&Layout] = frame.alloc_slice_from_iter(locals.iter());
+            let locals: &[&Layout] = frame.alloc_slice_from_iter(locals.iter()).unwrap_or_else(|error| panic!("{error}"));
+            let locals: &[&&Layout] = frame.alloc_slice_from_iter(locals.iter()).unwrap_or_else(|error| panic!("{error}"));
             let locals = IndexSlice::<usize, _>::from_raw(locals);
             // The body has not started, has returned or has panicked, and holds nothing then.
             // alloc: `layout_of_coroutine` takes `IndexVec`s (R-abi lifts this)

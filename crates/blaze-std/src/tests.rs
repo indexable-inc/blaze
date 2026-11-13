@@ -167,7 +167,7 @@ fn control<P: fmt::Debug>(
 
 /// A simulated world of `seed` with `plant`.
 fn world(seed: u64, plant: Plant) -> Io {
-    Io::planted(SimWorld::new(seed, Limits::USUAL), plant)
+    Io::planted(SimWorld::new(seed, Limits::USUAL), plant).expect("a planted world")
 }
 
 /// The root context of `io`.

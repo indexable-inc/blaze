@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use hegel::{TestCase, generators as gs};
 
-use crate::{Region, Tag, racy, tag};
+use crate::{MemError, Region, Tag, racy, tag};
 
 /// The pool's page (`pool::PAGE` in blaze-cas): 64 KiB, a whole number of base pages on every
 /// system blaze runs on.
@@ -191,42 +191,43 @@ fn the_tag_follows_reuses_and_evictions(tc: TestCase) {
 }
 
 #[test]
-#[should_panic(expected = "counted both")]
 fn a_sparse_region_counted_by_its_prefix_refuses_a_range() {
     let region = Region::reserve_sparse(16 * PAGE, Tag::Other).expect("reserve");
     region.ensure(100).expect("commit a prefix");
-    let _ = region.reuse(4 * PAGE, PAGE);
+    let refused = region.reuse(4 * PAGE, PAGE);
+    assert!(matches!(refused, Err(MemError::Mixed { .. })), "counted both: {refused:?}");
 }
 
 #[test]
-#[should_panic(expected = "counted both")]
 fn a_sparse_region_counted_by_ranges_refuses_a_prefix() {
     let region = Region::reserve_sparse(16 * PAGE, Tag::Other).expect("reserve");
     region.reuse(4 * PAGE, PAGE).expect("reuse");
-    let _ = region.ensure(100);
+    let refused = region.ensure(100);
+    assert!(matches!(refused, Err(MemError::Mixed { .. })), "counted both: {refused:?}");
 }
 
 #[test]
-#[should_panic(expected = "must be whole pages")]
 fn a_range_not_of_whole_pages_is_refused() {
     let region = Region::reserve_sparse(16 * PAGE, Tag::Other).expect("reserve");
-    let _ = region.reuse(100, PAGE);
+    let refused = region.reuse(100, PAGE);
+    assert!(matches!(refused, Err(MemError::Range { .. })), "must be whole pages: {refused:?}");
 }
 
 #[test]
-#[should_panic(expected = "never reused")]
 fn evicting_more_than_is_held_is_refused() {
     let region = Region::reserve_sparse(16 * PAGE, Tag::Other).expect("reserve");
     region.reuse(0, PAGE).expect("reuse");
-    // SAFETY: nothing references the region; the call panics before the kernel sees it.
-    let _ = unsafe { region.evict(&[0..2 * PAGE]) };
+    // SAFETY: nothing references the region; the call is refused before the kernel sees it.
+    let refused = unsafe { region.evict(&[0..2 * PAGE]) };
+    assert!(matches!(refused, Err(MemError::Overgiven { .. })), "never reused: {refused:?}");
+    assert_eq!(region.held(), PAGE, "a refused eviction gives nothing back");
 }
 
 #[test]
-#[should_panic(expected = "not sparse")]
 fn evicting_from_a_region_that_is_not_sparse_is_refused() {
     let region = Region::reserve(16 * PAGE, Tag::Other).expect("reserve");
     region.ensure(PAGE).expect("commit");
-    // SAFETY: nothing references the region; the call panics before the kernel sees it.
-    let _ = unsafe { region.evict(&[0..PAGE]) };
+    // SAFETY: nothing references the region; the call is refused before the kernel sees it.
+    let refused = unsafe { region.evict(&[0..PAGE]) };
+    assert!(matches!(refused, Err(MemError::NotSparse { .. })), "not sparse: {refused:?}");
 }

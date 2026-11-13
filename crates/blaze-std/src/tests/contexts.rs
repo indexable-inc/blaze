@@ -59,10 +59,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         let child = match make {
             Make::Until(ms) => parent.until(clock.after(Duration::from_millis(ms))),
             Make::Span => parent.span("child"),
-            Make::Scope => parent.scoped(),
+            Make::Scope => parent.scoped().map_err(|e| format!("harness: {e}"))?,
             Make::Task => {
                 let frame = Frame::with_reserve(FRAME, blaze_mem::Tag::Frames).map_err(|e| format!("harness: {e:?}"))?;
-                parent.task("task", frame)
+                parent.task("task", frame).map_err(|e| format!("harness: {e}"))?
             }
         };
         if child.deadline() > parent.deadline() {
