@@ -6,6 +6,7 @@ use std::num::NonZero;
 use bstd::{
     cx::Cx,
     fs::{Dir, File, Flushed, FsError, ReadWrite, Unsynced, Written},
+    mem::ByteLen,
     path::Path,
 };
 
@@ -15,7 +16,7 @@ pub fn clone_a_flushed_file(cx: &Cx, dir: &Dir<ReadWrite>, flushed: &Flushed, to
 }
 
 /// A buffered writer is finished.
-pub fn finish_a_buffered_writer(cx: &Cx, file: &File<ReadWrite>, capacity: NonZero<usize>) -> Result<usize, FsError> {
+pub fn finish_a_buffered_writer(cx: &Cx, file: &File<ReadWrite>, capacity: NonZero<usize>) -> Result<ByteLen, FsError> {
     let mut writer = file.buffered(cx.frame(), capacity)?;
     let pushed = writer.push(cx, b"abc");
     let finished = writer.finish(cx);
