@@ -9,8 +9,8 @@
 use super::eval::{check_error_with, check_pass_and_stdio};
 use crate::mir_pretty::MirEvalErrorPretty as _;
 
-/// A `check` that does not hold panics, which stops the run with an error. (Not the older
-/// tests' `fn should_not_reach() { _ }`: a call of it runs to the end, see the control below.)
+/// A `check` that does not hold panics, which stops the run with an error; that it can is
+/// held for every fixture (`tests::assertion_helpers`), and the control below runs it.
 const PRE: &str = r#"
 fn check(b: bool) { if !b { panic!("a check did not hold") } }
 "#;

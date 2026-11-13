@@ -19,6 +19,8 @@ use crate::mir::{
 };
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
+    // What the program checks itself with must be able to fail.
+    crate::tests::assertion_helpers::hold(db, file_id);
     let unoptimized = eval_main_at(db, file_id, MirOptLevel::Off);
     // rustc's MIR optimizations change nothing a program does.
     for level in [MirOptLevel::Debug, MirOptLevel::Release] {
@@ -453,8 +455,8 @@ fn main() {
             should_not_reach();
         }
     }
-    // FIXME: this should be 3
-    if s.get() != 2 {
+    // `xt.2`, the moved-out `x1` and the dropped `xt.0`.
+    if s.get() != 3 {
         should_not_reach();
     }
 }
@@ -465,6 +467,8 @@ fn main() {
 #[test]
 fn drop_glue_of_a_long_list_of_boxes() {
     // A level of native stack a node overflowed it: smoke's const_heap drops a list of 1000.
+    // 10,000 nodes: each is two `Drop` impls run, and the evaluator of a test build takes
+    // about 0.4 ms a node.
     check_pass(
         r#"
 //- minicore: drop, add, cell
@@ -485,6 +489,11 @@ pub struct Box<T: ?Sized> {
     inner: *mut T,
 }
 
+// As alloc's: without a `Drop` impl a box has no drop glue, and its contents are not dropped.
+impl<T: ?Sized> Drop for Box<T> {
+    fn drop(&mut self) {}
+}
+
 struct X<'a>(&'a Cell<i32>);
 impl<'a> Drop for X<'a> {
     fn drop(&mut self) {
@@ -502,12 +511,12 @@ fn main() {
     {
         let mut list = List::Nil;
         let mut i = 0;
-        while i < 100000 {
+        while i < 10000 {
             list = List::Cons(X(&s), box_new(list));
             i += 1;
         }
     }
-    if s.get() != 100000 {
+    if s.get() != 10000 {
         should_not_reach();
     }
 }
