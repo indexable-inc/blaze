@@ -83,7 +83,8 @@ for (const [x, y, n] of letters) {
 	if (letterOf[i] === -1) shadowOf[i] = n;
 }
 
-function hash(seed: number, i: number, j: number): number {
+/** A stable number in [0, 1) for a seed and a cell. */
+export function hash(seed: number, i: number, j: number): number {
 	let h = Math.imul(seed + 0x9e3779b9, 0x85ebca6b) ^ Math.imul(i + 0x7f4a7c15, 0xc2b2ae35) ^ Math.imul(j + 0x165667b1, 0x27d4eb2f);
 	h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
 	h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
@@ -91,7 +92,7 @@ function hash(seed: number, i: number, j: number): number {
 }
 
 /** Smooth value noise over (x, k), `sx` and `sk` cells to a lattice step. */
-function noise(seed: number, x: number, k: number, sx: number, sk: number): number {
+export function noise(seed: number, x: number, k: number, sx: number, sk: number): number {
 	const fx = x / sx;
 	const fk = k / sk;
 	const xi = Math.floor(fx);

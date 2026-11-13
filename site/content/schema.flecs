@@ -45,6 +45,22 @@ struct Command(text: string)            // one shell command with a copy button
 struct Art(piece: string, label: string) // an animated drawing (client/art.ts draws `piece`); label is its alt text, never read out
 struct Img(src: string, alt: string, width: i32, height: i32)
 struct Go(label: string, href: string)  // the page's one big button: a link to another page of the site (/start)
+// A race: one edit building under blaze and under cargo, as two lanes of cells on one time scale, each with its time.
+// The times are a measurement, never written in a page: `dir` is the benchmark history (as BenchHistory's), and the
+// build (gen/bench/race.ts) sets Raced from the latest run on `platform` that timed `edit` (body, leaf, ...: a phase
+// of the history) of `project` (`ripgrep/cranelift`) under both; a Race the history cannot answer stops the build.
+// `of` is the blaze the run measured, as docs/benchmarks.md names it (the history does not record it), and the caption
+// says it. `more` is the page with every benchmark, linked from the caption. client/intro.ts runs the lanes in real
+// time; as rendered they stand finished.
+struct Race(dir: string, platform: string, project: string, edit: string, of: string, more: string)
+// What that run measured, set by the build: the two medians in seconds, the edit and the project as /bench words
+// them, the run's day (YYYY-MM-DD), commit and machine, and how many edits each median is over.
+struct Raced(blaze_s: f64, cargo_s: f64, edit: string, project: string, date: string, commit: string, machine: string, runs: i32)
+// A row of chips; a chip is a small link to a lesson, drawn with the lesson's glyph and, when the lesson's theme has a
+// tag (Experimental, Canary), that tag.
+Chips {}
+Chips { (With, flecs.core.OrderedChildren) }
+struct Chip(label: string, href: string)
 
 // Containers: their children are their content, in order.
 struct Section(title: string)           // <section> with an <h2>

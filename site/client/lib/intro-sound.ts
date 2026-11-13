@@ -187,22 +187,38 @@ export function hidden(is: boolean) {
 let knock: Stereo | null = null;
 
 /**
- * The Start button's knock, when the site's sound is on. Call it from a gesture's handler. Says whether it sounded.
+ * Gets the knock ready ahead of `tap`, when the site's sound is on: the context made or resumed and the knock
+ * rendered, which is most of what `tap` would otherwise wait for. Call it from a gesture's handler (a press).
  */
-export function tap(): boolean {
-	if (!enabled()) return false;
+export function ready() {
+	if (!enabled() || !unlock()) return;
+	knock ??= select(SR, 7);
+}
+
+/**
+ * The Start button's knock, when the site's sound is on. Call it from a gesture's handler. Null when nothing will
+ * sound; else a promise of the moment (performance.now) the knock is heard, so the page's exit can start on it. A
+ * context made by this very press takes a moment to run, and the knock is scheduled once it does.
+ */
+export function tap(): Promise<number> | null {
+	if (!enabled()) return null;
 	const o = unlock();
-	if (!o) return false;
+	if (!o) return null;
+	const ctx = o.ctx as AudioContext;
 	try {
 		knock ??= select(SR, 7);
-		const g = o.ctx.createGain();
+		const g = ctx.createGain();
 		g.gain.value = SELECT;
 		g.connect(o.bus);
-		const src = source(o.ctx, knock);
+		const src = source(ctx, knock);
 		src.connect(g);
-		src.start();
-		return true;
+		const start = () => {
+			const at = ctx.currentTime + 0.02;
+			src.start(at);
+			return heardAt(ctx, at);
+		};
+		return ctx.state === 'running' ? Promise.resolve(start()) : ctx.resume().then(start);
 	} catch {
-		return false;
+		return null;
 	}
 }

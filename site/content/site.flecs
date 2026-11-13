@@ -14,8 +14,10 @@ site {
   learn {}
   updates {}
 
-  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line and the way into the course.
-  // No sidebar here, so the last line is the way to the course map and the reference pages.
+  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line, the proof of it, and the way
+  // into the course. No sidebar here, so the last line is the way to the course map and the reference pages.
+  // Everything it claims is a measurement or something built and tested, with its source beside it; what the course
+  // calls experimental says so here too (a Chip takes its lesson's theme's tag).
   index : Page {
     Hero
     Title: {"blaze"}
@@ -23,8 +25,43 @@ site {
     Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
 
     Lede is("Builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+
+    // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
+    // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
+    // 2026-10-22 (commit 2cf189feb6, AWS c7a.48xlarge pinned to 16 cores, median of 5 edits): ripgrep 15.1.0,
+    // `body` (edit one function, then build), blaze 0.069 s, cargo 0.787 s. ripgrep because it is the history's
+    // first project and sits in the middle of that run: across its nine projects the same edit is 6x to 34x faster
+    // under blaze on eight (median 12x), and slower on one, bevy (11.6 s against 3.96 s), which /bench shows.
+    // docs/benchmarks.md says every published number is blaze v1's (2026-10-20 to 10-25) and no run of v2 is published
+    // yet, so `of` says v1 and the caption carries it with the run's day; the commit is in the figure's title.
+    Race race(dir: "docs/benchmarks/history", platform: "Linux x86-64", project: "ripgrep/cranelift", edit: "body", of: "blaze v1", more: "/bench")
+
     Go start(label: "Start the course", href: "/start")
-    Dim more("[Course map](/learn) · [Install](/install) · [Benchmarks](/bench) · [GitHub](https://github.com/indexable-inc/blaze)")
+
+    Chips built {
+      // Build scripts run in blaze's sandbox, no network and no writes outside their own folder: the hermetic lesson's
+      // "already run in a sandbox"; crates/blaze-cargo/src/sandbox.rs, and its Linux test
+      // `a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing` (sandbox/linux.rs). Proc macros run as
+      // wasm32-wasip1 modules under Wasmtime (crates/blaze-macro-eval/src/wasm.rs and wasm/tests.rs; docs/cargo.md,
+      // "Every build runs its proc macros as wasm32-wasip1 modules under Wasmtime").
+      Chip sandbox(label: "Sandboxed build scripts, proc macros", href: "/learn/hermetic")
+      // The effects lint (crates/blaze-lints/src/blaze/effects.rs, effects_tests.rs: `noalloc_refuses_the_global_allocator`
+      // and 18 more) and the linear checker (crates/hir-ty-linear, 40 tests:
+      // `a_value_left_at_the_end_of_its_scope_is_an_error`). Their designs are still `status: plan`; the lesson is in the
+      // experimental band, so the chip says Experimental.
+      Chip effects(label: "Effects and linear types", href: "/learn/extensions")
+      // lean/theorems.json lists 90 theorems; the `lean` job of .github/workflows/blaze.yaml builds them, refuses
+      // `sorry` and checks each one's axioms (harness/v2/lean_gate.py). They prove Lean models of about 13 MIR passes;
+      // only two of the Rust passes are tied to their model so far (lean/BlazeValidated/passes.lean), so the chip does
+      // not say the compiler's passes are proved. Experimental, by its lesson's band.
+      Chip proofs(label: "Lean proofs, checked in CI", href: "/learn/proofs")
+      // bstd is crates/blaze-std; its `#[bstd::test]` runs a test under 256 seeds with failed effects and power cuts
+      // (src/tests/simtest.rs `the_default_seeds_inject_and_the_counter_passes`, which asserts all three), with a
+      // planted-bug control beside it. Experimental, by its lesson's band.
+      Chip sim(label: "Simulation tests in bstd", href: "/learn/bstd")
+    }
+
+    Dim more("[Course map](/learn) · [Install](/install) · [GitHub](https://github.com/indexable-inc/blaze)")
   }
 
   // Lesson 1: what blaze is, installing it, the first build and the commands you will type.
