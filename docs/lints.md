@@ -952,6 +952,11 @@ method of an impl of a trait so marked, that may, through any call:
   and the toolchain is trusted for `unsafe`. Calling the `unsafe fn` yourself
   (`unchecked_add`, `NonNull::new_unchecked`, `hint::assert_unchecked`) still counts: the
   precondition is yours to uphold, and the finding names the call.
+  A check blaze proves holds where it is, and a call of `unwrap`, `expect` or a slice's or
+  `Vec`'s index it proves cannot panic there, is not one either (the same proof
+  [`unreachable`](#unreachable) uses: `v[i]` under `if i < v.len()` or in
+  `for i in 0..v.len()`, `o.unwrap()` under `if o.is_some()` or `if let Some(_) = o`, `a / b`
+  under `if b != 0`).
 - `noalloc`: call the global allocator (`Vec::new`, `Box::new`, `to_owned`, `malloc`). An
   allocator the code names (`Vec::new_in(frame)`) is allowed.
 - `nonblocking`: block the thread: std's and `parking_lot`'s locks, condvars and channels,
@@ -1172,9 +1177,61 @@ part. To keep a check that should only run outside unwinding, guard it with
 `if !std::thread::panicking() { .. }`.
 
 **Not found.** Panics in functions `drop` calls (only its own body is read), and arithmetic
-overflow. A `drop` that calls `std::thread::panicking()` anywhere is not checked.
+overflow. A `drop` that calls `std::thread::panicking()` anywhere is not checked. A site blaze
+proves cannot fail where it is (an index under `if i < v.len()`, an `unwrap` under
+`if o.is_some()`, a division under `if b != 0`: see [`unreachable`](#unreachable)) is not
+counted, here or in `unwind_across_ffi`.
 
 **Allowing it.** `#[expect(blaze::panic_in_drop, reason = "..")]` on the `drop` function.
+
+## `unreachable`
+
+**What it catches.** A `blaze::unreachable!()` (a blaze extension, opt-in:
+[the design](v2/plan/design/proved-unreachable.md)) that blaze cannot prove no path reaches.
+An error that no level waives: it fires only where the code wrote the macro. The finding is at
+the site and names the function and what could not be shown:
+
+```text
+error: `get`: can't prove this `blaze::unreachable!()` is never reached: can't show `i < v.len()` here: no check before this branch rules the path out
+```
+
+**What blaze proves.** One pass over the function's own MIR, before any optimization, so the
+answer is the same in every profile. It follows the checks that dominate the site: a `match`,
+`if let`, `is_some`/`is_none`/`is_ok`/`is_err` (the variant is known after), a comparison with
+`len()` or `is_empty()` of a slice, `str`, `Vec` or `String`, `for i in 0..v.len()`, a
+comparison with zero or a `NonZero`'s `get()`, comparisons of integers with constants, and
+code after an expression that never returns. It forgets what it knew of a value when the value
+is reassigned, and of what a `&mut` leads to at every call and write through a pointer. It
+does not follow arithmetic (`v[len - 1]`) or what a function of your own returns.
+
+**How to fix it.** Add the check that rules the path out so that it dominates the site. Where
+blaze cannot prove it, return a `Result`, or write core's `unreachable!()`, the promise blaze
+does not check, which counts as a panic site (`nopanic`, `panic_in_drop`).
+
+**At run time** the macro is a panic, like `unreachable!()`, never undefined behaviour:
+defence in depth for code whose lints were not run.
+
+**Allowing it.** It can't be. `#[allow(blaze::unreachable)]`, `#[expect(..)]` and `#[warn(..)]`
+are each an error at the attribute; a flag or a line of a manifest's lint table
+(`[lints]`, `[workspace.metadata.blaze.lints]`, its ratchet, a baseline) that sets it below
+`deny` refuses the check, naming the lint; `--cap-lints`, `warnings` and a group that covers
+it do not reach it.
+
+## `todo`
+
+**What it catches.** A `todo!()` in code that is not a test (`#[test]`, `#[cfg(test)]`): a
+hole, as in Agda and Haskell. The finding names the function, the type the expression must
+have there and the bindings in scope that have that type:
+
+```text
+warning: `todo!()` in `open`: needs `Result<Dir, FsError>`; in scope: `cached`
+```
+
+**Levels.** `warn` in every local build, dev and release alike. The merge gate and a build
+for a release deny it (`--deny blaze::todo`), so a hole never lands or ships. The prover
+behind [`unreachable`](#unreachable) never discharges a `todo!()`: it is unfinished, not dead.
+
+**Allowing it.** `#[expect(blaze::todo, reason = "..")]` on the function.
 
 ## `pod_serialized_by_field`
 

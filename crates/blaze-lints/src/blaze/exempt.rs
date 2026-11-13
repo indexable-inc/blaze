@@ -111,6 +111,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::PodSerializedByField
         | Lint::Checkfree
         | Lint::Nopanic
+        | Lint::Unreachable
+        | Lint::Todo
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
