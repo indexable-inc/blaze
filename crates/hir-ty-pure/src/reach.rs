@@ -382,6 +382,8 @@ struct Solver<'a, 'db> {
     names: HashMap<TermId, u32, Global>,
     /// The locals a binding of the source names.
     named: Vec<bool>,
+    /// The enum each discriminant term is of, for messages.
+    enums: HashMap<TermId, hir_def::EnumId, Global>,
     variants: Vec<EnumVariantId>,
     models: HashMap<hir_def::FunctionId, Option<Model>, Global>,
     /// The locals whose address a `&mut` or a raw pointer took.
@@ -441,6 +443,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             ranges: Vec::new(), // alloc: one range per term
             names: HashMap::new_in(Global),
             named: Vec::new(),
+            enums: HashMap::new_in(Global),
             variants: Vec::new(), // alloc: the variants the body names, few
             models: HashMap::new_in(Global),
             exposed: Vec::new(),
@@ -512,7 +515,14 @@ impl<'a, 'db> Solver<'a, 'db> {
             return self.constant(value);
         }
         let range = ty.and_then(|ty| models::discriminants(self.db, ty)).unwrap_or(ANY);
-        self.term(Term::Discr(of), range)
+        let term = self.term(Term::Discr(of), range);
+        if let Some(ty) = ty
+            && let TyKind::Adt(def, _) = ty.kind()
+            && let hir_def::AdtId::EnumId(it) = def.def_id()
+        {
+            self.enums.insert(term, it);
+        }
+        term
     }
 
     fn field(&mut self, of: TermId, field: u32) -> TermId {
@@ -1682,6 +1692,22 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let inner = Atom { rel: *rel, a: *a, b: *b };
                 let truth = (atom.rel == Rel::Eq) == (value == 1);
                 return self.said_atom(if truth { inner } else { inner.not() });
+            }
+        }
+        // A discriminant compared with a variant's value is the value being that variant.
+        for (term, other) in [(atom.a, atom.b), (atom.b, atom.a)] {
+            if let (Term::Discr(of), Some(value)) =
+                (&self.terms[term as usize], self.const_of(other))
+                && matches!(atom.rel, Rel::Eq | Rel::Ne)
+                && let Some(enum_) = self.enums.get(&term)
+            {
+                let variant = enum_.enum_variants(self.db).variants.iter().find(|(_, it)| {
+                    self.db.const_eval_discriminant(it.0).ok() == Some(value)
+                });
+                let (name, _) = variant?;
+                let is = if atom.rel == Rel::Eq { "is" } else { "is not" };
+                // alloc: a message's part
+                return Some(format!("{} {is} {}", self.said(*of)?, name.as_str()));
             }
         }
         let sign = match atom.rel {
