@@ -193,6 +193,11 @@ proc_macro = "deny"
 # decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
 # yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
 std_use = "deny"
+# Arithmetic whose meaning is the profile's (docs/lints.md#implicit_overflow,
+# docs/v2/plan/design/explicit-overflow.md), in `edition` above: crates opt in at their root
+# (`#![deny(blaze::implicit_overflow)]`), `blaze-std` and `blaze-mem` first, once a stage-0
+# release knows the lint; the rest of the tree has not said what its overflow means yet.
+implicit_overflow = "allow"
 # A `todo!()` outside test code is a typed hole (docs/v2/plan/design/proved-unreachable.md,
 # "`blaze::todo`: typed holes"), in `general` above and named here: a warning in a local check,
 # so code checks while a hole in it is still open. The merge gate denies it on its command

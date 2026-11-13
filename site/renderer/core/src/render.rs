@@ -243,6 +243,7 @@ fn highlighted(e: &Entity) -> Option<String> {
 const ELEMENTS: &[&str] = &[
     "Lede", "P", "Dim", "H3", "Li", "Code", "Command", "Img", "Art", "Section", "Issue", "Goal", "Step", "Quiz",
     "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table", "Go",
+    "Race", "Chips", "Chip",
 ];
 
 fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
@@ -440,6 +441,24 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
     if e.has("Go") {
         return go(n, ctx);
     }
+    if e.has("Race") {
+        return race(n, ctx);
+    }
+    if e.has_tag("Chips") {
+        // A row of small links; every child is a Chip.
+        let kids: Vec<Id> = e.children.clone();
+        let mut items = String::new();
+        for c in kids {
+            if !ctx.e(c).has("Chip") {
+                return Err(format!("{}: a Chips' children are Chips", ctx.e(c).path));
+            }
+            items += &format!("<li>{}</li>", chip(c, ctx)?);
+        }
+        return Ok(format!("<ul class=\"chips\">{items}</ul>"));
+    }
+    if e.has("Chip") {
+        return Err(format!("{}: a Chip belongs in a Chips", e.path));
+    }
     if e.has_tag("Ul") || e.has_tag("Ol") {
         let t = if e.has_tag("Ul") { "ul" } else { "ol" };
         return Ok(format!("<{t}>\n{}\n</{t}>", children(n, ctx)?));
@@ -488,6 +507,131 @@ fn go(n: Id, ctx: &Ctx) -> Result<String, String> {
     Ok(format!(
         "<p class=\"go\"><a href=\"{}\"{lesson}>{}</a></p>",
         esc(&ctx.s.served.href(&to.url)),
+        esc(&label)
+    ))
+}
+
+/// A time as a Race writes it: whole milliseconds under a second, else seconds to two places.
+fn took(seconds: f64) -> (String, &'static str) {
+    let ms = (seconds * 1000.0).round();
+    if ms < 1000.0 { (js::number(ms), "ms") } else { (format!("{seconds:.2}"), "s") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::took;
+
+    #[test]
+    fn a_race_writes_milliseconds_under_a_second_and_seconds_from_it() {
+        assert_eq!(took(0.069), ("69".to_string(), "ms"));
+        assert_eq!(took(0.787), ("787".to_string(), "ms"));
+        // 999.6 ms rounds to a second, so it is written as one.
+        assert_eq!(took(0.9996), ("1.00".to_string(), "s"));
+        assert_eq!(took(11.6), ("11.60".to_string(), "s"));
+    }
+}
+
+/// A race: blaze and cargo building the same edit, as two terminals side by side, each typing its command and
+/// printing what the tool prints, with a clock. The times are the build's (`Raced`, from the benchmark history:
+/// gen/bench/race.ts). The caption is one line, the edit and the project, linking to every benchmark; which run it was
+/// (the blaze, the platform, the day, the machine, the commit and the number of edits) is in its title and on that
+/// page. As rendered both terminals stand finished; client/intro.ts runs them in real time from `data-blaze-ms` and
+/// `data-cargo-ms`. The `Finished` line is cargo's own wording, which blaze prints too (blaze-thin's answer.rs).
+fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let path = &e.path;
+    let ask = e.value("Race");
+    let raced = e
+        .value("Raced")
+        .ok_or_else(|| format!("{path}: the Race has no times (the build sets them: run the build)"))?;
+    let (blaze, cargo) = (js::to_number(raced.get("blaze_s")), js::to_number(raced.get("cargo_s")));
+    if !(blaze.is_finite() && cargo.is_finite() && blaze > 0.0 && cargo > 0.0) {
+        return Err(format!("{path}: a Race's times are seconds above zero, not {blaze} and {cargo}"));
+    }
+    let of = field(ask, "of");
+    if of.is_empty() {
+        return Err(format!("{path}: a Race says which blaze its run measured (`of`, \"blaze v1\")"));
+    }
+    let more = field(ask, "more");
+    let to = ctx
+        .s
+        .pages
+        .iter()
+        .find(|p| p.url == more)
+        .ok_or_else(|| format!("{path}: Race more {more:?} is not a page of the site (/bench)"))?;
+    let project = field(Some(raced), "project");
+    let term = |who: &str, seconds: f64, compiling: bool| {
+        let (t, unit) = took(seconds);
+        // cargo's progress bar while it works (cargo clears it when done, so as rendered it is hidden); blaze is done
+        // before a bar would show.
+        let compiling = if compiling {
+            "<span class=\"out run\" hidden>\n<b class=\"st cy\">    Building</b> <span class=\"fill\"></span><span class=\"rest\"></span></span>".to_string()
+        } else {
+            String::new()
+        };
+        format!(
+            "<div class=\"term {who}\"><div class=\"bar\"><span class=\"who\">{who}</span><span class=\"took\"><b>{t}</b> {unit}</span></div><pre><span class=\"line\"><span class=\"ps\">$ </span><span class=\"typed\">{who} build</span><span class=\"caret\"></span></span>{compiling}<span class=\"out\" data-at=\"end\">\n<b class=\"st\">    Finished</b> `dev` profile [unoptimized + debuginfo] target(s) in {seconds:.2}s</span></pre></div>"
+        )
+    };
+    let commit = field(Some(raced), "commit");
+    let runs = js::to_number(raced.get("runs"));
+    let mut how = vec![
+        format!("{} on {}", of, field(ask, "platform")),
+        field(Some(raced), "date"),
+        field(Some(raced), "machine"),
+    ];
+    if !commit.is_empty() {
+        how.push(format!("blaze {}", js::slice_utf16(&commit, 10)));
+    }
+    if runs >= 1.0 {
+        how.push(format!("median of {} edits", js::number(runs)));
+    }
+    how.retain(|h| !h.is_empty());
+    Ok(format!(
+        "<figure class=\"race\" data-blaze-ms=\"{}\" data-cargo-ms=\"{}\" title=\"{}\"><div class=\"terms\">{}{}</div><figcaption><a href=\"{}\">{} in {}, then build</a></figcaption></figure>",
+        js::number((blaze * 1000.0).round()),
+        js::number((cargo * 1000.0).round()),
+        esc(&how.join(", ")),
+        term("blaze", blaze, false),
+        term("cargo", cargo, true),
+        esc(&ctx.s.served.href(&to.url)),
+        esc(&field(Some(raced), "edit")),
+        esc(&project),
+    ))
+}
+
+/// A chip: a small link to a lesson, with the lesson's glyph and, when the lesson's band of the course carries a tag
+/// (Experimental, Canary), that tag, so the page cannot call finished what the course calls unsettled.
+fn chip(n: Id, ctx: &Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let path = &e.path;
+    let (label, href) = (field(e.value("Chip"), "label"), field(e.value("Chip"), "href"));
+    if label.is_empty() {
+        return Err(format!("{path}: a Chip needs a label"));
+    }
+    let to = ctx
+        .s
+        .pages
+        .iter()
+        .find(|p| p.url == href)
+        .ok_or_else(|| format!("{path}: Chip {href:?} is not a page of the site (/learn/proofs)"))?;
+    let target = ctx.e(to.node);
+    let on_course = match target.parent {
+        Some(parent) if target.has("Lesson") => ctx.s.world.course_of(ctx.s.pages, parent)?,
+        _ => None,
+    };
+    let (_, c) = on_course.ok_or_else(|| format!("{path}: Chip {href:?} is not a lesson on a course"))?;
+    let node = c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
+    let theme = &c.themes[node.theme];
+    let tag = if theme.tag.is_empty() {
+        String::new()
+    } else {
+        format!("<span class=\"tag\">{}</span>", esc(&theme.tag))
+    };
+    Ok(format!(
+        "<a class=\"chip\" href=\"{}\"><span class=\"chip-glyph\" aria-hidden=\"true\">{}</span><span class=\"chip-t\">{}</span>{tag}</a>",
+        esc(&ctx.s.served.href(&to.url)),
+        glyph(ctx, to.node)?,
         esc(&label)
     ))
 }

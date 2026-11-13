@@ -141,6 +141,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::DefaultHasher
         // The edition's lints name a construct the edition removes, not a cost on a line.
         | Lint::LossyAs
+        | Lint::ImplicitOverflow
         | Lint::GlobalState
         | Lint::AsyncFn
         | Lint::MutRef

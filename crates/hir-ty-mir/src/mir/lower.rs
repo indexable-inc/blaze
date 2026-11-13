@@ -2470,7 +2470,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Underscore => Ok(Some(current)),
+            // `_` is an expression only where a value is asked of it (as the left of an
+            // assignment it is a wildcard pattern, `ExprCollector::collect_pat_from_expr`):
+            // a typed hole, which type checking reports and nothing can run. Lowered to
+            // nothing it ran, with whatever was in its place before.
+            Expr::Underscore => Err(MirLowerError::TypeError("a typed hole (`_`) has no value")),
             Expr::IncludeBytes => not_supported!("include_bytes!()"),
         }
     }

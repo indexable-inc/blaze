@@ -58,6 +58,7 @@
 //!     int_impl: size_of, transmute
 //!     num_methods:
 //!     int_wrapping:
+//!     int_overflow: non_zero, from, result, option, iterator
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -491,7 +492,8 @@ pub mod convert {
     }
     // endregion:as_mut
     // region:infallible
-    pub enum Infallible {}
+    // An alias of `!`, as in core since Rust 1.100.
+    pub type Infallible = !;
     // endregion:infallible
 }
 
@@ -2268,6 +2270,15 @@ pub mod iter {
                 {
                     self
                 }
+                // region:int_overflow
+                fn sum<S>(self) -> S
+                where
+                    Self: Sized,
+                    S: crate::iter::Sum<Self::Item>,
+                {
+                    loop {}
+                }
+                // endregion:int_overflow
                 // region:ord
                 fn min(self) -> Option<Self::Item>
                 where
@@ -2428,6 +2439,16 @@ pub mod iter {
         pub use self::collect::{FromIterator, IntoIterator, Iter};
     }
     pub use self::traits::{FromIterator, IntoIterator, Iterator};
+    // region:int_overflow
+    pub trait Sum<A = Self>: Sized {
+        fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
+    impl Sum for u32 {
+        fn sum<I: Iterator<Item = u32>>(_iter: I) -> u32 {
+            loop {}
+        }
+    }
+    // endregion:int_overflow
     pub(crate) use self::traits::Iter;
 }
 // endregion:iterator
@@ -2877,6 +2898,32 @@ pub mod num {
         }
     }
     // endregion:reach
+
+    // region:int_overflow
+    pub struct TryFromIntError(pub(crate) ());
+
+    macro_rules! impl_try_from_int {
+        ($($from:ty => $($to:ty)*;)*) => {
+            $($(
+                impl crate::convert::TryFrom<$from> for $to {
+                    type Error = TryFromIntError;
+                    fn try_from(_value: $from) -> crate::result::Result<$to, TryFromIntError> {
+                        loop {}
+                    }
+                }
+            )*)*
+        }
+    }
+
+    impl_try_from_int! {
+        u64 => u8 u16 u32 i8 i16 i32 i64 usize isize;
+        u32 => u8 u16 i8 i16 i32;
+        usize => u8 u16 u32 i8 i16 i32 i64 isize;
+        i64 => u8 u16 u32 u64 i8 i16 i32 usize isize;
+        i32 => u8 u16 u32 u64 i8 i16 usize;
+        isize => u8 u16 u32 u64 i8 i16 i32 usize;
+    }
+    // endregion:int_overflow
 }
 // endregion:non_zero
 
@@ -2942,6 +2989,63 @@ impl_int_wrapping! {
     isize i8 i16 i32 i64 i128
 }
 // endregion:int_wrapping
+
+// region:int_overflow
+macro_rules! impl_int_overflow {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn checked_add(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_sub(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_mul(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_neg(self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_shl(self, _rhs: u32) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_shr(self, _rhs: u32) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn overflowing_add(self, _rhs: Self) -> (Self, bool) {
+                    loop {}
+                }
+                pub const fn strict_add(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn pow(self, _exp: u32) -> Self {
+                    loop {}
+                }
+            }
+        )*
+    }
+}
+
+impl_int_overflow! {
+    usize u8 u16 u32 u64 u128
+    isize i8 i16 i32 i64 i128
+}
+
+macro_rules! impl_int_abs {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn abs(self) -> Self {
+                    loop {}
+                }
+            }
+        )*
+    }
+}
+
+impl_int_abs! { isize i8 i16 i32 i64 i128 }
+// endregion:int_overflow
 
 // region:int_bounds
 macro_rules! impl_int_bounds {
@@ -3282,6 +3386,7 @@ pub mod prelude {
 
     pub mod rust_2024 {
         pub use super::v1::*;
+        pub use crate::future::{Future, IntoFuture};    // :future
     }
 }
 

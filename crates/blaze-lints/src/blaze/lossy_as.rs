@@ -19,7 +19,9 @@
 //! `bool as u8`, `u8 as char`, `f32 as f64`, pointer to pointer, a fieldless enum to its
 //! integer); an operand whose value is known and fits the target, an integer literal (`-1 as
 //! i64`, `255 as u8`) or a `const` with no generics that evaluates (`LEN as u32`, in a const
-//! context or not); a cast a macro wrote. There is no fix: each loss has its own conversion,
+//! context or not); a cast a macro wrote; where `implicit_overflow` is on, a cast that can
+//! lose an integer's value (to a narrower integer, between signed and unsigned, a float to an
+//! integer), which that lint judges with the prover. There is no fix: each loss has its own conversion,
 //! which the note names.
 
 use hir::HirDisplay as _;
@@ -46,7 +48,7 @@ const CHAR_BITS: u64 = 21;
 
 /// How wide an integer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Width {
+pub(super) enum Width {
     Fixed(u64),
     /// `usize` or `isize`: the target's pointer width, 32 to 64 bits.
     Pointer,
@@ -72,7 +74,7 @@ impl Width {
 
 /// What a cast's operand or target is, as far as what a cast loses goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Int { signed: bool, width: Width },
     /// A float of this many bits.
     Float(u64),
@@ -83,7 +85,7 @@ enum Kind {
 }
 
 impl Kind {
-    fn of(ty: Ty<'_>) -> Option<Kind> {
+    pub(super) fn of(ty: Ty<'_>) -> Option<Kind> {
         Some(match ty.kind() {
             TyKind::Int(it) => Kind::Int { signed: true, width: int_width(it) },
             TyKind::Uint(it) => Kind::Int { signed: false, width: uint_width(it) },
@@ -121,7 +123,7 @@ fn mantissa(bits: u64) -> u64 {
 
 /// What a cast can lose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Loss {
+pub(super) enum Loss {
     /// An integer to a narrower one of the same signedness, or an unsigned one to a narrower
     /// signed one.
     HighBits,
@@ -145,7 +147,7 @@ enum Loss {
 }
 
 /// What casting a `from` to a `to` can lose; `None` when every value survives.
-fn loss(from: Kind, to: Kind) -> Option<Loss> {
+pub(super) fn loss(from: Kind, to: Kind) -> Option<Loss> {
     let same_width = |a: Width, b: Width| a == b;
     match (from, to) {
         (Kind::Pointer, Kind::Int { .. }) => Some(Loss::Address),
@@ -178,6 +180,13 @@ fn loss(from: Kind, to: Kind) -> Option<Loss> {
 }
 
 impl Loss {
+    /// Whether it is a loss of an integer's value, which `implicit_overflow` judges where it
+    /// is on: a cast to a narrower integer, between signed and unsigned, or of a float to an
+    /// integer.
+    pub(super) fn of_value(self) -> bool {
+        matches!(self, Loss::HighBits | Loss::Sign { .. } | Loss::Wrap { .. } | Loss::Fraction)
+    }
+
     /// What the cast does to a value it loses, after "which": `to` the target as shown.
     fn said(self, to: &str) -> String {
         // alloc: a finding's message part
@@ -272,6 +281,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let infer = analysis.infer();
     let file = analysis.tree().1;
     let target = cx.krate().to_display_target(db);
+    // `implicit_overflow` judges the casts that can lose an integer's value, with the prover.
+    let yields = cx.on_blaze(Lint::ImplicitOverflow);
     for (id, expr) in body.exprs() {
         let Expr::Cast { expr: operand, .. } = expr else { continue };
         let (from_ty, to_ty) = (infer.expr_ty(operand), infer.expr_ty(id));
@@ -280,6 +291,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         }
         let (Some(from), Some(to)) = (Kind::of(from_ty), Kind::of(to_ty)) else { continue };
         let Some(lost) = loss(from, to) else { continue };
+        if yields && lost.of_value() {
+            continue;
+        }
         if known(cx, def, body, operand, from).is_some_and(|value| fits(value, to)) {
             continue;
         }
@@ -301,7 +315,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// The value of the integer `operand`, of kind `from`, when it is known without running the
 /// code: an integer literal, maybe negated, or a `const` with no generics that evaluates.
-fn known(
+pub(super) fn known(
     cx: &Cx<'_, '_>,
     def: DefWithBodyId,
     body: &Body,
@@ -343,7 +357,7 @@ fn literal_value(literal: &Literal) -> Option<i128> {
 }
 
 /// Whether `value` survives a cast to `to`, on every pointer width.
-fn fits(value: i128, to: Kind) -> bool {
+pub(super) fn fits(value: i128, to: Kind) -> bool {
     match to {
         Kind::Int { signed, width } => {
             let bits = width.least();

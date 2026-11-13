@@ -54,6 +54,7 @@ site {
     hermetic {}
     sharing {}
     const_exprs {}
+    comptime {}
     extensions {}
     bstd {}
     proofs {}

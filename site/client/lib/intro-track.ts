@@ -205,13 +205,16 @@ export function reverb(input: Float32Array, sr: number): Stereo {
 
 /**
  * The Start button's sound, anim's "an answer confirmed": a thock for the press and two mallet notes a fifth apart
- * (A5, E6: the key the letters land in), in the soundtrack's room. Short enough to render where it is played.
+ * (A5, E6: the key the letters land in), in the soundtrack's room. The press also sets the page alight
+ * (client/lib/burn.ts), so under the notes is the flare anim's burn-out opens with: a breath of noise that brightens
+ * and closes as the fire crosses the page. Short enough to render where it is played.
  */
 export function select(sr: number, seed: number): Stereo {
 	const tr = new Track(sr, 1.6, new Rng(seed, 'select'));
 	thock(tr, 0, 0.8, 150, 0);
 	mallet(tr, 0, 880, 0.07, 1, -0.15);
 	mallet(tr, 0.07, 1318.51, 0.05, 0.9, 0.15);
+	whoosh(tr, 0, 0.7, 0.05, -0.2, 0.2, (p) => 500 + 3500 * sin(PI * p));
 	const wet = reverb(tr.send, sr);
 	for (let i = 0; i < tr.l.length; i++) {
 		tr.l[i] += 0.5 * wet.l[i]!;

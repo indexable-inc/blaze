@@ -29,6 +29,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statS
 import path from 'node:path';
 import { buildGraphPage } from '../graph/build';
 import { benchScript } from './bench';
+import { raceScript } from './bench/race';
 import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
 import { Site, snapshot, type Page, type SnapshotInput } from './site-wasm';
@@ -52,15 +53,21 @@ const entityOf = (p: Page) => (p.url === '/' ? 'site.index' : `site${p.url.repla
 
 /**
  * The scripts the content asks the build to write, run after it: for each `BenchHistory {dir}`, the charts of the
- * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/).
+ * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/); for each
+ * `Race`, the two times it asks that history for, as its `Raced` (gen/bench/race.ts).
  */
 function generated(all: Map<string, Node>): { name: string; code: string }[] {
 	const out: { name: string; code: string }[] = [];
+	const historyDir = (dir: unknown) => (process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(dir ?? '')));
 	for (const n of all.values()) {
 		const h = n.values.get('BenchHistory');
-		if (!h) continue;
-		const dir = process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(h.dir ?? ''));
-		out.push({ name: `${n.path} (generated)`, code: benchScript(dir, n.path) });
+		if (h) out.push({ name: `${n.path} (generated)`, code: benchScript(historyDir(h.dir), n.path) });
+		// A Race's two times, from the same history: the latest run that timed its edit under blaze and cargo.
+		const r = n.values.get('Race');
+		if (r) {
+			const ask = { dir: String(r.dir ?? ''), platform: String(r.platform ?? ''), project: String(r.project ?? ''), edit: String(r.edit ?? '') };
+			out.push({ name: `${n.path} (generated)`, code: raceScript(historyDir(r.dir), n.path, ask) });
+		}
 	}
 	return out;
 }

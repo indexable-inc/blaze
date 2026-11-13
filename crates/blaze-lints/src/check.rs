@@ -1056,6 +1056,32 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.range(node)
     }
 
+    /// Where `range` of `file` (the walked file or an expansion) is written in the tree of
+    /// [`Cx::text`]: `None` for what a macro made up, or a range of another file. An argument
+    /// of a macro call is written where the call is, so a lint of expressions reaches it: the
+    /// invisible group a `$e:expr` fragment is spliced in, whose tokens carry the macro's
+    /// spans, is trimmed off its ends first.
+    pub(crate) fn written_range(&self, file: HirFileId, range: TextRange) -> Option<TextRange> {
+        let HirFileId::MacroFile(call) = file else { return Some(range) };
+        let map = &call.parse_macro_expansion(self.db).value.1;
+        // alloc: the spans of one expression of an expansion, few
+        let spans: Vec<_> = map.spans_for_range(range).collect();
+        let written = |span: &span::Span| span.ctx.is_root();
+        let start = spans.iter().position(written)?;
+        let end = spans.iter().rposition(written)?;
+        let inner = &spans[start..=end];
+        let first = inner[0];
+        if inner.iter().any(|it| it.anchor != first.anchor || it.ctx != first.ctx)
+            || first.anchor.file_id != self.base.file.span_file_id(self.db)
+        {
+            return None;
+        }
+        let low = inner.iter().map(|it| it.range.start()).min()?;
+        let high = inner.iter().map(|it| it.range.end()).max()?;
+        let anchor = self.base.ast_id_map.try_get_erased(first.anchor.ast_id)?;
+        Some(TextRange::new(low, high) + anchor.text_range().start())
+    }
+
     /// Where `token`, of the tree walked or of an expansion, is written in the tree of
     /// [`Cx::text`]; `None` for one a macro made up.
     pub(crate) fn token_range(&self, token: ast::Token<'_>) -> Option<TextRange> {

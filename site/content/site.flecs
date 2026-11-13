@@ -14,17 +14,28 @@ site {
   learn {}
   updates {}
 
-  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line and the way into the course.
-  // No sidebar here, so the last line is the way to the course map and the reference pages.
+  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line, the proof of it, and the way
+  // into the course, and as little text as that takes (Andrew, 2026-11-12: "less text and more clear it is an
+  // alternative to cargo build"). No sidebar here, so the last line is the way to the course map and the reference pages.
   index : Page {
     Hero
     Title: {"blaze"}
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
-    Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
+    Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
 
-    Lede is("Builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+    // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
+    // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
+    // 2026-10-22 (commit 2cf189feb6, AWS c7a.48xlarge pinned to 16 cores, median of 5 edits): helix 25.07.1 with
+    // LLVM, `body` (edit one function, then build), blaze 0.110 s, cargo 3.084 s. helix because its wait is long enough
+    // to see in real time (Andrew, 2026-11-12: ripgrep's 69 ms against 787 ms was "too fast to really see"); LLVM
+    // because it is cargo's default. Across that run's nine projects the same edit is 6x to 34x faster under blaze on
+    // eight, and slower on one, bevy (11.2 s against 3.8 s), which /bench shows. docs/benchmarks.md says every
+    // published number is blaze v1's, so `of` says v1; it and the run's day are in the figure's title.
+    Race race(dir: "docs/benchmarks/history", platform: "Linux x86-64", project: "helix/llvm", edit: "body", of: "blaze v1", more: "/bench")
+
     Go start(label: "Start the course", href: "/start")
-    Dim more("[Course map](/learn) · [Install](/install) · [Benchmarks](/bench) · [GitHub](https://github.com/indexable-inc/blaze)")
+
+    Dim more("[Course map](/learn) · [Install](/install) · [GitHub](https://github.com/indexable-inc/blaze)")
   }
 
   // Lesson 1: what blaze is, installing it, the first build and the commands you will type.
@@ -36,7 +47,7 @@ site {
     Description: {"What blaze is, how to install it, and your first build: the first lesson of the course, a few minutes long."}
 
     Step what("Rust, rebuilt in milliseconds") {
-      Lede is("**blaze** builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+      Lede is("`blaze build` builds Rust. Edits rebuild in milliseconds.")
       Art art(piece: "incremental", label: "A lattice of functions. One changes, and only it and the few that depend on it light up and settle.")
       Dim course("A short course, one idea per screen. Press **Continue** or →.")
     }

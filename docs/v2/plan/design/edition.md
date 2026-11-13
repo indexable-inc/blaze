@@ -153,6 +153,7 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 | removed | instead |
 |---|---|
 | lossy `as` casts (truncating, sign-changing, float to int, pointer to int) | `From`, `TryFrom`, the named methods (`wrapping_`, `cast_signed`), `ptr::addr` |
+| integer arithmetic whose overflow is the profile's (`+ - * << >>`, unary `-`) where blaze can't show it fits | `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*`, or a check that bounds it ([explicit-overflow](explicit-overflow.md)) |
 | `async` and `await` | fibers and the inferred may-suspend effect |
 | the ambient file, clock, network, environment, process and thread APIs | capabilities of [bstd](std.md) |
 | the global allocator | an allocator the code was handed |
@@ -174,6 +175,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | lint | flags | fix |
 |---|---|---|
 | `blaze::lossy_as` | an `as` cast that can lose value or sign, or goes between pointer and integer | `T::from(x)` when lossless; else suggests `try_from` or the named method |
+| `blaze::implicit_overflow` | integer `+ - * << >>`, unary `-`, compound forms and value-losing casts the prover can't show fit; `strict_*`, `pow`, `abs`, `sum` | `checked_*` with `?` and `try_from` in an `Option` function, `try_from(x)?` where the error takes `TryFromIntError` |
 | `blaze::global_state` | a `static mut`, a `static` whose type has interior mutability (an atomic, a lock, a cell), a `thread_local!` | none: says where the state is used, so its owner can be chosen |
 | `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until fibers are the runtime of the crate |
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |

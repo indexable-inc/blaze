@@ -232,6 +232,12 @@
    "why": "Asked for by Andrew, 2026-11-12: bstd's ~30 error types should compose, so that `fn main(cx: &Cx) -> Result<(), E>` works when one function mixes `need_fs()?` (Missing) and `open_dir()?` (FsError) with no glue. The union type and its widening were already on main (E3 parts 1 and 2); what was missing was a set as a generic argument (a parser bug), matching by member, the error's words and the proof.",
    "recommended": "Yes: a set costs what the hand-written enum costs (measured for layout), and each area keeps its own error; the alternative, one named enum per mix of areas with `From` impls, is the pattern the edition removes.",
    "state": "built and tested under cargo on branch bstd-error-sets (parser, matching by member, diagnostics, determinism and layout tests); the bstd port waits for D29; the typed binding `e: T`, the unneeded-member advice and inferred sets are not built"
+  },
+  {
+   "id": "D31",
+   "date": "2026-11-12",
+   "decision": "`blaze::implicit_overflow` (edition group, allow by default) refuses integer `+ - * << >>`, unary `-`, compound forms, value-losing casts and profile-dependent or panicking calls (`pow`, `abs`, `next_power_of_two`, `sum`, `product`, `strict_*`) unless the code writes `checked_*`/`wrapping_*`/`saturating_*`/`overflowing_*`/`try_from` or the reach prover shows the operation fits. The proof treats an operation it can't show fits as fitting from then on, so the verdict is the same with and without overflow checks. `/` and `%` are excluded because their panics are the same in every profile. `blaze-std` and `blaze-mem` deny it once `bstd-fallible-alloc` (D29) lands (docs/v2/plan/design/explicit-overflow.md).",
+   "why": "Asked for by Andrew, 2026-11-12: code written by LLMs should say whether arithmetic wraps, checks or saturates, denying plain `+ -` or at least linting for it."
   }
  ]
 }

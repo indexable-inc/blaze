@@ -149,15 +149,17 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    tree of nightly features (#967) to the new pin: an issue for each new language feature, and
    a comment and a close on the issue of each one stabilized or removed. The workflow does not
    run it yet; it is run by hand after the merge.
-7. Nothing yet holds what blaze copies of rustc by hand to the new pin: the lint registry
-   (`crates/blaze-lint-defs/src/lints.rs`, rustc's `declare_lint!`s) and the feature gates of
-   blaze-diagnostics. They were rustc 1.99.0's until 2026-11-12, two weeks after the pin moved
-   to a 1.101 nightly, with nine lints unknown by name. Until the registry is generated from
-   rustc's source at `library/UPSTREAM`'s commit (as `checks/features/attributes/table.py`
-   generates the attribute table), a bump that crosses a release reads that release's
-   "Language" section against [language.md](language.md) and adds its cases to
-   `crates/blaze-diagnostics/src/tests/stabilized.rs` and
-   `crates/hir-ty-mir/src/tests/mir/stabilized.rs`.
+7. blaze's registry of rustc's lints (`crates/blaze-lint-defs/src/rustc.rs`: every lint with
+   its level, text and flags, the groups, the renamed and removed names) is written from
+   rustc's source at the new commit by the bump itself
+   (`blaze run -q -p scripts --bin lint_table -- '{"command": "write", "rust": "<checkout>"}'`),
+   and the gate's `lint_table check` fails a tree whose registry was written from another
+   commit than `library/UPSTREAM`'s, or was edited. What the new lints, levels and wordings
+   ask of blaze-diagnostics is then its tests' to show. A bump that crosses a release also
+   reads that release's "Language" section against [language.md](language.md) and adds its
+   cases to `crates/blaze-diagnostics/src/tests/stabilized.rs` and
+   `crates/hir-ty-mir/src/tests/mir/stabilized.rs`. The feature gates of blaze-diagnostics
+   are still a hand copy.
 
 Fixes for what a nightly breaks (layouts, the ABI, std's source, intrinsics, borrow-check
 verdicts) are pushed to `toolchain/bump`. The next day's run merges main into it and moves it to

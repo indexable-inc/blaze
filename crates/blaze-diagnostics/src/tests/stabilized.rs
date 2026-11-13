@@ -226,6 +226,42 @@ fn main() {}
     )]);
 }
 
+/// tests/ui/repr/repr-repeated-attrs.rs (rust-lang/rust#157036): a representation given
+/// more than once is `repeated_reprs`, at every place it is given, beside the errors and the
+/// `conflicting_repr_hints` it already was.
+#[test]
+fn v1_100_a_repeated_repr_is_linted() {
+    // alloc: a test's flags
+    let args = ["-W".to_owned(), "repeated-reprs".to_owned()];
+    let options = Options {
+        lints: crate::lints::CommandLine::parse(&args).expect("the test's flag is rustc's"),
+        ..Options::default()
+    };
+    let said = super::ui_core_as(
+        Mode::Other,
+        "repr-repeated-attrs.rs",
+        "2015",
+        "sized",
+        include_str!("stabilized/repr-repeated-attrs.rs"),
+        &options,
+    );
+    // The lint's own diagnostics, each whole and in order. The errors beside them (E0692,
+    // `conflicting_repr_hints`) are rustc's too, but blaze gives a crate's errors before its
+    // lints where rustc goes item by item, so the two outputs are not one text.
+    let repeated = |stderr: &str| -> Vec<String> {
+        stderr
+            .split("\n\n")
+            .filter(|it| {
+                it.starts_with("warning: `#[repr(..)]` attribute is specified more than once")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let expected = repeated(include_str!("stabilized/repr-repeated-attrs.stderr"));
+    assert_eq!(expected.len(), 9, "rustc's test has nine");
+    assert_eq!(repeated(&said), expected);
+}
+
 /// `dependency_on_unit_never_type_fallback` went with the unit fallback (1.100): naming it is
 /// `renamed_and_removed_lints`, as rustc's `register_removed` has it.
 #[test]

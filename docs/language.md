@@ -38,13 +38,13 @@ for), **not checked**.
 | `dependency_on_unit_never_type_fallback` removed, `never_type_fallback_flowing_into_unsafe` no longer an edition lint | fixed | blaze-lint-defs; D:v1_100_the_unit_fallback_lint_is_removed |
 | `extern "custom"` (#158504) | ok | D:v1_100_extern_custom; codegen: `hir-ty-codegen/mod.rs:4537` |
 | `aligned_fields_in_packed`, deny by default, where E0588 was (#162160) | fixed | blaze had neither the error nor the lint, and the lint's name was unknown. `checks/defs/packed.rs`; D:v1_100_an_aligned_type_in_a_packed_one_is_a_lint (rustc's test, byte for byte); R: the packed layout |
-| `repeated_reprs` lint (#157036) | fixed (name), open (the lint is not given) | blaze-lint-defs; D: lint names |
-| `dropping_references`, `dropping_copy_types`, `undropped_manually_drops` on `drop_in_place` (#160229) | open | the registry's text is the pin's; the lints do not look at `drop_in_place` |
+| `repeated_reprs` lint (#157036) | fixed | unknown name, not given; `lints/syntax/attrs/check_attr.rs`; D:v1_100_a_repeated_repr_is_linted (the nine diagnostics of rustc's test) |
+| `dropping_references`, `dropping_copy_types`, `undropped_manually_drops` on `drop_in_place` (#160229) | fixed | `lints/bodies/calls/items/drop_forget_useless.rs`; rustc's three tests at the pin (`tests/lints/bodies/calls/items/ui/`) |
 | `#[expect(dead_code)]` under a dead parent is fulfilled (#161005) | fixed | `lints/names/dead/report.rs`; `tests/lints/names/dead/expect_inside_dead_code.rs` (rustc's test) |
 | volatile accesses may trap (#160564) | n/a | a guarantee |
 | closures capture what `if let` moves (#154210) | ok | R:v1_100_if_let_in_a_closure_captures_only_the_moved_field |
 | `let ... else` takes an `expr` metavariable as grouped (#158515) | ok | D:v1_100_let_else_takes_an_expr_metavariable_as_grouped (rustc's test) |
-| `box` patterns are no syntax (#156749) | more | `#![feature(box_patterns)]` is E0557 (removed), but a `box` pattern still parses and rustc's error for it is not given: `a_box_pattern_is_removed_syntax` (rustc's test) fails on main |
+| `box` patterns are no syntax (#156749) | fixed | rustc's error was not given; `checks/ast_validation/pats.rs`; `a_box_pattern_is_removed_syntax` (rustc's test, byte for byte; it failed on main) |
 | dyn-compatibility checked in more places (#154992), layout cycles of enums (#157562), `ambiguous_glob_imported_traits` in more cases (#161805) | not checked | each refuses or warns about more |
 | nine lints of the pin unknown by name | fixed | blaze-lint-defs; D:v1_100_the_lints_of_1_80_to_1_100_are_known_by_name |
 
@@ -136,11 +136,9 @@ for), **not checked**.
 | 1.80 zero-sized accesses through any pointer (#117329) | ok | R:v1_80_zero_sized_accesses_through_any_pointer |
 | 1.80 `Result` layout guarantee (#124870), maximum allocation size | not checked / n/a | |
 
-## What a bump should do
+## What a bump does
 
-The lint registry (`crates/blaze-lint-defs/src/lints.rs`) and the feature gates are hand copies
-of rustc's and had drifted from the pin (agents row `lang1100-2`). Three differences from the
-pinned nightly are left, each with new wording in rustc that blaze-diagnostics does not have:
-`linker_info` and `linker_messages` are crate-level lints there, `rust_2021_prefixes_incompatible_syntax`
-a semantics change, and `semicolon_in_expressions_from_non_local_macros` not in the dependency
-report.
+The lint registry is generated from rustc's source at the pinned commit
+(`scripts/src/bin/lint_table.rs`, [toolchain.md](toolchain.md) step 7) and the gate holds it to
+the pin; it was a hand copy of rustc 1.99's until this branch (agents row `lang1100-2`). The
+feature gates of blaze-diagnostics are still copied by hand.
