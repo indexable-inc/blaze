@@ -247,7 +247,35 @@ impl<'h, 't> Printer<'h, 't> {
     }
 
     /// rustc's `pretty_print_type`.
+    /// blaze: `ty`, the pointee of a reference or a raw pointer: an error union in
+    /// parentheses, as it is written there (`&(A | B)`; `&A | B` is a union of `&A`).
+    fn print_pointee(&mut self, ty: Ty<'t>) {
+        let union = self.spelling() == Spelling::Diagnostic
+            && hir_ty::error_union::members(self.interner, ty).is_some();
+        if union {
+            self.write_str("(");
+        }
+        self.print_type(ty);
+        if union {
+            self.write_str(")");
+        }
+    }
+
     fn pretty_print_type(&mut self, ty: Ty<'t>) {
+        // blaze: an error union (`#![blaze::error_unions]`) is written in a message as it is
+        // in source, `A | B`, its members in their canonical order: never as core's
+        // `ErrorUnion<(A, B)>`, which no program names.
+        if self.spelling() == Spelling::Diagnostic
+            && let Some(members) = hir_ty::error_union::members(self.interner, ty)
+        {
+            for (at, member) in members.iter().enumerate() {
+                if at != 0 {
+                    self.write_str(" | ");
+                }
+                self.print_type(member);
+            }
+            return;
+        }
         match ty.kind() {
             TyKind::Bool
             | TyKind::Char
@@ -266,7 +294,7 @@ impl<'h, 't> Printer<'h, 't> {
                     Mutability::Mut => "*mut ",
                     Mutability::Not => "*const ",
                 });
-                self.print_type(ty);
+                self.print_pointee(ty);
             }
             TyKind::Ref(r, ty, m) => {
                 self.write_str("&");
@@ -277,7 +305,7 @@ impl<'h, 't> Printer<'h, 't> {
                 if m == Mutability::Mut {
                     self.write_str(self.unique_ref());
                 }
-                self.print_type(ty);
+                self.print_pointee(ty);
             }
             TyKind::Tuple(tys) => {
                 self.write_str("(");

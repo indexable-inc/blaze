@@ -325,7 +325,7 @@ impl<T> Task<'_, T> {
 }
 
 /// What a panic said.
-fn said(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn said(payload: &(dyn Any + Send)) -> String {
     match payload.downcast_ref::<&'static str>() {
         // alloc: an error's message.
         Some(said) => (*said).to_owned(),

@@ -24,6 +24,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 mod graph;
 pub mod index;
+pub mod lint_level;
 pub mod load;
 pub mod lock;
 mod order;

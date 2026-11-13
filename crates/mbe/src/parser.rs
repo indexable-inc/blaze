@@ -15,7 +15,10 @@ use tt::{
 
 use crate::{MacroCallStyle, ParseError};
 
-pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, ParseError> {
+/// The style of a rule, and for an `attr(..)` rule the group of its arguments' pattern.
+pub(crate) fn parse_rule_style<'a>(
+    src: &mut TtIter<'a>,
+) -> Result<(MacroCallStyle, Option<(tt::Subtree, TtIter<'a>)>), ParseError> {
     // Skip an optional `unsafe`. This is only actually allowed for `attr`
     // rules, but we'll let rustc worry about that.
     if let Some(TtElement::Leaf(tt::Leaf::Ident(ident))) = src.peek()
@@ -27,17 +30,15 @@ pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, P
     let kind = match src.peek() {
         Some(TtElement::Leaf(tt::Leaf::Ident(ident))) if ident.sym == sym::attr => {
             src.next().expect("already peeked");
-            // FIXME: Add support for `attr(..)` rules with attribute arguments,
-            // which would be inside these parens.
-            src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
-            MacroCallStyle::Attr
+            let args = src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
+            (MacroCallStyle::Attr, Some(args))
         }
         Some(TtElement::Leaf(tt::Leaf::Ident(ident))) if ident.sym == sym::derive => {
             src.next().expect("already peeked");
             src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
-            MacroCallStyle::Derive
+            (MacroCallStyle::Derive, None)
         }
-        _ => MacroCallStyle::FnLike,
+        _ => (MacroCallStyle::FnLike, None),
     };
     Ok(kind)
 }

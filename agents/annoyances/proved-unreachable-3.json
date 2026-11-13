@@ -1,0 +1,18 @@
+{
+ "id": "proved-unreachable-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane proved-unreachable",
+ "where": "cargo test -p hir-expand on origin/main (136432aa02), pinned nightly",
+ "what": "hir-expand`s test target does not compile: `error: invalid format string: unmatched `}` found` at crates/hir-expand/src/budget_tests.rs:216 (`assert!(.., \"ends in `}`\")`). `cargo test -p hir-def -p hir-expand -p intern` therefore ran nothing of the three.",
+ "cost": "one wasted run (about 4 minutes) and hir-expand`s tests not run for a change to its builtin macros",
+ "cause": "a `}` in an assert message; cargo`s rustc reads the message as a format string",
+ "whys": [
+  "the test target fails to compile under cargo",
+  "nothing compiles test targets with cargo before a merge"
+ ],
+ "class": "test code only one of the two builders compiles",
+ "prevention": "not built: `cargo check --tests` of touched crates in the gate while cargo is the dev-loop builder",
+ "workaround": "run the other crates` tests without `-p hir-expand`",
+ "fix": "write the message as \"ends in `}}`\"",
+ "state": "open"
+}

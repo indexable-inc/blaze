@@ -30,3 +30,26 @@ impl From<MacroCallStyle> for MacroCallStyles {
         }
     }
 }
+
+/// A call of a declarative macro in its style, with what that style hands the macro besides
+/// its input: an attribute's arguments, which an `attr(..)` rule's first pattern matches.
+#[derive(Clone, Copy, Debug)]
+pub enum MacroCall<'a> {
+    FnLike,
+    /// `#[m]` (`None`), or `#[m(..)]`, `#[m[..]]`, `#[m{..}]` with the tokens inside the
+    /// delimiters.
+    Attr {
+        args: Option<&'a tt::TopSubtree>,
+    },
+    Derive,
+}
+
+impl MacroCall<'_> {
+    pub fn style(self) -> MacroCallStyle {
+        match self {
+            MacroCall::FnLike => MacroCallStyle::FnLike,
+            MacroCall::Attr { .. } => MacroCallStyle::Attr,
+            MacroCall::Derive => MacroCallStyle::Derive,
+        }
+    }
+}

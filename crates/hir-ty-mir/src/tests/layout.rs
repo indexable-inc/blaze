@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod closure;
+mod error_unions;
 mod errors;
 mod field_order;
 

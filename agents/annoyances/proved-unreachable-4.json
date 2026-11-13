@@ -1,0 +1,18 @@
+{
+ "id": "proved-unreachable-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane proved-unreachable",
+ "where": "crates/hir-ty-pure/src/reach.rs, `assume` and the linear proofs",
+ "what": "After linear arithmetic went in, `if k >= 1 && k <= v.len() { v[v.len() - k] }` was refused while the same guards nested passed: a fact that was entailed only through an implication (what `a && b` leaves) was never written into the state, and the linear proof reads the facts as written.",
+ "cost": "about 15 minutes, four probe tests",
+ "cause": "two readers of one state with different views: `holds` follows implications, `known` lists facts",
+ "whys": [
+  "the && form failed and the nested form passed",
+  "the fact was entailed, not stored",
+  "`assume` skipped storing what was already entailed",
+  "a second consumer of the state (the linear search) was added that reads storage, not entailment"
+ ],
+ "class": "two procedures over one state that disagree on what the state says",
+ "prevention": "built: `assume` writes the fact down and `saturate` writes every implied conclusion whose premise holds; the Hegel oracle draws `&&` guards with linear sites",
+ "state": "fixed in 66a440f8c4"
+}

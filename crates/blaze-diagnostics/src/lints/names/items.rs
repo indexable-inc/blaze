@@ -82,10 +82,7 @@ mod gives {
     pub(super) const COPY: LintSet = LintSet::of(&[LintId::named("missing_copy_implementations")]);
     pub(super) const TYPE_ALIAS_BOUNDS: LintSet =
         LintSet::of(&[LintId::named("type_alias_bounds")]);
-    pub(super) const MANGLE: LintSet = LintSet::of(&[
-        LintId::named("no_mangle_const_items"),
-        LintId::named("no_mangle_generic_items"),
-    ]);
+    pub(super) const MANGLE: LintSet = LintSet::of(&[LintId::named("no_mangle_const_items")]);
     pub(super) const PUBLICITY: LintSet = LintSet::of(&[LintId::named("unreachable_pub")]);
     pub(super) const TRACK_CALLER: LintSet =
         LintSet::of(&[LintId::named("ungated_async_fn_track_caller")]);
@@ -199,9 +196,8 @@ pub(super) fn after_abort<'db>(
         if type_alias {
             found.extend(bounds::type_alias(cx, item, &krate));
         }
-        if mangle {
-            found.extend(mangle::item(cx, item));
-        }
+        // Not only a lint: a generic `#[no_mangle]` function is an error.
+        found.extend(mangle::item(cx, item, mangle));
         if publicity {
             found.extend(publicity::item(cx, item, effective));
         }

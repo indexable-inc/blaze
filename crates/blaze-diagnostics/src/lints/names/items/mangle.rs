@@ -1,6 +1,7 @@
-//! `no_mangle_const_items` (deny) and `no_mangle_generic_items`: a `#[no_mangle]` constant,
-//! and a `#[no_mangle]` or `#[export_name]` function (free, or of an impl) generic over types or
-//! consts, its own parameters or its impl's, an `impl Trait` parameter among them.
+//! `no_mangle_const_items` (deny), and the error for a `#[no_mangle]` or `#[export_name]`
+//! function (free, or of an impl) generic over types or consts, its own parameters or its
+//! impl's, an `impl Trait` parameter among them: a hard error since Rust 1.99
+//! (rust-lang/rust#154585), the lint `no_mangle_generic_items` before it.
 //!
 //! Follows `compiler/rustc_lint/src/builtin.rs` (`InvalidNoMangleItems`) and
 //! `compiler/rustc_middle/src/ty/generics.rs` (`requires_monomorphization`) (MIT or Apache-2.0).
@@ -20,7 +21,9 @@ use crate::{
     model::{Applicability, Diag, SuggestionStyle},
 };
 
-pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<Found> {
+/// What `item` breaks: the error of a generic function always, the lint of a constant when
+/// `lint` says it may fire.
+pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, lint: bool) -> Option<Found> {
     match item.node.value {
         ast::Item::Fn(it) if matches!(item.container, Container::Module | Container::Impl(_)) => {
             let attr =
@@ -33,22 +36,19 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<Found> {
                 return None;
             }
             let span = cx.span(item.node.with_value(def_span(it.syntax())));
-            let mut diag = Diag::lint(
-                "no_mangle_generic_items",
-                "functions generic over types or consts must be mangled",
-                span,
-            );
+            let mut diag =
+                Diag::error(None, "functions generic over types or consts must be mangled", span);
             let attr = cx.span(item.node.with_value(attr));
             diag.suggestion_with_style(
-                vec![(attr, String::new())], // alloc: the suggestion of a lint that fires
+                vec![(attr, String::new())], // alloc: the suggestion of an error
                 "remove this attribute",
                 Applicability::MaybeIncorrect,
                 SuggestionStyle::HideCodeInline,
             );
             crate::lints::code_fact(cx, &mut diag, item.ptr());
-            Some(Found::lint(diag, Phase::Late, item.ptr()))
+            Some(Found::new(diag, Phase::Late))
         }
-        ast::Item::Const(it) if matches!(item.container, Container::Module) => {
+        ast::Item::Const(it) if lint && matches!(item.container, Container::Module) => {
             attr_span(cx, it, "no_mangle")?;
             let range = item_range_view(it.syntax());
             let span = cx.span(item.node.with_value(range));
