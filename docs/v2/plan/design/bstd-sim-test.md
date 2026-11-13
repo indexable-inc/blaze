@@ -116,5 +116,5 @@ compiles pass or fail as they do on the commit before (132 passed, 3 failed, bot
   from the disk (a commit record), or the test crashes its world itself (`io.crash()`).
 - In the blaze edition (S5) `#[test]` names this attribute.
 - A world of the test's own making under the attribute (scripted devices, an environment, a
-  withheld capability): such a test still makes its `Io` and calls `bstd::test::seeded`-like
-  code by hand.
+  withheld capability): `bstd::test::run` makes every world with `Io::sim(seed)`, so such a
+  test still makes its `Io` and loops its seeds by hand.
