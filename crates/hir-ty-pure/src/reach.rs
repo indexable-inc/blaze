@@ -287,6 +287,187 @@ impl Reach {
     }
 }
 
+/// What kind of operation an [`Overflow`] site is: the lint asks of an expression the kind its
+/// syntax is, so a check lowering adds at the same expression (the cast of a signed shift
+/// amount) is not taken for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OpKind {
+    /// `+`, `-` or `*` of integers, compound or not.
+    Arith,
+    /// `<<` or `>>`: whether the amount is below the bits.
+    Shift,
+    /// `-` of a signed integer.
+    Neg,
+    /// An `as` between integers: whether the value survives, `usize` and `isize` taken as
+    /// narrow as 32 bits on the target side.
+    Cast,
+}
+
+/// What the prover could not show of one operation: the fact that is missing, for the
+/// message (docs/v2/plan/design/explicit-overflow.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Missing {
+    /// Nothing bounds the left operand, the right one, or both, on the side the result needs.
+    Unbounded { left: bool, right: bool },
+    /// `a - b` of an unsigned type: nothing shows `b <= a`.
+    Order,
+    /// The operands are bounded, but what bounds them lets the result reach this value,
+    /// outside its type.
+    Reaches(i128),
+    /// A shift: nothing shows the amount is below this many bits (or not negative).
+    Amount(u32),
+    /// `-a`: nothing shows `a` is not the type's least value.
+    NotMin,
+    /// A cast: nothing shows the value is at least this (`0 <= x` for a signed to unsigned).
+    Below(i128),
+    /// A cast: nothing shows the value is at most this.
+    Above(i128),
+    /// A `u128`: its values past `i128::MAX` are not held, so nothing of it is shown.
+    Wide,
+}
+
+/// What [`overflow_of_body`] found of a body and its closures: each integer operation the
+/// MIR has (`+`, `-`, `*`, a shift, a negation, an `as` between integers), at the expression
+/// it is written at, with what was not shown (none where it fits). An expression lowered
+/// more than once has one entry per lowering.
+///
+/// The semantics are the profile's with overflow checks, whichever the crate has: an
+/// operation not shown to fit is reported and taken to fit after it (as a run that got past
+/// it did), so a body with no site reported overflows in no profile, and the answer is the
+/// same in both.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Overflow {
+    pub sites: Box<[(ExprId, OpKind, Option<Missing>)]>,
+    /// Why a body was not analysed: none for the function's own, else the closure's
+    /// expression it is of; with the reason.
+    pub refused: Box<[(Option<ExprId>, &'static str)]>,
+}
+
+impl Overflow {
+    /// What was not shown of the operation of kind `kind` written at `expr`: `None` when every
+    /// lowering of it fits, or none was made (code no path reaches is not lowered).
+    pub fn missing(&self, expr: ExprId, kind: OpKind) -> Option<Missing> {
+        self.sites.iter().find_map(|&(at, of, missing)| (at == expr && of == kind).then_some(missing)?)
+    }
+
+    /// Whether an operation of kind `kind` at `expr` was lowered and analysed.
+    pub fn analysed(&self, expr: ExprId, kind: OpKind) -> bool {
+        self.sites.iter().any(|&(at, of, _)| at == expr && of == kind)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A bug planted for the control of the overflow oracle (`tests/reach_oracle.rs`): every
+    /// `+` is taken to fit.
+    pub(crate) static PLANT_ADD_ALWAYS_FITS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The integer operations of the body of `def` and of its closures that the prover can't
+/// show keep their value ([`Overflow`]), once per definition: what `blaze::implicit_overflow`
+/// reads.
+#[blaze_query::tracked(returns(ref))]
+pub fn overflow_of_body(db: &Db, def: DefWithBodyId) -> Overflow {
+    let Ok(root) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else {
+        return Overflow {
+            sites: Box::default(),
+            refused: Box::new([(None, "its body does not lower to MIR")]),
+        };
+    };
+    let krate = hir_def::HasModule::krate(&def, db);
+    let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let env = db.trait_environment(def.generic_def(db));
+    // alloc: the body's MIR and its closures', a few
+    let mut bodies: Vec<(Option<ExprId>, &MirBody<'_>)> = vec![(None, root)];
+    let mut refused = Vec::new(); // alloc: the bodies not analysed, few
+    let mut at = 0;
+    while at < bodies.len() {
+        for &closure in &bodies[at].1.closures {
+            let expr = closure.loc(db).expr;
+            match db.runtime_mir_body_for_closure(closure) {
+                Ok(body) => bodies.push((Some(expr), body)),
+                Err(_) => refused.push((Some(expr), "its body does not lower to MIR")),
+            }
+        }
+        at += 1;
+    }
+    let mut sites = Vec::new(); // alloc: the sites of the bodies, the result
+    for (of, body) in bodies {
+        match prove_overflow(db, &infcx, env, body) {
+            Ok(found) => sites.extend(found),
+            Err(why) => refused.push((of, why)),
+        }
+    }
+    sites.sort();
+    Overflow { sites: sites.into_boxed_slice(), refused: refused.into_boxed_slice() }
+}
+
+/// The integer operations of `body` with what was not shown of each, or why it was not
+/// analysed.
+fn prove_overflow<'db>(
+    db: &'db Db,
+    infcx: &InferCtxt<'db>,
+    env: ParamEnv<'db>,
+    body: &MirBody<'db>,
+) -> Result<Vec<(ExprId, OpKind, Option<Missing>)>, &'static str> {
+    if body.coroutine.is_some() {
+        return Err("it is a coroutine");
+    }
+    // alloc: the body's blocks by index, once per proof
+    let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
+    analysable(&blocks)?;
+    let Ok(layout) = db.target_data_layout(hir_def::HasModule::krate(&body.owner, db)) else {
+        return Err("its target's layout is not known");
+    };
+    let word = layout.pointer_size().bits() as u32;
+    let mut solver = Solver::new(db, infcx, env, body, &blocks, word);
+    solver.mode = Mode::Overflow;
+    let Some(entries) = solver.solve() else {
+        return Err("its proof did not settle within the budget");
+    };
+    // The verdicts, from the settled entry states: each block walked once more, recording.
+    solver.recording = true;
+    for (at, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry else { continue };
+        let mut state = entry.clone(); // clone: the block's entry state, walked to its end
+        let _ = solver.transfer(at as u32, &mut state);
+    }
+    Ok(std::mem::take(&mut solver.verdicts))
+}
+
+/// Refuses a body with inline assembly, a `yield` or a `for const` loop.
+fn analysable(blocks: &[&BasicBlock]) -> Result<(), &'static str> {
+    for block in blocks {
+        let asm =
+            block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)));
+        let odd = matches!(
+            block.terminator.as_ref().map(|it| &it.kind),
+            Some(
+                TerminatorKind::Yield { .. }
+                    | TerminatorKind::ComptimeFor { .. }
+                    | TerminatorKind::ComptimeNext { .. }
+                    | TerminatorKind::CoroutineDrop
+            )
+        );
+        if asm || odd {
+            return Err("it has inline assembly, a `yield` or a `for const` loop");
+        }
+    }
+    Ok(())
+}
+
+/// What a proof is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Which panic sites are dead or cannot fail: the MIR's own semantics, its profile's.
+    Panics,
+    /// Which integer operations keep their value ([`overflow_of_body`]): an operation not
+    /// shown to fit is taken to fit after it, in either profile, and an overflow check's
+    /// `Assert` adds nothing, so both profiles give one answer.
+    Overflow,
+}
+
 fn index(block: BasicBlockId) -> usize {
     block.into_raw().into_u32() as usize
 }
@@ -345,21 +526,8 @@ pub fn prove<'db>(
     let count = body.basic_blocks.len();
     // alloc: the body's blocks by index, once per proof
     let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
-    for block in &blocks {
-        let asm =
-            block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)));
-        let odd = matches!(
-            block.terminator.as_ref().map(|it| &it.kind),
-            Some(
-                TerminatorKind::Yield { .. }
-                    | TerminatorKind::ComptimeFor { .. }
-                    | TerminatorKind::ComptimeNext { .. }
-                    | TerminatorKind::CoroutineDrop
-            )
-        );
-        if asm || odd {
-            return Reach::refused("it has inline assembly, a `yield` or a `for const` loop");
-        }
+    if let Err(why) = analysable(&blocks) {
+        return Reach::refused(why);
     }
     // A `usize`'s range is the target's: a wider guess would prove an overflow check that can
     // fail, a narrower one a bound that does not hold.
@@ -448,6 +616,15 @@ struct Solver<'a, 'db> {
     /// The statement being walked, and how many unknowns it has made.
     at: (u32, u32),
     made: u32,
+    /// What the proof is for.
+    mode: Mode,
+    /// Where the statement being walked is written.
+    span: MirSpan,
+    /// Whether [`Self::note`] keeps what it is told: on for the last walk of a settled
+    /// [`Mode::Overflow`] proof.
+    recording: bool,
+    /// What [`Self::note`] kept.
+    verdicts: Vec<(ExprId, OpKind, Option<Missing>)>,
 }
 
 /// The widest range a term's value is kept in.
@@ -503,6 +680,10 @@ impl<'a, 'db> Solver<'a, 'db> {
             word,
             at: (0, 0),
             made: 0,
+            mode: Mode::Panics,
+            span: MirSpan::Unknown,
+            recording: false,
+            verdicts: Vec::new(), // alloc: only an overflow proof's, its result
         };
         solver.exposed = solver.exposed_locals();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
@@ -769,6 +950,144 @@ impl<'a, 'db> Solver<'a, 'db> {
         let Some(floor) = least.checked_neg() else { return false };
         self.lin_le(state, form, most, &known, LINEAR_DEPTH, &mut fuel)
             && self.lin_le(state, &negated, floor, &known, LINEAR_DEPTH, &mut fuel)
+    }
+
+    /// Whether every product of the bounds of `a` and `b` is inside `range`.
+    fn product_within(&self, state: &State, a: TermId, b: TermId, range: Option<(i128, i128)>) -> bool {
+        let Some((least, most)) = range else { return false };
+        let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
+        let ends = [
+            low_a.checked_mul(low_b),
+            low_a.checked_mul(high_b),
+            high_a.checked_mul(low_b),
+            high_a.checked_mul(high_b),
+        ];
+        match ends {
+            [Some(a), Some(b), Some(c), Some(d)] => {
+                least <= a.min(b).min(c).min(d) && a.max(b).max(c).max(d) <= most
+            }
+            _ => false,
+        }
+    }
+
+    /// Keeps the verdict of the operation being walked, when recording.
+    fn note(&mut self, kind: OpKind, missing: Option<Missing>) {
+        if !self.recording {
+            return;
+        }
+        if let MirSpan::ExprId(expr) = self.span {
+            self.verdicts.push((expr, kind, missing));
+        }
+    }
+
+    /// The verdict of a shift of a `ty` by `amount`: it is below the bits and not negative.
+    /// Taken to hold after it, as every operation an overflow proof reports.
+    fn note_shift(&mut self, state: &mut State, ty: Ty<'db>, amount: TermId) {
+        let bits = type_bits(ty, self.word);
+        let (zero, limit) = (self.constant(0), self.constant(i128::from(bits)));
+        let (natural, below) = (Atom::new(Rel::Le, zero, amount), Atom::new(Rel::Lt, amount, limit));
+        let shown = self.entails(state, natural) && self.entails(state, below);
+        self.note(OpKind::Shift, (!shown).then_some(Missing::Amount(bits)));
+        let _ = self.assume(state, natural) && self.assume(state, below);
+    }
+
+    /// The verdict of a cast of `value`, a `from`, to `to`: every value it can have here is
+    /// one `to` holds, on every pointer width (`usize` and `isize` as narrow as 32 bits).
+    fn note_cast(&mut self, state: &State, value: TermId, from: Ty<'db>, to: Ty<'db>) {
+        if !self.recording {
+            return;
+        }
+        let Some((least, most)) = int_range(to, self.word.min(32)) else { return };
+        if wide(from) || wide(to) {
+            return self.note(OpKind::Cast, Some(Missing::Wide));
+        }
+        let (low, high) = (self.constant(least), self.constant(most));
+        let missing = if !self.entails(state, Atom::new(Rel::Le, low, value)) {
+            Some(Missing::Below(least))
+        } else if !self.entails(state, Atom::new(Rel::Le, value, high)) {
+            Some(Missing::Above(most))
+        } else {
+            None
+        };
+        self.note(OpKind::Cast, missing);
+    }
+
+    /// What is missing for `a op b`, a `ty` in `range`, to fit: an operand nothing bounds on
+    /// the side the result needs, `b <= a` for an unsigned difference, or how far what bounds
+    /// them lets it reach.
+    fn missing_arith(
+        &self,
+        state: &State,
+        op: &BinOp,
+        (a, b): (TermId, TermId),
+        exact: Option<&Form>,
+        ty: Ty<'db>,
+        (least, most): (i128, i128),
+    ) -> Missing {
+        if wide(ty) {
+            return Missing::Wide;
+        }
+        let known = self.known(state);
+        let mut fuel = LINEAR_FUEL;
+        let zero: Form = (Vec::new(), 0);
+        let (high_ok, low_ok) = match exact {
+            Some(form) => {
+                let high = self.lin_le(state, form, most, &known, LINEAR_DEPTH, &mut fuel);
+                let low = match (form_add(&zero, form, -1), least.checked_neg()) {
+                    (Some(negated), Some(floor)) => {
+                        self.lin_le(state, &negated, floor, &known, LINEAR_DEPTH, &mut fuel)
+                    }
+                    _ => false,
+                };
+                (high, low)
+            }
+            None => (false, false),
+        };
+        let sub = matches!(op, BinOp::Sub | BinOp::SubWithOverflow);
+        let mul = matches!(op, BinOp::Mul | BinOp::MulWithOverflow);
+        if sub && least == 0 && high_ok && !low_ok {
+            return Missing::Order;
+        }
+        let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
+        let above = |high: i128| high >= most;
+        let below = |low: i128| least < 0 && low <= least;
+        let (left, right) = match (mul, sub) {
+            (true, _) => (above(high_a) || below(low_a), above(high_b) || below(low_b)),
+            (false, true) => (
+                (!high_ok && above(high_a)) || (!low_ok && below(low_a)),
+                (!high_ok && below(low_b)) || (!low_ok && above(high_b)),
+            ),
+            (false, false) => (
+                (!high_ok && above(high_a)) || (!low_ok && below(low_a)),
+                (!high_ok && above(high_b)) || (!low_ok && below(low_b)),
+            ),
+        };
+        if left || right {
+            return Missing::Unbounded { left, right };
+        }
+        // Both are bounded: how far the bounds let it go, on the side that fails.
+        let reach = match (exact, mul) {
+            (Some(form), false) if !high_ok => self.form_high(state, form),
+            (Some(form), false) => form_add(&zero, form, -1)
+                .and_then(|negated| self.form_high(state, &negated))
+                .and_then(i128::checked_neg),
+            _ => {
+                let ends = [
+                    low_a.checked_mul(low_b),
+                    low_a.checked_mul(high_b),
+                    high_a.checked_mul(low_b),
+                    high_a.checked_mul(high_b),
+                ];
+                ends.into_iter()
+                    .flatten()
+                    .filter(|&it| it < least || most < it)
+                    .max_by_key(|it| it.unsigned_abs())
+            }
+        };
+        match reach {
+            Some(value) => Missing::Reaches(value),
+            None => Missing::Unbounded { left: true, right: true },
+        }
     }
 
     fn not(&mut self, of: TermId) -> TermId {
@@ -1352,6 +1671,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 // Decided by the two types, never by what this state knows of the value: a
                 // term's range is its type's in every state it appears in.
                 let value = self.operand(state, operand);
+                if self.mode == Mode::Overflow
+                    && let Some(from) = self.operand_ty(operand)
+                {
+                    self.note_cast(state, value, from, ty.as_ref());
+                }
                 let from = self.operand_ty(operand).and_then(|it| int_range(it, self.word));
                 match (from, int_range(ty.as_ref(), self.word)) {
                     (Some((low, high)), Some((least, most))) if least <= low && high <= most => {
@@ -1365,6 +1689,25 @@ impl<'a, 'db> Solver<'a, 'db> {
             {
                 let value = self.operand(state, operand);
                 self.not(value)
+            }
+            Rvalue::UnaryOp(UnOp::Neg, operand)
+                if self.mode == Mode::Overflow
+                    && self.operand_ty(operand).is_some_and(|it| matches!(it.kind(), TyKind::Int(_))) =>
+            {
+                let ty = self.operand_ty(operand);
+                let value = self.operand(state, operand);
+                let least = ty.and_then(|it| int_range(it, self.word)).map_or(i128::MIN, |it| it.0);
+                let min = self.constant(least);
+                let not_min = Atom::new(Rel::Ne, value, min);
+                let shown = self.entails(state, not_min);
+                self.note(OpKind::Neg, (!shown).then_some(Missing::NotMin));
+                // Taken to fit after it, as every operation an overflow proof reports.
+                let _ = self.assume(state, not_min);
+                let zero: Form = (Vec::new(), 0);
+                match form_add(&zero, &self.form(value), -1) {
+                    Some(negated) => self.lin(negated),
+                    None => self.fresh(ty),
+                }
             }
             // Arithmetic that is linear: the exact sum, difference or multiple, as a form. A
             // local holds it only where it fits the type: shown by the state, or, for a
@@ -1416,14 +1759,53 @@ impl<'a, 'db> Solver<'a, 'db> {
                     (Some(form), Some((least, most))) => self.form_within(state, form, least, most),
                     _ => false,
                 };
+                // A product of two unknowns fits when every product of their bounds does.
+                let product = matches!(op, BinOp::Mul | BinOp::MulWithOverflow) && exact.is_none();
+                let inside = product && self.product_within(state, a, b, range);
+                let integral = ty.is_some_and(|it| matches!(it.kind(), TyKind::Int(_) | TyKind::Uint(_)));
+                if self.mode == Mode::Overflow
+                    && integral
+                    && let (Some(ty), Some(range)) = (ty, range)
+                {
+                    match op {
+                        BinOp::Shl => self.note_shift(state, ty, b),
+                        _ => {
+                            #[cfg(test)]
+                            let planted = matches!(op, BinOp::Add | BinOp::AddWithOverflow)
+                                && PLANT_ADD_ALWAYS_FITS.get();
+                            #[cfg(not(test))]
+                            let planted = false;
+                            let shown = (fits || inside || planted) && !wide(ty);
+                            let missing = (!shown)
+                                .then(|| self.missing_arith(state, op, (a, b), exact.as_ref(), ty, range));
+                            self.note(OpKind::Arith, missing);
+                        }
+                    }
+                }
                 let pair = |this: &mut Self, value, flag| {
                     this.term(Term::Agg(NO_VARIANT, Box::new([value, flag])), ANY)
                 };
+                let shift = matches!(op, BinOp::Shl);
                 match (exact, range) {
                     (Some(form), Some(_)) if fits && !checked => self.lin(form),
                     (Some(form), Some(_)) if fits => {
                         let (value, flag) = (self.lin(form), self.constant(0));
                         pair(self, value, flag)
+                    }
+                    // An overflow proof takes an operation it could not show to fit to fit:
+                    // it is reported, and a run past it with overflow checks had it fit.
+                    // `<<` drops its high bits in every profile, so it is not one.
+                    (Some(form), Some(_)) if self.mode == Mode::Overflow && !shift => {
+                        let value = self.fresh(ty);
+                        let exact = self.lin(form);
+                        state.put(Atom::new(Rel::Eq, value, exact));
+                        match checked {
+                            true => {
+                                let flag = self.constant(0);
+                                pair(self, value, flag)
+                            }
+                            false => value,
+                        }
                     }
                     (Some(form), Some(_)) if checked => {
                         let (value, flag) = (self.fresh(ty), self.fresh(None));
@@ -1446,24 +1828,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                         }
                     }
                     _ if checked => {
-                        // A product of two unknowns: its check holds when every product of
-                        // their bounds fits the type.
-                        let ((low_a, high_a), (low_b, high_b)) =
-                            (self.bounds(state, a), self.bounds(state, b));
-                        let ends = [
-                            low_a.checked_mul(low_b),
-                            low_a.checked_mul(high_b),
-                            high_a.checked_mul(low_b),
-                            high_a.checked_mul(high_b),
-                        ];
-                        let inside = match (ends, range) {
-                            ([Some(a), Some(b), Some(c), Some(d)], Some((least, most))) => {
-                                least <= a.min(b).min(c).min(d) && a.max(b).max(c).max(d) <= most
-                            }
-                            _ => false,
-                        };
                         let value = self.fresh(ty);
-                        let flag = match inside {
+                        let flag = match inside || self.mode == Mode::Overflow {
                             true => self.constant(0),
                             false => {
                                 let flag = self.fresh(None);
@@ -1486,6 +1852,13 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let ty = self.operand_ty(left);
                 let integral = ty.is_some_and(|it| int_range(it, self.word).is_some());
                 let (a, b) = (self.operand(state, left), self.operand(state, right));
+                if self.mode == Mode::Overflow
+                    && *op == BinOp::Shr
+                    && let Some(ty) = ty
+                    && matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
+                {
+                    self.note_shift(state, ty, b);
+                }
                 let by = match (op, self.const_of(b)) {
                     (BinOp::Div, Some(by)) if by > 0 => Some(by),
                     (BinOp::Shr, Some(by)) if (0..=100).contains(&by) => Some(1i128 << by),
@@ -1519,6 +1892,45 @@ impl<'a, 'db> Solver<'a, 'db> {
                         self.fresh(Some(ty))
                     }
                 }
+            }
+            // `x & m` of a constant `m >= 0` is in `0..=m`, and at most `x` when `x >= 0`;
+            // `x % d` of `x >= 0` and `d > 0` is in `0..d`, and at most `x`: the masks and
+            // remainders that say which bits or which slot is meant.
+            Rvalue::BinaryOp(op @ (BinOp::BitAnd | BinOp::Rem), left, right)
+                if self.operand_ty(left).is_some_and(|it| {
+                    matches!(it.kind(), TyKind::Int(_) | TyKind::Uint(_))
+                }) =>
+            {
+                let ty = self.operand_ty(left);
+                let (a, b) = (self.operand(state, left), self.operand(state, right));
+                let zero = self.constant(0);
+                let natural =
+                    |this: &Self, state: &State, it| this.entails(state, Atom::new(Rel::Le, zero, it));
+                let result = self.fresh(ty);
+                match op {
+                    BinOp::BitAnd => {
+                        let mask = [(a, b), (b, a)].into_iter().find_map(|(value, mask)| {
+                            self.const_of(mask).filter(|&it| it >= 0).map(|it| (value, it))
+                        });
+                        if let Some((value, mask)) = mask {
+                            let mask = self.constant(mask);
+                            state.put(Atom::new(Rel::Le, zero, result));
+                            state.put(Atom::new(Rel::Le, result, mask));
+                            if natural(self, state, value) {
+                                state.put(Atom::new(Rel::Le, result, value));
+                            }
+                        }
+                    }
+                    _ => {
+                        let positive = self.entails(state, Atom::new(Rel::Lt, zero, b));
+                        if positive && natural(self, state, a) {
+                            state.put(Atom::new(Rel::Le, zero, result));
+                            state.put(Atom::new(Rel::Lt, result, b));
+                            state.put(Atom::new(Rel::Le, result, a));
+                        }
+                    }
+                }
+                result
             }
             Rvalue::BinaryOp(op, left, right) => {
                 let rel = match op {
@@ -1577,6 +1989,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             self.at = (block, stmt as u32);
             self.made = 0;
             self.kill_point(state, self.at);
+            self.span = statement.span;
             if let StatementKind::Assign(to, rvalue) = &statement.kind {
                 let value = self.rvalue(state, to, rvalue);
                 self.write(state, to, value);
@@ -1621,6 +2034,15 @@ impl<'a, 'db> Solver<'a, 'db> {
                 if rest_runs {
                     out.edges.push((index(targets.otherwise()) as u32, rest));
                 }
+            }
+            // An overflow check proves nothing of an overflow proof: the operation it guards
+            // made its own verdict and took itself to fit, which a crate built without the
+            // check must agree with.
+            TerminatorKind::Assert { msg, target, .. }
+                if self.mode == Mode::Overflow && msg.is_optional_overflow_check() =>
+            {
+                out.safe = true;
+                out.edges.push((index(*target) as u32, state.clone()));
             }
             TerminatorKind::Assert { cond, expected, target, cleanup, .. } => {
                 let value = self.operand(state, cond);
@@ -2228,6 +2650,11 @@ fn uint_bits(ty: UintTy, word: u32) -> u32 {
 
 fn int_bits(ty: IntTy, word: u32) -> u32 {
     ty.bit_width().map_or(word, |it| it as u32)
+}
+
+/// Whether `ty` is `u128`, whose values past `i128::MAX` the prover's integers do not hold.
+fn wide(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Uint(UintTy::U128))
 }
 
 /// How many bits an integer type has; 0 for any other type.
