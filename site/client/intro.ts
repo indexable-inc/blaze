@@ -2,41 +2,90 @@
  * The intro, the site's front door (a `Hero` page, content/site.flecs; render.rs writes `<main class="intro">` with
  * the wordmark's still picture, an empty canvas and the page's blocks under them).
  *
- * - The wordmark is drawn live on the canvas (client/lib/wordmark.ts), big in the middle of the window: the five
- *   letters drop in one by one, each landing knocking the word; a beat after the last, the fire catches from the b to
- *   the e and burns on. Once it is alight the line and the Start button under it show. A key or a press shows them
- *   at once.
+ * - The wordmark is drawn live on the canvas (client/lib/wordmark.ts), big in the window: the five letters drop in one
+ *   by one, each landing knocking the word; a beat after the last, the fire catches from the b to the e and burns on.
+ *   Once it is alight the rest of the page shows. A key or a press shows it at once.
  * - Every cell is a whole number of device pixels, and the canvas sits on a device pixel, so the pixels stay sharp
  *   at any zoom. The pointer's breath parts the flames and its sweep drags them.
- * - Under prefers-reduced-motion nothing drops and nothing moves: the word is in place, burning, held still.
+ * - The race (a `Race` block: blaze and cargo building the same edit, the two times a measurement from the benchmark
+ *   history) runs in real time, over and over: both lanes start together, each fills at the pace it was measured at
+ *   and stops on its time, so blaze is done before the eye has moved and cargo is still going.
+ * - Start: the page burns away (client/lib/burn.ts), from the bottom left up and across in about three quarters of a
+ *   second, and then the lesson loads and fades in (the site's page transition, styles/shell.css). A key or a second
+ *   press during it goes at once. Back brings the intro back whole, not burnt.
+ * - Under prefers-reduced-motion nothing drops and nothing moves: the word is in place, burning, held still, the race
+ *   stands finished, and Start goes at once.
  * - Sound: none until the reader asks (browsers allow none, and nobody wants a page that starts talking). The
  *   speaker in the corner plays the intro again from the start with its soundtrack (client/lib/intro-sound.ts), the
  *   picture started on the moment the sound is, then a small fire burns on; pressing it again, hiding the tab or
- *   leaving the page stops it. The Start button knocks when the site's sound is on (`blaze.sound`, on unless the
- *   reader turned it off), and the page waits a tenth of a second for the knock before it goes.
+ *   leaving the page stops it. Start knocks when the site's sound is on (`blaze.sound`, on unless the reader turned
+ *   it off), and the fire starts on the knock.
  * - A reader who has finished the lesson the Start button leads to is sent on to the course map instead.
  *
- * Without JS the page is the still picture, the line and the button.
+ * Without JS the page is the still picture, the line, the race standing finished, and the links.
  */
 
+import { BURNT, burn } from './lib/burn';
 import { icon } from './lib/icon';
-import { hidden, leave, play, sounding, stop, tap } from './lib/intro-sound';
+import { hidden, leave, play, ready, sounding, stop, tap } from './lib/intro-sound';
 import { FPS, IGNITE_AT, LANDED, LIT } from './lib/intro-timeline';
 import { onPage } from './lib/page';
 import { load } from './lib/progress';
 import { Fire, LEAD, SHOWN, THEMES, W, draw, knock } from './lib/wordmark';
 
-/** The word is as big as the window lets it be: this share of its width and of its height, up to this many CSS px a cell. */
+/**
+ * The word is as big as the window lets it be: this share of its width and of its height, up to this many CSS px a
+ * cell. The height's share leaves room under it for the line, the race, the button and the links without a scroll.
+ */
 const WIDE = 0.86;
-const TALL = 0.46;
+const TALL = 0.4;
 const CELL_MAX = 22;
 /** The fire steps the still frame has burnt (reduced motion): the flames at their full height. */
 const WARM = 48;
-/** How long the Start button's knock is heard before the page goes, in ms: its body, not its ring. */
-const KNOCK_MS = 110;
+/** The longest the exit waits for the Start knock to be heard before it starts without it, in ms. */
+const KNOCK_WAIT = 120;
+/** A page that is still here this long after it burnt (the load was stopped, or failed) is put back, in ms. */
+const STRANDED = 5000;
+/** The race: a beat with both lanes empty, the run, then the result held, in seconds. */
+const RACE_READY = 0.4;
+const RACE_HOLD = 2.6;
 
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const light = matchMedia('(prefers-color-scheme: light)');
+
+type Lane = { ms: number; cells: number; rects: SVGRectElement[]; took: HTMLElement; lit: number; text: string };
+
+/**
+ * The race, run in real time. Each lane fills, cell by cell, at the pace its build was measured at (the lanes share
+ * one scale: the slower one's time is the whole lane) and its counter stops on its time. `frame(t)` paints the
+ * moment `t` seconds after the page lit; as rendered, and with motion reduced, the lanes stand finished.
+ */
+function racer(fig: HTMLElement): (t: number) => void {
+	const lanes: Lane[] = [...fig.querySelectorAll<HTMLElement>('.lane')].flatMap((el) => {
+		const ms = Number(fig.dataset[el.classList.contains('blaze') ? 'blazeMs' : 'cargoMs']);
+		const took = el.querySelector<HTMLElement>('.took b');
+		const rects = [...el.querySelectorAll<SVGRectElement>('.cells rect')];
+		const cells = Number(el.dataset.cells);
+		return took && ms > 0 && cells > 0 ? [{ ms, cells, rects, took, lit: cells, text: took.textContent ?? '' }] : [];
+	});
+	const whole = Math.max(...lanes.map((l) => l.ms));
+	const period = RACE_READY + whole / 1000 + RACE_HOLD;
+	// A time as render.rs writes it: whole milliseconds under a second, else seconds to two places.
+	const show = (ms: number, final: number) => (final < 1000 ? String(Math.round(ms)) : (ms / 1000).toFixed(2));
+	return (t) => {
+		const ran = (((t % period) + period) % period) - RACE_READY;
+		for (const l of lanes) {
+			const at = Math.min(Math.max(0, ran * 1000), l.ms);
+			const lit = at >= l.ms ? l.cells : Math.min(l.cells, Math.floor((l.cells * at) / l.ms));
+			if (lit !== l.lit) {
+				for (let i = Math.min(lit, l.lit); i < Math.max(lit, l.lit); i++) l.rects[i]?.classList.toggle('on', i < lit);
+				l.lit = lit;
+			}
+			const text = show(at, l.ms);
+			if (text !== l.text) l.took.textContent = l.text = text;
+		}
+	};
+}
 
 onPage((signal) => {
 	const main = document.querySelector<HTMLElement>('main.intro');
@@ -81,12 +130,15 @@ onPage((signal) => {
 	/** The still frame: the letters in place and the fire burning, held. */
 	const hold = () => draw(ctx, fire, LANDED + 1, px, theme());
 
-	let lit = false;
+	/** The moment the rest of the page showed, on the page's clock: the race's zero. */
+	let lit = Number.NaN;
 	const reveal = () => {
-		if (lit) return;
-		lit = true;
+		if (!Number.isNaN(lit)) return;
+		lit = performance.now();
 		main.dataset.lit = '';
 	};
+	const fig = main.querySelector<HTMLElement>('.race');
+	const race = fig && racer(fig);
 
 	const tick = (now: number) => {
 		frame = requestAnimationFrame(tick);
@@ -99,6 +151,7 @@ onPage((signal) => {
 			while (fire.steps < Math.floor(burnt * FPS)) fire.step();
 		}
 		if (t >= LIT) reveal();
+		if (!Number.isNaN(lit)) race?.((now - lit) / 1000);
 		// Every frame while a letter is falling or the word still shakes; after that only when the fire has stepped.
 		const moving = t < LANDED + 0.3;
 		if (!moving && fire.steps === drawn) return;
@@ -180,6 +233,54 @@ onPage((signal) => {
 	);
 	main.append(snd);
 	document.addEventListener('visibilitychange', () => hidden(document.hidden), { signal });
+
+	/**
+	 * The exit: the page burns away, then `href` loads. The fire starts on the knock when there is one (never waiting
+	 * more than KNOCK_WAIT for it). A key or a press while it burns goes at once. `undo` puts the page back whole,
+	 * for a reader who comes back to it out of the back/forward cache.
+	 */
+	let undo: (() => void) | null = null;
+	const exit = (href: string) => {
+		if (undo) return;
+		const pressed = performance.now();
+		const dpr = devicePixelRatio || 1;
+		const r = canvas.getBoundingClientRect();
+		const fireOver = burn(px, Math.round(r.left * dpr), Math.round(r.top * dpr), theme(), getComputedStyle(document.documentElement).backgroundColor);
+		document.body.append(fireOver.canvas);
+		const gone = new AbortController();
+		let burning = 0;
+		let went = false;
+		const go = () => {
+			if (went) return;
+			went = true;
+			location.assign(href);
+			setTimeout(() => went && undo?.(), STRANDED);
+		};
+		const step = (now: number) => {
+			const t = (now - at) / 1000;
+			fireOver.draw(t);
+			if (t >= BURNT) go();
+			// On after the page is asked for: the embers go out while the next one loads.
+			burning = requestAnimationFrame(step);
+		};
+		// With no knock the fire starts on the press. With one it starts when the knock is heard: now, or the moment
+		// it is due, or KNOCK_WAIT after the press if the sound is slower than that. It only ever moves earlier, and
+		// never once it is burning.
+		const heard = tap();
+		let at = heard ? pressed + KNOCK_WAIT : pressed;
+		const sooner = (when: number) => (at = Math.min(at, Math.max(when, performance.now())));
+		heard?.then(sooner, () => sooner(0));
+		burning = requestAnimationFrame(step);
+		addEventListener('keydown', go, { signal: gone.signal });
+		addEventListener('pointerdown', go, { signal: gone.signal });
+		undo = () => {
+			undo = null;
+			went = false;
+			gone.abort();
+			cancelAnimationFrame(burning);
+			fireOver.canvas.remove();
+		};
+	};
 	addEventListener(
 		'pagehide',
 		() => {
@@ -189,42 +290,31 @@ onPage((signal) => {
 		},
 		{ signal },
 	);
+	// Back, out of the back/forward cache: the page as it was before it burnt.
+	addEventListener('pageshow', (e) => e.persisted && undo?.(), { signal });
 
 	// The Start button.
 	const go = main.querySelector<HTMLAnchorElement>('.go a');
-	// Lesson 1 lived here before the intro, so an old `/#<step>` link names one of its steps: send it on, step kept.
-	// The intro has no anchors of its own.
-	if (go && location.hash.length > 1) {
-		location.replace(go.getAttribute('href') + location.hash);
-		return;
-	}
 	if (go) {
 		const { lesson, course } = go.dataset;
 		if (lesson && course && load().lessons[lesson]?.done) {
 			go.textContent = 'Continue the course';
 			go.href = course;
 		}
-		// A mouse's press is a gesture already, so the knock lands with the press, not the release.
-		let knocked = -Infinity;
-		go.addEventListener(
-			'pointerdown',
-			(e) => {
-				if (e.button === 0 && e.pointerType === 'mouse' && tap()) knocked = performance.now();
-			},
-			{ signal },
-		);
+		// A mouse's press comes a moment before its click: the sound is made ready then, so the knock is on time.
+		go.addEventListener('pointerdown', (e) => e.button === 0 && ready(), { signal });
 		go.addEventListener(
 			'click',
 			(e) => {
+				// A new tab, a download, a window: the browser's, and this page stays as it is.
 				if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-				if (performance.now() - knocked > 600) {
-					if (!tap()) return;
-					knocked = performance.now();
+				if (still.matches) {
+					// Nothing burns and nothing waits; the knock rings for as long as the page takes to go.
+					tap()?.catch(() => {});
+					return;
 				}
-				const wait = KNOCK_MS - (performance.now() - knocked);
-				if (wait <= 0) return;
 				e.preventDefault();
-				setTimeout(() => location.assign(go.href), wait);
+				exit(go.href);
 			},
 			{ signal },
 		);
@@ -232,6 +322,7 @@ onPage((signal) => {
 
 	return () => {
 		cancelAnimationFrame(frame);
+		undo?.();
 		if (sounding()) leave();
 		snd.remove();
 		delete main.dataset.on;

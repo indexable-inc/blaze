@@ -1,14 +1,14 @@
 /* The intro, the site's front door (a `Hero` page: render.rs writes it without the sidebar; client/intro.ts runs it).
-   The wordmark big in the middle of the window, then one line and the way in. Near-black, quiet: the fire is the
-   only colour on the page. */
+   The wordmark big in the window, then one line, the proof of it (a race, measured), the way in, and what else is
+   built. One screen, no scroll. Near-black, quiet: the fire is the only colour on the page. */
 
 body.front { min-height: 100svh; }
-main.intro { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: clamp(18px, 3.2svh, 34px); max-width: none; min-height: 100svh; margin: 0; padding: 28px 16px 36px; text-align: center; overflow: hidden; }
+main.intro { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: clamp(14px, 2.4svh, 26px); max-width: none; min-height: 100svh; margin: 0; padding: 20px 16px 24px; text-align: center; overflow: hidden; }
 
 /* The wordmark's frame: the letters with room for their flames, 43 by 23 cells (the brand picture's own shape, which
    is what shows without JS). intro.ts sizes it to a whole number of device pixels a cell and draws on the canvas,
    which runs twelve rows above the frame, for the letters to fall through. */
-.wordmark { position: relative; flex: none; width: min(86vw, 46svh * 688 / 368, 946px); aspect-ratio: 688 / 368; margin: 0; line-height: 0; }
+.wordmark { position: relative; flex: none; width: min(86vw, 40svh * 688 / 368, 946px); aspect-ratio: 688 / 368; margin: 0; line-height: 0; }
 .wordmark .logo, .wordmark .logo img { display: block; width: 100%; height: 100%; }
 .wordmark .logo img { margin: 0; border-radius: 0; box-shadow: none; background: none; image-rendering: pixelated; }
 .wordmark canvas { position: absolute; left: 0; top: 0; display: none; image-rendering: pixelated; pointer-events: none; }
@@ -16,12 +16,41 @@ main.intro[data-on] .wordmark { aspect-ratio: auto; }
 main.intro[data-on] .wordmark .logo { display: none; }
 main.intro[data-on] .wordmark canvas { display: block; }
 
-/* Under the word: what blaze is, the way in, and the reference pages, quietly. */
-.intro-after { display: grid; justify-items: center; gap: 22px; max-width: 100%; }
-.doc.intro .lede { max-width: 30em; margin: 0; font-size: clamp(18px, 2.3vw, 22px); line-height: 1.45; letter-spacing: -0.015em; color: var(--ink-1); text-wrap: balance; }
-.doc.intro .dim { margin: 0; font-size: 14px; color: var(--ink-3); }
+/* Under the word: what blaze is, the race, the way in, what else is built, and the reference pages, quietly. */
+.intro-after { display: grid; justify-items: center; gap: clamp(14px, 2.2svh, 22px); width: 100%; max-width: 100%; }
+.doc.intro .lede { max-width: 46em; margin: 0; font-size: clamp(17px, 1.9vw, 20px); line-height: 1.45; letter-spacing: -0.015em; color: var(--ink-1); text-wrap: balance; }
+.doc.intro .dim { margin: 0; font-size: 13.5px; color: var(--ink-3); }
 .doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
 .doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+
+/* A race (content/schema.flecs Race; render.rs): blaze and cargo building the same edit, two lanes of cells on one
+   time scale, each with its time. The lit cells are how long each took: blaze's few in the fire's colour, cargo's
+   whole lane in the quiet ink. intro.ts lights them in real time. */
+.race { display: grid; gap: 6px; width: min(100%, 540px); margin: 0; }
+.race .lane { display: grid; grid-template-columns: 3.2em minmax(0, 1fr) 5.4em; align-items: center; gap: 12px; }
+.race .who { text-align: left; font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3); }
+.race .cells { display: block; width: 100%; height: auto; shape-rendering: crispEdges; }
+.race .cells rect { fill: var(--line); }
+.race .cells rect.on { fill: var(--ink-3); }
+.race .blaze .cells rect.on { fill: var(--fire); }
+.race .took { text-align: right; font-size: 14px; line-height: 1.2; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.race .took b { font-size: 25px; font-weight: 600; letter-spacing: -0.03em; }
+.race .blaze :is(.who, .took b) { color: var(--ink-1); }
+.race figcaption { margin-top: 4px; font-size: 12.5px; line-height: 1.45; color: var(--ink-3); text-wrap: balance; }
+/* Each part of the caption stays whole on a line: a narrow window breaks between them, never inside one. */
+.race figcaption span, .race figcaption a { white-space: nowrap; }
+.doc .race figcaption a { color: var(--ink-2); text-decoration-color: transparent; }
+.doc .race figcaption a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+
+/* Chips (content/schema.flecs): small links to lessons, each with its lesson's glyph and, when the lesson's band of
+   the course has one, its tag (Experimental), so nothing unsettled reads as finished. */
+.doc .chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.doc .chips li { margin: 0; }
+.doc a.chip { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px 0 9px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-2); font-size: 13.5px; text-decoration: none; white-space: nowrap; transition: color 0.12s, background-color 0.12s; }
+.doc a.chip:hover { background: var(--s-tint); color: var(--ink-1); }
+.chip-glyph { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
+.chip-glyph .glyph { display: block; width: 100%; height: 100%; }
+.chip .tag { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
 
 /* Go: a page's one big button, a link (content/schema.flecs). */
 .doc .go { margin: 0; }
@@ -56,10 +85,17 @@ main.intro[data-on] .wordmark canvas { display: block; }
 	.doc .go a { height: 50px; }
 	.doc.intro .dim { font-size: 13.5px; }
 }
-/* A short window (a phone on its side): everything closes up so the word, the line and the button fit in it. */
+/* A short window (a phone on its side): everything closes up, and the chips go, so the word, the line, the race and
+   the button fit in it. */
 @media (max-height: 480px) {
-	main.intro { gap: 10px; padding-block: 12px; }
-	.intro-after { gap: 10px; }
-	.doc.intro .lede { max-width: none; font-size: 17px; }
-	.doc .go a { height: 44px; }
+	main.intro { gap: 8px; padding-block: 8px; }
+	.intro-after { gap: 8px; }
+	.doc.intro .lede { max-width: none; font-size: 16px; }
+	.race { gap: 2px; }
+	.race .took b { font-size: 19px; }
+	.doc .go a { height: 40px; }
+	.doc .chips { display: none; }
 }
+
+/* The exit (client/lib/burn.ts): the fire that burns the page away on Start, over everything. */
+.intro-burn { position: fixed; z-index: 50; top: 0; left: 0; image-rendering: pixelated; pointer-events: none; }
