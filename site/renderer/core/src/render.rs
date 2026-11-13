@@ -565,7 +565,7 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
         // cargo's progress bar while it works (cargo clears it when done, so as rendered it is hidden); blaze is done
         // before a bar would show.
         let compiling = if compiling {
-            "<span class=\"out run\" hidden>\n<b class=\"st cy\">    Building</b> [<span class=\"fill\"></span>]</span>".to_string()
+            "<span class=\"out run\" hidden>\n<b class=\"st cy\">    Building</b> <span class=\"fill\"></span><span class=\"rest\"></span></span>".to_string()
         } else {
             String::new()
         };

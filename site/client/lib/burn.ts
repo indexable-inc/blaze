@@ -30,8 +30,15 @@ export const BURNT = SWEEP + RAGGED + GONE;
 
 export type Burn = {
 	canvas: HTMLCanvasElement;
-	/** Paints the frame `t` seconds after the fire starts; before 0 nothing has caught. */
-	draw(t: number): void;
+	/**
+	 * Paints the frame `t` seconds after the fire starts; before 0 nothing has caught. A burnt cell is the page's
+	 * background (`ash`), or with `reveal` nothing, so what is under the canvas shows through it.
+	 */
+	draw(t: number, reveal?: boolean): void;
+	/** The cells not yet burnt at `t`, as a `clip-path` for a layer over the whole window (CSS px). */
+	standing(t: number): string;
+	/** Every cell is gone and every ember out. */
+	readonly out: number;
 };
 
 /**
@@ -68,9 +75,26 @@ export function burn(px: number, ox: number, oy: number, theme: Theme, ash: stri
 	};
 	return {
 		canvas,
-		draw(t) {
+		out: BURNT + EMBER_LIFE,
+		standing(t) {
+			// One rectangle per run of standing cells in a row; nonzero winding unions them.
+			let d = '';
+			const at = (v: number) => +(v / dpr).toFixed(2);
+			for (let y = 0; y < rows; y++) {
+				let x = 0;
+				while (x < cols) {
+					while (x < cols && t - reach[y * cols + x]! >= GONE) x++;
+					const from = x;
+					while (x < cols && t - reach[y * cols + x]! < GONE) x++;
+					if (x > from) d += `M${at(x0 + from * px)} ${at(y0 + y * px)}H${at(x0 + x * px)}V${at(y0 + (y + 1) * px)}H${at(x0 + from * px)}Z`;
+				}
+			}
+			return `path('${d || 'M0 0Z'}')`;
+		},
+		draw(t, reveal = false) {
 			ctx.clearRect(0, 0, canvas.width, canvas.height);
 			if (t >= BURNT + EMBER_LIFE) {
+				if (reveal) return;
 				ctx.fillStyle = ash;
 				ctx.fillRect(0, 0, canvas.width, canvas.height);
 				return;
@@ -79,7 +103,9 @@ export function burn(px: number, ox: number, oy: number, theme: Theme, ash: stri
 				for (let x = 0; x < cols; x++) {
 					const age = t - reach[y * cols + x]!;
 					if (age < 0) continue;
-					if (age >= GONE) cell(x, y, ash);
+					if (age >= GONE) {
+						if (!reveal) cell(x, y, ash);
+					}
 					else cell(x, y, theme.fire[4 - FLAME.findIndex((a) => age < a)]!);
 				}
 			}
