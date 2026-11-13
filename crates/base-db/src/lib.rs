@@ -25,7 +25,6 @@ mod table;
 pub mod target;
 #[cfg(test)]
 mod tests;
-pub mod trees;
 mod view;
 
 use std::{str::FromStr as _, sync::atomic::AtomicUsize};
@@ -60,6 +59,7 @@ pub use crate::{
 };
 use blaze_hash::HashSet;
 pub use blaze_ids::ContentId;
+pub use blaze_vfs::outside::{Look, LookKind, Looks};
 use blaze_ids::Hasher;
 use blaze_query::db::{Durability, Setter};
 pub use blaze_query::db::{par_for_each, par_map};
@@ -466,6 +466,18 @@ impl std::fmt::Display for ReadError {
     }
 }
 
+/// Whether `error` says nothing is at the path, as `blaze_usercode::inputs` reads it: not
+/// found, or a part of the path before its last is no directory.
+fn not_there(error: &std::io::Error) -> bool {
+    // `ENOTDIR`, on Linux and on macOS.
+    #[cfg(unix)]
+    const NOT_A_DIRECTORY: i32 = 20;
+    #[cfg(not(unix))]
+    const NOT_A_DIRECTORY: i32 = 267;
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+        || error.raw_os_error() == Some(NOT_A_DIRECTORY)
+}
+
 /// What [`IncludedFile::content_now`] last read of each path, with the generation of the
 /// watches outside every view ([`blaze_vfs::outside::generation`]) read before it looked.
 static VOUCHED: std::sync::LazyLock<
@@ -513,12 +525,27 @@ impl IncludedFile {
     }
 
     /// The file at `path` read from disk now, as the front end reads a file outside the VFS
-    /// ([`Files::included_file`] reads the path its view has it at).
-    pub fn read_now(path: &std::path::Path) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        // Read from the disk every time, and counted as a look at it: no watch vouches for
-        // the file (`blaze_vfs::outside::looks`).
-        blaze_vfs::outside::looked(path);
-        std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
+    /// ([`Files::included_file`] reads the path its view has it at). Read from the disk every
+    /// time: no watch vouches for the file here. The look is pushed to `looks`, the list of
+    /// the build the file is read for, as a [`LookKind::File`] look.
+    ///
+    /// The invariant: the answer pushed is what `blaze_usercode::inputs::Files` says of the
+    /// path when asked again: the BLAKE3 hash of a regular file's bytes, `None` for a path
+    /// that is not there. Anything else read (a directory, a device, a file that can't be
+    /// read) pushes nothing: its answer there is one this crate does not make.
+    pub fn read_now(path: &std::path::Path, looks: &Looks) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        let read = std::fs::read(path);
+        if looks.keeps() {
+            match &read {
+                // A regular file alone hashes as its bytes; a pipe or a device read here does not.
+                Ok(bytes) if std::fs::metadata(path).is_ok_and(|it| it.is_file()) => {
+                    looks.push(path, LookKind::File, Some(blaze_ids::b3::hash(bytes)));
+                }
+                Err(error) if not_there(error) => looks.push(path, LookKind::File, None),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        read.map(Into::into).map_err(|it| ReadError::of(&it))
     }
 
     /// [`IncludedFile::content`] of the file at `path` as it is on disk now
@@ -534,8 +561,8 @@ impl IncludedFile {
     /// build asked of each file its closure includes, and a build that looked at any path no
     /// watch covers is never answered again without a walk (the no-op lane), so reth's build
     /// with nothing changed walked 5,305 units for one path a registry crate's `#[path]`
-    /// names that is not there.
-    pub fn content_now(path: &std::path::Path) -> ContentId {
+    /// names that is not there. A look made is pushed to `looks` ([`IncludedFile::read_now`]).
+    pub fn content_now(path: &std::path::Path, looks: &Looks) -> ContentId {
         let kept = VOUCHED.lock().get(path).copied();
         if let Some((generation, id)) = kept
             && (generation == HELD || blaze_vfs::outside::name_unchanged_since(path, generation))
@@ -554,7 +581,7 @@ impl IncludedFile {
         if plain && kept.is_none() {
             blaze_vfs::outside::watch_name(path);
         }
-        let id = IncludedFile::content_of(IncludedFile::read_now(path).as_deref());
+        let id = IncludedFile::content_of(IncludedFile::read_now(path, looks).as_deref());
         if plain {
             // alloc: once per included file, its path as the key of what was read of it
             VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
@@ -785,13 +812,90 @@ pub fn crate_durability(db: &Db, krate: Crate) -> Durability {
     }
 }
 
+/// The crate graph's list, and the same crates split by the kind of their root file's source
+/// root. `crates` (every crate, in topological order) and `content` are of the durability the
+/// writer gives, `MEDIUM` for a build's graph: a workspace change (a local crate added, a
+/// member's feature flipped) moves them and must not move the `HIGH` revision. `library` (the
+/// crates of library roots, in the same order) is `HIGH` and written only when it changes, so
+/// a reader of it alone (a library root's [`source_root_crates`], what a sealed crate's cover
+/// reads) is a `HIGH` read that a workspace change leaves. `local` is the rest, of the
+/// writer's durability. A reader of one part reads that part only (rule 21: what it is made
+/// from is the part it read).
 #[blaze_query::input(singleton, debug)]
 struct AllCrates {
     #[returns(clone)]
     crates: std::sync::Arc<[Crate]>,
     #[returns(copy)]
     content: InputId,
+    #[returns(clone)]
+    library: std::sync::Arc<[Crate]>,
+    #[returns(clone)]
+    local: std::sync::Arc<[Crate]>,
 }
+
+/// `crates` split by [`Files::in_library_root`] of each one's root file, each part in the
+/// order given.
+fn by_root_kind(
+    db: &Db,
+    crates: &[Crate],
+) -> (std::sync::Arc<[Crate]>, std::sync::Arc<[Crate]>) {
+    let files = db.files();
+    // alloc: the two parts of the crate graph's list, once per write of it (setup).
+    let (library, local): (Vec<Crate>, Vec<Crate>) = crates
+        .iter()
+        .copied()
+        .partition(|krate| files.in_library_root(db, krate.data(db).root_file_id));
+    (library.into(), local.into())
+}
+
+/// Writes the crate graph's list `crates` (and its content ID and parts) with `durability`,
+/// `library` at `HIGH`: the one writer of [`AllCrates`].
+fn write_all_crates(db: &mut Db, crates: std::sync::Arc<[Crate]>, durability: Durability) {
+    let content = InputId(crate_graph_content(&*db, &crates));
+    let (library, local) = by_root_kind(&*db, &crates);
+    match AllCrates::try_get(&*db) {
+        Some(all) => {
+            all.set_crates(db).with_durability(durability).to(crates);
+            all.set_content(db).with_durability(durability).to(content);
+            set_crate_lists(db, all, library, local, Some(durability));
+        }
+        None => {
+            _ = AllCrates::builder(durability, crates, content, library, local)
+                .library_durability(Durability::HIGH)
+                .new(db);
+        }
+    }
+}
+
+/// Sets each part of the list that differs: an equal part is left, so its readers stay.
+fn set_crate_lists(
+    db: &mut Db,
+    all: AllCrates,
+    library: std::sync::Arc<[Crate]>,
+    local: std::sync::Arc<[Crate]>,
+    durability: Option<Durability>,
+) {
+    if *all.library(&*db) != *library {
+        all.set_library(db).with_durability(Durability::HIGH).to(library);
+    }
+    if *all.local(&*db) != *local {
+        files::set(all.set_local(db), durability, local);
+    }
+}
+
+/// Splits the list again after a write that may have moved a crate's root file into a root
+/// of the other kind (a source root's set, a file's root, a crate's data): an implied write,
+/// so it runs once a batch, after its last write.
+pub(crate) fn refresh_crate_lists(db: &mut Db, written: &Written<'_>) {
+    if written.roots.is_empty() && !written.crates {
+        return;
+    }
+    let Some(all) = AllCrates::try_get(&*db) else { return };
+    let (library, local) = by_root_kind(&*db, &all.crates(&*db));
+    set_crate_lists(db, all, library, local, None);
+}
+
+inventory::submit!(Implied { name: "base-db crate lists by root kind", write: refresh_crate_lists });
 
 /// The crate graph's content ID is of its crates' content IDs, in topological order.
 pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 1";
@@ -830,16 +934,7 @@ pub fn set_all_crates_with_durability(
     // alloc: the crate graph's list, once per set (setup).
     let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
     db.write_crates("set_all_crates_with_durability", |db| {
-        let content = InputId(crate_graph_content(&*db, &crates));
-        match AllCrates::try_get(&*db) {
-            Some(all) => {
-                all.set_crates(db).with_durability(durability).to(crates);
-                all.set_content(db).with_durability(durability).to(content);
-            }
-            None => {
-                _ = AllCrates::new(db, durability, crates, content);
-            }
-        }
+        write_all_crates(db, crates, durability)
     })
 }
 
@@ -867,18 +962,7 @@ pub fn add_crates(db: &mut Db, added: &[Crate], durability: Durability) {
     }
     // alloc: the crate graph's list, once per plan that adds crates.
     let crates: std::sync::Arc<[Crate]> = was.iter().chain(added).copied().collect();
-    db.write("base_db::add_crates", |db| {
-        let content = InputId(crate_graph_content(&*db, &crates));
-        match AllCrates::try_get(&*db) {
-            Some(all) => {
-                all.set_crates(db).with_durability(durability).to(crates);
-                all.set_content(db).with_durability(durability).to(content);
-            }
-            None => {
-                _ = AllCrates::new(db, durability, crates, content);
-            }
-        }
-    })
+    db.write("base_db::add_crates", |db| write_all_crates(db, crates, durability))
 }
 
 /// Returns the crates in topological order.
@@ -900,7 +984,13 @@ pub struct InternedSourceRootId {
 pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     #[blaze_query::tracked(returns(deref))]
     pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
-        let crates = AllCrates::get(db).crates(db);
+        // A library root's crates are of the library part alone, a `HIGH` read; a local
+        // root's of the local part ([`AllCrates`]).
+        let all = AllCrates::get(db);
+        let crates = match root.source_root_ref(db).is_library {
+            true => all.library(db),
+            false => all.local(db),
+        };
         blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
             let mut found = Vec::new_in(frame);
             found.extend(crates.iter().copied().filter(|&krate| {

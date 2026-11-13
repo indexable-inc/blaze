@@ -1,0 +1,14 @@
+{
+ "id": "kept-lowered-moved-apart",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 5 T1 (the idle budget), int-1112",
+ "where": "crates/blaze-cargo/src/serve/unit.rs KeptLowered, Steps::lower; crates/blaze-cargo/src/serve/job/giving.rs",
+ "what": "Counting kept front ends (so the process tables are freed only once none is) needs a Drop on KeptLowered, but `lower` took a kept front end apart by a struct pattern, which a Drop type forbids; and the take is not a drop of the database, only its end as a kept one. KeptLowered became a counted holder of KeptParts (Deref), taken apart by into_parts, which ends the count. Separately: an idle daemon held to 48 MiB with something it may not give (a floor in its wait, a live image) would have listed and purged every 250 ms forever, since the allocator's estimate never falls; it now plans again only after the budget's wait.",
+ "cost": "a redesign of the kept front end's type in the middle of a memory task",
+ "cause": "the kept front end's lifetime (kept, taken, dropped) was implicit in moves, with no type marking where it ends",
+ "class": "a resource whose end is a move, not a drop, so no hook sees it",
+ "prevention": "a holder type whose every way out (drop, take) is one method that says what ends",
+ "workaround": "none",
+ "fix": "KeptLowered::{new, into_parts, Drop}; giving.rs backs an idle plan off by idle::BUDGET_AFTER",
+ "state": "fixed, not built yet"
+}

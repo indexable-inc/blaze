@@ -72,7 +72,7 @@ pub(crate) fn observe(cx: &Cx<'_, '_>, effective: &Effective) -> Observation {
     // What a builtin derive makes has no node, and what a derive or attribute macro on the
     // type writes is in its expansion: both go with the type as if in it.
     for of in defs.impls() {
-        let Some(ptr) = defs[of.def].node else { continue };
+        let Some(ptr) = defs.node(cx, of.def) else { continue };
         for owner in [of.self_adt, of.trait_].into_iter().flatten() {
             if !matches!(defs[owner].kind, Kind::Struct | Kind::Union | Kind::Enum | Kind::Trait) {
                 continue;
@@ -99,7 +99,7 @@ pub(crate) fn observe(cx: &Cx<'_, '_>, effective: &Effective) -> Observation {
 /// attributes, an attribute macro on it): its span, as diagnostics place it, is inside the
 /// owner's.
 fn written_on(cx: &Cx<'_, '_>, defs: &Defs, owner: DefIdx, ptr: InFile<syntax::SyntaxNodePtr>) -> bool {
-    let Some(at) = defs[owner].node else { return false };
+    let Some(at) = defs.node(cx, owner) else { return false };
     if at.file_id.macro_file().is_some() {
         return false;
     }
@@ -150,7 +150,7 @@ fn inactive(cx: &Cx<'_, '_>) -> Vec<Inactive> {
         if source.file_id.macro_file().is_some() || !matches!(source.value, hir::ModuleSourceView::SourceFile(_)) {
             continue;
         }
-        let root = cx.vsema.parse_or_expand(source.file_id);
+        let root = cx.root(source.file_id);
         let mut past = TextSize::new(0);
         for node in root.descendants() {
             let range = node.text_range();
@@ -221,7 +221,8 @@ fn item(cx: &Cx<'_, '_>, defs: &Defs, def: DefIdx, used: bool, reported: Option<
     let d = &defs[def];
     // What a builtin derive makes has no node and goes with its type, as if in it: a `#[cfg]`
     // on the type leaves the derive out too.
-    let parent = match (d.parent, d.node, defs.impl_of(def).and_then(|it| it.self_adt)) {
+    let node = defs.node(cx, def);
+    let parent = match (d.parent, node, defs.impl_of(def).and_then(|it| it.self_adt)) {
         (_, None, Some(adt)) if matches!(d.kind, Kind::Impl { .. }) => Some(adt),
         (Parent::Def(it), _, _) => Some(it),
         (Parent::Module | Parent::Anon(_), _, _) => None,
@@ -248,7 +249,7 @@ fn item(cx: &Cx<'_, '_>, defs: &Defs, def: DefIdx, used: bool, reported: Option<
         companions: Vec::new(), // alloc: empty until an impl is of it
         fixable: false,
     };
-    let Some(ptr) = d.node else { return item };
+    let Some(ptr) = node else { return item };
     let node = cx.syntax_view(ptr);
     let in_file = ptr.file_id.macro_file().is_none();
     let range = match ast::AnyHasName::cast(node.value).and_then(|it| it.name()) {

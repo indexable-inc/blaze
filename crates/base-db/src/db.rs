@@ -32,9 +32,8 @@ use triomphe::Arc;
 
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
-    LibraryRoots, LocalRoots, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
+    LibraryRoots, LocalRoots, Looks, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
     ViewError, ViewRoot,
-    editioned_file_id::Parses,
     maintain::{Maintenance, Note, Trigger},
     set_all_crates_with_durability,
 };
@@ -55,8 +54,6 @@ pub struct Db {
     log: Option<std::sync::Arc<EventLog>>,
     /// The maintainers' state and the writes they have yet to see ([`crate::maintain`]).
     pub(crate) maintenance: Maintenance,
-    /// What the files' parses are read from besides parsing.
-    pub(crate) parses: Parses,
 }
 
 /// Where [`Db::run_all`] runs its tasks.
@@ -200,7 +197,6 @@ impl Db {
             run,
             log,
             maintenance: Maintenance::default(),
-            parses: Parses::new(crate::trees::installed().cloned()),
         };
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
         crate::settings::set_from_env(&mut db);
@@ -279,11 +275,11 @@ impl Db {
         self.files.file_source_root(self, id)
     }
 
-    /// See [`Files::reload_included_file`].
-    pub fn reload_included_file(&mut self, path: &AbsPath) -> bool {
+    /// See [`Files::reload_included_file`]; `looks` is the list of the build it is read for.
+    pub fn reload_included_file(&mut self, path: &AbsPath, looks: &Looks) -> bool {
         let files = Arc::clone(&self.files);
         self.write("Db::reload_included_file", |db| {
-            let changed = files.reload_included_file(db, path);
+            let changed = files.reload_included_file(db, path, looks);
             if changed && let Some(file) = files.find_included(path) {
                 db.note(Note::Included(file));
                 // The text `include!` parses of it changed with it: a file no module is in.
@@ -338,8 +334,9 @@ impl Db {
     /// reads it reports the error naming the path, as rustc does. The paths set, sorted; when
     /// none moved, nothing is written and no maintenance pass runs. O(the files' bytes), once
     /// per call: for whoever owns the database across changes on disk (a daemon's kept front
-    /// end, each job), as a file outside the VFS can change with no change of the VFS.
-    pub fn reload_included_files(&mut self, trigger: Trigger<'_>) -> Vec<AbsPathBuf> {
+    /// end, each job), as a file outside the VFS can change with no change of the VFS. Each
+    /// look at the disk it makes is pushed to `looks`, the list of the build it is called for.
+    pub fn reload_included_files(&mut self, trigger: Trigger<'_>, looks: &Looks) -> Vec<AbsPathBuf> {
         let files = Arc::clone(&self.files);
         let span = tracing::info_span!(
             target: "blaze",
@@ -353,7 +350,7 @@ impl Db {
         let mut moved: Vec<AbsPathBuf> = files
             .included_paths()
             .inspect(|_| read += 1)
-            .filter(|path| !files.included_is_read(db, path))
+            .filter(|path| !files.included_is_read(db, path, looks))
             .map(|path| path.to_path_buf()) // alloc: a path that moved, the result
             .collect(); // alloc: none unless a file moved; the paths are the result
         span.record("files", read);
@@ -369,7 +366,7 @@ impl Db {
             let path: &AbsPath = path.as_path();
             let on_disk = files.on_disk(path.as_ref());
             let was = files.find_included(path).map(|it| read_said(it.read_field(db)));
-            let now = read_said(&IncludedFile::read_now(&on_disk));
+            let now = read_said(&IncludedFile::read_now(&on_disk, looks));
             tracing::info!(
                 target: "blaze",
                 path = %path,
@@ -380,7 +377,7 @@ impl Db {
             );
         }
         // Read once more as each is set: one changed back since is not set, nor listed.
-        self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path)));
+        self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path, looks)));
         span.record("moved", moved.len() as u64);
         moved
     }

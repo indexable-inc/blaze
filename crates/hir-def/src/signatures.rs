@@ -612,19 +612,7 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             unreachable!("the spans of a file, not a macro's, are a real span map")
         };
         let mut bodies = Vec::new_in(frame);
-        bodies_under(root, |body| {
-            let item = body.parent().expect("a body is under its item");
-            if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(body) {
-                return;
-            }
-            let (start, anchor) = span_map.anchor_at(item.text_range().start());
-            let own = start == item.text_range().start()
-                && anchor != ROOT_ERASED_FILE_AST_ID
-                && ast_id_map.get_erased(anchor) == ast::ptr(item);
-            if own {
-                bodies.push(body);
-            }
-        });
+        cut_under(root, &span_map, &ast_id_map, |body, _| bodies.push(body));
         let outline = copy_without(root, &bodies, Some(CUT));
         let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it)));
         let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
@@ -645,6 +633,58 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             cuts,
         }
     })
+}
+
+/// The bodies [`file_outline`] cuts out of the tree `root` of a file, in order, each with the
+/// ast id of its item, the anchor its spans count from: the [`left_out`] body of each item
+/// that is its own span anchor, but a fn's whose text may start with an inner attribute.
+fn cut_under<'t>(
+    root: ast::Node<'t>,
+    span_map: &RealSpanMap,
+    ast_id_map: &AstIdMap,
+    mut each: impl FnMut(ast::Node<'t>, span::ErasedFileAstId),
+) {
+    bodies_under(root, |body| {
+        let item = body.parent().expect("a body is under its item");
+        if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(body) {
+            return;
+        }
+        let (start, anchor) = span_map.anchor_at(item.text_range().start());
+        let own = start == item.text_range().start()
+            && anchor != ROOT_ERASED_FILE_AST_ID
+            && ast_id_map.get_erased(anchor) == ast::ptr(item);
+        if own {
+            each(body, anchor);
+        }
+    });
+}
+
+/// Where in `file_id`'s live tree each body its [`FileOutline`] cuts out is, in order, with the
+/// ast id of the body's item: what a by-piece check (blaze-diagnostics' `pieces`) skips of the
+/// live tree for a body it found clean. Recomputed from the live file at each call, never kept
+/// in the outline, so the outline's equality, and its backdating at a body edit, are untouched;
+/// no query of its own, as what it gives moves with every edit.
+pub fn cut_bodies(db: &Db, file_id: EditionedFileId) -> Box<[(TextRange, span::ErasedFileAstId)]> {
+    let file = HirFileId::from(file_id);
+    let root = file.root(db);
+    let ast_id_map = file.ast_id_map(db);
+    let SpanMap::RealSpanMap(span_map) = file.span_map(db) else {
+        unreachable!("the spans of a file, not a macro's, are a real span map")
+    };
+    // alloc: the result, one entry a cut body, once per file a check asks
+    let mut cut = Vec::new();
+    cut_under(root, &span_map, &ast_id_map, |body, anchor| cut.push((body.text_range(), anchor)));
+    cut.into_boxed_slice()
+}
+
+/// The body [`file_outline`] cuts out of `def`'s item ([`cut_under`]), in the tree of `def`'s
+/// own syntax ([`body_syntax`]), not the live file's: the same while the body is, whatever
+/// moves around it, so what is read off it is read by position-free syntax. `None` for a def
+/// with no syntax of its own (written by a macro) or no body there.
+pub fn cut_body_syntax(db: &Db, def: DefWithBodyId) -> Option<ast::Node<'_>> {
+    let tree = body_tree(db, def).as_ref()?;
+    let syntax = body_syntax(db, def).as_ref()?;
+    left_out(ast::to_node(syntax.item, ast::Node::root(tree)))
 }
 
 /// The [`SignatureSyntax`] of the item at `id` of `module`, `elide`'s node of it left out when
@@ -892,7 +932,7 @@ fn visibility_of(
 }
 
 /// The root of `file`'s [`FileOutline`]: the file less the bodies it leaves out.
-pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
+pub fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
     syntax::view::root(&file_outline(db, file).tree).expect("an outline's root is a file")
 }
 

@@ -358,6 +358,7 @@ pub fn import(file: &Path, name: &str) -> Imported {
             action,
             args: Vec::new(),
             env: Vec::new(),
+            at_once: 1,
             expect: Expect { fails: fails.then(|| "error".to_owned()), ..Expect::default() },
             known: BTreeMap::new(),
         });

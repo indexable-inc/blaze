@@ -1220,6 +1220,11 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(from, true);
             named(to, true);
         }
+        // A copy of a file's data reads `from` and makes `to`.
+        Effect::CopyData { from, to, .. } => {
+            named(from, false);
+            named(to, true);
+        }
         // A prewarm reads which pages of `like` are cached and asks for those of `file`: it
         // names both and changes neither.
         Effect::Prewarm { like, file, .. } => {
@@ -1280,7 +1285,7 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
         }
-        Effect::Clone { to, .. } | Effect::Link { to, .. } => {
+        Effect::Clone { to, .. } | Effect::CopyData { to, .. } | Effect::Link { to, .. } => {
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
         }

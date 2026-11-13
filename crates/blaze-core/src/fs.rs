@@ -27,7 +27,7 @@ pub(crate) mod linux;
 mod wasi;
 
 #[cfg(target_os = "wasi")]
-pub(crate) use wasi::{clone, entries, seal, set_mode, set_times, stamps};
+pub(crate) use wasi::{clone, copy_data, entries, seal, set_mode, set_times, stamps};
 
 #[cfg(any(unix, target_os = "wasi"))]
 use std::{fs::File, io::Write as _};
@@ -274,13 +274,38 @@ pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
 /// device. Off Linux, `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves
-/// the bytes in the drive's cache.
+/// the bytes in the drive's cache. Opened read-only where it is there ([`to_sync`]).
 pub(crate) fn sync(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     return linux::sync(path);
     #[cfg(not(target_os = "linux"))]
     // durable: the effect is the sync its caller asked for.
-    return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
+    return to_sync(path)?.sync_all();
+}
+
+/// The file at `path` opened to be synced ([`sync`], [`barrier`]). On a Unix read-only where
+/// it is there: `fsync`, `F_FULLFSYNC` and `F_BARRIERFSYNC` need no write access, and a file
+/// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+/// Made, opened to append as an append makes it, only where it is missing (the contract of a
+/// sync and a barrier: "made where it is missing"). Linux's is `linux::to_sync`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn to_sync(path: &Path) -> io::Result<File> {
+    match File::open(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            OpenOptions::new().append(true).create(true).open(path)
+        }
+        opened => opened,
+    }
+}
+
+/// [`to_sync`] where the system is no Unix: opened to append, as Windows' `FlushFileBuffers`
+/// needs a handle with write access (`GENERIC_WRITE`) and WASI's `fd_sync` a descriptor with
+/// the right to sync, which a read-only open does not carry. On Windows a file sealed
+/// read-only (its read-only attribute) refuses that open, so its sync fails, naming it: a
+/// sealed file is synced there before it is sealed, or not at all. WASI seals nothing.
+#[cfg(not(unix))]
+fn to_sync(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new().append(true).create(true).open(path)
 }
 
 /// [`crate::Effect::Barrier`] on Linux: `fdatasync`, the cheapest call there that orders a
@@ -301,7 +326,7 @@ pub(crate) fn barrier(path: &Path) -> io::Result<()> {
 #[expect(unsafe_code, reason = "fcntl(F_BARRIERFSYNC), the one call that orders a file's bytes without the drive's flush")]
 pub(crate) fn barrier(path: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
-    let file = OpenOptions::new().append(true).create(true).open(path)?;
+    let file = to_sync(path)?;
     // SAFETY: an open descriptor, and a command that takes no argument.
     match unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } {
         -1 => Err(io::Error::last_os_error()),
@@ -314,7 +339,7 @@ pub(crate) fn barrier(path: &Path) -> io::Result<()> {
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub(crate) fn barrier(path: &Path) -> io::Result<()> {
     // durable: the effect is the ordering its caller asked for; this system's one call for it waits for the device.
-    OpenOptions::new().append(true).create(true).open(path)?.sync_data()
+    to_sync(path)?.sync_data()
 }
 
 /// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
@@ -396,23 +421,32 @@ pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
     // SAFETY: the mapping made above, whole, used by nothing after this.
     unsafe { libc::munmap(at, len) };
     asked?;
-    // Each run of pages the cache holds, asked for in `file`. Bounded: one turn a page.
-    let (mut bytes, mut next) = (0u64, 0usize);
-    while next < held.len() && bytes < most {
-        if held[next] & 1 == 0 {
-            next += 1;
-            continue;
+    // Each run of pages the cache holds, asked for in `file`, inside `like`'s data extents
+    // only: a hole of `like` is a hole of its clone, which reads as zeros with no read of the
+    // device, so a read-ahead of it only fills the cache with zero pages. Measured
+    // 2026-11-12 on xfs (hello world's 158 MB dev executable): the first edit after a place
+    // read ahead 158 MB, the whole file, of which 134 MB are its two 64 MiB reserves of
+    // zeros, holes on the disk. Bounded: one turn a page of the data, and one an extent.
+    let mut bytes = 0u64;
+    data_extents(&like, len as u64, |data, hole| {
+        let (mut next, end) = ((data as usize) / page, (hole as usize).div_ceil(page).min(held.len()));
+        while next < end && bytes < most {
+            if held[next] & 1 == 0 {
+                next += 1;
+                continue;
+            }
+            let first = next;
+            while next < end && held[next] & 1 != 0 {
+                next += 1;
+            }
+            let (from, to) = ((first * page).max(data as usize), (next * page).min(hole as usize));
+            // One call takes a count that fits its integer, and no more than is left of `most`.
+            let run = ((to - from) as u64).min(most - bytes).min(1 << 30);
+            read_ahead(file.as_raw_fd(), from as u64, run)?;
+            bytes += run;
         }
-        let first = next;
-        while next < held.len() && held[next] & 1 != 0 {
-            next += 1;
-        }
-        let (from, to) = (first * page, (next * page).min(len));
-        // One call takes a count that fits its integer, and no more than is left of `most`.
-        let run = ((to - from) as u64).min(most - bytes).min(1 << 30);
-        read_ahead(file.as_raw_fd(), from as u64, run)?;
-        bytes += run;
-    }
+        Ok(())
+    })?;
     Ok(bytes)
 }
 
@@ -834,6 +868,180 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
+/// [`crate::Effect::CopyData`]: `to` made new (it must not be there) with `from`'s length, and
+/// each extent of `from` that holds data copied at its own offset: a hole of `from` stays a
+/// hole of `to`, and the bytes copied, the completion's, are `from`'s data, not its length
+/// (hello world's dev executable is 158 MB of which 134 MB are two 64 MiB reserves of
+/// zeros: until 2026-11-12 a patched place on tmpfs and ext4 wrote them all as data,
+/// 308,808 blocks a path, 164 to 330 ms). Linux: `lseek` with `SEEK_DATA` and `SEEK_HOLE`
+/// for the extents and `copy_file_range` for each, through no memory of this process
+/// (`blaze_sys`). macOS: the same `lseek`s, each extent read and written through one
+/// buffer of [`COPY_BUFFER`] bytes (`pread`, `pwrite`); not `clonefile`, since a volume
+/// that clones (APFS) is placed by [`crate::Effect::Clone`] and this is the route of one
+/// that does not (HFS+, exFAT, a network volume), and not `fcopyfile`, whose sparse copy
+/// says nothing of the bytes it copied. The source is opened as a clone's is: a symbolic
+/// link refused ([`crate::CLONE_THROUGH_A_LINK`]), and what is no regular file
+/// ([`crate::CLONE_OF_NO_FILE`]). A `to` left part made by a failure is removed; the
+/// error names both files.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    making_parent(to, || {
+        let source = open_source(from)?;
+        let len = source.metadata()?.len();
+        let target = OpenOptions::new().write(true).create_new(true).open(to)?;
+        // The length first, so what no extent writes is a hole of `to`.
+        let copied = target.set_len(len).and_then(|()| {
+            let mut bytes = 0u64;
+            data_extents(&source, len, |data, hole| {
+                bytes += copy_extent(&source, &target, data, hole)?;
+                Ok(())
+            })?;
+            Ok(bytes)
+        });
+        copied.map_err(|error| {
+            drop(target);
+            _ = std::fs::remove_file(to);
+            // alloc: an error path.
+            io::Error::new(
+                error.kind(),
+                format!("copying the data of {} to {}: {error}", from.display(), to.display()),
+            )
+        })
+    })
+}
+
+/// The most bytes [`copy_data`] holds of a file at once on macOS, where each extent goes
+/// through this process: one buffer, whatever the file's length.
+#[cfg(target_os = "macos")]
+const COPY_BUFFER: usize = 1 << 20;
+
+/// `each(data, hole)` of every extent of `file`'s first `len` bytes that holds data, in order:
+/// `lseek` with `SEEK_DATA` from where the last ended, then `SEEK_HOLE` from there (the file's
+/// end counts as a hole). A file system that keeps no record of holes says the whole file is
+/// one extent of data, which is true of it. Bounded: each pass moves past one extent, or ends.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn data_extents(file: &File, len: u64, mut each: impl FnMut(u64, u64) -> io::Result<()>) -> io::Result<()> {
+    let mut at = 0u64;
+    while at < len {
+        let Some(data) = seek_extent(file, at, true)? else { break };
+        if data >= len {
+            break;
+        }
+        let hole = seek_extent(file, data, false)?.unwrap_or(len).min(len);
+        if hole <= data {
+            // alloc: an error path.
+            return Err(io::Error::other(format!(
+                "the file's data at {data} ends at {hole}, before it begins: it changed while it was copied"
+            )));
+        }
+        each(data, hole)?;
+        at = hole;
+    }
+    Ok(())
+}
+
+/// Where `file`'s next data (`data`) or next hole begins at or after `at`; `None` where there
+/// is none (`ENXIO`: `at` is at or past the end, or only a hole is left).
+#[cfg(target_os = "linux")]
+fn seek_extent(file: &File, at: u64, data: bool) -> io::Result<Option<u64>> {
+    use blaze_sys::linux::{Whence, lseek};
+    use std::os::fd::AsRawFd as _;
+    let whence = if data { Whence::Data } else { Whence::Hole };
+    match lseek(blaze_sys::Fd::new(file.as_raw_fd()), at, whence) {
+        Ok(found) => Ok(Some(found)),
+        Err(blaze_sys::Errno::Nxio) => Ok(None),
+        Err(errno) => Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
+    }
+}
+
+/// Where `file`'s next data (`data`) or next hole begins at or after `at`; `None` where there
+/// is none (`ENXIO`). Darwin's `SEEK_HOLE` is 3 and `SEEK_DATA` 4 (`<sys/unistd.h>`).
+#[cfg(target_vendor = "apple")]
+#[expect(unsafe_code, reason = "lseek with SEEK_DATA and SEEK_HOLE, which std does not wrap")]
+fn seek_extent(file: &File, at: u64, data: bool) -> io::Result<Option<u64>> {
+    use std::os::fd::AsRawFd as _;
+    let whence = if data { 4 } else { 3 };
+    let Ok(at) = libc::off_t::try_from(at) else {
+        return Err(io::Error::other("an offset past what the system's offsets hold"));
+    };
+    // SAFETY: an open descriptor; the call takes numbers and no memory.
+    match unsafe { libc::lseek(file.as_raw_fd(), at, whence) } {
+        -1 => match io::Error::last_os_error() {
+            error if error.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+            error => Err(error),
+        },
+        found => Ok(Some(found as u64)),
+    }
+}
+
+/// The bytes of `from` from `data` to `hole` copied to `to` at the same offsets by the kernel
+/// (`copy_file_range`, a short copy continued, an interruption made again up to
+/// [`linux::INTERRUPTS_MOST`] times); the bytes copied. A copy that moves nothing before
+/// `hole` is the source cut short while it was copied: the error.
+#[cfg(target_os = "linux")]
+fn copy_extent(from: &File, to: &File, data: u64, hole: u64) -> io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+    let (source, target) = (blaze_sys::Fd::new(from.as_raw_fd()), blaze_sys::Fd::new(to.as_raw_fd()));
+    let (mut at, mut interrupted) = (data, 0);
+    // Bounded: each pass copies at least one byte, is one of at most `INTERRUPTS_MOST`
+    // interruptions in a row, or ends.
+    while at < hole {
+        match blaze_sys::linux::copy_file_range(source, at, target, at, hole - at) {
+            Ok(0) => {
+                // alloc: an error path.
+                return Err(io::Error::other(format!(
+                    "it ended at {at}, inside data that ran to {hole}: it was cut while it was copied"
+                )));
+            }
+            Ok(copied) => (at, interrupted) = (at + copied as u64, 0),
+            Err(blaze_sys::Errno::Intr) if interrupted < linux::INTERRUPTS_MOST => interrupted += 1,
+            Err(errno) => return Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
+        }
+    }
+    Ok(hole - data)
+}
+
+/// The bytes of `from` from `data` to `hole` read and written to `to` at the same offsets
+/// through one buffer of at most [`COPY_BUFFER`] bytes (`pread`, `pwrite`); the bytes copied.
+#[cfg(target_os = "macos")]
+fn copy_extent(from: &File, to: &File, data: u64, hole: u64) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt as _;
+    // alloc: one buffer an extent, at most `COPY_BUFFER` bytes
+    let mut buffer = vec![0u8; ((hole - data) as usize).min(COPY_BUFFER)];
+    let mut at = data;
+    // Bounded: each pass copies at least one byte or ends.
+    while at < hole {
+        let want = ((hole - at) as usize).min(buffer.len());
+        let read = from.read_at(&mut buffer[..want], at)?;
+        if read == 0 {
+            // alloc: an error path.
+            return Err(io::Error::other(format!(
+                "it ended at {at}, inside data that ran to {hole}: it was cut while it was copied"
+            )));
+        }
+        to.write_all_at(&buffer[..read], at)?;
+        at += read as u64;
+    }
+    Ok(hole - data)
+}
+
+/// [`crate::Effect::CopyData`] where no call copies a file's data extents is used here
+/// (Windows, the other Unixes): refused naming both files; nothing copies through memory
+/// instead. Windows would take `FSCTL_QUERY_ALLOCATED_RANGES` and a copy of each range.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "wasi")))]
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error path.
+        format!(
+            "copying the data of {} to {}: this system has no call blaze uses to copy a file's \
+             data extents, and blaze does not copy it through memory instead",
+            from.display(),
+            to.display()
+        ),
+    ))
+}
+
 /// The volume that holds `path`, for an error: where it is mounted and its file system on
 /// macOS; the file system's type and the device on Linux. Two different devices are what a
 /// cross-volume clone (`EXDEV`) refuses.
@@ -1169,9 +1377,109 @@ fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
 }
 
+/// The invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
+/// seals a placed output) succeed on the real file system through `driver`, which runs at
+/// `root`, a directory of the test's own; a sync or a barrier of a missing file makes it, as
+/// before; and a file a sync kept (`uring.rs`'s `Kept::read_only`) is appended to after it.
+/// The control: the open the drivers made before, for writing, of the sealed file is refused
+/// with permission denied, and so is an append to it through `driver` (an open for writing,
+/// as a sync's was before). As root, whom the kernel lets write any file, both are granted, and asserted so.
+/// For each driver's own test (`kqueue.rs`, `uring.rs`, `threads.rs` through either).
+#[cfg(all(test, unix))]
+pub(crate) fn assert_syncs_a_sealed_file(driver: &mut impl crate::Driver, root: &Path) {
+    use crate::{Done, Effect, IoError, Tag};
+    let name = |it: &str| FileName::new(it).unwrap();
+    let mut one = |effect: Effect| {
+        let mut seen = Vec::new();
+        crate::run_until_idle(&mut *driver, &mut vec![effect], |done, _| seen.push(done.done))
+            .expect("the effect ends");
+        let [done] = &seen[..] else { panic!("{seen:?}") };
+        done.clone()
+    };
+    std::fs::create_dir_all(root.join("sealed")).unwrap();
+    let sealed = root.join("sealed/out");
+    std::fs::write(&sealed, b"placed").unwrap();
+    seal(&sealed, 0o444).unwrap();
+    let out = name("sealed/out");
+    assert_eq!(one(Effect::Sync { file: out.clone(), tag: Tag(1) }), Done::Synced);
+    assert_eq!(one(Effect::Barrier { file: out.clone(), tag: Tag(2) }), Done::Ordered);
+    assert_eq!(one(Effect::Sync { file: out.clone(), tag: Tag(3) }), Done::Synced);
+
+    let root_user = crate::raw::euid() == 0;
+    let before = OpenOptions::new().append(true).create(true).open(&sealed);
+    match root_user {
+        false => assert_eq!(
+            before.as_ref().map(|_| ()).map_err(io::Error::kind),
+            Err(io::ErrorKind::PermissionDenied),
+            "the control: the write-open a sync made before is refused"
+        ),
+        true => assert!(before.is_ok(), "root opens a read-only file for writing: {before:?}"),
+    }
+    drop(before);
+    let append = one(Effect::Append { file: out.clone(), bytes: b"!".to_vec(), tag: Tag(4) });
+    match root_user {
+        false => assert!(
+            matches!(&append, Done::Failed(IoError(why)) if why.contains("Permission denied")),
+            "the control: an append to the sealed file is refused: {append:?}"
+        ),
+        true => assert_eq!(append, Done::Appended),
+    }
+    if !root_user {
+        assert_eq!(std::fs::read(&sealed).unwrap(), b"placed");
+    }
+
+    // Missing: made, as a sync and a barrier always made it.
+    assert_eq!(one(Effect::Sync { file: name("sealed/new"), tag: Tag(5) }), Done::Synced);
+    assert_eq!(std::fs::read(root.join("sealed/new")).unwrap(), b"");
+    assert_eq!(one(Effect::Barrier { file: name("sealed/barrier"), tag: Tag(6) }), Done::Ordered);
+    assert!(root.join("sealed/barrier").is_file());
+
+    // A writable file a sync opened first is appended to after it, through a descriptor that
+    // can write.
+    std::fs::write(root.join("sealed/plain"), b"plain").unwrap();
+    let plain = name("sealed/plain");
+    assert_eq!(one(Effect::Sync { file: plain.clone(), tag: Tag(7) }), Done::Synced);
+    let more = Effect::Append { file: plain.clone(), bytes: b" more".to_vec(), tag: Tag(8) };
+    assert_eq!(one(more), Done::Appended);
+    assert_eq!(one(Effect::Sync { file: plain, tag: Tag(9) }), Done::Synced);
+    assert_eq!(std::fs::read(root.join("sealed/plain")).unwrap(), b"plain more");
+    // Writable again, so the test's directory can be removed.
+    set_mode(&sealed, 0o644).unwrap();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The invariant ([`assert_syncs_a_sealed_file`]'s, on the file calls every driver but the
+    /// ring's makes): [`sync`] and [`barrier`] of a file sealed read-only succeed, and of a
+    /// missing one make it. The control: the write-open they made before is refused.
+    #[test]
+    fn a_sync_of_a_file_sealed_read_only_succeeds() {
+        let root = dir("sync-sealed");
+        let sealed = root.join("sealed");
+        std::fs::write(&sealed, b"placed").unwrap();
+        seal(&sealed, 0o444).unwrap();
+        sync(&sealed).unwrap();
+        barrier(&sealed).unwrap();
+        write_back(&sealed).unwrap();
+        let before = OpenOptions::new().append(true).create(true).open(&sealed);
+        match crate::raw::euid() {
+            // Root, whom the kernel lets write any file.
+            0 => assert!(before.is_ok(), "{before:?}"),
+            _ => assert_eq!(
+                before.map(|_| ()).map_err(|error| error.kind()),
+                Err(io::ErrorKind::PermissionDenied),
+                "the control: the write-open a sync made before is refused"
+            ),
+        }
+        sync(&root.join("made")).unwrap();
+        assert_eq!(std::fs::read(root.join("made")).unwrap(), b"");
+        barrier(&root.join("ordered")).unwrap();
+        assert!(root.join("ordered").is_file());
+        set_mode(&sealed, 0o644).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-fs-{name}-{}", std::process::id()));

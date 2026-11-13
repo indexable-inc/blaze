@@ -15,7 +15,15 @@ use crate::{CodeId, Slot, Thread, Tier, Txn};
 /// A message with what it borrows owned, so a drawn one outlives its draw.
 #[derive(Clone, Debug)]
 enum Owned {
-    Hello { program: [u8; 32], pid: u64, arm: bool, mac: bool, page: u32 },
+    Hello {
+        program: [u8; 32],
+        pid: u64,
+        arm: bool,
+        mac: bool,
+        page: u32,
+        holds: Option<[u8; 32]>,
+        running: bool,
+    },
     Need { slot: u32, thread: u64 },
     Applied { txn: u64, epoch: u64 },
     Failed { txn: u64, why: String },
@@ -93,13 +101,17 @@ impl Owned {
 
     fn message<'a>(&'a self, lists: &'a Lists<'a>) -> Message<'a> {
         match self {
-            Owned::Hello { program, pid, arm, mac, page } => Message::Ask(Ask::Hello {
-                program: ProgramId(*program),
-                pid: *pid,
-                arch: if *arm { Arch::Aarch64 } else { Arch::X86_64 },
-                os: if *mac { Os::Macos } else { Os::Linux },
-                page: *page,
-            }),
+            Owned::Hello { program, pid, arm, mac, page, holds, running } => {
+                Message::Ask(Ask::Hello {
+                    program: ProgramId(*program),
+                    pid: *pid,
+                    arch: if *arm { Arch::Aarch64 } else { Arch::X86_64 },
+                    os: if *mac { Os::Macos } else { Os::Linux },
+                    page: *page,
+                    holds: *holds,
+                    running: *running,
+                })
+            }
             Owned::Need { slot, thread } => {
                 Message::Ask(Ask::Need { slot: Slot(*slot), thread: Thread(*thread) })
             }
@@ -188,6 +200,8 @@ fn owned(tc: &TestCase) -> Owned {
             arm: tc.draw(gs::booleans()),
             mac: tc.draw(gs::booleans()),
             page: small(tc),
+            holds: tc.draw(gs::booleans()).then(|| id(tc)),
+            running: tc.draw(gs::booleans()),
         },
         1 => Owned::Need { slot: small(tc), thread: number(tc) },
         2 => Owned::Applied { txn: number(tc), epoch: number(tc) },
@@ -351,4 +365,100 @@ fn the_oracle_catches_a_longer_head_and_keys_out_of_order() {
     assert_eq!(swapped.len(), 39);
     assert!(cbor::check(&swapped).is_err(), "the oracle took keys out of order");
     assert_eq!(Ask::decode(&swapped), Err(WireError::Key { at: 17, want: "slot" }));
+}
+
+/// A `Hello` of these fields under id 1, its item as the launcher writes it.
+fn hello_item(holds: Option<[u8; 32]>, running: bool) -> Vec<u8> {
+    let hello = Ask::Hello {
+        program: ProgramId([5; 32]),
+        pid: 9,
+        arch: Arch::X86_64,
+        os: Os::Linux,
+        page: 4096,
+        holds,
+        running,
+    };
+    let mut out = Vec::new();
+    hello.encode(1, &mut out).expect("a hello fits a frame");
+    out[4..].to_vec()
+}
+
+/// The invariant: a `Hello` reads back as itself with a start image's check word and without
+/// one, running or not, in the deterministic encoding, its seven keys in the order of their
+/// encodings. The control: a check word of 31 bytes is refused by name, never read as `None`.
+#[test]
+fn a_hello_round_trips_with_and_without_what_it_holds() {
+    for holds in [None, Some([0xab; 32])] {
+        for running in [false, true] {
+            let item = hello_item(holds, running);
+            assert_eq!(cbor::check(&item).map_err(|it| it.to_string()), Ok(()), "{holds:?} {running}");
+            let Ok((1, Ask::Hello { holds: read, running: ran, program, .. })) = Ask::decode(&item) else {
+                panic!("{holds:?} {running}: {:?}", Ask::decode(&item));
+            };
+            assert_eq!((read, ran, program), (holds, running, ProgramId([5; 32])));
+        }
+    }
+    // The control: the check word's byte string one byte short. Its head is `0x58 0x20`
+    // (a byte string of 32), found by the bytes that follow it.
+    let item = hello_item(Some([0xab; 32]), false);
+    let at = item.windows(34).position(|it| it[..2] == [0x58, 0x20] && it[2..] == [0xab; 32]).expect("the check word");
+    let mut short = item[..at].to_vec();
+    short.extend_from_slice(&[0x58, 0x1f]);
+    short.extend_from_slice(&item[at + 2..at + 33]);
+    short.extend_from_slice(&item[at + 34..]);
+    assert_eq!(
+        Ask::decode(&short),
+        Err(WireError::Range { at, what: "a start image's check word is 32 bytes" })
+    );
+}
+
+/// The invariant: a `Hello` of the five fields a launcher said before `holds` and `running`
+/// is read as holding nothing and not running, so a daemon answers it as it answered every
+/// launcher before. The control: a map of 6 is neither, and is refused.
+#[test]
+fn a_hello_of_five_fields_holds_nothing_and_is_not_running() {
+    let five = |fields: usize| {
+        let mut out = Vec::new();
+        let mut to = crate::wire::cbor::Writer::new(&mut out);
+        to.map(3);
+        to.text("id");
+        to.uint(1);
+        to.text("body");
+        to.map(1);
+        to.text("Hello");
+        to.map(fields);
+        to.text("os");
+        to.text("Linux");
+        to.text("pid");
+        to.uint(9);
+        to.text("arch");
+        to.text("X86_64");
+        to.text("page");
+        to.uint(4096);
+        to.text("program");
+        to.bytes(&[5; 32]);
+        to.text("schema");
+        to.uint(u64::from(SCHEMA));
+        out
+    };
+    let item = five(5);
+    assert_eq!(cbor::check(&item).map_err(|it| it.to_string()), Ok(()));
+    assert_eq!(
+        Ask::decode(&item),
+        Ok((
+            1,
+            Ask::Hello {
+                program: ProgramId([5; 32]),
+                pid: 9,
+                arch: Arch::X86_64,
+                os: Os::Linux,
+                page: 4096,
+                holds: None,
+                running: false,
+            }
+        ))
+    );
+    assert_eq!(item, five(5), "one encoding");
+    // The control.
+    assert!(Ask::decode(&five(6)).is_err(), "a hello of 6 fields was read");
 }

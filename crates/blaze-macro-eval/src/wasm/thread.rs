@@ -288,10 +288,46 @@ impl Drop for Answering {
     }
 }
 
+/// Gives back what the calling expansion thread keeps free: its heaps' free pages if a heap
+/// give-back was asked since it last did (`blaze_mem::tag::settle_heap`), and its warm frame
+/// memory if an idle daemon asked for it (`blaze_mem::frame::settle_spare`). Outside any
+/// expansion: what a thread does as it goes idle, and the job [`settle_idle`] hands it.
+fn settle_here() {
+    blaze_mem::tag::settle_heap();
+    blaze_mem::frame::settle_spare();
+}
+
+/// Wakes every expansion thread waiting for work in its channel's `recv` so it gives back now
+/// ([`settle_here`]): what a heap give-back's ask calls (`blaze_mem::tag::heap_wakes_by`), as
+/// it unparks the pool's workers. A thread blocked in `recv` would otherwise hold its heaps'
+/// free pages through every purge until its next expansion, and a purge waiting for every
+/// counted thread would wait out its deadline. Each idle thread is handed [`settle_here`] as a
+/// job and goes back idle after it, as after any job.
+fn settle_idle() {
+    #[cfg(test)]
+    if tests::NO_WAKE.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    // Taken out of the lock before any send: a send may wake a thread, a system call.
+    let idle = std::mem::take(&mut THREADS.lock().idle);
+    for thread in idle {
+        // alloc: a give-back's job, one an idle thread
+        if thread.send(Box::new(settle_here)).is_err() {
+            // Its thread is gone, as `submit` finds one.
+            let mut threads = THREADS.lock();
+            threads.started = threads.started.saturating_sub(1);
+        }
+    }
+}
+
 /// Gives `job` to an idle expansion thread, or to a new one while fewer than [`cap`] are alive
 /// (or, for a `nested` one, fewer than [`ceiling`]), else queues it for the first thread to end
 /// its expansion. A nested one past the ceiling is refused, naming the counts.
 fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
+    // The tests' allocator keeps no pages per thread: theirs acks as one that does, so the
+    // threads count for give-backs from their start ([`tests::gives_back`]).
+    #[cfg(test)]
+    tests::gives_back();
     let cap = cap();
     let mut threads = THREADS.lock();
     while let Some(idle) = threads.idle.pop() {
@@ -327,10 +363,16 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
         THREADS.lock().started -= 1;
         return Err(Stop("could not hand its expansion to a new thread".to_owned())); // alloc: error path
     }
+    // Idle expansion threads are woken at a give-back's ask; set before the first starts. The
+    // same waker again takes no second slot.
+    blaze_mem::tag::heap_wakes_by(settle_idle);
     let spawned = thread::Builder::new()
         .name("blaze wasm expansion".to_owned()) // alloc: once per thread started
         .stack_size(STACK)
         .spawn(move || {
+            // The thread counts for every heap give-back while it lives: a purge waits for
+            // its give-back, made as it goes idle or woken there ([`settle_idle`]).
+            let _settles = blaze_mem::tag::count_heap_settles();
             while let Ok(job) = taken.recv() {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
@@ -347,6 +389,9 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
                         None => threads.idle.push(mine.clone()),
                     }
                 }
+                // Idle now, outside any expansion: what it keeps free goes back if asked
+                // meanwhile, as a pool worker gives it back as it parks.
+                settle_here();
             }
         });
     spawned.map(drop).map_err(|error| {
@@ -368,11 +413,81 @@ mod tests {
 
     use blaze_core::lock::{Lock, Signal};
 
-    use super::{cap, ceiling, submit};
+    use super::{THREADS, cap, ceiling, submit};
 
     /// Held by each test: they share the process's expansion threads, and one holding the
     /// ceiling would refuse another's nested expansion.
     static SERIAL: Lock<()> = Lock::new("macro.thread.test.serial", ());
+
+    /// The planted bug of [`a_give_back_reaches_a_thread_waiting_for_work`]: no expansion
+    /// thread is woken at a give-back's ask ([`super::settle_idle`] returns at once).
+    pub(super) static NO_WAKE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// The tests' allocator (std's) gives nothing back per thread, so no thread would count for
+    /// a give-back: this stands in for mimalloc's as `blaze_mem::tag::heap_gives_back_by` takes
+    /// it, acking the give-back asked now on the calling thread as mimalloc's does once it
+    /// collected. Set before any expansion thread starts ([`submit`]); the first call wins.
+    pub(super) fn gives_back() {
+        blaze_mem::tag::heap_gives_back_by(|| {
+            blaze_mem::tag::heap_gave_back(blaze_mem::tag::heap_give_backs());
+        });
+    }
+
+    /// Waits, at most `within`, until `until` holds: whether it did.
+    fn within(within: Duration, until: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while !until() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    /// The invariant: after `blaze_mem::tag::ask_heap_give_back`,
+    /// `blaze_mem::tag::heap_give_back_settled` reports every counted thread given back within
+    /// its bound while an expansion thread sits idle in its channel's `recv`: the ask's waker
+    /// ([`super::settle_idle`]) reaches it. The control, the waker removed ([`NO_WAKE`]): the
+    /// idle thread never gives back, and the give-back stays pending past the bound.
+    #[test]
+    fn a_give_back_reaches_a_thread_waiting_for_work() {
+        let _serial = SERIAL.lock();
+        for woken in [true, false] {
+            NO_WAKE.store(!woken, Ordering::SeqCst);
+            // An expansion thread that ran its job and waits for the next.
+            let gate = Arc::new(Gate::default());
+            gate.open();
+            submit(false, gate.job()).expect("an expansion is handed in");
+            assert!(
+                gate.reaches(Duration::from_secs(10), |it| it.done.load(Ordering::Acquire) == 1),
+                "the expansion ran"
+            );
+            assert!(
+                within(Duration::from_secs(10), || !THREADS.lock().idle.is_empty()),
+                "its thread went idle"
+            );
+            let asked = blaze_mem::tag::ask_heap_give_back();
+            // Busy threads of other tests give back as they next go idle: the bound is theirs.
+            let bound = if woken { Duration::from_secs(30) } else { Duration::from_millis(300) };
+            let settled = within(bound, || {
+                matches!(
+                    blaze_mem::tag::heap_give_back_settled(),
+                    blaze_mem::tag::Settle::Settled { generation } if generation >= asked
+                )
+            });
+            NO_WAKE.store(false, Ordering::SeqCst);
+            let now = blaze_mem::tag::heap_give_back_settled();
+            match woken {
+                true => assert!(settled, "an idle expansion thread was not reached: {now:?}"),
+                false => assert!(
+                    !settled,
+                    "control: with no waker the idle thread gave back anyway: {now:?}"
+                ),
+            }
+        }
+    }
 
     /// A gate the test's expansions wait at until it opens, and how many of them run now, ran
     /// at most at once, and are done.

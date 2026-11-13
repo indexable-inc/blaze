@@ -48,7 +48,7 @@ mod giveway;
 mod graph;
 mod host;
 mod ids;
-mod stack;
+pub mod stack;
 #[cfg(test)]
 mod tests;
 

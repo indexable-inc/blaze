@@ -1,12 +1,19 @@
 //! Body entries carried through the kernel (end-state.md, order row 3): a two-crate program's
 //! bodies, each with its inference, MIR and borrow check entries in one session, carried
 //! across an edit of the leaf crate's file with the change set a driver gives (the file's text
-//! differs; the impls fact from the impls maintainer's last write; identities from
-//! [`Identities`]' exact delta, or always dirty and counted). Each test counts the entries'
-//! runs and checks every entry against a fresh run (the oracle); one control drops the
-//! identity read from every trace, another leaves a changed identity out of the delta, and the
-//! oracle must catch the stale entry each leaves. A second session over the same store, with a
-//! new database, hits every entry.
+//! differs; the impls fact from the impls maintainer's last write; the identities that differ
+//! from a test's column, each exact; every other kind valued, or every kind valued). Each test
+//! counts the entries' runs and checks every entry against a fresh run (the oracle); one
+//! control drops the identity read from every trace, another leaves a changed identity out of
+//! the column, and the oracle must catch the stale entry each leaves. A second session over the
+//! same store, with a new database, hits every entry; a row the carry did not reach answers at
+//! the next revision under its crate's stamp.
+//!
+//! The map from a file's syntax to the database's bodies is the driver's ([`keyed`],
+//! [`written`], [`join`]): the fixture has an `impl`'s method and a trait's default method,
+//! keyed by where they are written as a function at a file's top is. A claim of the runs to
+//! keep lets go when its keep fails, and a served borrow check's row depends on what its MIR
+//! read.
 //!
 //! MIR and the borrow check are stand-ins here (hir-ty's tests link no MIR builder and no
 //! borrow checker): [`fake_mir`] reads the body's inference and offers it as its answer;
@@ -19,8 +26,8 @@ use base_db::{Crate, Db, all_crates};
 use blaze_cas::{Key as StoreKey, Kind as StoreKind, Mismatch, content_of};
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_front_items::{
-    Reading,
-    entry::ItemId,
+    ITEMS, Reading, Table,
+    entry::{Entry, ItemId, Kind},
     steps::{FileKey, Items, Parse, Source, reads as source},
 };
 use blaze_hash::HashMap;
@@ -38,16 +45,17 @@ use hir_def::{
     deps::{PortableIds, body_key as hir_body_key},
     expr_store::Body,
     nameres::{crate_def_map, demand::crate_body_owners},
-    signatures::FunctionSignature,
+    signatures::{ConstSignature, FunctionSignature},
 };
 use hir_expand::fixture::{self, Fixture};
 use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
 use super::{
-    ANY_REVISION, BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, IDENTITY_NAME, Identities,
-    InferEntry, MirEntry, RUNS, always_dirty, bodies, borrowck_schema, def_of, reads, register,
-    run_infer, serve,
+    ANY_KIND, ANY_REVISION, BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, Exact, HELD,
+    How, InferEntry, KEEP_ALL, Keyed, MirEntry, OWN_FACTS_ONLY, Of, OwnerKey, Place, RUNS,
+    Written, borrowck_schema, claim_keeps, fact_read, join, key_of, keyed, places, reads,
+    register, run_infer, serve, stamp, unpost, written,
 };
 use crate::{
     InferenceResult,
@@ -72,13 +80,19 @@ pub fn other() -> u32 { 2 }
 //- /main.rs crate:main deps:core,leaf new_source_root:local
 pub fn caller() -> u32 { let _x = leaf::leaf(); 1 }
 pub fn twice() -> u32 { caller() + caller() }
+pub struct T;
+impl T { pub fn method(&self) -> u32 { 5 } }
+pub trait D { fn default_method(&self) -> u32 { 6 } }
 "#;
 
 /// The files as the fixture has them, by stable name, each with its crate, in fixture order.
 const FILES: [(&str, &str); 2] = [("leaf.rs", "leaf"), ("main.rs", "main")];
 const LEAF: &str = "pub fn leaf() -> u32 { 1 }\npub fn other() -> u32 { 2 }\n";
-const MAIN: &str =
-    "pub fn caller() -> u32 { let _x = leaf::leaf(); 1 }\npub fn twice() -> u32 { caller() + caller() }\n";
+const MAIN: &str = "pub fn caller() -> u32 { let _x = leaf::leaf(); 1 }\npub fn twice() -> u32 { caller() + caller() }\npub struct T;\nimpl T { pub fn method(&self) -> u32 { 5 } }\npub trait D { fn default_method(&self) -> u32 { 6 } }\n";
+
+/// How many bodies the fixture has: two functions in each file, an `impl`'s method and a
+/// trait's default method.
+const BODIES: usize = 6;
 
 const HASHED: &str = "blaze v2 body entries test 1";
 const CHECKER: &str = "body entries test checker";
@@ -115,10 +129,32 @@ fn size_of(db: &Db, s: StructId) -> u64 {
         .map_or(u64::MAX, |it| it.size.bytes())
 }
 
-/// [`LAYOUT`]'s value: how many fields the leaf crate's struct has; none where it has no struct.
+/// [`LAYOUT`]'s value: how many fields each struct of the leaf crate has, and each variant of
+/// each of its enums, in declaration order; none where it has no struct or enum. What a read
+/// of any of their field types below a layout row stands for here.
 fn layout(db: &Db) -> Option<ContentId> {
-    let fields = VariantId::from(sized(db)?).fields(db).fields().len() as u64;
-    Some(Hasher::new("blaze v2 body entries test layout").update(&fields.to_le_bytes()).finish())
+    let def_map = crate_def_map(db, crate_named(db, "leaf"));
+    let mut h = Hasher::new("blaze v2 body entries test layout");
+    let mut any = false;
+    for (_, module) in def_map.modules(db) {
+        for it in module.scope(db).declarations() {
+            // alloc: a test's fact value, one list per ADT
+            let variants: Vec<VariantId> = match it {
+                ModuleDefId::AdtId(AdtId::StructId(it)) => vec![it.into()],
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                    crate::layout::enum_variant_ids(db, it).iter().map(|&v| v.into()).collect()
+                }
+                _ => continue,
+            };
+            any = true;
+            h.update(&(variants.len() as u64).to_le_bytes());
+            for variant in variants {
+                let fields = crate::layout::variant_field_ids(db, variant).len() as u64;
+                h.update(&fields.to_le_bytes());
+            }
+        }
+    }
+    any.then(|| h.finish())
 }
 
 fn reading() -> Reading {
@@ -348,25 +384,20 @@ impl Tree {
         tree
     }
 
-    /// The bodies of every file, from its `items` as the syntax gives them, each with the
-    /// database's body of its name.
+    /// The bodies of every file as the driver maps them: the file's body parts by where they
+    /// start ([`keyed`]), joined with where each body of its crate is written ([`written`],
+    /// [`join`]).
     fn map(&mut self) {
         self.bodies.clear();
         self.keys.clear();
-        for (name, krate) in FILES {
-            let text = &self.files[name];
-            let record = blaze_front_items::parse(text, reading());
-            let parsed = blaze_front_items::tree(&record, text, reading()).expect("a tree");
-            let items = blaze_front_items::file_items(parsed.root()).expect("items").items;
-            let (named, passed) = bodies(&items).expect("the file's bodies");
-            assert_eq!(passed, 0, "the fixture has no body this map passes over");
-            let db = self.fixture.db();
-            let def_map = crate_def_map(db, crate_named(db, krate));
-            for it in named {
-                let def = def_of(db, def_map, def_map.crate_root(db), &it).expect("a body by its name");
-                self.bodies.insert((name.to_owned(), it.item), def);
+        let db = self.fixture.db();
+        for (at, (name, krate)) in FILES.into_iter().enumerate() {
+            let file = self.fixture.file(at).file_id(db);
+            let keyed = keyed_of(&self.files[name]);
+            for (item, def) in join(&keyed, &written_in(db, krate, file)) {
+                self.bodies.insert((name.to_owned(), item), def);
                 let file = FileKey { name: name.to_owned(), reading: reading() };
-                self.keys.push(BodyKey { file, item: it.item, krate: krate.to_owned() });
+                self.keys.push(BodyKey { file, item, krate: krate.to_owned() });
             }
         }
     }
@@ -386,6 +417,23 @@ impl Tree {
             last.crates.iter().any(|it| !it.keys_changed.is_empty() || !it.traits_changed.is_empty())
         })
     }
+}
+
+/// The body parts of `text`'s `items`, by where they start ([`keyed`]).
+fn keyed_of(text: &str) -> Vec<Keyed> {
+    let record = blaze_front_items::parse(text, reading());
+    let parsed = blaze_front_items::tree(&record, text, reading()).expect("a tree");
+    let items = blaze_front_items::file_items(parsed.root()).expect("items");
+    keyed(&items.items, &items.lines).expect("the file's bodies")
+}
+
+/// The bodies of the crate `krate` written in `file`, each where ([`written`]).
+fn written_in(db: &Db, krate: &str, file: base_db::FileId) -> Vec<(DefWithBodyId, Written)> {
+    crate_body_owners(db, crate_named(db, krate))
+        .into_iter()
+        .filter_map(|def| Some((def, written(db, def)?)))
+        .filter(|(_, at)| at.file == file)
+        .collect()
 }
 
 impl World for Tree {
@@ -434,28 +482,30 @@ impl BodyWorld for Tree {
         }
     }
 
-    fn run(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String> {
+    fn run(&self, def: DefWithBodyId, of: Of) -> Result<SchemaHash, String> {
         let db = self.db();
-        match step {
-            Step::Infer => Ok(run_infer(db, def)),
-            Step::Mir => {
+        match of {
+            Of::Infer => Ok(run_infer(db, def)),
+            // The stand-in MIR is the body's alone: its owners are the body (the fixture's
+            // bodies have no closure).
+            Of::Mir(Place::BODY) => {
                 let _ = fake_mir(db, def);
                 Ok(MIR_SCHEMA)
             }
-            Step::Borrowck => match fake_borrowck(db, def) {
+            Of::Mir(place) => Err(format!("no stand-in MIR at {place:?}")),
+            Of::Borrowck => match fake_borrowck(db, def) {
                 true => Ok(borrowck_schema(db, def, CHECKER)),
                 false => Err(String::from("its borrow check fails")),
             },
-            Step::Const => Err(String::from("a constant's value has no body entry")),
         }
     }
 
-    fn schema(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String> {
-        match step {
-            Step::Infer => Ok(infer::SCHEMA),
-            Step::Mir => Ok(MIR_SCHEMA),
-            Step::Borrowck => Ok(borrowck_schema(self.db(), def, CHECKER)),
-            Step::Const => Err(String::from("a constant's value has no body entry")),
+    fn schema(&self, def: DefWithBodyId, of: Of) -> Result<SchemaHash, String> {
+        match of {
+            Of::Infer => Ok(infer::SCHEMA),
+            Of::Mir(Place::BODY) => Ok(MIR_SCHEMA),
+            Of::Mir(place) => Err(format!("no stand-in MIR at {place:?}")),
+            Of::Borrowck => Ok(borrowck_schema(self.db(), def, CHECKER)),
         }
     }
 
@@ -523,7 +573,15 @@ fn reset_runs() {
     RUNS.with(|it| it.set([0; Step::COUNT]));
 }
 
-/// Every body's three entries in `session`, by the body's key: `(infer, mir, borrowck)`.
+/// The MIR entries' inputs of the body `key`: one per place of its owners ([`places`]).
+fn owners(tree: &Tree, key: &BodyKey) -> Vec<OwnerKey> {
+    let def = tree.body(key).expect("a body of the tree");
+    // clone: the body's key, one owner's input each
+    places(tree.db(), def).into_iter().map(|place| OwnerKey { body: key.clone(), place }).collect()
+}
+
+/// Every body's entries in `session`, by the body's key: `(infer, mir, borrowck)`, the MIR
+/// each owner's entry's place and value in turn.
 fn ask_all(
     kernel: &Kernel<Tree>,
     session: &mut Session,
@@ -536,7 +594,11 @@ fn ask_all(
         .map(|key| {
             let off = &Setting::OFF;
             let infer = kernel.get_in::<InferEntry<Tree>, _>(session, store, tree, key, off).unwrap().value().to_vec();
-            let mir = kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, key, off).unwrap().value().to_vec();
+            let mut mir = Vec::new();
+            for owner in owners(tree, key) {
+                mir.extend_from_slice(&owner.place.bytes());
+                mir.extend_from_slice(kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, &owner, off).unwrap().value());
+            }
             let check = kernel.get_in::<BorrowckEntry<Tree>, _>(session, store, tree, key, off).unwrap().value().to_vec();
             (format!("{key:?}"), [infer, mir, check])
         })
@@ -562,8 +624,12 @@ fn fresh(kernel: &Kernel<Tree>, tree: &Tree) -> Vec<(String, [Vec<u8>; 3])> {
 struct Carried {
     /// The entries' runs during the carry and the asks after it, by step.
     runs: [u32; Step::COUNT],
-    /// The always-dirty count by name, asked before the carry.
-    dirty: Vec<(&'static str, usize)>,
+    /// What the kernel's carry counted (`valued`, `differed`, ...).
+    carry: blaze_kernel::Carried,
+    /// Each kind the session read, as [`BodyDelta::say`] said it.
+    said: Vec<(ReadKind, How)>,
+    /// The distinct layout reads the session had before the carry ([`Session::names_of`]).
+    layout: usize,
     /// The first entry that differs from a fresh run, named with both values; `Ok` when none.
     fresh: Result<(), String>,
 }
@@ -599,89 +665,160 @@ fn differs(kept: &[(String, [Vec<u8>; 3])], fresh: &[(String, [Vec<u8>; 3])]) ->
     Ok(())
 }
 
-/// Where a carry's change set has its identity reads' difference from.
+/// How a carry's change set says what differs.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Ids {
-    /// No delta: every identity read is always dirty.
-    Dirty,
-    /// [`Identities`]' exact delta.
+enum Says {
+    /// No producer: every kind the session reads is valued by the kernel.
+    Valued,
+    /// The test's producers: the edited file, the impls maintainer's last write and the
+    /// bodies whose identity differs between the pins, each exact; every other kind valued.
     Exact,
-    /// The planted bug of the delta's control: [`Identities`]' delta with every body of
-    /// `main.rs` left out, as a maintainer that said a changed identity unchanged would.
+    /// The planted bug of the producer's control: [`Says::Exact`] with every body of `main.rs`
+    /// left out of the identity column, as a producer that said a changed identity unchanged.
     MainLeftOut,
 }
 
-fn carried(edited: &str, dropped: Option<ReadKind>, ids: Ids) -> Carried {
+/// Each body's identity at `tree`'s pin, by its key's bytes ([`key_of`], what its identity
+/// read is keyed by), with its file: what a producer of the identity column keeps from a pin to
+/// the next.
+fn identities(tree: &Tree) -> BTreeMap<Vec<u8>, (String, Option<ContentId>)> {
+    let db = tree.db();
+    tree.keys
+        .iter()
+        .map(|key| {
+            let def = tree.body(key).expect("a mapped body");
+            let identity = crate::body_store::with_store(db, |store| store.facts.identity(db, def))
+                .expect("the test database's item store");
+            let mut bytes = Vec::new();
+            key_of::<Tree>(key, &mut bytes);
+            // clone: a body's file name, kept with its identity
+            (bytes, (key.file.name.clone(), identity))
+        })
+        .collect()
+}
+
+/// The producers' word on a carry of `tree` from the pin whose identities were `before`, as
+/// `says` gives it.
+fn delta(tree: &mut Tree, before: &BTreeMap<Vec<u8>, (String, Option<ContentId>)>, says: Says) -> BodyDelta {
+    if says == Says::Valued {
+        return BodyDelta::default();
+    }
+    let after = identities(tree);
+    let mut differ: Vec<Vec<u8>> = Vec::new();
+    for (bytes, (file, identity)) in &after {
+        let moved = before.get(bytes).is_none_or(|(_, was)| was != identity);
+        if moved && !(says == Says::MainLeftOut && file == "main.rs") {
+            // clone: one body of the column
+            differ.push(bytes.clone());
+        }
+    }
+    // clone: each body gone, of the column
+    differ.extend(before.keys().filter(|it| !after.contains_key(*it)).cloned());
+    // The impls fact, from the impls maintainer's last write: which crate a fact is seen from
+    // is the reader's, and both crates see the impls of both.
+    let mut impls = Vec::new();
+    let mut impls_kind = ReadKind(IMPLS.kind.0);
+    if tree.impls_written() {
+        for (_, krate) in FILES {
+            let mut key = Vec::new();
+            impls_kind = fact_read(IMPLS, krate, &mut key);
+            impls.push(key);
+        }
+    }
+    let by = "a test's column";
+    BodyDelta {
+        exact: vec![
+            Exact { kind: source::FILE, by, keys: vec![b"leaf.rs".to_vec()] },
+            Exact { kind: source::EXISTS, by, keys: Vec::new() },
+            Exact { kind: source::CFG, by, keys: Vec::new() },
+            Exact { kind: reads::IDENTITY, by, keys: differ },
+            Exact { kind: impls_kind, by, keys: impls },
+        ],
+    }
+}
+
+/// A carry of `leaf.rs` from `first` to `then`, every entry asked before and after; `dropped`
+/// is a read kind left out of every trace of the first pin.
+fn carried_from(first: Option<&str>, then: &str, dropped: Option<ReadKind>, says: Says) -> Carried {
     let kernel = kernel();
     let mut tree = Tree::new();
-    let mut identities = Identities::default();
-    identities.delta(&tree, &tree.keys).expect("the first pin's identities");
+    if let Some(first) = first {
+        tree.edit("leaf.rs", first);
+    }
+    let before_ids = identities(&tree);
     let mut store = Memory::default();
     let mut session = Session::new(&tree);
     DROPPED.with(|it| it.set(dropped));
     let before = ask_all(&kernel, &mut session, &mut store, &tree);
     DROPPED.with(|it| it.set(None));
-    assert_eq!(before.len(), 4, "four bodies");
+    assert_eq!(before.len(), BODIES, "every body of the fixture");
+    let layout = session.names_of(&store, ReadKind(LAYOUT.kind.0)).unwrap();
     let from = tree.pin();
-    tree.edit("leaf.rs", edited);
+    tree.edit("leaf.rs", then);
+    let delta = delta(&mut tree, &before_ids, says);
     let mut changed = Changed::between(from, tree.pin());
-    changed.differs(Read { kind: source::FILE, key: b"leaf.rs" });
-    changed.exact(source::EXISTS);
-    changed.exact(source::CFG);
-    // The impls fact, from the impls maintainer's last write: which crate a fact is seen
-    // from is the reader's, and both crates see the impls of both.
-    // alloc: a test's change set
-    let impls_differ: Vec<(FactRef, String)> = match tree.impls_written() {
-        true => FILES.iter().map(|(_, krate)| (IMPLS, (*krate).to_owned())).collect(),
-        false => Vec::new(),
-    };
-    let identities = match ids {
-        Ids::Dirty => None,
-        Ids::Exact => Some(identities.delta(&tree, &tree.keys).expect("the identity delta")),
-        Ids::MainLeftOut => {
-            let mut differ = identities.delta(&tree, &tree.keys).expect("the identity delta");
-            differ.retain(|key| key.file.name != "main.rs");
-            Some(differ)
-        }
-    };
-    let delta = BodyDelta { exact: vec![(ReadKind(IMPLS.kind.0), impls_differ)], unknown: Vec::new(), identities };
-    delta.say::<Tree>(&mut changed);
-    let dirty = always_dirty(&mut session, &store, &delta).unwrap();
+    let said = delta.say(&session, &mut changed);
     reset_runs();
     let carry = kernel.carry(&mut session, &mut store, &tree, &changed, &Setting::OFF).unwrap();
     assert_eq!(carry.dropped, None, "{carry:?}");
     let after = ask_all(&kernel, &mut session, &mut store, &tree);
     let runs = runs();
     let fresh = differs(&after, &fresh(&kernel, &tree));
-    Carried { runs, dirty, fresh }
+    Carried { runs, carry, said, layout, fresh }
 }
 
-/// The floor of a leaf body edit: the edited body's three entries, and nothing else. With
-/// item-hash's identity delta no read is always dirty: the callers' entries are not valued.
+fn carried(edited: &str, dropped: Option<ReadKind>, says: Says) -> Carried {
+    carried_from(None, edited, dropped, says)
+}
+
+/// How `carried` said `kind`, if the session read it.
+fn said(carried: &Carried, kind: ReadKind) -> Option<How> {
+    carried.said.iter().find(|(it, _)| *it == kind).map(|(_, how)| *how)
+}
+
+/// The floor of a leaf body edit: the edited body's three entries, and nothing else. The
+/// identity column is exact: no caller's identity read is valued.
 #[test]
 fn a_leaf_body_edit_reruns_its_three_entries_and_no_callers() {
-    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Ids::Exact);
+    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Says::Exact);
     assert_eq!(leaf.runs, [1, 1, 1, 0], "the edited body's inference, MIR and borrow check, once each");
-    assert!(leaf.dirty.is_empty(), "the identity delta is exact, nothing is always dirty: {:?}", leaf.dirty);
+    assert_eq!(said(&leaf, reads::IDENTITY), Some(How::Exact("a test's column")), "{:?}", leaf.said);
     leaf.fresh.expect("every entry is what a fresh run gives");
 }
 
-/// The same edit with no identity delta: every entry's identity is always dirty, counted by
-/// name, and still only the edited body's three entries rerun.
+/// The invariant: a carry whose producers say some kinds exactly ends where a carry that
+/// values every read ends: the same runs, and every entry what a fresh run gives, for a body
+/// edit, a comment edit and a signature edit. Valuing costs one valuation a distinct read
+/// (each body's identity among them), exactness none. The control is
+/// [`the_oracle_catches_a_producer_that_leaves_a_change_out`].
 #[test]
-fn with_no_identity_delta_every_identity_read_is_always_dirty() {
-    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Ids::Dirty);
-    assert_eq!(leaf.runs, [1, 1, 1, 0]);
-    assert_eq!(leaf.dirty, [(IDENTITY_NAME, 12)], "every entry reads its identity");
-    leaf.fresh.expect("every entry is what a fresh run gives");
+fn a_producers_exact_delta_ends_where_valuing_every_read_ends() {
+    for edited in [
+        LEAF.replace("{ 1 }", "{ 3 }"),
+        format!("// a comment\n{LEAF}"),
+        LEAF.replace("leaf() -> u32", "leaf() -> u64"),
+    ] {
+        let valued = carried(&edited, None, Says::Valued);
+        let exact = carried(&edited, None, Says::Exact);
+        assert_eq!(valued.runs, exact.runs, "the same entries rerun either way");
+        assert_eq!(said(&valued, reads::IDENTITY), Some(How::Valued), "{:?}", valued.said);
+        assert!(
+            valued.carry.valued >= exact.carry.valued + BODIES,
+            "valuing reads each body's identity once: {:?} against {:?}",
+            valued.carry,
+            exact.carry
+        );
+        assert!(valued.carry.differed <= valued.carry.valued, "{:?}", valued.carry);
+        valued.fresh.expect("every valued entry is what a fresh run gives");
+        exact.fresh.expect("every exact entry is what a fresh run gives");
+    }
 }
 
 /// The floor of a comment edit: no entry.
 #[test]
 fn a_comment_edit_reruns_no_entry() {
-    let comment = carried(&format!("// a comment\n{LEAF}"), None, Ids::Exact);
+    let comment = carried(&format!("// a comment\n{LEAF}"), None, Says::Exact);
     assert_eq!(comment.runs, [0; Step::COUNT], "a comment changes no body's record");
-    assert!(comment.dirty.is_empty(), "{:?}", comment.dirty);
     comment.fresh.expect("every entry is what a fresh run gives");
 }
 
@@ -689,29 +826,28 @@ fn a_comment_edit_reruns_no_entry() {
 /// caller's inference names the leaf, whose type is other now.
 #[test]
 fn a_signature_edit_reaches_the_caller_through_its_identity() {
-    let signature = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Ids::Exact);
+    let signature = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Says::Exact);
     assert!(signature.runs[Step::Infer as usize] >= 2, "the leaf and its caller: {:?}", signature.runs);
     signature.fresh.expect("every entry is what a fresh run gives");
 }
 
-/// The control: with the identity read left out of every trace, the signature edit reaches
-/// no caller entry (its body's record and its facts are as they were), and the oracle finds
-/// the stale one.
+/// The control: with the identity read left out of every trace, the session reads no identity
+/// (no kind to say), the signature edit reaches no caller entry (its body's record and its
+/// facts are as they were), and the oracle finds the stale one, every read valued.
 #[test]
 fn the_oracle_catches_a_trace_that_drops_the_identity_read() {
-    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), Some(reads::IDENTITY), Ids::Dirty);
-    assert_eq!(planted.dirty, [(IDENTITY_NAME, 0)], "no entry has an identity read to post");
+    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), Some(reads::IDENTITY), Says::Valued);
+    assert_eq!(said(&planted, reads::IDENTITY), None, "no entry has an identity read to post");
     assert!(planted.fresh.is_err(), "a caller entry that read the leaf's signature stayed as it was");
 }
 
-/// The delta's control: a signature edit of the leaf changes the callers' identities, and a
-/// delta that says `main.rs`'s bodies' identities are unchanged leaves the caller's entries as
-/// they were; the oracle finds the stale one. (The same edit with the exact delta is
+/// The producer's control: a signature edit of the leaf changes the callers' identities, and a
+/// producer that says `main.rs`'s bodies' identities are unchanged leaves the caller's entries
+/// as they were; the oracle finds the stale one. (The same edit with the whole column is
 /// [`a_signature_edit_reaches_the_caller_through_its_identity`].)
 #[test]
-fn the_oracle_catches_an_identity_delta_that_leaves_a_change_out() {
-    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Ids::MainLeftOut);
-    assert!(planted.dirty.is_empty(), "{:?}", planted.dirty);
+fn the_oracle_catches_a_producer_that_leaves_a_change_out() {
+    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Says::MainLeftOut);
     assert!(planted.fresh.is_err(), "the caller's inference, which names the leaf's type, stayed as it was");
 }
 
@@ -722,41 +858,17 @@ const GROWN: &str = "pub struct S { pub a: u32, pub b: u64 }\n";
 /// A carry across the leaf crate's struct gaining a field, every body's stand-in MIR having
 /// read the struct's size ([`fake_mir`]) through its layout row; `dropped` is a read kind left
 /// out of every trace of the first pin. No body's text, identity or impl changes: only what
-/// decides the layout does, which no delta gives yet (always dirty, counted by name).
+/// decides the layout does, which no producer gives: it is valued.
 fn layout_carried(dropped: Option<ReadKind>) -> Carried {
-    let kernel = kernel();
-    let mut tree = Tree::new();
-    tree.edit("leaf.rs", &format!("{LEAF}{SIZED}"));
-    let mut identities = Identities::default();
-    identities.delta(&tree, &tree.keys).expect("the first pin's identities");
-    let mut store = Memory::default();
-    let mut session = Session::new(&tree);
-    DROPPED.with(|it| it.set(dropped));
-    let before = ask_all(&kernel, &mut session, &mut store, &tree);
-    DROPPED.with(|it| it.set(None));
-    assert_eq!(before.len(), 4, "four bodies");
-    let from = tree.pin();
-    tree.edit("leaf.rs", &format!("{LEAF}{GROWN}"));
-    let mut changed = Changed::between(from, tree.pin());
-    changed.differs(Read { kind: source::FILE, key: b"leaf.rs" });
-    changed.exact(source::EXISTS);
-    changed.exact(source::CFG);
-    let differ = identities.delta(&tree, &tree.keys).expect("the identity delta");
-    assert!(differ.is_empty(), "a struct's field is in no body's identity here: {differ:?}");
-    let delta = BodyDelta {
-        exact: vec![(ReadKind(IMPLS.kind.0), Vec::new())],
-        unknown: vec![(ReadKind(LAYOUT.kind.0), "layout")],
-        identities: Some(differ),
-    };
-    delta.say::<Tree>(&mut changed);
-    let dirty = always_dirty(&mut session, &store, &delta).unwrap();
-    reset_runs();
-    let carry = kernel.carry(&mut session, &mut store, &tree, &changed, &Setting::OFF).unwrap();
-    assert_eq!(carry.dropped, None, "{carry:?}");
-    let after = ask_all(&kernel, &mut session, &mut store, &tree);
-    let runs = runs();
-    let fresh = differs(&after, &fresh(&kernel, &tree));
-    Carried { runs, dirty, fresh }
+    adt_carried(&format!("{LEAF}{SIZED}"), &format!("{LEAF}{GROWN}"), dropped)
+}
+
+/// A carry of `leaf.rs` from `first` to `then`, every body's stand-in MIR having read the leaf
+/// crate's struct's size ([`fake_mir`]) through its layout row; `dropped` is a read kind left
+/// out of every trace of the first pin. The layout kind is valued, every other said by the
+/// test's producers.
+fn adt_carried(first: &str, then: &str, dropped: Option<ReadKind>) -> Carried {
+    carried_from(Some(first), then, dropped, Says::Exact)
 }
 
 /// The invariant: a body's MIR entry that read a type's layout holds only while what decides
@@ -767,9 +879,10 @@ fn layout_carried(dropped: Option<ReadKind>) -> Carried {
 #[test]
 fn a_struct_that_gains_a_field_misses_the_mir_entries_that_read_its_size() {
     let grown = layout_carried(None);
-    assert_eq!(grown.dirty, [("layout", 4)], "each body's MIR entry read the layout's fact");
+    assert!(grown.layout > 0, "each body's MIR entry read the layout's fact");
+    assert_eq!(said(&grown, ReadKind(LAYOUT.kind.0)), Some(How::Valued), "{:?}", grown.said);
     assert_eq!(grown.runs[Step::Infer as usize], 0, "no inference names the struct: {:?}", grown.runs);
-    assert_eq!(grown.runs[Step::Mir as usize], 4, "each MIR entry read the struct's size: {:?}", grown.runs);
+    assert_eq!(grown.runs[Step::Mir as usize], BODIES as u32, "each MIR entry read the struct's size: {:?}", grown.runs);
     grown.fresh.expect("every entry is what a fresh run gives");
 }
 
@@ -779,9 +892,57 @@ fn a_struct_that_gains_a_field_misses_the_mir_entries_that_read_its_size() {
 #[test]
 fn the_oracle_catches_a_trace_that_drops_the_layout_fact() {
     let planted = layout_carried(Some(ReadKind(LAYOUT.kind.0)));
-    assert_eq!(planted.dirty, [("layout", 0)], "no entry has a layout fact to post");
+    assert_eq!(planted.layout, 0, "no entry has a layout fact to post");
     assert_eq!(planted.runs[Step::Mir as usize], 0, "no MIR entry was reached: {:?}", planted.runs);
     assert!(planted.fresh.is_err(), "a MIR entry that read the struct's size stayed as it was");
+}
+
+/// The leaf crate's enum, read by every stand-in MIR through the struct that holds one (the
+/// struct's layout reads the enum's), as the first pin has it and with a field its variant
+/// gains.
+const ENUMED: &str = "pub enum E { A, B(u8) }\npub struct S { pub a: E }\n";
+const ENUM_GROWN: &str = "pub enum E { A, B(u8, u64) }\npub struct S { pub a: E }\n";
+
+/// The invariant: a body's MIR entry that read a struct's layout is kept across an edit that
+/// leaves what decides the layout as it was. Another body of the leaf crate is edited: its
+/// three entries run again, and every MIR entry that read the struct's size hits, its layout
+/// fact valued again and found the same. The control is
+/// [`a_struct_that_gains_a_field_misses_the_mir_entries_that_read_its_size`]: the same trace
+/// misses when the struct gains a field.
+#[test]
+fn a_mir_entry_that_read_a_struct_s_size_is_kept_when_the_struct_is_not_edited() {
+    let first = format!("{LEAF}{SIZED}");
+    let kept = adt_carried(&first, &first.replace("{ 2 }", "{ 5 }"), None);
+    assert!(kept.layout > 0, "each body's MIR entry read the layout's fact");
+    assert_eq!(kept.runs, [1, 1, 1, 0], "the edited body's three entries alone: {:?}", kept.runs);
+    kept.fresh.expect("every entry is what a fresh run gives");
+}
+
+/// The invariant, for an enum: a MIR entry that read a layout an enum decides is kept while the
+/// enum is as it was (another body edited), and misses when a variant gains a field, the
+/// enum's layout row read through to its variants' field types.
+#[test]
+fn a_mir_entry_that_read_an_enum_s_layout_is_kept_until_a_variant_gains_a_field() {
+    let first = format!("{LEAF}{ENUMED}");
+    let kept = adt_carried(&first, &first.replace("{ 2 }", "{ 5 }"), None);
+    assert!(kept.layout > 0, "each body's MIR entry read the layout's fact");
+    assert_eq!(kept.runs, [1, 1, 1, 0], "the edited body's three entries alone: {:?}", kept.runs);
+    kept.fresh.expect("every kept entry is what a fresh run gives");
+    let grown = adt_carried(&first, &format!("{LEAF}{ENUM_GROWN}"), None);
+    assert_eq!(grown.runs[Step::Infer as usize], 0, "no inference names the enum: {:?}", grown.runs);
+    assert_eq!(grown.runs[Step::Mir as usize], BODIES as u32, "each MIR entry read the enum's layout: {:?}", grown.runs);
+    grown.fresh.expect("every entry is what a fresh run gives");
+}
+
+/// The control for an enum: with the field types' fact left out of every trace, a variant's new
+/// field reaches no MIR entry, each wrongly hits with the old size in its answer, and the
+/// oracle finds the stale one.
+#[test]
+fn the_oracle_catches_a_trace_that_drops_an_enum_s_field_types_fact() {
+    let planted = adt_carried(&format!("{LEAF}{ENUMED}"), &format!("{LEAF}{ENUM_GROWN}"), Some(ReadKind(LAYOUT.kind.0)));
+    assert_eq!(planted.layout, 0, "no entry has a layout fact to post");
+    assert_eq!(planted.runs[Step::Mir as usize], 0, "no MIR entry was reached: {:?}", planted.runs);
+    assert!(planted.fresh.is_err(), "a MIR entry that read the enum's layout stayed as it was");
 }
 
 /// A hit in a second session: a new database of the same files and a new session over the
@@ -811,11 +972,13 @@ fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memor
     let off = &Setting::OFF;
     for key in &keys {
         let got = kernel.get_in::<InferEntry<Tree>, _>(session, store, tree, key, off).unwrap();
-        serve(tree, key, Step::Infer, &got).unwrap();
-        let got = kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, key, off).unwrap();
-        serve(tree, key, Step::Mir, &got).unwrap();
+        serve(tree, key, Of::Infer, &got).unwrap();
+        for owner in owners(tree, key) {
+            let got = kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, &owner, off).unwrap();
+            serve(tree, key, Of::Mir(owner.place), &got).unwrap();
+        }
         let got = kernel.get_in::<BorrowckEntry<Tree>, _>(session, store, tree, key, off).unwrap();
-        serve(tree, key, Step::Borrowck, &got).unwrap();
+        serve(tree, key, Of::Borrowck, &got).unwrap();
     }
 }
 
@@ -855,10 +1018,77 @@ fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
     steps
 }
 
+/// A second database served every entry (as [`answered_in_a_second_database`]), then
+/// `leaf.rs`'s first body edited and the session carried to the new pin; as the driver does,
+/// `leaf.rs`'s bodies are unposted (the edit reached their file) and each crate stamped at the
+/// new revision since the serve. Then each body's inference and borrow check is asked of the
+/// second database. The invariant: every row the carry did not reach (`main.rs`'s bodies)
+/// answers at the new revision with no step run, every other runs, and no answer disagrees
+/// with the database (`Installed::errors`, which checks each served answer's identity and
+/// facts again). `Err` names what broke it.
+fn carried_rows_answer() -> Result<(), String> {
+    let kernel = kernel();
+    let mut store = Memory::default();
+    let first = Tree::new();
+    {
+        let mut session = Session::new(&first);
+        ask_all(&kernel, &mut session, &mut store, &first);
+    }
+    // clone: a counted reference
+    let mut second = Tree::with_defs(first.defs.clone());
+    let mut session = Session::new(&second);
+    ask_and_serve(&kernel, &mut session, &mut store, &second);
+    let (_, since) = second.db().nonce_and_revision();
+    let edited: Vec<DefWithBodyId> =
+        second.bodies.iter().filter(|((file, _), _)| file == "leaf.rs").map(|(_, def)| *def).collect();
+    let others = BODIES - edited.len();
+    let from = second.pin();
+    second.edit("leaf.rs", &LEAF.replace("{ 1 }", "{ 3 }"));
+    let mut changed = Changed::between(from, second.pin());
+    BodyDelta::default().say(&session, &mut changed);
+    let carry = kernel.carry(&mut session, &mut store, &second, &changed, &Setting::OFF).map_err(|it| it.to_string())?;
+    if carry.dropped.is_some() {
+        return Err(format!("the carry dropped the session: {carry:?}"));
+    }
+    let db = second.db();
+    for &def in &edited {
+        unpost(db, def);
+    }
+    for (_, krate) in FILES {
+        stamp(db, crate_named(db, krate), since);
+    }
+    reset_runs();
+    for &def in second.bodies.values() {
+        let _ = InferenceResult::of(db, def);
+        let _ = lookup_passed(db, def, CHECKER, || panic!("no store here verifies"));
+    }
+    second.installed.errors().map_err(|it| format!("a served answer disagrees with the database: {it:?}"))?;
+    let infer = second.installed.steps()[Step::Infer as usize];
+    if infer.hits != others as u64 {
+        return Err(format!("{} inferences answered from rows, {others} not reached by the edit", infer.hits));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_row_the_carry_did_not_reach_answers_at_the_next_revision() {
+    carried_rows_answer().unwrap();
+}
+
+/// The control: a driver whose unpost drops nothing (`KEEP_ALL`) leaves the edited bodies'
+/// rows under the stamp, and they answer for bodies whose identity moved: caught.
+#[test]
+fn the_oracle_catches_a_stamp_over_a_moved_entrys_row() {
+    KEEP_ALL.with(|it| it.set(true));
+    let planted = carried_rows_answer();
+    KEEP_ALL.with(|it| it.set(false));
+    assert!(planted.is_err(), "an edited body's row answered under the stamp");
+}
+
 #[test]
 fn a_query_in_a_second_database_answers_from_the_kernels_entries_without_running() {
     let steps = answered_in_a_second_database(false);
-    let bodies = 4;
+    let bodies = BODIES as u64;
     assert_eq!(
         steps[Step::Infer as usize],
         StepCounts { hits: bodies, ran: 0, refused: 0 },
@@ -932,4 +1162,235 @@ fn an_entry_kept_by_one_solver_misses_after_a_solver_source_edit() {
         ask_all(&kernel_of(build), &mut session, &mut store, &tree);
         assert_eq!(runs()[Step::Infer as usize] > 0, ran, "{what}: {:?}", runs());
     }
+}
+
+/// Whether `def` has a body written (a trait's method or `const` may declare none).
+fn has_body(db: &Db, def: DefWithBodyId) -> bool {
+    match def {
+        DefWithBodyId::FunctionId(it) => FunctionSignature::of(db, it).has_body(),
+        DefWithBodyId::ConstId(it) => ConstSignature::of(db, it).has_body(),
+        DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => true,
+    }
+}
+
+/// `keyed` with a decoy at every key's start: an item of a kind no body is, sorted before it,
+/// as a file whose items share a start would have. A join that ignores the kind pairs a body
+/// with its decoy.
+fn with_decoys(keyed: Vec<Keyed>) -> Vec<Keyed> {
+    let mut out = Vec::with_capacity(2 * keyed.len());
+    for (n, it) in keyed.iter().enumerate() {
+        out.push(Keyed { item: ItemId([0xd0 ^ n as u8; 16]), kind: Kind::File, start: it.start });
+    }
+    out.extend(keyed);
+    out.sort_unstable_by_key(|it| (it.start, it.kind));
+    out
+}
+
+/// The invariant: every body `crate_body_owners` gives that is written in a pinned file has
+/// one key, whose body is it: the key's item is in the file's `items` with the body's kind
+/// and, for a function, its name. Run with a decoy at every key's start ([`with_decoys`]).
+/// `Err` names the first body that breaks it.
+fn keyed_by_where_written() -> Result<usize, String> {
+    let tree = Tree::new();
+    let db = tree.db();
+    let mut checked = 0;
+    for (at, (name, krate)) in FILES.into_iter().enumerate() {
+        let text = &tree.files[name];
+        let record = blaze_front_items::parse(text, reading());
+        let parsed = blaze_front_items::tree(&record, text, reading()).expect("a tree");
+        let items = blaze_front_items::file_items(parsed.root()).expect("items");
+        let table = Table::read(ITEMS, &items.items).expect("`items` reads");
+        let file = tree.fixture.file(at).file_id(db);
+        let bodies = written_in(db, krate, file);
+        let pairs = join(&with_decoys(keyed(&items.items, &items.lines).expect("the file's bodies")), &bodies);
+        for def in crate_body_owners(db, crate_named(db, krate)) {
+            let Some(written_at) = written(db, def).filter(|it| it.file == file) else { continue };
+            if !has_body(db, def) {
+                continue;
+            }
+            checked += 1;
+            let keys: Vec<ItemId> = pairs.iter().filter(|(_, it)| *it == def).map(|(item, _)| *item).collect();
+            let [item] = keys.as_slice() else {
+                return Err(format!("{def:?} in `{name}` has {} keys", keys.len()));
+            };
+            let item = *item;
+            let entry = match table.get(&item.0) {
+                Ok(Some(bytes)) => Entry::read(bytes)?,
+                _ => return Err(format!("{def:?} in `{name}` is keyed by {item:?}, which `items` has no entry of")),
+            };
+            if entry.kind != written_at.kind {
+                return Err(format!("{def:?} in `{name}` is keyed by a {:?}", entry.kind));
+            }
+            if let DefWithBodyId::FunctionId(it) = def
+                && FunctionSignature::of(db, it).name.as_str() != entry.name
+            {
+                return Err(format!("{def:?} in `{name}` is keyed by the item `{}`", entry.name));
+            }
+        }
+    }
+    Ok(checked)
+}
+
+#[test]
+fn an_impl_and_a_trait_body_are_keyed_by_where_they_are_written() {
+    let checked = keyed_by_where_written().unwrap();
+    assert_eq!(checked, BODIES, "every body of the fixture, the method and the default method too");
+    let tree = Tree::new();
+    assert_eq!(tree.keys.len(), BODIES, "the tree keys each body once");
+}
+
+/// The control: a join that ignores the kind ([`ANY_KIND`]) pairs a body with the decoy at its
+/// start, and the oracle finds it.
+#[test]
+fn the_oracle_catches_a_join_that_ignores_the_kind() {
+    ANY_KIND.with(|it| it.set(true));
+    let caught = keyed_by_where_written();
+    ANY_KIND.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen: {caught:?}");
+}
+
+/// Every served step's trace of `db` the item store holds, by body, step and schema.
+fn traced(db: &Db) -> Vec<(DefWithBodyId, Step, SchemaHash)> {
+    super::super::with_store(db, |store| {
+        store.traces.lock().keys().copied().filter(|(_, step, _)| step.served()).collect()
+    })
+    .expect("the tree's item store")
+}
+
+/// The invariant: every traced run is an entry in the store or is claimed by the next
+/// `claim_keeps`. Every body's three steps run in the tree's database; a claim takes them
+/// all, and its keep puts the first body's three entries in the store and then fails (the
+/// claim is dropped, not kept); the next claim must take every other run. Kept, that claim
+/// leaves nothing to a third. `Err` names the runs no one holds.
+fn left_to_the_next() -> Result<(), String> {
+    let kernel = kernel();
+    let tree = Tree::new();
+    let db = tree.db();
+    for &def in tree.bodies.values() {
+        let _ = run_infer(db, def);
+        let _ = fake_mir(db, def);
+        let _ = fake_borrowck(db, def);
+    }
+    let runs = traced(db);
+    assert_eq!(runs.len(), 3 * BODIES, "each body's inference, MIR and borrow check");
+    let claim = claim_keeps(db).expect("an item store");
+    assert_eq!(claim.steps.len(), runs.len(), "the first claim takes every run");
+    assert!(claim.refused.is_empty(), "no run was refused: {:?}", claim.refused);
+    // The keep: the first body's entries reach the store, then it fails.
+    let mut store = Memory::default();
+    let mut session = Session::new(&tree);
+    let off = &Setting::OFF;
+    let first = &tree.keys[0];
+    let def = tree.body(first).unwrap();
+    kernel.get_in::<InferEntry<Tree>, _>(&mut session, &mut store, &tree, first, off).unwrap();
+    for owner in owners(&tree, first) {
+        kernel.get_in::<MirEntry<Tree>, _>(&mut session, &mut store, &tree, &owner, off).unwrap();
+    }
+    kernel.get_in::<BorrowckEntry<Tree>, _>(&mut session, &mut store, &tree, first, off).unwrap();
+    let kept = [
+        (def, Step::Infer, infer::SCHEMA),
+        (def, Step::Mir, MIR_SCHEMA),
+        (def, Step::Borrowck, borrowck_schema(db, def, CHECKER)),
+    ];
+    drop(claim);
+    let next = claim_keeps(db).expect("an item store");
+    let lost: Vec<_> = runs.iter().filter(|run| !kept.contains(*run) && !next.steps.contains(*run)).collect();
+    if !lost.is_empty() {
+        return Err(format!("{} runs neither kept nor claimed again: {lost:?}", lost.len()));
+    }
+    next.kept();
+    let third = claim_keeps(db).expect("an item store");
+    if !third.steps.is_empty() {
+        return Err(format!("a kept claim's {} runs were claimed again", third.steps.len()));
+    }
+    third.kept();
+    Ok(())
+}
+
+#[test]
+fn a_keep_that_fails_leaves_its_runs_to_the_next() {
+    left_to_the_next().unwrap();
+}
+
+/// The control: a claim that holds its marks when dropped ([`HELD`]) leaves the failed keep's
+/// runs to no one, and the oracle finds them.
+#[test]
+fn the_oracle_catches_a_failed_keep_that_holds_its_claims() {
+    HELD.with(|it| it.set(true));
+    let caught = left_to_the_next();
+    HELD.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
+}
+
+/// What the database's query of a body's borrow check does (`hir_ty_borrowck`'s `borrowck`):
+/// the served verdict, looked up in a query so the engine keeps its row and what it read.
+#[blaze_query::tracked(returns(copy))]
+fn served_check(db: &Db, def: DefWithBodyId) -> bool {
+    lookup_passed(db, def, CHECKER, || panic!("no store here verifies"))
+}
+
+/// How many of `tree`'s bodies' borrow checks ran (missed their served verdict) when each is
+/// asked of its query.
+fn checks_ran(tree: &Tree) -> u64 {
+    let before = tree.installed.steps()[Step::Borrowck as usize].ran;
+    for &def in tree.bodies.values() {
+        let _ = served_check(tree.db(), def);
+    }
+    tree.installed.steps()[Step::Borrowck as usize].ran - before
+}
+
+/// The invariant: the engine's row of a served step depends on every fact it and its earlier
+/// steps read. A first tree keeps every entry of `leaf.rs` with a struct, whose size each
+/// body's stand-in MIR reads (no inference or borrow check reads it); a second database is
+/// served every entry and asks each borrow check: none runs. The struct gains a field there;
+/// asked again, each borrow check whose MIR read the size runs, as many as in a fresh
+/// database served nothing. `Err` says the two counts.
+fn reruns_after_a_mir_fact() -> Result<(), String> {
+    let kernel = kernel();
+    let mut store = Memory::default();
+    let sized = format!("{LEAF}{SIZED}");
+    let grown = format!("{LEAF}{GROWN}");
+    let mut first = Tree::new();
+    first.edit("leaf.rs", &sized);
+    {
+        let mut session = Session::new(&first);
+        ask_all(&kernel, &mut session, &mut store, &first);
+    }
+    // clone: a counted reference
+    let mut second = Tree::with_defs(first.defs.clone());
+    second.edit("leaf.rs", &sized);
+    {
+        let mut session = Session::new(&second);
+        reset_runs();
+        ask_and_serve(&kernel, &mut session, &mut store, &second);
+        assert_eq!(runs(), [0; Step::COUNT], "no entry runs in the second session: each is the store's");
+    }
+    assert_eq!(checks_ran(&second), 0, "each borrow check is its served verdict");
+    second.edit("leaf.rs", &grown);
+    let again = checks_ran(&second);
+    // clone: a counted reference
+    let mut fresh = Tree::with_defs(first.defs.clone());
+    fresh.edit("leaf.rs", &grown);
+    let expected = checks_ran(&fresh);
+    assert_eq!(expected, BODIES as u64, "a database served nothing runs every borrow check");
+    second.installed.errors().map_err(|why| format!("a served answer disagreed with the database: {why}"))?;
+    match again == expected {
+        true => Ok(()),
+        false => Err(format!("{again} borrow checks ran after the struct grew, and {expected} in a fresh database")),
+    }
+}
+
+#[test]
+fn a_served_borrow_check_reruns_after_a_fact_only_its_mir_read_changes() {
+    reruns_after_a_mir_fact().unwrap();
+}
+
+/// The control: a served row that holds its own facts alone ([`OWN_FACTS_ONLY`]) keeps the
+/// borrow checks' rows past the struct's new field, and the oracle finds them.
+#[test]
+fn the_oracle_catches_a_served_row_without_its_earlier_steps_facts() {
+    OWN_FACTS_ONLY.with(|it| it.set(true));
+    let caught = reruns_after_a_mir_fact();
+    OWN_FACTS_ONLY.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
 }

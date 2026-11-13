@@ -206,6 +206,9 @@ struct Seen<'a> {
     call: &'a Env,
     made: Option<inputs::Env>,
     /// What file, directory and listing reads are asked through: no variable is read there.
+    /// Their looks at the disk are kept by no build ([`base_db::Looks::none`]): an
+    /// expansion's lookup is shared by every job, and what it read is in the reads of the
+    /// unit's record, which each build that uses the unit takes.
     none: inputs::Env,
 }
 
@@ -230,15 +233,15 @@ impl Inputs for Seen<'_> {
         &mut self,
         path: &std::path::Path,
     ) -> Result<blaze_usercode::trace::Entry, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.entry(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.entry(path)
     }
 
     fn file(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.file(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.file(path)
     }
 
     fn dir(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.dir(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.dir(path)
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
@@ -258,7 +261,7 @@ impl Inputs for Seen<'_> {
         path: &std::path::Path,
         out: &mut blaze_usercode::trace::Names<'_>,
     ) -> Result<bool, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.names(path, out)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.names(path, out)
     }
 }
 

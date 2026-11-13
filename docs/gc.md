@@ -416,6 +416,10 @@ no pin holds them.
 newest of a name is the name's, one with no keys lets it go; `collect::Pin`). The daemon
 writes two unasked at a build's end: `toolchain` (the standard library's unit records, their
 slots and outputs, as builds find them in the store) and `bstd` (the same of bstd's units).
+The pin `vfs image` names the listings (`Kind::Set`) of the texts the daemon image on disk
+names, and while an image is made the next one's beside it (blaze-cas `sets::FileSet`): an
+image's texts are a root from before a byte of it is written until the image after it is in
+place. The pin of a name made last is the name's, whatever the clocks did (`Store::pin`).
 `blaze gc --dry-run` (or `--kept`) prints each pin with its keys, bytes and why, and what else
 is kept and by what, and removes nothing. `blaze clean` is this project's build dir, as before;
 `blaze clean --unkept` asks the daemon's store to forget every record no root keeps, whatever

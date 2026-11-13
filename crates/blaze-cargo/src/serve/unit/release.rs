@@ -48,7 +48,10 @@
 //! `unit bodies` 782 ms. What is kept is bounded: the values of at most [`EDIT_CRATES`]
 //! crates a build, and of those only what the next two builds read again
 //! ([`blaze_query::db::Storage::end_epoch`], run at every build's end, lets go of what the
-//! last two did not read); memory short takes it all as before.
+//! last two did not read); memory short takes it all as before. Past its own wait with nothing
+//! to do ([`crate::serve::idle::front_after`]: 64 times its last remake, from 30 s to 30
+//! minutes), nothing is kept for the next edit: the daemon is held to
+//! [`crate::serve::idle::BUDGET`], and the front end goes whole (`job::giving`).
 //!
 //! **Every other build that compiles holds the inference of the workspace's crates it
 //! finished last** ([`Release::held`]): a cold build and a rebuild of many crates let go of a
@@ -64,7 +67,8 @@
 //! 5.7 s, each later one 0.95 s). The bound: a build holds the inference of at most
 //! [`EDIT_CRATES`] crates more than it did, from each one's last unit to the build's end and
 //! past it under [`blaze_query::db::Storage::end_epoch`]'s rule; memory short lets go of the
-//! held crates with the rest. Its MIR goes at its end as before, every crate's by its tag
+//! held crates with the rest, and so does an idle daemon past the front end's wait
+//! ([`crate::serve::idle::front_after`]), with the whole front end. Its MIR goes at its end as before, every crate's by its tag
 //! (`hir::evict::drop_mir` keeps none by crate), so the first edit still lowers the edited
 //! crate's built and runtime MIR again where the lints read them: `mir_body_query` and
 //! `runtime_mir_body_query` under `evicted_asked` in that build's `query_counts`. A check
@@ -141,7 +145,47 @@ pub(crate) fn give_kept_caches() -> u64 {
     let describes = hir_ty_codegen::v2::let_go_kept_walks();
     blaze_mem::tag::give_back_heap();
     let gave = before.saturating_sub(kept_caches());
-    tracing::info!(target: "blaze", describes, gave, "codegen's kept walks were let go");
+    // None is left, nor an empty table put back in its place: the process tables
+    // ([`give_kept_tables`]) are released only while no walk is kept.
+    let kept_walks = hir_ty_codegen::v2::kept_walks();
+    tracing::info!(target: "blaze", describes, gave, kept_walks, "codegen's kept walks were let go");
+    gave
+}
+
+/// What the process tables every front end's ids index hold: the type interner's tables and
+/// the trait solver's shared caches (the `intern` and `solver` tags, blaze-mem's and the
+/// heap's). No drop of a front end frees them: they are statics of the process
+/// (hir-ty's `next_solver::interner`), freed only by [`give_kept_tables`].
+pub(crate) fn kept_tables() -> u64 {
+    let snapshot = blaze_mem::tag::snapshot();
+    let of = |tag: blaze_mem::Tag| {
+        let it = snapshot.get(tag);
+        it.live.saturating_add(it.heap)
+    };
+    of(blaze_mem::Tag::Intern).saturating_add(of(blaze_mem::Tag::Solver))
+}
+
+/// Releases the process tables ([`kept_tables`]) as a fresh process has them
+/// (`hir::evict::release_process_tables`), then gives this thread's freed heap back; the
+/// bytes [`kept_tables`] fell by. For the loop only while nothing names an interned id: no
+/// front end kept or out, no walk kept or in flight, no link image kept, no task running
+/// (`job::giving` lists the source only then); the release itself refuses, by panic naming
+/// both counts, while a front end is kept or a task is entered.
+pub(crate) fn give_kept_tables() -> u64 {
+    let before = kept_tables();
+    let released = hir::evict::release_process_tables();
+    blaze_mem::tag::give_back_heap();
+    let after = kept_tables();
+    let gave = before.saturating_sub(after);
+    tracing::info!(
+        target: "blaze",
+        tables = released.tables,
+        released = released.bytes,
+        before,
+        after,
+        gave,
+        "the process tables were released: no front end, walk or image names an interned id"
+    );
     gave
 }
 

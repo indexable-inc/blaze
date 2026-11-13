@@ -483,7 +483,15 @@ fn tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_i
         let mut records = Loaded::new().expect("the program's data");
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
         let served =
-            blaze_launch_rt::run(driver, ours, ProgramId([3; 32]), &mut records, ready, stay);
+            blaze_launch_rt::run(
+                driver,
+                blaze_launch_rt::control::Join::Now(ours),
+                None,
+                ProgramId([3; 32]),
+                &mut records,
+                ready,
+                stay,
+            );
         (served, records)
     });
     let start = entry.recv_timeout(PATIENCE).expect("the daemon's word to start").expect("an entry");

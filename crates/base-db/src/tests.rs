@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, Looks, VfsPath};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgOptions};
@@ -24,6 +24,7 @@ use crate::{
     target::{Arch, TargetData},
 };
 
+mod durable_roots;
 mod memo_properties;
 
 #[global_allocator]
@@ -1053,7 +1054,7 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
     assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
     assert_ne!(missing_content, dir_content, "a different error is a different input");
-    assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
+    assert!(db.files().included_is_read(&db, &missing, &Looks::none()), "the same error is what was read");
 }
 
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
@@ -1456,13 +1457,13 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
 
     // An edit on disk, read again: the reader runs again and reads the new text.
     std::fs::write(&m, "pub fn f() { 1 }").unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's edit")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's edit"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
     assert_eq!(disk_module_runs(), runs + 2);
 
     // Gone from disk: no module file, never the old text.
     std::fs::remove_file(&m).unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's removal")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's removal"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), None);
     assert_eq!(disk_module_runs(), runs + 3);
     std::fs::remove_dir_all(&dir).unwrap();

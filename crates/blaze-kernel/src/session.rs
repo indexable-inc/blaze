@@ -6,7 +6,9 @@
 //!   its value once a parent asked for it, and its height: one more than the highest step it
 //!   reads, 0 where it reads no step.
 //! - **Postings.** For a read's name (its kind and key, as a read-list keeps it), the rows whose
-//!   entry's list names it. A read of a step's value is posted under its name as any other, and
+//!   entry's list names it, and, for a read the world answers, what it saw at the session's pin
+//!   (every live reader saw the same: invariant I4), so a carry can value the read once at the
+//!   new pin and compare ([`Changed::valued`]). A read of a step's value is posted under its name as any other, and
 //!   that name also says which row is the step's own ([`Session::link`]), so the readers of a
 //!   row are the postings of its name.
 //! - **Admission is two calls that cannot be taken apart.** [`Session::post`] writes the
@@ -39,15 +41,16 @@ use blaze_cas::Key;
 use blaze_ids::ContentId;
 
 #[cfg(test)]
-use crate::Seen;
-#[cfg(test)]
 use crate::nest::planted::{self, Bug};
 use crate::store::{Get, Put};
 use crate::trie::{self, Broken, Cursor, Nodes};
-use crate::{KernelError, Of, Pin, Read, ReadKind, StepId, World, entry, hex, table};
+use crate::{KernelError, Of, Pin, Read, ReadKind, Seen, StepId, World, entry, hex, table};
 
 /// `blaze kernel s`, then the layout's number: the root record of a saved session.
-const ROOT_MAGIC: [u8; 16] = *b"blaze kernel s 2";
+///
+/// Layout 3: a posting record keeps what its read saw (`seen`). A root of layout 2 is refused
+/// by name ([`Session::open`]): its postings say nothing a valued carry can compare.
+const ROOT_MAGIC: [u8; 16] = *b"blaze kernel s 3";
 
 /// The key of a read's postings in the map of its kind: the hash of its name.
 fn name_key(name: &[u8]) -> ContentId {
@@ -71,6 +74,29 @@ fn broken(broken: Broken) -> KernelError {
 fn unreadable(key: Key, why: &str) -> KernelError {
     // alloc: an error
     broken(Broken { key, why: why.to_owned() })
+}
+
+/// Appends what a read saw, as a posting record keeps it: 0 nothing kept, 1 gone, 2 then the
+/// hash.
+fn put_seen(out: &mut Vec<u8>, seen: Option<Seen>) {
+    match seen {
+        None => out.push(0),
+        Some(Seen::Gone) => out.push(1),
+        Some(Seen::Is(hash)) => {
+            out.push(2);
+            out.extend_from_slice(&hash.0);
+        }
+    }
+}
+
+/// What [`put_seen`] wrote: none where the bytes are no such value.
+fn read_seen(input: &mut Cursor<'_>) -> Option<Option<Seen>> {
+    match input.u8()? {
+        0 => Some(None),
+        1 => Some(Some(Seen::Gone)),
+        2 => Some(Some(Seen::Is(input.id()?))),
+        _ => None,
+    }
 }
 
 /// An entry found valid or made under a session's pin, as its row keeps it.
@@ -133,6 +159,12 @@ struct Post {
     readers: Vec<u32>,
     /// For a read of a step's value: that step's own row.
     row: Option<u32>,
+    /// What the read saw at the session's pin, as every live reader of it saw it (I4): set by
+    /// each posting of a list that names it ([`Session::post`]) and by a carry that valued it
+    /// ([`Changed::valued`]); none for a read the kernel answers itself, for a name no list
+    /// posted in this process whose record is not read yet, and for a read that could not be
+    /// valued at the last valuation.
+    seen: Option<Seen>,
     /// Whether the readers the store keeps for the read are among `readers`: false for a name
     /// first met in this process while its kind has postings in the store. Readers are posted
     /// to it all the same, and the store's are read in when a carry or a save needs them all.
@@ -324,9 +356,10 @@ impl Session {
             let (name, post) = self.posts.get_index(at).expect("a changed name is in the session");
             let kind = entry::named(name).expect("a read's name starts with its kind").kind.0;
             // alloc: one posting's record
-            let mut bytes = Vec::with_capacity(2 + name.len() + 1 + 32 + 2 + 32 * post.readers.len());
+            let mut bytes = Vec::with_capacity(2 + name.len() + 1 + 32 + 33 + 2 + 32 * post.readers.len());
             trie::put_counted(&mut bytes, name);
             trie::put_maybe_id(&mut bytes, post.row.map(|row| self.id_of(row)));
+            put_seen(&mut bytes, post.seen);
             // alloc: one posting's readers by identity, in order (rule 25)
             let mut readers: Vec<[u8; 32]> = post.readers.iter().map(|row| self.id_of(*row).0).collect();
             readers.sort_unstable();
@@ -429,7 +462,7 @@ impl Session {
         // Nothing to read in where the store keeps no posting of its kind, or all are here.
         let loaded = names.root.is_none() || names.whole;
         // alloc: the session's names, one a read it ever met
-        let post = Post { readers: Vec::new(), row: None, loaded, dirty: false };
+        let post = Post { readers: Vec::new(), row: None, seen: None, loaded, dirty: false };
         let at = self.posts.insert_full(Box::from(name), post).0;
         // alloc: the session's names by kind
         names.names.push(u32::try_from(at).expect("a session's names are counted in u32"));
@@ -473,11 +506,12 @@ impl Session {
             let mut input = Cursor::new(bytes);
             input.counted()?;
             let own = input.maybe_id()?;
+            let seen = read_seen(&mut input)?;
             let count = usize::try_from(input.var()?).ok()?;
             let readers = input.take(count.checked_mul(32)?)?;
-            input.ended().then_some((own, readers))
+            input.ended().then_some((own, seen, readers))
         })();
-        let Some((own, readers)) = parsed else {
+        let Some((own, seen, readers)) = parsed else {
             let name = self.posts.get_index(at).expect("a name by its place").0;
             return Err(unreadable(
                 Key(name_key(name)),
@@ -493,6 +527,11 @@ impl Session {
         let post = self.posts.get_index_mut(at).expect("a name by its place").1;
         if post.row.is_none() {
             post.row = own;
+        }
+        // What this process posted or valued is of the session's pin now: it wins over the
+        // record, which a save wrote at this pin or an earlier one.
+        if post.seen.is_none() {
+            post.seen = seen;
         }
         let had = post.readers.len();
         for row in rows {
@@ -649,6 +688,40 @@ impl Session {
         Ok(rows.len())
     }
 
+    /// Each kind of read the world answers that the session has postings of, in memory or in
+    /// the store, in order: what a change set given to a carry of it must say a difference of
+    /// ([`CarryError::Unsaid`]).
+    pub fn kinds(&self) -> Vec<ReadKind> {
+        // alloc: one carry's kinds, for its holder to say each
+        let mut kinds: Vec<ReadKind> = self
+            .kinds
+            .iter()
+            .filter(|(kind, names)| {
+                !ReadKind(**kind).is_kernels() && (!names.names.is_empty() || names.root.is_some())
+            })
+            .map(|(kind, _)| ReadKind(*kind))
+            .collect();
+        kinds.sort_unstable_by_key(|kind| kind.0);
+        kinds
+    }
+
+    /// How many distinct reads of `kind` the session posted, in memory or in the store (read
+    /// in from `store` where they are not all in memory): what a carry that values the kind
+    /// values ([`Changed::valued`]).
+    pub fn names_of<G: Get + ?Sized>(&mut self, store: &G, kind: ReadKind) -> Result<usize, KernelError> {
+        self.load_kind(store, kind.0)?;
+        Ok(self.kinds.get(&kind.0).map_or(0, |names| names.names.len()))
+    }
+
+    /// The key of the entry the session holds live for the identity whose ID is `id`, its row
+    /// read from `store` where it is not in memory: none where it holds none. For a check
+    /// between requests (whether a carry left an entry as it was), which leaves no node held.
+    pub fn entry_of<G: Get + ?Sized>(&mut self, store: &G, id: &ContentId) -> Result<Option<Key>, KernelError> {
+        let known = self.known(store, id);
+        self.nodes.clear();
+        Ok(known?.map(|(_, known)| known.key))
+    }
+
     /// Drops what it verified, postings too. No answer changes: each value is looked up again
     /// when asked for.
     pub fn clear(&mut self) {
@@ -758,9 +831,14 @@ impl Session {
     }
 
     /// Writes the postings of the entry the identity `id` is about to be admitted with: each
-    /// read `names` names (a name as a read-list keeps it) → this identity's row. `slot` is
-    /// the slot of the list in the identity's chain, none for an entry with no reads. The
-    /// row's height comes with it: one more than the highest step among the reads.
+    /// read `reads` names (a name as a read-list keeps it, and what it saw) → this identity's
+    /// row. `slot` is the slot of the list in the identity's chain, none for an entry with no
+    /// reads. The row's height comes with it: one more than the highest step among the reads.
+    ///
+    /// What each read the world answers saw is kept on its posting, whether or not the list's
+    /// readers were written before (a row admitted again through a list posted at an earlier
+    /// pin): it is what every live reader saw at this pin (I4), which a valued carry compares
+    /// with the read as it is at the next ([`Changed::valued`]).
     ///
     /// The first half of an admission (the module's doc): [`Session::admit`] takes what this
     /// gives. Each step among the reads was looked up or run just before, through
@@ -769,7 +847,7 @@ impl Session {
         &mut self,
         id: ContentId,
         slot: Option<u32>,
-        names: impl Iterator<Item = &'n [u8]>,
+        reads: impl Iterator<Item = (&'n [u8], Seen)>,
         by: By,
     ) -> Posted {
         // alloc: the session's rows, one an identity it ever admitted
@@ -782,7 +860,7 @@ impl Session {
         let row = u32::try_from(row).expect("a session's rows are counted in u32");
         let unwritten = Session::planted_unposted(by);
         let mut height = 0;
-        for name in names {
+        for (name, seen) in reads {
             let read = entry::named(name).expect("a read-list's name starts with its kind");
             let at = self.name_at(name);
             let post = self.posts.get_index_mut(at).expect("a name found or put just now").1;
@@ -806,6 +884,8 @@ impl Session {
                     "a step whose value an entry read is live in the session while the entry is posted",
                 );
                 height = height.max(child.height + 1);
+            } else if !(Session::planted_seen_at_first() && (written || unwritten)) {
+                self.saw(at, Some(seen));
             }
             if written || unwritten {
                 continue;
@@ -872,6 +952,33 @@ impl Session {
             }
         }
         let _ = by;
+        false
+    }
+
+    /// Keeps `seen` as what the read at `at` in `posts` saw, the posting written again where
+    /// that is not what it kept.
+    fn saw(&mut self, at: usize, seen: Option<Seen>) {
+        let post = self.posts.get_index_mut(at).expect("a name by its place").1;
+        if post.seen == seen {
+            return;
+        }
+        post.seen = seen;
+        if !post.dirty {
+            post.dirty = true;
+            // alloc: the names the next save writes
+            self.dirty_posts.push(at as u32);
+        }
+    }
+
+    /// A planted bug: a posting keeps what its read saw only where its list's readers are
+    /// written, so a row admitted again through a list posted before leaves the old value.
+    fn planted_seen_at_first() -> bool {
+        #[cfg(test)]
+        {
+            if planted::is(Bug::SeenAtFirstPost) {
+                return true;
+            }
+        }
         false
     }
 
@@ -1171,19 +1278,21 @@ impl Session {
     /// dropped and queued. None: the session was dropped whole.
     ///
     /// Total (invariant I2): `changed` says, for every kind of read the session has a posting
-    /// of, either the exact names that differ or that every one may. A kind it does not
-    /// mention is a refusal naming the kind, never read as "nothing changed".
+    /// of, the exact names that differ, that each read is to be valued at the new pin and
+    /// compared with what it saw, or that every one may differ. A kind it does not mention is
+    /// a refusal naming the kind, never read as "nothing changed".
     ///
     /// The postings of each changed name are read from `store` where they are not in memory
-    /// (one path a name). A store that fails part way drops the session whole: some rows were
-    /// dropped and their readers not yet reached.
-    pub(crate) fn seed<G: Get + ?Sized>(
+    /// (one path a name); a valued kind's are all read. A store that fails part way drops the
+    /// session whole: some rows were dropped and their readers not yet reached.
+    pub(crate) fn seed<G: Get + ?Sized, W: World + ?Sized>(
         &mut self,
         store: &G,
         registry: ContentId,
-        now: Pin,
+        world: &W,
         changed: &Changed,
     ) -> Result<Option<Queue>, KernelError> {
+        let now = world.pin();
         if changed.from != self.pin {
             return Err(KernelError::Carry(CarryError::From {
                 session: self.pin,
@@ -1220,7 +1329,7 @@ impl Session {
             return Err(KernelError::Carry(CarryError::Unsaid { kind: ReadKind(kind), names }));
         }
         let mut queue = Queue::new(self.live.saturating_add(self.rows.len()));
-        if let Err(error) = self.seed_rows(store, changed, &mut queue) {
+        if let Err(error) = self.seed_rows(store, world, changed, &mut queue) {
             self.clear();
             return Err(error);
         }
@@ -1239,9 +1348,10 @@ impl Session {
     }
 
     /// Drops and queues the rows `changed` reaches directly.
-    fn seed_rows<G: Get + ?Sized>(
+    fn seed_rows<G: Get + ?Sized, W: World + ?Sized>(
         &mut self,
         store: &G,
+        world: &W,
         changed: &Changed,
         queue: &mut Queue,
     ) -> Result<(), KernelError> {
@@ -1267,9 +1377,74 @@ impl Session {
                         self.dirty_readers(store, at, queue)?;
                     }
                 }
+                Difference::Valued => self.seed_valued(store, world, kind, queue)?,
             }
         }
         Ok(())
+    }
+
+    /// Values each read of `kind` the session posted, once, at the world as it is now, and
+    /// drops and queues the readers of each that is not what they saw: another hash, gone
+    /// where it was, there where it was gone, or not valuable now. Every name of the kind is
+    /// read in from `store` first, so a saved session's postings are valued as one in memory.
+    ///
+    /// It cannot leave a change out: `World::hash` is what every lookup values a read by, and
+    /// every live entry's reads are posted (I1) with what they saw at the session's pin (I4).
+    /// What each read is now is kept on its posting, so the next carry compares with it.
+    fn seed_valued<G: Get + ?Sized, W: World + ?Sized>(
+        &mut self,
+        store: &G,
+        world: &W,
+        kind: u16,
+        queue: &mut Queue,
+    ) -> Result<(), KernelError> {
+        if !Session::planted_valued_unloaded() {
+            self.load_kind(store, kind)?;
+        }
+        let names = self.kinds.get(&kind).map_or(0, |names| names.names.len());
+        let gone_same = Session::planted_valued_gone_same();
+        for n in 0..names {
+            let at = self.kinds[&kind].names[n] as usize;
+            self.load_post(store, at)?;
+            let (name, post) = self.posts.get_index(at).expect("a name of the kind by its place");
+            let read = entry::named(name).expect("a read's name starts with its kind");
+            let now = world.hash(read).ok();
+            let differs = match gone_same {
+                true => now.is_some_and(|now| now != Seen::Gone && Some(now) != post.seen),
+                false => now.is_none() || now != post.seen,
+            };
+            queue.valued += 1;
+            if differs {
+                queue.differed += 1;
+                self.dirty_readers(store, at, queue)?;
+            }
+            self.saw(at, now);
+        }
+        Ok(())
+    }
+
+    /// A planted bug: a valued kind values only the names in memory, never reading the
+    /// postings the store keeps of it.
+    fn planted_valued_unloaded() -> bool {
+        #[cfg(test)]
+        {
+            if planted::is(Bug::ValuedUnloaded) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A planted bug: a valued read that is gone now, or cannot be valued, is taken as what
+    /// its readers saw.
+    fn planted_valued_gone_same() -> bool {
+        #[cfg(test)]
+        {
+            if planted::is(Bug::ValuedGoneSame) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Queues every live reader of the read at `at` in `posts`.
@@ -1291,9 +1466,7 @@ impl Session {
     /// is not in memory: for a check between requests, which leaves no node held.
     #[cfg(test)]
     pub(crate) fn holds<G: Get + ?Sized>(&mut self, store: &G, id: &ContentId) -> Result<bool, KernelError> {
-        let held = self.known(store, id)?.is_some();
-        self.nodes.clear();
-        Ok(held)
+        Ok(self.entry_of(store, id)?.is_some())
     }
 
     /// The root of the postings of `kind` in the store, as the last save left it.
@@ -1332,6 +1505,10 @@ pub(crate) struct Queue {
     was: blaze_hash::HashMap<u32, (Key, Option<ContentId>), Global>,
     /// How many rows may still be taken (rule 18): [`Popped::Spent`] past it.
     left: usize,
+    /// The reads the seed valued ([`Changed::valued`]), and of those the ones that differed:
+    /// [`Carried::valued`], [`Carried::differed`].
+    pub(crate) valued: usize,
+    pub(crate) differed: usize,
     /// A planted bug's rows repaired already, which it does not queue again.
     #[cfg(test)]
     done: Vec<u32>,
@@ -1359,6 +1536,8 @@ impl Queue {
             // alloc: one carry's queue; empty where nothing the session read changed
             was: blaze_hash::HashMap::new_in(Global),
             left: rows.saturating_mul(8).saturating_add(64),
+            valued: 0,
+            differed: 0,
             #[cfg(test)]
             done: Vec::new(),
         }
@@ -1425,17 +1604,20 @@ impl Queue {
 /// What differs between two pins of a world, as whoever moved the world says it: the reads a
 /// carry starts from ([`crate::Kernel::carry`]).
 ///
-/// It is total by kind of read (invariant I2). For each kind the world answers, it says
-/// either the exact reads that differ ([`Changed::exact`], [`Changed::differs`]) or that any
-/// read of the kind may ([`Changed::everything`]: a kind with no exact difference, such as a
-/// fact valued by something that keeps no history). A read that differs is one whose
+/// It is total by kind of read (invariant I2). For each kind the world answers, it says one of
+/// three things: the exact reads that differ ([`Changed::exact`], [`Changed::differs`]: a
+/// producer that knows them, in time of the change); that each read of the kind the session
+/// posted is to be valued at the new pin and compared with what its entries saw
+/// ([`Changed::valued`]: exact with no producer, at one valuation a distinct read); or that
+/// any read of the kind may differ ([`Changed::everything`]: nothing says, and every reader is
+/// looked up again). A read that differs is one whose
 /// [`World::hash`] at `to` is not what it was at `from`: a hash for another hash, a thing
 /// that appeared where nothing was ([`crate::Seen::Gone`] before) or went, and a read that
 /// can or cannot be valued where before it was the other. Postings are by name, so a name
 /// nothing was under is covered like any other, as long as it is said here.
 ///
-/// The kernel cannot check that the names are all of them: that is the one thing a carry
-/// trusts, and what a driver's own tests are for (`exhaustive/nested.rs` has the control: a
+/// For an exact kind the kernel cannot check that the names are all of them: that is the one
+/// thing a carry under it trusts, and what a driver's own tests are for (`exhaustive/nested.rs` has the control: a
 /// fact that appears and is left out ends stale).
 pub struct Changed {
     from: Pin,
@@ -1446,6 +1628,8 @@ pub struct Changed {
 enum Difference {
     /// The names (kind and key) of the reads that differ.
     Exact(Vec<Box<[u8]>>),
+    /// Each posted read is valued at the new pin and compared with what it saw.
+    Valued,
     Everything,
 }
 
@@ -1463,7 +1647,7 @@ impl Changed {
     }
 
     /// Says `read` differs between the two pins. Its kind's difference is exact, unless
-    /// [`Changed::everything`] was said of it.
+    /// [`Changed::valued`] or [`Changed::everything`] was said of it (each covers the read).
     pub fn differs(&mut self, read: Read<'_>) {
         // alloc: one carry's change set
         let kind = self.kinds.entry(read.kind.0).or_insert_with(|| Difference::Exact(Vec::new()));
@@ -1474,6 +1658,18 @@ impl Changed {
             name.extend_from_slice(read.key);
             names.push(name.into_boxed_slice());
         }
+    }
+
+    /// Says the difference of `kind` is found by valuing: the seed values each read of the
+    /// kind the session posted once at the new pin (`World::hash`), and reaches the readers of
+    /// each that is not what they saw (another hash, gone, there where it was gone, or not
+    /// valuable now). Exact with no producer, from any earlier pin, a saved session's too: it
+    /// costs one valuation a distinct read, where [`Changed::everything`] costs a lookup an
+    /// entry. A kind the kernel answers itself is refused at the carry
+    /// ([`CarryError::Steps`]), as with [`Changed::exact`].
+    pub fn valued(&mut self, kind: ReadKind) {
+        // alloc: one carry's change set
+        self.kinds.insert(kind.0, Difference::Valued);
     }
 
     /// Says any read of `kind` may differ: every entry with a read of that kind is looked up
@@ -1489,7 +1685,9 @@ impl Changed {
     pub(crate) fn may_differ(&self, read: Read<'_>) -> bool {
         match self.kinds.get(&read.kind.0) {
             None => false,
-            Some(Difference::Everything) => true,
+            // A valued read may differ: the seed found out, and the repair's maintainer is not
+            // told which.
+            Some(Difference::Everything | Difference::Valued) => true,
             // Linear in the reads said to differ of this kind: the change set of one carry.
             Some(Difference::Exact(names)) => names.iter().any(|name| &name[2..] == read.key),
         }
@@ -1559,6 +1757,11 @@ pub struct Carried {
     pub changed: usize,
     /// Of those, the entries whose value is the same bytes: their readers stayed verified.
     pub cut: usize,
+    /// Reads the seed valued, one a distinct read of a kind said [`Changed::valued`].
+    pub valued: usize,
+    /// Of those, the reads that were not what their entries saw: another hash, gone, new, or
+    /// not valuable now. A kind said exact or everything adds to neither count.
+    pub differed: usize,
     /// Entries dropped from the session: they cannot be valued at the new pin, or they have no
     /// key to be looked up again by (a value of a step that may not be asked for, which no
     /// step read: [`crate::Kernel::get_in`]), or they were admitted through a cover. Each is

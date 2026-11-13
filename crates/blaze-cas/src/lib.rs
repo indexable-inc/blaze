@@ -38,6 +38,7 @@
 
 mod checks;
 pub mod chunk;
+mod census;
 mod cold;
 pub mod collect;
 mod copy;
@@ -47,7 +48,10 @@ mod disk;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod driven;
 mod flags;
+mod forget;
 mod handle;
+mod heap;
+mod home;
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "docs/v2/plan/design/store-pool.md: a pinned read through a pump (`Hot::pin_pack`) is a test's on the simulation; the index slots and files of their own are not on the pool yet")
@@ -75,6 +79,7 @@ mod segment;
 pub mod sealed;
 pub mod sets;
 mod sync;
+mod whole;
 mod table;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
@@ -86,7 +91,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Tag};
+use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Stamp, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
@@ -101,7 +106,9 @@ use crate::disk::{
     NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub use crate::census::{Census, KindCensus};
 pub use crate::driven::Driven;
+pub use crate::forget::Forgot;
 use crate::flags::{FLAGS, Flag, Row};
 pub use crate::handle::Handle;
 pub use crate::peers::SharedConfig;
@@ -128,8 +135,12 @@ use crate::table::{Held, Table};
 /// and what is written next is of format 5, which a blaze of format 4 refuses by name.
 /// Format 6 added when each pack was last used to the head ([`disk::PackRef::used`]: what the
 /// collector orders packs by, [`collect`]); a head of format 4 or 5 is read with none, and the
-/// next head written is of format 6.
-pub(crate) const FORMAT: u32 = 6;
+/// next head written is of format 6. Format 7 added the records forgotten alone
+/// ([`disk::ForgottenRef`], [`forget`]): a head of format 4 to 6 is read with none. Format 8
+/// added a placed output's whole file as the home of its value's record
+/// ([`disk::ExternalRef::placed`], [`Store::home_placed`]): a head of format 4 to 7 is read
+/// with none.
+pub(crate) const FORMAT: u32 = 8;
 
 /// The oldest format read ([`FORMAT`]).
 pub(crate) const FORMAT_READ: u32 = 4;
@@ -264,10 +275,14 @@ pub enum Kind {
     /// A listing of an item set ([`sets`]): a leaf's item keys, or a root's leaves. The
     /// collector keeps what a kept listing names, as it keeps a chunked output's chunks.
     Set,
+    /// A VFS file's bytes under its `FILE_DOMAIN` content id (`blaze_vfs::TEXT_SCHEMA`): the
+    /// daemon's image names a file by that id and pages its text in from here on its first
+    /// read, so it is hot (read on the edit path).
+    Text,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Query,
         Kind::Code,
         Kind::Debug,
@@ -278,6 +293,7 @@ impl Kind {
         Kind::Derived,
         Kind::Pin,
         Kind::Set,
+        Kind::Text,
     ];
 
     /// The kind's byte on disk and on the wire.
@@ -293,6 +309,7 @@ impl Kind {
             Kind::Derived => 7,
             Kind::Pin => 8,
             Kind::Set => 9,
+            Kind::Text => 10,
         }
     }
 
@@ -308,6 +325,7 @@ impl Kind {
             7 => Some(Kind::Derived),
             8 => Some(Kind::Pin),
             9 => Some(Kind::Set),
+            10 => Some(Kind::Text),
             _ => None,
         }
     }
@@ -324,6 +342,7 @@ impl Kind {
             Kind::Derived => "derived",
             Kind::Pin => "pin",
             Kind::Set => "set",
+            Kind::Text => "text",
         }
     }
 
@@ -545,7 +564,11 @@ impl fmt::Display for Corrupt {
 pub struct Config {
     /// The store's directory, under the driver's root.
     pub dir: FileName,
-    /// Read-only stores under it, searched after it: the shared base layer.
+    /// Shared directories (each what [`SharedConfig::root`] names, such as the machine's std
+    /// store) whose writers' stores it reads behind its own records, in order, read-only: every
+    /// `w-<writer>` directory under each, mapped and checked whole before readers see it, as a
+    /// shared store reads its other writers ([`Store::look_again`] on a miss). It never writes
+    /// there, and its collector, [`Store::stored_bytes`] and its budget leave their packs out.
     pub layers: Vec<FileName>,
     /// Tags it asks with are `tags..tags + 2^32`.
     pub tags: u64,
@@ -629,6 +652,31 @@ pub struct Placed {
     pub result: Result<(), String>,
     /// How its bytes got there; all zero when it failed.
     pub bytes: PlacedBytes,
+    /// The path as looked at once the place renamed its file there, with when it was looked
+    /// at ([`PlacedStamp`]), on every route (a value's bytes, a clone, a derive, a maker's
+    /// runs, a patch, a second path): the store looks at its staged file whole before the
+    /// rename and at the path after it, and gives the second look only if it is the same
+    /// inode, size, modified time and mode ([`Store::vouch`]). So whoever later finds this
+    /// stamp at the path, change time included, finds the bytes placed, with no hash of them.
+    /// `None` for a place that failed, and for one that succeeded but whose path, looked at
+    /// after the rename, held another file (a writer renamed one there in between) or could
+    /// not be looked at: the place's span says which (`unvouched`).
+    pub stamp: Option<PlacedStamp>,
+}
+
+/// What one look at a placed file found, and when it was asked ([`Placed::stamp`]): what the
+/// daemon's local marks persist, so a later [`blaze_core::Effect::Stamp`] of the path is
+/// compared with it whole (inode, size, modified time, change time, mode), with no hash of
+/// the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlacedStamp {
+    /// The path as the system said it was after the rename: the staged file's inode, size,
+    /// modified time and mode, and the change time the rename (and a link) left.
+    pub stamp: blaze_core::Stamp,
+    /// The wall time ([`blaze_core::Effect::Now`]) read just before the look was asked, in
+    /// nanoseconds since the Unix epoch: never later than the look, so a check that a stamp
+    /// is steady (its modified time far enough before its look) errs only toward refusing.
+    pub looked_ns: u64,
 }
 
 /// How the bytes of what [`Store::place`] placed got there: what a build reports, so a copy
@@ -647,6 +695,10 @@ pub struct PlacedBytes {
     /// whose whole file is not yet there and written back (it is written where it goes, never
     /// waited for), or the ranges written into an output's clone of its base.
     pub copied: u64,
+    /// Copied by the kernel from the path's own file into the new one where blocks are not
+    /// shared ([`PlaceBy::Copy`], `Effect::CopyData`): that file's data extents, none of its
+    /// holes, through no memory of the daemon. A patched place's runs are in `copied`.
+    pub kernel: u64,
 }
 
 impl std::ops::AddAssign for PlacedBytes {
@@ -654,6 +706,7 @@ impl std::ops::AddAssign for PlacedBytes {
         self.cloned += it.cloned;
         self.written += it.written;
         self.copied += it.copied;
+        self.kernel += it.kernel;
     }
 }
 
@@ -768,7 +821,7 @@ enum PlacedFile {
     /// not cloned from, since a clone of a file with data not written back waits for all of
     /// it. `waiting`, what can be made of nothing but a clone of it (a derived file's wait for
     /// its base, and a place the store has no other way to make); `doomed`, let go of
-    /// meanwhile ([`Store::unplace`]). `span`, the write-back, open until it completes.
+    /// meanwhile ([`Store::names_step`]). `span`, the write-back, open until it completes.
     Flushing {
         waiting: Vec<Waiter>,
         written: u64,
@@ -778,7 +831,7 @@ enum PlacedFile {
     },
     /// There, read-only and written back (`file`, the one handle a clone is asked through,
     /// [`Flushed::clone_to`]): `cloning` clones of it are in flight, and it is removed once they
-    /// end when `doomed` ([`Store::unplace`]) or `lost` (a clone found it gone); `after`, the
+    /// end when `doomed` ([`Store::names_step`]) or `lost` (a clone found it gone); `after`, the
     /// places that wait to be made from it afresh once it is. `owed`, the bytes written to
     /// make it that no place has reported yet (one made before any place asked for it), which
     /// the next place of it reports.
@@ -808,6 +861,10 @@ enum PlacedFile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlacePlant {
     None,
+    /// The names of the whole files kept as a set ([`whole::Names::plant_one_name`]): the
+    /// file a path is placed from again goes although a second path still names it
+    /// (`tests::place_crash`'s oracle `bounded`).
+    OneName,
     /// The store's whole file of an output is written under the content's own name, in place,
     /// as before 2026-11-12: a crash then leaves any part of it under that name
     /// (`tests::place_whole`).
@@ -839,6 +896,20 @@ pub(crate) enum PlacePlant {
     /// An output placed from its maker's bytes is not begun on its way to the device as its
     /// place ends: the clone its next patch starts from forces all of it out.
     MadeNoWriteBack,
+    /// A place answers the look of its staged file taken before the rename, change time
+    /// and all, with no look after it: a later look at the path never finds it whole
+    /// (`tests::place_copy`).
+    StampsStaged,
+    /// A place vouches for whatever its look after the rename finds, a file another writer
+    /// renamed onto the path in between too (`tests::place_copy`).
+    VouchesAnyLook,
+    /// A placed file is made its value's home ([`home`]) before it is synced: its records
+    /// move once it is mapped, and a crash may tear the file a head names
+    /// (`tests::place_crash`).
+    HomesBeforeSync,
+    /// No placed file is ever made its value's home: the pack keeps the bytes as well
+    /// (`tests::home`).
+    HomesNothing,
 }
 
 /// Whether a value can be the base of a derived one ([`Reader::derivable`]).
@@ -917,7 +988,10 @@ pub enum PlaceBy {
     Clone,
     /// It does not (ext4, tmpfs): every place writes the value's bytes where they go from
     /// the store's records, the store keeps no whole files to clone from, and a patched
-    /// place reads the path's file, writes what changed over it in memory and writes that.
+    /// place starts from a copy the kernel makes of the path's file's data extents under a
+    /// staged name (`Effect::CopyData`: its holes stay holes, nothing passes through the
+    /// daemon's memory), writes what changed into it and renames it onto the path: the
+    /// clone route with one effect swapped, the path's file never written in place.
     Copy,
 }
 
@@ -927,7 +1001,7 @@ impl PlaceBy {
         match self {
             PlaceBy::Clone => "outputs are placed by cloning: the store's file system shares blocks",
             PlaceBy::Copy => {
-                "outputs are placed by copying: the store's file system cannot share blocks (as ext4 and tmpfs cannot), so each place writes the value's bytes and a patched place rewrites its file"
+                "outputs are placed by copying: the store's file system cannot share blocks (as ext4 and tmpfs cannot), so each place writes the value's bytes and a patched place starts from a kernel copy of its file's data"
             }
         }
     }
@@ -945,6 +1019,34 @@ struct Whole {
     id: ContentId,
     len: u64,
     base: Option<Key>,
+}
+
+/// What a place in flight names ([`whole::Names`]), applied at its answer: `file`, the whole
+/// file of `placed/` it is made from (none: it is made from no whole file, so its path names
+/// none once it is answered); `base`, a derived value's base's whole file, named while the
+/// place is in flight; `key`, the key placed ([`Store::place`]; none for a maker's runs, a
+/// patch or a second path).
+#[derive(Clone, Copy, Debug)]
+struct Naming {
+    file: Option<ContentId>,
+    base: Option<ContentId>,
+    key: Option<Key>,
+}
+
+/// The write of the listing of the store's names (`placed/names`, [`Store::names_step`]).
+#[derive(Default)]
+struct Listing {
+    /// A write is in flight.
+    writing: bool,
+    /// The names changed since the last write was asked: one more is asked once it ends.
+    again: bool,
+    /// The length of the write in flight, and of every one written: what a test of a place's
+    /// own bytes takes out of the disk's count ([`Sim::bytes_written`]), so it counts the
+    /// listing apart from the place, never skipping it.
+    #[cfg(test)]
+    asked: u64,
+    #[cfg(test)]
+    pub(crate) written: u64,
 }
 
 /// [`Whole`] of `key` as `look` finds it, or for a value there that is kept as no whole file
@@ -966,10 +1068,28 @@ fn whole_of(look: Look<'_>, key: &Key) -> Result<Result<Whole, (Kind, u64)>, NoB
             .map_err(|why| NoBase::Unreadable(format!("the derived value {key:?} holds {why}")))?;
         return Ok(Ok(Whole { id: key.0, len: recipe.len, base: Some(recipe.base) }));
     }
-    Ok(match clones_from_file(&header, found.place.form()) {
+    Ok(match clones_from_file(&header) {
         true => Ok(Whole { id: header.content, len: header.raw, base: None }),
         false => Err((header.kind, header.raw)),
     })
+}
+
+/// The content a whole file of `placed/` is named for: its name, 64 lowercase hex digits.
+fn content_named(name: &str) -> Option<ContentId> {
+    let digits = name.as_bytes();
+    if digits.len() != 2 * size_of::<ContentId>() {
+        return None;
+    }
+    let digit = |it: u8| match it {
+        b'0'..=b'9' => Some(it - b'0'),
+        b'a'..=b'f' => Some(it - b'a' + 10),
+        _ => None,
+    };
+    let mut id = [0u8; size_of::<ContentId>()];
+    for (at, pair) in digits.chunks_exact(2).enumerate() {
+        id[at] = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Some(ContentId(id))
 }
 
 /// One store, as a state machine.
@@ -1058,11 +1178,11 @@ pub struct Store {
     placed_on_open: PlacedOnOpen,
     /// Whether the open's look through `placed/` is done; until it is, places that clone from
     /// a whole file wait in `held`, so no write of one is begun that the look would sweep, and
-    /// the whole files let go of wait in `held_unplaces`, so no remove fails its listing.
+    /// the names the places answered meanwhile change wait in `renamed`, so the listing the
+    /// look reads is the one they change.
     placed_looked: bool,
     held: Vec<(ContentId, Waiter)>,
-    held_unplaces: Vec<ContentId>,
-    /// Open while anything waits in `held` or `held_unplaces`, from the first held to the
+    /// Open while anything waits in `held` or `held_asks`, from the first held to the
     /// look's end or the store's break: the wait, named (every-wait-says-what).
     look_wait: Option<tracing::Span>,
     /// Times the look through `placed/` has failed: its own bound ([`FAILURES_MOST`]), which
@@ -1088,9 +1208,41 @@ pub struct Store {
     place_by: Option<PlaceBy>,
     /// The places asked before that is decided, made once it is, in the order asked.
     held_asks: Vec<HeldAsk>,
-    /// The outputs whose path's file is being read to be copied with what changed written
-    /// ([`PlaceBy::Copy`], [`Store::place_patched`]), by the tag their place was asked with.
-    overs: HashMap<Tag, (FileName, Sparse), Global>, // alloc: the store's own table, for its life
+    /// The second paths asked of places not yet begun ([`Store::place_also`]): by the first
+    /// place's tag, the second's tag and path, taken into its `publish::Writing` as it
+    /// begins, or answered as failed with the first.
+    also: HashMap<Tag, (Tag, FileName), Global>, // alloc: the store's own table, for its life
+    /// What names each whole file of `placed/` ([`whole`]): the paths placed from it and the
+    /// places in flight making it. Read from `placed/names` as the store opens.
+    names: whole::Names,
+    /// What each place in flight names ([`Naming`]), by its tag, until its answer.
+    naming: HashMap<Tag, Naming, Global>, // alloc: the store's own table, for its life
+    /// Places answered whose change of `names` is not yet made: until the open's look read
+    /// the listing, and otherwise until the step that ends the call ([`Store::names_step`]).
+    renamed: Vec<(FileName, Naming, bool)>,
+    /// The key each path was last placed from by [`Store::place`], as answered: the
+    /// collector's placed roots. Two paths of one key are two entries, so replacing one leaves
+    /// the key to the other (the planted bug of `Collecting::placed`, a set, until
+    /// 2026-11-12, dropped it).
+    place_keys: HashMap<FileName, Key, Global>, // alloc: the store's own table, a name a path placed
+    /// The keys whose records are to be forgotten alone once nothing roots them
+    /// ([`Store::forget`], [`Store::forget_due`]).
+    forgets: Vec<Key>, // alloc: the store's own list, the records a build's places let go of
+    /// A record was forgotten alone since the last head began: the next commit writes a head
+    /// though nothing else changed ([`forget`]).
+    forgot: bool,
+    /// The write of the listing of `names` (`placed/names`): in flight, and changed since.
+    listing: Listing,
+    /// The placed files being made their values' one home, by content ([`Store::home_placed`]).
+    homing: ByHash<ContentId, home::Homing, Global>, // alloc: the store's own table, a few words a placed output
+    /// Asks of a home's syncs and mapping so far: what tells a stale answer from the current.
+    home_rounds: u64,
+    /// Some home in `homing` is mapped and has records not yet moved to it (still in a
+    /// segment, or a commit in flight): [`Store::homes_due`] after each completion.
+    homes_waiting: bool,
+    /// The open's listing of `placed/`, held until the own head is read: a file that is a
+    /// record's home is kept by the sweep though no path names it ([`Store::placed_listed`]).
+    listing_held: Option<Done>,
     /// Under the planted bug [`PlacePlant::PatchThroughLink`]: each path that is another
     /// name of a file of the store's, with that file.
     #[cfg(test)]
@@ -1135,6 +1287,12 @@ pub struct Store {
     /// [`Store::release_moves`].
     #[cfg(test)]
     hold_moves: bool,
+    /// Its global-heap bytes as last counted into the process's `store heap bytes`
+    /// ([`Store::note_heap`]).
+    heap_noted: u64,
+    /// A planted bug for the heap tests (`tests::heap`).
+    #[cfg(test)]
+    plant_heap: heap::HeapPlant,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -1314,8 +1472,9 @@ impl Reader {
         self.shared.durable(ticket)
     }
 
+    /// Its store's tiers and, behind them, the layer it reads live ([`Store::read_live`]).
     fn look<'g>(&'g self, guard: &'g Guard) -> Look<'g> {
-        Look::new(&self.shared, Held::task(guard))
+        Look::reading(&self.shared, guard)
     }
 }
 
@@ -1771,12 +1930,11 @@ enum Op {
         of: Option<Source>,
         bytes: PlacedBytes,
     },
-    /// The clone into `staged`'s name, or (`staged` none) the write of `to` itself, which
-    /// [`Effect::Write`] makes beside it and renames over it already.
+    /// The clone into `staged`'s name.
     Place {
         asked: Tag,
         to: FileName,
-        staged: Option<Staged>,
+        staged: Staged,
         of: Option<Source>,
         bytes: PlacedBytes,
     },
@@ -1789,12 +1947,37 @@ enum Op {
         staged: Staged,
         bytes: PlacedBytes,
     },
-    /// `staged`'s clone renamed onto `to`.
+    /// `staged`'s clone, whole, looked at once before its rename onto `to` ([`Store::vouch`]).
+    StagedLook {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+    },
+    /// `staged`'s clone, looked at as `looked`, renamed onto `to`.
     Commit {
         asked: Tag,
         to: FileName,
         staged: Staged,
         bytes: PlacedBytes,
+        looked: Stamp,
+    },
+    /// The wall clock read before the second look of a place renamed onto `to`, whose staged
+    /// file was looked at as `staged` ([`Store::vouch`]).
+    VouchNow {
+        asked: Tag,
+        to: FileName,
+        bytes: PlacedBytes,
+        staged: Stamp,
+    },
+    /// `to` looked at after its rename, the clock read as `looked_ns` just before
+    /// ([`Store::vouched`]).
+    VouchLook {
+        asked: Tag,
+        to: FileName,
+        bytes: PlacedBytes,
+        staged: Stamp,
+        looked_ns: u64,
     },
     /// `to` mapped to be hashed, after the rename of `staged` onto it failed with `why`.
     Verify {
@@ -1825,15 +2008,15 @@ enum Op {
     },
     /// A step of the try of a clone that decides how the store places ([`Store::ask_shares`]).
     Shares(u8),
-    /// The path's file of the patched place `asked` read whole, to be copied with what
-    /// changed written ([`PlaceBy::Copy`]).
-    OverRead {
-        asked: Tag,
-    },
     /// Whether the directory of whole files is there, as the store opens.
     LookPlaced,
     /// The directory of whole files listed as the store opens.
     ListPlaced,
+    /// The listing of the whole files' names (`placed/names`) read as the store opens, before
+    /// the directory is listed.
+    ReadNames,
+    /// The listing of the whole files' names written ([`Store::write_listing`]).
+    NamesWritten,
     /// A temporary file of it removed.
     Swept {
         file: FileName,
@@ -1871,9 +2054,16 @@ enum Op {
     PatchWarm {
         asked: Tag,
     },
-    /// The output place `asked` derives renamed from its staged name onto its path.
+    /// The staged file of the output place `asked` derives looked at once, whole, before its
+    /// rename ([`Store::vouch`]).
+    PatchLook {
+        asked: Tag,
+    },
+    /// The output place `asked` derives renamed from its staged name, looked at as `looked`,
+    /// onto its path.
     PatchRename {
         asked: Tag,
+        looked: Stamp,
     },
     /// The write-back of an output just placed from its maker's bytes, which nothing waits
     /// for ([`Store::runs_step`]).
@@ -1914,13 +2104,25 @@ enum Op {
     NameFile {
         content: ContentId,
     },
+    /// A sync of the whole file of `content` or of `placed/`, asked so the file can be its
+    /// value's one home ([`Store::home_placed`]); `round`, which ask of it this answers.
+    HomeSynced {
+        content: ContentId,
+        round: u64,
+    },
+    /// The whole file of `content`, synced, mapped to be read as its value's home.
+    HomeMapped {
+        content: ContentId,
+        round: u64,
+    },
     /// A fetch of `key`, whose value is kept only once `admit` takes it ([`Store::fetch`]).
     Fetch {
         key: Key,
         admit: Admit,
     },
-    /// The shared directory listed, for the other writers' stores in it.
-    Peers,
+    /// A shared directory listed, for the writers' stores in it: the `root`th of
+    /// [`peers::Peers`]'s roots (the store's own shared directory, or a layer).
+    Peers { root: usize },
     /// Its own empty head written, so the other writers find a store in its directory.
     Announce,
 }
@@ -2036,6 +2238,7 @@ impl Tier {
                     usable: it.usable,
                     gone: it.removed || it.retiring,
                     used: Arc::clone(&it.used), // clone: a count per pack, once per view
+                    forgotten: Arc::clone(&it.forgotten), // clone: an `Arc` per pack, once per view
                 })
                 // alloc: the view's packs, exactly sized; once per view
                 .collect(),
@@ -2088,9 +2291,18 @@ struct Pack {
     /// store's clock ([`Store::clock`]); 0 until the clock is first told. Readers write it
     /// (a second at most once), the head keeps it.
     used: Arc<std::sync::atomic::AtomicU64>,
+    /// The offsets of its records forgotten alone ([`forget`]), in order: no key's, though
+    /// the pack is kept; the head lists them ([`disk::ForgottenRef`]) until the pack is
+    /// removed. Shared with each view published since it last changed.
+    forgotten: Arc<Vec<u64>>, // alloc: the pack's own list, a few records a pack
 }
 
 impl Pack {
+    /// Whether its record at `offset` was forgotten alone ([`forget`]).
+    fn forgot(&self, offset: u64) -> bool {
+        !self.forgotten.is_empty() && self.forgotten.binary_search(&offset).is_ok()
+    }
+
     /// Its `len` bytes at `at`: committed, pinned through the store's pool for as long as
     /// `look`'s table of pins lives; or drained and not yet committed, its own. `None` when
     /// they are neither, or cannot be read (the pin's error is the reader's to report:
@@ -2127,6 +2339,11 @@ impl Pack {
 struct External {
     len: u64,
     file: FileName,
+    /// A placed output's whole file (`placed/<content>`) made its record's home once it was
+    /// synced ([`Store::home_placed`]), not a hot value's `file-<content>`: a clone base as it
+    /// was ([`clones_from_file`]), removed through the placed files' own steps
+    /// ([`Store::let_go`]) once the head that lists it removed is durable.
+    placed: bool,
     mapping: Option<Mapping>,
     /// Held until it is written and mapped.
     memory: Option<Vec<u8>>,
@@ -2282,10 +2499,13 @@ fn location(tier: usize, pack: u32, offset: u64) -> u64 {
 }
 
 /// Why an effect failed, as a message: only ever for an error.
-/// Whether a value of `header` kept as `form` is placed by cloning the whole file of it the
-/// store keeps ([`CLONE_FROM`]): an output long enough, unless it is a file of its own already.
-fn clones_from_file(header: &RecordHeader, form: Form) -> bool {
-    header.kind == Kind::Output && header.raw >= CLONE_FROM && form != Form::External
+/// Whether a value of `header` is placed by cloning the whole file of it the store keeps
+/// ([`CLONE_FROM`]): an output long enough, whether its record holds its bytes or names that
+/// file as their one home ([`Store::home_placed`]). An output's record is a file of its own
+/// only so, never as a `file-<content>`, which only a value that is no output is (the put,
+/// `segment::Own`), so a derived place of a homed base still clones the base's whole file.
+fn clones_from_file(header: &RecordHeader) -> bool {
+    header.kind == Kind::Output && header.raw >= CLONE_FROM
 }
 
 /// The op a commit's sync is asked as: `op`, which the head waits for, or (`waited` false, only
@@ -2313,7 +2533,10 @@ fn describe(done: &Done) -> String {
 impl Store {
     /// A store that is opening: it asks to map its index and packs.
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
-        let mut store = Store::new(config, None);
+        // Its layers are shared directories whose writers it reads behind its own records
+        // ([`peers`]): none, and it reads its own directory alone.
+        let layers = peers::Peers::of_layers(&config);
+        let mut store = Store::new(config, layers);
         store.ask_private(effects);
         store
     }
@@ -2328,14 +2551,15 @@ impl Store {
             config.load_tags
         );
         // alloc: setup, once per store
-        let mut tiers = vec![Tier::new(config.dir.clone())];
-        tiers.extend(config.layers.iter().cloned().map(Tier::new));
+        // A layer's writers are tiers once its first look lists them ([`peers`]).
+        let tiers = vec![Tier::new(config.dir.clone())];
         let columns = Arc::<Encodings>::default();
         // clone: setup, once per store
         let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
         let hot = hot::Hot::new(config.load_tags, &config.loader);
         // alloc: setup, once per store
-        let shared = Arc::new(Shared::new(view, hot.side()));
+        // clone: setup, once per store: the layers a live layer must be a writer of
+        let shared = Arc::new(Shared::new(view, hot.side(), config.layers.clone()));
         let own = Own::new(0);
         // clone: setup, the store's own segment's `Arc`, once per store
         shared.add_segment(own.segment().clone());
@@ -2385,7 +2609,6 @@ impl Store {
             placed_on_open: PlacedOnOpen::default(),
             placed_looked: false,
             held: Vec::new(),          // alloc: empty, allocates nothing
-            held_unplaces: Vec::new(), // alloc: empty, allocates nothing
             look_wait: None,
             look_tries: 0,
             new_keys: None,
@@ -2394,7 +2617,18 @@ impl Store {
             staged_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
             place_by: None,
             held_asks: Vec::new(), // alloc: empty, allocates nothing
-            overs: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            also: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            names: whole::Names::default(),
+            naming: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            renamed: Vec::new(), // alloc: empty, allocates nothing
+            place_keys: HashMap::new_in(Global), // alloc: the store's own table, a name a path placed
+            forgets: Vec::new(), // alloc: empty, allocates nothing
+            forgot: false,
+            listing: Listing::default(),
+            homing: ByHash::new_in(Global), // alloc: the store's own table, a few words a placed output
+            home_rounds: 0,
+            homes_waiting: false,
+            listing_held: None,
             #[cfg(test)]
             plant_linked: HashMap::new_in(Global), // alloc: a test's
             collecting: collect::Collecting::new(),
@@ -2416,6 +2650,9 @@ impl Store {
             plant_no_drain: false,
             #[cfg(test)]
             hold_moves: false,
+            heap_noted: 0,
+            #[cfg(test)]
+            plant_heap: heap::HeapPlant::None,
         };
         // A pool the system refused to reserve stops the store, naming why: nothing is read
         // another way.
@@ -2529,9 +2766,26 @@ impl Store {
         self.look().get_in_place(key)
     }
 
-    /// The value of `key` as [`Reader::pinned`] gives it.
+    /// The value of `key` as [`Reader::pinned`] gives it: of its own tiers or, behind them, of
+    /// the layer it reads live ([`Store::read_live`]).
     pub fn pinned(&self, key: &Key) -> Result<Option<Pinned>, Corrupt> {
-        self.look().pinned(key)
+        let guard = enter();
+        Look::reading(&self.shared, &guard).pinned(key)
+    }
+
+    /// Reads `layer` (the machine's layer's writer, another store of this process) live,
+    /// behind its own tiers: a read through any of its readers, a [`Store::has`], a
+    /// [`Store::pinned`] and a [`Store::place`] that miss every tier it has find what `layer`
+    /// was given, in its writers' segments and its packs, before `layer` commits and this
+    /// store looks again ([`Store::look_again`]). Nothing of it is written into this store:
+    /// what a sealed crate's build puts into the layer is kept once a machine, and every
+    /// home in the process reads it from there. [`Store::get`] reads its own tiers alone (its
+    /// entry is valid for a borrow of this store, which holds nothing of another's).
+    ///
+    /// Refused, naming both, for a store whose directory is under none of
+    /// [`Config::layers`], for this store itself, and for a second.
+    pub fn read_live(&mut self, layer: &Reader) -> Result<(), String> {
+        self.shared.read_live(&layer.shared)
     }
 
     /// Gives it the encodings of one schema's values: [`Store::settle`] moves values of the
@@ -2549,9 +2803,11 @@ impl Store {
         self.publish_view();
     }
 
-    /// Whether it has a value of `key`, unverified: for planning, never for use.
+    /// Whether it has a value of `key`, unverified: for planning, never for use. Its own
+    /// tiers, then the layer it reads live ([`Store::read_live`]).
     pub fn has(&self, key: &Key) -> bool {
-        self.look().has(key)
+        let guard = enter();
+        Look::reading(&self.shared, &guard).has(key)
     }
 
     /// [`Reader::prefetch`], from the store's own thread. On a store whose misses are pumped
@@ -2600,6 +2856,8 @@ impl Store {
     /// gives none back: 0.
     pub fn trim_pool(&mut self) -> u64 {
         self.tidy();
+        self.shrink_tables();
+        self.note_heap();
         if self.hot.pumped() {
             return 0;
         }
@@ -3496,20 +3754,25 @@ impl Store {
         // How the store places is not decided yet (it is opening): the place is made once it
         // is, with the places held for the look through `placed/`.
         if self.place_by.is_none() && self.broken.is_none() {
-            self.look().find(key)?;
+            if !self.has(key) {
+                return None;
+            }
             let tag = self.tags.fresh();
             self.place_spans.insert(tag, Self::place_span(&to));
             self.waiting_for_look();
             self.held_asks.push(HeldAsk::Place { tag, key: *key, to });
             return Some(tag);
         }
-        self.place_now(key, to, None, effects)
+        let tag = self.place_now(key, to, None, effects);
+        self.names_step(effects);
+        tag
     }
 
     /// The span of a place of `to`, open until its answer ([`Store::answer`]): how the bytes
     /// get to `to` is said where it is chosen ([`Store::publish`]), and what it had to wait
     /// for where it waits. No parent: it ends on a later completion, under whatever request
-    /// is current then.
+    /// is current then. `unvouched` says why a place that succeeded answers no stamp
+    /// ([`Placed::stamp`], [`Store::vouch`]). One span shape for every route.
     fn place_span(to: &FileName) -> tracing::Span {
         tracing::info_span!(
             target: "blaze",
@@ -3519,6 +3782,7 @@ impl Store {
             how = tracing::field::Empty,
             bytes = tracing::field::Empty,
             waits = tracing::field::Empty,
+            unvouched = tracing::field::Empty,
         )
     }
 
@@ -3531,22 +3795,27 @@ impl Store {
         held: Option<Tag>,
         effects: &mut Vec<Effect>,
     ) -> Option<Tag> {
-        // What a path holds the collector keeps until the path holds another value
-        // ([`Store::unplace`]): the next output there may be made of this one.
-        self.collecting.placed(*key);
         enum Plan {
             Clone(FileName, u64, ContentId),
             File(ContentId, u64),
-            /// The file a recipe gives, of this length ([`Kind::Derived`]).
-            Derived(u64),
+            /// The file a recipe gives, of this length, and its base's whole file, where the
+            /// store keeps one ([`Kind::Derived`]).
+            Derived(u64, Option<ContentId>),
             Write(Vec<u8>),
             Refused(String),
         }
         let look = self.look();
-        let found = look.find(key)?;
+        // A key none of its tiers holds and the layer it reads live does
+        // ([`Store::read_live`]) is placed by its bytes, as by copying: the layer's files are
+        // no clone base until the layer commits them and this store lists them as a tier.
+        let found = match look.find(key) {
+            Some(found) => Some(found),
+            None if self.has(key) => None,
+            None => return None,
+        };
         // By copying: the bytes of the file the value gives (a derived value's its chain
         // applied), written where they go; no file of the store is cloned or kept.
-        let copied = (self.place_by == Some(PlaceBy::Copy)).then(|| {
+        let copied = (self.place_by == Some(PlaceBy::Copy) || found.is_none()).then(|| {
             match self.reader().file_of(&enter(), key) {
                 Ok(Some(bytes)) => Plan::Write(bytes),
                 // alloc: an error, once per place refused
@@ -3557,7 +3826,7 @@ impl Store {
         // The planted bug: the path is taken as another name of the value's own file.
         #[cfg(test)]
         let linked = match (&found, self.plant == PlacePlant::PatchThroughLink) {
-            (Ok(found), true) => look
+            (Some(Ok(found)), true) => look
                 .record(*found, key)
                 .ok()
                 .and_then(|(header, _)| self.tiers[found.tier].externals.get(&header.content))
@@ -3565,24 +3834,29 @@ impl Store {
                 .map(|it| it.file.clone()),
             _ => None,
         };
-        let plan = match found.and_then(|found| Ok((found, look.record(found, key)?.0))) {
+        let header = found.map(|found| found.and_then(|found| Ok((found, look.record(found, key)?.0))));
+        let plan = match header {
             _ if copied.is_some() => copied.expect("checked"),
+            None => unreachable!("a key no tier holds is placed by its bytes, as `copied`"),
             // alloc: the error of a corrupt value
-            Err(corrupt) => Plan::Refused(corrupt.to_string()),
-            Ok((found, header)) if clones_from_file(&header, found.place.form()) => {
+            Some(Err(corrupt)) => Plan::Refused(corrupt.to_string()),
+            Some(Ok((_, header))) if clones_from_file(&header) => {
                 Plan::File(header.content, header.raw)
             }
             // A recipe is never placed as its own bytes: what is placed is the file it gives.
-            Ok((found, header)) if header.kind == Kind::Derived => {
+            Some(Ok((found, header))) if header.kind == Kind::Derived => {
                 match look.read(found, key).map(|entry| derived::decode(entry.bytes)) {
-                    Ok(Ok(recipe)) => Plan::Derived(recipe.len),
+                    Ok(Ok(recipe)) => Plan::Derived(
+                        recipe.len,
+                        whole_of(look, &recipe.base).ok().and_then(Result::ok).map(|it| it.id),
+                    ),
                     // alloc: the error of a value that is no recipe
                     Ok(Err(why)) => Plan::Refused(format!("the derived value {key:?} holds {why}")),
                     // alloc: the error of a corrupt value
                     Err(corrupt) => Plan::Refused(corrupt.to_string()),
                 }
             }
-            Ok((found, _)) => match look.read(found, key) {
+            Some(Ok((found, _))) => match look.read(found, key) {
                 // alloc: the error of a corrupt value
                 Err(corrupt) => Plan::Refused(corrupt.to_string()),
                 Ok(entry) => match self.tiers[found.tier].externals.get(&entry.content) {
@@ -3607,13 +3881,27 @@ impl Store {
             self.plant_linked.insert(to.clone(), file);
         }
         let tag = held.unwrap_or_else(|| self.tags.fresh());
+        // The base's whole file a derived value's place clones is named while it is in flight.
+        let mut base = None;
         let plan = match plan {
-            Plan::Derived(len) => {
+            Plan::Derived(len, of) => {
+                base = of;
                 self.derived.insert(key.0, len);
                 Plan::File(key.0, len)
             }
             plan => plan,
         };
+        // What the place names until its answer ([`whole::Names`]): the whole file it clones
+        // (a whole file's place) or none (its path then names none), and its key, the
+        // collector's root once the path holds it.
+        let file = match &plan {
+            Plan::File(content, _) => Some(*content),
+            // A value that is a file of its own (`file-<content>`): named as `placed/`'s are,
+            // and its record forgotten once nothing names it ([`Store::names_step`]).
+            Plan::Clone(_, _, content) => Some(*content),
+            _ => None,
+        };
+        self.begin_naming(tag, Naming { file, base, key: Some(*key) });
         if held.is_none() {
             self.place_spans.insert(tag, Self::place_span(&to));
         }
@@ -3621,9 +3909,9 @@ impl Store {
             // A value kept as a file of its own, which the store's commit synced.
             Plan::Clone(from, raw, content) => {
                 let content = Content::File { from: Flushed::synced(from), content, of: None, len: raw };
-                self.publish(tag, to, content, Durable::No, 0, effects);
+                self.publish(tag, to, content, 0, effects);
             }
-            Plan::Derived(_) => unreachable!("made a file's plan above"),
+            Plan::Derived(..) => unreachable!("made a file's plan above"),
             Plan::File(content, raw) => {
                 let waiter =
                     Waiter { asked: tag, to, key: *key, raw, retried: false, base_of: None };
@@ -3640,13 +3928,14 @@ impl Store {
             // Not synced: an output is placed again by the build that finds it missing or
             // changed, and the answer of this one waits for no disk.
             Plan::Write(bytes) => {
-                self.publish(tag, to, Content::Bytes(bytes), Durable::No, 0, effects)
+                self.publish(tag, to, Content::Bytes(bytes), 0, effects)
             }
             Plan::Refused(why) => self.answer(Placed {
                 tag,
                 to,
                 result: Err(why),
                 bytes: PlacedBytes::default(),
+                stamp: None,
             }),
         }
         Some(tag)
@@ -3678,17 +3967,10 @@ impl Store {
         self.tidy();
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
-        let span = tracing::info_span!(
-            target: "blaze",
-            parent: None,
-            "place",
-            %to,
-            how = tracing::field::Empty,
-            bytes = tracing::field::Empty,
-            waits = tracing::field::Empty,
-        );
-        self.place_spans.insert(tag, span);
-        self.publish(tag, to, Content::Sparse(file), Durable::No, 0, effects);
+        self.place_spans.insert(tag, Self::place_span(&to));
+        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.publish(tag, to, Content::Sparse(file), 0, effects);
+        self.names_step(effects);
         tag
     }
 
@@ -3698,11 +3980,12 @@ impl Store {
     /// it and has looked since), and gives what the link wrote. How it went comes through
     /// [`Store::placed`], under the tag returned.
     ///
-    /// The path's file is cloned under a staged name beside it, the runs written into the
-    /// clone, and the clone renamed onto `to`, unsynced ([`publish::Writing`]): the file a
-    /// program may be running is never written, and what is written is the patch, whatever
-    /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
-    /// not there, or on a volume that shares no blocks, fails the place, naming it.
+    /// The path's file is cloned under a staged name beside it (where blocks are not shared,
+    /// [`PlaceBy::Copy`], the kernel copies its data extents there instead, its holes kept
+    /// holes: `Effect::CopyData`), the runs written into it, and it is renamed onto `to`,
+    /// unsynced ([`publish::Writing`]): the file a program may be running is never written,
+    /// and what is written is the patch, whatever the file's length. Nothing of the store is
+    /// read, cloned or waited for. A `to` that is not there fails the place, naming it.
     ///
     /// `started` says a program is started from `to` (an executable): its clone is then asked
     /// to hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`],
@@ -3722,43 +4005,92 @@ impl Store {
         self.tidy();
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
-        let span = tracing::info_span!(
-            target: "blaze",
-            parent: None,
-            "place",
-            %to,
-            how = tracing::field::Empty,
-            bytes = tracing::field::Empty,
-            waits = tracing::field::Empty,
-        );
-        self.place_spans.insert(tag, span);
+        self.place_spans.insert(tag, Self::place_span(&to));
+        self.begin_naming(tag, Naming { file: None, base: None, key: None });
         self.starts(&to, started);
         if self.place_by.is_none() && self.broken.is_none() {
             self.waiting_for_look();
             self.held_asks.push(HeldAsk::Over { tag, to, file, started });
             return tag;
         }
-        self.publish(tag, to, Content::Over { file, started }, Durable::No, 0, effects);
+        self.publish(tag, to, Content::Over { file, started }, 0, effects);
+        self.names_step(effects);
+        tag
+    }
+
+    /// Asks for `also` to be made another name of the file the place `first` makes (a hard
+    /// link of its staged file, under a staged name of its own, renamed onto `also` beside
+    /// the first's rename; `publish::Writing`, `publish::Also`), and answers it under the tag
+    /// returned, with the first's stamp: for two paths of one build that hold the same file
+    /// (an executable and cargo's uplifted copy of it), so the build copies or clones it once
+    /// and not once a path. `first` is a place from a maker's runs or a patch
+    /// ([`Store::place_made`], [`Store::place_patched`]) not yet answered; any other fails
+    /// this place, naming both paths. Two paths on different file systems fail both places
+    /// as the link is refused, naming both: nothing copies instead.
+    ///
+    /// A link makes the two paths one inode: a user's write in place of one (`strip`,
+    /// `codesign`, a `chmod`) is the other's too. The store itself never writes a placed file
+    /// in place (every place is a new inode renamed onto its path), so its next place of
+    /// either makes both new again.
+    pub fn place_also(&mut self, first: Tag, also: FileName) -> Tag {
+        assert!(
+            !self.tiers.iter().any(|tier| also.is_under(&tier.dir)),
+            "{also} is in the store: values are placed outside it"
+        );
+        let tag = self.tags.fresh();
+        let span = Self::place_span(&also);
+        span.record("how", "link");
+        self.place_spans.insert(tag, span);
+        // Another name of a file made from runs: its path names no whole file once answered.
+        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        if let Some(writing) = self.writing.get(&first) {
+            if let Some(was) = &writing.also {
+                // alloc: an error, once per place refused
+                let why = format!(
+                    "{also} was to be another name of the file placed at {}, which already has \
+                     its second path {}",
+                    writing.to, was.to
+                );
+                self.answer(Placed { tag, to: also, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
+                return tag;
+            }
+            let temp = self.staging_name(&also, tag);
+            let writing = self.writing.get_mut(&first).expect("the write found just above");
+            writing.also = Some(publish::Also { tag, to: also, temp });
+            return tag;
+        }
+        let held = self.held_asks.iter().any(|it| matches!(it, HeldAsk::Over { tag, .. } if *tag == first));
+        if held && !self.also.contains_key(&first) {
+            self.also.insert(first, (tag, also));
+            return tag;
+        }
+        // alloc: an error, once per place refused
+        let why = format!(
+            "{also} was to be another name of the file the place {first:?} makes, which is no \
+             place of runs or of a patch in flight"
+        );
+        self.answer(Placed { tag, to: also, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
         tag
     }
 
     /// How a step of an output written from its maker's runs went ([`publish::Writing`]): the
-    /// next effects asked, or its place answered. One that fails removes what it made under
-    /// its staged name and refuses the place, naming the path and the step.
+    /// next effects asked, or its place answered (and its second path's, [`Store::place_also`]).
+    /// One that fails removes what it made under its staged names and refuses the place (and
+    /// the second), naming the path and the step.
     fn runs_step(&mut self, asked: Tag, step: publish::Step, done: &Done, effects: &mut Vec<Effect>) {
         let Some(writing) = self.writing.get_mut(&asked) else { return };
         let tags = &mut self.tags;
         let next = writing.step(step, done, |step| tags.ask(Op::Runs { asked, step }), effects);
         let result = match next {
             publish::Next::Going => return,
-            publish::Next::Done(wrote) => Ok(wrote),
+            publish::Next::Done(ended) => Ok(ended),
             publish::Next::Failed(why) => Err(why),
         };
-        let Some(publish::Writing { to, temp, len, over, .. }) = self.writing.remove(&asked) else {
+        let Some(publish::Writing { to, temp, len, base, also, written, .. }) = self.writing.remove(&asked) else {
             return;
         };
         match result {
-            Ok(wrote) => {
+            Ok(ended) => {
                 // What the path's file holds that is only in memory is begun on its way to
                 // the device, and nothing waits for it: the clone the path's next patch
                 // starts from ([`Store::place_patched`]) then finds the file written back,
@@ -3773,54 +4105,210 @@ impl Store {
                     let file = to.clone();
                     effects.push(Effect::WriteBack { file, tag: self.tags.ask(Op::OutputBack) });
                 }
-                let cloned = if over { len.saturating_sub(wrote) } else { 0 };
-                let bytes = PlacedBytes { cloned, written: 0, copied: wrote };
-                self.answer(Placed { tag: asked, to, result: Ok(()), bytes });
+                let publish::Ended { wrote, copied, looked } = ended;
+                let cloned = match base {
+                    publish::Base::Clone => len.saturating_sub(wrote),
+                    publish::Base::Copy | publish::Base::Holes => 0,
+                };
+                let bytes = PlacedBytes { cloned, written, copied: wrote, kernel: copied };
+                // Each path looked at again after the renames, and vouched for only if it is
+                // the inode looked at before them ([`Store::vouch`]); the second path is
+                // another name of the same inode, with no byte of its own.
+                match looked {
+                    Some(looked) => {
+                        self.vouch(asked, to, bytes, looked, effects);
+                        if let Some(publish::Also { tag, to, .. }) = also {
+                            self.vouch(tag, to, PlacedBytes::default(), looked, effects);
+                        }
+                    }
+                    // Only under a planted bug that renamed nothing: no staged file to vouch by.
+                    None => {
+                        self.answer(Placed { tag: asked, to, result: Ok(()), bytes, stamp: None });
+                        if let Some(publish::Also { tag, to, .. }) = also {
+                            self.answer(Placed { tag, to, result: Ok(()), bytes: PlacedBytes::default(), stamp: None });
+                        }
+                    }
+                }
             }
             Err(why) => {
                 // clone: the effect and the op each own the name; once per place that fails
                 let tag = self.tags.ask(Op::Discard { file: temp.clone() });
                 effects.push(Effect::Remove { file: temp, tag });
+                if let Some(publish::Also { tag: also_tag, to: also_to, temp }) = also {
+                    // clone: the effect and the op each own the name; once per place that fails
+                    let tag = self.tags.ask(Op::Discard { file: temp.clone() });
+                    effects.push(Effect::Remove { file: temp, tag });
+                    // alloc: an error, once per place that fails
+                    let result = Err(format!("making {also_to} another name of the file placed at {to}: {why}"));
+                    self.answer(Placed { tag: also_tag, to: also_to, result, bytes: PlacedBytes::default(), stamp: None });
+                }
                 // alloc: an error, once per place that fails
                 let result = Err(format!("writing {to} from its maker's bytes: {why}"));
-                self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+                self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default(), stamp: None });
             }
         }
     }
 
-    /// Lets go of the whole file kept to place `key`'s value by cloning ([`CLONE_FROM`]), for
-    /// a path that now holds an output placed from its maker's bytes ([`Store::place_made`]),
-    /// once no clone of it is in flight. As [`Store::unplace`], but nothing is begun in its
-    /// place: the new output was written where it goes, so no whole file of it is made, and
-    /// none is cloned, derived or written back on the edit path. Only a file this run knows
-    /// of goes (one it made, checked or is making): a value placed from its maker's bytes
-    /// has none, and one an earlier run left under `placed/` is the open's to keep.
-    pub fn unplace_made(&mut self, key: &Key, effects: &mut Vec<Effect>) {
-        self.tidy();
-        let Ok(Ok(Whole { id, len, base })) = whole_of(self.look(), key) else { return };
-        if !self.files.contains_key(&id) {
+    /// The place `tag` begun, naming what [`Naming`] says until its answer: its whole file
+    /// and its base's are named by a place in flight ([`whole::Names::making`]), so nothing
+    /// removes them meanwhile.
+    fn begin_naming(&mut self, tag: Tag, naming: Naming) {
+        for file in naming.file.iter().chain(&naming.base) {
+            self.names.making(*file);
+        }
+        // One naming a tag: a second would leave the first's files named for ever.
+        if let Some(was) = self.naming.insert(tag, naming) {
+            // alloc: the error that breaks the store
+            let why = format!("a place's tag was given a second naming (first {was:?}): one naming a place");
+            // clone: the error that breaks the store
+            let dir = self.tiers[0].dir.clone();
+            self.fail(dir, why);
+        }
+    }
+
+    /// The names changed by the places answered since the last step, once the open has read
+    /// the listing: each path names the whole file it was placed from, or none; the key a
+    /// path holds is the collector's root; the listing is written again; and each whole file
+    /// a place let go of that nothing names now goes, once no clone of it is in flight
+    /// ([`Store::let_go`]). Called at the end of every entry that can answer a place. Until
+    /// 2026-11-12 the daemon let go of a path's last file by asking (`Store::unplace`,
+    /// `Store::unplace_made`), and the collector's roots were a set of keys, so a key placed
+    /// at two paths was dropped with the first path replaced.
+    fn names_step(&mut self, effects: &mut Vec<Effect>) {
+        if !self.placed_looked || self.renamed.is_empty() {
             return;
         }
-        if base.is_some() {
-            self.derived.insert(id, len);
-        }
-        match (self.placed_looked, &self.broken) {
-            (true, _) => self.let_go(id, effects),
-            // alloc: once per output built again while the open's look runs
-            (false, None) => {
-                self.waiting_for_look();
-                self.held_unplaces.push(id);
+        // alloc: the whole files a step's places let go of, a few
+        let mut let_go: Vec<ContentId> = Vec::new();
+        // alloc: the keys a step's places stopped holding, a few
+        let mut unrooted: Vec<Key> = Vec::new();
+        for (to, Naming { file, base, key }, made) in std::mem::take(&mut self.renamed) {
+            // A naming exists only as `begin_naming` counted it, so neither fails; were the
+            // books to disagree, the store stops naming the path and the file.
+            let not_begun = |it: whole::NotBegun| format!("the place of {to}: {it}");
+            if let Some(base) = base {
+                if let Err(it) = self.names.made_from(base) {
+                    // clone: the error that breaks the store
+                    let dir = self.tiers[0].dir.clone();
+                    return self.fail(dir, not_begun(it));
+                }
+                let_go.push(base);
             }
-            (false, Some(_)) => {}
+            let was = match file {
+                Some(file) => {
+                    let_go.push(file);
+                    match self.names.placed(to.as_str(), file, made) {
+                        Ok(was) => was,
+                        Err(it) => {
+                            // clone: the error that breaks the store
+                            let dir = self.tiers[0].dir.clone();
+                            return self.fail(dir, not_begun(it));
+                        }
+                    }
+                }
+                None if made => self.names.cleared(to.as_str()),
+                None => None,
+            };
+            let_go.extend(was);
+            if made {
+                let held = match key {
+                    Some(key) => {
+                        let held = self.place_keys.insert(to, key);
+                        if held != Some(key) {
+                            // The mark made before does not hold the key the path holds now.
+                            self.collecting.rooted();
+                        }
+                        held.filter(|it| *it != key)
+                    }
+                    None => self.place_keys.remove(&to),
+                };
+                unrooted.extend(held);
+            }
         }
+        self.write_listing(effects);
+        for content in self.names.doomed(let_go) {
+            // A value that is a file of its own goes with its record, never by its file
+            // alone: the record is forgotten (below), and the file is removed once the head
+            // that says so is durable ([`forget`]).
+            if self.tiers[0].externals.contains_key(&content) {
+                continue;
+            }
+            self.let_go(content, effects);
+        }
+        // A key no path holds any more whose value is a file of its own that nothing names:
+        // its record is asked to be forgotten, which happens once no root names it either
+        // ([`Store::forget_due`]): the file is the record's one home, and a home holds the
+        // current program's, not every build's.
+        for key in unrooted {
+            if self.place_keys.values().any(|it| *it == key) {
+                continue;
+            }
+            let look = self.look();
+            let external = match look.find(&key) {
+                Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
+                    look.record(found, &key).ok().map(|(header, _)| header.content)
+                }
+                _ => None,
+            };
+            if let Some(content) = external
+                && self.names.names(&content) == 0
+            {
+                self.forget(key);
+            }
+        }
+    }
+
+    /// Asks for the listing of the names to be written over `placed/names`, whole and
+    /// durably ([`Effect::Write`]), or for one more once the write in flight ends: one write
+    /// at a time, the last asked holding the names as they are when it is asked.
+    fn write_listing(&mut self, effects: &mut Vec<Effect>) {
+        if self.listing.writing {
+            self.listing.again = true;
+            return;
+        }
+        self.listing.writing = true;
+        self.listing.again = false;
+        let tag = self.tags.ask(Op::NamesWritten);
+        let bytes = self.names.listing();
+        #[cfg(test)]
+        {
+            self.listing.asked = bytes.len() as u64;
+        }
+        effects.push(Effect::Write { file: self.names_file(), bytes, tag });
+    }
+
+    /// The listing of the names of `placed/`'s whole files ([`whole::Names::listing`]).
+    fn names_file(&self) -> FileName {
+        // alloc: a file name for an effect, which owns it; once per listing written
+        self.tiers[0].file("placed/names")
     }
 
     /// A place answered: its span ends, saying how many bytes its path was given.
     fn answer(&mut self, placed: Placed) {
         if let Some(span) = self.place_spans.remove(&placed.tag) {
-            span.record("bytes", placed.bytes.cloned + placed.bytes.copied);
+            span.record("bytes", placed.bytes.cloned + placed.bytes.copied + placed.bytes.kernel);
         }
+        // What it named is the path's now, or (refused) let go of: at the step that ends this
+        // call, once the open has read the listing ([`Store::names_step`]).
+        if let Some(naming) = self.naming.remove(&placed.tag) {
+            // clone: the name, kept until the step; once per place
+            self.renamed.push((placed.to.clone(), naming, placed.result.is_ok()));
+        }
+        // A second path asked of a place that ended before it began its writing (refused as
+        // it was published): refused with it, naming both ([`Store::place_also`]).
+        let also = self.also.remove(&placed.tag);
+        // clone: the error's names, once per place refused with its second path
+        let first = also.as_ref().map(|_| (placed.to.clone(), placed.result.clone()));
         self.placed.push(placed);
+        if let (Some((tag, to)), Some(first)) = (also, first) {
+            let why = match first.1 {
+                // alloc: an error, once per place refused
+                Err(why) => format!("{to} was to be another name of the file placed at {}, whose place failed: {why}", first.0),
+                // alloc: an error, once per place refused
+                Ok(()) => format!("{to} was to be another name of the file placed at {}, which was placed by no writing of runs", first.0),
+            };
+            self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
+        }
     }
 
     /// Makes `to` hold `content`, replaced in one step for a reader, for the place `asked`:
@@ -3829,14 +4317,16 @@ impl Store {
     /// they go; a file written back is cloned under a staged name and renamed onto the path;
     /// a file written back and a derived value's ranges are a clone of the file with the
     /// ranges written and its length set, renamed onto the path. The place's span says which
-    /// (`how`: `write`, `clone`, `derive`). No hard link is ever made: an output is its
-    /// user's to replace, write to and make executable, and a link is the store's own inode.
+    /// (`how`: `write`, `clone`, `derive`). No hard link to a file of the store's is ever
+    /// made: an output is its user's to replace, write to and make executable, and a link is
+    /// the store's own inode.
     ///
-    /// `durable` is how far the path's new bytes are taken toward the disk, and has no
-    /// default. An output is [`Durable::No`]: the build that finds it missing or changed
-    /// places it again. Bytes may be asked [`Durable::Yes`]; a clone or a derive made durable,
-    /// and a write-back begun of an output ([`Durable::Started`]), are refused by name:
-    /// nothing asks for one, and none is made as something less.
+    /// Every route makes the file under a staged name beside `to`, looks at it once whole
+    /// (its [`blaze_core::Stamp`]), renames it onto `to`, and looks at `to` again
+    /// ([`Store::vouch`]): the answer's [`Placed::stamp`] is that second look, given only when
+    /// it is the staged file's inode, size, modified time and mode. Nothing of a place is
+    /// synced: an output is placed again by the build that finds it missing or changed
+    /// (until 2026-11-12 `publish` took a `Durable` that every caller gave as `No`).
     ///
     /// `written`, the bytes written into the store to make the file this is cloned from
     /// that no place reported yet.
@@ -3845,129 +4335,42 @@ impl Store {
         asked: Tag,
         to: FileName,
         content: Content,
-        durable: Durable,
         written: u64,
         effects: &mut Vec<Effect>,
     ) {
         if let Some(span) = self.place_spans.get(&asked) {
             span.record("how", content.how());
         }
-        let takes = match (&content, durable) {
-            (_, Durable::No) | (Content::Bytes(_), Durable::Yes) => true,
-            (_, Durable::Started | Durable::Yes) => false,
-        };
-        if !takes {
-            // What the content counted as cloning is counted back.
-            match &content {
-                Content::File { of: Some(source), .. } => self.cloned(source.content, effects),
-                Content::Patch { base_id, .. } => self.cloned(*base_id, effects),
-                Content::File { of: None, .. }
-                | Content::Bytes(_)
-                | Content::Sparse(_)
-                | Content::Over { .. } => {}
-            }
-            // alloc: an error, once per place refused
-            let why = format!(
-                "{to} was to be published by a {} taken {durable:?} toward the disk: the store \
-                 makes a clone or a derive durable for no one, and begins no write-back of an \
-                 output",
-                content.how()
-            );
-            return self.answer(Placed {
-                tag: asked,
-                to,
-                result: Err(why),
-                bytes: PlacedBytes::default(),
-            });
-        }
-        let over = match &content {
-            Content::Over { started, .. } => Some(*started),
-            _ => None,
-        };
-        // By copying, a patched place reads the path's own file whole and writes it back with
-        // what changed: there is no clone of it to write into.
-        let content = match content {
-            Content::Over { file, .. } if self.place_by == Some(PlaceBy::Copy) => {
-                if let Err(why) = file.check() {
-                    // alloc: an error, once per place refused
-                    let why = format!("{to} was to be written from runs that are no file: {why}");
-                    return self.answer(Placed {
-                        tag: asked,
-                        to,
-                        result: Err(why),
-                        bytes: PlacedBytes::default(),
-                    });
-                }
-                if let Some(span) = self.place_spans.get(&asked) {
-                    span.record("how", "copy of the path's file with what changed written");
-                }
-                // The planted bug: the runs are written through the path's name, which is
-                // the store's own file.
-                #[cfg(test)]
-                if let Some(linked) = self.plant_linked.get(&to) {
-                    for (at, bytes) in &file.runs {
-                        // clone: a test's planted write owns its name and bytes
-                        let (file, bytes) = (linked.clone(), bytes.clone());
-                        let tag = self.tags.ask(Op::OutputBack);
-                        effects.push(Effect::WriteAt { file, at: *at, bytes, tag });
-                    }
-                }
-                // clone: the effect and the state each own the name; once per place
-                effects.push(Effect::ReadAll { file: to.clone(), tag: asked });
-                self.tags.ops.insert(asked, Op::OverRead { asked });
-                self.overs.insert(asked, (to, file));
-                return;
-            }
-            content => content,
-        };
         match content {
+            // A value's bytes are a file of one run, written as a maker's runs are
+            // ([`publish::Writing`]): under this place's staged name, looked at whole, renamed
+            // onto `to` and vouched for. Until 2026-11-12 they went as one write under the
+            // driver's own temporary name, of which no look could be taken before its rename.
             Content::Bytes(bytes) => {
-                let placed = PlacedBytes { cloned: 0, written, copied: bytes.len() as u64 };
-                // No staged name: every driver makes a write under a temporary name of its own
-                // process beside `to` and renames it over `to` (`write_unsynced`, io_uring's
-                // `push_temporary`), so two writes of the same bytes there both end with them.
-                // clone: the effect and the op each own the name; once per place
-                effects.push(publish::write(to.clone(), bytes, durable, asked));
-                let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
-                self.tags.ops.insert(asked, op);
-            }
-            Content::Sparse(file) | Content::Over { file, .. } => {
-                if let Err(why) = file.check() {
-                    // alloc: an error, once per place refused
-                    let why = format!("{to} was to be written from runs that are no file: {why}");
-                    return self.answer(Placed {
-                        tag: asked,
-                        to,
-                        result: Err(why),
-                        bytes: PlacedBytes::default(),
-                    });
-                }
-                let temp = self.staging_name(&to, asked);
-                // The planted bugs: written under `placed/`, as the store's own files are,
-                // and cloned from there.
-                #[cfg(test)]
-                let (temp, plant) = match self.plant {
-                    PlacePlant::MadeClonesUnflushed => (
-                        self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
-                        Some(publish::Plant::ClonesUnflushed),
-                    ),
-                    PlacePlant::MadeWaitsForWriteBack => (
-                        self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
-                        Some(publish::Plant::WaitsForWriteBack),
-                    ),
-                    _ => (temp, None),
+                let file = Sparse {
+                    len: bytes.len() as u64,
+                    runs: match bytes.is_empty() {
+                        true => Vec::new(), // alloc: empty, allocates nothing
+                        false => vec![(0, bytes)], // alloc: the one run's slot, once per place
+                    },
                 };
-                let (mut writing, clear) =
-                    publish::Writing::begin(to, temp, file, over.is_some(), asked);
-                writing.warm = over == Some(true);
-                #[cfg(test)]
-                let writing = writing.planted_with(plant);
-                self.writing.insert(asked, writing);
-                self.tags.ops.insert(asked, Op::Runs { asked, step: publish::Step::Clear });
-                effects.push(clear);
+                self.write_runs(asked, to, file, publish::Base::Holes, false, written, effects);
+            }
+            Content::Sparse(file) => {
+                self.write_runs(asked, to, file, publish::Base::Holes, false, written, effects);
+            }
+            // What a patched place's staged file starts from: a clone of the path's file
+            // where blocks are shared, else the kernel's copy of its data extents; one state
+            // machine.
+            Content::Over { file, started } => {
+                let base = match self.place_by == Some(PlaceBy::Copy) {
+                    true => publish::Base::Copy,
+                    false => publish::Base::Clone,
+                };
+                self.write_runs(asked, to, file, base, started, written, effects);
             }
             Content::File { from, content, of, len } => {
-                let bytes = PlacedBytes { cloned: len, written, copied: 0 };
+                let bytes = PlacedBytes { cloned: len, written, copied: 0, kernel: 0 };
                 effects.push(self.clear_staged(asked, from, to, content, of, bytes));
             }
             Content::Patch { base, base_id, id, len } => {
@@ -3989,6 +4392,125 @@ impl Store {
                 effects.push(Effect::Remove { file: temp, tag: asked });
             }
         }
+    }
+
+    /// The place `asked` of `file` at `to` from `base`, begun as a [`publish::Writing`]: a
+    /// value's bytes, a maker's runs, or a patch of the path's own file. `started`: a program
+    /// is started from `to`, so a clone of its file is prewarmed. `written`, as
+    /// [`Store::publish`]'s.
+    #[expect(clippy::too_many_arguments, reason = "one private entry of three routes, each argument its own")]
+    fn write_runs(
+        &mut self,
+        asked: Tag,
+        to: FileName,
+        file: Sparse,
+        base: publish::Base,
+        started: bool,
+        written: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Err(why) = file.check() {
+            // alloc: an error, once per place refused
+            let why = format!("{to} was to be written from runs that are no file: {why}");
+            return self.answer(Placed { tag: asked, to, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
+        }
+        let temp = self.staging_name(&to, asked);
+        // The planted bugs: written under `placed/`, as the store's own files are, and cloned
+        // from there.
+        #[cfg(test)]
+        let (temp, plant) = match self.plant {
+            PlacePlant::MadeClonesUnflushed => (
+                self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
+                Some(publish::Plant::ClonesUnflushed),
+            ),
+            PlacePlant::MadeWaitsForWriteBack => (
+                self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
+                Some(publish::Plant::WaitsForWriteBack),
+            ),
+            _ => (temp, None),
+        };
+        // The planted bug: the path is another name of the store's own file, and a patch is
+        // written into it in place.
+        #[cfg(test)]
+        let in_place = match base {
+            // clone: a test's planted name
+            publish::Base::Copy => self.plant_linked.get(&to).cloned(),
+            publish::Base::Clone | publish::Base::Holes => None,
+        };
+        let (mut writing, clear) = publish::Writing::begin(to, temp, file, base, asked);
+        // Only a clone is prewarmed: a copy's pages are in the cache as it is made.
+        writing.warm = base == publish::Base::Clone && started;
+        writing.written = written;
+        // The second path asked of it before it began ([`Store::place_also`]).
+        if let Some((tag, also)) = self.also.remove(&asked) {
+            let temp = self.staging_name(&also, tag);
+            writing.also = Some(publish::Also { tag, to: also, temp });
+        }
+        #[cfg(test)]
+        let mut writing = writing.planted_with(plant);
+        #[cfg(test)]
+        {
+            writing.plant_in_place = in_place;
+        }
+        self.writing.insert(asked, writing);
+        self.tags.ops.insert(asked, Op::Runs { asked, step: publish::Step::Clear });
+        effects.push(clear);
+    }
+
+    /// The place `asked` renamed `to` onto its path, whose staged file was `staged` as looked
+    /// at whole before the rename: the wall clock read, then the path looked at again, and the
+    /// place answered with `bytes` ([`Op::VouchNow`], [`Op::VouchLook`], [`Store::vouched`]).
+    /// The second look is the one a later look compares with: the rename (and a link) moved
+    /// the inode's change time after the first.
+    fn vouch(&mut self, asked: Tag, to: FileName, bytes: PlacedBytes, staged: Stamp, effects: &mut Vec<Effect>) {
+        // The planted bug: the staged file's look reported as the path's, its change time
+        // the one before the rename.
+        #[cfg(test)]
+        if self.plant == PlacePlant::StampsStaged {
+            let stamp = Some(PlacedStamp { stamp: staged, looked_ns: 1 });
+            return self.answer(Placed { tag: asked, to, result: Ok(()), bytes, stamp });
+        }
+        let tag = self.tags.ask(Op::VouchNow { asked, to, bytes, staged });
+        effects.push(Effect::Now { tag });
+    }
+
+    /// The second look of a place came ([`Store::vouch`]): the place is answered, done, with
+    /// that look's stamp if it is the staged file's inode, size, modified time and mode, and
+    /// with none, saying why in its span, if it is not (another writer renamed a file onto the
+    /// path between the rename and the look) or if the look failed. The bytes are placed
+    /// either way; only the store's word on what the path holds now is withheld.
+    fn vouched(&mut self, asked: Tag, to: FileName, bytes: PlacedBytes, staged: Stamp, look: Result<(u64, Stamp), String>) {
+        // The planted bug: any look vouched for, the stranger's file too.
+        #[cfg(test)]
+        let staged = match (&look, self.plant == PlacePlant::VouchesAnyLook) {
+            (Ok((_, now)), true) => *now,
+            _ => staged,
+        };
+        let stamp = match look {
+            Ok((looked_ns, now))
+                if (now.ino, now.size, now.mtime_ns, now.mode)
+                    == (staged.ino, staged.size, staged.mtime_ns, staged.mode) =>
+            {
+                Ok(PlacedStamp { stamp: now, looked_ns })
+            }
+            // alloc: why, once per place not vouched for
+            Ok((_, now)) => Err(format!(
+                "{to} was looked at after its rename and is not the file renamed there: {now:?} \
+                 where the staged file was {staged:?}; another writer placed a file there"
+            )),
+            // alloc: why, once per place not vouched for
+            Err(why) => Err(format!("{to} could not be looked at after its rename: {why}")),
+        };
+        let stamp = match stamp {
+            Ok(stamp) => Some(stamp),
+            Err(why) => {
+                if let Some(span) = self.place_spans.get(&asked) {
+                    span.record("unvouched", why.as_str());
+                }
+                None
+            }
+        };
+        self.answer(Placed { tag: asked, to, result: Ok(()), bytes, stamp });
     }
 
     /// How a step of an output's derive went ([`Content::Patch`], [`Patching`]): its staged
@@ -4055,11 +4577,8 @@ impl Store {
                         effects.push(Effect::Prewarm { like, file, tag });
                     }
                     None => {
-                        // clone: the effect owns the names; once per place
-                        let (from, to) = (patching.temp.clone(), patching.to.clone());
-                        let tag = self.tags.ask(Op::PatchRename { asked });
-                        // Not synced: the path holds its old file or the new one, whole.
-                        effects.push(publish::rename(from, to, Durable::No, tag));
+                        let tag = self.tags.ask(Op::PatchLook { asked });
+                        effects.push(publish::look(&patching.temp, tag));
                     }
                     Some(why) => {
                         // alloc: an error, once per place that fails
@@ -4072,11 +4591,8 @@ impl Store {
                 let Some(patching) = self.patching.get(&asked) else { return };
                 match done {
                     Done::Prewarmed { .. } => {
-                        // clone: the effect owns the names; once per place
-                        let (from, to) = (patching.temp.clone(), patching.to.clone());
-                        let tag = self.tags.ask(Op::PatchRename { asked });
-                        // Not synced: the path holds its old file or the new one, whole.
-                        effects.push(publish::rename(from, to, Durable::No, tag));
+                        let tag = self.tags.ask(Op::PatchLook { asked });
+                        effects.push(publish::look(&patching.temp, tag));
                     }
                     done => {
                         // alloc: an error, once per place that fails
@@ -4088,7 +4604,25 @@ impl Store {
                     }
                 }
             }
-            Op::PatchRename { asked } => match done {
+            // The staged file whole, looked at once, then renamed onto its path.
+            Op::PatchLook { asked } => {
+                let Some(patching) = self.patching.get(&asked) else { return };
+                match publish::looked(&done) {
+                    Ok(looked) => {
+                        // clone: the effect owns the names; once per place
+                        let (from, to) = (patching.temp.clone(), patching.to.clone());
+                        let tag = self.tags.ask(Op::PatchRename { asked, looked });
+                        // Not synced: the path holds its old file or the new one, whole.
+                        effects.push(publish::rename(from, to, Durable::No, tag));
+                    }
+                    Err(why) => {
+                        // alloc: an error, once per place that fails
+                        let why = format!("looking at its staged file before its rename: {why}");
+                        self.patch_failed(asked, &why, effects)
+                    }
+                }
+            }
+            Op::PatchRename { asked, looked } => match done {
                 Done::Renamed => {
                     let Some(Patching { to, len, wrote, written, .. }) =
                         self.patching.remove(&asked)
@@ -4096,8 +4630,8 @@ impl Store {
                         return;
                     };
                     let bytes =
-                        PlacedBytes { cloned: len.saturating_sub(wrote), written, copied: wrote };
-                    self.answer(Placed { tag: asked, to, result: Ok(()), bytes });
+                        PlacedBytes { cloned: len.saturating_sub(wrote), written, copied: wrote, kernel: 0 };
+                    self.vouch(asked, to, bytes, looked, effects);
                 }
                 // A derived value's file has no hash of its own to check the path against,
                 // so a rename refused is the place's failure.
@@ -4120,65 +4654,11 @@ impl Store {
         effects.push(Effect::Remove { file: temp, tag });
         // alloc: an error, once per place that fails
         let result = Err(format!("deriving {to} from a clone of its base: {why}"));
-        self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+        self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default(), stamp: None });
     }
 
-    /// Lets go of the whole file kept to place `key`'s value by cloning ([`CLONE_FROM`]), for a
-    /// path that now holds `now`'s value instead, once no clone of it is in flight: so a store
-    /// whose outputs are built again and again does not keep a whole file of each. Nothing goes
-    /// when `now`'s bytes are `key`'s (two keys of one output). Only that file goes, never the
-    /// value (its record and chunks stay): placing it again writes it again, and every clone of
-    /// it already placed keeps its blocks. When `now` is derived from `key`'s value
-    /// ([`Kind::Derived`]), `now`'s whole file is made of a clone of this one first.
-    pub fn unplace(&mut self, key: &Key, now: &Key, effects: &mut Vec<Effect>) {
-        self.tidy();
-        // The path holds `now`'s value: `key` is no longer kept for it.
-        self.collecting.unplaced(key);
-        let look = self.look();
-        // The whole file each is placed from, if one is kept of it; else its content alone.
-        let file_of = |key: &Key| match whole_of(look, key) {
-            Ok(Ok(whole)) => Some((whole.id, Some(whole))),
-            Ok(Err(_)) => {
-                let found = look.find(key)?.ok()?;
-                Some((look.record(found, key).ok()?.0.content, None))
-            }
-            Err(_) => None,
-        };
-        let Some((content, Some(old))) = file_of(key) else { return };
-        let new = file_of(now);
-        if new.as_ref().is_some_and(|(it, _)| *it == content) {
-            return;
-        }
-        if old.base.is_some() {
-            self.derived.insert(content, old.len);
-        }
-        // What replaces it is derived from it: its file is begun now, so that it clones this
-        // one before this one goes (the file then goes once that clone has ended), and a
-        // build that edits one image again and again never writes a whole file of it twice.
-        if let Some((id, Some(Whole { len, base: Some(base), .. }))) = new
-            && base == *key
-            && self.placed_looked
-            && self.place_by == Some(PlaceBy::Clone)
-            && self.broken.is_none()
-        {
-            self.derived.insert(id, len);
-            if !self.files.contains_key(&id) {
-                // alloc: empty, allocates nothing
-                self.make_file(id, Vec::new(), effects);
-            }
-        }
-        match (self.placed_looked, &self.broken) {
-            (true, _) => self.let_go(content, effects),
-            // alloc: once per output built again while the open's look runs
-            (false, None) => {
-                self.waiting_for_look();
-                self.held_unplaces.push(content);
-            }
-            (false, Some(_)) => {}
-        }
-    }
-
-    /// The whole file of `content` removed, once no clone of it is in flight ([`Store::unplace`]).
+    /// The whole file of `content` removed, once no clone of it is in flight: nothing names it
+    /// ([`Store::names_step`]).
     fn let_go(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
         match self.files.get_mut(&content) {
             Some(PlacedFile::There { lost: true, .. }) => {}
@@ -4213,9 +4693,9 @@ impl Store {
         effects.push(Effect::Stat { file: self.placed_dir(), tag });
     }
 
-    /// A place or an unplace is held for the open's look through `placed/`: the wait's span
-    /// opens with the first, naming the directory looked through; it closes as the look ends
-    /// or the store breaks, saying how many places and unplaces waited.
+    /// A place is held for the open's look through `placed/`: the wait's span opens with the
+    /// first, naming the directory looked through; it closes as the look ends or the store
+    /// breaks, saying how many places waited.
     fn waiting_for_look(&mut self) {
         if self.look_wait.is_none() {
             let dir = self.placed_dir();
@@ -4227,7 +4707,6 @@ impl Store {
                 "places wait for the open's look through placed/",
                 %dir,
                 places = tracing::field::Empty,
-                unplaces = tracing::field::Empty,
             ));
         }
     }
@@ -4236,7 +4715,6 @@ impl Store {
     fn look_wait_over(&mut self) {
         if let Some(span) = self.look_wait.take() {
             span.record("places", self.held.len());
-            span.record("unplaces", self.held_unplaces.len());
         }
     }
 
@@ -4259,9 +4737,8 @@ impl Store {
         tracing::info!(target: "blaze", %dir, kept, kept_bytes, swept, held, "placed files found at open");
         self.look_wait_over();
         self.placed_looked = true;
-        for content in std::mem::take(&mut self.held_unplaces) {
-            self.let_go(content, effects);
-        }
+        // The names the places answered meanwhile changed, over the listing read.
+        self.names_step(effects);
         for (content, waiter) in std::mem::take(&mut self.held) {
             self.place_file(content, waiter, effects);
         }
@@ -4272,11 +4749,11 @@ impl Store {
                     if self.place_now(&key, to.clone(), Some(tag), effects).is_none() {
                         // alloc: an error, once per place refused
                         let why = format!("the store has nothing under {key:?} any more");
-                        self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default() });
+                        self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
                     }
                 }
                 HeldAsk::Over { tag, to, file, started } => {
-                    self.publish(tag, to, Content::Over { file, started }, Durable::No, 0, effects);
+                    self.publish(tag, to, Content::Over { file, started }, 0, effects);
                 }
             }
         }
@@ -4355,45 +4832,6 @@ impl Store {
         self.ask_placed(effects);
     }
 
-    /// The path's file of a patched place came, read whole ([`PlaceBy::Copy`]): cut to the
-    /// new length, the runs written over it in memory, and the whole written to the path as
-    /// any value's bytes are (under a temporary name, renamed over it: the file a program may
-    /// be running is never written). A path whose file is not there fails the place, naming
-    /// it.
-    fn over_read(&mut self, asked: Tag, done: Done, effects: &mut Vec<Effect>) {
-        let Some((to, file)) = self.overs.remove(&asked) else { return };
-        let refuse = |store: &mut Store, to: FileName, why: String| {
-            store.answer(Placed { tag: asked, to, result: Err(why), bytes: PlacedBytes::default() });
-        };
-        let mut bytes = match done {
-            Done::Read(bytes) if !bytes.is_empty() => bytes,
-            // alloc: an error, once per place that fails
-            Done::Read(_) => {
-                let why = format!("{to} is not there (or is empty) to be copied with what changed written");
-                return refuse(self, to, why);
-            }
-            done => {
-                // alloc: an error, once per place that fails
-                let why = format!("reading {to} to copy it with what changed written: {}", describe(&done));
-                return refuse(self, to, why);
-            }
-        };
-        let Sparse { len, runs } = file;
-        bytes.resize(len as usize, 0);
-        for (at, run) in runs {
-            let Some(into) = usize::try_from(at)
-                .ok()
-                .and_then(|at| bytes.get_mut(at..at.checked_add(run.len())?))
-            else {
-                // alloc: an error, once per place refused
-                let why = format!("{to} was to be written from runs that end past its {len} bytes");
-                return refuse(self, to, why);
-            };
-            into.copy_from_slice(&run);
-        }
-        self.publish(asked, to, Content::Bytes(bytes), Durable::No, 0, effects);
-    }
-
     /// The look through `placed/` failed with `done`: asked again from the start, until it has
     /// failed [`FAILURES_MOST`] times (its own count, `look_tries`), which breaks the store
     /// naming the directory, what the look was for and the last error.
@@ -4421,6 +4859,12 @@ impl Store {
     /// of a write a crash cut short) goes. Nothing of this run's is there yet: its places wait
     /// for this ([`Store::place`]).
     fn placed_listed(&mut self, done: Done, effects: &mut Vec<Effect>) {
+        // A file that is a record's home is kept though no path names it: the head that says
+        // so is read first (the head and `placed/` are read at once as the store opens).
+        if !self.tiers[0].head_read && self.peers.is_none() && self.broken.is_none() {
+            self.listing_held = Some(done);
+            return;
+        }
         let Done::Listed(found) = done else {
             return self.placed_look_failed(&done, effects);
         };
@@ -4429,8 +4873,18 @@ impl Store {
                 continue;
             }
             let name = file.as_str().rsplit('/').next().unwrap_or("");
-            let named = name.len() == 2 * size_of::<ContentId>()
-                && name.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'));
+            // The listing itself, read already.
+            if name == "names" {
+                continue;
+            }
+            // A whole file named for its content stays only where the listing names it: one
+            // no path names (a path placed since from another, a place a crash cut short) goes.
+            // A record's home ([`Store::home_placed`]) stays while its record does: the record
+            // goes by the forget, and the file with it, never the file alone.
+            let named = content_named(name).is_some_and(|id| {
+                self.names.names(&id) > 0
+                    || self.tiers[0].externals.get(&id).is_some_and(|it| it.placed && !it.dropped)
+            });
             // A derived value's whole file is not named so and goes with the rest: nothing
             // says its bytes are its base's with its ranges written but having made it, and
             // an earlier run's making may have been cut by a crash at any write. (The planted
@@ -4488,6 +4942,10 @@ impl Store {
         // A derived value's is never taken as an earlier run left it: it is made, and its
         // rename replaces whatever is under its name. (The planted bug looks for one.)
         let made_unseen = self.derived.contains_key(&content) && !self.keeps_derived();
+        // The key's record moves to the file once the file is durable ([`Store::home_placed`]).
+        if waiter.base_of.is_none() {
+            self.home_wanted(content, waiter.key, effects);
+        }
         enum At {
             There(Flushed, u64),
             Lost,
@@ -4604,7 +5062,7 @@ impl Store {
             let base = match self.files.get_mut(&base_id) {
                 Some(PlacedFile::There { file, cloning, lost: false, .. }) => {
                     // Counted, so the base stays until this clone of it ended; one let go
-                    // of meanwhile ([`Store::unplace`]) stays let go of.
+                    // of meanwhile ([`Store::names_step`]) stays let go of.
                     *cloning += 1;
                     // clone: a file's name, a reference count: the clone holds its source's
                     file.clone()
@@ -4613,7 +5071,7 @@ impl Store {
             };
             let Waiter { asked, to, raw, .. } = waiter;
             let content = Content::Patch { base, base_id, id: content, len: raw };
-            self.publish(asked, to, content, Durable::No, 0, effects);
+            self.publish(asked, to, content, 0, effects);
             return None;
         }
         if !writing {
@@ -4631,7 +5089,7 @@ impl Store {
             _ => return Some(waiter),
         };
         let Waiter { asked, to, .. } = waiter;
-        self.publish(asked, to, Content::Bytes(bytes), Durable::No, 0, effects);
+        self.publish(asked, to, Content::Bytes(bytes), 0, effects);
         None
     }
 
@@ -4696,7 +5154,7 @@ impl Store {
         let of = Some(Source { content, key, retried });
         // clone: a file's name, a reference count: the clone's op holds its source's
         let content = Content::File { from: file.clone(), content, of, len: raw };
-        self.publish(asked, to, content, Durable::No, written, effects);
+        self.publish(asked, to, content, written, effects);
     }
 
     /// The place `asked` of `from`'s clone at `to` begun ([`Staged`]): its staged name cleared
@@ -4726,10 +5184,8 @@ impl Store {
         clear
     }
 
-    /// `staged`'s clone, whole under its own name, renamed onto `to`: it replaces whatever is
-    /// there in one step, a concurrent place's clone of the same bytes too. Not synced: the
-    /// path holds its old file or the clone, whole, and a crash that undoes the rename leaves
-    /// the old one, placed again by the build that finds it.
+    /// `staged`'s clone, whole under its own name, looked at once ([`Op::StagedLook`]) and then
+    /// renamed onto `to` ([`Store::rename_staged`]).
     fn commit_staged(
         &mut self,
         asked: Tag,
@@ -4738,9 +5194,28 @@ impl Store {
         bytes: PlacedBytes,
         effects: &mut Vec<Effect>,
     ) {
+        // clone: the effect's name and the op's staged file, once per place
+        let file = staged.temp.clone();
+        let tag = self.tags.ask(Op::StagedLook { asked, to, staged, bytes });
+        effects.push(publish::look(&file, tag));
+    }
+
+    /// `staged`'s clone, looked at as `looked`, renamed onto `to`: it replaces whatever is
+    /// there in one step, a concurrent place's clone of the same bytes too. Not synced: the
+    /// path holds its old file or the clone, whole, and a crash that undoes the rename leaves
+    /// the old one, placed again by the build that finds it.
+    fn rename_staged(
+        &mut self,
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+        looked: Stamp,
+        effects: &mut Vec<Effect>,
+    ) {
         // clone: the effect and the op each own the names; once per place
         let (from, into) = (staged.temp.clone(), to.clone());
-        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
+        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes, looked });
         effects.push(publish::rename(from, into, Durable::No, tag));
     }
 
@@ -4899,7 +5374,7 @@ impl Store {
                     // clone: the output's write owns its bytes, as the store's file's does
                     let copy = Content::Bytes(bytes.clone());
                     let written = std::mem::take(&mut written);
-                    self.publish(asked, to, copy, Durable::No, written, effects);
+                    self.publish(asked, to, copy, written, effects);
                 }
                 // Written under its writing name: it takes the content's name by a rename
                 // only once it is sealed and written back, so no crash leaves other bytes
@@ -4924,7 +5399,7 @@ impl Store {
     }
 
     /// The derived whole file `id` begun for `waiting` (none: made ahead of its place,
-    /// [`Store::unplace`]): its recipe read, and the whole file of its base waited for, which
+    /// [`Store::names_step`]): its recipe read, and the whole file of its base waited for, which
     /// is made first where it is not there (written from its value, or derived in its turn).
     /// A recipe that cannot be read, a base the store keeps no whole file of, and a chain of
     /// more than [`derived::CHAIN_MOST`] derived values with no whole file refuse `waiting`,
@@ -5244,6 +5719,7 @@ impl Store {
                 to,
                 result: Err(why.to_owned()),
                 bytes: PlacedBytes::default(),
+                stamp: None,
             });
         }
     }
@@ -5325,11 +5801,17 @@ impl Store {
             owed: if waiting.is_empty() { written } else { 0 },
         };
         self.files.insert(content, there);
+        for waiter in waiting.iter().filter(|it| it.base_of.is_none()) {
+            self.home_key(content, waiter.key);
+        }
         for (at, waiter) in waiting.into_iter().enumerate() {
             // The first place made the file: its bytes are written once, for all.
             let written = if at == 0 { written } else { 0 };
             self.serve(content, file, waiter, written, effects);
         }
+        // Written back and named: it becomes its value's one home once it is synced, off
+        // every answer's path ([`Store::home_placed`]).
+        self.home_ready(content, effects);
     }
 
     /// How a step of the whole file of `content` went ([`PlacedFile`]).
@@ -5635,6 +6117,18 @@ impl Store {
     /// move a segment's durable count (puts that ended empty, such as a claim's loser) with
     /// no completion, so a waiter checks [`Store::durable`] rather than wait on this list.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+        let tickets = self.complete_op(completion, effects);
+        // What the places it answered changed of the names of the whole files.
+        self.names_step(effects);
+        // Records that wait for a commit, or for one to end, to move to their placed file.
+        if self.homes_waiting {
+            self.homes_due(effects);
+        }
+        tickets
+    }
+
+    /// [`Store::complete`], before the names its answers changed are made.
+    fn complete_op(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
         self.tidy();
         if self.hot.owns(completion.tag) {
             return self.tail_loaded(completion, effects);
@@ -5694,7 +6188,7 @@ impl Store {
                 Done::Removed => {
                     // clone: the effect and the op each own the name; once per place
                     let into = staged.temp.clone();
-                    let op = Op::Place { asked, to, staged: Some(staged), of, bytes };
+                    let op = Op::Place { asked, to, staged, of, bytes };
                     let tag = self.tags.ask(op);
                     effects.push(from.clone_to(into, tag));
                 }
@@ -5707,6 +6201,7 @@ impl Store {
                         to,
                         result: Err(describe(&done)),
                         bytes: PlacedBytes::default(),
+                        stamp: None,
                     });
                 }
             },
@@ -5720,7 +6215,7 @@ impl Store {
                     // bytes too. (Under the planted bug the clone was made at `to` itself.)
                     // A program is started from `to`: the clone is first asked to hold in
                     // memory what the system holds of `to`'s file, which the rename replaces.
-                    (Done::Cloned, _, Some(staged))
+                    (Done::Cloned, _, staged)
                         if !(cfg!(test) && staged.temp == to) && self.started.contains(&to) =>
                     {
                         // clone: the effect and the op each own the names; once per place
@@ -5728,11 +6223,12 @@ impl Store {
                         let tag = self.tags.ask(Op::Warm { asked, to, staged, bytes });
                         effects.push(Effect::Prewarm { like, file, tag });
                     }
-                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                    (Done::Cloned, _, staged) if !(cfg!(test) && staged.temp == to) => {
                         self.commit_staged(asked, to, staged, bytes, effects);
                     }
-                    (Done::Cloned | Done::Written, _, _) => {
-                        self.answer(Placed { tag: asked, to, result: Ok(()), bytes })
+                    // The planted bug's clone made at `to` itself: no staged file to vouch by.
+                    (Done::Cloned, _, _) => {
+                        self.answer(Placed { tag: asked, to, result: Ok(()), bytes, stamp: None })
                     }
                     (done, Some(Source { content, key, .. }), _) => {
                         // Whether the file it cloned from is gone or no file is found, to
@@ -5764,6 +6260,7 @@ impl Store {
                             to,
                             result,
                             bytes: PlacedBytes::default(),
+                            stamp: None,
                         });
                     }
                 }
@@ -5779,16 +6276,42 @@ impl Store {
                         "asking the system to read ahead what it holds of {to}: {}",
                         describe(&done)
                     ));
-                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default(), stamp: None });
                 }
             },
             Op::Recheck { content, waiter, why } => {
                 self.rechecked(content, waiter, &why, &done, effects)
             }
-            Op::Commit { asked, to, staged, bytes } => match done {
-                Done::Renamed => {
-                    self.answer(Placed { tag: asked, to, result: Ok(()), bytes })
+            Op::StagedLook { asked, to, staged, bytes } => match publish::looked(&done) {
+                Ok(looked) => self.rename_staged(asked, to, staged, bytes, looked, effects),
+                Err(why) => {
+                    // clone: the effect and the op each own the name; once per place that fails
+                    let tag = self.tags.ask(Op::Discard { file: staged.temp.clone() });
+                    effects.push(Effect::Remove { file: staged.temp, tag });
+                    // alloc: an error, once per place that fails
+                    let result = Err(format!("looking at the clone placed at {to} before its rename: {why}"));
+                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default(), stamp: None });
                 }
+            },
+            Op::VouchNow { asked, to, bytes, staged } => match done {
+                Done::Wall(since) => {
+                    // Read before the look is asked, so never later than it: a check that a
+                    // stamp is steady (its modified time far enough before its look) errs
+                    // only toward refusing.
+                    let looked_ns = u64::try_from(since.as_nanos()).unwrap_or(u64::MAX);
+                    // clone: the effect's name and the op's, once per place
+                    let file = to.clone();
+                    let tag = self.tags.ask(Op::VouchLook { asked, to, bytes, staged, looked_ns });
+                    effects.push(publish::look(&file, tag));
+                }
+                done => self.vouched(asked, to, bytes, staged, Err(describe(&done))),
+            },
+            Op::VouchLook { asked, to, bytes, staged, looked_ns } => {
+                let look = publish::looked(&done).map(|now| (looked_ns, now));
+                self.vouched(asked, to, bytes, staged, look);
+            }
+            Op::Commit { asked, to, staged, bytes, looked } => match done {
+                Done::Renamed => self.vouch(asked, to, bytes, looked, effects),
                 done => {
                     // Refused (on Windows, a `to` that is read-only or open without sharing
                     // its delete): a success only if `to` already holds the value's bytes.
@@ -5829,7 +6352,14 @@ impl Store {
                     )),
                 };
                 let bytes = if result.is_ok() { bytes } else { PlacedBytes::default() };
-                self.answer(Placed { tag: asked, to, result, bytes });
+                // `to` holds the bytes, but as a file this place did not make: no look of its
+                // own to vouch by ([`Store::vouched`]).
+                if result.is_ok()
+                    && let Some(span) = self.place_spans.get(&asked)
+                {
+                    span.record("unvouched", "the rename was refused and the path's own file found to hold the bytes; it is not the file this place made");
+                }
+                self.answer(Placed { tag: asked, to, result, bytes, stamp: None });
                 // clone: the effect and the op each own the name; once per refused rename
                 let tag = self.tags.ask(Op::Discard { file: temp.clone() });
                 effects.push(Effect::Remove { file: temp, tag });
@@ -5844,13 +6374,13 @@ impl Store {
                 }
             }
             Op::Shares(step) => self.shares_step(step, &done, effects),
-            Op::OverRead { asked } => self.over_read(asked, done, effects),
             Op::LookPlaced => match done {
                 // None yet: nothing placed.
                 Done::Stat(None) => self.placed_look_done(None, effects),
+                // The listing first: the look removes the whole files it does not name.
                 Done::Stat(Some(meta)) if meta.dir => {
-                    let tag = self.tags.ask(Op::ListPlaced);
-                    effects.push(Effect::List { dir: self.placed_dir(), tag });
+                    let tag = self.tags.ask(Op::ReadNames);
+                    effects.push(Effect::ReadAll { file: self.names_file(), tag });
                 }
                 Done::Stat(Some(_)) => {
                     self.placed_look_done(Some("it is a file, not a directory".into()), effects)
@@ -5858,6 +6388,44 @@ impl Store {
                 done => self.placed_look_failed(&done, effects),
             },
             Op::ListPlaced => self.placed_listed(done, effects),
+            Op::ReadNames => match done {
+                // None written yet reads as empty: no names.
+                Done::Read(bytes) => match whole::Names::decode(&bytes) {
+                    Ok(listed) => {
+                        self.names.opened(listed);
+                        let tag = self.tags.ask(Op::ListPlaced);
+                        effects.push(Effect::List { dir: self.placed_dir(), tag });
+                    }
+                    Err(why) => {
+                        let file = self.names_file();
+                        // alloc: the error that breaks the store
+                        let what = format!("it is no listing of the names of the store's whole files: {why}");
+                        tracing::error!(target: "blaze", %file, "{what}");
+                        self.fail(file, what);
+                    }
+                },
+                done => self.placed_look_failed(&done, effects),
+            },
+            Op::NamesWritten => {
+                self.listing.writing = false;
+                #[cfg(test)]
+                if matches!(done, Done::Written) {
+                    self.listing.written += self.listing.asked;
+                }
+                if !matches!(done, Done::Written) {
+                    // The next change of the names writes them whole again; until then the
+                    // open after a crash keeps what the last listing written names.
+                    // alloc: a problem reported
+                    self.placed_problem(format!(
+                        "{}, the listing of the names of the store's whole files, was not written: {}",
+                        self.names_file(),
+                        describe(&done)
+                    ));
+                }
+                if std::mem::take(&mut self.listing.again) {
+                    self.write_listing(effects);
+                }
+            }
             Op::Swept { file } => {
                 if !matches!(done, Done::Removed) {
                     // alloc: a problem reported
@@ -5876,10 +6444,13 @@ impl Store {
             | Op::NameFile { .. }) => {
                 self.file_step(op, done, effects);
             }
+            Op::HomeSynced { content, round } => self.home_synced(content, round, &done, effects),
+            Op::HomeMapped { content, round } => self.home_mapped(content, round, done, effects),
             op @ (Op::PatchClear { .. }
             | Op::PatchClone { .. }
             | Op::PatchWrite { .. }
             | Op::PatchWarm { .. }
+            | Op::PatchLook { .. }
             | Op::PatchRename { .. }) => {
                 self.patch_step(op, done, effects);
             }
@@ -5940,7 +6511,7 @@ impl Store {
             // The planted commit wrote its head without it.
             #[cfg(test)]
             Op::Unwaited => {}
-            Op::Peers => self.peers_listed(done, effects),
+            Op::Peers { root } => self.peers_listed(root, done, effects),
             Op::Announce => self.announced(&done, effects),
             op => return self.step(&op, &done, effects),
         }
@@ -6005,6 +6576,8 @@ impl Store {
             closing: false,
             // alloc: once per pack made
             used: Arc::new(std::sync::atomic::AtomicU64::new(self.shared.tick())),
+            // alloc: once per pack made, empty
+            forgotten: Arc::new(Vec::new()),
         });
         self.tiers[0].packs.len() - 1
     }
@@ -6134,6 +6707,7 @@ impl Store {
             let external = own.externals.entry(header.content).or_insert_with(|| External {
                 len: header.raw,
                 file,
+                placed: false,
                 mapping: None,
                 // alloc: a value of `EXTERNAL_FROM` bytes or more, held past its segment's chunk until its own file is written and mapped
                 memory: Some(payload.to_vec()),
@@ -6221,6 +6795,16 @@ impl Store {
             ));
         };
         if first.place == Place::Segment(here) {
+            return Ok(Some(here));
+        }
+        // The key's record was forgotten alone ([`forget`]) and this put came after: its claim
+        // kept the record in the segment, the delta still at the forgotten one
+        // (`Own::claim`). This record is the key's home: the delta's spot is swapped to it
+        // here, on the store's thread, as a move swaps one, and its move takes it.
+        if let Place::Pack(loc) = first.place
+            && own.packs.get(loc.pack as usize).is_some_and(|it| it.forgot(loc.offset))
+        {
+            _ = own.delta.replace(held, first.at(Place::Segment(here)));
             return Ok(Some(here));
         }
         if spots.any(|it| it.place == Place::Segment(here)) {
@@ -6766,7 +7350,15 @@ impl Store {
         // A pack retired with nothing copied on (every record of it dead or forgotten) is
         // still a head to write: the one that names it removed.
         let retiring = own.packs.iter().any(|it| it.retiring);
-        if packs.is_empty() && externals.is_empty() && !compact && dropped.is_empty() && !retiring {
+        // A record forgotten alone since the last head is a head to write: the one listing it.
+        let forgot = std::mem::take(&mut self.forgot);
+        if packs.is_empty()
+            && externals.is_empty()
+            && !compact
+            && dropped.is_empty()
+            && !retiring
+            && !forgot
+        {
             // Nothing to write and no commit in flight: every record drained is in what a
             // commit wrote already, and a put that wrote none (it lost its key to another
             // writer's put of the same bytes, or panicked before it wrote) has nothing to make
@@ -6787,12 +7379,13 @@ impl Store {
             .map(|(content, it)| ExternalRef {
                 content: *content,
                 len: if it.dropped { disk::EXTERNAL_REMOVED } else { it.len },
+                placed: it.placed,
             })
-            .chain(
-                own.removing
-                    .iter()
-                    .map(|content| ExternalRef { content: *content, len: disk::EXTERNAL_REMOVED }),
-            )
+            .chain(own.removing.iter().map(|content| ExternalRef {
+                content: *content,
+                len: disk::EXTERNAL_REMOVED,
+                placed: false,
+            }))
             // alloc: once per commit, the head it writes
             .collect();
         all_externals.sort_unstable_by_key(|it| it.content);
@@ -6821,7 +7414,21 @@ impl Store {
             externals: all_externals,
             // clone: once per commit, the head it writes
             units: own.units.clone(),
+            forgotten: own
+                .packs
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| !it.removed && !it.retiring)
+                .flat_map(|(at, it)| {
+                    it.forgotten.iter().map(move |&offset| disk::ForgottenRef { pack: at as u32, offset })
+                })
+                // alloc: once per commit, the head it writes
+                .collect(),
         };
+        #[cfg(test)]
+        if self.collecting.plant == collect::Plant::ForgetUnlisted {
+            head.forgotten.clear();
+        }
         let mut index = None;
         if compact {
             // The table's bytes, how many records it holds, and (a table built off this
@@ -7275,14 +7882,27 @@ impl Store {
             if to >= pack.usable {
                 pack.memory.drain(..(to - pack.usable) as usize);
                 pack.usable = to;
+                // What the commit wrote is read through the pool now: the room it took to
+                // drain is let go, not kept for the next build's records.
+                #[cfg(test)]
+                let keeps = self.plant_heap == heap::HeapPlant::KeepsPackMemory;
+                #[cfg(not(test))]
+                let keeps = false;
+                if !keeps {
+                    pack.memory.shrink_to_fit();
+                }
             }
         }
         self.hot.commit_ended();
+        self.note_heap();
         for at in 0..self.tiers[0].packs.len() {
             let pack = &mut self.tiers[0].packs[at];
             if std::mem::take(&mut pack.retiring) {
                 pack.removed = true;
                 pack.base = None;
+                // Its records forgotten alone go with it: no head lists them again.
+                // alloc: empty, allocates nothing
+                pack.forgotten = Arc::new(Vec::new());
                 // alloc: empty, allocates nothing; it lets go of the pack's memory
                 pack.memory = Vec::new();
                 // alloc: empty, allocates nothing; it lets go of the pack's checks
@@ -7296,12 +7916,22 @@ impl Store {
         // from the next publish on. A reader of an older view reads its mapping, which lives
         // while that view does.
         let mut gone = false;
+        // alloc: empty, allocates nothing but when a placed file stopped being a home
+        let mut unhomed = Vec::new();
         for content in &commit.dropped {
             let own = &mut self.tiers[0];
             if !own.externals.get(content).is_some_and(|it| it.dropped) {
                 continue;
             }
             let external = own.externals.remove(content).expect("found above");
+            if external.placed {
+                // A placed file again, no record's home: it goes by the placed files' own
+                // steps once no path names it ([`Store::let_go`]), which a place of it waits
+                // for, so no removal meets a new file of the same name.
+                unhomed.push(*content);
+                gone = true;
+                continue;
+            }
             own.removing.push(*content);
             // clone: the op and the effect each own the name; once per whole file removed
             let tag = self.tags.ask(Op::RemoveExternal { content: *content, file: external.file.clone() });
@@ -7310,6 +7940,11 @@ impl Store {
         }
         if gone {
             self.publish_view();
+        }
+        for content in unhomed {
+            if self.names.names(&content) == 0 {
+                self.let_go(content, effects);
+            }
         }
         let mut batch = commit.batch;
         for content in &commit.externals {
@@ -7363,11 +7998,10 @@ impl Store {
     fn fail(&mut self, file: FileName, what: impl Into<String>) {
         self.broken.get_or_insert(Broken { file, what: what.into() });
         self.look_wait_over();
-        self.held_unplaces.clear();
         for ask in std::mem::take(&mut self.held_asks) {
             let (HeldAsk::Place { tag, to, .. } | HeldAsk::Over { tag, to, .. }) = ask;
             let why = self.broken.as_ref().map(ToString::to_string).unwrap_or_default();
-            self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default() });
+            self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default(), stamp: None });
         }
         if self.held.is_empty() {
             return;
@@ -7474,6 +8108,14 @@ impl Store {
                 closing: false,
                 // alloc: once per pack, at opening
                 used: Arc::new(std::sync::atomic::AtomicU64::new(it.used)),
+                // alloc: once per pack, at opening, the records the head lists forgotten in it
+                forgotten: Arc::new(
+                    head.forgotten
+                        .iter()
+                        .filter(|forgot| forgot.pack as usize == number)
+                        .map(|forgot| forgot.offset)
+                        .collect(),
+                ),
             })
             // alloc: opening, once per tier
             .collect();
@@ -7486,7 +8128,14 @@ impl Store {
                     it.content,
                     External {
                         len: it.len,
-                        file: tier.file(&disk::external_file(&it.content)),
+                        // A placed output's whole file, its record's home (format 8), keeps
+                        // its name in `placed/`: a clone base as before.
+                        file: match it.placed {
+                            // alloc: a file name, once per whole file at opening
+                            true => tier.file(&format!("placed/{:x}", it.content)),
+                            false => tier.file(&disk::external_file(&it.content)),
+                        },
+                        placed: it.placed,
                         mapping: None,
                         memory: None,
                         committed: true,
@@ -7499,11 +8148,12 @@ impl Store {
             // alloc: opening, once per tier
             .collect();
         // The whole files the head lists as removed: an earlier run's removal may not have
-        // been made (a crash after the head). Only the store's own are its to remove.
+        // been made (a crash after the head). Only the store's own are its to remove. A placed
+        // one is a placed file again: the sweep of `placed/` keeps it while a path names it.
         let removed_files: Vec<(ContentId, FileName)> = head
             .externals
             .iter()
-            .filter(|it| it.len == disk::EXTERNAL_REMOVED)
+            .filter(|it| it.len == disk::EXTERNAL_REMOVED && !it.placed)
             .map(|it| (it.content, tier.file(&disk::external_file(&it.content))))
             // alloc: opening, once per tier; empty but after a settle let a whole file go
             .collect();
@@ -7569,6 +8219,13 @@ impl Store {
         if self.tiers[at].waiting == 0 {
             self.finish_open(at, effects);
         }
+        // The listing of `placed/` waited for the own head, which names the files that are
+        // records' homes.
+        if at == 0
+            && let Some(done) = self.listing_held.take()
+        {
+            self.placed_listed(done, effects);
+        }
     }
 
     fn install(
@@ -7595,7 +8252,13 @@ impl Store {
                         );
                     }
                     external.mapping = Some(mapping);
-                    external.memory = None;
+                    #[cfg(test)]
+                    let keeps = self.plant_heap == heap::HeapPlant::KeepsExternalMemory;
+                    #[cfg(not(test))]
+                    let keeps = false;
+                    if !keeps {
+                        external.memory = None;
+                    }
                 }
                 self.mapped_for(batch);
             }
@@ -7762,6 +8425,7 @@ impl Drop for Store {
     /// A reader or writer may outlive the store and still be in a task that loaded what its
     /// limbo holds: the limbo goes with what they share, dropped when the last lets go.
     fn drop(&mut self) {
+        self.forget_heap();
         self.shared.orphan(std::mem::take(&mut self.limbo));
     }
 }
@@ -7853,7 +8517,8 @@ fn open_tier(tier: &mut Tier, look: Look<'_>) -> Result<(), (FileName, String)> 
                         ))
                     },
                 )?;
-            if header.form != Form::Dictionary {
+            // A record forgotten alone ([`forget`]) is no key's: its key finds what else there is.
+            if header.form != Form::Dictionary && !pack.forgot(at) {
                 let loc = Loc {
                     pack: number as u32,
                     kind: header.kind,

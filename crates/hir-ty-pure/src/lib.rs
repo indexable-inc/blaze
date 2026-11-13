@@ -31,10 +31,11 @@ pub mod facts;
 mod function;
 mod identity;
 mod loops;
-pub mod may;
+pub mod expect;
 mod memory;
 pub mod models;
 pub mod program_lifetime;
+mod sealed;
 mod values;
 mod walk;
 

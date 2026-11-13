@@ -35,6 +35,12 @@ mod heads;
 #[blaze::sans_io]
 mod idle;
 mod image;
+// Track 6, T2: the daemon's local facts (tool, placed outputs, carries) as VFS marks.
+#[blaze::sans_io]
+mod local;
+// Track 7, task A: the sealed layer, installed once a machine and read in place by every home.
+#[blaze::sans_io]
+pub(crate) mod sealed;
 #[cfg(all(unix, feature = "native"))]
 pub(crate) mod inspect;
 mod job;
@@ -381,30 +387,19 @@ pub fn record_makers() -> Result<RecordMakers, String> {
     })
 }
 
-/// Which blaze `exe` is, the hash of its bytes, with the file it hashed ([`executable`]), as
-/// one open file was both: one that changed while it was read is an error. What a client
-/// compares with the daemon's to know it speaks to the same blaze; no stored value is keyed by
-/// it ([`RecordMakers`]).
+/// Which blaze `exe` (this process's own executable) is: the hash of its bytes, known by its
+/// stamp ([`local::tool_hash`], `<state>/tool`: read whole once a build of blaze, never at a
+/// start after), with the file it names ([`executable`]). What a client compares with the
+/// daemon's to know it speaks to the same blaze; no stored value is keyed by it
+/// ([`RecordMakers`]).
 pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(exe)
+    let file = std::fs::File::open(exe)
         .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
-    let before = executable(exe, &file)?;
-    let mut hasher = blaze_ids::Hasher::new("blaze v2 build id 1");
-    let mut chunk = vec![0u8; 1 << 20]; // alloc: one buffer, once per start
-    loop {
-        let read = file
-            .read(&mut chunk)
-            .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&chunk[..read]);
-    }
-    if executable(exe, &file)? != before {
-        bail!("blaze itself, {}, changed while it was read for its build id", exe.display());
-    }
-    Ok(blaze_api::Build { id: hasher.finish(), exe: before })
+    let running = blaze_profile::identity::running()
+        .with_context(|| format!("finding the running file of blaze itself, {}", exe.display()))?;
+    let hash = local::tool_hash(&state()?.join("tool"), &running).map_err(anyhow::Error::msg)?;
+    let id = blaze_ids::Hasher::new("blaze v2 build id 2").part(&hash).finish();
+    Ok(blaze_api::Build { id, exe: executable(exe, &file)? })
 }
 
 /// The open file `file` of `exe` as a [`blaze_api::Executable`]: what changes when its bytes do.
@@ -1122,7 +1117,10 @@ pub(crate) fn engine(
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
     #[cfg(unix)]
-    let (lock, before) = hold(&state, ready)?;
+    let (lock, before) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: wait for the daemon before it").entered();
+        hold(&state, ready)?
+    };
     #[cfg(not(unix))]
     let (_, before) = (ready, Before::None);
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
@@ -1173,9 +1171,21 @@ pub(crate) fn engine(
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
-    let (profiling, keeper) =
-        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
+    // Which blaze this is, for clients to compare: no stored value is keyed by it. Before the
+    // history's thread starts: it seeds the process's hash of its own executable
+    // (`local::tool_hash`), which the history's identity and crash record then read, not hash.
+    let build = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: which blaze this is").entered();
+        build_of(&paths.launcher)?
+    };
+    // Returns once its thread is spawned: the history opens there, and the first build waits
+    // for its number (`Observe::numbering`), never the start.
+    let (profiling, keeper) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: start the profile history").entered();
+        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?
+    };
     // Fixed for the daemon's life before any job: a build's tasks only read it.
+    let toolchain_span = tracing::info_span!(target: "blaze", "daemon start: find the toolchain").entered();
     let sysroot = crate::toolchain::sysroot().with_context(|| {
         // alloc: once, on the error that stops the daemon from starting
         let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir().ok());
@@ -1187,12 +1197,12 @@ pub(crate) fn engine(
         )
     })?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
-    // Which blaze this is, for clients to compare: no stored value is keyed by it.
-    let build = build_of(&paths.launcher)?;
+    drop(toolchain_span);
     // Keyed by what makes std's records and outputs ([`RecordMakers`]), never the executable's
     // bytes: the shared store holds std units' records and outputs alone, and each std key's
     // outputs are files at fixed paths under it, so two blazes share it only when every byte
     // either writes there is made by the same code from the same inputs (AGENTS.md rule 25).
+    let lease_span = tracing::info_span!(target: "blaze", "daemon start: lease the shared store").entered();
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
     let std = machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| {
@@ -1208,6 +1218,7 @@ pub(crate) fn engine(
     {
         tracing::warn!(target: "blaze", dir = %std.display(), "the shared store's record did not read and was written afresh: {why}");
     }
+    drop(lease_span);
     let host = crate::toolchain::host()
         .context("blaze has no target triple for this machine's architecture and system")?
         .to_owned();
@@ -1218,7 +1229,10 @@ pub(crate) fn engine(
     let sources = sources()?;
     // A daemon that stopped mid-write left a package's half-written directory, which nothing
     // reads: removed before any fetch writes beside it.
-    let swept = fetch::sweep_parts(&sources).map_err(|why| anyhow::anyhow!(why))?;
+    let swept = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: remove half-written packages").entered();
+        fetch::sweep_parts(&sources).map_err(|why| anyhow::anyhow!(why))?
+    };
     if let Some(first) = swept.first() {
         tracing::info!(target: "blaze", removed = swept.len(), first = %first.display(), "half-written fetched packages removed");
     }
@@ -1231,6 +1245,7 @@ pub(crate) fn engine(
     // budget. A ledger that cannot be joined stops the start, naming it.
     #[cfg(all(unix, feature = "native"))]
     let (machine, budget) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: join the machine's memory ledger").entered();
         let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
         let joined = machine::Machine::join(told_machine, told, &crate::version(), &build, &root()?)
             .context("joining the machine's memory ledger")?;
@@ -1281,7 +1296,9 @@ pub(crate) fn engine(
             Err(std::env::VarError::NotPresent) => daemon::Without::default(),
             Err(error) => anyhow::bail!("the daemon's ${}: {error}", daemon::RESTORE_WITHOUT),
         },
+        premises: daemon::Premises::of_this_process().map_err(anyhow::Error::msg)?,
     };
+    let samplers_span = tracing::info_span!(target: "blaze", "daemon start: start the samplers").entered();
     // A sampler that can't be made is no other path: every dump and history says it is off.
     if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {
         tracing::warn!("{why}");
@@ -1293,6 +1310,7 @@ pub(crate) fn engine(
         tracing::warn!("{why}");
         eprintln!("blaze serve: {why}");
     }
+    drop(samplers_span);
     signals::catch();
     signals::record_ends();
     // After `record_ends`, which leaves a signal something handles alone: the crash record's
@@ -1317,10 +1335,16 @@ pub(crate) fn engine(
              watchdog would not see query runs as progress"
         );
     }
-    let steps = Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?);
+    let steps = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: make the steps").entered();
+        Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?)
+    };
     let scratch = paths.state.join("spawn");
-    let driver = blaze_core::native(std::path::Path::new("/"), threads)
-        .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    let driver = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: make the driver").entered();
+        blaze_core::native(std::path::Path::new("/"), threads)
+            .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?
+    };
     // A plane task's end ends the loop's wait in this driver, where it has a waker.
     let wake = blaze_core::Driver::waker(&driver);
     let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads, wake));
@@ -1432,11 +1456,9 @@ fn begin(
         eprintln!("{who}: {shared}");
     }
     let started = daemon.started();
-    if started.cold == Some(daemon::Cold::Interned) {
-        bail!("{who}: the daemon image's symbols: {}", daemon::Cold::Interned);
-    }
-    if let Some(restored) = &started.restored {
-        eprintln!("{who}: restored the daemon image {restored}");
+    if let Some(mapped) = &started.mapped {
+        // The words harness/incremental.py reads: the VFS and the history came from it.
+        eprintln!("{who}: restored the daemon image {mapped}");
     }
     // What a client that started it quotes (`cli::daemon::start_said`): why the warm state is
     // gone, and how the daemon before it ended.

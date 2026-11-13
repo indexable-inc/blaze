@@ -851,6 +851,55 @@ fn a_cancelled_request_does_not_wait_for_another_requests_task() {
     assert_eq!(finished(&out), [(1, true)]);
 }
 
+thread_local! {
+    /// The planted bug of [`a_modelled_raise_is_held_to_one_threads_share`]: a forecast raises
+    /// a task to the whole budget, as before 2026-11-12. Per thread, so no other test sees it.
+    pub(crate) static FORECAST_WHOLE_BUDGET: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The invariant: after `Forecast { bytes: u64::MAX }` a waiting task's memory is
+/// `forecast::share(budget, work)`, one work thread's share, and two such tasks start together
+/// once the task holding the budget ends. The control, the raise to the whole budget planted
+/// ([`FORECAST_WHOLE_BUDGET`]): each forecast task asks all of it, and one starts alone.
+#[test]
+fn a_modelled_raise_is_held_to_one_threads_share() {
+    for planted in [false, true] {
+        FORECAST_WHOLE_BUDGET.set(planted);
+        let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
+        open(&mut plane, 1, 1, true);
+        // 1 asks the whole budget and runs alone; 2 and 3 wait behind it for memory.
+        let out = add(
+            &mut plane,
+            1,
+            vec![
+                node(1, &[], Pool::Work, 100, None, 160),
+                node(2, &[], Pool::Work, 10, None, 1),
+                node(3, &[], Pool::Work, 10, None, 1),
+            ],
+        );
+        assert_eq!(runs(&out), [1]);
+        for id in [2, 3] {
+            let raise = PlaneInput::Forecast { at_ns: 0, id: NodeId(id), bytes: u64::MAX };
+            plane.step(raise).unwrap();
+        }
+        let share = crate::forecast::share(Some(160), 4);
+        assert_eq!(share, 40);
+        let asked = (plane.memory_of(NodeId(2)), plane.memory_of(NodeId(3)));
+        match planted {
+            false => assert_eq!(asked, (Some(share), Some(share)), "each raise held to the share"),
+            true => assert_eq!(asked, (Some(160), Some(160)), "control: each asks the budget"),
+        }
+        let mut started = runs(&built(&mut plane, 1));
+        started.sort_unstable();
+        FORECAST_WHOLE_BUDGET.set(false);
+        match planted {
+            false => assert_eq!(started, [2, 3], "both forecast tasks fit at a share of {share}"),
+            true => assert_eq!(started.len(), 1, "control: at the whole budget one starts alone"),
+        }
+    }
+}
+
 #[test]
 fn a_task_bigger_than_the_budget_fails_naming_itself() {
     let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();

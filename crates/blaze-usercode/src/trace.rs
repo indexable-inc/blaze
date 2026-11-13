@@ -260,6 +260,20 @@ pub enum Entry {
     Missing,
 }
 
+/// What a look at the disk for an [`Entry`] is kept by ([`blaze_vfs::outside::LookKind::Entry`]):
+/// `None` for a path that is not there, else a hash of which it is, and for a file of its
+/// content ID and git mode. Equal entries give equal digests and unequal ones do not, so a
+/// later ask of an unchanged disk gives the digest kept.
+pub fn entry_digest(entry: &Entry) -> Option<[u8; 32]> {
+    let mut hasher = Hasher::new("blaze v2 disk entry look 1");
+    match entry {
+        Entry::Missing => return None,
+        Entry::Dir => hasher.update(&[0]),
+        Entry::File(id, mode) => hasher.update(&[1]).part(&id.0).part(&mode.git().to_le_bytes()),
+    };
+    Some(hasher.finish().0)
+}
+
 /// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it
 /// is a directory: on Unix a name is its bytes, all of them packed in one buffer; elsewhere an
 /// `OsString` each, as [`os_in`] has them there.

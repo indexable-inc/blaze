@@ -249,7 +249,9 @@ fn setup(package: &Package) -> Result<Setup, String> {
     let path = conf::find(package.conf_dir.as_deref(), &package.manifest_dir);
     // The profile `clippy.toml` names, read once per request; this path is given no workspace
     // metadata, so `[workspace.metadata.blaze.lints]`'s `profile` is `blaze check`'s alone.
-    let conf = Conf::load(path, package.rust_version.as_deref())?.with_profile(None)?;
+    // This server is no daemon's build: no build keeps its look at the profile.
+    let conf = Conf::load(path, package.rust_version.as_deref())?
+        .with_profile(None, &blaze_vfs::outside::Looks::none())?;
     Ok(Setup { command_line, conf })
 }
 

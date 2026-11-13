@@ -1,0 +1,14 @@
+{
+ "id": "store-stamp-before-rename",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3b, int-1112",
+ "where": "crates/blaze-cas/src/lib.rs Store::vouch, Store::vouched; publish.rs Writing; heap.rs",
+ "what": "A placed output's stamp was taken of the staged file before its rename, so its change time was never the path's: the daemon could not compare a later look whole and hashed the file again. Only the run route filled it at all; clone and derive answered `stamp: None`. Separately, a commit's `pack.memory.drain(..)` kept the room of every record drained, held on the heap while the daemon idled.",
+ "cost": "every placed output hashed again on the next build's check; an idle store's heap scaled with the last build's records",
+ "cause": "the stamp was read where it was cheapest (the staged look the rename needs) instead of where its consumer looks (the path, after the rename); a drained Vec keeps its capacity",
+ "class": "a fact reported about a different object than the one its consumer checks; a buffer's capacity outliving its contents",
+ "prevention": "one vouch step for every route: a second look at the path after the rename, accepted only when it is the staged inode; heap_bytes counts capacities, and a test bounds an idle store's heap at 1,000 and 100,000 records",
+ "workaround": "none",
+ "fix": "Store::vouch/vouched; Op::StagedLook, Op::PatchLook, Op::VouchNow, Op::VouchLook; shrink_to_fit after the drain; Store::heap_bytes and `store_heap` in PoolCounts. Controls: PlacePlant::StampsStaged, VouchesAnyLook, HeapPlant::KeepsPackMemory, KeepsExternalMemory.",
+ "state": "written, not built"
+}

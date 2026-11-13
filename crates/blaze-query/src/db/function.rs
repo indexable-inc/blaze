@@ -171,7 +171,9 @@ impl Vtable {
             made: None,
             memory: memory::<F>,
             used: Some(used::<F> as fn(&Storage, u32) -> u64),
+            values: Some(values::<F> as fn(&Storage, u32) -> u64),
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
+            db: Some(std::any::TypeId::of::<F::Db> as fn() -> std::any::TypeId),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
             weighed: if F::BUDGETED {
                 Some(Weighed {
@@ -776,6 +778,11 @@ pub(crate) mod probe {
         /// frame at round 1 again, so its `cycle_recover` is told 1 in every round
         /// ([`super::run`], `tests/inner_heads.rs`).
         pub(crate) static KEPT_HEADS_START_AGAIN: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] stamps a row current with
+        /// no look at its edges.
+        pub(crate) static REFRESH_UNVERIFIED: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] records no read edge.
+        pub(crate) static REFRESH_RECORDS_NO_READ: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -895,6 +902,90 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
         State::Current => Verified::Current,
         State::Assumed => Verified::Assumed,
         State::Provisional(_) | State::OnStack(_) => Verified::Changed,
+    }
+}
+
+/// What [`refresh_by_key`] found of a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refreshed {
+    /// A function's row, verified (or run) in this view: its kept reads are those of its last
+    /// run and are not replaced in this view. Its value may have been let go: none is made for
+    /// this.
+    Current,
+    /// A function's row that cannot be brought up to date from here: running on this task (a
+    /// cycle through it), provisional, proved only on the assumption of a verify open lower
+    /// on this task's stack, or of a key its function no longer takes. No read is recorded.
+    Unsettled,
+    /// Not a function's row (an input's field, an interned or a tracked struct): it keeps no
+    /// reads, and there is nothing to bring up to date.
+    NotAFunction,
+}
+
+/// Brings the row `key` names up to date in this view, without knowing which function it is
+/// a row of: [`Vtable::verify`], what a reader's edge on the row does, asked by its key.
+///
+/// The invariant: a row this answers [`Refreshed::Current`] for is what a fresh run of its
+/// function gives in this view (its value, and the reads its run kept: verified by its edges,
+/// each dependency brought up to date first, and run again if one changed, or run when it
+/// never ran), and the running query, if any, now has a read edge on it, as a fetch of it
+/// leaves. So a query that uses what the row holds besides its value (its kept reads:
+/// [`super::Storage::row_reads`], [`super::Reads::for_each_read_through`], which asks this
+/// itself) runs again when the row does. A row a reader proved by durability, with no look
+/// at its edges, keeps the stamp of the view it was last verified in until it is asked for:
+/// this is the asking. No value is made for a row whose value was let go.
+///
+/// For the engine's own operation reachable by key alone, so no caller keeps a list of the
+/// queries it may meet (a `match` over each function's typed `arguments`).
+///
+/// # Panics
+///
+/// When `D` is not the database type of `key`'s function or of the storage, or `key` is an
+/// ID the storage never gave ([`super::NeverGiven`]). Unwinds as a fetch does (a pending
+/// write, a bound that ran out).
+pub fn refresh_by_key<D: Database>(db: &D, key: DatabaseKeyIndex) -> Refreshed {
+    let storage = db.storage();
+    let (index, id) = (key.ingredient_index(), key.key_index());
+    let Some(vtable) = ingredient::vtable(index) else {
+        return Refreshed::NotAFunction;
+    };
+    let (Some(verify), Some(db_type)) = (vtable.verify, vtable.db) else {
+        return Refreshed::NotAFunction;
+    };
+    // The cast below is to the function's own database type, so `D` must be it: a key of
+    // another database's function (ingredients are the process's) is refused by name. Its
+    // table, made by the verify if this storage has none, checks `F::Db` against the
+    // storage's one database type.
+    assert!(
+        db_type() == std::any::TypeId::of::<D>(),
+        "`{}` was asked to refresh with a database of another type ({})",
+        vtable.name,
+        std::any::type_name::<D>()
+    );
+    #[cfg(test)]
+    if probe::REFRESH_UNVERIFIED.with(Cell::get)
+        && let Some(header) = header_of(storage, index, id)
+    {
+        // The planted bug: the row is stamped current with no look at its edges.
+        let word = header.verified.load(Ordering::Acquire);
+        header.verified.store(storage.view_bits() | (word & VALUE), Ordering::Release);
+        read(storage, header);
+        return Refreshed::Current;
+    }
+    // SAFETY: `db` is a `&D`, and `D` is the function's `F::Db` (checked above);
+    // `id` is passed as it is, and `verify_edge` refuses an ID that is not a key of its
+    // function (`FromIdIn`) or that the storage never gave.
+    match unsafe { verify(std::ptr::from_ref(db).cast::<()>(), storage, id) } {
+        Verified::Current => {
+            let header = header_of(storage, index, id)
+                .expect("a row verified in this view has its page: `verify_edge` made it");
+            #[cfg(test)]
+            if probe::REFRESH_RECORDS_NO_READ.with(Cell::get) {
+                return Refreshed::Current;
+            }
+            read(storage, header);
+            Refreshed::Current
+        }
+        Verified::Changed | Verified::Assumed => Refreshed::Unsettled,
     }
 }
 
@@ -1585,7 +1676,9 @@ fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
         below -= 1;
         let frame = &mut local.frames[below];
         match frame.kind {
-            FrameKind::Barrier { .. } => {
+            // A witness frame is passed through as a barrier is: a cycle member's hand-over reaches
+            // the run below it, and the witness ends not complete (its provisional read set its head).
+            FrameKind::Barrier { .. } | FrameKind::Witness { .. } => {
                 // Its pop must not cut the reads it is under.
                 frame.edges_start = top as u32;
             }
@@ -2076,6 +2169,11 @@ fn memory<F: Function>(storage: &Storage, index: u32) -> MemoryUsage {
         // A budgeted function's values say what they hold beside themselves ([`Function::weigh`]).
         value_bytes: weighed,
     }
+}
+
+/// [`Vtable::values`] of `F`: the values its table holds now, one load.
+fn values<F: Function>(storage: &Storage, index: u32) -> u64 {
+    storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed) as u64)
 }
 
 /// [`Vtable::used`] of `F`: its rows that ran, each holding a node from its first run

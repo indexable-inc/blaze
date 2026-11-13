@@ -617,7 +617,23 @@ shared by both):
   the simulated driver is the primary one. It is for what only a kernel shows (the watcher's event order, `kill -9`, a program
   really run, a splice of a real image) and as the cross-check of the simulated driver.
 
+      cargo +nightly-<date> build --release -p blaze-thin
       RUST_TEST_THREADS=6 cargo +nightly-<date> test --release -p blaze-engine --test revisions --no-fail-fast
+
+Every real case runs through the thin `blaze` (crates/blaze-thin) with the engine beside it, as
+an install lays them out, and `cargo test -p blaze-engine` does not build another package's
+binary: build `blaze-thin` first (it lands beside `blaze-engine` in the target directory), or
+name one with `BLAZE_REVISIONS_THIN`, as `BLAZE_REVISIONS_BLAZE` names the engine. Missing, every
+real case fails naming the path. The two are hard-linked per test into
+`CARGO_TARGET_TMPDIR/revisions-bin/<root>` (`replace engine` changes that test's engine alone),
+so both must be files on that filesystem.
+
+A case is of the thin `blaze`'s own path when a revision states `daemon_after`, `starts`,
+`at_once` or `run the file` (spec.rs `Test::as_typed`). Its `build`, `run`, `check` and `test`
+run with no `--message-format` and no `BLAZE_*` but `BLAZE_HOME` (any other sends the command to
+the engine, blaze-thin's `route::env`), so a daemon such a command starts runs without
+`BLAZE_VERIFY_STORE=1` and `BLAZE_LOCK=write`: what such a case loses is the store's read-back
+check. The driver's own reads (`why`, `explain`, `stop`, `store`) keep the whole environment.
 
 `BLAZE_REVISIONS_REPORT=<file>` appends one JSON line a revision; each row is also printed
 (`revisions: real <case> rev2 run ok units=1 executed=..`).

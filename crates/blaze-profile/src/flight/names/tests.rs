@@ -631,3 +631,61 @@ fn a_name_a_long_span_holds_reads_back_past_retain_generations() {
         }
     }
 }
+
+/// The invariant: a reader of a live ring holds at most [`RETAIN`] generations of it, each read
+/// generation in one text buffer and one index sized to what it defines, so what it holds stays
+/// under `RETAIN * (T + A)` plus the generation being read into, its definition buffer and the
+/// rows it read, however many generations the ring went through (`T` the text bytes, `A` the
+/// index bytes of one). The control keeps 64 generations, as the reader did before 2026-11-12,
+/// and goes past the bound; and the newest names still read back.
+#[test]
+fn a_reader_holds_at_most_window_generations_in_one_buffer_each() {
+    const NAMES: usize = 4;
+    const TEXT: usize = 4_000;
+    const GENERATIONS: usize = 200;
+    for planted in [false, true] {
+        let mut rings = [ModelRing {
+            rows: Vec::new(), // alloc: a test's ring
+            cap: 1 << 17,
+            head: 0,
+            generation: 0,
+            lost: 0,
+        }];
+        let mut local = Local::with_limits(1, 0, u64::MAX, NAMES as u16);
+        let mut reader = Streams::default();
+        if planted {
+            reader.plant(Plant::RetainSixtyFour);
+        }
+        let mut newest = Vec::new(); // alloc: a test's tokens
+        for generation in 0..GENERATIONS {
+            newest.clear();
+            for name in 0..NAMES {
+                // Distinct each generation, so each is defined again: TEXT bytes a name.
+                let text = format!("{generation:>8}.{name}:{}", "x".repeat(TEXT - 11));
+                assert_eq!(text.len(), TEXT);
+                newest.push((local.intern(&text, &mut Writer(&mut rings[0])), text));
+            }
+            reader.catch_up(1, &mut Rings(&rings));
+        }
+        assert!(local.generation() as usize >= GENERATIONS, "a generation for each four names");
+        let text_bytes = NAMES * TEXT;
+        let index_bytes = (NAMES + 1) * size_of::<(u32, u32)>();
+        let stream = &reader.rings[1];
+        let bound = (RETAIN * (text_bytes + index_bytes)
+            // The generation being read into, its buffers grown by doubling.
+            + 2 * (text_bytes + index_bytes)
+            + stream.gens.capacity() * size_of::<Gen>()
+            + stream.bytes.capacity()
+            + reader.rings.capacity() * size_of::<Stream>()
+            + reader.scratch.capacity() * size_of::<(u64, [u64; WORDS])>()) as u64;
+        let held = reader.held_bytes();
+        match planted {
+            false => assert!(held <= bound, "the reader holds {held} bytes, over {bound}"),
+            true => assert!(held > bound, "64 generations held {held} bytes, not over {bound}"),
+        }
+        for (token, text) in &newest {
+            let got = reader.text(*token, &mut Rings(&rings));
+            assert_eq!(got.as_deref(), Some(text.as_str()), "the newest names read back");
+        }
+    }
+}

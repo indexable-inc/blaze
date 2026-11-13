@@ -241,6 +241,9 @@ impl Disk {
                 self.made(sim, *tag, to);
             }
             Effect::Link { to, tag, .. } => self.made(sim, *tag, to),
+            // A copy of the data reads the source's pages where they are, written back or
+            // not: it forces nothing out, as a clone does.
+            Effect::CopyData { to, tag, .. } => self.made(sim, *tag, to),
             // A prewarm asks the page cache to read ahead and is not waited for: no byte is
             // written, read for a caller or flushed, and no name changes.
             Effect::Prewarm { .. } => {}

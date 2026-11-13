@@ -480,7 +480,7 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
     let mut history =
-        crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+        crate::history::History::open(dir, crate::history::CAP_MOST, crate::sampler::unsampled())
             .unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
@@ -613,7 +613,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
 fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+    crate::history::History::open(&dir, crate::history::CAP_MOST, crate::sampler::unsampled())
         .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb)

@@ -1147,9 +1147,9 @@ nonblocking; [effects](effects.md)):
 
 Effect attributes on bstd itself. This branch has `#[blaze::pure]`, `nopanic`, `noalloc` and
 `nonblocking` ([effects](effects.md)); bstd marks with those where the mark holds and is
-checked, and the positive form being built (`#[blaze::may(block, alloc, ..)]`) replaces each
-with a list of what a function may do, so "only `_synced` and `flush` may block" becomes
-`may(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
+checked, and the positive form being built (`#[blaze::expect(block, alloc, ..)]`) replaces
+each with the exact list of what a function does, so "only `_synced` and `flush` may block"
+becomes `expect(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
 cancelled, check}`, `Budget`'s counting, `Instant::{since_start, since}`, `Durable::unsynced`,
 `How::says`, `Buffered::held`. Not marked, and why: every call that reaches the driver takes
 `Io`'s process lock and polls inline in S1, which the walk rightly reads as blocking, so

@@ -1714,7 +1714,17 @@ impl<M: Memo> Plane<M> {
                         && self.task_slots.live(task)
                         && !self.tasks[row_of(task)].running
                     {
-                        let most = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
+                        // A raise from a model is a guess, held to one work thread's share
+                        // as every other guess is (`forecast::forecast`): a task that needs
+                        // more grows by `Realized` as it runs. Raised to the whole budget, one
+                        // modelled task ran alone on a 149 GiB grant for a 5 GiB peak.
+                        let budget = self.config.budget.as_ref().map(|it| it.bytes);
+                        let most = crate::forecast::share(budget, self.config.work);
+                        #[cfg(test)]
+                        let most = match crate::plane_tests::FORECAST_WHOLE_BUDGET.get() {
+                            true => budget.unwrap_or(u64::MAX),
+                            false => most,
+                        };
                         let row = &mut self.tasks[row_of(task)];
                         row.memory = row.memory.max(bytes.min(most));
                     }

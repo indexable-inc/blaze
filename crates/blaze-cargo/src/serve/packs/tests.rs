@@ -218,6 +218,8 @@ fn the_settings_refuse_what_they_do_not_know() {
     assert_eq!(config.sources, [Base::Dir("/mnt/packs".into()), Base::Url("https://packs.example.invalid/x".to_owned())]);
     assert_eq!(config.pins, ["toolchain", "bstd"]);
     assert!(config.serve.is_none() && config.peers.is_empty() && config.install.is_none());
+    assert!(config.prebuilt, "records built elsewhere are taken unless the settings say not");
+    assert!(!Config::parse(r#"{ "prebuilt": false }"#).unwrap().prebuilt);
     let key = "ab".repeat(32);
     let serving = Config::parse(&format!(
         r#"{{ "key_file": "/k", "serve": {{ "bind": "10.0.0.4:7420", "readers": ["{key}"] }}, "peers": [{{ "url": "http://10.0.0.5:7420/", "key": "{key}" }}] }}"#
@@ -235,6 +237,7 @@ fn the_settings_refuse_what_they_do_not_know() {
         (r#"{ "key_file": "/k", "serve": { "bind": "10.0.0.4:7420" } }"#, "`serve` has no `readers`"),
         // A machine that asks or answers peers signs with its own key.
         (r#"{ "serve": { "bind": "10.0.0.4:7420", "readers": [] } }"#, "need `key_file`"),
+        (r#"{ "prebuilt": "no" }"#, "`prebuilt` is not true or false"),
     ] {
         let refused = Config::parse(bad).unwrap_err();
         assert!(refused.contains(names), "{bad}: {refused}");
@@ -385,4 +388,128 @@ fn an_import_pins_what_it_imports_and_a_collection_before_the_first_build_takes_
     let (there, forgotten) = imported_then_collected(false);
     assert!(forgotten > 1000, "the control's collection forgot {forgotten} records: it did not run");
     assert!(there.iter().any(|it| !*it), "the control kept every record with no pin: it tests nothing");
+}
+
+/// The invariant: a sealed layer (`serve::sealed`) is installed only from records that hash to
+/// their signed manifest's entries. On the layer's own import path (`cli::store`'s
+/// `imported_into_layer`, what `blaze store install` and a home's first use run), a pack with
+/// one record's bytes changed after it was signed is a hard error naming the source and the
+/// record's key, never a layer that holds it. The control is the check removed
+/// (`stored::UNCHECKED`): the same tampered pack installs, so the refusal is the check's.
+#[cfg(feature = "native")]
+#[test]
+fn a_tampered_record_on_the_layer_import_is_refused_naming_the_source_and_the_key() {
+    use crate::cli::store::imported_into_layer;
+    use crate::serve::sealed::Cover;
+    let dir = tempfile::tempdir().unwrap();
+    let seed = [7u8; 32];
+    let (public, _) = super::sign(&seed, b"").unwrap();
+    let trust = Trust::new(vec![public]);
+    let mut first = origin(&dir.path().join("a"), 30);
+    let out = dir.path().join("out");
+    // A raw body, signed: what a release's `seal` publishes, uncompressed so one byte of one
+    // record can be changed.
+    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, Some(&seed), false, true, &|_| false).unwrap();
+    assert!(done.signed);
+    let base = Base::Dir(out.clone());
+    let cover = Cover(ContentId::of("blaze packs test cover", b"one"));
+    let shared = |name: &str| {
+        let at = dir.path().join(name);
+        fs::create_dir_all(at.join("store")).unwrap();
+        at
+    };
+    // The path itself works: the pack as it was signed installs whole.
+    let got = imported_into_layer(&shared("good"), cover, &base, "t1", "toolchain", &trust).unwrap().unwrap();
+    assert_eq!(got.summary.put, 30, "the untampered pack did not install whole: {got:?}");
+
+    let head = base.head("t1", "toolchain").unwrap().unwrap();
+    let manifest = base.manifest(&head).unwrap();
+    let body_at = out.join(layout::body_path(&head.pack));
+    let mut body = fs::read(&body_at).unwrap();
+    let at = body.len() / 2;
+    body[at] ^= 0x10;
+    fs::write(&body_at, &body).unwrap();
+    let hit = (0..manifest.records().len() as u32)
+        .find(|index| (at as u64) < manifest.at(*index) + manifest.records()[*index as usize].len)
+        .unwrap();
+    let named = manifest.records()[hit as usize].key.to_string();
+    let refused = imported_into_layer(&shared("tampered"), cover, &base, "t1", "toolchain", &trust).unwrap_err();
+    assert!(refused.contains(&named), "the refusal does not name the record {named}: {refused}");
+    assert!(refused.contains(&base.named()), "the refusal does not name the source: {refused}");
+
+    // The control: with the check removed the same tampered pack installs into a layer.
+    stored::UNCHECKED.set(true);
+    let planted = imported_into_layer(&shared("planted"), cover, &base, "t1", "toolchain", &trust);
+    stored::UNCHECKED.set(false);
+    let planted = planted.unwrap().unwrap();
+    assert_eq!(planted.summary.put, 30, "the planted bug's import did not take the pack: it tests nothing");
+}
+
+/// The invariant: a job's packs are its request's (`JobInput::packs`, made by
+/// `packs::given`): for a request that said `--no-prebuilt`, a source that has the key is
+/// never asked (its packs are not even loaded) and the key stays a miss, built here; for one
+/// that did not, the record is taken from the source into the job's store, its pack whole, so
+/// the unit is replayed, not built. The control is the switch ignored (the request that said
+/// `--no-prebuilt` given the packs anyway): the same lookup asks the source and finds the key,
+/// so the first half's miss is the switch's doing, not a source that could not answer.
+#[cfg(feature = "native")]
+#[test]
+fn with_no_prebuilt_a_source_that_has_the_key_is_never_asked() {
+    use std::sync::Arc;
+
+    use super::{Packs, SourceState, given};
+    let dir = tempfile::tempdir().unwrap();
+    let seed = [7u8; 32];
+    let (public, _) = super::sign(&seed, b"").unwrap();
+    let mut first = origin(&dir.path().join("a"), 12);
+    let out = dir.path().join("out");
+    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, Some(&seed), false, false, &|_| false).unwrap();
+    assert!(done.signed);
+    let config = Config::parse(&format!(
+        r#"{{ "sources": ["{}"], "trusted": ["{}"] }}"#,
+        out.display(),
+        blaze_pack::peer::hex(&public)
+    ))
+    .unwrap();
+    let home = dir.path().join("home");
+    let mut store = empty(&home);
+    // alloc: the test's store handle, which lives for the process as the daemon's does.
+    let handle: &'static blaze_cas::Handle = Box::leak(Box::new(blaze_cas::Handle::new(store.store(), home.clone())));
+    let packs = Arc::new(Packs::new(config, "t1".to_owned(), None, handle));
+    // What `unit::compile::names` does on a miss with the packs its job carries.
+    let look = |carried: Option<Arc<Packs>>, key: &Key| match carried {
+        Some(carried) => super::asked(&carried, &[], false, || Ok(super::missed(key))).unwrap(),
+        None => false,
+    };
+    let asked = |packs: &Packs| !matches!(packs.state.lock().sources[0], SourceState::New);
+
+    // `--no-prebuilt`: nothing is asked and nothing arrives.
+    assert!(given(Some(Arc::clone(&packs)), false).is_none(), "a request that said --no-prebuilt carries packs");
+    assert!(!look(given(Some(Arc::clone(&packs)), false), &key(3)));
+    assert!(!asked(&packs), "a source was asked for a request that said --no-prebuilt");
+    assert!((0..12).all(|n| !handle.has(&key(n))), "a record arrived for a request that said --no-prebuilt");
+
+    // The control, the switch ignored: the very lookup asks the source and takes the record.
+    let ignored = Some(Arc::clone(&packs));
+    assert!(look(ignored, &key(3)), "the source has the key and the lookup did not find it: the test tests nothing");
+    assert!(asked(&packs));
+
+    // Prebuilt (the default): the record and the rest of its pack are in the job's store,
+    // as its record was put there, so the unit that looks it up finds it and is not built.
+    let mut again = empty(&dir.path().join("home-2"));
+    // alloc: the second home's handle, as above.
+    let second: &'static blaze_cas::Handle = Box::leak(Box::new(blaze_cas::Handle::new(again.store(), dir.path().join("home-2"))));
+    let config = Config::parse(&format!(
+        r#"{{ "sources": ["{}"], "trusted": ["{}"] }}"#,
+        out.display(),
+        blaze_pack::peer::hex(&public)
+    ))
+    .unwrap();
+    let prebuilt = given(Some(Arc::new(Packs::new(config, "t1".to_owned(), None, second))), true);
+    assert!(prebuilt.is_some());
+    assert!(look(prebuilt, &key(5)));
+    for n in 0..12 {
+        let got = second.read(&key(n), |entry| (entry.kind, entry.bytes.to_vec())).unwrap();
+        assert_eq!(got, Some((kind(n), value(n))), "record {n} of the pack is not in the job's store as its source had it");
+    }
 }

@@ -280,6 +280,14 @@
    "why": "lane reth-1112: rule useful-not-parity matches cargo where real code depends on it, and reth does: its `reth-node-core` script stamps the build time and asks `git` whether the checkout is dirty, and says in its source that debug builds must not run it again. Traced, it read 2,916 files of the checkout: every build hashed them (13 s of each edit) and every edit ran it again and remade the crates above it. What is given up: such a script is not run again when a file it read outside its package changes (the `-dirty` suffix of a version string goes stale, as under cargo).",
    "recommended": "Yes.",
    "state": "built on reth-1112 (4787b9a562), not yet measured on reth; the owner has not seen it"
+  },
+  {
+   "id": "D31",
+   "date": "2026-11-12",
+   "decision": "A run with nothing changed is answered with no daemon: the thin client checks the request's slot (`<state>/slots/<key>`, blaze-certify) by lstat and execs the program; the daemon exits 600 s after the last edit (30 s if it did no work), never while a launcher is connected, and is held to D29's bound while it stays. Reverses D29's 'not a process a run'.",
+   "why": "Andrew, 2026-11-12 17:52: \"it needs to be better, not just 3x, but better\": Relax holds nothing between runs, so a daemon that stays loses the held row whatever it holds.",
+   "recommended": "Yes. The cost: the first edit after an idle exit pays a daemon start and a restore from disk.",
+   "state": "written on int-1112, not compiled"
   }
  ]
 }

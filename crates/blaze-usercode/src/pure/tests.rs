@@ -27,9 +27,9 @@ const TOOLS: &[&str] = &["/toolchain"];
 
 fn roots() -> crate::roots::RootMap {
     crate::roots::RootMap::default()
-        .with(crate::roots::Role::Package, Path::new("/ws/p"))
-        .with(crate::roots::Role::OutDir, Path::new("/ws/p/target/debug/build/p-0123/out"))
-        .with(crate::roots::Role::Target, Path::new("/ws/p/target"))
+        .with(crate::roots::Role::Package, Path::new("/ws/p"), &blaze_vfs::outside::Looks::none())
+        .with(crate::roots::Role::OutDir, Path::new("/ws/p/target/debug/build/p-0123/out"), &blaze_vfs::outside::Looks::none())
+        .with(crate::roots::Role::Target, Path::new("/ws/p/target"), &blaze_vfs::outside::Looks::none())
 }
 
 fn places(toolchain: &[PathBuf]) -> Places<'_> {
@@ -386,7 +386,7 @@ fn what_a_run_printed_and_wrote_is_checked_against_the_proof() {
         || OutFile {
             path: "x.rs".into(),
             executable: false,
-            bytes: Some(b"fn x() {}".to_vec()),
+            bytes: Some(b"fn x() {}".to_vec().into()),
             link: None,
         };
     checked_value("p", &proof(), &value(b"cargo:rustc-cfg=x\n", vec![file()])).unwrap();
@@ -465,7 +465,7 @@ fn a_kept_pure_result_is_found_until_a_variable_or_file_it_read_changes() {
         files: vec![OutFile {
             path: "x.rs".into(),
             executable: false,
-            bytes: Some(b"fn x() {}".to_vec()),
+            bytes: Some(b"fn x() {}".to_vec().into()),
             link: None,
         }],
     };
@@ -536,12 +536,13 @@ fn a_pure_result_kept_in_one_checkout_is_found_in_another() {
     let mut store = opened(&mut sim);
     let at = |home: &str| {
         let roots = crate::roots::RootMap::default()
-            .with(crate::roots::Role::Package, Path::new(&format!("{home}/p")))
+            .with(crate::roots::Role::Package, Path::new(&format!("{home}/p")), &blaze_vfs::outside::Looks::none())
             .with(
                 crate::roots::Role::OutDir,
                 Path::new(&format!("{home}/p/target/debug/build/p-0123/out")),
+                &blaze_vfs::outside::Looks::none(),
             )
-            .with(crate::roots::Role::Target, Path::new(&format!("{home}/p/target")));
+            .with(crate::roots::Role::Target, Path::new(&format!("{home}/p/target")), &blaze_vfs::outside::Looks::none());
         let inputs = Fixed {
             files: [(PathBuf::from(format!("{home}/p/data.txt")), [3; 32])].into(),
             env: vec![

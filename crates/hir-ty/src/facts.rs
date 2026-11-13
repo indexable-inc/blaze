@@ -160,7 +160,7 @@ pub enum Callee {
     /// A closure's body: it has no item of its own to ask a fact of yet (slice 2).
     Closure,
     /// Through a `dyn`: the target is whichever vtable the receiver carries. No bound on the
-    /// trait proves anything of it yet (`#[blaze::may(..)]` on the trait is a declared fact).
+    /// trait proves anything of it yet (`#[blaze::expect(..)]` on the trait is a declared fact).
     Dyn,
     /// Through a function pointer.
     Pointer,

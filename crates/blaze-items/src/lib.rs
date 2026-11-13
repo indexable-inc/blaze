@@ -314,6 +314,29 @@ pub enum Fact {
     /// made (rustc keeps the two apart too: `explicit_item_bounds` and `fn_sig` are not
     /// `collect_return_position_impl_trait_in_trait_tys`).
     RpititTys(ItemKey),
+    /// The inherent impls whose simplified self type is T, in the asking crate and every crate
+    /// it loads (blocks included), each by its key and signature: what
+    /// `InherentImpls::in_crate_for_self_ty` gives a body of the asking crate. Changes when an
+    /// impl of T is added, removed or changes its signature, not for an impl of another type.
+    InherentImpls(SimplifiedType),
+    /// The impls of a trait (by its key) in the asking crate and every crate it loads, each by
+    /// its key and signature: what `TraitImpls::for_crate_and_trait` gives a body of the asking
+    /// crate. Changes when an impl of that trait is added, removed or changed.
+    TraitImpls(ItemKey),
+    /// The traits the asking crate sees that have a value item named N, each by its key and the
+    /// signatures of those items: what `in_crate_trait_value_items` gives. Changes when a trait
+    /// gains, loses or changes an item named N, not for an item of another name.
+    TraitsNamed(NameHash),
+    /// The traits in a module's trait scope (by the module's key) that have a value item named
+    /// N, each by its key and those items' signatures: what `module_items_named` gives.
+    ScopeTraitsNamed {
+        scope: ItemKey,
+        name: NameHash,
+    },
+    /// Every trait and inherent impl declared in a block (by the key of the block's module),
+    /// each by its key and signature: what `TraitImpls::for_block` and `InherentImpls::for_block`
+    /// give a body that is not the block's owner.
+    BlockImpls(ItemKey),
 }
 
 /// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
@@ -342,6 +365,11 @@ pub mod kinds {
     pub const CRATE: QueryKind = QueryKind(0x1012);
     pub const HIDDEN_TYPES: QueryKind = QueryKind(0x1013);
     pub const RPITIT_TYS: QueryKind = QueryKind(0x1014);
+    pub const INHERENT_IMPLS: QueryKind = QueryKind(0x1015);
+    pub const TRAIT_IMPLS: QueryKind = QueryKind(0x1016);
+    pub const TRAITS_NAMED: QueryKind = QueryKind(0x1017);
+    pub const SCOPE_TRAITS_NAMED: QueryKind = QueryKind(0x1018);
+    pub const BLOCK_IMPLS: QueryKind = QueryKind(0x1019);
     // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
     // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
@@ -371,6 +399,11 @@ impl Fact {
             Fact::Crate(_) => kinds::CRATE,
             Fact::HiddenTypes(_) => kinds::HIDDEN_TYPES,
             Fact::RpititTys(_) => kinds::RPITIT_TYS,
+            Fact::InherentImpls(_) => kinds::INHERENT_IMPLS,
+            Fact::TraitImpls(_) => kinds::TRAIT_IMPLS,
+            Fact::TraitsNamed(_) => kinds::TRAITS_NAMED,
+            Fact::ScopeTraitsNamed { .. } => kinds::SCOPE_TRAITS_NAMED,
+            Fact::BlockImpls(_) => kinds::BLOCK_IMPLS,
         }
     }
 
@@ -391,7 +424,12 @@ impl Fact {
             | Fact::DropCheck(it)
             | Fact::Derive(it)
             | Fact::HiddenTypes(it)
-            | Fact::RpititTys(it) => hasher.id(&it.0),
+            | Fact::RpititTys(it)
+            | Fact::TraitImpls(it)
+            | Fact::BlockImpls(it) => hasher.id(&it.0),
+            Fact::InherentImpls(self_ty) => hasher.id(&self_ty.0),
+            Fact::TraitsNamed(name) => hasher.id(&name.0),
+            Fact::ScopeTraitsNamed { scope, name } => hasher.id(&scope.0).id(&name.0),
             Fact::Field { ty, field } => hasher.id(&ty.0).update(&field.to_le_bytes()),
             Fact::Method { self_ty, name } => hasher.id(&self_ty.0).id(&name.0),
             Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {

@@ -204,6 +204,7 @@ fn targets(cargo: bool) -> Targets {
             files: vec![("/home/a/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())],
             width: Some(100),
             command: "build".to_owned(),
+            prebuilt: true,
             verbose: 2,
             refused: Some(16),
         }),

@@ -19,6 +19,8 @@
 
 pub(super) mod harness;
 mod kept;
+/// A crate's kept roots kept as a record, served and stored beside its impl tables.
+pub use self::kept::frozen as kept_record;
 mod outside;
 #[cfg(test)]
 mod tests;

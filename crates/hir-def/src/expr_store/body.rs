@@ -228,7 +228,7 @@ impl Body {
 }
 
 /// The syntax of the item `def` is the body of.
-fn def_syntax(db: &Db, def: DefWithBodyId) -> InFile<view::Node<'_>> {
+pub(crate) fn def_syntax(db: &Db, def: DefWithBodyId) -> InFile<view::Node<'_>> {
     match def {
         DefWithBodyId::FunctionId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),
         DefWithBodyId::ConstId(it) => it.lookup(db).source_view(db).map(|it| it.syntax()),

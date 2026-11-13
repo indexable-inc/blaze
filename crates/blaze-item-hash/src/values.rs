@@ -22,6 +22,8 @@
 //! - `WholeScope(module)`: every name of a module's scope with what it is there (each name's
 //!   `Resolves` value): what a read of a whole scope stands for, an iteration and never a
 //!   lookup. Any name added to the module changes it; it is per module, never per crate.
+//! - `FieldOrder`: the field order plan every layout reads (`hir_ty::layout::field_order`), by
+//!   its content ID, or that there is none: one fact for the build, no subject but a tag.
 //!
 //! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
 //! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
@@ -49,6 +51,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{
     body_store::{Step, step_value},
+    layout::field_order::FieldOrder,
     method_resolution::{loaded_crates, scope_sets::module_trait_set},
     next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
@@ -78,6 +81,8 @@ pub mod kinds {
     /// What a crate's def map holds outside its modules' scopes: its preludes, what its
     /// root's attributes decide for name resolution, whether it shadows a primitive type.
     pub const CRATE_NAMES: QueryKind = QueryKind(0x1808);
+    /// The build's field order plan, which every ADT's layout reads.
+    pub const FIELD_ORDER: QueryKind = QueryKind(0x1809);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -88,6 +93,11 @@ const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
 const TRAITS_DOMAIN: &str = "blaze v2 item-hash traits in scope 1";
 const WHOLE_SCOPE_DOMAIN: &str = "blaze v2 item-hash whole scope 1";
 const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
+const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
+
+/// The subject of the [`kinds::FIELD_ORDER`] fact: a tag, which no key is. The plan is one
+/// for the build, so the fact names nothing else.
+const FIELD_ORDER_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: field order!");
 
 /// The subject of a fact about the body's own item (a function, const or static, or a
 /// discriminant's variant), in place of its key: a tag, which no hash is. What it stands for
@@ -162,6 +172,8 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
             Some(Resolved::Module(root)) => Some(crate_names_of(db, root.krate(db))),
             Some(_) => None,
         }
+    } else if kind == kinds::FIELD_ORDER {
+        (fact.subject == FIELD_ORDER_SUBJECT).then(|| field_order_of(db))
     } else if kind == kinds::TRAITS_IN_SCOPE || kind == kinds::WHOLE_SCOPE {
         match key::resolve(db, ItemKey(fact.subject)) {
             None => Some(absent(kind)),
@@ -174,6 +186,23 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
     } else {
         None
     }
+}
+
+/// The `FieldOrder` fact: what a read of the field order plan's input stands for.
+pub fn field_order() -> FactRef {
+    FactRef { kind: kinds::FIELD_ORDER, subject: FIELD_ORDER_SUBJECT, object: FactObject::None }
+}
+
+/// The plan's content ID, or that the build has none: what every layout reads of it. Equal
+/// plans are equal IDs (`FieldOrderPlan`'s own equality).
+fn field_order_of(db: &Db) -> ContentId {
+    let plan = FieldOrder::try_get(db).and_then(|it| it.plan(db).as_ref().map(|plan| plan.id()));
+    let mut h = Hasher::new(FIELD_ORDER_DOMAIN);
+    match plan {
+        Some(id) => h.update(&[1]).id(&id),
+        None => h.update(&[0]),
+    };
+    h.finish()
 }
 
 /// The `TraitsInScope` fact of `module`.
@@ -468,6 +497,20 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
         Some(feature) => h.update(&[1]).part(feature.as_str().as_bytes()),
         None => h.update(&[0]),
     };
+    // What a layout reads besides the flags: the `#[repr]` an ADT's flags say it has, and
+    // what its `#[blaze::bits]` says of its backing, each as its value's `Debug` text, fed to
+    // the hasher as it is written (both values are made of the attributes' tokens alone, so
+    // the text is the same in every process).
+    if let AttrDefId::AdtId(adt) = owner
+        && flags.contains(AttrFlags::HAS_REPR)
+    {
+        h.update(b"repr");
+        feed_debug(&mut h, &AttrFlags::repr_assume_has(db, adt));
+    }
+    if let Some(bits) = AttrFlags::blaze_bits(db, owner) {
+        h.update(b"bits");
+        feed_debug(&mut h, &bits);
+    }
     if let AttrDefId::FunctionId(function) = owner {
         let features = AttrFlags::target_features(db, function).iter().map(|it| it.as_str());
         // alloc: none for up to 8 target features, the most a function names in practice.
@@ -479,6 +522,21 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
         }
     }
     h.finish()
+}
+
+/// Hashes `value`'s `Debug` text into `h` as it is written, with no buffer, then an end mark
+/// no text holds (`0xff` is no UTF-8 byte).
+fn feed_debug(h: &mut Hasher, value: &impl std::fmt::Debug) {
+    struct Fed<'a>(&'a mut Hasher);
+    impl std::fmt::Write for Fed<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    std::fmt::Write::write_fmt(&mut Fed(&mut *h), format_args!("{value:?}"))
+        .expect("a `Debug` into a hasher does not fail");
+    h.update(&[0xff]);
 }
 
 /// A crate's lang items by item key, the crates it loads and depends on by crate key (itself

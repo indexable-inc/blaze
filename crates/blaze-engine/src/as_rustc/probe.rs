@@ -167,12 +167,15 @@ pub(super) fn check(
         .iter()
         .position(|it| !it.is_std && it.mode != UnitMode::RunCustomBuild && it.target.is_lib())
         .context("the load made no unit of the probe's crate")?;
+    // A probe keeps no records: nothing of it is sealed.
+    let sealed = blaze_lower::unsealed(&units);
     let lower = blaze_lower::Lower {
         units: &units,
         config: &config,
         files: &*tree,
         root: tree.view,
         host_cpu: None,
+        sealed: &sealed,
     };
     let mut lowered =
         blaze_lower::lower(lower).context("lowering the probe with the standard library")?;

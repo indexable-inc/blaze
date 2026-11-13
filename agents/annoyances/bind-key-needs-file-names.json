@@ -1,0 +1,14 @@
+{
+ "id": "bind-key-needs-file-names",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor T4 of track 7b, int-1112",
+ "where": "crates/hir-ty-codegen/v2/frontend/described.rs HirFrontend::naming_of; crates/blaze-engine/tests/revisions (as_built, status, spans)",
+ "what": "A launched run binds a function's first call from a record keyed by its describe key, which holds content and never place, so one record serves every machine. The bytes it binds hold names of files (`file!()`, a panic's location, the span tables positions are read from), and a registry crate's are under `$CARGO_HOME`: a key of the describe alone would serve one machine's names on another. The revision driver could not say a launched run is the built program either: it read no exit status, never ran the file `blaze build` makes, and counted no spans.",
+ "cost": "a launched run's correctness rested on review; no case caught a key that missed the names",
+ "cause": "a store key was reused for an output with one more input than the value it was made for (rule 21)",
+ "class": "a key carried over from one value to a derived value whose bytes read more than the first",
+ "prevention": "each record's key is built from its own value's inputs: the bind key is the describe key, the naming, the policy and the program's symbols; a case that changes only the input left out shows in the program's output",
+ "workaround": "none",
+ "fix": "naming_of hashes the names of the root files of the home and every crate it loads; a_naming_moves_with_a_root_files_name_and_with_nothing_else holds it (control: the dependencies left out). The revision cases a_launched_run_*_prints_what_the_built_program_prints hold a run to the built file's stdout, stderr and status; the six-dependency one moves $CARGO_HOME under a second home and prints the directory hashbrown's panic names.",
+ "state": "written, not yet built or run"
+}

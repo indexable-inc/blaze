@@ -3,11 +3,9 @@
 //!
 //! What it checks:
 //! - the daemon image (`<state>/db/image`): that it is an image of this blaze's layout whose
-//!   spine hashes to what it names, every group of every section against its CRC32C
-//!   ([`blaze_image::Image::verify`]), and every reference of the database's sections (a table
-//!   slot's memo, a memo's edges, value and key bytes, an input's path) against what the image
-//!   holds ([`blaze_query::Database::check_image`]): the check a restore makes, plus the
-//!   groups a restore checks only as it reads them;
+//!   spine hashes to what it names, and every group of every section against its CRC32C
+//!   ([`blaze_image::Image::verify`]): the check a start makes, plus the groups a start checks
+//!   only as it reads them;
 //! - the profile history (`<state>/profile`): that its manifest reads and lists files that
 //!   are there ([`blaze_profile::history::read_manifest`]).
 //!
@@ -22,12 +20,10 @@ use std::{
     ffi::OsString,
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use blaze_core::{Mapping, exit::Exit};
 use blaze_image::{Image, OpenError};
-use blaze_query::{Database, DbError};
 use serde::Serialize;
 
 use super::say;
@@ -187,11 +183,11 @@ fn image(file: &Path) -> Check {
         Err(error) => return check(Verdict::Fault, format!("it cannot be read: {error}")),
     };
     let len = bytes.len();
-    // Copied to a 16-byte boundary, as a mapped file's pages are: the database's records need it.
+    // Copied to a 16-byte boundary, as a mapped file's pages are.
     let mapping = Mapping::copy(&bytes);
     drop(bytes);
     let opened = match Image::open(mapping) {
-        Ok(opened) => Arc::new(opened),
+        Ok(opened) => opened,
         Err(error @ OpenError::Layout { .. }) => {
             return check(
                 Verdict::Unused,
@@ -209,22 +205,10 @@ fn image(file: &Path) -> Check {
         return check(Verdict::Fault, format!("{first}{more}"));
     }
     let sections = opened.sections().len();
-    let whole = format!("{} in {sections} sections, every group's checksum holds", size(len));
-    // clone: a count of the image, once a check
-    match Database::check_image(opened.clone()) {
-        Ok(checked) => check(
-            Verdict::Ok,
-            format!(
-                "{whole}; the database's {} memos of {} keys, {} edges and {} inputs name only what the image holds",
-                checked.memos, checked.keys, checked.edges, checked.inputs
-            ),
-        ),
-        Err(DbError::Refused(refused)) => check(
-            Verdict::Unused,
-            format!("{whole}; {refused}: this blaze starts with an empty database rather than read it"),
-        ),
-        Err(error) => check(Verdict::Fault, error.to_string()),
-    }
+    check(
+        Verdict::Ok,
+        format!("{} in {sections} sections, every group's checksum holds", size(len)),
+    )
 }
 
 /// The profile history in `dir`: its manifest read, as every reader of it does.
@@ -300,7 +284,7 @@ mod tests {
 
     use super::*;
 
-    /// An image of one section the database does not read: whole, and no database's.
+    /// An image of one section, as a daemon writes the plane's history.
     fn an_image() -> Vec<u8> {
         let mut builder = Builder::new();
         builder.add(SectionId::PLANE_HISTORY, SchemaHash(ContentId([3; 32])), &[7; 5000]);
@@ -328,11 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_image_of_no_database_is_unused_not_a_fault() {
+    fn a_whole_image_is_sound() {
         let dir = state_with(Some(&an_image()));
         let report = examine(dir.path(), 7);
         assert!(report.ok, "{report:?}");
-        assert_eq!(report.checks[0].verdict, Verdict::Unused, "{report:?}");
+        assert_eq!(report.checks[0].verdict, Verdict::Ok, "{report:?}");
         assert!(report.checks[0].said.contains("every group's checksum holds"), "{report:?}");
     }
 

@@ -45,13 +45,12 @@ use span::{
 use std::alloc::Global;
 use syntax::ast;
 use thin_vec::ThinVec;
-use triomphe::Arc as TArc;
 use tt::{Delimiter, DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree};
 
 use crate::{
     AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, DefWithBodyId,
     EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc, ExternCrateId,
-    ExternCrateLoc, FunctionLoc, FxIndexMap, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
+    ExternCrateLoc, FunctionLoc, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
     ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId, UseLoc,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -64,12 +63,11 @@ use crate::{
     item_tree::{TreeId, VisibilityExplicitness},
     lang_item::{LangItemEnum, LangItemTarget, LangItems},
     nameres::{
-        DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin, ModulesSlot,
+        DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin,
         diagnostics::{DefDiagnosticKind, PreludeError, TraitItemImport},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use, Used},
     },
     per_ns::{Item, Namespace},
-    unstable_features::UnstableFeatures,
     visibility::Visibility,
 };
 
@@ -238,32 +236,25 @@ fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
     krate.given::<DefMapSlot, Frozen>(db).cloned()
 }
 
-/// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
-/// `DefMap` is frozen. Bytes that do not read stop the query with [`Unreadable`], failing the
-/// job that asked: never a panic of the daemon, and never a crate resolved instead.
+/// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it: the
+/// crate's def map read from its pages ([`pages::set`]), a name at a time; nothing decodes a
+/// crate's def map whole. Under [`Mode::Verify`] what was read is written again as pages and
+/// compared with the record ([`FrozenDefMaps`] holds it whole, for that alone); under
+/// [`Mode::Check`] the crate is given no pages and is resolved, and [`check`] compares. Pages
+/// that do not read stop the query with [`Unreadable`], failing the job that asked: never a
+/// panic of the daemon, and never a crate resolved instead.
 pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
-    // A crate given pages is read from them and from nothing else: its frozen bytes, when it
-    // was given those as well (the image's part, for the image's other readers), are not
-    // decoded. One path a crate, said by what it was given ([`pages::set`]).
-    if pages::is_paged(db, krate) {
-        // The value is the record's, found by content: told to the engine (`row::STORED`).
-        blaze_query::db::report_stored_read(db);
-        return Some(pages::served(db, krate));
-    }
-    let frozen = frozen_def_map(db, krate)?;
-    if frozen.mode == Mode::Check {
+    if !pages::is_paged(db, krate) {
         return None;
     }
-    // As above: read from the image, in `Mode::Serve` and `Mode::Verify` alike (neither
-    // resolves the crate; `Mode::Check` does, and its row's reads are its own).
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
     blaze_query::db::report_stored_read(db);
-    let (def_map, local) = match decode(db, krate, &frozen.bytes) {
-        Ok(it) => it,
-        Err(why) => Unreadable::of(db, krate, "def map", why).throw(),
-    };
-    if frozen.mode == Mode::Verify {
-        match encode_maps(db, krate, &def_map, &local) {
-            Ok(written) if *written == *frozen.bytes => {}
+    let (def_map, local) = pages::served(db, krate);
+    if let Some(frozen) = frozen_def_map(db, krate)
+        && frozen.mode == Mode::Verify
+    {
+        match pages::encode_of(db, krate, &def_map, &local) {
+            Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
             Ok(written) => differs(db, krate, "what was read of it", &written, &frozen.bytes),
             // alloc: error path
             Err(why) => differs(db, krate, &format!("what was read of it ({why})"), &[], &[]),
@@ -272,20 +263,48 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     Some((def_map, local))
 }
 
-/// Whether [`served`] gives `krate`'s `DefMap` from the image, without decoding it: the name
-/// resolution maintainer never maintains such a crate.
+/// Whether [`served`] gives `krate`'s `DefMap` from its pages: the name resolution maintainer
+/// never maintains such a crate.
 pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
-    pages::is_paged(db, krate) || frozen_def_map(db, krate).is_some_and(|it| it.mode != Mode::Check)
+    pages::is_paged(db, krate)
 }
 
-/// Records a difference between the `DefMap` resolving found and the frozen one, in
-/// [`Mode::Check`].
+/// A test's serve of `records` (each crate's def map pages, as [`pages::encode`] writes them)
+/// in `mode`, held whole in memory, as `crate::deps::serve` gives a crate's records: its pages
+/// under [`Mode::Serve`] and [`Mode::Verify`], the record whole under [`Mode::Check`] and
+/// [`Mode::Verify`].
+#[cfg(test)]
+pub(crate) fn serve_pages(db: &mut Db, records: &[(Crate, Vec<u8>)], mode: Mode) {
+    if mode != Mode::Serve {
+        let maps = (records.iter())
+            .map(|(krate, bytes)| (*krate, Frozen { bytes: bytes.as_slice().into(), mode }))
+            .collect();
+        set(db, maps);
+    }
+    if mode != Mode::Check {
+        let maps = (records.iter())
+            .map(|(krate, bytes)| {
+                let held: crate::deps::ImageBuf =
+                    Arc::new(blaze_format::Aligned::copy_from(bytes));
+                let key = blaze_ids::ContentId::of("blaze test def map pages", bytes);
+                // dyn: a test's holder of one record, one a crate
+                let source: Arc<dyn pages::PageSource> = Arc::new(pages::Whole(held));
+                (*krate, pages::Paged { key, source })
+            })
+            .collect();
+        pages::set(db, maps);
+    }
+}
+
+/// Records a difference between the `DefMap` resolving found, written as pages, and the
+/// crate's pages, in [`Mode::Check`].
 pub(super) fn check(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap) {
     let Some(frozen) = frozen_def_map(db, krate) else { return };
     if frozen.mode != Mode::Check {
         return;
     }
-    match encode_maps(db, krate, def_map, local) {
+    // The record is the crate's pages: what resolving found is written as pages to compare.
+    match pages::encode_of(db, krate, def_map, local) {
         Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
         Ok(written) => differs(db, krate, "the live one", &written, &frozen.bytes),
         Err(why) => {
@@ -2488,17 +2507,6 @@ impl<'a> Dec<'a> {
     }
 }
 
-fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<(DefMap, LocalDefMap)> {
-    let mut dec = Dec::new(db, krate, bytes);
-    dec.files()?;
-    dec.in_def_map = true;
-    let mut def_map = dec.def_map()?;
-    let local = dec.local()?;
-    dec.finish()?;
-    def_map.hand_over_scopes(db);
-    Ok((def_map, local))
-}
-
 impl Dec<'_> {
     pub fn u8(&mut self) -> R<u8> {
         Ok(self.r.u8()?)
@@ -3644,139 +3652,6 @@ impl Dec<'_> {
         })
     }
 
-    fn def_map(&mut self) -> R<DefMap> {
-        let db = self.db;
-        let krate = self.krate;
-        let edition = self.edition()?;
-        let mut data = DefMapCrateData::new(edition);
-        data.proc_macro = self.bool()?;
-        data.rustc_coherence_is_core = self.bool()?;
-        data.no_core = self.bool()?;
-        data.no_std = self.bool()?;
-        data.arbitrary_ints = self.bool()?;
-        data.handles = self.bool()?;
-        data.views = self.bool()?;
-        data.pattern_types = self.bool()?;
-        data.early_drop = self.bool()?;
-        data.recursion_limit = self.option(Self::u32)?;
-        data.registered_tools = self.many(Self::symbol)?;
-        let mut features = UnstableFeatures::default();
-        for it in self.many(Self::symbol)? {
-            features.enable(it);
-        }
-        data.unstable_features = features;
-
-        // The modules: the root as `DefMap::empty` makes it (the crate's one root id,
-        // `facts::queries::crate_root`, the maintainer's too), and the others as the collector
-        // does, each in its parent: a crate read from its image has the module ids it has
-        // when resolved.
-        let (n, room) = self.len_and_room()?;
-        let mut skeleton = Vec::with_capacity(room);
-        for _ in 0..n {
-            let parent = self.option(Self::u32)?;
-            let name = self.option(Self::name)?;
-            skeleton.push((parent, name));
-        }
-        let placeholder = ModuleData::new(
-            ModuleOrigin::CrateRoot { definition: krate.root_file_id(db) },
-            Visibility::Public,
-            None,
-        );
-        let mut def_map = DefMap::empty(db, krate, TArc::new(data), placeholder, None);
-        self.own.to_mut().push(def_map.root);
-        for (parent, name) in skeleton.iter().skip(1) {
-            let parent = parent.ok_or("a module with no parent")? as usize;
-            let parent = *self.own.get(parent).ok_or("a module before its parent")?;
-            // clone: the decoded map's own storage, once per crate served
-            let name = name.clone().ok_or("a module with no name")?;
-            let module = super::facts::queries::child_module(db, krate, None, parent, name);
-            self.own.to_mut().push(module);
-        }
-        let mut table = super::ModulesMap::new();
-        for (index, (parent, _)) in skeleton.iter().enumerate() {
-            let origin = self.origin()?;
-            let visibility = self.visibility()?;
-            let scope = self.scope()?;
-            let (n, room) = self.len_and_room()?;
-            let mut children = FxIndexMap::with_capacity_and_hasher(room, Default::default());
-            for _ in 0..n {
-                let name = self.name()?;
-                let child = self.len()?;
-                children.insert(name, *self.own.get(child).ok_or("a child not read")?);
-            }
-            let parent = parent.map(|it| self.own[it as usize]);
-            let module = ModuleData::collected(
-                self.db,
-                self.own[index],
-                origin,
-                visibility,
-                parent,
-                scope,
-                children,
-            );
-            table.insert(self.own[index], module);
-        }
-        def_map.modules = ModulesSlot::Building(table);
-
-        def_map.prelude = self.option(|dec| {
-            let module = dec.module()?;
-            Ok((module, dec.option(Self::use_id)?))
-        })?;
-        def_map.macro_use_prelude = self
-            .many(|dec| {
-                let name = dec.name()?;
-                let id = dec.macro_id()?;
-                Ok((name, (id, dec.option(Self::extern_crate)?)))
-            })?
-            .into_iter()
-            // alloc: the decoded map's own storage, once per crate served
-            .collect();
-        def_map.derive_helpers_in_scope = self
-            .many(|dec| {
-                let ast_id = dec.ast_id()?;
-                let helpers = dec.many(|dec| {
-                    let name = dec.name()?;
-                    let id = dec.macro_id()?;
-                    let call = match dec.u8()? {
-                        0 => Either::Left(dec.call()?),
-                        1 => Either::Right(dec.builtin_derive_impl()?),
-                        // alloc: error path
-                        it => return Err(format!("derive helper {it}")),
-                    };
-                    Ok((name, id, call))
-                })?;
-                Ok((ast_id, helpers))
-            })?
-            .into_iter()
-            // alloc: the decoded map's own storage, once per crate served
-            .collect();
-        let exported = self.many(|dec| {
-            let id = dec.macro_id()?;
-            Ok((id, dec.many(Self::name)?.into_boxed_slice()))
-        })?;
-        let functions = self.many(|dec| {
-            let ModuleDefId::FunctionId(function) = dec.def()? else {
-                // alloc: error path
-                return Err("a procedural macro of no function".to_owned());
-            };
-            let MacroId::ProcMacroId(id) = dec.macro_id()? else {
-                // alloc: error path
-                return Err("a function of a macro no procedural one".to_owned());
-            };
-            Ok((function, id))
-        })?;
-        let data = TArc::get_mut(&mut def_map.data).ok_or("the def map's crate data is shared")?;
-        // alloc: the decoded map's own storage, once per crate served
-        data.exported_derives = exported.into_iter().collect();
-        // alloc: the decoded map's own storage, once per crate served
-        data.fn_proc_macro_mapping_back = functions.iter().map(|&(f, id)| (id, f)).collect();
-        // alloc: the decoded map's own storage, once per crate served
-        data.fn_proc_macro_mapping = functions.into_iter().collect();
-        def_map.names = self.name_records()?;
-        def_map.diagnostics = self.many(Self::diagnostic)?;
-        Ok(def_map)
-    }
-
     fn name_records(&mut self) -> R<NameRecords> {
         let uses = self.many(|dec| {
             let import = dec.import_or_extern_crate()?;
@@ -3916,24 +3791,26 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
             .unwrap()
     }
 
-    /// The bytes of each crate of a fresh database of [`FIXTURE`], dependencies first.
+    /// The def map pages of each crate of a fresh database of [`FIXTURE`], dependencies
+    /// first: what a crate's def map is served from.
     fn frozen() -> Vec<(&'static str, Vec<u8>)> {
         let db = fixture::db(FIXTURE).into_db();
         ["lib", "main"]
             .into_iter()
-            .map(|name| (name, encode(&db, crate_named(&db, name)).unwrap()))
+            .map(|name| (name, pages::encode(&db, crate_named(&db, name)).unwrap()))
             .collect()
+    }
+
+    /// `bytes`, def map pages by crate name, served to the crates of `db` in `mode`.
+    fn serve_named(db: &mut TestDB, mode: Mode, bytes: &[(&'static str, Vec<u8>)]) {
+        let records: Vec<(Crate, Vec<u8>)> =
+            bytes.iter().map(|(name, bytes)| (crate_named(db, name), bytes.clone())).collect();
+        serve_pages(db, &records, mode);
     }
 
     fn with(mode: Mode, bytes: &[(&'static str, Vec<u8>)]) -> TestDB {
         let mut db = fixture::db(FIXTURE).into_db();
-        let maps = bytes
-            .iter()
-            .map(|(name, bytes)| {
-                (crate_named(&db, name), Frozen { bytes: bytes.as_slice().into(), mode })
-            })
-            .collect();
-        set(&mut db, maps);
+        serve_named(&mut db, mode, bytes);
         db
     }
 
@@ -3972,7 +3849,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         for (name, written) in &bytes {
             let krate = crate_named(&db, name);
             _ = super::super::crate_def_map(&db, krate);
-            assert_eq!(encode(&db, krate).as_ref(), Ok(written), "{name}");
+            assert_eq!(pages::encode(&db, krate).as_ref(), Ok(written), "{name}");
         }
         assert_eq!(differences(), Vec::<String>::new());
     }
@@ -4144,9 +4021,7 @@ macro_rules! unroll { () => { pub fn made() {} } }
         let bytes = encode(&db, lib).unwrap();
         assert_eq!(unreadable(&db, lib, &bytes), None);
         let mut served = fixture::db(INCLUDED).into_db();
-        let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
-        let served_lib = crate_named(&served, "lib");
-        set(&mut served, [(served_lib, frozen)].into_iter().collect());
+        serve_named(&mut served, Mode::Serve, &[("lib", pages::encode(&db, lib).unwrap())]);
         for name in ["lib", "main"] {
             let dump =
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
@@ -4192,13 +4067,11 @@ pub mod inside { pub fn f() {} }
             assert_eq!(unreadable(&other, krate, written), None, "{name}");
         }
         let mut served = fixture::db(&WROTE.replace("first", "other")).into_db();
-        let maps = (bytes.iter())
-            .map(|(name, bytes)| {
-                let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
-                (crate_named(&served, name), frozen)
-            })
+        let paged: Vec<_> = ["lib", "main"]
+            .into_iter()
+            .map(|name| (name, pages::encode(&first, crate_named(&first, name)).unwrap()))
             .collect();
-        set(&mut served, maps);
+        serve_named(&mut served, Mode::Serve, &paged);
         for name in ["lib", "main"] {
             let dump =
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
@@ -4296,13 +4169,11 @@ pub mod inside { pub fn f() {} }
         }
         // Read under the other home, it is the crate resolved there, its literal that home's.
         let mut served = fetched("homeB", Some("/homeB/sources"));
-        let maps = (bytes.iter())
-            .map(|(name, bytes)| {
-                let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
-                (crate_named(&served, name), frozen)
-            })
+        let paged: Vec<_> = ["lib", "main"]
+            .into_iter()
+            .map(|name| (name, pages::encode(&a, crate_named(&a, name)).unwrap()))
             .collect();
-        set(&mut served, maps);
+        serve_named(&mut served, Mode::Serve, &paged);
         for name in ["lib", "main"] {
             let dump =
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
@@ -4327,11 +4198,10 @@ pub mod inside { pub fn f() {} }
         // Bytes written with a port are refused by a database told none, by name: the mark
         // is not read as text.
         let ported = fetched("homeA", Some("/homeA/sources"));
-        let bytes = encode(&ported, crate_named(&ported, "lib")).unwrap();
+        let bytes = pages::encode(&ported, crate_named(&ported, "lib")).unwrap();
         let mut served = fetched("homeA", None);
         let lib = crate_named(&served, "lib");
-        let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
-        set(&mut served, [(lib, frozen)].into_iter().collect());
+        serve_named(&mut served, Mode::Serve, &[("lib", bytes)]);
         let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::super::crate_def_map(&served, lib).dump(&served)
         }));

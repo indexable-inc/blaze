@@ -218,9 +218,12 @@ pub struct Profiling {
     /// `blaze-history` thread writes, and the explorer and `blaze debug sql` read.
     pub dir: PathBuf,
     pub duckdb: Option<PathBuf>,
-    /// The number of the daemon's first build: past every build the history names, so a build
-    /// stays one id across the daemon's restarts ([`History::next_build`]). Never 0.
-    pub first_build: u32,
+    /// The number of the daemon's first build, once the history's thread opened it: past
+    /// every build the history names, so a build stays one id across the daemon's restarts
+    /// ([`History::next_build`]), never 0; or the history's error. Taken by
+    /// [`Observe::numbering`]; `None` once taken (and in a test's profiling, which numbers
+    /// from 1).
+    pub opened: Option<Receiver<Result<u32, String>>>,
     ended: Sender<ToHistory>,
     failed: Receiver<String>,
     /// What the history's thread tells the loop of `blaze why`'s ledger: its restore, and each
@@ -229,6 +232,50 @@ pub struct Profiling {
     /// What the history's thread is doing, for a `blaze why` that waited too long to name.
     doing: Arc<Doing>,
 }
+
+/// How long the daemon's first build waits for the profile history to open before it fails,
+/// naming the history and its thread (rule 18): the open syncs twice and replays what the last
+/// daemon left, at most a few hundred milliseconds when measured.
+pub const OPEN_WAIT: Duration = Duration::from_secs(120);
+
+/// Why the daemon's builds cannot be numbered: the profile history at `dir` did not open.
+/// The daemon stops on it (`daemon::Failed::History`), as its start did when it waited for
+/// the open: a build numbered past no history could take the id of a build it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unopened {
+    pub dir: PathBuf,
+    pub why: Unopen,
+}
+
+/// What [`Unopened`] says of the open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unopen {
+    /// The history's own error.
+    Failed(String),
+    /// Its thread ended without a word.
+    Gone,
+    /// No word in [`OPEN_WAIT`].
+    Waited(Duration),
+}
+
+impl std::fmt::Display for Unopened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dir = self.dir.display();
+        match &self.why {
+            Unopen::Failed(why) => write!(f, "the profile history at {dir} did not open: {why}"),
+            Unopen::Gone => write!(
+                f,
+                "the profile history at {dir} did not open: its thread (`blaze-history`) ended before it opened it"
+            ),
+            Unopen::Waited(waited) => write!(
+                f,
+                "the profile history at {dir} did not open in {waited:?} (serve/observe.rs OPEN_WAIT): its thread (`blaze-history`) never answered"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unopened {}
 
 /// How long a `blaze why` waits for the builds that ended before it was asked to be explained,
 /// on the loop's clock, before it fails naming the build and what the history's thread is
@@ -377,6 +424,9 @@ enum ToHistory {
     /// no client waits for a write, and one that fails is the history's failure, said in
     /// `blaze status` as any flush's is.
     Client(history::ClientRows),
+    /// A solo answer the loop took from its kept rows ([`Observe::solo_rows`]), numbered as a
+    /// build of its own: its row and its client's spans, written by the next flush made.
+    Solo(history::Solo, history::ClientRows),
     /// A message whose taking panics, saying this: the planted fault of the supervised
     /// thread's test.
     #[cfg(test)]
@@ -613,12 +663,17 @@ fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyedMiss> {
     misses.iter().map(keyed).collect()
 }
 
-/// What the query engine counted since the last take, as `build`'s `query_counts` rows. Taken
-/// on the loop as the build ends, so the next build's runs are its own.
-fn query_counts(build: u64) -> Vec<QueryCountRow> {
+/// What the query engine counted since the last take, as `build`'s `query_counts` rows: the
+/// front end's, by ingredient, and the daemon's own database's (`plan`, `std units`, the
+/// load's queries, by `Query::NAME`). Taken on the loop as the build ends, so the next build's
+/// runs are its own.
+fn query_counts(build: u64, plan: Option<&blaze_query::Database>) -> Vec<QueryCountRow> {
     // alloc: once a build, a row a query function that did anything
     let mut rows = Vec::new();
     blaze_query::db::take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
+    if let Some(plan) = plan {
+        plan.take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
+    }
     rows
 }
 
@@ -704,9 +759,58 @@ impl Keeper {
     }
 }
 
-/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on,
-/// writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]); a history that does not
-/// open is the error, which fails `blaze serve`.
+/// The bytes the home's own store at `store` holds as the daemon starts, before it is opened:
+/// the length of every file under it (its packs, index table and whole files, as
+/// `blaze_cas::collect::Usage::bytes` counts them, with what is not yet committed). A store not
+/// made yet holds nothing; any other error names the file and fails the start. A layer read
+/// behind the store is another writer's directory, outside it, so it is not counted.
+fn home_store_bytes(store: &Path) -> Result<u64, String> {
+    let _span = tracing::info_span!(target: "blaze", "profile cap: measure the home's store", dir = %store.display()).entered();
+    let mut sum = 0u64;
+    // alloc: once a daemon's start, the directories still to list
+    let mut dirs = vec![store.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                // alloc: an error, once a daemon
+                return Err(format!("listing {} to size the profile's cap: {error}", dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                // alloc: an error, once a daemon
+                format!("listing {} to size the profile's cap: {error}", dir.display())
+            })?;
+            // A file the store removes as it is listed (it is not open yet: only a peer's
+            // collector) holds nothing.
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    // alloc: an error, once a daemon
+                    return Err(format!(
+                        "reading {} to size the profile's cap: {error}",
+                        entry.path().display()
+                    ));
+                }
+            };
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                sum = sum.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(sum)
+}
+
+/// Starts the thread `blaze-history`, which opens the history in `state` and keeps it from
+/// then on, writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]). Returns once
+/// the thread is spawned, never waiting for the open (its syncs, its replay of what the last
+/// daemon left): the first build waits for it ([`Observe::numbering`]), and a history that
+/// does not open stops the daemon there, named ([`Unopened`]).
 pub fn keep_history(
     state: &Path,
     duckdb: Option<PathBuf>,
@@ -722,11 +826,15 @@ pub fn keep_history(
         Err(std::env::VarError::NotUnicode(_)) => Some("(not UTF-8)"),
     };
     blaze_profile::sampler::sample_between_builds(blaze_profile::sampler::detail_of(detail)?);
+    // Unset, the cap follows what the home's own store holds as the daemon starts
+    // ([`history::cap_for`]); a layer read behind it is another writer's and not counted.
     let cap = match std::env::var(history::CAP_VAR) {
-        Ok(value) => history::cap_of(Some(&value))?,
-        Err(std::env::VarError::NotPresent) => history::cap_of(None)?,
+        Ok(value) => history::cap_of(Some(&value), 0)?,
+        Err(std::env::VarError::NotPresent) => {
+            history::cap_of(None, home_store_bytes(&state.join("store"))?)?
+        }
         Err(std::env::VarError::NotUnicode(value)) => {
-            history::cap_of(Some(&value.to_string_lossy()))?
+            history::cap_of(Some(&value.to_string_lossy()), 0)?
         }
     };
     let owner = claim(&dir).map_err(|it| it.to_string())?;
@@ -774,25 +882,51 @@ pub fn keep_history(
                     _ = told_to.send(Told::Restored { torn: said.torn, dropped: why.dropped() });
                     keep(history, &mut why, &rows, &failed_to, &told_to, &now);
                 }
-                Err(error) => _ = opened_to.send(Err(error.to_string())), // alloc: error path, once a daemon
+                Err(error) => {
+                    // alloc: error path, once a daemon
+                    let why = error.to_string();
+                    // Said by the loop at once, and the first build fails on it.
+                    _ = failed_to.send(why.clone()); // clone: error path, once a daemon
+                    _ = opened_to.send(Err(why));
+                }
             }
         })
         .map_err(|error| {
             format!("starting the profile history's thread (`blaze-history`): {error}")
         })?; // alloc: error path
-    let first_build =
-        match opened.recv() {
-            Ok(Ok(first)) => first,
-            Ok(Err(why)) => return Err(why),
-            Err(_) => return Err(
-                "the profile history's thread (`blaze-history`) ended before it opened the history"
-                    .to_owned(),
-            ), // alloc: error path
-        };
     // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
     // ([`provenance_rows`]); one that keeps none counts alone.
     blaze_query::db::log_runs(true);
-    Ok((Profiling { dir, duckdb, first_build, ended, failed, told, doing }, Keeper(thread)))
+    Ok((Profiling { dir, duckdb, opened: Some(opened), ended, failed, told, doing }, Keeper(thread)))
+}
+
+/// The number of the daemon's first build, as the history's thread at `dir` tells it on
+/// `opened`, waited for at most [`OPEN_WAIT`] under a span naming the wait.
+fn first_number(dir: &Path, opened: &Receiver<Result<u32, String>>) -> Result<u32, Unopened> {
+    let _waiting = tracing::info_span!(target: "blaze", "the first build waits for the profile history to open", dir = %dir.display()).entered();
+    // alloc: an error path, once a daemon
+    let unopened = |why| Unopened { dir: dir.to_path_buf(), why };
+    match opened.recv_timeout(OPEN_WAIT) {
+        Ok(Ok(first)) => Ok(first.max(1)),
+        Ok(Err(why)) => Err(unopened(Unopen::Failed(why))),
+        Err(RecvTimeoutError::Disconnected) => Err(unopened(Unopen::Gone)),
+        Err(RecvTimeoutError::Timeout) => Err(unopened(Unopen::Waited(OPEN_WAIT))),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the open's control: [`Observe::numbering`] waits for the open
+    /// itself, as the start did when it waited in `keep_history`.
+    static WAITS_AT_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each client's rows given to the history ([`Observe::client_rows`],
+    /// [`Observe::program_rows`]), as the history's thread would take them: its build, its
+    /// client times and its `spans` rows as encoded. What a test reads of a table only the
+    /// history's thread writes, kept whether the daemon keeps a history or not.
+    pub(crate) static CLIENT_ROWS: std::cell::RefCell<Vec<(u64, Option<(i64, i64)>, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Each solo answer given to the history ([`Observe::solo_rows`]), with the build it was
+    /// numbered: kept whether the daemon keeps a history or not, as [`CLIENT_ROWS`] is.
+    pub(crate) static SOLO_ROWS: std::cell::RefCell<Vec<(u64, blaze_certify::kept::Kept)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
 }
 
 /// A history another process writes: build ids are numbered from what a history holds, so a
@@ -1295,6 +1429,17 @@ fn take(
                 }
             }
         }
+        Ok(ToHistory::Solo(solo, rows)) => {
+            let build = solo.build;
+            doing.set(Step::Flushing, build);
+            match history.solo_build(solo, &rows) {
+                Ok(()) => batch.flush(Some(build)),
+                Err(error) => {
+                    tracing::error!("{error}");
+                    _ = failed.send(error.to_string()); // alloc: error path
+                }
+            }
+        }
         Ok(ToHistory::Ended(Finished {
             ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
             query_counts,
@@ -1609,10 +1754,21 @@ impl Observe {
         self.tasks.clock(super::plane::ns(now), blaze_profile::clock::mono_ns());
     }
 
-    /// The number of the daemon's first build ([`Profiling::first_build`]); a daemon that
-    /// keeps no history numbers from 1, as 0 is no build.
-    pub fn first_build(&self) -> u32 {
-        self.profiling.as_ref().map_or(1, |it| it.first_build)
+    /// How the plane numbers the daemon's builds: from the history's first number
+    /// ([`Profiling::opened`]), asked at the plane's first open and not before, so the start
+    /// waits for no open of the history; a daemon that keeps no history numbers from 1, as 0
+    /// is no build. Asked once a daemon: a second ask numbers from 1.
+    pub fn numbering(&mut self) -> super::plane::Numbered {
+        let Some((dir, opened)) =
+            self.profiling.as_mut().and_then(|it| Some((it.dir.clone(), it.opened.take()?))) // clone: a path, once a daemon
+        else {
+            return super::plane::Numbered::From(1);
+        };
+        #[cfg(test)]
+        if WAITS_AT_START.get() {
+            return super::plane::Numbered::From(first_number(&dir, &opened).unwrap_or(1));
+        }
+        super::plane::Numbered::Later(Box::new(move || first_number(&dir, &opened))) // alloc: once a daemon
     }
 
     /// The history's last error.
@@ -1658,7 +1814,9 @@ impl Observe {
 
     /// A build that ended, for the history to write with what the query engine counted by
     /// now; dropped by a daemon that keeps none, which takes no counts.
-    pub fn ended(&mut self, mut ended: Ended) {
+    /// `plan`: the daemon's one database, whose counts since the last build's end are this
+    /// build's rows too.
+    pub fn ended(&mut self, mut ended: Ended, plan: Option<&blaze_query::Database>) {
         let build = ended.row.build_id;
         let Some(profiling) = &self.profiling else {
             let _span =
@@ -1678,7 +1836,7 @@ impl Observe {
             self.answers.add(answer, dropped);
             return;
         };
-        let query_counts = query_counts(build);
+        let query_counts = query_counts(build, plan);
         // alloc: once a build, a kind of crate slot it wrote
         let mut given: Vec<(&'static str, u64)> = Vec::new();
         base_db::take_given(|kind, writes| given.push((kind, writes)));
@@ -1720,14 +1878,77 @@ impl Observe {
     /// ([`Observe::history_error`]), not the client's. A daemon that keeps no history answers
     /// the same and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
     pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
+        // clone: a test's record of the rows, once a client
+        #[cfg(test)]
+        CLIENT_ROWS.with_borrow_mut(|it| it.push((rows.build, rows.times, rows.spans.clone())));
         let Some(profiling) = &self.profiling else {
             return out.push(Reply { to, response: Response::Done { ok: true } });
         };
         if profiling.ended.send(ToHistory::Client(rows)).is_err() {
             let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
-            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+            return fail(out, to, ApiError::new(what, Some(CLIENT_ROWS_AT.to_owned()))); // alloc: error path
         }
         out.push(Reply { to, response: Response::Done { ok: true } });
+    }
+
+    /// Whether the loop takes the solo answers' kept rows ([`Observe::solo_rows`]): a daemon
+    /// that keeps a history does; one that keeps none leaves them for the next daemon that
+    /// does, rather than take rows it would drop. A test's daemon, which keeps none, takes them
+    /// into [`SOLO_ROWS`].
+    pub fn takes_solo_rows(&self) -> bool {
+        self.profiling.is_some() || cfg!(test)
+    }
+
+    /// A solo answer's kept rows, taken by the loop and numbered `build`: its spans made its
+    /// process's rows as a client's are, and its row and spans handed to the history's thread.
+    /// Spans that do not encode, or a thread that is gone, are said at error naming the build
+    /// and the process: the file is already taken, so the record is lost, loudly.
+    pub fn solo_rows(&mut self, build: u64, kept: blaze_certify::kept::Kept) {
+        let spans = match crate::cli::client_rows::spans_of(build, kept.pid, Vec::new(), &kept.timed) {
+            Ok(spans) => spans,
+            Err(why) => {
+                return tracing::error!(target: "blaze", "the solo answer of process {} (build {build}) is not kept: {why}", kept.pid);
+            }
+        };
+        let pid = kept.pid;
+        // clone: a test's record of what was taken, once a solo answer
+        #[cfg(test)]
+        SOLO_ROWS.with_borrow_mut(|it| it.push((build, kept.clone())));
+        let Some(profiling) = &self.profiling else { return };
+        let blaze_certify::kept::Kept { started_ns, ended_ns, certified, slot, workspace, command, .. } = kept;
+        let solo = history::Solo { build, started_ns, ended_ns, workspace, command, slot, certified_by: certified };
+        let rows = history::ClientRows { build, times: None, spans, ..history::ClientRows::default() };
+        if profiling.ended.send(ToHistory::Solo(solo, rows)).is_err() {
+            tracing::error!(target: "blaze", "the profile history's thread (`blaze-history`) is gone: the solo answer of process {pid} (build {build}) is not kept");
+        }
+    }
+
+    /// A launched program's two spans (`program: exec to Hello`, `program: Hello to exit`),
+    /// made by the launch host once its process ended: written as `blaze client` rows of its
+    /// process under the build that ran it, with no client times (the client's own rows set
+    /// those). A span that does not encode is said at error, naming the build and process.
+    pub fn program_rows(&mut self, ran: crate::serve::unit::run::launch::ProgramSpans) {
+        #[cfg(not(test))]
+        let Some(profiling) = &self.profiling else { return };
+        let spans = match crate::cli::client_rows::spans_of(ran.build, ran.pid, Vec::new(), &ran.timed) {
+            Ok(spans) => spans,
+            Err(why) => {
+                return tracing::error!(target: "blaze", "the program spans of build {} (process {}) are not kept: {why}", ran.build, ran.pid);
+            }
+        };
+        // A test's record of the rows is kept with no history too: the rows are made first.
+        #[cfg(test)]
+        let Some(profiling) = ({
+            // clone: a test's record of the rows, once a program
+            CLIENT_ROWS.with_borrow_mut(|it| it.push((ran.build, None, spans.clone())));
+            &self.profiling
+        }) else {
+            return;
+        };
+        let rows = history::ClientRows { build: ran.build, times: None, spans, ..history::ClientRows::default() };
+        if profiling.ended.send(ToHistory::Client(rows)).is_err() {
+            tracing::error!(target: "blaze", "the profile history's thread (`blaze-history`) is gone: the program spans of build {} are not kept", ran.build);
+        }
     }
 
     /// `blaze why`: what the last build computed again and why, in groups (each listing
@@ -2012,7 +2233,7 @@ impl Observe {
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
 /// What a client's profile rows are named as in an error.
-const CLIENT_ROWS: &str = "a client's profile rows";
+const CLIENT_ROWS_AT: &str = "a client's profile rows";
 
 /// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
 /// C: the explorer serves through Flecs and blaze-http's HTTP/3 on ring) says to the explorer.
@@ -2143,7 +2364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A ring of the test's own: the process's is a sampler's wherever one runs.
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
-        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let history = History::open(dir.path(), history::CAP_MOST, &UNSAMPLED).unwrap();
         let counts = blaze_query::db::Counts {
             executed: 6384,
             verified: 1,
@@ -2316,7 +2537,7 @@ mod tests {
         let keeper = std::thread::Builder::new()
             .name("blaze-history-test".to_owned())
             .spawn(move || {
-                let history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
                 let (mut why, _) = File::restore(&at);
                 keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
             })
@@ -2357,7 +2578,7 @@ mod tests {
         let keeper = std::thread::Builder::new()
             .name("blaze-history-test".to_owned())
             .spawn(move || {
-                let history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
                 let (mut why, _) = File::restore(&at);
                 keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
             })
@@ -2409,7 +2630,7 @@ mod tests {
         let keeper = std::thread::Builder::new()
             .name("blaze-history-test".to_owned())
             .spawn(move || {
-                let mut history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let mut history = History::open(&at, history::CAP_MOST, &UNSAMPLED).unwrap();
                 let (mut why, _) = File::restore(&at);
                 let now = Instant::now();
                 let mut keeping = Keeping {
@@ -2492,7 +2713,7 @@ mod tests {
     fn a_readers_flush_is_written_then_told_with_its_number() {
         let dir = tempfile::tempdir().unwrap();
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
-        let history = History::open(dir.path(), history::CAP_BYTES, &UNSAMPLED).unwrap();
+        let history = History::open(dir.path(), history::CAP_MOST, &UNSAMPLED).unwrap();
         let (sent, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
         sent.send(ToHistory::Flush(to(4, 9))).unwrap();
@@ -2580,7 +2801,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
-            first_build: 1,
+            opened: None,
             ended,
             failed,
             told,
@@ -2595,12 +2816,12 @@ mod tests {
                 dropped: None,
             })
             .unwrap();
-        observe.ended(ended_row(1));
+        observe.ended(ended_row(1), None);
         observe.rebuilt(to(1, 1), Some("/w".to_owned()), None, false, at, &mut out);
         assert!(out.is_empty(), "build 1 is not explained yet: {out:?}");
         assert_eq!(observe.wait(at), Some(WHY_WAIT), "the loop wakes by the deadline");
         // A build that ends after it was asked is not waited for.
-        observe.ended(ended_row(2));
+        observe.ended(ended_row(2), None);
         told_to.send(explained(1)).unwrap();
         observe.tick(at, |_| false, &mut out);
         match &out[..] {
@@ -2691,7 +2912,7 @@ mod tests {
         let profiling = Profiling {
             dir: dir.path().to_path_buf(),
             duckdb: None,
-            first_build: 1,
+            opened: None,
             ended,
             failed,
             told,
@@ -2700,21 +2921,21 @@ mod tests {
         let mut observe = Observe::new(Some(profiling));
         let mut out = Vec::new();
         let at = Duration::from_secs(5);
-        observe.ended(ended_row(1));
+        observe.ended(ended_row(1), None);
         told_to.send(explained(1)).unwrap();
         observe.tick(at, |_| false, &mut out);
         assert!(out.is_empty(), "{out:?}");
 
         // The thread ends; the loop has not seen it yet. Build 2's send fails.
         drop(rows);
-        observe.ended(ended_row(2));
+        observe.ended(ended_row(2), None);
         assert!(observe.history_error().is_some_and(|it| it.contains("no build is written")));
         observe.rebuilt(to(1, 1), None, None, false, at, &mut out);
         assert!(out.is_empty(), "held for build 2, not answered with build 1: {out:?}");
         drop(told_to);
         observe.tick(at, |_| false, &mut out);
         // Seen gone: build 3 ends after, and one asked then fails at once.
-        observe.ended(ended_row(3));
+        observe.ended(ended_row(3), None);
         observe.rebuilt(to(1, 2), None, None, false, at, &mut out);
         match &out[..] {
             [
@@ -2753,7 +2974,76 @@ mod tests {
             .collect();
         assert_eq!(refused, [Some("blaze explore"), Some("a read of the profile history")]);
         assert_eq!(out.last().map(|it| &it.response), Some(&Response::Done { ok: false }));
-        assert_eq!(observe.first_build(), 1);
+        assert!(matches!(observe.numbering(), super::super::plane::Numbered::From(1)));
+    }
+
+    /// An observer of a history whose thread tells its open on `opened`, at `dir`.
+    fn opening(dir: &Path, opened: Receiver<Result<u32, String>>) -> Observe {
+        let (ended, _rows) = crossbeam_channel::unbounded();
+        let (_failed_to, failed) = crossbeam_channel::unbounded();
+        let (_told_to, told) = crossbeam_channel::unbounded();
+        Observe::new(Some(Profiling {
+            dir: dir.to_path_buf(),
+            duckdb: None,
+            opened: Some(opened),
+            ended,
+            failed,
+            told,
+            doing: Arc::new(Doing::default()),
+        }))
+    }
+
+    /// The invariant: the daemon's start waits for no open of its history: `numbering` returns
+    /// while the open is held (the history's word not yet sent, the test's gate), its number is
+    /// asked only by the plane's first open, which waits for the gate and is answered the
+    /// history's number; a history that fails, or whose thread ends without a word, is a typed
+    /// error naming the history's directory, never a panic. Control: the planted
+    /// `WAITS_AT_START` (the start waiting for the open, as before) does not return while the
+    /// gate is shut, and the oracle sees it.
+    #[test]
+    fn keeping_a_history_does_not_wait_for_its_open() {
+        use super::super::plane::Numbered;
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("profile");
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let Numbered::Later(number) = opening(&at, opened).numbering() else {
+            panic!("a history being opened numbers later")
+        };
+        let (answer_to, answer) = crossbeam_channel::bounded(1);
+        let first_open = std::thread::spawn(move || answer_to.send(number()).unwrap());
+        assert!(answer.recv_timeout(Duration::from_millis(50)).is_err(), "the first open waits for the gate");
+        gate.send(Ok(7)).unwrap();
+        assert_eq!(answer.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(7));
+        first_open.join().unwrap();
+
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let mut observe = opening(&at, opened);
+        let Numbered::Later(number) = observe.numbering() else { panic!("numbered later") };
+        assert!(matches!(observe.numbering(), Numbered::From(1)), "asked once a daemon");
+        gate.send(Err("the history's file is torn".to_owned())).unwrap();
+        let failed = number().unwrap_err();
+        assert_eq!(failed, Unopened { dir: at.clone(), why: Unopen::Failed("the history's file is torn".to_owned()) });
+        assert!(failed.to_string().contains(&at.display().to_string()), "{failed}");
+
+        let (gate, opened) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        let Numbered::Later(number) = opening(&at, opened).numbering() else { panic!("numbered later") };
+        drop(gate);
+        assert_eq!(number(), Err(Unopened { dir: at.clone(), why: Unopen::Gone }));
+
+        // The control: the planted start waits for the open, and does not return while the
+        // gate is shut.
+        let (gate, opened) = crossbeam_channel::bounded(1);
+        let (said_to, said) = crossbeam_channel::bounded(1);
+        let planted_at = at.clone();
+        let planted = std::thread::spawn(move || {
+            WAITS_AT_START.set(true);
+            let numbered = opening(&planted_at, opened).numbering();
+            said_to.send(matches!(numbered, Numbered::From(9))).unwrap();
+        });
+        assert!(said.recv_timeout(Duration::from_millis(50)).is_err(), "the control: the planted start waits");
+        gate.send(Ok(9)).unwrap();
+        assert!(said.recv_timeout(Duration::from_secs(10)).unwrap());
+        planted.join().unwrap();
     }
 
     #[test]

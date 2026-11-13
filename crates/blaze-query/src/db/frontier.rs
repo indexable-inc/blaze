@@ -336,6 +336,10 @@ pub(crate) enum Plant {
     /// by then (the compare-and-swap from the claimed state taken out): a seal a walk broke
     /// while the check ran is put back.
     CheckStoresHeldBlindly,
+    /// The log holds the rows a walk found and not the input fields written
+    /// ([`changed_keys_since`]'s second half taken out): a witnessed run that read only a
+    /// field is not named when the field is written.
+    ForgetsWrittenFields,
 }
 
 /// The storage's part of the changed set.
@@ -836,6 +840,45 @@ pub fn changed_ids_since<F: Function>(db: &F::Db, since: View) -> Changed<Id> {
     Changed::Keys(ids.into_iter().map(Id::from_u32).collect()) // alloc: the caller's answer
 }
 
+/// Every key ([`Storage::key_of`]) the walks since `since` found changed, of every ingredient,
+/// and every input or tracked field written since, into `out` (cleared first), sorted, each
+/// once: what a reader that is no row ([`super::witnessed`]) looks its reads up in. Brought up
+/// to date first, as [`changed_ids_since`] is; it may name more, as that does (a change and a
+/// change back, a finding merged into a later view's).
+///
+/// # Errors
+///
+/// [`Unknown::InsideQuery`] asked inside a query while a walk is due, and
+/// [`Unknown::NotAView`] for a view after the storage's: the caller takes every key it holds
+/// as changed.
+pub fn changed_keys_since<D: Database>(
+    db: &D,
+    since: View,
+    out: &mut Vec<u64>,
+) -> Result<(), Unknown> {
+    let storage = db.storage();
+    if local::with(|local| local.task_frames()) != 0 {
+        if due(storage) {
+            return Err(Unknown::InsideQuery);
+        }
+    } else {
+        bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    }
+    let log = Arc::clone(&storage.frontier.walked.lock().log); // clone: a count, no allocation under the lock
+    if since > storage.view() {
+        return Err(Unknown::NotAView { view: storage.view() });
+    }
+    out.clear();
+    let from = log.partition_point(|found| found.at <= since.as_u64());
+    for found in &log[from..] {
+        // alloc: the caller's buffer, a word a key named
+        out.extend(found.nodes.iter().map(|&node| storage.key_of(node)).filter(|&key| key != 0));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(())
+}
+
 /// Whether a walk is due: a view opened since the last, or a node said it changed.
 fn due(storage: &Storage) -> bool {
     !walked_here(storage)
@@ -1329,6 +1372,15 @@ fn walk(db: *const (), storage: &Storage) {
         "edit work"
     );
 
+    // The fields written go in the log beside the rows found (after the work's count, which
+    // is of rows): what was read of them changed too, for a reader that is no row
+    // ([`changed_keys_since`]). No function owns a field, so [`changed_ids_since`] names none.
+    if plant != Plant::ForgetsWrittenFields && !taken.written.is_empty() {
+        // alloc: none past the walk's list, a word a field written
+        found.extend_from_slice(&taken.written);
+        found.sort_unstable();
+        found.dedup();
+    }
     let log = logged(frontier, view, found);
     // Sorted by node, each once ([`set_apart`] searches it).
     unwound.sort_unstable_by_key(|it| it.0);
@@ -1481,7 +1533,18 @@ impl Storage {
         }
         let mut written = std::mem::take(&mut frontier.walked.lock().written);
         let fields = written.len();
-        written.retain(|&node| !seen_by_all(node));
+        // A field every reader has seen leaves the next walk's start, and goes in the log as
+        // a walk would put it ([`changed_keys_since`]); one left goes in with that walk.
+        let forgets = plant == Plant::ForgetsWrittenFields;
+        written.retain(|&node| {
+            let behind = !seen_by_all(node);
+            if !behind && !forgets {
+                found.push(node); // alloc: as above
+            }
+            behind
+        });
+        found.sort_unstable();
+        found.dedup();
         left += written.len() as u64;
         done.said = said.len() as u64 + fields as u64;
         done.left = left;

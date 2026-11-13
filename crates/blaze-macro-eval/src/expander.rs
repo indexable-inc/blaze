@@ -475,10 +475,16 @@ impl Library {
             // alloc: once per calling crate and revision
             at,
             made_of: made_of.map(|it| it.map(str::to_owned)), // alloc: as above
-            map: roots.to_map(|map| match &self.macros.sources {
-                Some(sources) => map.with_sources(sources),
-                None => map,
-            }),
+            // Made once per calling crate and revision for every job that expands there: no
+            // build keeps the looks resolving the roots' links makes, and what the expansion
+            // read is in the reads of the unit's record, which each build using it takes.
+            map: roots.to_map(
+                |map| match &self.macros.sources {
+                    Some(sources) => map.with_sources(sources),
+                    None => map,
+                },
+                &blaze_vfs::outside::Looks::none(),
+            ),
         });
         pinned.insert(calling, Arc::clone(&kept)); // clone: as above
         kept

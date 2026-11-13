@@ -1,18 +1,20 @@
-//! The tree in the daemon's image (docs/v2/plan/design/restore.md), opened in place: three
+//! The tree in the daemon's image (docs/v2/plan/design/restore.md), opened in place: two
 //! sections of `blaze-image`'s file, read where they are mapped. Nothing is re-interned or
-//! hashed again on a start; a file's bytes are read (and their page groups checked) only when
-//! something reads that file.
+//! hashed again on a start. The image holds no file's bytes: a file is its content ID and its
+//! size, its text the content store's ([`crate::Texts`], /tmp/plan/vfs-image-next.md), paged in
+//! and checked only when something reads that file.
 //!
 //! - **`vfs tree`** ([`SectionId::VFS_TREE`]): a header of [`WORDS`] words (counts, where each
 //!   column is, the hash naming the image, the base the journal started from when it was
 //!   written), then the node columns as the store keeps them (IDs, shapes; each directory's
-//!   entries as names, nodes and mode bytes; each file's place in the blobs), the names (spans
+//!   entries as names, nodes and mode bytes; each file's size), the names (spans
 //!   and bytes) and the two indexes (by content ID and by name, open addressed, at most half
 //!   full). Node `n` of the image is node `n` of the tree that wrote it. It is checked whole
 //!   when opened (its CRC32Cs, then [`crate::store::Base::check`]'s pass over it), as every
 //!   start reads it.
-//! - **`vfs blobs`** ([`SectionId::VFS_BLOBS`]): every file's bytes, one after another. A file
-//!   of the image is this section's range, its page groups checked the first time it is read.
+//! - The section that held every file's bytes (`0x0301`) is retired ([`SectionId::RETIRED`]):
+//!   [`Vfs::write_image`] puts each file the store lacks, and writes the image only once every
+//!   put is durable, so an image never names a text the store does not hold.
 //! - **`vfs disks`** ([`SectionId::VFS_DISKS`]): the watchers' metadata and journal cursors.
 //!
 //! The image is named by the hash of its tree section, which commits to every file's content
@@ -37,20 +39,21 @@ use blaze_image::{
 
 use crate::{
     CommitError, OpError, Recovered, Vfs,
-    disk::Disks,
+    disk::{Disks, Marks},
     journal::{FromImage, Journal, Loaded, base_of},
     section::Section,
-    store::{Base, FILE, Mapped, NAME_INDEX_KEY, Source, Table, Writer, home},
+    store::{Base, FILE, NAME_INDEX_KEY, Source, Table, Writer, home},
+    texts::{StoreFault, Texts},
     tree::Tree,
 };
 pub use blaze_bytes::Bytes;
 
 pub const TREE_SCHEMA: SchemaHash = schema(
-    "blaze v2 vfs tree 2: header [u64; 30]; ids ContentId; shapes [u32; 2]; entry names u32; \
-     entry nodes u32; entry modes u8; files [u64; 2]; index u32; spans [u32; 2]; name bytes u8; \
+    "blaze v2 vfs tree 3: header [u64; 30]; ids ContentId; shapes [u32; 2]; entry names u32; \
+     entry nodes u32; entry modes u8; files u64, each file's size in node order, its text the \
+     content store's under its id (TEXT_SCHEMA); index u32; spans [u32; 2]; name bytes u8; \
      name index u32 by SipHash-1-3 under the header's key, blaze_ids::index_key of the names",
 );
-pub const BLOBS_SCHEMA: SchemaHash = schema("blaze v2 vfs blobs 1: file bytes");
 pub const DISKS_SCHEMA: SchemaHash = schema("blaze v2 vfs disks 2: disk.rs's encoding");
 
 const IMAGE_DOMAIN: &str = "blaze v2 vfs image 1";
@@ -60,7 +63,7 @@ const IMAGE_DOMAIN: &str = "blaze v2 vfs image 1";
 /// (`fuzz/targets/vfs_image.rs`) reads it from here rather than keeping a copy.
 pub mod tree_layout {
     /// The header's first word, as bytes.
-    pub const MAGIC_BYTES: [u8; 8] = *b"BZVFSTR2";
+    pub const MAGIC_BYTES: [u8; 8] = *b"BZVFSTR3";
     /// The header's first word.
     pub const MAGIC: u64 = u64::from_le_bytes(MAGIC_BYTES);
 
@@ -74,7 +77,8 @@ pub mod tree_layout {
     pub const W_NAME_BYTES: usize = 5;
     pub const W_INDEX: usize = 6;
     pub const W_NAME_INDEX: usize = 7;
-    pub const W_BLOBS: usize = 8;
+    /// The sum of every file's size: the bytes of text the image names and holds none of.
+    pub const W_TEXT_BYTES: usize = 8;
     /// Where each of the [`COLUMNS`] columns starts in the section.
     pub const W_COLUMNS: usize = 9;
     pub const W_BASED: usize = 19;
@@ -106,7 +110,7 @@ pub mod tree_layout {
         (W_ENTRIES, 4),
         (W_ENTRIES, 4),
         (W_ENTRIES, 1),
-        (W_FILES, 16),
+        (W_FILES, 8),
         (W_INDEX, 4),
         (W_NAMES, 8),
         (W_NAME_BYTES, 1),
@@ -124,16 +128,18 @@ pub struct ImageMark {
     pub nodes: u64,
 }
 
-/// Why [`Vfs::write_image`] wrote no image.
+/// Why [`Vfs::write_image`] wrote no image. Nothing was written into the builder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImageError {
     /// The journal is moving to another image, or names a node of its base a collection
     /// dropped, until a rewrite asked for or in flight is durable: flush, and write the image
-    /// once it is. Nothing was written into the builder.
+    /// once it is.
     Busy,
-    /// A file of the image the tree was restored from failed its check, so its bytes are not
-    /// there to write. The builder holds part of the VFS's sections: drop it.
-    Corrupt(Corrupt),
+    /// Texts of files the image names were put into the content store and are not durable
+    /// yet: flush the store, and write the image once they are.
+    Storing,
+    /// The content store refused the text of a file the image would name.
+    Unstored(StoreFault),
 }
 
 impl fmt::Display for ImageError {
@@ -143,11 +149,23 @@ impl fmt::Display for ImageError {
                 "the VFS's journal is moving to another image or names nodes a collection \
                  dropped: flush, and write the image once its rewrite is durable",
             ),
-            ImageError::Corrupt(corrupt) => {
-                write!(f, "a file of the VFS's image cannot be written to the next: {corrupt}")
+            ImageError::Storing => f.write_str(
+                "texts of files the VFS's image names are not durable in the content store \
+                 yet: flush the store, and write the image once they are (an image names only \
+                 durable texts)",
+            ),
+            ImageError::Unstored(fault) => {
+                write!(f, "the VFS's image cannot name a file whose text the store refused: {fault}")
             }
         }
     }
+}
+
+/// The daemon's image as a start or a settle reads it: its file as mapped, and the content
+/// store its files' texts are in.
+pub struct ImageFile {
+    pub file: Mapping,
+    pub texts: Arc<dyn Texts>,
 }
 
 impl std::error::Error for ImageError {}
@@ -226,16 +244,34 @@ impl From<Corrupt> for CommitError {
 }
 
 impl Vfs {
-    /// Writes the tree into `image` (its three sections: tree, blobs, disks) as it is now,
-    /// and stages it: once the file holding it is durable, [`Vfs::image_durable`] has the
-    /// journal's next flush rewrite the journal to start from it. Every node the tree has is
-    /// written, numbered as it is, so a collection first makes the image compact.
-    pub fn write_image(&mut self, image: &mut Builder) -> Result<ImageMark, ImageError> {
+    /// Writes the tree into `image` (its two sections: tree, disks) as it is now, and stages
+    /// it: once the file holding it is durable, [`Vfs::image_durable`] has the journal's next
+    /// flush rewrite the journal to start from it. Every node the tree has is written, numbered
+    /// as it is, so a collection first makes the image compact. Each file's text the image
+    /// would name is put into `texts` first if it lacks it, and the image is written only once
+    /// every put is durable ([`ImageError::Storing`] until then).
+    pub fn write_image(
+        &mut self,
+        image: &mut Builder,
+        texts: &dyn Texts,
+    ) -> Result<ImageMark, ImageError> {
         if !self.journal.can_stage() {
             return Err(ImageError::Busy);
         }
-        let mark = write_tree(self.tree.table(), self.journal.based_on(), image)
-            .map_err(ImageError::Corrupt)?;
+        store_texts(self.tree.table(), texts).map_err(ImageError::Unstored)?;
+        if !texts.durable() {
+            return Err(ImageError::Storing);
+        }
+        let mark = write_tree(self.tree.table(), self.journal.based_on(), image);
+        #[cfg(test)]
+        if tests::PLANT_TEXTS.with(std::cell::Cell::get) {
+            // The planted bug: every file's bytes written back in, as the layout before did.
+            let table = self.tree.table();
+            let mut texts = image.section(SectionId(0x0301), schema("planted vfs blobs"));
+            for node in (0..table.len()).filter(|&node| !table.shape(node).is_dir()) {
+                _ = texts.bytes(table.blob(node).expect("a planted text reads"));
+            }
+        }
         // alloc: once per image written.
         let mut disks = Vec::new();
         self.disks.encode(&mut disks);
@@ -253,13 +289,14 @@ impl Vfs {
 
     /// The VFS of a journal's bytes over the daemon's image, its tree mapped in place: what
     /// [`Vfs::recover`] gives for the same history, reading only the journal's tail. `image`
-    /// is the image's file as mapped; with none, or one the journal does not start from, the
-    /// journal is loaded alone. [`Recovered::image`] says which, and why.
+    /// is the image's file as mapped and the store of its texts; with none, or one the journal
+    /// does not start from, the journal is loaded alone. [`Recovered::image`] says which, and
+    /// why.
     pub fn restore(
         journal: FileName,
         tags: u64,
         bytes: &[u8],
-        image: Option<Mapping>,
+        image: Option<ImageFile>,
     ) -> (Vfs, Recovered) {
         let alone = |why: ImageUse| {
             // clone: the journal's name, once per start.
@@ -279,23 +316,53 @@ impl Vfs {
             return alone(ImageUse::Unnamed { image: opened.name, journal: named.map(|it| it.0) });
         }
         let Opened { tree, name, nodes, image, .. } = opened;
-        let (disks, refused) = match open_disks(&image) {
+        // The image's column first: the journal's `SEEN` records apply over it.
+        let (mut disks, refused) = match open_disks(&image) {
             Ok(disks) => (disks, None),
             Err(why) => (Disks::default(), Some(why)),
         };
+        let mut marks = Marks::default();
         let from = FromImage { tree, name, nodes, resumed };
         let Loaded { tree, heads, journal, mut found } =
-            Journal::restore(journal, tags, bytes, from);
+            Journal::restore(journal, tags, bytes, from, &mut disks, &mut marks);
+        if refused.is_some() {
+            // The column is only what the journal has since the image: none holds all its head.
+            for disk in disks.by_head.values_mut() {
+                disk.root = None;
+            }
+        }
         found.image = match resumed {
             false => ImageUse::Used { name, nodes, disks: refused },
             true => ImageUse::Resumed { name, nodes, disks: refused },
         };
         // alloc: no views yet, once per start.
-        (Vfs { tree, heads, views: Vec::new(), journal, disks }, found)
+        (Vfs { tree, heads, views: Vec::new(), journal, disks, marks }, found)
     }
 
-    /// The first page group of the image's file bytes a read found corrupt, if any: its
-    /// files there read as that error, never as their bytes, until written again.
+    /// The ids of the files the live tree names: what the next image names, as
+    /// [`Vfs::write_image`] names every node of the table.
+    pub fn file_ids(&self) -> impl Iterator<Item = &ContentId> {
+        let table = self.tree.table();
+        (0..table.len()).filter(move |&node| !table.shape(node).is_dir()).map(move |node| table.id(node))
+    }
+
+    /// The ids of the files the image this VFS was restored from names; none when the restore
+    /// mapped no image. The table is content-addressed and only appends: its base nodes (those
+    /// below `Table::base_len`) are the image's own, whatever the journal's tail added after
+    /// them, so they are read from there and never from what the tail changed.
+    pub fn image_file_ids(&self) -> Option<impl Iterator<Item = &ContentId>> {
+        let table = self.tree.table();
+        table.mapped()?;
+        Some(
+            (0..table.base_len())
+                .filter(move |&node| !table.shape(node).is_dir())
+                .map(move |node| table.id(node)),
+        )
+    }
+
+    /// The first file of the image a read found the content store does not give as the image
+    /// names it ([`blaze_image::Cause::Text`]), if any: it reads as that error, never as other
+    /// bytes, until written again.
     pub fn corrupt(&self) -> Option<Corrupt> {
         self.tree.table().mapped().and_then(|it| it.corrupt())
     }
@@ -318,13 +385,28 @@ fn id_of(words: &[u64]) -> ContentId {
     ContentId(id)
 }
 
-/// Writes the blobs and the tree of `table` into `image`, recording the image the journal
-/// starts from (`based_on`); its name and node count.
-fn write_tree(
-    table: &Table,
-    based_on: Option<ContentId>,
-    image: &mut Builder,
-) -> Result<ImageMark, Corrupt> {
+/// Puts into `texts` each file of `table` whose text is the tree's own and which `texts` lacks.
+/// A file of an image's base is the store's already: an image is written only once every text
+/// it names is durable there.
+fn store_texts(table: &Table, texts: &dyn Texts) -> Result<(), StoreFault> {
+    for node in 0..table.len() {
+        if table.shape(node).is_dir() {
+            continue;
+        }
+        if let Source::Heap(bytes) = table.source(node) {
+            let id = table.id(node);
+            if !texts.has(id) {
+                texts.put(id, bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes the tree of `table` into `image`, recording the image the journal starts from
+/// (`based_on`); its name and node count. Every text it names is in the store
+/// ([`store_texts`]): no file's bytes are read.
+fn write_tree(table: &Table, based_on: Option<ContentId>, image: &mut Builder) -> ImageMark {
     let nodes = table.len() as usize;
     // alloc: the image's columns, built once per image written (the edge); no read does.
     let mut ids: Vec<ContentId> = Vec::with_capacity(nodes);
@@ -332,32 +414,24 @@ fn write_tree(
     // alloc: as above.
     let (mut entry_names, mut entry_nodes, mut entry_modes) = (Vec::new(), Vec::new(), Vec::new());
     // alloc: as above.
-    let mut files: Vec<[u64; 2]> = Vec::new();
-    let blobs_len = {
-        let mut blobs = image.section(SectionId::VFS_BLOBS, BLOBS_SCHEMA);
-        for node in 0..nodes as u32 {
-            let shape = table.shape(node);
-            ids.push(*table.id(node));
-            if shape.is_dir() {
-                let entries = table.entries(shape);
-                shapes.push([entry_names.len() as u32, shape.len]);
-                entry_names.extend_from_slice(entries.names);
-                entry_nodes.extend_from_slice(entries.nodes);
-                entry_modes.extend_from_slice(entries.modes);
-                continue;
-            }
-            let bytes = match table.source(shape) {
-                Source::Heap(bytes) => bytes,
-                Source::Mapped { at, len } => {
-                    let mapped = table.mapped().expect("a file of an image in its table");
-                    mapped.read(at, len)?
-                }
-            };
-            shapes.push([files.len() as u32, FILE]);
-            files.push([blobs.bytes(bytes), bytes.len() as u64]);
+    let mut files: Vec<u64> = Vec::new();
+    let mut text_bytes = 0u64;
+    for node in 0..nodes as u32 {
+        let shape = table.shape(node);
+        ids.push(*table.id(node));
+        if shape.is_dir() {
+            let entries = table.entries(shape);
+            shapes.push([entry_names.len() as u32, shape.len]);
+            entry_names.extend_from_slice(entries.names);
+            entry_nodes.extend_from_slice(entries.nodes);
+            entry_modes.extend_from_slice(entries.modes);
+            continue;
         }
-        blobs.len()
-    };
+        let len = table.file_len(node);
+        shapes.push([files.len() as u32, FILE]);
+        files.push(len);
+        text_bytes += len;
+    }
 
     let names = table.names();
     // alloc: as above.
@@ -401,7 +475,7 @@ fn write_tree(
     header[W_NAME_BYTES] = name_bytes.len() as u64;
     header[W_INDEX] = index.len() as u64;
     header[W_NAME_INDEX] = name_index.len() as u64;
-    header[W_BLOBS] = blobs_len;
+    header[W_TEXT_BYTES] = text_bytes;
     header[W_NAME_KEY..].copy_from_slice(&name_key.words());
     if let Some(based_on) = &based_on {
         header[W_BASED] = 1;
@@ -431,24 +505,24 @@ fn write_tree(
     let name = hasher.finish();
     header[W_NAME..W_BASED_ON].copy_from_slice(&words_of(&name));
     section.patch(0, bytes_of(&header));
-    Ok(ImageMark { name, nodes: nodes as u64 })
+    ImageMark { name, nodes: nodes as u64 }
 }
 
 /// An image's tree, opened in place.
-struct Opened {
-    tree: Tree,
-    name: ContentId,
-    nodes: u64,
-    based_on: Option<ContentId>,
-    image: Arc<Image<Mapping>>,
+pub(crate) struct Opened {
+    pub(crate) tree: Tree,
+    pub(crate) name: ContentId,
+    pub(crate) nodes: u64,
+    pub(crate) based_on: Option<ContentId>,
+    pub(crate) image: Arc<Image<Mapping>>,
 }
 
 /// The tree of the image in `file`: its spine checked, its tree section checked whole and
-/// viewed in place; its blobs not read.
-fn open(file: Mapping) -> Result<Opened, ImageUse> {
+/// viewed in place, its files' texts in `texts` and none read. An image of an earlier tree
+/// layout (one with a blobs section, tree 2) is [`ImageUse::Refused`] by its schema.
+pub(crate) fn open(ImageFile { file, texts }: ImageFile) -> Result<Opened, ImageUse> {
     let image = Image::open(file).map_err(ImageUse::Unopened)?;
     let tree = image.section(SectionId::VFS_TREE, TREE_SCHEMA).map_err(ImageUse::Refused)?;
-    let blobs = image.section(SectionId::VFS_BLOBS, BLOBS_SCHEMA).map_err(ImageUse::Refused)?;
     image.whole(&tree).map_err(ImageUse::Corrupt)?;
     // alloc: the image, once per start, shared by every file read from it.
     let image = Arc::new(image);
@@ -456,13 +530,17 @@ fn open(file: Mapping) -> Result<Opened, ImageUse> {
     if header[W_MAGIC] != MAGIC {
         return Err(ImageUse::Malformed("a VFS tree section without its magic"));
     }
-    if header[W_BLOBS] != blobs.len || header[W_BASED] > 1 {
+    if header[W_BASED] > 1 {
         return Err(ImageUse::Malformed("a VFS tree header that is not its image's"));
     }
     let base = view(&image, &tree, header).map_err(ImageUse::Corrupt)?;
-    // alloc: once per start.
-    let mapped = Arc::new(Mapped::new(Arc::clone(&image), blobs));
-    let writer = Writer::restore(mapped, base).map_err(ImageUse::Malformed)?;
+    if base.files.iter().try_fold(0u64, |sum, &len| sum.checked_add(len))
+        != Some(header[W_TEXT_BYTES])
+    {
+        return Err(ImageUse::Malformed("a VFS tree whose file sizes are not its header's sum"));
+    }
+    let writer =
+        Writer::restore(Arc::clone(&image), texts, base).map_err(ImageUse::Malformed)?;
     Ok(Opened {
         tree: Tree::over(writer),
         name: id_of(&header[W_NAME..W_BASED_ON]),
@@ -510,4 +588,4 @@ fn open_disks(image: &Image<Mapping>) -> Result<Disks, DisksUnused> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

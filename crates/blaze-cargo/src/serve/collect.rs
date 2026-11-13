@@ -388,6 +388,20 @@ pub struct Collects {
     /// The store's next index table is with a worker, being built
     /// ([`blaze_cas::rebuild`]): the loop walks no row of it.
     index_out: bool,
+    /// Where the forgets a build queued stand ([`blaze_cas::Store::forget_due`]).
+    forgets: Forgets,
+}
+
+/// The record-level forgets a build's end asks for: a scan of the pins marks the roots on a
+/// worker, then, between builds, [`blaze_cas::Store::forget_due`] forgets what no root names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Forgets {
+    /// None is asked.
+    None,
+    /// A build ended with keys queued: a scan is to be taken once no build is under way.
+    Scan,
+    /// The scan was taken: the forgets run once it is back and no build is under way.
+    Due,
 }
 
 impl Collects {
@@ -415,6 +429,7 @@ impl Collects {
             pins_out: false,
             pins_asked: None,
             index_out: false,
+            forgets: Forgets::None,
         }
     }
 
@@ -450,6 +465,95 @@ impl Collects {
                 }
             }
         }
+        // The keys the build's places let go of wait for a mark taken after this build's
+        // roots: a scan, then the forgets ([`Collects::turn`]). Keys still waiting after
+        // those (a record in a writer's segment, a file not committed) are asked again at
+        // the next build's end, never in a loop of scans.
+        if store.forgets_waiting() > 0 && self.forgets == Forgets::None {
+            self.forgets = Forgets::Scan;
+        }
+    }
+
+    /// Takes a scan of the store's pins and hands it to a worker, when none is out and the
+    /// store gives one: it comes back as [`Back::Pins`]. Whether one was taken.
+    fn scan_pins(&mut self, store: &mut Store) -> bool {
+        if self.pins_out {
+            return false;
+        }
+        let Some(mut scan) = store.pins_take() else { return false };
+        self.pins_out = true;
+        // clone: a channel's sender, once a scan
+        let send = self.send.clone();
+        let work = move || {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "store pins scan",
+                records = tracing::field::Empty,
+            )
+            .entered();
+            scan.run();
+            span.record("records", scan.records());
+            scan
+        };
+        match self.run {
+            Compress::Inline => _ = send.send(Back::Pins(Some(work()))),
+            Compress::Pool => blaze_graph::exec::shared().submit_as(
+                None,
+                Class::Normal,
+                work,
+                move |done| _ = send.send(Back::Pins(done.ok())),
+            ),
+        }
+        true
+    }
+
+    /// The forgets a build's end asked for, one step a turn and only between builds: the
+    /// scan that marks the roots goes to a worker, and once it is back the store forgets
+    /// what no root names ([`blaze_cas::Store::forget_due`], bounded by its queue: one look
+    /// a key), in a span with what it forgot, what it kept and why. What it forgot goes into
+    /// the next head, written by the flush asked here.
+    fn forget_step(&mut self, store: &mut Store, idle: bool, effects: &mut Vec<blaze_core::Effect>) {
+        if !idle {
+            return;
+        }
+        match self.forgets {
+            Forgets::None => {}
+            Forgets::Scan => {
+                if self.scan_pins(store) {
+                    self.forgets = Forgets::Due;
+                }
+            }
+            Forgets::Due if self.pins_out => {}
+            Forgets::Due => {
+                self.forgets = Forgets::None;
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "store forget unrooted records",
+                    forgotten = tracing::field::Empty,
+                    kept = tracing::field::Empty,
+                    waiting = tracing::field::Empty,
+                    why_kept = tracing::field::Empty,
+                )
+                .entered();
+                let forgot = store.forget_due();
+                span.record("forgotten", forgot.forgotten.len());
+                span.record("kept", forgot.kept.len());
+                span.record("waiting", forgot.waiting);
+                if !forgot.kept.is_empty() {
+                    // Each reason once, with how many keys it kept, in the order of the reasons.
+                    // alloc: once a forget, its reasons
+                    let mut why: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+                    for (_, reason) in &forgot.kept {
+                        *why.entry(*reason).or_default() += 1;
+                    }
+                    let text = why.iter().map(|(reason, n)| format!("{n}: {reason}")).collect::<Vec<_>>().join("; "); // alloc: a span's field, once a forget
+                    span.record("why_kept", text.as_str());
+                }
+                if !forgot.forgotten.is_empty() {
+                    store.flush(effects);
+                }
+            }
+        }
     }
 
     /// Steps taken on the loop, and how many took longer than [`STEP_BOUND`].
@@ -465,6 +569,7 @@ impl Collects {
             || self.pins_out
             || self.pins_asked.is_some()
             || self.index_out
+            || self.forgets != Forgets::None
         {
             return Some(now + Duration::from_millis(1));
         }
@@ -504,33 +609,7 @@ impl Collects {
                 }
             ));
         }
-        if !self.pins_out
-            && let Some(mut scan) = store.pins_take()
-        {
-            self.pins_out = true;
-            // clone: a channel's sender, once a scan
-            let send = self.send.clone();
-            let work = move || {
-                let span = tracing::info_span!(
-                    target: "blaze",
-                    "store pins scan",
-                    records = tracing::field::Empty,
-                )
-                .entered();
-                scan.run();
-                span.record("records", scan.records());
-                scan
-            };
-            match self.run {
-                Compress::Inline => _ = send.send(Back::Pins(Some(work()))),
-                Compress::Pool => blaze_graph::exec::shared().submit_as(
-                    None,
-                    Class::Normal,
-                    work,
-                    move |done| _ = send.send(Back::Pins(done.ok())),
-                ),
-            }
-        }
+        self.scan_pins(store);
         PinsRead::Reading
     }
 
@@ -566,6 +645,9 @@ impl Collects {
             usage.scanned.records,
             size_text(usage.scanned.rooted_bytes),
         ));
+        for line in census_lines(&usage, &store.census(), &blaze_cas::Kind::ALL) {
+            out.push_str(&line.text);
+        }
         match self.budget {
             Some(it) if it.budget > 0 => out.push_str(&format!(
                 "home: {} held of a budget of {} ({}%), {} free on its volume\n",
@@ -771,6 +853,7 @@ impl Collects {
                 ),
             }
         }
+        self.forget_step(store, idle, effects);
         if !self.other_out && self.other_at.is_none_or(|at| now.saturating_sub(at) >= OTHER_EVERY) {
             self.other_at = Some(now);
             self.measure_other();
@@ -943,6 +1026,112 @@ fn other_bytes(state: &Path) -> Result<u64, String> {
     let mut sum = 0;
     walk(state, true, &mut sum)?;
     Ok(sum)
+}
+
+/// What one line of the store's census ([`census_lines`]) counts.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // read by the census's oracle (its tests)
+enum CensusOf {
+    /// The live records of one kind: their stored bytes and their overhead.
+    Kind(blaze_cas::Kind),
+    /// The whole files the store keeps beside its packs.
+    WholeFiles,
+    /// Records no key finds any more, still in their packs.
+    Dead,
+    /// What the store line holds that no line above names: the difference, signed.
+    Rest,
+    /// Another writer's directory read behind the store: not in the store line.
+    Layer,
+}
+
+/// One line `blaze gc` prints under the store line, and what it adds to that line's bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+// `of` and `summed` are what the census's oracle reads (its tests); the report prints `text`.
+#[cfg_attr(not(test), allow(dead_code))]
+struct CensusLine {
+    of: CensusOf,
+    /// The bytes of the store line this line accounts for (0 for a layer's).
+    summed: i128,
+    text: String,
+}
+
+/// The census of what the store holds, as [`Collects::report`] prints it under the store
+/// line: one line for each kind of `kinds` (every [`blaze_cas::Kind`] but in the planted-bug
+/// control), one for the whole files, one for the dead records and one for the rest, so the
+/// lines sum to `usage.bytes` exactly; then one line a layer read behind the store, which is
+/// another writer's directory and so not in that sum. A census the store line does not cover
+/// says by how much, never clamped.
+fn census_lines(
+    usage: &blaze_cas::collect::Usage,
+    census: &blaze_cas::Census,
+    kinds: &[blaze_cas::Kind],
+) -> Vec<CensusLine> {
+    let mut lines = Vec::with_capacity(kinds.len() + 3 + census.layers.len()); // alloc: a report asked for
+    let mut summed: i128 = 0;
+    for &kind in kinds {
+        let Some(counted) = census.kinds.iter().find(|it| it.kind == kind) else {
+            // alloc: a report asked for
+            lines.push(CensusLine {
+                of: CensusOf::Kind(kind),
+                summed: 0,
+                text: format!("  kind {}: not in the store's census\n", kind.name()),
+            });
+            continue;
+        };
+        let bytes = i128::from(counted.stored) + i128::from(counted.overhead);
+        summed += bytes;
+        lines.push(CensusLine {
+            of: CensusOf::Kind(kind),
+            summed: bytes,
+            // alloc: a report asked for
+            text: format!(
+                "  kind {}: {} records, {} stored, {} raw, {} of headers and index\n",
+                kind.name(),
+                counted.records,
+                size_text(counted.stored),
+                size_text(counted.raw),
+                size_text(counted.overhead),
+            ),
+        });
+    }
+    let (files, file_bytes) = census.whole_files;
+    summed += i128::from(file_bytes);
+    lines.push(CensusLine {
+        of: CensusOf::WholeFiles,
+        summed: i128::from(file_bytes),
+        text: format!("  whole files: {files}, {}\n", size_text(file_bytes)), // alloc: a report asked for
+    });
+    summed += i128::from(usage.dead_bytes);
+    lines.push(CensusLine {
+        of: CensusOf::Dead,
+        summed: i128::from(usage.dead_bytes),
+        // alloc: a report asked for
+        text: format!("  dead: {} of records no key finds, in their packs\n", size_text(usage.dead_bytes)),
+    });
+    let rest = i128::from(usage.bytes) - summed;
+    let text = match u64::try_from(rest) {
+        // alloc: a report asked for
+        Ok(rest) => format!("  rest: {} (pack checks, and what is between records)\n", size_text(rest)),
+        // alloc: a report asked for
+        Err(_) => format!(
+            "  rest: the lines above are {} over the store line ({}): the census counts bytes the store line does not\n",
+            size_text(u64::try_from(-rest).unwrap_or(u64::MAX)),
+            size_text(usage.bytes),
+        ),
+    };
+    lines.push(CensusLine { of: CensusOf::Rest, summed: rest, text });
+    for (writer, records, stored) in &census.layers {
+        lines.push(CensusLine {
+            of: CensusOf::Layer,
+            summed: 0,
+            // alloc: a report asked for
+            text: format!(
+                "  layer {writer}: {records} records, {} (read behind the store, not in its line)\n",
+                size_text(*stored)
+            ),
+        });
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1175,5 +1364,223 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!((72 << 10..512 << 10).contains(&bytes), "{bytes}");
         assert_eq!(other_bytes(&dir.join("gone")), Ok(0));
+    }
+
+    /// Whether `lines` are a whole census of `store`: every kind of [`blaze_cas::Kind::ALL`]
+    /// named once, the kinds' lines adding up to what the store's own census holds of every
+    /// kind, and all the lines that count summing to the store line's bytes exactly.
+    fn census_whole(lines: &[CensusLine], usage: &blaze_cas::collect::Usage, census: &blaze_cas::Census) -> Result<(), String> {
+        for kind in blaze_cas::Kind::ALL {
+            let named = lines.iter().filter(|it| it.of == CensusOf::Kind(kind)).count();
+            if named != 1 {
+                return Err(format!("kind {} has {named} lines, not 1", kind.name()));
+            }
+        }
+        let kinds: i128 = lines.iter().filter(|it| matches!(it.of, CensusOf::Kind(_))).map(|it| it.summed).sum();
+        let held: i128 = census.kinds.iter().map(|it| i128::from(it.stored) + i128::from(it.overhead)).sum();
+        if kinds != held {
+            return Err(format!("the kinds' lines hold {kinds} bytes, the census {held}"));
+        }
+        let summed: i128 = lines.iter().map(|it| it.summed).sum();
+        if summed != i128::from(usage.bytes) {
+            return Err(format!("the lines sum to {summed} bytes, the store line is {}", usage.bytes));
+        }
+        if lines.iter().any(|it| it.of == CensusOf::Layer && it.summed != 0) {
+            return Err("a layer's line counts toward the store line".to_owned());
+        }
+        Ok(())
+    }
+
+    /// A store on the simulation holding records of several kinds, short and long,
+    /// committed: its usage and its census.
+    fn census_of_a_store_of_many_kinds() -> (blaze_cas::collect::Usage, blaze_cas::Census) {
+        let mut sim = blaze_core::sim::Sim::new(37, blaze_core::sim::Faults::default());
+        let mut store = opened(&mut sim);
+        let kinds = [
+            blaze_cas::Kind::Query,
+            blaze_cas::Kind::Code,
+            blaze_cas::Kind::Debug,
+            blaze_cas::Kind::Run,
+        ];
+        for n in 0..2_000u64 {
+            let kind = kinds[(n % kinds.len() as u64) as usize];
+            // Some long enough to be compressed or kept apart, most short.
+            let repeat = if n % 97 == 0 { 4_096 } else { 8 };
+            store.put(key(n), kind, &n.to_le_bytes().repeat(repeat)).unwrap();
+        }
+        let mut effects = Vec::new();
+        store.flush(&mut effects);
+        driven(&mut sim, &mut store, &mut effects);
+        (store.usage(), store.census())
+    }
+
+    /// The invariant: the census `blaze gc` prints names every record kind once, its kinds'
+    /// lines hold what the store's census holds, and its lines (kinds, whole files, dead, the
+    /// rest) sum to the store line's bytes exactly, a layer's line outside that sum.
+    #[test]
+    fn the_census_lines_sum_to_the_store_line() {
+        let (usage, census) = census_of_a_store_of_many_kinds();
+        assert!(usage.bytes > 0, "the store holds what was put");
+        let lines = census_lines(&usage, &census, &blaze_cas::Kind::ALL);
+        census_whole(&lines, &usage, &census).unwrap();
+        let held: u64 = census.kinds.iter().map(|it| it.records).sum();
+        assert_eq!(held, 2_000, "every record put is in the census");
+        let text: String = lines.iter().map(|it| it.text.as_str()).collect();
+        for kind in blaze_cas::Kind::ALL {
+            assert!(text.contains(&format!("  kind {}: ", kind.name())), "{text}");
+        }
+        assert!(text.contains("  whole files: ") && text.contains("  rest: "), "{text}");
+    }
+
+    /// The control: a census that leaves one kind out is refused by the oracle.
+    #[test]
+    fn the_oracle_catches_a_kind_left_out() {
+        let (usage, census) = census_of_a_store_of_many_kinds();
+        let all = blaze_cas::Kind::ALL;
+        let without: Vec<blaze_cas::Kind> = all.iter().copied().filter(|it| *it != blaze_cas::Kind::Code).collect();
+        let lines = census_lines(&usage, &census, &without);
+        let said = census_whole(&lines, &usage, &census).expect_err("a kind left out");
+        assert!(said.contains("kind code"), "{said}");
+    }
+
+    /// A store with records 0..8 committed, its pins read, and `pinned` pinned after that
+    /// scan; keys 1, 2 and 3 queued to be forgotten, as a place that let them go queues them.
+    fn queued(sim: &mut blaze_core::sim::Sim, pinned: u64) -> Store {
+        let mut store = filled(sim, 8);
+        periods(sim, &mut store, 1);
+        let added = store.pin_change("forget test", "a test's pin", 0, &[key(pinned)], &[]).unwrap();
+        assert!(matches!(added, blaze_cas::collect::PinAdded::Written(_)), "{added:?}");
+        let mut effects = Vec::new();
+        store.flush(&mut effects);
+        driven(sim, &mut store, &mut effects);
+        for n in 1..4 {
+            store.forget(key(n));
+        }
+        store
+    }
+
+    /// The invariant of the driver's forgets: after a build's end with keys queued, the
+    /// collector takes a scan of the roots on a worker and then, between builds, forgets
+    /// every queued record no root names, keeping a pinned one; nothing is left queued.
+    /// The control (test-the-cause): the forgets asked at the build's end without that scan
+    /// forget nothing, as the pin added after the last scan leaves no mark to forget under,
+    /// so the scan is what lets them go and what keeps the pin's key.
+    #[test]
+    fn a_build_end_forgets_what_its_places_let_go_after_a_scan_and_keeps_a_pinned_key() {
+        let mut sim = blaze_core::sim::Sim::new(7, blaze_core::sim::Faults::default());
+        let mut store = queued(&mut sim, 2);
+        let gone = std::env::temp_dir().join(format!("blaze-collect-forget-{}", std::process::id()));
+        let mut collects = Collects::new(&gone, Compress::Inline, Pace::default());
+        collects.build_ended(&mut store);
+        assert_eq!(collects.forgets, Forgets::Scan, "a build's end with keys queued asks a scan");
+        // A build under way: nothing is taken.
+        let mut effects = Vec::new();
+        collects.turn(&mut store, None, false, blaze_core::Driver::now(&sim), &mut effects);
+        driven(&mut sim, &mut store, &mut effects);
+        assert_eq!(collects.forgets, Forgets::Scan, "no scan is taken while a build is under way");
+        for _ in 0..20 {
+            if collects.forgets == Forgets::None {
+                break;
+            }
+            let mut effects = Vec::new();
+            collects.turn(&mut store, None, true, blaze_core::Driver::now(&sim), &mut effects);
+            driven(&mut sim, &mut store, &mut effects);
+        }
+        assert_eq!(collects.forgets, Forgets::None, "the forgets ran within 20 idle turns");
+        let guard = blaze_cas::enter();
+        let reader = store.reader();
+        let there = |n: u64| reader.get(&guard, &key(n)).unwrap().is_some();
+        assert!(!there(1) && !there(3), "the unrooted queued records are forgotten");
+        assert!(there(2), "the pinned key is kept");
+        assert!(there(0) && there(4), "what was not queued is untouched");
+        assert_eq!(store.forgets_waiting(), 0, "nothing is left queued");
+
+        // The control: the same store, forgets asked with no scan after the pin.
+        let mut sim = blaze_core::sim::Sim::new(7, blaze_core::sim::Faults::default());
+        let mut store = queued(&mut sim, 2);
+        let forgot = store.forget_due();
+        assert!(forgot.forgotten.is_empty(), "with no scan after the last root, nothing is forgotten: {forgot:?}");
+        assert_eq!(forgot.waiting, 3, "every queued key waits for a scan: {forgot:?}");
+    }
+
+    /// The daemon image's texts across a restart, on the simulation: a store whose first run
+    /// put forty file texts (before seventy thousand other records, so its index table holds
+    /// them) and, with `pinned`, pinned them as the image maker does before it writes an image
+    /// naming them ([`crate::serve::image`]). The second run starts from that image and then
+    /// collects everything unrooted; without `pinned` (a store of the layout before) it starts
+    /// only after the collection. What the start found, and whether each text is still there.
+    fn image_texts_across_a_restart(pinned: bool) -> (blaze_cas::sets::FileSetStart, Vec<bool>) {
+        use blaze_cas::sets::Prepared;
+        use blaze_core::Driver as _;
+
+        use crate::serve::image::text_pin_at_start;
+        let mut sim = blaze_core::sim::Sim::new(37, blaze_core::sim::Faults::default());
+        let mut store = opened(&mut sim);
+        let ids: Vec<blaze_ids::ContentId> =
+            (0..40u64).map(|n| blaze_ids::ContentId::of("blaze serve image text test", &n.to_le_bytes())).collect();
+        let text_key = |id: &blaze_ids::ContentId| blaze_cas::Key::of(blaze_vfs::TEXT_SCHEMA, *id, &[]);
+        for (n, id) in ids.iter().enumerate() {
+            store.put(text_key(id), blaze_cas::Kind::Text, &(n as u64).to_le_bytes().repeat(40)).unwrap();
+        }
+        for n in 0..70_000 {
+            store.put(key(n), blaze_cas::Kind::Code, &n.to_le_bytes().repeat(8)).unwrap();
+        }
+        let flushed = |sim: &mut blaze_core::sim::Sim, store: &mut Store| {
+            let mut effects = Vec::new();
+            store.flush(&mut effects);
+            driven(sim, store, &mut effects);
+        };
+        flushed(&mut sim, &mut store);
+        if pinned {
+            let none: Option<std::slice::Iter<'_, blaze_ids::ContentId>> = None;
+            let (mut pin, _) = text_pin_at_start(&mut store, none, 1).unwrap();
+            let keys: Vec<blaze_cas::Key> = ids.iter().map(text_key).collect();
+            // clone: the keys asked twice, as two turns of the image maker ask them
+            assert_eq!(pin.prepare(&mut store, keys.clone(), 2), Ok(Prepared::Flush));
+            flushed(&mut sim, &mut store);
+            assert_eq!(pin.prepare(&mut store, keys, 2), Ok(Prepared::Ready), "durable after a flush");
+            // The image is written and renamed into place.
+            pin.placed();
+            pin.settle(&mut store, 3).unwrap();
+            flushed(&mut sim, &mut store);
+        }
+        drop(store);
+        let mut store = opened(&mut sim);
+        let started = |store: &mut Store| text_pin_at_start(store, Some(ids.iter()), 4).unwrap().1;
+        let start = if pinned { Some(started(&mut store)) } else { None };
+        let gone = std::env::temp_dir().join(format!("blaze-image-texts-none-{}", std::process::id()));
+        let pace = Pace { grace: Duration::ZERO, ..Pace::default() };
+        let mut collects = Collects::new(&gone, Compress::Inline, pace);
+        periods(&mut sim, &mut store, 4);
+        collects.ask(sim.now(), false, true);
+        for _ in 0..20_000 {
+            let mut effects = Vec::new();
+            collects.turn(&mut store, None, true, sim.now(), &mut effects);
+            driven(&mut sim, &mut store, &mut effects);
+            if !collects.asked_waits(sim.now()) && store.usage().counts.packs_retired > 0 && !store.committing() {
+                break;
+            }
+            sim.advance(Duration::from_millis(60));
+        }
+        assert!(store.usage().counts.records_forgotten > 0, "the collection forgot the other records: {:?}", store.usage());
+        let kept = ids.iter().map(|id| store.has(&text_key(id))).collect();
+        let start = start.unwrap_or_else(|| started(&mut store));
+        (start, kept)
+    }
+
+    /// The invariant: the texts the daemon image on disk names are a root of the store's
+    /// collector across a restart: the start finds the set listed as the run that wrote the
+    /// image left it and a collection of everything unrooted keeps every text. The control is
+    /// a store of the layout before, with no pin: the same collection forgets every text, and
+    /// the start that follows says so, naming how many it lacks.
+    #[test]
+    fn the_texts_the_daemon_image_names_survive_a_restart_and_a_collection() {
+        use blaze_cas::sets::FileSetStart;
+        let (start, kept) = image_texts_across_a_restart(true);
+        assert!(matches!(start, FileSetStart::Listed { keys: 40, .. }), "{start:?}");
+        assert!(kept.iter().all(|it| *it), "every text the image names is kept: {kept:?}");
+        let (start, kept) = image_texts_across_a_restart(false);
+        assert!(matches!(start, FileSetStart::Unlisted { keys: 40, missing: 40, .. }), "{start:?}");
+        assert!(kept.iter().all(|it| !*it), "with no pin the collection forgets them: {kept:?}");
     }
 }

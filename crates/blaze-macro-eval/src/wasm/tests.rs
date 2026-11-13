@@ -739,7 +739,8 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     use blaze_cas::{Kind, Origin};
     let (key, code) = echo_code();
     let mut sim = Sim::new(5, Faults::default());
-    let mut base = opened_in(&mut sim, "base", &[]);
+    // A layer is a shared directory of writers' stores: this one has one writer, `w-1`.
+    let mut base = opened_in(&mut sim, "base/w-1", &[]);
     let put = Put { keep: Keep::Machine(key), value: code, what: WHAT.to_owned() };
     let published = publish(&mut base, vec![put]);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
@@ -749,7 +750,7 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     let mine = opened_in(&mut sim, "mine", &["base"]);
     let daemon = modules();
     let error = Library::load_with(&daemon, &echo(), Some(&mine.reader()), WHAT).unwrap_err();
-    let base = FileName::new("base").unwrap();
+    let base = FileName::new("base/w-1").unwrap();
     assert!(
         matches!(&error, LoadError::NotLocal { origin: Origin::Behind(dir), kind: Kind::Machine } if *dir == base),
         "{error:?}"

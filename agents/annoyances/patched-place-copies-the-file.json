@@ -1,0 +1,14 @@
+{
+ "id": "patched-place-copies-the-file",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane patch-place, int-1112; built by claude-opus-5-5 (Claude Opus 5.5), track 3, int-1112",
+ "where": "crates/blaze-cas/src/lib.rs Store::publish (Content::Over under PlaceBy::Copy), Store::over_read; crates/blaze-core/src/sim.rs SimFile",
+ "what": "A patched place on a file system that shares no blocks reads the path's whole file into user memory, writes the runs over it and writes the whole buffer back: 158 MB for a 10 KB patch, the two 64 MiB patch reserves allocated as data (308,808 blocks on tmpfs), 164-327 ms a place, twice a body edit. The simulation could not have shown it: SimFile is whole bytes with no holes, so no test can assert that holes stay holes or that a place allocates only what it writes.",
+ "cost": "330-580 ms of every hello body edit on tmpfs and ext4; 137 MB of RAM per program on tmpfs",
+ "cause": "the Copy route was written as 'the bytes of the file, then a whole-file write' because the only effects it had were ReadAll and Write; no effect copies a file's data extents in the kernel",
+ "class": "a cost proportional to a file's length where the work is proportional to a change, hidden because the test double (the simulated file) has no notion of the resource being wasted (allocated blocks)",
+ "prevention": "Effect::CopyData (data extents copied in the kernel, holes kept) so the Copy route is the Clone route with one effect swapped; the simulation counts allocated blocks per file and a place's test asserts bytes written equal the runs and allocation grows only by what the runs touch",
+ "workaround": "put BLAZE_HOME and the target directory on a file system that shares blocks (xfs with reflink, btrfs)",
+ "fix": "Built, not yet compiled or run (int-1112, track 3). Effect::CopyData (blaze-core): SEEK_DATA/SEEK_HOLE + copy_file_range on Linux, lseek + pread/pwrite on macOS, refused on Windows. publish::Writing::Base::Copy swaps the clone for it. Op::OverRead, Store::overs, over_read and the ReadAll route are deleted. SimFile counts allocated sectors and Sim::bytes_copied. tests/place_copy.rs asserts: written = the runs, copied = the old data, allocation = old blocks plus the runs' blocks, no write of the path's file, and the stamp of the new inode. Control: the_oracle_catches_a_patch_written_in_place.",
+ "state": "fixed, not yet verified"
+}

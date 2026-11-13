@@ -13,6 +13,7 @@ use super::*;
 use crate::collect::{
     CollectBatch, Collector, Facts, Pace, PeriodScan, Pin, Plant, Standing, Step,
 };
+use crate::sets::{FILE_SET_EARLY_RELEASE, FileSet, FileSetStart, Prepared, listing_of};
 
 /// Keys are numbered below this.
 const KEYS: u64 = 160;
@@ -34,9 +35,14 @@ fn pace() -> Pace {
 
 /// The value of key `n`, always the same: an output long enough to be chunks for one key in
 /// eight, else text of a few hundred to a few thousand bytes.
+/// One key in eight is machine code: a file of its own (`file-<content>`), the record a
+/// forget alone is for ([`crate::forget`]).
 fn value(n: u64) -> (Kind, Vec<u8>) {
     if n % 8 == 7 {
         return (Kind::Output, noise(300 << 10, n));
+    }
+    if n % 8 == 5 {
+        return (Kind::Machine, noise(2 << 10, n));
     }
     let kind = [Kind::Query, Kind::Code, Kind::Debug, Kind::Run][n as usize % 4];
     (kind, text(n, 200 + (n as usize * 37) % 3000))
@@ -76,12 +82,18 @@ enum Op {
     CrashInCommit(u8),
     Crash,
     Reopen,
+    /// The key's record asked to be forgotten alone ([`Store::forget`]), as a place that held
+    /// it being replaced asks.
+    Forget(u64),
+    /// Between builds: the pins scanned ([`Store::pins_take`]) and what is queued forgotten
+    /// where no root names it ([`Store::forget_due`]).
+    ForgetDue,
 }
 
 #[hegel::composite]
 fn op(tc: &TestCase) -> Op {
     let key = || tc.draw(gs::integers::<u64>().max_value(KEYS - 1));
-    match tc.draw(gs::integers::<u8>().max_value(27)) {
+    match tc.draw(gs::integers::<u8>().max_value(29)) {
         0..5 => Op::Put(key(), tc.draw(gs::integers::<u8>().min_value(1).max_value(60))),
         5..8 => Op::Use(key()),
         8 => Op::Hold(key()),
@@ -103,6 +115,8 @@ fn op(tc: &TestCase) -> Op {
             1 => Op::Reopen,
             _ => Op::CrashInCommit(tc.draw(gs::integers::<u8>().max_value(40))),
         },
+        28 => Op::Forget(key()),
+        29 => Op::ForgetDue,
         _ => Op::Moves(tc.draw(gs::integers::<u8>().min_value(1).max_value(8))),
     }
 }
@@ -152,6 +166,11 @@ struct World {
     seconds: u64,
     /// The longest record put, as stored: the most one step may copy past its bound.
     longest: u64,
+    /// The keys whose records the store forgot alone since the last reopen, with their
+    /// bytes: found again only after a crash took the head that listed them, and then whole.
+    forgot: BTreeMap<u64, Vec<u8>>,
+    /// The keys forgotten and still so after a reopen: never found again until put again.
+    forgot_for_good: BTreeSet<u64>,
 }
 
 impl World {
@@ -176,6 +195,8 @@ impl World {
             held: Vec::new(),
             seconds: 1_000_000,
             longest: 0,
+            forgot: BTreeMap::new(),
+            forgot_for_good: BTreeSet::new(),
         }
     }
 
@@ -247,6 +268,72 @@ impl World {
                 return Err(format!("key {n}: the bytes a reader pinned changed under it"));
             }
         }
+        // A record forgotten alone is never served: not in this run, and not after a reopen
+        // that found it gone.
+        for &n in self.forgot.keys().chain(&self.forgot_for_good) {
+            if let Some(bytes) = self.peek(n)? {
+                return Err(format!("key {n}: served ({} bytes) after its record was forgotten", bytes.len()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The keys a root names that a forget must keep: the pins'. (Use is no root of a
+    /// forget: a forget is asked of a record its place let go of, between builds.)
+    fn pinned(&self, n: u64) -> bool {
+        self.pins.values().any(|(keys, _)| keys.contains(&n))
+    }
+
+    /// Between builds, as the daemon's turn does once a build ended: the pins scanned, then
+    /// the forgets due, each checked against the roots and taken into the model.
+    fn forget_due(&mut self) -> Result<(), String> {
+        if self.build.is_some() {
+            return Ok(());
+        }
+        if self.scan.is_none()
+            && let Some(mut scan) = self.store.pins_take()
+        {
+            scan.run();
+            self.store.pins_put(scan);
+        }
+        let forgot = self.store.forget_due();
+        for forgotten in forgot.forgotten {
+            let n = (0..KEYS)
+                .find(|&n| key(n) == forgotten)
+                .ok_or_else(|| format!("{forgotten:?} forgotten, which no op asked for"))?;
+            if self.pinned(n) {
+                return Err(format!("key {n}: forgotten alone, though a pin names it"));
+            }
+            if let Some(rec) = self.model.remove(&n) {
+                self.forgot.insert(n, rec.bytes);
+            }
+            self.used.remove(&n);
+            self.used_before.remove(&n);
+        }
+        Ok(())
+    }
+
+    /// After a reopen: each record forgotten since the last is gone for good (`flushed`: the
+    /// head that listed it was written) or, after a crash, gone or back whole: the state
+    /// before the forget or after it, never one between.
+    fn forgot_reopened(&mut self, flushed: bool) -> Result<(), String> {
+        for (n, bytes) in std::mem::take(&mut self.forgot) {
+            match self.peek(n)? {
+                None => _ = self.forgot_for_good.insert(n),
+                Some(found) if flushed => {
+                    return Err(format!(
+                        "key {n}: back ({} bytes) after a reopen whose flush wrote its forget",
+                        found.len()
+                    ));
+                }
+                Some(found) if found == bytes => {
+                    _ = self.model.insert(n, Rec { bytes, ticket: Ticket::DURABLE });
+                }
+                Some(found) => {
+                    return Err(format!("key {n}: back after a crash as {} other bytes", found.len()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -272,6 +359,9 @@ impl World {
         // A put of a value the store has writes nothing, and is a use of it as a read is.
         let ticket = self.model.get(&n).map_or(ticket, |rec| rec.ticket);
         self.longest = self.longest.max(bytes.len() as u64 + 4096);
+        // Put again: the value is the key's once more.
+        self.forgot.remove(&n);
+        self.forgot_for_good.remove(&n);
         self.model.insert(n, Rec { bytes, ticket });
         self.used.insert(n);
         Ok(())
@@ -392,6 +482,7 @@ impl World {
         for (_, ticket) in self.pins.values_mut() {
             *ticket = Ticket::DURABLE;
         }
+        self.forgot_reopened(!crashed)?;
         // A pin whose keys were not all durable names keys the crash took: the model keeps
         // the pin for the keys it still holds.
         let model = &self.model;
@@ -528,6 +619,8 @@ impl World {
             }
             Op::Crash => self.reopen(true)?,
             Op::Reopen => self.reopen(false)?,
+            Op::Forget(n) => self.store.forget(key(*n)),
+            Op::ForgetDue => self.forget_due()?,
         }
         Ok(())
     }
@@ -762,6 +855,72 @@ fn the_oracle_catches_a_root_missed() {
     let plants = Plants { collect: Plant::RootMissed, ..Plants::default() };
     let (seed, why) = control(plants, directed(), 0..4);
     assert!(why.contains("forgotten, though it was used within two periods"), "seed {seed}: {why}");
+}
+
+/// The run the forget's controls share: forty keys put and committed (5, 13, 21 and 29 are
+/// machine code, each a file of its own), key 5 pinned, the four asked forgotten between
+/// builds, the forgets written, the store opened again, then a crash after more forgets.
+fn forgets() -> Vec<Op> {
+    vec![
+        Op::BuildBegin,
+        Op::Put(0, 40),
+        Op::BuildEnd,
+        Op::Flush,
+        Op::Pin(0, vec![5]),
+        Op::Flush,
+        Op::Forget(5),
+        Op::Forget(13),
+        Op::Forget(21),
+        Op::Forget(2),
+        Op::ForgetDue,
+        Op::Flush,
+        Op::Reopen,
+        Op::Forget(29),
+        Op::Forget(3),
+        Op::ForgetDue,
+        Op::Flush,
+        Op::Crash,
+        Op::Put(13, 1),
+        Op::Flush,
+        Op::Reopen,
+    ]
+}
+
+/// The invariant of a record forgotten alone ([`crate::forget`]), on the directed run: what
+/// no root names is forgotten (its file removed once the head saying so is durable), the
+/// pinned key is kept, a forgotten key is never served, and one put again is found again.
+#[test]
+fn a_record_forgotten_alone_is_gone_and_a_pinned_one_is_kept() {
+    for seed in 0..4 {
+        assert_eq!(runs(&forgets(), seed, quiet(), Plants::default()), Ok(()), "seed {seed}");
+    }
+    let mut world = World::new(9, quiet(), Plants::default());
+    for op in &forgets()[..12] {
+        world.step(op).unwrap();
+        world.check().unwrap();
+    }
+    assert!(world.forgot.contains_key(&13) && world.forgot.contains_key(&2), "{:?}", world.forgot.keys());
+    assert!(!world.forgot.contains_key(&5), "the pinned key is kept");
+    let file = name(&format!("store/{}", disk::external_file(&content_of(&value(13).1))));
+    assert!(!world.sim.exists(&file), "the forgotten record's own file is removed once its head is durable");
+}
+
+/// The planted-bug control: a forget that asks no root forgets the pinned key.
+#[test]
+fn the_oracle_catches_a_forget_that_ignores_the_roots() {
+    let plants = Plants { collect: Plant::ForgetIgnoresRoots, ..Plants::default() };
+    let (seed, why) = control(plants, forgets(), 0..4);
+    assert!(why.contains("key 5: forgotten alone, though a pin names it"), "seed {seed}: {why}");
+}
+
+/// The planted-bug control: a head that lists the whole files of forgotten records removed but
+/// not the records: opened again, the store finds a record whose bytes are gone, the state
+/// between the forget's before and after.
+#[test]
+fn the_oracle_catches_a_forget_its_head_does_not_list() {
+    let plants = Plants { collect: Plant::ForgetUnlisted, ..Plants::default() };
+    let (seed, why) = control(plants, forgets(), 0..4);
+    assert!(why.contains("key 13") || why.contains("key 21") || why.contains("key 2:"), "seed {seed}: {why}");
 }
 
 /// A build that begins after a pack was scanned, and finds a key the scan judged unused: the
@@ -1040,4 +1199,395 @@ fn a_pin_is_grown_only_once_the_stores_pins_are_read_and_only_by_new_keys() {
     assert!(store.end_period());
     assert!(matches!(store.pin_add("closure", "a build kept by name", 13, &[key(3)]), Ok(PinAdded::Written(_))));
     assert_eq!(store.pins().find(|pin| pin.name == "closure").unwrap().keys.len(), 3);
+}
+
+/// The invariant: the pin of a name made last is the name's, whatever the clocks did: one made
+/// while a scan of the pins is out is the name's when the scan comes back, and a pin an earlier
+/// run made on a clock that ran ahead does not outdo it, then or after a reopen.
+#[test]
+fn a_pin_made_while_a_scan_is_out_is_the_names_when_it_comes_back() {
+    let mut sim = Sim::new(5, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..3 {
+        store.put(key(n), Kind::Code, &text(n, 500)).unwrap();
+    }
+    // An earlier run, on a clock far ahead.
+    store.pin("image", "first", 500, &[key(1)]).unwrap();
+    flush(&mut sim, &mut store);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    let mut scan = store.pins_take().expect("a scan of the pins, the store at rest");
+    store.pin("image", "second", 10, &[key(2)]).unwrap();
+    scan.run();
+    store.pins_put(scan);
+    let names = |store: &Store| -> Vec<(String, Vec<Key>)> {
+        store.pins().map(|pin| (pin.name.clone(), pin.keys.clone())).collect()
+    };
+    assert_eq!(names(&store), [("image".to_owned(), vec![key(2)])], "the pin made last is the name's");
+    let when = store.pins().find(|pin| pin.name == "image").unwrap().when;
+    assert!(when > 500, "written again past the earlier run's clock, at {when}");
+    flush(&mut sim, &mut store);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    assert!(store.end_period());
+    assert_eq!(names(&store), [("image".to_owned(), vec![key(2)])], "and so after a reopen");
+}
+
+// The durable daemon image's file texts ([`FileSet`]): an image on disk names texts the store
+// holds, and the store's collector must never forget one while that image is the durable one.
+
+const IMAGE_PIN: &str = "file set";
+const IMAGE_WHY: &str = "the simulation's durable image";
+
+fn image_set() -> ContentId {
+    ContentId::of("blaze v2 store test file set 1", b"")
+}
+
+fn text_key(id: u64) -> Key {
+    Key(ContentId::of("blaze v2 store test file text 1", &id.to_le_bytes()))
+}
+
+fn text_bytes(id: u64) -> Vec<u8> {
+    text((1 << 20) | id, 200 + (id as usize * 53) % 1500)
+}
+
+/// The root of the listing of `files`' texts, computed apart from [`FileSet`].
+fn image_root(files: &BTreeSet<u64>) -> Key {
+    let mut keys: Vec<Key> = files.iter().map(|&id| text_key(id)).collect();
+    keys.sort_unstable();
+    listing_of(&image_set(), &keys, &[]).1.0
+}
+
+#[derive(Clone, Debug)]
+enum ImageOp {
+    /// The tree changes: its `drop` lowest files go (never its last) and `add` new ones come.
+    Edit { drop: u8, add: u8 },
+    /// An image of the tree is begun, as the daemon's image maker begins one: its set
+    /// prepared, its texts put; with `flush`, the store flushed and both asked again. Begun
+    /// only once both are durable. With `crash`, the power goes out right after, before any
+    /// flush: the pin written and not durable, or the image begun and never renamed.
+    Make { flush: bool, crash: bool },
+    /// The image begun is renamed into place: from here on the durable one. With `crash`, the
+    /// power goes out before the pin lets go of the image before.
+    Place { crash: bool },
+    /// The daemon's next turn with the store: the pin narrowed to the durable image's set.
+    /// With `crash`, the power goes out before the narrowed pin is durable.
+    Settle { crash: bool },
+    Flush,
+    /// The power goes out, with the image being written (never renamed), and the daemon
+    /// starts again from the image on disk.
+    Crash,
+    Reopen,
+}
+
+#[hegel::composite]
+fn image_op(tc: &TestCase) -> ImageOp {
+    match tc.draw(gs::integers::<u8>().max_value(9)) {
+        0 | 1 => ImageOp::Edit {
+            drop: tc.draw(gs::integers::<u8>().max_value(4)),
+            add: tc.draw(gs::integers::<u8>().max_value(5)),
+        },
+        2 | 3 => ImageOp::Make { flush: tc.draw(gs::booleans()), crash: tc.draw(gs::booleans()) },
+        4 | 5 => ImageOp::Place { crash: tc.draw(gs::booleans()) },
+        6 => ImageOp::Settle { crash: tc.draw(gs::booleans()) },
+        7 => ImageOp::Flush,
+        8 => ImageOp::Crash,
+        _ => ImageOp::Reopen,
+    }
+}
+
+/// The store and its collector ([`World`]) under a daemon that makes images of a tree.
+struct Imaged {
+    world: World,
+    files: FileSet,
+    /// The live tree's files, by text id.
+    tree: BTreeSet<u64>,
+    next_id: u64,
+    /// The files of the image durable on disk; none before the first is placed.
+    on_disk: Option<BTreeSet<u64>>,
+    /// The files of the image begun and not yet placed.
+    writing: Option<BTreeSet<u64>>,
+    /// What the texts the image maker put wait on to be durable.
+    texts: Tickets,
+    /// Records put only to age the texts past the store's newest records.
+    fillers: u64,
+    /// What each start found, in order.
+    starts: Vec<FileSetStart>,
+}
+
+impl Imaged {
+    fn new(seed: u64) -> Result<Imaged, String> {
+        let mut world = World::new(seed, quiet(), Plants::default());
+        world.seconds += 1;
+        let (files, start) =
+            FileSet::start(&mut world.store, IMAGE_PIN, IMAGE_WHY, image_set(), None, world.seconds)
+                .map_err(|it| format!("the first start: {it:?}"))?;
+        Ok(Imaged {
+            world,
+            files,
+            tree: (0..12).collect(),
+            next_id: 12,
+            on_disk: None,
+            writing: None,
+            texts: Tickets::default(),
+            fillers: 0,
+            starts: vec![start],
+        })
+    }
+
+    /// The daemon starts from the image on disk: its set listed and pinned again, found as the
+    /// run that placed it left it.
+    fn start(&mut self) -> Result<(), String> {
+        let keys = self.on_disk.as_ref().map(|files| files.iter().map(|&id| text_key(id)).collect());
+        self.world.seconds += 1;
+        let (files, start) =
+            FileSet::start(&mut self.world.store, IMAGE_PIN, IMAGE_WHY, image_set(), keys, self.world.seconds)
+                .map_err(|it| format!("a start: {it:?}"))?;
+        self.files = files;
+        match (&self.on_disk, start) {
+            (None, FileSetStart::NoFile) => {}
+            (Some(files), FileSetStart::Listed { root, keys })
+                if root == image_root(files) && keys == files.len() as u64 => {}
+            (files, start) => {
+                return Err(format!(
+                    "the start found {start:?} of the durable image's set of {:?} files",
+                    files.as_ref().map(|it| it.len())
+                ));
+            }
+        }
+        self.starts.push(start);
+        Ok(())
+    }
+
+    fn step(&mut self, op: &ImageOp) -> Result<(), String> {
+        self.act(op)?;
+        match op {
+            ImageOp::Make { crash: true, .. } | ImageOp::Place { crash: true } | ImageOp::Settle { crash: true } => {
+                self.act(&ImageOp::Crash)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn act(&mut self, op: &ImageOp) -> Result<(), String> {
+        self.world.seconds += 1;
+        let when = self.world.seconds;
+        match op {
+            ImageOp::Edit { drop, add } => {
+                let gone: Vec<u64> =
+                    self.tree.iter().take(usize::from(*drop).min(self.tree.len() - 1)).copied().collect();
+                for id in gone {
+                    self.tree.remove(&id);
+                }
+                for _ in 0..*add {
+                    self.tree.insert(self.next_id);
+                    self.next_id += 1;
+                }
+            }
+            ImageOp::Make { flush, .. } => {
+                // The image maker is busy with the image begun.
+                if self.writing.is_some() {
+                    return Ok(());
+                }
+                for _ in 0..1 + u8::from(*flush) {
+                    let keys: Vec<Key> = self.tree.iter().map(|&id| text_key(id)).collect();
+                    let prepared = self
+                        .files
+                        .prepare(&mut self.world.store, keys, when)
+                        .map_err(|it| format!("prepare: {it:?}"))?;
+                    for &id in &self.tree {
+                        let ticket = self
+                            .world
+                            .store
+                            .put(text_key(id), Kind::Text, &text_bytes(id))
+                            .map_err(|it| format!("text {id}: its put was refused: {it:?}"))?;
+                        self.texts.add(ticket);
+                    }
+                    let store = &self.world.store;
+                    self.texts.retain_pending(|ticket| store.durable(ticket));
+                    if prepared == Prepared::Ready && self.texts.is_empty() {
+                        // clone: the files of the image as it was begun
+                        self.writing = Some(self.tree.clone());
+                        return Ok(());
+                    }
+                    if *flush {
+                        self.world.step(&Op::Flush)?;
+                    }
+                }
+            }
+            ImageOp::Place { .. } => {
+                if let Some(files) = self.writing.take() {
+                    self.on_disk = Some(files);
+                    self.files.placed();
+                }
+            }
+            ImageOp::Settle { .. } => {
+                self.files.settle(&mut self.world.store, when).map_err(|it| format!("settle: {it:?}"))?;
+            }
+            ImageOp::Flush => self.world.step(&Op::Flush)?,
+            ImageOp::Crash | ImageOp::Reopen => {
+                self.world.reopen(matches!(op, ImageOp::Crash))?;
+                // The image being written goes with the process: its file is never renamed.
+                self.writing = None;
+                self.texts = Tickets::default();
+                self.start()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A full collection: records past the store's newest, three periods' ends (so a text not
+    /// put since is unused), then a lap that forgets every record no root names, whatever its
+    /// pack's age.
+    fn collect(&mut self) -> Result<(), String> {
+        for _ in 0..60 {
+            self.fillers += 1;
+            let n = self.fillers;
+            self.world
+                .store
+                .put(Key(ContentId::of("blaze v2 store test filler 1", &n.to_le_bytes())), Kind::Debug, &text(n, 64))
+                .map_err(|it| format!("filler {n}: its put was refused: {it:?}"))?;
+        }
+        for _ in 0..3 {
+            for op in [Op::Flush, Op::Tick(20), Op::ScanTake, Op::ScanRun] {
+                self.world.step(&op)?;
+            }
+        }
+        self.world.collector.ask(true);
+        self.world.collect_to_rest()
+    }
+
+    /// What the store holds under text `id`, read as a check reads it.
+    fn peek_text(&self, id: u64) -> Result<Option<Vec<u8>>, String> {
+        let look = self.world.store.look();
+        let key = text_key(id);
+        match look.find(&key) {
+            None => Ok(None),
+            Some(Err(corrupt)) => Err(format!("text {id}: {corrupt}")),
+            Some(Ok(found)) => match look.value(found, &key, Use::Check) {
+                Ok((_, bytes)) => Ok(Some(bytes.into_owned())),
+                Err(corrupt) => Err(format!("text {id}: {corrupt}")),
+            },
+        }
+    }
+
+    /// The oracle: the store's own ([`World::check`]); every text the durable image names
+    /// reads its bytes; and once the store's pins are read, the pin names the durable image's
+    /// set.
+    fn check(&mut self) -> Result<(), String> {
+        self.world.check()?;
+        let Some(files) = &self.on_disk else { return Ok(()) };
+        for &id in files {
+            match self.peek_text(id)? {
+                Some(bytes) if bytes == text_bytes(id) => {}
+                Some(bytes) => return Err(format!("text {id}: read {} other bytes", bytes.len())),
+                None => return Err(format!("text {id}: the durable image names it and the store forgot it")),
+            }
+        }
+        if self.world.store.pins_read() {
+            let root = image_root(files);
+            let named = self.world.store.pins().any(|pin| pin.name == IMAGE_PIN && pin.keys.contains(&root));
+            if !named {
+                return Err(format!("the pin {IMAGE_PIN:?} does not name the durable image's set ({root:?})"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Runs `ops` with a full collection and the oracle after each, then a crash, a start, a
+/// collection and the oracle; `early_release` plants the bug [`FILE_SET_EARLY_RELEASE`].
+fn image_runs(ops: &[ImageOp], seed: u64, early_release: bool) -> Result<Imaged, String> {
+    FILE_SET_EARLY_RELEASE.with(|it| it.set(early_release));
+    let result = (|| {
+        let mut imaged = Imaged::new(seed)?;
+        imaged.collect().and_then(|()| imaged.check()).map_err(|why| format!("at the first start: {why}"))?;
+        for (at, op) in ops.iter().enumerate() {
+            imaged
+                .step(op)
+                .and_then(|()| imaged.collect())
+                .and_then(|()| imaged.check())
+                .map_err(|why| format!("op {at} ({op:?}): {why}"))?;
+        }
+        imaged
+            .act(&ImageOp::Crash)
+            .and_then(|()| imaged.collect())
+            .and_then(|()| imaged.check())
+            .map_err(|why| format!("at the end, after a crash: {why}"))?;
+        Ok(imaged)
+    })();
+    FILE_SET_EARLY_RELEASE.with(|it| it.set(false));
+    result
+}
+
+/// The invariant: every text the durable image names is readable after every step and after
+/// every crash and start: the image's set is a root of the collector from before a byte of the
+/// image is written until the image after it is durable ([`FileSet`]), in memory and in what a
+/// start reads back, and a start finds the durable image's set listed, as the run that placed
+/// it left it. A full collection (three periods' ends, then a lap that forgets every record no
+/// root names) runs after every step. `HEGEL_TEST_CASES=<n>` runs it longer.
+#[test]
+fn a_collect_keeps_every_text_the_durable_image_names() {
+    run_cases(16, |tc| {
+        let ops = tc.draw(gs::vecs(image_op()).min_size(1).max_size(16));
+        let seed = tc.draw(gs::integers());
+        if let Err(why) = image_runs(&ops, seed, false) {
+            panic!("seed {seed}, {ops:?}: {why}");
+        }
+    });
+}
+
+/// The directed image run: a first image placed and settled; the tree loses four files and
+/// gains three; the next image prepared (the collect after it is where an early release loses
+/// the first image's texts) and a crash after its collect; prepared again and a crash before
+/// its pin is durable; made and placed, and a crash before the old set is let go; then an
+/// image made over flushes, placed, settled with a crash before that is durable, and reopened.
+fn image_directed() -> Vec<ImageOp> {
+    vec![
+        ImageOp::Make { flush: true, crash: false },
+        ImageOp::Place { crash: false },
+        ImageOp::Settle { crash: false },
+        ImageOp::Flush,
+        ImageOp::Edit { drop: 4, add: 3 },
+        ImageOp::Make { flush: true, crash: false },
+        ImageOp::Crash,
+        ImageOp::Make { flush: false, crash: true },
+        ImageOp::Make { flush: true, crash: false },
+        ImageOp::Place { crash: true },
+        ImageOp::Edit { drop: 2, add: 2 },
+        ImageOp::Make { flush: false, crash: false },
+        ImageOp::Flush,
+        ImageOp::Make { flush: false, crash: false },
+        ImageOp::Place { crash: false },
+        ImageOp::Settle { crash: true },
+        ImageOp::Reopen,
+    ]
+}
+
+/// The directed image run keeps every text its durable image names and lets the collector
+/// forget the texts no image on disk names any more, so the control below tests a collector
+/// that does something.
+#[test]
+fn the_directed_image_run_keeps_the_durable_images_texts_and_collects_the_rest() {
+    let imaged = image_runs(&image_directed(), 1, false).unwrap();
+    assert!(imaged.starts.iter().skip(1).all(|it| matches!(it, FileSetStart::Listed { .. })), "{:?}", imaged.starts);
+    for id in 0..4 {
+        assert_eq!(imaged.peek_text(id).unwrap(), None, "text {id}: named by no image since the second");
+    }
+    let usage = imaged.world.store.usage();
+    assert!(usage.counts.records_forgotten > 0, "{usage:?}");
+}
+
+/// The planted-bug control: a pin that lets go of the durable image's set before the next
+/// image is durable loses, to the collect between, a text the durable image names.
+#[test]
+fn the_oracle_catches_the_old_set_let_go_before_the_next_image_is_durable() {
+    for seed in 0..2 {
+        assert!(image_runs(&image_directed(), seed, false).is_ok(), "seed {seed}: the file set as it is must pass");
+    }
+    let why = match image_runs(&image_directed(), 0, true) {
+        Ok(_) => panic!("the oracle missed the planted early release"),
+        Err(why) => why,
+    };
+    assert!(why.contains("the durable image names it and the store forgot it"), "{why}");
 }

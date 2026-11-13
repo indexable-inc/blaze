@@ -323,7 +323,7 @@ pub mod digest {
 pub mod record {
     pub use blaze_format::{
         ALIGN, Aligned, FormatError, HEADER_LEN, Header, MAGIC, Part, Persist, Placed, Record,
-        Rel, SCHEMA_DOMAIN, SchemaHash, Slice, Str, Sym, Writer, buffer_id, bytes_of_slice,
+        Rel, SCHEMA_DOMAIN, SchemaHash, Slice, Str, Writer, buffer_id, bytes_of_slice,
         header, open, open_as, open_verified, read_verified, record_at, schema, schema_of,
         to_bytes,
     };

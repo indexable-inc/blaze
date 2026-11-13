@@ -1,5 +1,6 @@
 //! What the thin `blaze` hands a command it began to the engine with: the connection its
-//! request is on, the request, and the daemon's answer as far as it was read.
+//! request is on, the request, the daemon's answer as far as it was read, and its own spans
+//! so far, which the engine sends as the build's client rows with its own.
 //!
 //! The thin `blaze` sends a build's request before it knows whether the answer is one it
 //! prints itself ([`crate::answer`]). When it is not, or it has not ended by
@@ -32,28 +33,37 @@ pub const WORD: &str = "__answered";
 /// for the first sign of a long build, once.
 pub const AFTER: Duration = Duration::from_millis(150);
 
-/// The first bytes of the file: its format's name and version.
-const MAGIC: &[u8; 16] = b"blaze answered 1";
+/// The first bytes of the file: its format's name and version. Version 1 had no spans and no
+/// start; a file of it is refused by name (both programs are one build, so none is met).
+const MAGIC: &[u8; 16] = b"blaze answered 2";
 
-/// What the file holds: the request's frame as it was sent, and every byte of the daemon's
-/// answer read so far.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What the file holds: the request's frame as it was sent, every byte of the daemon's
+/// answer read so far, and the thin `blaze`'s own spans until it handed over (`client: exec
+/// to main`, `client: solo check`, `client: connect`), which the engine sends beside its own
+/// as the build's client rows (`blaze_cargo::cli::client_rows`), with the kernel's start of
+/// the process (`started_ns`, the profile's clock): the command's client time begins there.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Held<'a> {
     pub request: &'a [u8],
     pub answer: &'a [u8],
+    pub timed: Vec<blaze_api::Timed>,
+    pub started_ns: i64,
 }
 
 impl<'a> Held<'a> {
-    /// The file's bytes: [`MAGIC`], the request's length in four big-endian bytes, the
-    /// request, then the answer to the file's end.
+    /// The file's bytes: [`MAGIC`], the start (a big-endian i64), the request's length in four
+    /// big-endian bytes, the request, the spans ([`blaze_certify::kept::put_timed`]), then the answer
+    /// to the file's end.
     pub fn write(&self) -> Result<Vec<u8>, String> {
         let len = u32::try_from(self.request.len())
             .map_err(|_| format!("a request of {} bytes is longer than a frame", self.request.len()))?;
         // alloc: once a handover, the file's bytes
-        let mut out = Vec::with_capacity(MAGIC.len() + 4 + self.request.len() + self.answer.len());
+        let mut out = Vec::with_capacity(MAGIC.len() + 8 + 4 + self.request.len() + 64 + self.answer.len());
         out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&self.started_ns.to_be_bytes());
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(self.request);
+        blaze_certify::kept::put_timed(&mut out, &self.timed)?;
         out.extend_from_slice(self.answer);
         Ok(out)
     }
@@ -62,14 +72,16 @@ impl<'a> Held<'a> {
     pub fn read(bytes: &'a [u8]) -> Result<Held<'a>, String> {
         let rest = bytes
             .strip_prefix(MAGIC)
-            .ok_or("it does not begin as what the thin `blaze` hands over begins")?;
+            .ok_or("it does not begin as what this thin `blaze` hands over begins (`blaze answered 2`)")?;
+        let (started_ns, rest) = rest.split_first_chunk::<8>().ok_or("it ends before the command's start")?;
         let (len, rest) = rest.split_first_chunk::<4>().ok_or("it ends before its request's length")?;
         let len = u32::from_be_bytes(*len) as usize;
         if rest.len() < len {
             return Err(format!("it holds {} bytes of a request of {len}", rest.len()));
         }
-        let (request, answer) = rest.split_at(len);
-        Ok(Held { request, answer })
+        let (request, rest) = rest.split_at(len);
+        let (timed, answer) = blaze_certify::kept::take_timed(rest).map_err(|why| format!("the thin `blaze`'s spans: {why}"))?;
+        Ok(Held { request, answer, timed, started_ns: i64::from_be_bytes(*started_ns) })
     }
 }
 
@@ -133,16 +145,28 @@ impl Began {
 mod tests {
     use super::*;
 
+    /// The invariant: the file round-trips whole, the thin `blaze`'s spans with it, and any cut
+    /// of it before its answer is refused. Controls: a file of version 1's layout is refused
+    /// by name, and one byte changed in the magic is refused.
     #[test]
     fn the_file_round_trips_and_a_cut_one_is_refused() {
-        let held = Held { request: b"request", answer: b"answer so far" };
+        let timed = vec![
+            blaze_api::Timed { name: crate::talk::EXEC_TO_MAIN.to_owned(), start_ns: 5, end_ns: 9 },
+            blaze_api::Timed { name: crate::talk::CONNECT.to_owned(), start_ns: 12, end_ns: 14 },
+        ];
+        let held = Held { request: b"request", answer: b"answer so far", timed, started_ns: 5 };
         let bytes = held.write().unwrap();
-        assert_eq!(Held::read(&bytes), Ok(held));
-        let none = Held { request: b"r", answer: b"" };
+        assert_eq!(Held::read(&bytes), Ok(held.clone()));
+        let none = Held { request: b"r", answer: b"", timed: Vec::new(), started_ns: 0 };
         assert_eq!(Held::read(&none.write().unwrap()), Ok(none));
-        for cut in [0, 5, MAGIC.len(), MAGIC.len() + 3, MAGIC.len() + 4 + 3] {
+        let answer_at = bytes.len() - held.answer.len();
+        for cut in [0, 5, MAGIC.len(), MAGIC.len() + 7, MAGIC.len() + 8 + 3, MAGIC.len() + 12 + 3, answer_at - 1] {
             assert!(Held::read(&bytes[..cut]).is_err(), "{cut}");
         }
+        let mut old = b"blaze answered 1".to_vec();
+        old.extend_from_slice(&1u32.to_be_bytes());
+        old.extend_from_slice(b"r");
+        assert!(Held::read(&old).unwrap_err().contains("blaze answered 2"));
         let mut other = bytes.clone();
         other[0] = b'B';
         assert!(Held::read(&other).is_err());

@@ -592,9 +592,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
-                    // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
+                    // `#[blaze::expect(panic, alloc)]`: the list is [`AttrFlags::expect_attr`]'s to
                     // read and refuse.
-                    (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
+                    (Some(Word::blaze), Some(Word::expect)) => attr_flags.insert(AttrFlags::EXPECT),
                     // `#[blaze::multiversion("x86-64-v3", "avx512f")]`; the levels are
                     // [`AttrFlags::multiversion_levels`]'s to read.
                     (Some(Word::blaze), Some(Word::multiversion)) => {
@@ -756,7 +756,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
                 (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
-                (Some(Word::blaze), Some(Word::may)) => AttrFlags::MAY,
+                (Some(Word::blaze), Some(Word::expect)) => AttrFlags::EXPECT,
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
@@ -945,6 +945,7 @@ name_set! {
     deprecated,
     diagnostic,
     effects,
+    expect,
     differentiable,
     do_not_recommend,
     doc,
@@ -965,7 +966,6 @@ name_set! {
     macro_export,
     macro_style,
     marker,
-    may,
     may_dangle,
     may_suspend,
     memo,
@@ -1242,13 +1242,15 @@ bitflags::bitflags! {
         /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
         /// it.
         const BLAZE_MEMO = 1 << 112;
-        /// `#[blaze::may]` or `#[blaze::may(..)]` on a function, a trait or (as an inner
-        /// attribute) a module or the crate: the effects it may have, the positive spelling of
-        /// the three above and the only one of `diverge` (docs/v2/plan/design/effects.md). Inert
-        /// under rustc with `#![register_tool(blaze)]`; [`AttrFlags::may_attr`] reads the list.
-        const MAY = 1 << 101;
+        /// `#[blaze::expect]` or `#[blaze::expect(..)]` on a function, a trait or (as an inner
+        /// attribute) a module or the crate: the effects it is expected to have, exactly on a
+        /// function that writes its own list, the positive spelling of the three above and the
+        /// only one of `diverge` (docs/v2/plan/design/effects.md). Inert under rustc with
+        /// `#![register_tool(blaze)]`; [`AttrFlags::expect_attr`] reads the list. The deleted
+        /// spelling `#[blaze::may(..)]` sets nothing: blaze-lints refuses it by its path.
+        const EXPECT = 1 << 101;
         /// `#![blaze::effects]` at a crate's root: every function of the crate with no
-        /// `#[blaze::may(..)]` of its own, and no module's above it, may have no effect, checked
+        /// `#[blaze::expect(..)]` of its own, and no module's above it, may have no effect, checked
         /// (the gate the blaze edition will turn on; `blaze::undeclared_effect`).
         const BLAZE_EFFECTS = 1 << 102;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
@@ -1908,21 +1910,22 @@ impl EffectWord {
         }
     }
 
-    /// The word of `#[blaze::may(..)]` this spelling promises the absence of.
-    pub const fn may(self) -> MayWord {
+    /// The word of `#[blaze::expect(..)]` this spelling promises the absence of.
+    pub const fn absent(self) -> ExpectWord {
         match self {
-            EffectWord::Nopanic => MayWord::Panic,
-            EffectWord::Noalloc => MayWord::Alloc,
-            EffectWord::Nonblocking => MayWord::Block,
+            EffectWord::Nopanic => ExpectWord::Panic,
+            EffectWord::Noalloc => ExpectWord::Alloc,
+            EffectWord::Nonblocking => ExpectWord::Block,
         }
     }
 }
 
-/// A word of `#[blaze::may(..)]`: an effect a function is allowed to have. The positive
-/// spelling: what is not listed, the function does not have.
+/// A word of `#[blaze::expect(..)]`: an effect a function is expected to have. The positive
+/// spelling: what is not listed, the function does not have; on a function's own list, what
+/// is listed it has (`blaze::unfulfilled_effect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum MayWord {
+pub enum ExpectWord {
     /// `panic`: it may panic or abort (the absence `#[blaze::nopanic]` promises).
     Panic,
     /// `alloc`: it may call the global allocator (`#[blaze::noalloc]`).
@@ -1934,36 +1937,36 @@ pub enum MayWord {
     Diverge,
 }
 
-impl MayWord {
+impl ExpectWord {
     /// Every word, in the order of its index and the order a list is written in.
-    pub const ALL: [MayWord; 4] =
-        [MayWord::Panic, MayWord::Alloc, MayWord::Block, MayWord::Diverge];
+    pub const ALL: [ExpectWord; 4] =
+        [ExpectWord::Panic, ExpectWord::Alloc, ExpectWord::Block, ExpectWord::Diverge];
 
     /// The word, as written in the list.
     pub const fn text(self) -> &'static str {
         match self {
-            MayWord::Panic => "panic",
-            MayWord::Alloc => "alloc",
-            MayWord::Block => "block",
-            MayWord::Diverge => "diverge",
+            ExpectWord::Panic => "panic",
+            ExpectWord::Alloc => "alloc",
+            ExpectWord::Block => "block",
+            ExpectWord::Diverge => "diverge",
         }
     }
 
     /// The word written `text`.
-    pub fn of(text: &str) -> Option<MayWord> {
-        MayWord::ALL.into_iter().find(|it| it.text() == text)
+    pub fn of(text: &str) -> Option<ExpectWord> {
+        ExpectWord::ALL.into_iter().find(|it| it.text() == text)
     }
 
-    /// Its bit in a [`MayAttr::words`].
+    /// Its bit in a [`ExpectAttr::words`].
     pub const fn bit(self) -> u8 {
         1 << self as u8
     }
 }
 
-/// What `#[blaze::may(..)]` on an item says.
+/// What `#[blaze::expect(..)]` on an item says.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MayAttr {
-    /// The words listed, a [`MayWord::bit`] each.
+pub struct ExpectAttr {
+    /// The words listed, a [`ExpectWord::bit`] each.
     pub words: u8,
     /// `trusted = "why"` after the words: the list is taken at its word, not checked.
     pub trusted: Option<Symbol>,
@@ -1972,17 +1975,17 @@ pub struct MayAttr {
     pub malformed: Option<Symbol>,
 }
 
-impl MayAttr {
+impl ExpectAttr {
     /// Whether `word` is listed.
-    pub const fn has(&self, word: MayWord) -> bool {
+    pub const fn has(&self, word: ExpectWord) -> bool {
         self.words & word.bit() != 0
     }
 }
 
-/// What the arguments of `#[blaze::may(..)]` say: words of [`MayWord`] separated by commas
+/// What the arguments of `#[blaze::expect(..)]` say: words of [`ExpectWord`] separated by commas
 /// (each once, a trailing comma allowed), then at most one `trusted = "why"`.
-fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
-    let malformed = |words| MayAttr {
+fn expect_args(tt: ast::TokenTree<'_>) -> ExpectAttr {
+    let malformed = |words| ExpectAttr {
         words,
         trusted: None,
         malformed: Some(Symbol::intern(&tt.syntax().text().to_string())),
@@ -2007,7 +2010,7 @@ fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
                 _ => return malformed(words),
             }
         } else {
-            match MayWord::of(key.text()) {
+            match ExpectWord::of(key.text()) {
                 Some(word) if words & word.bit() == 0 => words |= word.bit(),
                 _ => return malformed(words),
             }
@@ -2018,7 +2021,7 @@ fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
             Some(_) => return malformed(words),
         }
     }
-    MayAttr { words, trusted, malformed: None }
+    ExpectAttr { words, trusted, malformed: None }
 }
 
 /// Whether `path` is the two segments `blaze::<word>`.
@@ -2424,26 +2427,26 @@ impl AttrFlags {
         }
     }
 
-    /// What `#[blaze::may(..)]` on `owner` (a function, a trait, or a module or the crate's root
-    /// for the inner attribute) says ([`MayAttr`]); `None` without it, one bit test.
+    /// What `#[blaze::expect(..)]` on `owner` (a function, a trait, or a module or the crate's root
+    /// for the inner attribute) says ([`ExpectAttr`]); `None` without it, one bit test.
     #[inline]
-    pub fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
-        if !AttrFlags::query(db, owner).contains(AttrFlags::MAY) {
+    pub fn expect_attr(db: &Db, owner: AttrDefId) -> Option<ExpectAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::EXPECT) {
             return None;
         }
-        return may_attr(db, owner);
+        return expect_attr(db, owner);
 
         #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
-        fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+        fn expect_attr(db: &Db, owner: AttrDefId) -> Option<ExpectAttr> {
             collect_attrs(db, owner, |attr| {
                 let read = match attr {
-                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "may") => {
-                        MayAttr { words: 0, trusted: None, malformed: None }
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "expect") => {
+                        ExpectAttr { words: 0, trusted: None, malformed: None }
                     }
-                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "expect") => {
                         match attr.token_tree() {
-                            Some(tt) => may_args(tt),
-                            None => MayAttr { words: 0, trusted: None, malformed: None },
+                            Some(tt) => expect_args(tt),
+                            None => ExpectAttr { words: 0, trusted: None, malformed: None },
                         }
                     }
                     _ => return ControlFlow::Continue(()),

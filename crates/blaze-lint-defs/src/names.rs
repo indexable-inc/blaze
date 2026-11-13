@@ -129,7 +129,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::pure",
             "blaze::capabilities",
             "blaze::undeclared_effect",
-            "blaze::unneeded_effect",
+            "blaze::unfulfilled_effect",
             "blaze::negative_effect",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
@@ -271,6 +271,11 @@ pub(super) const IGNORED: &[&str] = &[
 
 /// `register_removed`: the name and why.
 pub(super) const REMOVED: &[(&str, &str)] = &[
+    // blaze's own, deleted with no alias (AGENTS.md rule 30).
+    (
+        "blaze::unneeded_effect",
+        "a word of a function's own list it is proved not to have is `blaze::unfulfilled_effect`, deny: `#[blaze::expect(..)]` is exact",
+    ),
     ("intra_doc_link_resolution_failure", "use `rustdoc::broken_intra_doc_links` instead"),
     ("rustdoc", "use `rustdoc::all` instead"),
     ("unknown_features", "replaced by an error"),

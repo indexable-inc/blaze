@@ -13,6 +13,11 @@
 //! off any symlink (`/private/tmp`, never `/tmp`: a home named through a link turns the
 //! no-op lane off), with the store check forced on (`BLAZE_VERIFY_STORE=1`), and its exit
 //! status and output are read.
+//!
+//! `blaze` is the thin `blaze` (crates/blaze-thin) with the engine beside it, as an install
+//! lays them out ([`install`]): every command goes through the thin's route, and a case of
+//! its own path ([`Test::as_typed`]) runs its commands as a person types them, so the thin's
+//! own check of a request with nothing changed (blaze-thin's `solo`) is what answers them.
 
 use std::{
     collections::BTreeMap,
@@ -30,7 +35,7 @@ use std::{
 
 use super::{
     check::{self, Row},
-    spec::{Change, Observed, Revision, Step, Test},
+    spec::{Change, Observed, Ran, Revision, Step, Test},
 };
 
 /// Longer than any command here takes with the standard library built cold.
@@ -71,6 +76,8 @@ impl Drop for Slot {
 
 struct Out {
     ok: bool,
+    /// `None`: a signal ended it.
+    status: Option<i32>,
     stdout: String,
     stderr: String,
     ms: u128,
@@ -94,6 +101,21 @@ struct Real {
     running: Option<Running>,
     /// When the last edit step wrote its files.
     edited: Option<Instant>,
+    /// Where the thin `blaze` (`blaze`) and its engine ([`blaze_thin::ENGINE`]) are, this
+    /// test's alone ([`install`]).
+    bin: PathBuf,
+    /// [`Test::as_typed`]: `build`, `run`, `check` and `test` run as a person types them.
+    typed: bool,
+    /// The number of the last build the driver saw blaze name (a `build-finished` line,
+    /// `blaze why`), `Ok(None)` before any; `Err` says why it is not known (a cancelled build
+    /// names none). How a command typed with no messages is told to have built nothing.
+    last_build: Result<Option<u64>, &'static str>,
+    /// The program the last `blaze build` named (`compiler-artifact`'s `executable`): what
+    /// `run the file` runs.
+    last_executable: Option<String>,
+    /// Where in this home's `serve.log` the revision began: the count of
+    /// [`Expect::starts`](super::spec::Expect::starts) is of the lines after it.
+    starts_from: u64,
 }
 
 /// A program started by [`Step::Start`] and left running: `blaze run`'s process (which
@@ -142,6 +164,89 @@ fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
     })
 }
 
+/// The thin `blaze` and the engine, installed for the test whose root is named `name` as an
+/// install lays them out (harness/v2/integrate.py; the release's archive): the thin as
+/// `blaze` and the engine as [`blaze_thin::ENGINE`] in one directory, so the thin finds its
+/// engine beside its own file (blaze-thin main.rs, `Engine::beside`: the directory of its
+/// resolved `current_exe`). Each is a hard link of the built file (no copy of a large
+/// engine a test) in a directory of this test's own (in `CARGO_TARGET_TMPDIR`, on the built
+/// files' filesystem), so `replace engine` changes this test's engine alone. The engine is
+/// `BLAZE_REVISIONS_BLAZE` where that is set, else the built `blaze-engine`; the thin is
+/// `BLAZE_REVISIONS_THIN`, else `blaze-thin` beside the engine, which `cargo test` does not
+/// build: `cargo build -p blaze-thin` does. Either one missing fails the test, naming it.
+fn install(name: &str) -> PathBuf {
+    let engine = std::env::var_os("BLAZE_REVISIONS_BLAZE")
+        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_blaze-engine")), PathBuf::from);
+    let thin = std::env::var_os("BLAZE_REVISIONS_THIN").map_or_else(|| engine.with_file_name("blaze-thin"), PathBuf::from);
+    for (what, path, how) in [
+        ("the engine", &engine, "`cargo build -p blaze-engine`, or BLAZE_REVISIONS_BLAZE naming one"),
+        ("the thin `blaze`", &thin, "`cargo build -p blaze-thin` makes it beside the engine, or BLAZE_REVISIONS_THIN names one"),
+    ] {
+        if let Err(error) = fs::metadata(path) {
+            panic!("{what} {} is not there ({error}): {how}", path.display());
+        }
+    }
+    let bin = Path::new(env!("CARGO_TARGET_TMPDIR")).join("revisions-bin").join(name);
+    let _ = fs::remove_dir_all(&bin);
+    fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("making {}: {error}", bin.display()));
+    for (from, to) in [(&thin, bin.join("blaze")), (&engine, bin.join(blaze_thin::ENGINE))] {
+        fs::hard_link(from, &to).unwrap_or_else(|error| {
+            panic!(
+                "linking {} as {} ({error}): the built file and CARGO_TARGET_TMPDIR are on one filesystem, or it is \
+                 named on another",
+                from.display(),
+                to.display()
+            )
+        });
+    }
+    bin
+}
+
+/// The arguments of a revision before its `--` (blaze's) and after it (the program's).
+fn split(revision: &Revision) -> (&[String], &[String]) {
+    let at = revision.args.iter().position(|it| it == "--").unwrap_or(revision.args.len());
+    (&revision.args[..at], revision.args.get(at + 1..).unwrap_or_default())
+}
+
+/// Every run of an action but the first, held to what each run is held to
+/// ([`check::OF_THE_ACTION`] is the first's): each failure says which run it is of.
+fn of_other_runs(revision: &Revision, others: &[Observed]) -> Vec<check::Failure> {
+    let mut failed = Vec::new();
+    let n = others.len() + 1;
+    for (index, seen) in others.iter().enumerate() {
+        for mut failure in check::held(revision, seen, None, check::OF_THE_ACTION) {
+            failure.got = format!("run {} of {n} started together: {}", index + 2, failure.got);
+            failed.push(failure);
+        }
+    }
+    failed
+}
+
+/// No build ran: nothing was made again, and no memo ran; `why` says how that is known.
+fn nothing_built(seen: &mut Observed, why: &str) {
+    (seen.redone, seen.executed, seen.verified) = (Some(Vec::new()), Some(0), Some(0));
+    seen.records = Some(0);
+    seen.runs = Some(0);
+    // No build ran, so no unit was made, whether or not a `blaze-work` line said so.
+    seen.units = Some(seen.units.unwrap_or(0));
+    (seen.written, seen.unkept, seen.described) = (Some(0), Some(0), Some(0));
+    seen.ran = Some(BTreeMap::new());
+    seen.spans = Some(BTreeMap::new());
+    seen.noop = Some(true);
+    seen.why = why.to_owned();
+    // No build ran, so there is no work to account for.
+    seen.account = Some(Vec::new());
+}
+
+/// A process started and not yet waited for ([`Real::finish`]).
+struct Started {
+    child: std::process::Child,
+    stdout: thread::JoinHandle<String>,
+    stderr: thread::JoinHandle<String>,
+    began: Instant,
+    what: String,
+}
+
 fn alive(pid: &str) -> bool {
     Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().unwrap().success()
 }
@@ -158,9 +263,14 @@ impl Real {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("test"), &test.name).unwrap();
-        let blaze = std::env::var_os("BLAZE_REVISIONS_BLAZE").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_blaze")), PathBuf::from);
+        let bin = install(&root.file_name().expect("the root has a name").to_string_lossy());
         Real {
-            blaze,
+            blaze: bin.join("blaze"),
+            bin,
+            typed: test.as_typed(),
+            last_build: Ok(None),
+            last_executable: None,
+            starts_from: 0,
             dir: root.join("w"),
             home: root.join("h"),
             cache: root.join("c"),
@@ -191,38 +301,69 @@ impl Real {
         }
     }
 
-    /// `blaze ARGS` in the checkout, in the environment every command of the test has.
+    /// `blaze ARGS` in the checkout, in the environment every command of the test has; in a
+    /// case of the thin's own path ([`Test::as_typed`]) a `build`, `run`, `check` or `test`
+    /// in a person's (the driver's own reads, `why`, `explain`, `stop`, `store`, keep it whole).
     fn command(&self, args: &[&str], env: &BTreeMap<String, String>) -> Command {
         let mut command = Command::new(&self.blaze);
+        let typed = self.typed && matches!(args.first().copied(), Some("build" | "run" | "check" | "test"));
+        self.environ(&mut command, env, !typed);
+        command.args(args);
+        command
+    }
+
+    /// `command` in the checkout, in the environment every command of the test has: blaze's
+    /// and the programs [`Expect::as_built`](super::spec::Expect::as_built) runs alike.
+    /// `whole`: with the driver's own settings of blaze (`BLAZE_LOCK`, `BLAZE_VERIFY_STORE`,
+    /// `BLAZE_DUCKDB`); without them it is a person's, whose command the thin `blaze` reads
+    /// (any `BLAZE_*` but `BLAZE_HOME` sends it to the engine, blaze-thin's `route::env`).
+    fn environ(&self, command: &mut Command, env: &BTreeMap<String, String>, whole: bool) {
         command.env_clear();
-        for name in ["HOME", "BLAZE_DUCKDB"] {
+        let passed: &[&str] = if whole { &["HOME", "BLAZE_DUCKDB"] } else { &["HOME"] };
+        for name in passed {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
+        }
+        if whole {
+            command.env("BLAZE_LOCK", "write").env("BLAZE_VERIFY_STORE", "1");
         }
         command
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("TMPDIR", self.root.join("t"))
             .env("BLAZE_HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)
-            .env("BLAZE_LOCK", "write")
-            .env("BLAZE_VERIFY_STORE", "1")
             .env("RUST_BACKTRACE", "0")
             .envs(env)
-            .args(args)
             .current_dir(&self.dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command
     }
 
     fn blaze(&self, args: &[&str], env: &BTreeMap<String, String>) -> Out {
-        let mut command = self.command(args, env);
+        let command = self.command(args, env);
+        self.wait(command, &format!("blaze {}", args.join(" ")))
+    }
+
+    /// `command` run to its end, `what` naming it in a hang's panic.
+    fn wait(&self, command: Command, what: &str) -> Out {
+        let started = self.start(command, what);
+        self.finish(started)
+    }
+
+    /// `command` started, its output drained as it comes ([`Self::finish`] waits for it).
+    fn start(&self, mut command: Command, what: &str) -> Started {
         let began = Instant::now();
-        let mut child = command.spawn().unwrap_or_else(|error| panic!("starting {}: {error}", self.blaze.display()));
+        let mut child = command.spawn().unwrap_or_else(|error| panic!("starting `{what}`: {error}"));
         let stdout = drain(child.stdout.take().unwrap());
         let stderr = drain(child.stderr.take().unwrap());
+        Started { child, stdout, stderr, began, what: what.to_owned() }
+    }
+
+    /// A [`Started`] process waited for, at most [`DEADLINE`] from its start.
+    fn finish(&self, started: Started) -> Out {
+        let Started { mut child, stdout, stderr, began, what } = started;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -232,8 +373,7 @@ impl Real {
                 child.wait().unwrap();
                 self.kill_daemon();
                 panic!(
-                    "`blaze {}` in {} ran {} s without finishing: a hang (the daemon's log: {})",
-                    args.join(" "),
+                    "`{what}` in {} ran {} s without finishing: a hang (the daemon's log: {})",
                     self.dir.display(),
                     DEADLINE.as_secs(),
                     self.home.join("v2/serve.log").display()
@@ -241,7 +381,13 @@ impl Real {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        Out { ok: status.success(), stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap(), ms: began.elapsed().as_millis() }
+        Out {
+            ok: status.success(),
+            status: status.code(),
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+            ms: began.elapsed().as_millis(),
+        }
     }
 
     /// The pid of the daemon the home's log last says is listening.
@@ -325,14 +471,220 @@ impl Real {
         }
     }
 
-    /// The revision's action run, and what blaze says of it. `account`: whether the
-    /// daemon is asked what it made again (the incremental build), or only the outcome is
-    /// read (the clean one).
-    fn act(&mut self, revision: &Revision, env: &BTreeMap<String, String>, account: bool) -> Observed {
-        let mut args = vec![revision.action.word(), "--message-format=json"];
-        args.extend(revision.args.iter().map(String::as_str));
+    /// The revision's action run, and what blaze says of it: one [`Observed`] a run (an
+    /// incremental action runs `at_once` times, started together; a clean one once). The
+    /// first holds what is of the action as a whole ([`check::OF_THE_ACTION`]). `account`:
+    /// whether the daemon is asked what it made again and whether a daemon is reached (the
+    /// incremental build), or only the outcome is read (the clean one).
+    fn act(&mut self, revision: &Revision, env: &BTreeMap<String, String>, account: bool) -> Vec<Observed> {
+        let mut runs = self.acted(revision, env, account);
+        // After the action's account, so the build is never the one that account is of.
+        if revision.expect.as_built {
+            let built = self.as_built(revision, env);
+            for seen in &mut runs {
+                seen.built = Some(built.clone()); // clone: one build's run, held against each run
+            }
+        }
+        runs
+    }
+
+    /// Who holds blaze's state now: whether a daemon runs on it, asked of `serve.lock` as
+    /// blaze asks it (`blaze_cargo::serve::holder`, a shared try-lock that never waits).
+    fn held(&self) -> bool {
+        let state = self.home.join("v2");
+        match blaze_cargo::serve::holder(&state) {
+            Ok(blaze_cargo::serve::Holder::None) => false,
+            Ok(blaze_cargo::serve::Holder::Daemon { .. }) => true,
+            Err(error) => panic!("who holds {}: {error:#}", state.join("serve.lock").display()),
+        }
+    }
+
+    /// The daemon's log of this home.
+    fn log(&self) -> PathBuf {
+        self.home.join("v2/serve.log")
+    }
+
+    /// How long this home's `serve.log` is: 0 where no daemon ever wrote one.
+    fn log_len(&self) -> u64 {
+        match fs::metadata(self.log()) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("{}: {error}", self.log().display()),
+        }
+    }
+
+    /// The daemons that started since `from` bytes into `serve.log`: the lines a daemon writes
+    /// as it starts serving (`blaze_cargo::serve::LISTENING`). The log is appended to by every
+    /// daemon; one shorter than `from` is not counted but refused, naming it.
+    fn starts_since(&self, from: u64) -> u64 {
+        let log = match fs::read(self.log()) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && from == 0 => return 0,
+            Err(error) => panic!("{}: {error}", self.log().display()),
+        };
+        assert!(
+            log.len() as u64 >= from,
+            "{} is {} bytes, shorter than the {from} it was when the revision began: its daemon starts can't be counted",
+            self.log().display(),
+            log.len()
+        );
+        String::from_utf8_lossy(&log[from as usize..]).lines().filter(|line| line.contains(blaze_cargo::serve::LISTENING)).count()
+            as u64
+    }
+
+    /// What blaze's JSON messages in `stdout` say of the builds the driver tells apart: the
+    /// last build's number, and, of a `blaze build` (`build`), the program it names.
+    fn saw(&mut self, stdout: &str, build: bool) {
+        for line in stdout.lines().filter(|line| line.starts_with("{\"reason\"")) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            match value["reason"].as_str() {
+                Some("build-finished") => {
+                    if let Some(id) = value["build_id"].as_u64() {
+                        self.last_build = Ok(Some(id));
+                    }
+                }
+                Some("compiler-artifact") if build => {
+                    if let Some(path) = value["executable"].as_str() {
+                        self.last_executable = Some(path.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `blaze build` with the revision's arguments before a `--`: the program it names, or why
+    /// there is none.
+    fn built_file(&mut self, revision: &Revision, env: &BTreeMap<String, String>) -> Result<String, String> {
+        let mut args = vec!["build", "--message-format=json"];
+        args.extend(split(revision).0.iter().map(String::as_str));
         let out = self.blaze(&args, env);
-        let mut seen = Observed { ok: out.ok, said: out.stderr, ms: out.ms, ..Observed::default() };
+        if !out.ok {
+            return Err(format!("`blaze {}` failed:\n{}", args.join(" "), out.stderr));
+        }
+        self.last_executable = None;
+        self.saw(&out.stdout, true);
+        // clone: the path, out of the driver's state
+        self.last_executable.clone().ok_or_else(|| format!("`blaze {}` named no executable in its messages", args.join(" ")))
+    }
+
+    /// [`Expect::as_built`](super::spec::Expect::as_built): `blaze build` with the revision's
+    /// arguments before a `--`, then the file it names run with those after it, in the
+    /// checkout and the test's environment.
+    fn as_built(&mut self, revision: &Revision, env: &BTreeMap<String, String>) -> Result<Ran, String> {
+        let executable = self.built_file(revision, env)?;
+        let mut command = Command::new(&executable);
+        self.environ(&mut command, env, !self.typed);
+        command.args(split(revision).1);
+        let ran = self.wait(command, &executable);
+        Ok(Ran { stdout: ran.stdout, stderr: ran.stderr, status: ran.status })
+    }
+
+    /// The action's commands, `runs` of them started together and each waited for. A case of
+    /// the thin's own path ([`Test::as_typed`]) types them as a person does; any other asks for
+    /// blaze's JSON messages. `run the file` runs the program the last `blaze build` named; from
+    /// nothing (`fresh`) that build is made first.
+    fn commands(&mut self, revision: &Revision, env: &BTreeMap<String, String>, runs: u64, fresh: bool) -> Vec<Out> {
+        let label = &revision.label;
+        let mut started = Vec::new();
+        if revision.action == super::spec::Action::RunTheFile {
+            if fresh && let Err(why) = self.built_file(revision, env) {
+                panic!("{label}: `run the file` from nothing: {why}");
+            }
+            // clone: the path, out of the driver's state
+            let Some(program) = self.last_executable.clone() else {
+                panic!("{label}: `run the file` with no program made: no `blaze build` named one before it (a `build` step, or an `as_built` revision)");
+            };
+            for _ in 0..runs {
+                let mut command = Command::new(&program);
+                self.environ(&mut command, env, !self.typed);
+                command.args(split(revision).1);
+                started.push(self.start(command, &program));
+            }
+        } else {
+            let mut args = vec![revision.action.word()];
+            if !self.typed {
+                args.push("--message-format=json");
+            }
+            args.extend(revision.args.iter().map(String::as_str));
+            for _ in 0..runs {
+                let command = self.command(&args, env);
+                started.push(self.start(command, &format!("blaze {}", args.join(" "))));
+            }
+        }
+        started.into_iter().map(|it| self.finish(it)).collect()
+    }
+
+    /// The revision's action run, and what blaze says of it ([`Self::act`]).
+    fn acted(&mut self, revision: &Revision, env: &BTreeMap<String, String>, account: bool) -> Vec<Observed> {
+        // Whether a daemon is reached, asked before the driver asks anything of its own.
+        let before = account.then(|| self.held());
+        let at_action = self.log_len();
+        let outs = self.commands(revision, env, if account { revision.at_once } else { 1 }, !account);
+        let after = account.then(|| self.held());
+        let started_by_action = self.starts_since(at_action);
+        let starts = account.then(|| self.starts_since(self.starts_from));
+        if !self.typed {
+            let [out] = <[Out; 1]>::try_from(outs).unwrap_or_else(|_| panic!("{}: one run of a JSON action", revision.label));
+            let (mut seen, build) = self.read_messages(revision, out);
+            (seen.daemon_after, seen.starts) = (after, starts);
+            if account {
+                if seen.noop == Some(true) {
+                    nothing_built(&mut seen, "answered as the last build was (the no-op lane)");
+                } else {
+                    self.account_of(revision, &mut seen, build);
+                }
+            }
+            return vec![seen];
+        }
+        let mut runs: Vec<Observed> = outs
+            .into_iter()
+            .map(|out| Observed { ok: out.ok, status: out.status, stdout: out.stdout, said: out.stderr, ms: out.ms, ..Observed::default() })
+            .collect();
+        let first = &mut runs[0];
+        (first.panics, first.first_panic, first.alarms) = self.panics();
+        (first.daemon_after, first.starts) = (after, starts);
+        if !account {
+            return runs;
+        }
+        // A command typed as a person types it says nothing of its build: whether one ran is
+        // known from the daemon. No daemon before, none started and none after: none built.
+        if before == Some(false) && started_by_action == 0 && after == Some(false) {
+            nothing_built(&mut runs[0], "no daemon held blaze's state before the action, none started during it and none held it after: nothing was built");
+            return runs;
+        }
+        if runs.len() > 1 {
+            runs[0].account_said = format!(
+                "{} runs started together that a daemon served: blaze names the last build alone, so what each made is not \
+                 told apart and is not read",
+                runs.len()
+            );
+            return runs;
+        }
+        let none = BTreeMap::new();
+        let why = self.blaze(&["why", "--all", "--json"], &none);
+        let named = serde_json::from_str::<serde_json::Value>(why.stdout.trim()).ok().filter(|_| why.ok).map(|it| it["build"].as_u64());
+        let mut seen = runs.swap_remove(0);
+        match (named, self.last_build) {
+            (None, _) => seen.account_said = format!("`blaze why --all --json` said: {}{}", why.stdout, why.stderr),
+            (Some(build), Ok(last)) if build == last => nothing_built(
+                &mut seen,
+                "a daemon answered it with no build of its own: `blaze why` names the build the driver saw before it",
+            ),
+            (Some(Some(build)), Ok(_)) => {
+                self.last_build = Ok(Some(build));
+                self.account_of(revision, &mut seen, Some(build));
+            }
+            (Some(None), Ok(_)) => seen.account_said = "`blaze why --all --json` names no build, after a build the driver saw".to_owned(),
+            (Some(_), Err(unknown)) => seen.account_said = format!("whether the action built is not known: {unknown}"),
+        }
+        vec![seen]
+    }
+
+    /// What one command run with `--message-format=json` said: the build's messages read, every
+    /// other line of standard output the program's; and the build's number, where it names one.
+    fn read_messages(&mut self, revision: &Revision, out: Out) -> (Observed, Option<u64>) {
+        let mut seen = Observed { ok: out.ok, status: out.status, said: out.stderr, ms: out.ms, ..Observed::default() };
         // Each line of standard output that is one of blaze's JSON messages is the build's;
         // every other line is the program's.
         let mut build = None;
@@ -387,26 +739,24 @@ impl Real {
         diagnostics.sort();
         seen.diagnostics = Some(diagnostics);
         (seen.panics, seen.first_panic, seen.alarms) = self.panics();
+        if let Some(build) = build {
+            self.last_build = Ok(Some(build));
+        }
+        if revision.action == super::spec::Action::Build
+            && let Some(path) = &executable
+        {
+            self.last_executable = Some(path.clone()); // clone: the path, kept as the last build's program
+        }
         if revision.expect.bytes && seen.ok {
             seen.image = executable.and_then(|path| fs::read(path).ok());
         }
-        if !account {
-            return seen;
-        }
-        if seen.noop == Some(true) {
-            // No build ran: nothing was made again, and no memo ran.
-            (seen.redone, seen.executed, seen.verified) = (Some(Vec::new()), Some(0), Some(0));
-            seen.records = Some(0);
-            seen.runs = Some(0);
-            // No build ran, so no unit was made, whether or not a `blaze-work` line said so.
-            seen.units = Some(seen.units.unwrap_or(0));
-            (seen.written, seen.unkept, seen.described) = (Some(0), Some(0), Some(0));
-            seen.ran = Some(BTreeMap::new());
-            seen.why = "answered as the last build was (the no-op lane)".to_owned();
-            // No build ran, so there is no work to account for.
-            seen.account = Some(Vec::new());
-            return seen;
-        }
+        (seen, build)
+    }
+
+    /// What blaze says it made of the build numbered `build` (`blaze why`, `blaze explain`),
+    /// into `seen`: what was made again, its account, the engine's memos, its spans and its
+    /// queries, each as the revision asks for them.
+    fn account_of(&mut self, revision: &Revision, seen: &mut Observed, build: Option<u64>) {
         let none = BTreeMap::new();
         let why = self.blaze(&["why", "--all", "--json"], &none);
         match serde_json::from_str::<serde_json::Value>(why.stdout.trim()) {
@@ -504,6 +854,26 @@ impl Real {
             }
         }
         if let Some(build) = build
+            && !revision.expect.spans.is_empty()
+        {
+            // Each span name the build ran, with how many (`span_sums`, folded spans counted).
+            let view = self.blaze(&["explain", "time_by_span_name", &format!("build={build}"), "--json"], &none);
+            let mut spans = BTreeMap::new();
+            for line in view.stdout.lines() {
+                let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                let count = &row["spans"];
+                // A sum may come as an integer, a float or (DuckDB's HUGEINT) a string.
+                let count = count.as_u64().or_else(|| count.as_f64().map(|it| it as u64)).or_else(|| count.as_str().and_then(|it| it.parse().ok()));
+                if let (Some(name), Some(count)) = (row["name"].as_str(), count) {
+                    *spans.entry(name.to_owned()).or_insert(0) += count;
+                }
+            }
+            match view.ok && !spans.is_empty() {
+                true => seen.spans = Some(spans),
+                false => seen.why.push_str(&format!("`blaze explain time_by_span_name build={build}` said: {}{}\n", view.stdout, view.stderr)),
+            }
+        }
+        if let Some(build) = build
             && !revision.expect.max_ran.is_empty()
         {
             // Each query that ran in the build, by name (`query_counts`).
@@ -524,7 +894,6 @@ impl Real {
                 false => seen.why.push_str(&format!("`blaze explain counts_by_cause build={build}` said: {}{}\n", counts.stdout, counts.stderr)),
             }
         }
-        seen
     }
 
     /// The running program ended, if one runs: what it and `blaze run` said on standard error.
@@ -544,6 +913,8 @@ impl Real {
                 let mut args = vec!["build"];
                 args.extend(revision.args.iter().map(String::as_str));
                 self.cancel(&args, env, *after);
+                // It may have made a build, whose number it never said.
+                self.last_build = Err("a build was cancelled since the last build blaze named, and may have made one");
             }
             Step::Beside(name) => {
                 let first = self.dir.clone(); // clone: the checkout to come back to
@@ -556,6 +927,8 @@ impl Real {
                 let out = self.blaze(&args, env);
                 self.dir = first;
                 assert!(out.ok, "{}: the build of the second checkout `{name}` failed:\n{}", revision.label, out.stderr);
+                // Its messages were not asked for: whether it made a build is not said.
+                self.last_build = Err("a second checkout was built since the last build blaze named, which names no number");
             }
             Step::Start => {
                 assert!(self.running.is_none(), "{label}: `start` with a program already running");
@@ -647,8 +1020,35 @@ impl Real {
                 args.extend(revision.args.iter().map(String::as_str));
                 let out = self.blaze(&args, env);
                 assert!(out.ok, "{}: the step `{}` failed:\n{}", revision.label, action.word(), out.stderr);
+                self.saw(&out.stdout, *action == super::spec::Action::Build);
             }
+            Step::ReplaceEngine => self.replace_engine(label),
         }
+    }
+
+    /// `replace engine` ([`Step::ReplaceEngine`]): the engine beside the thin `blaze` copied to a
+    /// name beside it, its modification time set to now, and renamed over itself. A copy that
+    /// kept the file's inode would test nothing, and is refused.
+    fn replace_engine(&self, label: &str) {
+        use std::os::unix::fs::MetadataExt as _;
+        let engine = self.bin.join(blaze_thin::ENGINE);
+        let beside = self.bin.join(format!("{}.replacing", blaze_thin::ENGINE));
+        let was = fs::metadata(&engine).unwrap_or_else(|error| panic!("{label}: `replace engine`: {}: {error}", engine.display()));
+        fs::copy(&engine, &beside).unwrap_or_else(|error| panic!("{label}: `replace engine`: copying {} to {}: {error}", engine.display(), beside.display()));
+        let copy = fs::File::options().write(true).open(&beside).unwrap_or_else(|error| panic!("{label}: `replace engine`: {}: {error}", beside.display()));
+        copy.set_modified(SystemTime::now()).unwrap_or_else(|error| panic!("{label}: `replace engine`: the time of {}: {error}", beside.display()));
+        drop(copy);
+        fs::rename(&beside, &engine).unwrap_or_else(|error| panic!("{label}: `replace engine`: renaming {} over {}: {error}", beside.display(), engine.display()));
+        let now = fs::metadata(&engine).unwrap_or_else(|error| panic!("{label}: `replace engine`: {}: {error}", engine.display()));
+        assert!(
+            now.ino() != was.ino() && now.len() == was.len(),
+            "{label}: `replace engine`: {} is inode {} of {} bytes, was inode {} of {} bytes: not the same bytes under a new inode",
+            engine.display(),
+            now.ino(),
+            now.len(),
+            was.ino(),
+            was.len()
+        );
     }
 
     /// Commands run in the checkout of the project `name` from here on (`project NAME`), or
@@ -682,6 +1082,7 @@ impl Real {
         }
         (self.home, self.cache) = (home, cache);
         self.log_read = 0;
+        self.starts_from = 0;
     }
 
     /// Commands run under the home `h-<name>` and the machine directory `c-<name>` from here
@@ -703,6 +1104,7 @@ impl Real {
         }
         (self.home, self.cache) = (home, cache);
         self.log_read = 0;
+        self.starts_from = 0;
         let out = self.blaze(&["store", "import", at, "--pin", "build", "--unsigned"], env);
         assert!(out.ok, "`packed {name}`: the import failed:\n{}", out.stderr);
     }
@@ -746,6 +1148,8 @@ impl Drop for Real {
         if !thread::panicking() || !self.keep {
             let _ = fs::remove_dir_all(&self.root);
         }
+        // The installed pair is no log: it goes whatever became of the test.
+        let _ = fs::remove_dir_all(&self.bin);
     }
 }
 
@@ -766,14 +1170,21 @@ pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
     real.keep = clean_when == Clean::Always;
     fs::create_dir_all(real.root.join("t")).unwrap();
     let mut rows: Vec<Row> = Vec::new();
+    // Each revision's runs after its first (`at_once`), held again beside the clean build.
+    let mut others: Vec<Vec<Observed>> = Vec::new();
     for (index, revision) in test.revisions.iter().enumerate() {
         let env = test.env_at(index);
         let before = test.files_at(index.saturating_sub(1));
+        real.starts_from = real.log_len();
         for step in &revision.steps {
             real.step(step, revision, &env, &before);
         }
-        let seen = real.act(revision, &env, true);
-        let failed = check::held(revision, &seen, None, &[]);
+        let mut runs = real.act(revision, &env, true).into_iter();
+        let seen = runs.next().unwrap_or_else(|| panic!("{}: an action with no run", revision.label));
+        let rest: Vec<Observed> = runs.collect();
+        let mut failed = check::held(revision, &seen, None, &[]);
+        failed.extend(of_other_runs(revision, &rest));
+        others.push(rest);
         rows.push(Row { label: revision.label.clone(), seen, failed, clean_ok: None });
     }
     real.end_running();
@@ -804,13 +1215,14 @@ pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
                 let files: Vec<Change> =
                     test.files_at(index).into_iter().map(|(path, bytes)| Change { path, bytes: Some(bytes) }).collect();
                 real.write(&files, &Step::Edit);
-                let clean = real.act(revision, &env, false);
+                let clean = real.act(revision, &env, false).into_iter().next().unwrap_or_else(|| panic!("{}: a clean action with no run", revision.label));
                 real.stop();
                 real.set_aside("clean");
                 clean
             }
         };
         rows[index].failed = check::held(revision, &rows[index].seen, Some(&clean), &[]);
+        rows[index].failed.extend(of_other_runs(revision, &others[index]));
         rows[index].clean_ok = Some(clean.ok);
         built.push((index, clean));
     }

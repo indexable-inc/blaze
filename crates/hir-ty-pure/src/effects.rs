@@ -2,9 +2,9 @@
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
 //! `#[blaze::pure]` here; beside it `nopanic`, `noalloc`, `nonblocking` and `terminates`, which
-//! `#[blaze::may(..)]` asks for by the words it leaves out, [`crate::may`]; and the crate-wide
-//! `ambient`, `unsafe` and `global_alloc` of `#![blaze::capabilities]`); and the toolchain's
-//! entry points a call of which counts as kinds at the call ([`MODELS`]).
+//! `#[blaze::expect(..)]` asks for by the words it leaves out, [`crate::expect`]; and the
+//! crate-wide `ambient`, `unsafe` and `global_alloc` of `#![blaze::capabilities]`); and the
+//! toolchain's entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
 //! new effect is an [`EffectDef`] in [`EFFECTS`] over the kinds the walk already records, with
@@ -14,7 +14,7 @@
 use base_db::{CrateOrigin, Db};
 use hir_def::{
     AttrDefId, FunctionId, ItemContainerId, Lookup, TraitId,
-    attrs::{AttrFlags, MayWord, PureAttr},
+    attrs::{AttrFlags, ExpectWord, PureAttr},
 };
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
@@ -79,7 +79,7 @@ pub enum Rule {
     /// the sets of an effect that refuses a panic, never a kind of [`crate::walk::Summary`]'s
     /// `kinds`, and never refused itself.
     Precondition,
-    /// A call through a `dyn` of a method no `#[blaze::may(..)]` or trust says the effects of
+    /// A call through a `dyn` of a method no `#[blaze::expect(..)]` or trust says the effects of
     /// (or through a `dyn Fn`), or the drop of a value that owns a `dyn`: its target is
     /// whatever object the function is handed. It matters only to a check whose root takes
     /// such a `dyn` (`crate::function`): every other object is made in the root's own graph,
@@ -228,11 +228,11 @@ impl EffectSet {
 /// walked for the other effects and for build scripts).
 pub struct EffectDef {
     /// The attribute's word: "pure". (`terminates` has no attribute of its own: it is what a
-    /// `#[blaze::may(..)]` without `diverge` asks.)
+    /// `#[blaze::expect(..)]` without `diverge` asks.)
     pub name: &'static str,
-    /// The word of `#[blaze::may(..)]` that allows what this refuses: a list without it asks
+    /// The word of `#[blaze::expect(..)]` that allows what this refuses: a list without it asks
     /// for this effect. None for `pure`, which no list names.
-    pub word: Option<MayWord>,
+    pub word: Option<ExpectWord>,
     pub refuses: EffectSet,
     /// What the attribute on an item says: checked, trusted with a reason, or malformed.
     pub attr: fn(&Db, AttrDefId) -> Option<PureAttr>,
@@ -309,7 +309,7 @@ pub(crate) fn trusted(
     if let Some(PureAttr::Trusted(why)) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some((why, None));
     }
-    if let Some(why) = may_trusted(db, AttrDefId::FunctionId(func), effect) {
+    if let Some(why) = expect_trusted(db, AttrDefId::FunctionId(func), effect) {
         return Some((why, None));
     }
     let trait_ = match func.lookup(db).container {
@@ -321,41 +321,41 @@ pub(crate) fn trusted(
 }
 
 /// Why `trait_` is trusted for `effect`, if it is: its `#[blaze::<effect>(trusted = "..")]`,
-/// or its `#[blaze::may(.., trusted = "..")]` that leaves the effect's word out.
+/// or its `#[blaze::expect(.., trusted = "..")]` that leaves the effect's word out.
 pub(crate) fn trusted_trait(db: &Db, trait_: TraitId, effect: &EffectDef) -> Option<Symbol> {
     match (effect.attr)(db, AttrDefId::TraitId(trait_)) {
         Some(PureAttr::Trusted(why)) => Some(why),
-        _ => may_trusted(db, AttrDefId::TraitId(trait_), effect),
+        _ => expect_trusted(db, AttrDefId::TraitId(trait_), effect),
     }
 }
 
-/// The reason of `owner`'s `#[blaze::may(.., trusted = "why")]` when its list leaves out
+/// The reason of `owner`'s `#[blaze::expect(.., trusted = "why")]` when its list leaves out
 /// `effect`'s word: the list is taken at its word, so the item does not have the effect.
-fn may_trusted(db: &Db, owner: AttrDefId, effect: &EffectDef) -> Option<Symbol> {
+fn expect_trusted(db: &Db, owner: AttrDefId, effect: &EffectDef) -> Option<Symbol> {
     let word = effect.word?;
-    let may = AttrFlags::may_attr(db, owner)?;
-    if may.malformed.is_some() || may.has(word) {
+    let expect = AttrFlags::expect_attr(db, owner)?;
+    if expect.malformed.is_some() || expect.has(word) {
         return None;
     }
-    may.trusted
+    expect.trusted
 }
 
 /// Bit `i` set for each effect `EFFECTS[i]` that a call of the trait's method `method` through
-/// a `dyn` or a type parameter cannot have: the method's `#[blaze::may(..)]`, or without one
+/// a `dyn` or a type parameter cannot have: the method's `#[blaze::expect(..)]`, or without one
 /// its trait's, leaves the effect's word out, and every impl's method is held within that list
 /// where it is written (`blaze::undeclared_effect`). Nothing for a method with no list.
 pub(crate) fn bound_mask(db: &Db, method: FunctionId) -> u32 {
     let ItemContainerId::TraitId(trait_) = method.lookup(db).container else { return 0 };
-    let may = AttrFlags::may_attr(db, AttrDefId::FunctionId(method))
-        .or_else(|| AttrFlags::may_attr(db, AttrDefId::TraitId(trait_)));
-    let Some(may) = may else { return 0 };
-    if may.malformed.is_some() {
+    let expect = AttrFlags::expect_attr(db, AttrDefId::FunctionId(method))
+        .or_else(|| AttrFlags::expect_attr(db, AttrDefId::TraitId(trait_)));
+    let Some(expect) = expect else { return 0 };
+    if expect.malformed.is_some() {
         return 0;
     }
     EFFECTS
         .iter()
         .enumerate()
-        .filter(|(_, effect)| effect.word.is_some_and(|word| !may.has(word)))
+        .filter(|(_, effect)| effect.word.is_some_and(|word| !expect.has(word)))
         .fold(0, |mask, (index, _)| mask | 1 << index)
 }
 

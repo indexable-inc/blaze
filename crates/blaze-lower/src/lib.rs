@@ -91,6 +91,18 @@ pub struct Lower<'a, T> {
     /// The machine's CPU, for a `-C target-cpu=native` in the rustflags; without it such a
     /// flag is an error naming it.
     pub host_cpu: Option<&'a HostCpu>,
+    /// What pins each package's sources, in `units.packages`' order: the digest of the tree it
+    /// is read from, or none, as the driver's one rule decides it (blaze-cargo's
+    /// `serve::sealed::pin`). Written on each crate of the package as
+    /// [`base_db::CrateData::sealed`]; a list of another length is refused. [`unsealed`]
+    /// for a lowering that seals nothing.
+    pub sealed: &'a [Option<ContentId>],
+}
+
+/// What a lowering that seals no crate passes as [`Lower::sealed`]: `units`' packages, none
+/// pinned. A test's, a probe's.
+pub fn unsealed(units: &Units) -> Vec<Option<ContentId>> {
+    vec![None; units.packages.len()] // alloc: once a lowering, a slot a package
 }
 
 // A view of references, copied whatever `T` is: a derive would ask `T: Copy`.
@@ -175,15 +187,22 @@ impl fmt::Display for LowerError {
 impl std::error::Error for LowerError {}
 
 /// What a build script's run gave: what [`Lowered::ran`] applies to the units depending on it.
+///
+/// Its bytes are the run's result's own: each file's text and its variables are shared
+/// (`Arc`), never copied, by the front end that applies it ([`Lowered::ran`]: the file texts,
+/// and each dependent crate's record of the run), so a run's bytes exist once in the daemon.
+/// Until 2026-11-12 each file was copied into the texts, and its variables into every
+/// dependent crate's record of it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ran {
     /// As `--cfg` takes them (`foo`, `foo="bar"`).
     pub cfgs: Vec<String>,
-    pub env: Vec<(String, String)>,
+    pub env: std::sync::Arc<[(String, String)]>,
     /// Absolute, as cargo names it.
     pub out_dir: String,
-    /// What it left in `OUT_DIR`, by `/`-separated path under it.
-    pub files: Vec<(String, Vec<u8>)>,
+    /// What it left in `OUT_DIR`, by `/`-separated path under it: the bytes of the run's
+    /// result (blaze-usercode's `OutFile`), shared.
+    pub files: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
 /// A build's units in the front end, owned by the daemon's loop. Tasks read it through a
@@ -342,9 +361,11 @@ struct MacroHost {
     links: bool,
 }
 
+/// A run as one dependent crate has it applied: its cfgs and variables shared with every
+/// other crate it is applied to and with the run itself ([`Ran`]), never a copy a crate.
 struct Applied {
-    cfgs: Vec<CfgAtom>,
-    env: Vec<(String, String)>,
+    cfgs: std::sync::Arc<[CfgAtom]>,
+    env: std::sync::Arc<[(String, String)]>,
     out_dir: String,
 }
 
@@ -662,7 +683,7 @@ fn lower_writes<T: blaze_query::Tree>(
     graph: &mut Graph,
     kept: Kept<'_>,
 ) -> Result<Setup, Refused> {
-    let Lower { units, config, files, root, host_cpu } = lower;
+    let Lower { units, config, files, root, host_cpu, sealed } = lower;
     // The first plan of the front end: what is told once a database is told now.
     let first = graph.other.is_none();
     let unit_count = units.graph.units.len();
@@ -674,6 +695,16 @@ fn lower_writes<T: blaze_query::Tree>(
     }
     let packages: blaze_hash::HashMap<&str, &PackagePlan, Global> =
         units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
+    if sealed.len() != units.packages.len() {
+        return Err(Refused::Error(LowerError::new(format!(
+            "the build has {} packages and {} pins of them (`Lower::sealed`)",
+            units.packages.len(),
+            sealed.len()
+        ))));
+    }
+    // What pins each package, by its id ([`Lower::sealed`]).
+    let pins: blaze_hash::HashMap<&str, Option<ContentId>, Global> =
+        units.packages.iter().zip(sealed).map(|(it, pin)| (it.id.as_str(), *pin)).collect();
     let package_of = |unit: &Unit| {
         packages.get(unit.pkg_id.as_str()).copied().ok_or_else(|| {
             LowerError::at(
@@ -1128,6 +1159,9 @@ fn lower_writes<T: blaze_query::Tree>(
                 package,
                 unit.is_std.then_some(config.library.as_str()),
             ))?),
+            // Its package's pin, every crate of it alike ([`Lower::sealed`]): a fact of the
+            // tree it is read from, written at its durability with the rest of its data.
+            sealed: pins.get(package.id.as_str()).copied().flatten(),
         };
         let extra = base_db::ExtraCrateData {
             version: Some(package.version.clone()),
@@ -1924,7 +1958,8 @@ impl Lowered {
             return Ok(());
         }
         let ran = canonical_run(&crates, run, ran);
-        let cfgs = cfg_atoms(&ran, &lowering.what)?;
+        // alloc: once per apply, the run's cfgs parsed, shared by every crate it applies to
+        let cfgs: std::sync::Arc<[CfgAtom]> = cfg_atoms(&ran, &lowering.what)?.into();
         let trigger = Trigger::of("a build script's run applied", &lowering.what);
         self.batch(trigger, |this| this.apply_run(&ran, &crates, lowering, &cfgs))
     }
@@ -1945,7 +1980,7 @@ impl Lowered {
         ran: &Ran,
         crates: &Crates,
         lowering: &Lowering,
-        cfgs: &[CfgAtom],
+        cfgs: &std::sync::Arc<[CfgAtom]>,
     ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
@@ -1953,7 +1988,8 @@ impl Lowered {
         let mut left: Vec<(String, std::sync::Arc<[u8]>)> = Vec::with_capacity(ran.files.len()); // alloc: once per apply, a file the run left each
         for (path, bytes) in &ran.files {
             let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-            let shared = std::sync::Arc::<[u8]>::from(bytes.as_slice());
+            // The run's own bytes, shared: the text is the allocation the run's result holds.
+            let shared = std::sync::Arc::clone(bytes); // clone: a count
             let at = format!("{out_dir}/{path}");
             left.push((at.clone(), std::sync::Arc::clone(&shared))); // clone: a count and the path, once per file per apply
             loaded.push(files::Loaded { path: at, id, bytes: blaze_vfs::Bytes::from(shared) });
@@ -1999,8 +2035,12 @@ impl Lowered {
             // of a run class that every plan naming this crate has for it.
             let runs = self.applied.entry(krate).or_default();
             runs.retain(|it| it.out_dir != *out_dir);
-            let applying =
-                Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
+            // clone: two counts and the `OUT_DIR`, once per dependent crate
+            let applying = Applied {
+                cfgs: std::sync::Arc::clone(cfgs),
+                env: std::sync::Arc::clone(&ran.env),
+                out_dir: out_dir.clone(),
+            };
             runs.push(applying);
             runs.sort_by(|a, b| a.out_dir.cmp(&b.out_dir));
             let base = &crates.units[dependent];
@@ -2056,10 +2096,12 @@ impl Lowered {
     /// not run when the view did not move (nothing is written, so nothing is parsed again) or
     /// on `Ok(false)`.
     ///
-    /// A write, as [`Lowered::ran`] is.
+    /// A write, as [`Lowered::ran`] is. Each look at the disk the reads again make is pushed
+    /// to `looks`, the list of the build the front end is moved for.
     pub fn refresh<T: blaze_query::Tree>(
         &mut self,
         lower: Lower<'_, T>,
+        looks: &base_db::Looks,
         seed: impl FnOnce(&Db) -> Result<(), LowerError>,
     ) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
@@ -2076,7 +2118,7 @@ impl Lowered {
         self.class_runs.clear();
         if root == self.view {
             // The view did not move, but a file outside it may have.
-            self.db.reload_included_files(INCLUDED_MOVED);
+            self.db.reload_included_files(INCLUDED_MOVED, looks);
             return Ok(true);
         }
         let tree = files::Mounts {
@@ -2092,7 +2134,7 @@ impl Lowered {
         self.narrowed.clear();
         // One change: the view's files, the seeds and the const macros they list, one batch.
         self.batch(Trigger::named("the view moved"), |this| {
-            this.refresh_writes(&tree, root, seed)
+            this.refresh_writes(&tree, root, looks, seed)
         })?;
         // A crate of the macro host whose root now links `proc_macro` or no longer does is
         // made with another cfg (`crates::host_side`): lowered anew, as a moved root is.
@@ -2116,6 +2158,7 @@ impl Lowered {
         &mut self,
         tree: &files::Mounts<'_, T>,
         root: ContentId,
+        looks: &base_db::Looks,
         seed: impl FnOnce(&Db) -> Result<(), LowerError>,
     ) -> Result<(), LowerError> {
         let (sets, other) = (self.crates.sets, self.crates.other);
@@ -2149,7 +2192,7 @@ impl Lowered {
         seed(db)?;
         // In this batch: one change, one pass. A file outside the VFS moves with no move of the
         // view, and one inside it may be newly outside: read again whatever the view did.
-        db.reload_included_files(INCLUDED_MOVED);
+        db.reload_included_files(INCLUDED_MOVED, looks);
         self.view = root;
         if removed {
             for lowering in &self.crates.units {
@@ -2448,16 +2491,17 @@ impl Lowered {
         });
     }
 
-    /// The images of the crates `served` keyed and found none of, written to `images` from
-    /// what this front end resolves them to ([`hir_def::deps::store`]), with each crate refused
-    /// and why.
+    /// The images of the crates `served` keyed and found none of that `which` names, written
+    /// to `images` from what this front end resolves them to ([`hir_def::deps::store`]), with
+    /// each crate refused and why.
     pub fn store_deps(
         &self,
         served: &hir_def::deps::Served,
         // dyn: as in `serve_deps`
         images: &dyn hir_def::deps::ImageStore,
+        which: hir_def::deps::Which,
     ) -> Result<hir_def::deps::Stored, LowerError> {
-        hir_def::deps::store(&self.db, served, images).map_err(LowerError::new)
+        hir_def::deps::store(&self.db, served, images, which).map_err(LowerError::new)
     }
 
     /// The database to give what else the store served for the crates [`Lowered::serve_deps`]
@@ -2514,14 +2558,17 @@ fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> 
         cfgs: ran.cfgs.iter().map(text).collect(), // alloc: as above
         env: ran.env.iter().map(|(name, value)| (name.clone(), text(value))).collect(), // alloc: as above
         out_dir: out_dir.to_owned(), // alloc: as above
+        // A file that does not name its `OUT_DIR` is the run's own bytes, shared; one that
+        // does is written anew, once.
         files: ran
             .files
             .iter()
             .map(|(path, bytes)| {
-                (
-                    path.clone(),
-                    crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()).into_owned(),
-                )
+                let bytes = match crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()) {
+                    Cow::Borrowed(_) => std::sync::Arc::clone(bytes), // clone: a count
+                    Cow::Owned(written) => std::sync::Arc::from(written), // alloc: as above
+                };
+                (path.clone(), bytes)
             })
             .collect(), // alloc: as above
     })

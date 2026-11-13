@@ -12,6 +12,13 @@ use hegel::generators as gs;
 use hegel::{Hegel, Settings, TestCase};
 
 use super::*;
+use blaze_vfs::outside::{Look, LookKind};
+
+/// A look at `path` of `kind` that said `answer`, made here.
+#[track_caller]
+fn look(path: &str, kind: LookKind, answer: Option<[u8; 32]>) -> Look {
+    Look { path: PathBuf::from(path), kind, answer, by: std::panic::Location::caller() }
+}
 
 /// The directories of the checkout's outputs, the `dev` profile's and `release`'s.
 const OUT: [&str; 2] = ["/b/debug", "/b/release"];
@@ -425,7 +432,6 @@ struct Daemon {
     /// What the store holds each kind's output of each profile made from.
     known: [[Option<String>; 2]; 2],
     watches: Watches,
-    looks: u64,
     /// The watches' generation read before the header was last looked at on the disk.
     header_read: Option<u64>,
     /// The path dependency as it was last read, and the watches' generation read before.
@@ -455,7 +461,6 @@ impl Daemon {
             planned: 0,
             known: [[None, None], [None, None]],
             watches: Watches::default(),
-            looks: 0,
             header_read: None,
             dep_read: 0,
             dep_generation: 0,
@@ -624,7 +629,7 @@ impl Daemon {
                 false => absent.push(PathBuf::from(LAYOUT)),
             }
             let mut recording =
-                Recording::new(inputs, self.watches.generation, self.looks, dirs, absent);
+                Recording::new(inputs, self.watches.generation, dirs, absent);
             // The steps' word: the variable the build script asked for by name, when its
             // kept run's reads are known.
             recording.vouch_env(match world.names {
@@ -657,13 +662,17 @@ impl Daemon {
         let vouched = self.header_read.is_some_and(|generation| {
             self.watches.unchanged_since(Path::new(INCLUDE), generation)
         });
+        // This walk's own looks ([`blaze_vfs::outside::Looks`]): the header's directory is
+        // looked at as an entry and the listing as a listing, neither a file's, so a walk
+        // with either keeps no answer.
+        let mut looks = Vec::new(); // alloc: a model walk's looks
         if !vouched {
             self.header_read = Some(self.watches.generation);
-            self.looks += 1;
+            looks.push(look(INCLUDE, LookKind::Entry, None));
             self.watches.want(INCLUDE);
         }
         if world.lists {
-            self.looks += 1;
+            looks.push(look(INCLUDE, LookKind::Listing, Some([0; 32])));
         }
         let made_from = world.made_from();
         let profile = usize::from(world.release);
@@ -708,9 +717,7 @@ impl Daemon {
             let last = recording.end(Walk {
                 passed: true,
                 made_nothing,
-                looks: self.looks,
-                looked_at: None,
-                files: None,
+                looks,
                 worked: None,
             });
             self.answers.keep(shape, last, Some(files));
@@ -1075,7 +1082,7 @@ fn a_refusal_names_the_input() {
     assert_eq!(daemon.inputs(&was).moved(&daemon.inputs(&now), &unasked), Some(Moved::Command));
     assert_eq!(NotReplayed::NoAnswer(Unkept::Made).input(), None);
     assert_eq!(NotReplayed::NoAnswer(Unkept::None).input(), None);
-    let looked = NotReplayed::NoAnswer(Unkept::Looked(Some(PathBuf::from("/net/a.h")))).input();
+    let looked = NotReplayed::NoAnswer(Unkept::Looked(PathBuf::from("/net/a.h"))).input();
     assert!(looked.is_some_and(|it| it.starts_with("/net/a.h, which no watch covers")));
     let moved = NotReplayed::OutputsMoved(PathBuf::from(OUT[0])).input();
     assert_eq!(moved.as_deref(), Some("the outputs under /b/debug"));
@@ -1086,15 +1093,8 @@ fn a_refusal_names_the_input() {
 fn a_traced_request_is_never_answered_by_the_lane() {
     let (daemon, world) = (Daemon::new(), plain());
     let inputs = daemon.inputs(&world);
-    let recording = Recording::new(inputs.clone(), 0, 0, Vec::new(), Vec::new());
-    let last = recording.end(Walk {
-        passed: true,
-        made_nothing: true,
-        looks: 0,
-        looked_at: None,
-        files: None,
-        worked: None,
-    });
+    let recording = Recording::new(inputs.clone(), 0, Vec::new(), Vec::new());
+    let last = recording.end(Walk { passed: true, made_nothing: true, looks: Vec::new(), worked: None });
     let asked = |traced| Asked {
         inputs: &inputs,
         edited: Edited::Unread("the roots are one"),
@@ -1316,12 +1316,10 @@ fn the_answers_kept_are_bounded_and_weighed() {
     let (daemon, world) = (Daemon::new(), plain());
     let inputs = daemon.inputs(&world);
     let kept = || {
-        Recording::new(inputs.clone(), 0, 0, vec![PathBuf::from(OUT[0])], Vec::new()).end(Walk {
+        Recording::new(inputs.clone(), 0, vec![PathBuf::from(OUT[0])], Vec::new()).end(Walk {
             passed: true,
             made_nothing: true,
-            looks: 0,
-            looked_at: None,
-            files: None,
+            looks: Vec::new(),
             worked: None,
         })
     };
@@ -1377,13 +1375,11 @@ fn asked_after_a_look() -> (bool, Option<NotReplayed>) {
     let inputs = daemon.inputs(&world);
     let was = Some([7; 32]);
     daemon.watches.file = was;
-    let recording = Recording::new(inputs.clone(), 0, 0, Vec::new(), Vec::new());
+    let recording = Recording::new(inputs.clone(), 0, Vec::new(), Vec::new());
     let last = recording.end(Walk {
         passed: true,
         made_nothing: true,
-        looks: 2,
-        looked_at: Some(PathBuf::from("/root")),
-        files: Some(vec![(PathBuf::from("/root"), was)]),
+        looks: vec![look("/root", LookKind::File, was)],
         worked: None,
     });
     let asked = Asked {
@@ -1407,16 +1403,24 @@ fn asked_after_a_look() -> (bool, Option<NotReplayed>) {
 fn a_walk_that_looked_at_files_is_answered_while_they_are_the_same() {
     assert_eq!(asked_after_a_look(), (true, Some(NotReplayed::Looked(PathBuf::from("/root")))));
     let (daemon, world) = (Daemon::new(), plain());
-    let recording = Recording::new(daemon.inputs(&world), 0, 0, Vec::new(), Vec::new());
+    let recording = Recording::new(daemon.inputs(&world), 0, Vec::new(), Vec::new());
     let last = recording.end(Walk {
         passed: true,
         made_nothing: true,
-        looks: 1,
-        looked_at: Some(PathBuf::from("/net/dir")),
-        files: None,
+        looks: vec![look("/net/dir", LookKind::Entry, None)],
         worked: None,
     });
-    assert!(matches!(last, Err(Unkept::Looked(Some(_)))));
+    assert!(matches!(&last, Err(Unkept::Looked(path)) if path == Path::new("/net/dir")));
+    // A file looked at twice, saying two things, keeps none either: it cannot be looked at
+    // again by one answer.
+    let recording = Recording::new(daemon.inputs(&world), 0, Vec::new(), Vec::new());
+    let last = recording.end(Walk {
+        passed: true,
+        made_nothing: true,
+        looks: vec![look("/root", LookKind::File, None), look("/root", LookKind::File, Some([1; 32]))],
+        worked: None,
+    });
+    assert!(matches!(&last, Err(Unkept::Looked(path)) if path == Path::new("/root")));
 }
 
 /// The control: with a changed file ignored, the answer is said again over it.

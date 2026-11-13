@@ -95,7 +95,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     }
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
-    // `#[blaze::may(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
+    // `#[blaze::expect(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
@@ -104,6 +104,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::pure",
         "blaze::capabilities",
         "blaze::undeclared_effect",
+        "blaze::unfulfilled_effect",
         "blaze::program_lifetime",
     ];
     for it in &blaze_lints()[1..] {
@@ -264,7 +265,7 @@ fn counts_are_rustcs() {
     assert_eq!(group("unused").unwrap().lints.len(), 24);
     // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
     assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
-    assert_eq!(removed().len(), 66);
+    assert_eq!(removed().len(), 67);
 }
 
 #[test]
@@ -339,6 +340,9 @@ fn future_incompatible() {
 fn renamed_and_removed() {
     assert_eq!(named("bare_trait_object"), Named::Renamed("bare_trait_objects"));
     assert_eq!(named("raw_pointer_derive"), Named::Removed("using derive with raw pointers is ok"));
+    // Deleted, not renamed: no alias stands for it.
+    assert!(matches!(named("blaze::unneeded_effect"), Named::Removed(_)));
+    assert!(lint("blaze::unneeded_effect").is_none());
     assert_eq!(named("broken_intra_doc_links"), Named::Ignored);
     assert_eq!(named("no_such_lint"), Named::Unknown);
     assert!(matches!(named("nonstandard_style"), Named::Group(_)));

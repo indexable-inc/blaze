@@ -183,6 +183,54 @@ pub struct JobInput {
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.
     pub cancelled: Arc<AtomicBool>,
+    /// The looks at the disk outside every view of the build this job is (a clone of its
+    /// certificate's list, `job::certify`'s `Building`): every task of the job pushes each
+    /// look it makes here, so the build's certificate holds what it rests on that no record
+    /// names. [`blaze_vfs::outside::Looks::none`] for a job no certificate is written of.
+    pub looks: blaze_vfs::outside::Looks,
+    /// The pack sources and peers a record this job's store misses is asked of before its
+    /// unit is built (`unit::compile::names`): the daemon's (packs.json's), none when the
+    /// settings name none or say `"prebuilt": false`, and none for a request that said
+    /// `--no-prebuilt` ([`blaze_api::Cargo::prebuilt`]), whose misses are all built here.
+    pub packs: Option<Arc<super::packs::Packs>>,
+    /// The root each crate's body entries' session was last saved under in this checkout, by
+    /// the crate's stable name: the journal's marks (`local::BodiesMark`), read as the job
+    /// starts. A crate whose front end kept no session of its own opens and carries the one
+    /// marked here, after a restart too.
+    pub body_marks: Arc<std::collections::BTreeMap<String, blaze_cas::Key>>,
+}
+
+/// The result of a task that jobs share (one node of the plane by its key, single-flighted:
+/// a pinned native input's layout), as every job that takes it has it: its value, and every
+/// look at the disk outside every view its run made, in a list of the task's own, never the
+/// list of the job whose post ran it. A job that takes the result, the one that ran it or one
+/// that joined it, takes those looks into its own build's ([`Shared::take`]), so no build's
+/// certificate misses a read whichever build's job ran the step.
+///
+/// The invariant: every build that rests on a shared task's value holds that task's looks.
+#[derive(Clone, Debug)]
+pub struct Shared<T> {
+    value: T,
+    looks: Arc<[blaze_vfs::outside::Look]>,
+}
+
+impl<T> Shared<T> {
+    /// `value`, with what its task looked at: `looks`, the task's own list.
+    pub fn new(value: T, looks: &blaze_vfs::outside::Looks) -> Shared<T> {
+        // alloc: once a shared task, its few looks, shared by every job that takes it
+        Shared { value, looks: looks.all().into() }
+    }
+
+    /// The value, for a job whose build's looks are `into`: the task's looks kept there too.
+    pub fn take(&self, into: &blaze_vfs::outside::Looks) -> &T {
+        into.extend(&self.looks);
+        &self.value
+    }
+
+    /// What the task looked at.
+    pub fn looks(&self) -> &[blaze_vfs::outside::Look] {
+        &self.looks
+    }
 }
 
 /// Why a step gave no result.
@@ -243,11 +291,55 @@ pub struct Put {
 
 /// A value for the store from a kept front end ([`Steps::store_kept`]) and what it is ("the
 /// def-map image of dependency crate `serde`"): what an error names when the store holds other
-/// bytes under its key.
+/// bytes under its key; and which store it goes to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct KeptPut {
     pub put: Put,
     pub what: Arc<str>,
+    pub into: PutInto,
+}
+
+/// A launched program's start image as the journal marks it, handed to the launch host at the
+/// daemon's start ([`Steps::launch_marked`], `serve::local::LaunchMark`).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a mark, once a restore; compared by the tests
+pub struct LaunchMarked {
+    /// The program's path, the one its link was asked for (the mark's name).
+    pub program: String,
+    /// The path it runs from ([`LaunchKept::runs_as`]).
+    pub runs_as: String,
+    /// The unit's whole record key of the build the image holds.
+    pub record: ContentId,
+    /// The image's key in the home's store.
+    pub key: blaze_cas::Key,
+}
+
+/// A launched program's start image to keep (`blaze_launch_host::start`, [`Steps::launch_kept`]):
+/// the loop puts `bytes` under `key` in the home's store and, once the put is durable, marks it
+/// the program's in the journal (`serve::local::LaunchMark`, `launch\0<program>`), so a start
+/// restores the program from it with no build.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: none made; compared by the tests
+pub struct LaunchKept {
+    /// The program's path, the one its link was asked for.
+    pub program: String,
+    /// The path it runs from, cargo's `executable`: what a build's answer names it by, kept in
+    /// its mark so a program restored from the image is asked for by it too.
+    pub runs_as: String,
+    /// The unit's whole record key of the build the image holds.
+    pub record: ContentId,
+    pub key: blaze_cas::Key,
+    pub bytes: Vec<u8>,
+}
+
+/// Which store a [`KeptPut`] goes to, put by the loop, each ticket waited on with its own
+/// store's `durable` (a ticket is its store's).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PutInto {
+    /// The daemon's own store, its home's.
+    Home,
+    /// The machine's sealed layer ([`crate::serve::sealed`], the loop's `World::std`), which
+    /// every home reads below its own: a front-end record of a sealed crate
+    /// (`hir_def::deps::sealed`), made once a machine. Never the home too.
+    Layer,
 }
 
 /// A file a unit writes: where cargo writes it (absolute, one of the unit's
@@ -326,7 +418,19 @@ pub struct Compiled {
     /// errors (in its items, or only in its bodies or lints), or blaze's own failure to make
     /// it. None when `ok`, or when nothing more is known than that it failed.
     pub why: Option<String>,
+    /// Finished values only: nothing here waits to be encoded or filed. The answer waits for
+    /// these (with `outputs`); the unit's record does not ([`Compiled::record`]).
     pub puts: Vec<Put>,
+    /// The unit's record still to encode and file, put after the build's answer by its
+    /// after-answer task ([`crate::serve::unit::file_records`]), as one more of the puts the
+    /// job's settling waits for, so its request certificate is written only once the record
+    /// is durable (`Jobs::certify_settled`). None for a unit whose record is not kept, or
+    /// was replayed.
+    pub record: Option<Box<crate::serve::unit::PendingRecord>>,
+    /// Each crate's stable name with the root its body entries' session was saved under (its
+    /// rows among `puts`): the loop marks each once `puts` are durable
+    /// (`Jobs::body_sessions`), a later root of one name over an earlier one.
+    pub body_sessions: Vec<(String, blaze_cas::Key)>,
     /// What the loop puts into the standard library's shared store ([`JobInput::std`]): a std
     /// unit's record and every output it names, once made here; nothing for any other unit.
     pub share: Vec<Put>,
@@ -623,32 +727,9 @@ impl std::fmt::Display for OutputFields {
 pub type Leased =
     Result<Result<Vec<blaze_gc::lease::Lease>, (String, blaze_gc::lease::Wait)>, String>;
 
-/// A place the code a run executes is held in that is no file: an output of the build that
-/// placed it there, as a file is ([`Steps::held_code`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CodeHolder {
-    /// The launch host's program (`serve::unit::run::launch`): a launcher's file is the same
-    /// bytes at every build, and its code is the host's, told to each launcher.
-    Launcher,
-    /// The daemon's code memory of a dev executable (`serve::unit::run::inproc`), which its
-    /// runs map over their file.
-    Memory,
-}
-
-impl CodeHolder {
-    /// Every holder, each once.
-    pub const ALL: [CodeHolder; 2] = [CodeHolder::Launcher, CodeHolder::Memory];
-}
-
-/// The holder as errors and `blaze why` name it.
-impl std::fmt::Display for CodeHolder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            CodeHolder::Launcher => "the launch host",
-            CodeHolder::Memory => "the daemon's code memory",
-        })
-    }
-}
+/// A place the code a run executes is held in that is no file ([`Steps::held_code`]): its one
+/// home is the certificate's, which names an output under each.
+pub use blaze_certify::certificate::CodeHolder;
 
 /// What a [`CodeHolder`] holds for a program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -736,8 +817,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// bodies of those it checked, the constants they evaluated, the goals and bodies' steps
     /// offered). So what one build computed is in the store, durable, by the time it answers,
     /// whether or not the head builds again in this daemon's life: a stop, a crash or a reboot
-    /// after it loses none of it (persisted-state-round-trips). Called once per kept front
-    /// end, while no task reads it; one already stored hands back no puts.
+    /// after it loses none of it (persisted-state-round-trips). Called twice per kept front
+    /// end, while no task reads it: at its build's end, which writes the sealed crates' pages
+    /// (those outside the workspace, `hir_def::deps::sealed`) and the outcomes; and before the
+    /// front end is let go for idleness or the daemon stops (`Jobs::store_members`), which
+    /// writes the workspace members' pages and those of the crates above them. A third call,
+    /// or one on a front end a build wrote into since its second, hands back no puts until
+    /// the next build's end.
     fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
     /// On the loop, once the puts of a front end [`Steps::store_kept`] stored are made: what
     /// of the build's the store would not keep although everything else was kept and the
@@ -771,6 +857,18 @@ pub trait Steps: Sized + Send + Sync + 'static {
     fn give_caches(&self) -> u64 {
         0
     }
+    /// On the loop: the bytes of the process tables every front end's ids index (the type
+    /// interner's and the trait solver's), which no drop of a front end frees. 0 for steps
+    /// that keep none.
+    fn kept_tables(&self) -> u64 {
+        0
+    }
+    /// On the loop, only while no front end is kept or out, no link image is kept, and no
+    /// task runs or may walk (`job::giving` lists it only then): releases those tables, as a
+    /// fresh process has them; the bytes they fell by.
+    fn give_tables(&self) -> u64 {
+        0
+    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// after the build's answer: what the build's end lets go of its front end (every MIR it
     /// made, and the values no build read since the one before). The front end is the task's
@@ -780,6 +878,62 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// and that build goes on with what was not let go.
     fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
         let _ = (kept, wanted);
+    }
+    /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
+    /// before [`Steps::release_kept`]: the first calls of the checkout's launched runs that no
+    /// bind record answers, made with the front end (`run::needs`), until `wanted` is set,
+    /// every launcher has gone, or none attached in time. What it made for the store.
+    fn serve_needs(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) -> Vec<KeptPut> {
+        let _ = (kept, wanted);
+        Vec::new() // alloc: none, empty
+    }
+    /// On the loop, just after a request set a stored front end's `wanted`: wakes the task
+    /// serving launched runs' first calls ([`Steps::serve_needs`]), so it lets the front end go.
+    fn wake_needs(&self) {}
+    /// On the loop, once, as the daemon starts: the home's store, what wakes the loop, and the
+    /// journal's marks of launched programs' start images ([`LaunchMarked`]), each
+    /// restored from its image when first asked for (a certificate's look, a launcher's
+    /// `Hello`). Steps with no launch host keep nothing.
+    fn launch_marked(
+        &self,
+        store: blaze_cas::Reader,
+        waker: Option<blaze_core::Waker>,
+        marked: Vec<LaunchMarked>,
+    ) {
+        let _ = (store, waker, marked);
+    }
+    /// On the loop, each turn: the start images to put and, once durable, mark.
+    fn launch_kept(&self) -> Vec<LaunchKept> {
+        Vec::new() // alloc: none, empty
+    }
+    /// On the loop, each turn: the programs a first call of which waits for a front end no
+    /// task holds, each by the path it runs from ([`LaunchKept::runs_as`]), for each of which the loop sends itself the `blaze run` it last answered
+    /// ([`Steps::launch_built`] says how it ended); and the needs waiting past their bound
+    /// refused.
+    fn launch_wants(&self) -> Vec<String> {
+        Vec::new() // alloc: none, empty
+    }
+    /// On the loop: how many launchers are connected to the launch host now. A daemon a
+    /// launcher is connected to does not exit idle ([`super::idle::exit_due`]).
+    fn launchers_connected(&self) -> usize {
+        0
+    }
+    /// On the loop: the client of build `build` became process `pid`'s program at `exec_ns`
+    /// (its rows' [`blaze_api::Timed::exec_of`]): the launch host joins it to the program's
+    /// `Hello` and exit for the program's spans.
+    fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64) {
+        let _ = (pid, build, exec_ns);
+    }
+    /// On the loop: the launched programs' spans made since the last take, each of the build
+    /// that ran it, for the profile history.
+    fn launch_spans(&self) -> Vec<crate::serve::unit::run::launch::ProgramSpans> {
+        Vec::new() // alloc: none, empty
+    }
+    /// On the loop: the daemon's own request for `program` ended; `Err` says why none ran or
+    /// it failed. Where it held no front end for the program, its waiting needs are refused
+    /// with that reason.
+    fn launch_built(&self, program: &str, built: Result<(), String>) {
+        let _ = (program, built);
     }
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
@@ -913,6 +1067,9 @@ pub enum Looked {
     File,
     /// `Inputs::dir`: the hash of a directory's sorted names; nothing where no directory is.
     Listing,
+    /// `Inputs::entry`: what the path itself is, a link not followed
+    /// ([`blaze_usercode::trace::entry_digest`]); nothing where nothing is there.
+    Entry,
     /// `Inputs::tree`: the hash of everything below a directory (`package`: as a package is
     /// walked); nothing where no directory is.
     Tree { package: bool },
@@ -1177,6 +1334,21 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         phase: Phase,
         images: &mut Vec<Image<S>>,
     ) -> Result<Option<Compiled>, Failed>;
+    /// On a worker: unit `unit`, which stands (`job::standing`: sealed, kept by the last build
+    /// of the same plan and config, over units that stand), in one task: [`Phase::Names`],
+    /// whose lookup finds its record, then [`Phase::Store`], which gives its replay, as
+    /// [`Front::compile`] gives them one phase a task. `None` when the lookup finds no record:
+    /// then nothing of it is made, and the caller fails the unit naming it.
+    fn stand(
+        &self,
+        reader: S::Reader,
+        unit: usize,
+        images: &mut Vec<Image<S>>,
+    ) -> Result<Option<Compiled>, Failed>;
+    /// On the loop: by unit of the job's units, whether it is sealed, its package's sources
+    /// pinned by a digest (`serve::sealed::pin`, what the planner writes on its crates): what a
+    /// unit must be to stand. Asked only of a build that a stood plan applies to.
+    fn sealed(&self) -> Result<Vec<bool>, ApiError>;
     /// The error that unit `unit` can't be made, saying `what`: a diagnostic of the unit,
     /// named and rendered as its others are, for a compile that panicked.
     fn refused(&self, unit: usize, what: String) -> Diagnostic;

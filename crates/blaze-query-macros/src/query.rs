@@ -55,11 +55,244 @@ impl Query<'_> {
     /// The public function's body: the fetch, then the return mode.
     pub(crate) fn public_body(&self, fetch_args: &[TokenStream]) -> TokenStream {
         let name = &self.name;
+        if self.options.scope.is_some() {
+            // The scoped fetch hands out the copy or clone itself, while the value is borrowed
+            // from the scope ([`Query::expand_scoped`]).
+            return quote!(#name::__blaze_query_fetch_scoped(#(#fetch_args),*));
+        }
         let value = quote!(value);
         let handed = self.mode().expr(&value);
         quote! {
             let #value = #name::__blaze_query_fetch(#(#fetch_args),*);
             #handed
+        }
+    }
+
+    /// What `scope = task` refuses, naming the function: a value dropped with its scope is
+    /// handed out by copy or clone, never by reference (a reference could outlive the scope);
+    /// it is never evicted or weighed (it is dropped whole); and its cycles are served only
+    /// by `cycle_initial`, each round's value taking the last's place: a `cycle_result`
+    /// fallback for every member and a `cycle_fn` told the persistent engine's heads are not
+    /// what a scope's cycle can give.
+    fn check_scoped(&self) -> syn::Result<()> {
+        let options = self.options;
+        let scope = options.scope.as_ref().expect("a scoped query");
+        let name = &self.name;
+        let refuse = |span: proc_macro2::Span, why: &str| {
+            // alloc: expansion time, the error's message
+            Err(syn::Error::new(span, format!("task-scoped `{name}`: {why}")))
+        };
+        match &options.returns {
+            Some((_, Mode::Clone | Mode::Copy)) => {}
+            Some((ident, _)) => {
+                return refuse(
+                    ident.span(),
+                    "its values are dropped with its task scope, so it hands out a copy or a \
+                     clone: `returns(clone)` or `returns(copy)`",
+                );
+            }
+            None => {
+                return refuse(
+                    scope.span(),
+                    "its values are dropped with its task scope, so it hands out a copy or a \
+                     clone: say `returns(clone)` or `returns(copy)`",
+                );
+            }
+        }
+        if let Some((lru, _)) = &options.lru {
+            return refuse(lru.span(), "its values are dropped whole with its scope: no `lru`");
+        }
+        if let Some(result) = &self.cycle_result {
+            return refuse(
+                syn::spanned::Spanned::span(result),
+                "a scope serves a cycle by `cycle_initial` alone: no `cycle_result`",
+            );
+        }
+        if let Some(recover) = &self.cycle_fn {
+            return refuse(
+                syn::spanned::Spanned::span(recover),
+                "a scope serves a cycle by `cycle_initial` alone, each round's value taking the \
+                 last's place: no `cycle_fn`",
+            );
+        }
+        if let Some(self_ty) = &options.self_ty {
+            return refuse(
+                syn::spanned::Spanned::span(self_ty),
+                "a scoped function is a free function",
+            );
+        }
+        Ok(())
+    }
+
+    /// `scope = task`: the [`Scoped`] configuration, keyed by the arguments as they are stored
+    /// (nothing interned), and the fetch that hands out the copy or clone while the value is
+    /// borrowed from the task's scope (`blaze_query::db::plumbing::fetch_scoped`). No row, so
+    /// no `durable`, `changed_since`, `evict_values` or `arguments`. Its `cycle_initial` is
+    /// called with the database and the arguments: a scoped key has no ID.
+    fn expand_scoped(&self) -> TokenStream {
+        let plumbing = plumbing();
+        let db = db();
+        let Query { name, query_name, vis, cfgs, db_lt, db_ty, args, output, call, inner, .. } =
+            self;
+        let config = self.hygiene.ident("Configuration");
+        let value_check = self.hygiene.ident("values_are_values");
+
+        // alloc: expansion time, once per annotated item; no query runs this
+        let idents: Vec<&Ident> = args.iter().map(|it| &it.ident).collect();
+        // alloc: expansion time, once per annotated item; no query runs this
+        let db_tys: Vec<&Type> = args.iter().map(|it| &it.ty.db).collect();
+        // alloc: expansion time, once per annotated item; no query runs this
+        let stored_tys: Vec<&Type> = args.iter().map(|it| &it.ty.stored).collect();
+        let stores = args.iter().map(|it| {
+            let ident = &it.ident;
+            it.ty.store(&quote!(#ident))
+        });
+        let loads = args.iter().enumerate().map(|(index, it)| {
+            let ident = &it.ident;
+            let index = syn::Index::from(index);
+            let load = it.ty.load(&quote!(::core::clone::Clone::clone(&key.#index)));
+            quote!(let #ident = #load;)
+        });
+        let unpack = quote!(#(#loads)*);
+        let writes = (0..args.len()).map(|index| {
+            let comma = (index > 0).then(|| quote!(out.write_str(", ")?;));
+            let index = syn::Index::from(index);
+            quote! {
+                #comma
+                (&&&#plumbing::KeyText(&key.#index)).write_key(out)?;
+            }
+        });
+
+        // alloc: expansion time, once per annotated item; no query runs this
+        let mut checked: Vec<&Type> = vec![&output.db];
+        checked.extend(db_tys.iter().copied());
+        let checks = value::check(&value_check, db_lt, &checked);
+
+        let options = self.options;
+        let tag = match &options.mem_tag {
+            Some(tag) => quote! {{
+                #[allow(unused_imports)]
+                use #plumbing::Tag::*;
+                #tag
+            }},
+            None => quote!(#plumbing::Tag::Query),
+        };
+        let settled = options.settled.as_ref().map(|settled| {
+            quote! {
+                fn settled<#db_lt>(
+                    db: &#db_lt Self::Db,
+                    key: &Self::Key,
+                    value: &Self::Value,
+                ) {
+                    (#settled)(db, key, value)
+                }
+            }
+        });
+        let stored_output = &output.stored;
+        let ran = output.store(&quote!(value));
+        let (kind, cycle_initial) = match &self.cycle_initial {
+            Some(initial) => {
+                let value = output.store(&quote!((#initial)(db, #(#idents),*)));
+                (quote!(Fixpoint), quote!({ #unpack #value }))
+            }
+            None => {
+                let message = "{} has no `cycle_initial`: the engine called it for another cycle kind";
+                (
+                    quote!(Panic),
+                    quote!({
+                        let _ = (db, key);
+                        ::core::unreachable!(#message, <Self as #plumbing::Scoped>::NAME)
+                    }),
+                )
+            }
+        };
+        let equal = if options.no_eq.is_some() {
+            quote!({
+                let _ = (old, new);
+                false
+            })
+        } else {
+            quote!(old == new)
+        };
+        let loaded = output.load_ref(&quote!(value));
+        let output_db = &output.db;
+        let public_output = self.public_output();
+        let handed = self.mode().expr(&quote!(value));
+
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_camel_case_types)]
+            #(#cfgs)*
+            #vis struct #name {
+                _priv: ::core::convert::Infallible,
+            }
+
+            #(#cfgs)*
+            #[allow(
+                non_camel_case_types,
+                non_snake_case,
+                dead_code,
+                unused_lifetimes,
+                unused_variables,
+                clippy::all,
+            )]
+            const _: () = {
+                #inner
+
+                struct #config;
+
+                #checks
+
+                impl #plumbing::Scoped for #config {
+                    type Db = #db_ty;
+                    type Key = (#(#stored_tys,)*);
+                    type Value = #stored_output;
+                    const NAME: &'static str = #query_name;
+                    const CYCLE: #plumbing::CycleKind = #plumbing::CycleKind::#kind;
+                    const TAG: #plumbing::Tag = #tag;
+
+                    fn execute<#db_lt>(db: &#db_lt Self::Db, key: &Self::Key) -> Self::Value {
+                        #unpack
+                        let value = #call;
+                        #ran
+                    }
+
+                    fn cycle_initial<#db_lt>(db: &#db_lt Self::Db, key: &Self::Key) -> Self::Value {
+                        #cycle_initial
+                    }
+
+                    #[inline]
+                    fn equal(old: &Self::Value, new: &Self::Value) -> bool {
+                        #equal
+                    }
+
+                    fn write_key(
+                        key: &Self::Key,
+                        out: &mut dyn ::core::fmt::Write,
+                    ) -> ::core::fmt::Result {
+                        use #plumbing::{KeyTextDebug as _, KeyTextId as _, KeyTextOther as _};
+                        #(#writes)*
+                        ::core::result::Result::Ok(())
+                    }
+
+                    #settled
+                }
+
+                impl #name {
+                    #[inline]
+                    #[allow(clippy::needless_lifetimes, clippy::too_many_arguments)]
+                    fn __blaze_query_fetch_scoped<#db_lt>(
+                        db: &#db_lt #db_ty,
+                        #(#idents: #db_tys,)*
+                    ) -> #public_output {
+                        let key = (#(#stores,)*);
+                        #plumbing::fetch_scoped::<#config, _>(db, key, |value: &#stored_output| {
+                            let value: &#output_db = #loaded;
+                            #handed
+                        })
+                    }
+                }
+            };
         }
     }
 
@@ -69,6 +302,12 @@ impl Query<'_> {
     }
 
     pub(crate) fn expand(&self) -> TokenStream {
+        if self.options.scope.is_some() {
+            return match self.check_scoped() {
+                Ok(()) => self.expand_scoped(),
+                Err(error) => error.to_compile_error(),
+            };
+        }
         let plumbing = plumbing();
         let db = db();
         let Query { name, query_name, vis, cfgs, db_lt, db_ty, args, output, call, inner, .. } =

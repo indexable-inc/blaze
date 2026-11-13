@@ -23,6 +23,10 @@ blaze-launch-rt.workspace = true
 crossbeam-channel.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+# Starts the daemon the sidecar names, for a program started from its file with no daemon
+# (`blaze_client::start::daemon`), and the one deadline it waits to.
+blaze-client.workspace = true
+blaze-core.workspace = true
 libc.workspace = true
 
 [lints]

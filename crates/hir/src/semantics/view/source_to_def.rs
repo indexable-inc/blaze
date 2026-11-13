@@ -117,6 +117,8 @@ pub(super) struct ViewCtx<'db, 'a> {
 
 impl<'db> Semantics<'db> {
     pub(super) fn with_ctx<T>(&self, f: impl FnOnce(&mut ViewCtx<'db, '_>) -> T) -> T {
+        // A probe is asked nothing of what source maps to (`Semantics::new_probe`).
+        self.ask();
         let mut cache = self.imp.s2d_cache.borrow_mut();
         let mut ctx = ViewCtx {
             sema: self,

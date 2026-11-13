@@ -579,14 +579,14 @@ errors gone:
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn two_builds_of_the_history_diff_through_duckdb() {
-        use crate::history::{BuildRow, CAP_BYTES, History, Outcome};
+        use crate::history::{BuildRow, CAP_MOST, History, Outcome};
         let duckdb = PathBuf::from(
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
         crate::install();
         let dir = std::env::temp_dir().join(format!("blaze-diff-duckdb-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        let mut history = History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap();
         for (build, ms) in [(81u32, 1), (82, 30)] {
             std::thread::spawn(move || {
                 let _build = crate::flight::building(build);

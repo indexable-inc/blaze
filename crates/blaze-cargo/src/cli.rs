@@ -170,11 +170,12 @@ fn why_recomputed<O: Write, S: show::Sink>(
 /// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
 /// `err` as a warning naming the step and the build, and the command's own outcome stands.
 ///
+/// They go on the command's own connection, `client`, before it closes.
 /// `wait`: whether the daemon's answer to them is waited for. A `run` about to become its
 /// program does not wait (unless `BLAZE_PROFILE` is to read them back): the rows are handed to
 /// the daemon and the program starts.
-fn sent_client_rows(err: &mut impl Write, color: bool, wait: bool) {
-    let said = match client_rows::send(wait) {
+fn sent_client_rows(client: &mut blaze_api::client::Client, err: &mut impl Write, color: bool, wait: bool) {
+    let said = match client_rows::send(client, wait) {
         Ok(None) => return,
         Ok(Some(path)) => format!(
             "{}: the build's trace (ui.perfetto.dev): {}\n",
@@ -708,7 +709,10 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
     let connected = match began {
         Some(began) => resume::client(began).map(Some).map_err(anyhow::Error::msg),
-        None => daemon::connect(Start::IfMissing),
+        None => daemon::connect(match asked.flags.no_prebuilt {
+            true => Start::IfMissingNoPrebuilt,
+            false => Start::IfMissing,
+        }),
     };
     drop(connecting);
     let mut client = match connected {
@@ -808,11 +812,12 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         }
     };
     let mut err = io::stderr().lock();
+    // A `run` about to become its program hands its rows to the daemon and does not wait for
+    // the answer: the program starts as soon as its image is known to be built. They go on the
+    // command's own connection, before it closes: a command is one connection.
+    sent_client_rows(&mut client, &mut err, color, !matches!(then, Ok(Then::Exec(_))));
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
-    // A `run` about to become its program hands its rows to the daemon and does not wait for
-    // the answer: the program starts as soon as its image is known to be built.
-    sent_client_rows(&mut err, color, !matches!(then, Ok(Then::Exec(_))));
     if let Err(error) = closed {
         let _ = err.write_all(
             say::error(&format!("closing the connection to the build engine: {error}"), color)

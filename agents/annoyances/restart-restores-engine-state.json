@@ -1,0 +1,14 @@
+{
+ "id": "restart-restores-engine-state",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 6 executor T3, int-1112",
+ "where": "crates/blaze-cargo/src/serve/daemon.rs Daemon::start_untagged, serve/image.rs Images::make, serve/job.rs Jobs::{carry_sessions, restore_carries}",
+ "what": "A start restored the symbol table, the query database, the library syntax trees and the carry sessions from the daemon image, and the database settled onto every new image: hello's image was 130.7 MiB of which only the VFS (70.4) is what a start needs, and a no-op after a start took 2,722 ms against 27 ms for the competitor. The carry sessions' pointer was durable only in an image, so a crash before one lost the session.",
+ "cost": "a 4.9 GB footprint at hello's first answer after a start (reth 19.5 GiB); 60 MiB of engine sections written each image",
+ "cause": "the in-memory engine was treated as state to persist instead of a cache of what this process verified (end-state.md: seals are not restored)",
+ "class": "a cache persisted whole beside the records that already outlive the process, so a start pays to load what no request asks",
+ "prevention": "what outlives a process is a store record read in place or a journal mark (serve::local); the image holds the VFS and the history only, and the retired section ids (blaze_image::SectionId::RETIRED) are never reused",
+ "workaround": "none",
+ "fix": "T3 of /tmp/plan/6-restart.md: the start opens the store, maps the image for the VFS and history, replays the journal with its marks and starts the database empty; carry sessions are journal marks; the image's engine sections and the settle swap are gone. Controls: serve::tests the_oracle_catches_a_start_that_drops_the_marks, the_oracle_catches_a_start_that_keeps_no_carry_mark (plant daemon::DROPS_MARKS).",
+ "state": "written, not compiled"
+}

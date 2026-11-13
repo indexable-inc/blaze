@@ -3,7 +3,8 @@ name: release
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
 # Linux (x86_64, aarch64) and macOS (aarch64), puts every asset into the R2 bucket blaze-releases (where blaze fetches
 # it from, .github/scripts/r2.py) and makes a GitHub release of that name: a `.tar.xz` and a `.tar.gz` per target (`blaze` a hard link to `blaze-engine`), a `.sha256` of each, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
-# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
+# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), bstd's
+# `bstd-<digest>.tar.xz` (harness/library.py `archive`), and the
 # notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
 # is on a commit of main as it is: no release commits a version to main, whose Cargo.toml stays
@@ -38,6 +39,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.notes.outputs.version }}
+      bstd: ${{ steps.bstd.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -69,6 +71,18 @@ jobs:
         with:
           name: library
           path: ${{ runner.temp }}/library/library-*.tar.xz
+          if-no-files-found: error
+      # bstd's tree, which a release ships beside the library as `bstd-<digest>.tar.xz`
+      # (crates/blaze-std, the crates it depends on by path and a workspace of just them;
+      # harness/library.py `archive`): its digest is the build's BLAZE_BSTD_DIGEST below, so
+      # every target's blaze names the one archive made here (crates/blaze-new's BSTD_DIGEST).
+      - id: bstd
+        run: |
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/bstd\", \"tree\": \"bstd\"}" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bstd
+          path: ${{ runner.temp }}/bstd/bstd-*.tar.xz
           if-no-files-found: error
 
   build:
@@ -122,6 +136,15 @@ jobs:
       # library from the release's assets (the step `Standard library` below; shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+      # The bstd this release ships (the notes job's archive), which its blaze places and reads
+      # sealed (crates/blaze-cargo/src/cli/store.rs `shipped`): on a tag only, since a build of a
+      # branch is no release and has no assets to fetch it from.
+      - if: github.ref_type == 'tag'
+        env:
+          BSTD: ${{ needs.notes.outputs.bstd }}
+        run: |
+          [ ${#BSTD} -eq 64 ] || { echo "::error::the notes job gave no bstd digest (got '$BSTD')"; exit 1; }
+          echo "BLAZE_BSTD_DIGEST=$BSTD" >> "$GITHUB_ENV"
       # The `dist` profile, with LLVM, as every native blaze has (blaze-engine's default
       # `native`): build_release.py refuses a binary that loads libLLVM or a C++ runtime, or on
       # Linux asks for a glibc newer than RHEL 9's. PGO is off: blaze applies only a profile
@@ -254,7 +277,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
+            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz out/bstd-*.tar.xz
       # A canary: promote.yaml tests the archives just published and makes this same release
       # stable when they pass (docs/release.md). By dispatch, since a release this token
       # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.

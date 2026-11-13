@@ -796,11 +796,11 @@ impl<S: Step, W: World + ?Sized> Lists<Found> for Walk<'_, '_, S, W> {
     fn held<'n>(
         &mut self,
         slot: Option<u32>,
-        names: &mut dyn Iterator<Item = &'n [u8]>,
+        reads: &mut dyn Iterator<Item = (&'n [u8], Seen)>,
         found: &mut Found,
     ) {
         let id = self.identity.id();
-        found.posted = Some(self.looker.state.session.post(id, slot, names, By::Hit));
+        found.posted = Some(self.looker.state.session.post(id, slot, reads, By::Hit));
     }
 
     fn listed(&self) -> bool {
@@ -1131,7 +1131,7 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         let kept = keep::<S, dyn Put>(&mut **store, input, identity, &trace, &value, reads)?;
         // The postings of the trace it was kept with: every step among its reads was asked
         // for by the run, so each is in the session, linked to its name.
-        let posted = self.session.post(identity.id(), kept.slot, trace.names(), By::Keep);
+        let posted = self.session.post(identity.id(), kept.slot, trace.names().zip(trace.seen()), By::Keep);
         // The entry's own hash where it has one (an entry with reads); a bare value's is made
         // only for a parent that asked.
         let hash = match need {
@@ -1343,11 +1343,12 @@ pub(crate) fn carry<W: World + ?Sized>(
     verify: &Setting,
 ) -> Result<Carried, KernelError> {
     let mut carried = Carried::default();
-    let Some(mut queue) = session.seed(&*store, kernel.registry(), world.pin(), changed)? else {
+    let Some(mut queue) = session.seed(&*store, kernel.registry(), world, changed)? else {
         carried.dropped = Some(Dropped::Registry);
         return Ok(carried);
     };
     carried.seeded = queue.len();
+    (carried.valued, carried.differed) = (queue.valued, queue.differed);
     // Bounded (rule 18): each turn takes a row out of the queue, and the queue stops giving
     // rows past its count.
     loop {
@@ -1639,6 +1640,18 @@ pub(crate) mod planted {
         /// A carry keeps a reached row that no step reads (a value asked for at the top) as
         /// it was, unrepaired, in place of looking it up again.
         RootKept,
+        /// A valued read that is gone now, or cannot be valued now, is taken as what its
+        /// readers saw (`Changed::valued`): a fact that went reaches no one.
+        ValuedGoneSame,
+        /// A valued kind values only the names in memory, reading no posting back from the
+        /// store: a session opened from its root values nothing.
+        ValuedUnloaded,
+        /// A posting keeps what its read saw only where its list's readers are written: a row
+        /// admitted again through a list posted at an earlier pin leaves that pin's value.
+        SeenAtFirstPost,
+        /// The exhaustive check's holder says a kind exact with no name where it has no
+        /// difference of it: the driver has the bug (I2), the kernel is as it is.
+        KindSaidClean,
     }
 
     thread_local! {

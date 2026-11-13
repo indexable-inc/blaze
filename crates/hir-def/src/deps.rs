@@ -46,12 +46,12 @@ pub use crate::deps::{
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{
         Ineligible, KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, PlanBase, absolute, eligible,
-        key_inputs, keys, why_not_eligible,
+        key_inputs, keys, sealed, sealed_in, why_not_eligible,
     },
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     serve::{
-        ImageStore, ITEMS_DOMAIN, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored,
-        filing_keys, front_keys, items_key, pages_key, serve, store,
+        ImageStore, ITEMS_DOMAIN, KEPT_DOMAIN, PAGES_DOMAIN, ReadThrough, Refused, Served,
+        Stored, Which, filing_keys, front_keys, items_key, kept_key, pages_key, serve, store,
     },
 };
 pub use crate::nameres::frozen::Mode;

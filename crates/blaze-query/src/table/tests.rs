@@ -328,11 +328,6 @@ fn a_column_publishes_takes_and_restores_by_index() {
     assert!(column.take(7).is_none(), "taken once");
     drop(task);
     drop(taken);
-    let (next, values) = column.take_all();
-    assert_eq!((next, values.len()), (400, 399));
-    column.restore(next, values, |value| {
-        value.rsplit(':').next().and_then(|it| it.parse().ok()).expect("an index")
-    });
     assert_eq!(column.values_mut().count(), 399);
     assert_eq!(column.push(|index| index.to_string()), 400);
 }

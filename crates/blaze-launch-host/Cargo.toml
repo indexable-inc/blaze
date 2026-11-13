@@ -1,6 +1,6 @@
 [package]
 name = "blaze-launch-host"
-description = "The daemon's side of blaze's launcher (docs/v2/plan/design/launcher.md, steps 3 to 5): a build's functions and statics made records the launcher takes, and the sans-IO state of one program its launchers run - slots by identity, what each launcher has bound, a rebuild classified as an edit to apply live or a restart"
+description = "The daemon's side of blaze's launcher (docs/v2/plan/design/launcher.md, steps 3 to 5): a build's functions and statics made records the launcher takes, bind records kept by key, and the sans-IO state of one program its launchers run - slots by identity, records given piece by piece, what each launcher has bound, a rebuild classified as an edit to apply live or a restart"
 publish = false
 
 version.workspace = true
@@ -14,6 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+# A bind record's key (`blaze_cas::Key`): the store's.
+blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true

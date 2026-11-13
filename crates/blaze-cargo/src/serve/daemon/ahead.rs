@@ -139,7 +139,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// `arrived` handed to the session, and what the session asked for started.
-    fn to_session(&mut self, arrived: Arrived) {
+    pub(super) fn to_session(&mut self, arrived: Arrived) {
         let mut replies = std::mem::take(&mut self.replies);
         self.session.arrive(&mut cx!(self), arrived, &mut replies);
         self.replies = replies;

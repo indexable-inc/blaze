@@ -541,6 +541,33 @@ fn read_head(db: &Db, krate: Crate, source: &dyn PageSource) -> R<Head> {
     Ok(head)
 }
 
+/// Why the pages of `krate` in `source` cannot be read in this database, if they cannot: their
+/// header does not parse or does not match the record's size, or a file they name is not
+/// loaded or has other content than they were made from. Reads the header and the files
+/// segment alone, a few hundred bytes: what a serve checks of a crate's pages before it gives
+/// them, so pages a key left an input out of are an error of the serve, not of the first
+/// query that reads them.
+// dyn: the crate's one source
+pub fn unreadable(db: &Db, krate: Crate, source: &dyn PageSource) -> Option<String> {
+    let checked = || -> R {
+        let header = read(source, 0, HEADER as u32, Header::parse)?;
+        if u64::from(header.total) != source.size() {
+            // alloc: error path
+            return Err(format!(
+                "a record of {} bytes whose header says {}",
+                source.size(),
+                header.total
+            ));
+        }
+        read(source, header.files.0, header.files.1, |bytes| {
+            let mut dec = Dec::new(db, krate, bytes);
+            dec.files()?;
+            dec.finish()
+        })
+    };
+    checked().err()
+}
+
 /// What [`crate::nameres::crate_local_def_map`] serves for a crate read from pages: its head
 /// as a `DefMap` whose modules' scopes and records are still in the record, read when asked.
 pub(super) fn served(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
@@ -810,6 +837,25 @@ pub(in crate::nameres) fn records(db: &Db, krate: Crate) -> &OwnedRecords {
 pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let pair = crate::nameres::crate_local_def_map(db, krate);
     encode_maps(db, krate, pair.def_map(db), pair.local(db), None)
+}
+
+/// The pages of `def_map` and `local`, the maps of `krate` (resolved, or read from pages):
+/// what [`super::check`] and a verify of [`super::served`] compare with a crate's record.
+pub(in crate::nameres) fn encode_of(
+    db: &Db,
+    krate: Crate,
+    def_map: &DefMap,
+    local: &LocalDefMap,
+) -> R<Vec<u8>> {
+    encode_maps(db, krate, def_map, local, None)
+}
+
+/// [`encode`] with `name` left out of every name table: a test's planted bug, for an oracle
+/// outside this module to catch.
+#[cfg(test)]
+pub(crate) fn encode_without(db: &Db, krate: Crate, name: &str) -> R<Vec<u8>> {
+    let pair = crate::nameres::crate_local_def_map(db, krate);
+    encode_maps(db, krate, pair.def_map(db), pair.local(db), Some(name))
 }
 
 /// Writes one segment into `body`, and returns where it is there.

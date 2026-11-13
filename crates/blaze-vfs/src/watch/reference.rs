@@ -1,6 +1,7 @@
 //! The watcher as it was before its names were interned (each slot a `String` and a
-//! `FileName`, cloned into every list it joins): kept, unchanged but for its tests, as the
-//! reference [`super::Watcher`] is held to, effect for effect and output for output.
+//! `FileName`, cloned into every list it joins): kept, unchanged but for its tests and the rules
+//! changed since (a start sweeps whatever the cursor, 2026-11-12), as the reference
+//! [`super::Watcher`] is held to, effect for effect and output for output.
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -255,7 +256,10 @@ impl Watcher {
         }
     }
 
-    /// Starts following the directory from where `vfs` saved this head's disk, or from scratch.
+    /// Starts following the directory from where `vfs` saved this head's disk, or from scratch,
+    /// and looks at the whole directory again whatever the cursor (2026-11-12, the rule
+    /// [`super::Watcher::start`] follows: the journal's history may not name a change made
+    /// while no daemon watched, and a sweep of an unchanged column reads nothing).
     pub fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
         assert!(!self.watching, "{} is watched already", self.dir);
         self.watching = true;
@@ -266,10 +270,8 @@ impl Watcher {
             .map_or(Cursor::None, |disk| disk.cursor);
         // clone: once per watch.
         effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
-        if since == Cursor::None {
-            // clone: once per watch.
-            self.rescan(vfs, &self.dir.clone(), effects);
-        }
+        // clone: once per watch.
+        self.rescan(vfs, &self.dir.clone(), effects);
     }
 
     /// Stops the watch: it ends with [`Watched::Ended`]. Looks in flight still commit.

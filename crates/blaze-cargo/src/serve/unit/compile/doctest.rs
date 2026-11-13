@@ -302,7 +302,7 @@ fn base_key(db: &base_db::Db, part: Key, krate: base_db::Crate, name: &str) -> K
 /// not an image's, is the error, naming the key.
 fn found(job: &Job, base: Key) -> Result<Option<Found>, ApiError> {
     let guard = blaze_cas::enter();
-    let Some((_, entry, _)) = super::filed_in(job, &job.input.store, false, &guard, base)? else {
+    let Some((_, entry, _)) = super::filed_in(job, &job.input.store, &guard, base)? else {
         return Ok(None);
     };
     match header::outputs_natives(entry.bytes) {

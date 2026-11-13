@@ -1,0 +1,14 @@
+{
+ "id": "sync-of-a-sealed-file",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3i, int-1112; fix: claude-opus-5-5 (Claude Opus 5.5), executor sync, int-1112",
+ "where": "crates/blaze-core/src/fs.rs, fs/linux.rs, the uring and iocp drivers: Effect::Sync; crates/blaze-cas/src/home.rs",
+ "what": "Making a placed output's file its record's one home needs an fsync of `placed/<content>`, which the store seals 0444 before anyone clones it. Effect::Sync opens its file WRITE|CREATE|APPEND, so on every real driver the sync of a sealed file fails EACCES; the simulation ignores modes and never shows it. Until Sync opens an existing file read-only (fsync and F_FULLFSYNC work on a read-only fd), every home fails loudly as a placed problem and the bytes stay in the pack: 917 MB home, no cut.",
+ "cost": "the disk cut of one home per placed output would pass every sim test and do nothing on a real disk",
+ "cause": "one effect (Sync) doubles as 'make the file if missing, then flush', so its open asks for write access a flush never needs",
+ "class": "an effect whose driver asks for more access than the effect's meaning, invisible to a simulation that does not model permissions",
+ "prevention": "Sync and Barrier open an existing file read-only and make it (opened to append) only where it is missing; uring keeps a file a sync opened as Kept::read_only, and an append to that name lets it go and opens its own; the sim refuses an append, a write at an offset or from memory and a cut of a file whose mode has no owner write bit (EACCES), as the kernel refuses a user who is not root",
+ "workaround": "none",
+ "fix": "written, not built: crates/blaze-core/src/fs.rs (to_sync, assert_syncs_a_sealed_file), fs/linux.rs (to_sync), uring.rs (Wants, Kept::read_only), uring/files.rs and uring/ops.rs (READ_ONLY), sim.rs (refused_write); tests on kqueue+threads, uring+threads, the fs calls and the sim. Windows still opens to append (FlushFileBuffers needs GENERIC_WRITE), so a sealed file's sync fails there by name",
+ "state": "fixed in the tree, not yet built"
+}

@@ -62,9 +62,10 @@ use aho_corasick::AhoCorasick;
 
 use blaze_core::Traced;
 use blaze_ids::ContentId;
+use blaze_vfs::outside::{LookKind, Looks};
 
 use crate::{
-    inputs::Unreadable,
+    inputs::{Env, Files, MOST_LINKS, Now, Unreadable},
     run::Value,
     trace::{self, Entry, Inputs, Names},
 };
@@ -202,13 +203,15 @@ impl RootMap {
     /// `role`'s root is `path`, in place of any it had, with its other spellings: the path its
     /// links resolve to (read once, here, at setup) and the forms of each that [`spellings`]
     /// names. A path that is not UTF-8, not absolute or the file system's root names no root:
-    /// what is under it stays absolute in keys. On Windows nothing is a root.
-    pub fn set(&mut self, role: Role, path: &Path) -> &mut RootMap {
+    /// what is under it stays absolute in keys. On Windows nothing is a root. Each look at
+    /// the disk that resolving the path's links makes is pushed to `looks`, the list of the
+    /// build the map is made for ([`resolve`]).
+    pub fn set(&mut self, role: Role, path: &Path, looks: &Looks) -> &mut RootMap {
         self.roots.retain(|it| it.0 != role);
         self.aliases.retain(|it| it.0 != role);
         self.resolved.retain(|it| it.0 != role);
         if let Some(path) = path.to_str().map(trim).filter(|it| usable(it)) {
-            let resolved = resolve(path);
+            let resolved = resolve(path, looks);
             for alias in spellings(path, resolved.as_deref()) {
                 self.aliases.push((role, alias));
             }
@@ -226,8 +229,9 @@ impl RootMap {
         self
     }
 
-    pub fn with(mut self, role: Role, path: &Path) -> RootMap {
-        self.set(role, path);
+    /// [`RootMap::set`], by value.
+    pub fn with(mut self, role: Role, path: &Path, looks: &Looks) -> RootMap {
+        self.set(role, path, looks);
         self
     }
 
@@ -257,17 +261,86 @@ impl RootMap {
     }
 }
 
-/// The path `root`'s links resolve to, when it is there and UTF-8. A root that is not there,
-/// or that a link leads away from, is counted as a look at the disk
-/// ([`blaze_vfs::outside::looked`]): no watch hears a link above a root pointed elsewhere, so
-/// nothing vouches that it still resolves so.
-fn resolve(root: &str) -> Option<String> {
+/// The path `root`'s links resolve to, when it is there and UTF-8. For a root that is not
+/// there, or that a link leads away from, each name the resolution rests on is asked of as an
+/// entry and its look pushed to `looks` ([`look_through`]): no watch of the root's own
+/// directory hears a link above it pointed elsewhere.
+fn resolve(root: &str, looks: &Looks) -> Option<String> {
     let resolved = std::fs::canonicalize(root).ok();
     let resolved = resolved.as_deref().and_then(Path::to_str).map(|it| trim(it).to_owned()); // alloc: setup, once per root of a run
-    if resolved.as_deref() != Some(root) {
-        blaze_vfs::outside::looked(Path::new(root));
+    if resolved.as_deref() != Some(root) && looks.keeps() {
+        look_through(Path::new(root), looks);
     }
     resolved
+}
+
+/// What a look says of a name [`look_through`] could not ask of as an entry or follow (a
+/// name no view holds, a link that can't be read, more than [`MOST_LINKS`] links): no
+/// [`crate::trace::entry_digest`] is this, so asking again never agrees and a build that
+/// rests on such a name is never taken to stand without being run again.
+const UNASKABLE: [u8; 32] = *b"blaze v2 look: not an entry\0\0\0\0\0";
+
+/// Asks of every name the resolution of `root`'s links stats, in the order the kernel walks
+/// them, as an entry ([`Inputs::entry`] of the process's [`Files`], a link not followed): a
+/// directory on the way, each link where it is, and the name the walk ends at (the root
+/// resolved, a file, or the first part that is not there). Each look made is pushed to
+/// `looks`; a name a watch vouches for is not looked at.
+///
+/// The invariant: where `root` resolves to is a function of what these entries are, so while
+/// each look says again what it said, the root resolves as it did.
+fn look_through(root: &Path, looks: &Looks) {
+    use std::path::Component;
+    let env = Env::default();
+    let mut now = Now { files: Files::shared(), env: &env, looks };
+    // alloc: setup, once per root named through a link: the parts not yet resolved, last first
+    let mut left: Vec<std::ffi::OsString> = Vec::new();
+    for part in root.components().rev() {
+        match part {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => left.push("..".into()), // alloc: setup, as above
+            Component::Normal(name) => left.push(name.to_owned()), // alloc: setup, as above
+            Component::Prefix(_) => return looks.push(root, LookKind::Entry, Some(UNASKABLE)),
+        }
+    }
+    let mut at = PathBuf::from("/"); // alloc: setup, as above
+    let mut links = 0;
+    // Bounded: each turn takes one part, and only a link, of which at most `MOST_LINKS` are
+    // followed, adds any.
+    while let Some(part) = left.pop() {
+        if part == ".." {
+            // `at` has no link in it, so its parent is the name's.
+            at.pop();
+            continue;
+        }
+        let name = at.join(&part); // alloc: setup, as above
+        match now.entry(&name) {
+            Ok(Entry::Dir) => at = name,
+            Ok(Entry::File(_, blaze_vfs::Mode::Symlink)) => {
+                links += 1;
+                let target = match links <= MOST_LINKS {
+                    true => std::fs::read_link(&name).ok(),
+                    false => None,
+                };
+                let Some(target) = target else {
+                    return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                };
+                for part in target.components().rev() {
+                    match part {
+                        Component::RootDir => at = PathBuf::from("/"), // alloc: setup, as above
+                        Component::CurDir => {}
+                        Component::ParentDir => left.push("..".into()), // alloc: setup, as above
+                        Component::Normal(name) => left.push(name.to_owned()), // alloc: setup, as above
+                        Component::Prefix(_) => {
+                            return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                        }
+                    }
+                }
+            }
+            // Nothing is below a file or a name that is not there: the walk ends here.
+            Ok(Entry::File(..) | Entry::Missing) => return,
+            Err(_) => return looks.push(&name, LookKind::Entry, Some(UNASKABLE)),
+        }
+    }
 }
 
 /// The directories a path in which means the same file in every checkout on a machine: the
@@ -409,10 +482,11 @@ impl<'a> Roots<'a> {
 
     /// These roots, owned, with their other spellings ([`RootMap::set`]) and `machine`, the
     /// machine-wide directories: what a run made with [`Roots::new`] is kept through.
-    pub fn to_map(&self, machine: impl FnOnce(RootMap) -> RootMap) -> RootMap {
+    /// `looks` as [`RootMap::set`]'s.
+    pub fn to_map(&self, machine: impl FnOnce(RootMap) -> RootMap, looks: &Looks) -> RootMap {
         let mut map = RootMap::default();
         for &(role, root) in &self.roots[..self.len] {
-            map.set(role, Path::new(root));
+            map.set(role, Path::new(root), looks);
         }
         machine(map)
     }
@@ -781,11 +855,12 @@ impl<'a> Roots<'a> {
 
     /// Whether a root's links resolve elsewhere now than when its map was made
     /// ([`RootMap::set`], read again here as a run is kept): the spellings its output was
-    /// scanned for may not be the ones it saw.
+    /// scanned for may not be the ones it saw. No look is kept of this: it compares with what
+    /// the map's making resolved, whose looks the map's build holds ([`look_through`]).
     pub fn relinked(&self) -> bool {
-        self.resolved
-            .iter()
-            .any(|(role, then)| self.get(*role).is_some_and(|root| resolve(root) != *then))
+        self.resolved.iter().any(|(role, then)| {
+            self.get(*role).is_some_and(|root| resolve(root, &Looks::none()) != *then)
+        })
     }
 
     /// `traced`, what a run read, and `value`, what it gave, as they are kept: the trace

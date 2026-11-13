@@ -1,0 +1,14 @@
+{
+ "id": "effect-list-a-ceiling",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, int-1112 expect track",
+ "where": "crates/hir-ty-pure/src/expect.rs Marks, crates/blaze-lints/src/blaze/expect.rs unfulfilled",
+ "what": "`#[blaze::may(alloc)]` on a function proved not to allocate passed for any public function and only warned (`unneeded_effect`) on a private one, so a list read as a promise said nothing: a reader could not tell from `may(alloc)` whether the function allocates.",
+ "cost": "effect lists in the tree drifted from what the code does; the owner had to ask for the rename",
+ "cause": "one spelling stood for two meanings, a bound on others (trait methods, defaults) and a statement about this body, and the checker took the weaker meaning for both",
+ "class": "one annotation carrying a bound and a claim, checked only as the bound",
+ "prevention": "`blaze::expect` on a function with a body and its own list is exact (`unfulfilled_effect`, deny); inherited, trusted, bodiless and unknown lists stay bounds; `Marks.exact` is the one place that decides which",
+ "workaround": "none",
+ "fix": "may renamed expect and deleted (refused with a respelling fix); unneeded_effect removed and banned. Control: the PRIVATE_ONLY plant brings back the old private-only check and an_unfulfilled_word_is_refused_on_every_function_that_writes_its_list fails.",
+ "state": "fixed, not yet compiled"
+}

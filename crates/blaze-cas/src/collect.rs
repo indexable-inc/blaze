@@ -67,8 +67,12 @@ pub(crate) fn cold_unit_id() -> ContentId {
 const SCAN_SLICE: u64 = 4 << 20;
 
 /// A set of keys the collector keeps whatever their last use, under a name: a record of the
-/// store ([`Kind::Pin`]). The newest pin of a name (by `when`, then by its key) is the name's;
-/// one with no keys lets the name go.
+/// store ([`Kind::Pin`]). The pin of a name made last is the name's, whatever its maker's
+/// clock did: across runs by `when` (then by its key), which [`Store::pin`] keeps later than
+/// every pin of the name the store knows of, and within a run by the order they were made,
+/// which a scan that reads an older pin of the name keeps ([`Store::keep_scan`]). One with no
+/// keys lets the name go, and is kept itself (a scan roots each name's newest pin) so that no
+/// older pin of the name comes back once it is forgotten.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pin {
     pub name: String,
@@ -151,13 +155,13 @@ impl Pin {
 }
 
 /// Of `pins` (each with its record's key), the one each name has now: the newest by `when`,
-/// then by key, in the order of their names. One with no keys is left out: its name was let go.
-fn current_pins(mut pins: Vec<(Key, Pin)>) -> Vec<(Key, Pin)> {
+/// then by key, in the order of their names. One with no keys stays: its name was let go, and
+/// its record is what keeps an older pin of the name from being the name's again.
+fn newest_pins(mut pins: Vec<(Key, Pin)>) -> Vec<(Key, Pin)> {
     pins.sort_by(|(a_key, a), (b_key, b)| {
         (&a.name, b.when, b_key).cmp(&(&b.name, a.when, a_key))
     });
     pins.dedup_by(|later, first| later.1.name == first.1.name);
-    pins.retain(|(_, pin)| !pin.keys.is_empty());
     pins
 }
 
@@ -177,6 +181,9 @@ pub(crate) struct Mark {
     /// How many keys readers had ever kept ([`Keep`]) when its scan was taken: a key kept
     /// since is in no set of it, so a seal under it is refused.
     kept_changes: u64,
+    /// How many roots had been added ([`Collecting::roots`]) when its scan was taken: a
+    /// record forgotten alone under it ([`crate::forget`]) is one no root added since names.
+    roots: u64,
 }
 
 /// A reader's hold on a key for longer than a build: while it lives, the collector keeps the
@@ -220,10 +227,12 @@ pub(crate) struct Collecting {
     scan_out: bool,
     /// The pack a batch is out for.
     out: Option<usize>,
-    /// Each name's pin, as the last scan and the pins made since have it.
+    /// Each name's pin, as the last scan and the pins made since have it, a name let go
+    /// with its pin of no keys.
     pins: Vec<(Key, Pin)>,
-    /// The keys placed at a path and not let go of ([`Store::place`], [`Store::unplace`]).
-    placed: ByHashSet<Key, Global>, // alloc: the store's own table, for its life
+    /// The record keys of the pins this store made since it opened, the last of each name:
+    /// the name's whatever a scan reads ([`Store::keep_scan`]).
+    made: Vec<Key>,
     /// What the last scan measured.
     scanned: Scanned,
     counts: Counts,
@@ -235,6 +244,9 @@ pub(crate) struct Collecting {
     pub(crate) small_commit: bool,
     /// The commit in flight is one the collector began.
     pub(crate) commit_ours: bool,
+    /// How many times a root was added (a path placed with a key it did not hold, a pin
+    /// made): a mark of a scan taken before the last of them does not hold it.
+    roots: u64,
     /// A planted bug for the collector's simulation (`tests/collect.rs`).
     #[cfg(test)]
     pub(crate) plant: Plant,
@@ -248,28 +260,48 @@ impl Collecting {
             scan_out: false,
             out: None,
             pins: Vec::new(), // alloc: empty, allocates nothing
-            placed: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
+            made: Vec::new(), // alloc: empty, allocates nothing
             scanned: Scanned::default(),
             counts: Counts::default(),
             carry: None,
             carry_out: false,
             small_commit: false,
             commit_ours: false,
+            roots: 0,
             #[cfg(test)]
             plant: Plant::None,
         }
     }
 
-    /// A key was placed at a path: kept until it is let go of, and the mark made before
-    /// does not hold it.
-    pub(crate) fn placed(&mut self, key: Key) {
-        if self.placed.insert(key) {
-            self.mark = None;
-        }
+    /// A path holds a key it did not before (the store's placed roots, `Store::place_keys`):
+    /// the mark made before does not hold it.
+    pub(crate) fn rooted(&mut self) {
+        self.mark = None;
+        self.roots += 1;
     }
 
-    pub(crate) fn unplaced(&mut self, key: &Key) {
-        self.placed.remove(key);
+    /// Whether the store's mark says that no root names `key`: a sound mark, of a scan taken
+    /// after the last root was added and with the readers' keeps as they are (`kept_changes`
+    /// now), that neither roots `key` nor has it named by a record ([`Mark::weak`]), and no
+    /// pin names it. What a record forgotten alone needs ([`crate::forget`]): the collector's
+    /// rule of what a root names, asked of one record. No mark: not known, so `false`.
+    pub(crate) fn unrooted(&self, key: &Key, kept_changes: u64) -> bool {
+        #[cfg(test)]
+        if self.plant == Plant::ForgetIgnoresRoots {
+            return true;
+        }
+        let Some(mark) = &self.mark else { return false };
+        mark.sound
+            && mark.roots == self.roots
+            && mark.kept_changes == kept_changes
+            && !mark.rooted.contains(key)
+            && !mark.weak.contains_key(key)
+            && !self.pins.iter().any(|(_, pin)| pin.keys.contains(key))
+    }
+
+    /// Whether the store holds a mark at all: a forget waits for one ([`crate::forget`]).
+    pub(crate) fn marked(&self) -> bool {
+        self.mark.as_ref().is_some_and(|it| it.roots == self.roots)
     }
 
     /// An index swap left `carry` to be run. One not yet taken is replaced: its tables are
@@ -304,6 +336,11 @@ pub(crate) enum Plant {
     RootMissed,
     /// A pack is sealed without its kept records copied on.
     SealBeforeCopies,
+    /// A record is forgotten alone whatever roots it ([`crate::forget`]).
+    ForgetIgnoresRoots,
+    /// A head lists no record forgotten alone, though it lists the whole files they named as
+    /// removed: after a crash or a reopen the record is found and its file is gone.
+    ForgetUnlisted,
 }
 
 /// The flags of use of an index swap, carried from the tables before it to the new index
@@ -447,6 +484,8 @@ pub struct PeriodScan {
     /// The keys readers keep ([`Keep`]), and how many were ever kept, as it was taken.
     kept: Vec<Key>,
     kept_changes: u64,
+    /// [`Collecting::roots`] as it was taken.
+    roots: u64,
     done: bool,
     pub(crate) demote: Vec<(Key, Loc, Row)>,
     pub(crate) promote: Vec<(Key, Loc, Row)>,
@@ -528,7 +567,9 @@ impl PeriodScan {
                 }
             }
         }
-        self.pins = current_pins(pins);
+        // Each name's newest pin is kept, its record too: one of no keys among them, so that
+        // an older pin of its name is never the name's again.
+        self.pins = newest_pins(pins);
         for (key, pin) in &self.pins {
             self.rooted.insert(*key);
             for key in &pin.keys {
@@ -631,10 +672,12 @@ impl PeriodScan {
         match loc.form {
             // A file of its own goes cold as a record does: into a pack, compressed, and
             // its file is let go ([`Store::external_replaced`]). Machine code stays a file,
-            // which its loader maps ([`Kind::Machine`]). A pin stays as it is: every scan
-            // reads it; so does a listing of an item set a scan follows ([`Kind::Set`]).
+            // which its loader maps ([`Kind::Machine`]), and so does an output whose placed
+            // file is its home ([`crate::home`]): that file is what its places clone, so a
+            // copy in a pack would hold its bytes twice again. A pin stays as it is: every
+            // scan reads it; so does a listing of an item set a scan follows ([`Kind::Set`]).
             Form::Raw | Form::Lz4 | Form::Warm | Form::External
-                if (loc.form != Form::External || loc.kind != Kind::Machine)
+                if (loc.form != Form::External || !matches!(loc.kind, Kind::Machine | Kind::Output))
                     && !matches!(loc.kind, Kind::Pin | Kind::Set)
                     && self.periods >= 2
                     && !read
@@ -1080,10 +1123,13 @@ pub enum Sealed {
 }
 
 impl Store {
-    /// Keeps `keys` under `name` whatever their last use, until a newer pin of the name: a
+    /// Keeps `keys` under `name` whatever their last use, until the next pin of the name: a
     /// record of the store, durable with its ticket. No keys lets the name go. `when` is the
-    /// caller's clock, in nanoseconds since the Unix epoch: of two pins of a name the later
-    /// is the name's.
+    /// caller's clock, in nanoseconds since the Unix epoch, and is written later than every
+    /// pin of the name the store knows of: so the pin made last is the name's, in this run and
+    /// in the next, whatever that clock did. A pin of an earlier run that this one has not
+    /// read yet, and that a clock gone back left later, is outdone when a scan reads it
+    /// ([`Store::keep_scan`]).
     pub fn pin(
         &mut self,
         name: &str,
@@ -1091,16 +1137,27 @@ impl Store {
         when: u64,
         keys: &[Key],
     ) -> Result<Ticket, Mismatch> {
+        let when = self
+            .collecting
+            .pins
+            .iter()
+            .filter(|(_, it)| it.name == name)
+            .fold(when, |when, (_, it)| when.max(it.when.saturating_add(1)));
         // alloc: a pin made, kept as the name's
         let pin = Pin { name: name.to_owned(), why: why.to_owned(), when, keys: keys.to_vec() };
         let key = pin.key();
         let ticket = self.put(key, Kind::Pin, &pin.encode())?;
+        let collecting = &mut self.collecting;
         // alloc: the pins as they are now, a few
-        let mut pins = std::mem::take(&mut self.collecting.pins);
+        let mut pins = std::mem::take(&mut collecting.pins);
         pins.push((key, pin));
-        self.collecting.pins = current_pins(pins);
+        collecting.pins = newest_pins(pins);
+        // The one made last of each name: the one before of this name is no longer its.
+        let pins = &collecting.pins;
+        collecting.made.retain(|made| pins.iter().any(|(it, _)| it == made));
+        collecting.made.push(key);
         // The mark made before does not hold the keys it names.
-        self.collecting.mark = None;
+        collecting.rooted();
         Ok(ticket)
     }
 
@@ -1161,19 +1218,21 @@ impl Store {
     }
 
     /// Each name's pin, in the order of their names: as the last period's scan found them
-    /// and as the pins made since changed them. Empty until the first scan after an open.
+    /// and as the pins made since changed them; a name let go is not among them. Empty until
+    /// the first scan after an open, but for the pins made since.
     pub fn pins(&self) -> impl Iterator<Item = &Pin> {
-        self.collecting.pins.iter().map(|(_, pin)| pin)
+        self.collecting.pins.iter().map(|(_, pin)| pin).filter(|pin| !pin.keys.is_empty())
     }
 
     /// The bytes the records of `keys` take in the own tier's packs, as stored: what a pin of
     /// them keeps. A key it has no committed record of counts nothing.
     pub fn stored_bytes(&self, keys: &[Key]) -> u64 {
         let look = self.look();
+        // Only its own: a layer's or another writer's record is not its to keep or count.
         keys.iter()
-            .filter_map(|key| match look.find(key)?.ok()?.place {
-                Place::Pack(loc) => disk::span_of(loc.stored),
-                Place::Segment(_) => None,
+            .filter_map(|key| match look.find(key)?.ok()? {
+                Found { tier: 0, place: Place::Pack(loc), .. } => disk::span_of(loc.stored),
+                _ => None,
             })
             .sum()
     }
@@ -1220,6 +1279,7 @@ impl Store {
         PeriodScan {
             kept,
             kept_changes,
+            roots: self.collecting.roots,
             reader: self.reader(),
             // clone: an `Arc`, once a scan
             index: own.index.clone(),
@@ -1239,8 +1299,8 @@ impl Store {
             }),
             // alloc: once a scan, a flag a pack
             passed: own.packs.iter().map(|it| it.removed || it.retiring).collect(),
-            // alloc: once a scan, the keys placed: a few
-            placed: self.collecting.placed.iter().copied().collect(),
+            // alloc: once a scan, the keys the paths hold: a few
+            placed: self.place_keys.values().copied().collect(),
             done: false,
             demote: Vec::new(),  // alloc: empty, allocates nothing
             promote: Vec::new(), // alloc: empty, allocates nothing
@@ -1365,15 +1425,48 @@ impl Store {
 
     /// The plan, the pins and the mark of a scan that ran, kept: what [`Store::plan_put`]
     /// and the scans the store runs itself end with.
+    ///
+    /// The pins a scan read are the store's, but for a name this store pinned since it
+    /// opened: that pin was made after every pin an earlier run wrote, so it stays the name's
+    /// whatever the scan found (one made after the scan walked, which it did not see; one of
+    /// an earlier run whose `when` a clock gone back left later). A pin read later than this
+    /// store's own is written again, later than it, so that the next run reads the order they
+    /// were made in; and a mark of a scan taken at the store's roots as they are now, which
+    /// rooted the older pin's keys, is not kept.
     pub(crate) fn keep_scan(&mut self, scan: PeriodScan) -> Moves {
         let PeriodScan {
-            demote, promote, named, pins, rooted, weak, sound, scanned, kept_changes, mut problems, ..
+            demote, promote, named, mut pins, rooted, weak, sound, scanned, kept_changes, roots, mut problems, ..
         } = scan;
         self.problems.append(&mut problems);
         for (content, external) in &mut self.tiers[0].externals {
             external.keys = named.get(content).copied().unwrap_or(0);
         }
         let collecting = &mut self.collecting;
+        let before = std::mem::take(&mut collecting.pins);
+        // alloc: once a scan, the pins of this store's that a scan read as older: none unless a clock went back
+        let mut again: Vec<Pin> = Vec::new();
+        let mut outdone = false;
+        for made in &collecting.made {
+            let Some((_, mine)) = before.iter().find(|(key, _)| key == made) else { continue };
+            match pins.iter_mut().find(|(_, it)| it.name == mine.name) {
+                Some((key, _)) if key == made => {}
+                Some(found) => {
+                    outdone = true;
+                    if (found.1.when, found.0) > (mine.when, *made) {
+                        // clone: a pin written again, once a clock went back
+                        again.push(Pin { when: found.1.when.saturating_add(1), ..mine.clone() });
+                    }
+                    // clone: the name's pin as this store made it, a few
+                    *found = (*made, mine.clone());
+                }
+                None => {
+                    outdone = true;
+                    // clone: the name's pin as this store made it, a few
+                    pins.push((*made, mine.clone()));
+                }
+            }
+        }
+        pins.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
         collecting.pins = pins;
         collecting.scanned = scanned;
         collecting.generations += 1;
@@ -1384,7 +1477,19 @@ impl Store {
             weak,
             sound,
             kept_changes,
+            roots,
         }));
+        // A mark that rooted another pin than the name's, at the roots as they are: not the
+        // store's. (One of a scan taken before a root was added holds for no seal already.)
+        if outdone && roots == collecting.roots {
+            collecting.rooted();
+        }
+        for pin in again {
+            if let Err(mismatch) = self.pin(&pin.name, &pin.why, pin.when, &pin.keys) {
+                // alloc: a problem reported
+                self.problems.push(format!("the pin `{}` was not written again: {mismatch:?}", pin.name));
+            }
+        }
         Moves { demote, demoted: 0, promote, promoted: 0 }
     }
 
@@ -1611,7 +1716,8 @@ impl Store {
             self.external_replaced(content);
         }
         for content in &batch.files {
-            if self.files.contains_key(content) && self.placed_looked {
+            // A whole file a path still names stays until that path is placed again.
+            if self.files.contains_key(content) && self.placed_looked && self.names.names(content) == 0 {
                 self.let_go(*content, effects);
             }
         }

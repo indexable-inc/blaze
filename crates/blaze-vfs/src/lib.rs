@@ -18,7 +18,8 @@
 //! - Outside every view: the directories user code reads that no view holds, watched so a
 //!   check asks a lock-free table whether anything under a path changed ([`outside`]).
 //!
-//! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
+//! Unsafe code is only in `store` and `lent` (docs/v2/plan/design/unsafe.md), whose APIs are
+//! safe.
 
 #![deny(unsafe_code)]
 #![feature(allocator_api)]
@@ -26,22 +27,26 @@
 mod disk;
 mod image;
 mod journal;
+#[allow(unsafe_code)]
+mod lent;
 pub mod outside;
 mod paths;
 mod probes;
 mod reader;
 mod rebase;
 mod section;
+mod settle;
 #[allow(unsafe_code)]
 mod store;
 mod sync;
 mod text;
+mod texts;
 mod tree;
 pub mod watch;
 
 use std::{borrow::Cow, fmt};
 
-use blaze_core::{Completion, Effect, FileName, Tag};
+use blaze_core::{Completion, Effect, FileName, Stamp, Tag};
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Idx};
 use serde::{Deserialize, Serialize};
@@ -54,11 +59,15 @@ use crate::{
 pub use blaze_image::Corrupt;
 
 pub use crate::{
-    image::{Bytes, DisksUnused, ImageError, ImageMark, ImageUse, tree_layout},
+    disk::{COARSE_NS, FINE_NS, MARK_MOST, racy, window_ns},
+    image::{Bytes, DisksUnused, ImageError, ImageFile, ImageMark, ImageUse, tree_layout},
+    lent::lent,
     outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,
+    settle::{Settled, Unsettled},
     text::{Text, TextFile, text_of},
+    texts::{FaultWhy, HeldTexts, StoreFault, TEXT_SCHEMA, Texts},
     tree::Jobs,
     watch::{Watched, Watcher},
 };
@@ -274,17 +283,110 @@ pub struct Vfs {
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,
-    /// What each head's watcher last saw of the disk: saved in the image with the tree.
+    /// What each head's watcher last saw of the disk: saved in the image with the tree, and
+    /// what changed since in the journal (`SEEN` records).
     disks: disk::Disks,
+    /// The machine's local facts by name ([`Vfs::mark`]): in the journal (`MARK` records).
+    marks: disk::Marks,
 }
+
+/// One head's column as its watcher last saw it ([`Vfs::column`]): the watched directory
+/// `dir` (a name under the driver's root, as every [`FileName`] is), each name under it with
+/// its [`Stamp`], and `root`, the head's root, when the column vouches for it (`None`: it
+/// vouches for no root). The invariant: a column never pairs a root with a stamp of bytes other
+/// than the ones that root holds at that path. A name taken inside its racy window ([`racy`]),
+/// one whose head chose other bytes (a conflict, a commit by anyone but the watcher) and one
+/// never read are [`Stamp::UNKNOWN`]: the column vouches for none of them.
+pub struct Column<'a> {
+    pub dir: &'a str,
+    pub root: Option<ContentId>,
+    disk: &'a disk::Disk,
+}
+
+impl Column<'_> {
+    /// Calls `f` with every name at or under `dir` (the names are under the driver's root,
+    /// `dir` itself first) and its stamp, each once, in name order: the image's column merged
+    /// with what changed since, a name gone left out, a stamp that vouches for nothing
+    /// [`Stamp::UNKNOWN`].
+    pub fn each(&self, mut f: impl FnMut(&str, blaze_core::Stamp)) {
+        self.disk.under_saved(self.dir, |name, stamp| match disk::vouches(&stamp) {
+            true => f(name, stamp),
+            false => f(name, blaze_core::Stamp::UNKNOWN),
+        });
+    }
+
+    /// At most how many names [`Column::each`] hands: what a copy of it reserves.
+    pub fn len(&self) -> usize {
+        self.disk.size().0
+    }
+
+    /// Whether the column holds no name.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A mark [`Vfs::mark`] refused: more than [`MARK_MOST`] bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MarkTooLarge {
+    pub name: String,
+    pub len: usize,
+}
+
+impl fmt::Display for MarkTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the mark `{}` is {} bytes, over the {MARK_MOST} a mark holds (blaze-vfs MARK_MOST)",
+            self.name, self.len
+        )
+    }
+}
+
+impl std::error::Error for MarkTooLarge {}
 
 impl Vfs {
     /// A VFS recovered from its journal's bytes (empty for a new one), and what it found.
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
-        let Loaded { tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
+        let (mut disks, mut marks) = (disk::Disks::default(), disk::Marks::default());
+        let Loaded { tree, heads, journal, found } =
+            Journal::recover(journal, tags, bytes, &mut disks, &mut marks);
         // alloc: empty, allocates nothing; once per process.
-        (Vfs { tree, heads, views: Vec::new(), journal, disks: disk::Disks::default() }, found)
+        (Vfs { tree, heads, views: Vec::new(), journal, disks, marks }, found)
+    }
+
+    /// Sets `name`'s mark to `bytes` (empty: removes it), a local fact the next start finds
+    /// ([`Vfs::marked`]); durable once the ticket is in what [`Vfs::complete`] returns. A mark
+    /// already `bytes` records nothing, its ticket given with the next batch. Refused, naming
+    /// it, over [`MARK_MOST`] bytes.
+    pub fn mark(&mut self, name: &str, bytes: &[u8]) -> Result<Ticket, MarkTooLarge> {
+        if bytes.len() > MARK_MOST {
+            // alloc: once per refusal, the name it is about.
+            return Err(MarkTooLarge { name: name.to_owned(), len: bytes.len() });
+        }
+        if self.marks.get(name).unwrap_or_default() == bytes {
+            return Ok(self.journal.ticket());
+        }
+        self.marks.set(name, bytes);
+        Ok(self.journal.record_mark(name, bytes))
+    }
+
+    /// Removes `name`'s mark; `None` (and nothing recorded) for a name with none.
+    pub fn unmark(&mut self, name: &str) -> Option<Ticket> {
+        self.marks.get(name)?;
+        self.marks.set(name, &[]);
+        Some(self.journal.record_mark(name, &[]))
+    }
+
+    /// `name`'s mark, as last set.
+    pub fn marked(&self, name: &str) -> Option<&[u8]> {
+        self.marks.get(name)
+    }
+
+    /// Every mark whose name starts with `prefix`, in name order.
+    pub fn marks<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a str, &'a [u8])> {
+        self.marks.under(prefix)
     }
 
     /// A handle that reads any root this tree has, from any thread, without the `Vfs` and
@@ -293,6 +395,22 @@ impl Vfs {
     /// the `Vfs` itself once no reader can be in it; no caller has to say when.
     pub fn reader(&self) -> Reader {
         self.tree.reader()
+    }
+
+    /// What `head`'s watcher last saw of the disk ([`Column`]); `None` for a head no watcher
+    /// saved a column of. What a request's slot copies (blaze-certify's `slot::Column`): the
+    /// column's one home stays here.
+    pub fn column(&self, head: &str) -> Option<Column<'_>> {
+        let disk = self.disks.get(head)?;
+        // The root the column was kept against (`Disk::root`), while it is the head's: a commit
+        // by anyone but the watcher moves both at once (`Vfs::rechain`), so they differ only
+        // where a journal's tail was cut between a head record and its `SEEN`.
+        let root = match () {
+            #[cfg(test)]
+            () if planted(Plant::ColumnOfTheHead) => self.head(head),
+            () => disk.root.filter(|it| Some(*it) == self.head(head)),
+        };
+        Some(Column { dir: disk.dir.as_str(), root, disk })
     }
 
     /// The root `head` is at, if it was ever written.
@@ -338,12 +456,16 @@ impl Vfs {
         let base = self.root(base).ok_or(CommitError::UnknownBase(base))?;
         let at = self.heads.get(head).copied().unwrap_or(self.tree.empty());
         if base == at {
-            return self.move_head(head, at, false, ops.iter().map(Cow::Borrowed));
+            let commit = self.move_head(head, at, false, ops.iter().map(Cow::Borrowed))?;
+            self.rechain(head, at);
+            return Ok(commit);
         }
         let moved = rebase::rebase(&self.tree, base, at, ops)?;
         let ops =
             ops.iter().zip(moved).map(|(op, moved)| moved.map_or(Cow::Borrowed(op), Cow::Owned));
-        self.move_head(head, at, true, ops)
+        let commit = self.move_head(head, at, true, ops)?;
+        self.rechain(head, at);
+        Ok(commit)
     }
 
     /// [`Vfs::commit`] of ops it may keep: each write's bytes become the file's own with no
@@ -357,11 +479,77 @@ impl Vfs {
         let base = self.root(base).ok_or(CommitError::UnknownBase(base))?;
         let at = self.heads.get(head).copied().unwrap_or(self.tree.empty());
         if base == at {
-            return self.move_head(head, at, false, ops.into_iter().map(Cow::Owned));
+            let commit = self.move_head(head, at, false, ops.into_iter().map(Cow::Owned))?;
+            self.rechain(head, at);
+            return Ok(commit);
         }
         let moved = rebase::rebase(&self.tree, base, at, &ops)?;
         let ops = ops.into_iter().zip(moved).map(|(op, moved)| Cow::Owned(moved.unwrap_or(op)));
-        self.move_head(head, at, true, ops)
+        let commit = self.move_head(head, at, true, ops)?;
+        self.rechain(head, at);
+        Ok(commit)
+    }
+
+    /// The watcher's commit of what it saw on the disk to `head`, as it is now: the column's
+    /// stamps for it are the watcher's to save ([`Watcher`]), so the column is not moved here as
+    /// [`Vfs::commit`] moves it.
+    pub(crate) fn commit_seen(&mut self, head: &str, ops: Vec<Op>) -> Result<Commit, CommitError> {
+        let at = self.heads.get(head).copied().unwrap_or(self.tree.empty());
+        self.move_head(head, at, false, ops.into_iter().map(Cow::Owned))
+    }
+
+    /// After a commit to `head` by anyone but its watcher, from the root `from`: the column
+    /// moves with the head. What the commit changed is marked in it, so its invariant holds of
+    /// the head's new root (`Disk::root`): a saved stamp of a path the commit changed is one
+    /// the head chose against ([`disk::chose`]), and a path the commit made that the column has
+    /// no name for is saved [`Stamp::UNKNOWN`], so the column holds every file of the root. A
+    /// `SEEN` record after the commit's head record says so. A column kept against another root
+    /// than `from` (a journal cut between a head record and its `SEEN`) vouches for none after.
+    fn rechain(&mut self, head: &str, from: NodeId) {
+        #[cfg(test)]
+        if planted(Plant::ColumnOfTheHead) {
+            return;
+        }
+        let Some(disk) = self.disks.by_head.get_mut(head) else { return };
+        let Some(synced) = disk.root else { return };
+        let to = self.heads.get(head).copied().unwrap_or(self.tree.empty());
+        // alloc: per commit to a watched head by another writer, its `SEEN` record's entries.
+        let mut entries = Vec::new();
+        let mut count = 0u32;
+        if synced == self.tree.id(from) {
+            // alloc: per such commit, the one buffer each name is built in.
+            let mut name = String::new();
+            let changed = self.tree.diff(from, to);
+            let relisted = self.tree.relisted(from, to);
+            let paths = changed
+                .iter()
+                .map(|it| (it.path.as_str(), it.kind != ChangeKind::Removed))
+                .chain(relisted.iter().map(|it| (it.as_str(), true)));
+            for (path, made) in paths {
+                name.clear();
+                name.push_str(disk.dir.as_str());
+                if !path.is_empty() {
+                    name.push('/');
+                    name.push_str(path);
+                }
+                let stamp = match disk.saved(&name) {
+                    Some(saved) if disk::vouches(&saved) => disk::chose(saved),
+                    Some(_) => continue,
+                    None if made => Stamp::UNKNOWN,
+                    None => continue,
+                };
+                disk.set(&name, stamp);
+                disk::put_entry(&mut entries, &name, stamp);
+                count += 1;
+            }
+            disk.root = Some(self.tree.id(to));
+        } else {
+            disk.root = None;
+        }
+        // alloc: per such commit, the record's payload.
+        let mut seen = Vec::new();
+        disk::encode_seen(&mut seen, head, disk, count, &entries);
+        self.journal.record_seen(&seen);
     }
 
     fn move_head<'o>(
@@ -386,8 +574,11 @@ impl Vfs {
     /// Moves `head` to `root` whatever it was at, as a checkout, a fork or a push does.
     pub fn set_head(&mut self, head: &str, root: ContentId) -> Result<Ticket, CommitError> {
         let node = self.root(root).ok_or(CommitError::UnknownBase(root))?;
+        let from = self.heads.get(head).copied().unwrap_or(self.tree.empty());
         self.heads.insert(head.into(), node);
-        Ok(self.journal.record_head(&self.tree, head, node))
+        let ticket = self.journal.record_head(&self.tree, head, node);
+        self.rechain(head, from);
+        Ok(ticket)
     }
 
     /// Removes `head`, as a deleted branch or a closed PR does; `None` when there is none.
@@ -505,10 +696,24 @@ impl Vfs {
         self.tree.diff(node(from), node(to))
     }
 
+    /// The directories whose listing differs between two roots (relative to the root, `""` the
+    /// root itself), sorted bytewise: a listing is a directory's names and whether each is a
+    /// directory, so one differs where a name is added or removed or turns between a file and a
+    /// directory, and where the directory itself is added or removed (with every directory
+    /// under it). A file whose bytes or mode changed changes no listing. What [`Vfs::diff`]'s
+    /// files alone do not say: which directories above an added or removed file it made or
+    /// emptied. Both must be roots this tree has, as [`Vfs::diff`]'s.
+    pub fn relisted(&self, from: ContentId, to: ContentId) -> Vec<String> {
+        let node = |root: ContentId| {
+            self.root(root).unwrap_or_else(|| panic!("the listings of {root:x}, which is no root here"))
+        };
+        self.tree.relisted(node(from), node(to))
+    }
+
     /// Asks for what commits made since the last flush need to be durable.
     pub fn flush(&mut self, effects: &mut Vec<Effect>) {
         self.tree.reclaim();
-        self.journal.flush(&self.tree, &self.heads, effects);
+        self.journal.flush(&self.tree, &self.heads, &self.disks, &self.marks, effects);
     }
 
     /// Whether a completion is of an effect this asked for.
@@ -518,7 +723,7 @@ impl Vfs {
 
     /// Takes a completion of its own, and says which commits are now durable.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
-        self.journal.complete(&self.tree, &self.heads, completion, effects)
+        self.journal.complete(&self.tree, &self.heads, &self.disks, &self.marks, completion, effects)
     }
 
     /// Drops every node no head, open view or root in `keep` reaches. Readers move to the
@@ -571,6 +776,39 @@ pub struct Recovered {
     pub heads_dropped: usize,
     /// What [`Vfs::restore`] did with the image it was given; `None` from [`Vfs::recover`].
     pub image: ImageUse,
+    /// `SEEN` records replayed: watcher batches' stamps and rewrites' overlays.
+    pub seen: u64,
+    /// `MARK` records replayed.
+    pub marks: u64,
+}
+
+/// A bug planted for a test's control, each reverting one case of the column's invariant
+/// ([`Column`]): the planted column pairs its root with a stamp of other bytes.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plant {
+    None,
+    /// A conflict saves the disk's stamp as one that vouches, as before 2026-11-12.
+    ConflictVouched,
+    /// A file moved from a node the tree no longer has is saved under its stamp, and the record
+    /// that it is gone comes apart from the commit's, as before 2026-11-12.
+    AgainApart,
+    /// A commit by another writer leaves the column as it was, and the column is paired with
+    /// the head's root whatever it was kept against, as before 2026-11-12.
+    ColumnOfTheHead,
+    /// A file renamed from a name the head chose other bytes for (or the column vouches no
+    /// root) is taken as a move of the head's bytes, not read, as before 2026-11-12.
+    MoveFromChosen,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLANT: std::cell::Cell<Plant> = const { std::cell::Cell::new(Plant::None) };
+}
+
+#[cfg(test)]
+pub(crate) fn planted(plant: Plant) -> bool {
+    PLANT.get() == plant
 }
 
 /// Counts each test thread's allocations, for the allocation-budget tests

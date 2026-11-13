@@ -544,7 +544,13 @@ fn file_now(db: &Db, ported: &[u8]) -> Result<(base_db::AbsPathBuf, ContentId), 
         .and_then(|it| base_db::AbsPathBuf::try_from(it).ok())
         // alloc: error path
         .ok_or_else(|| format!("the file read `{}` is no absolute path here", shown()))?;
-    let content = base_db::IncludedFile::content_now(AsRef::<std::path::Path>::as_ref(&path));
+    // A dependency's record checked inside the front end, which no one build owns: its look
+    // is kept by none. The file is a read of the crate's record, which each build that uses
+    // the crate takes as its own read.
+    let content = base_db::IncludedFile::content_now(
+        AsRef::<std::path::Path>::as_ref(&path),
+        &base_db::Looks::none(),
+    );
     Ok((path, content))
 }
 

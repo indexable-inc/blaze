@@ -29,6 +29,7 @@ mod arch;
 mod comptime;
 mod const_ast;
 mod const_macro;
+mod const_quote;
 mod const_traits;
 mod deps;
 mod intrinsics;

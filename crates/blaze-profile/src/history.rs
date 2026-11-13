@@ -35,8 +35,8 @@
 //! encoded in memory here and handed to the core, which writes it to a hidden name, syncs it to
 //! stable storage, then renames it, so DuckDB never reads half a file and a power loss never
 //! leaves the manifest listing bytes the disk lost (every file and the manifest, with the
-//! directory synced around the manifest's rename). Past [`CAP_BYTES`] (or the cap the history
-//! is opened with), the oldest builds are retired first, each whole: every table and flush of a
+//! directory synced around the manifest's rename). Past the cap the history is opened with
+//! ([`cap_for`] of the home's store, or [`CAP_VAR`]), the oldest builds are retired first, each whole: every table and flush of a
 //! build at once, with every file that holds a row of it and so every build those files hold
 //! rows of too, so a reader of a build reads all of it or none; never a build still running
 //! ([`History::build_started`] to [`History::build_ended`]) nor the newest flush's. What goes is
@@ -156,32 +156,43 @@ pub use manifest::Manifest;
 pub use pin::Pin;
 pub use retire::PINS;
 
-/// What the history keeps by default: 256 MiB, about 25 million rows at the ~10 bytes a row
-/// takes compressed. Measured 2026-11-11: hello-world's cold build (std's front end and
-/// code, 400,000 spans) is 18 MiB and each edit after it 0.3 MiB, so the default holds a
-/// small project's cold build and several hundred edits, and of a large workspace its
-/// newest builds: the newest flush's builds and every build still running are never retired
-/// ([`files`]), so the build being asked about is whole whatever the cap. It was 4 GiB until
-/// then (from 1 GiB, which trimmed a self-build from under itself before running builds were
-/// kept): a day's work left 1.3 GiB. What goes is said each time ([`said_capped`]). A daemon
-/// started with [`CAP_VAR`] keeps that many MiB instead.
-pub const CAP_BYTES: u64 = 256 << 20;
+/// The most the history keeps by default, whatever the store holds: 256 MiB, about 25
+/// million rows at the ~10 bytes a row takes compressed. Measured 2026-11-11: hello-world's
+/// cold build (std's front end and code, 400,000 spans) is 18 MiB and each edit after it
+/// 0.3 MiB; a day's work under the 4 GiB cap of before left 1.3 GiB. The newest flush's
+/// builds and every build still running are never retired ([`files`]), so the build being
+/// asked about is whole whatever the cap. What goes is said each time ([`said_capped`]).
+pub const CAP_MOST: u64 = 256 << 20;
+
+/// The least the history keeps by default: 8 MiB, a few dozen edits' rows, so a new home's
+/// profile is not a tenth of the home (2026-11-12: a hello-world home held 92 MB of profile
+/// beside 760 MB in all, against the 75 MB of the competitor's whole home).
+pub const CAP_LEAST: u64 = 8 << 20;
+
+/// The cap the history keeps by default when the home's store holds `store_bytes`: a quarter
+/// of the store, between [`CAP_LEAST`] and [`CAP_MOST`], so a profile is never the most of
+/// what a home holds and grows only with the work the home has done.
+pub fn cap_for(store_bytes: u64) -> u64 {
+    (store_bytes / 4).clamp(CAP_LEAST, CAP_MOST)
+}
 
 /// The daemon's setting for the history's cap, in MiB: `BLAZE_PROFILE_CAP_MB=4096` keeps what
-/// the default was until 2026-11-11.
+/// the default was until 2026-11-11, whatever the store holds.
 pub const CAP_VAR: &str = "BLAZE_PROFILE_CAP_MB";
 
-/// The cap a daemon started with [`CAP_VAR`] set to `value` keeps: [`CAP_BYTES`] unset, that
-/// many MiB set; a value that is no whole number of MiB from 1 up is refused, naming it.
-pub fn cap_of(value: Option<&str>) -> Result<u64, String> {
-    let Some(value) = value else { return Ok(CAP_BYTES) };
+/// The cap a daemon started with [`CAP_VAR`] set to `value` keeps, its home's store holding
+/// `store_bytes` (layers left out) as it started: [`cap_for`] of that unset, that many MiB
+/// set; a value that is no whole number of MiB from 1 up is refused, naming it.
+pub fn cap_of(value: Option<&str>, store_bytes: u64) -> Result<u64, String> {
+    let Some(value) = value else { return Ok(cap_for(store_bytes)) };
     match value.trim().parse::<u64>() {
         Ok(mib) if mib >= 1 && mib <= u64::MAX >> 20 => Ok(mib << 20),
         // alloc: an error, once a daemon
         _ => Err(format!(
             "{CAP_VAR}={value:?} is not a number of MiB from 1 up for the profile history to keep \
-             (unset, it keeps {} MiB)",
-            CAP_BYTES >> 20
+             (unset, it keeps a quarter of the home's store, {} to {} MiB)",
+            CAP_LEAST >> 20,
+            CAP_MOST >> 20,
         )),
     }
 }
@@ -389,15 +400,42 @@ pub struct BuildRow {
 
 /// What a client sent of a build it asked for, as it ended (`blaze_api::Request::ClientRows`):
 /// its own `spans`, `events` and `folded` rows, each an Arrow IPC stream of that table's
-/// schema with every row's `build_id` the build's, and when it started and ended.
+/// schema with every row's `build_id` the build's, and, from the client that asked for the
+/// build, when it started and ended (`times`). A launched program's rows (`program:` spans,
+/// sent by the daemon as its launcher ends) carry no times: they never write the build's row
+/// again, so the client's times stand.
 #[derive(Debug, Default)]
 pub struct ClientRows {
     pub build: u64,
-    pub started_ns: i64,
-    pub ended_ns: i64,
+    pub times: Option<(i64, i64)>,
     pub spans: Vec<u8>,
     pub events: Vec<u8>,
     pub folded: Vec<u8>,
+}
+
+/// A solo answer, as the daemon that took its kept rows gives it ([`History::solo_build`]):
+/// a command its client answered by its own check with no daemon asked, numbered by that
+/// daemon as a build of its own (`blaze_certify::kept::Kept`).
+#[derive(Debug)]
+pub struct Solo {
+    pub build: u64,
+    /// The client's start and end, on the schema's clock.
+    pub started_ns: i64,
+    pub ended_ns: i64,
+    pub workspace: String,
+    pub command: String,
+    /// The request slot's key (`builds.solo_slot`).
+    pub slot: String,
+    /// The build whose answer the slot held (`builds.solo_certified_by`).
+    pub certified_by: Option<u64>,
+}
+
+/// A solo build's own columns, beside its [`BuildRow`] until the flush that writes it.
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: a test's rows
+pub struct SoloOf {
+    pub build: u64,
+    pub slot: String,
+    pub certified_by: Option<u64>,
 }
 
 /// What a client's rows name their process (`process_name`): told from its daemon's by it
@@ -813,8 +851,10 @@ fn column(array: impl Array + 'static) -> ArrayRef {
     Arc::new(array)
 }
 
-/// The `builds` rows of `rows`, all of the process `pid`.
-pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
+/// The `builds` rows of `rows`, all of the process `pid`; a row whose build is in `solo` has
+/// its solo columns from it.
+pub fn builds(rows: &[BuildRow], solo: &[SoloOf], pid: u32) -> Result<RecordBatch, ArrowError> {
+    let solo_of = |row: &BuildRow| solo.iter().find(|it| it.build == row.build_id);
     let outcomes = column(StringArray::from_iter_values(Outcome::ALL.iter().map(|it| it.name())));
     let outcome = UInt32Array::from_iter_values(rows.iter().map(|it| it.outcome as u32));
     // alloc: a batch's columns, once a flush
@@ -837,6 +877,8 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
         column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.1)))),
         column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.0)))),
         column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.1)))),
+        column(StringArray::from_iter(rows.iter().map(|it| solo_of(it).map(|it| it.slot.as_str())))),
+        column(UInt64Array::from_iter(rows.iter().map(|it| solo_of(it).and_then(|it| it.certified_by)))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
@@ -872,6 +914,8 @@ pub struct History {
     seq: u64,
     /// Builds that started (outcome running) or ended since the last flush: written by the next.
     ended: Vec<BuildRow>,
+    /// The solo columns of the solo builds among [`History::ended`]'s rows, cleared with them.
+    solo: Vec<SoloOf>,
     /// Errors builds said since the last flush: written by the next.
     errors: Vec<ErrorRow>,
     /// Images builds linked, and the crate graphs they built, since the last flush.
@@ -1024,6 +1068,8 @@ impl History {
             seq: opened.seq,
             // alloc: once a history
             ended: Vec::new(),
+            // alloc: none until a solo answer is taken
+            solo: Vec::new(),
             // alloc: once a history
             errors: Vec::new(),
             // alloc: once a history
@@ -1235,7 +1281,7 @@ impl History {
         self.client_events.extend(events);
         self.client_folded.extend(folded);
         self.client_build = self.client_build.max(build);
-        let times = (client.started_ns, client.ended_ns);
+        let Some(times) = client.times else { return Ok(()) };
         match self.recent.iter_mut().rev().find(|it| it.build_id == build) {
             Some(row) => {
                 row.client_ns = Some(times);
@@ -1249,6 +1295,40 @@ impl History {
                 self.pending_clients.push_back((build, times));
             }
         }
+        Ok(())
+    }
+
+    /// Notes a solo answer as a build of its own, for the next flush to write: its `builds` row
+    /// (outcome ok, `misses` 0, the client's times as its own, its solo columns) and its
+    /// client's rows (`client`, of the same build, with no times: the row has them). A batch
+    /// that does not fit is the error, naming the build and table; nothing of it is noted
+    /// then. Its row is never written again: no client sends rows of it later.
+    pub fn solo_build(&mut self, solo: Solo, client: &ClientRows) -> Result<(), HistoryError> {
+        let Solo { build, started_ns, ended_ns, workspace, command, slot, certified_by } = solo;
+        debug_assert_eq!(client.build, build, "a solo build's client rows are its own");
+        debug_assert!(client.times.is_none(), "a solo build's row has its client's times");
+        self.client_rows(client)?;
+        self.solo.push(SoloOf { build, slot, certified_by });
+        self.ended.push(BuildRow {
+            build_id: build,
+            commit: None,
+            workspace,
+            command,
+            started_ns,
+            dur_ns: Some(ended_ns.saturating_sub(started_ns)),
+            started_unix_ns: None,
+            outcome: Outcome::Ok,
+            hits: None,
+            misses: Some(0),
+            joined: None,
+            // No tree is digested for a command that read nothing but stamps: its slot's
+            // certified build has the tree, which the check found unchanged.
+            tree: None,
+            // The thin `blaze` answered it, which no hash of this daemon's executable names.
+            blaze: None,
+            client_ns: Some((started_ns, ended_ns)),
+            daemon_cpu_ns: None,
+        });
         Ok(())
     }
 
@@ -1376,6 +1456,7 @@ impl History {
                         self.dropped.add(table, rows as u64);
                     }
                     self.ended.clear();
+                    self.solo.clear();
                     self.errors.clear();
                     self.links.clear();
                     self.crate_deps.clear();
@@ -1613,7 +1694,7 @@ impl History {
         spans.append(&mut self.client_spans);
         let counters = [batches::counters(&self.read.counters, self.process)
             .map_err(arrow_error(&schema::COUNTERS))?];
-        let builds = [builds(&self.ended, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
+        let builds = [builds(&self.ended, &self.solo, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
         let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
         let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
         let crate_deps =
@@ -1888,6 +1969,7 @@ impl History {
         let done = |table: &Table| wrote[table_at(table)];
         if done(&schema::BUILDS) {
             self.ended.clear();
+            self.solo.clear();
         }
         if done(&schema::ERRORS) {
             self.errors.clear();
@@ -2320,7 +2402,7 @@ mod tests {
     fn a_child_process_row_and_a_test_run_row_read_back_column_for_column() {
         use crate::facts::{ProcessRow, TestOutcome, TestRunRow};
         let dir = scratch("processes-test-runs");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let child = ProcessRow {
             build_id: 71,
             pid: 4242,
@@ -2408,7 +2490,7 @@ mod tests {
     #[test]
     fn a_clients_rows_are_written_with_its_builds_row_given_its_times() {
         let dir = scratch("client-rows");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(BuildRow { daemon_cpu_ns: Some((7, 3)), ..row(81, Outcome::Ok) });
         history.flush(Some(81)).unwrap();
         let span = client_span(81);
@@ -2419,8 +2501,7 @@ mod tests {
         history
             .client_rows(&ClientRows {
                 build: 81,
-                started_ns: 500,
-                ended_ns: 90_000,
+                times: Some((500, 90_000)),
                 spans: bytes,
                 ..ClientRows::default()
             })
@@ -2455,6 +2536,58 @@ mod tests {
             matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })),
             "{refused:?}"
         );
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The invariant: a solo answer is one `builds` row of its own number, outcome ok, with
+    /// the client's times as its start, length and client columns, `misses` 0 and its solo
+    /// columns set, and its client's spans under it; a daemon's build in the same flush has
+    /// null solo columns. Control: a solo build's spans of another build are refused naming
+    /// it, and nothing of it is noted.
+    #[test]
+    fn a_solo_answer_is_one_build_row_with_its_slot_and_its_clients_spans() {
+        let dir = scratch("solo-build");
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
+        history.build_ended(row(90, Outcome::Ok));
+        let mut bytes = Vec::new();
+        let spans = batches::spans(&[client_span(91)], Process { pid: 9, name: "client", commit: None });
+        crate::live::encode(&spans.unwrap(), &mut bytes).unwrap();
+        let solo = |build: u64| Solo {
+            build,
+            started_ns: 500,
+            ended_ns: 2_500,
+            workspace: "/w".into(),
+            command: "run".into(),
+            slot: "ab12".into(),
+            certified_by: Some(90),
+        };
+        let client = ClientRows { build: 91, spans: bytes, ..ClientRows::default() };
+        history.solo_build(solo(91), &client).unwrap();
+        let flushed = history.flush(None).unwrap();
+        assert_eq!((flushed.builds, flushed.client), (2, 1));
+        let read = read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
+        let column = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap()).clone();
+        let ids = column("build_id");
+        let ids = ids.as_primitive::<arrow_array::types::UInt64Type>();
+        let at = (0..ids.len()).find(|&it| ids.value(it) == 91).expect("the solo build's row");
+        let daemon = 1 - at;
+        let slot = column("solo_slot");
+        let slot = slot.as_string::<i32>();
+        assert_eq!((slot.value(at), slot.is_null(daemon)), ("ab12", true));
+        let by = column("solo_certified_by");
+        let by = by.as_primitive::<arrow_array::types::UInt64Type>();
+        assert_eq!((by.value(at), by.is_null(daemon)), (90, true));
+        let int = |name: &str| column(name).as_primitive::<arrow_array::types::Int64Type>().value(at);
+        assert_eq!((int("started_ns"), int("dur_ns")), (500, 2_000));
+        assert_eq!((int("client_started_ns"), int("client_ended_ns")), (500, 2_500));
+        assert_eq!(column("misses").as_primitive::<arrow_array::types::UInt64Type>().value(at), 0);
+
+        let mut other = Vec::new();
+        let spans = batches::spans(&[client_span(93)], Process { pid: 9, name: "client", commit: None });
+        crate::live::encode(&spans.unwrap(), &mut other).unwrap();
+        let refused = history.solo_build(solo(92), &ClientRows { build: 92, spans: other, ..ClientRows::default() });
+        assert!(matches!(refused, Err(HistoryError::Client { build: 92, table: "spans", .. })), "{refused:?}");
+        assert!(history.ended.is_empty() && history.solo.is_empty(), "nothing of a refused solo build is noted");
         _ = fs::remove_dir_all(&dir);
     }
 
@@ -2502,7 +2635,8 @@ mod tests {
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
-        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], 7).unwrap();
+        let solo = [SoloOf { build: 2, slot: "ab12".into(), certified_by: Some(1) }];
+        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], &solo, 7).unwrap();
 
         let mut writer = Writer::new();
         for (table, batch) in
@@ -2586,7 +2720,7 @@ mod tests {
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;
         let dir = scratch("bugs");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let at = std::panic::Location::caller();
         let site = |count| Site {
             kind: "AdtDef",
@@ -2653,7 +2787,7 @@ mod tests {
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
         let mut history =
-            History::open(&dir.join("profile"), CAP_BYTES, sampler::unsampled()).unwrap();
+            History::open(&dir.join("profile"), CAP_MOST, sampler::unsampled()).unwrap();
         let built = |history: &mut History, build_id| {
             let row = BuildRow {
                 workspace: workspace.to_str().unwrap().into(),
@@ -2690,7 +2824,7 @@ mod tests {
     fn the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush() {
         use crate::facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow};
         let dir = scratch("facts");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.linked([LinkRow {
             build_id: 61,
             image: "app (bin)".into(),
@@ -2738,7 +2872,7 @@ mod tests {
 
         use crate::account::{Account, End, Origin, STEP_UNIT, Seen, Step};
         let dir = scratch("accounts");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let steps = [Step {
             step: STEP_UNIT.to_owned(),
             ends: vec![End::Changed { origin: Origin::Workspace, input: "/w/src/lib.rs".to_owned() }],
@@ -2776,7 +2910,7 @@ mod tests {
 
         use crate::facts::QueryCountRow;
         let dir = scratch("query-counts");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let mir = QueryCountRow {
             build_id: 63,
             query: "mir_body_query",
@@ -2862,7 +2996,7 @@ mod tests {
         .join()
         .unwrap();
         let dir = scratch("flush");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         for table in schema::TABLES {
             let path = dir.join(format!("schema.{}.parquet", table.name));
             let read = read_back(&path);
@@ -2905,7 +3039,7 @@ mod tests {
     fn rows_written_between_flushes_past_a_rings_size_are_all_flushed() {
         crate::install();
         let dir = scratch("drained");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let bursts = 24;
         let burst = flight::CAP / 8;
         let tid = std::thread::spawn(move || {
@@ -2957,12 +3091,12 @@ mod tests {
     #[test]
     fn a_history_opened_again_numbers_on_from_its_files() {
         let dir = scratch("reopen");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(1, Outcome::Failed));
         let first = history.flush(Some(1)).unwrap();
         drop(history);
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert!(
             !dir.join(".1-00000099.spans.parquet.tmp").exists(),
             "a half-written file is deleted"
@@ -2993,7 +3127,7 @@ mod tests {
         // Past any build another test of this process writes rows of.
         const KILLED: u32 = 7_000_001;
         let dir = scratch("killed-mid-build");
-        let mut first = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut first = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
             let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
@@ -3007,7 +3141,7 @@ mod tests {
             "the timer's flush is named for the build its rows are of: {timer:?}"
         );
         drop(first);
-        let second = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let second = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert!(
             second.next_build() > KILLED,
             "the next daemon's first build is {}, a number the stopped daemon's rows already hold",
@@ -3024,7 +3158,7 @@ mod tests {
     fn a_flush_with_no_new_samples_names_nothing() {
         static OWN: sampler::Ring = sampler::Ring::new();
         let dir = scratch("idle");
-        let mut history = History::open(&dir, CAP_BYTES, &OWN).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, &OWN).unwrap();
         let asked = symbols::ASKED.with(std::cell::Cell::get);
         let first = history.flush(None).unwrap();
         let idle = history.flush(None).unwrap();
@@ -3054,15 +3188,49 @@ mod tests {
         _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_cap_is_the_default_or_the_mib_the_daemon_was_started_with() {
-        assert_eq!(cap_of(None), Ok(CAP_BYTES));
-        assert_eq!(cap_of(Some("4096")), Ok(4 << 30));
-        assert_eq!(cap_of(Some(" 1 ")), Ok(1 << 20));
+    /// The oracle of the default cap `cap` (a store's bytes to the bytes kept): for stores of
+    /// `small` and `large` bytes, `small <= large`, it never falls as the store grows and
+    /// stays within [`CAP_LEAST`] and [`CAP_MOST`].
+    fn cap_follows(cap: impl Fn(u64) -> u64, small: u64, large: u64) -> Result<(), String> {
+        let (at_small, at_large) = (cap(small), cap(large));
+        if at_small > at_large {
+            return Err(format!("{small} bytes keep {at_small}, more ({large}) keep {at_large}"));
+        }
+        for (store, kept) in [(small, at_small), (large, at_large)] {
+            if !(CAP_LEAST..=CAP_MOST).contains(&kept) {
+                return Err(format!("{store} bytes keep {kept}, out of {CAP_LEAST}..={CAP_MOST}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: unset, the cap never falls as the home's store grows and stays within
+    /// [`CAP_LEAST`] and [`CAP_MOST`]; a [`CAP_VAR`] that reads is the cap whatever the store
+    /// holds; one that does not is refused, naming it.
+    #[hegel::test(test_cases = 300)]
+    fn the_cap_follows_the_store_between_its_bounds(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let small = tc.draw(gs::integers::<u64>());
+        let large = tc.draw(gs::integers::<u64>().min_value(small));
+        cap_follows(|store| cap_of(None, store).unwrap(), small, large).unwrap();
+        let mib = tc.draw(gs::integers::<u64>().min_value(1).max_value(u64::MAX >> 20));
+        assert_eq!(cap_of(Some(&mib.to_string()), small), Ok(mib << 20), "the variable wins");
+        assert_eq!(cap_of(Some(" 1 "), large), Ok(1 << 20));
         for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
-            let said = cap_of(Some(bad)).expect_err(bad);
+            let said = cap_of(Some(bad), small).expect_err(bad);
             assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
         }
+        assert_eq!(cap_for(64 << 20), 16 << 20, "a quarter of the store between the bounds");
+    }
+
+    /// The control: the oracle refuses a cap that is a quarter of the store with the clamp
+    /// left out, and one that falls as the store grows.
+    #[test]
+    fn the_oracle_catches_a_cap_without_its_bounds() {
+        assert!(cap_follows(|store| store / 4, 0, 1 << 30).is_err(), "under the least");
+        assert!(cap_follows(|store| store / 4, 1 << 30, u64::MAX).is_err(), "over the most");
+        assert!(cap_follows(|store| CAP_MOST - (store / 4).min(CAP_MOST - CAP_LEAST), 0, 1 << 30).is_err());
+        cap_follows(cap_for, 0, u64::MAX).unwrap();
     }
 
     #[test]
@@ -3118,7 +3286,7 @@ mod tests {
         // build's merge (with build 5, a run beside the other tests read 3 rows merged of 4).
         const BUILD: u64 = 8_000_005;
         let dir = scratch("manifest-round-trip");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
         for _ in 0..3 {
@@ -3139,7 +3307,7 @@ mod tests {
         assert_eq!((entry.version, entry.rows, entry.builds), (schema::VERSION, 4, Some([BUILD, BUILD])));
         assert_eq!(entry.boot.as_deref(), clock::boot());
 
-        let history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         assert_eq!(
             fs::read(dir.join(manifest::FILE)).unwrap(),
             bytes,
@@ -3155,7 +3323,7 @@ mod tests {
     #[test]
     fn a_merge_committed_and_not_deleted_reads_each_row_once() {
         let dir = scratch("merged-not-deleted");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.flush(None).unwrap();
         history.build_ended(row(7, Outcome::Ok));
         let one = history.flush(None).unwrap();
@@ -3194,7 +3362,7 @@ mod tests {
         assert!(inputs.iter().all(|it| it.exists()), "the crash left the inputs");
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2, "the inputs are unlisted, so read once");
 
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         assert!(
             inputs.iter().all(|it| !it.exists()),
             "the open deletes the retired files no pin holds"
@@ -3209,7 +3377,7 @@ mod tests {
     #[test]
     fn a_pinned_reader_keeps_retired_files_until_it_lets_go() {
         let dir = scratch("pinned-merge");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.flush(None).unwrap();
         history.build_ended(row(5, Outcome::Running));
         history.flush(None).unwrap();
@@ -3244,7 +3412,7 @@ mod tests {
     #[test]
     fn a_history_with_no_manifest_is_adopted_from_its_files() {
         let dir = scratch("adopted");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(3, Outcome::Ok));
         history.flush(Some(3)).unwrap();
         drop(history);
@@ -3262,7 +3430,7 @@ mod tests {
             (was.version, was.rows, was.builds, was.t_ns)
         );
 
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         assert!(dir.join(manifest::FILE).exists(), "the next writer writes it");
         assert_eq!(read_manifest(&dir).unwrap(), adopted);
     }
@@ -3272,9 +3440,9 @@ mod tests {
     #[test]
     fn a_parquet_file_blaze_did_not_write_stops_the_open_naming_it() {
         let dir = scratch("unclassified");
-        drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
+        drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         fs::write(dir.join("notes.parquet"), b"not ours").unwrap();
-        let Err(error) = History::open(&dir, CAP_BYTES, sampler::unsampled()) else {
+        let Err(error) = History::open(&dir, CAP_MOST, sampler::unsampled()) else {
             panic!("the open went on")
         };
         assert!(
@@ -3288,7 +3456,7 @@ mod tests {
     #[test]
     fn past_the_cap_a_build_goes_whole() {
         let dir = scratch("cap-whole");
-        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
         history.build_ended(row(1, Outcome::Ok));

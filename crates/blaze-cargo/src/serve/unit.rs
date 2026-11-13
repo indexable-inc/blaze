@@ -51,13 +51,15 @@ pub(crate) mod portable;
 mod reach;
 mod reads;
 pub(super) mod release;
-mod run;
+pub(crate) mod run;
 mod say;
 mod script;
-pub(crate) use compile::span_unit;
+pub(crate) use compile::{Filed, PendingRecord, file_records, span_unit};
 pub(crate) use script::compile_of;
 mod test;
 
+#[cfg(test)]
+mod library_tests;
 #[cfg(test)]
 mod tests;
 
@@ -237,8 +239,11 @@ impl Steps for Real {
         let at = || Some("the standard library's sources".to_owned());
         let library =
             crate::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
-        let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
         let named = blaze_units::stdlib::library_at(&library.commit);
+        if crate::toolchain::library::owned(&library).is_some() {
+            return library_from_texts(&library.dir, &library.digest, named, kept);
+        }
+        let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
         let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint");
         hasher.part(library.digest.as_bytes());
         library_fingerprint(&library.dir, "", &mut hasher).map_err(in_dir)?;
@@ -285,13 +290,40 @@ impl Steps for Real {
     }
 
     fn store_kept(&self, kept: &mut KeptLowered) -> Result<Vec<KeptPut>, ApiError> {
-        if kept.stored {
-            return Ok(Vec::new()); // alloc: none
-        }
-        let later = std::mem::take(&mut kept.later);
-        let deps = kept.deps.take();
+        // Its parts, borrowed apart below.
+        let kept: &mut KeptParts = kept;
+        // The build's end stores the sealed crates and keeps what it was served with; the
+        // second store, before the front end is let go for idleness or at a stop
+        // (`super::job::giving`'s `store_members`), writes the members and the crates above
+        // them, and whatever was refused before is tried once more. An edited member's pages
+        // written at the build's end would be paid by the next edit and thrown away by it.
+        let (which, later, deps) = match kept.stored {
+            Stored::All => return Ok(Vec::new()), // alloc: none
+            Stored::No => {
+                // The outcomes of the sealed crates now; a member's waits for its image,
+                // which the second store writes.
+                let db = kept.lowered.db();
+                // alloc: setup: once per front end stored, one entry a crate walked
+                let mut sealed = blaze_hash::HashMap::new_in(std::alloc::Global);
+                // alloc: once per front end stored, the outcomes it checked split in two
+                let (now, members): (Vec<deps::Later>, Vec<deps::Later>) =
+                    std::mem::take(&mut kept.later)
+                        .into_iter()
+                        .partition(|it| hir_def::deps::sealed_in(db, it.krate, &mut sealed));
+                kept.later = members;
+                (hir_def::deps::Which::Sealed, now, None)
+            }
+            Stored::Sealed => {
+                (hir_def::deps::Which::All, std::mem::take(&mut kept.later), kept.deps.take())
+            }
+        };
+        // What it was served with stays with it for the second store until that store takes it.
+        let served = match which {
+            hir_def::deps::Which::Sealed => kept.deps.as_ref(),
+            hir_def::deps::Which::All => deps.as_ref(),
+        };
         let stored = cancellable(|| {
-            deps::store(&kept.lowered, deps.as_ref(), &mut kept.session, &later, &kept.root)
+            deps::store(&kept.lowered, served, &mut kept.session, &later, &kept.root, which)
         });
         let (puts, flushes) = match stored {
             Ok(stored) => stored?,
@@ -311,7 +343,10 @@ impl Steps for Real {
             Err(Failed::Error(error)) => return Err(error),
         };
         kept.flushed = Some(flushes);
-        kept.stored = true;
+        kept.stored = match which {
+            hir_def::deps::Which::Sealed => Stored::Sealed,
+            hir_def::deps::Which::All => Stored::All,
+        };
         // What storing ran (each dependency's signatures) is folded into the reverse edges
         // here, after the answer and with the front end exclusive, never at the next build's
         // first write (`Storage::pack_reverse`).
@@ -336,6 +371,62 @@ impl Steps for Real {
 
     fn give_caches(&self) -> u64 {
         release::give_kept_caches()
+    }
+
+    fn kept_tables(&self) -> u64 {
+        release::kept_tables()
+    }
+
+    fn give_tables(&self) -> u64 {
+        release::give_kept_tables()
+    }
+
+    fn serve_needs(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
+        run::launch::serve_needs(kept, &self.shared.launches, wanted)
+            .into_iter()
+            .map(|it| KeptPut {
+                put: Put { key: it.key, kind: it.kind, bytes: it.bytes },
+                what: Arc::from("a launched run's first call"),
+                into: super::work::PutInto::Home,
+            })
+            .collect()
+    }
+
+    fn wake_needs(&self) {
+        self.shared.launches.wake();
+    }
+
+    fn launch_marked(
+        &self,
+        store: blaze_cas::Reader,
+        waker: Option<blaze_core::Waker>,
+        marked: Vec<super::work::LaunchMarked>,
+    ) {
+        self.shared.launches.marked(store, waker, marked);
+    }
+
+    fn launch_kept(&self) -> Vec<super::work::LaunchKept> {
+        self.shared.launches.kept()
+    }
+
+    fn launch_wants(&self) -> Vec<String> {
+        self.shared.launches.wants()
+    }
+
+    fn launchers_connected(&self) -> usize {
+        self.shared.launches.connected()
+    }
+
+    fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64) {
+        self.shared.launches.execd(pid, build, exec_ns);
+    }
+
+    fn launch_spans(&self) -> Vec<crate::serve::unit::run::launch::ProgramSpans> {
+        self.shared.launches.program_spans()
+    }
+
+    fn launch_built(&self, program: &str, built: Result<(), String>) {
+        self.shared.launches.built_by_daemon(program, built);
     }
 
     fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
@@ -371,7 +462,7 @@ impl Steps for Real {
                 // never lowered into, as its images and outcomes would be lost (rule 3).
                 let mut flushed = None;
                 if let Some(it) = &mut kept {
-                    if !it.stored {
+                    if it.stored == Stored::No {
                         let what = "the head's last front end is lowered into, and what its build left for the store was never written (`Steps::store_kept`)";
                         return Err(Failed::Error(ApiError::new(what, Some(it.root.clone())))); // clone: an error, once
                     }
@@ -401,12 +492,16 @@ impl Steps for Real {
                     },
                     None => None,
                 };
+                // What pins each package, by the one rule of what is sealed
+                // (`serve::sealed::pin`): the planner writes it on each crate.
+                let sealed = compile::pins(&input.units, &input.config.sources).map_err(Failed::Error)?;
                 let lower = || Lower {
                     units: &input.units,
                     config: &input.config,
                     files: &input.files,
                     root: input.root,
                     host_cpu: self.shared.host_cpu.as_ref(),
+                    sealed: &sealed,
                 };
                 let failed = |error| Failed::Error(lower_error(error));
                 // A front end kept and moved to the view keeps what it was served, until a serve of
@@ -420,13 +515,13 @@ impl Steps for Real {
                 // seen before costs nothing. Until 2026-11-12 the plan's units were the front
                 // end's identity (`unkept`), and every switch lowered the workspace again, the
                 // standard library included (hello-world: 4.5 s a switch, 820,026 queries).
-                let (mut lowered, session, seeded) = match kept {
-                    Some(KeptLowered { session, mut lowered, seeds, units: kept_units, .. }) => {
+                let (mut lowered, session, seeded) = match kept.map(KeptLowered::into_parts) {
+                    Some(KeptParts { session, mut lowered, seeds, units: kept_units, .. }) => {
                         let same_plan =
                             Arc::ptr_eq(&kept_units, &input.units) || kept_units == input.units;
                         // Why the front end can't take this request, when it can't.
                         let moved: Option<String> =
-                            match lowered.refresh(lower(), |db| seed(db, &seeds)).map_err(failed)? {
+                            match lowered.refresh(lower(), &input.looks, |db| seed(db, &seeds)).map_err(failed)? {
                                 // alloc: a reason, once per front end let go
                                 false => Some("the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with".to_owned()),
                                 true if same_plan => None,
@@ -891,7 +986,73 @@ impl KeptDb for KeptLowered {
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
 /// the next build of the head lowers into it only when it lowers the same.
+///
+/// Counted while it is kept (`hir::evict::front_end_kept`), so the process tables every
+/// front end's ids index are released only once none is (`release::give_kept_tables`), and
+/// its drop retires its database's shared solver caches (`hir::evict::front_end_dropped`),
+/// which no drop of a database did before. The next build of its head takes its parts
+/// ([`KeptLowered::into_parts`]), which ends the count the same way.
 pub struct KeptLowered {
+    /// There until the next build of its head takes them.
+    parts: Option<KeptParts>,
+}
+
+impl KeptLowered {
+    /// `parts` kept: one front end more that the process tables wait for.
+    fn new(parts: KeptParts) -> KeptLowered {
+        hir::evict::front_end_kept();
+        KeptLowered { parts: Some(parts) }
+    }
+
+    /// Its parts, for the next build of its head to lower into: it is no longer kept
+    /// (`hir::evict::front_end_taken`). Its database's shared solver caches stay, for the build
+    /// that takes it and the next at its revision; that build's own tasks hold a release of the
+    /// process tables off until it keeps the database again or drops it.
+    fn into_parts(mut self) -> KeptParts {
+        let parts = self.parts.take().expect("a kept front end has its parts until they are taken, once");
+        hir::evict::front_end_taken();
+        parts
+    }
+}
+
+impl Drop for KeptLowered {
+    fn drop(&mut self) {
+        if let Some(parts) = &self.parts {
+            hir::evict::front_end_dropped(parts.lowered.db());
+        }
+    }
+}
+
+impl std::ops::Deref for KeptLowered {
+    type Target = KeptParts;
+
+    fn deref(&self) -> &KeptParts {
+        self.parts.as_ref().expect("a kept front end has its parts until they are taken, once")
+    }
+}
+
+impl std::ops::DerefMut for KeptLowered {
+    fn deref_mut(&mut self) -> &mut KeptParts {
+        self.parts.as_mut().expect("a kept front end has its parts until they are taken, once")
+    }
+}
+
+/// How much of what a kept front end's build left for the store was written
+/// ([`Steps::store_kept`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stored {
+    /// Nothing yet.
+    No,
+    /// The build's end's store: the sealed crates' images, outcomes, constants, goals and
+    /// bodies' steps (`hir_def::deps::Which::Sealed`). The next build may lower into it.
+    Sealed,
+    /// And the members' and the crates' above them (`hir_def::deps::Which::All`): what is
+    /// written before the front end is let go for idleness, and at a stop.
+    All,
+}
+
+/// What a [`KeptLowered`] keeps.
+pub struct KeptParts {
     /// What its database keeps of the store ([`deps::session`]), its goals flushed as it is
     /// stored ([`Steps::store_kept`]). Declared first: its goal store is uninstalled before the
     /// database it is keyed to drops.
@@ -908,9 +1069,9 @@ pub struct KeptLowered {
     /// paths are named from, until it is stored ([`Steps::store_kept`]).
     later: Vec<deps::Later>,
     root: String,
-    /// Whether what its build left for the store was written ([`Steps::store_kept`]): the
-    /// next build lowers into it only then.
-    stored: bool,
+    /// How much of what its build left for the store was written ([`Steps::store_kept`]): the
+    /// next build lowers into it only once the build's end stored it ([`Stored::Sealed`]).
+    stored: Stored,
     /// What its store's flushes did, for the `-v` note of the next build lowering into it.
     flushed: Option<deps::Flushes>,
     /// The trees its job's last edit reparsed in place, for the next build to seed its parses
@@ -933,6 +1094,8 @@ pub struct UnitReader {
     /// The dependencies' check outcomes its database was served ([`deps::serve`]): written
     /// with the front end, only while no reader holds it.
     checks: Arc<blaze_diagnostics::cache::Served>,
+    /// Each crate's body entries kept between serves ([`deps::Session::bodies`]).
+    bodies: Arc<crate::serve::front_carry::bodies::Sessions>,
 }
 
 impl UnitReader {
@@ -957,6 +1120,11 @@ impl UnitReader {
 
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
         &self.checks
+    }
+
+    /// Each crate's body entries kept between serves, for a unit's serve and keep of them.
+    pub(crate) fn bodies(&self) -> &crate::serve::front_carry::bodies::Sessions {
+        &self.bodies
     }
 
     /// The job's files by path.
@@ -1058,7 +1226,11 @@ fn broke_each(into: &mut Vec<Broke>, broke: &Broke, ready: &[u32], itself: bool)
 impl Writer<Real> for UnitWriter {
     fn reader(&self) -> Option<UnitReader> {
         (!self.waiting())
-            .then(|| UnitReader { front: Arc::clone(&self.front), checks: self.session.checks() })
+            .then(|| UnitReader {
+                front: Arc::clone(&self.front),
+                checks: self.session.checks(),
+                bodies: self.session.bodies(),
+            })
     }
 
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
@@ -1486,7 +1658,7 @@ impl Writer<Real> for UnitWriter {
         let used: Vec<ContentId> =
             job.memo_used.iter().filter_map(|it| it.get()).flatten().copied().collect();
         let memo = Some(job.shared.memos.hold(used));
-        Ok(KeptLowered {
+        Ok(KeptLowered::new(KeptParts {
             session,
             lowered: Held::new(lowered, "a kept front end"),
             units: job.input.units.clone(),
@@ -1495,12 +1667,12 @@ impl Writer<Real> for UnitWriter {
             retractions,
             later,
             root: job.mounted.root().to_owned(), // alloc: once per front end kept
-            stored: false,
+            stored: Stored::No,
             flushed: None,
             seeds,
             memo,
             release: Some(release),
-        })
+        }))
     }
 }
 
@@ -1612,8 +1784,68 @@ fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError>
     Ok(())
 }
 
+/// A shipped tree blaze placed (`toolchain::library::owned`) as the [`Library`] mounted at
+/// `named`: its texts file mapped ([`crate::toolchain::library::open_texts`]), made first when an
+/// older blaze placed the tree without one, and each file's bytes lent from the mapping with no
+/// copy and no file of the tree read. Its fingerprint is of the digest and the listing's hash;
+/// `kept` holding it at `named` returns no source, as a library read file by file does.
+fn library_from_texts(
+    tree: &std::path::Path,
+    digest: &str,
+    named: String,
+    kept: &[(String, String)],
+) -> Result<Library, ApiError> {
+    use crate::toolchain::library::{open_texts, write_texts};
+    let _s = tracing::info_span!(target: "blaze", "std library: map its texts").entered();
+    let in_tree = |what| ApiError::new(what, Some(tree.display().to_string()));
+    let (mapping, listing) = match open_texts(tree, digest).map_err(in_tree)? {
+        Some(opened) => opened,
+        None => {
+            tracing::info!(
+                target: "blaze",
+                tree = %tree.display(),
+                "a shipped tree placed with no texts file (by an older blaze): its texts are written once"
+            );
+            write_texts(tree, digest).map_err(in_tree)?;
+            open_texts(tree, digest).map_err(in_tree)?.ok_or_else(|| {
+                in_tree(format!(
+                    "the texts of the shipped tree at {} were written and are not there",
+                    tree.display()
+                ))
+            })?
+        }
+    };
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint 2");
+    hasher.part(digest.as_bytes()).part(&listing.hash);
+    let fingerprint = format!("{:x}", hasher.finish());
+    if kept.iter().any(|(it, mounted)| *it == fingerprint && *mounted == named) {
+        return Ok(Library { at: named, fingerprint, source: None });
+    }
+    // alloc: the source's files, once a mount of the tree
+    let mut files = Vec::with_capacity(listing.entries.len());
+    for entry in listing.entries {
+        let lent = usize::try_from(entry.at)
+            .ok()
+            .zip(usize::try_from(entry.at + entry.len).ok())
+            .and_then(|(at, end)| blaze_vfs::lent(&mapping, at..end));
+        let bytes = lent.ok_or_else(|| {
+            in_tree(format!(
+                "{}: its text at {}..{} is not inside the texts file's {} bytes",
+                entry.path,
+                entry.at,
+                entry.at + entry.len,
+                mapping.bytes().len()
+            ))
+        })?;
+        files.push(SourceFile { path: entry.path, bytes, mode: entry.mode });
+    }
+    Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
+}
+
 /// Every file under the library's `dir`, by its path from there. A link is its target's bytes:
-/// the library's digest (`library::digest_of`) was checked when it was found or fetched.
+/// the library's digest (`library::digest_of`) was checked when it was found or fetched. Only
+/// for a library blaze did not place (one `BLAZE_LIBRARY` names, or one beside the program): a
+/// tree blaze placed is mounted from its texts ([`library_from_texts`]).
 fn library_files(
     dir: &std::path::Path,
     prefix: &str,
@@ -1645,7 +1877,8 @@ fn library_files(
 }
 
 /// Every file under the library's `dir` as [`library_files`] reads it, but looked at only:
-/// its path, size, time of its last change and whether it is executable, in name order.
+/// its path, size, time of its last change and whether it is executable, in name order. Only
+/// for a library [`library_files`] reads.
 fn library_fingerprint(
     dir: &std::path::Path,
     prefix: &str,
@@ -2180,6 +2413,33 @@ impl Front<Real> for JobFront {
             return Err(Failed::Again);
         }
         cancellable(|| compile::compile(&self.0, &reader, unit, phase, images))?
+    }
+
+    fn stand(
+        &self,
+        reader: UnitReader,
+        unit: usize,
+        images: &mut Vec<Image<Real>>,
+    ) -> Result<Option<Compiled>, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| compile::stand(&self.0, &reader, unit, images))?
+    }
+
+    fn sealed(&self) -> Result<Vec<bool>, ApiError> {
+        let units = self.0.units();
+        // What pins each package, as the lowering wrote it on its crates.
+        let pins = compile::pins(units, &self.0.input.config.sources)?;
+        let by_id: HashMap<&str, bool> = (units.packages.iter())
+            .zip(&pins)
+            .map(|(package, pin)| (package.id.as_str(), pin.is_some()))
+            .collect(); // alloc: once per build that a stood plan applies to, a package an entry
+        // A unit of no package of the plan is no unit the planner sealed.
+        let sealed: Vec<bool> = (units.graph.units.iter())
+            .map(|unit| by_id.get(unit.pkg_id.as_str()).copied().unwrap_or(false))
+            .collect(); // alloc: once per build that a stood plan applies to, a flag a unit
+        Ok(sealed)
     }
 
     fn refused(&self, unit: usize, what: String) -> blaze_api::Diagnostic {

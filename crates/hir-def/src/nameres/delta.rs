@@ -82,6 +82,16 @@ pub struct ImplsServed(pub fn(&Db, Crate) -> bool);
 
 inventory::collect!(ImplsServed);
 
+/// Whether name resolution maintains `krate` now: it holds the crate's state and no frozen
+/// image serves its def map (a crate served in the write that is still to drop its state is
+/// not). What `crate::deps::serve` leaves out of its fetch for a crate it asked before, so a
+/// crate an edit took the image of is maintained by deltas from then on and never pays a
+/// cold run for being served again.
+pub fn maintained(db: &mut Db, krate: Crate) -> bool {
+    !frozen::is_served(&*db, krate)
+        && db.with_state::<State, _>(|_, state| state.crates.contains_key(&krate))
+}
+
 /// Whether a served crate owes the impls maintainer its decoded map's items after `written`:
 /// the crate graph reached it, and no [`ImplsServed`] says its impls are records.
 fn owes_served_delta(db: &Db, written: &Written<'_>, krate: Crate) -> bool {

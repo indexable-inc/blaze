@@ -43,7 +43,7 @@ use base_db::Db;
 use blaze_format::{Part, SchemaHash, schema_of};
 use hir_def::{ConstId, DefWithBodyId};
 
-use super::{INSTALLED, Lookup, Step};
+use super::{Lookup, REGISTRY, Step};
 use crate::{
     consteval::{ConstEvalError, deps::codec},
     next_solver::StoredAllocation,
@@ -65,7 +65,7 @@ pub(crate) fn constant<'db>(
     def: ConstId,
     run: impl FnOnce() -> Result<StoredAllocation, ConstEvalError<'db>>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return run();
     }
     stored(db, def, run)

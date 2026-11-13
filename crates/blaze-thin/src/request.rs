@@ -105,6 +105,8 @@ pub fn request(asked: &Asked, sent: Sent) -> Request {
         // `-q` and no `-v`: cargo's `Verbosity` as a count is 0 either way.
         verbose: 0,
         refused: Some(REFUSED_SHOWN),
+        // The thin `blaze` routes no `--no-prebuilt` ([`crate::route`]): the full CLI reads it.
+        prebuilt: true,
     };
     let profile = if asked.release { "release" } else { "dev" };
     let targets = Targets {

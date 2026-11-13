@@ -30,12 +30,21 @@ blaze-ids.workspace = true
 blaze-report.workspace = true
 # What an answer shows: the screen's one core, the engine's too (docs/terminal.md).
 blaze-screen.workspace = true
+# The request slot's reader and machine (`solo.rs`), the client's own check of a request with
+# nothing changed; and the one encoding of a client's spans by name (`kept::put_timed`), which
+# the handover writes and a solo answer's kept record holds. blaze-cargo links it everywhere,
+# the wasm seed too.
+blaze-certify.workspace = true
 
 # The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
 # blaze-engine take from here) links none of these, so the wasm seed builds none of them.
 [target.'cfg(unix)'.dependencies]
 # Where the daemon listens, the checkout, the config files outside it, the environment.
 blaze-client.workspace = true
+# The decoder of what a certified build said (`solo.rs`), the daemon's own.
+blaze-protocol.workspace = true
+# `serve.lock`'s holder, asked without waiting (`solo.rs`).
+stdx.workspace = true
 # The one deadline wait.
 blaze-core.workspace = true
 libc.workspace = true

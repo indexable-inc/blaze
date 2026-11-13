@@ -32,6 +32,7 @@ site {
       Step stage("Stage 0") {
         P text("For now a derive takes and returns text, `fn(&str) -> String`. That is stage 0, not the final API.")
         P fast("Edit what the macro writes, and the rebuild took 0.04 s, against about 1 s with a proc-macro crate.")
+        P next("A macro now takes and returns a syntax tree: [Const macros return trees](/updates/const-macro-trees).")
       }
 
       Step faster("Why faster?") {

@@ -204,13 +204,13 @@ pub fn only_the_name(n: usize) {
 }
 
 /// What the tests of a `dyn` the root takes share: a trait with a method whose
-/// `#[blaze::may(..)]` says what any object's may do and one with none, and a holder of one.
+/// `#[blaze::expect(..)]` says what any object's may do and one with none, and a holder of one.
 const PROBED: &str = r#"
 //- minicore: sized, copy, phantom_data, drop, unsize, coerce_unsized, dispatch_from_dyn
 //- /lib.rs crate:kernel
 pub trait Probe {
     /// Allocates, in any impl, and nothing else.
-    #[blaze::may(alloc)]
+    #[blaze::expect(alloc)]
     fn listed(&self, at: u32);
     fn unlisted(&self, at: u32);
 }
@@ -266,7 +266,7 @@ pub fn hands_it_to_a_trusted_function(world: &World<'_>) {
 /// A function that takes a `dyn` is refused for what it does through it, not for taking it:
 /// one that stores it, reads beside it or hands it to a function that calls nothing through
 /// it is clean. A call through it has the effects the trait's method declares
-/// (`#[blaze::may(alloc)]`: no panic and no wait in any impl, an allocation in some). A call
+/// (`#[blaze::expect(alloc)]`: no panic and no wait in any impl, an allocation in some). A call
 /// of a method with no list is refused naming the method and the `dyn` taken, wherever in
 /// the root's graph it is made, under a callee trusted for the effect too: that one answers
 /// for its own code, not for the object it is handed.

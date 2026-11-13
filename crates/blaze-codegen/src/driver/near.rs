@@ -15,9 +15,9 @@
 //!   the same key.
 //! - **The recursion limit's check, a symbol defined twice, the front end's closed facts**
 //!   ([`crate::backend::Frontend::closed`]): each is a refusal or a fact of the whole
-//!   program. They stay with the whole walk, which a launched build still runs behind the
-//!   program (launcher.md, section 4: the eager check); a frontier describe is made against
-//!   no closed facts, as a walk's first round is.
+//!   program. A launched run checks a symbol defined twice over its roots ([`Build::start`]),
+//!   and does not check the other two (the start's module doc lists what it defers); a
+//!   frontier describe is made against no closed facts, as a walk's first round is.
 //! - **Which describe a key keeps** when two instances share it, and a function's least
 //!   origin: each is a choice over every describe of the key. One ask sees one describe, so a
 //!   callee's identity here is its own origin's ([`Callee::identity`]); a key asked for by
@@ -35,8 +35,8 @@ use std::{alloc::Global, collections::HashMap};
 use blaze_ids::ContentId;
 
 use super::{
-    Build, FnNode, FrontInstance, FrontStatic, Lookup, Node, Put, Sorted, StaticId, error, kept,
-    later, subject,
+    Build, FnNode, FrontInstance, FrontStatic, Lookup, Node, Planted, Put, Sorted, StaticId, error,
+    kept, later, subject,
 };
 use crate::{
     CodegenError, CompiledFunction, InstanceKey, Linkage, Target,
@@ -44,7 +44,8 @@ use crate::{
     plan::{Mode, Origin},
 };
 
-/// A function a frontier form's code refers to: what the next ask for it is made of.
+/// A function a frontier form's code refers to: what the next ask for it is made of, and what
+/// a launcher's slot of it is keyed and bound by.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a test's copy, and the caller's list of what to ask next
 pub struct Callee<I> {
     /// The instance and whose code asks for it: what [`Build::near`] takes.
@@ -53,6 +54,14 @@ pub struct Callee<I> {
     /// What it is across edits of its body ([`subject`]), by the origin of this describe of it:
     /// the whole walk's is by the least origin of every describe of its key.
     pub identity: ContentId,
+    /// What a caller's code assumes of it beyond its address ([`crate::backend::Described::abi`]):
+    /// with `identity`, what a running program's slot of it is.
+    pub abi: ContentId,
+    /// The symbol it defines and how, where it defines one.
+    pub symbol: Option<(String, Linkage)>,
+    /// The content key of its describe ([`Frontend::record_key`]), where the front end has one:
+    /// what a launcher's bind key of it is made of.
+    pub ask: Option<blaze_cas::Key>,
 }
 
 /// One function ready to compile, with no walk of its program ([`Build::near`]).
@@ -80,13 +89,68 @@ impl<I, S> Near<I, S> {
         self.nodes.get(&self.key).expect("a frontier form holds the function it is of")
     }
 
+    /// The items of the function asked for and of every body it builds in, at any depth,
+    /// sorted, each once: whose span tables its code's positions name.
+    pub(super) fn items(&self) -> Vec<blaze_items::ItemKey> {
+        // alloc: once a function made, its items and those it builds in
+        let mut items: Vec<blaze_items::ItemKey> = self.nodes.values().map(|it| it.unit.item).collect();
+        items.sort_unstable();
+        items.dedup();
+        items
+    }
+
     /// What is at each place of the function asked for.
     pub fn refs(&self) -> &[Target] {
         &self.node().refs
     }
 }
 
+/// The target at each place of a function or static, and the ask at each place that is a
+/// function's ([`Build::resolve`]).
+pub(super) type Places<B> = (Vec<Target>, Vec<Option<(FrontInstance<B>, Origin)>>);
+
+/// What a frontier form has resolved so far: every function described, by who asked, and every
+/// static, each once; and the two lists of them in the order they were first referred to.
+pub(super) struct Resolved<B: Prepare> {
+    pub(super) described: HashMap<(FrontInstance<B>, Origin), Node<B>>,
+    /// Each static's id and, where it is defined weakly, its name.
+    pub(super) statics: HashMap<FrontStatic<B>, (StaticId, Option<String>)>,
+    pub(super) callees: Vec<Callee<FrontInstance<B>>>,
+    pub(super) named_statics: Vec<(FrontStatic<B>, StaticId)>,
+}
+
+impl<B: Prepare> Resolved<B> {
+    pub(super) fn new() -> Self {
+        Resolved {
+            // alloc (each): once an ask, sized by what the function refers to
+            described: HashMap::new(),
+            statics: HashMap::new(),
+            callees: Vec::new(),
+            named_statics: Vec::new(),
+        }
+    }
+}
+
 impl<B: Prepare> Build<'_, B> {
+    /// The refusal of `what` asked for alone in a build that is not a launched program's: any
+    /// other build's places say which callees are direct, which only a whole walk knows.
+    pub(super) fn launched_only(&self, what: &str) -> Result<(), CodegenError> {
+        if self.policy.mode == Mode::Launched {
+            return Ok(());
+        }
+        let nothing = (InstanceKey(ContentId::default()), blaze_items::ItemKey(ContentId::default()));
+        Err(error(
+            nothing.0,
+            nothing.1,
+            // alloc: an error
+            format!(
+                "{what} asked for alone, with no walk of its program, in a build that is not a launched \
+                 program's ({:?}): which of its callees are called directly only a whole walk says",
+                self.policy.mode,
+            ),
+        ))
+    }
+
     /// `asked` (a function and whose code asks for it) ready to compile: described, each
     /// function and static it refers to described and no further, and each function it builds
     /// in resolved as it is. Describes go through the walk kept of the program where the build
@@ -98,104 +162,40 @@ impl<B: Prepare> Build<'_, B> {
         &self,
         asked: &(FrontInstance<B>, Origin),
     ) -> Result<Near<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
-        let nothing = || (InstanceKey(ContentId::default()), blaze_items::ItemKey(ContentId::default()));
-        if self.policy.mode != Mode::Launched {
-            let (unit, item) = nothing();
-            return Err(error(
-                unit,
-                item,
-                // alloc: an error
-                format!(
-                    "`{}` asked for alone, with no walk of its program, in a build that is not a launched \
-                     program's ({:?}): which of its callees are called directly only a whole walk says",
-                    self.frontend.spell(&asked.0),
-                    self.policy.mode,
-                ),
-            ));
-        }
+        // alloc: an error's name of the function
+        self.launched_only(&format!("`{}`", self.frontend.spell(&asked.0)))?;
         let counts = kept::Counts::default();
-        let describe = |asked: &(FrontInstance<B>, Origin)| {
-            self.described(asked, 0, &counts).and_then(|it| self.node(&asked.0, asked.1, it))
-        };
-        // Every function described, by who asked: each once.
-        // alloc (each below): once an ask, sized by what the function refers to
-        let mut described: HashMap<(FrontInstance<B>, Origin), Node<B>> = HashMap::new();
-        let mut statics: HashMap<FrontStatic<B>, (StaticId, Option<String>)> = HashMap::new();
-        let (mut callees, mut named_statics) = (Vec::new(), Vec::new());
-        let root = describe(asked)?;
+        let root = self.described(asked, 0, &counts).and_then(|it| self.node(&asked.0, asked.1, it))?;
+        self.near_from(root, &counts)
+    }
+
+    /// [`Build::near`] of the function `root` is the node of, described already: by
+    /// [`Build::start`], which described it as a root.
+    pub(super) fn near_from(
+        &self,
+        root: Node<B>,
+        counts: &kept::Counts,
+    ) -> Result<Near<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
+        let mut resolved = Resolved::<B>::new();
         let (key, identity) = (root.unit.instance.key(), subject(root.described.identity, root.described.origin));
         // The function and what it builds in: each one's places are resolved.
         let mut whole: blaze_hash::HashMap<InstanceKey, Node<B>, Global> = blaze_hash::HashMap::new_in(Global);
         let mut direct: blaze_hash::HashMap<InstanceKey, Vec<InstanceKey>, Global> =
             blaze_hash::HashMap::new_in(Global);
+        // alloc: once an ask, the functions it builds in
         let mut queue = vec![root];
         while let Some(mut node) = queue.pop() {
             let own = node.unit.instance.key();
             if whole.contains_key(&own) {
                 continue;
             }
-            let requester = node.described.origin;
-            let mut refs = Vec::with_capacity(node.described.refs.len());
-            // The callee at each place, for what the function builds in.
-            let mut at_place: Vec<Option<&(FrontInstance<B>, Origin)>> = Vec::new();
-            let mut asks = Vec::with_capacity(node.described.refs.len());
-            for it in &node.described.refs {
-                asks.push(match it {
-                    // clone: the ask's handle of a callee; who asks for it is a copy
-                    FrontRef::Function(callee) => Some((callee.clone(), requester)),
-                    _ => None,
-                });
-            }
-            for (it, ask) in node.described.refs.iter().zip(&asks) {
-                at_place.push(ask.as_ref());
-                refs.push(match it {
-                    FrontRef::Function(_) => {
-                        let ask = ask.as_ref().expect("a function reference has its ask");
-                        if !described.contains_key(ask) {
-                            let made = describe(ask)?;
-                            callees.push(Callee {
-                                asked: ask.clone(), // clone: the caller's list of what to ask next
-                                key: made.unit.instance.key(),
-                                identity: subject(made.described.identity, made.described.origin),
-                            });
-                            described.insert(ask.clone(), made); // clone: the map's key
-                        }
-                        let callee = &described[ask];
-                        match (&callee.described.symbol, callee.described.linkage) {
-                            // A weak definition is called by its name, as the whole walk has it.
-                            // clone: a weakly defined function's name, a few a program
-                            (Some(name), Linkage::Weak) => Target::Extern(name.clone()),
-                            _ => Target::Function(callee.unit.instance.key()),
-                        }
-                    }
-                    FrontRef::Static(value) => {
-                        if !statics.contains_key(value) {
-                            let made = self
-                                .frontend
-                                .describe_static(value)
-                                .and_then(|it| self.static_node(value, it))?;
-                            let id = (made.described.item, made.described.instance);
-                            let weak = match made.described.linkage {
-                                Linkage::Weak => made.described.symbol.clone(), // clone: as a function's
-                                Linkage::Strong => None,
-                            };
-                            named_statics.push((value.clone(), id)); // clone: the caller's list
-                            statics.insert(value.clone(), (id, weak)); // clone: the map's key
-                        }
-                        match &statics[value] {
-                            (_, Some(name)) => Target::Extern(name.clone()), // clone: as a function's
-                            ((item, instance), None) => Target::Static { item: *item, instance: *instance },
-                        }
-                    }
-                    FrontRef::Extern(name) => Target::Extern(name.clone()), // clone: the place's own target
-                    FrontRef::Weak(name) => Target::Weak(name.clone()),     // clone: as above
-                });
-            }
+            let (refs, asks) =
+                self.resolve(&node.described.refs, node.described.origin, counts, &mut resolved)?;
             // What it builds in directly: each resolved in its turn.
             let mut built_in = Vec::with_capacity(node.described.built_in.len());
             for &at in &node.described.built_in {
-                let callee = match (refs.get(at as usize), at_place.get(at as usize).copied().flatten()) {
-                    (Some(Target::Function(_)), Some(ask)) => &described[ask],
+                let callee = match (refs.get(at as usize), asks.get(at as usize).and_then(Option::as_ref)) {
+                    (Some(Target::Function(_)), Some(ask)) => &resolved.described[ask],
                     _ => {
                         return Err(error(
                             own,
@@ -220,7 +220,6 @@ impl<B: Prepare> Build<'_, B> {
                 built_in.push(callee_key);
                 queue.push(callee.clone()); // clone: a built-in function's node, resolved in its turn
             }
-            drop(at_place);
             direct.insert(own, built_in);
             node.refs = refs;
             whole.insert(own, node);
@@ -243,11 +242,88 @@ impl<B: Prepare> Build<'_, B> {
             key,
             identity,
             nodes: Sorted::of(whole),
-            callees,
-            statics: named_statics,
+            callees: resolved.callees,
+            statics: resolved.named_statics,
             described,
             verified,
         })
+    }
+
+    /// The target at each of `refs`, the references of a function or static whose code is
+    /// `requester`'s, as a launched program has them: a function through its slot by its key
+    /// (by its name where it is defined weakly), a static by its id (by its name likewise).
+    /// Each function and static is described once into `resolved`, the first reference to one
+    /// adding it to its list, and nothing it refers to is described. With the ask at each
+    /// place that is a function's, for what the code builds in.
+    pub(super) fn resolve(
+        &self,
+        refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>],
+        requester: Origin,
+        counts: &kept::Counts,
+        resolved: &mut Resolved<B>,
+    ) -> Result<Places<B>, CodegenError> {
+        let describe = |asked: &(FrontInstance<B>, Origin)| {
+            self.described(asked, 0, counts).and_then(|it| self.node(&asked.0, asked.1, it))
+        };
+        // alloc (each): once a function or static resolved, sized by its references
+        let mut targets = Vec::with_capacity(refs.len());
+        let mut asks = Vec::with_capacity(refs.len());
+        for it in refs {
+            let (target, ask) = match it {
+                FrontRef::Function(callee) => {
+                    // clone: the ask's handle of a callee; who asks for it is a copy
+                    let ask = (callee.clone(), requester);
+                    if !resolved.described.contains_key(&ask) {
+                        let made = describe(&ask)?;
+                        let described = &made.described;
+                        resolved.callees.push(Callee {
+                            asked: ask.clone(), // clone: the caller's list of what to ask next
+                            key: made.unit.instance.key(),
+                            identity: subject(described.identity, described.origin),
+                            abi: described.abi,
+                            // clone: a defined symbol's name, a few a program
+                            symbol: described.symbol.clone().map(|name| (name, described.linkage)),
+                            ask: self.frontend.record_key(&ask.0, &ask.1),
+                        });
+                        resolved.described.insert(ask.clone(), made); // clone: the map's key
+                    }
+                    let callee = &resolved.described[&ask];
+                    let weak_by_name = self.planted != Some(Planted::WeakByKey);
+                    let target = match (&callee.described.symbol, callee.described.linkage) {
+                        // A weak definition is called by its name, as the whole walk has it.
+                        // clone: a weakly defined function's name, a few a program
+                        (Some(name), Linkage::Weak) if weak_by_name => Target::Extern(name.clone()),
+                        _ => Target::Function(callee.unit.instance.key()),
+                    };
+                    (target, Some(ask))
+                }
+                FrontRef::Static(value) => {
+                    if !resolved.statics.contains_key(value) {
+                        let made = self
+                            .frontend
+                            .describe_static(value)
+                            .and_then(|it| self.static_node(value, it))?;
+                        let id = (made.described.item, made.described.instance);
+                        let weak = match made.described.linkage {
+                            Linkage::Weak => made.described.symbol.clone(), // clone: as a function's
+                            Linkage::Strong => None,
+                        };
+                        resolved.named_statics.push((value.clone(), id)); // clone: the caller's list
+                        resolved.statics.insert(value.clone(), (id, weak)); // clone: the map's key
+                    }
+                    let target = match &resolved.statics[value] {
+                        (_, Some(name)) => Target::Extern(name.clone()), // clone: as a function's
+                        ((item, instance), None) => Target::Static { item: *item, instance: *instance },
+                    };
+                    (target, None)
+                }
+                FrontRef::Extern(name) => (Target::Extern(name.clone()), None), // clone: the place's own target
+                FrontRef::Weak(name) => (Target::Weak(name.clone()), None),     // clone: as above
+            };
+            targets.push(target);
+            asks.push(ask);
+        }
+        Ok((targets, asks))
     }
 
     /// `near`'s function compiled alone, as a lazy build's first call compiles one

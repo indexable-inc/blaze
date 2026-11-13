@@ -23,7 +23,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use base_db::Db;
@@ -177,9 +180,29 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// The release of the interner's tables ([`hir_ty::evict::tables_released`]) every entry of
+/// [`EXPORTS`] was made under: a release frees the rows its keys name, and the next row
+/// interned takes a freed one's number, so the table starts over when the count moved.
+static EXPORTS_UNDER: AtomicU64 = AtomicU64::new(0);
+
+/// Empties [`EXPORTS`] when the interner's tables were released since its entries were made.
+/// A release runs only while no task does, so no export is being built across it. A thread
+/// that sees the count moved empties the table itself before it stores the count (Release),
+/// so one that reads the new count (Acquire) reads after an emptying: no key made before the
+/// release is read after it. Two threads may both empty it; the second drops only entries
+/// made since, each still held by the compile that made it, so it is built again, never wrong.
+fn exports_since_release() {
+    let released = hir_ty::evict::tables_released();
+    if EXPORTS_UNDER.load(Ordering::Acquire) != released {
+        EXPORTS.pin().clear();
+        EXPORTS_UNDER.store(released, Ordering::Release);
+    }
+}
+
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
 fn export(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<Arc<Export>> {
+    exports_since_release();
     // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
     // clone: the slot's `Arc`, so the table's guard is let go before the export is built

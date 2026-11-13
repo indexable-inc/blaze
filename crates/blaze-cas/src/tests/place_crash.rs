@@ -16,6 +16,8 @@
 //!
 //! The planted bugs ([`PlacePlant`]) each take one safeguard out; the oracle must catch each.
 
+use std::collections::BTreeSet;
+
 use hegel::TestCase;
 use hegel::generators as gs;
 
@@ -39,11 +41,11 @@ enum Op {
     /// A new derived value: `ranges` ranges written over the value `base` (of those so far
     /// that the store keeps a whole file of).
     Derived { base: u8, seed: u64, ranges: u8, len: Len },
-    /// The value `value` placed at path `path`, as a build's job does: with `replace`, the
-    /// whole file of what the path held is let go of first ([`Store::unplace`]). Then `steps`
-    /// completions are delivered (none: all of them), so what follows (another place, a
-    /// crash) comes at any step of it.
-    Place { value: u8, path: u8, replace: bool, steps: Option<u8> },
+    /// The value `value` placed at path `path`, as a build's job does: the whole file of what
+    /// the path held is let go of as it is answered, unless another path names it
+    /// ([`crate::whole`]). Then `steps` completions are delivered (none: all of them), so what
+    /// follows (another place, a crash) comes at any step of it.
+    Place { value: u8, path: u8, steps: Option<u8> },
     /// Everything in flight run to its end.
     Settle,
     /// `placed/` has room for `room` more bytes, until a crash: writes there past it fail.
@@ -89,8 +91,14 @@ struct World {
     /// What each path holds: none, or exactly these bytes. Changed only by a place that
     /// ended well, and read off the disk after a crash (once it is found to be allowed).
     holds: [Option<Vec<u8>>; PATHS.len()],
-    /// The value each path was last placed with, for the next place's [`Store::unplace`].
+    /// The value each path was last placed with: what names its whole file ([`World::bounded`]).
     last: [Option<usize>; PATHS.len()],
+    /// Whether each path was placed well since the last crash: until it is, the listing a
+    /// crash left may still name a file of a value it held before.
+    fresh: [bool; PATHS.len()],
+    /// `placed/` was ever filled: a whole file's write may then have failed, so a path's file
+    /// need not be there.
+    filled: bool,
     /// Every value a place was ever asked of at each path.
     ever: [Vec<usize>; PATHS.len()],
     asked: Vec<Asked>,
@@ -106,6 +114,7 @@ impl World {
         let mut sim = Sim::new(case.seed, Faults { max_latency: latency, ..Faults::default() });
         let mut store = open(&mut sim, "store");
         store.plant = plant;
+        store.names.plant_one_name = plant == PlacePlant::OneName;
         World {
             sim,
             store: Some(store),
@@ -114,6 +123,8 @@ impl World {
             values: Vec::new(),
             holds: [None, None, None],
             last: [None; PATHS.len()],
+            fresh: [true; PATHS.len()],
+            filled: false,
             ever: [Vec::new(), Vec::new(), Vec::new()],
             asked: Vec::new(),
         }
@@ -179,12 +190,85 @@ impl World {
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
                     self.last[n] = Some(value);
+                    self.fresh[n] = true;
                 }
                 // A place may fail (a full `placed/`): then its path is as it was.
                 Err(_) => {}
             }
         }
-        self.look()
+        self.look()?;
+        match steps.is_none() && self.asked.is_empty() {
+            true => self.bounded(),
+            false => Ok(()),
+        }
+    }
+
+    /// The name in `placed/` of the whole file value `value` is placed from, if it has one.
+    fn whole_name(&self, value: usize) -> Option<String> {
+        let Value { key, bytes, whole, base } = &self.values[value];
+        match (whole, base) {
+            (false, _) => None,
+            (true, Some(_)) => Some(format!("store/placed/{:x}{}", key.0, crate::DERIVED_SUFFIX)),
+            (true, None) => Some(format!("store/placed/{:x}", content_of(bytes))),
+        }
+    }
+
+    /// The oracle of the store's bound on `placed/` ([`crate::whole`]), with nothing in
+    /// flight: every whole file there is the file of a value a path holds, or (a path not
+    /// placed since a crash, whose name the listing the crash left may hold) of one it was
+    /// ever placed with; and, `placed/` never filled, every path placed since the last crash
+    /// with a whole output names a file that is there, whatever was placed at the other paths.
+    fn bounded(&mut self) -> Result<(), String> {
+        let mut listed = None;
+        let mut effects = vec![Effect::List { dir: name("store/placed"), tag: Tag(u64::MAX - 7) }];
+        run_until_idle(&mut self.sim, &mut effects, |completion, _| {
+            if completion.tag == Tag(u64::MAX - 7) {
+                listed = Some(completion.done);
+            }
+        })
+        .map_err(|why| format!("listing placed/: {why:?}"))?;
+        let found: Vec<String> = match listed {
+            Some(Done::Listed(found)) => found.into_iter().map(|(file, _)| file.as_str().to_owned()).collect(),
+            // None yet: nothing placed by cloning.
+            _ => Vec::new(),
+        };
+        let mut allowed = BTreeSet::new();
+        // A home ([`crate::home`]) stays while its record does, whatever path names it.
+        let store = self.store.as_ref().expect("the store is open");
+        allowed.extend(
+            store.tiers[0]
+                .externals
+                .iter()
+                .filter(|(_, it)| it.placed && !it.dropped)
+                .map(|(content, _)| format!("store/placed/{content:x}")),
+        );
+        for n in 0..PATHS.len() {
+            let values: Vec<usize> = match self.fresh[n] {
+                true => self.last[n].into_iter().collect(),
+                false => self.ever[n].clone(),
+            };
+            allowed.extend(values.into_iter().filter_map(|value| self.whole_name(value)));
+        }
+        for file in &found {
+            let leaf = file.rsplit('/').next().unwrap_or("");
+            let whole = crate::content_named(leaf).is_some()
+                || leaf.strip_suffix(crate::DERIVED_SUFFIX).is_some_and(|it| crate::content_named(it).is_some());
+            if whole && !allowed.contains(file) {
+                return Err(format!("{file} is in placed/ and no path's value is placed from it"));
+            }
+        }
+        for n in 0..PATHS.len() {
+            let Some(value) = self.last[n] else { continue };
+            if self.filled || !self.fresh[n] || self.values[value].base.is_some() {
+                continue;
+            }
+            if let Some(file) = self.whole_name(value)
+                && !found.contains(&file)
+            {
+                return Err(format!("{file} was removed while {} names it", PATHS[n]));
+            }
+        }
+        Ok(())
     }
 
     /// The oracle between crashes: a path with no place in flight holds exactly what the last
@@ -276,12 +360,46 @@ impl World {
         Ok(())
     }
 
-    /// The store dropped, as its process ends, and opened again.
-    fn open(&mut self) {
+    /// The store dropped, as its process ends, and opened again; `Err` if it does not open.
+    fn open(&mut self) -> Result<(), String> {
         self.store = None;
-        let mut store = open(&mut self.sim, "store");
+        let mut effects = Vec::new();
+        let mut store = Store::open(config("store"), &mut effects);
+        drive(&mut self.sim, &mut store, &mut effects);
+        if !store.ready() {
+            return Err(format!("the store does not open: {:?}", store.broken()));
+        }
         store.plant = self.plant;
+        store.names.plant_one_name = self.plant == PlacePlant::OneName;
         self.store = Some(store);
+        Ok(())
+    }
+
+    /// The oracle of homes ([`crate::home`]), after an open: every output put reads its bytes,
+    /// whole, from the pack's copy or from the placed file its record names; never neither,
+    /// never a file a crash tore or took. (Puts are flushed before the next op, so none is
+    /// lost.)
+    fn homes(&self) -> Result<(), String> {
+        let store = self.store.as_ref().expect("the store is open");
+        for (n, value) in self.values.iter().enumerate() {
+            if value.base.is_some() {
+                continue;
+            }
+            match store.get(&value.key) {
+                Ok(Some(entry)) if entry.bytes == &value.bytes[..] => {}
+                Ok(Some(entry)) => {
+                    return Err(format!(
+                        "output {n} reads {} bytes that are not its {}: first apart at {:?}",
+                        entry.bytes.len(),
+                        value.bytes.len(),
+                        entry.bytes.iter().zip(&value.bytes).position(|(a, b)| a != b)
+                    ));
+                }
+                Ok(None) => return Err(format!("output {n} is gone: no record of it")),
+                Err(why) => return Err(format!("output {n} does not read: {why:?}")),
+            }
+        }
+        Ok(())
     }
 
     fn step(&mut self, op: &Op) -> Result<(), String> {
@@ -305,7 +423,7 @@ impl World {
                 let gives = derived::applied(&base.bytes, len, writes.iter().map(|(at, it)| (*at, it)));
                 self.put(Kind::Derived, &recipe, gives, Some(based))?;
             }
-            Op::Place { value, path: n, replace, steps } => {
+            Op::Place { value, path: n, steps } => {
                 if self.values.is_empty() {
                     return Ok(());
                 }
@@ -316,12 +434,6 @@ impl World {
                 }
                 let key = self.values[value].key;
                 let store = self.store.as_mut().expect("the store is open");
-                if let (true, Some(before)) = (replace, self.last[n])
-                    && before != value
-                {
-                    let before = self.values[before].key;
-                    store.unplace(&before, &key, &mut self.effects);
-                }
                 let tag = store
                     .place(&key, path(n), &mut self.effects)
                     .ok_or_else(|| format!("the store has no value {value} to place"))?;
@@ -330,17 +442,27 @@ impl World {
                 self.pump(steps)?;
             }
             Op::Settle => self.pump(None)?,
-            Op::Fill { room } => self.sim.fill(name("store/placed"), u64::from(room)),
+            Op::Fill { room } => {
+                self.filled = true;
+                self.sim.fill(name("store/placed"), u64::from(room))
+            }
             Op::Crash => {
                 self.sim.crash();
                 self.effects.clear();
                 self.asked.clear();
-                self.open();
+                self.fresh = [false; PATHS.len()];
+                self.open()?;
+                self.homes()?;
                 self.look_after_crash()?;
             }
             Op::Reopen => {
                 self.pump(None)?;
-                self.open();
+                // A listing a full `placed/` refused leaves the open the one before it.
+                if self.filled {
+                    self.fresh = [false; PATHS.len()];
+                }
+                self.open()?;
+                self.homes()?;
                 self.look()?;
             }
         }
@@ -412,7 +534,6 @@ fn op(tc: &TestCase) -> Op {
         5..11 => Op::Place {
             value: byte(tc),
             path: byte(tc),
-            replace: tc.draw(gs::booleans()),
             steps: match tc.draw(gs::booleans()) {
                 true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
                 false => None,
@@ -467,7 +588,7 @@ fn whole(seed: u64) -> Op {
 }
 
 fn place(value: u8, path: u8) -> Op {
-    Op::Place { value, path, replace: true, steps: None }
+    Op::Place { value, path, steps: None }
 }
 
 /// `ops` on each of `seeds`, as it is (which must pass) and with `plant` planted: the first
@@ -479,6 +600,17 @@ fn caught(ops: &[Op], seeds: std::ops::Range<u64>, plant: PlacePlant) -> Option<
         assert_eq!(run(&case, PlacePlant::None), Ok(()), "seed {seed}: the store as it is must pass");
         run(&case, plant).err().map(|why| (seed, why))
     })
+}
+
+/// The planted-bug control: the names of the whole files kept as a set, as the collector's
+/// placed keys were: a path placed again from another value removes the file a second path
+/// still names, and the bound's oracle says so.
+#[test]
+fn the_oracle_catches_a_whole_file_removed_while_a_second_path_names_it() {
+    let ops = [whole(1), place(0, 0), place(0, 1), whole(2), place(1, 0)];
+    let (seed, why) = caught(&ops, 0..8, PlacePlant::OneName)
+        .expect("the oracle missed a whole file removed while a second path names it");
+    assert!(why.contains("was removed while two/build/a names it"), "seed {seed}: {why}");
 }
 
 /// The planted-bug control: a whole file found after a crash and cloned from without its
@@ -635,21 +767,20 @@ fn a_warm_edits_placement_writes_its_ranges_and_forces_no_write_back() {
     let mut sim = Sim::new(31, quiet());
     let (mut store, base, gives) = derived_once(&mut sim, LEN, 1, 4096);
     assert_eq!(store.reader().derivable(&enter(), &key(1)), Derivable::Yes, "written back: a base");
-    let (wrote, read) = (sim.bytes_written(), sim.bytes_read());
+    let (wrote, read) = (own(sim.bytes_written(), &store), sim.bytes_read());
     // As a build's job replaces the image at its path: the old one's whole file is let go
     // of, and the new one placed.
     let mut effects = Vec::new();
-    store.unplace(&key(1), &key(2), &mut effects);
     store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
     let placed = placed_one(&mut sim, &mut store, &mut effects);
     assert_eq!(placed.result, Ok(()));
     assert_eq!(
         placed.bytes,
-        PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096 },
+        PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096, kernel: 0 },
         "what the place reports is what was written where it goes"
     );
     assert_eq!(sim.contents(&name("one/build/a")), gives);
-    let (wrote, read) = (sim.bytes_written() - wrote, sim.bytes_read() - read);
+    let (wrote, read) = (own(sim.bytes_written(), &store) - wrote, sim.bytes_read() - read);
     assert!(
         (2 * 4096..=3 * 4096).contains(&wrote),
         "an edit of one 4 KiB range wrote {wrote} bytes: its range into the output and into \
@@ -665,31 +796,30 @@ fn a_warm_edits_placement_writes_its_ranges_and_forces_no_write_back() {
     // The next edit: its base is the file the last one derived, written back by now.
     assert_eq!(store.reader().derivable(&enter(), &key(2)), Derivable::Yes);
     let next = edit(&mut sim, &mut store, (2, gives.as_slice()), 3, 8 << 20);
-    let wrote = sim.bytes_written();
-    store.unplace(&key(2), &key(3), &mut effects);
+    let wrote = own(sim.bytes_written(), &store);
     store.place(&key(3), name("one/build/a"), &mut effects).unwrap();
     let placed = placed_one(&mut sim, &mut store, &mut effects);
     assert_eq!(placed.result, Ok(()));
-    assert_eq!(placed.bytes, PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096 });
+    assert_eq!(placed.bytes, PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096, kernel: 0 });
     assert_eq!(sim.contents(&name("one/build/a")), next);
-    let wrote = sim.bytes_written() - wrote;
+    let wrote = own(sim.bytes_written(), &store) - wrote;
     assert!((2 * 4096..=3 * 4096).contains(&wrote), "the second edit wrote {wrote} bytes");
     assert_eq!(sim.bytes_forced(), 0);
     assert!(!sim.exists(&name(&format!("store/placed/{:x}{DERIVED_SUFFIX}", key(2).0))));
 
     // One output, two paths: the second is a clone of the store's file of it, written back.
-    let wrote = sim.bytes_written();
+    let wrote = own(sim.bytes_written(), &store);
     store.place(&key(3), name("one/debug/a"), &mut effects).unwrap();
     let placed = placed_one(&mut sim, &mut store, &mut effects);
     assert_eq!(placed.result, Ok(()));
     assert_eq!(
         placed.bytes,
-        PlacedBytes { cloned: LEN as u64, written: 2 * 4096, copied: 0 },
+        PlacedBytes { cloned: LEN as u64, written: 2 * 4096, copied: 0, kernel: 0 },
         "cloned whole; it is the first to report what making the store's files wrote (its \
          own ranges and those of the file before it, which no place cloned)"
     );
     assert_eq!(sim.contents(&name("one/debug/a")), next);
-    assert_eq!((sim.bytes_written() - wrote, sim.bytes_forced()), (0, 0));
+    assert_eq!((own(sim.bytes_written(), &store) - wrote, sim.bytes_forced()), (0, 0));
     assert!(store.problems().is_empty(), "{:?}", store.problems());
 }
 
@@ -702,9 +832,8 @@ fn one_edit_at_two_paths_derives_each_and_writes_the_whole_file_nowhere() {
     const LEN: usize = 4 << 20;
     let mut sim = Sim::new(32, quiet());
     let (mut store, _, gives) = derived_once(&mut sim, LEN, 2, 4096);
-    let wrote = sim.bytes_written();
+    let wrote = own(sim.bytes_written(), &store);
     let mut effects = Vec::new();
-    store.unplace(&key(1), &key(2), &mut effects);
     let a = store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
     let b = store.place(&key(2), name("one/debug/a"), &mut effects).unwrap();
     drive(&mut sim, &mut store, &mut effects);
@@ -713,11 +842,11 @@ fn one_edit_at_two_paths_derives_each_and_writes_the_whole_file_nowhere() {
     for it in &placed {
         assert!(it.tag == a || it.tag == b);
         assert_eq!(it.result, Ok(()));
-        assert_eq!(it.bytes, PlacedBytes { cloned: LEN as u64 - 2 * 4096, written: 0, copied: 2 * 4096 });
+        assert_eq!(it.bytes, PlacedBytes { cloned: LEN as u64 - 2 * 4096, written: 0, copied: 2 * 4096, kernel: 0 });
     }
     assert_eq!(sim.contents(&name("one/build/a")), gives);
     assert_eq!(sim.contents(&name("one/debug/a")), gives);
-    let wrote = sim.bytes_written() - wrote;
+    let wrote = own(sim.bytes_written(), &store) - wrote;
     assert!(
         (6 * 4096..=7 * 4096).contains(&wrote),
         "two ranges at two paths and in the store's file wrote {wrote} bytes"
@@ -745,7 +874,7 @@ fn an_edit_over_a_base_not_written_back_is_put_whole_written_once_and_forces_not
     store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
     let placed = placed_one(&mut sim, &mut store, &mut effects);
     assert_eq!(placed.result, Ok(()), "answered while its file's write-back is held");
-    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64 });
+    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64, kernel: 0 });
     assert_eq!(sim.contents(&name("one/build/a")), base);
     assert_eq!(
         store.reader().derivable(&enter(), &key(1)),
@@ -757,15 +886,14 @@ fn an_edit_over_a_base_not_written_back_is_put_whole_written_once_and_forces_not
     edited[LEN / 2] ^= 1;
     store.put(key(2), Kind::Output, &edited).unwrap();
     flush(&mut sim, &mut store);
-    let wrote = sim.bytes_written();
-    store.unplace(&key(1), &key(2), &mut effects);
+    let wrote = own(sim.bytes_written(), &store);
     store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
     let placed = placed_one(&mut sim, &mut store, &mut effects);
     assert_eq!(placed.result, Ok(()));
-    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64 });
+    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64, kernel: 0 });
     assert_eq!(sim.contents(&name("one/build/a")), edited);
     assert_eq!(
-        sim.bytes_written() - wrote,
+        own(sim.bytes_written(), &store) - wrote,
         2 * LEN as u64,
         "the whole file once where it goes, and once as the store's file of it"
     );
@@ -791,12 +919,12 @@ fn roomy(len: usize) -> (Vec<(u64, Vec<u8>)>, Vec<u8>) {
 /// What a place of `key(2)` at `one/build/a` wrote into files in all, the store's own file of
 /// it included, and the file it left there.
 fn placed_writing(sim: &mut Sim, store: &mut Store) -> (u64, Vec<u8>) {
-    let wrote = sim.bytes_written();
+    let wrote = own(sim.bytes_written(), store);
     let mut effects = Vec::new();
     store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
     let placed = placed_one(sim, store, &mut effects);
     assert_eq!(placed.result, Ok(()));
-    (sim.bytes_written() - wrote, sim.contents(&name("one/build/a")))
+    (own(sim.bytes_written(), store) - wrote, sim.contents(&name("one/build/a")))
 }
 
 /// The invariant: an image put as its runs over the base of holes ([`derived::holes`]) is
@@ -827,7 +955,6 @@ fn an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_it
     assert_eq!(store.reader().derivable(&enter(), &key(2)), Derivable::Yes, "a base for the next edit");
     let edited = edit(&mut sim, &mut store, (2, &file), 3, 8192);
     let mut effects = Vec::new();
-    store.unplace(&key(2), &key(3), &mut effects);
     store.place(&key(3), name("one/build/a"), &mut effects).unwrap();
     assert_eq!(placed_one(&mut sim, &mut store, &mut effects).result, Ok(()));
     assert_eq!(sim.contents(&name("one/build/a")), edited);
@@ -887,7 +1014,7 @@ fn a_derived_value_places_the_same_bytes_after_a_restart_as_a_whole_put_of_them(
         if !crashed {
             assert_eq!(
                 placed.bytes,
-                PlacedBytes { cloned: LEN as u64, written: 3 * 700, copied: 0 },
+                PlacedBytes { cloned: LEN as u64, written: 3 * 700, copied: 0, kernel: 0 },
                 "the base's file is checked, not written again; the ranges are"
             );
         }
@@ -962,4 +1089,34 @@ fn a_value_that_is_no_base_is_said_so_and_a_recipe_of_one_is_refused_by_name() {
         "{refused}"
     );
     assert!(!sim.exists(&name("one/build/b")));
+}
+
+/// The invariant (`crate::home`): wherever the power goes while an output's placed file is
+/// written, synced and made its record's home, the store opens and the output reads its bytes,
+/// from the pack's copy or from the file, and a place of it after gives them. A crash after
+/// each count of completions of the first place, and of everything after it, on a few seeds.
+#[test]
+fn a_crash_at_every_step_of_making_a_home_leaves_the_pack_copy_or_the_file() {
+    for steps in 0..48u8 {
+        for seed in 0..4 {
+            let ops = [whole(1), Op::Place { value: 0, path: 0, steps: Some(steps) }, Op::Crash, place(0, 1)];
+            // clone: a test's ops, once a seed.
+            let case = Case { seed, latency_us: 300, ops: ops.to_vec() };
+            assert_eq!(run(&case, PlacePlant::None), Ok(()), "steps {steps}, seed {seed}");
+        }
+    }
+}
+
+/// The planted-bug control: the records moved to the placed file before its sync and
+/// `placed/`'s answered. The commit that names it is durable and the file is not, so on some
+/// seed the crash tears it and the output reads torn bytes, or none.
+#[test]
+fn the_oracle_catches_a_home_named_before_its_file_is_synced() {
+    let ops = [whole(1), place(0, 0), Op::Settle, Op::Crash];
+    let (seed, why) = caught(&ops, 0..64, PlacePlant::HomesBeforeSync)
+        .expect("the oracle missed a record moved to a file not yet synced");
+    assert!(
+        why.contains("output 0") || why.contains("does not open"),
+        "seed {seed}: {why}"
+    );
 }

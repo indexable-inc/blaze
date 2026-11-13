@@ -254,6 +254,20 @@ classified by `BodyFacts::classify`:
   entry names the part of section 3 that covers it (the body and its scopes by content, the def
   map by names, the owner's signature by owner, the crate's data by crate inputs).
 - **fact**: it stands for one fact of section 5; the fact goes into the shape.
+- **read through**: its value is a function of its own row's reads and of nothing else, and no
+  fact is keyed by its arguments (a type's layout, `layout_of_ty_query` and
+  `layout_of_adt_query`, keyed by a type and an environment whose interned ids are one
+  process's; and the derived tables a layout reads: a struct's flags, an enum's discriminants,
+  a `bits` struct's packing, a field's bit width, the plan's ranks of an ADT's fields). The store
+  brings the row up to date by its key (`blaze_query::db::refresh`, the engine's own verify,
+  which also gives the running query a read edge on it) and classifies the row's reads in its
+  place, through again where one is read through, down to covered reads, facts or refusals. So
+  a body's MIR that reads `size_of::<S>()` is traced as the facts that decide `S`'s layout (its
+  fields' types, its `#[repr]` in its `Attrs` fact, its variants and fields in its `Fields`
+  fact, each variant's discriminant as its `ConstValue`, the target, the build's field order
+  plan as `FieldOrder`), and no type is ever keyed. Cutoff is by those inputs, not by the
+  layout: a field's type edited to another of the same layout still misses. A row a store
+  answered, or one that cannot be brought up to date (a cycle through it), is refused by name.
 - **refused**: anything else. The result is not stored and the refusal is counted by query name
   (as the goal store's `inexpressible`). A refused body is inferred as it always is; nothing is
   answered another way.

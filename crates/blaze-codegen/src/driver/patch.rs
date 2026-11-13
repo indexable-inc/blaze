@@ -148,10 +148,12 @@ pub(super) struct Walked<I, S> {
     /// Why it is the whole key of what the walk holds of the front end (rule
     /// keys-cover-every-input). Every item's describe and count here are the front end's
     /// answers in this view or a later one with no write between. The front end's changed
-    /// set since it covers every input of those answers: `hir-ty-codegen`'s is the query
-    /// engine's over `described_memo`, `counted_memo` and `described_static_memo`, which
-    /// records every read of a run and puts a row with a read it cannot see in every walk;
-    /// a describe that reads beside the database is asked each build
+    /// set since it covers every input of those answers: `hir-ty-codegen`'s is the engine's
+    /// changed keys since the view looked up in the postings of what each describe and count
+    /// read below `HIGH` (`v2/frontend/witnesses.rs`), and the query engine's own over
+    /// `described_static_memo`; reads at `HIGH` are the durable view's, compared above
+    /// (`view`). A count whose reads are not all posted is named every build; a describe
+    /// whose reads are not all posted, or that reads beside the database, is asked each build
     /// ([`Frontend::each_build`]). The walk's other inputs (roots, check roots, policy, the
     /// durable view) are compared by value, and with no view (`None`) every item is asked.
     seen: Option<u64>,

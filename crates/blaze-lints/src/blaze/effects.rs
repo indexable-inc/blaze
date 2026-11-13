@@ -1,5 +1,5 @@
-//! `nopanic`, `noalloc`, `nonblocking` (the old spellings; what a function may do, `#[blaze::may(..)]`,
-//! is `may.rs`'s) and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md; a `#[blaze::memo]` function is held to `pure` too, docs/v2/plan/design/std.md "Eval") (`deny` by default; each fires only where the code
+//! `nopanic`, `noalloc`, `nonblocking` (the old spellings; what a function is expected to do,
+//! `#[blaze::expect(..)]`, is `expect.rs`'s) and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md; a `#[blaze::memo]` function is held to `pure` too, docs/v2/plan/design/std.md "Eval") (`deny` by default; each fires only where the code
 //! asks for it, docs/v2/plan/design/effects.md): a function marked `#[blaze::nopanic]`,
 //! `#[blaze::noalloc]` or `#[blaze::nonblocking]` (or a method of an impl of, or a default
 //! method of, a trait so marked) that may, through any call, panic, call the global allocator or

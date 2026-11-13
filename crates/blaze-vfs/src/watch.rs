@@ -3,9 +3,11 @@
 //! disk (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md).
 //!
 //! - **Start**: the journal is asked for what changed since the cursor the head's [`Disk`] saved
-//!   (FSEvents' event ID, NTFS's USN). With no cursor (a first start, or Linux, whose journal
-//!   does not outlive a restart) the whole directory is looked at again ([`Watcher::rescan`]),
-//!   which with a saved column is a sweep of stamps, not a read of every file.
+//!   (FSEvents' event ID, NTFS's USN), and the whole directory is looked at again
+//!   ([`Watcher::rescan`]) whatever the cursor: with a saved column that is a sweep of stamps,
+//!   not a read of every file, and it sees a change the journal's history does not name (a
+//!   history the system dropped, a change made while no daemon watched). A start's own look is
+//!   what a first request waits for, never a round trip through the journal.
 //! - **Every look is stamps first**: the paths of a batch are stamped together in one
 //!   [`Effect::Stamp`] (io_uring's batched `statx` on Linux); a path whose stamp is the one the
 //!   column saved, and which the head has, is unchanged and never read or hashed. The rest are
@@ -37,6 +39,13 @@
 //!   is made only where a name leaves: an effect's [`FileName`], an [`Op`]'s path, a
 //!   [`Watched`]'s. Batches, the stamp buffer and every list are reused, so a warm batch of
 //!   unchanged paths allocates nothing.
+//! - **Racy stamps**: a stamp taken within its window ([`window_ns`](crate::disk::window_ns): by the file system's
+//!   clock, coarse or fine) of its file's change (by the later of its mtime and ctime, against the wall clock when the batch's stamps were asked) is not
+//!   saved: a second write in the same tick of the file system's clock could leave it over
+//!   other bytes. The name is saved as [`Stamp::UNKNOWN`] and kept, and once it is steady
+//!   ([`Watcher::steady`]) it is told again, read, and its stamp saved. Every saved stamp is
+//!   also a `SEEN` record in the VFS journal, after the head record of its commit, so a start
+//!   finds the column without an image and a crash never leaves a stamp ahead of its bytes.
 
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 
@@ -50,7 +59,7 @@ use std::alloc::Global;
 
 use crate::{
     Commit, Mode, Op, Vfs,
-    disk::Disk,
+    disk::{Disk, chose, encode_seen, put_entry, racy, steady_at, vouches},
     paths::{PathId, Paths},
     tree::{NodeId, Tree, ancestors},
 };
@@ -173,6 +182,16 @@ struct Batch {
     /// from before the watch.
     cursor: Option<Cursor>,
     caught_up: bool,
+    /// The wall clock when its first stamps were asked (0: not yet): a stamp within its
+    /// [`window_ns`](crate::disk::window_ns) of its change before then is not saved.
+    asked_ns: u64,
+    /// A look at the whole directory: the head's root when it began. Committed onto that same
+    /// root with every path it looked at seen, it begins the column's root (`Disk::root`) again,
+    /// whatever the column was kept against.
+    restart: Option<ContentId>,
+    /// A look at the whole directory from a column that vouches for no root: every file it has
+    /// is read, none settled by its stamp alone, so what it saves is of bytes it read.
+    cold: bool,
 }
 
 impl Batch {
@@ -197,6 +216,9 @@ impl Batch {
             gone: HashMap::new_in(Global),
             cursor: None,
             caught_up: false,
+            asked_ns: 0,
+            restart: None,
+            cold: false,
         }
     }
 
@@ -272,13 +294,26 @@ impl Batch {
                 });
             }
         }
+        // A move takes the head's bytes at its source, so only a source whose saved stamp
+        // vouches for them (not one the head chose against, not unknown), in a column kept
+        // against the head's root, is one; any other target is read.
+        let pairs = disk.is_some_and(|it| it.root == Some(tree.id(head)));
+        #[cfg(test)]
+        let planted = crate::planted(crate::Plant::MoveFromChosen);
+        #[cfg(not(test))]
+        let planted = false;
         for (at, slot) in self.slots.iter().enumerate() {
             let (Some(saved), Some(_)) = (slot.saved, slot.was) else { continue };
+            let vouched = planted
+                || pairs
+                    && disk
+                        .and_then(|it| it.saved(paths.get(slot.name)))
+                        .is_some_and(|it| vouches(&it));
             let left = match slot.look {
                 Some(Look::Gone) => true,
                 _ => slot.stamp.is_some_and(|now| !now.is_gone() && now.ino != saved.ino),
             };
-            if left && !saved.is_dir() {
+            if left && !saved.is_dir() && vouched {
                 self.gone.entry(saved.ino).or_insert(at);
             }
         }
@@ -320,6 +355,9 @@ impl Batch {
         self.gone.shrink_to(SPARE_SLOTS);
         self.cursor = None;
         self.caught_up = false;
+        self.asked_ns = 0;
+        self.restart = None;
+        self.cold = false;
     }
 }
 
@@ -376,6 +414,14 @@ struct Work {
     sources: Vec<PathId>,
     early: Vec<PathId>,
     late: Vec<PathId>,
+    /// A `SEEN` record's entries as [`save`] applies them, and its payload.
+    entries: Vec<u8>,
+    seen: Vec<u8>,
+    /// By slot of the batch being committed: whether the head changed it since it was looked at
+    /// (by anyone but this watcher), so the head keeps its own ([`Watched::Conflict`]).
+    conflicted: Vec<bool>,
+    /// Files above a path the commit writes, deleted to make room for its directory ([`room`]).
+    above: Vec<PathId>,
 }
 
 pub struct Watcher {
@@ -401,10 +447,26 @@ pub struct Watcher {
     spare: Vec<Batch>,
     spare_names: Option<Arc<Names>>,
     work: Work,
+    /// The wall clock as the driver last gave it: a batch asked for now is stamped at it.
+    now_ns: u64,
+    /// Each name saved as [`Stamp::UNKNOWN`] because its stamp was racy, and when that stamp
+    /// is steady ([`steady_at`](crate::disk::steady_at): its change plus its window): told again then
+    /// ([`Watcher::steady`]).
+    racy: HashMap<Box<str>, u64, Global>,
     /// The planted bug of the tests' control: a file's first stamp is saved whatever its read
     /// met, as before [`VERIFIES`].
     #[cfg(test)]
     trusts_reads: bool,
+    /// Planted bugs of the stamps' controls: a stamp inside the racy window is saved, and a
+    /// batch's `SEEN` record is made before its head record.
+    #[cfg(test)]
+    pub(crate) trusts_racy: bool,
+    #[cfg(test)]
+    pub(crate) seen_before_head: bool,
+    /// The planted bug of the start's control: a start with a saved cursor trusts the journal
+    /// alone and sweeps nothing, as before every start swept.
+    #[cfg(test)]
+    pub(crate) sweeps_only_without_cursor: bool,
 }
 
 /// The batch numbered `number` of `batches`, whose first is `first`.
@@ -436,8 +498,16 @@ impl Watcher {
             spare: Vec::new(),
             spare_names: None,
             work: Work::default(),
+            now_ns: 0,
+            racy: HashMap::new_in(Global),
             #[cfg(test)]
             trusts_reads: false,
+            #[cfg(test)]
+            trusts_racy: false,
+            #[cfg(test)]
+            seen_before_head: false,
+            #[cfg(test)]
+            sweeps_only_without_cursor: false,
         }
     }
 
@@ -451,9 +521,11 @@ impl Watcher {
     }
 
     /// Starts following the directory from where `vfs` saved this head's disk, or from scratch.
-    pub fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
+    /// `wall_ns` is the wall clock now (ns since the epoch, the file system's clock).
+    pub fn start(&mut self, vfs: &Vfs, wall_ns: u64, effects: &mut Vec<Effect>) {
         assert!(!self.watching, "{} is watched already", self.dir);
         self.watching = true;
+        self.now_ns = wall_ns;
         let since = vfs
             .disks
             .get(&self.head)
@@ -461,10 +533,12 @@ impl Watcher {
             .map_or(Cursor::None, |disk| disk.cursor);
         // clone: once per watch.
         effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
-        if since == Cursor::None {
-            let dir = self.paths.intern(self.dir.as_str());
-            self.rescan_at(vfs, dir, effects);
+        #[cfg(test)]
+        if self.sweeps_only_without_cursor && since != Cursor::None {
+            return;
         }
+        let dir = self.paths.intern(self.dir.as_str());
+        self.rescan_at(vfs, dir, effects);
     }
 
     /// Stops the watch: it ends with [`Watched::Ended`]. Looks in flight still commit.
@@ -478,6 +552,31 @@ impl Watcher {
     /// Whether a completion is of an effect this asked for.
     pub fn owns(&self, tag: Tag) -> bool {
         tag.0.checked_sub(self.tags).is_some_and(|it| it < TAGS)
+    }
+
+    /// Tells again each name saved as [`Stamp::UNKNOWN`] for a racy stamp whose change is now
+    /// its window ([`window_ns`](crate::disk::window_ns)) before `wall_ns`: it is stamped, read and, steady, saved. Nothing while the
+    /// watch has not caught up (the batch would wait behind what it holds).
+    pub fn steady(&mut self, vfs: &Vfs, wall_ns: u64, effects: &mut Vec<Effect>) {
+        if !self.watching || !self.caught_up || self.racy.is_empty() {
+            return;
+        }
+        self.now_ns = wall_ns;
+        let due = |steady_at: u64| steady_at <= wall_ns;
+        if !self.racy.values().any(|&it| due(it)) {
+            return;
+        }
+        // alloc: per round of names gone steady, the names the batch takes owned.
+        let mut names: Vec<FileName> = self
+            .racy
+            .iter()
+            .filter(|(_, at)| due(**at))
+            .filter_map(|(name, _)| FileName::new(name))
+            .collect();
+        // In name order: the batch is the same whatever the map's order.
+        names.sort_unstable();
+        self.racy.retain(|_, at| !due(*at));
+        self.told(vfs, names, effects);
     }
 
     /// Whether nothing it was told is waiting to be looked at or committed.
@@ -517,7 +616,10 @@ impl Watcher {
         pending
     }
 
-    fn push(&mut self, batch: Batch) -> u64 {
+    fn push(&mut self, mut batch: Batch) -> u64 {
+        if batch.asked_ns == 0 {
+            batch.asked_ns = self.now_ns;
+        }
         let number = self.first + self.batches.len() as u64;
         self.batches.push_back(batch);
         number
@@ -557,12 +659,15 @@ impl Watcher {
 
     /// Takes a completion of its own; commits what is looked at in full to the head, and
     /// flushes `vfs` after.
+    /// `wall_ns` is the wall clock now, as [`Watcher::start`]'s.
     pub fn complete(
         &mut self,
         vfs: &mut Vfs,
         completion: Completion,
+        wall_ns: u64,
         effects: &mut Vec<Effect>,
     ) -> Vec<Watched> {
+        self.now_ns = wall_ns;
         // alloc: none unless a path changed.
         let mut out = Vec::new();
         if completion.tag == Tag(self.tags) {
@@ -727,7 +832,7 @@ impl Watcher {
             out.push(Watched::Lost { path, why });
             match why {
                 Lost::Unnamed => self.relist(vfs, under, effects),
-                _ => self.rescan(vfs, &under, effects),
+                _ => self.rescan(vfs, &under, self.now_ns, effects),
             }
         }
         let was = self.caught_up;
@@ -770,7 +875,9 @@ impl Watcher {
     /// stamped, and the directories whose stamp moved are listed. The column's names are swept
     /// as they are ([`Batch::names`]); of the head, only what changed since the column held all
     /// of it is added (all of it when the column never did).
-    pub fn rescan(&mut self, vfs: &Vfs, under: &FileName, effects: &mut Vec<Effect>) {
+    /// `wall_ns` is the wall clock now, as [`Watcher::start`]'s.
+    pub fn rescan(&mut self, vfs: &Vfs, under: &FileName, wall_ns: u64, effects: &mut Vec<Effect>) {
+        self.now_ns = wall_ns;
         if self.rel(under.as_str()).is_none() {
             return;
         }
@@ -790,7 +897,14 @@ impl Watcher {
         }
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
+        // The root the column holds all of, while the tree has it: only what changed since is
+        // taken from the head.
+        let synced = disk.and_then(|it| it.root).and_then(|it| vfs.tree.node(&it));
         let mut batch = self.fresh(Some(under), None);
+        if root.is_empty() {
+            batch.restart = Some(vfs.tree.id(head));
+            batch.cold = synced.is_none();
+        }
         let mut names = self.names();
         let unshared =
             Arc::get_mut(&mut names).expect("a spare stamp buffer is the watcher's alone");
@@ -799,6 +913,10 @@ impl Watcher {
         }
         batch.swept = unshared.len();
         batch.names = Some(names);
+        if batch.cold {
+            // No stamp of the column vouches for the head's bytes: every name it has is looked at.
+            batch.forced.extend(0..batch.swept as u32);
+        }
         let missing = batch.swept(self.paths.get(under)).is_err();
         {
             let Watcher { paths, dir, below, work, .. } = self;
@@ -839,7 +957,7 @@ impl Watcher {
             if missing {
                 add(&root, &mut batch);
             }
-            match disk.and_then(|it| it.root).and_then(|it| tree.node(&it)) {
+            match synced {
                 Some(synced) => {
                     for change in tree.diff(synced, head) {
                         if inside(&change.path) {
@@ -971,6 +1089,7 @@ impl Watcher {
             let swept = batch.swept;
             assert_eq!(stamps.len(), swept + batch.slots.len(), "a stamp per name");
             let rescan = batch.rescan.is_some();
+            let cold = batch.cold;
             batch.open -= 1;
             let (of_swept, of_slots) = stamps.split_at(swept);
             for (slot, stamp) in batch.slots.iter_mut().zip(of_slots) {
@@ -1017,7 +1136,7 @@ impl Watcher {
                     if list {
                         lists.push(slot.name);
                     }
-                } else if slot.saved == Some(stamp) && slot.was.is_some() {
+                } else if slot.saved == Some(stamp) && slot.was.is_some() && !cold {
                     slot.look = Some(Look::Same);
                 } else {
                     changed.push(at);
@@ -1174,7 +1293,7 @@ impl Watcher {
                 out.push(Watched::Scanned);
             }
             for name in again {
-                vfs.disks.of(&self.head, &self.dir).set(self.paths.get(name), Stamp::GONE);
+                // Its stamp is gone from the column already, in the commit's own record.
                 // alloc: an output's path.
                 let path = self.paths.rel(name, self.below.len()).to_owned();
                 out.push(Watched::Lost { path, why: Lost::Rescan });
@@ -1216,14 +1335,127 @@ impl Watcher {
     }
 
     /// Commits what a batch saw; returns the files moved from a node the tree no longer has,
-    /// to be looked at again.
+    /// to be looked at again. Its stamps go into the column, and into a `SEEN` record made
+    /// after the commit's head record: a prefix of the journal that has the stamps has the
+    /// bytes they vouch for. A batch that saved no stamp and moved no root makes none; its
+    /// cursor rides with the next record (a cursor behind only tells again what is unchanged).
+    ///
+    /// The column's root (`Disk::root`) goes on to the head's new root when it was the head's
+    /// before (each path the batch saved is then of bytes the head took, or one it chose
+    /// against, [`crate::disk::chose`]), or when the batch looked at the whole directory from
+    /// the root the head is still at with every path seen; else it vouches for none. The one
+    /// record carries all of it, so no cut of the journal pairs a root with a stamp it lacks.
     fn commit(&mut self, vfs: &mut Vfs, batch: &mut Batch, out: &mut Vec<Watched>) -> Vec<PathId> {
+        let mut entries = std::mem::take(&mut self.work.entries);
+        entries.clear();
+        let asked_ns = match () {
+            #[cfg(test)]
+            () if self.trusts_racy => u64::MAX,
+            () => batch.asked_ns,
+        };
+        let base = vfs.tree.id(self.head_root(vfs));
+        self.conflicts(vfs, batch);
+        let seen_all = !batch.slots.iter().any(|it| matches!(it.look, Some(Look::Unreadable)));
+        let restarts = seen_all && batch.restart == Some(base);
+        let disk = vfs.disks.of(&self.head, &self.dir);
+        let chained = disk.root == Some(base);
+        let was = disk.root;
+        let mut count = save(
+            disk,
+            batch,
+            &self.paths,
+            asked_ns,
+            &self.work.conflicted,
+            &mut self.racy,
+            &mut entries,
+        );
+        #[cfg(test)]
+        let early = self.seen_before_head;
+        #[cfg(not(test))]
+        let early = false;
+        if count > 0 && early {
+            self.record_seen(vfs, count, &entries);
+            entries.clear();
+            count = 0;
+        }
+        let again = self.apply(vfs, batch, out);
+        let disk = vfs.disks.of(&self.head, &self.dir);
+        #[cfg(test)]
+        let apart = crate::planted(crate::Plant::AgainApart);
+        #[cfg(not(test))]
+        let apart = false;
+        // A file moved from a node the tree no longer has: not written, so not in the column.
+        if !apart {
+            for &name in &again {
+                disk.remove_under(self.paths.get(name));
+                put_entry(&mut entries, self.paths.get(name), Stamp::GONE);
+                count += 1;
+            }
+        }
+        // A file above a path written went for its directory: its stamp is of what is gone.
+        for &name in &self.work.above {
+            let name = self.paths.get(name);
+            if disk.saved(name).is_some_and(|it| !it.is_dir() && !it.is_unknown()) {
+                disk.set(name, Stamp::UNKNOWN);
+                put_entry(&mut entries, name, Stamp::UNKNOWN);
+                count += 1;
+            }
+        }
+        let after = vfs.tree.id(self.head_root(vfs));
+        let disk = vfs.disks.of(&self.head, &self.dir);
+        disk.root = (chained || restarts).then_some(after);
+        if count > 0 || disk.root != was {
+            self.record_seen(vfs, count, &entries);
+        }
+        if apart && !again.is_empty() {
+            entries.clear();
+            let disk = vfs.disks.of(&self.head, &self.dir);
+            for &name in &again {
+                disk.remove_under(self.paths.get(name));
+                put_entry(&mut entries, self.paths.get(name), Stamp::GONE);
+            }
+            self.record_seen(vfs, again.len() as u32, &entries);
+        }
+        self.work.entries = entries;
+        again
+    }
+
+    /// Which slots of `batch` the head changed since they were looked at, by anyone but this
+    /// watcher ([`Work::conflicted`]): what [`save`] and [`Watcher::apply`] both go by.
+    fn conflicts(&mut self, vfs: &Vfs, batch: &Batch) {
+        let base = self.head_root(vfs);
+        let Watcher { paths, ours, below, work, .. } = self;
+        let below = below.len();
+        let tree = &vfs.tree;
+        work.conflicted.clear();
+        work.conflicted.extend(batch.slots.iter().map(|slot| {
+            let path = paths.rel(slot.name, below);
+            if path.is_empty() || matches!(slot.look, Some(Look::Same | Look::Unreadable) | None) {
+                return false;
+            }
+            let now = seen(tree, base, path);
+            now != slot.was && !made(ours, paths, below, slot.name, now)
+        }));
+    }
+
+    /// A `SEEN` record of the head's disk as it is now, with `count` entries.
+    fn record_seen(&mut self, vfs: &mut Vfs, count: u32, entries: &[u8]) {
+        let disk = vfs.disks.get(&self.head).expect("the disk the batch saved into");
+        let seen = &mut self.work.seen;
+        seen.clear();
+        encode_seen(seen, &self.head, disk, count, entries);
+        vfs.journal.record_seen(seen);
+    }
+
+    /// The ops of what a batch saw, committed to the head.
+    fn apply(&mut self, vfs: &mut Vfs, batch: &mut Batch, out: &mut Vec<Watched>) -> Vec<PathId> {
         let Watcher { head, dir, below, paths, ours, work, .. } = self;
         let below = below.len();
-        save(vfs.disks.of(head, dir), batch, paths);
         let base = vfs.heads.get(&**head).copied().unwrap_or(vfs.tree.empty());
         let tree = &vfs.tree;
         let Work {
+            conflicted,
+            above,
             deleting,
             deletes,
             kept,
@@ -1242,6 +1474,7 @@ impl Watcher {
         deleting.resize(batch.slots.len(), false);
         (deletes.clear(), kept.clear(), writes.clear(), moves.clear(), taken.clear());
         (renames.clear(), renamed.clear(), sources.clear(), early.clear(), late.clear());
+        above.clear();
         for (at, slot) in batch.slots.iter_mut().enumerate() {
             let path = paths.rel(slot.name, below);
             if path.is_empty() || matches!(slot.look, Some(Look::Same | Look::Unreadable)) {
@@ -1249,8 +1482,7 @@ impl Watcher {
             }
             let entry = tree.entry(base, path);
             let node = entry.map(|it| it.0);
-            let now = entry.map(|(node, mode)| (tree.id(node), mode));
-            if now != slot.was && !made(ours, paths, below, slot.name, now) {
+            if conflicted[at] {
                 // alloc: an output's path.
                 out.push(Watched::Conflict { path: path.to_owned() });
                 continue;
@@ -1270,7 +1502,7 @@ impl Watcher {
                     continue;
                 }
                 Look::File(bytes) => {
-                    room(tree, base, paths, slot.name, below, deletes);
+                    room(tree, base, paths, slot.name, below, deletes, above);
                     let had = entry.filter(|_| is_file).map(|it| it.1);
                     let mode = file_mode(slot.stamp.expect("a read path is stamped"), had);
                     // Compared in place, not hashed: the commit hashes what it writes, once. A
@@ -1307,7 +1539,7 @@ impl Watcher {
             } else {
                 match tree.node(&id).map(|node| tree.bytes(node)) {
                     Some(Ok(Some(bytes))) => {
-                        room(tree, base, paths, target.name, below, deletes);
+                        room(tree, base, paths, target.name, below, deletes, above);
                         // alloc: per file moved from a node no op keeps, its bytes copied once.
                         writes.push((target.name, bytes.to_vec(), mode));
                     }
@@ -1368,8 +1600,7 @@ impl Watcher {
             bytes,
             mode,
         }));
-        let base = vfs.tree.id(base);
-        let commit = vfs.commit_owned(head, base, ops).unwrap_or_else(|error| {
+        let commit = vfs.commit_seen(head, ops).unwrap_or_else(|error| {
             panic!("the disk's changes to {dir} do not apply to its head: {error}")
         });
         let root = vfs.root(commit.root).expect("the root just made");
@@ -1420,7 +1651,8 @@ fn is_below(name: &str, dir: &str) -> bool {
     name.len() > dir.len() && name.starts_with(dir) && name.as_bytes()[dir.len()] == b'/'
 }
 
-/// Makes room in `base` for a file at `name`: the files above it and a directory at it go.
+/// Makes room in `base` for a file at `name`: the files above it (each also in `above`) and a
+/// directory at it go.
 fn room(
     tree: &Tree,
     base: NodeId,
@@ -1428,6 +1660,7 @@ fn room(
     name: PathId,
     below: usize,
     deletes: &mut Vec<PathId>,
+    above: &mut Vec<PathId>,
 ) {
     let mut from = 0;
     loop {
@@ -1436,7 +1669,9 @@ fn room(
         let up = from + slash;
         from = up + 1;
         if tree.lookup(base, &path[..up]).is_some_and(|it| !tree.is_dir(it)) {
-            deletes.push(paths.intern_prefix(name, below + up));
+            let file = paths.intern_prefix(name, below + up);
+            deletes.push(file);
+            above.push(file);
         }
     }
     if tree.lookup(base, paths.rel(name, below)).is_some_and(|it| tree.is_dir(it)) {
@@ -1444,30 +1679,88 @@ fn room(
     }
 }
 
-/// What a committed batch saw goes into the column: each path's stamp (a conflict's too: the
-/// disk was seen and the head chose), gone paths with everything under them, and the journal's
-/// cursor after it. An unreadable path keeps what it had, so it is looked at again.
-fn save(disk: &mut Disk, batch: &Batch, paths: &Paths) {
-    for slot in &batch.slots {
+/// What a committed batch saw goes into the column: each path's stamp, gone paths with
+/// everything under them, and the journal's cursor after it. A conflict's stamp is saved
+/// [`chose`]: the disk was seen, so it is not looked at again until it changes, but the head
+/// chose other bytes, so the stamp vouches for none of the head's; a conflict over a gone path
+/// saves [`Stamp::UNKNOWN`] (the name stays, so it is looked at again). An unreadable path keeps
+/// what it had, so it is looked at again. A file that replaces a directory drops the
+/// directory's names first: their stamps are of what the head no longer has. A stamp within its
+/// [`window_ns`](crate::disk::window_ns) of its change at `asked_ns` is saved as
+/// [`Stamp::UNKNOWN`], its name kept in `racy`. Each entry applied goes into `entries` (a
+/// `SEEN` record's), in order; the count of them.
+fn save(
+    disk: &mut Disk,
+    batch: &Batch,
+    paths: &Paths,
+    asked_ns: u64,
+    conflicted: &[bool],
+    racy_names: &mut HashMap<Box<str>, u64, Global>,
+    entries: &mut Vec<u8>,
+) -> u32 {
+    #[cfg(test)]
+    let vouched = crate::planted(crate::Plant::ConflictVouched);
+    #[cfg(not(test))]
+    let vouched = false;
+    let mut count = 0;
+    let mut put = |disk: &mut Disk, name: &str, stamp: Stamp| {
+        match stamp.is_gone() {
+            true => disk.remove_under(name),
+            false => disk.set(name, stamp),
+        }
+        put_entry(entries, name, stamp);
+        count += 1;
+    };
+    for (at, slot) in batch.slots.iter().enumerate() {
         let Some(stamp) = slot.stamp else { continue };
+        let name = paths.get(slot.name);
+        let conflict = conflicted[at];
+        // A file where the column had a directory: the names under it are of the head no more.
+        let replaces = |disk: &Disk| {
+            !conflict && !stamp.is_dir() && disk.get(name).is_some_and(|it| it.is_dir())
+        };
         match slot.look {
             Some(Look::Unreadable) | None => {}
-            Some(Look::Gone) => disk.remove_under(paths.get(slot.name)),
+            Some(Look::Gone) => {
+                racy_names.remove(name);
+                match conflict {
+                    true => put(&mut *disk, name, Stamp::UNKNOWN),
+                    false => put(&mut *disk, name, Stamp::GONE),
+                }
+            }
             Some(Look::Same) => {}
+            Some(Look::Dir | Look::File(_) | Look::Moved(_))
+                if !stamp.is_unknown() && racy(&stamp, asked_ns) =>
+            {
+                if replaces(disk) {
+                    put(&mut *disk, name, Stamp::GONE);
+                }
+                // alloc: per name saved racy, kept until it is steady and looked at again.
+                racy_names.insert(name.into(), steady_at(&stamp));
+                put(&mut *disk, name, Stamp::UNKNOWN);
+            }
             Some(Look::Dir | Look::File(_) | Look::Moved(_)) => {
-                disk.set(paths.get(slot.name), stamp)
+                racy_names.remove(name);
+                if replaces(disk) {
+                    put(&mut *disk, name, Stamp::GONE);
+                }
+                match conflict && !vouched {
+                    true => put(&mut *disk, name, chose(stamp)),
+                    false => put(&mut *disk, name, stamp),
+                }
             }
         }
     }
     // Written in place across its read: its bytes are of no stamp, so none is matched later.
     for &at in &batch.unsure {
         if matches!(batch.slots[at].look, Some(Look::File(_))) {
-            disk.set(paths.get(batch.slots[at].name), Stamp::UNKNOWN);
+            put(&mut *disk, paths.get(batch.slots[at].name), Stamp::UNKNOWN);
         }
     }
     if let Some(cursor) = batch.cursor {
         disk.cursor = cursor;
     }
+    count
 }
 
 #[cfg(test)]

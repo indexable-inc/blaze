@@ -1720,3 +1720,177 @@ fn a_damaged_file_record_is_refused() {
         assert_eq!((found.records, found.skipped), (0, bad.len()), "byte {at}");
     }
 }
+
+/// Every directory's listing in `root` (its names, and whether each is a directory), by path
+/// (`""` the root), read through a reader one directory at a time: the model's input, which
+/// walks all of both roots and skips nothing they share.
+fn listings(vfs: &Vfs, root: ContentId) -> BTreeMap<String, Vec<(String, bool)>> {
+    let reader = vfs.reader();
+    let mut out = BTreeMap::new();
+    let mut todo = vec![String::new()];
+    while let Some(dir) = todo.pop() {
+        let listing = listed(&reader, root, &dir).expect("a directory of the root lists");
+        for (name, is_dir) in &listing {
+            if *is_dir {
+                todo.push(match dir.is_empty() {
+                    true => name.clone(), // clone: the model's path
+                    false => format!("{dir}/{name}"),
+                });
+            }
+        }
+        out.insert(dir, listing);
+    }
+    out
+}
+
+/// The model of [`Vfs::relisted`]: each directory either root has whose listing differs
+/// between them (a directory only one root has differs), sorted bytewise.
+fn relisted_model(vfs: &Vfs, from: ContentId, to: ContentId) -> Vec<String> {
+    let (old, new) = (listings(vfs, from), listings(vfs, to));
+    let dirs: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    // clone: the model's paths
+    dirs.into_iter().filter(|it| old.get(*it) != new.get(*it)).cloned().collect()
+}
+
+/// The control's stand-in: the directory of each file the diff adds or removes, and nothing
+/// above it, as the rule before `relisted` was (only the changed files read).
+fn relisted_by_changed_files(vfs: &Vfs, from: ContentId, to: ContentId) -> Vec<String> {
+    let mut out: Vec<String> = vfs
+        .diff(from, to)
+        .into_iter()
+        .filter(|it| it.kind != ChangeKind::Modified)
+        .map(|it| it.path.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_owned()))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether `path` is a directory (`Some(true)`), a file (`Some(false)`) or nothing in `root`.
+fn kind_at(vfs: &Vfs, root: ContentId, path: &str) -> Option<bool> {
+    let reader = vfs.reader();
+    if reader.list(root, path).is_some() {
+        return Some(true);
+    }
+    reader.pin().file(root, path).expect("not corrupt").map(|_| false)
+}
+
+/// Ops that write `path` in `root` whatever is there: a file above it, or a directory at it,
+/// deleted first.
+fn write_over(vfs: &Vfs, root: ContentId, path: &str, bytes: &str) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut at = 0;
+    while let Some(slash) = path[at..].find('/') {
+        at += slash;
+        if kind_at(vfs, root, &path[..at]) == Some(false) {
+            ops.push(delete(&path[..at]));
+            break;
+        }
+        at += 1;
+    }
+    if kind_at(vfs, root, path) == Some(true) {
+        ops.push(delete(path));
+    }
+    ops.push(write(path, bytes));
+    ops
+}
+
+/// The invariant: [`Vfs::relisted`] names exactly the directories whose listing (names, and
+/// whether each is a directory) differs between two roots, a directory either root lacks with
+/// every directory under it, sorted bytewise; a file whose bytes or mode alone changed relists
+/// nothing. Against a model that lists every directory of both roots: a file added to a
+/// directory there, a new directory holding a file, a nested one, a removed directory, a file
+/// replacing a directory, a file turning into a directory, an edit and a mode change, then
+/// random changes over many seeds. Control: the rule of only the changed files' own
+/// directories misses the directories made or emptied above them, and the oracle says so.
+#[test]
+fn relisted_names_every_directory_whose_listing_changed() {
+    let mut vfs = new_vfs();
+    let empty = vfs.empty();
+    let base = [
+        ("Cargo.toml", "[package]"),
+        ("src/lib.rs", "pub mod a;"),
+        ("src/a.rs", "pub fn a() {}"),
+        ("src/old/one.rs", "1"),
+        ("src/old/deep/three.rs", "3"),
+        ("x", "x"),
+    ];
+    let ops: Vec<Op> = base.iter().map(|(path, bytes)| write(path, bytes)).collect();
+    let base = vfs.commit("h", empty, &ops).unwrap().root;
+    let cases: [(&str, Vec<Op>, &[&str]); 8] = [
+        ("a file added to a directory there", vec![write("src/b.rs", "b")], &["src"]),
+        ("an edit", vec![write("src/a.rs", "pub fn a() { 2 }")], &[]),
+        ("a mode change", vec![write_as("x", "x", Mode::Executable)], &[]),
+        ("a new directory holding a file", vec![write("src/new/n.rs", "n")], &["src", "src/new"]),
+        ("a new nested directory", vec![write("tests/a/b.rs", "b")], &["", "tests", "tests/a"]),
+        ("a removed directory", vec![delete("src/old")], &["src", "src/old", "src/old/deep"]),
+        (
+            "a file replacing a directory",
+            vec![delete("src/old"), write("src/old", "now a file")],
+            &["src", "src/old", "src/old/deep"],
+        ),
+        ("a file turning into a directory", vec![delete("x"), write("x/y", "y")], &["", "x"]),
+    ];
+    let mut caught = 0;
+    for (what, ops, want) in cases {
+        vfs.set_head("h", base).unwrap();
+        let to = vfs.commit("h", base, &ops).unwrap().root;
+        let model = relisted_model(&vfs, base, to);
+        assert_eq!(model, want, "{what}: the model");
+        assert_eq!(vfs.relisted(base, to), model, "{what}");
+        assert_eq!(vfs.relisted(to, base), model, "{what}, backwards");
+        assert_eq!(vfs.relisted(to, to), Vec::<String>::new(), "{what}: a root against itself");
+        caught += usize::from(relisted_by_changed_files(&vfs, base, to) != model);
+    }
+    assert!(caught > 0, "the control: the changed files' own directories are caught");
+
+    const PARTS: &[&str] = &["a", "a-b", "a.rs", "a0", "b", "src"];
+    let path = |rng: &mut Rng| {
+        let depth = 1 + rng.below(3);
+        let parts: Vec<&str> =
+            (0..depth).map(|_| PARTS[rng.below(PARTS.len() as u64) as usize]).collect();
+        parts.join("/")
+    };
+    for seed in 0..200 {
+        let mut rng = Rng::new(seed ^ 0x7265_6c69);
+        let mut vfs = new_vfs();
+        let mut from = vfs.empty();
+        for n in 0..1 + rng.below(10) {
+            let path = path(&mut rng);
+            let ops = write_over(&vfs, from, &path, &format!("{seed}:{n}"));
+            from = vfs.commit("h", from, &ops).unwrap().root;
+        }
+        let mut to = from;
+        for n in 0..1 + rng.below(4) {
+            let ops = match rng.below(3) {
+                0 => {
+                    let all = listings(&vfs, to);
+                    // Every file and directory of `to` but its root.
+                    let names: Vec<String> = all
+                        .iter()
+                        .flat_map(|(dir, listing)| {
+                            listing.iter().map(move |(name, _)| match dir.is_empty() {
+                                true => name.clone(), // clone: the model's path
+                                false => format!("{dir}/{name}"),
+                            })
+                        })
+                        .collect();
+                    if names.is_empty() {
+                        continue;
+                    }
+                    vec![delete(&names[rng.below(names.len() as u64) as usize])]
+                }
+                _ => {
+                    let path = path(&mut rng);
+                    write_over(&vfs, to, &path, &format!("{seed}:to:{n}"))
+                }
+            };
+            to = vfs.commit("h", to, &ops).unwrap().root;
+        }
+        let model = relisted_model(&vfs, from, to);
+        assert_eq!(vfs.relisted(from, to), model, "seed {seed}");
+        assert_eq!(vfs.relisted(to, from), model, "seed {seed}, backwards");
+    }
+}
+
+mod stamps;

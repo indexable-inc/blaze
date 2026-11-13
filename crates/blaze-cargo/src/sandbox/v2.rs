@@ -547,9 +547,12 @@ fn finish(spec: &confine::Spec, live: &Live) -> Result<Report, String> {
     // clone: once, as the run ends, the environment the files are hashed by. A run that is
     // lent its environment walked, if it did, the visible variables and the walk set
     // ([`program_env`]); any other was given all of it.
+    // Its looks at the disk are kept by no build's list: what they say is the run's trace,
+    // which its record keeps and each build that uses the run takes as its reads.
+    let none = blaze_vfs::outside::Looks::none();
     let mut disk = match spec.given.as_deref().filter(|_| lends(spec)) {
-        Some(given) => Disk::lent(spec.env.clone(), |name| walk_shows(given, name)),
-        None => Disk::new(spec.env.clone()),
+        Some(given) => Disk::lent(spec.env.clone(), |name| walk_shows(given, name), &none),
+        None => Disk::new(spec.env.clone(), &none),
     };
     let traced = trace::assemble(&lines, None, &mut disk)
         // alloc: the error, once, and no report.

@@ -32,7 +32,7 @@ use blaze_items::{Fact, ItemId};
 use hir::InFile;
 use hir_def::{AdtId, ModuleDefId};
 
-use crate::{cx::Cx, lower::Found, model::Diag};
+use crate::{check::crate_pass, cx::Cx, lower::Found, model::Diag};
 
 /// The lints rustc gives whether or not anything before them failed: its early lint pass on
 /// the AST (`unused_parens`, ..), name resolution's (`unused_imports`, ..), the attribute and
@@ -40,11 +40,15 @@ use crate::{cx::Cx, lower::Found, model::Diag};
 /// lint in bodies (`unreachable_code`, `unused_variables`, ..), each with the [`Phase`] of the
 /// pass that gives it.
 ///
+/// The syntax lints walk `syntax_cx`: the build's context scoped to the pieces of the syntax
+/// group its sweep left unclean (`Cx::scoped`, plan 12 E1), or `cx` itself for the whole
+/// crate; every other pass here walks `cx`, the whole crate.
+///
 /// [`Phase`]: crate::lower::Phase
-pub fn early(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
-    let mut found = syntax::lints(cx, cmd);
+pub fn early(cx: &Cx<'_, '_>, syntax_cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
+    let mut found = crate_pass(cx, "syntax lints", || syntax::lints(syntax_cx, cmd));
     found.extend(names::before_abort(cx));
-    found.extend(bodies::before_abort(cx, cmd.codegen));
+    found.extend(crate_pass(cx, "bodies before", || bodies::before_abort(cx, cmd.codegen)));
     found
 }
 
@@ -52,7 +56,7 @@ pub fn early(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
 /// late lint passes: `dead_code`, `non_upper_case_globals`, `unused_comparisons`, ..).
 pub fn late(cx: &Cx<'_, '_>) -> Vec<Found> {
     let mut found = names::after_abort(cx);
-    found.extend(bodies::after_abort(cx));
+    found.extend(crate_pass(cx, "bodies late", || bodies::after_abort(cx)));
     found
 }
 

@@ -33,6 +33,8 @@ fn setup(runs: u64, runs_end: u64) -> Setup {
         tags: 6 << 32,
         runs,
         runs_end,
+        slots: "/s/slots".into(),
+        premises: crate::serve::daemon::Premises { engine: "/s/blaze-engine".into(), library: None },
     }
 }
 
@@ -140,6 +142,7 @@ fn cargos_own_invocation_is_kept_whole() {
         width: None,
         verbose: 0,
         refused: Some(16),
+        prebuilt: true,
     });
     let work = Work::Test {
         targets: targets.clone(),
@@ -458,6 +461,9 @@ fn an_answered_jobs_placement_is_its_settlings_and_keeps_its_path_busy() {
         storing: None,
         stored: blaze_cas::Tickets::default(),
         durable: blaze_cas::Tickets::default(),
+        layer: blaze_cas::Tickets::default(),
+        layer_since: None,
+        layer_wait: None,
         placing: 1,
         placing_span: None,
         leases: None,
@@ -655,6 +661,7 @@ fn cargo_targets(args: &[&str], color: bool, width: Option<u32>) -> Targets {
         command: "build".into(),
         refused: Some(16),
         verbose: 0,
+        prebuilt: true,
     };
     Targets { cargo: Some(cargo), ..targets() }
 }

@@ -197,9 +197,9 @@ fn served_by_the_kernel(s: &Session, memory: &Memory) {
         }
         let served = super::entries::Served {
             revision,
+            krate: hir_def::HasModule::krate(&def, db),
             identity: kept.identity,
             facts: kept.facts.clone(),
-            children: Box::new([]),
             answer: kept.answer.clone(),
         };
         super::with_store(db, |store| store.served.lock().post(def, kept.step, kept.schema, served))

@@ -9,8 +9,13 @@
 //! | `Direct` of the function itself | the record's own bytes (`To::Own`): a jump into itself |
 //! | `Static` | a static place; [`Named::Static`] says which |
 //! | `Data` | the datum of that id among the record's data |
-//! | `Extern`, `Weak` | the function or static of the program that defines the name, when one does; else an outside symbol by name |
+//! | `Extern`, `Weak` | a function or static place filled by the program's own symbol of that name, when the program defines it ([`Made::symbols`]: the reader resolves the name); else an outside symbol by name |
 //! | `Position` | a datum made here: the `Location` the program observes (`file!()`, `line!()`, a panic's place), with its file name another datum |
+//!
+//! Nothing here reads a whole build: a record is made of one function and what its maker says
+//! of the positions its code names and of which symbols the program itself defines, so a record
+//! of a sealed function is the same in every build that gives the same inputs, and is kept by
+//! its bind key ([`crate::bind`]).
 //!
 //! A position is data of the record, so a record's id follows the lines of what it names: a
 //! function whose own line moved is bound again though its code is the code it was. What
@@ -50,22 +55,83 @@ pub struct Made {
     /// A function's placed length (its code and its pool); a static's size.
     pub len: u64,
     pub align: u32,
-    /// Its function and static places, in order.
+    /// Its function and static places that name a function or static of the build, in order.
     pub named: Vec<Named>,
+    /// Its function and static places that the program's own symbol fills (an `Extern` or
+    /// `Weak` relocation against a name the program defines: `#[no_mangle]`,
+    /// `#[export_name]`), each with its name: the place is its index among the record's
+    /// numbered places ([`blaze_launch::record::Place::numbered`]), sorted by place. With
+    /// `named` they are every numbered place, `named` filling the places this leaves.
+    pub symbols: Vec<(u32, String)>,
     /// The anchors of the span tables its positions were read from, sorted, each once.
     pub anchors: Vec<ContentId>,
 }
 
-/// What a record is made against, of its build: where the positions its code names are (the
-/// span tables, by anchor), and which symbols the program itself defines.
+/// What a symbol of the program itself is: a function or a static.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Defines {
+    Function,
+    Static,
+}
+
+/// What a record is made against: where the positions its code names are (the span tables
+/// of the functions it was made from, by anchor), and which symbols the program itself
+/// defines. Neither is a whole build: the tables are those of the record's own anchors, and
+/// the symbols the program's (name, kind) pairs, which the bind key covers
+/// ([`crate::bind::Under::symbols`]).
 pub trait Positions {
     /// The file name and the position of `span`, or why there is none.
     fn of(&self, span: &SpanRef) -> Result<(&str, Position), String>;
 
-    /// The function or static of the program that defines the symbol `name`, when one does
-    /// (`#[no_mangle]`, `#[export_name]`): a relocation against the name is then against it,
-    /// as a link resolves it, and never asked of the system's libraries.
-    fn defined(&self, name: &str) -> Option<Named>;
+    /// Whether the program defines the symbol `name` (`#[no_mangle]`, `#[export_name]`), and
+    /// as what: a relocation against the name is then a place the program's own function or
+    /// static fills, as a link resolves it, and never asked of the system's libraries. Which
+    /// one is the reader's to say ([`Made::symbols`]).
+    fn defines(&self, name: &str) -> Option<Defines>;
+}
+
+const SPANS_MAGIC: &[u8; 8] = b"BZSPANS1";
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The file name and the position of span `index` of `table`, a span table as
+/// `blaze_link::SpanTable` encodes it, read in place: what a [`Positions::of`] over the
+/// build's tables answers.
+pub fn position_in(table: &[u8], index: u32) -> Result<(&str, Position), String> {
+    let bad = || "its span table does not read".to_owned(); // alloc: an error
+    if table.get(..8) != Some(SPANS_MAGIC) {
+        return Err(bad());
+    }
+    let files = u32_at(table, 8).ok_or_else(bad)? as usize;
+    // Past the file names, to the spans.
+    let mut at = 12;
+    for _ in 0..files {
+        at += 4 + u32_at(table, at).ok_or_else(bad)? as usize;
+    }
+    let count = u32_at(table, at).ok_or_else(bad)?;
+    if index >= count {
+        return Err(format!("its span table has {count} spans")); // alloc: an error
+    }
+    let row = at + 4 + index as usize * 12;
+    let position = Position {
+        file: u32_at(table, row).ok_or_else(bad)?,
+        line: u32_at(table, row + 4).ok_or_else(bad)?,
+        column: u32_at(table, row + 8).ok_or_else(bad)?,
+    };
+    if position.file as usize >= files {
+        return Err(bad());
+    }
+    // The file's name: the `position.file`th.
+    let mut at = 12;
+    for _ in 0..position.file {
+        at += 4 + u32_at(table, at).ok_or_else(bad)? as usize;
+    }
+    let len = u32_at(table, at).ok_or_else(bad)? as usize;
+    let name = table.get(at + 4..at + 4 + len).ok_or_else(bad)?;
+    let name = core::str::from_utf8(name).map_err(|_| bad())?;
+    Ok((name, position))
 }
 
 const FILE_NAME_DOMAIN: &str = "blaze launch file name 1";
@@ -99,6 +165,7 @@ struct Maker<'a, P> {
     /// What each place is of, to find one named twice.
     targets: Vec<&'a Target>,
     named: Vec<Named>,
+    symbols: Vec<(u32, String)>,
     /// The data made here (file names, then locations follow as they are named), then the
     /// function's or static's own.
     data: Vec<Owned<'a>>,
@@ -117,6 +184,7 @@ impl<'a, P: Positions> Maker<'a, P> {
             places: Vec::new(),
             targets: Vec::new(),
             named: Vec::new(),
+            symbols: Vec::new(),
             data: Vec::new(),
             ids: Vec::new(),
             anchors: Vec::new(),
@@ -152,14 +220,16 @@ impl<'a, P: Positions> Maker<'a, P> {
                 self.named.push(Named::Static((*item, *instance)));
                 Outside::Static
             }
-            Target::Extern(name) | Target::Weak(name) => match self.positions.defined(name) {
-                Some(named @ Named::Function(_)) => {
-                    self.named.push(named);
-                    Outside::Function
-                }
-                Some(named @ Named::Static(_)) => {
-                    self.named.push(named);
-                    Outside::Static
+            Target::Extern(name) | Target::Weak(name) => match self.positions.defines(name) {
+                // The program's own symbol fills it: a numbered place, which the reader
+                // gives the function's slot or the static's number by the name.
+                Some(defines) => {
+                    let place = (self.named.len() + self.symbols.len()) as u32;
+                    self.symbols.push((place, name.clone())); // clone: a name the record's reader resolves
+                    match defines {
+                        Defines::Function => Outside::Function,
+                        Defines::Static => Outside::Static,
+                    }
                 }
                 None if matches!(target, Target::Weak(_)) => Outside::Weak(name),
                 None => Outside::Extern(name),
@@ -313,7 +383,7 @@ impl<'a, P: Positions> Maker<'a, P> {
             What::Static { .. } => size,
         };
         let id = RecordId(*blake3::hash(&out).as_bytes());
-        Ok(Made { id, bytes: out, len, align, named: self.named, anchors: self.anchors })
+        Ok(Made { id, bytes: out, len, align, named: self.named, symbols: self.symbols, anchors: self.anchors })
     }
 }
 

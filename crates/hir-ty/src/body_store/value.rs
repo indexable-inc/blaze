@@ -6,20 +6,10 @@
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
-use hir_def::{
-    DefWithBodyId, ExpressionStoreOwnerId,
-    expr_store::ExpressionStore,
-    hir::{ClosureKind, CoroutineKind, Expr},
-};
-use rustc_type_ir::inherent::IntoKind;
+use hir_def::DefWithBodyId;
 
 use super::{BodyFacts, Step, infer, mir, with_store};
-use crate::{
-    InferBodyId, InferenceResult,
-    mir::{MirOwner, MirStage},
-    next_solver::TyKind,
-    providers::mir_at,
-};
+use crate::{InferenceResult, mir::MirStage, providers::mir_at};
 
 const INFER_DOMAIN: &str = "blaze v2 item store step value 1 inference";
 const MIR_DOMAIN: &str = "blaze v2 item store step value 1 MIR";
@@ -70,35 +60,14 @@ fn mir_hash(
     let mut hasher = Hasher::new(MIR_DOMAIN);
     // alloc: one answer's bytes at a time, reused; once per body a revision, memoized
     let mut bytes = Vec::new();
-    let mut add = |tag: u8, expr: u32, owner: MirOwner<'_>| -> Option<()> {
+    for (place, owner) in mir::owners(db, def) {
         let body = mir_at(db, owner, MirStage::Built).ok()?;
         bytes.clear();
         mir::encode(db, facts, def, body, &mut bytes).ok()?;
-        hasher.update(&[tag]).update(&expr.to_le_bytes()).part(&bytes);
-        Some(())
-    };
-    add(0, u32::MAX, MirOwner::Body(InferBodyId::DefWithBodyId(def)))?;
-    let infer = InferenceResult::of(db, def);
-    let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(def));
-    for (expr, written) in store.exprs() {
-        // The kinds MIR lowering makes a body of, as the borrow check finds them.
-        let Expr::Closure {
-            closure_kind:
-                ClosureKind::Closure
-                | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
-                | ClosureKind::CoroutineClosure(CoroutineKind::Async),
-            ..
-        } = written
-        else {
-            continue;
-        };
-        let at = expr.into_raw().into_u32();
-        match infer.expr_ty(expr).kind() {
-            TyKind::Closure(id, _) => add(1, at, MirOwner::Closure(id.0))?,
-            TyKind::CoroutineClosure(id, _) => add(1, at, MirOwner::Closure(id.0.as_closure(db)))?,
-            TyKind::Coroutine(id, _) => add(2, at, MirOwner::Coroutine(id.0))?,
-            _ => {}
-        }
+        // Its tag and its expression as a `u32`: an expression's index is one, and the body's
+        // `NONE` (all ones) is `u32::MAX`, the bytes this value always hashed.
+        let expr = u32::try_from(place.expr).unwrap_or(u32::MAX);
+        hasher.update(&[place.tag]).update(&expr.to_le_bytes()).part(&bytes);
     }
     Some(hasher.finish())
 }

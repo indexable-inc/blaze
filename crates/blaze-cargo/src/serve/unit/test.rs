@@ -627,7 +627,9 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     let mut by_name: Vec<u32> =
         (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
     blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
-    let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
+    // clone: once per binary, the environment its tests' reads are checked in; each look at
+    // the disk a check makes is the build's own ([`crate::serve::work::JobInput::looks`])
+    let disk = blaze_usercode::inputs::Disk::new(binary.env.clone(), &job.input.looks);
     let selector = job
         .shared
         .selectors

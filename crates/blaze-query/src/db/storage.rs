@@ -664,6 +664,21 @@ impl Storage {
         tables + self.graph_usage().iter().map(MemoryUsage::held).sum::<u64>()
     }
 
+    /// Each function in use, with the values it holds and what it holds in bytes (its row
+    /// pages and what its values hold beside them, [`MemoryUsage::held`]), pushed onto `out`:
+    /// from counters alone, a few loads a function and no row read, so a build's report can say
+    /// what each query holds every time, not only under pressure ([`Storage::memory_usage`] walks
+    /// rows to count the ones in use). Sound with queries running, as every count is an atomic
+    /// load. A task-scoped function ([`super::task_scope`]) has no table here.
+    pub fn held_by_function(&self, out: &mut Vec<(&'static str, u64, u64)>) {
+        for index in self.live() {
+            let Some(vtable) = ingredient::vtable(index) else { continue };
+            let Some(values) = vtable.values else { continue };
+            // alloc: the caller's report, one entry per function in use
+            out.push((vtable.name, values(self, index), (vtable.memory)(self, index).held()));
+        }
+    }
+
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
     fn graph_usage(&self) -> [MemoryUsage; 4] {
         let live = self

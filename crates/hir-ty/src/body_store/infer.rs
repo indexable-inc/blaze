@@ -21,7 +21,7 @@ use hir_def::{
 };
 use std::alloc::Global;
 
-use super::{BodyFacts, INSTALLED, Lookup, Step};
+use super::{BodyFacts, Lookup, REGISTRY, Step};
 use crate::{
     InferenceResult,
     check_cache::ids::{self, IdKind, ItemSink, Table},
@@ -83,7 +83,7 @@ pub(crate) fn inference<'db>(
     def: DefWithBodyId,
     run: impl FnOnce() -> InferenceResult<'db>,
 ) -> InferenceResult<'db> {
-    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return run();
     }
     stored(db, def, run)

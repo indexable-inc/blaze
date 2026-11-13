@@ -25,6 +25,8 @@ use crate::serve::work::{RunPuts, Runs};
 
 pub(crate) mod inproc;
 pub(crate) mod launch;
+#[blaze::sans_io]
+pub(crate) mod needs;
 #[cfg(test)]
 mod tests;
 

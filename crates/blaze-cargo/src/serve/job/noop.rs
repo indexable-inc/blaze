@@ -337,9 +337,13 @@ pub(super) enum Unkept {
     Planned,
     /// Its last build said what a build with nothing to do does not say.
     Said(&'static str),
-    /// Its last build looked at a path outside every view on the disk, the last one this:
-    /// no watch vouches for it, so nothing says it is as it was.
-    Looked(Option<PathBuf>),
+    /// Its last build looked at this path outside every view on the disk, and the look can't
+    /// be made again as the lane is asked (no file's, or one that said two things): no watch
+    /// vouches for it, so nothing says it is as it was.
+    Looked(PathBuf),
+    /// Its last build kept no list of its looks at the disk ([`blaze_vfs::outside::Looks`]),
+    /// so nothing says what it looked at.
+    Unlooked,
     /// This output of its last build, or this directory its outputs are in, is one no watch
     /// can vouch for: an output right in the build directory or under neither build
     /// directory, or a directory that is not there or is named through a symlink.
@@ -356,14 +360,13 @@ impl Unkept {
             Unkept::None | Unkept::Failed | Unkept::Made | Unkept::Planned => None,
             // alloc: a reason, once a refusal
             Unkept::Said(what) => Some(format!("what the last build said ({what})")),
-            Unkept::Looked(Some(path)) => Some(format!(
+            Unkept::Looked(path) => Some(format!(
                 "{}, which no watch covers, so each build looks at it on the disk",
                 path.display()
             )),
-            Unkept::Looked(None) => Some(
-                "a path outside the view which no watch covers, so each build looks at it on the disk"
-                    .to_owned(),
-            ),
+            Unkept::Unlooked => {
+                Some("what the last build looked at on the disk, of which it kept no list".to_owned())
+            }
             Unkept::Outputs(path) => Some(format!(
                 "{}, which no watch can vouch for (an output right in the build directory or outside it, or a \
                  directory of outputs that is not there or is named through a symlink)",
@@ -388,14 +391,12 @@ impl fmt::Display for Unkept {
                 f.write_str("its last build planned anew or wrote a lock file")
             }
             Unkept::Said(what) => write!(f, "its last build said {what}"),
-            Unkept::Looked(Some(path)) => write!(
+            Unkept::Looked(path) => write!(
                 f,
                 "its last build looked at {} on the disk, which no watch covers",
                 path.display()
             ),
-            Unkept::Looked(None) => f.write_str(
-                "its last build looked at a path outside every view on the disk, which no watch covers",
-            ),
+            Unkept::Unlooked => f.write_str("its last build kept no list of what it looked at on the disk"),
             Unkept::Outputs(path) => write!(
                 f,
                 "{} of its last build's outputs is one no watch can vouch for",
@@ -650,7 +651,7 @@ pub(super) struct LastAnswer {
     /// The paths its walk found absent, which no watch can be confirmed of.
     pub(super) absent: Arc<[PathBuf]>,
     /// The files its walk looked at on the disk, which no watch vouched for, each with what
-    /// was there ([`Walk::files`]): looked at again as the lane is asked.
+    /// was there ([`Walk::looks`]): looked at again as the lane is asked.
     pub(super) looked: Arc<[(PathBuf, Option<[u8; 32]>)]>,
     /// What it said, in order, but its `Work` and its progress.
     pub(super) responses: Arc<[Response]>,
@@ -897,14 +898,13 @@ pub(super) struct Walk {
     pub(super) passed: bool,
     /// It compiled, missed, placed and shared nothing, and was not cancelled.
     pub(super) made_nothing: bool,
-    /// [`blaze_vfs::outside::looks`] as it ended.
-    pub(super) looks: u64,
-    /// The last path looked at ([`blaze_vfs::outside::last_look`]), for the reason.
-    pub(super) looked_at: Option<PathBuf>,
-    /// Every look of the walk, when each was of a file and said one thing
-    /// ([`blaze_vfs::outside::take_file_looks`]): the answer is kept with them and each is
-    /// looked at again as the lane is asked. None: some look can't be made again so.
-    pub(super) files: Option<Vec<(PathBuf, Option<[u8; 32]>)>>,
+    /// Every look of the walk at the disk outside every view, with what each saw: the
+    /// build's own [`blaze_vfs::outside::Looks`] as it ended ([`Looks::all`]). When each is
+    /// of a file and said one thing, the answer is kept with them and each is looked at
+    /// again as the lane is asked; any other look keeps no answer.
+    ///
+    /// [`Looks::all`]: blaze_vfs::outside::Looks::all
+    pub(super) looks: Vec<blaze_vfs::outside::Look>,
     /// Its `Work`.
     pub(super) worked: Option<Worked>,
 }
@@ -914,10 +914,8 @@ pub(super) struct Walk {
 /// once it ends, if it made nothing ([`Recording::end`]).
 pub(super) struct Recording {
     inputs: Inputs,
-    /// [`blaze_vfs::outside::generation`] and [`blaze_vfs::outside::looks`] as read before
-    /// it looked at anything.
+    /// [`blaze_vfs::outside::generation`] as read before it looked at anything.
     generation: u64,
-    looks: u64,
     dirs: Vec<PathBuf>,
     absent: Vec<PathBuf>,
     responses: Vec<Response>,
@@ -933,19 +931,17 @@ pub(super) struct Recording {
 
 impl Recording {
     /// A recording of a build of `inputs` whose outputs are in `dirs` and which is to find
-    /// nothing at each of `absent`, the watches' `generation` and the count of `looks` read
-    /// before it looks at anything.
+    /// nothing at each of `absent`, the watches' `generation` read before it looks at
+    /// anything. Its looks are its build's own ([`Walk::looks`]), so none is counted here.
     pub(super) fn new(
         inputs: Inputs,
         generation: u64,
-        looks: u64,
         dirs: Vec<PathBuf>,
         absent: Vec<PathBuf>,
     ) -> Recording {
         Recording {
             inputs,
             generation,
-            looks,
             dirs,
             absent,
             responses: Vec::new(), // alloc: once a build that walks its checkout's last plan
@@ -1043,11 +1039,10 @@ impl Recording {
         // vouch for) is kept with what was there and looked at again as the lane is asked.
         // A look of another kind keeps no answer. Until 2026-11-12 any look kept none: a
         // build script that asked of `/root` was a walk in every build.
-        let looked = match (walk.looks != self.looks, walk.files) {
-            (false, _) => Vec::new(), // alloc: none
-            (true, Some(files)) => files,
-            (true, None) if planted(Plant::KeepsALook) => Vec::new(), // alloc: none
-            (true, None) => return Err(Unkept::Looked(walk.looked_at)),
+        let looked = match files_of(&walk.looks) {
+            Ok(files) => files,
+            Err(_) if planted(Plant::KeepsALook) => Vec::new(), // alloc: none
+            Err(at) => return Err(Unkept::Looked(at)),
         };
         Ok(LastAnswer {
             inputs: self.inputs,
@@ -1063,6 +1058,23 @@ impl Recording {
             read: self.read,
         })
     }
+}
+
+/// The looks of a walk as files and what each held, when every one is of a file and saw one
+/// thing ([`blaze_vfs::outside::Looks::twice`] finds none); else the path of the first look
+/// that is not so, for the reason.
+fn files_of(looks: &[blaze_vfs::outside::Look]) -> Result<Vec<(PathBuf, Option<[u8; 32]>)>, PathBuf> {
+    if let Some((first, _)) = blaze_vfs::outside::Looks::twice(looks).next() {
+        return Err(first.path.clone()); // clone: a reason, once
+    }
+    looks
+        .iter()
+        .map(|look| match look.kind {
+            // clone: kept with the answer, once a build kept
+            blaze_vfs::outside::LookKind::File => Ok((look.path.clone(), look.answer)),
+            _ => Err(look.path.clone()), // clone: a reason, once
+        })
+        .collect() // alloc: once a build kept, its file looks
 }
 
 /// The most request shapes a checkout keeps an answer of ([`Answers`]): the plans it keeps

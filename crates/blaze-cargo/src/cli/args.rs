@@ -56,6 +56,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Check => &[
                 GLOBAL,
@@ -77,6 +78,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -94,10 +96,12 @@ impl Clap for Command {
                 REPORTS,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Test => &[
                 GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
                 JOBS, KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                PREBUILT,
             ],
             Command::Bench => &[
                 GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, NO_TESTS, FEATURES, JOBS,
@@ -369,6 +373,12 @@ const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 const GOAL: &[Flag] =
     &[Flag { possible: blaze_api::Goal::NAMES, ..Flag::new("goal", None, Takes::Value, "GOAL") }];
 
+/// `--no-prebuilt` is blaze's: this request takes no record from a pack source (packs.json's
+/// `remote`, an R2 bucket) and builds what the home's store and the machine's layer miss from
+/// source, the per-request form of packs.json's `"prebuilt": false`
+/// ([`blaze_api::Cargo::prebuilt`]).
+const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
+
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
@@ -407,6 +417,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "fix"
                 | "lint"
                 | "replace"
+                | "no-prebuilt"
         )
     )
 }
@@ -643,6 +654,8 @@ pub struct Flags {
     pub baselines: Option<String>,
     pub bless_baselines: bool,
     pub new_baselines: Vec<String>,
+    /// `--no-prebuilt`: no record of this request comes from a pack source.
+    pub no_prebuilt: bool,
 }
 
 impl Flags {
@@ -706,6 +719,7 @@ impl Flags {
             "replace" => self.replace.extend(owned()),
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
+            "no-prebuilt" => self.no_prebuilt = true,
             "new-baseline" => {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));

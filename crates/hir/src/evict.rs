@@ -19,6 +19,12 @@
 use base_db::{Crate, Db};
 use blaze_query::db::Database as _;
 use hir_def::{DefWithBodyId, nameres::demand::crate_body_owners};
+/// Counting the front ends a daemon keeps, and releasing the trait solver's interner tables once
+/// none is (`hir_ty::evict::release_process_tables`).
+pub use hir_ty::evict::{
+    Released, front_end_dropped, front_end_kept, front_end_taken, release_process_tables,
+    tables_released,
+};
 
 /// What [`drop_crates_after_store`] let go, by how many values: what its span and the release's
 /// line say.

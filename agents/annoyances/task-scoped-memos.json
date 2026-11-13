@@ -1,0 +1,14 @@
+{
+ "id": "task-scoped-memos",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, int-1112 memo lane",
+ "where": "crates/blaze-query/src/db/scoped.rs; crates/hir-ty/src/store_registry.rs (body_store, next_solver/goal_store)",
+ "what": "Every tracked function kept a persistent row, node and edges, even a memo needed only for the length of one task: on tempo's cold build the `query` tag is 37.8 GiB at peak. The two candidates the plan named (hir_ty_pure::walk::summary_in, hir_ty_codegen::v2::frontend::described_memo) could not be marked: described_memo is the key set of the engine's changed set (its changed_since feeds the driver's patch walk), and summary_in returns &'db Summary to ~25 callers reached from entry points in five crates. Separately, goal_store kept its own fixed table of 16 stores, a copy of body_store's registry from before that one grew.",
+ "cost": "the scoped engine lands with no production user yet; the tempo `query` number does not move until a function with no changed_since role and an owned return is marked",
+ "cause": "a memo's lifetime was not a property a function could state, so every memo was persistent; and a registry was copied into a second store rather than shared, so a fix to one (growth) missed the other",
+ "class": "a lifetime that is the task's held as the database's; one concept with two homes",
+ "prevention": "`#[tracked(scope = task)]` plus `task_scope`, refused at the macro for returns(ref)/lru/cycle_result, refused at run time outside a scope; one `store_registry::Registry<T>` for every per-database store",
+ "workaround": "none",
+ "fix": "scoped.rs (rows in the outermost task scope's blaze_mem frame, reads forwarded deduplicated into the persistent caller); Storage::held_by_function from counters; Registry<T> with Linked<T> guard used by body_store and goal_store. Controls: scoped::probe::DROP_FORWARDED_READS makes the memo test miss its caller's edge; clearing a slot makes the registry test miss its store.",
+ "state": "written, not yet built"
+}

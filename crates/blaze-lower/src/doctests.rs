@@ -214,6 +214,9 @@ impl Lowered {
                 manifest_kind: kind,
                 crate_types: kind.default_crate_types(),
                 proc_macro_cwd: base.proc_macro_cwd.clone(),
+                // An example crate is never sealed, whatever its library's pin: its root
+                // file is in a local root, written again by each build.
+                sealed: None,
             };
             // A test example's has `test` too.
             let cfg = match program.test {

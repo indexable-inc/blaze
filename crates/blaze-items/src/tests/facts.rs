@@ -2,16 +2,14 @@
 
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
-use hir_def::{
-    AdtId, DefWithBodyId, ModuleId, TraitId, expr_store::Body, hir::Expr, nameres::crate_def_map,
-};
+use hir_def::{AdtId, DefWithBodyId, TraitId, expr_store::Body, hir::Expr};
 use hir_expand::fixture;
 use hir_ty::{
     db::{InternedClosure, InternedClosureId},
     next_solver::SimplifiedType as HirSimplifiedType,
 };
 
-use super::{TestDB, edit, item, single};
+use super::{TestDB, edit, item, module, single};
 use crate::{
     Fact, ItemId, ItemKey, ScopeEntry, ScopeIndexKey, captures, code, const_value,
     const_value_of_static, discriminant, drop_check, hidden_types, implements, item_key, key,
@@ -41,15 +39,6 @@ fn trait_(db: &TestDB, path: &str) -> TraitId {
 
 fn implements_of(db: &TestDB, trait_path: &str, ty: &str) -> Fact {
     implements(db, trait_(db, trait_path), &HirSimplifiedType::Adt(adt(db, ty).into()))
-}
-
-#[track_caller]
-fn module(db: &TestDB, name: &str) -> ModuleId {
-    crate_def_map(db, fixture::test_crate(db))
-        .modules(db)
-        .map(|(id, _)| id)
-        .find(|id| id.name(db).is_some_and(|it| it.as_str() == name))
-        .unwrap_or_else(|| panic!("no module `{name}`"))
 }
 
 fn resolves_of(db: &TestDB, scope: &str, name: &str) -> Fact {
@@ -521,7 +510,7 @@ fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     let fact = Fact::Crate(key::crate_key(&db, krate));
     let gone = val(&db, fact);
     std::fs::create_dir_all(&dir).expect("the temporary directory");
-    assert!(db.reload_included_file(&path), "a directory is another error");
+    assert!(db.reload_included_file(&path, &base_db::Looks::none()), "a directory is another error");
     let directory = val(&db, fact);
     std::fs::remove_dir_all(&dir).expect("the temporary directory");
     assert_ne!(gone, directory, "two errors are two values");

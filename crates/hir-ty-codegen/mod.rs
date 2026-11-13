@@ -3913,6 +3913,15 @@ struct SuspendedState {
     held: hir_ty_mir::mir::HeldLocals,
 }
 
+/// The bugs a test plants in the process caches of interned rows.
+#[cfg(test)]
+pub(crate) mod plant {
+    /// [`super::erase_regions`]' map is kept across a release of the interner's tables, as
+    /// before it kept the release it was filled under.
+    pub(crate) static KEEPS_ERASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
 /// code, and the ones a caller passes on are its own parameters, which mean nothing in the
 /// callee. The fold is compile identity's ([`hir_ty_identity::instance::erased`]), which folds
@@ -3929,25 +3938,41 @@ pub(crate) fn erase_regions<'db>(
     use rustc_type_ir::TypeVisitableExt;
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
+    /// The release of the interner's tables ([`hir_ty::evict::tables_released`]) the map was
+    /// filled under, and the map: a release frees the rows it names, and the next row interned
+    /// takes a freed one's number, so the map starts over when the count moved. A release runs
+    /// only while no task does, so this thread's first use after it sees the move.
+    type Erased = (u64, HashMap<StoredGenericArgs, StoredGenericArgs, Global>);
     thread_local! {
-        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs, Global>> =
-            std::cell::RefCell::default();
+        static ERASED: std::cell::RefCell<Erased> = std::cell::RefCell::default();
     }
     // Binders are anonymized too (`erased`), so a type with bound variables but no free region
     // is erased as well: `for<'a> fn(&'a u8)` and `for<'b> fn(&'b u8)` are one instance.
     if !args.has_type_flags(hir_ty_identity::instance::ERASES) {
         return args;
     }
+    let released = hir_ty::evict::tables_released();
     let key = args.store();
-    if let Some(known) = ERASED.with_borrow(|it| it.get(&key).map(|it| it.as_ref())) {
+    let known = ERASED.with_borrow_mut(|(under, map)| {
+        #[cfg(test)]
+        if plant::KEEPS_ERASED.load(std::sync::atomic::Ordering::Relaxed) {
+            *under = released;
+        }
+        if *under != released {
+            map.clear();
+            *under = released;
+        }
+        map.get(&key).map(|it| it.as_ref())
+    });
+    if let Some(known) = known {
         return known;
     }
     let erased = hir_ty_identity::instance::erased(interner, args);
-    ERASED.with_borrow_mut(|it| {
-        if it.len() >= KEPT {
-            it.clear();
+    ERASED.with_borrow_mut(|(_, map)| {
+        if map.len() >= KEPT {
+            map.clear();
         }
-        it.insert(key, erased.store());
+        map.insert(key, erased.store());
     });
     erased
 }

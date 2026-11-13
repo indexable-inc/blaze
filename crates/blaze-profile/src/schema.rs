@@ -31,7 +31,9 @@ use crate::span;
 /// (2026-11-11), who ends a `wait`, said by every one: null in a file from before, where a null
 /// `owner` meant "not known". Still 5 with `query_counts`' validity census (2026-11-12:
 /// `proved_*`, `edge_*` and `edges_compared`), nullable and at the table's end: null in a file
-/// from before, where nothing counted them.
+/// from before, where nothing counted them. Still 5 with `builds.solo_slot` and
+/// `solo_certified_by` (2026-11-12), a solo answer's build, nullable and at the table's end:
+/// null in a file from before, where every build was a daemon's.
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
@@ -492,6 +494,16 @@ pub const BUILDS: Table = Table {
             "daemon_system_ns",
             Type::I64,
             "the daemon process's system CPU over the build, as `daemon_user_ns`",
+        ),
+        opt(
+            "solo_slot",
+            Type::Utf8,
+            "for a solo answer, the key of the request slot it was answered from: its client checked that nothing changed and answered with no daemon asked, and the next daemon took its kept rows; its `started_ns` and `client_started_ns` are the client's start, `client_ended_ns` its end, `misses` 0, `hits` and `tree` null. Null for a build a daemon ran, and in rows of a blaze before it",
+        ),
+        opt(
+            "solo_certified_by",
+            Type::U64,
+            "for a solo answer, the build whose answer its slot held: the build that last ran the request; null for none, and as `solo_slot`",
         ),
     ],
 };

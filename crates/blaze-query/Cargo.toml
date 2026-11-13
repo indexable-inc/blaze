@@ -14,7 +14,6 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-bytes.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
@@ -31,7 +30,6 @@ crossbeam-queue.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
-intern.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 thin-vec.workspace = true

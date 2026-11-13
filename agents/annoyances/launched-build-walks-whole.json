@@ -1,0 +1,14 @@
+{
+ "id": "launched-build-walks-whole",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 7b T1, int-1112",
+ "where": "crates/blaze-codegen/src/driver/start.rs (new), driver/near.rs; caller crates/blaze-cargo/src/serve/unit/codegen.rs generate",
+ "what": "A launched `blaze run` built whole: `generate` called `run_with_statics` whatever the mode, so a cold hello-world walked, described and compiled everything the program reaches (2,938 ms of 9,727 ms in the codegen walk) though the launcher calls some 210 functions. The one-function form (`Build::near`, `compile_near`) existed and nothing called it.",
+ "cost": "cold hello 9,727 ms against the competitor's 220 ms; codegen 188 MB and link 163 MB held warm",
+ "cause": "the launcher was added on top of the whole build's output (`Built`, the linked image) instead of on the one-function form, so the whole walk stayed the producer of every launched function",
+ "class": "a lazy consumer fed by an eager producer: the laziness is only at the edge and the cost is paid whole",
+ "prevention": "a launched run's codegen has no entry point that walks: `Build::start` makes the entry and what start sections name, `Build::one`/`Build::one_static` the rest on first call; the refinement test holds them to the whole build byte for byte",
+ "workaround": "none",
+ "fix": "Build::start, Build::one, Build::one_static (T1 of /tmp/plan/7b-launched.md); the daemon's driver (T3) calls them. Tests: driver::tests::start (refinement with Planted::WeakByKey as control).",
+ "state": "written, not built"
+}

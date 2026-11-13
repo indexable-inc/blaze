@@ -8,8 +8,9 @@ use std::{
     collections::HashMap,
     format,
     path::{Path as FsPath, PathBuf},
-    string::String,
+    string::{String, ToString},
     sync::Arc,
+    vec,
     vec::Vec,
 };
 
@@ -669,7 +670,7 @@ fn a_derive_reads_a_struct() {
         .collect();
     assert_eq!(fields, [("x", String::from("&'aT")), ("y", String::from("[u8;4]"))]);
     let name = strukt.name().and_then(|it| it.token()).expect("a name token");
-    assert_eq!(name.span(), name.index(), "the test's spans are the element numbers");
+    assert_eq!(name.span().index(), name.index(), "the test's spans are the element numbers");
 }
 
 /// The numbers of `kinds.rs` are `SyntaxKind`'s, and its token kinds have [`TOKEN`].
@@ -694,7 +695,9 @@ fn kinds_are_the_grammars() {
         let (name, _) = rest.split_once(':').expect("NAME: u16 = ..");
         let kind = *by_name.get(name).unwrap_or_else(|| panic!("no SyntaxKind::{name}"));
         let number = kind as u16;
-        let token = if number < first_node { " | TOKEN" } else { "" };
+        // A kind is a token's when it is before `ABI` or has a fixed text: the grammar numbers
+        // a few contextual keywords after its nodes.
+        let token = if number < first_node || !kind.text().is_empty() { " | TOKEN" } else { "" };
         let want = format!("pub(crate) const {name}: u16 = {number}{token};");
         if line != want {
             wrong.push(format!("{line}  (the grammar's: {want})"));
@@ -712,4 +715,252 @@ fn kinds_are_the_grammars() {
             );
         }
     }
+}
+
+// --- The builder ---------------------------------------------------------------------------
+
+/// Copies element `at` of `arrays` and its subtree into `b`, element by element: a node is
+/// `open` and `close` around its children, a token is `token_at` with its text and span.
+fn copy(arrays: &Arrays, at: usize, b: &mut Builder<'_>) {
+    let kind = arrays.kinds[at];
+    if kind & TOKEN != 0 {
+        b.token_at(arrays.texts[at], Span(arrays.spans[at]));
+        return;
+    }
+    let open = b.open(Kind(kind));
+    let end = arrays.ends[at] as usize;
+    let mut child = at + 1;
+    while child < end {
+        copy(arrays, child, b);
+        child = arrays.ends[child] as usize;
+    }
+    b.close(open);
+}
+
+/// Built arrays, owned, to compare (and, for the control, to break).
+struct Rebuilt {
+    kinds: Vec<u16>,
+    sizes: Vec<u32>,
+    spans: Vec<u32>,
+    texts: Vec<String>,
+}
+
+/// Element `at` of `arrays` and its subtree, rebuilt through `Builder::over` into arrays just
+/// as long.
+fn rebuild(arrays: &Arrays, at: usize) -> Rebuilt {
+    let n = (arrays.ends[at] as usize) - at;
+    // alloc: a test's buffers, one set per item rebuilt
+    let (mut kinds, mut sizes, mut spans) = (vec![0u16; n], vec![0u32; n], vec![0u32; n]);
+    // alloc: as above
+    let mut texts: Vec<&str> = vec![""; n];
+    let built = {
+        let mut b = Builder::over(&mut kinds, &mut sizes, &mut spans, &mut texts, Span::call_site());
+        copy(arrays, at, &mut b);
+        assert_eq!(b.len() as usize, n, "the builder wrote one element per element");
+        b.finish(Entry::Items)
+    };
+    assert_eq!(built.entry() as u8, Entry::Items as u8);
+    // alloc: owned, past the builder's buffers
+    let texts = built.texts().iter().map(|text| String::from(*text)).collect();
+    Rebuilt {
+        kinds: built.kinds().to_vec(), // alloc: owned, so the control can break one
+        sizes: built.sizes().to_vec(), // alloc: as above
+        spans: built.spans().to_vec(), // alloc: as above
+        texts,
+    }
+}
+
+/// Whether `built` is element `at` of `arrays` and its subtree: a node's kind, a token as
+/// [`TOKEN`] (its kind is the host's to find), each size `ends[i] - i`, each span and text.
+/// The first difference is named by the built element's number.
+fn same_tree(built: &Rebuilt, arrays: &Arrays, at: usize) -> Result<(), String> {
+    let n = (arrays.ends[at] as usize) - at;
+    if built.kinds.len() != n {
+        return Err(format!("built {} elements where the tree has {n}", built.kinds.len()));
+    }
+    for i in 0..n {
+        let j = at + i;
+        let token = arrays.kinds[j] & TOKEN != 0;
+        let kind = if token { TOKEN } else { arrays.kinds[j] };
+        let size = arrays.ends[j] - j as u32;
+        let span = arrays.spans[j];
+        let text = arrays.texts[j];
+        let differs = |what: &str, got: String, want: String| {
+            Err(format!("element {i} (the tree's {j}): its {what} is {got}, the tree's {want}"))
+        };
+        if built.kinds[i] != kind {
+            return differs("kind", built.kinds[i].to_string(), kind.to_string());
+        }
+        if built.sizes[i] != size {
+            return differs("size", built.sizes[i].to_string(), size.to_string());
+        }
+        if built.spans[i] != span {
+            return differs("span", built.spans[i].to_string(), span.to_string());
+        }
+        if built.texts[i] != text {
+            return differs("text", format!("{:?}", built.texts[i]), format!("{text:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The refinement: a tree copied element by element through `Builder::over` (open, token_at,
+/// close) has the kinds, sizes (`ends[i] - i`), spans and texts of the tree it was copied
+/// from, for every item of every file of the corpus `the_views_are_syntax_asts` walks: the
+/// builder can write every tree the parser makes, and sizes are relative, so an item rebuilt
+/// alone is the same run of elements it is inside its file. The control is
+/// `the_rebuild_check_catches_a_size_off_by_one`.
+#[test]
+fn every_item_rebuilt_is_the_parsers() {
+    let mut items = 0usize;
+    let mut elements = 0usize;
+    for file in corpus() {
+        let text =
+            std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let root = AstFile::parse(&text, Edition::CURRENT).syntax_node();
+        let root = match root.flat() {
+            Some(_) => root,
+            None => root.to_flat(),
+        };
+        let arrays = Arrays::of(&flat(&root));
+        let mut at = 1usize;
+        while at < arrays.kinds.len() {
+            if arrays.kinds[at] & TOKEN == 0 {
+                let rebuilt = rebuild(&arrays, at);
+                if let Err(e) = same_tree(&rebuilt, &arrays, at) {
+                    panic!("{}: the item at element {at}: {e}", file.display());
+                }
+                items += 1;
+                elements += rebuilt.kinds.len();
+            }
+            at = arrays.ends[at] as usize;
+        }
+    }
+    assert!(items > 1_000, "the corpus has {items} items");
+    std::eprintln!("{items} items, {elements} elements rebuilt");
+}
+
+/// The planted bug for `every_item_rebuilt_is_the_parsers`: a rebuilt tree with one size one
+/// too big is not the parser's, and the compare names that element.
+#[test]
+fn the_rebuild_check_catches_a_size_off_by_one() {
+    let text = "pub struct A<T> { x: T, y: [u8; 4] }";
+    let arrays = Arrays::of(AstFile::parse(text, Edition::CURRENT).root().shared_file());
+    let at = 1;
+    assert_eq!(arrays.kinds[at], kinds::STRUCT, "element 1 is the struct");
+    let mut rebuilt = rebuild(&arrays, at);
+    assert_eq!(same_tree(&rebuilt, &arrays, at), Ok(()), "the rebuild before the bug");
+    let broken = rebuilt.kinds.len() / 2;
+    rebuilt.sizes[broken] += 1;
+    let error = same_tree(&rebuilt, &arrays, at).expect_err("an off-by-one size");
+    assert!(error.starts_with(&format!("element {broken} ")), "{error}");
+    assert!(error.contains("its size is"), "{error}");
+}
+
+/// The invariant: a splice is one element, `SPLICE` with the input's number as its kind, size
+/// 1, and the spliced element's number as its span; a token's splice inside `wrap` is the
+/// wrapping nodes, outer to inner, each holding the rest. The control is the same splices of
+/// input 0, whose kinds differ.
+#[test]
+fn a_splice_is_one_element_naming_the_input() {
+    let text = "struct Point { x: i32 }";
+    let arrays = Arrays::of(AstFile::parse(text, Edition::CURRENT).root().shared_file());
+    let spliced = |input: u32| {
+        let tree = Tree { input, ..arrays.tree() };
+        let strukt = tree.item().and_then(|it| it.as_struct()).expect("a struct");
+        let name = strukt.name().expect("a name");
+        let token = name.token().expect("a name token");
+        let (mut kinds, mut sizes, mut spans) = ([0u16; 5], [0u32; 5], [0u32; 5]);
+        let mut texts = [""; 5];
+        let mut b = Builder::over(&mut kinds, &mut sizes, &mut spans, &mut texts, Span::mixed_site());
+        strukt.splice(&mut b, &[]);
+        b.tok(token);
+        name.splice(&mut b, &[Kind::PATH, Kind::PATH_SEGMENT]);
+        let built = b.finish(Entry::Items);
+        let out = (
+            built.kinds().to_vec(), // alloc: compared below
+            built.sizes().to_vec(), // alloc: as above
+            built.spans().to_vec(), // alloc: as above
+            built.texts().iter().all(|it| it.is_empty()),
+        );
+        (out, strukt.syntax().index(), token.index())
+    };
+    let ((kinds, sizes, spans, no_texts), strukt, token) = spliced(3);
+    assert_eq!(kinds, [SPLICE | 3, SPLICE | 3, kinds::PATH, kinds::PATH_SEGMENT, SPLICE | 3]);
+    assert_eq!(sizes, [1, 1, 3, 2, 1]);
+    assert_eq!(spans, [strukt, token, NO_SPAN, NO_SPAN, token]);
+    assert!(no_texts, "a splice and a node have no text");
+    let ((control, ..), ..) = spliced(0);
+    assert_eq!(control[0], SPLICE, "input 0's splice");
+    assert_ne!(control, kinds, "the input's number is in the kind");
+}
+
+/// The node kinds of the grammar (from `ABI`, without the contextual keywords it numbers after
+/// its nodes) that `kinds.rs` or `kinds!(..)` lacks, and the names in `kinds!(..)` that are no
+/// node kind.
+fn kinds_not_public(kinds_rs: &str, names: &[&str]) -> Vec<String> {
+    let nodes: Vec<String> = (SyntaxKind::ABI as u16..SyntaxKind::__LAST as u16)
+        .map(SyntaxKind::from)
+        .filter(|it| it.text().is_empty())
+        .map(|it| format!("{it:?}"))
+        .collect();
+    let in_file: Vec<&str> = kinds_rs
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub(crate) const "))
+        .filter(|rest| !rest.contains("| TOKEN"))
+        .filter_map(|rest| rest.split_once(':').map(|(name, _)| name))
+        .collect();
+    let mut wrong = Vec::new();
+    for node in &nodes {
+        if !in_file.contains(&node.as_str()) {
+            wrong.push(format!("{node} has no line in kinds.rs"));
+        }
+        if !names.contains(&node.as_str()) {
+            wrong.push(format!("{node} is not in kinds!(..)"));
+        }
+    }
+    for name in names {
+        if !nodes.iter().any(|it| it == name) {
+            wrong.push(format!("kinds!(..) names {name}, which is no node kind"));
+        }
+    }
+    wrong
+}
+
+/// The invariant: every node kind of the grammar is a `Kind` constant (so a macro can open
+/// any node the parser makes) and has its number in `kinds.rs`, and `Kind` names nothing
+/// else. The control: the list without one name is caught, naming it.
+#[test]
+fn every_node_kind_is_public() {
+    let path = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("src/kinds.rs");
+    let text = std::fs::read_to_string(&path).expect("kinds.rs");
+    let wrong = kinds_not_public(&text, crate::builder::KIND_NAMES);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let short: Vec<&str> =
+        crate::builder::KIND_NAMES.iter().copied().filter(|it| *it != "IMPL").collect();
+    assert_eq!(kinds_not_public(&text, &short), ["IMPL is not in kinds!(..)"]);
+}
+
+/// The invariant: `close` closes only the innermost open node.
+#[test]
+#[should_panic(expected = "const_ast::Builder::close: the node is not the innermost open one")]
+fn a_close_out_of_order_panics() {
+    let (mut kinds, mut sizes, mut spans) = ([0u16; 4], [0u32; 4], [0u32; 4]);
+    let mut texts = [""; 4];
+    let mut b = Builder::over(&mut kinds, &mut sizes, &mut spans, &mut texts, Span::call_site());
+    let outer = b.open(Kind::IMPL);
+    let _inner = b.open(Kind::ASSOC_ITEM_LIST);
+    b.close(outer);
+}
+
+/// The invariant: a fixed builder never writes past its arrays, and says how many they hold.
+#[test]
+#[should_panic(expected = "const_ast::Builder: the output has more than 2 elements")]
+fn a_full_fixed_builder_panics_naming_its_size() {
+    let (mut kinds, mut sizes, mut spans) = ([0u16; 2], [0u32; 2], [0u32; 2]);
+    let mut texts = [""; 2];
+    let mut b = Builder::over(&mut kinds, &mut sizes, &mut spans, &mut texts, Span::call_site());
+    b.token("a");
+    b.token("b");
+    b.token("c");
 }

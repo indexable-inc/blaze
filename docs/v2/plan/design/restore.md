@@ -52,11 +52,9 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
     in `crates/blaze-cargo/src/serve/tests.rs`.
 - **Each phase of a start is a span** (target `blaze`, under `daemon start`):
   - `read the state` (the journal, the image's map, both stores' opens);
-  - `restore the symbols`;
   - `restore the VFS`;
-  - `open the database`;
-  - `restore the plane's history`;
-  - `install the library's trees`.
+  - `open the database` (an empty one: no engine state is restored);
+  - `restore the plane's history`.
 
   The budgets are `harness/v2/budgets.py`'s `restart-first-answer-clean` and
   `restart-first-answer-kill9`.
@@ -100,7 +98,7 @@ and one identity for the whole front end.
 |---|---|---|
 | the rows' graph (edges 108, readers 106, nodes 105 MiB) | 320 MiB | readers: not held for a library's rows (built, below); edges: step 2 |
 | def map, lang items, name resolution's state | about 470 MiB | a record (`nameres::frozen`), decoded to heap; the maintainer keeps state for a served crate's readers |
-| syntax, item trees, macro expansions | about 550 MiB | library trees in the daemon image; expansions heap only |
+| syntax, item trees, macro expansions | about 550 MiB | heap only, parsed again after a restart |
 | signatures | about 110 MiB | a record read in place an item (`deps::signatures`), then memoized on the heap |
 | bodies, inference, MIR | let go at a build's end | records by body key (the item store) |
 | impls and method resolution's tables | with nameres | none |
@@ -520,7 +518,7 @@ code and said so.
 
 | Step | Where | What it costs on reth |
 |---|---|---|
-| 1. `daemon start` | `serve/daemon.rs`: read the state, restore the symbols, restore the VFS, open the database, restore the plane's history, install the library's trees | not in the build's numbers. The VFS's Merkle tree comes back whole (every file's and directory's content ID) and the watcher goes on from its saved cursor and stamps, so no file is read or hashed here. The front end's database is not persisted (constraint 2, below) |
+| 1. `daemon start` | `serve/daemon.rs`: read the state, restore the VFS, open an empty database, restore the plane's history | not in the build's numbers. The VFS's Merkle tree comes back whole (every file's and directory's content ID) and the watcher goes on from its saved cursor and stamps, so no file is read or hashed here. The front end's database is not persisted (constraint 2, below) |
 | 2. the request's plan | watches, `std library`, `plan` | not split out in what was sent |
 | 3. a new database | `Real::lower` (`serve/unit.rs`) with nothing kept: `blaze_lower::lower`, `lower_writes` | read: `files::Mounts::walk` takes every file of every package directory of the plan from the tree with its bytes, and `base_db::Files::set_view_root` hashes every file's bytes again to check the ID the tree gave (`content::hash_many`) and writes each as an input. **The 36,408 inputs written are here, by reading**: a text input a file, each file's source root, each root's file set, each crate's inputs. Bounded by the files of the plan's packages, not by the plan. The split by input kind is asked of reth-1112 (`blaze explain writes build=43`) |
 | 4. the keys | `deps::serve` of the ready units: `Walked::keys`, `hir_def::deps::image_key` | a hash a crate over its inputs and (path, content ID) of each file of its source root. It needs content IDs, never text; it gets them from the inputs step 3 wrote |

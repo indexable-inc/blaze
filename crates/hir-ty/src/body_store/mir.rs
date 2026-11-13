@@ -15,13 +15,12 @@ mod tests;
 use std::mem::{self, offset_of};
 
 use base_db::Db;
-use blaze_format::{
-    ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of,
-};
+use blaze_format::{ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as};
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     expr_store::Body,
+    expr_store::ExpressionStore,
     hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, Movability},
 };
 use hir_expand::{
@@ -30,12 +29,14 @@ use hir_expand::{
 };
 
 use super::{
-    BodyFacts, INSTALLED, Lookup, Step,
+    BodyFacts, Lookup, REGISTRY, Step,
     infer::{Keyed, items_of},
     with_crate_attrs,
 };
+use rustc_type_ir::inherent::IntoKind;
+
 use crate::{
-    InferBodyId,
+    InferBodyId, InferenceResult,
     check_cache::ids::{self, Table},
     db::{HirDatabase, InternedClosure},
     mir::{
@@ -43,7 +44,7 @@ use crate::{
         persist::{self, Locations},
     },
     next_solver::{
-        DbInterner,
+        DbInterner, TyKind,
         persist::{TABLE_SCHEMA, TyTableWriter},
     },
 };
@@ -117,9 +118,9 @@ blaze_format::record! {
 
 const _: () = assert!(size_of::<MirAnswerRoot>() == 48);
 
-/// The schema of a MIR answer and of everything its bytes are made with; [`place`] adds the
-/// owner's place to it, and [`super::with_crate_attrs`] the crate attributes that change MIR.
-const SCHEMA: SchemaHash = schema_of(&[
+/// The schema of a MIR answer and of everything its bytes are made with; [`schema_of`] adds the
+/// owner's [`place`] to it, and [`super::with_crate_attrs`] the crate attributes that change MIR.
+const SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Str("blaze v2 item store MIR 1"),
     Part::Schema(<MirAnswerRoot as Record>::SCHEMA),
     Part::Schema(persist::SCHEMA),
@@ -151,7 +152,7 @@ pub(crate) fn built<'db>(
     owner: MirOwner<'db>,
     run: impl FnOnce() -> Built<'db>,
 ) -> Built<'db> {
-    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return run();
     }
     stored(db, owner, run)
@@ -159,7 +160,8 @@ pub(crate) fn built<'db>(
 
 #[inline(never)]
 fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'db>) -> Built<'db> {
-    let Some((def, schema)) = place(db, owner) else { return run() };
+    let Some((def, at)) = place(db, owner) else { return run() };
+    let schema = schema_of(db, def, at);
     match lookup_mir(db, def, owner, schema) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
@@ -192,13 +194,68 @@ fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'d
     }
 }
 
-/// The body `owner`'s record is filed under, and the schema of its answers: [`SCHEMA`] with
-/// which MIR owner of the body it is and its place there. `None` for an owner of no body.
-pub(super) fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, SchemaHash)> {
-    let (tag, closure): (u64, InternedClosure<'db>) = match owner {
+/// Which MIR owner of a body a record is of, and where in the body: the four numbers
+/// [`SCHEMA`] is extended by for the owner's answers ([`schema_of`]). `tag` is 0 for the body
+/// or an anonymous constant of it, 1 for a closure, 2 for a coroutine, 3 for a by-move
+/// coroutine; `anon` is an anonymous constant's expression and whether it may use the body's
+/// generic parameters ([`in_body`]); `expr` a closure's or coroutine's expression and `kind`
+/// its [`kind_code`]; each [`NONE`] where the owner has none of it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Place {
+    pub tag: u8,
+    pub anon: u64,
+    pub expr: u64,
+    pub kind: u64,
+}
+
+impl Place {
+    /// The body's own MIR.
+    pub const BODY: Place = Place { tag: 0, anon: NONE, expr: NONE, kind: NONE };
+
+    /// Its stable bytes: `tag`, then `anon`, `expr` and `kind`, each little-endian.
+    pub fn bytes(self) -> [u8; 25] {
+        let mut out = [0; 25];
+        out[0] = self.tag;
+        out[1..9].copy_from_slice(&self.anon.to_le_bytes());
+        out[9..17].copy_from_slice(&self.expr.to_le_bytes());
+        out[17..25].copy_from_slice(&self.kind.to_le_bytes());
+        out
+    }
+
+    /// The place [`Place::bytes`] wrote as `bytes`.
+    pub fn read(bytes: &[u8; 25]) -> Place {
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        Place { tag: bytes[0], anon: word(1), expr: word(9), kind: word(17) }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the owners' oracle's control: [`place`] gives [`Place::BODY`] for
+    /// every owner, as a filing that kept one MIR entry a body would.
+    pub(super) static ONE_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn planted(place: Place) -> Place {
+    match ONE_PLACE.with(std::cell::Cell::get) {
+        true => Place::BODY,
+        false => place,
+    }
+}
+
+#[cfg(not(test))]
+fn planted(place: Place) -> Place {
+    place
+}
+
+/// The body `owner`'s record is filed under, and its place there: which MIR owner of the body
+/// it is and where. `None` for an owner of no body.
+pub(super) fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Place)> {
+    let (tag, closure): (u8, InternedClosure<'db>) = match owner {
         MirOwner::Body(body) => {
             let (def, anon) = in_body(db, body)?;
-            return Some((def, with_crate_attrs(db, def, schema_at(0, anon, NONE, NONE))));
+            return Some((def, planted(Place { tag: 0, anon, expr: NONE, kind: NONE })));
         }
         MirOwner::Closure(it) => (1, it.loc(db)),
         MirOwner::Coroutine(it) => (2, it.loc(db)),
@@ -206,8 +263,50 @@ pub(super) fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBo
     };
     let InternedClosure { owner, expr, kind } = closure;
     let (def, anon) = in_body(db, owner)?;
-    let schema = schema_at(tag, anon, u64::from(expr.into_raw().into_u32()), kind_code(kind));
-    Some((def, with_crate_attrs(db, def, schema)))
+    let place = Place { tag, anon, expr: u64::from(expr.into_raw().into_u32()), kind: kind_code(kind) };
+    Some((def, planted(place)))
+}
+
+/// The schema of the answers of `def`'s MIR owner at `place`: [`SCHEMA`] with the place, and
+/// the crate attributes that change MIR ([`super::with_crate_attrs`]).
+pub(super) fn schema_of(db: &Db, def: DefWithBodyId, place: Place) -> SchemaHash {
+    with_crate_attrs(db, def, schema_at(u64::from(place.tag), place.anon, place.expr, place.kind))
+}
+
+/// The MIR owners of `def` an entry keys, each with its [`place`]: the body, then each closure
+/// and `async` coroutine written in it, reached or not, in the order of their expressions (the
+/// kinds MIR lowering makes a body of, as the borrow check finds them). Not here: an anonymous
+/// constant's MIR, a by-move coroutine's and a `gen` coroutine's.
+pub(super) fn owners<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(Place, MirOwner<'db>)> {
+    // alloc: the body's owners, a handful
+    let mut out = Vec::new();
+    let mut push = |owner: MirOwner<'db>| {
+        if let Some((_, place)) = place(db, owner) {
+            out.push((place, owner));
+        }
+    };
+    push(MirOwner::Body(InferBodyId::DefWithBodyId(def)));
+    let infer = InferenceResult::of(db, def);
+    let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(def));
+    for (expr, written) in store.exprs() {
+        let Expr::Closure {
+            closure_kind:
+                ClosureKind::Closure
+                | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                | ClosureKind::CoroutineClosure(CoroutineKind::Async),
+            ..
+        } = written
+        else {
+            continue;
+        };
+        match infer.expr_ty(expr).kind() {
+            TyKind::Closure(id, _) => push(MirOwner::Closure(id.0)),
+            TyKind::CoroutineClosure(id, _) => push(MirOwner::Closure(id.0.as_closure(db))),
+            TyKind::Coroutine(id, _) => push(MirOwner::Coroutine(id.0)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The body `owner` is of, and where in it when `owner` is an anonymous constant of it: its
@@ -231,7 +330,7 @@ pub(crate) fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId,
 }
 
 fn schema_at(tag: u64, anon: u64, expr: u64, kind: u64) -> SchemaHash {
-    schema_of(&[
+    blaze_format::schema_of(&[
         Part::Schema(SCHEMA),
         Part::U64(tag),
         Part::U64(anon),
@@ -262,7 +361,8 @@ pub(crate) fn kind_code(kind: ClosureKind) -> u64 {
     }
 }
 
-/// `owner`'s stored MIR, made in this database; `def` and `schema` are its [`place`].
+/// `owner`'s stored MIR, made in this database; `def` and `schema` are its [`place`] and its
+/// [`schema_of`].
 fn lookup_mir<'db>(
     db: &'db Db,
     def: DefWithBodyId,

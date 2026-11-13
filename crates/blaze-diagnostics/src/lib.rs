@@ -19,7 +19,9 @@
 //! A check is one task: its tables live in the task's [`blaze_mem::Frame`] ([`Cx::frame`]),
 //! freed in one go when it returns. Only the diagnostics it gives outlive it.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool, custom_inner_attributes)]
+// `#![blaze::sans_io]` and blaze's other extensions; inert under rustc.
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
@@ -35,6 +37,7 @@ pub mod emit;
 pub mod lints;
 mod lower;
 pub mod model;
+mod pieces;
 pub mod print;
 pub mod reach;
 #[cfg(test)]

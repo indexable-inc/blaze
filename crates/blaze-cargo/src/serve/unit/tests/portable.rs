@@ -141,6 +141,7 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
         files: &tree,
         root: view,
         host_cpu: None,
+        sealed: &blaze_lower::unsealed(&units),
     })
     .unwrap();
     let places = at.places();

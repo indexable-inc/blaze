@@ -20,9 +20,13 @@
 //! | an impl method's types for the trait method's `impl Trait`s | `RpititTys(impl method)` |
 //! | the target's data layout | `Target(crate)` |
 //! | a dependency's batches, whether one impl specializes another | `Crate(crate)` |
+//! | a body's reads of its own crate's tables: the inherent impls of a type, a trait's impls, the traits with an item of a name | `InherentImpls(type)`, `TraitImpls(trait)`, `TraitsNamed(name)` |
+//! | the traits in a module's scope with an item of a name | `ScopeTraitsNamed { scope, name }` |
+//! | the impls declared in another body's block | `BlockImpls(block's module)` |
 //!
 //! A value is asked by a crate, `seen_by`: the crate of the goal or body that read the fact.
-//! The facts about which impls and traits exist (`Implements`, `Method`, `Vtable`) cover the
+//! The facts about which impls and traits exist (`Implements`, `Method`, `Vtable`,
+//! `InherentImpls`, `TraitImpls`, `TraitsNamed`) cover the
 //! crates it sees (`hir_ty::method_resolution::loaded_crates`: itself and those rustc loads to
 //! compile it), the only ones its goals search and the only ones a build has finished, proc
 //! macros included, when a job of it runs; they are its own ([`asker`]), and refuse while a
@@ -44,9 +48,10 @@ use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
-    HasModule, ImplId, Lookup, ModuleId, StaticId, TraitId, VariantId,
+    AdtId, AssocItemId, BlockIdLt, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId,
+    FunctionId, HasModule, ImplId, Lookup, ModuleId, StaticId, TraitId, VariantId,
     attrs::AttrFlags,
+    builtin_derive::BuiltinDeriveImplTrait,
     expr_store::{Body, ExpressionStore},
     hir::{ClosureKind, ExprId},
     item_scope::ItemScope,
@@ -65,6 +70,7 @@ use hir_ty::{
     db::{AnonConstId, HirDatabase, InternedClosure, InternedClosureId},
     generics::generics,
     layout::{RustcEnumVariantIdx, Variants},
+    method_resolution::{InherentImpls, TraitImpls, scope_sets::module_trait_set},
     next_solver::{Allocation, GenericArgs, SimplifiedType as HirSimplifiedType, Ty},
     sealed_bounds,
     traits::is_inherent_impl_coherent,
@@ -102,6 +108,11 @@ const CRATE: &str = "blaze v2 fact crate 1";
 const CONST_TYPE: &str = "blaze v2 fact const value type 1";
 const HIDDEN_TYPES: &str = "blaze v2 fact hidden types 1";
 const RPITIT_TYS: &str = "blaze v2 fact rpitit types 1";
+const INHERENT_IMPLS: &str = "blaze v2 fact inherent impls 1";
+const TRAIT_IMPLS: &str = "blaze v2 fact trait impls 1";
+const TRAITS_NAMED: &str = "blaze v2 fact traits named 1";
+const SCOPE_TRAITS_NAMED: &str = "blaze v2 fact scope traits named 1";
+const BLOCK_IMPLS: &str = "blaze v2 fact block impls 1";
 
 fn domain(fact: &Fact) -> &'static str {
     match fact {
@@ -125,6 +136,11 @@ fn domain(fact: &Fact) -> &'static str {
         Fact::Crate(_) => CRATE,
         Fact::HiddenTypes(_) => HIDDEN_TYPES,
         Fact::RpititTys(_) => RPITIT_TYS,
+        Fact::InherentImpls(_) => INHERENT_IMPLS,
+        Fact::TraitImpls(_) => TRAIT_IMPLS,
+        Fact::TraitsNamed(_) => TRAITS_NAMED,
+        Fact::ScopeTraitsNamed { .. } => SCOPE_TRAITS_NAMED,
+        Fact::BlockImpls(_) => BLOCK_IMPLS,
     }
 }
 
@@ -134,10 +150,13 @@ pub fn value(db: &Db, seen_by: Crate, fact: &Fact) -> Result<ContentId, Unhashab
 }
 
 /// Whether a value of a fact of `kind` depends on the crate that asks it: the facts of which
-/// impls and traits exist (`Implements`, `Method`, `Vtable`) cover the crates it sees. Every
-/// other fact's value is the same whoever asks.
+/// impls and traits exist (`Implements`, `Method`, `Vtable`, `InherentImpls`, `TraitImpls`,
+/// `TraitsNamed`) cover the crates it sees. Every other fact's value is the same whoever asks:
+/// `ScopeTraitsNamed` is one module's traits in scope, `BlockImpls` one block's impls.
 pub fn asked_by_crate(kind: blaze_query::QueryKind) -> bool {
-    kind == crate::kinds::IMPLEMENTS || kind == crate::kinds::METHOD || kind == crate::kinds::VTABLE
+    use crate::kinds as k;
+    [k::IMPLEMENTS, k::METHOD, k::VTABLE, k::INHERENT_IMPLS, k::TRAIT_IMPLS, k::TRAITS_NAMED]
+        .contains(&kind)
 }
 
 /// `seen_by` where a fact of `kind` depends on its asker ([`asked_by_crate`]), else `None`: what
@@ -175,6 +194,10 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
     let absent = || Ok(Hasher::new(domain).part(b"absent").finish());
     let mut h = Hasher::new(domain);
     h.part(b"present");
+    #[cfg(test)]
+    if planted::LISTING_IGNORED.get() && planted::lists(fact) {
+        return Ok(h.finish());
+    }
     match *fact {
         Fact::Signature(key) => {
             let Some(id) = item(db, key, fact) else { return absent() };
@@ -360,8 +383,134 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             h.id(&crate_inputs(db, krate));
             write_noted_reads(db, &mut h, krate);
         }
+        Fact::InherentImpls(self_ty) => {
+            let impls = inherent_impls_of(db, seen(), self_ty);
+            h.id(&entry(db, impls.iter().map(|(key, it)| (key, AnyImpl::Impl(it))))?.value());
+        }
+        Fact::TraitImpls(trait_) => {
+            let Some(trait_) = resolve_trait(db, trait_) else { return absent() };
+            h.id(&seen_impls_value(db, seen(), trait_)?);
+        }
+        Fact::TraitsNamed(name) => {
+            write_traits_named(db, &mut h, traits_with(db, seen(), name).iter(), name)?;
+        }
+        Fact::ScopeTraitsNamed { scope: at, name } => {
+            let module = match key::resolve(db, at) {
+                None => return absent(),
+                Some(Resolved::Module(it)) => it,
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no module"),
+            };
+            let traits = module_trait_set(db, module).traits();
+            let keyed = traits.iter().map(|&it| (key::item_key(db, ItemId::Trait(it)), it));
+            write_traits_named(db, &mut h, keyed, name)?;
+        }
+        Fact::BlockImpls(at) => {
+            let module = match key::resolve(db, at) {
+                None => return absent(),
+                Some(Resolved::Module(it)) => it,
+                Some(other) => unreachable!("{fact:?} names {other:?}, which is no module"),
+            };
+            let Some(block) = module.block(db) else {
+                unreachable!("{fact:?} names {module:?}, which is no block's module")
+            };
+            write_block_impls(db, &mut h, block)?;
+        }
     }
     Ok(h.finish())
+}
+
+/// The traits of `traits` with an item whose name hashes to `name`, sorted by key, each by its
+/// key and those items' signature hashes ([`named`]): what changes when such a trait comes or
+/// goes or one of those items changes, and not for an item of another name.
+fn write_traits_named(
+    db: &Db,
+    h: &mut Hasher,
+    traits: impl Iterator<Item = (ItemKey, TraitId)>,
+    name: NameHash,
+) -> Result<(), Unhashable> {
+    frame::task(Tag::Other, |frame| -> Result<(), Unhashable> {
+        let mut found: Vec<(ItemKey, Vec<ContentId, &Frame>), &Frame> = Vec::new_in(frame);
+        for (key, trait_) in traits {
+            let items = named(db, &trait_.trait_items(db).items, name, frame)?;
+            if !items.is_empty() {
+                found.push((key, items));
+            }
+        }
+        found.sort_unstable_by_key(|(key, _)| *key);
+        found.dedup_by_key(|(key, _)| *key);
+        h.part(b"traits").update(&(found.len() as u64).to_le_bytes());
+        for (key, items) in found.iter() {
+            h.id(&key.0).update(&(items.len() as u64).to_le_bytes());
+            for it in items.iter() {
+                h.id(it);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Every impl declared in `block`: its trait impls and built-in derives (`TraitImpls::for_block`)
+/// and its inherent impls (`InherentImpls::for_block`), sorted by key, each by its key and
+/// signature ([`entry`]).
+fn write_block_impls(db: &Db, h: &mut Hasher, block: BlockIdLt<'_>) -> Result<(), Unhashable> {
+    frame::task(Tag::Other, |frame| -> Result<(), Unhashable> {
+        let mut rows: Vec<(ItemKey, AnyImpl), &Frame> = Vec::new_in(frame);
+        if let Some(traits) = TraitImpls::for_block(db, block) {
+            rows.extend(
+                traits.impls().map(|it| (key::item_key(db, ItemId::Impl(it)), AnyImpl::Impl(it))),
+            );
+            // A derive's impl is listed under its trait alone: a lang item of the crate, as
+            // hir-ty's `TraitImpls` keeps none for a derive whose trait is not one.
+            let lang = lang_items(db, block.module(db).krate(db));
+            for &derived in BuiltinDeriveImplTrait::ALL {
+                let Some(trait_) = derived.get_id(lang) else { continue };
+                traits.for_trait(trait_, |impls| {
+                    if let Either::Right(derives) = impls {
+                        rows.extend(derives.iter().map(|&it| {
+                            (key::builtin_derive_key(db, it), AnyImpl::BuiltinDerive(it))
+                        }));
+                    }
+                });
+            }
+        }
+        if let Some(inherent) = InherentImpls::for_block(db, block).as_deref() {
+            for (_, impls) in inherent.iter() {
+                rows.extend(
+                    impls.iter().map(|&it| (key::item_key(db, ItemId::Impl(it)), AnyImpl::Impl(it))),
+                );
+            }
+        }
+        rows.sort_unstable_by_key(|&(key, _)| key);
+        h.id(&entry(db, rows.iter().copied())?.value());
+        Ok(())
+    })
+}
+
+/// The planted bug of the listing facts' oracles' control
+/// (`tests::own_tables::the_oracle_catches_a_listing_that_ignores_what_it_lists`).
+#[cfg(test)]
+pub(crate) mod planted {
+    use std::cell::Cell;
+
+    use crate::Fact;
+
+    thread_local! {
+        /// The listing facts (`InherentImpls`, `TraitImpls`, `TraitsNamed`, `ScopeTraitsNamed`,
+        /// `BlockImpls`) hash nothing of what they list, so an item added or removed leaves
+        /// them as they were.
+        pub(crate) static LISTING_IGNORED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn lists(fact: &Fact) -> bool {
+        matches!(
+            fact,
+            Fact::InherentImpls(_)
+                | Fact::TraitImpls(_)
+                | Fact::TraitsNamed(_)
+                | Fact::ScopeTraitsNamed { .. }
+                | Fact::BlockImpls(_)
+        )
+    }
 }
 
 /// What `krate` and every crate it depends on are made from, as their database inputs: each
@@ -483,6 +632,36 @@ pub fn implements(db: &Db, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> 
 
 pub fn resolves(db: &Db, scope: ModuleId, name: &Name) -> Fact {
     Fact::Resolves { scope: key::module_key(db, scope), name: key::name_hash(name.as_str()) }
+}
+
+/// The inherent impls for a simplified self type in the crates the asker sees: what
+/// `InherentImpls::in_crate_for_self_ty` of one of them gives.
+pub fn inherent_impls(db: &Db, self_ty: &HirSimplifiedType<'_>) -> Fact {
+    Fact::InherentImpls(key::simplified(db, self_ty))
+}
+
+/// A trait's impls in the crates the asker sees: what `TraitImpls::for_crate_and_trait` of one
+/// of them gives.
+pub fn trait_impls(db: &Db, trait_: TraitId) -> Fact {
+    Fact::TraitImpls(key::item_key(db, ItemId::Trait(trait_)))
+}
+
+/// The traits with an item named `name` in the crates the asker sees: what
+/// `in_crate_trait_value_items` of one of them gives. By the name's text: a name a macro's
+/// context keys covers every item of that text, more than the read, never less.
+pub fn traits_named(name: &Name) -> Fact {
+    Fact::TraitsNamed(key::name_hash(name.as_str()))
+}
+
+/// The traits in `module`'s scope with an item named `name`: what `module_items_named` gives.
+pub fn scope_traits_named(db: &Db, module: ModuleId, name: &Name) -> Fact {
+    Fact::ScopeTraitsNamed { scope: key::module_key(db, module), name: key::name_hash(name.as_str()) }
+}
+
+/// The impls declared in `block`, by the key of its def map's root module: what
+/// `TraitImpls::for_block` and `InherentImpls::for_block` give.
+pub fn block_impls(db: &Db, block: BlockIdLt<'_>) -> Fact {
+    Fact::BlockImpls(key::module_key(db, hir_def::nameres::block_def_map(db, block).root))
 }
 
 pub fn code(db: &Db, id: ItemId) -> Fact {

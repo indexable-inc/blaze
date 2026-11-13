@@ -27,7 +27,6 @@ indexmap.workspace = true
 inventory.workspace = true
 
 # local deps
-blaze-bytes.workspace = true
 blaze-dbsp.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true

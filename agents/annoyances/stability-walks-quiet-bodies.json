@@ -1,0 +1,14 @@
+{
+ "id": "stability-walks-quiet-bodies",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of plan 12 E2b, int-1112",
+ "where": "crates/blaze-diagnostics/src/lints/names/stability/walk.rs Walker::run, stability.rs body_quiet, lints/names/uses.rs named",
+ "what": "The stability walk entered every body of the crate and asked hir::view::Semantics of each of its paths, method calls and fields, though almost every body names nothing deprecated or unstable and so can find nothing: a body edit re-ran the Semantics resolution of every body of the crate for no finding.",
+ "cost": "a share of the `stability` crate pass on every body edit (plan 12 section 0: 5,672 analyze_impl spans of a six body edit across the names passes); not measured per pass",
+ "cause": "the pass had no per-body fact saying a body cannot find anything, so the walk could not tell which subtrees to leave out without walking them",
+ "class": "a crate-wide walk with no per-item verdict, redoing what an unchanged item would answer the same",
+ "prevention": "every crate-wide names pass asks a per-body memo read from HIR (uses.rs) before walking a body's syntax",
+ "workaround": "none",
+ "fix": "written, uncompiled (2026-11-12): uses::named(db, owner) lists every def a body's HIR names (paths, their qualifiers and resolved prefixes, method calls, fields' variants) through BodyPaths::resolve; stability::body_quiet(db, owner, krate) is true when the body's own syntax has no macro call, attribute, item or constraint, its store no expansion, every name resolves and none is deprecated or another crate's unstable; the walk sweeps body_quiet on the workers (span `stability quiet bodies`) and steps over each quiet body's cut (Cx::pieces). Tests: stability::tests::the_walk_over_quiet_bodies_equals_the_whole_walk (control PrefixModulesIgnored) and a_quiet_body_is_not_walked (control NeverQuiet).",
+ "state": "open"
+}

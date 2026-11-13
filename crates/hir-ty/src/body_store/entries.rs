@@ -1,7 +1,9 @@
 //! A body's inference, its built MIR and its borrow check's verdict as `blaze_kernel` step
 //! entries (docs/v2/plan/design/end-state.md, "The front end as kernel steps", order row 3):
-//! [`InferEntry`], [`MirEntry`] and [`BorrowckEntry`], each of one body by its syntax
-//! ([`BodyKey`]: its file and its content-hashed `blaze_front_items` item id, never a dense id).
+//! [`InferEntry`] and [`BorrowckEntry`], each of one body by its syntax ([`BodyKey`]: its file
+//! and its content-hashed `blaze_front_items` item id, never a dense id), and a [`MirEntry`] for
+//! each MIR owner of the body ([`OwnerKey`]: the body and the owner's [`Place`] in it, the body
+//! itself, each closure and each `async` coroutine, [`places`]).
 //!
 //! An entry's reads, which are what a carry reaches it by:
 //!
@@ -11,13 +13,15 @@
 //! - **its identity** ([`reads::IDENTITY`], valued by the item store's
 //!   [`BodyFacts::identity`](super::BodyFacts::identity)): what the identity hashes beyond the
 //!   body's tokens (its owner's signature, what each id it names is, what each path resolves
-//!   to, its crate's inputs). [`Identities`] keeps item-hash's identity column from pin to pin
-//!   and gives its delta exactly ([`BodyDelta::identities`]); a driver with no delta says it is
-//!   always dirty and counts it by name ([`always_dirty`]);
+//!   to, its crate's inputs). A carry says its difference as every other kind's
+//!   ([`BodyDelta::say`]): valued, each distinct read once, by the kernel, unless a producer
+//!   names the reads that differ ([`Exact`]); no kind is always dirty;
 //! - **its facts**: one read per fact the run's trace names ([`reads::fact`], the fact's kind
 //!   as the read's kind, so a driver says each kind's difference apart), valued by the world
 //!   ([`BodyWorld::fact`]); a fact that is the body's own earlier step
-//!   ([`BodyFacts::own_step`](super::BodyFacts::own_step)) is a read of that step's entry.
+//!   ([`BodyFacts::own_step`](super::BodyFacts::own_step)) is a read of that step's entry: of
+//!   its inference, or, for the borrow check, of every one of its MIR entries (a borrow check
+//!   reads each closure's MIR, all filed as the one fact).
 //!
 //! A step's run is the database's: [`BodyWorld::run`] asks it for the step, and the item store
 //! kept what that run read and made ([`super::Store::traced`], written where the step offers
@@ -27,7 +31,8 @@
 //! What is still trusted, and named: the identity covers every read the store's
 //! classification calls covered (item-hash's section 6), as the item store's records already
 //! trust; the world's map from a [`BodyKey`] to the database's body ([`BodyWorld::body`]) is
-//! the one the syntax gives ([`bodies`], [`def_of`]).
+//! the one the syntax gives: each body part of a file's `items` by where it starts ([`keyed`]),
+//! joined with where each body of the database is written ([`written`], [`join`]).
 
 use std::{alloc::Global, fmt, marker::PhantomData, sync::Arc};
 
@@ -36,22 +41,20 @@ use blaze_cas::Kind as StoreKind;
 use blaze_format::SchemaHash;
 use blaze_front_items::{
     ITEMS, Table,
-    entry::{Entry, ItemId, Kind, body_key},
+    entry::{Entry, ItemId, Kind, body_key, key_item},
+    lines::{ItemLines, LINES},
     steps::{FileKey, Items, Source},
 };
 use blaze_ids::ContentId;
 use blaze_kernel::{
-    Ask, Changed, CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Read, ReadKind, Reads,
-    Seen, Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
+    Ask, Changed, CodeId, Compute, Fact, Got, Kernel, KernelError, Read, ReadKind, Reads, Seen,
+    Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
 };
 use blaze_query::{QueryKind, db::View};
-use hir_def::{
-    DefWithBodyId, ModuleDefId, ModuleId,
-    nameres::DefMap,
-    signatures::{ConstSignature, FunctionSignature, StaticSignature},
-};
-use hir_expand::name::Name;
+use hir_def::{DefWithBodyId, HasModule as _, Lookup};
+use syntax::view::AstNode as _;
 
+pub use super::mir::Place;
 use super::{Refusal, Step, with_store};
 use crate::next_solver::goal_store::{FactObject, FactRef};
 
@@ -94,6 +97,39 @@ impl fmt::Debug for BodyKey {
     }
 }
 
+/// One MIR owner of a body as its MIR entry is keyed: the body, and the owner's place in it
+/// (the body itself is [`Place::BODY`]).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct OwnerKey {
+    pub body: BodyKey,
+    pub place: Place,
+}
+
+impl fmt::Debug for OwnerKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the MIR at {:?} of {:?}", self.place, self.body)
+    }
+}
+
+/// Which entry of a body: its inference, the MIR of one of its owners, its borrow check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Of {
+    Infer,
+    Mir(Place),
+    Borrowck,
+}
+
+impl Of {
+    /// The item store's step this entry is of.
+    pub fn step(self) -> Step {
+        match self {
+            Of::Infer => Step::Infer,
+            Of::Mir(_) => Step::Mir,
+            Of::Borrowck => Step::Borrowck,
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     use fmt::Write as _;
     // alloc: an error's or a label's text
@@ -115,11 +151,12 @@ pub trait BodyWorld: Source {
     /// (the syntax has no such item, or no body the database has is it).
     fn body(&self, key: &BodyKey) -> Result<DefWithBodyId, String>;
 
-    /// Asks the database for `step` of `def` (its inference, its built MIR, its borrow
-    /// check), so that the run that made its value, now or earlier, left its trace in the
-    /// item store; gives the schema it was offered under ([`infer_schema`], [`mir_schema`],
-    /// [`borrowck_schema`]). A borrow check that fails is an error naming the body.
-    fn run(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String>;
+    /// Asks the database for the step `of` of `def` (its inference, the built MIR of one of
+    /// its owners, its borrow check), so that the run that made its value, now or earlier,
+    /// left its trace in the item store; gives the schema it was offered under
+    /// ([`infer_schema`], [`mir_schema`], [`borrowck_schema`]). A borrow check that fails is
+    /// an error naming the body.
+    fn run(&self, def: DefWithBodyId, of: Of) -> Result<SchemaHash, String>;
 
     /// The value of `fact` as the crate named `krate` sees it now: gone where it names
     /// nothing; [`WorldError::not_now`] where it cannot be hashed now.
@@ -131,9 +168,10 @@ pub trait BodyWorld: Source {
     /// value is one whoever asks ([`BodyWorld::fact`] is given no body). Any other fact as it is.
     fn absolute(&self, def: DefWithBodyId, fact: FactRef) -> FactRef;
 
-    /// The schema `step` of `def` is offered under in [`BodyWorld::db`], as [`BodyWorld::run`]
-    /// gives it, with nothing run: what [`serve`] files an earlier step a served one read under.
-    fn schema(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String>;
+    /// The schema the step `of` of `def` is offered under in [`BodyWorld::db`], as
+    /// [`BodyWorld::run`] gives it, with nothing run: what [`serve`] finds a served step's row
+    /// under, and an earlier step's it read.
+    fn schema(&self, def: DefWithBodyId, of: Of) -> Result<SchemaHash, String>;
 }
 
 const SUBJECT: &str = "blaze v2 body entry 1";
@@ -170,10 +208,42 @@ fn input_of<W: BodyWorld + ?Sized + 'static>(bytes: &[u8]) -> Result<BodyKey, St
     Ok(BodyKey { file, item, krate: krate.to_owned() })
 }
 
-fn subject<W: BodyWorld + ?Sized + 'static>(key: &BodyKey) -> Subject {
+/// An entry's input as its key's bytes: a body's ([`BodyKey`], [`key_of`]) or one MIR owner's
+/// ([`OwnerKey`]: the body's, then its place's 25 bytes, [`Place::bytes`]).
+trait EntryInput: Sized {
+    fn write<W: BodyWorld + ?Sized + 'static>(&self, out: &mut Vec<u8>);
+    fn read<W: BodyWorld + ?Sized + 'static>(bytes: &[u8]) -> Result<Self, String>;
+}
+
+impl EntryInput for BodyKey {
+    fn write<W: BodyWorld + ?Sized + 'static>(&self, out: &mut Vec<u8>) {
+        key_of::<W>(self, out);
+    }
+
+    fn read<W: BodyWorld + ?Sized + 'static>(bytes: &[u8]) -> Result<BodyKey, String> {
+        input_of::<W>(bytes)
+    }
+}
+
+impl EntryInput for OwnerKey {
+    fn write<W: BodyWorld + ?Sized + 'static>(&self, out: &mut Vec<u8>) {
+        key_of::<W>(&self.body, out);
+        out.extend_from_slice(&self.place.bytes());
+    }
+
+    fn read<W: BodyWorld + ?Sized + 'static>(bytes: &[u8]) -> Result<OwnerKey, String> {
+        let Some((body, place)) = bytes.split_last_chunk::<25>() else {
+            // alloc: error path
+            return Err(format!("a MIR owner's key of {} bytes, under its place's 25", bytes.len()));
+        };
+        Ok(OwnerKey { body: input_of::<W>(body)?, place: Place::read(place) })
+    }
+}
+
+fn subject<W: BodyWorld + ?Sized + 'static, I: EntryInput>(input: &I) -> Subject {
     // alloc: the input's bytes, once an identity
     let mut bytes = Vec::new();
-    key_of::<W>(key, &mut bytes);
+    input.write::<W>(&mut bytes);
     Subject { of: ContentId::of(SUBJECT, &bytes), flags: ContentId::default() }
 }
 
@@ -293,23 +363,37 @@ pub fn run_infer(db: &Db, def: DefWithBodyId) -> SchemaHash {
     infer_schema()
 }
 
-/// The schema [`BodyWorld::run`] gives for a body's built MIR; an error for a body with no
-/// MIR of its own.
-pub fn mir_schema(db: &Db, def: DefWithBodyId) -> Result<SchemaHash, String> {
-    let owner = crate::mir::MirOwner::Body(crate::InferBodyId::DefWithBodyId(def));
-    match super::mir::place(db, owner) {
-        Some((_, schema)) => Ok(schema),
-        // alloc: error path
-        None => Err(format!("{def:?} has no MIR of its own")),
-    }
+/// The places of `def`'s MIR owners an entry keys ([`super::mir::owners`]): [`Place::BODY`],
+/// then each closure and `async` coroutine written in it, in the order of their expressions.
+/// Not here, so no entry: an inline constant's MIR, a by-move coroutine's and a `gen`
+/// coroutine's (a later step that reads one is refused by the item store already).
+pub fn places(db: &Db, def: DefWithBodyId) -> Vec<Place> {
+    // alloc: the body's places, a handful
+    super::mir::owners(db, def).into_iter().map(|(place, _)| place).collect()
 }
 
-/// Asks `db` for `def`'s built MIR: the run of [`BodyWorld::run`] for [`Step::Mir`].
-pub fn run_mir(db: &Db, def: DefWithBodyId) -> Result<SchemaHash, String> {
-    let schema = mir_schema(db, def)?;
-    let owner = crate::mir::MirOwner::Body(crate::InferBodyId::DefWithBodyId(def));
+/// The schema [`BodyWorld::run`] gives for the built MIR of `def`'s owner at `place`.
+pub fn mir_schema(db: &Db, def: DefWithBodyId, place: Place) -> SchemaHash {
+    super::mir::schema_of(db, def, place)
+}
+
+/// The place of [`places`] whose [`mir_schema`] is `schema`: which owner a MIR trace filed
+/// under `schema` is of. None for a schema no keyed owner of `def` has.
+pub fn place_of(db: &Db, def: DefWithBodyId, schema: SchemaHash) -> Option<Place> {
+    places(db, def).into_iter().find(|&place| mir_schema(db, def, place) == schema)
+}
+
+/// Asks `db` for the built MIR of `def`'s owner at `place`: the run of [`BodyWorld::run`] for
+/// [`Of::Mir`]. An error for a place no owner [`places`] gives is at.
+pub fn run_mir(db: &Db, def: DefWithBodyId, place: Place) -> Result<SchemaHash, String> {
+    let Some((_, owner)) = super::mir::owners(db, def).into_iter().find(|(at, _)| *at == place) else {
+        // alloc: error path
+        return Err(format!(
+            "{def:?} has no MIR owner at {place:?} that an entry keys (not an inline const's, by-move or `gen` MIR)"
+        ));
+    };
     let _ = crate::providers::mir_at(db, owner, crate::mir::MirStage::Built);
-    Ok(schema)
+    Ok(mir_schema(db, def, place))
 }
 
 /// The schema [`BodyWorld::run`] gives for a passing borrow check of `def` by the checker
@@ -336,12 +420,14 @@ fn dropped(kind: ReadKind) -> bool {
     DROPPED.with(|it| it.get() == Some(kind))
 }
 
-/// The run of `step` of the body `input`: its reads, then the answer its database's run made.
+/// The run of the step `of` of the body `input`: its reads, then the answer its database's run
+/// made.
 fn compute<W: BodyWorld + ?Sized + 'static>(
     ctx: &mut Reads<'_, W>,
     input: &BodyKey,
-    step: Step,
+    of: Of,
 ) -> Result<Vec<u8>, StepError> {
+    let step = of.step();
     #[cfg(test)]
     RUNS.with(|it| {
         let mut runs = it.get();
@@ -350,6 +436,7 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
     });
     // (a) The body's own syntax record.
     if ctx.part::<Items<W>>(&input.file, &body_key(input.item))?.is_none() {
+        // alloc: error path
         return Err(refused(format!("{input:?}: `items` of its file has no body under its id")));
     }
     // Its identity, and through it the body in the world's database.
@@ -358,7 +445,7 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
     if dropped(reads::IDENTITY) {
         ctx.forget::<IdentityOf<W>>(input);
     }
-    let schema = world.run(def, step).map_err(|why| refused(format!("{input:?} ({def:?}): {why}")))?;
+    let schema = world.run(def, of).map_err(|why| refused(format!("{input:?} ({def:?}): {why}")))?;
     let db = world.db();
     let Some(traced) = with_store(db, |store| store.traced(def, step, schema)) else {
         return Err(refused(format!("{input:?}: the database has no item store installed")));
@@ -386,12 +473,19 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
             Some(Step::Infer) if step > Step::Infer => {
                 ctx.step::<InferEntry<W>>(input)?;
             }
-            Some(Step::Mir) if step > Step::Mir => {
-                ctx.step::<MirEntry<W>>(input)?;
+            // A borrow check reads the MIR of every owner of the body (each closure's is
+            // checked with it), and the store files each such read as this one fact: the run
+            // reads every MIR entry of the body, so a fact only a closure's MIR read reaches
+            // the borrow check's entry.
+            Some(Step::Mir) if of == Of::Borrowck => {
+                for place in places(db, def) {
+                    // clone: the body's key, one MIR owner's input each
+                    ctx.step::<MirEntry<W>>(&OwnerKey { body: input.clone(), place })?;
+                }
             }
             Some(earlier) => {
                 return Err(refused(format!(
-                    "{input:?}: its {} read its own {}, which is no earlier step with an entry",
+                    "{input:?}: its {} ({of:?}) read its own {}, which is no earlier step with an entry",
                     super::what(step),
                     super::what(earlier)
                 )));
@@ -416,7 +510,7 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
 }
 
 macro_rules! body_step {
-    ($(#[$doc:meta])* $name:ident, $id:expr, $text:literal, $step:expr) => {
+    ($(#[$doc:meta])* $name:ident, $id:expr, $text:literal, $input:ty, |$it:ident| $of:expr) => {
         $(#[$doc])*
         pub struct $name<W: ?Sized>(PhantomData<fn(&W)>);
 
@@ -424,13 +518,13 @@ macro_rules! body_step {
             const ID: StepId = $id;
             const NAME: &'static str = $text;
             const KIND: StoreKind = StoreKind::Query;
-            type Input = BodyKey;
+            type Input = $input;
 
-            fn subject(input: &BodyKey) -> Subject {
-                subject::<W>(input)
+            fn subject(input: &$input) -> Subject {
+                subject::<W, $input>(input)
             }
 
-            fn label(input: &BodyKey) -> String {
+            fn label(input: &$input) -> String {
                 // alloc: a label, for an error or a check
                 format!("{} of {input:?}", $text)
             }
@@ -439,18 +533,20 @@ macro_rules! body_step {
         impl<W: BodyWorld + ?Sized + 'static> Compute for $name<W> {
             type World = W;
 
-            fn compute(ctx: &mut Reads<'_, W>, input: &BodyKey) -> Result<Vec<u8>, StepError> {
-                compute(ctx, input, $step)
+            fn compute(ctx: &mut Reads<'_, W>, input: &$input) -> Result<Vec<u8>, StepError> {
+                let $it = input;
+                let (body, of): (&BodyKey, Of) = $of;
+                compute(ctx, body, of)
             }
         }
 
         impl<W: BodyWorld + ?Sized + 'static> Ask for $name<W> {
-            fn key(input: &BodyKey, out: &mut Vec<u8>) {
-                key_of::<W>(input, out);
+            fn key(input: &$input, out: &mut Vec<u8>) {
+                input.write::<W>(out);
             }
 
-            fn input(key: &[u8]) -> Result<BodyKey, String> {
-                input_of::<W>(key)
+            fn input(key: &[u8]) -> Result<$input, String> {
+                <$input as EntryInput>::read::<W>(key)
             }
         }
     };
@@ -458,16 +554,17 @@ macro_rules! body_step {
 
 body_step!(
     /// `infer(body)`: the body's inference answer, as the item store encodes it.
-    InferEntry, ids::BODY_INFER, "body inference", Step::Infer
+    InferEntry, ids::BODY_INFER, "body inference", BodyKey, |it| (it, Of::Infer)
 );
 body_step!(
-    /// `mir(body)`: the body's built MIR, as the item store encodes it.
-    MirEntry, ids::BODY_MIR, "body MIR", Step::Mir
+    /// `mir(owner)`: the built MIR of one MIR owner of a body (the body itself, a closure, an
+    /// `async` coroutine), as the item store encodes it.
+    MirEntry, ids::BODY_MIR, "body MIR", OwnerKey, |it| (&it.body, Of::Mir(it.place))
 );
 body_step!(
     /// `borrowck(body)`: that the body's borrow check passed (no bytes; a failing check is no
     /// entry, but the error of whoever asks).
-    BorrowckEntry, ids::BODY_BORROWCK, "body borrow check", Step::Borrowck
+    BorrowckEntry, ids::BODY_BORROWCK, "body borrow check", BodyKey, |it| (it, Of::Borrowck)
 );
 
 /// Registers the three body entries on `kernel` with `code` (the front end's code identity,
@@ -483,29 +580,37 @@ pub fn register<W: BodyWorld + ?Sized + 'static>(
 }
 
 /// A served step's answer as the kernel verified it ([`serve`]): what the step's query in the
-/// database answers from (`super::Store::served_answer`), valid only at `revision`. With it,
-/// what the entry read, so the query reads each again and its row depends on them: the body's
-/// identity, each fact with what it saw, and each earlier step of the body it read, with the
-/// schema that step is filed under.
+/// database answers from (`super::Store::served_answer`), at `revision`, and at a later one
+/// only where its crate is stamped there ([`stamp`]). With it, what the entry read, so the
+/// query reads each again and its row depends on them: the body's identity, and each fact
+/// with what it saw, of the step itself and of every earlier step of the body it read (theirs
+/// taken from their own rows, so a fact only an earlier step read is here too), sorted, each
+/// pair once.
 pub struct Served {
     pub(super) revision: View,
+    /// The crate of the body: whose stamp the row answers under.
+    pub(super) krate: base_db::Crate,
     pub(super) identity: ContentId,
     pub(super) facts: Box<[(FactRef, Seen)]>,
-    pub(super) children: Box<[(Step, SchemaHash)]>,
     pub(super) answer: Arc<[u8]>,
 }
 
-/// The served answers of one database (`super::Store::served`), all posted at one revision:
-/// a post at another revision drops every answer of the one before, so none outlives it.
+/// The served answers of one database (`super::Store::served`), by body: each answers at the
+/// revision it was posted at, or at one its crate was stamped at ([`stamp`]), never at any
+/// other. A body's rows go when the driver unposts it ([`unpost`]).
 ///
 /// With them, what the driver claimed of the database (`claim_serve`, `claim_keeps`), so a
 /// body is served once a revision and kept once a run, however many units reach it.
 #[derive(Default)]
 pub(super) struct Posted {
-    revision: Option<View>,
-    rows: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Served>, Global>,
-    /// The crates a serve claimed at `revision`: cleared with the rows.
-    crates: blaze_hash::HashMap<base_db::Crate, (), Global>,
+    /// Each body's rows, one a step and schema.
+    rows: blaze_hash::HashMap<DefWithBodyId, Vec<(Step, SchemaHash, Arc<Served>)>, Global>,
+    /// Each crate's last stamp: the revision it is of, and the revision from which every row
+    /// of the crate posted is one the stamping driver knows of (a row posted before that,
+    /// by a driver whose rows it never saw, does not answer under the stamp).
+    stamped: blaze_hash::HashMap<base_db::Crate, (View, View), Global>,
+    /// The revision each crate's serve was last claimed at.
+    claimed: blaze_hash::HashMap<base_db::Crate, View, Global>,
     /// Each trace a keep claimed, by its body, step and schema: the trace itself (a counted
     /// reference), so a run that replaced it is claimed again and nothing else is. Not cleared
     /// at a revision: a trace is the run's, whatever revision it is read at.
@@ -517,6 +622,62 @@ thread_local! {
     /// The planted bug of the revision oracle's control: a served answer is given at any
     /// revision, not only the one it was posted at.
     pub(super) static ANY_REVISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the stamp's oracle's control: [`unpost`] drops nothing, so a body
+    /// whose entry moved keeps its old rows, and the crate's stamp makes them answer.
+    pub(super) static KEEP_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn keep_all() -> bool {
+    KEEP_ALL.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn keep_all() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the served row's oracle's control: [`serve`] keeps a row's own facts
+    /// alone, not those of the earlier steps it read.
+    pub(super) static OWN_FACTS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the claims' oracle's control: a [`Claim`] dropped without
+    /// [`Claim::kept`] keeps its marks, as a keep that failed and held its claims would.
+    pub(super) static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the syntax join's oracle's control: [`join`] pairs a body with the
+    /// first key at its start, whatever its kind.
+    pub(super) static ANY_KIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn own_facts_only() -> bool {
+    OWN_FACTS_ONLY.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn own_facts_only() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn held() -> bool {
+    HELD.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn held() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn any_kind() -> bool {
+    ANY_KIND.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn any_kind() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -530,8 +691,8 @@ fn any_revision() -> bool {
 }
 
 impl Posted {
-    /// The answer of `step` of `def` under `schema` posted at `now`; none posted at another
-    /// revision.
+    /// The answer of `step` of `def` under `schema` that answers at `now`: posted at `now`,
+    /// or posted since its crate's stamp at `now` began ([`stamp`]); none otherwise.
     pub(super) fn get(
         &self,
         now: View,
@@ -539,51 +700,79 @@ impl Posted {
         step: Step,
         schema: SchemaHash,
     ) -> Option<Arc<Served>> {
-        let served = self.rows.get(&(def, step, schema))?;
-        if served.revision != now && !any_revision() {
+        let rows = self.rows.get(&def)?;
+        let (_, _, served) = rows.iter().find(|(at, of, _)| (*at, *of) == (step, schema))?;
+        let stamped = || {
+            self.stamped.get(&served.krate).is_some_and(|&(at, since)| at == now && served.revision >= since)
+        };
+        if served.revision != now && !stamped() && !any_revision() {
             return None;
         }
         // clone: a counted reference
         Some(served.clone())
     }
 
-    /// The rows are of `now` from here on: those of another revision are dropped, and the
-    /// crates claimed there with them.
-    fn at(&mut self, now: View) {
-        if self.revision != Some(now) && !any_revision() {
-            self.rows.clear();
-            self.crates.clear();
-            self.revision = Some(now);
-        }
-    }
-
     pub(super) fn post(&mut self, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
-        self.at(served.revision);
-        // alloc: one answer a served step of a body, dropped at the next revision's first post
-        self.rows.insert((def, step, schema), Arc::new(served));
+        // alloc: a body's rows, a handful, kept until the driver unposts the body
+        let rows = self.rows.entry(def).or_insert_with(Vec::new);
+        // alloc: one answer a served step of a body, kept until its body is unposted
+        let served = Arc::new(served);
+        match rows.iter_mut().find(|(at, of, _)| (*at, *of) == (step, schema)) {
+            Some(row) => row.2 = served,
+            None => rows.push((step, schema, served)),
+        }
     }
 }
 
-/// Posts what the kernel gave for `step` of the body `key` (`got`, from a get or after a
-/// carry) to the item store of `world`'s database, at its revision now: the step's query
+/// Drops every row of `def` in `db`'s item store: the driver's word that the entries they
+/// were posted from may not hold now. Nothing where `db` has no item store (none was posted).
+pub fn unpost(db: &Db, def: DefWithBodyId) {
+    with_store(db, |store| {
+        if !keep_all() {
+            store.served.lock().rows.remove(&def);
+        }
+    });
+}
+
+/// Stamps `krate` in `db` at its revision now: every row of the crate still posted since
+/// `since` answers at this revision as if posted at it. The driver's word, said only once each
+/// body whose entry moved since its rows were posted is unposted ([`unpost`]), and only for
+/// rows it posted itself since `since` (a row posted before, by a driver whose rows it never
+/// saw, answers under no stamp of it).
+pub fn stamp(db: &Db, krate: base_db::Crate, since: View) {
+    let (_, now) = db.nonce_and_revision();
+    with_store(db, |store| {
+        store.served.lock().stamped.insert(krate, (now, since));
+    });
+}
+
+/// Posts what the kernel gave for the step `of` of the body `key` (`got`, from a get or after
+/// a carry) to the item store of `world`'s database, at its revision now: the step's query
 /// there answers from it until the database's next revision, checking again in the query what
-/// the entry read (`super::Store::served_answer`). The driver serves every entry it gets.
+/// the entry read (`super::Store::served_answer`). The row holds the facts the entry read and
+/// those of each earlier step's row it read (an earlier step is a read of that step's entry,
+/// whose own facts the kernel keeps in that entry, not in this one), so the query's row
+/// depends on every fact the answer does. The driver serves every entry it gets, an earlier
+/// step before a later one.
 ///
 /// Refused, naming the body: an entry with no read of its identity (no entry of a body step
-/// is made without one, so it is another step's or a corrupt one), a read of an earlier step
-/// whose key names another step, and a database with no item store installed.
+/// is made without one, so it is another step's or a corrupt one), a read of a step that is no
+/// earlier body step, an earlier step not served at this revision, and a database with no item
+/// store installed.
 pub fn serve<W: BodyWorld + ?Sized + 'static>(
     world: &W,
     key: &BodyKey,
-    step: Step,
+    of: Of,
     got: &Got<'_>,
 ) -> Result<(), String> {
+    let step = of.step();
     let def = world.body(key)?;
-    let schema = world.schema(def, step)?;
+    let schema = world.schema(def, of)?;
+    let db = world.db();
+    let (_, revision) = db.nonce_and_revision();
     let mut identity = None;
-    // alloc: the entry's facts and earlier steps, kept with its answer
+    // alloc: the entry's facts and its earlier steps', kept with its answer
     let mut facts = Vec::new();
-    let mut children = Vec::new();
     let mut note = |read: Read<'_>, seen: Seen| -> Result<(), String> {
         if read.kind == reads::IDENTITY {
             match seen {
@@ -594,13 +783,38 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
         } else if let Some((fact, _)) = fact_of(read) {
             facts.push((fact, seen));
         } else if read.kind == ReadKind::STEP {
-            let child = match read.key.split_first_chunk::<2>().map(|(id, _)| StepId(u16::from_be_bytes(*id))) {
-                Some(ids::BODY_INFER) => Step::Infer,
-                Some(ids::BODY_MIR) => Step::Mir,
+            let Some((id, rest)) = read.key.split_first_chunk::<2>() else {
+                // alloc: error path
+                return Err(format!("{key:?}: its {} read a step under a key of no step", super::what(step)));
+            };
+            let earlier = match StepId(u16::from_be_bytes(*id)) {
+                ids::BODY_INFER => Of::Infer,
+                ids::BODY_MIR => match rest.split_last_chunk::<25>() {
+                    Some((_, place)) => Of::Mir(Place::read(place)),
+                    // alloc: error path
+                    None => return Err(format!("{key:?}: its {} read a MIR entry with no place", super::what(step))),
+                },
                 // alloc: error path
                 _ => return Err(format!("{key:?}: its {} read a step that is no earlier body step", super::what(step))),
             };
-            children.push((child, world.schema(def, child)?));
+            if own_facts_only() {
+                return Ok(());
+            }
+            let earlier_schema = world.schema(def, earlier)?;
+            let posted = with_store(db, |store| store.served.lock().get(revision, def, earlier.step(), earlier_schema));
+            match posted {
+                Some(Some(row)) => facts.extend_from_slice(&row.facts),
+                Some(None) => {
+                    // alloc: error path
+                    return Err(format!(
+                        "{key:?}: its {} read its {} ({earlier:?}), which is not served",
+                        super::what(step),
+                        super::what(earlier.step())
+                    ));
+                }
+                // alloc: error path
+                None => return Err(format!("{key:?}: the database has no item store installed")),
+            }
         }
         Ok(())
     };
@@ -612,15 +826,10 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
         // alloc: error path
         return Err(format!("{key:?}: its {} entry has no read of its identity", super::what(step)));
     };
-    let db = world.db();
-    let (_, revision) = db.nonce_and_revision();
-    let served = Served {
-        revision,
-        identity,
-        facts: facts.into(),
-        children: children.into(),
-        answer: got.value().into(),
-    };
+    facts.sort_unstable();
+    facts.dedup();
+    let krate = def.krate(db);
+    let served = Served { revision, krate, identity, facts: facts.into(), answer: got.value().into() };
     match with_store(db, |store| store.served.lock().post(def, step, schema, served)) {
         Some(()) => Ok(()),
         // alloc: error path
@@ -635,26 +844,66 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
 /// installed (`BLAZE_ITEM_STORE=off`): nothing is served or kept there.
 pub fn claim_serve(db: &Db, krate: base_db::Crate) -> Option<bool> {
     let (_, now) = db.nonce_and_revision();
-    with_store(db, |store| {
-        let mut posted = store.served.lock();
-        posted.at(now);
-        posted.crates.insert(krate, ()).is_none()
-    })
+    with_store(db, |store| store.served.lock().claimed.insert(krate, now) != Some(now))
+}
+
+/// A run of a body's step the item store would not trace, named: its body, its step and
+/// why (the store's refusal). No entry can be kept of it; the driver says each, never drops
+/// one quietly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub def: DefWithBodyId,
+    pub step: Step,
+    pub why: String,
 }
 
 /// What [`claim_keeps`] handed over: each body's step whose run's trace no keep has claimed,
-/// with the schema it ran under, and how many runs the item store refused to trace (no entry
-/// can be kept of them; said by the driver, never dropped quietly).
-pub struct Claimed {
+/// with the schema it ran under, and each such run the item store refused to trace.
+///
+/// The claim lets go unless it is kept: dropped without [`Claim::kept`] (the keep failed, or
+/// returned early), each of its marks whose trace is still the one claimed is removed, so the
+/// next [`claim_keeps`] claims those runs again and none is lost to a keep that did not reach
+/// the store.
+pub struct Claim<'db> {
     pub steps: Vec<(DefWithBodyId, Step, SchemaHash)>,
-    pub refused: usize,
+    pub refused: Vec<Refused>,
+    db: &'db Db,
+    /// Each mark this claim made, with the trace it marked.
+    marks: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)>,
+}
+
+impl Claim<'_> {
+    /// The keep reached the store: the marks stay, and no later claim takes these runs.
+    pub fn kept(mut self) {
+        self.marks.clear();
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if self.marks.is_empty() || held() {
+            return;
+        }
+        let marks = std::mem::take(&mut self.marks);
+        // The posts' lock alone, for the marks, never across a wait (rule 27).
+        with_store(self.db, |store| {
+            let mut posted = store.served.lock();
+            for (key, ran) in marks {
+                // A mark another claim made since (a later run's trace) is that claim's.
+                if posted.kept.get(&key).is_some_and(|it| Arc::ptr_eq(it, &ran)) {
+                    posted.kept.remove(&key);
+                }
+            }
+        });
+    }
 }
 
 /// Claims every trace of a served step ([`Step::served`]) in `db` that no keep claimed
-/// before: each run is kept by exactly one caller, however many units' keeps run at once. The
-/// traces are taken under their lock, then the claims made under the posts' lock: never two
-/// at once, and neither across a wait. None where `db` has no item store installed.
-pub fn claim_keeps(db: &Db) -> Option<Claimed> {
+/// before: each run is kept by exactly one caller, however many units' keeps run at once, and
+/// a claim dropped without [`Claim::kept`] gives its runs back ([`Claim`]). The traces are
+/// taken under their lock, then the claims made under the posts' lock: never two at once, and
+/// neither across a wait. None where `db` has no item store installed.
+pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
     with_store(db, |store| {
         // alloc: one claim's snapshot of the database's traces, a counted reference each
         let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)> = store
@@ -665,201 +914,122 @@ pub fn claim_keeps(db: &Db) -> Option<Claimed> {
             .map(|(key, ran)| (*key, Arc::clone(ran)))
             .collect();
         let mut posted = store.served.lock();
-        let mut claimed = Claimed { steps: Vec::new(), refused: 0 };
+        let mut claim = Claim { steps: Vec::new(), refused: Vec::new(), db, marks: Vec::new() };
         for (key, ran) in traced {
             if posted.kept.get(&key).is_some_and(|it| Arc::ptr_eq(it, &ran)) {
                 continue;
             }
-            if matches!(*ran, Ran::Refused(_)) {
-                claimed.refused += 1;
-            } else {
-                claimed.steps.push(key);
+            let (def, step, _) = key;
+            match &*ran {
+                // alloc: the refusal's text, named to the driver
+                Ran::Refused(refusal) => claim.refused.push(Refused { def, step, why: format!("{refusal:?}") }),
+                Ran::Kept { .. } => claim.steps.push(key),
             }
-            posted.kept.insert(key, ran);
+            // clone: a counted reference, the mark and the claim's record of it
+            posted.kept.insert(key, Arc::clone(&ran));
+            claim.marks.push((key, ran));
         }
-        claimed
+        claim
     })
 }
 
-/// What differs, between two pins, of the reads body entries make, as the maintainers'
-/// deltas say it (end-state.md review point 8). A kind said by none of these is left unsaid,
-/// and a carry of a session with reads of it is refused naming it (`CarryError::Unsaid`):
-/// never taken as unchanged.
+/// One producer's word on one kind of read: the key ([`Read::key`], as an entry wrote it:
+/// [`fact_read`]'s for a fact, the body's for [`reads::IDENTITY`]) of each read of `kind`
+/// that differs between the carry's two pins. It may name more than differ, never fewer: a
+/// read it leaves out is taken as unchanged (`MainLeftOut` in the tests is the control).
+pub struct Exact {
+    pub kind: ReadKind,
+    /// Who says it, for the profile and a panic.
+    pub by: &'static str,
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// What differs, between two pins, of the reads body entries make (end-state.md review point
+/// 8): each kind a producer says exactly ([`Exact`], O(changed)), every other kind the
+/// session reads valued by the kernel (`Changed::valued`: each distinct read once at the new
+/// pin against what its entries saw). Total over the kinds the session reads, so no kind is
+/// left unsaid and none is always dirty.
 #[derive(Default)]
 pub struct BodyDelta {
-    /// The fact kinds whose difference a maintainer's delta gives exactly (impls' last write,
-    /// name resolution's bindings), each with the facts that differ and the crate each is
-    /// seen from.
-    pub exact: Vec<(ReadKind, Vec<(FactRef, String)>)>,
-    /// The fact kinds no delta gives yet, each by name: every entry with a read of one is
-    /// valued again at the carry ([`always_dirty`] counts them).
-    pub unknown: Vec<(ReadKind, &'static str)>,
-    /// The bodies whose identity differs, where a delta gives them; `None` while none does,
-    /// and every identity read is always dirty.
-    pub identities: Option<Vec<BodyKey>>,
+    pub exact: Vec<Exact>,
 }
 
-/// The name [`always_dirty`] gives identity reads by.
-pub const IDENTITY_NAME: &str = "body identity";
+/// How [`BodyDelta::say`] said a kind: by a producer's [`Exact`], named, or valued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum How {
+    Exact(&'static str),
+    Valued,
+}
 
 impl BodyDelta {
-    /// Says on `changed` what this delta says.
-    pub fn say<W: BodyWorld + ?Sized + 'static>(&self, changed: &mut Changed) {
-        match &self.identities {
-            None => changed.everything(reads::IDENTITY),
-            Some(bodies) => {
-                changed.exact(reads::IDENTITY);
-                // alloc: one read's name at a time, reused
-                let mut key = Vec::new();
-                for body in bodies {
-                    key.clear();
-                    key_of::<W>(body, &mut key);
-                    changed.differs(Read { kind: reads::IDENTITY, key: &key });
-                }
-            }
-        }
-        // alloc: one read's name at a time, reused
-        let mut key = Vec::new();
-        for (kind, facts) in &self.exact {
-            changed.exact(*kind);
-            for (fact, krate) in facts {
-                key.clear();
-                let read = fact_read(*fact, krate, &mut key);
-                assert_eq!(read, *kind, "a fact listed under another kind than its own");
-                changed.differs(Read { kind: read, key: &key });
-            }
-        }
-        for (kind, _) in &self.unknown {
-            changed.everything(*kind);
-        }
-    }
-
-    /// The kinds it says are always dirty, each with its name.
-    fn dirty(&self) -> impl Iterator<Item = (ReadKind, &'static str)> + '_ {
-        let identity = self.identities.is_none().then_some((reads::IDENTITY, IDENTITY_NAME));
-        identity.into_iter().chain(self.unknown.iter().copied())
-    }
-}
-
-/// For each kind `delta` says is always dirty, by name: how many of `session`'s entries read
-/// one, which a carry under `delta` values again whatever changed. Asked before the carry.
-pub fn always_dirty<G: Get + ?Sized>(
-    session: &mut Session,
-    store: &G,
-    delta: &BodyDelta,
-) -> Result<Vec<(&'static str, usize)>, KernelError> {
-    delta.dirty().map(|(kind, name)| Ok((name, session.readers_of(store, kind)?))).collect()
-}
-
-/// Item-hash's identity column of a pin's bodies, kept from one pin to the next: what gives
-/// [`BodyDelta::identities`] exactly, so no identity read is always dirty. Each body's
-/// identity is the item store's ([`BodyFacts::identity`](super::BodyFacts::identity), a
-/// memoized query: after an edit recomputed only where one of its parts changed), and the
-/// delta is every body whose identity is other bytes than at the last pin, is new, or is gone.
-///
-/// Still owed: a delta made from the parts' own deltas (the edited files' bodies, the
-/// readers of an item whose signature changed) without asking each body's identity.
-#[derive(Default)]
-pub struct Identities {
-    /// Each body by its key's bytes ([`key_of`]), with its identity at the last pin: none
-    /// where it had none.
-    kept: std::collections::BTreeMap<Vec<u8>, (BodyKey, Option<ContentId>)>,
-}
-
-impl Identities {
-    /// Keeps the identities of `keys`, the bodies of `world`'s pin, and gives the bodies whose
-    /// identity differs from the last pin's: other bytes, new, or gone (in key order). An
-    /// error names the body whose identity cannot be had.
-    pub fn delta<W: BodyWorld + ?Sized + 'static>(
-        &mut self,
-        world: &W,
-        keys: &[BodyKey],
-    ) -> Result<Vec<BodyKey>, String> {
-        let db = world.db();
-        // alloc: one pin's column, replacing the last
-        let mut now = std::collections::BTreeMap::new();
-        for key in keys {
-            let def = world.body(key)?;
-            let Some(identity) = with_store(db, |store| store.facts.identity(db, def)) else {
-                // alloc: error path
-                return Err(format!("{key:?}: the database has no item store installed"));
+    /// Says on `changed`, for each kind `session` reads ([`Session::kinds`]), what differs:
+    /// that kind's [`Exact`], else valued. Gives each kind with how it was said, in the
+    /// session's order. Two [`Exact`]s of one kind are a driver's bug, and panic naming both.
+    pub fn say(&self, session: &Session, changed: &mut Changed) -> Vec<(ReadKind, How)> {
+        // alloc: one carry's kinds, a few dozen
+        let mut said = Vec::new();
+        for kind in session.kinds() {
+            let mut of = self.exact.iter().filter(|it| it.kind == kind);
+            let Some(exact) = of.next() else {
+                changed.valued(kind);
+                said.push((kind, How::Valued));
+                continue;
             };
-            // alloc: one body's key
-            let mut bytes = Vec::new();
-            key_of::<W>(key, &mut bytes);
-            // clone: the key, kept with its identity
-            now.insert(bytes, (key.clone(), identity));
-        }
-        // alloc: the delta
-        let mut differs = Vec::new();
-        for (bytes, (key, identity)) in &now {
-            if self.kept.get(bytes).is_none_or(|(_, kept)| kept != identity) {
-                // clone: one body of the delta
-                differs.push(key.clone());
+            if let Some(other) = of.next() {
+                panic!(
+                    "two producers say reads of kind {:#06x} exactly, `{}` and `{}`: one producer a kind",
+                    kind.0, exact.by, other.by
+                );
             }
-        }
-        for (bytes, (key, _)) in &self.kept {
-            if !now.contains_key(bytes) {
-                // clone: one body of the delta
-                differs.push(key.clone());
+            changed.exact(kind);
+            for key in &exact.keys {
+                changed.differs(Read { kind, key: key.as_slice() });
             }
+            said.push((kind, How::Exact(exact.by)));
         }
-        self.kept = now;
-        Ok(differs)
+        said
     }
 }
 
-/// A body the syntax of one file has: its item, what it is, the inline modules it is in from
-/// the file's own module out, and its name.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Named {
+/// A body part of one file's `items`: its item, what the item is (a function, a `const`, a
+/// `static`, a variant's discriminant) and where its node starts in the file (its `lines`
+/// row's start, attributes and doc comments included).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Keyed {
     pub item: ItemId,
     pub kind: Kind,
-    pub modules: Vec<String>,
-    pub name: String,
+    pub start: u32,
 }
 
-/// The bodies of `items`, the value of `items(file)`, in the order written: a function, a
-/// `static` or a named `const` with a body at the file's top or in an inline module of it. Not
-/// yet: the bodies of `impl` and `trait` items; [`bodies`] gives how many of those it passed
-/// over, so a driver says what it did not key.
-pub fn bodies(items: &[u8]) -> Result<(Vec<Named>, usize), String> {
+/// The bodies of a file, from `items` and `lines`, the values of `items(file)` and its line
+/// part: each key of `items` that is a body's part ([`key_item`]), with its entry's kind and
+/// its row's start, sorted by `(start, kind)` as [`join`] takes them. Every body the syntax
+/// has, at the file's top, in an inline module, an `impl` or a `trait`, or in another body. An
+/// error names a table that does not read or a body with no entry or no row.
+pub fn keyed(items: &[u8], lines: &[u8]) -> Result<Vec<Keyed>, String> {
     // alloc: error path
     let table = Table::read(ITEMS, items).map_err(|why| format!("`items`' value: {why:?}"))?;
+    // alloc: error path
+    let rows = Table::read(LINES, lines).map_err(|why| format!("`lines`' value: {why:?}"))?;
     // alloc: the file's bodies
     let mut out = Vec::new();
-    let mut passed = 0;
-    walk(&table, ItemId::ROOT, &mut Vec::new(), &mut out, &mut passed)?;
-    Ok((out, passed))
-}
-
-fn walk(
-    table: &Table<'_>,
-    at: ItemId,
-    modules: &mut Vec<String>,
-    out: &mut Vec<Named>,
-    passed: &mut usize,
-) -> Result<(), String> {
-    let entry = entry_at(table, at)?;
-    for child in entry.children() {
-        let it = entry_at(table, child)?;
-        match it.kind {
-            Kind::Fn | Kind::Static | Kind::Const if it.has_body() && it.name != "_" => {
-                // alloc: one body's name and modules
-                out.push(Named { item: child, kind: it.kind, modules: modules.clone(), name: it.name.to_owned() });
-            }
-            Kind::Mod => {
-                // alloc: one module's name, while it is walked
-                modules.push(it.name.to_owned());
-                walk(table, child, modules, out, passed)?;
-                modules.pop();
-            }
-            Kind::Impl | Kind::Trait => *passed += it.children().len(),
-            Kind::Const if it.has_body() => *passed += 1,
-            _ => {}
-        }
+    for it in table.iter() {
+        // alloc: error path
+        let (key, _) = it.map_err(|why| format!("`items`' value: {why:?}"))?;
+        let Some((item, true)) = key_item(key) else { continue };
+        let kind = entry_at(&table, item)?.kind;
+        let row = match rows.get(&item.0) {
+            // alloc: error path
+            Ok(Some(row)) => ItemLines::read(row).map_err(|why| format!("`lines` under {}: {why}", hex(&item.0)))?,
+            // alloc: error path
+            Ok(None) => return Err(format!("`lines` has no row of the body under {}", hex(&item.0))),
+            // alloc: error path
+            Err(why) => return Err(format!("`lines` under {}: {why:?}", hex(&item.0))),
+        };
+        out.push(Keyed { item, kind, start: row.start });
     }
-    Ok(())
+    out.sort_unstable_by_key(|it| (it.start, it.kind));
+    Ok(out)
 }
 
 fn entry_at<'a>(table: &Table<'a>, id: ItemId) -> Result<Entry<'a>, String> {
@@ -872,63 +1042,53 @@ fn entry_at<'a>(table: &Table<'a>, id: ItemId) -> Result<Entry<'a>, String> {
     }
 }
 
-/// The body `named` is in `db`, where `file_module` is the module whose file `named` is of:
-/// the module its inline modules lead to by name, and the one function, `static` or `const`
-/// (as `named.kind` is) of its name declared there. An error names what is not there, or that
-/// two are.
-pub fn def_of(
-    db: &Db,
-    def_map: &DefMap,
-    file_module: ModuleId,
-    named: &Named,
-) -> Result<DefWithBodyId, String> {
-    let mut module = file_module;
-    for name in &named.modules {
-        let data = def_map
-            .modules(db)
-            .find(|(id, _)| *id == module)
-            .map(|(_, data)| data)
-            // alloc: error path
-            .ok_or_else(|| format!("no module {module:?} in its crate's def map"))?;
-        module = *data
-            .children(db)
-            .get(&Name::new_root(name))
-            // alloc: error path
-            .ok_or_else(|| format!("no module `{name}` in {module:?}"))?;
-    }
-    let data = def_map
-        .modules(db)
-        .find(|(id, _)| *id == module)
-        .map(|(_, data)| data)
-        // alloc: error path
-        .ok_or_else(|| format!("no module {module:?} in its crate's def map"))?;
-    let name = Name::new_root(&named.name);
-    let mut found = data.scope(db).declarations().filter_map(|def| match (named.kind, def) {
-        (Kind::Fn, ModuleDefId::FunctionId(it)) if FunctionSignature::of(db, it).name == name => {
-            Some(DefWithBodyId::FunctionId(it))
-        }
-        (Kind::Static, ModuleDefId::StaticId(it)) if StaticSignature::of(db, it).name == name => {
-            Some(DefWithBodyId::StaticId(it))
-        }
-        (Kind::Const, ModuleDefId::ConstId(it))
-            if ConstSignature::of(db, it).name.as_ref() == Some(&name) =>
-        {
-            Some(DefWithBodyId::ConstId(it))
-        }
-        _ => None,
-    });
-    let what = match named.kind {
-        Kind::Static => "static",
-        Kind::Const => "const",
-        _ => "function",
+/// Where a body of the database is written: its file, where its item's node starts there and
+/// what the item is, as [`Keyed`] says it of the syntax.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Written {
+    pub file: base_db::FileId,
+    pub start: u32,
+    pub kind: Kind,
+}
+
+/// Where `def` is written; none where its item is in a macro's expansion (no file has its
+/// node). A variant's body is its discriminant, whose node is where the syntax's row of it
+/// starts (`blaze_front_items::items`, the variant's entry), and none where it has none.
+pub fn written(db: &Db, def: DefWithBodyId) -> Option<Written> {
+    let (id, kind) = match def {
+        DefWithBodyId::FunctionId(it) => (it.lookup(db).id.erase(), Kind::Fn),
+        DefWithBodyId::ConstId(it) => (it.lookup(db).id.erase(), Kind::Const),
+        DefWithBodyId::StaticId(it) => (it.lookup(db).id.erase(), Kind::Static),
+        DefWithBodyId::VariantId(it) => (it.lookup(db).id.erase(), Kind::Variant),
     };
-    match (found.next(), found.next()) {
-        (Some(it), None) => Ok(it),
-        // alloc: error path
-        (None, _) => Err(format!("no {what} `{}` in {module:?}", named.name)),
-        // alloc: error path
-        (Some(_), Some(_)) => Err(format!("two of {what} `{}` in {module:?}", named.name)),
+    let file = id.file_id.file_id()?.file_id(db);
+    let start = match def {
+        DefWithBodyId::VariantId(it) => it.lookup(db).id.to_view(db).const_arg()?.syntax().text_range().start(),
+        _ => id.to_range(db).start(),
+    };
+    Some(Written { file, start: u32::from(start), kind })
+}
+
+/// Each body of `written` (the bodies of the database written in the file `keyed` is of, as
+/// [`written`] gives them) with the item of `keyed` (sorted, as [`keyed`] gives them) that
+/// starts where it does and is of its kind: an item's start is its node's start on both sides.
+/// A body with none is left out (the driver counts it).
+pub fn join(keyed: &[Keyed], written: &[(DefWithBodyId, Written)]) -> Vec<(ItemId, DefWithBodyId)> {
+    // alloc: the file's pairs
+    let mut out = Vec::with_capacity(written.len());
+    for &(def, at) in written {
+        let found = match any_kind() {
+            true => keyed.iter().find(|it| it.start == at.start),
+            false => keyed
+                .binary_search_by_key(&(at.start, at.kind), |it| (it.start, it.kind))
+                .ok()
+                .map(|found| &keyed[found]),
+        };
+        if let Some(it) = found {
+            out.push((it.item, def));
+        }
     }
+    out
 }
 
 #[cfg(test)]

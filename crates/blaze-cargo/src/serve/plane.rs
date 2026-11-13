@@ -772,6 +772,25 @@ struct Batch<W> {
     request: u32,
 }
 
+/// What gives the first request's number when the plane first opens one.
+// dyn: once a daemon, the history's open it waits for
+pub type Later = Box<dyn FnOnce() -> Result<u32, super::observe::Unopened> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the lazy numbering's control: [`Plane::number`] asks for the number
+    /// at once, as the start did when it waited for the history.
+    static ASKS_AT_NUMBER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How the plane numbers its requests ([`Plane::number`]).
+pub enum Numbered {
+    /// From this number on.
+    From(u32),
+    /// From the number this gives, asked at the first [`Plane::open`].
+    Later(Later),
+}
+
 /// The plane of thread tasks whose batches are each a `W`, given their costs and memory by `P`.
 pub struct Plane<W: Work, P: Predict> {
     graph: Graph,
@@ -782,6 +801,11 @@ pub struct Plane<W: Work, P: Predict> {
     batches: BTreeMap<u32, Batch<W>>,
     next_node: u32,
     next_request: u32,
+    /// The first request's number, asked at the first [`Plane::open`] ([`Numbered::Later`]).
+    later: Option<Later>,
+    /// Why the requests could not be numbered, for the daemon to stop on
+    /// ([`Plane::unnumbered`]).
+    unnumbered: Option<super::observe::Unopened>,
     happened: Vec<Happened<W::Value>>,
     ran: Vec<Ran<W::Value>>,
     said: Vec<PlaneOutput>,
@@ -951,6 +975,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
             batches: BTreeMap::new(),
             next_node: 0,
             next_request: 0,
+            later: None,
+            unnumbered: None,
             happened: Vec::new(),
             ran: Vec::new(),
             said: Vec::new(),
@@ -1489,18 +1515,53 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
     }
 
-    /// Requests are numbered from `first` on: the daemon's first build's number
-    /// ([`super::observe::Observe::first_build`]), past every build its history names, so a
-    /// request's number is its build's id in the flight recorder and the history. Never 0.
-    pub fn number_from(&mut self, first: u32) {
-        self.next_request = first.max(1);
+    /// How requests are numbered ([`super::observe::Observe::numbering`]): from the daemon's
+    /// first build's number on, past every build its history names, so a request's number is
+    /// its build's id in the flight recorder and the history. Never 0. [`Numbered::Later`] is
+    /// asked at the first [`Plane::open`], not before: a daemon answering from certificates
+    /// opens none, and its start waits for nothing of the history.
+    pub fn number(&mut self, by: Numbered) {
+        match by {
+            Numbered::From(first) => {
+                self.next_request = first.max(1);
+                self.later = None;
+            }
+            #[cfg(test)]
+            Numbered::Later(later) if ASKS_AT_NUMBER.get() => {
+                self.next_request = later().unwrap_or(1).max(1);
+            }
+            Numbered::Later(later) => self.later = Some(later),
+        }
+    }
+
+    /// Why the requests could not be numbered, once: the history did not open, so the daemon
+    /// stops on it (the request opened meanwhile was numbered 1 and is written to no history).
+    pub fn unnumbered(&mut self) -> Option<super::observe::Unopened> {
+        self.unnumbered.take()
     }
 
     /// A request, of weight 1: every job's share of the threads is the same. An `idle` one runs
     /// on what no other can use until it is promoted ([`Plane::promote`]).
-    pub fn open(&mut self, at: Duration, keep_going: bool, idle: bool) -> RequestId {
-        let request = RequestId(self.next_request);
+    /// The next request number, taken for a build the plane runs nothing of (a solo answer the
+    /// daemon took from its kept rows, `Daemon::solo_taken`): the one sequence of build ids. A
+    /// [`Numbered::Later`] numbering is asked here as at the first [`Plane::open`].
+    pub fn number_unplanned(&mut self) -> u32 {
+        if let Some(later) = self.later.take() {
+            self.next_request = match later() {
+                Ok(first) => first.max(1),
+                Err(unopened) => {
+                    self.unnumbered = Some(unopened);
+                    1
+                }
+            };
+        }
+        let number = self.next_request;
         self.next_request = self.next_request.wrapping_add(1).max(1);
+        number
+    }
+
+    pub fn open(&mut self, at: Duration, keep_going: bool, idle: bool) -> RequestId {
+        let request = RequestId(self.number_unplanned());
         let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle };
         // alloc: a request's live model, once per request
         self.folds.by.insert(request, Live { fold: Fold::new(), began_ns: ns(at) });
@@ -2783,5 +2844,55 @@ mod tests {
             plane.predict().record(kinds::PROGRAM, &program).expect("its runs teach its key");
         assert_eq!(record.seen, 2);
         assert_eq!(plane.forecast(kinds::PROGRAM, Some(program), 4 << 10, 0).0.basis, Basis::Own);
+    }
+
+    /// The invariant: a plane numbered later asks for its first number at its first open and
+    /// not before, once; its requests are numbered from the answer on; an answer that is the
+    /// history's failure numbers the request 1 and is kept, once, for the daemon to stop on,
+    /// never a panic. Control: the planted `ASKS_AT_NUMBER` asks before any open, and the
+    /// oracle sees it.
+    #[test]
+    fn a_plane_numbered_later_asks_once_at_its_first_open() {
+        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
+        let plane = || -> Plane<Idle, _> {
+            let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+            let history = blaze_history::History::new(blaze_history::Config::default());
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap()
+        };
+        let asked_before_open = |planted: bool| {
+            ASKS_AT_NUMBER.set(planted);
+            let mut plane = plane();
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counted = std::sync::Arc::clone(&asked);
+            plane.number(Numbered::Later(Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(41)
+            })));
+            ASKS_AT_NUMBER.set(false);
+            let before = asked.load(Ordering::SeqCst);
+            assert_eq!(plane.open(Duration::ZERO, false, false), RequestId(41));
+            assert_eq!(plane.open(Duration::ZERO, false, false), RequestId(42));
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once");
+            assert!(plane.unnumbered().is_none());
+            before
+        };
+        assert_eq!(asked_before_open(false), 0, "not asked before the first open");
+        assert_eq!(asked_before_open(true), 1, "the control: the planted plane asks before any open");
+
+        let mut failed = plane();
+        let unopened = super::super::observe::Unopened {
+            dir: "/home/u/.cache/blaze/v2/profile".into(),
+            why: super::super::observe::Unopen::Gone,
+        };
+        let said = unopened.clone(); // clone: compared below
+        failed.number(Numbered::Later(Box::new(move || Err(said))));
+        assert_eq!(failed.open(Duration::ZERO, false, false), RequestId(1));
+        assert_eq!(failed.unnumbered(), Some(unopened));
+        assert_eq!(failed.unnumbered(), None, "said once");
+        assert_eq!(failed.open(Duration::ZERO, false, false), RequestId(2));
+
+        let mut from = plane();
+        from.number(Numbered::From(0));
+        assert_eq!(from.open(Duration::ZERO, false, false), RequestId(1), "never 0");
     }
 }

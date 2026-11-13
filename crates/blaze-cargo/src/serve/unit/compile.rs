@@ -58,7 +58,10 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
 use blaze_profile::span::{self, Name};
-use blaze_units::schema::{Mode, Unit};
+use blaze_units::{
+    query::{BuildConfig, Units},
+    schema::{Mode, Unit},
+};
 use hir_ty_codegen::v2::BodyChecks;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +76,7 @@ use super::{
     portable::{self, Places},
     reads, say, script,
 };
-use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, Put};
+use crate::serve::work::{Compiled, Failed, JobKind, KeptPut, Linking, Output, Phase, Put, PutInto};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -906,7 +909,7 @@ fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
 fn kept_check(job: &Job, unit: usize) -> Result<Option<(Vec<Diag>, bool)>, ApiError> {
     let Some(base) = check_key(job, unit)? else { return Ok(None) };
     let guard = blaze_cas::enter();
-    let Some((_, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? else {
+    let Some((_, entry, body)) = filed_in(job, &job.input.store, &guard, base)? else {
         return Ok(None);
     };
     let checked = Checked::decoded(entry.bytes, body).map_err(|why| {
@@ -1113,7 +1116,12 @@ pub(crate) const UNKEPT_STEP: &str = "unit record";
 /// misses (and a warning), so the build that made it names the reason the next one will
 /// make it again for. Without it the next build's miss said only that its key was as it was.
 fn unkept(job: &Job, u: &Unit, why: String) -> blaze_kernel::Miss {
-    let item = span_unit(u);
+    unkept_as(span_unit(u), unit_subject(job, u).unwrap_or_default(), why)
+}
+
+/// [`unkept`] of the unit spanned as `item` ([`span_unit`]) whose subject is `subject`
+/// ([`unit_subject`]): what a record filed after the answer ([`file_records`]) says.
+fn unkept_as(item: String, subject: ContentId, why: String) -> blaze_kernel::Miss {
     tracing::warn!(
         target: "blaze",
         unit = %item,
@@ -1122,7 +1130,7 @@ fn unkept(job: &Job, u: &Unit, why: String) -> blaze_kernel::Miss {
     );
     blaze_kernel::Miss {
         step: UNKEPT_STEP,
-        subject: unit_subject(job, u).unwrap_or_default(),
+        subject,
         item,
         // alloc: once per unit whose record is not kept
         missed: blaze_kernel::Missed::Always(format!(
@@ -1134,6 +1142,210 @@ fn unkept(job: &Job, u: &Unit, why: String) -> blaze_kernel::Miss {
         beyond: None,
         via: None,
     }
+}
+
+/// A unit's record still to encode and file ([`Compiled::record`]): what [`store`] keeps of a
+/// made unit for it, so the build's answer waits only for what it gives (diagnostics, `ok`,
+/// the outputs with their keys) and the record is made after it, by [`file_records`] on the
+/// job's after-answer task. Where a record is filed depends on its encoded bytes (a root they
+/// still hold files it for this build's directories alone, [`Places::here`]), so encode and
+/// filing go together; nothing the answer gives a client reads the record's key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct PendingRecord {
+    unit: usize,
+    /// The unit as its spans name it ([`span_unit`]), for its errors, its reads and its miss.
+    item: String,
+    /// Its subject in `blaze why` ([`unit_subject`]), for a miss of a record no slot took.
+    subject: ContentId,
+    /// The key it is filed by: narrow, with its quoted files, or whole ([`record_key`]).
+    base: Key,
+    read: reads::Reads,
+    ok: bool,
+    open: bool,
+    why: Option<String>,
+    said: Said,
+    /// Each output's path, its key (that of its ported text where it has one,
+    /// [`ported_outputs`]) and whether it is executable, in the order the record names them.
+    outputs: Vec<(String, Key, bool)>,
+    artifact: Option<Artifact>,
+    made: Made,
+    /// The outputs (by index) named by their ported text.
+    ported: Vec<u32>,
+    /// Each native input its link read, by its path where it was read.
+    natives: Vec<(String, ContentId)>,
+    /// What each profile did to its functions ([`codegen::counted`]).
+    counted: Vec<(ContentId, ProfileCounts)>,
+    places: Places,
+    /// Why its outputs tie it to the build's directories, the first reason found.
+    tie: Option<String>,
+    /// Why what its closure's code was given ties it ([`portable::path_reads`]), read by the
+    /// unit's task where `tie` is none; asked after the record's own bytes.
+    reads_tie: Option<String>,
+    /// Its record and slot go into the machine's layer ([`PutInto::Layer`]), as its outputs did.
+    sealed: bool,
+    /// The slot of the files its diagnostics quote, first kept with this record ([`quotes_slot`]).
+    quotes: Option<Put>,
+}
+
+/// What [`file_records`] came to.
+#[derive(Debug, Default)]
+pub(crate) struct Filed {
+    /// The records, their slots and their quotes' slots, each into the store its unit's
+    /// outputs went to: puts of the after-answer task, which the job's settling waits for.
+    pub(crate) puts: Vec<KeptPut>,
+    /// Each unit whose record no slot of its key took: made again in every build.
+    pub(crate) misses: Vec<blaze_kernel::Miss>,
+    /// Each record that could not be encoded or filed, naming its unit: that record alone is
+    /// lost, said as a loss of the build.
+    pub(crate) refused: Vec<ApiError>,
+}
+
+/// On a worker, after the build's answer: each of `records` encoded and filed against the
+/// store of its build (`store`, read for the slots of its key) under the request's
+/// environment (`config`) and units (`units`), the values its reads are filed by. One
+/// record's failure fails that record alone (panics-fail-one-job).
+pub(crate) fn file_records(
+    records: Vec<Box<PendingRecord>>,
+    config: &BuildConfig,
+    units: &Units,
+    store: &blaze_cas::Reader,
+) -> Filed {
+    let mut filed = Filed {
+        // alloc: once per after-answer task, a record and its slot each
+        puts: Vec::with_capacity(records.len() * 2),
+        ..Filed::default()
+    };
+    for record in records {
+        match file_record(*record, config, units, store, &mut filed.puts) {
+            Ok(None) => {}
+            Ok(Some(miss)) => filed.misses.push(miss),
+            Err(error) => filed.refused.push(error),
+        }
+    }
+    filed
+}
+
+/// [`file_records`] of one record: its puts pushed to `puts`; the miss of a record no slot of
+/// its key took.
+fn file_record(
+    record: PendingRecord,
+    config: &BuildConfig,
+    units: &Units,
+    store: &blaze_cas::Reader,
+    puts: &mut Vec<KeptPut>,
+) -> Result<Option<blaze_kernel::Miss>, ApiError> {
+    let PendingRecord {
+        unit,
+        item,
+        subject,
+        base,
+        read,
+        ok,
+        open,
+        why,
+        said,
+        outputs,
+        artifact,
+        made,
+        ported,
+        natives,
+        counted,
+        places,
+        tie,
+        reads_tie,
+        sealed,
+        quotes,
+    } = record;
+    // Every string of its body and each native input's path is written against the build's
+    // directories ([`Places::cbor`], [`Places::text`]).
+    let bytes = {
+        let _span =
+            tracing::info_span!(target: "blaze", "unit record encode", unit = unit as u64).entered();
+        // alloc: error path
+        let failed = |why: String| ApiError::new(format!("encoding the record of {item}: {why}"), None);
+        let body = RecordRef {
+            ok,
+            open,
+            why: why.as_deref(),
+            said: &said,
+            outputs: outputs.iter().map(|(path, key, executable)| (path.as_str(), *key, *executable)).collect(),
+            artifact: artifact.as_ref(),
+            made: &made,
+            ported,
+        };
+        let keys: Vec<Key> = outputs.iter().map(|it| it.1).collect(); // alloc: once per record, a key an output
+        // alloc: once per record kept, a native input each
+        let natives: Vec<(String, ContentId)> = natives
+            .iter()
+            .map(|(path, hash)| {
+                (String::from_utf8_lossy(&places.text(path.as_bytes())).into_owned(), *hash)
+            })
+            .collect();
+        let mut bytes = Vec::new(); // alloc: once per record kept
+        header::write(&mut bytes, &keys, &natives, &counted);
+        let mut cbor = Vec::new(); // alloc: once per record kept
+        blaze_protocol::cbor::append(&mut cbor, &body).map_err(|why| failed(why.to_string()))?;
+        places.cbor(&cbor, &mut bytes).map_err(failed)?;
+        bytes
+    };
+    // What ties it to where it was made: an output, a root its bytes still hold, or a path its
+    // closure's code was given and could have made something of ([`portable::path_reads`]).
+    let tie = tie
+        .or_else(|| {
+            places.tied(&bytes).then(|| {
+                // alloc: once per record tied
+                "its record names a directory of the build where no path starts (a diagnostic, a variable its program is run with)".to_owned()
+            })
+        })
+        .or(reads_tie);
+    if let Some(why) = &tie {
+        tracing::info!(target: "blaze", unit, item = %item, "unit record kept for this build's directories alone: {why}");
+    }
+    // Every slot of the base key holding other names leaves the record unkept, and the unit
+    // compiles again next time. A record tied to the build's directories is filed under its
+    // key here ([`Places::here`]).
+    let base = match tie {
+        Some(_) => places.here(base),
+        None => base,
+    };
+    let primary = |manifest: &str| units.is_primary_manifest(manifest);
+    let filing = {
+        let _span =
+            tracing::info_span!(target: "blaze", "unit record file", unit = unit as u64).entered();
+        let guard = blaze_cas::enter();
+        reads::file(base, &read, &config.invocation.env, &primary, |slot| {
+            store.get(&guard, slot).ok().flatten().map(|it| it.bytes)
+        })
+        // alloc: error path
+        .map_err(|why| ApiError::new(format!("filing the record of {item}: {why}"), None))?
+    };
+    let Some(reads::Filing { key, slot }) = filing else {
+        // alloc: once per unit whose record is not kept
+        let why = format!(
+            "each of the {} slots of its record key holds other names of what its code read",
+            reads::SLOTS
+        );
+        return Ok(Some(unkept_as(item, subject, why)));
+    };
+    if !read.is_empty() {
+        say_reads(&item, "filed", None, read.named_then(&config.invocation.env, &primary));
+    }
+    let into = match sealed {
+        true => PutInto::Layer,
+        false => PutInto::Home,
+    };
+    let what: Arc<str> = Arc::from(format!("the record of {item}")); // alloc: once per record kept
+    // clone: a refcount, for the slot and the quotes' slot below
+    puts.push(KeptPut { put: Put { key, kind: Kind::Query, bytes }, what: Arc::clone(&what), into });
+    if let Some((key, bytes)) = slot {
+        // clone: a refcount, for the quotes' slot below
+        puts.push(KeptPut { put: Put { key, kind: Kind::Query, bytes }, what: Arc::clone(&what), into });
+    }
+    // The slot of the files its diagnostics quote is the home's, a sealed unit's too.
+    if let Some(put) = quotes {
+        puts.push(KeptPut { put, what, into: PutInto::Home });
+    }
+    Ok(None)
 }
 
 /// What a unit whose record the store does not keep is filed under past its record key: what
@@ -1248,7 +1460,9 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
                 &job.input.config.invocation.env,
                 &|manifest| job.units().is_primary_manifest(manifest),
                 |env, shape| job.input.macros.keeps().reads_now(env, shape),
-                |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
+                // Said for `blaze why`, of a record already missed: a look no output rests on,
+                // kept by no build.
+                |path| base_db::IncludedFile::content_now(std::path::Path::new(path), &base_db::Looks::none()),
                 |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
             );
             match slots {
@@ -1902,13 +2116,11 @@ fn machine_file(
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Ok(keys) = record_keys(job, unit) else { return false };
     let guard = blaze_cas::enter();
-    let found_in = |store: &blaze_cas::Reader, std: bool, base: Key| {
-        matches!(filed_in(job, store, std, &guard, base), Ok(Some(_)))
-    };
-    keys.into_iter().flatten().any(|base| {
-        found_in(&job.input.store, false, base)
-            || (shared(job, unit) && found_in(&job.input.std, true, base))
-    })
+    // A sealed unit's record (std's, any sealed tree's) is in the machine's layer, which the
+    // daemon's store reads behind its own records: one lookup finds either.
+    keys.into_iter()
+        .flatten()
+        .any(|base| matches!(filed_in(job, &job.input.store, &guard, base), Ok(Some(_))))
 }
 
 /// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
@@ -1921,10 +2133,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
 pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
     let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
     let guard = blaze_cas::enter();
-    let found_in = |store: &blaze_cas::Reader, std: bool| {
-        matches!(filed_in(job, store, std, &guard, narrow), Ok(Some(_)))
-    };
-    found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
+    matches!(filed_in(job, &job.input.store, &guard, narrow), Ok(Some(_)))
 }
 
 /// The narrowed identities of library crates the writer worked out and no unit gave the loop
@@ -1934,37 +2143,27 @@ fn library_puts(job: &Job) -> Vec<Put> {
     std::mem::take(&mut *job.library_narrows.lock())
 }
 
-/// The store a record is read from, named for an error: the daemon's, or with `std` the shared
-/// std store.
-fn store_named(job: &Job, std: bool) -> String {
-    match std {
-        // alloc: error path
-        true => format!("the shared std store ({})", job.input.config.std),
-        false => "the daemon's store".to_owned(), // alloc: error path
-    }
-}
-
 /// The record of base key `base` in `store`, filed under `base` or under what its code read
 /// with the values it has now ([`reads::find`]): a variable's in the job's environment, a
 /// file's outside every source root as it is on disk, a proc-macro expansion's worked out
 /// again from its names. With where it was found and where
 /// its CBOR body starts. An error names the slot that does not decode or whose reads can't be
-/// worked out, or the key and the store (`std`: the shared std store) a read of failed: a store
-/// that can't be read is never a record not kept (rule 3).
+/// worked out, or the key a read of failed: a store that can't be read is never a record not
+/// kept (rule 3). A sealed crate's record is found the same way, in the machine's layer the
+/// store reads behind its own (`serve::sealed`).
 fn filed_in<'g>(
     job: &Job,
     store: &'g blaze_cas::Reader,
-    std: bool,
     guard: &'g blaze_cas::Guard,
     base: Key,
 ) -> Result<Option<(reads::Found, blaze_cas::Entry<'g>, usize)>, ApiError> {
     // Under its key, then under its key here ([`Places::here`]): where a record is that is
     // tied to the directories of the build that made it ([`tied`]).
     let places = Places::of(job);
-    if let Some(found) = filed_under(job, &places, store, std, guard, base)? {
+    if let Some(found) = filed_under(job, &places, store, guard, base)? {
         return Ok(Some(found));
     }
-    filed_under(job, &places, store, std, guard, places.here(base))
+    filed_under(job, &places, store, guard, places.here(base))
 }
 
 /// [`filed_in`] under `base` itself.
@@ -1972,7 +2171,6 @@ fn filed_under<'g>(
     job: &Job,
     places: &Places,
     store: &'g blaze_cas::Reader,
-    std: bool,
     guard: &'g blaze_cas::Guard,
     base: Key,
 ) -> Result<Option<(reads::Found, blaze_cas::Entry<'g>, usize)>, ApiError> {
@@ -1984,15 +2182,12 @@ fn filed_under<'g>(
         let first = failed.take();
         failed.set(first.or(Some((*key, error))));
     };
-    // Lane packs-1112: what is fetched on a miss goes to the daemon's own store, so nothing
-    // is asked on behalf of the shared std store.
-    let _reading = crate::serve::packs::reading(std);
     let at = reads::find(
         base,
         &job.input.config.invocation.env,
         &|manifest| job.units().is_primary_manifest(manifest),
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
-        |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
+        |path| base_db::IncludedFile::content_now(std::path::Path::new(path), &job.input.looks),
         |slot| match store.get(guard, slot) {
             // Lane packs-1112: a slot not kept is asked of the packs, then read again.
             Ok(None) if crate::serve::packs::missed(slot) => match store.get(guard, slot) {
@@ -2008,7 +2203,7 @@ fn filed_under<'g>(
                 None
             }
         },
-        |key| match found(places, store, guard, key) {
+        |key| match found(places, store, guard, key, &job.input.looks) {
             Ok(it) => {
                 hit = it;
                 hit.is_some()
@@ -2022,10 +2217,9 @@ fn filed_under<'g>(
     if let Some((key, error)) = failed.take() {
         // alloc: error path
         let what = format!(
-            "reading {:x} (of record key {:x}) from {}: {error}",
+            "reading {:x} (of record key {:x}) from the daemon's store or a layer it reads: {error}",
             key.0,
             base.0,
-            store_named(job, std)
         );
         return Err(ApiError::new(what, None));
     }
@@ -2033,10 +2227,40 @@ fn filed_under<'g>(
     Ok(at.zip(hit).map(|(at, (entry, body))| (at, entry, body)))
 }
 
-/// Whether `unit` is the standard library's, whose records are also in the shared std store
-/// ([`crate::serve::work::JobInput::std`]).
-fn shared(job: &Job, unit: usize) -> bool {
-    job.unit(unit).is_ok_and(|it| it.is_std)
+/// Whether `unit` is sealed: its package's sources are pinned by the digest of the tree they
+/// are read from, by the one rule of what is sealed (`serve::sealed::pin`, which the planner
+/// writes on its crates too), so what it compiles to is the same for every home on the
+/// machine, and its record and outputs go into the machine's layer only
+/// ([`blaze_cas::Handle::layer`], the shared store every home reads below its own), where a
+/// home that never built it finds it. A workspace member and a path dependency never are.
+fn sealed(job: &Job, unit: usize) -> Result<bool, ApiError> {
+    let package = job.package(job.unit(unit)?)?;
+    let sources = std::path::Path::new(&job.input.config.sources);
+    Ok(crate::serve::sealed::pin(package, sources, shipped)?.is_some())
+}
+
+/// What pins each package of `units`, in their order (`blaze_lower::Lower::sealed`), by
+/// [`crate::serve::sealed::pin`]: what the planner writes on each crate.
+pub(super) fn pins(units: &blaze_units::query::Units, sources: &str) -> Result<Vec<Option<ContentId>>, ApiError> {
+    let sources = std::path::Path::new(sources);
+    // alloc: once a lowering, a pin a package
+    let mut pins = Vec::with_capacity(units.packages.len());
+    for package in &units.packages {
+        pins.push(crate::serve::sealed::pin(package, sources, shipped)?.map(|it| it.digest()));
+    }
+    Ok(pins)
+}
+
+/// The trees the toolchain ships sealed ([`crate::cli::store::shipped`]), listed once a
+/// process: they are fixed for a blaze. One that cannot be listed is every sealed test's error.
+fn shipped() -> Result<&'static [crate::serve::sealed::Placed], ApiError> {
+    static SHIPPED: std::sync::OnceLock<Result<Vec<crate::serve::sealed::Placed>, String>> =
+        std::sync::OnceLock::new();
+    match SHIPPED.get_or_init(|| crate::cli::store::shipped().map(|(_, placed)| placed)) {
+        Ok(placed) => Ok(placed),
+        // alloc: an error, once a unit that asks
+        Err(why) => Err(ApiError::new(format!("the toolchain's sealed trees: {why}"), None)),
+    }
 }
 
 /// The record of `key` in `store`, every output it names in `store` and every native input
@@ -2050,6 +2274,7 @@ fn found<'g>(
     store: &'g blaze_cas::Reader,
     guard: &'g blaze_cas::Guard,
     key: &Key,
+    looks: &base_db::Looks,
 ) -> Result<Option<(blaze_cas::Entry<'g>, usize)>, blaze_cas::Corrupt> {
     // Lane packs-1112: a record not kept is asked of the packs, then read again; so is each
     // output it names (`has`, below).
@@ -2061,7 +2286,8 @@ fn found<'g>(
         },
         None => return Ok(None),
     };
-    let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
+    // Each look at a native input is the build's own ([`crate::serve::work::JobInput::looks`]).
+    let mut disk = blaze_usercode::inputs::Disk::new(Vec::new(), looks);
     let mut on_disk = machine_file(&mut disk);
     let mut file = |path: &std::path::Path| {
         let real = places.real(path.as_os_str().as_encoded_bytes()).ok()?;
@@ -2107,8 +2333,8 @@ pub(crate) fn codegen_inputs(job: &Job) -> Result<Vec<(ContentId, ContentId)>, F
 
 /// What the build `unit`'s record is of did with each profile it used ([`header::profiles`]),
 /// read from its header in place: [`Recorded::Missing`], naming the unit and its record key,
-/// when the store has no record of it or the key is not known yet. The standard library's
-/// units are looked for in the shared std store too.
+/// when the store has no record of it or the key is not known yet. A sealed unit's record is
+/// found in the machine's layer the store reads behind its own (`serve::sealed`).
 pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiError> {
     let name = || job.unit(unit).map_or("", |it| it.target.name.as_str());
     let keys = record_keys(job, unit)?;
@@ -2120,21 +2346,10 @@ pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiE
         )));
     };
     let guard = blaze_cas::enter();
-    let read = |store: &blaze_cas::Reader,
-                std: bool,
-                base: Key|
-     -> Result<Option<Vec<_>>, ApiError> {
-        let Some((_, entry, _)) = filed_in(job, store, std, &guard, base)? else { return Ok(None) };
-        recorded_in(job, unit, base, entry.bytes).map(Some)
-    };
     let mut found = None;
     for base in keys.into_iter().flatten() {
-        found = match read(&job.input.store, false, base)? {
-            Some(profiles) => Some(profiles),
-            None if shared(job, unit) => read(&job.input.std, true, base)?,
-            None => None,
-        };
-        if found.is_some() {
+        if let Some((_, entry, _)) = filed_in(job, &job.input.store, &guard, base)? {
+            found = Some(recorded_in(job, unit, base, entry.bytes)?);
             break;
         }
     }
@@ -2211,19 +2426,20 @@ fn pack_keys(job: &Job) -> Vec<Key> {
     keys
 }
 
-/// The record of a standard library unit, and of bstd, with the slot of what it read and
-/// every output it names, handed to the store's collector to pin: the toolchain's own records
-/// and bstd's are kept whatever their last use (docs/gc.md, "The store's budget and
-/// collector"; [`crate::serve::collect::keep`]).
+/// The record of a sealed unit ([`sealed`]), with the slot of what it read and every output it
+/// names, handed to the store's collector to pin: a sealed tree's records are kept whatever
+/// their last use (docs/gc.md, "The store's budget and collector";
+/// [`crate::serve::collect::keep`]). One pin for every sealed tree, asked of the one rule:
+/// no name decides it. A unit whose sealing cannot be told pins nothing; its compile says why.
 fn pin_kept(job: &Job, unit: usize, at: &reads::Found, record: &Record) {
-    let Ok(it) = job.unit(unit) else { return };
-    let name = match (it.is_std, it.target.name == "bstd") {
-        (true, _) => crate::serve::collect::TOOLCHAIN,
-        (false, true) => crate::serve::collect::BSTD,
-        (false, false) => return,
-    };
+    if !sealed(job, unit).unwrap_or(false) {
+        return;
+    }
     let outputs = record.outputs.iter().map(|(_, output, _)| *output);
-    crate::serve::collect::keep(name, at.slot.iter().copied().chain(outputs).chain([at.key]));
+    crate::serve::collect::keep(
+        crate::serve::collect::TOOLCHAIN,
+        at.slot.iter().copied().chain(outputs).chain([at.key]),
+    );
 }
 
 /// [`kept`] under the base key `base`, one of the unit's ([`record_keys`]).
@@ -2249,7 +2465,7 @@ fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiErro
         )
     };
     let places = Places::of(job);
-    if let Some((at, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? {
+    if let Some((at, entry, body)) = filed_in(job, &job.input.store, &guard, base)? {
         let record: Record = decoded(&places, &entry.bytes[body..])
             .map_err(|error| undecoded("the daemon's store", error))?;
         pin_kept(job, unit, &at, &record);
@@ -2257,34 +2473,10 @@ fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiErro
         // alloc: none
         return Ok(Some(Kept { record, puts: Vec::new(), profiles }));
     }
-    if !shared(job, unit) {
-        return Ok(None);
-    }
-    let std = &job.input.std;
-    let in_std = || store_named(job, true);
-    let Some((at, entry, body)) = filed_in(job, std, true, &guard, base)? else { return Ok(None) };
-    let record: Record =
-        decoded(&places, &entry.bytes[body..]).map_err(|error| undecoded(&in_std(), error))?;
-    pin_kept(job, unit, &at, &record);
-    let profiles = recorded_in(job, unit, base, entry.bytes)?;
-    let mut puts = Vec::with_capacity(record.outputs.len() + 2); // alloc: once per std unit found shared
-    let copied = at.slot.iter().chain(record.outputs.iter().map(|(_, output, _)| output));
-    for key in copied {
-        let read = std.get(&guard, key).map_err(|error| {
-            let (what, pkg) = named();
-            // alloc: error path
-            ApiError::new(
-                format!("{what}: reading its output {:x} from {}: {error}", key.0, in_std()),
-                pkg,
-            )
-        })?;
-        let Some(it) = read else { return Ok(None) };
-        // alloc: a copy of what another daemon made, once per output, for the store to own
-        puts.push(Put { key: *key, kind: it.kind, bytes: it.bytes.to_vec() });
-    }
-    // alloc: the record's copy, once per std unit found shared
-    puts.push(Put { key: at.key, kind: entry.kind, bytes: entry.bytes.to_vec() });
-    Ok(Some(Kept { record, puts, profiles }))
+    // A std unit's record, and any sealed tree's, is in the machine's sealed layer, which the
+    // daemon's store reads behind its own records (`serve::sealed`): the `get` above found it
+    // there in place. Nothing of it is copied into this home (track 7, task A).
+    Ok(None)
 }
 
 /// The record whose CBOR body the store keeps as `body`, every string of it written against
@@ -2345,17 +2537,21 @@ fn unported(
     Ok(())
 }
 
-/// What std unit `unit` made, for the shared std store: its record `record` and every output
-/// it names, from `compiled`'s puts or the store.
-fn share(job: &Job, unit: usize, compiled: &Compiled, record: &Put) -> Result<Vec<Put>, ApiError> {
+/// What sealed unit `unit` made, for the machine's layer: every output its record names, taken
+/// out of `compiled`'s puts (the home keeps none of it) or, made by an earlier build of this
+/// home, read from the store.
+fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, ApiError> {
     let guard = blaze_cas::enter();
-    let mut share = Vec::with_capacity(compiled.outputs.len() + 1); // alloc: once per std unit made
+    let mut share = Vec::with_capacity(compiled.outputs.len() + 2); // alloc: once per sealed unit made
     for output in &compiled.outputs {
-        let put = match compiled.puts.iter().find(|it| it.key == output.key) {
-            // alloc: a copy for the shared store, once per output of a std unit made
-            Some(put) => Put { key: put.key, kind: put.kind, bytes: put.bytes.clone() },
+        // Two outputs of the same bytes are one put.
+        if share.iter().any(|it: &Put| it.key == output.key) {
+            continue;
+        }
+        let put = match compiled.puts.iter().position(|it| it.key == output.key) {
+            Some(at) => compiled.puts.remove(at),
             None => match job.input.store.get(&guard, &output.key) {
-                // alloc: a copy for the shared store, once per output of a std unit made
+                // alloc: a copy for the layer, once per output of a sealed unit an earlier build made
                 Ok(Some(it)) => Put { key: output.key, kind: it.kind, bytes: it.bytes.to_vec() },
                 Ok(None) => {
                     // alloc: an error, once
@@ -2375,8 +2571,6 @@ fn share(job: &Job, unit: usize, compiled: &Compiled, record: &Put) -> Result<Ve
         };
         share.push(put);
     }
-    // alloc: the record's copy, once per std unit made
-    share.push(Put { key: record.key, kind: record.kind, bytes: record.bytes.clone() });
     Ok(share)
 }
 
@@ -2413,8 +2607,12 @@ pub(crate) struct Phases {
     /// What [`Phase::Codegen`] made of a `Doctest` unit's examples and runner ([`doctest`]).
     doctests: Option<doctest::Generated>,
     /// The `parse` and `items` entries [`Phase::Bodies`] ran to serve its crate's bodies
-    /// ([`super::deps::serve_bodies`]), for [`Phase::Store`] to hand the loop.
+    /// ([`super::deps::serve_bodies`]), and its session's save, for [`Phase::Store`] to hand
+    /// the loop.
     body_puts: Vec<Put>,
+    /// The crate's stable name and the root its body entries' session was saved under by
+    /// [`Phase::Bodies`], for [`Phase::Store`] to hand the loop to mark.
+    body_sessions: Vec<(String, blaze_cas::Key)>,
 }
 
 /// What a unit does, as [`Phase::Names`] finds it.
@@ -2615,6 +2813,27 @@ pub(crate) fn compile(
     Ok(None)
 }
 
+/// A unit that stands (`serve::job::standing`) in its one task: [`Phase::Names`], whose lookup
+/// finds its record (`Phases::kept`), then [`Phase::Store`], which gives it; the phases between
+/// make nothing of a kept unit, and the store links what its link would ([`store`]). `None`,
+/// and nothing stored, when the lookup finds no record to replay.
+pub(super) fn stand(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    images: &mut Vec<Image>,
+) -> Result<Option<Compiled>, Failed> {
+    compile(job, reader, unit, Phase::Names, images)?;
+    let Some(slot) = job.phases.get(unit) else {
+        // alloc: error path
+        return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
+    };
+    if lock(slot).kept.is_none() {
+        return Ok(None);
+    }
+    compile(job, reader, unit, Phase::Store, images)
+}
+
 /// A unit as its phase spans name it in `unit`: its package, the package's version and its
 /// target, `serde v1.0.219 (build script)`, `blaze-api v0.1.0 (lib test)`. Every build script's
 /// target is `build-script-build`, so the target's name alone (the spans' `crate`) can't tell
@@ -2661,12 +2880,15 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     // Lane packs-1112, the miss hook: the unit's record is not in the store, and before the
     // unit is built the packs and peers the settings name are asked for each key the lookup
     // misses (`crate::serve::packs`); what they have is checked, put, and found by the same
-    // lookup run again. Nothing is asked when no settings name a source.
-    let kept = match kept {
-        None if crate::serve::packs::configured() => {
-            crate::serve::packs::asked(&pack_keys(job), || self::kept(job, unit))?
+    // lookup run again. Nothing is asked when no settings name a source, nor for a request
+    // that said `--no-prebuilt`: the job carries no packs then (`JobInput::packs`).
+    let kept = match (kept, &job.input.packs) {
+        (None, Some(packs)) => {
+            // A sealed unit's fetch goes into the machine's layer, never this home.
+            let sealed = sealed(job, unit)?;
+            crate::serve::packs::asked(packs, &pack_keys(job), sealed, || self::kept(job, unit))?
         }
-        other => other,
+        (other, _) => other,
     };
     // A launcher's program is replayed only where the daemon holds the code of the very
     // build its record is of; else it is built ([`super::run::launch::not_replayed`]).
@@ -2707,6 +2929,8 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             open: record.open,
             why: record.why,
             puts,
+            record: None,
+            body_sessions: Vec::new(),
             share: Vec::new(),
             outputs: record
                 .outputs
@@ -2844,7 +3068,11 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> R
     // Its unchanged bodies' inference and MIR answered from the store's kernel entries before
     // the check asks them ([`super::deps::serve_bodies`]); the first unit of a crate serves it.
     let served = super::deps::serve_bodies(job, reader, unit)?;
-    lock(slot).body_puts.extend(served);
+    {
+        let mut phases = lock(slot);
+        phases.body_puts.extend(served.puts);
+        phases.body_sessions.extend(served.sessions);
+    }
     let blaze_diagnostics::CrateCheck { diags, items_broken } = checking.check(db, files, &options);
     if hir_def::deps::eligible(db, krate) {
         let paths = blaze_diagnostics::cache::Paths::of(db, krate);
@@ -2973,7 +3201,7 @@ fn lint_profiles(job: &Job) -> &LintProfiles {
                 && !read.iter().any(|it| it.0 == settings)
             {
                 // clone: once per job and profile
-                read.push((settings.clone(), blaze_lints::profile::load(settings)));
+                read.push((settings.clone(), blaze_lints::profile::load(settings, &job.input.looks)));
             }
         }
         LintProfiles(read.into_boxed_slice())
@@ -3185,8 +3413,9 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
     Ok(())
 }
 
-/// [`Phase::Store`]: each output of the unit hashed into one put, its record encoded, and its
-/// compile.
+/// [`Phase::Store`]: each output of the unit hashed into one put, its diagnostics drawn, and
+/// its compile, with its record still to encode and file after the build's answer
+/// ([`Compiled::record`], [`file_records`]).
 fn store(
     job: &Job,
     reader: &UnitReader,
@@ -3249,10 +3478,6 @@ fn store(
         quoted,
     } = *making;
     puts.extend(library_puts(job));
-    // The bodies' inference and MIR this build ran, as kernel entries for the loop to put
-    // ([`super::deps::keep_bodies`]); each trace is kept by one unit only.
-    puts.extend(std::mem::take(&mut phases.body_puts));
-    puts.extend(super::deps::keep_bodies(job, reader, unit)?);
     // Under the narrow key when it holds no diagnostics; with diagnostics, all of them the
     // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
     // put in the slot a lookup reads; else under the whole one.
@@ -3513,6 +3738,8 @@ fn store(
         open,
         why,
         puts,
+        record: None,
+        body_sessions: Vec::new(),
         share: Vec::new(),
         outputs,
         artifact,
@@ -3521,142 +3748,6 @@ fn store(
         links,
         misses,
     };
-    // The record as the store keeps it, encoded before it is filed: where it is filed depends
-    // on what it holds. Every string of its body and each native input's path is written
-    // against the build's directories ([`Places::cbor`], [`Places::text`]); an output named
-    // by its ported text ([`ported_outputs`]) by that text's key.
-    let key = key.filter(|_| !script::pure::built_nothing(job, unit));
-    let encoded = match (key, &read) {
-        (Some(_), Ok(_)) => {
-            let _span = tracing::info_span!(target: "blaze", "unit record encode").entered();
-            let failed = |why: String| {
-                ApiError::new(format!("encoding the record of unit {unit} (`{}`): {why}", u.target.name), None)
-            };
-            let named = |at: usize, key: Key| {
-                ported_outputs.iter().find(|it| it.0 as usize == at).map_or(key, |it| it.1)
-            };
-            let record = RecordRef {
-                ok: compiled.ok,
-                open: compiled.open,
-                why: compiled.why.as_deref(),
-                said: &said,
-                outputs: compiled
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(at, it)| (it.path.as_str(), named(at, it.key), it.executable))
-                    .collect(),
-                artifact: compiled.artifact.as_ref(),
-                made: &made,
-                ported: ported_outputs.iter().map(|it| it.0).collect(),
-            };
-            let keys: Vec<Key> =
-                compiled.outputs.iter().enumerate().map(|(at, it)| named(at, it.key)).collect();
-            // alloc: once per record kept, a native input each
-            let natives: Vec<(String, ContentId)> = natives
-                .iter()
-                .map(|(path, hash)| {
-                    (String::from_utf8_lossy(&places.text(path.as_bytes())).into_owned(), *hash)
-                })
-                .collect();
-            let mut bytes = Vec::new();
-            header::write(&mut bytes, &keys, &natives, codegen::counted(job, unit));
-            let mut body = Vec::new(); // alloc: once per record kept
-            blaze_protocol::cbor::append(&mut body, &record).map_err(|why| failed(why.to_string()))?;
-            places.cbor(&body, &mut bytes).map_err(failed)?;
-            // What ties it to where it was made: a root its bytes still hold, or a path its
-            // closure's code was given and could have made something of ([`path_reads`]).
-            if tie.is_none() && places.tied(&bytes) {
-                // alloc: once per record tied
-                tie = Some("its record names a directory of the build where no path starts (a diagnostic, a variable its program is run with)".to_owned());
-            }
-            if tie.is_none() {
-                tie = portable::path_reads(reader.db(), krate, &places);
-            }
-            Some(bytes)
-        }
-        _ => None,
-    };
-    if let (Some(why), Some(_)) = (&tie, &encoded) {
-        tracing::info!(target: "blaze", unit, crate_name = %u.target.name, "unit record kept for this build's directories alone: {why}");
-    }
-    // Every slot of the base key holding other names leaves the record unkept, and the unit
-    // compiles again next time. A record tied to the build's directories is filed under its
-    // key here ([`Places::here`]).
-    let filing = match (key, &read, &encoded) {
-        (Some(base), Ok(read), Some(_)) => {
-            let base = match tie {
-                Some(_) => places.here(base),
-                None => base,
-            };
-            let guard = blaze_cas::enter();
-            reads::file(
-                base,
-                read,
-                &job.input.config.invocation.env,
-                &|manifest| job.units().is_primary_manifest(manifest),
-                |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
-            )
-            .map_err(|why| {
-                ApiError::new(
-                    format!("filing the record of unit {unit} (`{}`): {why}", u.target.name),
-                    None,
-                )
-            })?
-        }
-        _ => None,
-    };
-    // A unit made whose record is not kept is made again in every build, and the next build's
-    // miss finds its key as it was: say so here, where the reason is known (rules 3 and 19).
-    // (`key` is none already when its reads are not known.)
-    if filing.is_none()
-        && (key.is_some() || read.is_err())
-        && !script::pure::built_nothing(job, unit)
-    {
-        let why = match &read {
-            Err(why) => why.clone(), // clone: once per unit whose record is not kept
-            // alloc: as above
-            Ok(_) => format!(
-                "each of the {} slots of its record key holds other names of what its code read",
-                reads::SLOTS
-            ),
-        };
-        compiled.misses.push(unkept(job, u, why));
-    }
-    if let (Some(_), Ok(read)) = (&filing, &read)
-        && !read.is_empty()
-    {
-        let named = read.named_then(&job.input.config.invocation.env, &|manifest| {
-            job.units().is_primary_manifest(manifest)
-        });
-        say_reads(&span_unit(u), "filed", None, named);
-    }
-    if let (Some(reads::Filing { key, slot }), Some(bytes)) = (filing, encoded) {
-        let record = Put { key, kind: Kind::Query, bytes };
-        let slot = slot.map(|(key, bytes)| Put { key, kind: Kind::Query, bytes });
-        if shared(job, unit) {
-            compiled.share = share(job, unit, &compiled, &record)?;
-            // The texts the record names written against the directories, which a daemon
-            // that finds the record in the shared store reads ([`unported`]).
-            for (_, key) in &ported_outputs {
-                if let Some(put) = compiled.puts.iter().find(|it| it.key == *key) {
-                    // alloc: a copy for the shared store, once per dep-info of a std unit made
-                    compiled.share.push(Put { key: put.key, kind: put.kind, bytes: put.bytes.clone() });
-                }
-            }
-            if let Some(slot) = &slot {
-                // alloc: a slot's few names, once per std unit made that read a variable
-                compiled.share.push(Put {
-                    key: slot.key,
-                    kind: slot.kind,
-                    bytes: slot.bytes.clone(),
-                });
-            }
-        }
-        compiled.puts.push(record);
-        compiled.puts.extend(slot);
-        compiled.puts.extend(quotes_put);
-    }
     // Its check's outcome, when its check ran here, as an entry of its own: found by a later
     // build whose record misses for what the check does not read.
     if let (true, Ok(read), Some(diags)) = (phases.checking.is_some(), &read, &phases.diags) {
@@ -3664,17 +3755,108 @@ fn store(
         let puts = check_puts(job, reader, unit, read, diags, phases.items_broken, unmounted)?;
         compiled.puts.extend(puts);
     }
+    // The record as the store keeps it is encoded and filed after the build's answer
+    // ([`PendingRecord`], [`file_records`]): where it is filed depends on what it holds, and
+    // nothing the answer gives a client reads its key. What only this task can read for it is
+    // read here: what of the front end ties it to the build's directories ([`portable::path_reads`]).
+    let key = key.filter(|_| !script::pure::built_nothing(job, unit));
+    match (key, read) {
+        (Some(base), Ok(read)) => {
+            // Asked only where its outputs tie it to nothing; its bytes are asked first after
+            // the answer, as they were before the path reads ([`file_record`]).
+            let reads_tie = match tie {
+                Some(_) => None,
+                None => {
+                    let _span =
+                        tracing::info_span!(target: "blaze", "unit record path reads").entered();
+                    portable::path_reads(reader.db(), krate, &places)
+                }
+            };
+            // A sealed unit's outputs and the texts its record names go into the machine's
+            // layer alone (`compiled.share`, put through the layer's writer), its record and
+            // slot after them ([`PutInto::Layer`]): the home's store reads that writer live
+            // (`blaze_cas::Store::read_live`), so this build's places and lookups and every
+            // later build of any home on the machine find them there, and no home keeps a copy.
+            let sealed = sealed(job, unit)?;
+            if sealed {
+                let mut share = share(job, unit, &mut compiled)?;
+                // The texts the record names written against the directories, which a daemon
+                // that finds the record in the shared store reads ([`unported`]).
+                for (_, key) in &ported_outputs {
+                    if !share.iter().any(|it| it.key == *key)
+                        && let Some(at) = compiled.puts.iter().position(|it| it.key == *key)
+                    {
+                        share.push(compiled.puts.remove(at));
+                    }
+                }
+                compiled.share = share;
+            }
+            // An output named by its ported text ([`ported_outputs`]) by that text's key.
+            let named = |at: usize, key: Key| {
+                ported_outputs.iter().find(|it| it.0 as usize == at).map_or(key, |it| it.1)
+            };
+            let outputs = compiled
+                .outputs
+                .iter()
+                .enumerate()
+                // clone: an output's path, once per record kept, for its encode after the answer
+                .map(|(at, it)| (it.path.clone(), named(at, it.key), it.executable))
+                .collect();
+            // alloc: once per unit whose record is kept, its parts until the after-answer task files them
+            compiled.record = Some(Box::new(PendingRecord {
+                unit,
+                item: span_unit(u),
+                subject: unit_subject(job, u).unwrap_or_default(),
+                base,
+                read,
+                ok: compiled.ok,
+                open: compiled.open,
+                why: compiled.why.clone(), // clone: a failure's reason, once per failed unit's record
+                said,
+                outputs,
+                artifact: compiled.artifact.clone(), // clone: the unit's artifact, once per record kept
+                made: made.clone(), // clone: what the unit made, once per record kept; the job's slot keeps the other
+                ported: ported_outputs.iter().map(|it| it.0).collect(),
+                natives,
+                counted: codegen::counted(job, unit).to_vec(), // alloc: once per record kept, a profile each
+                places,
+                tie,
+                reads_tie,
+                sealed,
+                quotes: quotes_put,
+            }));
+        }
+        // A unit made whose record is not kept is made again in every build, and the next
+        // build's miss finds its key as it was: say so here, where the reason is known (rules
+        // 3 and 19). (`key` is none already when its reads are not known.)
+        (_, Err(why)) if !script::pure::built_nothing(job, unit) => {
+            compiled.misses.push(unkept(job, u, why));
+        }
+        _ => {}
+    }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);
     }
-    // The debug side files its links made, after its record is encoded: outputs of this
-    // compile alone, placed by the loop from the bytes the link holds. They are in no
+    // The debug side files its links made, after what its record names is taken: outputs of
+    // this compile alone, placed by the loop from the bytes the link holds. They are in no
     // record (a build that replays the record links nothing and has none to place, and a
     // key of theirs is in no store), and no artifact names them, so the build's answer
     // does not wait for them (`serve::job`'s `Job::names`).
     for codegen::SideFile { path, key, file } in side_files {
         compiled.outputs.push(Output { path, key, executable: false, made: Some(file) });
     }
+    // The bodies' steps this build ran, as kernel entries for the loop to put
+    // ([`super::deps::keep_bodies`]): each run is kept by one unit only, and its claim is kept
+    // only as the keep returns, so it is the last thing done here. Nothing fallible runs after
+    // it, and a kept claim's puts reach the loop; a keep or anything before it that fails lets
+    // the claim go to the next unit's keep.
+    compiled.puts.extend(std::mem::take(&mut phases.body_puts));
+    compiled.body_sessions.extend(std::mem::take(&mut phases.body_sessions));
+    let kept = super::deps::keep_bodies(job, reader, unit)?;
+    compiled.puts.extend(kept.puts);
+    // A later root of one crate replaces an earlier one where the loop marks them
+    // (`Jobs::body_sessions`): the keep's save is after the serve's.
+    compiled.body_sessions.extend(kept.sessions);
     Ok(compiled)
 }
 

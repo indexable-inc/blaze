@@ -1,0 +1,14 @@
+{
+ "id": "racy-window-fine-clock",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of the racy window by clock and track 6b R4, int-1112",
+ "where": "crates/blaze-vfs/src/disk.rs window_ns, racy; crates/blaze-vfs/src/watch.rs Watcher::save, Watcher::steady; crates/blaze-cargo/src/serve/local.rs steady",
+ "what": "The racy window was one constant, RACY_NS = 2 s, right for a file system whose stamps are whole seconds and wrong for one with fine stamps: every check within 2 s of a write took the stamp as vouching for nothing, so the edit loop re-read and re-hashed what it had just written (a 158 MB placed program, measured at 160 ms a hash). Two more copies of the 2 s constant live outside blaze-vfs (serve/job/certificate.rs RACY_NS, blaze-usercode inputs.rs RACY_NS), in other lanes' files.",
+ "cost": "every warm edit-loop check within 2 s of a place hashed each output it placed",
+ "cause": "the window was a property assumed of every file system instead of read from the stamp, whose sub-second part says which clock made it; and the constant was copied rather than called",
+ "class": "a tolerance set for the worst input and applied to every input, where the input itself says which case it is; one rule with several homes",
+ "prevention": "window_ns(stamp): COARSE_NS (2 s) when mtime and ctime are both whole seconds, else FINE_NS (20 ms, twice a 10 ms kernel tick); racy() is the one function every reader calls; a file system with a coarser fine clock is added by name. tests/stamps.rs the_racy_window_is_the_file_systems_clock (control: no single window satisfies a fine and a coarse stamp) and the DST on both clocks with its planted bug",
+ "workaround": "none",
+ "fix": "blaze_vfs::{window_ns, racy, COARSE_NS, FINE_NS} replace RACY_NS; the watcher keeps each racy name's steady instant; local.rs steady is !racy. Asked of the owners: certificate.rs and blaze-usercode's copies to call blaze_vfs::racy (/tmp/plan/handoff-6.md, /tmp/plan/handoff-2.md)",
+ "state": "open"
+}

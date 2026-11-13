@@ -35,7 +35,15 @@ fn most(check: &'static str, bound: Option<u64>, got: Option<u64>, what: &str, i
 /// The checks the simulated driver does not see, because its pipeline ends at code records:
 /// nothing is linked or run, no unit is counted, and no engine memo counts are read. It
 /// skips them and says so in each row; every other check it holds.
-pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ran", "max_ms", "noop", "link", "account"];
+pub const SIM_BLIND: &[&str] = &["prints", "says", "as built", "status", "spans", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ran", "max_ms", "noop", "link", "account", "daemon_after", "starts"];
+
+/// The checks of an action as a whole, not of each of its runs: with `at_once` runs, the
+/// first run's row holds them, and each other run is held to the rest (its outcome, status,
+/// `prints`, `says`, `as built`, `max_ms`) with these left to the first.
+pub const OF_THE_ACTION: &[&str] = &[
+    "redone", "redone_within", "redone_has", "reused", "max_units", "max_records", "max_runs", "max_executed", "max_verified",
+    "max_written", "max_unkept", "max_described", "max_ran", "noop", "link", "spans", "account", "daemon_after", "starts",
+];
 
 /// The standing expectation's check: every revision's build has an account that names no
 /// alarm (blaze-profile's `account`: no unexplained work, every sum held, work in proportion
@@ -89,8 +97,10 @@ pub fn held(revision: &Revision, seen: &Observed, clean: Option<&Observed>, blin
 fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Failure> {
     let expect = &revision.expect;
     let mut failed = Vec::new();
+    // A status other than 0 stated is an outcome, not a failure.
+    let fails_by_status = expect.status.is_some_and(|it| it != 0);
     match &expect.fails {
-        None if !seen.ok => failed.push(Failure {
+        None if !seen.ok && !fails_by_status => failed.push(Failure {
             check: "outcome",
             wanted: format!("`{}` succeeds", revision.action.word()),
             got: format!("it failed:\n{}", short(&seen.said)),
@@ -109,6 +119,15 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
         }
         _ => {}
     }
+    if let Some(status) = expect.status
+        && seen.status != Some(status)
+    {
+        failed.push(Failure {
+            check: "status",
+            wanted: format!("`{}` exits with status {status}", revision.action.word()),
+            got: format!("{:?} (`None`: a signal, or the driver does not see it):\n{}", seen.status, short(&seen.said)),
+        });
+    }
     if !failed.is_empty() {
         // The action did not end as stated: what it made and printed is not held to
         // anything, and the one failure is the finding.
@@ -125,6 +144,41 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
         && seen.stdout != *prints
     {
         failed.push(Failure { check: "prints", wanted: format!("{prints:?}"), got: format!("{:?}", short(&seen.stdout)) });
+    }
+    if expect.as_built {
+        as_built(seen, &mut failed);
+    }
+    if let Some(wanted) = expect.daemon_after
+        && seen.daemon_after != Some(wanted)
+    {
+        let holds = |it: bool| match it {
+            true => "a daemon holds blaze's state (`serve.lock`)",
+            false => "no daemon holds blaze's state (`serve.lock`)",
+        };
+        failed.push(Failure {
+            check: "daemon_after",
+            wanted: format!("right after the action, {}", holds(wanted)),
+            got: seen.daemon_after.map_or("the driver does not see it".to_owned(), |it| holds(it).to_owned()),
+        });
+    }
+    if let Some(wanted) = expect.starts
+        && seen.starts != Some(wanted)
+    {
+        failed.push(Failure {
+            check: "starts",
+            wanted: format!("exactly {wanted} daemon starts in `serve.log` during the revision"),
+            got: seen.starts.map_or("the driver does not see them".to_owned(), |it| it.to_string()),
+        });
+    }
+    for (name, count) in &expect.spans {
+        let got = seen.spans.as_ref().map(|it| it.get(name).copied().unwrap_or(0));
+        if got != Some(*count) {
+            failed.push(Failure {
+                check: "spans",
+                wanted: format!("exactly {count} spans named `{name}`"),
+                got: got.map_or("the driver does not see them".to_owned(), |it| it.to_string()),
+            });
+        }
     }
     for says in &expect.says {
         if !seen.stdout.contains(says.as_str()) && !seen.said.contains(says.as_str()) {
@@ -265,6 +319,45 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
         }
     }
     failed
+}
+
+/// [`super::spec::Expect::as_built`]: the program `blaze run` ran did what the file `blaze
+/// build` made does, on standard output, standard error and in its exit status.
+fn as_built(seen: &Observed, into: &mut Vec<Failure>) {
+    let check = "as built";
+    let built = match &seen.built {
+        Some(Ok(built)) => built,
+        Some(Err(why)) => {
+            // clone: the reason, into the failure's message
+            into.push(Failure { check, wanted: "the file `blaze build` makes, run".to_owned(), got: why.clone() });
+            return;
+        }
+        None => {
+            into.push(Failure { check, wanted: "the file `blaze build` makes, run".to_owned(), got: "the driver does not run it".to_owned() });
+            return;
+        }
+    };
+    if built.stdout != seen.stdout {
+        into.push(Failure {
+            check,
+            wanted: format!("the built program's standard output: {:?}", short(&built.stdout)),
+            got: format!("{:?}", short(&seen.stdout)),
+        });
+    }
+    if built.status != seen.status {
+        into.push(Failure {
+            check,
+            wanted: format!("the built program's exit status: {:?}", built.status),
+            got: format!("{:?}", seen.status),
+        });
+    }
+    if !seen.said.contains(built.stderr.as_str()) {
+        into.push(Failure {
+            check,
+            wanted: format!("the built program's standard error in `blaze run`'s: {:?}", short(&built.stderr)),
+            got: format!("{:?}", short(&seen.said)),
+        });
+    }
 }
 
 /// The cause the revision lists for `check` failing under `driver`: a row named for the check

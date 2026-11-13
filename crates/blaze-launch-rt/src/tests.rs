@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use blaze_launch::wire::{self, Ask, List, ProgramId, RecordId, Tell};
 use blaze_launch::{CodeId, Frame, FrameKind, Slot, Target, Thread, Tier, Txn};
 
+use crate::control::{Held, JOINS_TWICE, Join};
 use crate::sys::{self, Code};
+use crate::table::{Bound, Event};
 use crate::{Config, Driver, EditError, Error, Place, Records, Shared, arch};
 
 /// How long a test waits for another thread before it fails, naming what it waited for.
@@ -451,7 +453,7 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     let control = std::thread::spawn(move || {
         let mut records = records;
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
-        let served = crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay);
+        let served = crate::run(driver, Join::Now(ours), None, ProgramId([7; 32]), &mut records, ready, stay);
         (served, records)
     });
 
@@ -543,7 +545,7 @@ fn a_launcher_starts_from_an_image_of_placed_code() {
     let control = std::thread::spawn(move || {
         let mut records = crate::Loaded::new().expect("the program's data mapping");
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
-        crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay).1
+        crate::run(driver, Join::Now(ours), None, ProgramId([7; 32]), &mut records, ready, stay).1
     });
     let item = next_frame(&mut daemon);
     let Ok((_, Ask::Hello { arch, os, page, .. })) = Ask::decode(&item) else {
@@ -640,7 +642,7 @@ fn an_image_of_another_geometry_is_refused() {
     let control = std::thread::spawn(move || {
         let mut records = crate::Loaded::new().expect("the program's data mapping");
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
-        crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay).1
+        crate::run(driver, Join::Now(ours), None, ProgramId([7; 32]), &mut records, ready, stay).1
     });
     let item = next_frame(&mut daemon);
     let Ok((_, Ask::Hello { arch, os, page, .. })) = Ask::decode(&item) else {
@@ -658,6 +660,295 @@ fn an_image_of_another_geometry_is_refused() {
     assert!(why.contains("made for a mapping whose thunks are at"), "{why}");
     shared.stop();
     assert!(control.join().expect("the control thread ended").is_err());
+}
+
+/// A start image of two slots as a daemon lays it for this process's launcher: slot 1 the
+/// entry, bound to a function that returns 7, static 0 holding `VALUE` and named as the
+/// initializer; slot 0 declared with no code. Its `Tell::Image` frame, length first.
+fn start_frame() -> Vec<u8> {
+    use blaze_launch::image::{Bases, Input, lay};
+    use blaze_launch::record::{Record, What};
+
+    let arch = crate::control::ARCH;
+    let code = returns(7);
+    let value = VALUE.to_le_bytes();
+    let function = Record {
+        arch,
+        what: What::Code,
+        align: 16,
+        size: code.len() as u64,
+        bytes: &code,
+        fixups: List::of(&[]),
+        places: List::of(&[]),
+        data: List::of(&[]),
+        unwind: None,
+        name: "app::seven",
+    };
+    let holds = Record {
+        arch,
+        what: What::Static { mutable: false, thread_local: false },
+        align: 8,
+        size: 8,
+        bytes: &value,
+        fixups: List::of(&[]),
+        places: List::of(&[]),
+        data: List::of(&[]),
+        unwind: None,
+        name: "app::VALUE",
+    };
+    let statics = [wire::StaticDef { number: 0, record: RecordId([1; 32]), refs: List::of(&[]) }];
+    let binds = [wire::Bind {
+        slot: Slot(1),
+        record: RecordId([2; 32]),
+        code: CodeId([2; 32]),
+        tier: Tier::Zero,
+        len: (code.len() as u64).next_multiple_of(8),
+        align: 16,
+        refs: List::of(&[]),
+    }];
+    let page = sys::page().expect("a page size") as u64;
+    let input = Input {
+        arch,
+        os: crate::control::OS,
+        page,
+        slots: 2,
+        statics: &statics,
+        binds: &binds,
+        entry: Slot(1),
+        inits: &[0],
+    };
+    let records = |id: &RecordId| match id.0[0] {
+        1 => Some(holds),
+        2 => Some(function),
+        _ => None,
+    };
+    let image = lay(&input, &records, &Bases::NONE).unwrap_or_else(|why| panic!("{why}"));
+    let mut bytes = Vec::new();
+    image.encode(&mut bytes);
+    let mut frame = Vec::new();
+    Tell::Image { bytes: &bytes }.encode(1, &mut frame).expect("an image that fits a frame");
+    frame
+}
+
+/// The value of [`start_frame`]'s static.
+const VALUE: u64 = 0x1122_3344_5566_7788;
+
+/// The check word of [`start_frame`]'s start file, as a test's.
+const CHECK: [u8; 32] = [9; 32];
+
+/// What a launcher's start left, as far as a program sees it: its entry relative to slot 1's
+/// thunk, its initializers' count and the value the first holds, and what slot 1 returns.
+fn started(shared: &Arc<Shared>, start: &crate::Start) -> (usize, usize, u64, u32) {
+    let entry = start.entry.wrapping_sub(shared.thunk(Slot(1)).expect("a slot"));
+    // SAFETY: the address the launcher gave for the static the image defines: 8 bytes of the
+    // program's data mapping, written before the launcher answered and never unmapped.
+    let value = unsafe { (start.inits[0] as *const u64).read_unaligned() };
+    let birth = shared.birth();
+    let caller = std::thread::spawn(move || {
+        let me = birth.begin();
+        let got = call(me.shared(), 1);
+        me.safepoint();
+        got
+    });
+    (entry, start.inits.len(), value, caller.join().expect("the caller ended"))
+}
+
+/// A join that is never to run: a launcher that started from its file and fires no stub.
+fn never() -> Join {
+    Join::Later(Box::new(|| -> Result<UnixStream, String> { Err("this test's launcher joins no daemon".to_owned()) }))
+}
+
+/// The refinement: a launcher started from its start file's frame, with no socket, holds
+/// what a launcher told the same frame by a daemon holds: the same entry, initializers,
+/// static and code, through the same table, and it asks no one. The control: the frame cut
+/// by one byte is refused, naming the offset, and nothing runs.
+#[test]
+fn a_launcher_started_from_its_file_holds_what_one_told_the_image_holds() {
+    let frame = start_frame();
+    let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+
+    // Told by a daemon.
+    let (ours, mut daemon) = UnixStream::pair().expect("a socket pair");
+    daemon.set_read_timeout(Some(PATIENCE)).expect("a read timeout");
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let told_shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        crate::run(driver, Join::Now(ours), None, ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    let item = next_frame(&mut daemon);
+    assert!(
+        matches!(Ask::decode(&item), Ok((_, Ask::Hello { holds: None, running: false, .. }))),
+        "a launcher with no start file holds nothing"
+    );
+    daemon.write_all(&frame).expect("written to the launcher");
+    let start = entry.recv_timeout(PATIENCE).expect("an answer").expect("the image is taken");
+    let told = started(&told_shared, &start);
+    told_shared.stop();
+    assert_eq!(control.join().expect("the control thread ended"), Ok(()));
+
+    // From the file.
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let held_shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let file = frame.clone(); // clone: the file's bytes, the control thread's own
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        let held = Held { frame: &file, check: CHECK };
+        crate::run(driver, never(), Some(held), ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    let start = entry.recv_timeout(PATIENCE).expect("an answer").expect("the held image is taken");
+    let held = started(&held_shared, &start);
+    held_shared.stop();
+    assert_eq!(control.join().expect("the control thread ended"), Ok(()));
+
+    assert_eq!(held, told);
+    assert_eq!(told, (0, 1, VALUE, 7));
+
+    // The control.
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let cut_shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let cut = frame[..frame.len() - 1].to_vec();
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        let held = Held { frame: &cut, check: CHECK };
+        crate::run(driver, never(), Some(held), ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    let why = entry.recv_timeout(PATIENCE).expect("an answer").expect_err("a cut frame is refused");
+    assert!(why.contains(&format!("cut at byte {}", frame.len() - 1)), "{why}");
+    cut_shared.stop();
+    assert!(control.join().expect("the control thread ended").is_err());
+}
+
+/// How a join ends in [`a_first_need_with_no_daemon_joins_once_and_every_waiter_is_bound_or_refused_by_name`].
+#[derive(Clone, Copy, Debug)]
+enum Joined {
+    /// No daemon could be started.
+    Fails,
+    /// A daemon holds no code of the program.
+    Unheld,
+    /// A daemon welcomes the launcher and refuses the slot by name.
+    Welcomed,
+}
+
+/// One launcher started from its file, `waiters` threads firing slot 0's stub (`twice`: in
+/// two rounds, the second after the first was answered), its join ending as `joined`. Gives
+/// how many times the join ran and each waiter's answer.
+fn joined(waiters: usize, joined: Joined, twice: bool) -> (usize, Vec<Bound>) {
+    let frame = start_frame();
+    let ran = Arc::new(AtomicU64::new(0));
+    let (ours, mut daemon) = UnixStream::pair().expect("a socket pair");
+    daemon.set_read_timeout(Some(PATIENCE)).expect("a read timeout");
+    let mut socket = Some(ours);
+    let counted = Arc::clone(&ran);
+    let join = Join::Later(Box::new(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+        match (joined, socket.take()) {
+            (Joined::Fails, _) | (_, None) => Err("no daemon started".to_owned()),
+            (_, Some(socket)) => Ok(socket),
+        }
+    }));
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        let held = Held { frame: &frame, check: CHECK };
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        crate::run(driver, join, Some(held), ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    entry.recv_timeout(PATIENCE).expect("an answer").expect("the held image is taken");
+    // Every waiter's need is on the launcher's queue before the daemon says anything after
+    // the hello, so none comes after its answer and waits for a second.
+    let (sent, all_sent) = crossbeam_channel::unbounded::<()>();
+    let (go, gone) = crossbeam_channel::bounded::<()>(1);
+    // The daemon's side, on a thread of its own: it answers the hello and the one need.
+    let serving = std::thread::spawn(move || {
+        if matches!(joined, Joined::Fails) {
+            return Ok(());
+        }
+        let item = next_frame(&mut daemon);
+        match Ask::decode(&item) {
+            Ok((_, Ask::Hello { holds: Some(CHECK), running: true, .. })) => {}
+            other => return Err(format!("the join's first message is {other:?}")),
+        }
+        gone.recv_timeout(PATIENCE).map_err(|_| "every waiter's need was not sent in time".to_owned())?;
+        match joined {
+            Joined::Unheld => tell(&mut daemon, 1, &Tell::Unheld { why: "this daemon holds no start image" }),
+            _ => {
+                tell(&mut daemon, 1, &Tell::Welcome { slots: 2 });
+                let item = next_frame(&mut daemon);
+                match Ask::decode(&item) {
+                    Ok((_, Ask::Need { slot: Slot(0), .. })) => {}
+                    other => return Err(format!("the need after the welcome is {other:?}")),
+                }
+                tell(&mut daemon, 2, &Tell::Refused { slot: Slot(0), diagnostic: "slot 0 does not compile" });
+            }
+        }
+        Ok(())
+    });
+    let rounds = if twice { 2 } else { 1 };
+    let mut answers = Vec::new();
+    for round in 0..rounds {
+        // alloc: a test's waiters
+        let replies: Vec<Arc<sys::Handoff<Bound>>> = (0..waiters).map(|_| Arc::new(sys::Handoff::new())).collect();
+        let fired: Vec<JoinHandle<Bound>> = replies
+            .iter()
+            .enumerate()
+            .map(|(at, reply)| {
+                let (shared, reply, sent) = (Arc::clone(&shared), Arc::clone(reply), sent.clone());
+                std::thread::spawn(move || {
+                    let thread = Thread((round * waiters + at + 1) as u64);
+                    shared.send(Event::Need { slot: Slot(0), thread, reply: Arc::clone(&reply) });
+                    drop(sent.send(()));
+                    reply.take()
+                })
+            })
+            .collect();
+        for _ in 0..waiters {
+            all_sent.recv_timeout(PATIENCE).expect("a waiter sent its need");
+        }
+        if round == 0 {
+            drop(go.send(()));
+        }
+        answers.extend(fired.into_iter().map(|it| it.join().expect("a waiter ended")));
+    }
+    assert_eq!(serving.join().expect("the daemon's side ended"), Ok(()));
+    shared.stop();
+    drop(control.join().expect("the control thread ended"));
+    (ran.load(Ordering::Relaxed) as usize, answers)
+}
+
+/// The invariant: over any number of threads whose first call of one slot fires with no
+/// daemon, in any order, the join runs at most once a process, and every waiter gets one
+/// answer: the daemon's refusal of the slot, or why no daemon serves the program, each
+/// naming it. The control: `Plant::JoinsTwice`, a join not remembered, runs it again for a
+/// second round of calls, which the count catches.
+#[test]
+fn a_first_need_with_no_daemon_joins_once_and_every_waiter_is_bound_or_refused_by_name() {
+    for waiters in [1, 6] {
+        for how in [Joined::Fails, Joined::Unheld, Joined::Welcomed] {
+            let (ran, answers) = joined(waiters, how, matches!(how, Joined::Fails));
+            assert_eq!(ran, 1, "{waiters} {how:?}");
+            let wanted = match how {
+                Joined::Fails => "the first call of slot 0 waits for a daemon to start, and it did not: no daemon started",
+                Joined::Unheld => "this daemon holds no start image",
+                Joined::Welcomed => "slot 0 does not compile",
+            };
+            let rounds = if matches!(how, Joined::Fails) { 2 } else { 1 };
+            assert_eq!(answers.len(), waiters * rounds, "{waiters} {how:?}");
+            for answer in answers {
+                assert_eq!(answer, Bound::Refused(wanted.to_owned()), "{waiters} {how:?}");
+            }
+        }
+    }
+    // The control.
+    JOINS_TWICE.store(true, Ordering::Relaxed);
+    let (ran, _) = joined(2, Joined::Fails, true);
+    JOINS_TWICE.store(false, Ordering::Relaxed);
+    assert!(ran >= 2, "the planted join that is not remembered ran {ran} times and was not caught");
 }
 
 /// A safepoint's walk of its own stack reaches the stack's end where frames keep a frame

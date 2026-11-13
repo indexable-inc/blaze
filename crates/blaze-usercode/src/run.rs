@@ -46,7 +46,10 @@ pub struct OutFile {
     pub path: String,
     pub executable: bool,
     /// `None` for a directory, which is kept even when empty, and for a link ([`OutFile::link`]).
-    pub bytes: Option<Vec<u8>>,
+    /// Shared: the front end's text of the file is this allocation (`blaze_lower::Ran::files`),
+    /// so a clone of the value and its file applied are one copy of the bytes. Encoded as the
+    /// bytes it holds, as a `Vec<u8>` was (serde's `rc`).
+    pub bytes: Option<std::sync::Arc<[u8]>>,
     /// For a link the run left that leads into its own package ([`collect`]): where it leads,
     /// absolute. In a value as it is kept that path is ported ([`crate::roots::Roots::stored`]),
     /// the package's root its placeholder, so a reuse in another checkout
@@ -89,7 +92,7 @@ struct Plain {
 struct PlainFile {
     path: String,
     executable: bool,
-    bytes: Option<Vec<u8>>,
+    bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 /// What the bytes of a kept value start with when no file of it is a link ([`PlainRef`]).
@@ -853,6 +856,9 @@ pub fn collect(dir: &Path, package: Option<&Path>) -> Result<Vec<OutFile>, Strin
                     // alloc: error path
                     let (executable, bytes) =
                         read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    // alloc: once a file the run left, its bytes moved into the one shared
+                    // allocation every holder of the value reads (the read buffer let go)
+                    let bytes: std::sync::Arc<[u8]> = bytes.into();
                     out.push(OutFile { path: name, executable, bytes: Some(bytes), link: None });
                 }
             }
@@ -1303,7 +1309,7 @@ mod tests {
             services: Vec::new(),
         };
         spec.roots =
-            crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
+            crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir), &blaze_vfs::outside::Looks::none());
         spec
     }
 
@@ -1579,7 +1585,7 @@ mod tests {
                 OutFile {
                     path: "gen/a.rs".into(),
                     executable: false,
-                    bytes: Some(b"x".to_vec()),
+                    bytes: Some(b"x".to_vec().into()),
                     link: None,
                 },
             ],
@@ -1604,7 +1610,7 @@ mod tests {
             )
         );
         let mut file = value();
-        file.files[1].bytes = Some(b"y".to_vec());
+        file.files[1].bytes = Some(b"y".to_vec().into());
         let file_differs = differs(&value(), &file).unwrap();
         assert!(
             file_differs.starts_with("gen/a.rs in its OUT_DIR differs: 1 bytes hashing "),
@@ -1625,7 +1631,7 @@ mod tests {
         let bad = [OutFile {
             path: "../x".into(),
             executable: false,
-            bytes: Some(Vec::new()),
+            bytes: Some(Vec::new().into()),
             link: None,
         }];
         assert!(restore(&dir, &bad).is_err());
@@ -1736,7 +1742,7 @@ mod tests {
             files: vec![OutFile {
                 path: "a".into(),
                 executable: false,
-                bytes: Some(b"x".to_vec()),
+                bytes: Some(b"x".to_vec().into()),
                 link: None,
             }],
         };
@@ -1768,7 +1774,7 @@ mod tests {
         let file = |path: &str, executable: bool, bytes: &[u8]| OutFile {
             path: path.into(),
             executable,
-            bytes: Some(bytes.to_vec()),
+            bytes: Some(bytes.into()),
             link: None,
         };
         let listed =

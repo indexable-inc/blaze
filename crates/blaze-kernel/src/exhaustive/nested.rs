@@ -14,8 +14,9 @@
 //! invariant.
 //!
 //! The session is carried ([`Kernel::carry`]): a get that finds the world moved carries the
-//! session to the world as it is, with the exact difference of the facts between the two pins,
-//! and asks again; a step of a sequence may also carry it where it stands (1 way), so two
+//! session to the world as it is, with the difference of the facts between the two pins said
+//! one of the three ways a holder can say it ([`Says`]: by name, by valuing every posted read,
+//! or "nothing says"), and asks again; a step of a sequence may also carry it where it stands (1 way), so two
 //! carries meet with no get between. [`Over`] is there for the carry: `Over(0)` reads a fact
 //! and a [`Mid`], and `Over(1)` reads `Over(0)`, so a value with a reader of its own reads
 //! both the world and a value two steps above a fact, which is where repairing a parent
@@ -224,6 +225,20 @@ fn kernel() -> Kernel<Facts> {
     kernel
 }
 
+/// How the holder of the session says what differs for the facts at a carry: the three ways
+/// a kind's difference can be said ([`Changed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Says {
+    /// By name: each fact that is not what it was at the session's pin, from the holder's own
+    /// copy of the facts ([`Changed::exact`], [`Changed::differs`]), a producer's way.
+    Column,
+    /// By valuing: the kernel values each fact the session posted and compares it with what
+    /// its readers saw ([`Changed::valued`]).
+    Valued,
+    /// Nothing says: any fact may differ ([`Changed::everything`]).
+    Unknown,
+}
+
 /// What the store holds when a sequence starts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Start {
@@ -254,6 +269,8 @@ struct Exploring {
     moved: u64,
     /// What the carries did, summed.
     carried: Carried,
+    /// How the carries say what differs.
+    says: Says,
 }
 
 impl Exploring {
@@ -302,19 +319,29 @@ impl Exploring {
             .map(|got| (got.is_hit(), got.value().to_vec()))
     }
 
-    /// Carries the session to the world as it is, with what its holder knows differs: the
-    /// facts that are not what they were at the session's pin, each by name, a fact that
-    /// appeared or went like any other.
+    /// Carries the session to the world as it is, with what differs said as [`Says`] says:
+    /// by name, the facts that are not what they were at the session's pin (a fact that
+    /// appeared or went like any other); by valuing every fact the session posted; or that
+    /// any fact may differ.
     fn carry(&mut self) -> Result<(), Failure> {
         let from = Facts { facts: self.pinned }.pin();
         let mut changed = Changed::between(from, self.world.pin());
-        changed.exact(FACT);
-        for at in 0..FACTS {
-            let (was, now) = (self.pinned[at], self.world.facts[at]);
-            if was == now || (planted::is(Bug::AbsenceUnsaid) && was.is_none()) {
-                continue;
+        match self.says {
+            Says::Column => {
+                changed.exact(FACT);
+                for at in 0..FACTS {
+                    let (was, now) = (self.pinned[at], self.world.facts[at]);
+                    if was == now || (planted::is(Bug::AbsenceUnsaid) && was.is_none()) {
+                        continue;
+                    }
+                    changed.differs(Read { kind: FACT, key: &[at as u8] });
+                }
             }
-            changed.differs(Read { kind: FACT, key: &[at as u8] });
+            Says::Valued => changed.valued(FACT),
+            // The planted bug: a holder with no difference of the kind says it exact, naming
+            // nothing, as if nothing changed.
+            Says::Unknown if planted::is(Bug::KindSaidClean) => changed.exact(FACT),
+            Says::Unknown => changed.everything(FACT),
         }
         // The values a get asks for at the top whose steps may be asked for (`Top` may not):
         // none reads `Over(1)`, and `Mid(1)` and `Leaf(2)` are read only once `Top` or `Mid(1)`
@@ -359,6 +386,8 @@ impl Exploring {
                 self.carried.changed += carried.changed;
                 self.carried.cut += carried.cut;
                 self.carried.gone += carried.gone;
+                self.carried.valued += carried.valued;
+                self.carried.differed += carried.differed;
                 match carried.dropped {
                     None => Ok(()),
                     Some(why) => Err(Failure::Kernel {
@@ -460,9 +489,11 @@ impl Exploring {
     }
 }
 
-fn explore(bug: Bug, start: Start) -> (Exploring, Option<Failure>) {
+/// An empty store, the world with no fact, and a new session of it, with `bug` planted: the
+/// first half of [`explore`], and where a directed sequence starts.
+fn exploring(bug: Bug, says: Says) -> Exploring {
     planted::plant(bug);
-    let mut exploring = Exploring {
+    Exploring {
         kernel: kernel(),
         store: Undoable::default(),
         world: Facts { facts: [None; FACTS] },
@@ -475,7 +506,12 @@ fn explore(bug: Bug, start: Start) -> (Exploring, Option<Failure>) {
         pinned: [None; FACTS],
         moved: 0,
         carried: Carried::default(),
-    };
+        says,
+    }
+}
+
+fn explore(bug: Bug, start: Start, says: Says) -> (Exploring, Option<Failure>) {
+    let mut exploring = exploring(bug, says);
     let warmed = match start {
         Start::Cold => Ok(()),
         Start::Warm => exploring.warm(),
@@ -486,15 +522,15 @@ fn explore(bug: Bug, start: Start) -> (Exploring, Option<Failure>) {
 }
 
 fn stale_hit(bug: Bug) -> Vec<Did> {
-    match explore(bug, Start::Cold).1 {
+    match explore(bug, Start::Cold, Says::Column).1 {
         Some(Failure::Stale { after, hit: true, .. }) => after,
         other => panic!("{bug:?} was planted and the oracle found {other:?}"),
     }
 }
 
 /// The sequence after which a carried session gave a stale value, hit or computed from one.
-fn stale_after_a_carry(bug: Bug, start: Start) -> Vec<Did> {
-    match explore(bug, start).1 {
+fn stale_after_a_carry(bug: Bug, start: Start, says: Says) -> Vec<Did> {
+    match explore(bug, start, says).1 {
         Some(Failure::Stale { after, .. }) => after,
         other => panic!("{bug:?} was planted and the oracle found {other:?}"),
     }
@@ -508,17 +544,26 @@ fn stale_after_a_carry(bug: Bug, start: Start) -> Vec<Did> {
 /// is carried from pin to pin and never made again, so this is the carry's invariant too
 /// ([`Kernel::carry`]): every value a carried session gives is the fresh one, and so is every value of a session
 /// saved, dropped and opened again from the store at any step (rule 26), and a reached root
-/// that no step reads is repaired, not dropped. 65,536
-/// sequences a start, each prefix checked; some gets hit although a step under them ran
-/// again (early cutoff), and some carries stopped at an entry whose value came out the same.
+/// that no step reads is repaired, not dropped. It holds under each way of saying what
+/// differs: by name and by valuing every posted read from both starts, and "nothing says"
+/// from the warm one (five explorations). 65,536 sequences an exploration, each prefix
+/// checked; some gets hit although a step under them ran again (early cutoff), and some
+/// carries stopped at an entry whose value came out the same.
 #[test]
 fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
-    for start in [Start::Cold, Start::Warm] {
-        let (explored, failure) = explore(Bug::None, start);
-        assert_eq!(failure, None, "{start:?}");
+    let explorations = [
+        (Start::Cold, Says::Column),
+        (Start::Warm, Says::Column),
+        (Start::Cold, Says::Valued),
+        (Start::Warm, Says::Valued),
+        (Start::Warm, Says::Unknown),
+    ];
+    for (start, says) in explorations {
+        let (explored, failure) = explore(Bug::None, start, says);
+        assert_eq!(failure, None, "{start:?} {says:?}");
         assert_eq!(explored.sequences, WAYS.pow(STEPS));
         println!(
-            "{start:?}: {} sequences, {} hits, {} computed, {} early cutoffs, {} gets after a carry, carries {:?}",
+            "{start:?} {says:?}: {} sequences, {} hits, {} computed, {} early cutoffs, {} gets after a carry, carries {:?}",
             explored.sequences,
             explored.hits,
             explored.computed,
@@ -534,6 +579,14 @@ fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
             "{carried:?}"
         );
         assert!(carried.changed > 100 && carried.cut > 100, "{carried:?}");
+        // Only a valued carry values, and some of what it valued was what its readers saw.
+        match says {
+            Says::Valued => assert!(
+                carried.valued > 100 && carried.differed > 100 && carried.differed < carried.valued,
+                "{carried:?}"
+            ),
+            Says::Column | Says::Unknown => assert_eq!((carried.valued, carried.differed), (0, 0)),
+        }
     }
 }
 
@@ -542,7 +595,7 @@ fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
 /// warm start: the entries are another session's.
 #[test]
 fn a_hit_admitted_without_postings_is_caught() {
-    let after = stale_after_a_carry(Bug::HitUnposted, Start::Warm);
+    let after = stale_after_a_carry(Bug::HitUnposted, Start::Warm, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
 
@@ -550,7 +603,7 @@ fn a_hit_admitted_without_postings_is_caught() {
 /// change that carry is of.
 #[test]
 fn a_posting_written_at_the_next_carry_is_caught() {
-    let after = stale_after_a_carry(Bug::PostLate, Start::Cold);
+    let after = stale_after_a_carry(Bug::PostLate, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
 
@@ -558,7 +611,7 @@ fn a_posting_written_at_the_next_carry_is_caught() {
 /// leaves the entries that saw nothing there verified.
 #[test]
 fn an_absence_left_out_of_the_change_set_is_caught() {
-    let after = stale_after_a_carry(Bug::AbsenceUnsaid, Start::Cold);
+    let after = stale_after_a_carry(Bug::AbsenceUnsaid, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(_, Some(_)))), "{after:?}");
 }
 
@@ -569,7 +622,7 @@ fn an_absence_left_out_of_the_change_set_is_caught() {
 /// the oracle that catches it.
 #[test]
 fn a_root_kept_without_its_repair_is_caught() {
-    let after = stale_after_a_carry(Bug::RootKept, Start::Cold);
+    let after = stale_after_a_carry(Bug::RootKept, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
     assert!(after.iter().any(|it| matches!(it, Did::Get(1..))), "{after:?}");
 }
@@ -578,7 +631,7 @@ fn a_root_kept_without_its_repair_is_caught() {
 /// reads no posting back (it "starts empty" of readers) is carried past an entry it holds.
 #[test]
 fn a_session_opened_without_its_postings_is_caught() {
-    let after = stale_after_a_carry(Bug::OpenUnposted, Start::Cold);
+    let after = stale_after_a_carry(Bug::OpenUnposted, Start::Cold, Says::Column);
     assert!(after.iter().any(|it| matches!(it, Did::Reopen)), "{after:?}");
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
@@ -587,7 +640,7 @@ fn a_session_opened_without_its_postings_is_caught() {
 /// parent up against a child that is still as it was.
 #[test]
 fn a_parent_repaired_before_its_child_is_caught() {
-    let after = stale_after_a_carry(Bug::ParentFirst, Start::Cold);
+    let after = stale_after_a_carry(Bug::ParentFirst, Start::Cold, Says::Column);
     let sets = after.iter().filter(|it| matches!(it, Did::Set(..))).count();
     assert!(sets >= 2, "one change queues no parent beside a child: {after:?}");
 }
@@ -596,7 +649,7 @@ fn a_parent_repaired_before_its_child_is_caught() {
 /// is now gives, after a fact changed, the value it verified before.
 #[test]
 fn a_session_that_outlives_its_pin_is_caught() {
-    let after = match explore(Bug::StalePin, Start::Cold).1 {
+    let after = match explore(Bug::StalePin, Start::Cold, Says::Column).1 {
         Some(Failure::Stale { after, .. }) => after,
         other => panic!("a stale pin was planted and the oracle found {other:?}"),
     };
@@ -615,6 +668,73 @@ fn a_parent_that_records_its_childs_reads_but_one_is_caught() {
 #[test]
 fn a_cutoff_by_the_childs_identity_alone_is_caught() {
     stale_hit(Bug::IdentityOnly);
+}
+
+/// The control of I2 under a valued kind: a read that went, taken as what its readers saw,
+/// reaches no one, and the entry that saw the fact is given as it was (a fact set, a get, the
+/// fact gone, a get).
+#[test]
+fn a_valued_read_that_went_taken_as_what_it_saw_is_caught() {
+    let after = stale_after_a_carry(Bug::ValuedGoneSame, Start::Cold, Says::Valued);
+    assert!(after.iter().any(|it| matches!(it, Did::Set(_, None))), "{after:?}");
+}
+
+/// The control of I2 and rule 26 under a valued kind: a carry that values only the reads in
+/// memory values nothing of a session opened from the store, and an entry it holds whose fact
+/// changed stays verified. From the warm start, where a get finds and posts before the reopen.
+#[test]
+fn a_valued_kind_that_reads_no_posting_back_is_caught() {
+    let after = stale_after_a_carry(Bug::ValuedUnloaded, Start::Warm, Says::Valued);
+    assert!(after.iter().any(|it| matches!(it, Did::Reopen)), "{after:?}");
+    assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
+}
+
+/// The control of I2 when nothing says: a holder with no difference of a kind that says it
+/// exact with no name (in place of `Changed::everything`) leaves every reader verified.
+#[test]
+fn a_kind_with_no_difference_said_clean_is_caught() {
+    let after = stale_after_a_carry(Bug::KindSaidClean, Start::Cold, Says::Unknown);
+    assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
+}
+
+/// The five steps of the directed sequence below, with `bug` planted: `Leaf(2)` asked; fact 2
+/// set; a carry by name, which repairs the leaf through the list it was posted with; fact 2
+/// back to absent; a valued carry; `Leaf(2)` asked again.
+fn first_posting_then_valued(bug: Bug) -> Result<(), Failure> {
+    let mut it = exploring(bug, Says::Column);
+    let mut run = || -> Result<(), Failure> {
+        it.path.push(Did::Get(2));
+        it.ask(2)?;
+        it.world.facts[2] = Some(1);
+        it.path.push(Did::Set(2, Some(1)));
+        it.path.push(Did::Carry);
+        it.carry()?;
+        it.world.facts[2] = None;
+        it.path.push(Did::Set(2, None));
+        it.says = Says::Valued;
+        it.path.push(Did::Carry);
+        it.carry()?;
+        it.path.push(Did::Get(2));
+        it.ask(2)
+    };
+    let ran = run();
+    planted::plant(Bug::None);
+    ran
+}
+
+/// The control of I4: a posting that keeps what its read saw only where its list's readers
+/// are first written keeps, for a row repaired through the list it was posted with, what the
+/// read was at the earlier pin; the fact going back to it then looks like no change to a
+/// valued carry, and the leaf is given as it was at the pin between. Five steps and two ways
+/// of saying, which the exhaustive scope does not hold, so the sequence is directed; with no
+/// bug it gives the fresh value.
+#[test]
+fn a_value_kept_from_the_first_posting_is_caught() {
+    assert_eq!(first_posting_then_valued(Bug::None), Ok(()));
+    match first_posting_then_valued(Bug::SeenAtFirstPost) {
+        Err(Failure::Stale { .. }) => {}
+        other => panic!("SeenAtFirstPost was planted and the oracle found {other:?}"),
+    }
 }
 
 fn root(error: &KernelError) -> &KernelError {

@@ -34,6 +34,8 @@ numbers! {
     FDATASYNC           = 75,     83;
     SYNC_FILE_RANGE     = 277,    84;
     FTRUNCATE           = 77,     46;
+    LSEEK               = 8,      62;
+    COPY_FILE_RANGE     = 326,    285;
     RENAMEAT2           = 316,    276;
     UNLINKAT            = 263,    35;
     MKDIRAT             = 258,    34;

@@ -60,14 +60,14 @@ several readers.
     file's; `blaze slow` still reads every file, as its recorder counts take the last counter
     before the build.
 
-    **The cap.** Past `history::CAP_BYTES` (256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's
-    environment sets another, and 4096 is what it was until 2026-11-11) the history first
+    **The cap.** Past `history::cap_for` of the home's store as the daemon started (a quarter
+    of its bytes, between 8 and 256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's environment
+    sets another, and 4096 is what it was until 2026-11-11) the history first
     deletes its files of no build (what a daemon wrote between builds), oldest first, and only
     then its oldest builds whole, every table of a build at once, never one table of a build:
     a daemon left idle never writes a build's rows out of the history while rows of no build
-    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB, so the default
-    holds a small project's cold build and several hundred edits, and of a large workspace its
-    newest builds.
+    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB; the newest
+    flush's builds are never retired, so the build asked about is whole whatever the cap.
 
     **Between builds.** What a default profile records while no build runs is lean
     (2026-11-11: an idle daemon wrote 1.2 MB a minute, now 0.15 MB). A thread blocked inside
@@ -524,6 +524,8 @@ is the fixtures' few rows.
 | client_ended_ns | i64? | when that client sent its rows, at its request's end |
 | daemon_user_ns | i64? | the daemon process's user CPU over the build (getrusage `RUSAGE_SELF`, the end less the start); null in the `running` row |
 | daemon_system_ns | i64? | the same, system CPU |
+| solo_slot | utf8? | a solo answer's request slot key: its client answered with no daemon asked, and the next daemon took its kept rows (client times as its own, misses 0); null for a daemon's build |
+| solo_certified_by | u64? | a solo answer's: the build whose answer its slot held |
 
 A build has two rows: one of outcome `running` and null `dur_ns`, written as it starts (the
 history flushes at once), and one as it ends, with the same `started_ns`. The `builds` view keeps
@@ -544,7 +546,20 @@ request's end as `Request::ClientRows` (blaze-api schema 38), every row tagged w
 id the daemon gave it in `Worked::build_id`, with its start and end on the history's clock.
 The daemon writes them into `spans`, `events` and `folded` as the client's process
 (`process_name` = `blaze client`, `pid` the client's) and refuses rows of another build. The
-times go on a third row of the build in `builds` with `client_started_ns` and
+thin `blaze`, which has no flight recorder, sends its spans by name instead (schema 55,
+`ClientRows::timed`) on the request's own connection just before it execs the program:
+`client: exec to main` (from the kernel's start of the process), `client: solo check`,
+`client: connect`, `client: request on the wire` and `client: answer to exec`; the daemon
+makes them `spans` rows of the client's process. Every client sends its rows on the command's
+own connection, before it closes: a command is one connection (until 2026-11-12 the engine's
+were a second). When the thin `blaze` hands its answer to the engine (blaze-thin
+`handover`), the spans it timed until then and the kernel's start of the process go with it;
+the engine sends them inside its own `spans` batch, after its recorder's rows, so the
+command's rows are one client's, once each, and its start is the thin `blaze`'s. A command the
+thin `blaze` answered with no daemon (its own check, blaze-thin `solo`) writes its spans as
+`<state>/solo-rows/<pid>` (blaze-thin `kept`: made whole as `<pid>.part`, then renamed), which
+the next daemon is to take, each as a build of its own (the daemon's side is not built yet).
+The times go on a third row of the build in `builds` with `client_started_ns` and
 `client_ended_ns`; the view keeps the row with `dur_ns` and those times. A client's rows that
 arrive before the build's end row are held and go on it. The daemon answers the client as it
 hands the rows to the history's thread, before they are written, so the client's exit waits

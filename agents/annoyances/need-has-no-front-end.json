@@ -1,0 +1,14 @@
+{
+ "id": "need-has-no-front-end",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of 7b T3, int-1112",
+ "where": "crates/blaze-cargo/src/serve/unit/run/launch.rs wanted, serve_needs; crates/blaze-cargo/src/serve/unit/run/needs.rs",
+ "what": "A launched run's first call of a function no bind record answers (a workspace function, or one whose record names a static or a callee with no describe record) can only be made by the checkout's front end, and the front end belongs to whichever task holds it: the build's, then the store task after its answer, then the next request's. Between them nothing can make the need, so it must either wait for a task that will hold the front end or be refused by name; a need sent to a channel no task drains would hang the program's stub forever.",
+ "cost": "a design hole found while writing T3: the plan named the front end as the maker but not who holds it when a launcher asks",
+ "cause": "the front end has one owner at a time and is lent per task, while a launched program's first calls arrive at any time between builds",
+ "class": "work queued for an owner that is lent away, with no statement of who drains the queue when no one holds it",
+ "prevention": "a program's `front` flag says whether a task holds or will hold the front end; a need is queued only under it, and the task that lets the front end go clears it first and refuses what is queued (needs.rs's DST checks each need is answered once over every interleaving)",
+ "workaround": "run `blaze run` again: its build's store task serves the needs",
+ "fix": "Held::front and the store task's serve_needs (Does::StoreKept, between store_kept and release_kept); wake_needs from the loop when a request wants the front end",
+ "state": "written, not yet built or run"
+}

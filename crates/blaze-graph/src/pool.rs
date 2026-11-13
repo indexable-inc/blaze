@@ -707,6 +707,10 @@ impl Slot {
 /// What an idle worker's park waits for, as its wait and its error name it.
 #[cfg(not(blaze_check))]
 const IDLE_PARK: &str = "a job for an idle worker, or its pool's next due wait";
+/// What an idle worker gave back before it parked, when the kernel refused it: its idle
+/// fibers' stacks and its own stack's pages below its frame ([`crate::sched::Host`]).
+#[cfg(not(blaze_check))]
+const IDLE_STACKS: &str = "an idle worker's stack pages given back before it parks";
 
 /// Why a pool stopped for an error ([`Pool::broken`]): one of its workers could not go on. Its
 /// message names the worker, its group and the wait or the panic, and is what every scope on
@@ -2466,7 +2470,11 @@ impl Local {
     ///
     /// The park's, when the kernel refused the wait: the worker did not park, and stops the
     /// pool with it ([`work`]).
-    fn park(&self, ended: &impl Fn() -> bool) -> Result<(), blaze_core::wait::WaitError> {
+    fn park(
+        &self,
+        ended: &impl Fn() -> bool,
+        runner: &mut Runner<'_>,
+    ) -> Result<(), blaze_core::wait::WaitError> {
         let shared = &*self.shared;
         let slot = &shared.slots[self.index];
         #[cfg(not(blaze_check))]
@@ -2484,8 +2492,13 @@ impl Local {
             // Outside any job: the free pages this thread's heaps keep go back if a release
             // asked since it last gave them (memcap5); nothing otherwise.
             blaze_mem::tag::settle_heap();
-            // And the frame memory it keeps warm, if an idle daemon asked for it.
-            blaze_mem::frame::settle_spare();
+            // And the frame memory it keeps warm, if an idle daemon asked for it; then its
+            // idle fibers' stacks, unmapped, and the pages of its own stack below this frame.
+            if blaze_mem::frame::settle_spare() {
+                runner
+                    .give_back_stacks()
+                    .map_err(|why| blaze_core::wait::WaitError::io(IDLE_STACKS, why))?;
+            }
             crate::sched::idle(&shared.sched, true);
             let parked = DriverSpan::open(Driving::Idle);
             let waited = if shared.parked.load(Ordering::Acquire) != 0
@@ -2513,7 +2526,7 @@ impl Local {
         }
         #[cfg(blaze_check)]
         {
-            let _ = (slot, ended);
+            let _ = (slot, ended, runner);
             thread::park();
             Ok(())
         }
@@ -2616,16 +2629,18 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     let ran = || debug_assert!(turns.is_none(), "the model checker's pools have threads");
     // The error of a park the kernel refused, until the loop stops the pool with it.
     let refused: Cell<Option<blaze_core::wait::WaitError>> = Cell::new(None);
-    let park = |ended: &dyn Fn() -> bool| match turns {
+    let park = |ended: &dyn Fn() -> bool, runner: &mut Runner<'_>| match turns {
         #[cfg(not(blaze_check))]
         Some(turns) => {
+            // A driven worker's thread is its driver's: its stack is not this worker's to give.
+            let _ = runner;
             crate::sched::idle(&local.shared.sched, true);
             hand_back(local, &outer, turns, crate::sched::Turn::Idle);
             crate::sched::idle(&local.shared.sched, false);
             crate::sched::fire_due(&local.shared.sched);
         }
         _ => {
-            if let Err(error) = local.park(&ended) {
+            if let Err(error) = local.park(&ended, runner) {
                 refused.set(Some(error));
             }
         }
@@ -2725,14 +2740,14 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
                     shared.parked.load(Ordering::Acquire) == 0
                         || shared.abandoned.load(Ordering::SeqCst)
                 };
-                searching = local.sleep(&drained, || park(&drained));
+                searching = local.sleep(&drained, || park(&drained, &mut runner));
                 continue;
             }
             break;
         }
         search = None;
         let ended = || shared.stop.load(Ordering::SeqCst);
-        searching = local.sleep(&ended, || park(&ended));
+        searching = local.sleep(&ended, || park(&ended, &mut runner));
     }
     drop(search);
     drop(runner);

@@ -1,0 +1,42 @@
+about = "A launched run after `blaze stop` starts from its start image (the refinement): build and run, run again, `blaze stop`, run; what the program prints on standard output and standard error and the status it exits with are those of the file `blaze build` makes, and the run after the stop makes no unit, lowers no workspace, links no launcher, restores the program from the image its last run kept (one `launch: restore a program from its start image`) and reads no bind record, since every first call the kept runs made is in the image. Then a body edit of `main` runs the edited program, and last `edit, build, stop, run` prints the edited output, which it does only when the image marked is the edited build's and not the one kept before it. The program's own output is the oracle; its control is `the_refinement_oracle_catches_a_run_that_is_not_the_built_programs` in main.rs, and a stale image is blaze-launch-host's `Plant::KeyOfIdentityAlone` and blaze-cargo's `Plant::TrustsTheMark`, each caught in its own crate. Track 7c, task B; it passes once task C (the daemon keeps, marks and restores the image) is in."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+
+# Run again: the launcher that said `Hello` leaves its image kept.
+[[revision]]
+steps = []
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+
+# A daemon start: nothing of the front end is loaded, the program is the image's.
+[[revision]]
+steps = ["stop"]
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+max_units = 0
+max_records = 0
+spans = { "codegen walk" = 0, "lower workspace" = 0, "launch link" = 0, "launch: restore a program from its start image" = 1, "launch: read a bind record" = 0 }
+
+# A body edit of `main` after the start.
+[[revision]]
+action = "run"
+prints = "hello 1, hello 2, hello 3, hello 4\n"
+status = 3
+as_built = true
+
+# Edit, build, stop, run: the image marked is the edited build's.
+[[revision]]
+steps = ["edit", "build", "stop"]
+action = "run"
+prints = "hello 1, hello 2\n"
+status = 3
+as_built = true

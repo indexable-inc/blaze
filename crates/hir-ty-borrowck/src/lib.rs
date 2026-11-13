@@ -66,6 +66,8 @@ mod rpitit_tests;
 #[cfg(test)]
 mod views_tests;
 #[cfg(test)]
+mod kept_tests;
+#[cfg(test)]
 mod served;
 
 #[cfg(test)]
@@ -334,15 +336,81 @@ impl NotChecked {
 }
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
+///
+/// The one place a stored verdict is looked at: with an item store installed, a kept verdict of
+/// `def` by the checker in use (one the daemon served, or one this build offered and flushed)
+/// is the answer, `BorrowckResult::default()`, with no check run. A verdict is kept only for a
+/// result equal to that ([`kept`]), so the answer is the one the check would give. Under
+/// [`hir_ty::body_store::Mode::Verify`] a kept verdict runs the check as well, and its result is
+/// the answer (and is not offered again).
 #[blaze_query::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     let mode = mode(db);
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
+    let mut verified = None;
+    let served = hir_ty::body_store::lookup_passed(db, def, checker, || {
+        let result = borrowck_in_mode(db, def, mode);
+        let passes = kept(def, &result);
+        verified = Some(result);
+        passes
+    });
+    if served {
+        return BorrowckResult::default();
+    }
+    if let Some(result) = verified {
+        return result;
+    }
     let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
-    if gate::verdict(def, &result).is_ok() {
+    if kept(def, &result) {
         hir_ty::body_store::offer_passed(db, def, checker, reads);
     }
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of `kept_tests`: [`kept`] is the verdict alone, so a pass with a lint is
+    /// kept, and its served answer would drop the lint.
+    pub(crate) static KEEP_LOUD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `result`, `def`'s borrow check, is kept as a verdict: it passed and has nothing to
+/// say. A verdict holds no bytes, so the query answers a served one with
+/// `BorrowckResult::default()`; a pass with a lint (`unused_mut`) or one not checked
+/// (`NotChecked::Off`) is never kept, as its answer is not that.
+pub(crate) fn kept(def: DefWithBodyId, result: &BorrowckResult) -> bool {
+    if gate::verdict(def, result).is_err() {
+        return false;
+    }
+    #[cfg(test)]
+    if KEEP_LOUD.with(std::cell::Cell::get) {
+        return true;
+    }
+    if !result.diagnostics.is_empty() || result.not_checked.is_some() {
+        tracing::debug!(
+            target: "blaze",
+            ?def,
+            lints = result.diagnostics.len(),
+            not_checked = ?result.not_checked,
+            "a passing borrow check with something to say: no verdict kept"
+        );
+        return false;
+    }
+    true
+}
+
+/// The name the item store files the database's verdicts under, none when no check runs: what
+/// the driver keys a served borrow check by.
+pub fn checker_name(db: &Db) -> Option<&'static str> {
+    checker(mode(db))
+}
+
+/// The checker's name when `def`'s borrow check (the [`borrowck`] query, run or served) passed
+/// with nothing to say, so its verdict may be kept: the driver's borrow check step. None when
+/// it did not, or no check runs.
+pub fn silent_pass(db: &Db, def: DefWithBodyId) -> Option<&'static str> {
+    let checker = checker_name(db)?;
+    kept(def, borrowck(db, def)).then_some(checker)
 }
 
 /// The name the item store files `mode`'s verdicts under: each checker accepts other programs.

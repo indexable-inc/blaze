@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "blaze-2026.11"
+
+[dependencies]
+bstd = { package = "blaze-std", path = "@BLAZE_TREE@/crates/blaze-std" }
+
+# Its own workspace: bstd is a path dependency of another one, the tree.
+[workspace]

@@ -418,7 +418,7 @@ fn imaged(db: &mut Db, store: &Memory) -> (ContentId, ContentId) {
     let all = base_db::all_crates(db).to_vec();
     let served = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
     assert!(served.hits.is_empty());
-    let stored = deps::store(db, &served, store).unwrap();
+    let stored = deps::store(db, &served, store, deps::Which::Sealed).unwrap();
     (stored.filed[&crate_named(db, "core")], stored.filed[&crate_named(db, "lib")])
 }
 

@@ -34,6 +34,36 @@ use blaze_pack::{
 
 use super::{B3, Base, Body, Ed25519, admitted, compressed, id_of, key_of, sign};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    /// A planted bug for the controls of the tamper tests (`packs::tests`): [`import`] checks
+    /// no record against its manifest.
+    pub(crate) static UNCHECKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The check removed: each record's content is said to be what its manifest names, in the
+/// order the import reads them (manifest order, into a store that has none of them).
+#[cfg(test)]
+struct Blind {
+    contents: Vec<Id>,
+    next: Cell<usize>,
+}
+
+#[cfg(test)]
+impl blaze_pack::Hashes for Blind {
+    fn content(&self, _bytes: &[u8]) -> Id {
+        let at = self.next.replace(self.next.get() + 1);
+        self.contents[at]
+    }
+
+    fn manifest(&self, bytes: &[u8]) -> Id {
+        blaze_pack::Hashes::manifest(&B3, bytes)
+    }
+}
+
 /// Why an imported pack's records are pinned, as the store's pin says it.
 pub(crate) const WHY: &str = "records imported from a pack, kept from the import on";
 /// Tries at taking the scan that reads a store's pins, each after driving the store to rest.
@@ -421,7 +451,17 @@ pub(crate) fn import(
     let keys: Vec<Key> = import.manifest().records().iter().map(|it| key_of(&it.key)).collect(); // alloc: once an import
     records.pin(&head.pin, &keys).map_err(named)?;
     let mut body = Body::open(base, &head.pack, head.body_len).map_err(named)?;
-    let summary = import::run(&mut import, &mut Sink(records), &mut body, &B3)
-        .map_err(|refused| named(refused.to_string()))?;
+    #[cfg(test)]
+    let summary = match UNCHECKED.get() {
+        // The planted bug of the layer's tamper test: every record taken as its manifest says.
+        true => {
+            let contents = import.manifest().records().iter().map(|it| it.content).collect();
+            import::run(&mut import, &mut Sink(records), &mut body, &Blind { contents, next: Cell::new(0) })
+        }
+        false => import::run(&mut import, &mut Sink(records), &mut body, &B3),
+    };
+    #[cfg(not(test))]
+    let summary = import::run(&mut import, &mut Sink(records), &mut body, &B3);
+    let summary = summary.map_err(|refused| named(refused.to_string()))?;
     Ok(Some(Imported { pin: head.pin, pack: head.pack, summary, vouched }))
 }

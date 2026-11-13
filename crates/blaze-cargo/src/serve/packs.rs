@@ -36,11 +36,13 @@
 //! stated length, a range its own length, a peer's statements their format's most); a
 //! directory's by the file system. One build task waits; the daemon's loop never does.
 //!
-//! Where the bytes go: `blaze_cas::Handle::installed`, the process's one store writer. A put
-//! is readable at once and durable at the daemon's next flush.
+//! Where the bytes go: the store of the [`Packs`] the job carries (`JobInput::packs`; for the
+//! daemon, `blaze_cas::Handle::installed`, the process's one store writer). A put is readable
+//! at once and durable at the daemon's next flush. A request that said `--no-prebuilt` carries
+//! none ([`given`]), and nothing is asked for it.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -219,8 +221,15 @@ pub(crate) struct Serve {
 ///   "trusted": ["<64 hex: a public key whose packs are taken>"],
 ///   "key_file": "/home/me/.blaze-peer.key",
 ///   "peers": [{ "url": "http://10.0.0.5:7420", "key": "<64 hex: that peer's public key>" }],
-///   "serve": { "bind": "10.0.0.4:7420", "readers": ["<64 hex: a public key that may read>"] } }
+///   "serve": { "bind": "10.0.0.4:7420", "readers": ["<64 hex: a public key that may read>"] },
+///   "prebuilt": true }
 /// ```
+///
+/// `prebuilt` (true when left out): whether records someone else built are taken at all. With
+/// `false`, no source and no peer is asked, on a miss or for a sealed tree's layer
+/// (`serve::sealed`), and what is missing is built here; nothing else changes. No source is
+/// built in: a bucket that serves this layout over HTTPS (R2, S3, a directory) is named in
+/// `sources` and `install`, and the key its packs are signed with in `trusted`.
 ///
 /// Every field may be left out; a field it does not know is refused by name. `key_file`
 /// holds this machine's Ed25519 secret (64 hex digits): it signs what this machine states
@@ -234,6 +243,8 @@ pub(crate) struct Config {
     pub key_file: Option<PathBuf>,
     pub peers: Vec<PeerAt>,
     pub serve: Option<Serve>,
+    /// Whether records built elsewhere are taken ([`Config`]'s `prebuilt`).
+    pub prebuilt: bool,
 }
 
 impl Config {
@@ -264,7 +275,7 @@ impl Config {
             Value::Array(items) => items.iter().map(|item| text_of(what, item)).collect::<Result<Vec<String>, String>>(),
             _ => Err(format!("`{what}` is not a list")), // alloc: error path
         };
-        let mut config = Config::default();
+        let mut config = Config { prebuilt: true, ..Config::default() };
         for (name, value) in &fields {
             match name.as_str() {
                 "sources" => {
@@ -311,6 +322,10 @@ impl Config {
                         readers.push(key_from_hex("a key of `serve.readers`", &hex)?);
                     }
                     config.serve = Some(Serve { bind, readers });
+                }
+                "prebuilt" => {
+                    let Value::Bool(prebuilt) = value else { return Err("`prebuilt` is not true or false".to_owned()) };
+                    config.prebuilt = *prebuilt;
                 }
                 other => return Err(format!("`{other}` is not a setting")), // alloc: error path
             }
@@ -517,12 +532,17 @@ struct State {
     installed: Vec<Id>,
 }
 
+/// The pack sources and peers a job's misses are asked of, with the store what they give is
+/// put into: a value the job carries (`JobInput::packs`), never read from the process by the
+/// lookup, so a test asks its own sources of its own store.
 pub(crate) struct Packs {
     config: Config,
     scope: String,
     trust: Trust,
     /// This machine's key, which signs what it asks of a peer.
     seed: Option<[u8; 32]>,
+    /// The store a record fetched is put into: the daemon's, through the process's handle.
+    store: &'static blaze_cas::Handle,
     state: blaze_core::lock::Lock<State>,
     /// Held while a source's heads and manifests are read, so one task reads them and the
     /// others that miss meanwhile wait for it (in the span `pack source load`) and then find
@@ -530,7 +550,8 @@ pub(crate) struct Packs {
     loads: blaze_core::lock::Lock<()>,
 }
 
-static PACKS: OnceLock<Option<Packs>> = OnceLock::new();
+/// The daemon's packs, made of packs.json once its store's handle is installed.
+static PACKS: OnceLock<Option<Arc<Packs>>> = OnceLock::new();
 
 /// What a source's failure said, until the daemon's loop shows it in a build's own output
 /// ([`take_notices`]): once a failure, since a failed source is paused.
@@ -547,26 +568,41 @@ pub(crate) fn take_notices() -> Vec<String> {
     out
 }
 
-/// The process's packs: none when the settings are absent, name no source and no peer, or
-/// cannot be read (said once, as an error and a notice: a build with settings that do not
-/// parse reads no pack, and says why).
-fn packs() -> Option<&'static Packs> {
-    PACKS
-        .get_or_init(|| {
-            let made = Config::read().and_then(|config| match config {
-                Some(config) if !config.sources.is_empty() || !config.peers.is_empty() => {
-                    let seed = config.seed()?;
-                    Ok(Some(Packs::new(config, scope()?, seed)))
-                }
-                _ => Ok(None),
-            });
-            made.unwrap_or_else(|why| {
-                tracing::error!(target: "blaze", "no pack is read: {why}");
-                NOTICES.push(format!("no pack is read: {why}")); // alloc: once a daemon
-                None
-            })
+/// The daemon's packs: none before its store's handle is installed (nothing to put into),
+/// and none when the settings are absent, say `"prebuilt": false`, name no source and no
+/// peer, or cannot be read (said once, as an error and a notice: a build with settings that
+/// do not parse reads no pack, and says why).
+fn daemon_packs() -> Option<Arc<Packs>> {
+    let store = blaze_cas::Handle::installed()?;
+    let packs = PACKS.get_or_init(|| {
+        let made = Config::read().and_then(|config| match config {
+            // `prebuilt: false`: nothing built elsewhere is asked for.
+            Some(config) if config.prebuilt && (!config.sources.is_empty() || !config.peers.is_empty()) => {
+                let seed = config.seed()?;
+                Ok(Some(Arc::new(Packs::new(config, scope()?, seed, store)))) // alloc: once a daemon
+            }
+            _ => Ok(None),
+        });
+        made.unwrap_or_else(|why| {
+            tracing::error!(target: "blaze", "no pack is read: {why}");
+            NOTICES.push(format!("no pack is read: {why}")); // alloc: once a daemon
+            None
         })
-        .as_ref()
+    });
+    packs.as_ref().map(Arc::clone)
+}
+
+/// The packs a job of a request is given ([`super::work::JobInput::packs`]): the daemon's,
+/// unless the request said `--no-prebuilt` ([`blaze_api::Cargo::prebuilt`] false), when
+/// nothing built elsewhere is asked for and every miss is built here.
+pub(crate) fn of_request(prebuilt: bool) -> Option<Arc<Packs>> {
+    given(daemon_packs(), prebuilt)
+}
+
+/// `packs`, unless `prebuilt` is false: the one rule by which a request's switch turns its
+/// job's sources off.
+pub(crate) fn given(packs: Option<Arc<Packs>>, prebuilt: bool) -> Option<Arc<Packs>> {
+    packs.filter(|_| prebuilt)
 }
 
 /// The job whose units' keys were last asked of the peers in one batch.
@@ -578,31 +614,11 @@ pub(crate) fn first_ask_of(job: usize) -> bool {
     ASKED_OF.swap(job, std::sync::atomic::Ordering::Relaxed) != job
 }
 
-/// Whether the settings name a source or a peer to ask on a miss.
-pub(crate) fn configured() -> bool {
-    packs().is_some()
-}
-
 thread_local! {
-    /// The lookup under way on this thread asks the packs: the hard error it met, if any.
-    static ASKING: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
-    /// The store being read is not the daemon's own (the shared std store): what is fetched
-    /// goes to the daemon's own, so nothing is asked on behalf of another.
-    static OTHER_STORE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// For as long as it lives, reads on this thread are of a store that is not the daemon's own
-/// when `other` says so, and [`missed`] asks nothing for them.
-pub(crate) struct Reading(bool);
-
-pub(crate) fn reading(other: bool) -> Reading {
-    Reading(OTHER_STORE.replace(other))
-}
-
-impl Drop for Reading {
-    fn drop(&mut self) {
-        OTHER_STORE.set(self.0);
-    }
+    /// The lookup under way on this thread asks these packs (its job's, [`asked`]'s
+    /// argument, for the lookup's extent alone), whether it is a sealed unit's (what it
+    /// fetches goes into the machine's layer), and the hard error it met, if any.
+    static ASKING: RefCell<Option<(Arc<Packs>, bool, Option<String>)>> = const { RefCell::new(None) };
 }
 
 struct Asking;
@@ -613,22 +629,29 @@ impl Drop for Asking {
     }
 }
 
-/// `look` run with the packs asked for every key it misses ([`missed`]): what it gives, or
-/// the hard error a source caused (a record that is not what its manifest names).
+/// `look` run with `packs` (the job's) asked for every key it misses ([`missed`]): what it
+/// gives, or the hard error a source caused (a record that is not what its manifest names).
 ///
 /// `likely`: keys the build will ask for (every unit's record keys), asked of the peers in
 /// batches first, once: what a peer lacks then costs no request of its own.
-pub(crate) fn asked<T>(likely: &[Key], look: impl FnOnce() -> Result<T, ApiError>) -> Result<T, ApiError> {
+///
+/// `sealed`: the lookup is a sealed unit's (`serve::sealed`, `unit::compile::sealed`): what
+/// it fetches is installed into the machine's layer ([`blaze_cas::Handle::layer`]), never
+/// the home, so every home on the machine finds it there and none fetches it again.
+pub(crate) fn asked<T>(
+    packs: &Arc<Packs>,
+    likely: &[Key],
+    sealed: bool,
+    look: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
     let _span = tracing::info_span!("pack fetch on miss").entered();
-    if let Some(packs) = packs() {
-        // alloc: once a unit that missed, the keys not yet asked
-        let ids: Vec<Id> = likely.iter().map(id_of).collect();
-        packs.prime(&ids);
-    }
-    ASKING.with(|asking| *asking.borrow_mut() = Some(None));
+    // alloc: once a unit that missed, the keys not yet asked
+    let ids: Vec<Id> = likely.iter().map(id_of).collect();
+    packs.prime(&ids);
+    ASKING.with(|asking| *asking.borrow_mut() = Some((Arc::clone(packs), sealed, None)));
     let ending = Asking;
     let found = look();
-    let failed = ASKING.with(|asking| asking.borrow_mut().take().flatten());
+    let failed = ASKING.with(|asking| asking.borrow_mut().take().and_then(|(_, _, failed)| failed));
     drop(ending);
     match failed {
         Some(why) => Err(ApiError::new(why, None)),
@@ -636,21 +659,24 @@ pub(crate) fn asked<T>(likely: &[Key], look: impl FnOnce() -> Result<T, ApiError
     }
 }
 
-/// `key` is not in the daemon's store: whether it is now, fetched from a pack or a peer and
-/// checked. False outside [`asked`], for a read of another store, when no source has it and
+/// `key` is not in the job's store: whether it is now, fetched from a pack or a peer of the
+/// packs [`asked`] runs with and checked. False outside [`asked`], when no source has it and
 /// when a source failed (said in the log and in the build's output; the unit is built); a
 /// record that is not what a trusted manifest names fails the lookup [`asked`] runs, naming
 /// the source and the key.
 pub(crate) fn missed(key: &Key) -> bool {
-    if OTHER_STORE.get() || !ASKING.with(|asking| asking.borrow().is_some()) {
+    // clone: the packs leave the cell before they are asked, so nothing borrows it across
+    // the fetch's reads.
+    let Some((packs, sealed)) =
+        ASKING.with(|asking| asking.borrow().as_ref().map(|(packs, sealed, _)| (Arc::clone(packs), *sealed)))
+    else {
         return false;
-    }
-    let Some(packs) = packs() else { return false };
-    match packs.fetch(key) {
+    };
+    match packs.fetch(key, sealed) {
         Ok(kept) => kept,
         Err(why) => {
             ASKING.with(|asking| {
-                if let Some(first) = asking.borrow_mut().as_mut() {
+                if let Some((_, _, first)) = asking.borrow_mut().as_mut() {
                     first.get_or_insert(why);
                 }
             });
@@ -660,7 +686,7 @@ pub(crate) fn missed(key: &Key) -> bool {
 }
 
 impl Packs {
-    fn new(config: Config, scope: String, seed: Option<[u8; 32]>) -> Packs {
+    pub(crate) fn new(config: Config, scope: String, seed: Option<[u8; 32]>, store: &'static blaze_cas::Handle) -> Packs {
         let state = State {
             sources: config.sources.iter().map(|_| SourceState::New).collect(), // alloc: once a daemon
             peers: vec![None; config.peers.len()], // alloc: once a daemon
@@ -673,6 +699,7 @@ impl Packs {
             scope,
             trust,
             seed,
+            store,
             state: blaze_core::lock::Lock::new("serve.packs.state", state),
             loads: blaze_core::lock::Lock::new("serve.packs.loads", ()),
         }
@@ -798,8 +825,8 @@ impl Packs {
         Ok(bytes)
     }
 
-    /// The pack `it` of source `source`, imported whole into the daemon's store through its
-    /// handle: every record checked against the manifest before it is put, one the store
+    /// The pack `it` of source `source`, imported whole through `handle` (the daemon's store's,
+    /// or the machine's layer's for a sealed unit's lookup): every record checked against the manifest before it is put, one the store
     /// has left as it is. A pack is what its publisher selected to travel together (a pin's
     /// records), so the first miss it answers brings all of it, read in order a span at a
     /// time, and the misses after it are hits. Its records are pinned as every record of
@@ -838,13 +865,25 @@ impl Packs {
         }
     }
 
-    /// The record of `key`, fetched, checked and put into the daemon's store: whether it is
-    /// there now. The error is a hard one: a lie, or two trusted sayings that differ.
-    fn fetch(&self, key: &Key) -> Result<bool, String> {
-        let Some(handle) = blaze_cas::Handle::installed() else { return Ok(false) };
+    /// The record of `key`, fetched, checked and put into the daemon's store, or for a sealed
+    /// unit's lookup (`sealed`) into the machine's layer: whether the home finds it now (it
+    /// reads the layer live, `blaze_cas::Store::read_live`). The error is a hard one: a lie,
+    /// two trusted sayings that differ, or a sealed unit's fetch in a process with no layer.
+    fn fetch(&self, key: &Key, sealed: bool) -> Result<bool, String> {
+        let handle = self.store;
         if handle.has(key) {
             return Ok(true);
         }
+        let into = match sealed {
+            false => handle,
+            true => blaze_cas::Handle::layer().ok_or_else(|| {
+                // alloc: error path
+                format!(
+                    "the record of key {:x} is a sealed unit's, which is fetched into the machine's layer, and the daemon installed none",
+                    key.0
+                )
+            })?,
+        };
         let id = id_of(key);
         let now = Instant::now();
         // Each source's packs as they are loaded now; one not loaded (new, or failed longer
@@ -881,7 +920,7 @@ impl Packs {
                 if self.state.lock().installed.contains(&it.pack) {
                     continue;
                 }
-                if self.install(source, it, handle)? {
+                if self.install(source, it, into)? {
                     self.state.lock().installed.push(it.pack);
                 }
             }
@@ -940,7 +979,7 @@ impl Packs {
                         fetch.advance_clock(started.elapsed());
                     }
                     Effect::Keep { bytes, .. } => {
-                        handle.put(*key, kind, &bytes).map_err(|mismatch| {
+                        into.put(*key, kind, &bytes).map_err(|mismatch| {
                             format!("the record of key {id} is refused: {}", stored::differs(&mismatch)) // alloc: error path
                         })?;
                     }

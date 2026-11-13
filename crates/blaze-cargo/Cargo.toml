@@ -34,6 +34,7 @@ hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
+hir-ty-borrowck.workspace = true
 # `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
 blaze-doc.workspace = true
 # `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
@@ -123,6 +124,8 @@ blaze-gc.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-record.workspace = true
+# The request certificate and its machine, which the daemon drives over its store and view.
+blaze-certify.workspace = true
 blaze-kernel.workspace = true
 # the front end as kernel steps, carried by the daemon across builds (serve/front_carry.rs)
 blaze-front-items.workspace = true
@@ -164,6 +167,8 @@ lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
 # The property test of the no-op lane (`serve/job/noop/tests.rs`).
 hegeltest.workspace = true
+# The request machine's planted bugs, for the controls of `serve/job/certify/tests.rs`.
+blaze-certify = { workspace = true, features = ["plants"] }
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).
 test-utils.workspace = true
 # A database of a fixture's files, for a unit's check run again (`serve/unit/checks/tests.rs`).

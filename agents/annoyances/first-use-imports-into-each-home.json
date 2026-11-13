@@ -1,0 +1,14 @@
+{
+ "id": "first-use-imports-into-each-home",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executors of track 7 task A (core, then layers/bstd/registry), int-1112",
+ "where": "crates/blaze-cargo/src/cli/store.rs first_use, install; serve/unit/compile.rs kept_under; toolchain/library.rs own; serve/daemon.rs home store open; serve/packs/stored.rs",
+ "what": "Every new BLAZE_HOME re-put the toolchain's pack record by record into its own store, copied each std unit's record and outputs out of the shared std store into itself, and kept its own copy of library/ (80 MB): a cold hello-world home was 760 MB and resolved std from source (1,887 ms) when no pack was set.",
+ "cost": "760 MB a home against Relax's 75; seconds of every cold start",
+ "cause": "records of crates whose sources cannot change were treated as a home's, so each home paid for them again",
+ "class": "a value that is the same on every home of a machine stored once a home",
+ "prevention": "a sealed tree (sources that cannot change, told by where they are read from) has one layer a machine found by its cover digest (serve/sealed.rs); a home's store reads layers in place and never copies them",
+ "workaround": "none",
+ "fix": "serve::sealed: Cover, Install (stat, lock, stat, import by cover pin from the configured bases then share/blaze/sealed, into the layer's own writer directory); first_use and `blaze store install` drive it; `blaze store cover`; kept_under's copy deleted; library placed under the machine directory; `prebuilt: false` in packs.json asks no source. Second executor: the home store opens with the machine's layers (daemon.rs) and compile.rs's fresh/found_narrow/recorded_profiles/kept_under read the home store alone (the std branch and packs::reading deleted); sealed::Tree/placed/registry make covers for any list (shipped: library, bstd by blaze_new::BSTD_DIGEST; a Cargo.lock's registry packages by checksum, `--lock` on install and cover); toolchain::library::place places any shipped tree; the tamper test on the layer import path. Not built: the per-run --no-prebuilt, puts of sealed crates into the layer, the job's look of the home store (/tmp/plan/handoff-7A.md)",
+ "state": "written, not built"
+}

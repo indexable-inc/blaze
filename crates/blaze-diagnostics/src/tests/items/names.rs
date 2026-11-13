@@ -73,6 +73,52 @@ fn main() {
     assert!(!messages.iter().any(|it| it.starts_with("E0425")), "{messages:?}");
 }
 
+/// The invariant: a type a proc macro names at the call site inside the enum it declares is
+/// that enum's parameter, in a lone expansion and in each of two of the same tokens.
+#[test]
+fn the_enum_a_proc_macro_declares_at_its_call_site_sees_its_generics_in_every_select() {
+    // Our own: tempo's zone-node (`crates/zones/node/src/role.rs`), its three `tokio::select!`
+    // in one function: `:910` (three branches, no twin), `:924` and `:1015` (the same tokens).
+    // tokio's `select!` declares `mod __tokio_select_util` in its block and calls tokio-macros'
+    // `select_priv_declare_output_enum` there with one `_` per branch; the proc macro makes
+    // `Out<_0, _1>`'s names with `Span::call_site()`. An error naming `_2` (the lone call) would
+    // be hygiene or the expander; one naming only `_0` and `_1` would be the twins' map.
+    let fixture = r#"//- proc_macros: select_priv_declare_output_enum
+//- minicore: sized
+//- /main.rs crate:main edition:2021
+pub use proc_macros::select_priv_declare_output_enum;
+macro_rules! select {
+    ($($count:tt)*) => {{ mod __tokio_select_util { $crate::select_priv_declare_output_enum!( ( $($count)* ) ); } }};
+}
+fn main() { let _unique = select!(_ _ _); let _first = select!(_ _); let _second = select!(_ _); }
+"#;
+    let messages = checked(fixture).messages();
+    let names = ["E0425", "E0412", "E0433"];
+    assert!(
+        !messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))),
+        "{messages:?}"
+    );
+}
+
+/// The control of the test above: the check looks inside an enum a proc macro writes in the
+/// module of a `select!`, in each of two expansions of the same tokens, and says E0425 for a
+/// type nothing declares there, and nothing for the enum's own parameter.
+#[test]
+fn a_type_nothing_declares_in_an_enum_a_proc_macro_writes_in_a_select_is_e0425() {
+    let fixture = r#"//- proc_macros: pass
+//- minicore: sized
+//- /main.rs crate:main edition:2021
+macro_rules! select { () => {{ mod __tokio_select_util { proc_macros::pass! { pub(super) enum Out<_0> { _0(_0), _1(_9), Disabled } } } }}; }
+fn main() { let _first = select!(); let _second = select!(); }
+"#;
+    let messages = checked(fixture).messages();
+    assert!(
+        messages.iter().any(|it| it.starts_with("E0425") && it.contains("`_9`")),
+        "{messages:?}"
+    );
+    assert!(!messages.iter().any(|it| it.contains("`_0`")), "{messages:?}");
+}
+
 #[test]
 fn a_derive_and_a_macros_impl_in_a_file_of_two_crates_see_self_and_their_generics() {
     // Our own: blaze-mem's derives and llvm-sys's build script, at the root and in an inline

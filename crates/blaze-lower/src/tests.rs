@@ -292,7 +292,7 @@ fn lowered(units: &Units) -> Result<Built, LowerError> {
     let tree = MemTree::default();
     let root = view(&tree);
     let config = config(root, library(&tree));
-    let lowered = lower(Lower { units, config: &config, files: &tree, root, host_cpu: None })?;
+    let lowered = lower(Lower { units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(units) })?;
     Ok(Built { lowered })
 }
 
@@ -405,11 +405,11 @@ fn twins(units: &mut Units, out_dir: &str, env: &[(&str, &str)]) -> (usize, usiz
 fn gen_ran(out_dir: &str, cfg: &str) -> Ran {
     Ran {
         cfgs: vec![cfg.to_owned()],
-        env: vec![("GEN".to_owned(), format!("{out_dir}/gen.rs"))],
+        env: [("GEN".to_owned(), format!("{out_dir}/gen.rs"))].into(),
         out_dir: out_dir.to_owned(),
         files: vec![(
             "gen.rs".to_owned(),
-            format!("// {out_dir}\npub fn gen() {{}}\n").into_bytes(),
+            format!("// {out_dir}\npub fn gen() {{}}\n").into_bytes().into(),
         )],
     }
 }
@@ -837,9 +837,9 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     let mut built = lowered(&units()).unwrap();
     let ran = Ran {
         cfgs: vec!["has_gen".to_owned(), "gen=\"two\"".to_owned()],
-        env: vec![("GEN".to_owned(), "1".to_owned())],
+        env: [("GEN".to_owned(), "1".to_owned())].into(),
         out_dir: OUT_DIR.to_owned(),
-        files: vec![("gen.rs".to_owned(), b"pub fn gen() {}\n".to_vec())],
+        files: vec![("gen.rs".to_owned(), b"pub fn gen() {}\n".as_slice().into())],
     };
     built.lowered.ran(RUN, &ran).unwrap();
     let db = built.lowered.db();
@@ -871,6 +871,40 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     assert!(!krate(&built, LIB).cfg_options(db).check_atom(&flag("has_gen")));
     assert!(root_of(db, krate(&built, LIB)).file_for_path(&generated).is_none());
     assert!(!built.lowered.paths().contains_key(&file));
+}
+
+/// The invariant: a run's bytes exist once. After the run is applied, the file text the front
+/// end reads is the run's own allocation (its count is the run's and the front end's), and so
+/// are the variables each dependent crate's record of the run holds; nothing is a copy.
+/// The control is the copy this replaced (`Arc::from(bytes.as_slice())`, `env.clone()`):
+/// with it each count stays at one, which the assertions refuse.
+#[test]
+fn an_applied_run_shares_its_bytes_and_copies_none() {
+    let mut built = lowered(&units()).unwrap();
+    let text: std::sync::Arc<[u8]> = b"pub fn gen() {}\n".as_slice().into();
+    let ran = Ran {
+        cfgs: vec!["has_gen".to_owned()],
+        env: [("GEN".to_owned(), "1".to_owned())].into(),
+        out_dir: OUT_DIR.to_owned(),
+        files: vec![("gen.rs".to_owned(), std::sync::Arc::clone(&text))],
+    };
+    // The test's handle, the run's.
+    assert_eq!(std::sync::Arc::strong_count(&text), 2);
+    assert_eq!(std::sync::Arc::strong_count(&ran.env), 1);
+    built.lowered.ran(RUN, &ran).unwrap();
+    assert!(
+        std::sync::Arc::strong_count(&text) > 2,
+        "the front end's text of gen.rs is a copy of the run's bytes, not the run's own"
+    );
+    assert!(
+        std::sync::Arc::strong_count(&ran.env) > 1,
+        "the dependent crates' record of the run holds a copy of its variables"
+    );
+    // Dropped, the run leaves the front end's text the one allocation of those bytes.
+    drop(ran);
+    assert!(std::sync::Arc::strong_count(&text) > 1);
+    let db = built.lowered.db();
+    assert_eq!(krate(&built, LIB).env(db).get("GEN").as_deref(), Some("1"));
 }
 
 #[test]
@@ -1042,7 +1076,7 @@ fn a_macro_host_crate_that_links_proc_macro_is_told_the_hosts_side() {
         let root = changed(&tree, &[("a/src/lib.rs", Some(gated)), ("a/src/more.rs", Some(more))]);
         let config = config_of(root);
         built.lowered.refresh(
-            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
             |_| Ok(()),
         )
     };
@@ -1086,8 +1120,9 @@ fn relowered(built: &mut Built, plan: &Units) -> crate::Relowered {
     let tree = MemTree::default();
     let root = view(&tree);
     let config = config(root, library(&tree));
-    let lower = || Lower { units: plan, config: &config, files: &tree, root, host_cpu: None };
-    assert_eq!(built.lowered.refresh(lower(), |_| Ok(())), Ok(true), "the view did not move");
+    let sealed = crate::unsealed(plan);
+    let lower = || Lower { units: plan, config: &config, files: &tree, root, host_cpu: None, sealed: &sealed };
+    assert_eq!(built.lowered.refresh(lower(), &base_db::Looks::none(), |_| Ok(())), Ok(true), "the view did not move");
     built.lowered.relower(lower()).unwrap()
 }
 
@@ -1322,7 +1357,7 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     // only the file's content tells its identity apart, and the bin's through the lib's.
     let ran = |text: &str| Ran {
         out_dir: OUT_DIR.to_owned(),
-        files: vec![("gen.rs".to_owned(), text.as_bytes().to_vec())],
+        files: vec![("gen.rs".to_owned(), text.as_bytes().into())],
         ..Ran::default()
     };
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
@@ -1355,8 +1390,8 @@ fn a_code_identity_takes_a_file_with_no_text_by_its_bytes() {
         Ran {
             out_dir: OUT_DIR.to_owned(),
             files: vec![
-                ("gen.rs".to_owned(), generated.to_vec()),
-                ("libgen.a".to_owned(), archive.to_vec()),
+                ("gen.rs".to_owned(), generated.into()),
+                ("libgen.a".to_owned(), archive.into()),
             ],
             ..Ran::default()
         }
@@ -1401,7 +1436,7 @@ fn a_units_identity_leaves_out_the_process_environment() {
         config.invocation.env =
             env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
         let mut lowered =
-            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
                 .unwrap();
         [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
     };
@@ -1429,7 +1464,7 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
     let root = changed(&tree, &[("a/src/more.rs", Some(more)), ("a/src/new.rs", Some(new))]);
     let config = config(root, library(&MemTree::default()));
     let refreshed = built.lowered.refresh(
-        Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
@@ -1455,15 +1490,16 @@ fn a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error() {
     let more: &'static [u8] = b"pub fn more() -> u8 { 1 }\n";
     let root = changed(&tree, &[("a/src/more.rs", Some(more))]);
     let config = config(root, library(&MemTree::default()));
-    let lower = || Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
+    let sealed = crate::unsealed(&units);
+    let lower = || Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &sealed };
     let mut built = lowered(&units).unwrap();
     let mut seeded = 0;
-    let refreshed = built.lowered.refresh(lower(), |_| {
+    let refreshed = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| {
         seeded += 1;
         Ok(())
     });
     assert_eq!((refreshed, seeded), (Ok(true), 1));
-    let again = built.lowered.refresh(lower(), |_| panic!("seeded with no text written"));
+    let again = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| panic!("seeded with no text written"));
     assert_eq!(again, Ok(true), "the view did not move");
 
     let mut built = lowered(&units).unwrap();
@@ -1471,7 +1507,7 @@ fn a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error() {
         what: "the edit's parse was not taken".to_owned(),
         at: Some("/w/a/src/more.rs".to_owned()),
     };
-    let error = built.lowered.refresh(lower(), |_| Err(refused.clone()));
+    let error = built.lowered.refresh(lower(), &base_db::Looks::none(), |_| Err(refused.clone()));
     assert_eq!(error, Err(refused));
 }
 
@@ -1485,7 +1521,7 @@ fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower()
         let root = changed(&tree, changes);
         let config = config(root, library);
         built.lowered.refresh(
-            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None },
+            Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
             |_| Ok(()),
         )
     };
@@ -1599,8 +1635,8 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     let tree = MemTree::default();
     let view = view(&tree);
     let config = config(view, library(&tree));
-    let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
-    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
+    let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None, sealed: &crate::unsealed(&units) };
+    assert_eq!(built.lowered.refresh(next, &base_db::Looks::none(), |_| Ok(())), Ok(true));
     let unrecorded = harness("pub fn main() { let _ = 1; }");
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(unrecorded.clone())), Ok(1));
     assert_eq!(text_of(&built.lowered, root), format!("{disk}{unrecorded}"));
@@ -1699,8 +1735,8 @@ fn an_edit_of_a_root_file_reaches_every_root_of_it() {
     let tree = MemTree::default();
     let root = changed(&tree, &[("m/src/lib.rs", Some(EDITED))]);
     let config = config(root, library(&tree));
-    let next = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
-    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
+    let next = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) };
+    assert_eq!(built.lowered.refresh(next, &base_db::Looks::none(), |_| Ok(())), Ok(true));
     let edited = std::str::from_utf8(EDITED).unwrap();
     assert_eq!(text_of(&built.lowered, disk), edited);
     assert_eq!(text_of(&built.lowered, test_root), format!("{edited}{}", test_harness().after));
@@ -1924,7 +1960,7 @@ fn lowered_with(
 ) -> Result<Built, LowerError> {
     let root = changed(tree, changes);
     let config = config(root, library_with_proc_macro(tree));
-    let lowered = lower(Lower { units, config: &config, files: tree, root, host_cpu: None })?;
+    let lowered = lower(Lower { units, config: &config, files: tree, root, host_cpu: None, sealed: &crate::unsealed(units) })?;
     Ok(Built { lowered })
 }
 
@@ -2002,14 +2038,24 @@ fn a_packages_const_macros_are_one_crate_its_crates_depend_on_by_the_files_stem(
         Some("/rustc/abc/blaze/const-ast/lib.rs")
     );
     let on: Vec<Crate> = const_ast.data(db).dependencies.iter().map(|it| it.crate_id).collect();
-    assert_eq!(on, [krate(&built, CORE)]);
+    let quote = dependency_of(db, const_ast, "const_ast_quote").expect("`quote!`'s crate");
+    assert_eq!(on, [krate(&built, CORE), quote]);
+    // `quote!`'s crate: a proc-macro crate on the same root file, whose one macro is `quote`.
+    assert_eq!(quote.data(db).root_file_id, root, "one root file, two crates");
+    assert_eq!(quote.data(db).target_kind, TargetKind::Lib { is_proc_macro: true });
+    assert!(quote.cfg_options(db).check_atom(&flag("blaze_const_quote")));
+    assert!(!quote.cfg_options(db).check_atom(&flag("blaze_const_eval")));
+    assert!(const_ast.cfg_options(db).check_atom(&flag("blaze_const_eval")));
+    assert!(!const_ast.cfg_options(db).check_atom(&flag("blaze_const_quote")));
+    assert_eq!(const_macros_of(db, quote), ["quote"]);
 
     // Its macros are listed from its file, and every crate comes after what it depends on.
     assert_eq!(const_macros_of(db, macros), ["double"]);
     let all = base_db::all_crates(db);
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 10, "the units' 7, the macro crate, `const_ast` and `const_ast_quote`");
     let at = |krate: Crate| all.iter().position(|it| *it == krate).unwrap();
     assert!(at(krate(&built, PROC_MACRO)) < at(macros) && at(const_ast) < at(macros));
+    assert!(at(quote) < at(const_ast));
     assert!(at(macros) < at(krate(&built, LIB)) && at(macros) < at(krate(&built, LIB_TEST)));
 }
 
@@ -2035,7 +2081,7 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let root = changed(&tree, &[("a/src/macros.rs", Some(more))]);
     let with_more = config(root, library_with_proc_macro(&tree));
     let refreshed = built.lowered.refresh(
-        Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
@@ -2044,7 +2090,7 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let root = changed(&tree, &[]);
     let without = config(root, library_with_proc_macro(&tree));
     let Err(error) = built.lowered.refresh(
-        Lower { units: &units, config: &without, files: &tree, root, host_cpu: None },
+        Lower { units: &units, config: &without, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }, &base_db::Looks::none(),
         |_| Ok(()),
     ) else {
         panic!("the const macros' file went and nothing said so")
@@ -2077,7 +2123,7 @@ fn a_derived_method_has_a_body() {
     let config = config(root, library);
     let units = units();
     let lowered =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let db = lowered.db();
     let core = lowered.krate(CORE).expect("core is a crate");
@@ -2241,6 +2287,9 @@ fn a_target_of_the_hosts_own_triple_lowers_to_crates_of_keys_of_their_own() {
     let const_ast = |unit| dependency_of(db, macros(unit), "const_ast").expect("const-ast");
     assert_ne!(const_ast(LIB), const_ast(lib), "const-ast, once for each side");
     assert_eq!(const_ast(lib).extra_data(db).built_for, target);
+    let quote = |unit| dependency_of(db, const_ast(unit), "const_ast_quote").expect("its quote");
+    assert_ne!(quote(LIB), quote(lib), "`quote!`'s crate, once for each side");
+    assert_eq!(quote(lib).extra_data(db).built_for, target);
     blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
 }
 
@@ -2310,8 +2359,8 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     let config = config(root, library(&tree));
     let refresh = |built: &mut Built| {
         let passes = built.lowered.db().maintain_passes();
-        let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
-        assert_eq!(built.lowered.refresh(lower, |_| Ok(())), Ok(true));
+        let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) };
+        assert_eq!(built.lowered.refresh(lower, &base_db::Looks::none(), |_| Ok(())), Ok(true));
         built.lowered.db().maintain_passes() - passes
     };
     let unmoved = refresh(&mut built);
@@ -2391,7 +2440,7 @@ fn outside_root(twice: bool) -> Lowered {
     }
     units.packages.sort_by(|x, y| x.id.cmp(&y.id));
     let config = config(root, library);
-    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
 }
 
 /// A target whose root is outside its package's directory: cargo's `src_path` keeps the `..`s,
@@ -2530,7 +2579,7 @@ fn front_over(changes: &[(&'static str, Option<&'static [u8]>)]) -> Lowered {
     let root = changed(&tree, changes);
     let config = config(root, library(&tree));
     let units = units();
-    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
 }
 
 /// The lib's root as a plain function, and the same after an edit of each kind.
@@ -2853,7 +2902,7 @@ fn library_over(
     let config = config(root, library(&tree));
     let units = units_with_a_registry_lib();
     let mut front =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     for unit in [LIB, BIN] {
         let kept = |key: &ContentId| {
@@ -2881,7 +2930,7 @@ fn a_comment_in_a_registry_crate_moves_no_key_once_it_is_parsed() {
         let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
         let config = config(root, library(&tree));
         let units = units_with_a_registry_lib();
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap()
     };
     assert!(root_of(front.db(), front.krate(LIB).unwrap()).is_library);
     assert_eq!(front.narrowed(LIB), None);
@@ -2933,7 +2982,7 @@ fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
         let config = config(root, library(&tree));
         let units = units_with_a_registry_lib();
         let mut front =
-            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
                 .unwrap();
         let read = |key: &ContentId| {
             Ok(spoiled.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
@@ -2955,7 +3004,7 @@ fn a_kept_narrowed_identity_is_under_the_front_ends_code() {
     let config = config(root, library(&tree));
     let units = units_with_a_registry_lib();
     let mut front =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let other = ContentId([8; 32]);
     let kept = |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
@@ -3089,7 +3138,7 @@ fn lowered_in_workspace(rooted: bool) -> Built {
     let config = config(root, library(&tree));
     let units = program_units_of_a_real_library();
     let lowered =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) }).unwrap();
     Built { lowered }
 }
 
@@ -3185,7 +3234,7 @@ fn every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none() {
         let config = config(root, library(&tree));
         let units = units_with_a_registry_lib();
         let mut front =
-            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
                 .unwrap();
         let before = front.surface_of(front.krate(BIN).unwrap());
         let mut store = KeptNarrows::new();

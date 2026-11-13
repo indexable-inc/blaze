@@ -31,26 +31,155 @@ mod attr;
 mod def;
 mod lookup;
 mod target;
+#[cfg(test)]
+mod tests;
 mod walk;
 
+use base_db::Db;
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef};
-use hir_def::attrs::stability::{
-    DeprecatedSince, Deprecation, RustcVersion, Stability, StabilityLevel, UnstableReason,
+use hir_def::{
+    AdtId, DefWithBodyId, FieldId, VariantId,
+    attrs::stability::{
+        DeprecatedSince, Deprecation, RustcVersion, Stability, StabilityLevel, UnstableReason,
+    },
+    expr_store::Body,
+    resolver::{TypeNs, ValueNs},
 };
+use hir_ty::method_resolution::CandidateId;
 use intern::Symbol;
-use syntax::{SyntaxNodePtr, TextRange};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use self::def::Def;
 use crate::{
     cx::Cx,
-    lints::{registry::LintId, syntax::source_fact},
+    lints::{names::uses::Named, registry::LintId, syntax::source_fact},
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
     model::{Applicability, Diag, Level, MultiSpan},
 };
 
 pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
-    walk::walk(cx)
+    walk::walk(cx, walk::Bodies::QuietSkipped)
+}
+
+/// Whether the stability checks find nothing in `owner`'s body, as the crate `krate` checks it,
+/// read from HIR and the body's own syntax with no position: the walk leaves out the subtree
+/// of such a body ([`walk::Bodies::QuietSkipped`]). True only when
+///
+/// - its syntax has no macro call, no attribute, no item, no associated type constraint and
+///   no error node (what the walk checks besides paths: a macro's use and what it expands
+///   to, a `#[deprecated]` on what it can't be on, the uses in a nested item, a constraint's
+///   associated type, and a path lowering left out that the walk may not resolve), and its
+///   store holds no macro expansion;
+/// - every path, method call and field of it resolves ([`super::uses::named`]: none is
+///   [`Named::None`]), so none is the walk's "can't check" error;
+/// - nothing it names, nor the module or type any prefix of a path names, has a deprecation
+///   (`lookup_deprecation_entry`, what is inherited included), nor, being another crate's, an
+///   unstable stability; for an item of a trait impl, nor its trait's item; for a struct, a
+///   union or a variant, nor any of its fields.
+///
+/// Conservative by construction: what it cannot tell makes the body walked, never a lint
+/// missed. The walk's checks of a use only ever find something of a definition that is
+/// deprecated or unstable (`check`, `segment`), so a body that names none finds nothing.
+/// Kept by the database: a body edit runs it again for that body alone.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn body_quiet(db: &Db, owner: DefWithBodyId, krate: base_db::Crate) -> bool {
+    #[cfg(test)]
+    if tests::planted(db) == Some(tests::Plant::NeverQuiet) {
+        return false;
+    }
+    let Some(syntax) = hir_def::signatures::cut_body_syntax(db, owner) else { return false };
+    let loud = |kind: SyntaxKind| {
+        ast::Item::can_cast(kind)
+            || matches!(
+                kind,
+                SyntaxKind::MACRO_CALL
+                    | SyntaxKind::ATTR
+                    | SyntaxKind::ASSOC_TYPE_ARG
+                    | SyntaxKind::ERROR
+            )
+    };
+    if syntax.descendants().any(|it| loud(it.kind())) {
+        return false;
+    }
+    if !Body::of(db, owner).store.macro_calls().is_empty() {
+        return false;
+    }
+    let krate = hir::Crate::from(krate);
+    super::uses::named(db, owner).iter().all(|&named| quiet_named(db, krate, named))
+}
+
+/// Whether `named` is resolved and nothing the stability checks look at in it is deprecated
+/// or, of a crate other than `krate`, unstable ([`body_quiet`]).
+fn quiet_named(db: &Db, krate: hir::Crate, named: Named) -> bool {
+    let item = |it: ModuleDef| quiet_item(db, krate, it);
+    let variant = |it: VariantId| quiet_variant(db, krate, it);
+    match named {
+        Named::None => false,
+        Named::SelfCtor => true,
+        Named::Value(value) => match value {
+            ValueNs::ImplSelf(_) | ValueNs::LocalBinding(_) | ValueNs::GenericParam(_) => true,
+            ValueNs::FunctionId(it) => item(ModuleDef::Function(it.into())),
+            ValueNs::ConstId(it) => item(ModuleDef::Const(it.into())),
+            ValueNs::StaticId(it) => item(ModuleDef::Static(it.into())),
+            ValueNs::StructId(it) => variant(VariantId::StructId(it)),
+            ValueNs::EnumVariantId(it) => variant(VariantId::EnumVariantId(it)),
+        },
+        Named::Type(ty) => match ty {
+            TypeNs::SelfType(_) | TypeNs::GenericParam(_) | TypeNs::BuiltinType(_) => true,
+            TypeNs::AdtId(adt) | TypeNs::AdtSelfType(adt) => match adt {
+                AdtId::StructId(it) => variant(VariantId::StructId(it)),
+                AdtId::UnionId(it) => variant(VariantId::UnionId(it)),
+                AdtId::EnumId(it) => item(ModuleDef::Adt(hir::Adt::Enum(it.into()))),
+            },
+            TypeNs::EnumVariantId(it) => variant(VariantId::EnumVariantId(it)),
+            TypeNs::TypeAliasId(it) => item(ModuleDef::TypeAlias(it.into())),
+            TypeNs::TraitId(it) => item(ModuleDef::Trait(it.into())),
+            TypeNs::ModuleId(it) => {
+                #[cfg(test)]
+                if tests::planted(db) == Some(tests::Plant::PrefixModulesIgnored) {
+                    return true;
+                }
+                item(ModuleDef::Module(it.into()))
+            }
+        },
+        Named::Candidate(candidate) => match candidate {
+            CandidateId::FunctionId(it) => item(ModuleDef::Function(it.into())),
+            CandidateId::ConstId(it) => item(ModuleDef::Const(it.into())),
+        },
+        Named::Variant(it) => variant(VariantId::EnumVariantId(it)),
+    }
+}
+
+/// [`quiet_def`] of `item` and, of an item of a trait impl, of its trait's item (what the walk
+/// checks of it, [`def::trait_item`]).
+fn quiet_item(db: &Db, krate: hir::Crate, item: ModuleDef) -> bool {
+    quiet_def(db, krate, Def::Item(item))
+        && quiet_def(db, krate, Def::Item(def::trait_item(db, item)))
+}
+
+/// [`quiet_def`] of a struct, union or variant and of each of its fields.
+fn quiet_variant(db: &Db, krate: hir::Crate, variant: VariantId) -> bool {
+    let item = match variant {
+        VariantId::StructId(it) => ModuleDef::Adt(hir::Adt::Struct(it.into())),
+        VariantId::UnionId(it) => ModuleDef::Adt(hir::Adt::Union(it.into())),
+        VariantId::EnumVariantId(it) => ModuleDef::EnumVariant(it.into()),
+    };
+    quiet_def(db, krate, Def::Item(item))
+        && variant.fields(db).fields().iter().all(|(local_id, _)| {
+            let field = hir::Field::from(FieldId { parent: variant, local_id });
+            quiet_def(db, krate, Def::Field(field))
+        })
+}
+
+/// Whether `def` has no deprecation and, being another crate's than `krate`, is not unstable:
+/// what the walk's `check` and `segment` would find of a use of it is nothing.
+fn quiet_def(db: &Db, krate: hir::Crate, def: Def) -> bool {
+    def.deprecation(db).is_none()
+        && (def.krate(db) == Some(krate) || !def.stability(db).is_some_and(Stability::is_unstable))
 }
 
 /// Where a use is, as reported.

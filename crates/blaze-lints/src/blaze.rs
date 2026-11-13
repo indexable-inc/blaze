@@ -46,9 +46,9 @@ mod edition_tests;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
-mod may;
+mod expect;
 #[cfg(test)]
-mod may_tests;
+mod expect_tests;
 mod enum_vec_padded;
 mod error_debug;
 #[cfg(test)]
@@ -272,7 +272,7 @@ pub enum Lint {
     UnmarkedNonblocking,
     MutRef,
     UndeclaredEffect,
-    UnneededEffect,
+    UnfulfilledEffect,
     NegativeEffect,
     DurableWrite,
     UnboundedWait,
@@ -316,8 +316,9 @@ pub(crate) enum Kind {
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
 /// `#[blaze::nonblocking]`, `#[blaze::pure]`, `#![blaze::capabilities]`, and for
-/// `undeclared_effect` a `#[blaze::may(..)]` on the function, its trait or a module around it,
-/// or `#![blaze::effects]`), so a finding is a broken promise.
+/// `undeclared_effect` a `#[blaze::expect(..)]` on the function, its trait or a module around it,
+/// or `#![blaze::effects]`, for `unfulfilled_effect` a function's own `#[blaze::expect(..)]`),
+/// so a finding is a broken promise.
 pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Checkfree,
     Lint::Nopanic,
@@ -326,6 +327,8 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Pure,
     Lint::Capabilities,
     Lint::UndeclaredEffect,
+    // An expectation is exact: a listed word the function is proved not to have is refused.
+    Lint::UnfulfilledEffect,
     // Fires only on a type declared `#[blaze::program_lifetime]`.
     Lint::ProgramLifetime,
 ];
@@ -513,7 +516,7 @@ impl Lint {
         Lint::UnmarkedNonblocking,
         Lint::MutRef,
         Lint::UndeclaredEffect,
-        Lint::UnneededEffect,
+        Lint::UnfulfilledEffect,
         Lint::NegativeEffect,
         Lint::DurableWrite,
         Lint::UnboundedWait,
@@ -583,10 +586,11 @@ impl Lint {
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
             | Lint::NativeContracts
-            // Fire only where the code declares what a function may do (`#[blaze::may(..)]`, a
-            // module's default, `#![blaze::effects]`): `undeclared_effect` is `deny` there.
+            // Fire only where the code declares what a function is expected to do
+            // (`#[blaze::expect(..)]`, a module's default, `#![blaze::effects]`):
+            // `undeclared_effect` and `unfulfilled_effect` are `deny` there.
             | Lint::UndeclaredEffect
-            | Lint::UnneededEffect
+            | Lint::UnfulfilledEffect
             | Lint::NegativeEffect => Kind::General,
             // `packable`'s fix is a field with no address and a shift and mask per access,
             // and its `#[blaze::bits]` is an opt-in extension.
@@ -792,7 +796,7 @@ impl Lint {
             Lint::UnmarkedNonblocking => "unmarked_nonblocking",
             Lint::MutRef => "mut_ref",
             Lint::UndeclaredEffect => "undeclared_effect",
-            Lint::UnneededEffect => "unneeded_effect",
+            Lint::UnfulfilledEffect => "unfulfilled_effect",
             Lint::NegativeEffect => "negative_effect",
             Lint::DurableWrite => "durable_write",
             Lint::UnboundedWait => "unbounded_wait",
@@ -910,8 +914,8 @@ impl Lint {
             | Lint::UnmarkedNoalloc
             | Lint::UnmarkedNonblocking => concat!(general_docs!(), "#unmarked_pure-unmarked_nopanic-unmarked_noalloc-unmarked_nonblocking"),
             Lint::MutRef => concat!(general_docs!(), "#mut_ref"),
-            Lint::UndeclaredEffect | Lint::UnneededEffect | Lint::NegativeEffect => {
-                concat!(general_docs!(), "#undeclared_effect-unneeded_effect-negative_effect")
+            Lint::UndeclaredEffect | Lint::UnfulfilledEffect | Lint::NegativeEffect => {
+                concat!(general_docs!(), "#undeclared_effect-unfulfilled_effect-negative_effect")
             }
             Lint::DurableWrite => concat!(docs!(), "#durable_write"),
             Lint::UnboundedWait => concat!(docs!(), "#unbounded_wait"),
@@ -980,13 +984,13 @@ impl Lint {
                 "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
             }
             Lint::UndeclaredEffect => {
-                "add the word to the function's `#[blaze::may(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::may(.., trusted = \"why\")]` without the word"
+                "add the word to the function's `#[blaze::expect(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::expect(.., trusted = \"why\")]` without the word"
             }
-            Lint::UnneededEffect => {
-                "take the word off the list (`blaze check --fix` does), or keep the right to the effect with `#[expect(blaze::unneeded_effect, reason = \"..\")]`"
+            Lint::UnfulfilledEffect => {
+                "take the word off the list (`blaze check --fix` does): a function's own list is exact; a right kept for impls to come is a trait method's list, which bounds them"
             }
             Lint::NegativeEffect => {
-                "write what the function may do, `#[blaze::may(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
+                "write what the function may do, `#[blaze::expect(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
             }
             Lint::DurableWrite => {
                 "take `Effect::WriteUnsynced` or `Effect::RenameUnsynced` where a build can make the data again and its reader checks it, or say what must survive a crash with `// durable: <why>` on its line or the line above"
@@ -1337,6 +1341,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
     }
+    if node.kind() == syntax::SyntaxKind::ATTR {
+        expect::check_deleted(cx, node);
+    }
     if let Some(f) = ast::Fn::cast(node) {
         untyped_error::check(cx, f);
         bool_param::check(cx, f);
@@ -1453,7 +1460,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         checkfree::check(cx);
         effects::check(cx);
         unmarked_effects::check(cx);
-        may::check(cx);
+        expect::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);

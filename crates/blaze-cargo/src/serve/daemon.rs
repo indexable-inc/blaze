@@ -9,10 +9,12 @@
 //! - The plane is stepped after every completion; what it did goes to the jobs, and what the
 //!   jobs say to the session.
 //! - Between requests the database is collected, and the VFS once it made as many nodes as
-//!   its last collection kept, keeping each view's plan and every mount; after a cold build the daemon image ([`Images`]: the database, the VFS, the
-//!   plane's history and their symbols) is written and the database settles onto it.
-//! - A start maps that image once: the symbols are restored from it first, then the VFS, the
-//!   database and the plane's history each open their sections of it.
+//!   its last collection kept, keeping each view's plan and every mount; after a cold build the
+//!   daemon image ([`Images`]: the VFS and the plane's history) is written.
+//! - A start restores no engine state (docs/v2/plan/design/end-state.md: the in-memory engine is
+//!   a cache of what this process verified): it opens the store, maps the image for the VFS and
+//!   the plane's history, replays the journal's tail with its marks (`super::local`), and the
+//!   database starts empty; the first request is answered from the certificate.
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 //! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
 //!   each build that ends goes to the profile history's thread. A build whose tasks run while
@@ -38,9 +40,8 @@ use blaze_history::{Config as HistoryConfig, History, section::HistoryError};
 use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, OpenError, Refused};
 use blaze_profile::{Plot, Watchdog, watchdog::Progress};
-use blaze_query::{Database, DbError};
+use blaze_query::Database;
 use blaze_vfs::{DisksUnused, ImageUse, Outside, Ticket, Vfs};
-use intern::RestoreError;
 
 use super::{
     heads::{Heads, Out},
@@ -78,6 +79,22 @@ const STD_LOADS_END: u64 = 11 << 32;
 /// ([`super::packs::endpoint`]).
 const PEERS: u64 = 11 << 32;
 const PEERS_END: u64 = 12 << 32;
+/// The start files placed beside launched programs (`launch::Daemon::start_placed`).
+const PLACES: u64 = 12 << 32;
+const PLACES_END: u64 = 13 << 32;
+/// The take of the solo answers' kept rows (`blaze_certify::kept::Take`, [`Daemon::look_for_solo_rows`]).
+const SOLO_ROWS: u64 = 13 << 32;
+const SOLO_ROWS_END: u64 = SOLO_ROWS + blaze_certify::kept::TAGS;
+/// How often a daemon with nothing to do looks for solo answers' kept rows, on the driver's
+/// clock: a look is a stat of one directory, so once a second costs nothing, and a solo
+/// answer's rows reach the history within a second of the daemon's next idle stretch.
+const SOLO_LOOK_EVERY: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the solo rows' take's control ([`Daemon::solo_taken`]).
+    pub(super) static LEAVES_TAKEN_SOLO_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -92,6 +109,9 @@ const STILL_TIMER: Tag = Tag(OWN + 4);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
+/// The machine's sealed layers' directory, stated and made before the home store opens
+/// ([`LayerDir`]).
+const LAYER_DIR: Tag = Tag(OWN + 13);
 /// The longest one step of a loop turn may run in line before it is said ([`Stalled`]).
 const STEP_BOUND_NS: i64 = 20_000_000;
 
@@ -453,6 +473,7 @@ macro_rules! world {
     ($daemon:ident, $said:ident) => {
         World {
             now: $daemon.driver.now(),
+            wall_ns: $daemon.driver.wall_ns(),
             vfs: &mut $daemon.vfs,
             db: &$daemon.db,
             store: &mut $daemon.store,
@@ -470,6 +491,34 @@ macro_rules! world {
 }
 
 /// What the daemon starts with. No `Debug`: it holds the HTTP token.
+/// The files every request slot's premises are of (`blaze_certify::slot::Premise`), by absolute
+/// path: the engine's own executable, and the standard library's `DIGEST` where blaze owns the
+/// library (`toolchain::library::owned`; `None`: no slot is written, `Unslotted::NoLibrary`).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: the jobs' own copy, once a start
+pub struct Premises {
+    pub engine: String,
+    pub library: Option<String>,
+}
+
+impl Premises {
+    /// This process's: its executable and the library it found, each canonical, as the thin
+    /// client finds them (`Engine::beside`: no link in the path, so the slot's `stat` stamp is
+    /// the client's `lstat` one, handoff-10C C4).
+    pub fn of_this_process() -> Result<Premises, String> {
+        let engine = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| format!("the engine's own executable: {error}"))?;
+        // alloc: once a start, the engine's path
+        let engine = engine.to_str().ok_or_else(|| format!("the engine's path {} is not UTF-8", engine.display()))?.to_owned();
+        let library = crate::toolchain::library::found()
+            .ok()
+            .and_then(crate::toolchain::library::owned)
+            .and_then(|it| std::fs::canonicalize(it).ok())
+            .and_then(|it| it.to_str().map(str::to_owned)); // alloc: once a start, the library's path
+        Ok(Premises { engine, library })
+    }
+}
+
 pub struct Options {
     /// Its state directory ([`super::state`]), under the driver's root.
     pub state: FileName,
@@ -541,10 +590,12 @@ pub struct Options {
     /// The parts of a good image this start leaves unused because it was asked to
     /// ([`RESTORE_WITHOUT`]): each is said in the start's log as every other part not used.
     pub without: Without,
+    /// The premises of every request slot this daemon writes ([`Premises`]).
+    pub premises: Premises,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
-/// are whole: `database`, `history`, `trees`, `carries`, separated by commas. For finding which part of
+/// are whole: `history`, the one part a start reads besides the VFS, separated by commas. For finding which part of
 /// a restored state a fault follows (docs/v2/plan/design/restore.md, "Which part a fault
 /// follows"): the image stays on disk as it is, and each part left is said in the start's log.
 pub const RESTORE_WITHOUT: &str = "BLAZE_RESTORE_WITHOUT";
@@ -552,14 +603,8 @@ pub const RESTORE_WITHOUT: &str = "BLAZE_RESTORE_WITHOUT";
 /// The parts of a good image a start was asked to leave unused ([`RESTORE_WITHOUT`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Without {
-    /// The query database's sections: it starts empty ([`Cold::Asked`]).
-    pub database: bool,
     /// The plane's history: it starts empty ([`Unlearned::Asked`]).
     pub history: bool,
-    /// The library syntax trees: every library file is parsed.
-    pub trees: bool,
-    /// The front end's carry sessions: each checkout seeds its session on its next build.
-    pub carries: bool,
 }
 
 impl Without {
@@ -569,15 +614,19 @@ impl Without {
         let mut without = Without::default();
         for word in text.split(',').map(str::trim).filter(|it| !it.is_empty()) {
             match word {
-                "database" => without.database = true,
                 "history" => without.history = true,
-                "trees" => without.trees = true,
-                "carries" => without.carries = true,
+                // alloc: an error's text, once a start
+                "database" | "trees" | "carries" => {
+                    return Err(format!(
+                        "{RESTORE_WITHOUT} names `{word}`, which no start reads any more: a start \
+                         restores no engine state, so the only part it can leave unused is `history`"
+                    ));
+                }
                 // alloc: an error's text, once a start
                 _ => {
                     return Err(format!(
                         "{RESTORE_WITHOUT} names `{word}`, which is no part of the daemon image \
-                         a start can leave unused: the parts are `database`, `history`, `trees` and `carries`"
+                         a start can leave unused: the one part is `history`"
                     ));
                 }
             }
@@ -588,6 +637,97 @@ impl Without {
 
 fn under(dir: &FileName, name: &str) -> FileName {
     FileName::new(&format!("{dir}/{name}")).expect("a name under a directory is a name")
+}
+
+/// The machine's sealed layers' directory (`<std>/store`, every writer of the shared std
+/// store), made with each directory above it that is not there before the home store, which
+/// reads it as its layer, opens: the store's refusal of a layer it cannot list is then only
+/// ever a real fault, never a first daemon whose std store had not made its directory yet.
+/// Sans-IO: each step is one stat or one make, of [`LAYER_DIR`]; a make that fails because
+/// another (this daemon's std store, another daemon) made the directory meanwhile is stated
+/// once more, and is the error only if it is still not there.
+struct LayerDir {
+    /// The directory and every directory above it, outermost first.
+    dirs: Vec<FileName>,
+    /// The one stated or made now; `None` while the directory itself is stated first.
+    at: Option<usize>,
+    /// The make of `dirs[at]` failed and it is being stated again.
+    again: bool,
+}
+
+/// What [`LayerDir`] asks next.
+enum LayerStep {
+    Ask(Effect),
+    /// The directory is there: the home store opens.
+    There,
+    Failed(String),
+}
+
+impl LayerDir {
+    /// The walk for `dir`, and its first effect: a stat of `dir` itself, which is all a
+    /// machine that has it costs.
+    fn new(dir: &FileName) -> (LayerDir, Effect) {
+        let text = dir.as_str();
+        // alloc: once per daemon started, a name a directory above the layer
+        let dirs = text
+            .match_indices('/')
+            .map(|(at, _)| &text[..at])
+            .chain([text])
+            .filter(|it| !it.is_empty())
+            .filter_map(FileName::new)
+            .collect();
+        // clone: the effect owns the name
+        (LayerDir { dirs, at: None, again: false }, Effect::Stat { file: dir.clone(), tag: LAYER_DIR })
+    }
+
+    fn stat(&self, at: usize) -> LayerStep {
+        // clone: the effect owns the name
+        LayerStep::Ask(Effect::Stat { file: self.dirs[at].clone(), tag: LAYER_DIR })
+    }
+
+    /// The next of `at`, or [`LayerStep::There`] past the last.
+    fn next(&mut self, at: usize) -> LayerStep {
+        self.again = false;
+        match at + 1 < self.dirs.len() {
+            true => {
+                self.at = Some(at + 1);
+                self.stat(at + 1)
+            }
+            false => LayerStep::There,
+        }
+    }
+
+    fn done(&mut self, done: Done) -> LayerStep {
+        let last = self.dirs.len().saturating_sub(1);
+        let named = |dirs: &[FileName], at: usize| dirs.get(at).map_or("", FileName::as_str).to_owned(); // alloc: error path
+        match (self.at, done) {
+            (_, Done::Stat(Some(meta))) if !meta.dir => {
+                let at = self.at.unwrap_or(last);
+                LayerStep::Failed(format!("/{} is a file, where the sealed layers' directory goes", named(&self.dirs, at)))
+            }
+            (None, Done::Stat(Some(_))) => LayerStep::There,
+            (None, Done::Stat(None)) if self.dirs.is_empty() => LayerStep::There,
+            (None, Done::Stat(None)) => {
+                self.at = Some(0);
+                self.stat(0)
+            }
+            (Some(at), Done::Stat(Some(_))) => self.next(at),
+            (Some(at), Done::Stat(None)) if self.again => {
+                LayerStep::Failed(format!("/{}: its make failed and it is not there", named(&self.dirs, at)))
+            }
+            // clone: the effect owns the name
+            (Some(at), Done::Stat(None)) => LayerStep::Ask(Effect::MakeDir { dir: self.dirs[at].clone(), tag: LAYER_DIR }),
+            (Some(at), Done::MadeDir) => self.next(at),
+            (Some(at), Done::Failed(_)) if !self.again => {
+                self.again = true;
+                self.stat(at)
+            }
+            (at, Done::Failed(error)) => {
+                LayerStep::Failed(format!("/{}: {error}", named(&self.dirs, at.unwrap_or(last))))
+            }
+            (_, done) => LayerStep::Failed(format!("the sealed layers' directory was answered {done:?}")),
+        }
+    }
 }
 
 enum Stopping {
@@ -714,6 +854,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The build ahead under way, from its request sent to its `Done`: what its line in the
     /// log says, and its span.
     ahead_run: Option<ahead::Run>,
+    /// What is kept for launched programs across turns and starts ([`launch`]): start images
+    /// waiting to be durable before they are marked, and the runs a first call is built by.
+    launch: launch::Launch,
     /// How many turns in a row, since a request was last read and since a job was last under
     /// way, took no completion with no plane task running ([`quiet_turns_after`]): the work
     /// between requests waits for [`QUIET_BEFORE_BETWEEN`] of them ([`Daemon::between`]).
@@ -767,6 +910,12 @@ pub struct Daemon<D: Driver, S: Steps> {
     completions: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
+    /// Whether a job built something (a miss) or a save was taken since the start: such a
+    /// daemon waits [`super::idle::EXIT_AFTER`] idle before it exits, one that did not
+    /// [`super::idle::EXIT_UNWORKED`] ([`super::idle::exit_due`]).
+    worked: bool,
+    /// When the daemon was first seen with nothing to do since it last worked.
+    idle_since: Option<Duration>,
     /// When the memory's breakdown by area was last plotted ([`super::breakdown::EVERY`]), on
     /// the driver's clock, and which tags it wrote so far.
     broken_down: Duration,
@@ -786,6 +935,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// When this stretch with nothing to do last gave the stores' pool pages back: again
     /// each [`super::idle::POOL_AFTER`] of it.
     pool_idle: super::idle::Idle,
+    /// The take of the solo answers' kept rows in `<state>/solo-rows`, one look at a time.
+    solo: blaze_certify::kept::Take,
+    /// When the last look for them began: `None` until the first turn's, at the start.
+    solo_looked: Option<Duration>,
     /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
     /// watch fails (no source here) or is undone at the stop.
     pressure_watched: bool,
@@ -817,12 +970,13 @@ pub struct Daemon<D: Driver, S: Steps> {
 
 /// What of its image a start did not use, each by a rule: the image was written by another
 /// blaze, or a stop cut the journal. An image that is damaged is a [`StartError`] instead.
+/// No engine state is restored, so none is listed: the database always starts empty.
 #[derive(Default, Debug)]
 pub struct Started {
-    /// The image the database opened; `None` when it started empty ([`Started::cold`]).
-    pub restored: Option<Restored>,
-    /// Why the database started empty; `None` when it opened the image's.
-    pub cold: Option<Cold>,
+    /// The image the VFS and the plane's history were read from; `None` with [`Started::unimaged`].
+    pub mapped: Option<Mapped>,
+    /// Why no image was read: the VFS loaded its journal alone and the history starts empty.
+    pub unimaged: Option<Unimaged>,
     /// The image's VFS tree is of another layout: the journal was loaded alone and every
     /// checkout is scanned.
     pub tree: Option<Refused>,
@@ -838,24 +992,21 @@ pub struct Started {
     pub heads_dropped: usize,
     /// Why the plane's history started empty.
     pub unlearned: Option<Unlearned>,
-    /// Why the image's library syntax trees were not read: every library file is parsed.
-    pub trees: Option<String>,
-    /// Why the image's front-end carry sessions, or some of them, were not used: each such
-    /// checkout seeds its session on its next build.
+    /// Why the journal's marks of front-end carry sessions, or some of them, were not used
+    /// ([`Jobs::restore_carries`]): each such checkout seeds its session on its next build.
     pub carries: Option<String>,
 }
 
 impl Started {
     /// Whether the start used everything it found.
     pub fn whole(&self) -> bool {
-        self.cold.is_none()
+        self.unimaged.is_none()
             && self.tree.is_none()
             && self.disks.is_none()
             && !self.resumed
             && self.journal_cut == 0
             && self.heads_dropped == 0
             && self.unlearned.is_none()
-            && self.trees.is_none()
             && self.carries.is_none()
     }
 }
@@ -863,8 +1014,8 @@ impl Started {
 impl fmt::Display for Started {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut sep = "";
-        if let Some(cold) = &self.cold {
-            write!(f, "{sep}the database starts empty: {cold}")?;
+        if let Some(unimaged) = &self.unimaged {
+            write!(f, "{sep}no image was read ({unimaged}): the VFS loaded its journal alone")?;
             sep = "; ";
         }
         if let Some(refused) = &self.tree {
@@ -900,35 +1051,23 @@ impl fmt::Display for Started {
             write!(f, "{sep}the plane's history starts empty: {unlearned}")?;
             sep = "; ";
         }
-        if let Some(why) = &self.trees {
-            write!(
-                f,
-                "{sep}the stored library trees were not read ({why}): library files are parsed"
-            )?;
-            sep = "; ";
-        }
         if let Some(why) = &self.carries {
-            write!(
-                f,
-                "{sep}the front end's carry sessions were not used ({why}): each checkout seeds its session on its next build"
-            )?;
+            write!(f, "{sep}the front end's carry marks were not all used ({why})")?;
         }
         Ok(())
     }
 }
 
-/// The image a start's database opened, as its log names it.
+/// The image a start mapped for its VFS and the plane's history, as its log names it.
 #[derive(Clone, Debug)]
-pub struct Restored {
-    pub hash: ContentId,
-    pub len: u64,
+pub struct Mapped {
     /// Its [`Shape`](super::image::Shape): hash, bytes and sections.
     pub shape: String,
     /// From the start to the image mapped, on the driver's clock.
     pub mapped_in: Duration,
 }
 
-impl fmt::Display for Restored {
+impl fmt::Display for Mapped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}, mapped in {}", self.shape, super::image::ms(self.mapped_in))
     }
@@ -1155,40 +1294,22 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     tracing::info!(target: "blaze", "{said}");
 }
 
-/// Why a start's database is empty.
+/// Why a start read no image.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Cold {
+pub enum Unimaged {
     /// There is no image: the first start in this state directory.
     NoImage,
     /// The image is of another layout: another blaze wrote it.
     Layout(SchemaHash),
-    /// The image's symbol table or database sections are missing or of another schema.
-    Refused(Refused),
-    /// Values were interned in this process before the start, so the image's symbols can't be
-    /// restored: a second daemon in one process, as the simulation's restarts are. `blaze
-    /// serve` starts one daemon a process and stops on it.
-    Interned,
-    /// The start was asked to leave the database's sections unused ([`RESTORE_WITHOUT`]).
-    Asked,
 }
 
-impl fmt::Display for Cold {
+impl fmt::Display for Unimaged {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Cold::NoImage => write!(f, "there is no daemon image"),
-            Cold::Layout(found) => {
+            Unimaged::NoImage => write!(f, "there is no daemon image"),
+            Unimaged::Layout(found) => {
                 write!(f, "the daemon image is of layout {}, another blaze's", found.0)
             }
-            Cold::Refused(refused) => write!(f, "{refused}"),
-            Cold::Interned => write!(
-                f,
-                "values were interned in this process before its symbols could be restored"
-            ),
-            Cold::Asked => write!(
-                f,
-                "the start was asked to leave the image's database unused \
-                 ({RESTORE_WITHOUT} names `database`)"
-            ),
         }
     }
 }
@@ -1235,10 +1356,6 @@ impl std::error::Error for StartError {}
 pub enum ImageFault {
     /// Not an image, cut short, or a spine that is not the one its hash names.
     Open(OpenError),
-    /// Its symbol table is corrupt or not a table.
-    Symbols(RestoreError),
-    /// The database's sections are corrupt or of a shape no blaze writes.
-    Db(DbError),
     History(HistoryError),
     Vfs(VfsFault),
 }
@@ -1247,8 +1364,6 @@ impl fmt::Display for ImageFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ImageFault::Open(error) => write!(f, "{error}"),
-            ImageFault::Symbols(error) => write!(f, "{error}"),
-            ImageFault::Db(error) => write!(f, "the database's sections: {error}"),
             ImageFault::History(error) => write!(f, "{error}"),
             ImageFault::Vfs(fault) => write!(f, "{fault}"),
         }
@@ -1297,8 +1412,6 @@ pub enum Failed {
     Server(String),
     /// A group of the image the database or the VFS reads in place failed its check.
     Corrupt(Corrupt),
-    /// The database could not settle onto the image its cold build wrote.
-    Settle(DbError),
     /// The image a cold build or the stop asked for was not made; the one before it stays.
     Image(ImageFailed),
     /// A build stopped moving ([`blaze_profile::Stall`]'s words): its workers may be
@@ -1309,6 +1422,11 @@ pub enum Failed {
     /// The machine's memory ledger could not be locked, read or written, or no longer has this
     /// daemon's record: admitting on would be admitting against no machine budget.
     Ledger(String),
+    /// The VFS could not settle on the image just mapped ([`blaze_vfs::Vfs::settle`]).
+    Settle(blaze_vfs::Unsettled),
+    /// The profile history did not open, so no build can be numbered past the builds it
+    /// names ([`super::plane::Plane::unnumbered`]).
+    History(super::observe::Unopened),
 }
 
 impl fmt::Display for Failed {
@@ -1317,40 +1435,20 @@ impl fmt::Display for Failed {
             Failed::Server(why) | Failed::Stalled(why) | Failed::Store(why) => f.write_str(why),
             Failed::Ledger(why) => write!(f, "the machine's memory ledger: {why}"),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
-            Failed::Settle(error) => {
-                write!(f, "the database could not settle onto its image: {error}")
-            }
             Failed::Image(failed) => write!(f, "{failed}"),
+            Failed::Settle(unsettled) => write!(f, "{unsettled}"),
+            Failed::History(unopened) => write!(f, "{unopened}"),
         }
     }
 }
 
-/// What of the start an open of the image's bytes gives: the image, or why the database
-/// starts empty by a rule, or the fault.
-fn opening<I>(opened: Result<I, OpenError>) -> Result<Result<I, Cold>, ImageFault> {
+/// What of the start an open of the image's bytes gives: the image, or why none is read by a
+/// rule, or the fault.
+fn opening<I>(opened: Result<I, OpenError>) -> Result<Result<I, Unimaged>, ImageFault> {
     match opened {
         Ok(image) => Ok(Ok(image)),
-        Err(OpenError::Layout { found }) => Ok(Err(Cold::Layout(found))),
+        Err(OpenError::Layout { found }) => Ok(Err(Unimaged::Layout(found))),
         Err(error) => Err(ImageFault::Open(error)),
-    }
-}
-
-/// Why the database starts empty from an image whose symbols did not restore, or the fault.
-fn unrestored(error: RestoreError) -> Result<Cold, ImageFault> {
-    match error {
-        RestoreError::Refused(refused) => Ok(Cold::Refused(refused)),
-        RestoreError::Started { .. } => Ok(Cold::Interned),
-        error @ (RestoreError::Corrupt(_) | RestoreError::Invalid { .. }) => {
-            Err(ImageFault::Symbols(error))
-        }
-    }
-}
-
-/// Why the database starts empty from an image it did not open, or the fault.
-fn unopened(error: DbError) -> Result<Cold, ImageFault> {
-    match error {
-        DbError::Refused(refused) => Ok(Cold::Refused(refused)),
-        error => Err(ImageFault::Db(error)),
     }
 }
 
@@ -1398,6 +1496,16 @@ impl<S: Steps> Default for Spare<S> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A planted bug for the restart tests' controls (`serve::tests`): the start drops every
+    /// mark the journal's replay left before it reads them, as a start that kept none would.
+    pub(super) static DROPS_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the client spans' control (`serve::tests`): a client's rows lose its
+    /// `client: request on the wire` as the loop takes them, as a daemon that dropped a span.
+    pub(super) static DROPS_A_CLIENT_SPAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What the start read, each once it is in.
 #[derive(Default)]
 struct Read {
@@ -1409,8 +1517,8 @@ struct Read {
 }
 
 impl<D: Driver, S: Steps> Daemon<D, S> {
-    /// Recovers the VFS from its journal and the database from its image, opens the store,
-    /// and listens. Fails naming what could not be read, when the image is damaged, or when
+    /// Opens the store, maps the image for the VFS and the plane's history, replays the VFS's
+    /// journal with its marks, and listens; the database starts empty. Fails naming what could not be read, when the image is damaged, or when
     /// another daemon listens; what of the image it did not use by a rule is [`Daemon::started`].
     ///
     /// What the start allocates from the global heap outside a task (the journal's tree, the
@@ -1453,18 +1561,25 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if !activated && let Some(socket) = &options.socket {
             effects.push(Effect::Connect { at: Address::Unix(socket.clone()), tag: DIAL });
         }
+        // The home store opens once its layer's directory is there ([`LayerDir`]).
+        let layer = under(&options.std, "store");
+        let (mut layer_dir, first) = LayerDir::new(&layer);
+        effects.push(first);
         let store_config =
             blaze_cas::Config {
                 dir: under(&state, "store"),
-                layers: Vec::new(),
+                // The machine's sealed layers (`serve::sealed`): every writer of the shared
+                // directory this daemon's std store is a writer of, each installed cover's and
+                // each daemon's, read in place behind the home's own records, never copied in
+                // (track 7, task A). One lookup: the home store's `get` finds a sealed record.
+                layers: vec![layer], // alloc: once per daemon started, one name
                 tags: STORE,
                 load_tags: LOADS,
                 // clone: once per daemon started, a path
                 loader: options.store_loader.clone(),
             };
-        let mut store = Store::open(store_config, &mut effects);
-        store.encode_columns(blaze_format::Spans::columns());
-        store.encode_columns(hir_def::item_tree::ItemTree::columns());
+        let mut store_config = Some(store_config);
+        let mut store: Option<Store> = None;
         let shared = blaze_cas::SharedConfig {
             root: under(&options.std, "store"),
             writer: options.writer,
@@ -1490,7 +1605,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         loop {
             let read_all = read.journal.is_some() && read.image.is_some() && read.socket_free;
             let opened = |it: &Store| it.ready() || it.broken().is_some();
-            if read_all && opened(&store) && opened(&std) {
+            if read_all && store.as_ref().is_some_and(opened) && opened(&std) {
                 break;
             }
             driver.submit(&mut effects);
@@ -1499,8 +1614,36 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 blaze_core::wait::Deadline::after(driver.now(), Duration::from_millis(50)),
             );
             for completion in done.drain(..) {
-                if store.owns(completion.tag) {
+                if let Some(store) = &mut store
+                    && store.owns(completion.tag)
+                {
                     store.complete(completion, &mut effects);
+                    continue;
+                }
+                if completion.tag == LAYER_DIR {
+                    match layer_dir.done(completion.done) {
+                        LayerStep::Ask(effect) => effects.push(effect),
+                        LayerStep::There => {
+                            let Some(config) = store_config.take() else {
+                                return Err("the home store was opened twice".to_owned().into());
+                            };
+                            let mut opened = Store::open(config, &mut effects);
+                            opened.encode_columns(blaze_format::Spans::columns());
+                            opened.encode_columns(hir_def::item_tree::ItemTree::columns());
+                            // The home reads the machine's sealed layer's in-process writer live
+                            // (`blaze_cas::Store::read_live`): what this daemon's own builds put
+                            // into the layer, a sealed unit's record and outputs and a sealed
+                            // crate's front-end records, is found by its next look before the
+                            // layer commits, as `blaze serve`'s `Handle::install_layer` does.
+                            opened.read_live(&std.reader()).map_err(|why| {
+                                format!("the home store reads the machine's layer {} live: {why}", std.dir())
+                            })?;
+                            store = Some(opened);
+                        }
+                        LayerStep::Failed(why) => {
+                            return Err(format!("making the machine's sealed layers' directory: {why}").into());
+                        }
+                    }
                     continue;
                 }
                 if std.owns(completion.tag) {
@@ -1555,6 +1698,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
         }
         drop(reading);
+        let Some(mut store) = store else {
+            return Err("the start's wait ended with the home store unopened".to_owned().into());
+        };
         if let Some(broken) = store.broken() {
             return Err(broken.to_string().into());
         }
@@ -1578,84 +1724,60 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // clone: a count of the mapping, once a start.
         let on_disk = mapping.clone();
         let mut started = Started::default();
-        // clone: a count of the mapping, shared by the VFS and the image the rest read.
+        // clone: a count of the mapping, shared by the VFS and the image the history reads.
         let opened = match mapping.clone().map(|it| opening(Image::open(it))).transpose() {
             Ok(None) => {
-                started.cold = Some(Cold::NoImage);
+                started.unimaged = Some(Unimaged::NoImage);
                 None
             }
-            Ok(Some(Ok(opened))) => Some(Arc::new(opened)),
-            Ok(Some(Err(cold))) => {
-                started.cold = Some(cold);
+            Ok(Some(Ok(opened))) => {
+                started.mapped = Some(Mapped {
+                    shape: super::image::Shape(&opened).to_string(),
+                    mapped_in: read.mapped_in,
+                });
+                Some(opened)
+            }
+            Ok(Some(Err(unimaged))) => {
+                started.unimaged = Some(unimaged);
                 None
             }
             Err(fault) => return Err(StartError::image(&image, fault)),
         };
-        // First: every other section names symbols by their IDs in this table.
-        let restored = {
-            let _span =
-                tracing::info_span!(target: "blaze", "daemon start: restore the symbols").entered();
-            opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)))
-        };
         let restoring =
             tracing::info_span!(target: "blaze", "daemon start: restore the VFS").entered();
-        let (mut vfs, recovered) =
-            Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
+        // The VFS's file texts are the store's: the image names each file by its id alone.
+        let texts = super::image::StoreTexts::new(&mut store);
+        let (mut vfs, recovered) = Vfs::restore(
+            journal.clone(),
+            VFS,
+            &read.journal.unwrap_or_default(),
+            // clone: a count of the texts, once a start.
+            mapping.map(|file| blaze_vfs::ImageFile { file, texts: texts.clone() }),
+        );
         vfs.hash_on(on_pool);
         started.journal_cut = recovered.skipped;
         started.heads_dropped = recovered.heads_dropped;
         vfs_used(recovered.image, &mut started)
             .map_err(|fault| StartError::image(&image, ImageFault::Vfs(fault)))?;
+        // The texts the image the start used names are pinned again before anything collects
+        // (serve/image.rs, `text_pin_at_start`): a store of the layout before says so.
+        let (text_pin, _) = super::image::text_pin_at_start(
+            &mut store,
+            vfs.image_file_ids(),
+            blaze_gc::record::now_ns(),
+        )?;
         drop(restoring);
         let config =
             blaze_query::Config { tree: Some(Arc::new(vfs.reader())), dir: Some(db_dir), tags: DB };
         let opening_db =
             tracing::info_span!(target: "blaze", "daemon start: open the database").entered();
-        let mut db = match restored {
-            None => Database::new(config),
-            Some((_, Err(error))) => {
-                started.cold =
-                    Some(unrestored(error).map_err(|fault| StartError::image(&image, fault))?);
-                Database::new(config)
-            }
-            Some((_, Ok(()))) if options.without.database => {
-                started.cold = Some(Cold::Asked);
-                Database::new(config)
-            }
-            Some((opened, Ok(()))) => {
-                let restored = Restored {
-                    hash: opened.hash(),
-                    len: opened.len(),
-                    shape: super::image::Shape(&*opened).to_string(),
-                    mapped_in: read.mapped_in,
-                };
-                match Database::from_image_with(config.clone(), opened) {
-                    Ok(db) => {
-                        // What a key no database gave names as its first suspect
-                        // (`blaze_query::db::NeverGiven`), with `blaze doctor` to check it.
-                        blaze_query::db::note_restored(blaze_query::db::RestoredFrom {
-                            file: format!("/{image}"), // alloc: once a start
-                            format: blaze_image::LAYOUT.0.to_string(), // alloc: once a start
-                            hash: restored.hash.to_string(), // alloc: once a start
-                        });
-                        started.restored = Some(restored);
-                        db
-                    }
-                    Err(error) => {
-                        started.cold = Some(
-                            unopened(error).map_err(|fault| StartError::image(&image, fault))?,
-                        );
-                        Database::new(config)
-                    }
-                }
-            }
-        };
+        let mut db = Database::new(config);
         steps.register(&mut db);
         drop(opening_db);
         let learning =
             tracing::info_span!(target: "blaze", "daemon start: restore the plane's history")
                 .entered();
-        let history = match opened.as_deref() {
+        let history = match opened.as_ref() {
             None => History::new(HistoryConfig::default()),
             Some(_) if options.without.history => {
                 started.unlearned = Some(Unlearned::Asked);
@@ -1669,22 +1791,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
         };
         drop(learning);
-        // Before any front end's database is made: each reads the trees installed when made.
-        if opened.is_some() && options.without.trees {
-            // alloc: a start's report, once
-            started.trees = Some(format!(
-                "the start was asked to leave them unused: {RESTORE_WITHOUT} names `trees`"
-            ));
-        } else if let Some(opened) = &opened {
-            let _span =
-                tracing::info_span!(target: "blaze", "daemon start: install the library's trees")
-                    .entered();
-            match super::image::trees(opened) {
-                Ok(Some(trees)) => _ = base_db::trees::install(Arc::new(trees)),
-                Ok(None) => {}
-                Err(why) => started.trees = Some(why),
-            }
-        }
+        drop(opened);
         // The limit the daemon runs under (`blaze serve --memory-gb`, `BLAZE_DAEMON_MEMORY_GB`, or
         // the machine's) made every subsystem's budget and the limit a build's release is decided
         // against (`admission::Squeeze`), before any job. The plane only carries the budget: a
@@ -1704,10 +1811,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             budget: options.budget,
             starve_after: 8,
         };
-        let observe = Observe::new(options.profiling);
+        let mut observe = Observe::new(options.profiling);
         let mut plane = Plane::new(plane_config, history, runner)
             .map_err(|error| format!("the plane: {error}"))?;
-        plane.number_from(observe.first_build());
+        plane.number(observe.numbering());
         // The explorer's task table: every node and move the plane says, on the profile's clock.
         #[cfg(feature = "native")]
         {
@@ -1777,33 +1884,38 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             tags: JOBS,
             runs: RUNS,
             runs_end: RUNS_END,
+            slots: format!("/{state}/slots"),
+            premises: options.premises.clone(), // clone: the jobs' own copy, once a start
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
-        // The front end's carry sessions the image kept: each checkout's next build opens its
-        // own, carried to the build's root, rather than seeding one (`front_carry::Pass::Open`).
-        if opened.is_some() && options.without.carries {
-            // alloc: a start's report, once
-            started.carries = Some(format!(
-                "the start was asked to leave them unused: {RESTORE_WITHOUT} names `carries`"
-            ));
-        } else if let Some(opened) = &opened {
+        // The front end's carry sessions the journal marks: each checkout's next build opens
+        // its own, carried to the build's root, rather than seeding one
+        // (`front_carry::Pass::Open`). Read from the marks the journal's replay left, image or
+        // not; a mark that does not decode is said and its checkout seeds.
+        {
+            #[cfg(test)]
+            if DROPS_MARKS.get() {
+                // alloc: a test's plant, once a start
+                let names: Vec<String> = vfs.marks("").map(|(name, _)| name.to_owned()).collect();
+                for name in names {
+                    _ = vfs.unmark(&name);
+                }
+            }
             let _span = tracing::info_span!(
                 target: "blaze",
-                "daemon start: restore the front end's carry sessions",
-                sessions = tracing::field::Empty,
+                "daemon start: read the local marks",
+                marks = vfs.marks("").count() as u64,
+                carries = vfs.marks(super::local::CARRY).count() as u64,
                 why = tracing::field::Empty,
             )
             .entered();
-            match super::image::carries(opened) {
-                Ok(sessions) => {
-                    _span.record("sessions", sessions.len() as u64);
-                    started.carries = jobs.restore_carries(&mut vfs, sessions);
-                }
-                Err(why) => {
-                    _span.record("why", why.as_str());
-                    started.carries = Some(why);
-                }
+            started.carries = jobs.restore_carries(&mut vfs);
+            if let Some(why) = &started.carries {
+                _span.record("why", why.as_str());
             }
+            // The launched programs' start images the journal marks: each is restored when
+            // first asked for, with no build ([`launch`]).
+            steps.launch_marked(store.reader(), driver.waker(), launch::marked(&mut vfs));
         }
         // The system's memory pressure, watched for the daemon's life: it fails at once where
         // there is no source ([`Daemon::pressure`]).
@@ -1823,7 +1935,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             plane,
             mounts,
             heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
-            images: Images::new(image, IMAGE, on_disk),
+            images: Images::new(image, IMAGE, on_disk, texts, text_pin),
             jobs,
             steps,
             replies: Vec::new(),
@@ -1839,6 +1951,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             answering: Vec::new(), // alloc: none until a request
             ahead: super::ahead::Ahead::new(false),
             ahead_run: None,
+            launch: launch::Launch::default(),
             quiet_turns: 0,
             failed: None,
             machine,
@@ -1860,6 +1973,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             stall: None,
             completions: 0,
             plotted: Duration::ZERO,
+            worked: false,
+            idle_since: None,
             broken_down: Duration::ZERO,
             shown: super::breakdown::Shown::default(),
             looked: Duration::ZERO,
@@ -1868,6 +1983,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             given_back: Duration::ZERO,
             idle: super::idle::Idle::default(),
             pool_idle: super::idle::Idle::every(super::idle::POOL_AFTER),
+            solo: blaze_certify::kept::Take::new(SOLO_ROWS),
+            solo_looked: None,
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
@@ -1928,12 +2045,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// appended to `into`; `false` once the connection is gone.
     pub fn take_local(&mut self, conn: blaze_core::Conn, into: &mut Vec<u8>) -> bool {
         self.server.take_local(conn, into, &mut self.effects)
-    }
-
-    /// Whether its database started from the image: an image's symbols are restored once a
-    /// process, before any is interned, so one started again in a process starts it empty.
-    pub fn warm(&self) -> bool {
-        self.started.cold.is_none()
     }
 
     /// What of its image the start did not use, and why.
@@ -2090,6 +2201,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             &mut self.store,
             std::path::PathBuf::from("/"),
         ))?;
+        // The machine's sealed layer, which the home store reads below its own
+        // (`Config::layers`): this daemon's writer of it is what a sealed crate built here, and
+        // a pack fetched on a miss for one, is put through ([`blaze_cas::Handle::layer`]), so
+        // every home on the machine finds it and none builds it again.
+        let layer_dir = self.std.dir().clone(); // clone: a refcount, once per daemon
+        blaze_cas::Handle::install_layer(blaze_cas::Handle::new(
+            &mut self.std,
+            std::path::PathBuf::from("/"),
+        ))
+        .map_err(|why| format!("the machine's layer store {}: {why}", layer_dir.as_str()))?;
         // Lane packs-1112: the read-only endpoint peers read this store through, only when
         // `<root>/packs.json` asks for one (`serve`); one asked for that the settings do not
         // allow stops the daemon's start, naming why. It listens on this daemon's driver.
@@ -2116,6 +2237,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Nothing is built ahead from here on, and what is, is cancelled (the turn's
         // `ahead_turn` sends the cancel).
         self.ahead.stop();
+        // The launch host's start images kept so far are put, and marked once durable before
+        // the image (the stop's wait below counts them); a first call is built no more.
+        self.launch_turn();
         // The socket's name first: the next daemon may bind it while this one writes its
         // image, and a client that comes meanwhile finds no one rather than waits.
         self.server.unlisten(&mut self.effects);
@@ -2128,9 +2252,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.observe.stop(&mut replies);
         self.send(replies);
         self.heads.stop(&mut self.effects);
+        // Every kept front end's workspace members are written before the image (R3, rule (b)):
+        // the next daemon reads them from their pages, and the edited member alone, with those
+        // above it, is resolved anew. Each store settles as what an answered build left does,
+        // so the wait below is theirs too.
+        let mut said = self.spare.said.pop().unwrap_or_default();
+        let members = self.jobs.store_all_members(&mut world!(self, said));
+        self.said(said);
+        if members > 0 {
+            tracing::info!(target: "blaze", members, "the stop writes the workspace members' pages of its kept front ends");
+        }
         // What answered builds left to settle first: the image is of the daemon with every
         // kept front end back, and the stop's flush then takes what their stores put.
-        let left = self.jobs.settling();
+        let left = self.jobs.settling() + self.launch.due.len() + usize::from(self.launch.undurable());
         if left > 0 {
             let span = tracing::info_span!(
                 target: "blaze",
@@ -2161,16 +2295,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// stop), so no request lets go of it; the settle's, asked between requests, is let go
     /// when one comes ([`Daemon::let_go_of_image`]).
     fn ask_image(&mut self, waited: bool) {
-        let carries = self.jobs.carry_sessions(&mut self.vfs, &self.store);
-        let front = self.jobs.front_db();
-        let parts = Parts {
-            db: &self.db,
-            front,
-            vfs: &mut self.vfs,
-            predict: self.plane.predict(),
-            effects: &mut self.effects,
-            carries: &carries,
-        };
+        // The marks go to the journal the image's flush rewrites, so an image never leaves a
+        // durable carry session unmarked.
+        self.jobs.carry_sessions(&mut self.vfs, &self.store);
+        let parts =
+            Parts {
+                vfs: &mut self.vfs,
+                store: &mut self.store,
+                predict: self.plane.predict(),
+                effects: &mut self.effects,
+            };
         match waited {
             true => self.images.ask(parts),
             false => self.images.ask_between(parts),
@@ -2351,11 +2485,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let part = spanned.then(|| {
             tracing::info_span!(target: "blaze", "loop turn: observe, watch and say").entered()
         });
+        self.history_unopened();
         self.store_broke();
         self.observed();
         self.watch();
         self.doing();
         self.plot();
+        self.look_for_solo_rows();
         drop(part);
         step.next("after the answers");
         let _between = spanned.then(|| {
@@ -2366,22 +2502,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // An image someone waits for (a stop's, a snapshot's) is made whatever comes; the
         // settle's is not made while a request is read and held, nor soon after one.
         let makes = self.stopping.is_some() || !self.jobs.idle() || self.quiet_between_requests();
-        // The carry sessions only for an image made this turn: a durable save becomes the
-        // image's as it is made ([`Jobs::carry_sessions`]).
-        let carries = match makes {
-            true => self.jobs.carry_sessions(&mut self.vfs, &self.store),
-            false => Vec::new(), // alloc: none
-        };
-        let front = self.jobs.front_db();
-        let parts = Parts {
-            db: &self.db,
-            front,
-            vfs: &mut self.vfs,
-            predict: self.plane.predict(),
-            effects: &mut self.effects,
-            carries: &carries,
-        };
+        // Each turn, image or not: a save whose puts became durable is marked in the journal at
+        // once, so a crash after it opens that session ([`Jobs::carry_sessions`]).
+        self.jobs.carry_sessions(&mut self.vfs, &self.store);
         if makes {
+            let parts =
+                Parts {
+                vfs: &mut self.vfs,
+                store: &mut self.store,
+                predict: self.plane.predict(),
+                effects: &mut self.effects,
+            };
             self.images.step(parts, idle);
         }
         self.between();
@@ -2389,6 +2520,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.collect_turn();
         // A stalled job's leases end once its tasks let go of it.
         self.jobs.release_leases();
+        // The launch host's start images put and marked, and its first calls built.
+        self.launch_turn();
         let fetched = self.fetch_urls.take_answers();
         if !fetched.is_empty() {
             self.send(fetched);
@@ -2510,7 +2643,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.observe.started(row);
         }
         for row in self.jobs.rows.drain(..) {
-            self.observe.ended(row);
+            self.observe.ended(row, Some(&*self.db));
         }
         // The errors builds said, before their answers are told below: a build's own flush,
         // as it is answered, writes them.
@@ -2825,6 +2958,57 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
+    /// A look for the solo answers' kept rows (`<state>/solo-rows`, `blaze_certify::kept`)
+    /// begun: at the first turn, which is the start's, and then each [`SOLO_LOOK_EVERY`] while
+    /// the daemon has nothing to do; one look at a time. A daemon that keeps no history leaves
+    /// them for one that does ([`Observe::takes_solo_rows`]).
+    fn look_for_solo_rows(&mut self) {
+        let now = self.driver.now();
+        let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        let due = match self.solo_looked {
+            None => true,
+            Some(at) => !working && now.saturating_sub(at) >= SOLO_LOOK_EVERY,
+        };
+        if !due || self.solo.looking() || self.stopping.is_some() || !self.observe.takes_solo_rows() {
+            return;
+        }
+        self.solo_looked = Some(now);
+        self.solo.look(under(&self.state, blaze_certify::kept::DIR), &mut self.effects);
+    }
+
+    /// A step of the look for solo answers' kept rows done; once the look ends, each record it
+    /// took (read, then removed, so none is taken twice) is numbered as a build of its own and
+    /// given to the history ([`Observe::solo_rows`]), and each file it refused is said.
+    fn solo_taken(&mut self, completion: Completion) {
+        let wall_ns = self.driver.wall_ns();
+        let Some(taken) =
+            self.solo.complete(completion, wall_ns, crate::raw::process::alive, &mut self.effects)
+        else {
+            return;
+        };
+        let blaze_certify::kept::Taken { kept, refused, more: _, failed } = taken;
+        // `more`: the rest are the next look's, a second later.
+        for why in &refused {
+            tracing::warn!(target: "blaze", why = %why, "a solo answer's kept rows are not a record");
+        }
+        if let Some(why) = failed {
+            tracing::warn!(target: "blaze", why = %why, "the solo answers' kept rows could not be taken");
+        }
+        for record in kept {
+            // The planted bug of the take's control: each record's file written back once it
+            // was taken, as a take that leaves the file would.
+            #[cfg(test)]
+            if LEAVES_TAKEN_SOLO_ROWS.get() {
+                let (whole, _) = blaze_certify::kept::names(record.pid);
+                let file = under(&self.state, &format!("{}/{whole}", blaze_certify::kept::DIR));
+                let bytes = record.write().expect("a record that was read writes");
+                self.effects.push(Effect::Write { file, bytes, tag: Tag(SOLO_ROWS_END - 1) });
+            }
+            let build = u64::from(self.plane.number_unplanned());
+            self.observe.solo_rows(build, record);
+        }
+    }
+
     /// The plane's and the memory's plots, at most once each [`PLOT_EVERY`] of the driver's
     /// clock, and the memory's breakdown by area once each [`super::breakdown::EVERY`]: each
     /// row of the build under way ([`Jobs::build_under_way`]), 0 while none is.
@@ -2876,6 +3060,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.pool_idle.look(now, working) {
             self.trim_idle_pools();
         }
+        // Longest: a daemon in no edit loop exits, once nothing it holds is undurable and no
+        // launcher is connected; a run with nothing changed is answered by its client alone.
+        let working = working || !self.jobs.idle() || self.jobs.storing() > 0;
+        let idle_for = match working {
+            true => {
+                self.idle_since = None;
+                Duration::ZERO
+            }
+            false => now.saturating_sub(*self.idle_since.get_or_insert(now)),
+        };
+        let undurable = self.jobs.storing() > 0 || self.launch.undurable() || self.jobs.slots_writing();
+        if self.stopping.is_none()
+            && super::idle::exit_due(idle_for, self.worked, self.steps.launchers_connected(), undurable)
+        {
+            tracing::info!(target: "blaze", "the daemon exits: no edit loop is live");
+            self.stop();
+        }
+        // What an idle daemon holds past its budget with nothing more it may give
+        // ([`super::idle::BUDGET`], `Jobs::idle_over`): 0 is the budget held.
+        blaze_profile::plot(Plot::IdleOverBytes, self.jobs.idle_over());
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
@@ -2915,6 +3119,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     ///
     /// What answered jobs left to settle is given up then too, each as a loss naming the break:
     /// their answers were sent and stand (`Jobs::store_broke`).
+    /// The history did not open, as the plane's first open found ([`Plane::unnumbered`]): no
+    /// build can be numbered past the builds it names, so the daemon stops, naming it.
+    fn history_unopened(&mut self) {
+        if let Some(unopened) = self.plane.unnumbered() {
+            self.fail(Failed::History(unopened));
+        }
+    }
+
     fn store_broke(&mut self) {
         let (tell_jobs, fail) = (!self.jobs.quiet(), self.failed.is_none());
         if !(tell_jobs || fail) {
@@ -2976,6 +3188,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
+            PLACES..PLACES_END => self.start_placed(completion),
+            SOLO_ROWS..SOLO_ROWS_END => self.solo_taken(completion),
             // Lane packs-1112: a peer's request, answered from the store.
             PEERS..PEERS_END => {
                 if let Some(peers) = &mut self.peers {
@@ -3008,6 +3222,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.placed(&mut world!(self, said), placed);
+                // A look of its layers may have come in: each build that waited for it begins.
+                if self.jobs.awaits_look() {
+                    self.jobs.looked(&mut world!(self, said));
+                }
                 self.said(said);
             }
             STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => {
@@ -3028,7 +3246,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
                 debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
                 let mut out = self.spare.out.pop().unwrap_or_default();
-                self.heads.complete(&mut self.vfs, completion, &mut self.effects, &mut out);
+                self.heads.complete(&mut self.vfs, self.driver.wall_ns(), completion, &mut self.effects, &mut out);
                 self.outs(out);
             }
             JOBS..JOBS_END | RUNS..RUNS_END => {
@@ -3051,6 +3269,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.ahead_heard(reply);
             return;
         }
+        // A reply to a run the daemon sent itself for a launched program's first call: the
+        // launch host's, and no client's.
+        if reply.to.conn == launch::CONN {
+            self.launch_heard(reply);
+            return;
+        }
+        self.launch_replied(reply);
         self.server.reply(reply, &mut self.effects);
         if matches!(reply.response, blaze_api::Response::Done { .. })
             && let Some(at) = self.answering.iter().position(|(to, _)| *to == reply.to)
@@ -3060,6 +3285,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     fn arrive(&mut self, arrived: Arrived) {
+        // A `blaze run` is kept to its `Done`: what a launched program's first call is built by.
+        self.launch_arrived(&arrived);
         // From a request read off its connection to its `Done` handed to the server, which
         // the turn submits before anything else it does: what a client waits for of the
         // daemon, whatever held the request between (a watcher's flush, a build).
@@ -3089,7 +3316,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             return;
         }
         let mut out = self.spare.out.pop().unwrap_or_default();
-        self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
+        self.heads.arrive(&self.vfs, self.driver.wall_ns(), arrived, &mut self.effects, &mut out);
         self.outs(out);
         self.ahead_do();
     }
@@ -3183,12 +3410,42 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 Out::Pass(Arrived::Request {
                     from,
                     request:
-                        Request::ClientRows { build, events, folded, spans, ended_ns, started_ns },
+                        Request::ClientRows {
+                            pid,
+                            build,
+                            spans,
+                            timed,
+                            events,
+                            folded,
+                            ended_ns,
+                            started_ns,
+                        },
                 }) => {
+                    #[cfg(test)]
+                    let timed = match DROPS_A_CLIENT_SPAN.get() {
+                        true => timed.into_iter().filter(|it| it.name != blaze_thin::talk::ON_THE_WIRE).collect(),
+                        false => timed,
+                    };
+                    // The client became its program's process (it exec'd it): the launch host
+                    // joins that instant to the launcher's `Hello` and exit for the
+                    // program's own spans.
+                    if let Some(exec_ns) = blaze_api::Timed::exec_of(&timed) {
+                        self.steps.launch_execd(pid, build, exec_ns);
+                    }
+                    // A client that times its spans by name (the thin `blaze`) has them made
+                    // its process's rows here; one that sent both ways is refused by name.
+                    let spans = match crate::cli::client_rows::spans_of(build, pid, spans, &timed) {
+                        Ok(spans) => spans,
+                        Err(why) => {
+                            let error = blaze_api::ApiError::new(why, None);
+                            self.reply(&Reply { to: from, response: blaze_api::Response::Error(error) });
+                            self.reply(&Reply { to: from, response: blaze_api::Response::Done { ok: false } });
+                            continue;
+                        }
+                    };
                     let rows = blaze_profile::history::ClientRows {
                         build,
-                        started_ns,
-                        ended_ns,
+                        times: Some((started_ns, ended_ns)),
                         spans,
                         events,
                         folded,
@@ -3297,6 +3554,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // its client, and no wait here when it has not.
             let it = match it {
                 Said::Report(job, Response::Work(mut worked)) => {
+                    self.worked |= worked.misses > 0;
                     if let (Some(build), true) = (worked.build_id, worked.misses > 0) {
                         let _span = tracing::info_span!(
                             target: "blaze",
@@ -3449,6 +3707,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.stopping.is_some()
             || !self.jobs.idle()
             || self.jobs.storing() > 0
+            || self.launch.undurable()
             || self.jobs.placing_after() != 0
         {
             return;
@@ -3476,9 +3735,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             self.vfs.collect_if_due(&self.mounts.roots());
             self.heads.sweep();
-            // The requests that read a corrupt group failed with it; the image is not used
-            // past it.
-            let corrupt = self.db.take_corrupt().into_iter().next().or_else(|| self.vfs.corrupt());
+            // The requests that read a corrupt group of the VFS's failed with it; the image is
+            // not used past it. (The database is no part of the image: nothing of it is read
+            // from one.)
+            let corrupt = self.vfs.corrupt();
             if let Some(corrupt) = corrupt {
                 return self.fail(Failed::Corrupt(corrupt));
             }
@@ -3491,6 +3751,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.jobs.cold && !self.settling {
             self.jobs.cold = false;
             self.settling = true;
+            self.worked = true;
             self.changed_since_settle = false;
             let _span = tracing::info_span!(
                 target: "blaze",
@@ -3509,24 +3770,36 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.settling = false;
             return self.fail(failed);
         }
-        if self.images.done()
-            && let Some(db) = Arc::get_mut(&mut self.db)
-        {
-            let settled = match self.images.take_mapped() {
-                Some(image) => {
-                    let _span = tracing::info_span!(
-                        target: "blaze",
-                        "between requests: settle the database on the image",
-                    )
-                    .entered();
-                    db.settle(image, &mut self.effects).map(|()| db.reclaim())
+        if self.images.done() {
+            // The database is no part of the image and does not settle onto it (a restart
+            // restores no engine state). The VFS settles on the image just mapped: from now on
+            // it reads every file text the image holds from the mapping and lets its own go.
+            if let Some(image) = self.images.take_mapped() {
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "between requests: settle the VFS on the image",
+                    nodes = tracing::field::Empty,
+                    freed = tracing::field::Empty
+                )
+                .entered();
+                // clone: a count of the mapping, once an image.
+                match self.vfs.settle(blaze_vfs::ImageFile {
+                    // clone: a count of the image's mapping, once a settle.
+                    file: image.owner().clone(),
+                    texts: self.images.texts(),
+                }) {
+                    Ok(settled) => {
+                        span.record("nodes", settled.nodes);
+                        span.record("freed", settled.freed);
+                    }
+                    Err(unsettled) => {
+                        drop(span);
+                        self.settling = false;
+                        return self.fail(Failed::Settle(unsettled));
+                    }
                 }
-                None => Ok(()),
-            };
-            self.settling = false;
-            if let Err(error) = settled {
-                self.fail(Failed::Settle(error));
             }
+            self.settling = false;
         }
     }
 
@@ -3588,6 +3861,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if !self.jobs.idle()
             || self.jobs.storing() > 0
+            || self.launch.undurable()
             || self.jobs.placing_after() != 0
             || !quiet
             // The settle's image is being written: the two do not share the disk.
@@ -3675,7 +3949,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     fn stepping_stop(&mut self) {
         let now = self.driver.now();
         if let Some((since, _)) = &self.stop_settles {
-            let left = self.jobs.settling();
+            let left = self.jobs.settling() + self.launch.due.len() + usize::from(self.launch.undurable());
             let waited = now.saturating_sub(*since);
             if left > 0 && waited < STOP_SETTLES_WITHIN {
                 return;
@@ -3751,6 +4025,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 }
 
 mod ahead;
+mod launch;
+#[cfg(test)]
+pub(super) use launch::MARKS_BEFORE_DURABLE;
 
 #[cfg(test)]
 mod tests {
@@ -3819,45 +4096,17 @@ mod tests {
     }
 
     #[test]
-    fn an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault() {
+    fn an_image_of_another_layout_is_not_read_and_a_damaged_one_is_a_fault() {
         let found = SchemaHash(ContentId([1; 32]));
-        assert_eq!(opening::<()>(Err(OpenError::Layout { found })), Ok(Err(Cold::Layout(found))));
+        assert_eq!(
+            opening::<()>(Err(OpenError::Layout { found })),
+            Ok(Err(Unimaged::Layout(found)))
+        );
         assert_eq!(opening::<()>(Ok(())), Ok(Ok(())));
         let cut = OpenError::Header("a length that is not the file's");
         assert_eq!(opening::<()>(Err(cut.clone())), Err(ImageFault::Open(cut)));
         let torn = OpenError::Hash { found: ContentId([2; 32]), wanted: ContentId([3; 32]) };
         assert_eq!(opening::<()>(Err(torn.clone())), Err(ImageFault::Open(torn)));
-    }
-
-    #[test]
-    fn symbols_of_another_schema_start_cold_and_corrupt_ones_are_a_fault() {
-        let refused = Refused::Missing { id: SectionId::SYMBOLS };
-        assert_eq!(unrestored(RestoreError::Refused(refused.clone())), Ok(Cold::Refused(refused)));
-        assert_eq!(
-            unrestored(RestoreError::Started { section: SectionId::SYMBOLS }),
-            Ok(Cold::Interned)
-        );
-        let bad = RestoreError::Corrupt(corrupt(SectionId::SYMBOLS));
-        assert_eq!(unrestored(bad.clone()), Err(ImageFault::Symbols(bad)));
-        let invalid = RestoreError::Invalid { section: SectionId::SYMBOLS, what: "a count", at: 8 };
-        assert_eq!(unrestored(invalid.clone()), Err(ImageFault::Symbols(invalid)));
-    }
-
-    #[test]
-    fn a_database_section_of_another_schema_starts_cold_and_any_other_error_is_a_fault() {
-        let refused = Refused::Schema {
-            id: SectionId::DB_TABLE,
-            found: SchemaHash(ContentId([4; 32])),
-            wanted: SchemaHash(ContentId([5; 32])),
-        };
-        assert_eq!(unopened(DbError::Refused(refused.clone())), Ok(Cold::Refused(refused)));
-        for error in [
-            DbError::Corrupt(corrupt(SectionId::DB_INPUTS)),
-            DbError::Invalid { section: SectionId::DB_MEMOS, what: "a memo past the end" },
-            DbError::Symbols,
-        ] {
-            assert_eq!(unopened(error.clone()), Err(ImageFault::Db(error)));
-        }
     }
 
     #[test]
@@ -3904,17 +4153,35 @@ mod tests {
     }
 
     #[test]
-    fn a_cold_start_says_why() {
+    fn a_start_without_an_image_says_why() {
         let started = Started {
-            cold: Some(Cold::NoImage),
+            unimaged: Some(Unimaged::NoImage),
             journal_cut: 12,
             heads_dropped: 1,
             ..Started::default()
         };
         assert!(!started.whole());
         let said = started.to_string();
-        assert!(said.contains("the database starts empty: there is no daemon image"), "{said}");
+        assert!(said.contains("no image was read (there is no daemon image)"), "{said}");
         assert!(said.contains("12 bytes"), "{said}");
+    }
+
+    #[test]
+    /// Rule 26: the words a start of the layout before took (`database`, `trees`, `carries`
+    /// name parts no start reads now) are refused by name, never taken quietly; `history`
+    /// still parses.
+    #[test]
+    fn restore_without_refuses_the_parts_no_start_reads_by_name() {
+        assert_eq!(Without::parse("history"), Ok(Without { history: true }));
+        assert_eq!(Without::parse(" , "), Ok(Without::default()));
+        for word in ["database", "trees", "carries"] {
+            let Err(why) = Without::parse(&format!("history,{word}")) else {
+                panic!("`{word}` was taken")
+            };
+            assert!(why.contains(&format!("`{word}`, which no start reads any more")), "{why}");
+        }
+        let Err(why) = Without::parse("memos") else { panic!("`memos` was taken") };
+        assert!(why.contains("no part of the daemon image"), "{why}");
     }
 
     #[test]

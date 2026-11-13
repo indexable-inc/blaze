@@ -1014,7 +1014,11 @@ impl<W: World + ?Sized> Kernel<W> {
     ///
     /// - **Seed.** The entries with a read `changed` names ([`Changed`], total by kind of
     ///   read) are dropped from the session and queued, found through the postings their
-    ///   admission wrote.
+    ///   admission wrote. For a kind said [`Changed::valued`], the reads that differ are found
+    ///   here: each read of the kind the session posted is valued once in `world` and compared
+    ///   with what its posting says its entries saw, and the readers of each that is other
+    ///   (gone, new, not valuable now) are the ones queued; what it is now is kept on the
+    ///   posting for the next carry.
     /// - **Every reached entry with a key is repaired.** A value a step read, and one a request
     ///   asked for at the top of a step that may be asked for ([`Kernel::get_in`]), is named
     ///   by the key a read of it uses, so it is repaired in place and cut where its value is
@@ -1045,7 +1049,9 @@ impl<W: World + ?Sized> Kernel<W> {
     /// differs (I2), and an entry is repaired after every queued entry it reads (I3: lowest
     /// first, and a reader is queued whenever an entry it read comes to another hash, even
     /// one repaired already), then every entry the session holds after the carry is what a
-    /// lookup with no session gives at the new pin. By induction on height: an entry never
+    /// lookup with no session gives at the new pin. A valued kind meets I2 by itself: every
+    /// live entry's reads are posted (I1) with what they saw at the old pin (I4), and the seed
+    /// compares each with the value every lookup uses. By induction on height: an entry never
     /// queued has no read that differs and no child whose hash differs, so its list holds as
     /// it did; a queued one was looked up after its children were final. Checked by
     /// `exhaustive/nested.rs` (every sequence, with the pin moved under a carried session at
@@ -1409,12 +1415,13 @@ pub(crate) trait Lists<T> {
     fn answer(&mut self, key: Key) -> Result<Option<T>, KernelError>;
 
     /// `found` is the entry of the list in `slot` of the identity's chain, whose reads are
-    /// named `names`; no slot and no names for the entry with no reads. Said once, for the
-    /// entry the walk ends with: where a session's postings are written.
+    /// named and saw as `reads` says (what [`Lists::now`] gave for each, in the list's
+    /// order); no slot and no reads for the entry with no reads. Said once, for the entry the
+    /// walk ends with: where a session's postings are written, with what each read saw.
     fn held<'n>(
         &mut self,
         slot: Option<u32>,
-        names: &mut dyn Iterator<Item = &'n [u8]>,
+        reads: &mut dyn Iterator<Item = (&'n [u8], Seen)>,
         found: &mut T,
     );
 
@@ -1444,16 +1451,23 @@ fn find_key<S: Step, G: Get + ?Sized, T>(
         lists.held(None, &mut std::iter::empty(), &mut found);
         return Ok(Some(found));
     }
+    // What each read of the list being walked is now, for the postings of the one that holds:
+    // one buffer for the walk, cleared a list.
+    // alloc: one lookup's values of one list's reads
+    let mut seen: Vec<Seen> = Vec::new();
     let walked = walk::<_, T, Stop, _>(&Looking(store), entry::BOUNDS, &id, |at, bytes, list| {
         let mut key = AnswerKey::new(bytes);
         let mut holds = true;
+        seen.clear();
         for name in list.reads() {
             let read = entry::named(name).ok_or(Stop::Name { at, len: name.len() })?;
             // The walk leaves the reads to its visitor: each one asked the value of is said.
             blaze_record::Store::tally(&Looking(store)).valued(1);
             match lists.now(read).map_err(Stop::Kernel)? {
-                Now::Seen(seen) => {
-                    key.value(entry::digest(seen));
+                Now::Seen(now) => {
+                    key.value(entry::digest(now));
+                    // alloc: one lookup's values of one list's reads
+                    seen.push(now);
                 }
                 Now::Pending => holds = false,
                 Now::Not => return Ok(None),
@@ -1465,7 +1479,9 @@ fn find_key<S: Step, G: Get + ?Sized, T>(
         let Some(mut found) = lists.answer(Key(key.finish())).map_err(Stop::Kernel)? else {
             return Ok(None);
         };
-        lists.held(Some(at.n), &mut list.reads(), &mut found);
+        // Every read of a list that holds was seen (none was pending), so the two are zipped
+        // read for read.
+        lists.held(Some(at.n), &mut list.reads().zip(seen.iter().copied()), &mut found);
         Ok(Some(found))
     });
     match walked {

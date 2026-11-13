@@ -14,7 +14,7 @@ fn launched() -> Policy {
 /// member's or a dependency's (which calls dependencies' alone), a member's naming some
 /// static, and a function building in some of the dependency's functions after it that it
 /// calls.
-fn drawn(tc: &hegel::TestCase) -> Program {
+pub(super) fn drawn(tc: &hegel::TestCase) -> Program {
     use hegel::generators as gs;
     let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(9));
     let statics: u32 = tc.draw(gs::integers::<u32>().max_value(2));

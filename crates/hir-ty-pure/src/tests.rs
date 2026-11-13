@@ -11,4 +11,5 @@ mod fns;
 mod held;
 mod models;
 mod scripts;
+mod sealed;
 mod share;

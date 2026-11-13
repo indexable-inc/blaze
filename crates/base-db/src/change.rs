@@ -90,11 +90,16 @@ impl FileChange {
     }
 }
 
-/// The files of a root change far less often than what is in them.
-fn source_root_durability(_: &SourceRoot) -> Durability {
-    Durability::MEDIUM
+/// The kind of a root's file set and of its files' root map, by the root's kind
+/// ([`crate::files::root_set_durability`]): `HIGH` for a library's, whose set moves only with
+/// a new toolchain or a fetched package, so a read of it under a covered frame is allowed;
+/// `MEDIUM` for a local root. Until 2026-11-12 every root's was `MEDIUM` here.
+fn source_root_durability(root: &SourceRoot) -> Durability {
+    crate::files::root_set_durability(root.is_library)
 }
 
+/// A library file's text is `HIGH`, a local one's `LOW`
+/// ([`crate::files::root_content_durability`], the one rule).
 fn file_text_durability(source_root: &SourceRoot) -> Durability {
-    if source_root.is_library { Durability::HIGH } else { Durability::LOW }
+    crate::files::root_content_durability(source_root.is_library)
 }

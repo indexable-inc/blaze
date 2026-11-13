@@ -743,21 +743,6 @@ pub(super) fn ask(
     }
 }
 
-/// `request` handed to the daemon that is running, its answer not waited for: for a command
-/// about to become another program (`run`'s client rows). The daemon takes a request as it
-/// reads it, whether or not its connection is still there when it answers. No daemon running
-/// is an error, as [`ask`]'s.
-pub(super) fn tell(request: Request) -> Result<(), String> {
-    let mut client = match daemon::connect(Start::Never) {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned());
-        }
-        Err(error) => return Err(format!("{error:#}")),
-    };
-    client.send(request).map(|_| ()).map_err(|error| error.to_string())
-}
-
 /// [`ask`], where no daemon running (under [`Start::Never`]) is not an error: whether one
 /// was asked.
 fn ask_if_running(

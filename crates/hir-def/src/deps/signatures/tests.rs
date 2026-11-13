@@ -7,7 +7,7 @@ use std::alloc::Global;
 
 use super::*;
 use crate::{
-    deps::{DepImages, ImageRef, ImageStore, keys, serve, store, write_image},
+    deps::{DepImages, ImageRef, ImageStore, Which, keys, serve, store, write_image},
     test_db::{TestDB, TestDBExt},
 };
 
@@ -167,7 +167,7 @@ fn stored(fixture: &str) -> Memory {
     let memory = Memory::default();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    let stored = store(&db, &served, &memory).unwrap();
+    let stored = store(&db, &served, &memory, Which::Sealed).unwrap();
     assert_eq!(stored.refused, Vec::new());
     assert!(!stored.written.is_empty());
     memory
@@ -557,7 +557,7 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     let key = keys(&db, &[lib], BUILD)[&lib];
     let image = memory.images.lock()[&key].clone();
     let image = ImageRef::open(&image, key).unwrap();
-    let bytes = write_image(key, [image.part(Part::DefMap), image.part(Part::LangItems), part]);
+    let bytes = write_image(key, [image.part(Part::LangItems), part]);
     memory.images.lock().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 

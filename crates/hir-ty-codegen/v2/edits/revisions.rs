@@ -273,9 +273,9 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     "{}: the step `packed {name}` is the real driver's: the simulation has one home and one database",
                     test.name
                 ),
-                Step::Start | Step::Await { .. } | Step::Count { .. } | Step::End => {
+                Step::Start | Step::Await { .. } | Step::Count { .. } | Step::End | Step::ReplaceEngine => {
                     panic!(
-                        "{}: a step of a running program, which the simulated driver has none of: the case's \
+                        "{}: a step of a running program or of the engine on disk, which the simulated driver has none of: the case's \
                          `drivers` names `real` alone",
                         test.name
                     );

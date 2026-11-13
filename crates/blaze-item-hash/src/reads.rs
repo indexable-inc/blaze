@@ -19,7 +19,8 @@ use blaze_items::{
 };
 use blaze_query::db::{Database as _, FromIdIn, Id, ReadKind};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId,
+    AdtId, AssocItemId, AttrDefId, BlockIdLt, BuiltinDeriveImplId, DefWithBodyId, EnumId,
+    EnumVariantId,
     ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleId, StaticId, TraitId, TypeAliasId, VariantId,
     hir::{ClosureKind, CoroutineKind},
@@ -31,10 +32,12 @@ use hir_ty::{
     db::{InternedClosureId, InternedCoroutineId},
     generics::generics,
     method_resolution::{
-        InherentImpls_in_crate_for_self_ty, TraitImpls_blanket_in_crate_and_deps,
-        TraitImpls_for_crate_and_trait, TraitImpls_in_crate_and_deps_for_trait_and_self_ty,
+        InherentImpls_in_block_for_self_ty, InherentImpls_in_crate_for_self_ty, SelfTyKey,
+        TraitImpls_blanket_in_crate_and_deps, TraitImpls_for_crate_and_trait,
+        TraitImpls_in_block_for_trait_and_self_ty,
+        TraitImpls_in_crate_and_deps_for_trait_and_self_ty,
         TraitImpls_in_crate_for_trait_and_self_ty, impl_value_item, in_crate_trait_value_items,
-        inherent_value_item, scope_sets::module_items_named, trait_value_item,
+        inherent_value_item, loaded_crates, scope_sets::module_items_named, trait_value_item,
     },
     next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
@@ -91,10 +94,26 @@ pub(crate) enum Rule {
     /// `blaze_items::goals::fact_value`: the value of the fact its key names, which is that fact.
     FactValue,
     /// Keyed by several arguments, a crate first (or a module's): a table of that crate's
-    /// items, or of it and its dependencies. Another crate's `Crate` fact, which hashes it and
-    /// every crate it depends on; refused for the body's own, whose impls and traits no fact
-    /// lists.
+    /// items, or of it and its dependencies. A read of the body's crate or a crate it loads is
+    /// a fact per item as the body's crate sees it ([`own_item_read`]): the impls of one trait
+    /// for one simplified self type, or its blanket impls, are lane items' `Implements { trait,
+    /// self type }` fact; the inherent impls of one type its `InherentImpls`; all the impls of
+    /// one trait its `TraitImpls`; the traits with a value item of one name its `TraitsNamed`;
+    /// and a module's traits in scope with an item of one name its `ScopeTraitsNamed`, of any
+    /// crate. Each is valued by what it lists, each by its own key and signature, in every
+    /// crate the body's crate sees, so an item of it added or removed anywhere there (a `const
+    /// _` block's included) changes it, and nothing else does. Any other read of another crate
+    /// is that crate's `Crate` fact, which hashes it and every crate it depends on; any other
+    /// read of the body's own crate is refused, naming the read.
     DepCrate(Args),
+    /// Keyed by a block (`TraitImpls::for_block`, `InherentImpls::for_block`) or a block first
+    /// (`InherentImpls::in_block_for_self_ty`, `TraitImpls::in_block_for_trait_and_self_ty`):
+    /// lane items' `BlockImpls` fact of the block, each impl there by key and signature, for
+    /// the body's own block as for another's. The own block's is not covered: the identity
+    /// hashes what the body's paths resolve to, and an impl in a block is an item of the
+    /// block's item tree, whose paths (its trait, its self type) are not the body's. A block of
+    /// no body's (a signature's array length) is refused.
+    Block,
     /// Keyed by an impl or a trait and a name: its item of that name, of its `Fields` fact as
     /// `ImplItems::of` and `TraitItems` are.
     FieldNamed(Of),
@@ -117,17 +136,22 @@ pub(crate) enum Rule {
     /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact
     /// under [`Names::Facts`].
     TraitsInScope,
-    /// A type's layout (`layout_of_ty_query`, `layout_of_adt_query`): keyed by a type and an
-    /// environment, which no fact names and whose interned ids are one process's. Its value is
-    /// a function of what its own row read (the target's data layout, `repr`, the fields'
-    /// types and each field's layout row, to the leaves), so the store classifies those reads
-    /// in its place (`Classified::Through`), each by its own rule here: what decides a layout
-    /// is traced as facts keyed by items and crates. A read below a layout row is classified
+    /// A row whose value is a function of what it read and nothing else, with no fact of its
+    /// own: a type's layout (`layout_of_ty_query`, `layout_of_adt_query`, keyed by a type and
+    /// an environment, which no fact names and whose interned ids are one process's), and the
+    /// derived tables a layout reads (a struct's flags, an enum's discriminants, a `bits`
+    /// struct's packing, a field's bit width, the plan's ranks of an ADT's fields). The store
+    /// reads the row's own reads in its place (`Classified::Through`), each by its own rule
+    /// here, through again where that is `Through`: what decides a layout is traced as facts
+    /// keyed by items and crates. A read below a layout row is classified
     /// for the same body and step as one the step made itself; a layout row reads no
     /// name-resolution row of its own (it asks queries that do: field types, attributes), so
     /// [`Rule::Names`] under [`Names::Identity`], which is sound only for the body's own
     /// paths, is not met below one.
     Through,
+    /// The field order plan's input (`hir_ty::layout::field_order::FieldOrder`), which every
+    /// ADT's layout reads: the build's `FieldOrder` fact.
+    FieldOrder,
 }
 
 /// How a read of name resolution is stood for: the switch between the identity made from the
@@ -178,6 +202,8 @@ pub(crate) enum Of {
     /// A `VariantId`: its struct or union, or an enum variant's enum.
     Variant,
     Enum,
+    /// An `AdtId`.
+    Adt,
     Trait,
     Impl,
     Assoc,
@@ -191,6 +217,7 @@ pub(crate) enum Of {
 pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("AssocItemId::assoc_visibility", "hir-def/src/visibility.rs", Rule::Signature(Of::Assoc)),
     ("AttrFlags::query", "hir-def/src/attrs.rs", Rule::Attrs(Of::AttrOwner)),
+    ("AttrFlags::repr_assume_has", "hir-def/src/attrs.rs", Rule::Attrs(Of::Adt)),
     ("BlockIdLt", "hir-def/src/lib.rs", Rule::Names),
     ("Body::has_lowering_errors", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::of", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
@@ -203,8 +230,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("FunctionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("ImplItems::of", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Impl)),
     ("ImplSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("InherentImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("InherentImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("InherentImpls::for_module", "hir-ty/src/method_resolution.rs", Rule::ModuleCrate),
+    ("InherentImpls::in_block_for_self_ty", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("InherentImpls::in_crate_for_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::SelfTy)),
     ("ItemBounds::of", "hir-ty/src/next_solver/util.rs", Rule::Items),
     ("ModuleIdLt", "hir-def/src/lib.rs", Rule::Names),
@@ -221,10 +250,12 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("StaticSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StructSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("TraitImpls::blanket_in_crate_and_deps", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Trait)),
+    ("TraitImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("TraitImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("TraitImpls::for_crate_and_deps", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("TraitImpls::for_crate_and_trait", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Trait)),
     ("TraitImpls::for_module", "hir-ty/src/method_resolution.rs", Rule::ModuleCrate),
+    ("TraitImpls::in_block_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("TraitImpls::in_crate_and_deps_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitImpls::in_crate_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitItems::query_with_diagnostics", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Trait)),
@@ -234,6 +265,9 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("UnstableFeatures::query", "hir-def/src/unstable_features.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("VariantFields::field_visibilities", "hir-def/src/visibility.rs", Rule::Signature(Of::Variant)),
     ("VariantFields::kept", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
+    ("bit_width_of", "hir-ty/src/layout/bits.rs", Rule::Through),
+    ("bits_layout_query", "hir-ty/src/layout/bits.rs", Rule::Through),
+    ("blaze_bits", "hir-def/src/attrs.rs", Rule::Attrs(Of::AttrOwner)),
     ("block_def_map", "hir-def/src/nameres.rs", Rule::Names),
     ("body_upvars_mentioned", "hir-def/src/upvars.rs", Rule::OwnBody),
     ("cfg_options", "base-db/src/input.rs", Rule::CrateInput),
@@ -262,9 +296,14 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("diagnostic_items", "hir-def/src/diagnostic_item.rs", Rule::WholeCrate),
     ("dyn_compatibility_of_trait_query", "hir-ty/src/dyn_compatibility.rs", Rule::Items),
     ("elided_lifetimes", "hir-ty/src/lower.rs", Rule::Signature(Of::Function)),
+    ("enum_discriminants", "hir-ty/src/consteval/discriminants.rs", Rule::Through),
+    ("enum_variant_ids", "hir-ty/src/layout.rs", Rule::Fields(Of::Enum)),
+    ("explicit_discriminant", "hir-ty/src/consteval/discriminants.rs", Rule::ConstValue),
+    ("explicit_discriminant_indices", "hir-ty/src/consteval/discriminants.rs", Rule::Through),
     ("extra_data", "base-db/src/input.rs", Rule::CrateInput),
     ("fact_value", "blaze-items/src/goals.rs", Rule::FactValue),
     ("failed_expansion", "hir-ty-mir/src/mir/lower.rs", Rule::OwnBody),
+    ("field_ranks", "hir-ty/src/layout/field_order.rs", Rule::Through),
     ("field_types_of_variant", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_enum_variant_constructor", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_fn", "hir-ty/src/lower.rs", Rule::Items),
@@ -300,6 +339,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("module_trait_set", "hir-ty/src/method_resolution/scope_sets.rs", Rule::TraitsInScope),
     ("name_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("orphan_rules_hold", "hir-ty/src/traits.rs", Rule::Coherence),
+    ("plan", "hir-ty/src/layout/field_order.rs", Rule::FieldOrder),
     ("predicates", "hir-ty/src/builtin_derive.rs", Rule::Derive),
     ("relevant_impls", "hir-ty/src/method_resolution.rs", Rule::Items),
     ("representability", "hir-ty/src/representability.rs", Rule::Items),
@@ -310,6 +350,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("scope", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("scope_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("specializes_query", "hir-ty/src/specialization.rs", Rule::Items),
+    ("struct_flags", "hir-ty/src/layout.rs", Rule::Through),
+    ("struct_tail_may_be_unsized", "hir-ty/src/layout.rs", Rule::Through),
     ("supertraits_info", "hir-ty/src/lower.rs", Rule::Items),
     ("table", "hir-def/src/nameres.rs", Rule::Names),
     ("tait_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
@@ -326,6 +368,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("type_for_type_alias_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::Alias)),
     ("unstable_feature", "hir-def/src/attrs.rs", Rule::Attrs(Of::AttrOwner)),
     ("variances_of_query", "hir-ty/src/variance.rs", Rule::Items),
+    ("variant_field_ids", "hir-ty/src/layout.rs", Rule::Fields(Of::Variant)),
     ("workspace_data", "base-db/src/input.rs", Rule::CrateInput),
 ];
 
@@ -448,6 +491,7 @@ fn apply(
         }
         Rule::Names => return name_fact(db, def, read, kind),
         Rule::Through => return Classified::Through,
+        Rule::FieldOrder => Some(values::field_order()),
         Rule::TraitsInScope => {
             arg::<ModuleId>(db, key).map(|module| values::traits_in_scope(db, module))
         }
@@ -486,6 +530,7 @@ fn apply(
         Rule::Attrs(Of::Function) => {
             arg::<FunctionId>(db, key).and_then(|it| values::attrs(db, it.into()))
         }
+        Rule::Attrs(Of::Adt) => arg::<AdtId>(db, key).and_then(|it| values::attrs(db, it.into())),
         Rule::Attrs(_) => arg::<AttrDefId>(db, key).and_then(|it| values::attrs(db, it)),
         Rule::DropCheck => {
             arg::<AdtId>(db, key).map(|adt| item_fact(db, items::DROP_CHECK, ItemId::Adt(adt)))
@@ -512,9 +557,17 @@ fn apply(
             }
             _ => None,
         },
-        Rule::DepCrate(of) => match crate_of_args(db, key, of) {
-            Some(krate) if krate == def.krate(db) => return Classified::Refused,
-            krate => krate.map(|krate| whole_crate(db, krate)),
+        Rule::DepCrate(of) => match own_item_read(db, def.krate(db), read, name, of) {
+            Some(fact) => Some(fact),
+            None => match crate_of_args(db, key, of) {
+                Some(krate) if krate == def.krate(db) => return Classified::Refused,
+                krate => krate.map(|krate| whole_crate(db, krate)),
+            },
+        },
+        Rule::Block => match block_of(db, key).map(|block| block.owner(db)) {
+            // A block of no body's (an array length's in a signature) is no body's text.
+            None | Some(None) => None,
+            Some(Some(_)) => Goals.fact_of(db, Some(def.krate(db)), read, name),
         },
         Rule::FieldNamed(of) => match of {
             Of::Impl => impl_value_item::arguments(db, key)
@@ -624,6 +677,7 @@ fn item_of(db: &Db, key: Id, of: Of) -> Option<ItemId> {
             VariantId::EnumVariantId(it) => ItemId::Adt(it.lookup(db).parent.into()),
         },
         Of::Enum => ItemId::Adt(arg::<EnumId>(db, key)?.into()),
+        Of::Adt => ItemId::Adt(arg::<AdtId>(db, key)?),
         Of::Trait => ItemId::Trait(arg::<TraitId>(db, key)?),
         Of::Impl => ItemId::Impl(arg::<ImplId>(db, key)?),
         Of::Assoc => ItemId::from(arg::<AssocItemId>(db, key)?),
@@ -675,6 +729,93 @@ fn crate_of_args(db: &Db, key: Id, of: Args) -> Option<Crate> {
         Args::Name => in_crate_trait_value_items::arguments(db, key)?.0,
         Args::ModuleName => module_items_named::arguments(db, key)?.0.krate(db),
     })
+}
+
+/// The block a [`Rule::Block`] read is of.
+fn block_of(db: &Db, key: Id) -> Option<BlockIdLt<'_>> {
+    arg::<BlockIdLt<'_>>(db, key)
+        .or_else(|| InherentImpls_in_block_for_self_ty::arguments(db, key).map(|(it, _)| it))
+        .or_else(|| {
+            TraitImpls_in_block_for_trait_and_self_ty::arguments(db, key).map(|(it, _, _)| it)
+        })
+}
+
+/// The fact per item a [`Rule::DepCrate`] read stands for, made by a body of `own`, of `own` or
+/// a crate `own` loads; its value is as `own` sees it (`blaze_items::goals::fact_value`), over
+/// every crate `own` loads: what the read can give, as the loaded set is closed (a crate `own`
+/// loads loads only crates `own` does), and more, never less.
+///
+/// - The impls of one trait for one simplified self type
+///   (`TraitImpls::in_crate_and_deps_for_trait_and_self_ty`, `in_crate_for_trait_and_self_ty`)
+///   or one trait's blanket impls (`TraitImpls::blanket_in_crate_and_deps`): the `Implements`
+///   fact, each impl by its key and signature (`blaze_items::implements_value`). The blanket
+///   impls alone are the fact of no simplified self type (`blaze_items::key::unsimplified`), as
+///   lane items' `relevant_impls` reads are.
+/// - `InherentImpls::in_crate_for_self_ty`, `TraitImpls::for_crate_and_trait`,
+///   `in_crate_trait_value_items` and `module_items_named`: lane items' fact of that listing
+///   (`blaze_items::goals::fact_of_read`, the one home of the mapping), `module_items_named`
+///   of a module of any crate, as one module's traits in scope are the same whoever asks.
+///
+/// `None` for one of a crate `own` does not load, whose tables no fact of `own` covers.
+fn own_item_read(
+    db: &Db,
+    own: Crate,
+    read: blaze_query::db::DatabaseKeyIndex,
+    name: &'static str,
+    of: Args,
+) -> Option<FactRef> {
+    let key = read.key_index();
+    let (krate, trait_, self_ty) = match of {
+        Args::TraitSelfTy => {
+            let (krate, trait_, SelfTyKey(self_ty)) =
+                TraitImpls_in_crate_for_trait_and_self_ty::arguments(db, key).or_else(|| {
+                    TraitImpls_in_crate_and_deps_for_trait_and_self_ty::arguments(db, key)
+                })?;
+            #[cfg(test)]
+            if planted::SELF_TY_IGNORED.get() {
+                return Some(implements_fact(db, trait_, key::unsimplified()));
+            }
+            (krate, trait_, key::simplified(db, &self_ty))
+        }
+        Args::Trait => match TraitImpls_blanket_in_crate_and_deps::arguments(db, key) {
+            Some((krate, trait_)) => (krate, trait_, key::unsimplified()),
+            None => return Goals.fact_of(db, Some(own), read, name),
+        },
+        Args::SelfTy | Args::Name | Args::ModuleName => {
+            return Goals.fact_of(db, Some(own), read, name);
+        }
+    };
+    if krate != own && !loaded_crates(db, own).contains(&krate) {
+        return None;
+    }
+    Some(implements_fact(db, trait_, self_ty))
+}
+
+/// The planted bug of the own-crate impls oracle's control
+/// (`tests::classify::the_oracle_catches_an_implements_fact_that_ignores_an_added_impl`).
+#[cfg(test)]
+pub(crate) mod planted {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// A read of one trait's impls for one self type stands for the trait's blanket impls
+        /// alone, so its value ignores an impl for the type added or removed.
+        pub(crate) static SELF_TY_IGNORED: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
+/// Lane items' `Implements { trait_, self_ty }` fact as hir-ty's stores keep it: the trait by
+/// key, the simplified self type as its object (`blaze_items::table`'s split of it).
+pub(crate) fn implements_fact(
+    db: &Db,
+    trait_: TraitId,
+    self_ty: blaze_items::SimplifiedType,
+) -> FactRef {
+    FactRef {
+        kind: items::IMPLEMENTS,
+        subject: key::item_key(db, ItemId::Trait(trait_)).0,
+        object: FactObject::Id(self_ty.0),
+    }
 }
 
 fn generic_def_item(def: GenericDefId) -> ItemId {

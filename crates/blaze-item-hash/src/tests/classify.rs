@@ -267,7 +267,47 @@ fn attrs_changes_with_any_flag_the_signature_leaves_out() {
             changes: false,
             of: |db| attrs_of_item(db, "f"),
         },
+        // A layout reads an ADT's `#[repr]` (`AttrFlags::repr_assume_has`) as this fact: one
+        // that changes the integer keeps the flags as they were, and must change the fact.
+        Pair {
+            what: "an enum's #[repr] integer changed",
+            before: "#[repr(u8)] pub enum E { A, B }",
+            after: "#[repr(u16)] pub enum E { A, B }",
+            changes: true,
+            of: |db| attrs_of_item_or_adt(db, "E"),
+        },
+        Pair {
+            what: "a field added under the same #[repr]",
+            before: "#[repr(C)] pub struct S { pub a: u8 }",
+            after: "#[repr(C)] pub struct S { pub a: u8, pub b: u8 }",
+            changes: false,
+            of: |db| attrs_of_item_or_adt(db, "S"),
+        },
     ]);
+}
+
+/// The invariant: the `FieldOrder` fact, which every ADT layout's read of the plan stands
+/// for, is the plan's ID or that there is none: equal for an equal plan, another for another
+/// plan, and back to the first with the plan gone.
+#[test]
+fn the_field_order_fact_changes_with_the_plan_and_only_then() {
+    use hir_ty::layout::field_order::{self, FieldOrderPlan};
+    let mut db = db_of(&format!("{PRELUDE}pub struct S {{ pub a: u32 }}"));
+    let krate = local_crate(&db);
+    let fact = values::field_order();
+    // alloc: a test plan, once per install
+    let plan = |n: u8| Some(Arc::new(FieldOrderPlan::new(ContentId([n; 32]), HashMap::default())));
+    let none = values::value(&db, krate, fact);
+    assert!(none.is_some(), "no plan is a value");
+    field_order::install(&mut db, plan(1));
+    let one = values::value(&db, krate, fact);
+    field_order::install(&mut db, plan(1));
+    assert_eq!(values::value(&db, krate, fact), one, "the same plan again");
+    field_order::install(&mut db, plan(2));
+    let two = values::value(&db, krate, fact);
+    assert!(none != one && one != two && none != two, "{none:?} {one:?} {two:?}");
+    field_order::install(&mut db, None);
+    assert_eq!(values::value(&db, krate, fact), none, "the plan gone");
 }
 
 fn attrs_of_item(db: &Db, name: &str) -> FactRef {
@@ -529,16 +569,6 @@ pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 /// out of the store; it is never a wrong answer. Each is to be made a fact or covered by the
 /// request named, never by widening a rule here.
 const REFUSALS: &[(&str, &str)] = &[
-    // Tables of the body's own crate: another crate's are its `Crate` fact, but no fact lists
-    // the own crate's impls or traits.
-    ("InherentImpls::in_crate_for_self_ty", "the own crate's impls"),
-    ("TraitImpls::in_crate_and_deps_for_trait_and_self_ty", "the own crate's impls"),
-    ("TraitImpls::in_crate_for_trait_and_self_ty", "the own crate's impls"),
-    ("TraitImpls::blanket_in_crate_and_deps", "the own crate's impls"),
-    ("TraitImpls::for_crate_and_trait", "the own crate's impls"),
-    ("in_crate_trait_value_items", "the own crate's traits"),
-    ("module_items_named", "the items of the traits in scope of an own module"),
-    ("InherentImpls::in_block_for_self_ty", "a block's impls: no fact yet"),
     ("closure_exprs", "read for another body's closures"),
     // Of a type or a goal in an environment: no fact names one.
     ("lookup_impl_method_stored", "a method's impl, selected in an environment"),
@@ -552,9 +582,7 @@ const REFUSALS: &[(&str, &str)] = &[
     // a const evaluated as itself only.
     ("const_eval_query", "a const with arguments or an environment"),
     ("anon_const_eval", "an anonymous const: ConstValue names none"),
-    // Keyed by a block of another body or a whole-crate walk: no fact names them.
-    ("TraitImpls::for_block", "a block's impls: no fact yet"),
-    ("InherentImpls::for_block", "a block's impls: no fact yet"),
+    // A whole-crate walk: no fact names it.
     ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
     ("modules", "a walk of every module of a published crate (DefMap::table)"),
     // Positions: the identity has no spans.
@@ -841,28 +869,49 @@ pub fn concrete() -> Option<u32> { let _ = 5u32.make(); <(u32,) as List>::valtyp
     assert!(flushed.written > 0, "no goal was stored: {flushed:?}");
 }
 
-/// A read keyed by several arguments (request 00827) is the fact of what its first names: a
-/// crate's table its `Crate` fact, refused for the body's own; an impl's or trait's item of a
-/// name its `Fields`; a const evaluated as itself its `ConstValue`.
+/// A read keyed by several arguments (request 00827) is the fact of what its first names: of
+/// the body's crate or one it loads, the fact per item of what it lists (`Implements` for the
+/// impls of one trait for one type or the blanket ones, `InherentImpls`, `TraitImpls`,
+/// `TraitsNamed`), a module's traits in scope by name `ScopeTraitsNamed`, another crate's
+/// table its `Crate` fact, never the body's own crate's, and never refused; an impl's or
+/// trait's item of a name its `Fields`; a const evaluated as itself its `ConstValue`.
 #[test]
 fn several_argument_reads_are_facts_of_their_first() {
+    use blaze_items::kinds as items;
     let (db, seen) = steps_seen();
     let mut facts = 0;
     for it in &seen {
         let want = match reads::rule_of(&db, it.read, it.name) {
-            Some(Rule::DepCrate(_)) => blaze_items::kinds::CRATE,
+            Some(Rule::DepCrate(_)) => items::CRATE,
             Some(Rule::FieldNamed(_)) => kinds::FIELDS,
-            Some(Rule::ConstEval) => blaze_items::kinds::CONST_VALUE,
+            Some(Rule::ConstEval) => items::CONST_VALUE,
             _ => continue,
         };
+        let per_item =
+            [items::INHERENT_IMPLS, items::TRAIT_IMPLS, items::TRAITS_NAMED, items::SCOPE_TRAITS_NAMED];
         match it.class {
+            Classified::Fact(fact) if fact.kind == items::IMPLEMENTS => {
+                assert_eq!(want, items::CRATE, "{}: Implements", it.name);
+                assert!(matches!(fact.object, FactObject::Id(_)), "{}: {fact:?}", it.name);
+                facts += 1;
+            }
+            Classified::Fact(fact) if per_item.contains(&fact.kind) => {
+                assert_eq!(want, items::CRATE, "{}: {fact:?} of a crate's table", it.name);
+                let object = matches!(fact.object, FactObject::Id(_));
+                let scoped = fact.kind == items::SCOPE_TRAITS_NAMED;
+                assert_eq!(object, scoped, "{}: {fact:?}", it.name);
+                facts += 1;
+            }
             Classified::Fact(fact) => {
                 assert_eq!(fact.kind, want, "{}", it.name);
                 let own = key::crate_key(&db, it.def.krate(&db));
-                assert!(want != blaze_items::kinds::CRATE || fact.subject != own, "{}", it.name);
+                assert!(want != items::CRATE || fact.subject != own, "{}", it.name);
                 facts += 1;
             }
-            Classified::Refused => assert_ne!(want, kinds::FIELDS, "{}: refused", it.name),
+            Classified::Refused => {
+                assert_ne!(want, kinds::FIELDS, "{}: refused", it.name);
+                assert_ne!(want, items::CRATE, "{}: a crate's table refused", it.name);
+            }
             Classified::Covered => panic!("{}: covered", it.name),
             // Only the name-facts classification makes a scan; these reads are of other rules.
             Classified::Scan(_) => panic!("{}: a scan", it.name),
@@ -1179,4 +1228,276 @@ fn recorded_names_are_facts_with_values_or_handles() {
         }
     }
     assert!(names > 0 && handles > 0, "{names} name facts, {handles} handles");
+}
+
+/// Both shapes tempo's refused bodies have: a `main` that deserializes a local type whose impl
+/// a derive writes inside `const _: () = { .. };` (serde's), through a generic container, and
+/// a local `impl Trait for Local` that a method call of the same crate needs (syn's `Parse`).
+/// `Entry` has two impls of `De` (`De<u8>`, `De<u16>`), both of one simplified self type, so a
+/// third added or one removed is an edit of the impls of that (trait, type) and nothing else.
+const OWN_IMPLS: &str = r#"
+pub trait De<M> { fn de() -> Self; }
+pub struct Map<K, V> { pub k: K, pub v: V }
+pub struct Entry { pub a: u32 }
+const _: () = {
+    impl De<u8> for Entry { fn de() -> Entry { Entry { a: 1 } } }
+};
+impl De<u8> for u32 { fn de() -> u32 { 0 } }
+impl<K: De<u8>, V: De<u8>> De<u8> for Map<K, V> { fn de() -> Self { Map { k: K::de(), v: V::de() } } }
+pub fn from_str<T: De<u8>>() -> T { T::de() }
+pub fn main() { let e = from_str::<Entry>(); let m = from_str::<Map<u32, Entry>>(); let _ = (e.a, m.v.a); }
+pub trait Parse { fn parse(n: u32) -> Self; }
+pub struct Config { pub n: u32 }
+impl Parse for Config { fn parse(n: u32) -> Config { Config { n } } }
+pub trait Input { fn take<T: Parse>(&self) -> T; }
+impl Input for u32 { fn take<T: Parse>(&self) -> T { T::parse(*self) } }
+pub fn reads(s: u32) -> u32 { let c = s.take::<Config>(); c.n }
+impl Config { pub fn get(&self) -> u32 { self.n } }
+pub fn inherent(c: &Config) -> u32 { c.get() }
+pub fn local() -> u32 { struct L; impl L { fn v(&self) -> u32 { 1 } } L.v() }
+pub fn outer() -> u32 {
+    struct K;
+    impl K { fn w(&self) -> u32 { 2 } }
+    fn inner() -> u32 { K.w() }
+    inner()
+}
+"#;
+
+/// [`OWN_IMPLS`] with one more impl of `De` for `Entry`.
+const OWN_IMPLS_ADDED: &str = "impl De<u16> for Entry { fn de() -> Entry { Entry { a: 2 } } }\n";
+
+/// The reads of the own crate's impl tables of one trait for one type (or its blanket impls)
+/// that the steps of `body` made, with what each was classified as.
+fn own_impl_reads(db: &Db, seen: &[Seen], body: &str) -> Vec<(Classified, Option<SimplifiedType<SolverDefId<'static>>>)> {
+    let ItemId::Function(f) = named(db, body) else { panic!("`{body}` is no function") };
+    let def = DefWithBodyId::FunctionId(f);
+    let names = [
+        "TraitImpls::in_crate_and_deps_for_trait_and_self_ty",
+        "TraitImpls::in_crate_for_trait_and_self_ty",
+        "TraitImpls::blanket_in_crate_and_deps",
+    ];
+    seen.iter()
+        .filter(|it| it.def == def && names.iter().any(|name| reads::cmp_listed(name, it.name).is_eq()))
+        .map(|it| {
+            let self_ty = hir_ty::method_resolution::TraitImpls_in_crate_and_deps_for_trait_and_self_ty::arguments(
+                db,
+                it.read.key_index(),
+            )
+            .filter(|(krate, _, _)| *krate == local_crate(db))
+            .map(|(_, _, it)| erase(it.0));
+            (it.class, self_ty)
+        })
+        .collect() // alloc: test
+}
+
+/// A simplified type with its def's lifetime dropped, to compare across a test's databases'
+/// borrows: only `Adt` is asked for here.
+fn erase(ty: SimplifiedType<SolverDefId<'_>>) -> SimplifiedType<SolverDefId<'static>> {
+    match ty {
+        SimplifiedType::Adt(SolverDefId::AdtId(adt)) => adt_type(adt),
+        _ => SimplifiedType::Placeholder,
+    }
+}
+
+/// The orders the bodies' steps are asked in: whichever body runs a goal or a table read first
+/// changes which memos the next one finds.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    Forward,
+    Reversed,
+    /// The odd positions forward, then the even ones backward: neither of the others for three
+    /// bodies or more.
+    Shuffled,
+}
+
+/// The bodies of `db`'s local crate, and those of the items declared in their blocks, in
+/// `order`.
+fn bodies_in(db: &Db, order: Order) -> Vec<DefWithBodyId> {
+    let mut bodies: Vec<DefWithBodyId> = Vec::new(); // alloc: test
+    for &def in crate_body_owners(db, local_crate(db)).iter() {
+        bodies.push(def);
+        bodies.extend(hir_def::nameres::demand::body_blocks(db, def).owners.iter().copied());
+    }
+    let n = bodies.len();
+    match order {
+        Order::Forward => {}
+        Order::Reversed => bodies.reverse(),
+        Order::Shuffled => {
+            let at: Vec<usize> = (1..n).step_by(2).chain((0..n).step_by(2).rev()).collect(); // alloc: test
+            bodies = at.iter().map(|&i| bodies[i]).collect(); // alloc: test
+        }
+    }
+    bodies
+}
+
+/// [`steps_seen_in`] with the goal store installed too and the bodies asked in `order`: every
+/// body's inference, then every MIR, then every borrow check.
+fn steps_seen_ordered(db: Db, order: Order) -> (Db, Vec<Seen>) {
+    let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
+    let goals = hir_ty::next_solver::goal_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        Arc::new(blaze_items::goals::Goals),
+        ContentId([7; 32]),
+    )
+    .expect("a goal store for the test database");
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    let bodies = bodies_in(&db, order);
+    for &def in &bodies {
+        let _ = InferenceResult::of(&db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(&db, def);
+    }
+    installed.flush().expect("the test store flushes");
+    drop(installed);
+    goals.flush().expect("the test goal store flushes");
+    drop(goals);
+    let seen = std::mem::take(&mut *probe.seen.lock());
+    (db, seen)
+}
+
+/// One body's step as a trace: the body by its item's path (its id is one database's), the
+/// step, the sorted distinct (ingredient, class) of its reads, and whether it is stored (none
+/// refused).
+type Trace = (String, Step, Vec<(&'static str, String)>, bool);
+
+/// The traces of `seen`, sorted by body and step.
+fn traces(db: &Db, seen: &[Seen]) -> Vec<Trace> {
+    let mut by_step: Vec<((String, Step), (&'static str, String))> = seen // alloc: test
+        .iter()
+        .map(|it| {
+            let path = key::path(db, ItemId::of_body(db, it.def)); // alloc: test
+            ((path, it.step), (it.name, format!("{:?}", it.class))) // alloc: test
+        })
+        .collect();
+    by_step.sort_unstable();
+    by_step.dedup();
+    let mut out: Vec<Trace> = Vec::new(); // alloc: test
+    for ((path, step), read) in by_step {
+        let same = out.last().is_some_and(|(at, then, _, _)| *at == path && *then == step);
+        match out.last_mut() {
+            Some((_, _, reads, _)) if same => reads.push(read),
+            _ => out.push((path, step, vec![read], true)), // alloc: test
+        }
+    }
+    for (_, _, reads, stored) in &mut out {
+        *stored = !reads.iter().any(|(_, class)| class == "Refused");
+    }
+    out
+}
+
+/// The listing facts a read of the own crate's tables stands for.
+const LISTINGS: [blaze_query::QueryKind; 5] = [
+    blaze_items::kinds::INHERENT_IMPLS,
+    blaze_items::kinds::TRAIT_IMPLS,
+    blaze_items::kinds::TRAITS_NAMED,
+    blaze_items::kinds::SCOPE_TRAITS_NAMED,
+    blaze_items::kinds::BLOCK_IMPLS,
+];
+
+/// The reads this lane made facts: none of them is refused any more.
+const OWN_TABLES: [&str; 9] = [
+    "InherentImpls::in_crate_for_self_ty",
+    "TraitImpls::for_crate_and_trait",
+    "in_crate_trait_value_items",
+    "module_items_named",
+    "TraitImpls::for_block",
+    "InherentImpls::for_block",
+    "InherentImpls::in_block_for_self_ty",
+    "TraitImpls::in_block_for_trait_and_self_ty",
+    "TraitImpls::blanket_in_crate_and_deps",
+];
+
+/// The invariant: a body's step whose reads include its own crate's tables (the impls of one
+/// trait for one type or of its blanket ones, the inherent impls of a type, a trait's impls,
+/// the traits with an item of a name, a module's traits in scope by name, a block's impls) is
+/// not kept out by them: each is a fact with a value, never refused, and every body's trace,
+/// and whether its step is stored, is byte for byte the same whichever order the bodies ran
+/// in, with the goal store solving goals for whichever ran first.
+#[test]
+fn own_crate_impls_are_the_same_in_any_order() {
+    let mut by_order: Vec<Vec<Trace>> = Vec::new(); // alloc: test
+    for order in [Order::Forward, Order::Reversed, Order::Shuffled] {
+        let db = db_of(&format!("{PRELUDE}{OWN_IMPLS}"));
+        let (db, seen) = steps_seen_ordered(db, order);
+        for body in ["main", "reads"] {
+            let found = own_impl_reads(&db, &seen, body);
+            assert!(
+                found.iter().any(|(_, self_ty)| self_ty.is_some()),
+                "`{body}` read no own-crate impls of a trait for a type: the fixture misses the path"
+            );
+            for (class, _) in &found {
+                let Classified::Fact(fact) = class else {
+                    panic!("`{body}` ({order:?}): an own-crate impl read is {class:?}")
+                };
+                assert_eq!(fact.kind, blaze_items::kinds::IMPLEMENTS, "`{body}`: {fact:?}");
+                assert!(values::value(&db, local_crate(&db), *fact).is_some(), "`{body}`: {fact:?} has a value");
+            }
+        }
+        let mut listings = 0;
+        for it in &seen {
+            if OWN_TABLES.iter().any(|name| reads::cmp_listed(name, it.name).is_eq()) {
+                assert_ne!(it.class, Classified::Refused, "{order:?}: {} of {:?} refused", it.name, it.def);
+            }
+            let Classified::Fact(fact) = it.class else { continue };
+            if LISTINGS.contains(&fact.kind) {
+                let value = values::value_in(&db, it.def, fact);
+                assert!(value.is_some(), "{order:?}: {} as {fact:?} has no value", it.name);
+                listings += 1;
+            }
+        }
+        assert!(listings > 0, "{order:?}: no read of the own crate's tables: the fixture misses the path");
+        by_order.push(traces(&db, &seen));
+    }
+    assert_eq!(by_order[0], by_order[1], "the traces depend on the order (forward, reversed)");
+    assert_eq!(by_order[0], by_order[2], "the traces depend on the order (forward, shuffled)");
+}
+
+/// Whether the `Implements` fact `main`'s read of the impls of `De` for `Entry` stands for has
+/// another value once an impl of `De` for `Entry` is added: the key of `main`'s steps, which
+/// lists that fact's value, must change; removing it is the same pair the other way round.
+fn own_impl_fact_moves_with_an_added_impl() -> bool {
+    let value_in = |source: String| {
+        let (db, seen) = steps_seen_in(db_of(&source));
+        let ItemId::Adt(entry) = named(&db, "Entry") else { panic!("`Entry` is no ADT") };
+        let fact = own_impl_reads(&db, &seen, "main")
+            .into_iter()
+            .find_map(|(class, self_ty)| match class {
+                Classified::Fact(fact) if self_ty == Some(adt_type(entry)) => Some(fact),
+                _ => None,
+            })
+            .expect("`main` reads the own crate's impls of `De` for `Entry` as a fact");
+        values::value(&db, local_crate(&db), fact).expect("the fact has a value")
+    };
+    let before = value_in(format!("{PRELUDE}{OWN_IMPLS}"));
+    let after = value_in(format!("{PRELUDE}{OWN_IMPLS}{OWN_IMPLS_ADDED}"));
+    before != after
+}
+
+/// The invariant: an impl of the trait for the type added to (or removed from) the body's own
+/// crate changes the fact its read of those impls stands for, so its step's key.
+#[test]
+fn an_added_own_crate_impl_changes_the_implements_fact() {
+    assert!(own_impl_fact_moves_with_an_added_impl(), "an added impl left the fact as it was");
+}
+
+/// The control: with the planted bug (the read stands for the trait's blanket impls alone, so
+/// its value ignores an impl for the type), the oracle above sees no change.
+#[test]
+fn the_oracle_catches_an_implements_fact_that_ignores_an_added_impl() {
+    reads::planted::SELF_TY_IGNORED.set(true);
+    let moved = own_impl_fact_moves_with_an_added_impl();
+    reads::planted::SELF_TY_IGNORED.set(false);
+    assert!(!moved, "the planted bug went unseen: the fact moved with the type's impls ignored");
 }

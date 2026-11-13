@@ -324,6 +324,7 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Rename { from, to, .. } => format!("rename {from} to {to}"),
         Effect::RenameUnsynced { from, to, .. } => format!("rename {from} to {to}, unsynced"),
         Effect::Clone { from, to, .. } => format!("clone {from} to {to}"),
+        Effect::CopyData { from, to, .. } => format!("copy the data of {from} to {to}"),
         Effect::Prewarm { file, .. } => format!("prewarm {file}"),
         Effect::Seal { file, .. } => format!("seal {file}"),
         Effect::Remove { file, .. } => format!("remove {file}"),
@@ -420,6 +421,20 @@ impl Files {
         self.dirs.get(dir).copied().unwrap_or(0)
     }
 
+    /// A file's [`Stamp`], as [`Effect::Entries`] and [`Effect::Stamp`] report it: the inode is
+    /// the model's index plus one (never 0, which with the rest 0 is a name with nothing
+    /// there), the times its count of changes, since a disk with no clock has no other.
+    fn file_stamp(&self, ino: Ino) -> Stamp {
+        let inode = &self.inodes[ino];
+        Stamp {
+            ino: ino as u64 + 1,
+            size: inode.live.len() as u64,
+            mtime_ns: inode.changes,
+            ctime_ns: inode.changes,
+            mode: S_IFREG | 0o644,
+        }
+    }
+
     fn stat(&self, file: &FileName) -> Option<Meta> {
         match self.ino(file) {
             Some(ino) => {
@@ -474,16 +489,7 @@ impl Files {
         for (name, ino) in self.live.iter().filter(|(name, _)| name.starts_with(&under)) {
             match name[under.len()..].split_once('/') {
                 None => {
-                    let inode = &self.inodes[*ino];
-                    let stamp = Stamp {
-                        // Never 0, which with the rest 0 is a name with nothing there.
-                        ino: *ino as u64 + 1,
-                        size: inode.live.len() as u64,
-                        mtime_ns: inode.changes,
-                        ctime_ns: inode.changes,
-                        mode: S_IFREG | 0o644,
-                    };
-                    found.insert(name.clone(), stamp);
+                    found.insert(name.clone(), self.file_stamp(*ino));
                 }
                 Some((first, _)) => {
                     let inner = format!("{under}{first}");
@@ -594,6 +600,36 @@ impl Files {
                     Done::Cloned
                 }
             },
+            // A copy of the source's data into a new inode: every file system makes one, so
+            // there is no refusal for the volume. Like a clone, a crash that keeps the new
+            // entry keeps it whole (the copy is synced before the store renames it).
+            Effect::CopyData { from, to, .. } => match self.ino(from) {
+                None => missing(from),
+                Some(_) if self.live.contains_key(to.as_str()) => {
+                    Done::Failed(IoError(format!("{to}: already there")))
+                }
+                Some(ino) => {
+                    let bytes = self.inodes[ino].live.clone(); // clone: the new inode's own bytes
+                    let len = bytes.len() as u64;
+                    let copy =
+                        self.inode(Inode { live: bytes.clone(), durable: bytes, ..Inode::default() }); // clone: live and durable start equal
+                    self.link(to.as_str(), copy, asked);
+                    Done::Copied { bytes: len }
+                }
+            },
+            // Another name of the same inode: the model keys names to inodes, so the two share
+            // bytes as a hard link does. The store asks it for the second path of a program,
+            // which nothing writes in place.
+            Effect::Link { from, to, .. } => match self.ino(from) {
+                None => missing(from),
+                Some(_) if self.live.contains_key(to.as_str()) => {
+                    Done::Failed(IoError(format!("{to}: already there")))
+                }
+                Some(ino) => {
+                    self.link(to.as_str(), ino, asked);
+                    Done::Linked
+                }
+            },
             Effect::Remove { file, .. } => {
                 if self.live.contains_key(file.as_str()) {
                     self.unlink(file.as_str(), asked);
@@ -622,17 +658,15 @@ impl Files {
             | Effect::Prewarm { .. }
             | Effect::Seal { .. }
             | Effect::WriteBack { .. }
+            | Effect::Stamp { .. }
             | Effect::SyncDir { .. } => return None,
-            // File effects neither the store nor the kernel asks for (2026-11-12): links,
-            // modes, times, locks, stamps of a batch and directories of their own are not
-            // modelled.
+            // File effects neither the store nor the kernel asks for (2026-11-12): symbolic
+            // links, modes, times, locks and directories of their own are not modelled.
             Effect::ReadLink { .. }
             | Effect::Mode { .. }
             | Effect::Times { .. }
-            | Effect::Link { .. }
             | Effect::Lock { .. }
             | Effect::Unlock { .. }
-            | Effect::Stamp { .. }
             | Effect::MakeDir { .. }
             | Effect::RemoveDir { .. } => panic!(
                 "the crash model has no rule for {effect:?}: neither the store nor the kernel asked for it when the rules were written; add one to blaze-storemodel's fs.rs"
@@ -828,6 +862,18 @@ impl CrashFs {
                 }
             }
             Effect::Map { file, .. } => Done::Mapped(Mapping::copy(&files.contents(file))),
+            // One look at each name, as the store asks before it renames a placed file.
+            Effect::Stamp { files: names, .. } => Done::Stamped(
+                names
+                    .iter()
+                    .map(|name| {
+                        // alloc: a name of the batch as the model keys it.
+                        let name = FileName::new(name).expect("a Names entry is a name");
+                        files.ino(&name).map_or(Stamp::GONE, |ino| files.file_stamp(ino))
+                    })
+                    // alloc: the stamps, which the completion carries.
+                    .collect(),
+            ),
             // The model keeps no symbolic link: the two are one.
             Effect::Stat { file, .. } | Effect::Lstat { file, .. } => Done::Stat(files.stat(file)),
             Effect::List { dir, .. } => files.list(dir),

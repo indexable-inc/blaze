@@ -89,6 +89,16 @@ pub(crate) struct Shared {
     /// read stamps its pack with. `std`'s atomic under the model checker too: a hint, read
     /// and written with no ordering.
     tick: std::sync::atomic::AtomicU64,
+    /// The shared directories the store reads as layers ([`crate::Config::layers`]): what a
+    /// live layer ([`Shared::read_live`]) must be a writer of.
+    layers: Vec<FileName>,
+    /// The machine's layer's writer in this process, read live ([`Shared::read_live`]): a
+    /// read through a task's guard ([`crate::Reader`]) that misses every tier of this store
+    /// asks it next, so what the layer's writer was given (in its segments, its packs) is
+    /// found by this store's readers before the layer commits and this store looks again.
+    /// Nothing of it is written here: keys are content, so a key it holds that a listed tier
+    /// holds too is the same bytes.
+    live: OnceLock<Arc<Shared>>,
 }
 
 /// A read found the pool's pinned bytes at their bound through every wait for the store to
@@ -116,9 +126,11 @@ impl std::fmt::Display for AtBound {
 }
 
 impl Shared {
-    pub(crate) fn new(view: View, side: Option<Arc<Side>>) -> Shared {
+    pub(crate) fn new(view: View, side: Option<Arc<Side>>, layers: Vec<FileName>) -> Shared {
         Shared {
             side,
+            layers,
+            live: OnceLock::new(),
             bound: Lock::new("store.pool.pinned", ()),
             unpinned: Signal::new("store.pool.unpinned"),
             // alloc: empty, allocates nothing until a key is kept
@@ -135,6 +147,43 @@ impl Shared {
             // alloc: empty, allocates nothing until a whole file is written
             unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
         }
+    }
+
+    /// Makes `layer` (another store's, in this process: the machine's layer's writer) the
+    /// store this one reads live behind its own tiers ([`Shared::live`]). Refused, naming
+    /// both, when `layer`'s directory is in none of this store's layers, when it is this
+    /// store, and when another is read live already: one a store.
+    pub(crate) fn read_live(&self, layer: &Arc<Shared>) -> Result<(), String> {
+        let guard = blaze_reclaim::enter();
+        let held = Held::task(&guard);
+        let dir = &layer.view(held).tiers[0].dir;
+        let mine = &self.view(held).tiers[0].dir;
+        if ptr::eq(self, &**layer) || !self.layers.iter().any(|root| dir.is_under(root)) {
+            // alloc: the error of a layer the store does not read
+            return Err(format!(
+                "the store {mine} cannot read {dir} live: it reads as layers only {:?}, and a live layer is a writer of one of them",
+                self.layers.iter().map(FileName::as_str).collect::<Vec<_>>()
+            ));
+        }
+        // clone: the store holds its live layer for its life
+        let mut given = Some(layer.clone());
+        let live = self.live.get_or_init(|| given.take().expect("taken only here"));
+        match given {
+            None => Ok(()),
+            // The same layer again (the daemon as it opens its home, then its handle's
+            // install): one live layer still.
+            Some(_) if Arc::ptr_eq(live, layer) => Ok(()),
+            // alloc: the error of a second live layer
+            Some(_) => Err(format!(
+                "the store {mine} reads {} live already: one live layer a store",
+                live.view(held).tiers[0].dir
+            )),
+        }
+    }
+
+    /// The store read live behind this one's tiers, if any ([`Shared::read_live`]).
+    pub(crate) fn live(&self) -> Option<&Shared> {
+        self.live.get().map(|it| &**it)
     }
 
     /// `key` is kept by one more reader.
@@ -363,13 +412,26 @@ pub(crate) struct PackView {
     /// When a record of it was last read, in seconds on the store's clock: the pack's own
     /// word, which a read writes at most once a second ([`Look::was_read`]).
     pub(crate) used: Arc<std::sync::atomic::AtomicU64>,
+    /// The offsets of its records forgotten alone, in order ([`crate::forget`]).
+    pub(crate) forgotten: Arc<Vec<u64>>, // alloc: the store's pack's list, shared
 }
 
 impl TierView {
-    /// Whether `loc` is in a pack that was retired: its key finds nothing in this tier.
+    /// Whether `loc` is in a pack that was retired, or is a record forgotten alone
+    /// ([`crate::forget`]): its key finds nothing in this tier.
     #[inline]
     pub(crate) fn gone(&self, loc: Loc) -> bool {
-        self.packs.get(loc.pack as usize).is_some_and(|it| it.gone)
+        self.packs.get(loc.pack as usize).is_some_and(|it| {
+            it.gone || (!it.forgotten.is_empty() && it.forgotten.binary_search(&loc.offset).is_ok())
+        })
+    }
+
+    /// Whether a spot of a delta names a record that is gone ([`TierView::gone`]): its key
+    /// finds nothing in this tier, and an older record of the key the index holds is not
+    /// found in its place.
+    #[inline]
+    pub(crate) fn spot_gone(&self, place: Place) -> bool {
+        matches!(place, Place::Pack(loc) if self.gone(loc))
     }
 }
 
@@ -735,11 +797,29 @@ impl At<'_> {
 pub(crate) struct Look<'a> {
     pub(crate) shared: &'a Shared,
     pub(crate) held: Held<'a>,
+    /// The store read live behind `shared`'s tiers ([`Shared::live`]), asked by a read that
+    /// misses them all: only a look through a task's guard has one, since what another store
+    /// frees is held only by the process's epoch ([`Held::task`]), never by a borrow of this
+    /// store ([`Held::writer`]).
+    live: Option<&'a Shared>,
 }
 
 impl<'a> Look<'a> {
+    /// A look at `shared`'s tiers alone.
     pub(crate) fn new(shared: &'a Shared, held: Held<'a>) -> Look<'a> {
-        Look { shared, held }
+        Look { shared, held, live: None }
+    }
+
+    /// A look at `shared`'s tiers and, behind them, the store it reads live: a reader's,
+    /// in a task (`guard`).
+    pub(crate) fn reading(shared: &'a Shared, guard: &'a blaze_reclaim::Guard) -> Look<'a> {
+        Look { shared, held: Held::task(guard), live: shared.live() }
+    }
+
+    /// The look a read that missed every tier asks next: the live layer's own tiers, which
+    /// read no live layer of theirs.
+    fn behind(self) -> Option<Look<'a>> {
+        self.live.map(|live| Look::new(live, self.held))
     }
 
     pub(crate) fn view(self) -> &'a View {
@@ -748,9 +828,13 @@ impl<'a> Look<'a> {
 
     pub(crate) fn find(self, key: &Key) -> Option<Result<Found<'a>, Corrupt>> {
         let view = self.view();
-        for (at, tier) in view.tiers.iter().enumerate() {
+        'tiers: for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
                 if let Some((row, spot)) = table.get(self.held, key) {
+                    // A record forgotten alone: nothing of the key in this tier.
+                    if tier.spot_gone(spot.place) {
+                        continue 'tiers;
+                    }
                     return Some(Ok(Found {
                         view,
                         tier: at,
@@ -790,9 +874,13 @@ impl<'a> Look<'a> {
     /// taking one from an older tier behind it.
     pub(crate) fn kept(self, key: &Key) -> Option<(ContentId, Ticket)> {
         let view = self.view();
-        for (at, tier) in view.tiers.iter().enumerate() {
+        'tiers: for (at, tier) in view.tiers.iter().enumerate() {
             for table in std::iter::once(&tier.delta).chain(&tier.prev) {
                 if let Some((row, spot)) = table.get(self.held, key) {
+                    // A record forgotten alone keeps nothing: a put writes the value again.
+                    if tier.spot_gone(spot.place) {
+                        continue 'tiers;
+                    }
                     // A put of a value the store has is a use of it, as a read is: the
                     // collector keeps what a build was told is kept.
                     self.was_read(Found {
@@ -856,7 +944,9 @@ impl<'a> Look<'a> {
             let mut shadow = blaze_hash::HashSet::new_in(frame);
             for table in std::iter::once(&it.delta).chain(&it.prev) {
                 for (row, spot) in table.iter(self.held) {
-                    if shadow.insert(spot.key) {
+                    // A record forgotten alone shadows the index's older one of its key, and
+                    // is itself no row.
+                    if shadow.insert(spot.key) && !it.spot_gone(spot.place) {
                         each(
                             spot.key,
                             Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) },
@@ -1184,8 +1274,11 @@ impl<'a> Look<'a> {
                 Cow::Owned(whole)
             }
             Form::External => match found.place {
-                Place::Segment(_) => Cow::Borrowed(payload),
-                Place::Pack(_) => match self.external(found, &header.content) {
+                // A put's bytes ride in its segment until the commit writes its file.
+                Place::Segment(_) if header.stored > 0 => Cow::Borrowed(payload),
+                // A record moved to its placed file ([`crate::home`]) names the file from its
+                // segment on: the file was listed, mapped and published before the move.
+                Place::Segment(_) | Place::Pack(_) => match self.external(found, &header.content) {
                     Ok(bytes) => Cow::Borrowed(bytes),
                     Err(Some(file)) => {
                         return Err(Corrupt {
@@ -1284,7 +1377,9 @@ impl<'a> Look<'a> {
     }
 
     pub(crate) fn get(self, key: &Key) -> Result<Option<Entry<'a>>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.get(key));
+        };
         self.read(found?, key).map(Some)
     }
 
@@ -1301,7 +1396,9 @@ impl<'a> Look<'a> {
     /// [`Look::get`] reads it, and the part is of that. A part past the value's end is an
     /// error naming the key: never bytes of the record after it.
     pub(crate) fn part(self, key: &Key, at: u64, len: u64) -> Result<Option<&'a [u8]>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.part(key, at, len));
+        };
         let found = found?;
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
         let end = at.checked_add(len);
@@ -1351,7 +1448,15 @@ impl<'a> Look<'a> {
 
     /// [`Look::get`] and the directory the value is in: its own tier's, or a tier behind it.
     pub(crate) fn get_from(self, key: &Key) -> Result<Option<(Origin, Entry<'a>)>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            let Some(behind) = self.behind() else { return Ok(None) };
+            // The live layer's own records are behind this store's, under its directory.
+            return Ok(behind.get_from(key)?.map(|(origin, entry)| match origin {
+                // clone: the name of the directory a reader refuses a value of
+                Origin::Own => (Origin::Behind(behind.view().tiers[0].dir.clone()), entry),
+                origin => (origin, entry),
+            }));
+        };
         let found = found?;
         let origin = match found.tier {
             0 => Origin::Own,
@@ -1362,7 +1467,9 @@ impl<'a> Look<'a> {
     }
 
     pub(crate) fn get_in_place(self, key: &Key) -> Result<Option<(Heat, Entry<'a>)>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.get_in_place(key));
+        };
         let found = found?;
         if found.place.form() != Form::Warm {
             return self.read(found, key).map(|entry| Some((Heat::Hot, entry)));
@@ -1393,7 +1500,7 @@ impl<'a> Look<'a> {
                 true
             }
             Some(Err(_)) => true,
-            None => false,
+            None => self.behind().is_some_and(|behind| behind.has(key)),
         }
     }
 
@@ -1401,7 +1508,9 @@ impl<'a> Look<'a> {
     /// of its record in place when they are a whole raw record of a mapped pack or a file of
     /// its own at a 16-byte boundary, else one aligned copy of the value made whole.
     pub(crate) fn pinned(self, key: &Key) -> Result<Option<Pinned>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
+        let Some(found) = self.find(key) else {
+            return self.behind().map_or(Ok(None), |behind| behind.pinned(key));
+        };
         let found = found?;
         let entry = self.read(found, key)?;
         let bytes = match (self.pins_holding(found, &entry, key)?, self.mapping_holding(found, &entry)) {
@@ -1546,6 +1655,24 @@ impl Pinned {
             PinnedBytes::Mapped { file, .. } => file.as_ref(),
             PinnedBytes::Pool { .. } | PinnedBytes::Copied(_) => None,
         }
+    }
+}
+
+impl Pinned {
+    /// The pinned value as [`blaze_bytes::Bytes`] that keep the pin alive: a VFS file's text
+    /// paged in from the store ([`Kind::Text`]) is lent on as the file's bytes, with no copy.
+    pub fn into_bytes(self) -> blaze_bytes::Bytes {
+        let bytes: *const [u8] = &*self;
+        // dyn: `Bytes::held` takes its owner so; one call per text paged in
+        // alloc: the pin's owner cell, once per text paged in, freed with the last clone
+        let owner: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(self);
+        // SAFETY: `bytes` points into what `owner` holds: the pool's pages a `PinnedRun` pins
+        // (resident and never the sweep's to take or write while the pin lives), a range of a
+        // `Mapping` of a file the store replaces only by renaming another over it (kept mapped
+        // by the clone `owner` holds), or an `Arc<Aligned>` copy that `owner` keeps. Moving the
+        // `Pinned` into the `Arc` moves its handle, not those bytes, so the address holds for
+        // as long as `owner` lives, and none of them is written while it does.
+        unsafe { blaze_bytes::Bytes::held(bytes, owner) }
     }
 }
 

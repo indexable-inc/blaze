@@ -892,6 +892,9 @@ pub(crate) struct Parts {
     /// What the walks over the front end keep, which made `built`: where `built` goes back
     /// once the link is done with it ([`Drop`]).
     kept: Arc<blaze_codegen::driver::Kept<HirInstance, hir_ty_codegen::v2::HirStatic>>,
+    /// A launched build's start, made for its link ([`super::run::launch::prepare`]): taken
+    /// by the link, once. `None` for every other build, whose code is in `built`.
+    launch: Option<blaze_core::lock::Lock<Option<super::run::launch::Prepared>>>,
 }
 
 /// The `Built` goes back to the driver that made it, whatever became of its link
@@ -923,6 +926,7 @@ impl Parts {
             frontend,
             policy: &self.policy,
             image: self.image,
+            launch: self.launch.as_ref(),
             side: Default::default(),
             spans: Default::default(),
         }
@@ -937,6 +941,8 @@ pub(crate) struct Generated<'a> {
     pub(crate) policy: &'a Policy,
     /// Whether the link maps the dependency image ([`Parts::image`]).
     pub(crate) image: bool,
+    /// A launched build's start, for its link to take ([`Parts::launch`]).
+    pub(crate) launch: Option<&'a blaze_core::lock::Lock<Option<super::run::launch::Prepared>>>,
     /// The span tables the build's code names, as a change of those its last link was given
     /// ([`HirFrontend::link_inputs`]): read once, by the first link that needs them, and none
     /// for a library.
@@ -1045,6 +1051,17 @@ pub(crate) fn frontend_over<'db>(
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
+    HirFrontend::new(Databases::new(db), hash_source(db, paths, spellings, mounted), build_time)
+}
+
+/// How [`frontend_over`] names the files of `db` in what it hashes: what a launched run's
+/// span tables are read with too ([`super::run::launch`]).
+pub(crate) fn hash_source(
+    db: &base_db::Db,
+    paths: &Arc<std::collections::HashMap<base_db::FileId, String>>,
+    spellings: &Arc<blaze_lower::Spellings>,
+    mounted: &Arc<Mounted>,
+) -> HashSource {
     // A file of the view by the job's paths, as rustc names it: from the directory of the crate
     // root it is under as cargo passed the root, `..`s kept (`Spellings::name`); one with two
     // such names has none, and the code generator refuses what names it. One `include!` parses
@@ -1064,11 +1081,8 @@ pub(crate) fn frontend_over<'db>(
             }
         }
     };
-    HirFrontend::new(
-        Databases::new(db),
-        HashSource::Items(ItemHashes::new(Box::new(names))),
-        build_time,
-    )
+    // alloc: once a front end, its namer
+    HashSource::Items(ItemHashes::new(Box::new(names)))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
@@ -1183,6 +1197,46 @@ pub(crate) fn generate<'db>(
     // configuration (docs/v2/plan/design/incremental-walk.md): the walk takes each one the
     // database's memo still holds and describes only what an edit changed or newly reaches.
     let kept = frontend.kept();
+    // A launched run (`blaze run` of a host binary): only its start is made here, and each
+    // later first call is answered from its bind record or made by the front end
+    // (docs/v2/plan/design/launcher.md). Nothing is walked whole.
+    if policy.mode == BuildMode::Launched {
+        // The view the start reads: what the next build asks what changed since.
+        let view = blaze_codegen::backend::Frontend::view(&frontend);
+        let guard = blaze_cas::enter();
+        let store = Reading { store: &job.input.store, guard: &guard };
+        let build = Build::new(&backends, &frontend, &policy, &job.memo)
+            .owned_by(&u.target.name)
+            .keeping(&kept)
+            .recording(&job.input.store);
+        let start = match build.start(&asked, &roots.statics, "main", &store) {
+            Ok(start) => start,
+            Err(errors) => {
+                if let Some(put) = profile {
+                    unput_profile(job, put);
+                }
+                return Ok(Err(refused(reader, mounted.root(), errors)));
+            }
+        };
+        let (prepared, puts) = super::run::launch::prepare(
+            job,
+            unit,
+            reader,
+            mounted,
+            build_time,
+            (&frontend, &build, &policy),
+            view,
+            start,
+            &store,
+        )?;
+        // The start's records join the unit's puts as a walked build's do (`compile` moves
+        // `built.puts` into them).
+        let mut built = Built::default();
+        built.puts = puts;
+        built.puts.extend(profile);
+        let launch = Some(blaze_core::lock::Lock::new("serve.unit.codegen.launch", Some(prepared)));
+        return Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch }));
+    }
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
@@ -1232,7 +1286,7 @@ pub(crate) fn generate<'db>(
                 let _ = slot
                     .set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
             }
-            Ok(Ok(Parts { built, roots, policy, image, build_time, kept }))
+            Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch: None }))
         }
         Err(errors) => {
             if let Some(put) = profile {
@@ -2710,7 +2764,8 @@ fn relink(
     .entered();
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
-    let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
+    // A look at one is the build's own ([`crate::serve::work::JobInput::looks`]).
+    let mut files = blaze_usercode::inputs::Disk::new(Vec::new(), &job.input.looks);
     let mut read = Vec::with_capacity(located.len());
     // The `global_asm!` objects first, which are not read off the machine, then `located`.
     let mut native_ids = Vec::with_capacity(assembled.len() + located.len());

@@ -672,6 +672,7 @@ pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test 
         },
         args: request.args(),
         env,
+        at_once: 1,
         expect,
         known: BTreeMap::new(),
     };

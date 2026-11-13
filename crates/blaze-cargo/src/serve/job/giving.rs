@@ -10,8 +10,12 @@
 //! | allocator | what the last reading says the allocators keep freed | a purge on the purger's thread (`Plane::ask_purge`), then a reading marked purged |
 //! | pool | the pages the stores' pools hold (the `store` tag's committed bytes), unless their last sweeps freed nothing | asked of the pools' slicer (`blaze_graph::poolgive::Slices`): `Store::evict_pool` of one slice a turn ([`Jobs::sweep_pools`]), never the whole give in a turn |
 //! | caches | what codegen keeps between builds (`Steps::kept_caches`), listed only while no task that may walk a program runs (`Plane::walks_in_flight`) | `Steps::give_caches` |
+//! | caches ([`CHUNKS`]) | the warm chunks no owner holds (`blaze_mem::chunks::cached`) | `blaze_mem::chunks::trim` |
+//! | caches ([`NAMES`]) | the names the flight reader keeps of past generations (`blaze_profile::flight::names_held`) | `blaze_profile::flight::trim_names` |
+//! | caches ([`IMAGES`]), idle only | the kept link images no run maps (`Paths::weights`, less the live ones) | `Paths::evict_to(0)`, which never lets a live one go |
+//! | caches ([`TABLES`]), idle only | the process tables (`Steps::kept_tables`), listed only once no front end is kept or out, no image is kept and no task runs or walks | `Steps::give_tables` |
 //! | values | each kept front end's values kept by bytes (`KeptDb::values`); the front ends of the builds under way, all or nothing | a task on a worker ([`Jobs::give_values`]); `Writer::short` |
-//! | front end | each kept front end (`KeptDb::held`), the checkout built last the floor unless a build is under way (then that build's own front end is what the edit loop needs) | dropped: its checkout's next build lowers anew, and its `blaze why` says so |
+//! | front end | each kept front end (`KeptDb::held`), the checkout built last the floor unless a build is under way (then that build's own front end is what the edit loop needs) or the daemon is idle past its own wait ([`idle::front_after`]: 64 times its last remake, 30 s to 30 min; its values are kept with it until then) | dropped: its checkout's next build lowers anew, and its `blaze why` says so |
 //! | running tasks | the builds under way, while a thread task runs: what their front ends hold in MIR and inference | `Writer::stop_for_memory`: the readers stopped, each task gives way, the release applied, the tasks posted again whole |
 //!
 //! The limit the planner is told is the limit's give-back line, a sixteenth under it
@@ -36,10 +40,18 @@
 //! and what the machine's ledger last told it to hold for the other daemons' wants
 //! (`blaze_graph::ledger::Ledger::yielded`, `admission::yield_to`), while it has no build
 //! under way. While it has no job at all it says, every [`GIVES_EVERY`], what it could give
-//! back and keep its floor (`Plane::set_gives`), which the ledger records for the others. An
-//! idle daemon keeps its floor (the front end of the checkout built last) for [`COLD_AFTER`]
-//! of idleness; past that, told to yield, the floor goes too: the daemon stays up, small,
-//! and its next build lowers anew. No daemon exits for being idle.
+//! back and keep its floor (`Plane::set_gives`), which the ledger records for the others.
+//!
+//! The idle budget (decision D29). Once the daemon has had no job for [`idle::BUDGET_AFTER`]
+//! the planner is told [`idle::BUDGET`] as the limit, exactly (no give-back line under it),
+//! and everything goes in rung order: the caches, the link images no run maps, the front ends
+//! whole and last, the process tables once nothing that names an interned id is left. The
+//! front end of the checkout built last keeps its floor, values and all, for its own wait
+//! ([`idle::front_after`], 64 times its last remake within 30 s and 30 minutes): what an edit
+//! after the wait pays is that remake, and the wait shortens by itself as a reload from disk
+//! gets cheap. The daemon stays up,
+//! small, and its next build lowers anew; what it could not give is the `idle over bytes`
+//! counter ([`Jobs::idle_over`]). No daemon exits for being idle.
 //!
 //! Every give is a `memory give-back` span and event (what, whose, how much, why, what it
 //! costs to make again), which `blaze explain memory` reads. A front end let go keeps the
@@ -66,13 +78,38 @@ use blaze_protocol::events::NodeKind;
 
 use super::{Does, Jobs, KeptDb, Stage, Step, Steps, World, key_of};
 use crate::serve::{
+    idle,
     plane::{kinds, ns},
-    work::{Front as _, Writer as _},
+    work::{Front as _, Kept as _, Writer as _},
 };
 
 /// The owner of the one source that is every build under way's front end: no checkout's
 /// number.
 const RUNNING: u32 = u32::MAX;
+
+/// The owner of the kept link images no run maps (a [`Rung::Caches`] source, idle only).
+const IMAGES: u32 = u32::MAX - 1;
+
+/// The owner of blaze-mem's warm cached chunks (a [`Rung::Caches`] source).
+const CHUNKS: u32 = u32::MAX - 2;
+
+/// The owner of the names the flight reader keeps (a [`Rung::Caches`] source).
+const NAMES: u32 = u32::MAX - 3;
+
+/// The owner of the process tables every front end's ids index, the type interner's and the
+/// trait solver's (a [`Rung::Caches`] source, idle only, and only once nothing names an id).
+const TABLES: u32 = u32::MAX - 4;
+
+/// What a [`Rung::Caches`] give of `owner` is named by, in its span and `blaze explain memory`.
+const fn cache_name(owner: u32) -> &'static str {
+    match owner {
+        IMAGES => "kept link images",
+        CHUNKS => "chunks",
+        NAMES => "flight names",
+        TABLES => "process tables",
+        _ => "codegen's kept walks",
+    }
+}
 
 /// How often, at most, the sources are listed again after a plan that had nothing to give: a
 /// listing weighs every kept front end's values.
@@ -87,11 +124,6 @@ const RUNNING_EVERY: Duration = Duration::from_secs(1);
 /// (`Plane::set_gives`): a listing weighs every kept front end's values.
 const GIVES_EVERY: Duration = Duration::from_secs(5);
 
-/// How long a daemon has had no job before its floor may go for another daemon's want: 30
-/// minutes. Under it the front end of the checkout built last is kept whatever the others
-/// want (the edit loop's next build is seconds); past it the daemon is not in an edit loop.
-const COLD_AFTER: Duration = Duration::from_secs(30 * 60);
-
 /// The most slices a give of values is swept in ([`give_in_slices`]): a build that asks for
 /// the front end meanwhile waits for one slice's end at most, an eighth of the give.
 pub(super) const SLICES: u64 = 8;
@@ -103,6 +135,9 @@ const SLICE_MIN: u64 = 256 << 20;
 #[derive(Clone, Copy, Debug)]
 struct Memory {
     limit: u64,
+    /// Whether the planner is told `limit` itself, not its give-back line: the idle budget
+    /// ([`Memory::held_to`]), a number the daemon gives down to, not a ceiling it keeps under.
+    exact: bool,
     footprint: u64,
     /// What of the footprint the allocators keep freed, an estimate.
     kept: u64,
@@ -112,17 +147,58 @@ struct Memory {
 }
 
 impl Memory {
-    /// What the planner is told: the limit as its give-back line ([`Lines::give`]).
+    /// The same reading, held to the idle budget ([`idle::BUDGET`], exactly) when `idle`: the
+    /// daemon has had no job for [`idle::BUDGET_AFTER`].
+    fn held_to(self, idle: bool) -> Memory {
+        match idle {
+            true => Memory { limit: idle::BUDGET, exact: true, ..self },
+            false => self,
+        }
+    }
+
+    /// What the planner is told: the limit as its give-back line ([`Lines::give`]), or the
+    /// limit itself when it is exact.
     fn now(&self, at: Duration) -> Now {
         Now {
             at_ns: ns(at),
-            limit: Lines::of(self.limit).give(),
+            limit: if self.exact { self.limit } else { Lines::of(self.limit).give() },
             footprint: self.footprint,
             ask: self.ask,
             reading: self.readings,
             purged: self.purged,
         }
     }
+}
+
+/// What the process-wide caches hold ([`Jobs::process_held`]), in bytes.
+#[derive(Clone, Copy, Debug)]
+struct Process {
+    /// blaze-mem's warm cached chunks ([`CHUNKS`]).
+    chunks: u64,
+    /// The flight reader's names ([`NAMES`]).
+    names: u64,
+    /// The process tables ([`TABLES`]).
+    tables: u64,
+}
+
+/// Where the pages of a checkout's members are, of the front end it keeps now
+/// ([`Jobs::store_members`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum Members {
+    /// Not written by this front end: its build's end stored the sealed crates alone.
+    #[default]
+    Unwritten,
+    /// Its second store is under way, the front end out with it.
+    Writing,
+    /// Written, the front end back; durable once nothing is left to settle under
+    /// [`members_job`].
+    Written,
+}
+
+/// What the store of checkout `root`'s members is named by among what is left to settle
+/// (`Settling`): it is no job's, and no job has this slot, so nothing else is under it.
+fn members_job(root: u32) -> blaze_api::build::JobId {
+    blaze_api::build::JobId { slot: u32::MAX, generation: root }
 }
 
 /// What the give-back rule knows of one checkout.
@@ -133,6 +209,11 @@ struct Root {
     /// What its front end took to make from nothing, lowering to kept, the last time; 0 until
     /// one was.
     cost_ns: u64,
+    /// Whether `cost_ns` was measured: a front end never made from nothing in this daemon
+    /// waits the longest before it loses its floor ([`idle::FRONT_MOST`]).
+    measured: bool,
+    /// Whether its kept front end's members are in the store ([`Jobs::store_members`]).
+    members: Members,
 }
 
 /// A kept front end's values being given on a worker ([`Jobs::give_values`]).
@@ -179,6 +260,11 @@ pub(super) struct Giving<S: Steps> {
     /// Since when the daemon has had no job, and when it last said what it could give.
     idle_since: Option<Duration>,
     gives_at: Option<Duration>,
+    /// What the footprint was past [`idle::BUDGET`] at the last plan of an idle daemon that
+    /// found nothing more it could give; 0 otherwise ([`Jobs::idle_over`]).
+    idle_over: u64,
+    /// What is left past the budget was said, in this idle stretch.
+    idle_said: bool,
 }
 
 impl<S: Steps> Giving<S> {
@@ -198,7 +284,26 @@ impl<S: Steps> Giving<S> {
             building_since: None,
             idle_since: None,
             gives_at: None,
+            idle_over: 0,
+            idle_said: false,
         }
+    }
+
+    /// Whether the daemon has had no job for [`idle::BUDGET_AFTER`] at `now`, as the loop's
+    /// last turn saw it: held to [`idle::BUDGET`].
+    fn idle_at(&self, now: Duration) -> bool {
+        self.idle_since.is_some_and(|since| now.saturating_sub(since) >= budget_after())
+    }
+
+    /// Whether checkout `owner`'s kept front end is past its own wait at `now`, the daemon
+    /// idle that long ([`idle::front_after`] of its last remake): no floor then.
+    fn front_waited(&self, owner: u32, now: Duration) -> bool {
+        let Some(since) = self.idle_since else { return false };
+        let remake = match self.roots.get(owner as usize) {
+            Some(root) if root.measured => Some(Duration::from_nanos(root.cost_ns)),
+            _ => None,
+        };
+        now.saturating_sub(since) >= front_wait(remake)
     }
 
     fn root(&mut self, root: u32) -> &mut Root {
@@ -212,17 +317,28 @@ impl<S: Steps> Giving<S> {
     /// A job of checkout `root` lowers at `now`, into its kept front end (`kept`) or from
     /// nothing: the time a front end made from nothing takes is what giving it back costs.
     pub(super) fn lowers(&mut self, root: u32, kept: bool, now: Duration) {
-        self.root(root).began = (!kept).then_some(now);
+        let it = self.root(root);
+        it.began = (!kept).then_some(now);
+        // The build writes into the front end: its members' pages are of the next build's end.
+        it.members = Members::Unwritten;
     }
 
     /// Checkout `root`'s front end is kept again at `now`: it is the floor, and one made from
     /// nothing is held for a time that grows with what it took
     /// (`blaze_graph::giveback::hold_ns`).
     pub(super) fn kept(&mut self, root: u32, now: Duration) {
+        // The store of its members, back: no build kept it, so it is not the floor for that.
+        if self.root(root).members == Members::Writing {
+            self.root(root).members = Members::Written;
+            return;
+        }
         self.last_built = Some(root);
         if let Some(began) = self.root(root).began.take() {
             let cost_ns = ns(now.saturating_sub(began));
-            self.root(root).cost_ns = cost_ns;
+            // A test says what the remake took: the simulation's lowering takes no time.
+            #[cfg(test)]
+            let cost_ns = sim::REMAKE.get().map_or(cost_ns, ns);
+            *self.root(root) = Root { began: None, cost_ns, measured: true, members: Members::Unwritten };
             self.planner.remade(Rung::FrontEnd, root, ns(now), cost_ns);
         }
     }
@@ -286,6 +402,41 @@ pub(super) fn give_in_slices<K: KeptDb>(front: &mut K, bytes: u64, wanted: &Atom
     gave
 }
 
+/// How long the daemon has no job before it is held to the idle budget:
+/// [`idle::BUDGET_AFTER`], or none under the simulation's planted bug that sets the waits to
+/// zero ([`sim::Plant::NoWait`]).
+fn budget_after() -> Duration {
+    #[cfg(test)]
+    if sim::PLANT.get() == sim::Plant::NoWait {
+        return Duration::ZERO;
+    }
+    idle::BUDGET_AFTER
+}
+
+/// How long the daemon has no job before a kept front end whose last remake took `remake`
+/// (`None`: never measured, the longest wait) is no floor: [`idle::front_after`]. Under the
+/// simulation's planted bugs, none ([`sim::Plant::NoWait`]) or the one constant wait this
+/// replaced ([`sim::Plant::ConstantWait`]).
+fn front_wait(remake: Option<Duration>) -> Duration {
+    #[cfg(test)]
+    match sim::PLANT.get() {
+        sim::Plant::NoWait => return Duration::ZERO,
+        sim::Plant::ConstantWait => return idle::BUDGET_AFTER,
+        _ => {}
+    }
+    remake.map_or(idle::FRONT_MOST, idle::front_after)
+}
+
+/// What the kept link images of `paths` weigh less the live ones (a run maps them, and its
+/// patches go into that memory): what `Paths::evict_to(0)` gives.
+fn unmapped_images<S: Steps>(paths: &super::Paths<S>) -> u64 {
+    let live: u64 = (paths.images.iter().enumerate())
+        .filter(|(_, it)| it.as_ref().is_some_and(|it| it.kept.live()))
+        .map(|(id, _)| paths.weights.row(id as u32, true).bytes)
+        .sum();
+    paths.weights.held().saturating_sub(live)
+}
+
 /// The last component of a checkout's path: the project, as a user names it.
 fn project(checkout: &str) -> &str {
     checkout.trim_end_matches('/').rsplit('/').next().filter(|it| !it.is_empty()).unwrap_or(checkout)
@@ -303,13 +454,22 @@ impl<S: Steps> Jobs<S> {
         self.giving.out.len()
     }
 
+    /// What the footprint is past [`idle::BUDGET`] while the daemon is idle past
+    /// [`idle::BUDGET_AFTER`] and the planner's last plan found nothing more to give (the
+    /// floor-less front ends held by their remake, live link images, or what no source
+    /// names); 0 otherwise. The daemon's `idle over bytes` counter: 0 is the budget held.
+    pub fn idle_over(&self) -> u64 {
+        self.giving.idle_over
+    }
+
     /// What the driver decides on this turn: the limit the daemon is held to, the plane's last
-    /// footprint reading, and `ask`. Under the daemon's simulation a test says them
+    /// footprint reading, and `ask`; with `idle`, the limit is the idle budget
+    /// ([`Memory::held_to`]). Under the daemon's simulation a test says them
     /// ([`sim::TOLD`]): the process's own footprint is no part of a simulated daemon.
-    fn memory(&self, w: &World<'_, S>, ask: u64, building: bool) -> Memory {
+    fn memory(&self, w: &World<'_, S>, ask: u64, building: bool, idle: bool) -> Memory {
         #[cfg(test)]
         if let Some(memory) = sim::memory() {
-            return memory;
+            return memory.held_to(idle);
         }
         let reading = w.plane.reading();
         let limit = blaze_graph::admission::limit();
@@ -320,12 +480,14 @@ impl<S: Steps> Jobs<S> {
                 true => limit,
                 false => limit.min(blaze_graph::admission::yield_to()),
             },
+            exact: false,
             footprint: reading.footprint,
             kept: reading.kept,
             readings: reading.readings,
             purged: reading.purged,
             ask,
         }
+        .held_to(idle)
     }
 
     /// One turn of giving back: one step of the give-back rule ([`Jobs::plan_gives`]), then at
@@ -403,17 +565,20 @@ impl<S: Steps> Jobs<S> {
             (false, Some(_)) => self.giving.building_since = None,
             _ => {}
         }
-        let memory = self.memory(w, ask, building);
-        // A daemon with no job at all: since when, whether its floor is still kept, and what
-        // it could give back, said for the machine's ledger every `GIVES_EVERY`.
-        let idle = !building && self.order.is_empty();
-        match (idle, self.giving.idle_since) {
+        // A daemon with no job at all: since when, whether it is held to the idle budget yet,
+        // and what it could give back, said for the machine's ledger every `GIVES_EVERY`.
+        let jobless = !building && self.order.is_empty();
+        match (jobless, self.giving.idle_since) {
             (true, None) => self.giving.idle_since = Some(w.now),
             (false, Some(_)) => self.giving.idle_since = None,
             _ => {}
         }
-        let cold = self.giving.idle_since.is_some_and(|since| w.now.saturating_sub(since) >= COLD_AFTER);
+        let idle = jobless && self.giving.idle_at(w.now);
         if !idle {
+            (self.giving.idle_over, self.giving.idle_said) = (0, false);
+        }
+        let memory = self.memory(w, ask, building, idle);
+        if !jobless {
             if self.giving.gives_at.take().is_some() {
                 w.plane.set_gives(0);
             }
@@ -421,7 +586,9 @@ impl<S: Steps> Jobs<S> {
             self.giving.gives_at = Some(w.now);
             let mut sources = std::mem::take(&mut self.giving.sources);
             sources.clear();
-            self.give_sources(w, memory.kept, false, cold, &mut sources);
+            self.give_sources(w, memory.kept, false, idle, &mut sources);
+            #[cfg(test)]
+            sim::listed(&sources);
             let gives = sources
                 .iter()
                 .filter(|it| !(it.rung == Rung::FrontEnd && it.floor))
@@ -456,6 +623,7 @@ impl<S: Steps> Jobs<S> {
             if outcome == Outcome::Enough {
                 self.giving.floor_said = false;
                 self.giving.idle_until = None;
+                self.giving.idle_over = 0;
                 // And the pools owe the ladder nothing more.
                 self.giving.pool.enough();
                 // No task under way is asked to give way any more.
@@ -480,8 +648,36 @@ impl<S: Steps> Jobs<S> {
         .entered();
         let mut sources = std::mem::take(&mut self.giving.sources);
         sources.clear();
-        self.give_sources(w, memory.kept, building, cold, &mut sources);
+        self.give_sources(w, memory.kept, building, idle, &mut sources);
+        #[cfg(test)]
+        sim::listed(&sources);
         let outcome = self.giving.planner.step(&now, &sources, &mut gives);
+        // Idle with nothing more to give and still past the budget: by how much, and once a
+        // stretch, what is left by name (the sources the planner would not take).
+        let stuck = idle && matches!(outcome, Outcome::Waits { .. } | Outcome::FloorOver { .. });
+        let over = if stuck { now.footprint.saturating_sub(idle::BUDGET) } else { 0 };
+        if over != 0 && !std::mem::replace(&mut self.giving.idle_said, true) {
+            // alloc: once an idle stretch the budget is not reached, a line naming what is left
+            let left: Vec<String> = sources
+                .iter()
+                .filter(|it| it.gives != 0)
+                .map(|it| format!("{} of {}: {} bytes", it.rung.name(), self.source_name(it), it.gives))
+                .collect();
+            tracing::warn!(
+                target: "blaze",
+                over,
+                budget = idle::BUDGET,
+                footprint = now.footprint,
+                left = %left.join("; "),
+                "memory give-back: the idle daemon is past its budget and nothing more is given now"
+            );
+        }
+        self.giving.idle_over = over;
+        // When nothing more is given: planned again after `PLAN_EVERY`, or, idle, after the
+        // budget's wait. An idle daemon past its budget with nothing it may give (a floor
+        // inside its wait, a live image, what no source names) would otherwise list and purge
+        // four times a second for as long as it stays so.
+        let replan = if idle { budget_after().max(PLAN_EVERY) } else { PLAN_EVERY };
         match outcome {
             Outcome::Gave { rung } => {
                 span.record("outcome", rung.name());
@@ -492,7 +688,7 @@ impl<S: Steps> Jobs<S> {
             }
             Outcome::Waits { need } => {
                 span.record("outcome", "waits");
-                self.giving.idle_until = Some(w.now + PLAN_EVERY);
+                self.giving.idle_until = Some(w.now + replan);
                 tracing::debug!(
                     target: "blaze",
                     need,
@@ -501,7 +697,7 @@ impl<S: Steps> Jobs<S> {
             }
             Outcome::FloorOver { over, limit, footprint, owner, kept } => {
                 span.record("outcome", "the floor does not fit");
-                self.giving.idle_until = Some(w.now + PLAN_EVERY);
+                self.giving.idle_until = Some(w.now + replan);
                 // Said only of the daemon's own limit: one that keeps its floor against
                 // another daemon's want is within its limit, and says nothing.
                 let yielding = memory.limit < blaze_graph::admission::limit();
@@ -538,16 +734,20 @@ impl<S: Steps> Jobs<S> {
         self.giving.gives = gives;
     }
 
-    /// What every owner can give now (the module's table), added to `sources`.
+    /// What every owner can give now (the module's table), added to `sources`; `idle` whether
+    /// the daemon is held to the idle budget ([`idle::BUDGET_AFTER`]): the kept link images
+    /// and the process tables are sources too, and a front end past its own wait
+    /// ([`idle::front_after`]) is no floor.
     fn give_sources(
         &mut self,
         w: &World<'_, S>,
         allocator_kept: u64,
         building: bool,
-        cold: bool,
+        idle: bool,
         sources: &mut Vec<Source>,
     ) {
         let one = |rung, gives, grain| Source { rung, owner: 0, gives, grain, remake_ns: 0, floor: false };
+        let cache = |owner, gives| Source { rung: Rung::Caches, owner, gives, grain: gives, remake_ns: 0, floor: false };
         if allocator_kept != 0 {
             // alloc: none past the most sources, the scratch kept (every push below)
             sources.push(one(Rung::Allocator, allocator_kept, allocator_kept));
@@ -565,17 +765,56 @@ impl<S: Steps> Jobs<S> {
                 sources.push(one(Rung::Caches, caches, caches));
             }
         }
+        // The process's own caches: blaze-mem's warm chunks and the flight reader's names,
+        // made again as they are next used.
+        let process = self.process_held(w);
+        if process.chunks != 0 {
+            sources.push(cache(CHUNKS, process.chunks));
+        }
+        if process.names != 0 {
+            sources.push(cache(NAMES, process.names));
+        }
+        if idle {
+            // The kept link images no run maps: the next link of each lays it out whole, so
+            // only an idle daemon lets them go, past the budget's own rule
+            // (`Paths::evict_to`, which never lets a live one go).
+            let images = unmapped_images(&self.paths);
+            if images != 0 {
+                sources.push(cache(IMAGES, images));
+            }
+            // The process tables, last: only once nothing that names an interned id is
+            // left, no front end kept or out (stored, swept or under way), no link image
+            // kept, and no task running or walking. Freed under any of those, an id read
+            // after would name another value.
+            let nothing_names_an_id = self.roots.fronts.iter().all(Option::is_none)
+                && self.roots.storing.iter().all(|&it| it == 0)
+                && self.giving.out.is_empty()
+                && self.paths.kept == 0
+                && w.plane.walks_in_flight() == 0
+                && w.plane.running() == 0;
+            #[cfg(test)]
+            let nothing_names_an_id = nothing_names_an_id || sim::PLANT.get() == sim::Plant::TablesAlways;
+            if nothing_names_an_id && process.tables != 0 {
+                sources.push(cache(TABLES, process.tables));
+            }
+        }
         // The floor is what the edit loop needs next: the front end of the checkout built
         // last, unless a build is under way, whose own front end (out with it) is that.
-        // Nor is there a floor in a daemon idle past `COLD_AFTER`: it is in no edit loop.
-        let floor = self.giving.last_built.filter(|_| !building && !cold);
+        // Nor is it a floor in a daemon idle past that front end's own wait
+        // (`idle::front_after`): it is in no edit loop, and is held to the idle budget.
+        let waited = |owner: u32| idle && self.giving.front_waited(owner, w.now);
+        #[cfg(test)]
+        let waited = |owner: u32| waited(owner) && sim::PLANT.get() != sim::Plant::IdleKeepsFloor;
+        let floor = self.giving.last_built.filter(|&owner| !building && !waited(owner));
         for (at, front) in self.roots.fronts.iter_mut().enumerate() {
             let Some(front) = front else { continue };
             let owner = at as u32;
             let cost_ns = self.giving.roots.get(at).map_or(0, |it| it.cost_ns);
             let held = front.held();
             let values = front.values();
-            if values != 0 {
+            // Idle and still the floor: its values are the edit loop's too, kept with it
+            // until its wait has passed (under the budget's limit they would go at once).
+            if values != 0 && !(idle && floor == Some(owner)) {
                 // What the values cost to make again is not summed from their queries' spans
                 // yet: their part of the front end's own cost, by bytes, which is more than
                 // they cost (a value is made again from its memo's inputs, kept).
@@ -728,6 +967,7 @@ impl<S: Steps> Jobs<S> {
         let checkout = match give.rung {
             Rung::Values | Rung::FrontEnd if give.owner != RUNNING => self.checkout_of(give.owner).to_owned(), // alloc: a give's name, once a give
             Rung::Values | Rung::Running => "the builds under way".to_owned(), // alloc: a give's name, once a give
+            Rung::Caches => cache_name(give.owner).to_owned(), // alloc: a give's name, once a give
             _ => String::new(),                                // alloc: none, empty
         };
         #[cfg(test)]
@@ -786,7 +1026,7 @@ impl<S: Steps> Jobs<S> {
                 Asked::Wanted => None,
                 Asked::Dry { .. } => Some(0),
             },
-            Rung::Caches => Some(w.steps.give_caches()),
+            Rung::Caches => Some(self.give_cache(w, give.owner)),
             Rung::Values => {
                 self.giving.running_asked = Some(w.now);
                 for &id in &self.order {
@@ -797,7 +1037,35 @@ impl<S: Steps> Jobs<S> {
                 }
                 None
             }
-            Rung::FrontEnd => self.give_front_end(give, &checkout),
+            Rung::FrontEnd => {
+                // Let go for idleness: only once its members' pages are durable, so the next
+                // process, or the next build of this one, reads them from the store. Until
+                // then the give writes them and gives nothing this turn.
+                let idle = !self.building() && self.order.is_empty() && self.giving.idle_at(w.now);
+                let members = self.giving.roots.get(give.owner as usize).map_or(Members::Unwritten, |it| it.members);
+                #[cfg(test)]
+                let members = match sim::PLANT.get() {
+                    sim::Plant::DropsUnwritten => Members::Written,
+                    _ => members,
+                };
+                let durable = !self.settling.iter().any(|it| it.job == members_job(give.owner));
+                match (idle, members) {
+                    (true, Members::Unwritten) => {
+                        self.store_members(w, give.owner);
+                        None
+                    }
+                    (true, Members::Writing) => None,
+                    (true, Members::Written) if !durable => None,
+                    (false, Members::Unwritten | Members::Writing) => {
+                        crate::serve::said::logged!(WARN,
+                            "blaze serve: the kept front end of {checkout} is let go for memory before its workspace members' pages \
+                             were written: the next build, or the next daemon, resolves its members from their sources"
+                        );
+                        self.give_front_end(give, &checkout)
+                    }
+                    _ => self.give_front_end(give, &checkout),
+                }
+            }
             Rung::Running => {
                 for &id in &self.order {
                     let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
@@ -838,6 +1106,84 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         w.plane.ask_purge();
+    }
+
+    /// What the process-wide caches hold now: blaze-mem's warm chunks, the flight reader's
+    /// names and the process tables. Under the daemon's simulation the model's
+    /// ([`sim::Told`]): the test process's own are no part of a simulated daemon.
+    fn process_held(&self, w: &World<'_, S>) -> Process {
+        #[cfg(test)]
+        if let Some(told) = sim::TOLD.get() {
+            return Process { chunks: told.chunks, names: told.names, tables: told.tables };
+        }
+        Process {
+            chunks: blaze_mem::chunks::cached().warm,
+            names: blaze_profile::flight::names_held(),
+            tables: w.steps.kept_tables(),
+        }
+    }
+
+    /// Who holds `source`, as a line names it.
+    fn source_name(&self, source: &Source) -> &str {
+        match source.rung {
+            Rung::Caches => cache_name(source.owner),
+            Rung::Values | Rung::FrontEnd if source.owner != RUNNING => self.checkout_of(source.owner),
+            Rung::Values | Rung::Running => "the builds under way",
+            Rung::Allocator | Rung::Pool | Rung::FrontEnd => "the process",
+        }
+    }
+
+    /// A [`Rung::Caches`] give of `owner`, under a span named for it with the bytes before and
+    /// after: what went.
+    fn give_cache(&mut self, w: &mut World<'_, S>, owner: u32) -> u64 {
+        #[cfg(test)]
+        if sim::TOLD.get().is_some() && matches!(owner, CHUNKS | NAMES | TABLES) {
+            let fronts = self.roots.fronts.iter().flatten().count();
+            return sim::gave_cache(owner, fronts);
+        }
+        // The give's own span (`memory give-back`) names the rung and the owner; this one is
+        // named for the owner, with what it held before and after.
+        let span = match owner {
+            IMAGES => tracing::info_span!(target: "blaze", "kept link images", before = tracing::field::Empty, after = tracing::field::Empty),
+            CHUNKS => tracing::info_span!(target: "blaze", "chunks", before = tracing::field::Empty, after = tracing::field::Empty),
+            NAMES => tracing::info_span!(target: "blaze", "flight names", before = tracing::field::Empty, after = tracing::field::Empty),
+            TABLES => tracing::info_span!(target: "blaze", "process tables", before = tracing::field::Empty, after = tracing::field::Empty),
+            _ => tracing::info_span!(target: "blaze", "codegen's kept walks", before = tracing::field::Empty, after = tracing::field::Empty),
+        };
+        let _entered = span.enter();
+        let (before, after) = match owner {
+            IMAGES => {
+                let before = self.paths.weights.held();
+                self.paths.evict_to(0);
+                (before, self.paths.weights.held())
+            }
+            CHUNKS => {
+                let before = blaze_mem::chunks::cached().warm;
+                let chunks = blaze_mem::chunks::trim();
+                tracing::debug!(target: "blaze", chunks, "warm chunks trimmed");
+                (before, blaze_mem::chunks::cached().warm)
+            }
+            NAMES => {
+                let before = blaze_profile::flight::names_held();
+                let trimmed = blaze_profile::flight::trim_names();
+                tracing::debug!(target: "blaze", trimmed, "flight names trimmed");
+                (before, blaze_profile::flight::names_held())
+            }
+            TABLES => {
+                let before = w.steps.kept_tables();
+                let gave = w.steps.give_tables();
+                tracing::debug!(target: "blaze", gave, "process tables released");
+                (before, w.steps.kept_tables())
+            }
+            _ => {
+                let before = w.steps.kept_caches();
+                let gave = w.steps.give_caches();
+                (before, before.saturating_sub(gave))
+            }
+        };
+        span.record("before", before);
+        span.record("after", after);
+        before.saturating_sub(after)
     }
 
     /// Checkout `root`'s kept front end gives about `bytes` of its values on a worker (the
@@ -935,7 +1281,9 @@ impl<S: Steps> Jobs<S> {
                 self.roots.lost[root as usize] = Some(line);
             }
         }
-        let now = self.memory(w, 0, self.building()).now(w.now);
+        let building = self.building();
+        let idle = !building && self.order.is_empty() && self.giving.idle_at(w.now);
+        let now = self.memory(w, 0, building, idle).now(w.now);
         self.giving.planner.done(&now);
         self.lower_waiting(w, root);
     }
@@ -948,6 +1296,115 @@ impl<S: Steps> Jobs<S> {
         let Some(out) = self.giving.out.iter().find(|it| it.node == node) else { return };
         let front = out.kept.lock().take();
         self.gave_values(w, node, front, 0);
+    }
+
+    /// Writes the pages of checkout `root`'s members, and of the crates above them, from its
+    /// kept front end: the front end's second store ([`Steps::store_kept`] on one its build's
+    /// end stored), by a task of an idle plane request of its own, as a build's end posts its
+    /// first ([`Jobs::store_kept`]). No job's: it settles as what an answered job left does
+    /// (`Settling`, named by [`members_job`]), its puts made by `stored_kept`, the front end
+    /// the checkout's again once they are, and what is left to settle gone once they are
+    /// durable; a lowering of the checkout meanwhile waits for it as for any store. Whether a
+    /// task was posted: none when the checkout keeps no front end now, or the plane refused
+    /// it (said; the front end is dropped with the task, as a refused store's is).
+    pub(super) fn store_members(&mut self, w: &mut World<'_, S>, root: u32) -> bool {
+        let Some(front) = self.roots.fronts.get_mut(root as usize).and_then(Option::take) else {
+            return false;
+        };
+        let checkout = self.checkout_of(root).to_owned(); // alloc: a store's name, once a store
+        let request = w.plane.open(w.now, false, true);
+        let name = super::named("storing the members of the kept front end of ", &checkout);
+        let fresh = super::lone_learned(
+            w.plane,
+            NodeKind::Store,
+            &name,
+            Pool::Work,
+            kinds::STORE_KEPT,
+            super::store_cost_key(&checkout),
+        );
+        let node = fresh.first();
+        let wanted = Arc::new(AtomicBool::new(false)); // alloc: once a store, shared with the task
+        let does = Does::StoreKept {
+            steps: Arc::clone(w.steps), // clone: a refcount, once a store
+            kept: Lock::new("serve.job.store_members.kept", Some(front)),
+            checkout: checkout.clone(), // clone: the task's span's name, once a store
+            build: 0,
+            logs: false,
+            wanted: Arc::clone(&wanted), // clone: a refcount, once a store
+            filing: None,
+        };
+        // The task is no job's: nothing cancels it but its own end.
+        let never = Arc::new(AtomicBool::new(false)); // alloc: once a store
+        let work = Step::of(&never, does);
+        let command = "store the workspace members' pages of a kept front end";
+        self.store_requests.insert(request);
+        let posted = match w.plane.add(w.now, request, fresh, Some(work), false) {
+            Ok(()) => {
+                self.roots.storing[root as usize] += 1;
+                self.root_members(root, Members::Writing);
+                // alloc: once a store
+                self.settling.push(super::Settling {
+                    job: members_job(root),
+                    command: command.to_owned(),
+                    checkout: Some(checkout.clone()), // clone: the checkout's path, once a store
+                    view: checkout.clone(), // clone: as above
+                    storing: Some(super::Storing {
+                        job: members_job(root),
+                        command: command.to_owned(),
+                        request,
+                        node,
+                        root,
+                        checkout,
+                        wanted,
+                        promoted: false,
+                        value: None,
+                    }),
+                    stored: blaze_cas::Tickets::default(),
+                    durable: blaze_cas::Tickets::default(),
+                    layer: blaze_cas::Tickets::default(),
+                    layer_since: None,
+                    layer_wait: None,
+                    placing: 0,
+                    placing_span: None,
+                    leases: None,
+                    since: None,
+                    wait: None,
+                });
+                true
+            }
+            Err(error) => {
+                crate::serve::said::logged!(WARN,
+                    "blaze serve: the plane refused the task storing the workspace members' pages of the kept front end of \
+                     {checkout}, so the front end is dropped with it and its next build lowers anew: {error}"
+                );
+                false
+            }
+        };
+        w.plane.close(w.now, request);
+        posted
+    }
+
+    /// Sets what the give-back rule knows of checkout `root`'s members.
+    fn root_members(&mut self, root: u32, members: Members) {
+        self.giving.root(root).members = members;
+    }
+
+    /// At a stop: the members of every kept front end not written yet are written
+    /// ([`Jobs::store_members`]), and the stop waits for them as for what answered builds left
+    /// to settle (`Daemon::stop`). How many stores were posted.
+    pub fn store_all_members(&mut self, w: &mut World<'_, S>) -> usize {
+        let mut posted = 0;
+        for at in 0..self.roots.fronts.len() {
+            let root = at as u32;
+            let members = self.giving.roots.get(at).map_or(Members::Unwritten, |it| it.members);
+            if self.roots.fronts[at].is_some()
+                && members == Members::Unwritten
+                && self.store_members(w, root)
+            {
+                posted += 1;
+            }
+        }
+        posted
     }
 
     /// Lets go of checkout `checkout`'s kept front end, whole: its next build lowers anew,
@@ -1032,14 +1489,34 @@ pub(crate) mod sim {
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,
+        time::Duration,
     };
 
-    use blaze_graph::giveback::Rung;
+    use blaze_graph::giveback::{Rung, Source};
 
-    use super::Memory;
+    use super::{CHUNKS, Memory, NAMES, TABLES};
+
+    /// The planted bugs of the idle budget's tests, each the control of one.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Plant {
+        #[default]
+        Nothing,
+        /// The floor ignores the idle wait: the front end built last is kept however long the
+        /// daemon is idle.
+        IdleKeepsFloor,
+        /// The process tables are listed whatever else is kept.
+        TablesAlways,
+        /// Every idle wait is zero: the budget holds the moment the daemon has no job.
+        NoWait,
+        /// A front end's wait is the one 30 s constant, whatever its remake costs.
+        ConstantWait,
+        /// An idle front end is let go at once, its members' pages unwritten
+        /// ([`super::Jobs::store_members`] skipped).
+        DropsUnwritten,
+    }
 
     /// The model's memory besides the kept front ends.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, Default)]
     pub(crate) struct Told {
         pub limit: u64,
         /// What the tasks and everything not listed below hold.
@@ -1050,6 +1527,11 @@ pub(crate) mod sim {
         pub stuck: u64,
         /// The task that waits to start, by its bytes; 0 for none.
         pub task: u64,
+        /// What the process-wide caches hold: warm chunks, the flight reader's names, the
+        /// process tables (`Jobs::process_held`); each a cache give of its owner returns.
+        pub chunks: u64,
+        pub names: u64,
+        pub tables: u64,
     }
 
     /// A kept front end of the model: what it holds that only dropping it frees, and its
@@ -1069,6 +1551,15 @@ pub(crate) mod sim {
         pub(crate) static GAVE: RefCell<Vec<(Rung, String, u64)>> = const { RefCell::new(Vec::new()) };
         /// The planted bug: the driver gives with no plan (every kept front end, for any wait).
         pub(crate) static PLANT_NO_PLAN: Cell<bool> = const { Cell::new(false) };
+        /// The idle budget's planted bug, while a test plants one.
+        pub(crate) static PLANT: Cell<Plant> = const { Cell::new(Plant::Nothing) };
+        /// What a front end's remake took, as the driver records it once kept; `None`: what the
+        /// simulation's clock measured.
+        pub(crate) static REMAKE: Cell<Option<Duration>> = const { Cell::new(None) };
+        /// The sources of the driver's last listing, as it listed them.
+        pub(crate) static LISTED: RefCell<Vec<Source>> = const { RefCell::new(Vec::new()) };
+        /// At each give of the process tables, how many front ends were kept.
+        pub(crate) static TABLES_GIVEN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
         /// The driver's turns under the model: each is a footprint reading, taken after any
         /// purge.
         static TURNS: Cell<u64> = const { Cell::new(0) };
@@ -1079,20 +1570,56 @@ pub(crate) mod sim {
         let told = TOLD.get()?;
         let turn = TURNS.get() + 1;
         TURNS.set(turn);
-        let fronts: u64 = FRONTS.with_borrow(|it| it.values().map(|it| it.core + it.values).sum());
-        let footprint = told.other + told.kept + told.stuck + fronts;
+        let footprint = footprint_of(&told);
         let ask = match told.task {
             0 => 0,
             task => (footprint + task).saturating_sub(told.limit).min(footprint),
         };
         Some(Memory {
             limit: told.limit,
+            exact: false,
             footprint,
             kept: told.kept + told.stuck,
             readings: turn,
             purged: turn,
             ask,
         })
+    }
+
+    /// The model's footprint: everything it holds.
+    fn footprint_of(told: &Told) -> u64 {
+        let fronts: u64 = FRONTS.with_borrow(|it| it.values().map(|it| it.core + it.values).sum());
+        told.other + told.kept + told.stuck + told.chunks + told.names + told.tables + fronts
+    }
+
+    /// The model's footprint now; 0 while no test says one.
+    pub(crate) fn footprint() -> u64 {
+        TOLD.get().map_or(0, |told| footprint_of(&told))
+    }
+
+    /// The driver listed `sources`.
+    pub(super) fn listed(sources: &[Source]) {
+        LISTED.with_borrow_mut(|it| {
+            it.clear();
+            it.extend_from_slice(sources); // alloc: a test's record
+        });
+    }
+
+    /// A cache give of `owner` with `fronts` front ends kept: what the model held of it goes,
+    /// and that much is what went.
+    pub(super) fn gave_cache(owner: u32, fronts: usize) -> u64 {
+        let Some(told) = TOLD.get() else { return 0 };
+        let (gave, told) = match owner {
+            CHUNKS => (told.chunks, Told { chunks: 0, ..told }),
+            NAMES => (told.names, Told { names: 0, ..told }),
+            TABLES => {
+                TABLES_GIVEN.with_borrow_mut(|it| it.push(fronts)); // alloc: a test's record
+                (told.tables, Told { tables: 0, ..told })
+            }
+            _ => (0, told),
+        };
+        TOLD.set(Some(told));
+        gave
     }
 
     /// A purge: what the model's allocators kept freed is returned.
@@ -1132,6 +1659,10 @@ pub(crate) mod sim {
         FRONTS.with_borrow_mut(BTreeMap::clear);
         GAVE.with_borrow_mut(Vec::clear);
         PLANT_NO_PLAN.set(false);
+        PLANT.set(Plant::Nothing);
+        REMAKE.set(None);
+        LISTED.with_borrow_mut(Vec::clear);
+        TABLES_GIVEN.with_borrow_mut(Vec::clear);
         TURNS.set(0);
     }
 }
@@ -1140,8 +1671,45 @@ pub(crate) mod sim {
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use super::{SLICE_MIN, SLICES, give_in_slices, project};
-    use crate::serve::work::KeptDb;
+    use super::{SLICE_MIN, SLICES, give_in_slices, project, unmapped_images};
+    use crate::serve::{
+        job::Paths,
+        tests::{Fake, FakeImage},
+        work::{Image, KeptDb},
+    };
+
+    /// Paths keeping three images, 60, 30 and 40 bytes, the second live as `live` says.
+    fn kept_images(live: bool) -> Paths<Fake> {
+        let image = |path: &str, held: u64, live: bool| Image::<Fake> { path: path.into(), kept: FakeImage { held, live } };
+        let mut paths = Paths::<Fake>::new(u64::MAX);
+        paths.keep_one(&[], image("/w/target/debug/a", 60, false), true);
+        paths.keep_one(&[], image("/w/target/debug/run", 30, live), true);
+        paths.keep_one(&[], image("/w/target/debug/c", 40, false), true);
+        paths
+    }
+
+    /// The invariant: the idle budget's give of the kept link images (`Paths::evict_to(0)`)
+    /// lets go of every image no run maps and never a live one, whose patches go into memory
+    /// the running program maps; what the source lists is exactly what goes.
+    #[test]
+    fn a_live_image_outlasts_the_idle_budget() {
+        let mut paths = kept_images(true);
+        assert_eq!(unmapped_images(&paths), 100, "the source lists the images no run maps");
+        paths.evict_to(0);
+        let run = paths.intern("/w/target/debug/run");
+        assert!(paths.images[run as usize].is_some(), "the live image outlasts the budget");
+        assert_eq!((paths.kept, paths.weights.held(), unmapped_images(&paths)), (1, 30, 0));
+    }
+
+    /// The control: the same images with `live` cleared all go, the one the run mapped too.
+    #[test]
+    fn the_oracle_catches_a_live_image_let_go() {
+        let mut paths = kept_images(false);
+        paths.evict_to(0);
+        let run = paths.intern("/w/target/debug/run");
+        assert!(paths.images[run as usize].is_none(), "the image the oracle keeps went, as it should here");
+        assert_eq!((paths.kept, paths.weights.held()), (0, 0));
+    }
 
     #[test]
     fn a_project_is_named_by_its_checkouts_last_component() {

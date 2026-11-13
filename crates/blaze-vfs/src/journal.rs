@@ -40,6 +40,14 @@
 //!   rewrite loads the image and the old file whole over it: every record of the old file is
 //!   of a node the image has or one the file makes, because an image is written only while no
 //!   node of the file's base was dropped since the file was last rewritten (`settled`).
+//! - **Stamps and marks**: a `SEEN` record follows the head record of each batch the watcher
+//!   committed, with the stamps it saved ([`crate::disk::encode_seen`]), and a `MARK` record
+//!   holds one local fact by name; a rewrite holds one `SEEN` per disk (its overlay over the
+//!   image it was opened from) and every mark, after the head records. A `SEEN` is after the
+//!   head it vouches for, so a prefix that has it has the head: a stamp never names bytes the
+//!   recovered head lacks. An image is written only while the file is quiet (everything
+//!   recorded is durable), so the column it holds vouches only for heads the file has. A file
+//!   of the layout before these records loads as it did: its stamps are the image's alone.
 
 use std::sync::Arc;
 
@@ -51,6 +59,7 @@ use std::alloc::Global;
 
 use crate::{
     FILE_DOMAIN, Mode, Recovered, Ticket,
+    disk::{Disks, Marks, encode_mark},
     image::Bytes,
     tree::{DIR_MODE, NodeId, Tree, check},
 };
@@ -69,6 +78,10 @@ const SEQUENCE: u8 = 5;
 /// The image the file starts from: the hash of its tree and its node count. Only first.
 const BASE: u8 = 6;
 const BASE_PAYLOAD: usize = 32 + 8;
+/// The stamps one watcher batch saved, or a disk's overlay in a rewrite: [`Disks::replay`].
+const SEEN: u8 = 7;
+/// One local fact by name, or its removal (empty bytes): [`Marks::replay`].
+const MARK: u8 = 8;
 
 /// Sequence numbers are below this: one more per head move from 0 never reaches it, so a
 /// record at or above it is forged, and the next number never overflows.
@@ -192,17 +205,38 @@ impl Journal {
     /// The journal whose file holds `bytes`, and the tree and heads it holds. A file that
     /// starts from an image loads only the records that name no node of it (none past the
     /// first that does), and is rewritten as what loaded.
-    pub(crate) fn recover(file: FileName, tags: u64, bytes: &[u8]) -> Loaded {
-        Journal::load(file, tags, bytes, None)
+    pub(crate) fn recover(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
+        Journal::load(file, tags, bytes, None, disks, marks)
     }
 
     /// The journal whose file holds `bytes`, loaded over `image`: the file's records after its
     /// base record, each node of the image found where it is.
-    pub(crate) fn restore(file: FileName, tags: u64, bytes: &[u8], image: FromImage) -> Loaded {
-        Journal::load(file, tags, bytes, Some(image))
+    /// `disks` is the image's column (or empty): the file's `SEEN` records apply over it.
+    pub(crate) fn restore(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        image: FromImage,
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
+        Journal::load(file, tags, bytes, Some(image), disks, marks)
     }
 
-    fn load(file: FileName, tags: u64, bytes: &[u8], image: Option<FromImage>) -> Loaded {
+    fn load(
+        file: FileName,
+        tags: u64,
+        bytes: &[u8],
+        image: Option<FromImage>,
+        disks: &mut Disks,
+        marks: &mut Marks,
+    ) -> Loaded {
         let mut found = Recovered::default();
         let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> =
             HashMap::new_in(Global);
@@ -222,13 +256,25 @@ impl Journal {
             lost_base = from.is_none();
         }
         while let Some(one) = record(&bytes[valid..]) {
-            if load(&mut tree, &one, &mut moves, &mut sequence).is_none() {
+            let loaded = match one.kind {
+                SEEN => disks.replay(one.payload).map(|()| found.seen += 1),
+                MARK => marks.replay(one.payload).map(|()| found.marks += 1),
+                _ => load(&mut tree, &one, &mut moves, &mut sequence),
+            };
+            if loaded.is_none() {
                 break;
             }
             found.records += 1;
             valid += one.len;
         }
         found.skipped = bytes.len() - valid;
+        if lost_base {
+            // The column holds only what changed since the image it lost: no disk holds all of
+            // its head, so each is looked at whole once (what it lacks is not seen, so read).
+            for disk in disks.by_head.values_mut() {
+                disk.root = None;
+            }
+        }
         let mut journal = Journal {
             file,
             tags,
@@ -313,7 +359,21 @@ impl Journal {
         self.ticket()
     }
 
-    fn ticket(&mut self) -> Ticket {
+    /// Records the stamps a watcher batch saved: `payload` is [`crate::disk::encode_seen`]'s,
+    /// made after the batch's head record, so it is after it in the file. It is made durable
+    /// with the records around it and given no ticket of its own.
+    pub(crate) fn record_seen(&mut self, payload: &[u8]) {
+        frame(&mut self.open.bytes, SEEN, |out| out.put_bytes(payload));
+    }
+
+    /// Records that `name`'s mark is `bytes` (empty: it has none); the ticket is in what
+    /// [`Journal::complete`] returns once that is durable.
+    pub(crate) fn record_mark(&mut self, name: &str, bytes: &[u8]) -> Ticket {
+        frame(&mut self.open.bytes, MARK, |out| encode_mark(out, name, bytes));
+        self.ticket()
+    }
+
+    pub(crate) fn ticket(&mut self) -> Ticket {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
         self.open.tickets.push(ticket);
@@ -332,9 +392,15 @@ impl Journal {
 
     /// Whether an image of the tree written now can become the file's base: no image is on
     /// its way to being one, and the file names only nodes the tree has or the file makes, so
-    /// it loads whole over that image if the rewrite naming it never happens.
+    /// it loads whole over that image if the rewrite naming it never happens. The file is quiet
+    /// too (everything recorded is durable, nothing in flight): the image's column then vouches
+    /// only for heads the file has, whether or not the rewrite naming the image happens.
     pub(crate) fn can_stage(&self) -> bool {
-        self.next.is_none() && self.switching.is_none() && self.settled
+        let quiet = matches!(self.flight, Flight::Idle)
+            && self.open.bytes.is_empty()
+            && self.open.tickets.is_empty()
+            && self.cut.is_none();
+        quiet && self.next.is_none() && self.switching.is_none() && self.settled
     }
 
     /// The image the file starts from, which an image written now records.
@@ -367,6 +433,8 @@ impl Journal {
         &mut self,
         tree: &Tree,
         heads: &HashMap<Box<str>, NodeId, Global>,
+        disks: &Disks,
+        marks: &Marks,
         effects: &mut Vec<Effect>,
     ) {
         if !matches!(self.flight, Flight::Idle) {
@@ -405,6 +473,25 @@ impl Journal {
             for name in &names {
                 let sequence = self.heads[&***name];
                 head_record(&mut bytes, sequence, Some(&tree.id(heads[*name])), name);
+            }
+            // After the heads they vouch for: each disk's overlay, heads in name order.
+            // alloc: once per rewrite, the disks by head and one record's payload, reused.
+            let mut watched: Vec<&Box<str>> = disks.by_head.keys().collect();
+            watched.sort_unstable();
+            let (mut seen, mut entries) = (Vec::new(), Vec::new());
+            for head in watched {
+                let disk = &disks.by_head[head];
+                let overlay = disk.overlay();
+                (seen.clear(), entries.clear());
+                for (name, stamp) in &overlay {
+                    crate::disk::put_entry(&mut entries, name, *stamp);
+                }
+                let count = u32::try_from(overlay.len()).expect("under 2^32 names");
+                crate::disk::encode_seen(&mut seen, head, disk, count, &entries);
+                frame(&mut bytes, SEEN, |out| out.put_bytes(&seen));
+            }
+            for (name, value) in marks.all() {
+                frame(&mut bytes, MARK, |out| encode_mark(out, name, value));
             }
             frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence));
             // What was recorded and not appended is in the rewrite: the heads as they are now.
@@ -445,6 +532,8 @@ impl Journal {
         &mut self,
         tree: &Tree,
         heads: &HashMap<Box<str>, NodeId, Global>,
+        disks: &Disks,
+        marks: &Marks,
         completion: Completion,
         effects: &mut Vec<Effect>,
     ) -> Vec<Ticket> {
@@ -497,7 +586,7 @@ impl Journal {
                 unreachable!("the journal has nothing in flight as tag +{offset} for {done:?}")
             }
         }
-        self.flush(tree, heads, effects);
+        self.flush(tree, heads, disks, marks, effects);
         durable
     }
 
@@ -521,6 +610,40 @@ impl Journal {
             self.rewrite_settles = false;
         }
         self.compact |= lost || (self.dirty && self.appended >= self.rewritten);
+    }
+
+    /// The node count of the image `name` when it is durable: the file starts from it, a
+    /// rewrite to it is in flight, or the next starts from it. Never of an image only staged,
+    /// whose file may not be whole.
+    pub(crate) fn durable_image(&self, name: &ContentId) -> Option<u64> {
+        let images = [&self.base, &self.switching, &self.next];
+        images.into_iter().flatten().find(|it| it.name == *name).map(|it| it.nodes)
+    }
+
+    /// Follows a settle onto the durable image `name` ([`crate::Vfs::settle`]): each node's
+    /// new number, and every node of the image (the tree's first ones, as many as the image
+    /// holds) in that image's set and in what the file has, so [`write_node`]'s claim holds:
+    /// no record reads the image's bytes. Where the image is the next one the file starts
+    /// from and not yet the file's base, the rewrite to it ([`Journal::durable`] asked for it)
+    /// comes before any append, so no record made now is appended to a file not starting
+    /// from it.
+    pub(crate) fn onto_image(
+        &mut self,
+        name: &ContentId,
+        renumbered: &[Option<NodeId>],
+        len: usize,
+    ) {
+        self.written = self::renumbered(&self.written, renumbered, len).0;
+        let all = [&mut self.base, &mut self.switching, &mut self.staged, &mut self.next];
+        for base in all.into_iter().flatten() {
+            base.of = self::renumbered(&base.of, renumbered, len).0;
+        }
+        let images = [&mut self.base, &mut self.switching, &mut self.next];
+        let image = images.into_iter().flatten().find(|it| it.name == *name);
+        let image = image.expect("a settle onto an image the journal holds durable");
+        let nodes = NodeId(u32::try_from(image.nodes).expect("an image of under 2^32 nodes"));
+        image.of.insert_range(NodeId(0)..nodes);
+        self.written.insert_range(NodeId(0)..nodes);
     }
 }
 
@@ -631,6 +754,9 @@ pub(crate) const KINDS: (u8, u8, u8, u8, u8) = (FILE, DIR, HEAD, REMOVE, SEQUENC
 
 #[cfg(test)]
 pub(crate) const BASE_KIND: u8 = BASE;
+
+#[cfg(test)]
+pub(crate) const STAMP_KINDS: (u8, u8) = (SEEN, MARK);
 
 /// The image a journal's file starts from, if its first record is a base record: the hash of
 /// the image's tree and its node count.

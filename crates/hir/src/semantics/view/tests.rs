@@ -478,6 +478,19 @@ fn main() {
 }
 "#;
 
+/// [`TWO_SELECTS`] with tokio's own split: `select!` hands its branches, one `_` each, to a
+/// proc macro that declares `enum Out<_0, _1>` and `Mask` with every token at the call site,
+/// as tokio-macros' `select_priv_declare_output_enum` does.
+const TWO_SELECTS_OF_A_PROC_MACRO: &str = r#"
+//- proc_macros: select_priv_declare_output_enum
+//- /main.rs crate:main
+pub use proc_macros::select_priv_declare_output_enum;
+macro_rules! select {
+    ($($count:tt)*) => {{ mod __tokio_select_util { $crate::select_priv_declare_output_enum!( ( $($count)* ) ); } }};
+}
+fn main() { let _first = select!(_ _); let _second = select!(_ _); }
+"#;
+
 /// The planted bug [`BLOCKS_OF_ANY_FILE`] for as long as this lives.
 struct BlocksOfAnyFile;
 
@@ -503,7 +516,24 @@ fn each_of_two_identical_expansions_in_a_body_maps_its_block_module_and_enum_to_
     // The shape of two `tokio::select!` of the same arms in one function (tempo's zone-node,
     // `role.rs`): each expands to a block declaring `mod __tokio_select_util`, whose enum
     // `Out<_0, _1> { _0(_0), _1(_1), Disabled }` a macro called in the module makes.
-    let fx = fixture::db(TWO_SELECTS);
+    two_expansions_map_to_their_own_defs(fixture::db(TWO_SELECTS));
+}
+
+/// The invariant: a node of a macro expansion maps to the def made from that node, never to
+/// the def of the node at the same range of another expansion. Two calls of one macro with the
+/// same tokens have expansions of the same text, so every node of one has a twin of the same
+/// kind and range in the other; only the file tells them apart. Here a proc macro declares the
+/// enum, every token at the call site, as tokio-macros does.
+#[test]
+fn each_of_two_identical_selects_maps_the_enum_its_proc_macro_declares_to_its_own_defs() {
+    two_expansions_map_to_their_own_defs(fixture::db(TWO_SELECTS_OF_A_PROC_MACRO));
+}
+
+/// The checks of the two tests above on `fx`, a fixture of two `select!` of the same tokens in
+/// one body, each expanding to a block that declares a module with `enum Out` in it: each
+/// module and each enum maps to its own def, and each type in a variant is the enum's own
+/// parameter.
+fn two_expansions_map_to_their_own_defs(fx: fixture::Fixture) {
     let file_id = fx.only_file();
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
@@ -515,14 +545,14 @@ fn each_of_two_identical_expansions_in_a_body_maps_its_block_module_and_enum_to_
             for module in root.descendants().filter_map(view::Module::cast) {
                 let def = vsema
                     .to_module_def(module)
-                    .unwrap_or_else(|| panic!("`mod util` of {file:?} is a module"));
+                    .unwrap_or_else(|| panic!("the module of {file:?} is a module"));
                 modules.push((file, def));
             }
         }
-        assert_eq!(modules.len(), 2, "one `mod util` per `select!()`: {modules:?}");
+        assert_eq!(modules.len(), 2, "one module per `select!()`: {modules:?}");
         assert_ne!(
             modules[0].1, modules[1].1,
-            "each expansion's `mod util` is the module of its own block: {modules:?}"
+            "each expansion's module is the module of its own block: {modules:?}"
         );
 
         let mut enums = 0u32;
@@ -601,6 +631,28 @@ fn main() {
 }
 "#,
     );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let _planted = BlocksOfAnyFile::planted();
+        let vsema = Semantics::new(&db);
+        for (_, root) in roots(&vsema, file_id) {
+            for ty in root.descendants().filter_map(view::PathType::cast) {
+                let _ = vsema.scope(ty.syntax());
+            }
+        }
+    });
+}
+
+/// The control of
+/// [`each_of_two_identical_selects_maps_the_enum_its_proc_macro_declares_to_its_own_defs`], as
+/// [`an_enum_that_maps_to_no_def_is_named_not_walked_past`] is of the `macro_rules!` shape:
+/// under the planted bug the first `select!`'s `enum Out`, which the proc macro declares, maps
+/// to no def, and asking for the scope of its `_0` stops naming the enum.
+#[test]
+#[should_panic(expected = "maps to no def")]
+fn planted_blocks_of_any_file_stop_at_the_enum_a_proc_macro_declares() {
+    let fx = fixture::db(TWO_SELECTS_OF_A_PROC_MACRO);
     let file_id = fx.only_file();
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {

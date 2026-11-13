@@ -5,10 +5,14 @@
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin, all_crates};
 use hir_expand::fixture;
 
-/// The minicore regions the stand-ins use, then `alloc` and `std`. A test appends its crates.
+/// The minicore regions the stand-ins use, then `alloc` and `std`, in a library root as a
+/// build's toolchain is (blaze-lower gives a crate the origin of its root: base-db
+/// `crate_durability`), so their files are `HIGH` and a summary of their instances runs under the
+/// covered frame of a sealed crate (`crate::sealed`). A test appends its crates with
+/// [`with_toolchain`], which starts a local root for them.
 pub(super) const TOOLCHAIN: &str = r#"
 //- minicore: sized, copy, clone, drop, deref, fmt, result, option, panic, as_ref, from, try, fn, transmute, unsize, coerce_unsized, dispatch_from_dyn, builtin_impls, index, slice, str, borrow, asm, write
-//- /alloc.rs crate:alloc
+//- /alloc.rs crate:alloc new_source_root:library
 pub mod alloc {
     unsafe extern "Rust" {
         #[rustc_allocator]
@@ -695,8 +699,24 @@ pub mod unchecked {
 
 /// The database of the toolchain with `crates` appended (each starting `//- /path crate:..`).
 pub(super) fn db_with(crates: &str) -> Db {
-    // alloc: a test's fixture text
-    fixture::db(&format!("{TOOLCHAIN}{crates}")).into_db()
+    fixture::db(&with_toolchain(TOOLCHAIN, crates)).into_db()
+}
+
+/// The fixture of `toolchain` (TOOLCHAIN, or a test's edit of it) with `crates` after it, in a
+/// local root of their own: the first file of `crates` starts one, unless it starts a root
+/// itself (a test's library crate).
+#[track_caller]
+pub(super) fn with_toolchain(toolchain: &str, crates: &str) -> String {
+    let start = crates.find("//- /").expect("the appended crates start with a `//- /path` line");
+    let end = crates[start..].find('\n').map_or(crates.len(), |it| start + it);
+    let first = &crates[start..end];
+    assert!(first.contains(" crate:"), "the first appended file names its crate: {first}");
+    match first.contains("new_source_root:") {
+        // alloc: a test's fixture text
+        true => format!("{toolchain}{crates}"),
+        // alloc: a test's fixture text
+        false => format!("{toolchain}{}{first} new_source_root:local{}", &crates[..start], &crates[end..]),
+    }
 }
 
 /// The crate named `name` in `db`.

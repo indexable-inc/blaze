@@ -663,7 +663,7 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     for test in ["a", "b", "c"] {
         assert_eq!(fake.result(test).trace, not_known(), "{test}");
     }
-    let mut inputs = crate::inputs::Disk::new(Vec::new());
+    let mut inputs = crate::inputs::Disk::new(Vec::new(), &blaze_vfs::outside::Looks::none());
     assert!(fake.result("a").trace.traced(&mut inputs).unwrap().is_none());
     assert!(fake.reads.is_empty() && fake.records.is_empty());
     assert_eq!(fake.frames(conn), vec![Frame::Quit]);

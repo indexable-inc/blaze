@@ -1,0 +1,14 @@
+{
+ "id": "round-1112-r7-unbuilt-spans",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), round runner 7, int-1112",
+ "where": "profile spans `place`, `place step`, `request certificate*` (crates/blaze-profile; serve placing and certificate code in crates/blaze-cargo)",
+ "what": "The spans that answer 'what did this build spend after its end' (`place ... how=patch how=copy`, `request certificate: hash an output no stamp vouches for`) carry build_id NULL, so `WHERE build_id = B` finds nothing and a reader has to order by start_ns and guess which build or request each belongs to; the `builds` table has started_ns where spans have start_ns, so even the time join needs a schema read first.",
+ "cost": "about 10 minutes of empty queries and a hand-made timeline to tie places and certificate hits to builds (hello body edit, m.py there-and-back)",
+ "cause": "work done for a build after its answer (placing, the request certificate) runs outside the build's span tree and is not stamped with the build or request it serves",
+ "class": "profile rows that lose the owner they serve once the work moves off the build's own task",
+ "prevention": "every span opened for a build or request carries that build_id / request id, also when it runs after the answer on the loop; one name for the start column across tables",
+ "workaround": "order by start_ns and read `request certificate` / BUILD rows in sequence (runner 7's query in its m74 report)",
+ "fix": "",
+ "state": "open"
+}

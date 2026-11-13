@@ -1,9 +1,9 @@
-about = "Under blaze's launcher a panic's backtrace names the program's own functions: the launcher's code is one more image where the standard library looks for symbols."
+about = "Under blaze's launcher (`blaze run` of a host binary) a panic's backtrace names the program's own functions: the launcher's code is one more image where the standard library looks for symbols."
 drivers = ["real"]
 
 [[revision]]
 action = "run"
-env = { BLAZE_LAUNCH = "1", RUST_BACKTRACE = "1" }
+env = { RUST_BACKTRACE = "1" }
 fails = "too deep at 3"
 says = ["src/main.rs:4:9", "the_deepest_one", "the_one_between"]
 

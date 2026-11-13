@@ -103,6 +103,9 @@ pub(crate) fn told_to_stop(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Start {
     IfMissing,
+    /// As [`Start::IfMissing`], for a request that said `--no-prebuilt`: a home's first daemon
+    /// started for it installs no sealed layer from a pack ([`super::store::first_use`]).
+    IfMissingNoPrebuilt,
     Never,
 }
 
@@ -231,7 +234,7 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     }
     // Lane packs-1112: a home with no store yet and an `install` base in its settings gets
     // the configured packs before its first daemon starts (`super::store::first_use`).
-    super::store::first_use().map_err(anyhow::Error::msg)?;
+    super::store::first_use(start != Start::IfMissingNoPrebuilt).map_err(anyhow::Error::msg)?;
     use anyhow::Context as _;
     let (log, ready, mut child) = started()?;
     let pid = child.id();

@@ -38,6 +38,10 @@ pub struct Revision {
     pub args: Vec<String>,
     /// Variables of the environment of every command from this revision on.
     pub env: Vec<(String, String)>,
+    /// How many times the action runs, all started together (`at_once`; 1 where unstated):
+    /// each run is held to `prints`, `status` and `as_built`, and what is counted of the
+    /// action (`max_units`, `starts`, ..) is of all of them together.
+    pub at_once: u64,
     pub expect: Expect,
     /// Checks known to fail here, each with its cause: a known failure is listed, never
     /// hidden, and one that passes fails the test until its row is removed.
@@ -57,6 +61,11 @@ pub enum Action {
     Build,
     Run,
     Test,
+    /// `run the file`: the program the last `blaze build` made (its `compiler-artifact`'s
+    /// `executable`, `target/debug/<name>`) run by hand, with the revision's environment and
+    /// the arguments after its `--`, not through blaze: what a person does who runs the built
+    /// file. Its `prints`, `status` and `as_built` are held as a `run`'s. Not a step.
+    RunTheFile,
 }
 
 impl Action {
@@ -66,11 +75,12 @@ impl Action {
             Action::Build => "build",
             Action::Run => "run",
             Action::Test => "test",
+            Action::RunTheFile => "run the file",
         }
     }
 
     fn of(word: &str) -> Option<Action> {
-        [Action::Check, Action::Build, Action::Run, Action::Test].into_iter().find(|it| it.word() == word)
+        [Action::Check, Action::Build, Action::Run, Action::Test, Action::RunTheFile].into_iter().find(|it| it.word() == word)
     }
 }
 
@@ -133,6 +143,12 @@ pub enum Step {
     Count { times: u64, text: String },
     /// The running program is ended.
     End,
+    /// `replace engine`: the engine beside the thin `blaze` (`blaze-engine` in the directory
+    /// the driver installed the two in) copied to a name beside it and renamed over itself:
+    /// the same bytes under a new inode and new times, as an install of the same release
+    /// over itself leaves it, so its stamp moves and nothing else. Only the real driver has
+    /// an engine on disk.
+    ReplaceEngine,
 }
 
 /// What must come of a revision's action. Every list is of function paths as `blaze why`
@@ -191,6 +207,37 @@ pub struct Expect {
     pub link: Option<String>,
     /// The linked bytes equal a clean build's.
     pub bytes: bool,
+    /// `run`: the program `blaze run` ran is the program `blaze build` makes, by what it does:
+    /// the file the build names, run in the checkout with the same arguments and environment,
+    /// prints the same standard output and exits with the same status, and what it prints on
+    /// standard error is in what `blaze run` printed there (which carries blaze's own lines
+    /// beside the program's). The refinement of a launched run, which makes a function at its
+    /// first call, by the ahead-built program; the build runs after the action and its
+    /// account, so it is never the build those are of.
+    pub as_built: bool,
+    /// The action's exit status: for a `run`, the program's. A status other than 0 is the
+    /// outcome stated, not a failure, unless `fails` says it is one.
+    pub status: Option<i32>,
+    /// Exactly how many spans of each name the build ran (`blaze explain time_by_span_name`):
+    /// `spans = { "codegen walk" = 0 }` holds a build to no walk. Sorted by name.
+    pub spans: Vec<(String, u64)>,
+    /// `daemon_after`: right after the action (before the driver asks anything of its own), a
+    /// daemon holds blaze's state (`serve.lock` in it is held: a shared try-lock fails,
+    /// `blaze_cargo::serve::holder`) when `true`, and none does when `false`.
+    pub daemon_after: Option<bool>,
+    /// `starts`: exactly how many daemons started during the revision, its steps and its
+    /// action: the lines `serve.log` gained that a daemon writes as it starts serving
+    /// (`blaze_cargo::serve::LISTENING`), counted right after the action.
+    pub starts: Option<u64>,
+}
+
+/// A program run apart from blaze: [`Expect::as_built`]'s file.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Ran {
+    pub stdout: String,
+    pub stderr: String,
+    /// `None`: ended by a signal.
+    pub status: Option<i32>,
 }
 
 /// What a driver saw of one revision's action. A `None` is a thing the driver cannot see,
@@ -243,6 +290,16 @@ pub struct Observed {
     /// The account's numbers in words, for a failure's message.
     pub account_said: String,
     pub ms: u128,
+    /// The action's exit status; `None` where a signal ended it or the driver does not see it.
+    pub status: Option<i32>,
+    /// [`Expect::as_built`]: the file `blaze build` made, run; or why there is none.
+    pub built: Option<Result<Ran, String>>,
+    /// Each span name the build ran, with its count ([`Expect::spans`]).
+    pub spans: Option<BTreeMap<String, u64>>,
+    /// [`Expect::daemon_after`]: whether a daemon held blaze's state right after the action.
+    pub daemon_after: Option<bool>,
+    /// [`Expect::starts`]: the daemons that started during the revision.
+    pub starts: Option<u64>,
 }
 
 impl Step {
@@ -267,6 +324,7 @@ impl Step {
             Step::Await { within_ms, text } => format!("await {within_ms} {text}"),
             Step::Count { times, text } => format!("count {times} {text}"),
             Step::End => "end".to_owned(),
+            Step::ReplaceEngine => "replace engine".to_owned(),
         }
     }
 }
@@ -315,6 +373,7 @@ fn step(word: &str, at: &str) -> Step {
         "kill" => Step::Kill,
         "start" => Step::Start,
         "end" => Step::End,
+        "replace engine" => Step::ReplaceEngine,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
             Some(("home", name)) => {
@@ -368,12 +427,13 @@ fn step(word: &str, at: &str) -> Step {
                     _ => Step::Count { times: number, text: text.to_owned() },
                 }
             }
-            _ => Step::Do(Action::of(word).unwrap_or_else(|| {
+            // `run the file` is an action, never a step: a step's command is blaze's.
+            _ => Step::Do(Action::of(word).filter(|it| *it != Action::RunTheFile).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `edit twice`, \
                      `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `home NAME`, `packed NAME`, \
-                     `cancel build after N ms`, `start`, `await MS TEXT`, `count TIMES TEXT`, `end`, `check`, \
-                     `build`, `run`, `test`"
+                     `cancel build after N ms`, `start`, `await MS TEXT`, `count TIMES TEXT`, `end`, `replace engine`, \
+                     `check`, `build`, `run`, `test`"
                 )
             })),
         },
@@ -381,10 +441,39 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 27] = [
+const KEYS: [&str; 33] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
     "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ran", "max_ms", "noop", "link", "bytes", "known", "about",
+    "as_built", "status", "spans", "daemon_after", "starts", "at_once",
 ];
+
+/// The blaze checkout this test is of: what a case's `@BLAZE_TREE@` stands for.
+pub fn tree() -> PathBuf {
+    let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::canonicalize(&tree).unwrap_or_else(|error| panic!("the tree at {}: {error}", tree.display()))
+}
+
+/// The suffix of a case's file that is a file of the tree: `Cargo.lock.from-tree` holds the
+/// path `Cargo.lock` and is written as `Cargo.lock` with the bytes of the tree's.
+const FROM_TREE: &str = ".from-tree";
+
+/// A case's file as it is written: `@BLAZE_TREE@` in it is the tree's path ([`tree`]), so a
+/// project can depend on the tree's crates (bstd) wherever the driver writes it; and a file
+/// [`FROM_TREE`] is the tree's file it names.
+fn resolved(path: String, bytes: Vec<u8>) -> (String, Vec<u8>) {
+    if let Some(named) = path.strip_suffix(FROM_TREE) {
+        let of = tree().join(String::from_utf8(bytes).expect("a `.from-tree` file holds a path").trim());
+        let bytes = fs::read(&of).unwrap_or_else(|error| panic!("{path}: reading {}: {error}", of.display()));
+        return (named.to_owned(), bytes);
+    }
+    const TREE: &[u8] = b"@BLAZE_TREE@";
+    if !bytes.windows(TREE.len()).any(|it| it == TREE) {
+        return (path, bytes);
+    }
+    let text = String::from_utf8(bytes).unwrap_or_else(|_| panic!("{path}: names `@BLAZE_TREE@` and is not UTF-8"));
+    let tree = tree();
+    (path, text.replace("@BLAZE_TREE@", tree.to_str().expect("the tree's path is UTF-8")).into_bytes())
+}
 
 fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
     let mut entries: Vec<_> = fs::read_dir(dir)
@@ -396,10 +485,9 @@ fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
         if path.is_dir() {
             files(&path, under, into);
         } else {
-            into.push(Change {
-                path: path.strip_prefix(under).unwrap().to_str().unwrap().to_owned(),
-                bytes: Some(fs::read(&path).unwrap()),
-            });
+            let (path, bytes) =
+                resolved(path.strip_prefix(under).unwrap().to_str().unwrap().to_owned(), fs::read(&path).unwrap());
+            into.push(Change { path, bytes: Some(bytes) });
         }
     }
 }
@@ -445,7 +533,8 @@ impl Test {
                 Some(words) => words.iter().map(|it| step(it, &at)).collect(),
                 None => vec![Step::Edit],
             };
-            let word = text(row, "action", &at).unwrap_or_else(|| panic!("{at}: `action` is check, build, run or test"));
+            let word = text(row, "action", &at)
+                .unwrap_or_else(|| panic!("{at}: `action` is check, build, run, test or run the file"));
             let action = Action::of(&word).unwrap_or_else(|| panic!("{at}: no action `{word}`"));
             let env = match row.get("env") {
                 None => Vec::new(),
@@ -468,6 +557,11 @@ impl Test {
                 action,
                 args: texts(row, "args", &at).unwrap_or_default(),
                 env,
+                at_once: match count(row, "at_once", &at) {
+                    None => 1,
+                    Some(0) => panic!("{at}: `at_once` is how many runs start together, at least 1, not 0"),
+                    Some(n) => n,
+                },
                 expect: Expect {
                     fails: text(row, "fails", &at),
                     prints: text(row, "prints", &at),
@@ -500,12 +594,46 @@ impl Test {
                     noop: flag(row, "noop", &at),
                     link: text(row, "link", &at),
                     bytes: flag(row, "bytes", &at),
+                    as_built: flag(row, "as_built", &at),
+                    status: row.get("status").map(|it| match it.as_integer() {
+                        Some(n @ 0..=255) => n as i32,
+                        _ => panic!("{at}: `status` is an exit status, 0 to 255, not {it}"),
+                    }),
+                    spans: match row.get("spans") {
+                        None => Vec::new(),
+                        Some(toml::Value::Table(counts)) => counts
+                            .iter()
+                            .map(|(name, count)| match count.as_integer() {
+                                // clone: the case's text, read once
+                                Some(n) if n >= 0 => (name.clone(), n as u64),
+                                _ => panic!("{at}: `spans.{name}` is a count, not {count}"),
+                            })
+                            .collect(),
+                        Some(other) => panic!("{at}: `spans` is a table from a span's name to how many ran, not {other}"),
+                    },
+                    daemon_after: row.get("daemon_after").map(|it| {
+                        it.as_bool().unwrap_or_else(|| panic!("{at}: `daemon_after` is true or false, not {it}"))
+                    }),
+                    starts: count(row, "starts", &at),
                 },
                 known,
             });
         }
         assert!(revisions.len() >= 2, "{at}: a revision test has at least two revisions");
         Test { name: name.to_owned(), about, drivers, seeds: count(&table, "seeds", &at).unwrap_or(8), revisions }
+    }
+
+    /// Whether the test is of the thin `blaze`'s own path: some revision states what only that
+    /// path shows, whether a daemon is reached (`daemon_after`, `starts`), runs at once
+    /// (`at_once`), or the built file run by hand (`run the file`). Each of its `build`,
+    /// `run`, `check` and `test` commands is then run as a person types it, with no
+    /// `--message-format` and no `BLAZE_*` variable but `BLAZE_HOME`, since either one sends
+    /// the command line to the engine before the thin `blaze` checks anything (blaze-thin's
+    /// `route`): those keys would otherwise hold the engine, never the client.
+    pub fn as_typed(&self) -> bool {
+        self.revisions.iter().any(|it| {
+            it.expect.daemon_after.is_some() || it.expect.starts.is_some() || it.at_once > 1 || it.action == Action::RunTheFile
+        })
     }
 
     /// The revision that began the project revision `upto` (an index) is of, and the

@@ -79,11 +79,16 @@ pub struct Vtable {
     /// A function's rows in use, a walk of every row made ([`Storage::memory_usage`]); every
     /// row of another ingredient is in use, as its `memory` says.
     pub(crate) used: Option<fn(storage: &Storage, ingredient: u32) -> u64>,
+    /// A function's values held now, from its counter alone ([`Storage::held_by_function`]).
+    pub(crate) values: Option<fn(storage: &Storage, ingredient: u32) -> u64>,
     /// Brings `id`'s row up to the storage's view (verifying it, running it if it changed),
     /// for a reader that verifies an edge on it. `db` is the database that owns `storage`, as
     /// the ingredient's own database type.
     pub(crate) verify:
         Option<unsafe fn(db: *const (), storage: &Storage, id: Id) -> super::function::Verified>,
+    /// A function's database type (`F::Db`), so a caller that holds only a row's key casts a
+    /// database to it checked ([`super::refresh`]).
+    pub(crate) db: Option<fn() -> std::any::TypeId>,
     /// Empties a function's provisional row (a cycle's round or its unwinding): only the
     /// thread of the row's cycle calls it.
     pub(crate) reset: Option<unsafe fn(storage: &Storage, ingredient: u32, id: Id)>,

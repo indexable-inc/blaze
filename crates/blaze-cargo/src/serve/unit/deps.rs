@@ -24,7 +24,7 @@
 //!   global trait goals' answers (`hir_ty::next_solver::goal_store`). Each is served with the
 //!   images and stored where they are.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
@@ -42,7 +42,7 @@ use std::alloc::Global;
 use super::{Job, compile, graph};
 use crate::serve::{
     front_carry::bodies,
-    work::{KeptPut, Put},
+    work::{KeptPut, Put, PutInto},
 };
 
 pub(crate) const IMAGES: &str = "BLAZE_DEP_IMAGES";
@@ -59,18 +59,20 @@ impl Kept {
     /// What a later [`serve`] of the same front end served, added: a crate's latest key holds,
     /// and a crate keyed again is a hit or stale only as that serve found it.
     fn add(&mut self, more: Served) {
-        let Served { keys, hits, stale, build, lookups } = more;
+        let Served { keys, hits, stale, old_layout, build, lookups } = more;
         // Every serve of one front end is by one blaze: what `store` makes the keys again with.
         self.served.build = build;
         // Over the front end's life here; a build's are the session's, which `store` says.
         self.served.lookups.add(lookups);
         self.served.hits.retain(|it| !keys.contains_key(it));
         self.served.stale.retain(|it| !keys.contains_key(it));
+        self.served.old_layout.retain(|it| !keys.contains_key(it));
         self.served.keys.extend(keys);
         self.served.hits.extend(hits);
         self.served.hits.sort_unstable();
         self.served.hits.dedup();
         self.served.stale.extend(stale);
+        self.served.old_layout.extend(old_layout);
     }
 }
 
@@ -230,8 +232,10 @@ pub(crate) fn images(
     }
     moved.sort_unstable();
     // The images and, of each crate read from one, its impl tables
-    // (`hir_ty::method_resolution::frozen`), in one write: the pass that first sees a crate
-    // read from its image finds its impls served too, and keys none of them.
+    // (`hir_ty::method_resolution::frozen`) and its kept roots
+    // (`hir_ty_codegen::v2::kept_record`), in one write: the pass that first sees a crate
+    // read from its image finds its impls served too, and keys none of them, and the build
+    // that lists its roots lowers only the bodies its record names.
     let images = &*session.images;
     let trigger = base_db::Trigger::named("the dependencies' images and impl tables served");
     let served = lowered.batch(trigger, |lowered| {
@@ -245,6 +249,8 @@ pub(crate) fn images(
             // or makes that crate's state in a pass over the whole graph.
             lowered.served_db().note_crates_changed();
         }
+        hir_ty_codegen::v2::kept_record::serve(lowered.served_db(), &served, images, mode)
+            .map_err(|why| ApiError::new(why, None))?;
         Ok::<_, ApiError>(served)
     });
     let served = match served {
@@ -263,7 +269,7 @@ pub(crate) fn images(
     session.walked.note(at, build, crates.iter().chain(keys.keys()));
     // Written: what was walked stands again only once [`serve`] is done and stamps its view.
     session.walked.at = None;
-    let Served { keys, hits, stale, build, lookups } = served;
+    let Served { keys, hits, stale, old_layout, build, lookups } = served;
     // What this serve's searches of the store came to, for the build's count ([`store`]).
     session.lookups.images.add(lookups);
     let of_moved = |krate: &Crate| moved.binary_search(krate).is_ok();
@@ -272,6 +278,7 @@ pub(crate) fn images(
         keys: keys.into_iter().filter(|(krate, _)| of_moved(krate)).collect(),
         hits: hits.into_iter().filter(of_moved).collect(),
         stale: stale.into_iter().filter(of_moved).collect(),
+        old_layout: old_layout.into_iter().filter(of_moved).collect(),
         build,
         lookups,
     }))
@@ -307,6 +314,10 @@ pub(crate) struct Session {
     items: Option<body_store::Installed>,
     images: Arc<Images>,
     checks: Arc<cache::Served>,
+    /// Each crate's body entries kept between serves ([`bodies::Kept`]): its kernel session,
+    /// file map and posted rows, carried from revision to revision, so an unedited body costs
+    /// one row lookup. Dropped with the database whose ids its rows name.
+    bodies: Arc<bodies::Sessions>,
     /// Why [`hir_def::deps::store`] wrote no image of each crate it last refused, for the
     /// report of the builds that read the database after ([`served`]).
     refused: HashMap<Crate, String, Global>,
@@ -497,8 +508,7 @@ pub(crate) fn session(
     let mut read = EnvReads::default();
     let items_mode = items_in(&mut read, env)?;
     // alloc: setup, once per database; clone: an `Arc` each
-    let paged = pages_in(&mut read, env)?;
-    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)).reading_pages(paged));
+    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)));
     // dyn: the goal store keeps both for the database's life; called once per database
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
     // dyn: hir-ty's goal store takes its facts as `dyn` (blaze-items depends on hir-ty, which can't name `Goals`); made once per database
@@ -520,11 +530,13 @@ pub(crate) fn session(
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
+    let bodies = Arc::new(bodies::Sessions::default()); // alloc: setup, once per database
     Ok(Session {
         installed,
         items,
         images,
         checks,
+        bodies,
         refused: HashMap::new_in(Global),
         env: read,
         keyed: HashMap::new_in(Global),
@@ -556,31 +568,6 @@ fn items_in(
     }
 }
 
-/// The switch of def map pages (docs/v2/plan/design/restore.md, "Def maps read in place"):
-/// set to `1`, a dependency's def map is kept as pages beside its image and read from them, a
-/// name at a time through the store's pool; unset, the image's def map part is decoded whole,
-/// as before. Off until the round's measurements say on; then the image's part goes and this
-/// with it. It is a read of the session ([`EnvReads`]), so a request that sets it otherwise
-/// lets the kept front end go.
-const PAGES: &str = "BLAZE_DEF_MAP_PAGES";
-
-/// What the job's [`PAGES`] asks: unset or `0` reads def maps from their images, `1` from
-/// their pages; any other value is an error naming it.
-fn pages_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<bool, ApiError> {
-    match read.var(env, PAGES, "whether def maps are read from pages").map_err(|why| ApiError::new(why, None))? {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(value) => Err(ApiError::new(
-            // alloc: error path
-            format!(
-                "{PAGES}={value} is not a value blaze takes: `1` reads a dependency's def map from its \
-                 pages, a name at a time; `0` or unset decodes it whole from its image"
-            ),
-            None,
-        )),
-    }
-}
-
 /// Once a build has ended: the first error the item store met in it (a record that does not
 /// open, a store that could not be read, under `verify` a stored result that differs), as the
 /// build's error.
@@ -600,6 +587,11 @@ impl Session {
     /// The dependencies' check outcomes the database was served, for a job's units to read.
     pub(crate) fn checks(&self) -> Arc<cache::Served> {
         Arc::clone(&self.checks)
+    }
+
+    /// Each crate's body entries kept between serves, for a job's units to serve and keep by.
+    pub(crate) fn bodies(&self) -> Arc<bodies::Sessions> {
+        Arc::clone(&self.bodies)
     }
 }
 
@@ -658,36 +650,38 @@ pub(crate) fn store(
     session: &mut Session,
     later: &[Later],
     root: &str,
+    which: hir_def::deps::Which,
 ) -> Result<(Vec<KeptPut>, Flushes), ApiError> {
     let images = &*session.images;
     let stored = match kept {
-        Some(kept) => Some(lowered.store_deps(&kept.served, images).map_err(super::lower_error)?),
+        Some(kept) => {
+            Some(lowered.store_deps(&kept.served, images, which).map_err(super::lower_error)?)
+        }
         None => None,
     };
     let db = lowered.db();
-    // The front-end records of the toolchain's own crates and of bstd (each crate's image and
-    // its def map pages) are handed to the store's collector to pin, as their unit records
-    // are (`compile::pin_kept`): kept whatever their last use (docs/gc.md). On use, not only
-    // on write: a crate whose image this build found is queued as one it wrote is, so a store
-    // filled by an earlier blaze, or imported, has them pinned by the first build that reads
-    // them. Queuing a key a pin already names writes nothing (`Collects::build_ended`).
+    // The front-end records of each sealed crate (`hir_def::deps::sealed`, the planner's pin
+    // and nothing else: no origin, no name): its image, its def map pages, its impl tables and
+    // the read-filing records its image is found through. They go into the machine's sealed
+    // layer, never this home ([`PutInto::Layer`]), so a second home on the machine finds them
+    // and writes none; and they are handed to the store's collector to pin, as a sealed unit's
+    // records are (`compile::pin_kept`), kept whatever their last use (docs/gc.md). On use, not
+    // only on write: a crate whose image this build found is queued as one it wrote is.
+    // Queuing a key a pin already names writes nothing (`Collects::build_ended`).
     let found = kept.iter().flat_map(|kept| &kept.served.hits).filter_map(|krate| {
         Some((*krate, cache::image_key(db, *krate)?))
     });
     let wrote = stored.iter().flat_map(|stored| &stored.filed).map(|(krate, filed)| (*krate, *filed));
     // alloc: once per front end stored, one per crate imaged
     let imaged: Vec<(Crate, ContentId)> = found.chain(wrote).collect();
+    // alloc: once per front end stored, one entry a crate walked
+    let mut sealed = HashMap::new_in(Global);
+    // alloc: once per front end stored, the keys of the sealed crates' front-end records
+    let mut layered: HashSet<blaze_cas::Key, Global> = HashSet::new_in(Global);
     for &(krate, filed) in &imaged {
-        let name = match &krate.data(db).origin {
-            base_db::CrateOrigin::Lang(_) => crate::serve::collect::TOOLCHAIN,
-            base_db::CrateOrigin::Local { name: Some(name), .. }
-            | base_db::CrateOrigin::Library { name, .. }
-                if name.as_str() == "bstd" =>
-            {
-                crate::serve::collect::BSTD
-            }
-            _ => continue,
-        };
+        if !hir_def::deps::sealed_in(db, krate, &mut sealed) {
+            continue;
+        }
         // The crate's front-end records, from the one list of their keys, and the
         // read-filing records its image is found through (a slot that holds nothing names
         // no record, and a pin of it keeps nothing).
@@ -695,8 +689,16 @@ pub(crate) fn store(
             .and_then(|kept| kept.served.keys.get(&krate))
             .into_iter()
             .flat_map(|key| crate::serve::collect::filing_keys(*key));
-        crate::serve::collect::keep(name, crate::serve::collect::front_keys(filed).chain(slots));
+        let keys = crate::serve::collect::front_keys(filed).chain(slots);
+        // alloc: once per sealed crate imaged, its few keys
+        let keys: Vec<blaze_cas::Key> = keys.collect();
+        layered.extend(keys.iter().copied());
+        crate::serve::collect::keep(crate::serve::collect::TOOLCHAIN, keys.into_iter());
     }
+    let into = |put: &Put| match layered.contains(&put.key) {
+        true => PutInto::Layer,
+        false => PutInto::Home,
+    };
     // Each stage's puts taken as it ends, so each says what it is in an error ([`KeptPut`]).
     let mut puts = Vec::new(); // alloc: once per front end stored, one per value put
     // alloc: once per front end stored, one per image written
@@ -713,19 +715,25 @@ pub(crate) fn store(
             }
             None => Arc::clone(&filing),
         };
-        puts.push(KeptPut { put, what });
+        puts.push(KeptPut { into: into(&put), put, what });
     }
     // The per-item entries asked since the last store, by whichever query made each: during
     // the serves and the build's tasks. One asked after this is written by the next store.
     let entry: Arc<str> =
         Arc::from("a per-item entry (a file's entry set, a macro definition's source or tokens)");
     puts.extend(
-        images.take_entries().into_iter().map(|put| KeptPut { put, what: Arc::clone(&entry) }),
+        images
+            .take_entries()
+            .into_iter()
+            .map(|put| KeptPut { into: into(&put), put, what: Arc::clone(&entry) }),
     );
     let mut stage = |what: &'static str| {
         let what: Arc<str> = Arc::from(what);
         puts.extend(
-            images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }),
+            images
+                .take_puts()
+                .into_iter()
+                .map(|put| KeptPut { into: into(&put), put, what: Arc::clone(&what) }),
         );
     };
     // Each imaged crate's impl tables (`hir_ty::method_resolution::frozen`), beside its
@@ -743,6 +751,22 @@ pub(crate) fn store(
         );
     }
     stage("the impl tables of a dependency crate");
+    // Each imaged crate's kept roots (`hir_ty_codegen::v2::kept_record`), beside its impl
+    // tables: the next build lists the crate's roots from them and lowers only the bodies
+    // whose blocks declare one. One read from its record already writes nothing. One whose
+    // record does not encode has none kept, and every build finds its kept roots from the
+    // bodies whose text can say one: said here, naming it.
+    let unrecorded = hir_ty_codegen::v2::kept_record::store(db, &imaged, images)
+        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    for (krate, why) in &unrecorded {
+        tracing::warn!(
+            target: "blaze",
+            krate = %krate.named(db),
+            why = %why,
+            "a dependency crate's kept roots do not encode: none are kept, and each build finds them from its bodies"
+        );
+    }
+    stage("the kept roots of a dependency crate");
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {
@@ -1110,31 +1134,53 @@ pub(crate) fn front_end() -> Result<ContentId, ApiError> {
 
 /// Serves the bodies of unit `unit`'s crate from the store's kernel entries
 /// (`front_carry::bodies::serve`), on the unit's own task before it asks them
-/// ([`compile`]'s bodies phase): an unchanged body's inference and MIR are then answered by
-/// the entry the store keeps, after a restart too, with nothing run. The first unit of a crate
+/// ([`compile`]'s bodies phase): an unchanged body's inference, each of its owners' MIR and its
+/// borrow check's verdict are then answered by the entry the store keeps, after a restart too,
+/// with nothing run. The first unit of a crate
 /// at a revision serves it; the rest skip. No body's step is run: each is looked up. The
 /// `parse` and `items` of a file the store has none of (an edited file) are run, so its
 /// unedited bodies map: their puts, for the unit's `Compiled::puts`, which the loop puts (the
-/// carry's pass at the build's end finds the same entries).
-pub(crate) fn serve_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<Vec<Put>, ApiError> {
-    let Some(krate) = reader.front.krate(unit) else { return Ok(Vec::new()) };
+/// carry's pass at the build's end finds the same entries). The crate's session is the one kept
+/// from its last serve ([`bodies::Sessions`]), else the one the job's marks name, carried to
+/// this revision: its save's puts are with the others, and its root is the unit's to mark once
+/// they are durable.
+pub(crate) fn serve_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<BodyPuts, ApiError> {
+    let Some(krate) = reader.front.krate(unit) else { return Ok(BodyPuts::default()) };
     let span = tracing::info_span!(
         target: "blaze",
         "body entries served",
         unit = unit as u64,
         bodies = tracing::field::Empty,
         served = tracing::field::Empty,
+        carried = tracing::field::Empty,
         missed = tracing::field::Empty,
         skipped = tracing::field::Empty,
         outside = tracing::field::Empty,
-        passed = tracing::field::Empty,
+        in_macros = tracing::field::Empty,
         unmapped = tracing::field::Empty,
+        session = tracing::field::Empty,
+        valued = tracing::field::Empty,
+        differed = tracing::field::Empty,
+        seeded = tracing::field::Empty,
+        repaired = tracing::field::Empty,
+        cut = tracing::field::Empty,
+        gone = tracing::field::Empty,
     );
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
-    let (puts, did) = serve_bodies_of(&reader.front, krate, &in_view, &job.input.store)?;
+    let marks = &job.input.body_marks;
+    let (puts, did) = serve_bodies_of(&reader.front, krate, &in_view, reader.bodies(), marks, &job.input.store)?;
     record_did(&span, &did);
     Ok(puts)
+}
+
+/// What a unit's serve or keep of body entries gives: the puts, for the unit's
+/// `Compiled::puts`, and each crate's stable name with the root its session was saved under,
+/// for the unit's `Compiled::body_sessions` (marked once the puts are durable).
+#[derive(Default)]
+pub(crate) struct BodyPuts {
+    pub(crate) puts: Vec<Put>,
+    pub(crate) sessions: Vec<(String, blaze_cas::Key)>,
 }
 
 /// [`serve_bodies`] of `krate` of `front`, over `store`, the view's paths given by `in_view`.
@@ -1142,21 +1188,26 @@ pub(crate) fn serve_bodies_of(
     front: &Arc<Lowered>,
     krate: Crate,
     in_view: &impl Fn(&str) -> Option<String>,
+    sessions: &bodies::Sessions,
+    marks: &BTreeMap<String, blaze_cas::Key>,
     store: &blaze_cas::Reader,
-) -> Result<(Vec<Put>, bodies::Did), ApiError> {
+) -> Result<(BodyPuts, bodies::Did), ApiError> {
     let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
     let guard = blaze_cas::enter();
     let reading = blaze_kernel::Reading { reader: store, guard: &guard };
     let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
-    let did = bodies::serve(&kernel, front, krate, in_view, &mut overlay).map_err(body_error)?;
-    Ok((overlay.into_puts(), did))
+    let (did, saved) =
+        bodies::serve(&kernel, front, krate, in_view, sessions, marks, &mut overlay).map_err(body_error)?;
+    Ok((BodyPuts { puts: overlay.into_puts(), sessions: saved.into_iter().collect() }, did))
 }
 
-/// Keeps, as kernel entries, every body's inference and MIR the database ran that no keep has
-/// yet (`front_carry::bodies::keep`), on unit `unit`'s task once its phases are done
-/// ([`compile`]'s store phase): the puts, for the unit's `Compiled::puts`, which the loop
-/// puts. A worker never writes the store.
-pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<Vec<Put>, ApiError> {
+/// Keeps, as kernel entries, every body's inference, owner's MIR and silent borrow check the
+/// database ran that no keep has yet (`front_carry::bodies::keep`), on unit `unit`'s task as
+/// the last thing its store phase does ([`compile`]): the puts, for the unit's
+/// `Compiled::puts`, which the loop puts. A worker never writes the store. A keep that fails
+/// lets its claim go, so the next keep finds the runs again. A crate served at this revision
+/// keeps through its kept session, whose root is given to mark.
+pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<BodyPuts, ApiError> {
     let span = tracing::info_span!(
         target: "blaze",
         "body entries kept",
@@ -1166,12 +1217,13 @@ pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) ->
         missed = tracing::field::Empty,
         refused = tracing::field::Empty,
         outside = tracing::field::Empty,
-        passed = tracing::field::Empty,
+        in_macros = tracing::field::Empty,
         unmapped = tracing::field::Empty,
+        unkeyed = tracing::field::Empty,
     );
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
-    let (puts, did) = keep_bodies_of(&reader.front, &in_view, &job.input.store)?;
+    let (puts, did) = keep_bodies_of(&reader.front, &in_view, reader.bodies(), &job.input.store)?;
     record_did(&span, &did);
     Ok(puts)
 }
@@ -1180,14 +1232,15 @@ pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) ->
 pub(crate) fn keep_bodies_of(
     front: &Arc<Lowered>,
     in_view: &impl Fn(&str) -> Option<String>,
+    sessions: &bodies::Sessions,
     store: &blaze_cas::Reader,
-) -> Result<(Vec<Put>, bodies::Did), ApiError> {
+) -> Result<(BodyPuts, bodies::Did), ApiError> {
     let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
     let guard = blaze_cas::enter();
     let reading = blaze_kernel::Reading { reader: store, guard: &guard };
     let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
-    let did = bodies::keep(&kernel, front, in_view, &mut overlay).map_err(body_error)?;
-    Ok((overlay.into_puts(), did))
+    let (did, sessions) = bodies::keep(&kernel, front, in_view, sessions, &mut overlay).map_err(body_error)?;
+    Ok((BodyPuts { puts: overlay.into_puts(), sessions }, did))
 }
 
 fn body_error(error: impl std::fmt::Display) -> ApiError {
@@ -1195,16 +1248,40 @@ fn body_error(error: impl std::fmt::Display) -> ApiError {
 }
 
 fn record_did(span: &tracing::Span, did: &bodies::Did) {
-    let bodies::Did { skipped, no_store, bodies, served, missed, kept, refused, outside, passed, unmapped } = *did;
+    let bodies::Did {
+        skipped,
+        no_store,
+        session,
+        bodies,
+        served,
+        carried,
+        missed,
+        kept,
+        refused,
+        outside,
+        in_macros,
+        unmapped,
+        unkeyed,
+        carry,
+    } = *did;
     span.record("skipped", skipped || no_store);
+    span.record("session", session.name());
     span.record("bodies", bodies as u64);
     span.record("served", served as u64);
+    span.record("carried", carried as u64);
+    span.record("valued", carry.valued as u64);
+    span.record("differed", carry.differed as u64);
+    span.record("seeded", carry.seeded as u64);
+    span.record("repaired", carry.repaired as u64);
+    span.record("cut", carry.cut as u64);
+    span.record("gone", carry.gone as u64);
     span.record("missed", missed as u64);
     span.record("kept", kept as u64);
     span.record("refused", refused as u64);
     span.record("outside", outside as u64);
-    span.record("passed", passed as u64);
+    span.record("in_macros", in_macros as u64);
     span.record("unmapped", unmapped as u64);
+    span.record("unkeyed", unkeyed as u64);
 }
 
 /// What makes unit records, by the code identity of each part ([`crate::serve::RecordMakers`]):
@@ -1233,8 +1310,6 @@ struct Images {
     /// from `puts`: an entry is kept by whichever query made it, during a serve or a build's
     /// tasks, where `puts` is written only by a flush and taken stage by stage.
     entries: Lock<Puts>,
-    /// Whether def maps are kept as pages and read from them ([`PAGES`]).
-    pages: bool,
 }
 
 /// What an [`Images`] was asked to keep since the last take: the puts in the order asked, and
@@ -1259,14 +1334,7 @@ impl Images {
             macros,
             puts: Lock::new("serve.deps.images.puts", puts),
             entries: Lock::new("serve.deps.images.entries", entries),
-            pages: false,
         }
-    }
-
-    /// These images, def maps kept as pages and read from them when `on` ([`PAGES`]).
-    fn reading_pages(mut self, on: bool) -> Images {
-        self.pages = on;
-        self
     }
 
     /// What it was asked to keep since the last take, in the order asked.
@@ -1417,10 +1485,6 @@ impl hir_def::deps::PageSource for InPool {
 }
 
 impl ImageStore for Images {
-    fn paged(&self) -> bool {
-        self.pages
-    }
-
     // dyn: hir-def's holder of one record, once per crate per front end
     fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn hir_def::deps::PageSource>>, String> {
         let guard = blaze_cas::enter();

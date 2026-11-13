@@ -1,0 +1,16 @@
+about = "A program run by hand with no daemon runs the last build (track 10, task C): run, then an edit built with `blaze build`, `blaze stop`, and the built file run by hand: it prints the edited output, since the build of another record removed the start file the first run's daemon wrote (blaze-cargo's `built`, H6), so the launcher starts a daemon and joins it. A start file kept past its build (`Plant::KeepsStartFile`) prints the old output, which this catches. The control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+
+[[revision]]
+steps = ["edit", "build", "stop"]
+action = "run the file"
+prints = "howdy 1, howdy 2, howdy 3\n"
+status = 3
+as_built = true
+starts = 1

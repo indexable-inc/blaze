@@ -538,6 +538,24 @@ pub enum Effect {
         to: FileName,
         tag: Tag,
     },
+    /// `to` made a file with `from`'s contents by a copy the kernel makes of `from`'s data
+    /// only: `to` is made new (it must not exist), given `from`'s length, and each extent of
+    /// `from` that holds data (`lseek` with `SEEK_DATA` and `SEEK_HOLE`) is copied at its own
+    /// offset (`copy_file_range` on Linux), so a hole of `from` stays a hole of `to` and no
+    /// byte passes through this process. For a file system that cannot share blocks (tmpfs,
+    /// ext4), where it stands in for [`Effect::Clone`] under a patched place: the new file
+    /// costs the data `from` holds, never its length. A new file's mode (0o666 less the
+    /// umask) and modified now, as a clone's. A symbolic link `from` is refused with
+    /// [`CLONE_THROUGH_A_LINK`], and what is no regular file with [`CLONE_OF_NO_FILE`]. `from`
+    /// is not to be written while this runs (the store's paths are replaced by rename, never
+    /// written in place). Completes with [`Done::Copied`], the data bytes the kernel copied;
+    /// a driver whose system has no such copy fails, naming that, and copies nothing through
+    /// memory instead.
+    CopyData {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
     /// The parts of `like` that the system's page cache holds are asked to be read into the
     /// cache of `file`, which holds the same bytes there (a clone of it, [`Effect::Clone`]):
     /// a clone shares its source's blocks and none of its cached pages, so the first run of a
@@ -547,7 +565,10 @@ pub enum Effect {
     /// asked for those ranges first, 7 ms). The read is the system's own read-ahead and is not
     /// waited for: the completion, [`Done::Prewarmed`], says how many bytes were asked for, and
     /// comes once they are asked. Which pages `like` holds is read as the effect is carried
-    /// out, so it is asked before `like`'s name is given to another file. At most
+    /// out, so it is asked before `like`'s name is given to another file. Only what lies in
+    /// `like`'s data extents is asked for (`lseek` `SEEK_DATA`/`SEEK_HOLE`): its holes are
+    /// the clone's, which read as zeros from no device (measured 2026-11-12 on xfs: a first
+    /// edit read ahead the whole 158 MB file, 134 MB of it two reserves of zeros). At most
     /// [`PREWARM_MOST`] bytes are asked for, from the file's start. macOS: `mincore` of a
     /// mapping of `like`, then `F_RDADVISE` a run; Linux: `mincore`, then
     /// `posix_fadvise(WILLNEED)` a run; Windows asks for nothing and says 0 bytes (no call that
@@ -878,6 +899,7 @@ impl Effect {
             | Effect::Private { tag, .. }
             | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
+            | Effect::CopyData { tag, .. }
             | Effect::Prewarm { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
@@ -1089,6 +1111,15 @@ impl Mapping {
         Mapping(std::sync::Arc::new(Held::Copied(raw::Aligned::copy(bytes))))
     }
 
+    /// The file at `path` mapped read-only and shared, as [`Effect::Map`] maps one, for a
+    /// driver that maps outside a state machine (a shipped tree's texts, mapped once at a
+    /// daemon's first use of the tree). The contract is [`Effect::Map`]'s: while the mapping
+    /// lives no one writes, appends to or truncates the file in place; it is only ever
+    /// replaced by renaming another over it.
+    pub fn map_file(path: &std::path::Path) -> std::io::Result<Mapping> {
+        fs::map(path)
+    }
+
     pub fn bytes(&self) -> &[u8] {
         match &*self.0 {
             Held::File(mapped) => mapped.bytes(),
@@ -1206,6 +1237,11 @@ pub enum Done {
     /// Of an [`Effect::Times`].
     Timed,
     Cloned,
+    /// Of an [`Effect::CopyData`]: the bytes of data the kernel copied, which is the source's
+    /// length less its holes.
+    Copied {
+        bytes: u64,
+    },
     /// Of an [`Effect::Prewarm`]: the bytes of the file asked to be read ahead.
     Prewarmed {
         bytes: u64,
@@ -1335,6 +1371,13 @@ pub trait Driver {
     fn in_flight(&self) -> usize;
     /// Monotonic time since the driver began.
     fn now(&self) -> Duration;
+    /// The wall clock now, in nanoseconds since the Unix epoch: the clock the driver's file
+    /// system stamps change times by, so what every racy question asks (a stamp within
+    /// `blaze_vfs::racy`'s window of this is not trusted). A native driver reads the system's
+    /// ([`system_wall_ns`]); the simulation reads its virtual clock from the seed's start
+    /// ([`sim::Sim::wall_start`]), the clock its disk stamps mtimes from, so a stamp taken
+    /// just after a write is racy there as on a real disk.
+    fn wall_ns(&self) -> u64;
     /// A handle another thread ends this driver's wait with ([`Waker`]), where the driver has
     /// one: what a thread that finished work the loop reads from a queue of its own (a plane
     /// task's end) calls after it queued it, so the loop turns then and not at its next
@@ -1343,6 +1386,23 @@ pub trait Driver {
     /// says so in the wait's name.
     fn waker(&self) -> Option<Waker> {
         None
+    }
+}
+
+/// The system's wall clock now, in nanoseconds since the Unix epoch: what every native
+/// [`Driver::wall_ns`] reads, and what code that stamps the real disk outside a driver (a
+/// start's look at its own executable, before any loop) compares those stamps with. A
+/// question on a loop asks its driver instead, so a simulation answers it. A reading before
+/// the epoch is a clock no stamp can be compared with: it panics, naming the reading, as a
+/// window measured from it would trust every stamp.
+pub fn system_wall_ns() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        // A reading past 2554 saturates: every stamp is then within its window, none trusted.
+        Ok(since) => u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
+        Err(error) => panic!(
+            "the system's wall clock reads {:?} before the Unix epoch: no file's change time can be compared with it",
+            error.duration()
+        ),
     }
 }
 

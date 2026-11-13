@@ -18,7 +18,7 @@ use crate::{
 const INDEX_MAGIC: [u8; 8] = *b"BLZINDX\x03";
 pub(crate) const INDEX_HEADER: usize = 64;
 /// The bytes of one slot's row: the key, then its place.
-const ROW: usize = 64;
+pub(crate) const ROW: usize = 64;
 /// Slots matched at once.
 const GROUP: usize = 16;
 /// The control byte of an empty slot; a full one holds its key's tag, below this.

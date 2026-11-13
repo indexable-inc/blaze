@@ -1,0 +1,26 @@
+about = "A run with nothing changed and no daemon is answered by the thin `blaze` from the request slot the last daemon wrote (track 10, task C), over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock): run, run, `blaze stop`, run; the last run's standard output, standard error and status are those of the file `blaze build` makes, it makes no unit and reads no record, and after it `serve.lock` has no holder and `serve.log` has no new start. The program's own output is the oracle; the control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = []
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+max_units = 0
+max_records = 0
+daemon_after = false
+starts = 0

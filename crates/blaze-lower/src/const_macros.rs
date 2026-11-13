@@ -10,6 +10,12 @@
 //! and blaze's copy of `const-ast`; its edition and cfgs are that unit's. Every crate of the
 //! package but its build script depends on it by the file's stem and has
 //! `cfg(blaze_const_macros)`, which rustc never sets.
+//!
+//! `const-ast` is two crates a platform on its one root file: `const_ast_quote`, a proc-macro
+//! crate (`cfg(blaze_const_quote)`) whose one macro, `quote`, is the host's lowering of
+//! `const_ast::quote!` to builder calls ([`hir_ty_mir::const_macro::quote`]), and `const_ast`
+//! (`cfg(blaze_const_eval)`), which depends on it, re-exports `quote!`, and whose builder grows
+//! on the const heap. A macro's output is a tree, never text.
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +43,16 @@ use super::{LowerError, Lowering, crates, files};
 
 /// The cfg every crate of a package with const macros has.
 pub(crate) const CFG: &str = "blaze_const_macros";
+
+/// The cfg of blaze's `const_ast` in the macro graph: its builder grows on the const heap, and
+/// it re-exports `quote!` from [`CONST_AST_QUOTE_NAME`]. Cargo never sets it.
+pub(crate) const CONST_EVAL_CFG: &str = "blaze_const_eval";
+
+/// The cfg of the proc-macro crate made from `const_ast`'s root file, which declares `quote`.
+pub(crate) const QUOTE_CFG: &str = "blaze_const_quote";
+
+/// The name of the proc-macro crate `const_ast` depends on for `quote!`.
+pub(crate) const CONST_AST_QUOTE_NAME: &str = "const_ast_quote";
 
 /// The macro crate of package `package` (an index of `Units::packages`) for one platform.
 pub(crate) struct Group {
@@ -280,39 +296,80 @@ pub(crate) fn make(
                 ));
             };
             let core = BuiltDependency::with_prelude(name("core"), made(core)?, true, true);
-            let data = base_db::BuiltCrateData {
-                root_file_id: const_ast_root,
-                edition: Edition::Edition2024,
-                dependencies: vec![core],
-                origin: CrateOrigin::Library { repo: None, name: Symbol::intern(CONST_AST_NAME) },
-                crate_attrs: Box::new([]),
-                target_kind: base_db::TargetKind::Lib { is_proc_macro: false },
-                manifest_kind: base_db::TargetKind::Lib { is_proc_macro: false },
-                crate_types: CrateTypes::of(&[CrateType::Rlib]),
-                proc_macro_cwd: Arc::new(abs(cx.const_ast_dir)?),
-            };
-            let extra = base_db::ExtraCrateData {
-                version: None,
-                display_name: Some(CrateDisplayName::from_canonical_name(CONST_AST_NAME)),
-                potential_cfg_options: None,
-                built_for: crates::built_for(unit.built_for()),
-                build_script_runs: Box::new([]),
-            };
-            let mut cfg = CfgOptions::default();
+            let mut target_cfg = CfgOptions::default();
             for it in target::target_cfg(cx.triple, &CfgArgs::default())
                 .map_err(|why| LowerError::at(why, cx.triple))?
             {
-                cfg.extend([crates::atom(&it).map_err(|why| LowerError::at(why, cx.triple))?]);
+                target_cfg
+                    .extend([crates::atom(&it).map_err(|why| LowerError::at(why, cx.triple))?]);
             }
-            let krate = Crate::create(
+            let made_crate = |db: &mut Db,
+                              crate_name: &str,
+                              dependencies: Vec<BuiltDependency>,
+                              is_proc_macro: bool,
+                              crate_type: CrateType,
+                              cfg_flag: &str|
+             -> Result<Crate, LowerError> {
+                let kind = base_db::TargetKind::Lib { is_proc_macro };
+                let data = base_db::BuiltCrateData {
+                    root_file_id: const_ast_root,
+                    edition: Edition::Edition2024,
+                    dependencies,
+                    origin: CrateOrigin::Library { repo: None, name: Symbol::intern(crate_name) },
+                    crate_attrs: Box::new([]),
+                    target_kind: kind,
+                    manifest_kind: kind,
+                    crate_types: CrateTypes::of(&[crate_type]),
+                    proc_macro_cwd: Arc::new(abs(cx.const_ast_dir)?),
+                    // blaze's own crates of the const-AST, at no tree a digest names.
+                    sealed: None,
+                };
+                let extra = base_db::ExtraCrateData {
+                    version: None,
+                    display_name: Some(CrateDisplayName::from_canonical_name(crate_name)),
+                    potential_cfg_options: None,
+                    built_for: crates::built_for(unit.built_for()),
+                    build_script_runs: Box::new([]),
+                };
+                // clone: the target's few cfg atoms, once for each of the two crates
+                let mut cfg = target_cfg.clone();
+                cfg.extend([CfgAtom::Flag(Symbol::intern(cfg_flag))]);
+                Ok(Crate::create(
+                    db,
+                    data,
+                    extra,
+                    cx.workspace.clone(),
+                    cfg,
+                    Env::default(),
+                    Durability::HIGH,
+                ))
+            };
+            // `const_ast::quote!`'s crate: the same root file as a proc-macro crate, whose one
+            // macro, `quote`, is the host's lowering of the quote to builder calls.
+            let quote = made_crate(
                 db,
-                data,
-                extra,
-                cx.workspace.clone(),
-                cfg,
-                Env::default(),
-                Durability::HIGH,
-            );
+                CONST_AST_QUOTE_NAME,
+                vec![core.clone()], // alloc, clone: its one dependency, once a platform
+                true,
+                CrateType::ProcMacro,
+                QUOTE_CFG,
+            )?;
+            all.push(quote);
+            let quote_macros = vec![hir_ty_mir::const_macro::quote::proc_macro()]; // alloc: its one macro
+            ProcMacros::give(db, [(quote, Ok(quote_macros))]);
+            // `const_ast` itself, with the const heap and `quote!` re-exported from that crate,
+            // which its root names by path (`pub use const_ast_quote::quote`): in its extern
+            // prelude, not a sysroot crate.
+            let on_quote =
+                BuiltDependency::with_prelude(name(CONST_AST_QUOTE_NAME), quote, true, false);
+            let krate = made_crate(
+                db,
+                CONST_AST_NAME,
+                vec![core, on_quote], // alloc: its two dependencies, once a platform
+                false,
+                CrateType::Rlib,
+                CONST_EVAL_CFG,
+            )?;
             all.push(krate);
             plan.const_ast.insert(platform, krate);
             krate
@@ -352,6 +409,8 @@ pub(crate) fn make(
         manifest_kind: base_db::TargetKind::Lib { is_proc_macro: true },
         crate_types: CrateTypes::of(&[CrateType::ProcMacro]),
         proc_macro_cwd: Arc::new(cx.proc_macro_cwd),
+        // Its root is the file the manifest names, which may be anywhere: no tree pins it.
+        sealed: None,
     };
     let extra = base_db::ExtraCrateData {
         version: Some(package_plan.version.clone()),

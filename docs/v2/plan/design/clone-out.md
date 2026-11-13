@@ -23,8 +23,11 @@ measured a second Firefox worktree at about 3 GB instead of 16.7 GB by cloning b
 | `doc` pages (`cli/doc.rs`) | written by the client, `std::fs::write` | no | unchanged: the client's |
 | `.blaze-record`, `CACHEDIR.TAG`, `.blaze-lease`, layout maps | written fresh | no | unchanged: small, the build dir's own |
 
-Nothing placed by hard link (`Effect::Link` has no producer), so no build-directory write can
-reach a stored file through a shared inode.
+No path is ever a hard link of a stored file, so no build-directory write can reach one
+through a shared inode. The one link the store makes (2026-11-12) is between two paths of
+one build that hold the same program: `Store::place_also` links the first path's staged file
+under the second's staged name, and both are renamed in. Both are new inodes outside the
+store.
 
 ## Design
 
@@ -42,12 +45,17 @@ reach a stored file through a shared inode.
   (`blaze_cas::PlaceBy`, `Store::ask_shares`), said once in the daemon's log and in `blaze
   daemon status` (`placing: ...`), and every place after is made that way. Where it shares
   blocks: clones, as below. Where it does not (ext4, tmpfs): every place writes the value's
-  bytes from the store's records, the store keeps no whole file to clone from, and a patched
-  place reads the path's file, writes what changed over it and writes that; the build dir then
-  costs its bytes. Never one tried and the other done for a file: until 2026-11-12 a first
+  bytes from the store's records, and the store keeps no whole file to clone from. A patched
+  place is the clone route with one effect swapped (2026-11-12). The kernel copies the path's
+  file's data extents into a new inode beside it (`Effect::CopyData`: `SEEK_DATA`/`SEEK_HOLE`
+  and `copy_file_range`; on macOS `lseek` with `pread`/`pwrite` through one bounded buffer).
+  Its holes stay holes. Then the cut, one write a run, and the rename. The path's file is
+  never written in place on any file system: a running program keeps its inode whole. Until
+  then the store read the whole file and wrote it back: 158 MB for a 10 KB patch, twice a
+  build. The build dir then costs its bytes. Never one tried and the other done for a file: until 2026-11-12 a first
   place was a write and every later one a clone, so a home on tmpfs or ext4 failed every build
-  after its first. A hard link is never made: it is the store's own inode, which a patched
-  place, a program writing its output, or a `chmod` would change. A clone that still fails (a
+  after its first. A path is never a hard link of a store file: that is the store's own inode, which a
+  program writing its output or a `chmod` would change. A clone that still fails (a
   path on another volume than the store's) fails its place, naming both volumes (APFS's
   container, `f_type` and the device on Linux). The build dir and the store are both under
   `<root>`, so they share a volume unless `--target-dir` moves the build dir.
@@ -62,7 +70,15 @@ reach a stored file through a shared inode.
   - `UF_IMMUTABLE` isn't used: every clone would inherit it, and it stops unlink, rename and
     hard link, which breaks gc, `blaze clean` and `rm -rf`. `FS_IMMUTABLE_FL` needs
     `CAP_LINUX_IMMUTABLE`.
-- **Reported.** Every `Placed` carries `PlacedBytes { cloned, written, copied }`. Each job sums
+- **Stamped.** A place through `publish::Writing` (made, patched, a second path) looks at its
+  staged file once before the rename. Its answer carries that look: `Placed.stamp` holds the
+  inode, size and mtime that vouch for the path, so nothing hashes the file again to vouch
+  for it. The ctime moves at the rename, so it does not vouch.
+- **Read ahead only data.** The prewarm of a started program's clone reads only its source's
+  data extents. Measured on xfs, it read 9.4 MB to 158 MB a file, 134 MB of that the two
+  reserves of zeros.
+- **Reported.** Every `Placed` carries `PlacedBytes { cloned, written, copied, kernel }`.
+  `kernel` is the data a patched place's extent copy moved in the kernel. Each job sums
   them and reports them:
   - in the `build placed` span (target `blaze`), and
   - in `Worked::placed` (API schema 27), which the client prints in the `blaze-work` JSON line.

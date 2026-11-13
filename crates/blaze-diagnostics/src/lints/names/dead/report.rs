@@ -266,7 +266,7 @@ impl Report<'_, '_, '_, '_> {
         let cx = k.cx;
         let defs = k.defs;
         let Some(first) = dead_codes.first() else { return };
-        let Some(at) = defs[first.def].node else { return };
+        let Some(at) = defs.node(cx, first.def) else { return };
         if let Some(seen) = &mut self.seen {
             seen.extend(dead_codes.iter().map(|it| (it.def, it.level)));
             return;
@@ -419,7 +419,7 @@ impl Report<'_, '_, '_, '_> {
 
     fn ident_span(&self, def: DefIdx) -> Option<Span> {
         let cx = self.k.cx;
-        let node = cx.syntax_view(self.k.defs[def].node?);
+        let node = cx.syntax_view(self.k.defs.node(cx, def)?);
         let name = ast::AnyHasName::cast(node.value)?.name()?;
         Some(cx.span(InFile::new(node.file_id, name.syntax().text_range())))
     }
@@ -427,7 +427,7 @@ impl Report<'_, '_, '_, '_> {
     /// rustc's `def_span`: of a variant or a field, all of it; of an item, its header.
     fn def_span(&self, def: DefIdx) -> Option<Span> {
         let cx = self.k.cx;
-        let ptr = self.k.defs[def].node?;
+        let ptr = self.k.defs.node(cx, def)?;
         let node = cx.syntax_view(ptr);
         let range: TextRange = match self.k.defs[def].kind {
             Kind::Variant | Kind::Field => crate::cx::item_range_view(node.value),

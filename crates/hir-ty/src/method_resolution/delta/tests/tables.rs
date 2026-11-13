@@ -92,7 +92,7 @@ fn filled() -> (Memory, Vec<(&'static str, Vec<u8>)>) {
     let all: Vec<Crate> = all_crates(&one.db).iter().copied().collect();
     let served = deps::serve(&mut one.db, &all, BUILD, &memory, Mode::Serve).unwrap();
     assert!(served.hits.is_empty(), "a cold store");
-    let stored = deps::store(&one.db, &served, &memory).unwrap();
+    let stored = deps::store(&one.db, &served, &memory, deps::Which::Sealed).unwrap();
     assert!(stored.refused.is_empty(), "{:?}", stored.refused);
     let mut imaged: Vec<(Crate, ContentId)> = stored.filed.iter().map(|(&k, &f)| (k, f)).collect();
     imaged.sort_unstable();

@@ -22,11 +22,15 @@ use std::{ffi::OsString, process::ExitCode};
 const ROUTE: &str = "--thin-route";
 
 fn main() -> ExitCode {
+    // `client: exec to main` ends here, its first line: from the kernel's start of this
+    // process (its fork; every exec since, a launcher's into this program, is in it).
+    #[cfg(unix)]
+    let main_ns = kernel::mono_ns();
     let started = std::time::Instant::now();
     let words: Vec<OsString> = std::env::args_os().skip(1).collect(); // alloc: once, the command line
     #[cfg(unix)]
     {
-        unix::main(words, started)
+        unix::main(words, started, main_ns)
     }
     #[cfg(not(unix))]
     {
@@ -54,6 +58,82 @@ mod other {
             Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(101)).unwrap_or(101)),
             Err(error) => said(format!("could not run the engine {}: {error}", engine.display())),
         }
+    }
+}
+
+/// The kernel's clocks and its start time of this process, on the profile's clock
+/// (`blaze_profile::clock::mono_ns`, which this program does not link: the same clock read the
+/// same way), for the client's spans ([`blaze_thin::talk::Timings`]).
+#[cfg(unix)]
+#[expect(unsafe_code, reason = "the system's clocks and its record of this process's start, read by FFI")]
+mod kernel {
+    /// The clock every instant of the profile's schema counts on: the machine's monotonic clock,
+    /// one for every process on it (`blaze_profile::clock::mono_ns`).
+    #[cfg(target_vendor = "apple")]
+    const MONO: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+    #[cfg(not(target_vendor = "apple"))]
+    const MONO: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
+    fn read(clock: libc::clockid_t) -> i64 {
+        let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `at` is a timespec to write; each clock read here exists on every version of
+        // the systems this builds for.
+        let read = unsafe { libc::clock_gettime(clock, &mut at) };
+        assert_eq!(read, 0, "clock {clock} is always readable");
+        at.tv_sec as i64 * 1_000_000_000 + at.tv_nsec as i64
+    }
+
+    /// Now on the profile's clock.
+    pub(super) fn mono_ns() -> i64 {
+        read(MONO)
+    }
+
+    /// When the kernel started this process, on the profile's clock: its age by the clock the
+    /// kernel records the start on, taken from now. macOS: `proc_pidinfo`'s
+    /// `PROC_PIDTBSDINFO` (libproc, not a documented API: the one call that gives a process's
+    /// start, to the microsecond), `pbi_start_tvsec`/`usec` on the wall clock.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn started_ns() -> Result<i64, String> {
+        let pid = std::process::id() as libc::c_int;
+        // SAFETY: a plain C struct of integers and byte arrays, for which zero is a value.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is `size` bytes to write, and lives across the call.
+        let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+        if got != size {
+            return Err(format!(
+                "proc_pidinfo(PROC_PIDTBSDINFO) of process {pid} gave {got} of {size} bytes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let start = info.pbi_start_tvsec as i64 * 1_000_000_000 + info.pbi_start_tvusec as i64 * 1_000;
+        let (wall, mono) = (read(libc::CLOCK_REALTIME), mono_ns());
+        Ok(mono - (wall - start))
+    }
+
+    /// Linux: `/proc/self/stat`'s `starttime` (field 22), in clock ticks since boot, against
+    /// `CLOCK_BOOTTIME`, the clock it counts on. Its tick is `_SC_CLK_TCK`'s, 10 ms on most
+    /// kernels: the span is that coarse here.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(super) fn started_ns() -> Result<i64, String> {
+        let stat = std::fs::read_to_string("/proc/self/stat")
+            .map_err(|error| format!("reading /proc/self/stat: {error}"))?;
+        // The command's name, field 2, is in parentheses and may hold spaces: the fields
+        // after its last `)` are 3 on.
+        let after = stat.rsplit_once(')').map(|it| it.1).ok_or("/proc/self/stat has no `)` after the name")?;
+        let ticks: i64 = after
+            .split_whitespace()
+            .nth(22 - 3)
+            .and_then(|it| it.parse().ok())
+            .ok_or("/proc/self/stat has no starttime, field 22")?;
+        // SAFETY: sysconf reads a constant of the system.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return Err(format!("sysconf(_SC_CLK_TCK) is {hz}"));
+        }
+        let start = ticks * 1_000_000_000 / hz as i64;
+        let (boot, mono) = (read(libc::CLOCK_BOOTTIME), mono_ns());
+        Ok(mono - (boot - start))
     }
 }
 
@@ -87,10 +167,10 @@ mod unix {
         handover::{Began, Held},
         pin, request,
         route::{self, Asked, Route},
-        talk::{self, BUILD, Ended, Read},
+        talk::{self, BUILD, Ended, Read, Timings},
     };
 
-    use super::{ROUTE, sys};
+    use super::{ROUTE, kernel, sys};
 
     /// The most bytes one read takes.
     const RECEIVE: usize = 64 << 10;
@@ -106,7 +186,7 @@ mod unix {
         failed()
     }
 
-    pub(super) fn main(words: Vec<OsString>, started: Instant) -> ExitCode {
+    pub(super) fn main(words: Vec<OsString>, started: Instant, main_ns: i64) -> ExitCode {
         if words.first().is_some_and(|it| it == ROUTE) {
             let said = match decide(&words[1..]) {
                 Ok(_) => "thin\n".to_owned(),
@@ -115,7 +195,7 @@ mod unix {
             let _ = std::io::stdout().write_all(said.as_bytes());
             return ExitCode::SUCCESS;
         }
-        let why = match decide(&words).and_then(|decided| run(decided, &words, started)) {
+        let why = match decide(&words).and_then(|decided| run(decided, &words, started, main_ns)) {
             Ok(code) => return code,
             Err(why) => why,
         };
@@ -167,7 +247,7 @@ mod unix {
     /// The command answered here: its exit code. `Err` is why the engine runs it instead, said
     /// before anything was written and before anything was asked of the daemon that the
     /// engine would not ask again.
-    fn run(decided: Decided, words: &[OsString], started: Instant) -> Result<ExitCode, String> {
+    fn run(decided: Decided, words: &[OsString], started: Instant, main_ns: i64) -> Result<ExitCode, String> {
         let Decided { asked, home, cwd, found } = decided;
         let Some(asked) = asked else {
             let this = std::env::current_exe()
@@ -189,7 +269,7 @@ mod unix {
         let width = terminal.then(place::stderr_columns).flatten().map(u32::from);
         let env = place::env(std::env::vars_os())?;
         let place = place::find(&cwd, None)?;
-        let files = place::config_files(&place, Some(&cargo_home(var)?))?;
+        let files = place::config_files(&place, Some(&cargo_home(var, &cwd)?))?;
         let sent = request::Sent {
             cwd: place::utf8(&place.cwd)?,
             root: place::utf8(&place.root)?,
@@ -228,10 +308,6 @@ mod unix {
 
         let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
         let engine = Engine::beside()?;
-        // No daemon: the engine starts one, saying so, as it always has.
-        let stream = UnixStream::connect(&homes.socket)
-            .map_err(|error| format!("no daemon answers at {}: {error}", homes.socket.display()))?;
-        let mut daemon = Daemon::new(stream);
         let spoken = talk::Spoken {
             asked: &asked,
             request: &request,
@@ -239,6 +315,42 @@ mod unix {
             cwd: &place.cwd,
             pid: std::process::id(),
         };
+        // The command's spans (`talk::Timings`): from the kernel's start of this process.
+        let mut timings = Timings::default();
+        let started_ns = kernel::started_ns()?;
+        timings.span(talk::EXEC_TO_MAIN, started_ns, main_ns);
+        // Nothing changed since the daemon's last answer to this request: its slot says so,
+        // and the client answers with no daemon asked (`solo`); anything else is the daemon's.
+        let solo_ns = kernel::mono_ns();
+        let solo = blaze_thin::solo::solo(&spoken, &homes.state, &engine.path, || started.elapsed());
+        let solo_ended_ns = kernel::mono_ns();
+        timings.span(talk::SOLO_CHECK, solo_ns, solo_ended_ns);
+        match solo {
+            // No daemon is asked, so none takes these spans now: they are kept as a file the
+            // next daemon takes into its profile (`blaze_thin::kept`). The answer is the
+            // check's: a `run`'s `client: answer to exec` starts as it ends.
+            blaze_thin::solo::Ended::Said { said, exec, slot, certified } => {
+                timings.answered_ns = Some(solo_ended_ns);
+                // clone: the state directory's path, once a solo answer
+                // The build's row names its workspace and command as the daemon's rows do
+                // (`builds.workspace`, `builds.command`: the command and its words).
+                let mut command = asked.command.name().to_owned(); // alloc: once a solo answer
+                for word in &asked.args {
+                    command.push(' ');
+                    command.push_str(word);
+                }
+                let workspace = place::utf8(&place.root)?;
+                let kept = Kept { state: homes.state.clone(), timings, started_ns, slot, certified, workspace, command };
+                return said_and_ran(&said, exec, Rows::Kept(kept));
+            }
+            blaze_thin::solo::Ended::Daemon(_) => {}
+        }
+        // No daemon: the engine starts one, saying so, as it always has.
+        let connect_ns = kernel::mono_ns();
+        let stream = UnixStream::connect(&homes.socket)
+            .map_err(|error| format!("no daemon answers at {}: {error}", homes.socket.display()))?;
+        timings.span(talk::CONNECT, connect_ns, kernel::mono_ns());
+        let mut daemon = Daemon::new(stream);
         // The whole of what is said to the daemon, on this one connection ([`talk::talk`]).
         let is_engine = |theirs: &blaze_api::Executable| match engine.is(theirs) {
             true => Ok(()),
@@ -248,24 +360,123 @@ mod unix {
                 engine.path.display()
             )),
         };
-        match talk::talk(&mut daemon, &spoken, is_engine, || started.elapsed()) {
+        match talk::talk(&mut daemon, &spoken, is_engine, || started.elapsed(), &mut timings) {
             Ended::Engine(why) => Err(why),
-            Ended::HandOver { request } => Ok(hand_over(daemon, &request, &engine, &homes.state, words)),
-            Ended::Said { said, exec: None } => Ok(wrote(&said)),
-            Ended::Said { said, exec: Some(exec) } => {
-                let _ = std::io::stderr().write_all(said.as_bytes());
-                let _ = std::io::stderr().flush();
-                let mut command = std::process::Command::new(&exec.program);
-                command
-                    .args(&exec.args)
-                    .envs(exec.env.iter().map(|(name, value)| (name, value)))
-                    .current_dir(&exec.cwd);
-                // This process becomes the program, which ends the command as it ends.
-                let error = command.exec();
-                // It could not be executed: cargo's error for that is the engine's to say.
-                Err(format!("the program {} could not be executed: {error}", exec.program.display()))
+            Ended::HandOver { request } => {
+                let held = Handed { request: &request, timed: timings.timed, started_ns };
+                Ok(hand_over(daemon, held, &engine, &homes.state, words))
+            }
+            Ended::Said { said, exec } => said_and_ran(&said, exec, Rows::Told(Told { daemon, timings, started_ns })),
+        }
+    }
+
+    /// Where an answer the daemon gave sends the command's spans as it ends: its connection,
+    /// what it timed, and the kernel's start of it on the profile's clock.
+    struct Told {
+        daemon: Daemon,
+        timings: Timings,
+        started_ns: i64,
+    }
+
+    impl Told {
+        /// The command's rows sent on its connection, last ([`talk::ROWS`]), its spans ended
+        /// `ended_ns`; the answer is not waited for: the command ends, or becomes its program,
+        /// next. A send that fails is said and the command goes on: its rows are a record of
+        /// it, not its answer.
+        fn send(self, ended_ns: i64) {
+            let Told { mut daemon, timings, started_ns } = self;
+            let Some(rows) = timings.rows(std::process::id(), started_ns, ended_ns) else { return };
+            if let Err(why) = talk::Link::send(&mut daemon, talk::ROWS, &rows) {
+                tracing::warn!(target: "blaze", why = %why, "thin: the command's client rows were not sent");
             }
         }
+    }
+
+    /// Where an answer the client's own check gave keeps the command's spans as it ends: a
+    /// file in the daemon's state directory, which the next daemon takes into its profile
+    /// ([`blaze_thin::kept`]).
+    struct Kept {
+        state: PathBuf,
+        timings: Timings,
+        started_ns: i64,
+        slot: String,
+        certified: Option<u64>,
+        workspace: String,
+        command: String,
+    }
+
+    impl Kept {
+        /// The command's rows written as its kept file, its spans ended `ended_ns`. A write
+        /// that fails is said and the command goes on, as [`Told::send`]'s.
+        fn keep(self, ended_ns: i64) {
+            let Kept { state, timings, started_ns, slot, certified, workspace, command } = self;
+            let record = blaze_certify::kept::Kept {
+                pid: std::process::id(),
+                started_ns,
+                ended_ns,
+                certified,
+                slot,
+                workspace,
+                command,
+                timed: timings.timed,
+            };
+            if let Err(why) = blaze_thin::kept::keep(&state, &record) {
+                tracing::warn!(target: "blaze", why = %why, "thin: the solo answer's client rows were not kept");
+            }
+        }
+    }
+
+    /// Where the command's spans go as it ends: to the daemon that answered, or kept for the
+    /// next one when the client's own check answered.
+    enum Rows {
+        Told(Told),
+        Kept(Kept),
+    }
+
+    impl Rows {
+        fn timings(&mut self) -> &mut Timings {
+            match self {
+                Rows::Told(told) => &mut told.timings,
+                Rows::Kept(kept) => &mut kept.timings,
+            }
+        }
+
+        fn send(self, ended_ns: i64) {
+            match self {
+                Rows::Told(told) => told.send(ended_ns),
+                Rows::Kept(kept) => kept.keep(ended_ns),
+            }
+        }
+    }
+
+    /// An answer said in full: `said` written to stderr, and for a `run` this process then
+    /// becomes the program (`exec`), whether the daemon answered or the client's own check.
+    /// `rows`: where the command's spans go, sent before it ends or execs.
+    fn said_and_ran(said: &str, exec: Option<blaze_thin::answer::Exec>, mut rows: Rows) -> Result<ExitCode, String> {
+        let Some(exec) = exec else {
+            let code = wrote(said);
+            rows.send(kernel::mono_ns());
+            return Ok(code);
+        };
+        let _ = std::io::stderr().write_all(said.as_bytes());
+        let _ = std::io::stderr().flush();
+        // `client: answer to exec` ends here, as this process becomes the program: its end is
+        // where the launch host's `program: exec to Hello` starts.
+        let exec_ns = kernel::mono_ns();
+        let timings = rows.timings();
+        if let Some(answered_ns) = timings.answered_ns {
+            timings.span(blaze_api::Timed::ANSWER_TO_EXEC, answered_ns, exec_ns);
+        }
+        rows.send(exec_ns);
+        let mut command = std::process::Command::new(&exec.program);
+        command
+            .args(&exec.args)
+            .envs(exec.env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&exec.cwd);
+        // This process becomes the program, which ends the command as it ends.
+        let error = command.exec();
+        // It could not be executed: cargo's error for that is the engine's to say.
+        Err(format!("the program {} could not be executed: {error}", exec.program.display()))
     }
 
     /// `said` written to stderr: the command's exit code, 0 unless stderr is closed under it.
@@ -277,14 +488,14 @@ mod unix {
         }
     }
 
-    /// cargo's home as the CLI finds it (`blaze_registry::cargo_home`), where the thin
-    /// `blaze` finds the same with no other read: `CARGO_HOME` when it is absolute, else
-    /// `.cargo` in an absolute `HOME`. A relative one, or neither, is the engine's to resolve.
-    fn cargo_home(var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    /// cargo's home as the CLI finds it (`blaze_registry::cargo_home`): `CARGO_HOME`, a
+    /// relative one joined to the current directory `cwd` as the engine joins it, else
+    /// `.cargo` in an absolute `HOME`. Neither is the engine's to resolve.
+    fn cargo_home(var: impl Fn(&str) -> Option<String>, cwd: &Path) -> Result<PathBuf, String> {
         let set = |name: &str| var(name).filter(|it| !it.is_empty()).map(PathBuf::from);
         match (set("CARGO_HOME"), set("HOME")) {
             (Some(home), _) if home.is_absolute() => Ok(home),
-            (Some(_), _) => Err("CARGO_HOME is relative".to_owned()),
+            (Some(home), _) => Ok(cwd.join(home)),
             (None, Some(home)) if home.is_absolute() => Ok(home.join(".cargo")),
             (None, _) => Err("no absolute HOME says where cargo's home is".to_owned()),
         }
@@ -357,6 +568,11 @@ mod unix {
     impl talk::Link for Daemon {
         type Until = Deadline;
 
+        /// Now on the profile's clock.
+        fn now_ns(&self) -> i64 {
+            kernel::mono_ns()
+        }
+
         /// `wait` from now, on this connection's clock.
         fn within(&self, wait: Duration) -> Deadline {
             Deadline::after(self.clock.now(), wait)
@@ -424,13 +640,22 @@ mod unix {
         error(&format!("could not run the engine {}: {failed}", engine.path.display()))
     }
 
+    /// What a handover carries of this program's own: the request's frame as sent, and the
+    /// command's spans so far with the kernel's start of it.
+    struct Handed<'a> {
+        request: &'a [u8],
+        timed: Vec<blaze_api::Timed>,
+        started_ns: i64,
+    }
+
     /// The engine takes over the command this program began: it is handed the connection
-    /// and, in a file with no name, the request and the answer read so far
-    /// ([`blaze_thin::handover`]), and this process becomes it. Returns only when that could
-    /// not be done, having said so: the request is sent, so the command is not run again.
-    fn hand_over(daemon: Daemon, request: &[u8], engine: &Engine, state: &Path, words: &[OsString]) -> ExitCode {
+    /// and, in a file with no name, the request, the answer read so far and this program's
+    /// spans ([`blaze_thin::handover`]), and this process becomes it. Returns only when that
+    /// could not be done, having said so: the request is sent, so the command is not run again.
+    fn hand_over(daemon: Daemon, handed: Handed<'_>, engine: &Engine, state: &Path, words: &[OsString]) -> ExitCode {
+        let Handed { request, timed, started_ns } = handed;
         let handed = || -> Result<std::io::Error, String> {
-            let held = Held { request, answer: &daemon.read }.write()?;
+            let held = Held { request, answer: &daemon.read, timed, started_ns }.write()?;
             // In the daemon's state directory, which is this user's alone; unlinked as soon
             // as it is open, so it is gone with the engine whatever becomes of it.
             let path = state.join(format!("thin-{}.answer", std::process::id()));

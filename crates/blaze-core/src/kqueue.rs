@@ -540,6 +540,7 @@ impl Kqueue {
             | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
+            | Effect::CopyData { .. }
             | Effect::Prewarm { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
@@ -1416,6 +1417,10 @@ impl Driver for Kqueue {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
     }
 
     fn waker(&self) -> Option<crate::Waker> {
@@ -2759,5 +2764,18 @@ mod tests {
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant: a sync and a barrier of a file sealed read-only succeed through this
+    /// driver and the threads driver, and of a missing file make it
+    /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control).
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+        let root = dir("sync-sealed");
+        crate::fs::assert_syncs_a_sealed_file(&mut Kqueue::new(&root, 1).unwrap(), &root);
+        let threads = dir("sync-sealed-threads");
+        crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(threads).unwrap();
     }
 }

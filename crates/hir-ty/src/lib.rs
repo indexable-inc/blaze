@@ -59,6 +59,7 @@ pub mod primitive;
 pub mod providers;
 pub mod record;
 pub mod solver_errors;
+mod store_registry;
 pub mod traits;
 pub mod used_imports;
 pub mod where_const;

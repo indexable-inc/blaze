@@ -1,18 +1,25 @@
-about = "Under blaze's launcher a body edit reaches a program that keeps running: after each save and build its output changes within the bound, and the program, which prints a line as it starts, started once."
+about = "Under blaze's launcher (`blaze run` of a host binary) a body edit reaches a program that keeps running: after each save and `blaze run` its output changes within the bound, and the program, which prints a line as it starts, started once."
 drivers = ["real"]
 
+# The program `blaze run` starts and leaves running: its start is made, the rest of its
+# code is answered a first call at a time.
 [[revision]]
-action = "build"
-env = { BLAZE_LAUNCH = "1" }
+steps = ["start", "await 120000 value 1"]
+action = "check"
 
+# Each edit's `blaze run` tells the running program, and runs one more that prints its value
+# once (`ONCE`) and ends.
 [[revision]]
-steps = ["start", "await 120000 value 1", "edit"]
-action = "build"
+env = { ONCE = "1" }
+steps = ["edit"]
+action = "run"
+prints = "once 2\n"
 
 [[revision]]
 steps = ["await 30000 value 2", "count 1 started", "edit"]
-action = "build"
+action = "run"
+prints = "once 3\n"
 
 [[revision]]
 steps = ["await 5000 value 3", "count 1 started", "end"]
-action = "build"
+action = "check"

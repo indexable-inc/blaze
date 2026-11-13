@@ -66,8 +66,11 @@ use crate::{
 };
 
 /// The domain of an image key. 7: a dependency enters by its surface where the lowering gave
-/// it one ([`super::given::surface`]), in place of its key.
-pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 7";
+/// it one ([`super::given::surface`]), in place of its key. 8: the image holds no def map,
+/// which is the crate's pages alone (`super::image::IMAGE_SCHEMA` 3), so an image of 7 is
+/// never asked for. 9: a workspace member, and every crate above one, has a key too
+/// ([`eligible`]); no record filed under 8 changes meaning, and none is asked for.
+pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 9";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
@@ -85,16 +88,19 @@ pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|
     hasher.finish()
 });
 
-/// Whether `krate` is read from an image: a crate no workspace member, none of whose
-/// dependencies is one either (a member's def map changes with every edit, so nothing that
-/// names it is kept), and every proc-macro crate among them with its library known.
+/// Whether `krate` is read from an image: every proc-macro crate among it and its
+/// dependencies has its library known. A workspace member is, and so is every crate above
+/// one: its key covers its files, so an edit moves it and the image of the crate as it was
+/// is never served for the crate as it is. Within one process a crate the maintainers hold
+/// state for is not served again (`super::serve`); its pages are written for the next
+/// process (`super::store` with [`super::Which::All`]).
 pub fn eligible(db: &Db, krate: Crate) -> bool {
     fn of(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
         if let Some(&known) = memo.get(&krate) {
             return known;
         }
         let data = krate.data(db);
-        let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
+        let mut eligible = libraries_known(db, krate);
         for dep in &data.dependencies {
             eligible &= of(db, dep.crate_id, memo);
         }
@@ -102,6 +108,32 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
         eligible
     }
     of(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// Whether `krate` is sealed: its sources, and those of every crate below it, cannot change,
+/// as the planner recorded on each ([`base_db::CrateData::sealed`], decided by the driver's one
+/// rule, blaze-cargo's `serve::sealed::pin`: a tree named by a digest that pins it). Nothing
+/// else is read: not the origin, not the source root's kind, not a name. A workspace member,
+/// a path dependency and a doctest crate carry no pin, so neither they nor any crate above
+/// them is sealed. What a build's end stores (`super::store` with [`super::Which::Sealed`]):
+/// a sealed crate's resolution does not change with an edit of the workspace, so its pages
+/// are written once; a member's are written when its front end is let go, or at a stop.
+pub fn sealed(db: &Db, krate: Crate) -> bool {
+    sealed_in(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// [`sealed`], memoized in `memo` across the crates of one caller's walk.
+pub fn sealed_in(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
+    if let Some(&known) = memo.get(&krate) {
+        return known;
+    }
+    let data = krate.data(db);
+    let mut sealed = data.sealed.is_some();
+    for dep in &data.dependencies {
+        sealed &= sealed_in(db, dep.crate_id, memo);
+    }
+    memo.insert(krate, sealed);
+    sealed
 }
 
 /// The key of `krate`'s image by `build`, or `None` when the crate is not [`eligible`]: the
@@ -130,7 +162,7 @@ pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<Conte
     #[cfg(test)]
     super::tests::KEYED.lock().push((db.nonce_and_revision().0, krate));
     let data = krate.data(db);
-    let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
+    let mut eligible = libraries_known(db, krate);
     // alloc: once per run of a crate's key, one key a dependency
     let mut deps = Vec::with_capacity(data.dependencies.len());
     // Every dependency is asked, eligible or not: a dependency that becomes eligible, or
@@ -353,6 +385,9 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, deps: &[ContentId], hasher: 
         manifest_kind: _,
         crate_types,
         proc_macro_cwd,
+        // Where the crate's records are kept, never what they hold; a function of the files
+        // hashed below.
+        sealed: _,
     } = krate.data(db);
     let ExtraCrateData { version, display_name, potential_cfg_options, built_for, build_script_runs } =
         krate.extra_data(db);
@@ -585,12 +620,13 @@ impl Base {
         };
     }
 
-    /// Why an image whose parts are `parts` would depend on a path its key does not hold: the
-    /// first part that holds one, and the path.
-    pub(crate) fn held_by(&self, parts: &[Vec<u8>; 3]) -> Option<Refused> {
+    /// Why the records of a crate whose bytes are `parts` (its image's parts and its def map
+    /// pages, each with what it is) would depend on a path its key does not hold: the first
+    /// part that holds one, and the path.
+    pub(crate) fn held_by(&self, parts: &[(super::Part, &[u8])]) -> Option<Refused> {
         let paths = self.dir.iter().chain(&self.out).chain(&self.others);
         for path in paths.filter(|it| it.len() >= SHORTEST_HELD) {
-            for (part, bytes) in super::Part::ALL.into_iter().zip(parts) {
+            for &(part, bytes) in parts {
                 if find(bytes, path.as_bytes()).is_some() {
                     // clone: why a crate is refused, once per refused crate
                     return Some(Refused::MachinePath { part, path: path.clone() });
@@ -633,12 +669,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// refused it and the crate the rule was met at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ineligible {
-    /// The crate is a workspace member.
-    Local,
     /// The crate is a proc-macro crate whose library's content ID is not known.
     LibraryNotKnown,
-    /// A crate it depends on, directly or through others, is `on`, a workspace member.
-    AboveLocal { on: Crate },
     /// A crate it depends on, directly or through others, is `on`, a proc-macro crate whose
     /// library's content ID is not known.
     AboveLibraryNotKnown { on: Crate },
@@ -648,9 +680,7 @@ impl Ineligible {
     /// The reason's kind, for a count by kind: one word, the same for every crate.
     pub fn kind(self) -> &'static str {
         match self {
-            Ineligible::Local => "workspace member",
             Ineligible::LibraryNotKnown => "proc macro library not known",
-            Ineligible::AboveLocal { .. } => "above a workspace member",
             Ineligible::AboveLibraryNotKnown { .. } => "above a proc macro whose library is not known",
         }
     }
@@ -658,8 +688,8 @@ impl Ineligible {
     /// The crate the rule was met at, when it is not the crate asked about.
     pub fn on(self) -> Option<Crate> {
         match self {
-            Ineligible::Local | Ineligible::LibraryNotKnown => None,
-            Ineligible::AboveLocal { on } | Ineligible::AboveLibraryNotKnown { on } => Some(on),
+            Ineligible::LibraryNotKnown => None,
+            Ineligible::AboveLibraryNotKnown { on } => Some(on),
         }
     }
 }
@@ -680,23 +710,15 @@ pub fn why_not_eligible(db: &Db, krate: Crate) -> Option<Ineligible> {
             return known;
         }
         let data = krate.data(db);
-        let mut why = if data.origin.is_local() {
-            Some(Ineligible::Local)
-        } else if !libraries_known(db, krate) {
-            Some(Ineligible::LibraryNotKnown)
-        } else {
-            None
-        };
+        let mut why = (!libraries_known(db, krate)).then_some(Ineligible::LibraryNotKnown);
         for dep in &data.dependencies {
             let below = of(db, dep.crate_id, memo);
             if why.is_none() {
                 why = below.map(|below| match below {
-                    Ineligible::Local => Ineligible::AboveLocal { on: dep.crate_id },
                     Ineligible::LibraryNotKnown => {
                         Ineligible::AboveLibraryNotKnown { on: dep.crate_id }
                     }
-                    above @ (Ineligible::AboveLocal { .. }
-                    | Ineligible::AboveLibraryNotKnown { .. }) => above,
+                    above @ Ineligible::AboveLibraryNotKnown { .. } => above,
                 });
             }
         }

@@ -24,7 +24,7 @@ makes each proof pay everywhere, and the rule that it must.
 | `hir-ty-codegen/fncache.rs:156` | everything a cached closure reaches is pure | its own walk, not `hir-ty-pure` | code id |
 | `hir-ty-identity/src/walk.rs:513` | `#[blaze::pure(trusted)]` | attribute | not keyed, by design |
 | `blaze-cargo/.../script/pure.rs:172` | a build script is pure | `hir_ty_pure::script_proof` | the pure key |
-| `blaze-lints/src/blaze/effects.rs:140`, `may.rs:194` | effects | `hir_ty_pure::check_generic` | diagnostics only |
+| `blaze-lints/src/blaze/effects.rs:140`, `expect.rs` | effects | `hir_ty_pure::check_generic` | diagnostics only |
 | `hir-ty-contracts/src/pass.rs:33` | a proved `ensures r < K` | Verus tier (being removed, D40) | no caller |
 
 What it shows: `hir-ty-pure` proves no-panic, no-alloc, no-block, termination and purity for
@@ -192,7 +192,7 @@ answer, so that an instance's facts are a join of records and never a walk.
    planted bugs.
 2. `nounwind` on definitions (`relied_on_own_no_unwind` is the hook; `Defined` in
    `llvm/lower.rs` needs the bit), `Drop` terminators whose glue cannot panic, closures,
-   `DeadCall` and `Hoist` in MIR, trait bounds (`#[blaze::may]` on a trait as a hard error) for
+   `DeadCall` and `Hoist` in MIR, trait bounds (`#[blaze::expect]` on a trait as a hard error) for
    `dyn` calls, `escape.rs` and `fncache.rs` on `facts_of`.
 3. Contracts and pattern types as range facts; linear; `&uniq`.
 

@@ -1090,6 +1090,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             at(root, &to, |to| fs::clone(from, to))?;
             Ok(Done::Cloned)
         }),
+        Effect::CopyData { from, to, .. } => at(root, &from, |from| {
+            let bytes = at(root, &to, |to| fs::copy_data(from, to))?;
+            Ok(Done::Copied { bytes })
+        }),
         Effect::Prewarm { like, file, .. } => at(root, &like, |like| {
             let bytes = at(root, &file, |file| fs::prewarm(like, file, crate::PREWARM_MOST))?;
             Ok(Done::Prewarmed { bytes })
@@ -2079,5 +2083,9 @@ impl Driver for Threads {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
     }
 }

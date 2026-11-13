@@ -1113,7 +1113,7 @@ fn impls_keep_their_order_and_their_reservation_bit() {
     use crate::{
         ImplId, Lookup,
         attrs::AttrFlags,
-        nameres::frozen::{self, Frozen, Mode},
+        nameres::frozen::{self, Mode},
         src::HasSource,
     };
     use syntax::view::AstNode;
@@ -1158,9 +1158,8 @@ impl Tr for D {}
         assert_eq!(scope.inherent_impls().count(), 1);
     }
 
-    let bytes = frozen::encode(&db, krate).unwrap();
-    let frozen = Frozen { bytes: bytes.into(), mode: Mode::Verify };
-    frozen::set(&mut db, [(krate, frozen)].into_iter().collect());
+    let bytes = frozen::pages::encode(&db, krate).unwrap();
+    frozen::serve_pages(&mut db, &[(krate, bytes)], Mode::Verify);
     let def_map = crate_def_map(&db, krate);
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert_eq!(scope.trait_impls_without_reservation().count(), 2);

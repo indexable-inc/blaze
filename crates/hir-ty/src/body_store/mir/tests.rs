@@ -26,7 +26,7 @@ use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_type_ir::inherent::Ty as _;
 use std::alloc::Global;
 
-use super::{RAN, built, decode, encode, lookup_mir, place};
+use super::{ONE_PLACE, RAN, built, decode, encode, lookup_mir, place, schema_of};
 use crate::{
     CallableDefId, InferBodyId, MemoryMap,
     body_store::{
@@ -317,7 +317,8 @@ fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
 
 /// The schema `owner`'s MIR is filed under.
 fn schema_of_mir<'db>(s: &'db Session, owner: MirOwner<'db>) -> blaze_format::SchemaHash {
-    place(&s.db, owner).expect("the test's owners are a body's").1
+    let (def, at) = place(&s.db, owner).expect("the test's owners are a body's");
+    schema_of(&s.db, def, at)
 }
 
 #[test]
@@ -326,10 +327,14 @@ fn a_body_and_its_closure_are_two_records_under_the_body() {
     let def = function(&db, "closures");
     let body = MirOwner::Body(InferBodyId::DefWithBodyId(def));
     let closure = MirOwner::Closure(closure_of(&db, def));
-    let (body_def, body_schema) = place(&db, body).unwrap();
-    let (closure_def, closure_schema) = place(&db, closure).unwrap();
+    let (body_def, body_place) = place(&db, body).unwrap();
+    let (closure_def, closure_place) = place(&db, closure).unwrap();
     assert_eq!((body_def, closure_def), (def, def), "a closure's MIR is filed under its body");
-    assert_ne!(body_schema, closure_schema, "and apart from the body's own");
+    assert_ne!(
+        schema_of(&db, def, body_place),
+        schema_of(&db, def, closure_place),
+        "and apart from the body's own"
+    );
 }
 
 #[test]
@@ -462,7 +467,8 @@ fn a_hit_allocates_only_the_decoded_mir() {
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     for closure in [false, true] {
         let owner = owner_of(&fresh.db, ask(&fresh, closure));
-        let (def, schema) = place(&fresh.db, owner).unwrap();
+        let (def, at) = place(&fresh.db, owner).unwrap();
+        let schema = super::schema_of(&fresh.db, def, at);
         // Warm: the identity, the facts' values and every type the MIR interns.
         assert!(matches!(lookup_mir(&fresh.db, def, owner, schema), Lookup::Hit { .. }));
         let body = Aligned::copy_from(&memory.answer_under("closures", Step::Mir, schema));
@@ -671,8 +677,56 @@ fn no_store_builds_as_without_one() {
     let db = second(FIXTURE);
     let def = function(&db, "closures");
     let owner = MirOwner::Body(InferBodyId::DefWithBodyId(def));
-    let (_, schema) = place(&db, owner).unwrap();
+    let (_, at) = place(&db, owner).unwrap();
+    let schema = super::schema_of(&db, def, at);
     assert!(matches!(lookup_mir(&db, def, owner, schema), Lookup::Off));
     let ask = Ask::new(&db, Durability::LOW, def, false, false);
     assert_eq!(*built_mir(&db, ask).as_ref().unwrap(), mir_of(&db, owner_of(&db, ask)));
+}
+
+/// A function with a closure and an `async` block: three MIR owners, each its own entry.
+const OWNERS: &str = r#"
+//- minicore: sized, copy, fn, future
+//- /main.rs crate:main deps:core new_source_root:local
+pub fn owners() -> u32 {
+    let id = |x: u32| x;
+    let _later = async { 2u32 };
+    id(1)
+}
+"#;
+
+/// The invariant: each MIR owner of a body has its own place and schema: `places` are
+/// distinct, and the place `place_of` finds by an owner's schema is that owner's. `Err` names
+/// the first owner that breaks it.
+fn owners_apart() -> Result<(), String> {
+    use crate::body_store::entries::{mir_schema, place_of, places};
+    let db = db_of(OWNERS);
+    let def = function(&db, "owners");
+    let places = places(&db, def);
+    assert_eq!(places.len(), 3, "the body, its closure and its `async` block: {places:?}");
+    for (n, &at) in places.iter().enumerate() {
+        if places[..n].contains(&at) {
+            return Err(format!("two owners of `owners` at {at:?}"));
+        }
+        let found = place_of(&db, def, mir_schema(&db, def, at));
+        if found != Some(at) {
+            return Err(format!("the owner at {at:?} is found at {found:?} by its schema"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn each_owner_of_a_body_has_its_own_place_and_schema() {
+    owners_apart().unwrap();
+}
+
+/// The control: owners all filed at one place ([`ONE_PLACE`]) share it, and the oracle finds
+/// them.
+#[test]
+fn the_oracle_catches_owners_filed_at_one_place() {
+    ONE_PLACE.with(|it| it.set(true));
+    let caught = owners_apart();
+    ONE_PLACE.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
 }

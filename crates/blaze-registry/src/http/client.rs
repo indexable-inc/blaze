@@ -32,8 +32,20 @@ const IN_FLIGHT: usize = 64;
 const ERROR_BODY_MOST: u64 = 64 << 10;
 
 /// [`Http`] over blaze-http, with the machine's certificates, on a runtime of its own that any
-/// number of threads ask through at once.
+/// number of threads ask through at once. Made by its first request, not by [`HyperHttp::new`]:
+/// a daemon that sends nothing never makes a runtime or loads the system's roots (about 90 ms
+/// of a macOS start, `rustls_native_certs::macos::load_native_certs`).
 pub struct HyperHttp {
+    timeout: Duration,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the client's one runtime and connection pool, made once by its first request and shared by every fetch"
+    )]
+    made: std::sync::OnceLock<Result<Made, String>>,
+}
+
+/// What a [`HyperHttp`] runs on, made by its first request ([`HyperHttp::made`]).
+struct Made {
     runtime: tokio::runtime::Runtime,
     client: Requests,
     in_flight: Arc<tokio::sync::Semaphore>,
@@ -47,12 +59,35 @@ struct Requests {
 }
 
 impl HyperHttp {
+    /// A client whose every request is held to `timeout`; nothing is made until its first
+    /// request ([`HyperHttp::made`]), which fails with what could not be made.
     pub fn new(timeout: Duration) -> anyhow::Result<HyperHttp> {
+        Ok(HyperHttp { timeout, made: Default::default() })
+    }
+
+    /// The runtime, the client and its turns, made by the first request; a failure to make
+    /// them is kept and is every request's error, naming what could not be made.
+    fn made(&self) -> anyhow::Result<&Made> {
+        let made = self.made.get_or_init(|| {
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "http client: make the runtime and load the system's root certificates"
+            )
+            .entered();
+            Made::new(self.timeout).map_err(|e| format!("making the HTTP client: {e:#}"))
+        });
+        made.as_ref().map_err(|e| anyhow::Error::msg(e.clone())) // clone: an error kept for every request
+    }
+}
+
+impl Made {
+    fn new(timeout: Duration) -> anyhow::Result<Made> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("blaze-registry http")
             .enable_all()
-            .build()?;
+            .build()
+            .context("making the HTTP client's tokio runtime")?;
         // No version: this crate is under every build of blaze, and the release blaze is is told
         // only to the engine (its build.rs), so that a release changes no crate below it.
         let user_agent = "blaze (https://github.com/indexable-inc/blaze)";
@@ -61,14 +96,16 @@ impl HyperHttp {
         let config =
             Config { idle_most: IN_FLIGHT, proxies, ..Config::new(tls, user_agent, timeout) };
         let driver = Driver::spawn(runtime.handle(), Client::new(config));
-        Ok(HyperHttp {
+        Ok(Made {
             runtime,
             client: Requests { driver },
             // alloc: the client's one semaphore, made once with it.
             in_flight: Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT)),
         })
     }
+}
 
+impl HyperHttp {
     /// One shared by the whole process, with cargo's default timeout of 30 seconds.
     pub fn shared() -> anyhow::Result<Arc<HyperHttp>> {
         #[expect(
@@ -91,7 +128,8 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(method, url, headers, body, Bounds::NONE))
+        let made = self.made()?;
+        made.runtime.block_on(made.client.fetch(method, url, headers, body, Bounds::NONE))
     }
 
     /// [`Http::get`] of `url` held to `bounds`: a body past `bounds.most` stops being read, and
@@ -102,7 +140,8 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Vec::new(), bounds))
+        let made = self.made()?;
+        made.runtime.block_on(made.client.fetch(Method::GET, url, headers, Vec::new(), bounds))
     }
 
     /// `url`'s body from byte `from` into `sink`, in order, each piece with its offset in the
@@ -121,7 +160,8 @@ impl HyperHttp {
         what: &str,
         watch: Watch<'_>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.ranged(url, headers, from, bounds, sink, what, watch))
+        let made = self.made()?;
+        made.runtime.block_on(made.client.ranged(url, headers, from, bounds, sink, what, watch))
     }
 }
 
@@ -137,11 +177,15 @@ impl HyperHttp {
         from: u64,
         what: &str,
     ) -> Pending<anyhow::Result<Response>> {
-        let (client, in_flight) = (self.client.clone(), self.in_flight.clone());
+        let made = match self.made() {
+            Ok(made) => made,
+            Err(e) => return Box::pin(std::future::ready(Err(e))),
+        };
+        let (client, in_flight) = (made.client.clone(), made.in_flight.clone());
         let (url, what) = (url.to_owned(), what.to_owned()); // alloc: moved into the task
         let headers: Vec<(String, String)> =
             headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect(); // alloc: as above
-        let task = self.runtime.spawn(async move {
+        let task = made.runtime.spawn(async move {
             let _turn = in_flight.acquire_owned().await?;
             let headers: Vec<(&str, &str)> =
                 headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect(); // alloc: borrowed views of the above
@@ -631,11 +675,15 @@ impl Http for HyperHttp {
     }
 
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
-        let (client, in_flight) = (self.client.clone(), self.in_flight.clone());
+        let made = match self.made() {
+            Ok(made) => made,
+            Err(e) => return Box::pin(std::future::ready(Err(e))),
+        };
+        let (client, in_flight) = (made.client.clone(), made.in_flight.clone());
         let url = url.to_owned();
         let headers: Vec<(String, String)> =
             headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
-        let task = self.runtime.spawn(async move {
+        let task = made.runtime.spawn(async move {
             let _turn = in_flight.acquire_owned().await?;
             let headers: Vec<(&str, &str)> =
                 headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
@@ -645,7 +693,14 @@ impl Http for HyperHttp {
     }
 
     fn sleep(&self, duration: Duration) -> Pending<()> {
-        let task = self.runtime.spawn(tokio::time::sleep(duration));
+        // A sleep only ever follows a request's spurious failure, which only a client made can
+        // give: one not made has no runtime to wait on, so the wait holds this thread, as
+        // [`Http::sleep`]'s does.
+        let Ok(made) = self.made() else {
+            super::wait_out(duration);
+            return Box::pin(std::future::ready(()));
+        };
+        let task = made.runtime.spawn(tokio::time::sleep(duration));
         Box::pin(async move {
             _ = task.await;
         })

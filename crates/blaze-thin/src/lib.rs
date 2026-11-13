@@ -25,16 +25,25 @@
 //! This library is what the engine shares with the program so the two can't differ: cargo's
 //! lines ([`say`]), the color rule and the request ([`request`]), the reader of the kept pin
 //! lookup and `--version`'s sentences ([`pin`]), and the handover's layout ([`handover`]).
-//! It reads files in [`pin`] alone; the program (`main.rs`) does the rest of the IO.
+//! It reads files in [`pin`] and, on Unix, [`solo`]: the client's own check of a build or a
+//! run with nothing changed over the request slot the daemon wrote, which answers it with no
+//! daemon asked (/tmp/plan/10-no-daemon-run.md), and [`kept`]: such an answer's spans,
+//! written as a file the next daemon takes into its profile (the record and the take are
+//! blaze-certify's `kept`); the program (`main.rs`) does the
+//! rest of the IO.
 
 #![deny(unsafe_code)]
 
 pub mod answer;
 pub mod handover;
+#[cfg(unix)]
+pub mod kept;
 pub mod pin;
 pub mod request;
 pub mod route;
 pub mod say;
+#[cfg(unix)]
+pub mod solo;
 pub mod talk;
 
 /// This blaze's version, as a pin names it: a release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a

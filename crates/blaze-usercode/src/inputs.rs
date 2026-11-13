@@ -25,9 +25,9 @@ use blaze_hash::FixedHasher;
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_mem::{Tag, frame};
 use blaze_query::{Cancelled, Cx};
-use blaze_vfs::outside::{Cover, Dirs};
+use blaze_vfs::outside::{Cover, Dirs, LookKind, Looks};
 
-use crate::trace::{DIRECTORY, Entry, Inputs, Names, listing, os_bytes};
+use crate::trace::{DIRECTORY, Entry, Inputs, Names, entry_digest, listing, os_bytes};
 
 /// What a traced path that is neither a file nor a directory hashes as.
 pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
@@ -243,7 +243,7 @@ fn mix(mut word: u64) -> u64 {
 
 /// The most symlinks one path is followed through, as the kernel's own bound is (`MAXSYMLINKS`
 /// is 32 on macOS, 40 on Linux): past it the path is not vouched for.
-const MOST_LINKS: usize = 40;
+pub(crate) const MOST_LINKS: usize = 40;
 
 /// Every name the answer about `path` rests on, each as the watch of its directory hears it
 /// (absolute, with no symlink above its last part): `path` itself when it is canonical; for a
@@ -371,7 +371,10 @@ impl Files {
             .finish()
     }
 
-    fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+    /// What `path` hashes as, links followed. When no watch vouches for the answer kept the
+    /// disk is looked at, and the look is pushed to `looks` with what it said; a file that
+    /// can't be read pushes nothing.
+    fn file(&self, path: &Path, looks: &Looks) -> Result<Option<[u8; 32]>, Unreadable> {
         let id = Files::path_id(path);
         let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
         let known = found.filter(|it| *it.path == *path.as_os_str());
@@ -384,11 +387,9 @@ impl Files {
         }
         let generation = self.dirs.generation();
         // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
-        // counted, so a stretch of checks that looked at nothing can be told
-        // (`blaze_vfs::outside::looks`).
-        blaze_vfs::outside::looked(path);
+        // the look kept by the build it was made for, with what it said.
         let (answer, settled) = self.look(path)?;
-        blaze_vfs::outside::looked_file(path, answer);
+        looks.push(path, LookKind::File, answer);
         if settled {
             match (known, found) {
                 (Some(known), _) => known.write(generation, answer),
@@ -466,7 +467,7 @@ impl Files {
     /// blaze-cargo's fetch reads a tree into one: a link is its target, `/`-separated; a file
     /// is executable when any of its execute bits is set. A file's content ID is kept under
     /// what `stat` says of it, as its hash is.
-    fn entry(&self, path: &Path) -> Result<Entry, Unreadable> {
+    fn entry(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
         // alloc: error path
@@ -497,7 +498,7 @@ impl Files {
             }
             canonical
         });
-        let entry = self.entry_now(path)?;
+        let entry = self.entry_now(path, looks)?;
         if plain {
             // alloc: once per path asked of, its name as the key of what was said of it
             self.entries.lock().insert(path.to_path_buf(), (generation, entry));
@@ -505,14 +506,21 @@ impl Files {
         Ok(entry)
     }
 
-    /// [`Files::entry`] of the disk now: a look, counted.
-    fn entry_now(&self, path: &Path) -> Result<Entry, Unreadable> {
+    /// [`Files::entry`] of the disk now: a look, pushed to `looks` with what it said
+    /// ([`entry_digest`]); a path that can't be read as an entry pushes nothing.
+    fn entry_now(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
+        let entry = self.entry_on_disk(path)?;
+        looks.push(path, LookKind::Entry, entry_digest(&entry));
+        Ok(entry)
+    }
+
+    /// What the disk says `path` itself is, a link not followed.
+    fn entry_on_disk(&self, path: &Path) -> Result<Entry, Unreadable> {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        blaze_vfs::outside::looked(path);
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
@@ -619,28 +627,41 @@ impl Env {
 }
 
 /// The machine's files and an environment, as one check sees them: what [`Files`] it hashes
-/// with and what [`Env`] it answers from, both shared.
+/// with and what [`Env`] it answers from, both shared, and the looks of the build the check
+/// is made for ([`Looks::none`] for a check no build keeps the looks of).
+///
+/// The invariant: each look at the disk this makes is pushed to `looks` with the answer it
+/// gave, and asking the same of an unchanged disk gives that answer again: a file's is what
+/// [`Inputs::file`] returns, a listing's what [`Inputs::dir`] returns, an entry's
+/// [`entry_digest`] of what [`Inputs::entry`] returns.
 #[derive(Clone, Copy)]
 pub struct Now<'a> {
     pub files: &'a Files,
     pub env: &'a Env,
+    pub looks: &'a Looks,
 }
 
-/// The machine's files as they are, through [`Files::shared`], and an environment of its own.
+/// The machine's files as they are, through [`Files::shared`], an environment of its own, and
+/// the looks of the build it reads for.
 pub struct Disk {
     files: &'static Files,
     env: Env,
+    looks: Looks,
 }
 
 impl Disk {
-    pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
-        Disk { files: Files::shared(), env: Env::new(env) }
+    /// `looks` is the list of the build this reads for: each look at the disk is pushed there.
+    pub fn new(env: Vec<(OsString, OsString)>, looks: &Looks) -> Disk {
+        // clone: an Arc, the build's list
+        Disk { files: Files::shared(), env: Env::new(env), looks: looks.clone() }
     }
 
     /// The files with the environment of a run that is lent it ([`Env::lent`], whose `sees`
-    /// this takes): what a build script's run is assembled and checked against.
-    pub fn lent(env: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool) -> Disk {
-        Disk { files: Files::shared(), env: Env::lent(env, sees) }
+    /// this takes): what a build script's run is assembled and checked against. `looks` as
+    /// [`Disk::new`]'s.
+    pub fn lent(env: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool, looks: &Looks) -> Disk {
+        // clone: an Arc, the build's list
+        Disk { files: Files::shared(), env: Env::lent(env, sees), looks: looks.clone() }
     }
 
     /// The same files with another environment.
@@ -649,7 +670,7 @@ impl Disk {
     }
 
     pub fn now(&self) -> Now<'_> {
-        Now { files: self.files, env: &self.env }
+        Now { files: self.files, env: &self.env, looks: &self.looks }
     }
 }
 
@@ -687,7 +708,7 @@ impl Inputs for Now<'_> {
     type Error = Unreadable;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
-        self.files.file(path)
+        self.files.file(path, self.looks)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -723,10 +744,12 @@ impl Inputs for Now<'_> {
             return Ok(true);
         }
         let generation = self.files.dirs.generation();
-        blaze_vfs::outside::looked(path);
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
-            Err(error) if missing(&error) => return Ok(false),
+            Err(error) if missing(&error) => {
+                self.looks.push(path, LookKind::Listing, None);
+                return Ok(false);
+            }
             Err(error) => return Err(unreadable(error)),
         };
         // alloc: the listing kept, once a directory listed off the disk
@@ -748,6 +771,10 @@ impl Inputs for Now<'_> {
             listed.push((name, dir));
         }
         out.sort();
+        // The look, once the whole listing was read: what [`Inputs::dir`] says of these names.
+        if self.looks.keeps() {
+            self.looks.push(path, LookKind::Listing, Some(listing(listed.iter().map(|it| it.0.as_os_str()))));
+        }
         if !links && std::fs::canonicalize(path).is_ok_and(|it| it == path) {
             if kept.is_none() {
                 self.files.dirs.watch_name(&asked);
@@ -759,7 +786,7 @@ impl Inputs for Now<'_> {
     }
 
     fn entry(&mut self, path: &Path) -> Result<Entry, Unreadable> {
-        self.files.entry(path)
+        self.files.entry(path, self.looks)
     }
 
     fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
@@ -990,7 +1017,7 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a"), b"one").unwrap();
-        let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())]);
+        let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())], &Looks::none());
         assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(disk.file(&dir.join("sub")).unwrap(), Some(DIRECTORY));
         assert_eq!(disk.file(&dir.join("none")).unwrap(), None);
@@ -1045,7 +1072,7 @@ mod tests {
         assert_eq!(lent.get(OsStr::new("TERM")), Some(OsStr::new("x")));
         let walked: Vec<&OsStr> = lent.vars().iter().map(|it| it.0.as_os_str()).collect();
         assert_eq!(walked, [OsStr::new("CC"), OsStr::new("PATH")]);
-        let mut disk = Disk::lent(vars(), |name| name != "TERM");
+        let mut disk = Disk::lent(vars(), |name| name != "TERM", &Looks::none());
         assert_eq!(disk.env(OsStr::new("TERM")), Some(OsStr::new("x")));
         assert_eq!(disk.env_all().len(), 2);
         // The control.
@@ -1065,7 +1092,7 @@ mod tests {
             let workers: Vec<_> = (0..8)
                 .map(|n| {
                     let (files, env, path) = (&files, if n % 2 == 0 { &one } else { &two }, &path);
-                    scope.spawn(move || Now { files, env }.file(path).unwrap())
+                    scope.spawn(move || Now { files, env, looks: &Looks::none() }.file(path).unwrap())
                 })
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
@@ -1073,11 +1100,74 @@ mod tests {
         assert!(hashes.iter().all(|it| *it == Some(blaze_ids::b3::hash(b"one"))));
         assert_eq!(files.stamped.len(), 1);
         std::fs::write(&path, b"two, longer").unwrap();
-        let mut now = Now { files: &files, env: &one };
+        let mut now = Now { files: &files, env: &one, looks: &Looks::none() };
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(files.stamped.len(), 2);
         assert_eq!(now.env(OsStr::new("X")), Some(OsStr::new("1")));
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The invariant: each look at the disk is pushed once to the build's [`Looks`], with its
+    /// kind and the answer the ask returned (an entry's through [`entry_digest`]), and the
+    /// same ask of the unchanged disk, through [`Looks::none`] as the daemon's later check
+    /// makes it, gives that answer again. No driver runs here, so no watch vouches and every
+    /// ask looks. The control: a handle that keeps nothing ([`Looks::none`]) holds no look.
+    #[test]
+    fn each_look_is_pushed_once_with_the_answer_a_second_ask_gives() {
+        let made = std::env::temp_dir().join(format!("blaze-files-looks-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&made);
+        std::fs::create_dir_all(made.join("sub")).unwrap();
+        let dir = std::fs::canonicalize(&made).unwrap();
+        let (file, gone) = (dir.join("a"), dir.join("gone"));
+        std::fs::write(&file, b"one").unwrap();
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let files = Files::watched_by(dirs);
+        let (env, looks, none) = (Env::default(), Looks::new(), Looks::none());
+        let mut now = Now { files: &files, env: &env, looks: &looks };
+        let mut again = Now { files: &files, env: &env, looks: &none };
+        let mut expect: Vec<(PathBuf, LookKind, Option<[u8; 32]>)> = Vec::new();
+
+        for path in [&file, &gone, &dir] {
+            let answer = now.file(path).unwrap();
+            assert_eq!(again.file(path).unwrap(), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::File, answer));
+        }
+        assert_eq!(expect[0].2, Some(blaze_ids::b3::hash(b"one")));
+        assert_eq!(expect[1].2, None);
+        assert_eq!(looks.len(), 3);
+
+        for path in [&file, &gone, &dir] {
+            let answer = entry_digest(&now.entry(path).unwrap());
+            assert_eq!(entry_digest(&again.entry(path).unwrap()), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::Entry, answer));
+        }
+        assert_eq!(expect[4].2, None, "an entry that is not there says nothing");
+        assert!(expect[3].2.is_some() && expect[5].2.is_some() && expect[3].2 != expect[5].2);
+        assert_eq!(looks.len(), 6);
+
+        for path in [&dir, &gone] {
+            let answer = now.dir(path).unwrap();
+            assert_eq!(again.dir(path).unwrap(), answer, "{}", path.display());
+            expect.push((path.clone(), LookKind::Listing, answer));
+        }
+        assert_eq!(expect[6].2, Some(listing([OsStr::new("a"), OsStr::new("sub")])));
+        assert_eq!(expect[7].2, None);
+
+        expect.sort();
+        let kept: Vec<_> = looks.all().into_iter().map(|it| (it.path, it.kind, it.answer)).collect();
+        assert_eq!(kept, expect, "one look per ask, of its kind, with its answer");
+        assert!(none.is_empty() && !none.keeps());
+        assert!(Looks::twice(&looks.all()).next().is_none());
+
+        // A second ask that says something else is a second look of the path, which
+        // [`Looks::twice`] names.
+        std::fs::write(&file, b"two, longer").unwrap();
+        assert_eq!(now.file(&file).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
+        let all = looks.all();
+        let twice: Vec<_> = Looks::twice(&all).collect();
+        assert_eq!(twice.len(), 1);
+        assert_eq!((twice[0].0.path.as_path(), twice[0].0.kind), (file.as_path(), LookKind::File));
+        _ = std::fs::remove_dir_all(&made);
     }
 
     #[test]
@@ -1090,7 +1180,7 @@ mod tests {
         std::fs::write(&path, b"one").unwrap();
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
-        let mut now = Now { files: &files, env: &Env::default() };
+        let mut now = Now { files: &files, env: &Env::default(), looks: &Looks::none() };
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs.dir(0).path(), dir.as_path());
@@ -1159,7 +1249,7 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
         let path = dir.join("sdks/named/lib/m");
-        assert_eq!(files.file(&path).unwrap(), hash);
+        assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
         let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
         assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
         let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
@@ -1180,14 +1270,14 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
         let hash = Some(blaze_ids::b3::hash(b"one"));
-        assert_eq!(files.file(&path).unwrap(), hash);
+        assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
         let warm =
-            blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
+            blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path, &Looks::none()).unwrap());
         assert_eq!(warm, hash);
         let missing = path.with_file_name("gone");
-        assert_eq!(files.file(&missing).unwrap(), None);
+        assert_eq!(files.file(&missing, &Looks::none()).unwrap(), None);
         let warm = blaze_alloc_count::assert_at_most(0, "a warm missing file", || {
-            files.file(&missing).unwrap()
+            files.file(&missing, &Looks::none()).unwrap()
         });
         assert_eq!(warm, None);
         _ = std::fs::remove_dir_all(&made);
@@ -1250,7 +1340,7 @@ mod tests {
         fn execute(cx: &mut Cx<'_>, package: &bool) -> Result<Both, Cancelled> {
             let kept = cx.tree("", *package)?.expect("the root is a directory");
             let (env, hashes) = (Env::new(Vec::new()), Hashes::default());
-            let now = Now { files: Files::shared(), env: &env };
+            let now = Now { files: Files::shared(), env: &env, looks: &Looks::none() };
             let mut inputs = ViewInputs { cx, root: Path::new("/v"), now, hashes: &hashes };
             let walked = match crate::trace::walk(&mut inputs, Path::new("/v"), *package) {
                 Ok(it) => it.expect("the root is a directory"),
@@ -1300,7 +1390,7 @@ mod tests {
                 std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
-        let mut disk = Disk::new(Vec::new());
+        let mut disk = Disk::new(Vec::new(), &Looks::none());
         for package in [false, true] {
             let (kept, walked) = db.pin().get::<ViewTree>(view, &package).expect("not cancelled");
             assert_eq!(walked, kept, "package {package}: the view walked and its own hash");

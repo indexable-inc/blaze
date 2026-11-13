@@ -1,0 +1,14 @@
+{
+ "id": "placed-files-let-go-by-caller",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3d, int-1112",
+ "where": "crates/blaze-cas/src/lib.rs Store::place / names_step, crates/blaze-cas/src/whole.rs, crates/blaze-cargo/src/serve/job.rs Jobs::place",
+ "what": "The store kept a whole file (placed/<content>, .derived) of every output it ever placed by cloning unless the daemon remembered to call Store::unplace / unplace_made with the path's last key; the collector's placed roots were a set of keys, so a key placed at two paths lost its root when one path was replaced. A hello-world home held 917 MB, 314 MB of it whole and derived files.",
+ "cost": "disk 12x the competitor's on hello world; the planted set bug unguarded",
+ "cause": "who names a cached file was the caller's bookkeeping (an unplace call per path) instead of the store's own record of what each path was placed from",
+ "class": "a cache's lifetime kept by the caller asking for deletion, and a reference count kept as a set",
+ "prevention": "the place routes count names per path themselves (whole::Names, listed in placed/names); no API lets a caller drop a cached file",
+ "workaround": "none",
+ "fix": "Names driven by every place route; unplace and unplace_made deleted; Collecting::placed replaced by Store::place_keys (one entry a path); the open sweeps content-named files the listing does not name. Control: PlacePlant::OneName (place_crash's oracle `bounded`) and whole.rs's plant_one_name.",
+ "state": "written, not built (see /tmp/plan/3d-next.md)"
+}

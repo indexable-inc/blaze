@@ -28,6 +28,21 @@ const LATEST_STABLE: &str = "2024";
 /// `init` write when no edition is asked, with no `bstd` line.
 pub const BSTD_SHIPS: bool = false;
 
+/// The digest of the bstd source tree the release this blaze is ships beside it
+/// (`bstd-<digest>.tar.xz`: crates/blaze-std, the crates of blaze it depends on by path and a
+/// workspace manifest of just them, digested as the library is), when it ships one: given to
+/// the build of a release as `BLAZE_BSTD_DIGEST` by the step that made the archive
+/// (harness/library.py `archive` with `"tree": "bstd"`, in release.yaml's notes job), none
+/// for a build of the tree. A shipped bstd is placed at
+/// `<machine>/bstd/<digest>/bstd` and its records are a sealed layer as the library's are
+/// (`cli::store::shipped` of blaze-cargo, the one list of what ships); a package names it there
+/// with `--bstd`. A bstd that is a path into a checkout is no shipped tree: its sources can
+/// change, so it is built in its home like any path crate.
+pub const BSTD_DIGEST: Option<&str> = match option_env!("BLAZE_BSTD_DIGEST") {
+    Some(digest) if !digest.is_empty() => Some(digest),
+    _ => None,
+};
+
 /// The edition written when none is asked: the latest blaze edition where a package of it
 /// can be built (bstd ships, or `bstd` says where it is), else Rust's latest. `--rust` on the
 /// command line asks for Rust's by name, whatever this is.

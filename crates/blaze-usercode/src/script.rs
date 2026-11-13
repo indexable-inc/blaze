@@ -41,6 +41,7 @@ use std::{
 use blaze_build_script::{Error, Unit, output};
 use blaze_core::{Command, Exit, Sandbox, Traced};
 use blaze_ids::ContentId;
+use blaze_vfs::outside::Looks;
 
 use crate::{
     Given, RunKey, RunKind,
@@ -114,9 +115,11 @@ impl Prepared {
 
     /// The disk a check of the run's inputs reads: every file as it is, a variable by name
     /// from [`Prepared::env`], and a walk of the environment as the run's sandbox shows it.
-    pub fn disk(&self) -> crate::inputs::Disk {
+    /// Each look it makes at the disk is pushed to `looks`, the list of the build the check
+    /// is made for.
+    pub fn disk(&self, looks: &Looks) -> crate::inputs::Disk {
         // clone: once per run prepared, the environment its checks answer from
-        crate::inputs::Disk::lent(self.env.clone(), walk_sees)
+        crate::inputs::Disk::lent(self.env.clone(), walk_sees, looks)
     }
 
     /// The script's whole environment, as it is started in it (its command's), given names
@@ -141,18 +144,21 @@ pub fn script_env(
 }
 
 /// `unit`'s run, in a build started with `inherited` (cargo's environment once started:
-/// [`blaze_build_script::env::cargo_started`]).
+/// [`blaze_build_script::env::cargo_started`]). Each look at the disk that resolving its
+/// package's and `OUT_DIR`'s links makes is pushed to `looks`, the list of the build the run
+/// is prepared for ([`RootMap::set`]).
 pub fn prepare(
     unit: &Unit,
     inherited: &[(OsString, OsString)],
     place: &Place,
+    looks: &Looks,
 ) -> Result<Prepared, Error> {
     let env = blaze_build_script::env(unit, inherited)?;
     let mut roots = place
         .roots
         .clone() // clone: setup, the run's roots are the build's and its own
-        .with(Role::Package, &unit.package.manifest_dir)
-        .with(Role::OutDir, &unit.out_dir);
+        .with(Role::Package, &unit.package.manifest_dir, looks)
+        .with(Role::OutDir, &unit.out_dir, looks);
     let view = roots.view();
     let mut given = Given::new(RunKind::BuildScript);
     // The roots a given string still holds once ported (`-L/ws/p/lib`, a root after a path
@@ -461,8 +467,8 @@ mod tests {
             memory: None,
             mode: Mode::Normal,
             roots: RootMap::default()
-                .with(Role::Target, Path::new("/t"))
-                .with(Role::Tools, Path::new("/bin")),
+                .with(Role::Target, Path::new("/t"), &Looks::none())
+                .with(Role::Tools, Path::new("/bin"), &Looks::none()),
         }
     }
 
@@ -480,9 +486,9 @@ mod tests {
         unit.out_dir = at(&unit.out_dir);
         let mut place = place();
         place.roots = RootMap::default()
-            .with(Role::Target, &at(Path::new("/t")))
-            .with(Role::Workspace, &at(Path::new("/ws")))
-            .with(Role::Tools, &at(Path::new("/bin")));
+            .with(Role::Target, &at(Path::new("/t")), &Looks::none())
+            .with(Role::Workspace, &at(Path::new("/ws")), &Looks::none())
+            .with(Role::Tools, &at(Path::new("/bin")), &Looks::none());
         (unit, place)
     }
 
@@ -491,19 +497,19 @@ mod tests {
     fn two_checkouts_at_different_paths_give_one_key() {
         let (a, a_place) = moved("/home/a");
         let (b, b_place) = moved("/srv/ci/b");
-        let one = prepare(&a, &inherited("/a"), &a_place).unwrap();
-        let two = prepare(&b, &inherited("/a"), &b_place).unwrap();
+        let one = prepare(&a, &inherited("/a"), &a_place, &Looks::none()).unwrap();
+        let two = prepare(&b, &inherited("/a"), &b_place, &Looks::none()).unwrap();
         assert_eq!(one.spec.key, two.spec.key);
         // What it is given is still its checkout's.
         assert_ne!(one.spec.command.env, two.spec.command.env);
         // Without its roots, a checkout elsewhere is another key.
         let (mut c, mut c_place) = moved("/srv/ci/c");
         c_place.roots = RootMap::default();
-        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place).unwrap().spec.key);
+        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place, &Looks::none()).unwrap().spec.key);
         // A path given that is under no root stays absolute.
         c_place = moved("/srv/ci/c").1;
         c.tools.rustc = "/opt/rustc".into();
-        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place).unwrap().spec.key);
+        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place, &Looks::none()).unwrap().spec.key);
     }
 
     fn inherited(path: &str) -> Vec<(OsString, OsString)> {
@@ -525,16 +531,16 @@ mod tests {
                 pinned: vec![("LLVM_SYS_231_PREFIX".into(), format!("sha256:{digest}"))],
                 ..place()
             };
-            prepare(&given, &inherited("/a"), &place).unwrap().spec.key
+            prepare(&given, &inherited("/a"), &place, &Looks::none()).unwrap().spec.key
         };
         let (a, b) = (with(&"a".repeat(64)), with(&"b".repeat(64)));
         assert_ne!(a, b);
         assert_eq!(a, with(&"a".repeat(64)));
-        let none = prepare(&given, &inherited("/a"), &place()).unwrap().spec.key;
+        let none = prepare(&given, &inherited("/a"), &place(), &Looks::none()).unwrap().spec.key;
         assert_ne!(a, none);
         // The variable it is given is set from the unit: in the key by its value too.
         assert!(
-            prepare(&given, &inherited("/a"), &place())
+            prepare(&given, &inherited("/a"), &place(), &Looks::none())
                 .unwrap()
                 .given
                 .iter()
@@ -544,14 +550,14 @@ mod tests {
 
     #[test]
     fn a_path_passed_through_is_traced_not_given() {
-        let one = prepare(&unit(), &inherited("/a"), &place()).unwrap();
-        let two = prepare(&unit(), &inherited("/b"), &place()).unwrap();
+        let one = prepare(&unit(), &inherited("/a"), &place(), &Looks::none()).unwrap();
+        let two = prepare(&unit(), &inherited("/b"), &place(), &Looks::none()).unwrap();
         assert_eq!(one.spec.key, two.spec.key);
         assert!(!one.given.iter().any(|it| it == "PATH"));
         assert!(one.given.iter().any(|it| it == "OUT_DIR"));
         let mut other = unit();
         other.target = "aarch64-unknown-linux-gnu".into();
-        let three = prepare(&other, &inherited("/a"), &place()).unwrap();
+        let three = prepare(&other, &inherited("/a"), &place(), &Looks::none()).unwrap();
         assert_ne!(one.spec.key, three.spec.key);
         for prepared in [&one, &two, &three] {
             assert_eq!(
@@ -566,7 +572,7 @@ mod tests {
 
     #[test]
     fn what_is_given_or_of_one_run_is_not_traced() {
-        let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
+        let prepared = prepare(&unit(), &inherited("/a"), &place(), &Looks::none()).unwrap();
         let mut traced = Traced {
             env: vec![
                 ("OUT_DIR".into(), Some("/t/build/p/0123456789abcdef/out".into())),
@@ -584,7 +590,7 @@ mod tests {
     /// would be under a key no check makes, and the run would never be found again.
     #[test]
     fn a_trace_that_disagrees_with_the_check_is_refused_naming_the_variable() {
-        let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
+        let prepared = prepare(&unit(), &inherited("/a"), &place(), &Looks::none()).unwrap();
         let mut other =
             Traced { env: vec![("PATH".into(), Some("/elsewhere".into()))], ..Traced::default() };
         let error = keyed(&prepared, &mut other).unwrap_err();
@@ -635,7 +641,7 @@ mod tests {
             let mut env = inherited("/a");
             env.push(("MAKEFLAGS".into(), flags.into()));
             env.push(("CARGO_MAKEFLAGS".into(), flags.into()));
-            prepare(&unit(), &env, &place()).unwrap()
+            prepare(&unit(), &env, &place(), &Looks::none()).unwrap()
         };
         let first = make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3");
         assert!(
@@ -658,7 +664,7 @@ mod tests {
             "no override finds the run given one"
         );
         // Only the jobserver: as a build outside make.
-        let outside = kept_whole(&prepare(&unit(), &inherited("/a"), &place()).unwrap());
+        let outside = kept_whole(&prepare(&unit(), &inherited("/a"), &place(), &Looks::none()).unwrap());
         assert!(finds(&outside, &make("-j8 --jobserver-auth=3,4")));
         // Cargo's rule records what the check has of it.
         let mut traced =
@@ -667,7 +673,7 @@ mod tests {
             env: vec!["MAKEFLAGS".into(), "CARGO_MAKEFLAGS".into()],
             ..CargoRule::default()
         };
-        rule::widen(&mut traced, &watched, &mut Disk::new(first.env.clone())).unwrap();
+        rule::widen(&mut traced, &watched, &mut Disk::new(first.env.clone(), &Looks::none())).unwrap();
         assert_eq!(
             traced.env,
             vec![
@@ -699,7 +705,7 @@ mod tests {
         // As the launcher assembles it (`sandbox/v2.rs`): a walk sees the given names and
         // the walk set.
         let sees = |name: &OsStr| prepared.given.iter().any(|it| it == name) || walk_sees(name);
-        let mut disk = Disk::lent(prepared.script_env().to_vec(), sees);
+        let mut disk = Disk::lent(prepared.script_env().to_vec(), sees, &Looks::none());
         let mut traced = trace::assemble(&lines, None, &mut disk).unwrap();
         keyed(prepared, &mut traced).unwrap();
         let roots = prepared.spec.roots.view();
@@ -725,7 +731,7 @@ mod tests {
             env.push(("OLDPWD".into(), oldpwd.into()));
             env.push(("SHLVL".into(), shlvl.into()));
             env.push(("NIX_BUILD_TOP".into(), format!("/tmp/nix-shell.{oldpwd}").into()));
-            prepare(&unit(), &env, &place()).unwrap()
+            prepare(&unit(), &env, &place(), &Looks::none()).unwrap()
         };
         let first = shell("/a", "x", "1");
         let given = first
@@ -777,7 +783,7 @@ mod tests {
                 store.iter().find(|it| it.0 == *key).map(|it| it.1.as_slice()),
             )
         };
-        let mut disk = prepared.disk();
+        let mut disk = prepared.disk(&Looks::none());
         let found = index::search(
             get,
             &prepared.spec.key,
@@ -824,20 +830,20 @@ mod tests {
         };
         let value = elided(b"cargo:rustc-cfg=x\n".to_vec());
         // Kept as the daemon keeps it when the sandboxed run ends: from its Start.
-        let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
-        let mut disk = Disk::new(prepared.script_env().to_vec());
+        let prepared = prepare(&unit(), &inherited("/a"), &place(), &Looks::none()).unwrap();
+        let mut disk = Disk::new(prepared.script_env().to_vec(), &Looks::none());
         pure::keep(&mut store, &proof, prepared.spec.roots.view(), Vec::new(), &mut disk, &value)
             .unwrap();
         // The next build's lookup, before anything is compiled: the script's environment made
         // again, under the run's roots.
         let roots = place()
             .roots
-            .with(Role::Package, &unit().package.manifest_dir)
-            .with(Role::OutDir, &unit().out_dir);
+            .with(Role::Package, &unit().package.manifest_dir, &Looks::none())
+            .with(Role::OutDir, &unit().out_dir, &Looks::none());
         let reader = store.reader();
         let guard = blaze_cas::enter();
         let find = |unit: &Unit| {
-            let mut disk = Disk::new(script_env(unit, &inherited("/a")).unwrap());
+            let mut disk = Disk::new(script_env(unit, &inherited("/a")).unwrap(), &Looks::none());
             pure::find(&reader, &guard, &proof, roots.view(), &mut disk).unwrap()
         };
         assert_eq!(
@@ -862,16 +868,16 @@ mod tests {
     fn a_rerun_that_read_the_whole_environment_finds_the_result_it_kept() {
         let mut env = inherited("/a");
         env.push(("CARGO_MAKEFLAGS".into(), "-j8 --jobserver-auth=3,4".into()));
-        let first = prepare(&unit(), &env, &place()).unwrap();
+        let first = prepare(&unit(), &env, &place(), &Looks::none()).unwrap();
         let store = kept_whole(&first);
         // The next build: prepared again, another jobserver, checked as the daemon checks it.
         let mut again_env = inherited("/a");
         again_env.push(("CARGO_MAKEFLAGS".into(), "-j8 --jobserver-auth=5,6".into()));
-        let again = prepare(&unit(), &again_env, &place()).unwrap();
+        let again = prepare(&unit(), &again_env, &place(), &Looks::none()).unwrap();
         assert_eq!(again.spec.key, first.spec.key);
         assert!(finds(&store, &again), "a no-op rebuild misses its kept run");
         // A variable passed through that changed is still an input of the whole environment.
-        let moved = prepare(&unit(), &inherited("/b"), &place()).unwrap();
+        let moved = prepare(&unit(), &inherited("/b"), &place(), &Looks::none()).unwrap();
         assert!(!finds(&store, &moved), "a changed PATH finds the run of another");
     }
 
@@ -895,7 +901,7 @@ mod tests {
             if let Some(path) = libclang {
                 env.push(("LIBCLANG_PATH".into(), path.into()));
             }
-            prepare(&unit(), &env, &place()).unwrap()
+            prepare(&unit(), &env, &place(), &Looks::none()).unwrap()
         };
         let first = shell("xterm", "1", "cc", None);
         // It walked its environment and asked for nothing by name.
@@ -998,7 +1004,7 @@ mod tests {
         wrote.files.push(OutFile {
             path: "x".into(),
             executable: false,
-            bytes: Some(Vec::new()),
+            bytes: Some(Vec::new().into()),
             link: None,
         });
         assert!(verify_elided(&value, &wrote).is_err());

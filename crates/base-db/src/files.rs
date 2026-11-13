@@ -32,7 +32,7 @@ use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{
-    Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, ReadError, SourceRoot,
+    Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, Looks, ReadError, SourceRoot,
     SourceRootId, SourceRootInput, content,
     named::Named,
     reparse::Reparse,
@@ -1027,7 +1027,11 @@ impl Files {
         let at = match self.included.find(hash, |it| it.path.as_path() == path) {
             Some(at) => at,
             None => {
-                let read = self.read_included(path);
+                // A first read is made inside a query (`include_bytes!`'s expansion), which
+                // no one build owns: its look is kept by none. Each build asks of every
+                // path read here again with its own looks ([`Db::reload_included_files`],
+                // [`IncludedFile::content_now`]).
+                let read = self.read_included(path, &Looks::none());
                 let content = InputId(IncludedFile::content_of(read.as_deref()));
                 let file = IncludedFile::new(db, durability, read, content);
                 let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
@@ -1155,8 +1159,8 @@ impl Files {
         self.included_by.iter().any(|&(by, at)| by == krate && self.included.get(at).file == file)
     }
 
-    fn read_included(&self, path: &AbsPath) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        IncludedFile::read_now(&self.on_disk(path.as_ref()))
+    fn read_included(&self, path: &AbsPath, looks: &Looks) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        IncludedFile::read_now(&self.on_disk(path.as_ref()), looks)
     }
 
     pub(crate) fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {
@@ -1298,21 +1302,22 @@ impl Files {
 
     /// Whether the file on disk is what was read of it.
     /// Asked through [`IncludedFile::content_now`]: no look at the disk while a watch vouches
-    /// for what was last read of it.
-    pub fn included_is_read(&self, db: &Db, path: &AbsPath) -> bool {
+    /// for what was last read of it; a look made is pushed to `looks`.
+    pub fn included_is_read(&self, db: &Db, path: &AbsPath, looks: &Looks) -> bool {
         let Some(file) = self.find_included(path) else { return false };
-        file.content_field(db).id() == IncludedFile::content_now(&self.on_disk(path.as_ref()))
+        file.content_field(db).id() == IncludedFile::content_now(&self.on_disk(path.as_ref()), looks)
     }
 
     /// Reads the file again, and says whether it changed. The text `include!` parses of it
     /// ([`IncludedSource`]), once one has, changes with it: its edit found for its next parse
-    /// as a file of the view's is ([`Reparse::after`]), and its source root's content.
-    pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath) -> bool {
+    /// as a file of the view's is ([`Reparse::after`]), and its source root's content. The
+    /// read's look at the disk is pushed to `looks`.
+    pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath, looks: &Looks) -> bool {
         let Some(at) = self.included.find(self.included.hash(path), |it| it.path.as_path() == path)
         else {
             return false;
         };
-        let read = self.read_included(path);
+        let read = self.read_included(path, looks);
         self.set_included_read(db, at, read)
     }
 
@@ -1330,11 +1335,47 @@ impl Files {
         }
         let read = Ok(bytes);
         let content = InputId(IncludedFile::content_of(read.as_deref()));
-        // Written by the build: it moves with each, as a workspace's own file does.
-        let file = IncludedFile::new(&*db, Durability::LOW, read, content);
+        // Under a library root, a library's file: as durable as that root's files
+        // (`root_content_durability`), so a sealed crate's summary that reads it stays sealed.
+        // Anywhere else it is written by the build and moves with each, as a workspace's own
+        // file does.
+        let durability = root_content_durability(self.under_library_root(path));
+        let file = IncludedFile::new(&*db, durability, read, content);
         let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
         self.included.insert(hash, |it| it.path.as_path() == path, make);
         true
+    }
+
+    /// Whether `path` is under a library root: below the deepest directory that holds every
+    /// file a library root names (a registry package's, the sysroot's), and that directory is
+    /// not the file system's root. Asked by [`Files::set_included_file`] alone, once a path
+    /// blaze writes before the disk has it: a walk of every named path, `O(files)`.
+    fn under_library_root(&self, path: &AbsPath) -> bool {
+        let writer = self.lock();
+        let mut dirs: HashMap<SourceRootId, &Path, Global> = HashMap::new_in(Global);
+        for (named, &file) in &writer.by_path {
+            let Some(at) = named.as_path() else { continue };
+            let at: &Path = at.as_ref();
+            let parent = at.parent().unwrap_or(at);
+            for &root in writer.roots_of(file) {
+                if !writer.root_contents.get(&root).is_some_and(|it| it.is_library) {
+                    continue;
+                }
+                match dirs.get_mut(&root) {
+                    None => {
+                        dirs.insert(root, parent);
+                    }
+                    Some(dir) => {
+                        while !parent.starts_with(*dir) {
+                            let Some(up) = dir.parent() else { break };
+                            *dir = up;
+                        }
+                    }
+                }
+            }
+        }
+        let path: &Path = path.as_ref();
+        dirs.values().any(|dir| dir.parent().is_some() && path.starts_with(dir))
     }
 
     /// The included file at `at` set to `read`, and the text `include!` parses of it with it.
@@ -1516,6 +1557,22 @@ impl Files {
         }
     }
 
+    /// Whether the source root [`Files::file_source_root`] gives `file` is a library's: what
+    /// makes a crate of that root file a library crate ([`crate::all_crates`]'s split, the
+    /// kind of the crate's inputs). `false` for a file in no source root yet; a later write of
+    /// a root names it again ([`crate::refresh_crate_lists`]). Read by writers only.
+    pub(crate) fn in_library_root(&self, db: &Db, file: FileId) -> bool {
+        let input = match self.file_source_roots.get(file.index()) {
+            Some(input) => input,
+            None => match self.source_of(file.index()) {
+                Some(source) => source.file_root,
+                None => return false,
+            },
+        };
+        let root = input.source_root_id(db);
+        self.lock().root_contents.get(&root).is_some_and(|it| it.is_library)
+    }
+
     fn path_for_file(&self, db: &Db, id: FileId) -> Option<VfsPath> {
         self.source_roots.iter().find_map(|(_, source_root)| {
             source_root.source_root_ref(db).path_for_file(&id).cloned()
@@ -1614,10 +1671,13 @@ fn file_durability(writer: &Writer, file: FileId) -> Durability {
 /// that asked a library file for its root below `HIGH`
 /// (docs/v2/plan/design/restore.md, step b1).
 pub(crate) fn root_durability(writer: &Writer, root: SourceRootId) -> Durability {
-    match writer.root_contents.get(&root).is_some_and(|it| it.is_library) {
-        true => Durability::HIGH,
-        false => Durability::MEDIUM,
-    }
+    root_set_durability(writer.root_contents.get(&root).is_some_and(|it| it.is_library))
+}
+
+/// [`root_durability`] by the root's kind, for a writer that holds the root itself
+/// ([`crate::FileChange::apply`]): the one rule for a root's file set and its files' root map.
+pub(crate) fn root_set_durability(is_library: bool) -> Durability {
+    if is_library { Durability::HIGH } else { Durability::MEDIUM }
 }
 
 /// Puts in `root` the aliases of its files it lacks: a set given whole keeps the aliases a file

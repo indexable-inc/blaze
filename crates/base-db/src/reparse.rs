@@ -29,7 +29,6 @@ use blaze_ids::ContentId;
 use span::Edition;
 use syntax::{Extensions, Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 
-use crate::trees::{TreeError, Trees};
 
 /// How many parses of one text a slot keeps: one per edition and kind it is parsed in, and
 /// again after the query engine let one go. Past that, the file's next edit is a whole parse.
@@ -127,20 +126,17 @@ impl Reparse {
     }
 
     /// The parse of `text` (this one's text) in `edition` and under `extensions`, an outline
-    /// when `outline`, made from the kept parse when there is one, else read from `stored` when
-    /// it has the text's under those extensions ([`Trees`]); kept for the next text. A stored
-    /// parse that is not the text's is an error.
+    /// when `outline`, made from the kept parse when there is one; kept for the next text.
     pub(crate) fn parse(
         &self,
         text: &Text,
         edition: Edition,
         extensions: Extensions,
         outline: bool,
-        stored: Option<&Trees>,
-    ) -> Result<Parse<SourceFile>, TreeError> {
+    ) -> Parse<SourceFile> {
         debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
         if let Some(own) = self.own(edition, extensions, outline) {
-            return Ok(own);
+            return own;
         }
         let parse = match self.previous(edition, extensions, outline) {
             Some((previous, delete)) => {
@@ -153,20 +149,11 @@ impl Reparse {
                 }
                 parse
             }
-            None => match stored {
-                Some(stored) => {
-                    match stored.map(self.slot.id, text, edition, outline, extensions)? {
-                        Some(parse) => parse,
-                        // clone: a refcount, as above.
-                        None => whole(text.clone(), edition, extensions, outline),
-                    }
-                }
-                // clone: a refcount, as above.
-                None => whole(text.clone(), edition, extensions, outline),
-            },
+            // clone: a refcount, as above.
+            None => whole(text.clone(), edition, extensions, outline),
         };
         self.keep(&parse, edition, extensions, outline);
-        Ok(parse)
+        parse
     }
 
     /// Whether a parse of this text is kept and alive.
@@ -177,19 +164,6 @@ impl Reparse {
     /// The blaze-vfs content ID of this text.
     pub(crate) fn id(&self) -> ContentId {
         self.slot.id
-    }
-
-    /// The live outlines of this text, by edition and syntax extensions: what the image
-    /// stores of a library file, each under its own key.
-    pub(crate) fn kept_outlines(
-        &self,
-    ) -> impl Iterator<Item = (Edition, Extensions, Parse<SourceFile>)> + '_ {
-        self.slot
-            .kept
-            .iter()
-            .filter_map(OnceLock::get)
-            .filter(|kept| kept.outline)
-            .filter_map(|kept| Some((kept.edition, kept.extensions, kept.parse.upgrade()?)))
     }
 
     /// Takes `parse`, a full parse its caller made of this text in `edition` (an edit's tree

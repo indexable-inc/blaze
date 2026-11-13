@@ -618,6 +618,15 @@ pub struct CrateData<Id> {
     /// dir otherwise.
     // FIXME: This ought to be a `VfsPath` or something opaque.
     pub proc_macro_cwd: Arc<AbsPathBuf>,
+    /// What pins its sources, when they cannot change: the digest of the tree it is read from
+    /// (a tree the toolchain ships, a registry package at its checksum, a git package at the
+    /// commit its lock file pins), as the driver's one rule decides it (blaze-cargo's
+    /// `serve::sealed::pin`) and the planner writes it, at the crate's durability. `None` for
+    /// a workspace member, a path dependency and a doctest crate, whatever their origin.
+    /// `hir_def::deps::sealed` reads it and nothing else. Not in the crate's content ID: it is
+    /// a function of the sources, which every key over the crate already hashes (its root's
+    /// path, its files), and it says where the crate's records are kept, never what they hold.
+    pub sealed: Option<ContentId>,
 }
 
 pub type CrateDataBuilder = CrateData<CrateBuilderId>;
@@ -1727,7 +1736,8 @@ impl Walk<'_, '_> {
                 made
             }
         };
-        db.set_crate_attr_files(input, false, Some(graph_durability(&krate.basic.origin)));
+        let durability = graph_durability(&*db, krate);
+        db.set_crate_attr_files(input, false, Some(durability));
         self.all.insert(input);
         self.visited.insert(source, input);
         self.done[at] = Some((input, changed));
@@ -1745,7 +1755,7 @@ impl Walk<'_, '_> {
         deps: &[Crate],
         deps_changed: u64,
     ) -> u64 {
-        let durability = graph_durability(&krate.basic.origin);
+        let durability = graph_durability(&*db, krate);
         let mut set = false;
         if !same_data(&krate.basic, deps, old.data(db)) {
             old.set_data_field(db).with_durability(durability).to(built_data(krate, deps));
@@ -1810,7 +1820,7 @@ impl Walk<'_, '_> {
         );
         let input = Crate::new(
             &*db,
-            graph_durability(&krate.basic.origin),
+            graph_durability(&*db, krate),
             data,
             // clone: a new crate's fields (setup).
             krate.extra.clone(),
@@ -1883,13 +1893,19 @@ fn seal_crate_depends(db: &mut Db, krate: Crate) {
 /// The kind of a crate's inputs when a [`CrateGraphBuilder`] makes it: `HIGH` for a library's
 /// (the toolchain's crates, registry and git dependencies), as blaze-lower states them
 /// ([`Crate::create`]), so [`crate::crate_durability`] of such a crate reads nothing below
-/// `HIGH`; `MEDIUM` for a workspace crate's, its structure.
-fn graph_durability(origin: &CrateOrigin) -> Durability {
-    match origin {
-        CrateOrigin::Local { .. } => Durability::MEDIUM,
-        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => {
-            Durability::HIGH
-        }
+/// `HIGH`; `MEDIUM` for a workspace crate's, its structure. A library crate is one whose root
+/// file is in a library root (what a sealed crate's cover reads, which may read nothing below
+/// `HIGH`) or whose origin is not `Local` (what [`crate::crate_durability`] decides by); the
+/// two agree for every crate blaze-lower makes, and where a hand-made graph has them disagree
+/// the higher kind is taken, which costs a verify and is never stale.
+fn graph_durability(db: &Db, krate: &CrateBuilder) -> Durability {
+    let library_origin = match krate.basic.origin {
+        CrateOrigin::Local { .. } => false,
+        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => true,
+    };
+    match library_origin || db.files().in_library_root(db, krate.basic.root_file_id) {
+        true => Durability::HIGH,
+        false => Durability::MEDIUM,
     }
 }
 
@@ -1924,6 +1940,7 @@ fn built_data(krate: &CrateBuilder, deps: &[Crate]) -> BuiltCrateData {
         crate_types: basic.crate_types,
         // clone: as above.
         proc_macro_cwd: basic.proc_macro_cwd.clone(),
+        sealed: basic.sealed,
     }
 }
 
@@ -1939,6 +1956,7 @@ fn same_data(new: &CrateDataBuilder, deps: &[Crate], old: &BuiltCrateData) -> bo
         manifest_kind,
         crate_types,
         proc_macro_cwd,
+        sealed,
     } = new;
     *root_file_id == old.root_file_id
         && *edition == old.edition
@@ -1948,6 +1966,7 @@ fn same_data(new: &CrateDataBuilder, deps: &[Crate], old: &BuiltCrateData) -> bo
         && *origin == old.origin
         && *crate_attrs == old.crate_attrs
         && *proc_macro_cwd == old.proc_macro_cwd
+        && *sealed == old.sealed
         && dependencies.len() == old.dependencies.len()
         && dependencies.iter().zip(deps).zip(&old.dependencies).all(|((new, &crate_id), old)| {
             let Dependency { crate_id: _, name, prelude, sysroot, private } = new;
@@ -1997,6 +2016,9 @@ impl CrateGraphBuilder {
                 manifest_kind: target_kind,
                 crate_types: target_kind.default_crate_types(),
                 proc_macro_cwd,
+                // A builder's crate is sealed only when its maker says what pins it
+                // ([`CrateGraphBuilder::seal`]).
+                sealed: None,
             },
             extra: ExtraCrateData {
                 version,
@@ -2009,6 +2031,13 @@ impl CrateGraphBuilder {
             env,
             ws_data,
         })
+    }
+
+    /// Seals `krate`: `pin` is the digest of the tree its sources are read from
+    /// ([`CrateData::sealed`]). What a maker of a graph that knows its trees calls (a test's
+    /// fixture, for a crate it stands in for a registry package with).
+    pub fn seal(&mut self, krate: CrateBuilderId, pin: ContentId) {
+        self.arena[krate].basic.sealed = Some(pin);
     }
 
     pub fn add_dep(

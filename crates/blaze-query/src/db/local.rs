@@ -60,7 +60,7 @@ pub(crate) const PENDING_FLOOR: u64 = 1 << 16;
 /// hold before any drop ([`next_dedup`]): 16 KiB of `u32`s, a spare's size ([`SPARE_BYTES`]),
 /// so a small run is never deduplicated before it is stored and a dedup never runs every few
 /// reads.
-const DEDUP_FROM: u32 = (SPARE_BYTES / size_of::<u32>()) as u32;
+pub(crate) const DEDUP_FROM: u32 = (SPARE_BYTES / size_of::<u32>()) as u32;
 
 /// The most entries one run held on its thread's edge stack at once ([`Frame::held_most`],
 /// exact: taken at each point its count stops rising) and the most rows one task's pending
@@ -117,6 +117,10 @@ pub(crate) enum Note {
     Most(u64),
     /// The run on top recorded more reads than [`RUN_READS`]: fail it.
     Runaway,
+    /// A [`super::covered`] frame on top read this node below `Durability::HIGH` (or a
+    /// replay brought such a read, this node the first of them; 0 when none was found by
+    /// node): refuse it by name.
+    Uncovered(u32),
 }
 
 /// What one task may hold on its query stack ([`RUN_READS`], [`PENDING_FLOOR`]); a test lowers
@@ -135,6 +139,13 @@ pub(crate) enum Kind {
     /// itself runs the key (it holds the flight; its frames are its own again).
     Barrier {
         lifted: bool,
+    },
+    /// A frame that is no row's ([`super::witnessed`], [`super::covered`]): reads land in it
+    /// as in a run's, but it is never found as a cycle's member, never counted among the
+    /// task's queries, and what it read is its caller's to answer for, not the run below it.
+    /// `covered`: held to `Durability::HIGH` reads, recording none.
+    Witness {
+        covered: bool,
     },
 }
 
@@ -198,16 +209,28 @@ pub(crate) struct Frame {
     pub(crate) cycle: CycleReads,
     /// A number no other run of this thread had: keys its tracked structs' occurrences.
     pub(crate) serial: u64,
+    /// A read of this durability or above is not pushed ([`Local::read`]) unless a capture
+    /// is open on the frame: `u8::MAX` (none skipped) but in a witness frame, whose reads at
+    /// `Durability::HIGH` are the durable view's to answer for.
+    pub(crate) skip_at: u8,
+    /// What a covered frame is held for, as its refusal names it; empty in any other.
+    pub(crate) what: &'static str,
 }
 
 impl Frame {
     pub(crate) fn new(storage: &Storage, kind: Kind, node: u32, ingredient: u32, id: Id) -> Frame {
+        Frame::of_query(storage, kind, node, ingredient, id.as_u32())
+    }
+
+    /// A frame of the query `ingredient`'s key numbered `id`, or of none where `id` is 0 (a
+    /// witness pushed with no query running, [`Local::push_witness`]).
+    fn of_query(storage: &Storage, kind: Kind, node: u32, ingredient: u32, id: u32) -> Frame {
         Frame {
             storage: ptr::from_ref(storage),
             kind,
             node,
             ingredient,
-            id: id.as_u32(),
+            id,
             edges_start: 0,
             dedup_floor: 0,
             dropped: 0,
@@ -227,6 +250,8 @@ impl Frame {
             pending_start: 0,
             cycle: CycleReads::NONE,
             serial: 0,
+            skip_at: u8::MAX,
+            what: "",
         }
     }
 }
@@ -359,6 +384,9 @@ pub(crate) struct Local {
     walls: u32,
     /// What the task may hold before the query holding it fails ([`super::Runaway`]).
     pub(crate) bounds: Bounds,
+    /// The innermost task scope open on the task ([`super::task_scope`]): its scoped
+    /// functions' tables, moved with the rest of its stack across fibers.
+    pub(crate) scope: Option<super::scoped::ScopePtr>,
 }
 
 /// A database [`super::attach`] lent: its address, its type (so [`super::with_attached_db`]
@@ -411,6 +439,7 @@ impl Local {
             steps: None,
             walls: 0,
             bounds: Bounds { run_reads: RUN_READS, pending_floor: PENDING_FLOOR },
+            scope: None,
         }
     }
 
@@ -431,6 +460,7 @@ impl Local {
             && self.fuel.is_none()
             && self.steps.is_none()
             && self.walls == 0
+            && self.scope.is_none()
     }
 
     /// Lets go of every buffer holding more than [`SPARE_BYTES`], for an empty stack kept as a
@@ -474,6 +504,7 @@ impl Local {
             steps: _,
             walls: _,
             bounds: _,
+            scope: _,
         } = self;
         vec(frames);
         vec(edges);
@@ -867,21 +898,43 @@ fn most_reads(held: u64) -> Note {
     }
 }
 
+/// Whether a read is recorded into `frame` for `storage`: a run's, or a witness frame's.
+#[inline(always)]
+fn records(frame: &Frame, storage: *const Storage) -> bool {
+    matches!(frame.kind, Kind::Run | Kind::Witness { .. }) && frame.storage == storage
+}
+
+/// What [`Local::push_witness`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Pushed {
+    /// A witness frame at this index of the stack.
+    At(u32),
+    /// None: a witness frame of the storage is on top, a witnessed run's (reads land there).
+    UnderWitness,
+    /// None: a covered frame of the storage is on top (its rule holds for what runs here).
+    UnderCovered,
+}
+
 #[inline(always)]
 fn bucket(node: u32) -> usize {
     (node as usize).wrapping_mul(0x9e37_79b9) >> 7 & (BLOOM - 1)
 }
 
 impl Local {
-    /// The top frame if it is a run of `storage`: what a read is recorded into.
+    /// The top frame if it is a run or a witness of `storage`: what a read is recorded into.
     #[inline(always)]
     pub(crate) fn recording(&mut self, storage: *const Storage) -> Option<&mut Frame> {
-        self.frames.last_mut().filter(|frame| frame.kind == Kind::Run && frame.storage == storage)
+        self.frames.last_mut().filter(|frame| records(frame, storage))
     }
 
     /// Records a read of `node` into the running query of `storage`, if any. What the caller
     /// does next, once it has let go of the stack ([`super::noted`]): [`Note::Runaway`], and
     /// the read not recorded, when that run recorded more reads than [`RUN_READS`].
+    ///
+    /// In a witness frame a read at its [`Frame::skip_at`] or above is folded and not pushed
+    /// (its caller answers for it by the durable view), unless a capture is open on the frame:
+    /// a capture's reads are replayed into other runs, which must get every one. In a covered
+    /// frame a read below it is [`Note::Uncovered`], not recorded.
     #[inline(always)]
     pub(crate) fn read(
         &mut self,
@@ -892,9 +945,20 @@ impl Local {
     ) -> Note {
         let edges_len = self.edges.len() as u32;
         let last = self.edges.last().copied();
-        let Some(frame) = self.recording(storage) else { return Note::Fine };
+        let top = self.frames.len().wrapping_sub(1);
+        let Local { frames, captures, .. } = &mut *self;
+        let Some(frame) = frames.last_mut().filter(|frame| records(frame, storage)) else {
+            return Note::Fine;
+        };
         frame.durability = frame.durability.min(durability);
         frame.changed = frame.changed.max(changed);
+        if durability >= frame.skip_at {
+            if !captures.last().is_some_and(|it| it.frame as usize == top) {
+                return Note::Fine;
+            }
+        } else if frame.kind == (Kind::Witness { covered: true }) {
+            return Note::Uncovered(node);
+        }
         if edges_len > frame.dedup_floor && last == Some(node) {
             return Note::Fine;
         }
@@ -1037,11 +1101,84 @@ impl Local {
             ControlFlow::Continue(())
         });
         self.mark_capture(start, capture);
+        if let Some(note) = self.uncovered_from(storage, start) {
+            return note;
+        }
         let limit = self.frames.last().map_or(u32::MAX, |it| it.dedup_at);
         if (self.edges.len() as u32) < limit {
             return Note::Fine;
         }
         self.full()
+    }
+
+    /// When the top frame is covered and what was folded into it (a replay's reads, pushed
+    /// from `start`) goes below `Durability::HIGH`: [`Note::Uncovered`], naming the first
+    /// node from `start` that is below it (0 when none is, by its node).
+    fn uncovered_from(&self, storage: &Storage, start: usize) -> Option<Note> {
+        let top = self.frames.last()?;
+        if top.kind != (Kind::Witness { covered: true }) || top.durability >= top.skip_at {
+            return None;
+        }
+        let low = self.edges[start..].iter().copied().find(|&node| {
+            super::witness::durability_of(storage, node).is_some_and(|it| it < top.skip_at)
+        });
+        Some(Note::Uncovered(low.unwrap_or(0)))
+    }
+
+    /// The barriers on the stack that are not lifted: a task scope opened under fewer is
+    /// another task's.
+    pub(crate) fn walls(&self) -> u32 {
+        self.walls
+    }
+
+    /// Pushes `nodes`, reads a task-scoped value's run made, for the recording run on top, as
+    /// [`Local::replay`] pushes a capture's: what the caller does next, as for a read.
+    pub(crate) fn push_reads(&mut self, storage: &Storage, nodes: &[u32]) -> Note {
+        let start = self.edges.len();
+        for &node in nodes {
+            // alloc: none once warm: the edge stack grows to its high-water mark once per thread
+            push_kept(&mut self.edges, node);
+        }
+        if let Some(note) = self.uncovered_from(storage, start) {
+            return note;
+        }
+        let limit = self.frames.last().map_or(u32::MAX, |it| it.dedup_at);
+        if (self.edges.len() as u32) < limit {
+            return Note::Fine;
+        }
+        self.full()
+    }
+
+    /// Pushes a witness frame of `storage` (`covered`: held to `Durability::HIGH`, for `what`),
+    /// unless the top frame is a witness of `storage` that already answers: a covered one for
+    /// either kind, a witnessed one for a witnessed run. A covered frame goes on a witnessed
+    /// one: what it reads is at `HIGH`, which the witness skips anyway. The frame is named by
+    /// the query running below it (a runaway's error, a capture's owner), if any.
+    pub(crate) fn push_witness(
+        &mut self,
+        storage: &Storage,
+        covered: bool,
+        what: &'static str,
+    ) -> Pushed {
+        let on = ptr::from_ref(storage);
+        if let Some(top) = self.frames.last().filter(|it| it.storage == on) {
+            match top.kind {
+                Kind::Witness { covered: true } => return Pushed::UnderCovered,
+                Kind::Witness { covered: false } if !covered => return Pushed::UnderWitness,
+                _ => {}
+            }
+        }
+        // The query running below it, or none (0: no `Id` names it).
+        let (ingredient, id) = self.top_query().unwrap_or((0, 0));
+        let mut frame = Frame::of_query(storage, Kind::Witness { covered }, 0, ingredient, id);
+        frame.skip_at = super::Durability::HIGH.0;
+        #[cfg(test)]
+        if !covered && super::witness::probe::SKIPS_EVERY_READ.with(std::cell::Cell::get) {
+            // The planted bug: the witness records no read at all.
+            frame.skip_at = 0;
+        }
+        frame.what = what;
+        Pushed::At(self.push(frame))
     }
 
     pub(crate) fn push(&mut self, mut frame: Frame) -> u32 {
@@ -1138,7 +1275,7 @@ impl Local {
         for (at, frame) in self.frames.iter().enumerate().rev() {
             match frame.kind {
                 Kind::Barrier { lifted: false } => return None,
-                Kind::Barrier { lifted: true } => {}
+                Kind::Barrier { lifted: true } | Kind::Witness { .. } => {}
                 Kind::Run | Kind::Verify => {
                     if frame.node == node && frame.storage == storage {
                         return Some(at as u32);
@@ -1150,7 +1287,21 @@ impl Local {
     }
 
     /// The occurrence number of the next tracked struct of `identity_hash` the top run makes.
+    ///
+    /// # Panics
+    ///
+    /// Under a witness frame ([`super::witnessed`], [`super::covered`]), naming the struct:
+    /// its fields' durability and seal group would be of the witnessed reads alone, which no
+    /// row holds, so a reader of them could be proved by reads that are not its own.
     pub(crate) fn occurrence(&mut self, ingredient: u32, identity_hash: u64) -> Option<u32> {
+        if self.frames.last().is_some_and(|it| matches!(it.kind, Kind::Witness { .. })) {
+            panic!(
+                "a tracked struct `{}` was made inside a witnessed or covered run \
+                 (`blaze_query::db::witnessed`, `covered`): its fields would rest on reads no row \
+                 holds; make it in a tracked function the run calls",
+                super::ingredient::name(ingredient)
+            );
+        }
         let serial = self.frames.last().filter(|it| it.kind == Kind::Run)?.serial;
         let count = self.occurrences.entry((serial, ingredient, identity_hash)).or_insert(0);
         let occurrence = *count;
@@ -1271,6 +1422,8 @@ impl Frame {
             pending_start: 0,
             cycle: CycleReads::NONE,
             serial: 0,
+            skip_at: u8::MAX,
+            what: "",
         }
     }
 }

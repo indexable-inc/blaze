@@ -257,7 +257,7 @@ fn work_out(
             continue;
         }
         let (unit, env) = run_of(job, run)?;
-        let mut disk = Disk::new(script_env(&unit, &env)?);
+        let mut disk = Disk::new(script_env(&unit, &env)?, &job.input.looks);
         let guard = blaze_cas::enter();
         let roots = run_roots(job, &unit);
         let found = pure::find_hit(&job.input.store, &guard, &proof, roots.view(), &mut disk)
@@ -440,7 +440,7 @@ pub(crate) fn keep(
     };
     let script = unit.package.descr();
     pure::checked_value(&script, &pure.proof, value).map_err(|it| (it.0, RunPuts::default()))?;
-    let mut disk = Disk::new(script_env.to_vec()); // alloc: once per kept run of a pure script, its key's environment
+    let mut disk = Disk::new(script_env.to_vec(), &job.input.looks); // alloc: once per kept run of a pure script, its key's environment
     pure::keep(store, &pure.proof, roots.view(), read, &mut disk, value)
         .map(|kept| {
             let mut puts = RunPuts::default();

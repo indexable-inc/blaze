@@ -5,6 +5,8 @@
 //! it does not load and the script does) is no home. [`keys_agree`], run over every script fixture, removes the cause:
 //! the summary through the home equals the one worked out in the script itself.
 
+use std::sync::Arc;
+
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_ids::ContentId;
 use hir_def::{FunctionId, ModuleDefId, lang_item::lang_items, nameres::crate_def_map};
@@ -23,7 +25,7 @@ use hir_ty_mir::mir::{
 use intern::Symbol;
 use rustc_type_ir::inherent::GenericArgs as _;
 
-use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate};
+use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate, with_toolchain};
 use crate::{
     Purity, Rule,
     identity::{content, content_in},
@@ -195,7 +197,7 @@ fn two_scripts_share_the_summaries_of_what_both_reach() {
             let one = summary(&db, env(a), instance.clone());
             let other = summary(&db, env(b), instance.clone());
             assert!(
-                std::ptr::eq(one, other),
+                Arc::ptr_eq(&one, &other),
                 "{} is summarized once for each script",
                 name_of(&db, instance)
             );
@@ -250,7 +252,7 @@ fn a_downstream_impl_keys_the_instance_by_the_crate_of_its_type() {
         assert_eq!(home_of(&db, b, byte), Some(shared));
         let from_b = summary(&db, env(b), byte.clone());
         assert!(from_b.impure.is_none(), "`each::<u8>` only prints");
-        assert!(std::ptr::eq(from_b, summary(&db, env(a), byte.clone())));
+        assert!(Arc::ptr_eq(&from_b, &summary(&db, env(a), byte.clone())));
     });
 }
 
@@ -267,7 +269,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
         assert_eq!(home_of(&db, c, helper), Some(shared));
         assert_eq!(home_env(&db, &env(c), helper), env(shared));
         let helper_a = named(&db, &reached(&db, a), "`shared::helper`", None).clone();
-        assert!(std::ptr::eq(summary(&db, env(c), helper.clone()), summary(&db, env(a), helper_a)));
+        assert!(Arc::ptr_eq(&summary(&db, env(c), helper.clone()), &summary(&db, env(a), helper_a)));
         // A recursion limit of its own can change what the solver answers in a generic: no
         // sharing of one, with `shared` or with `std`, the second candidate, which
         // `stands_for` checks the same. `each::<u8>` names only `shared`, so with `script_a`
@@ -282,7 +284,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
         assert_eq!(home_env(&db, &env(c), byte), env(c));
         let byte_a = named(&db, &reached(&db, a), "`shared::each`", Some("u8")).clone();
         assert_eq!(home_of(&db, a, &byte_a), Some(shared));
-        assert!(!std::ptr::eq(summary(&db, env(c), byte.clone()), summary(&db, env(a), byte_a)));
+        assert!(!Arc::ptr_eq(&summary(&db, env(c), byte.clone()), &summary(&db, env(a), byte_a)));
         // Every other instance it reaches in the toolchain is not generic (the walk stops at the
         // modelled `io::_print`) and so is its own crate's; a generic one would be `script_c`'s.
         for instance in in_c
@@ -312,9 +314,9 @@ fn a_specializing_dependency_of_the_script_alone_leaves_sharing() {
         assert_eq!(home_of(&db, s, helper), Some(shared));
         let in_a = reached(&db, a);
         let helper_a = named(&db, &in_a, "`shared::helper`", None);
-        assert!(std::ptr::eq(
-            summary(&db, env(s), helper.clone()),
-            summary(&db, env(a), helper_a.clone())
+        assert!(Arc::ptr_eq(
+            &summary(&db, env(s), helper.clone()),
+            &summary(&db, env(a), helper_a.clone())
         ));
         keys_agree(&db, s);
     });
@@ -521,8 +523,8 @@ fn a_no_std_crate_without_alloc_is_no_home_of_a_box() {
     // though it loads `alloc` through `std`. Worked out in `h`, the drop glue of `Box<Noisy>`
     // would not reach `Noisy`'s `drop`, which calls a foreign function.
     let toolchain = TOOLCHAIN.replacen("pub mod vec {", BOXED, 1).replacen(
-        "//- /alloc.rs crate:alloc\n",
-        "//- /alloc.rs crate:alloc\n#![feature(lang_items, staged_api)]\n",
+        "//- /alloc.rs crate:alloc new_source_root:library\n",
+        "//- /alloc.rs crate:alloc new_source_root:library\n#![feature(lang_items, staged_api)]\n",
         1,
     );
     let crates = r#"
@@ -548,7 +550,7 @@ fn main() {
     h::consume(make());
 }
 "#;
-    let mut db = fixture::db(&format!("{toolchain}{crates}")).into_db();
+    let mut db = fixture::db(&with_toolchain(&toolchain, crates)).into_db();
     blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
     let (h, script) = (crate_named(&db, "h"), crate_named(&db, "build_script"));
     let alloc = lang_crate(&db, LangCrateOrigin::Alloc);
@@ -577,7 +579,7 @@ fn main() {
 
 /// What a summary says, with each instance and function by name: comparable across two
 /// databases, whose interned ids differ.
-fn said(db: &Db, it: &Summary) -> String {
+pub(super) fn said(db: &Db, it: &Summary) -> String {
     let names = |instances: &mut dyn Iterator<Item = &Instance>| {
         instances.map(|it| name_of(db, it)).collect::<Vec<_>>()
     };
@@ -647,7 +649,7 @@ fn main() {
                 let purity = script_purity(&db, main_of(&db, script).unwrap()).clone();
                 let mut summaries: Vec<_> = reached(&db, script)
                     .iter()
-                    .map(|it| (name_of(&db, it), said(&db, summary(&db, env(script), it.clone()))))
+                    .map(|it| (name_of(&db, it), said(&db, &summary(&db, env(script), it.clone()))))
                     .collect();
                 summaries.sort();
                 out.push((format!("{purity:?}"), summaries));

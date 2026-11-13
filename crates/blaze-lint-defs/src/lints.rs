@@ -1099,11 +1099,11 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
         .externally_loaded(),
-    l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::may(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not")
+    l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::expect(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not; a list that is not one; and the deleted `#[blaze::may(..)]`, respelled `#[blaze::expect(..)]`")
         .externally_loaded(),
-    l("blaze::unneeded_effect", Warn, "detects a word of a private function's `#[blaze::may(..)]` for an effect the function is proved not to have")
+    l("blaze::unfulfilled_effect", Deny, "detects a word of a function's own `#[blaze::expect(..)]` for an effect the function is proved not to have, private or public: a function's own list is exact")
         .externally_loaded(),
-    l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function may do, `#[blaze::may(..)]`")
+    l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function is expected to do, `#[blaze::expect(..)]`")
         .externally_loaded(),
     l("blaze::durable_write", Allow, "detects a write that waits for the disk (a synced effect, `sync_all`, `fsync`) with no `// durable: <why>` saying what must survive a crash")
         .externally_loaded(),

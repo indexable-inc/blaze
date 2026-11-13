@@ -366,7 +366,6 @@ name = "base-db"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-bytes",
  "blaze-core",
  "blaze-dbsp",
  "blaze-format",
@@ -530,6 +529,7 @@ dependencies = [
  "blaze-api",
  "blaze-build-script",
  "blaze-cas",
+ "blaze-certify",
  "blaze-codegen",
  "blaze-codegen-code",
  "blaze-core",
@@ -594,6 +594,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-borrowck",
  "hir-ty-codegen",
  "hir-ty-pure",
  "hir-ty-ub",
@@ -648,6 +649,19 @@ dependencies = [
  "serde",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "blaze-certify"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-core",
+ "blaze-ids",
+ "blaze-protocol",
+ "blaze-record",
+ "blaze-vfs",
+ "hegeltest",
 ]
 
 [[package]]
@@ -1115,7 +1129,6 @@ dependencies = [
  "blaze-vfs",
  "hir-def",
  "hir-expand",
- "intern",
  "object 0.40.0",
  "parser",
  "serde",
@@ -1432,6 +1445,7 @@ name = "blaze-launch-host"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "blaze-cas",
  "blaze-codegen",
  "blaze-format",
  "blaze-hash",
@@ -1457,6 +1471,8 @@ dependencies = [
 name = "blaze-launcher"
 version = "0.0.0"
 dependencies = [
+ "blaze-client",
+ "blaze-core",
  "blaze-launch",
  "blaze-launch-rt",
  "crossbeam-channel",
@@ -1623,6 +1639,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-lower",
+ "blaze-mem",
  "blaze-profile",
  "blaze-query",
  "blaze-serde",
@@ -1798,7 +1815,6 @@ name = "blaze-query"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-bytes",
  "blaze-check",
  "blaze-core",
  "blaze-format",
@@ -1818,7 +1834,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "hegeltest",
  "indexmap",
- "intern",
  "serde",
  "smallvec",
  "thin-vec",
@@ -2153,13 +2168,16 @@ name = "blaze-thin"
 version = "0.0.0"
 dependencies = [
  "blaze-api",
+ "blaze-certify",
  "blaze-client",
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "blaze-protocol",
  "blaze-report",
  "blaze-screen",
  "libc",
+ "stdx",
  "tracing",
 ]
 
@@ -4213,6 +4231,7 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
+ "tracing",
  "triomphe",
 ]
 
@@ -4605,10 +4624,8 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-core",
- "blaze-format",
  "blaze-hash",
  "blaze-ids",
- "blaze-image",
  "blaze-mem",
  "blaze-phf",
 ]

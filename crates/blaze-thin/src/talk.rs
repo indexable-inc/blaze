@@ -1,7 +1,8 @@
 //! What the thin `blaze` says to the daemon for one command, and what it comes to: one
 //! connection, on which it asks which engine the daemon is ([`STATUS`]), sends the command's
 //! request ([`BUILD`]) and, for a `run` whose answer it prints, asks for the program's launch
-//! ([`LAUNCH`]).
+//! ([`LAUNCH`]); as the command ends, the program (`main.rs`) sends the command's own spans
+//! ([`Timings`], [`ROWS`]) on it last, waiting for no answer.
 //!
 //! The rule this holds, and its test counts (`tests::a_run_after_an_edit_is_one_connection_and_one_status`):
 //! a command is one connection and at most one `Status`. [`talk`] is given the one connection
@@ -26,6 +27,55 @@ use crate::{
 pub const STATUS: u64 = 1;
 pub const BUILD: u64 = 2;
 pub const LAUNCH: u64 = 3;
+/// The command's own spans ([`Timings`]), sent last as a `ClientRows`, answered by nobody: the
+/// command has ended (a `build`) or become its program (a `run`) by then.
+pub const ROWS: u64 = 4;
+
+/// The names of the thin `blaze`'s spans, each opened and closed in one place (handoff-12
+/// request 2): from the kernel's start of this process to `main`'s first line (`main.rs`),
+/// the client's own check of the request slot (`main.rs`, around `solo::solo`), the connect
+/// (`main.rs`), the build's request from its send to its answer's `Done` ([`talk`]), and from
+/// that `Done` to the program's exec ([`blaze_api::Timed::ANSWER_TO_EXEC`], `main.rs`).
+pub const EXEC_TO_MAIN: &str = "client: exec to main";
+pub const SOLO_CHECK: &str = "client: solo check";
+pub const CONNECT: &str = "client: connect";
+pub const ON_THE_WIRE: &str = "client: request on the wire";
+
+/// What the command timed of itself, on the profile's clock (`blaze_profile::clock::mono_ns`,
+/// [`Link::now_ns`]), and the build the daemon said its request is: sent to the daemon as
+/// the command ends, on its one connection ([`ROWS`]), as that build's client rows.
+#[derive(Debug, Default)]
+pub struct Timings {
+    pub timed: Vec<blaze_api::Timed>,
+    /// [`blaze_api::Worked::build_id`] of the answer, once heard.
+    pub build: Option<u64>,
+    /// When the build's answer ended (`Done`): where `client: answer to exec` starts.
+    pub answered_ns: Option<i64>,
+}
+
+impl Timings {
+    /// The span `name` from `start_ns` to `end_ns`.
+    pub fn span(&mut self, name: &str, start_ns: i64, end_ns: i64) {
+        // alloc: a span's name, a few a command
+        self.timed.push(blaze_api::Timed { name: name.to_owned(), start_ns, end_ns });
+    }
+
+    /// The command's rows for its build, `pid` its process, from `started_ns` (the kernel's
+    /// start of it) to `ended_ns`: `None` when no build was heard, which has no rows.
+    pub fn rows(self, pid: u32, started_ns: i64, ended_ns: i64) -> Option<Request> {
+        let build = self.build?;
+        Some(Request::ClientRows {
+            pid,
+            build,
+            spans: Vec::new(),
+            timed: self.timed,
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns,
+            started_ns,
+        })
+    }
+}
 
 /// How long the daemon is given to say which engine it is, and to answer a launch: both
 /// are answered by its loop as they are read. Past it the engine runs the command, and
@@ -62,6 +112,10 @@ pub trait Link {
     /// Lets go of the bytes read so far: what is read from here on is the next request's
     /// answer, which a handover carries whole.
     fn forget(&mut self);
+
+    /// Now on the profile's clock (`blaze_profile::clock::mono_ns`): what [`Timings`] are
+    /// read on.
+    fn now_ns(&self) -> i64;
 }
 
 /// The command [`talk`] speaks for.
@@ -94,11 +148,13 @@ pub enum Ended {
 /// One command's talk on `link`: the daemon asked which engine it is (`is_engine` says whether
 /// its executable is the one beside this program), the request sent, its answer taken, and a
 /// `run`'s launch asked. `took` is the time since the command began, read as the answer ends.
+/// `timings` gets the request's time on the wire ([`ON_THE_WIRE`]) and its build's id.
 pub fn talk<L: Link>(
     link: &mut L,
     spoken: &Spoken<'_>,
     is_engine: impl FnOnce(&Executable) -> Result<(), String>,
     took: impl FnOnce() -> Duration,
+    timings: &mut Timings,
 ) -> Ended {
     match before(link, is_engine) {
         Ok(()) => {}
@@ -106,6 +162,7 @@ pub fn talk<L: Link>(
     }
     // From here the request is sent: what follows ends in this program's own answer or
     // in the engine taking the answer over, never in the command asked a second time.
+    let sent_ns = link.now_ns();
     let request = match link.send(BUILD, spoken.request) {
         Ok(frame) => frame,
         Err(why) => return Ended::Engine(why),
@@ -116,11 +173,21 @@ pub fn talk<L: Link>(
     // Bounded: each turn takes one response of an answer that ends, or ends at the deadline.
     loop {
         match link.next(until, "the daemon's answer to the request") {
-            Ok(Read::Response(Envelope { id: BUILD, body, .. })) => match plain.take(body) {
-                Step::More => {}
-                Step::Done => break,
-                Step::HandOver(_) => return Ended::HandOver { request },
-            },
+            Ok(Read::Response(Envelope { id: BUILD, body, .. })) => {
+                if let Response::Work(worked) = &body {
+                    timings.build = worked.build_id;
+                }
+                match plain.take(body) {
+                    Step::More => {}
+                    Step::Done => {
+                        let answered = link.now_ns();
+                        timings.span(ON_THE_WIRE, sent_ns, answered);
+                        timings.answered_ns = Some(answered);
+                        break;
+                    }
+                    Step::HandOver(_) => return Ended::HandOver { request },
+                }
+            }
             // A response to no request of this connection, an answer not ended in time,
             // a daemon that hung up or bytes that are not the API's: the engine reads what
             // was read and says which.
@@ -132,16 +199,11 @@ pub fn talk<L: Link>(
     if link.held() != 0 {
         return Ended::HandOver { request };
     }
-    // What the screen says of the answer (docs/terminal.md): nothing of the program's command
-    // line, which is said only under `-v`, the engine's.
-    let said = plain.said(spoken.shown, asked.quiet, took());
-    if asked.command == Command::Build {
-        return Ended::Said { said, exec: None };
-    }
     // `run`: the one program of what was built, started as the daemon says to start it.
-    let program = plain.program().and_then(|it| Some((it.executable.as_deref()?, it.env.as_slice())));
-    let Some((executable, cargo_env)) = program else { return Ended::HandOver { request } };
-    let mut exec = Exec::of(executable, cargo_env, &asked.program, spoken.cwd);
+    // clone: the launch's program, once a run
+    let executable = plain.program().and_then(|it| it.executable.clone());
+    let Ok((said, exec)) = said(spoken, plain, took()) else { return Ended::HandOver { request } };
+    let (Some(mut exec), Some(executable)) = (exec, executable) else { return Ended::Said { said, exec: None } };
     // The answer is whole and plain, and nothing is written yet: a launch the daemon
     // refuses, or does not answer, is the engine's to say, which runs the command again
     // (its build is answered as this one was).
@@ -151,6 +213,24 @@ pub fn talk<L: Link>(
         Err(why) => return Ended::Engine(why),
     }
     Ended::Said { said, exec: Some(exec) }
+}
+
+/// What a whole, plain answer comes to for the command `spoken`, its build over `took`: what
+/// is written to stderr (the screen's, docs/terminal.md: nothing of the program's command
+/// line, which is said only under `-v`, the engine's) and, for a `run`, the one program of
+/// what was built, which the command becomes. `Err`: a `run` whose build has no one program
+/// to run (none, several, or one with a runner), which the engine says: [`talk`] hands the
+/// answer over, `crate::solo` asks the daemon.
+#[allow(clippy::result_unit_err, reason = "one reason, which each caller names its own way")]
+pub fn said(spoken: &Spoken<'_>, plain: Plain, took: Duration) -> Result<(String, Option<Exec>), ()> {
+    let asked = spoken.asked;
+    let said = plain.said(spoken.shown, asked.quiet, took);
+    if asked.command == Command::Build {
+        return Ok((said, None));
+    }
+    let program = plain.program().and_then(|it| Some((it.executable.as_deref()?, it.env.as_slice())));
+    let Some((executable, cargo_env)) = program else { return Err(()) };
+    Ok((said, Some(Exec::of(executable, cargo_env, &asked.program, spoken.cwd))))
 }
 
 /// No request of this blaze runs on another's daemon: the daemon says which engine it is,
@@ -186,10 +266,10 @@ fn before<L: Link>(
 /// when it runs its file.
 fn launch<L: Link>(
     link: &mut L,
-    executable: &str,
+    executable: String,
     pid: u32,
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    let launch = Request::Launch { program: executable.to_owned(), pid };
+    let launch = Request::Launch { program: executable, pid };
     link.send(LAUNCH, &launch)?;
     let until = link.within(ASKED_WITHIN);
     let mut launched = None;
@@ -276,6 +356,11 @@ mod tests {
 
         fn forget(&mut self) {
             self.forgotten += 1;
+        }
+
+        /// A clock that moves only as requests are sent: 10 a request.
+        fn now_ns(&self) -> i64 {
+            self.sent.len() as i64 * 10
         }
     }
 
@@ -404,8 +489,54 @@ mod tests {
             cwd: Path::new("/w"),
             pid: 41,
         };
-        let ended = talk(&mut link, &spoken, |_| Ok(()), || Duration::ZERO);
+        let ended = talk(&mut link, &spoken, |_| Ok(()), || Duration::ZERO, &mut Timings::default());
         (ended, link)
+    }
+
+    /// The invariant: a `run` after an edit, answered here, times its request on the wire
+    /// exactly once, from its send to its answer's `Done`, hears its build's id, and its rows
+    /// are that build's with each of the client's spans once and nothing of another's.
+    /// Controls: an answer handed to the engine times no wire (its spans are the engine's),
+    /// and a command whose answer named no build has no rows.
+    #[test]
+    fn a_run_times_its_request_on_the_wire_once_and_its_rows_are_its_builds() {
+        let asked = asked(&["run", "-q"]);
+        let mut link = Scripted::answering([status(), edit(), launched()].concat());
+        let shown = Shown::pipe(blaze_screen::Command::Run, false);
+        let spoken = Spoken { asked: &asked, request: &COMMAND, shown: &shown, cwd: Path::new("/w"), pid: 41 };
+        let mut timings = Timings::default();
+        timings.span(EXEC_TO_MAIN, 0, 1);
+        timings.span(CONNECT, 1, 2);
+        let ended = talk(&mut link, &spoken, |_| Ok(()), || Duration::ZERO, &mut timings);
+        assert!(matches!(ended, Ended::Said { exec: Some(_), .. }), "{ended:?}");
+        // Sent after the `Status`: the clock read 10 then, and 20 once the build was sent.
+        assert_eq!(timings.answered_ns, Some(20));
+        assert_eq!(timings.build, Some(7));
+        timings.span(blaze_api::Timed::ANSWER_TO_EXEC, 20, 25);
+        let Some(Request::ClientRows { pid, build, timed, spans, started_ns, ended_ns, .. }) = timings.rows(41, 0, 25)
+        else {
+            panic!("a build was heard, so there are rows");
+        };
+        assert_eq!((pid, build, started_ns, ended_ns, spans.len()), (41, 7, 0, 25, 0));
+        for name in [EXEC_TO_MAIN, CONNECT, ON_THE_WIRE, blaze_api::Timed::ANSWER_TO_EXEC] {
+            assert_eq!(timed.iter().filter(|it| it.name == name).count(), 1, "{name}: {timed:?}");
+        }
+        assert_eq!(timed.len(), 4, "{timed:?}");
+        assert_eq!(blaze_api::Timed::exec_of(&timed), Some(25));
+
+        // The controls.
+        let asked = asked_build();
+        let mut link = Scripted::answering([status(), edit()].concat());
+        let spoken = Spoken { asked: &asked, request: &COMMAND, shown: &shown, cwd: Path::new("/w"), pid: 41 };
+        let mut timings = Timings::default();
+        let ended = talk(&mut link, &spoken, |_| Ok(()), || Duration::ZERO, &mut timings);
+        assert!(matches!(ended, Ended::HandOver { .. }), "{ended:?}");
+        assert!(timings.timed.iter().all(|it| it.name != ON_THE_WIRE), "{:?}", timings.timed);
+        assert_eq!(Timings::default().rows(41, 0, 1), None);
+    }
+
+    fn asked_build() -> Asked {
+        asked(&["build"])
     }
 
     /// The handshake's count, which no timing changes: a `run` after an edit (a unit compiled,
@@ -450,7 +581,8 @@ mod tests {
         let shown = Shown::pipe(blaze_screen::Command::Run, false);
         let spoken =
             Spoken { asked: &asked, request: &COMMAND, shown: &shown, cwd: Path::new("/w"), pid: 41 };
-        let ended = talk(&mut link, &spoken, |_| Err("another build".to_owned()), || Duration::ZERO);
+        let ended =
+            talk(&mut link, &spoken, |_| Err("another build".to_owned()), || Duration::ZERO, &mut Timings::default());
         assert_eq!(ended, Ended::Engine("another build".to_owned()));
         assert_eq!(link.sent, [STATUS]);
 

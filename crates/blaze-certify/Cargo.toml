@@ -1,0 +1,39 @@
+[package]
+name = "blaze-certify"
+description = "blaze v2's request certificate with no compiler in it: the record, the request machine, the slot a daemon writes for a client, and the client's own check of an unchanged run"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# The planted bugs of the controls (`request::PLANT`, `solo::PLANT`), for the tests of a
+# crate that drives the machine (blaze-cargo's): only a dev dependency turns it on.
+plants = []
+
+[dependencies]
+# `Targets`, which a slot's key is of (`slot::key_of`).
+blaze-api.workspace = true
+# `Stamp`, compared whole.
+blaze-core.workspace = true
+# `ContentId`, `Hasher`: every key and digest.
+blaze-ids.workspace = true
+# CBOR of a request's targets, the slot key's bytes (`slot::key_of`).
+blaze-protocol.workspace = true
+# The record's one form: base, read-lists, answer, over a store handed in.
+blaze-record.workspace = true
+# `racy`, the racy window's one home; `outside::LookKind`, the kind a planted bug drops.
+blaze-vfs.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

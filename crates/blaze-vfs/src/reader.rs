@@ -96,7 +96,7 @@ impl Pinned<'_> {
         if shape.is_dir() {
             return Ok(None);
         }
-        Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(shape)? }))
+        Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(node)? }))
     }
 
     /// [`Pinned::file`], its bytes held past the pin: the tree's own, with one count taken. A
@@ -113,7 +113,7 @@ impl Pinned<'_> {
         if shape.is_dir() {
             return Ok(None);
         }
-        Ok(Some((*table.id(node), mode, table.bytes(shape)?)))
+        Ok(Some((*table.id(node), mode, table.bytes(node)?)))
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it

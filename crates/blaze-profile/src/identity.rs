@@ -25,17 +25,39 @@ pub fn binary() -> io::Result<String> {
     Ok(hex(&binary_hash()?))
 }
 
+/// The process's hash of its own executable, once known: [`seed`]ed by the one home of it
+/// (blaze-cargo's `serve::local::tool_hash`, by the executable's stamp), or read whole by
+/// [`binary_hash`].
+static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// The running executable's file: Linux's `/proc/self/exe`, which follows the running inode
+/// even once another file is renamed over its path; elsewhere the path it was started from
+/// (`std::env::current_exe`), which holds the running file unless something renamed another
+/// over it while it runs.
+pub fn running() -> io::Result<std::path::PathBuf> {
+    let proc = Path::new("/proc/self/exe");
+    match proc.exists() {
+        true => Ok(proc.to_path_buf()),
+        false => std::env::current_exe(),
+    }
+}
+
 /// The BLAKE3 hash of the executable running now, read once a process: the executable is not
 /// written in place while it runs (see ix-prof's `map`), so the first hash is every later one.
-/// A read that fails is not kept, and the next call tries again.
+/// [`seed`]ed, it reads nothing. A read that fails is not kept, and the next call tries again.
 pub fn binary_hash() -> io::Result<[u8; 32]> {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     if let Some(hash) = HASH.get() {
         return Ok(*hash);
     }
-    let exe = std::env::current_exe()?;
-    let hash = tree::hash_file(&exe)?.1;
+    let hash = tree::hash_file(&running()?)?.1;
     Ok(*HASH.get_or_init(|| hash))
+}
+
+/// Gives the process its hash of its own executable, `hash`, as known by the executable's
+/// stamp, so no reader of [`binary_hash`] reads the executable; whether it took. A hash
+/// already known stays (`false`): the first is every later one.
+pub fn seed(hash: [u8; 32]) -> bool {
+    HASH.set(hash).is_ok()
 }
 
 /// `hash` as 64 hex digits.

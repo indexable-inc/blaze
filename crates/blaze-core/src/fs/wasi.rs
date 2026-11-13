@@ -49,6 +49,16 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     ))
 }
 
+/// [`crate::Effect::CopyData`]: refused, as WASI has no call that says where a file's holes
+/// are or copies between files in the kernel; nothing copies through memory instead.
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    Err(refused(
+        to,
+        format_args!("copying the data of {} to it", from.display()),
+        "WASI has no call that finds a file's data extents, and blaze does not copy through memory instead",
+    ))
+}
+
 /// [`crate::Effect::Times`]: the access and modification times of `path`, through a symbolic
 /// link, both `modified_ns` since the epoch (WASI's `path_filestat_set_times`, whose times are
 /// 64-bit nanoseconds, so every `modified_ns` fits). An error names `path`.

@@ -25,6 +25,13 @@
 //! - a method's or field's check comes after the expression it is of, and a `let`'s type and
 //!   initializer before its pattern.
 //!
+//! A body the stability checks find nothing in ([`super::body_quiet`], read from HIR and the
+//! body's own syntax, kept by the database) is not entered: the walk steps over its subtree
+//! where the check's pieces cut it (`Cx::pieces`), so a body edit walks the edited body and
+//! the bodies that name something deprecated or unstable, not the crate. The quiet bodies are
+//! found up front, on the database's workers, and counted in the span `stability quiet
+//! bodies`.
+//!
 //! A use lives on the stack: it is a probe of the [`Index`] and is gone. Only what is
 //! reported is kept, with a `u64` key of where rustc's checks come to it, and sorted once at
 //! the end. The parent segments of a path are resolved only when the path itself was allowed
@@ -42,8 +49,10 @@
 //! (`check_stability_and_deprecation`) and `compiler/rustc_resolve/src/build_reduced_graph.rs`
 //! (`contains_macro_use`) (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
+use std::{alloc::Global, ops::ControlFlow};
 
+use base_db::EditionedFileId;
+use blaze_mem::Tag;
 use cfg::CfgOptions;
 use either::Either;
 use hir::{
@@ -54,7 +63,7 @@ use hir_expand::name::AsName as _;
 use intern::Symbol;
 use smallvec::SmallVec;
 use syntax::{
-    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange,
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode as _, Node},
 };
 
@@ -66,6 +75,7 @@ use super::{
 };
 use crate::{
     cx::Cx,
+    pieces::Piece,
     lints::{
         registry::LintId,
         syntax::{Tree, Walk},
@@ -168,6 +178,78 @@ struct Walker<'a, 'b, 'db> {
     /// Whether the crate enables `extern_types`, read the first time a help needs it.
     extern_types: Option<bool>,
     reported: Reported,
+    /// The bodies the walk steps over.
+    quiet: Quiet,
+}
+
+/// Which bodies [`walk`] enters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Bodies {
+    /// Every body: the whole walk, what the refinement compares with.
+    All,
+    /// Every body but the quiet ones ([`super::body_quiet`]).
+    QuietSkipped,
+}
+
+/// Of each file with quiet bodies, the ranges its pieces cut them at, in order.
+#[derive(Default)]
+struct Quiet {
+    files: blaze_hash::HashMap<EditionedFileId, Vec<TextRange>, Global>,
+}
+
+impl Quiet {
+    /// The quiet bodies of the check's pieces (`Cx::pieces`): every body piece's
+    /// [`super::body_quiet`] asked at once on the database's workers, then read in order. Span
+    /// `stability quiet bodies`: `bodies`, and once read `quiet`.
+    fn of(cx: &Cx<'_, '_>) -> Quiet {
+        let pieces = cx.pieces();
+        let list: &[Piece] = &pieces.list;
+        let finding = tracing::info_span!(
+            target: "blaze",
+            "stability quiet bodies",
+            bodies = list.iter().filter(|it| matches!(it, Piece::Body(_))).count(),
+            quiet = tracing::field::Empty,
+        )
+        .entered();
+        let db = cx.db;
+        let krate = cx.krate.base();
+        db.run_all(Tag::Diagnostics, list.len(), |db, at| {
+            if let Piece::Body(owner) = list[at] {
+                super::body_quiet(db, owner, krate);
+            }
+        });
+        let mut quiet = Quiet::default();
+        let mut file = None;
+        let mut count = 0usize;
+        for (&piece, &cut) in list.iter().zip(pieces.cuts.iter()) {
+            match piece {
+                Piece::Outline(it) => file = Some(it),
+                Piece::Body(owner) => {
+                    if !super::body_quiet(db, owner, krate) {
+                        continue;
+                    }
+                    let file = file.expect("a body's piece comes after its file's outline");
+                    let cut = cut.expect("a body's piece has its cut");
+                    // alloc: once per check, one entry a quiet body of a file
+                    quiet.files.entry(file).or_default().push(cut);
+                    count += 1;
+                }
+            }
+        }
+        finding.record("quiet", count);
+        quiet
+    }
+
+    /// The end of the quiet body `node` of `t` is in, if it is in one.
+    fn end(&self, t: &Tree<'_>, node: Node<'_>) -> Option<TextSize> {
+        if !t.in_file() {
+            return None;
+        }
+        let cuts = self.files.get(&t.file.file_id()?)?;
+        let range = node.text_range();
+        let at = cuts.partition_point(|it| it.start() <= range.start()).checked_sub(1)?;
+        cuts[at].contains_range(range).then(|| cuts[at].end())
+    }
 }
 
 /// What the checks found, by the pass that reports it.
@@ -196,7 +278,7 @@ struct Header {
 /// The stability checks of the crate, in rustc's order: what resolution reports of macros,
 /// each module's `check_mod_attrs` then `check_mod_unstable_api_usage`, the attribute
 /// parser's delayed lints, then typeck's.
-pub(super) fn walk(cx: &Cx<'_, '_>) -> Vec<Found> {
+pub(super) fn walk(cx: &Cx<'_, '_>, bodies: Bodies) -> Vec<Found> {
     let db = cx.db;
     let walk = cx.walk();
     let file = cx.krate.root_module(db).definition_source_view(db).file_id;
@@ -211,6 +293,10 @@ pub(super) fn walk(cx: &Cx<'_, '_>) -> Vec<Found> {
         root: tree.ptr(tree.root),
         extern_types: None,
         reported: Reported::default(),
+        quiet: match bodies {
+            Bodies::All => Quiet::default(),
+            Bodies::QuietSkipped => Quiet::of(cx),
+        },
     };
     let ctx =
         Ctx { owner: ROOT, module: 0, container: Container::Free, body: false, derive: false };
@@ -346,6 +432,12 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let mut j = from;
         loop {
             j = next(t, j);
+            if let Some(&node) = t.nodes.get(j)
+                && let Some(end) = self.quiet.end(t, node)
+            {
+                j = beyond(t, j, end);
+                continue;
+            }
             let here = t
                 .nodes
                 .get(j)
@@ -380,6 +472,8 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// the first node looked at after.
     fn visit(&mut self, t: &'a Tree<'db>, j: usize, ctx: Ctx) -> usize {
         let (kind, node) = (t.kinds[j], t.nodes[j]);
+        #[cfg(test)]
+        super::tests::visited(self.cx.db, t.file, node.text_range());
         match kind {
             SyntaxKind::ATTR => return past(t, j + 1, node),
             SyntaxKind::MACRO_CALL => {
@@ -1578,6 +1672,15 @@ fn unstable_abi(ty: ast::FnPtrType<'_>) -> bool {
             | "cmse-nonsecure-entry"
             | "Swift"
     )
+}
+
+/// The index of the first node of `t` from `from` on that starts at or after `end`.
+fn beyond(t: &Tree<'_>, from: usize, end: TextSize) -> usize {
+    let mut at = from;
+    while at < t.nodes.len() && t.nodes[at].text_range().start() < end {
+        at += 1;
+    }
+    at
 }
 
 /// The index of the first node looked at from `from` on that is not in `node`.

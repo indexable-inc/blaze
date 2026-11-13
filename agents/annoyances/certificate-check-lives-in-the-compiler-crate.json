@@ -1,0 +1,14 @@
+{
+ "id": "certificate-check-lives-in-the-compiler-crate",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor track 10 task A, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job/{certificate.rs, request.rs} (now crates/blaze-certify)",
+ "what": "The request certificate and its machine, which decide \"nothing changed\" with no compiler at all, lived inside blaze-cargo's daemon. A client that wanted to answer an unchanged `blaze run` alone (Relax's 27.8 ms against blaze's 127.9 ms no-op and 2,685 ms restart) could only reach the check by linking the whole compiler crate or by writing a second check of its own.",
+ "cost": "no-daemon run blocked on a crate split; the tempting route was a second, client-side check, a second rule for the same claim",
+ "cause": "the machine was written where its first driver was, and its types (CodeHolder, env_digest, the placed marks) were reached through that driver's modules",
+ "class": "a sans-IO core housed in its first driver's crate, so a second driver must copy it or link everything the first one does",
+ "prevention": "a sans-IO core is its own crate from the start, depending only on what its rule reads (ids, record form, stamps, the racy window); drivers import it",
+ "workaround": "none",
+ "fix": "blaze-certify holds certificate, request, slot and solo with no compiler; blaze-cargo's certify.rs drives the same Request; the client drives it through solo::Solo over a slot and lstats. Controls in solo/tests.rs: TrustsRacy, SkipsNames, SkipsPremises, SkipsDirectories, a name left out of the slot, an answer record swapped.",
+ "state": "fixed"
+}

@@ -1,0 +1,14 @@
+{
+ "id": "start-set-not-persisted",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of 7c task A, int-1112",
+ "where": "crates/blaze-launch-host/src/program.rs Program::start_image, Welcome; crates/blaze-launch-host/src/start.rs (new)",
+ "what": "A launched program's start (its kept `Tell::Image` frame and the slots earlier runs called) lived only in the daemon's memory: `blaze stop` then `blaze run` of hello took 2,685 ms against Relax's 27.8 ms, a whole build and about 210 first-call round trips, because a new daemon held nothing of the program and a first call's instance was a front-end handle that does not survive a start.",
+ "cost": "every run after a daemon start is a build; the restart row lost to the competitor by 100x",
+ "cause": "the program's state was an in-memory cache with no persisted form, and a slot's ask was a handle into the front end instead of bytes",
+ "class": "state kept warm in a process with no record to restore it from, so a restart is a rebuild",
+ "prevention": "what outlives a request is a record by content (rule 51) with a round-trip test and a refusal of an older layout (rule 26)",
+ "workaround": "none",
+ "fix": "The start image: the program's whole state and its laid frame as one store record (`Program::kept`, `Program::restored`, key `start_key` over program, record, policy, symbols, maker, root and the body's hash), and each `Names::Function` carries its callee's portable ask (bind layout `bzbind02`). Refinement `a_restored_program_tells_what_the_kept_one_tells`; controls Plant::DropsNeeded, ForgetsAsks, KeyOfIdentityAlone. Not built or run yet: C (the daemon's keep and restore) waits on it.",
+ "state": "written, not built"
+}

@@ -302,7 +302,7 @@ pub(super) fn trait_names(db: &Db, krate: Crate) -> HashMap<TraitId, SmallVec<[N
 /// build after another workspace's in one daemon stopped in `module_impls` on such a row).
 #[test]
 fn a_dependency_served_from_its_image_keeps_impl_tables_over_the_decoded_map() {
-    use hir_def::nameres::frozen::{self, Frozen, Mode};
+    use hir_def::nameres::frozen::pages;
 
     let mut loaded = Loaded::new(
         r#"
@@ -322,9 +322,14 @@ pub mod inner { pub struct T; impl super::Tr for T {} }
     let mut failures = String::new();
     check(&loaded.db, dep, "maintained", &mut failures);
     let maintained = crate_def_map(&loaded.db, dep).root_module_id();
-    let bytes = frozen::encode(&loaded.db, dep).expect("`dep`'s def map encodes");
-    let served = Frozen { bytes: bytes.into(), mode: Mode::Serve };
-    frozen::set(&mut loaded.db, [(dep, served)].into_iter().collect());
+    let bytes = pages::encode(&loaded.db, dep).expect("`dep`'s def map pages encode");
+    let held: hir_def::deps::ImageBuf =
+        std::sync::Arc::new(blaze_format::Aligned::copy_from(&bytes));
+    let key = blaze_ids::ContentId::of("blaze test def map pages", &bytes);
+    // dyn: a test's holder of one record
+    let source: std::sync::Arc<dyn pages::PageSource> = std::sync::Arc::new(pages::Whole(held));
+    let served = pages::Paged { key, source };
+    pages::set(&mut loaded.db, [(dep, served)].into_iter().collect());
     loaded.db.note_crates_changed();
     let decoded = crate_def_map(&loaded.db, dep).root_module_id();
     assert_ne!(maintained, decoded, "the decoded map's modules are not the maintained ones");

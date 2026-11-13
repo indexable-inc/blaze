@@ -223,6 +223,7 @@ impl Gen {
             command: self.text(),
             refused: self.maybe(Gen::u32),
             verbose: self.next() as u8,
+            prebuilt: self.yes(),
         }
     }
 
@@ -336,6 +337,14 @@ impl Gen {
                 spans: self.bytes(),
                 ended_ns: self.wide() as i64,
                 started_ns: self.wide() as i64,
+                pid: self.u32(),
+                timed: (0..self.below(3))
+                    .map(|_| crate::Timed {
+                        name: self.text(),
+                        start_ns: self.wide() as i64,
+                        end_ns: self.wide() as i64,
+                    })
+                    .collect(),
             },
             33 => Request::Lock { view: self.view(0), targets: self.targets() },
             35 => Request::Store { words: self.texts(0) },

@@ -724,12 +724,14 @@ pub(crate) fn executed(package_id: &str, output: &Output, out_dir: &str) -> Buil
 
 /// The files a run left in its `OUT_DIR`, by `/`-separated path under it, moved out of its
 /// value. A directory (no bytes) is no file: it is there on disk, which the run restored.
-fn out_files(files: Vec<OutFile>) -> Vec<(String, Vec<u8>)> {
+/// The files of a run's result as the front end applies them ([`blaze_lower::Ran::files`]):
+/// each the result's own bytes, shared, never a copy.
+fn out_files(files: Vec<OutFile>) -> Vec<(String, Arc<[u8]>)> {
     files.into_iter().filter_map(|file| Some((file.path, file.bytes?))).collect()
 }
 
 /// Every file under `dir`, by `/`-separated path: what a run outside the sandbox left.
-fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn walk(dir: &Path) -> Result<Vec<(String, Arc<[u8]>)>, String> {
     let mut out = Vec::new();
     let mut pending = vec![PathBuf::new()];
     while let Some(rel) = pending.pop() {
@@ -754,7 +756,9 @@ fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             } else if kind.is_file() {
                 let bytes = std::fs::read(entry.path())
                     .map_err(|error| format!("{}: {error}", entry.path().display()))?;
-                out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+                // alloc: once a file, its bytes moved into the one allocation the front end
+                // shares (the read buffer let go)
+                out.push((rel.to_string_lossy().replace('\\', "/"), Arc::<[u8]>::from(bytes)));
             }
         }
     }
@@ -1102,21 +1106,24 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// ([`blaze_usercode::roots::verify`]). blaze's own sources directory
 /// ([`blaze_units::query::BuildConfig::sources`]), where every registry and git package is
 /// kept, is machine-wide: a run that read there outside its own package can still be shared
-/// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's.
+/// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's. Each look
+/// at the disk resolving a root's links makes is the build's own
+/// ([`crate::serve::work::JobInput::looks`]).
 pub(crate) fn build_roots(job: &Job) -> RootMap {
+    let looks = &job.input.looks;
     RootMap::default()
-        .with(Role::Target, Path::new(&job.units().target_dir))
-        .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
-        .with(Role::Tools, &job.shared.tools)
-        .with(Role::Launcher, &job.shared.launcher)
+        .with(Role::Target, Path::new(&job.units().target_dir), looks)
+        .with(Role::Workspace, Path::new(&job.input.config.invocation.root), looks)
+        .with(Role::Tools, &job.shared.tools, looks)
+        .with(Role::Launcher, &job.shared.launcher, looks)
         .with_sources(Path::new(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
 pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
     build_roots(job)
-        .with(Role::Package, &unit.package.manifest_dir)
-        .with(Role::OutDir, &unit.out_dir)
+        .with(Role::Package, &unit.package.manifest_dir, &job.input.looks)
+        .with(Role::OutDir, &unit.out_dir, &job.input.looks)
 }
 
 /// Run `run` ready to begin; none while its script is not built.
@@ -1160,7 +1167,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
     let Some((_, code)) = program else {
-        let disk = blaze_usercode::inputs::Disk::new(Vec::new());
+        let disk = blaze_usercode::inputs::Disk::new(Vec::new(), &job.input.looks);
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
     };
     let mut read = vec![
@@ -1191,7 +1198,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         },
         roots: build_roots(job),
     };
-    let prepared = script::prepare(&unit, &env, &place)
+    let prepared = script::prepare(&unit, &env, &place, &job.input.looks)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
     // The variable the script reads is the layout, whatever else set it (a check, not a
     // fallback: `native_env` forces it).
@@ -1220,8 +1227,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     // ([`blaze_usercode::confine::walk_sees`]). A run outside the sandbox is given all of it.
     let disk = match outside(job, run) {
         // clone: once per run prepared, the environment its checks answer from
-        true => blaze_usercode::inputs::Disk::new(prepared.env.clone()),
-        false => prepared.disk(),
+        true => blaze_usercode::inputs::Disk::new(prepared.env.clone(), &job.input.looks),
+        false => prepared.disk(&job.input.looks),
     };
     let how = match outside(job, run) {
         true => {
@@ -1837,7 +1844,9 @@ impl ScriptRun {
         };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
-            env: output.env.clone(),
+            // alloc: once a run applied, its variables, which `output` keeps beside: shared by
+            // every crate the front end applies them to
+            env: output.env.as_slice().into(),
             out_dir: out_dir.clone(),
             files,
         };

@@ -1,0 +1,14 @@
+{
+ "id": "member-pages-rule-a-literal",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of R3 (/tmp/plan/6b-restart-rest.md), int-1112",
+ "where": "crates/hir-def/src/deps/serve.rs serve, crates/hir-def/src/nameres/delta.rs maintained",
+ "what": "R3's rule (a), 'a crate a maintainer holds state for is never served again in that process', read literally stops all serving: the lowering's batch runs nameres's maintainer over every crate before the first serve, so every crate is 'held' by then; and the impls maintainer's prepare registers every crate whose impls are not tables-served, a served def map without tables too.",
+ "cost": "a design pass to find the condition; the planned ImplsMaintained check was dropped",
+ "cause": "'maintained' is not one fact: the maintainers hold state for crates they were never asked to keep, and the serve had no memory of what it was asked before",
+ "class": "a rule phrased on an observable that other code sets for its own reasons",
+ "prevention": "the serve keeps its own record (`Asked`, the database's write-side state) of what it was asked; rule (a) is 'asked before by a serve of this database and maintained by nameres (not paged)'",
+ "workaround": "none",
+ "fix": "serve leaves out a crate asked before and maintained, keeps its key so a store writes it; tests a_maintained_crate_is_not_served_again (control: a fresh database is served it).",
+ "state": "written, not compiled"
+}

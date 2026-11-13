@@ -723,3 +723,240 @@ fn a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one() {
     lower(&big);
     assert_eq!(lower(small), first, "a tree lowered after an item of 600 names, same thread");
 }
+
+/// A crate with every kind of item an item tree has an id for, in macro expansions, an inline
+/// module, an extern block and blocks nested in statements, and builtin derives (which make no
+/// tree item).
+const SCOPED: &str = r#"
+macro_rules! make {
+    ($n:ident) => {
+        fn $n() {}
+        impl S { fn m(&self) {} }
+    };
+}
+#[derive(Clone, Debug)]
+struct S;
+union U { a: u8 }
+enum E { A, B(u8) }
+make!(made);
+mod inner {
+    pub use super::S;
+    extern "C" { fn ext(); static X: u8; }
+    const _: () = ();
+    trait T { fn t(); }
+    type A = u8;
+    static Y: u8 = 0;
+}
+fn outer() {
+    let _ = { fn a() {} 1 };
+    fn b() {}
+    make!(in_block);
+    struct InBlock;
+    impl InBlock {}
+    #[cfg(any())]
+    fn gone_in_block() {}
+}
+#[cfg(any())]
+fn gone() {}
+"#;
+
+/// The ast id of the item `item`'s id was made of, read back from the id's location.
+fn ast_of(db: &TestDB, item: crate::item_scope::ItemOfAst) -> hir_expand::ErasedAstId {
+    use crate::{AdtId, Lookup, MacroId, ModuleDefId, item_scope::ItemOfAst};
+    fn erase<N: span::AstIdNode>(id: hir_expand::AstId<N>) -> hir_expand::ErasedAstId {
+        hir_expand::InFile::new(id.file_id, id.value.erase())
+    }
+    match item {
+        ItemOfAst::Def(ModuleDefId::FunctionId(it)) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::AdtId(AdtId::StructId(it))) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::AdtId(AdtId::UnionId(it))) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::AdtId(AdtId::EnumId(it))) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::ConstId(it)) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::StaticId(it)) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::TraitId(it)) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::TypeAliasId(it)) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::MacroId(MacroId::Macro2Id(it))) => erase(it.lookup(db).id),
+        ItemOfAst::Def(ModuleDefId::MacroId(MacroId::MacroRulesId(it))) => {
+            erase(it.lookup(db).id)
+        }
+        ItemOfAst::Impl(it) => erase(it.lookup(db).id),
+        ItemOfAst::Use(it) => erase(it.lookup(db).id),
+        ItemOfAst::ExternBlock(it) => erase(it.lookup(db).id),
+        ItemOfAst::ExternCrate(it) => erase(it.lookup(db).id),
+        other => panic!("{other:?} is no item of a tree"),
+    }
+}
+
+/// Whether an item of `kind` is one the collector makes an id of (when its `cfg` holds).
+fn defines(kind: super::ItemKind) -> bool {
+    use super::ItemKind as K;
+    !matches!(kind, K::MacroCall | K::MacroRules | K::Macro2 | K::Mod)
+}
+
+/// Every item of every item tree of `SCOPED`'s crate (its files', its macro expansions', its
+/// blocks') that the collector defines, against the maps `by_ast` makes of the crate's scopes:
+/// the number of items checked, or the first that maps to no id or to the id of another item.
+fn check_scoped(
+    by_ast: impl Fn(&TestDB, &crate::item_scope::ItemScope) -> crate::item_scope::ItemsByAst,
+) -> Result<usize, String> {
+    use crate::{
+        DefWithBodyId, ModuleDefId,
+        expr_store::Body,
+        item_scope::ItemsByAst,
+        item_tree::{AttrsOrCfgRef, ModItemId, TreeId},
+        nameres::{block_def_map, crate_def_map},
+    };
+
+    let fx = fixture::db(SCOPED);
+    let db = fx.into_db();
+    let krate = fixture::test_crate(&db);
+    // Every scope: the modules', then the blocks' of every body of every scope met.
+    let mut scopes: Vec<&crate::item_scope::ItemScope> =
+        crate_def_map(&db, krate).modules(&db).map(|(_, module)| module.scope(&db)).collect();
+    let mut trees: Vec<(TreeId, Option<crate::BlockId>)> = Vec::new();
+    for (_, module) in crate_def_map(&db, krate).modules(&db) {
+        trees.push((TreeId::new(module.definition_source_file_id(), None), None));
+    }
+    let mut at = 0;
+    while at < scopes.len() {
+        let scope = scopes[at];
+        at += 1;
+        let calls = scope.iter_macro_invoc().map(|(_, &call)| call);
+        for call in calls.chain(scope.attr_macro_invocs().map(|(_, call)| call)) {
+            trees.push((TreeId::new(call.into(), None), None));
+        }
+        for def in scope.declarations().chain(scope.unnamed_consts().map(ModuleDefId::from)) {
+            let owner = match def {
+                ModuleDefId::FunctionId(it) => DefWithBodyId::from(it),
+                ModuleDefId::ConstId(it) => DefWithBodyId::from(it),
+                ModuleDefId::StaticId(it) => DefWithBodyId::from(it),
+                _ => continue,
+            };
+            for &block in Body::of(&db, owner).store.block_scopes() {
+                let map = block_def_map(&db, block);
+                scopes.push(map.module(&db, map.root_module_id()).scope(&db));
+                trees.push((TreeId::new(block.ast_id(&db).file_id, Some(block)), Some(block)));
+            }
+        }
+    }
+    let maps: Vec<ItemsByAst> = scopes.iter().map(|scope| by_ast(&db, scope)).collect();
+    let mut checked = 0;
+    let mut seen = std::collections::HashSet::new();
+    for (tree_id, _) in trees {
+        if !seen.insert(tree_id) {
+            continue;
+        }
+        let tree = tree_id.item_tree(&db, krate);
+        let mut items: Vec<ModItemId> = tree.top_level_items().to_vec();
+        while let Some(item) = items.pop() {
+            items.extend_from_slice(tree.nested_items(item));
+            let kind = tree.kind(item);
+            let disabled = matches!(tree.attrs(item), Some(AttrsOrCfgRef::CfgDisabled(..)));
+            if disabled || !defines(kind) {
+                continue;
+            }
+            let ast = hir_expand::InFile::new(tree_id.file_id(), item.ast_id(tree).erase());
+            let Some(found) = maps.iter().find_map(|map| map.def_of_ast(ast)) else {
+                return Err(format!("{kind:?} {ast:?} maps to no id"));
+            };
+            if ast_of(&db, found) != ast {
+                return Err(format!("{kind:?} {ast:?} maps to {found:?}, of another item"));
+            }
+            checked += 1;
+        }
+    }
+    let entries: usize = maps.iter().map(ItemsByAst::len).sum();
+    match entries == checked {
+        true => Ok(checked),
+        false => Err(format!("{entries} entries for {checked} items")),
+    }
+}
+
+/// The invariant: every item of every item tree of a crate that the collector defines (in its
+/// files, its macro expansions and its blocks) maps through its scope's `items_by_ast` to the id
+/// made of it, and the maps hold nothing else.
+#[test]
+fn every_item_maps_to_the_id_its_def_map_holds() {
+    let checked = check_scoped(|db, scope| scope.items_by_ast(db)).unwrap();
+    // S U E (made, its impl) (use, extern block, ext, X, const _, T, A, Y) outer (a) (b,
+    // in_block, its impl, InBlock, its impl): `m` and `t` are an impl's and a trait's, no
+    // scope's; `gone` and `gone_in_block` are `cfg`'d out.
+    assert_eq!(checked, 20);
+}
+
+/// The control: a map without the impls, a collector that made no impl, is caught.
+#[test]
+fn a_scope_map_without_impls_is_caught() {
+    use crate::item_scope::ItemOfAst;
+    let skipped = check_scoped(|db, scope| {
+        scope.items_by_ast(db).without(|it| matches!(it, ItemOfAst::Impl(_)))
+    });
+    assert!(skipped.unwrap_err().contains("Impl"), "an impl that maps to no id");
+}
+
+/// The names of the functions `body_items` lists for the body of the function `name` of
+/// `text`'s crate, in its order.
+fn body_item_names(text: &str, name: &str) -> Vec<String> {
+    use crate::{
+        DefWithBodyId, ModuleDefId, item_scope::ItemOfAst, nameres::block_def_map,
+        signatures::FunctionSignature,
+    };
+    let fx = fixture::db(text);
+    let db = fx.into_db();
+    let krate = fixture::test_crate(&db);
+    let owner = crate::test_items::function(&db, krate, name);
+    let mut names = Vec::new();
+    for item in super::body_items(&db, DefWithBodyId::from(owner)) {
+        let map = block_def_map(&db, item.block);
+        let scope = map.module(&db, map.root_module_id()).scope(&db);
+        match scope.items_by_ast(&db).def_of_ast(item.item) {
+            Some(ItemOfAst::Def(ModuleDefId::FunctionId(f))) => {
+                names.push(FunctionSignature::of(&db, f).name.as_str().to_owned())
+            }
+            other => names.push(format!("{other:?}")),
+        }
+    }
+    names
+}
+
+/// The invariant: `body_items` lists a body's items in source order, a block's own among those
+/// of the blocks nested in its statements and in place of the macro calls that write them.
+/// The control is the order the block trees alone give (a block's own items first), which is
+/// not it.
+#[test]
+fn body_items_are_in_source_order() {
+    let text = r#"
+macro_rules! make { ($n:ident) => { fn $n() {} }; }
+fn f() {
+    let _ = { fn a() {} 1 };
+    fn b() {}
+    let _ = || { fn c() {} };
+    make!(d);
+    let _ = [0; { fn e() {} 2 }];
+    fn g() {}
+}
+"#;
+    let names = body_item_names(text, "f");
+    assert_eq!(names, ["a", "b", "c", "d", "e", "g"]);
+    let own_first = ["b", "d", "g", "a", "c", "e"];
+    assert_ne!(names, own_first, "the control: the block trees' order alone");
+}
+
+/// The invariant: an inline `asm!` is an expression, not a body item: in a block with no def
+/// map (where listing it would find no block to put it in) and in one with a def map (where it
+/// would come out as a row of no id). The control is that second block: the rule this replaces
+/// (every `ASM_EXPR` an item) lists its `asm!` as a row between `b` and `c`.
+#[test]
+fn an_inline_asm_is_no_body_item() {
+    let text = r#"
+#[rustc_builtin_macro]
+macro_rules! asm {() => {}}
+fn f() {
+    unsafe { let _ = asm!("nop"); }
+    let _ = { fn a() {} 1 };
+    unsafe { fn b() {} let _ = asm!("nop"); fn c() {} }
+}
+"#;
+    let names = body_item_names(text, "f");
+    assert_eq!(names, ["a", "b", "c"]);
+}

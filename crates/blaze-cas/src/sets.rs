@@ -44,7 +44,7 @@ use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 
-use crate::{Handle, Key, Kind, Ticket, enter, sealed};
+use crate::{Handle, Key, Kind, Mismatch, Store, Ticket, Tickets, enter, sealed};
 
 #[cfg(test)]
 thread_local! {
@@ -757,4 +757,204 @@ impl Sets {
             durable: first.max(second),
         }))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A planted bug for the file set's simulation (`tests::collect`): the pin written before
+    /// a file is made durable names the next file's set alone, letting go of the durable
+    /// file's before the next one is.
+    pub(crate) static FILE_SET_EARLY_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What [`FileSet::start`] found of the set the durable file names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileSetStart {
+    /// No file is durable (none, or one the start does not use): the pin lets go of
+    /// whatever an earlier run left under its name.
+    NoFile,
+    /// The run that made the file durable listed its set: pinned as it was.
+    Listed { root: Key, keys: u64 },
+    /// The store holds no listing of the file's set: a store of the layout before a file's
+    /// set was pinned. Listed and pinned now; `missing` of its keys the store does not hold
+    /// (a collection before this start forgot them, and a read of one fails naming it).
+    Unlisted { root: Key, keys: u64, missing: u64 },
+}
+
+/// What [`FileSet::prepare`] says of the file about to be made durable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prepared {
+    /// Its set is listed and pinned, durably, beside the set of the file durable now: the
+    /// file may be made durable.
+    Ready,
+    /// The listing or the pin is written and not durable yet: flush the store and ask again.
+    Flush,
+}
+
+/// The keys a file outside the store names (the daemon image's file texts), kept from the
+/// collector across every change of that file and every crash. The keys are listed as a set
+/// is (a [`Kind::Set`] listing, leaves shared between files that name the same runs of keys)
+/// and one pin, `name`, names the listings' roots: the durable file's, and from
+/// [`FileSet::prepare`] until [`FileSet::placed`] the next file's beside it. A sans-IO core:
+/// it writes records and pins into the store it is given and owns no IO.
+///
+/// The invariant: the set of the file durable on disk is rooted at every point, in memory and
+/// in the store's durable state: the next file's set is pinned, beside it, durably before a
+/// byte of the next file is written ([`Prepared::Ready`]); the durable file's set is let go of
+/// only once the next file is ([`FileSet::placed`], then [`FileSet::settle`]); and a start
+/// lists and pins again what the file on disk names ([`FileSet::start`]). Tested in
+/// `tests::collect` (a collection after every step, a crash at every step, the planted early
+/// release [`FILE_SET_EARLY_RELEASE`]).
+pub struct FileSet {
+    name: &'static str,
+    why: &'static str,
+    /// The id the listings are of.
+    set: ContentId,
+    /// The root of the listing of what the durable file names, with its leaves (ascending).
+    on_disk: Option<(Key, Vec<Key>)>,
+    /// The same of the file being made durable, from [`FileSet::prepare`] on: none while it
+    /// names what the durable file names.
+    next: Option<(Key, Vec<Key>)>,
+    /// The roots the pin names as this run last wrote it; none before its first write.
+    pinned: Option<Vec<Key>>,
+    /// What the listings and the pins written wait on to be durable.
+    pending: Tickets,
+}
+
+impl FileSet {
+    /// The set of the file durable at a start: `keys`, what it names, or none when no file is
+    /// durable or the start does not use it. Its listing is put (a record the store has is not
+    /// written again) and the pin `name` names its root alone: whatever an earlier run left
+    /// pinned beside it (a file it was making when it stopped) is let go of. In memory at once,
+    /// so no collection after this misses it, and durable with the store's next flush; a crash
+    /// before then leaves the store's pin as it was, and the next start does this again.
+    pub fn start(
+        store: &mut Store,
+        name: &'static str,
+        why: &'static str,
+        set: ContentId,
+        keys: Option<Vec<Key>>,
+        when: u64,
+    ) -> Result<(FileSet, FileSetStart), Mismatch> {
+        let mut it =
+            FileSet { name, why, set, on_disk: None, next: None, pinned: None, pending: Tickets::default() };
+        let Some(keys) = keys else {
+            it.write(store, when)?;
+            return Ok((it, FileSetStart::NoFile));
+        };
+        let (keys, (root, root_bytes), leaves) = it.listing(keys);
+        let listed = store.has(&root);
+        let missing = match listed {
+            true => 0,
+            false => keys.iter().filter(|key| !store.has(key)).count() as u64,
+        };
+        it.put(store, &leaves, (root, root_bytes.as_slice()))?;
+        it.on_disk = Some((root, leaf_keys(&leaves)));
+        it.write(store, when)?;
+        let count = keys.len() as u64;
+        Ok((it, match listed {
+            true => FileSetStart::Listed { root, keys: count },
+            false => FileSetStart::Unlisted { root, keys: count, missing },
+        }))
+    }
+
+    /// Before the next file, which names `keys`, is made durable: its set is listed and the pin
+    /// names its root beside the durable file's. [`Prepared::Ready`] once both are durable:
+    /// only then may a byte of the file be written. Asked again for a file that names other
+    /// keys (what it was to name changed before it was made), the set asked before is let go
+    /// of; asked again for the same keys, nothing is written.
+    pub fn prepare(&mut self, store: &mut Store, keys: Vec<Key>, when: u64) -> Result<Prepared, Mismatch> {
+        let (_, (root, root_bytes), leaves) = self.listing(keys);
+        self.put(store, &leaves, (root, root_bytes.as_slice()))?;
+        self.next = match &self.on_disk {
+            Some((disk, _)) if *disk == root => None,
+            _ => Some((root, leaf_keys(&leaves))),
+        };
+        self.write(store, when)?;
+        self.pending.retain_pending(|ticket| store.durable(ticket));
+        Ok(match self.pending.is_empty() {
+            true => Prepared::Ready,
+            false => Prepared::Flush,
+        })
+    }
+
+    /// The file last prepared is durable on disk: its set is the durable file's from now on,
+    /// and the pin lets go of the set before at the next [`FileSet::settle`]. No IO: the
+    /// caller may hold no store here.
+    pub fn placed(&mut self) {
+        if let Some(next) = self.next.take() {
+            self.on_disk = Some(next);
+        }
+    }
+
+    /// Writes the pin when what it is to name changed since its last write (a file placed):
+    /// asked each turn the store is at hand. Durable with the store's next flush; until then
+    /// the store's pin names one set more than it needs to, never one less.
+    pub fn settle(&mut self, store: &mut Store, when: u64) -> Result<(), Mismatch> {
+        self.write(store, when)
+    }
+
+    /// The root of the durable file's set, and of the next file's while one is being made.
+    pub fn roots(&self) -> (Option<Key>, Option<Key>) {
+        (self.on_disk.as_ref().map(|it| it.0), self.next.as_ref().map(|it| it.0))
+    }
+
+    /// `keys` ascending without repeats, and their listing: the root's key and bytes, and the
+    /// leaves'.
+    #[allow(clippy::type_complexity)]
+    fn listing(&self, mut keys: Vec<Key>) -> (Vec<Key>, (Key, Vec<u8>), Vec<(Key, Vec<u8>)>) {
+        keys.sort_unstable();
+        keys.dedup();
+        let (leaves, root) = listing_of(&self.set, &keys, &[]);
+        (keys, root, leaves)
+    }
+
+    /// Puts the leaves and the root a listing is made of, but for the leaves the pin keeps
+    /// already (the durable file's and the next file's): those are in the store, put by this
+    /// run (their tickets among those waited on) or listed by the start.
+    fn put(&mut self, store: &mut Store, leaves: &[(Key, Vec<u8>)], root: (Key, &[u8])) -> Result<(), Mismatch> {
+        let known = |key: &Key| {
+            [&self.on_disk, &self.next]
+                .into_iter()
+                .flatten()
+                .any(|(_, leaves)| leaves.binary_search(key).is_ok())
+        };
+        for (key, bytes) in leaves.iter().map(|(key, bytes)| (*key, bytes.as_slice())).chain([root]) {
+            if known(&key) {
+                continue;
+            }
+            let ticket = store.put(key, Kind::Set, bytes)?;
+            self.pending.add(ticket);
+        }
+        Ok(())
+    }
+
+    /// The pin as it is to be: the durable file's root and the next file's, written when that
+    /// is not what it names now.
+    fn write(&mut self, store: &mut Store, when: u64) -> Result<(), Mismatch> {
+        // alloc: once a pin written, its one or two roots
+        let mut roots: Vec<Key> = [&self.on_disk, &self.next].into_iter().flatten().map(|it| it.0).collect();
+        #[cfg(test)]
+        if let Some((next, _)) = &self.next
+            && FILE_SET_EARLY_RELEASE.with(|it| it.get())
+        {
+            roots.retain(|it| it == next);
+        }
+        roots.sort_unstable();
+        if self.pinned.as_ref() == Some(&roots) {
+            return Ok(());
+        }
+        let ticket = store.pin(self.name, self.why, when, &roots)?;
+        self.pending.add(ticket);
+        self.pinned = Some(roots);
+        Ok(())
+    }
+}
+
+/// The keys of a listing's leaves, ascending: what [`FileSet`] searches.
+fn leaf_keys(leaves: &[(Key, Vec<u8>)]) -> Vec<Key> {
+    // alloc: once a listing kept, a key a leaf
+    let mut keys: Vec<Key> = leaves.iter().map(|it| it.0).collect();
+    keys.sort_unstable();
+    keys
 }

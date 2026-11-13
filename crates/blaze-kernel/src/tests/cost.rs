@@ -529,8 +529,16 @@ impl Built {
     }
 }
 
-const NOTHING: Carried =
-    Carried { dropped: None, seeded: 0, repaired: 0, changed: 0, cut: 0, gone: 0 };
+const NOTHING: Carried = Carried {
+    dropped: None,
+    seeded: 0,
+    repaired: 0,
+    changed: 0,
+    cut: 0,
+    valued: 0,
+    differed: 0,
+    gone: 0,
+};
 
 /// A change no entry of the session read: the carry reads nothing of the store and values
 /// nothing, and every entry is a session hit after it: one get of its entry, no probe, no
@@ -754,17 +762,22 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
 }
 
 /// A save writes the paths of what changed, not the session: after a carry that repaired three
-/// entries, the top among them, three rows differ (no posting does: their lists were posted),
-/// so the rows' root, the three leaves they are in, and the root record: 5 records, which is
-/// the floor of a map kept as write-once records (a changed row is a new leaf, a new leaf a
-/// new root). Layout 1 wrote 8 (a branch more a row) and 537 for the whole.
+/// entries, the top among them, three rows differ, and one posting: the changed fact's, whose
+/// value its leaf now saw (no reader came: the lists were posted). So the rows' root, the
+/// three leaves they are in, the facts' postings' root and the leaf the one posting is in, and
+/// the root record: 7 records, which is the floor of a map kept as write-once records (a
+/// changed row is a new leaf, a new leaf a new root). Layout 2 wrote 5 (it kept no posting's
+/// value), layout 1 wrote 8 (a branch more a row) and 537 for the whole.
 ///
 /// The disk floor (rule 67). Records: 52 for 256 entries, 0.2 an entry, beside the records
 /// of the entries themselves (printed below), so the session adds that share to the store's
-/// overhead a record. Bytes: the session's 73,721 against the entries' own 68,615 (287 and 268
-/// an entry): 107% of them, where the bar is a tenth; what is owed to bring them down is in
-/// kernel.md. The whole's name, by which a carry repairs it though no step reads it, is 79 of
-/// them: its posting (32 bytes of key, 41 of record) and 6 in its row.
+/// overhead a record. Bytes: the session's 81,897 against the entries' own 68,615 (319 and 268
+/// an entry): 119% of them, where the bar is a tenth; what is owed to bring them down is in
+/// kernel.md. Layout 3 added 8,176 to layout 2's 73,721: what each of the 240 facts' postings
+/// saw (a tag and a hash, 33 bytes) and a tag on each of the 256 steps' postings, which is
+/// what lets a carry value a fact once in place of looking up every reader. The whole's name,
+/// by which a carry repairs it though no step reads it, is 80 of them: its posting (32 bytes
+/// of key, 42 of record) and 6 in its row.
 #[test]
 fn a_save_writes_the_paths_of_what_changed() {
     let mut built = built();
@@ -777,15 +790,15 @@ fn a_save_writes_the_paths_of_what_changed() {
         own / 256,
         session / 256
     );
-    // 268 bytes an entry of its own, 287 of the session: 107%, where the bar is 10%.
-    assert_eq!((own, session), (68_615, 73_721));
+    // 268 bytes an entry of its own, 319 of the session: 119%, where the bar is 10%.
+    assert_eq!((own, session), (68_615, 81_897));
     assert_eq!(built.store.values.len(), 512 + 52, "an entry is two records: its list and itself");
     let changed = built.set(37, 12);
     built.carry(&changed);
     let (next, written) = built.save();
     println!("save: {whole} records for 256 entries, {written} after a carry that repaired 3");
     assert_ne!(next, root);
-    assert_eq!((whole, written), (3 * 17 + 1, 1 + 3 + 1));
+    assert_eq!((whole, written), (3 * 17 + 1, 1 + 3 + 2 + 1));
 }
 
 /// A session opened and carried over one changed fact whose leaf comes out the same reads
@@ -806,22 +819,23 @@ fn an_opened_session_reads_only_what_a_carry_reaches() {
     assert_eq!(built.session.len(), 256);
 }
 
-/// Rule 26, the previous layout: a root record of layout 1 (leaves of 8, lengths of four
-/// bytes) is refused naming the layout, and so is a root the store does not have; neither
-/// opens as an empty session. A node of layout 1 under a root of this layout is refused the
-/// same way by the carry that reads it.
+/// Rule 26, the previous layout: a root record of layout 2 (postings that keep no value their
+/// read saw, which a valued carry could not compare) is refused naming the layout, and so is a
+/// root the store does not have; neither opens as an empty session. A node of layout 1 under a
+/// root of this layout is refused the same way by the carry that reads it.
 #[test]
 fn a_saved_session_of_another_layout_is_refused_by_name() {
     let mut built = built();
     let (root, _) = built.save();
     let mut bytes = built.store.values.get(&root).unwrap().clone();
-    assert_eq!(&bytes[..16], b"blaze kernel s 2");
-    bytes[15] = b'1';
+    assert_eq!(&bytes[..16], b"blaze kernel s 3");
+    bytes[15] = b'2';
     let old = Key(ContentId::of("blaze v2 kernel cost test old root 1", &bytes));
     built.store.values.insert(old, bytes);
     let refused = Session::open(&built.store, old).map(|_| ()).unwrap_err();
     assert!(matches!(&refused, KernelError::Store { key, .. } if *key == old), "{refused}");
-    assert!(refused.to_string().contains("blaze kernel s 1"), "{refused}");
+    assert!(refused.to_string().contains("blaze kernel s 2"), "{refused}");
+    assert!(refused.to_string().contains("layout 2"), "{refused}");
     let nowhere = Key(ContentId([9; 32]));
     let refused = Session::open(&built.store, nowhere).map(|_| ()).unwrap_err();
     assert!(matches!(&refused, KernelError::Store { key, .. } if *key == nowhere), "{refused}");
@@ -883,6 +897,130 @@ fn a_posting_node_the_store_lost_is_an_error_naming_it() {
     built.session = Session::new(&built.world);
     let (_, value, _) = built.whole();
     assert_eq!(value, built.fresh());
+}
+
+// A valued carry ([`Changed::valued`]): the holder says only that a kind is to be valued, and
+// the seed values each read of it the session posted once and reaches the readers of the ones
+// that differ. 256 values that each read one of 16 facts, so a valuation a read is 16 and a
+// lookup an entry is 256.
+
+step!(Shared, 0x7f46, "cost shared leaf");
+
+/// Half of one of the first 16 facts: 256 inputs, 16 of them a fact.
+impl Compute for Shared {
+    type World = Wide;
+
+    fn compute(ctx: &mut Reads<'_, Wide>, input: &u8) -> Result<Vec<u8>, StepError> {
+        Ok(vec![*input, ctx.get::<Tile>(&(input % 16))? / 2])
+    }
+}
+
+/// A kernel, a store and a world, and a session that holds the 256 values of [`Shared`], each
+/// asked for at the top.
+fn shared() -> Built {
+    let mut kernel = wide_kernel();
+    kernel.register_ask::<Shared>(CodeId(ContentId([46; 32]))).unwrap();
+    let mut store = Memory::default();
+    let world = Wide { facts: vec![8; 256], valued: Cell::new(0) };
+    let mut session = Session::new(&world);
+    for input in 0..=255_u8 {
+        kernel.get_in::<Shared, _>(&mut session, &mut store, &world, &input, &Setting::OFF).unwrap();
+    }
+    assert_eq!(session.len(), 256);
+    Built { kernel, store, world, session }
+}
+
+impl Built {
+    /// Sets fact `at` to `to`, and says the facts are to be valued: nothing names the fact.
+    fn set_valued(&mut self, at: u8, to: u8) -> Changed {
+        let from = self.world.pin();
+        self.world.facts[usize::from(at)] = to;
+        let mut changed = Changed::between(from, self.world.pin());
+        changed.valued(TILE);
+        changed
+    }
+
+    /// Each value of [`Shared`] the session gives is what a computation in an empty store
+    /// with no session gives now.
+    fn shared_are_fresh(&mut self) {
+        let world = Wide { facts: self.world.facts.clone(), valued: Cell::new(0) };
+        let mut fresh = Memory::default();
+        for input in 0..=255_u8 {
+            let now = self
+                .kernel
+                .get_in::<Shared, _>(&mut self.session, &mut self.store, &self.world, &input, &Setting::OFF)
+                .unwrap()
+                .value()
+                .to_vec();
+            let want = self.kernel.get::<Shared, _>(&mut fresh, &world, &input, &Setting::OFF).unwrap().value().to_vec();
+            assert_eq!(now, want, "the value of Shared({input})");
+        }
+    }
+}
+
+/// The invariant: a carry told a kind is valued values each distinct read of it the session
+/// posted once and looks up only the readers of the reads that differ, and every value after
+/// it is fresh. One fact of 16 changes within what a value shows (8 to 9, both halve to 4):
+/// 16 reads valued by the seed, one differs, its 16 readers are looked up (a lookup and a run
+/// each, two reads valued, as in the cutoff's test) and come out the same; the 240 others
+/// cost nothing. Control: the same change said `everything` looks up all 256 (240 hits of one
+/// read valued, the 16 the same two), which is what valuing saves.
+#[test]
+fn a_valued_carry_values_each_read_once_and_looks_up_only_its_readers() {
+    let mut it = shared();
+    let changed = it.set_valued(3, 9);
+    let (carried, cost) = it.carry(&changed);
+    println!("valued carry: {carried:?} {cost:?}");
+    assert_eq!(carried, Carried { seeded: 16, repaired: 16, cut: 16, valued: 16, differed: 1, ..NOTHING });
+    assert_eq!((cost.probes, cost.valued), (0, 16 + 16 * 2), "{cost:?}");
+    assert_eq!(it.session.len(), 256);
+    it.shared_are_fresh();
+
+    let mut it = shared();
+    let from = it.world.pin();
+    it.world.facts[3] = 9;
+    let mut changed = Changed::between(from, it.world.pin());
+    changed.everything(TILE);
+    let (carried, cost) = it.carry(&changed);
+    println!("everything carry: {carried:?} {cost:?}");
+    assert_eq!(carried, Carried { seeded: 256, repaired: 256, cut: 256, ..NOTHING });
+    assert_eq!((cost.probes, cost.valued), (0, 240 + 16 * 2), "{cost:?}");
+    it.shared_are_fresh();
+}
+
+/// Rule 26 for what a posting saw: a session saved and opened again keeps, for each read,
+/// what its entries saw. Carried valued with nothing changed, it values the 16 reads and seeds
+/// none (a posting that kept no value, or the wrong one, would seed its readers or leave them
+/// stale); carried valued over one changed fact, saved and opened again first, it does what
+/// the session that never left memory does, and every value is fresh.
+#[test]
+fn a_saved_session_keeps_what_each_read_saw() {
+    let mut kept = shared();
+    let changed = kept.set_valued(3, 12);
+    let (carried_kept, _) = kept.carry(&changed);
+    assert_eq!(
+        carried_kept,
+        Carried { seeded: 16, repaired: 16, changed: 16, valued: 16, differed: 1, ..NOTHING }
+    );
+
+    let mut it = shared();
+    let (root, _) = it.save();
+    it.reopen(root);
+    let pin = it.world.pin();
+    let mut nothing = Changed::between(pin, pin);
+    nothing.valued(TILE);
+    let (carried, cost) = it.carry(&nothing);
+    assert_eq!(carried, Carried { valued: 16, ..NOTHING });
+    assert_eq!(cost.valued, 16, "{cost:?}");
+    assert_eq!(it.session.len(), 256);
+
+    let (root, _) = it.save();
+    it.reopen(root);
+    let changed = it.set_valued(3, 12);
+    let (carried, _) = it.carry(&changed);
+    assert_eq!(carried, carried_kept);
+    it.shared_are_fresh();
+    kept.shared_are_fresh();
 }
 
 // The cover (docs/v2/plan/design/kernel.md, "A covering digest"): a step whose one read is a

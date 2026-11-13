@@ -1,7 +1,13 @@
 //! The daemon's one image file (docs/v2/plan/design/restore.md, "The state is one mapped
-//! image"): the database's sections, the VFS's, the plane's history and the symbols they name,
-//! made in one builder and put at the file by [`Placer`], then mapped back for the database to
-//! settle onto.
+//! image"): the VFS's sections and the plane's history, made in one builder and put at the file
+//! by [`Placer`], then mapped back. No engine state is in it (docs/v2/plan/design/end-state.md:
+//! the in-memory engine is a cache of what this process verified and can be dropped): a start
+//! maps the VFS, replays the journal's tail and answers from the certificate. What one machine
+//! knows beside the store (the tool's hash, the outputs placed, each checkout's carry session)
+//! is a journal mark (`serve::local`), durable with the head it belongs to, image or not. An
+//! image of the layout before this one still holds the database's, the symbols', the library
+//! trees' and the carry sessions' sections ([`SectionId::RETIRED`] among them): they are
+//! never read.
 //!
 //! - An image is asked for after a cold build, by a snapshot and at a stop. One asked while
 //!   another is being made is made once that one is mapped.
@@ -16,15 +22,26 @@
 //! - The VFS writes its sections first. While its journal moves to another image
 //!   ([`ImageError::Busy`]) nothing is written and the VFS is flushed; the image is tried again
 //!   each turn. Busy when the VFS has nothing left to do is an error, and the old image stays.
+//! - The VFS's image names each file by its content ID and holds none of its bytes: its texts
+//!   are the store's ([`StoreTexts`], kind `Text`), put by the VFS before it writes. While a
+//!   put is not durable ([`ImageError::Storing`]) nothing is written and the store is flushed;
+//!   the image is tried again each turn, and Storing with nothing left in flight is an error.
+//! - The texts the image on disk names are a root of the store's collector by construction
+//!   ([`FileSet`], the pin [`TEXT_PIN`]): before the VFS writes, the set of the texts the next
+//!   image names is listed and pinned beside the set of the image on disk, and nothing is
+//!   written until both are durable ([`Prepared::Flush`]: the store is flushed and the image
+//!   tried again each turn, and with nothing left in flight it is [`Unmade::Unpinned`]). The
+//!   set before is let go of only once the image after it is renamed into place. A start pins
+//!   again what the image it used names ([`text_pin_at_start`]).
 //! - Once the write is renamed into place the VFS is told ([`Vfs::image_durable`]) and
-//!   flushed, which rewrites its journal onto the image; the file is then mapped and opened,
-//!   for [`Database::settle`].
+//!   flushed, which rewrites its journal onto the image (its marks with it); the file is then
+//!   mapped and opened, and its shape logged.
 //! - The plane's history is a [`History`], in the section [`blaze_history::section`] lays out.
 //!   One of another blaze starts an empty history ([`Unlearned`]), which changes how work is
 //!   ordered and admitted, never what is built; one that is corrupt or does not decode is an
 //!   error ([`HistoryError`]).
 //! - An image that is not made is an [`ImageFailed`]: the one before it stays on disk, and
-//!   whoever asked (the cold build's settle, a snapshot, a stop) fails with it.
+//!   whoever asked (the image between requests, a snapshot, a stop) fails with it.
 //! - Each image made is logged once mapped: its hash, bytes and sections ([`Shape`]), and how
 //!   long it took to make, write and map.
 
@@ -36,14 +53,128 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_cas::{
+    Handle, Key, Kind, Mismatch, Store, Tickets,
+    sets::{FileSet, FileSetStart, Prepared},
+};
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_history::{DecodeError, History, section::HistoryError};
+use blaze_ids::ContentId;
 use blaze_image::{
-    Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
+    Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
     place::{Outcome, Placer, Wrote},
 };
-use blaze_query::{Database, DbError};
-use blaze_vfs::{ImageError, ImageMark, Vfs};
+use blaze_vfs::{
+    Bytes, FaultWhy, ImageError, ImageMark, StoreFault, TEXT_SCHEMA, Texts, Vfs,
+};
+
+/// The VFS's file texts in the daemon's store (/tmp/plan/vfs-image-next.md): a file's bytes
+/// under `Key::of(TEXT_SCHEMA, id, &[])`, kind [`Kind::Text`], read in place through the
+/// store's pool as a [`blaze_cas::Pinned`] (never an mmap of a store file), put through a
+/// writer of its own and durable at the store's next flush.
+pub struct StoreTexts {
+    handle: Handle,
+    /// The puts not yet seen durable.
+    pending: blaze_core::lock::Lock<Tickets>,
+}
+
+impl StoreTexts {
+    /// The texts of `store`, which must be open.
+    pub fn new(store: &mut Store) -> Arc<StoreTexts> {
+        let handle = Handle::new(store, std::path::PathBuf::from("/"));
+        let pending = blaze_core::lock::Lock::new("serve.image.texts", Tickets::default());
+        // alloc: once a daemon, shared by the VFS and the image maker.
+        Arc::new(StoreTexts { handle, pending })
+    }
+
+    fn key(id: &ContentId) -> Key {
+        Key::of(TEXT_SCHEMA, *id, &[])
+    }
+}
+
+impl Texts for StoreTexts {
+    fn get(&self, id: &ContentId) -> Result<Option<Bytes>, StoreFault> {
+        match self.handle.pinned(&StoreTexts::key(id)) {
+            Ok(pinned) => Ok(pinned.map(blaze_cas::Pinned::into_bytes)),
+            Err(corrupt) => {
+                tracing::error!(target: "blaze", file = %format!("{id:x}"), %corrupt, "the store's text of a VFS file failed its check");
+                Err(StoreFault { file: *id, why: FaultWhy::Corrupt })
+            }
+        }
+    }
+
+    fn has(&self, id: &ContentId) -> bool {
+        self.handle.has(&StoreTexts::key(id))
+    }
+
+    fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), StoreFault> {
+        match self.handle.put(StoreTexts::key(id), Kind::Text, bytes) {
+            Ok(ticket) => {
+                self.pending.lock().add(ticket);
+                Ok(())
+            }
+            Err(mismatch) => {
+                tracing::error!(target: "blaze", file = %format!("{id:x}"), ?mismatch, "the store holds other bytes under a VFS file's text key");
+                Err(StoreFault { file: *id, why: FaultWhy::Mismatch })
+            }
+        }
+    }
+
+    fn durable(&self) -> bool {
+        let mut pending = self.pending.lock();
+        pending.retain_pending(|ticket| self.handle.durable(ticket));
+        pending.is_empty()
+    }
+}
+
+/// The name of the store's pin of the texts the daemon image on disk names ([`FileSet`]).
+pub const TEXT_PIN: &str = "vfs image";
+const TEXT_PIN_WHY: &str = "the file texts the daemon image on disk names";
+
+/// The id the listings of an image's texts are of.
+fn text_set() -> ContentId {
+    ContentId::of("blaze v2 daemon image texts 1", b"")
+}
+
+/// The store's pin of the image's texts at a start: `used` is the ids of the files the image
+/// the start used names, as its own columns hold them ([`Vfs::image_file_ids`]), none when it
+/// used none. Says what it found: the set listed as the run that wrote the image left it; none
+/// listed (a store of the layout before, whose collections did not keep an image's texts),
+/// with how many of them the store lacks; or no image, the pin let go.
+pub fn text_pin_at_start<'a>(
+    store: &mut Store,
+    used: Option<impl Iterator<Item = &'a ContentId>>,
+    when: u64,
+) -> Result<(FileSet, FileSetStart), String> {
+    // alloc: once a start, a key a file the image names
+    let keys = used.map(|ids| ids.map(StoreTexts::key).collect::<Vec<Key>>());
+    let (pin, start) = FileSet::start(store, TEXT_PIN, TEXT_PIN_WHY, text_set(), keys, when)
+        .map_err(|mismatch| {
+            format!("the store's pin {TEXT_PIN:?} of the daemon image's texts at a start: {}", Refusal(&mismatch))
+        })?;
+    match start {
+        FileSetStart::NoFile => {
+            tracing::info!(target: "blaze", pin = TEXT_PIN, "no daemon image used: the pin of its texts let go");
+        }
+        FileSetStart::Listed { keys, .. } => {
+            tracing::info!(target: "blaze", pin = TEXT_PIN, keys, "the daemon image's texts pinned as the run that wrote it left them");
+        }
+        FileSetStart::Unlisted { keys, missing, .. } => crate::serve::said::logged!(WARN,
+            "blaze serve: the store held no pin {TEXT_PIN:?} of the daemon image's {keys} file texts (a store of the layout before): pinned now; it lacks {missing} of them, and a read of one fails naming its file"
+        ),
+    }
+    Ok((pin, start))
+}
+
+/// A put the store refused, for a person.
+struct Refusal<'a>(&'a Mismatch);
+
+impl fmt::Display for Refusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Mismatch { key, kept, given } = self.0;
+        write!(f, "the store holds other bytes under the listing record {:x} (kept {kept:x}, given {given:x})", key.0)
+    }
+}
 
 /// Why the plane's history starts empty from an image: the image was written by another blaze.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -91,37 +222,6 @@ pub fn history<S: Stable>(
         }
         Err(error) => Err(error),
     }
-}
-
-/// The library syntax trees `image` stores, read in place; `None` when it was written without
-/// them. A section of another schema or layout, or one that does not read, is the error saying
-/// why, for the start to report: its library files are then parsed.
-pub fn trees(image: &Arc<Image<Mapping>>) -> Result<Option<base_db::trees::Trees>, String> {
-    let section = match image.section(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA) {
-        Ok(section) => section,
-        Err(Refused::Missing { .. }) => return Ok(None),
-        Err(refused) => return Err(refused.to_string()),
-    };
-    let bytes = image
-        .whole_bytes(&section)
-        .map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::SYNTAX_TREES))?;
-    base_db::trees::Trees::open(bytes).map(Some).map_err(|error| error.to_string())
-}
-
-/// The front end's carry sessions `image` names, a checkout each
-/// ([`super::front_carry::decode_sessions`]); `Err` saying why none is used: an image written
-/// without the section (by a blaze before it), or one of another schema or layout. Each
-/// checkout then seeds its session on its next build, which the start says.
-pub fn carries<S: Stable>(
-    image: &Image<S>,
-) -> Result<Vec<(String, super::front_carry::Saved)>, String> {
-    let section = image
-        .section(SectionId::FRONT_CARRY, super::front_carry::SESSIONS_SCHEMA)
-        .map_err(|refused| refused.to_string())?;
-    let bytes = image
-        .whole(&section)
-        .map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::FRONT_CARRY))?;
-    super::front_carry::decode_sessions(bytes)
 }
 
 /// An image as the logs name it: its hash, its bytes and its sections by what they hold,
@@ -175,9 +275,16 @@ pub(crate) fn ms(it: Duration) -> String {
 pub enum Unmade {
     /// The VFS's journal is moving to another image and nothing is left in flight to wait on.
     Busy,
-    /// A group of the image the VFS was restored from failed its check.
-    Vfs(Corrupt),
-    Db(DbError),
+    /// Texts the image names are not durable in the store and nothing is left in flight to
+    /// wait on.
+    Storing,
+    /// The store refused the text of a file the image would name.
+    Unstored(StoreFault),
+    /// The store's pin of the texts the image would name ([`TEXT_PIN`]) is not durable and
+    /// nothing is left in flight to wait on.
+    Unpinned,
+    /// The store refused a record of the listing of the texts the image would name.
+    Unlisted(Mismatch),
     TooLarge(TooLarge),
     Write(IoError),
     Map(IoError),
@@ -197,11 +304,16 @@ impl fmt::Display for ImageFailed {
         let file = &self.file;
         match &self.why {
             Unmade::Busy => write!(f, "the daemon image /{file}: {}", ImageError::Busy),
-            Unmade::Vfs(corrupt) => {
-                write!(f, "the daemon image /{file}: {}", ImageError::Corrupt(*corrupt))
+            Unmade::Storing => write!(f, "the daemon image /{file}: {}", ImageError::Storing),
+            Unmade::Unstored(fault) => {
+                write!(f, "the daemon image /{file}: {}", ImageError::Unstored(*fault))
             }
-            Unmade::Db(error) => {
-                write!(f, "the database's sections of the daemon image /{file}: {error}")
+            Unmade::Unpinned => write!(
+                f,
+                "the daemon image /{file}: the store's pin {TEXT_PIN:?} of the texts it names is not durable, and nothing is in flight to make it so"
+            ),
+            Unmade::Unlisted(mismatch) => {
+                write!(f, "the daemon image /{file}: listing the texts it names: {}", Refusal(mismatch))
             }
             Unmade::TooLarge(error) => write!(f, "the daemon image /{file}: {error}"),
             Unmade::Write(error) => write!(f, "writing the daemon image /{file}: {error}"),
@@ -222,16 +334,11 @@ impl From<&ImageFailed> for String {
 
 /// What an image is made of: the parts of the daemon that write its sections.
 pub struct Parts<'a> {
-    pub db: &'a Database,
-    /// A kept front end's database: its library files' parses are the image's library syntax
-    /// trees. With none kept the image has no such section, and the next start parses them.
-    pub front: Option<&'a base_db::Db>,
     pub vfs: &'a mut Vfs,
+    /// The store the VFS's texts are put in: flushed while they are not durable.
+    pub store: &'a mut Store,
     pub predict: &'a History,
     pub effects: &'a mut Vec<Effect>,
-    /// The front end's carry sessions (`Jobs::carry_sessions`): always written, so an image
-    /// without the section is one of a blaze before it, which [`carries`] says.
-    pub carries: &'a [u8],
 }
 
 enum State {
@@ -270,18 +377,32 @@ pub struct Images {
     waited: bool,
     /// The file system's refusal to share an image's blocks was said, once a daemon.
     said_unshared: bool,
-    /// The last image made, mapped, until the database settles onto it.
+    /// The last image made, mapped, until the loop takes it between requests.
     mapped: Option<Arc<Image<Mapping>>>,
     /// Why the last image asked was not made; cleared when one is asked again.
     failed: Option<ImageFailed>,
     /// How many images it has made and handed to the driver to write, in its life.
     made: u64,
+    /// The store the VFS's texts are in: what each image's files are put in, and what the VFS
+    /// settles on with an image.
+    texts: Arc<StoreTexts>,
+    /// The store's pin of the texts the image on disk names, and the next one's while it is
+    /// made.
+    text_pin: FileSet,
 }
 
 impl Images {
     /// The image at `file`, written and mapped with the tags `tags` and `tags + 1`. `on_disk`
     /// is the file as the start mapped it, none for no file: the first image shares its blocks.
-    pub fn new(file: FileName, tags: u64, on_disk: Option<Mapping>) -> Images {
+    /// `texts` is the store the VFS was restored with, and `text_pin` its pin of the texts the
+    /// image the start used names ([`text_pin_at_start`]).
+    pub fn new(
+        file: FileName,
+        tags: u64,
+        on_disk: Option<Mapping>,
+        texts: Arc<StoreTexts>,
+        text_pin: FileSet,
+    ) -> Images {
         Images {
             // clone: a name, once a daemon.
             placer: Placer::new(file.clone(), Tag(tags), on_disk),
@@ -295,7 +416,24 @@ impl Images {
             mapped: None,
             failed: None,
             made: 0,
+            texts,
+            text_pin,
         }
+    }
+
+    /// The pin of the image's texts lets go of the set of the image before once the image
+    /// after it is in place: asked each time the store is at hand.
+    fn settle_pin(&mut self, store: &mut Store) {
+        if let Err(mismatch) = self.text_pin.settle(store, blaze_gc::record::now_ns()) {
+            // clone: a refcount, once a refused pin.
+            self.failed = Some(ImageFailed { file: self.file.clone(), why: Unmade::Unlisted(mismatch) });
+        }
+    }
+
+    /// The store of the VFS's texts, as a settle on an image reads it.
+    pub fn texts(&self) -> Arc<dyn Texts> {
+        // clone: a count, once a settle.
+        self.texts.clone()
     }
 
     /// How many images it has made and handed to the driver to write: what a test of the stop
@@ -319,6 +457,7 @@ impl Images {
     /// request that comes while it is made lets go of it ([`Images::let_go`]).
     pub fn ask_between(&mut self, mut parts: Parts<'_>) {
         self.failed = None;
+        self.settle_pin(parts.store);
         match self.state {
             State::Idle => self.make(&mut parts, false),
             State::Waiting
@@ -351,6 +490,7 @@ impl Images {
     /// Makes what waits: an image whose VFS sections could not be written yet, or one asked
     /// while another was made. `idle` is whether the driver has no effect in flight or queued.
     pub fn step(&mut self, mut parts: Parts<'_>, idle: bool) {
+        self.settle_pin(parts.store);
         match self.state {
             State::Waiting => self.make(&mut parts, idle),
             State::Idle if self.again => {
@@ -366,10 +506,26 @@ impl Images {
         let _span =
             tracing::info_span!(target: "blaze", "image make", bytes = tracing::field::Empty)
                 .entered();
+        // The texts the image names are pinned, durably, before a byte of it is written.
+        // alloc: once an image made, a key a file of the tree (the listing keeps a key a leaf)
+        let keys: Vec<Key> = parts.vfs.file_ids().map(StoreTexts::key).collect();
+        match self.text_pin.prepare(parts.store, keys, blaze_gc::record::now_ns()) {
+            Ok(Prepared::Ready) => {}
+            Ok(Prepared::Flush) => {
+                let before = parts.effects.len();
+                parts.store.flush(parts.effects);
+                if idle && parts.effects.len() == before {
+                    return self.fail(Unmade::Unpinned);
+                }
+                self.state = State::Waiting;
+                return;
+            }
+            Err(mismatch) => return self.fail(Unmade::Unlisted(mismatch)),
+        }
         // The image as a transaction (`blaze_image::Txn`, linear): every way out of here
         // commits it to the placer or aborts it, or this does not compile.
         let mut txn = Txn::begin();
-        let mark = match parts.vfs.write_image(txn.sections()) {
+        let mark = match parts.vfs.write_image(txn.sections(), &*self.texts) {
             Ok(mark) => mark,
             Err(ImageError::Busy) => {
                 txn.abort();
@@ -381,31 +537,22 @@ impl Images {
                 self.state = State::Waiting;
                 return;
             }
-            Err(ImageError::Corrupt(corrupt)) => {
+            Err(ImageError::Storing) => {
                 txn.abort();
-                return self.fail(Unmade::Vfs(corrupt));
+                let before = parts.effects.len();
+                parts.store.flush(parts.effects);
+                if idle && parts.effects.len() == before {
+                    return self.fail(Unmade::Storing);
+                }
+                self.state = State::Waiting;
+                return;
+            }
+            Err(ImageError::Unstored(fault)) => {
+                txn.abort();
+                return self.fail(Unmade::Unstored(fault));
             }
         };
-        let mut live = intern::Live::new();
-        if let Err(error) = parts.db.write_image(txn.sections(), &mut live) {
-            txn.abort();
-            return self.fail(Unmade::Db(error));
-        }
         blaze_history::section::write(parts.predict, txn.sections());
-        if let Some(front) = parts.front {
-            if let Some(failed) = front.trees().and_then(|it| it.failed()) {
-                tracing::warn!(
-                    failed,
-                    "a stored library tree failed to read: the image carries none of the old ones on"
-                );
-            }
-            // alloc: the section, once an image.
-            let mut trees = Vec::new();
-            base_db::trees::write_section(front, &mut trees);
-            txn.sections().add(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA, &trees);
-        }
-        txn.sections().add(SectionId::FRONT_CARRY, super::front_carry::SESSIONS_SCHEMA, parts.carries);
-        intern::write_symbols(&live, txn.sections());
         match txn.commit(&mut self.placer, &on_pool, parts.effects) {
             Ok(asked) => {
                 _span.record("bytes", asked.len);
@@ -461,6 +608,9 @@ impl Images {
     fn placed(&mut self, vfs: &mut Vfs, outcome: Outcome, effects: &mut Vec<Effect>) {
         match (std::mem::replace(&mut self.state, State::Idle), outcome) {
             (State::Writing { mark, made, since, .. }, Outcome::Placed(wrote)) => {
+                // The image renamed into place is the one prepared last: its texts' set is the
+                // durable image's, and the set before is let go of with the store's next turn.
+                self.text_pin.placed();
                 assert!(
                     vfs.image_durable(mark.name),
                     "the image written is the one the VFS staged last"
@@ -547,7 +697,7 @@ impl Images {
         self.failed.as_ref()
     }
 
-    /// The last image made, for the database to settle onto.
+    /// The last image made, mapped: the loop takes it between requests.
     pub fn take_mapped(&mut self) -> Option<Arc<Image<Mapping>>> {
         self.mapped.take()
     }
@@ -658,29 +808,30 @@ mod tests {
         assert!(error.to_string().contains("the plane's history"), "{error}");
     }
 
-    /// The front end's carry sessions round trip through an image byte for byte (rule 26),
-    /// and an image of the layout before the section (none) opens: the sessions are refused
-    /// naming the section, which the start says (`Started::carries`), and each checkout seeds.
+    /// The invariant: an image of the layout before this one (with the database's, the
+    /// symbols', the library trees' and the carry sessions' sections) gives the same history
+    /// as one with the history alone, and its other sections are never read: here they hold
+    /// bytes no reader of theirs would take. Rule 26. Control: an image whose history section
+    /// is cut is refused, so the test reads the section it says it reads.
     #[test]
-    fn carry_sessions_survive_an_image_and_one_without_them_opens_saying_so() {
-        use super::super::front_carry::{SESSIONS_SCHEMA, Saved, decode_sessions, encode_sessions};
-        let saved = |n: u8| Saved {
-            session: blaze_cas::Key(blaze_ids::ContentId([n; 32])),
-            root: blaze_ids::ContentId([n + 1; 32]),
-        };
-        let sessions = vec![("/b".to_owned(), saved(3)), ("/a".to_owned(), saved(1))];
-        let bytes = encode_sessions(&sessions);
+    fn an_image_of_the_previous_layout_gives_its_history_and_its_engine_sections_go_unread() {
+        let mut learned = History::new(blaze_history::Config::default());
+        learned.observe(blaze_graph::admission::kinds::COMPILE, None, 1000, 1 << 10);
+        let bytes = learned.encode();
         let mut builder = Builder::new();
-        builder.add(SectionId::FRONT_CARRY, SESSIONS_SCHEMA, &bytes);
-        let image = Image::open(builder.finish().unwrap()).unwrap();
-        let restored = carries(&image).unwrap();
-        assert_eq!(restored, vec![("/a".to_owned(), saved(1)), ("/b".to_owned(), saved(3))], "in path order");
-        assert_eq!(encode_sessions(&restored), bytes, "the same bytes again");
-        assert!(decode_sessions(&bytes[..bytes.len() - 1]).is_err(), "a cut section is refused");
+        builder.add(SectionId::PLANE_HISTORY, HISTORY, &bytes);
+        let junk = |n: u8| SchemaHash(blaze_ids::ContentId([n; 32]));
+        for (at, retired) in SectionId::RETIRED.into_iter().enumerate() {
+            builder.add(retired, junk(3 + at as u8), b"not trees, not sessions");
+        }
+        let before = Image::open(builder.finish().unwrap()).unwrap();
+        let (restored, unlearned) = history(&before, blaze_history::Config::default()).unwrap();
+        assert_eq!((restored.encode(), unlearned), (bytes.clone(), None));
+        let shape = Shape(&before).to_string();
+        assert!(shape.contains("a section no blaze writes now"), "{shape}");
 
-        let before = with_history(HISTORY, &empty());
-        let Err(why) = carries(&before) else { panic!("an image without the section gave sessions") };
-        assert!(why.contains(SectionId::FRONT_CARRY.name()), "{why}");
+        let cut = with_history(HISTORY, &bytes[..bytes.len() - 1]);
+        assert!(history(&cut, blaze_history::Config::default()).is_err(), "a cut history is read");
     }
 }
 
@@ -695,19 +846,16 @@ mod shape_tests {
     fn an_images_shape_names_its_hash_bytes_and_sections_largest_first() {
         let mut builder = Builder::new();
         builder.add(SectionId::PLANE_HISTORY, SchemaHash(blaze_ids::ContentId([1; 32])), &[7; 10]);
-        builder.add(
-            SectionId::DB_MEMOS,
-            SchemaHash(blaze_ids::ContentId([2; 32])),
-            &vec![9; 3 << 20],
-        );
-        builder.add(SectionId::interned(1), SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
-        builder.add(SectionId::interned(2), SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
+        builder.add(SectionId::VFS_TREE, SchemaHash(blaze_ids::ContentId([2; 32])), &vec![9; 3 << 20]);
+        builder.add(SectionId::VFS_DISKS, SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
+        // A section of the layout before, which a shape names as such.
+        builder.add(SectionId::RETIRED[5], SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
         let image = Image::open(builder.finish().unwrap()).unwrap();
         let text = Shape(&image).to_string();
         assert!(text.starts_with(&format!("{} (", image.hash())), "{text}");
         assert!(
             text.contains(
-                "4 sections; the database's memos 3.0 MiB; an interned table 0.0 MiB in 2"
+                "4 sections; the VFS tree 3.0 MiB in 2; the symbol table, a section no blaze writes now 0.0 MiB"
             ),
             "{text}"
         );

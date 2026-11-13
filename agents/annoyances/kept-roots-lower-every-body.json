@@ -1,0 +1,14 @@
+{
+ "id": "kept-roots-lower-every-body",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of task B of /tmp/plan/7-cold-disk.md, int-1112",
+ "where": "crates/hir-ty-codegen/v2/roots/kept.rs kept; crates/hir-def/src/nameres/frozen.rs served",
+ "what": "Listing a build's roots lowered every body of every crate it linked, the standard library's included, to find the few items declared in blocks that are kept by name (`#[no_mangle]`, `#[used]`): the whole walk ran ExpressionStore::of on each body. A crate served from its image was also decoded whole into a heap DefMap unless BLAZE_DEF_MAP_PAGES=1 was set, so a sealed crate held its def map twice over and paid the decode on every cold start.",
+ "cost": "about 1.2 s before the codegen walk of a hello-world and most of a warm front end's 2,531 MB (plan 7, section 1; estimates until the plan's commands run)",
+ "cause": "what a crate keeps by name was computed from source in every database, never kept as a record of the crate, and the def map's paged reading was a switch beside the whole decode instead of the one way",
+ "class": "a per-crate fact derived again from every body each session instead of written once with the crate's records; a new read path added beside the old one behind a switch",
+ "prevention": "a fact of a sealed crate is a record keyed over its image (front_keys lists it); a read path that replaces another deletes it and its switch in the same change",
+ "workaround": "none",
+ "fix": "kept-roots record (kept/frozen.rs, kept_key) served and stored beside the impl tables; a served crate lowers only the record's owners, any other only bodies_declaring_roots; Part::DefMap left the image (key domain 8), the whole decode and BLAZE_DEF_MAP_PAGES are deleted. Tests: kept::tests (3 and a layout refusal), deps::tests a_served_crate_parses_no_file_and_decodes_no_def_map, a_layout_7_image_is_a_named_miss. Not yet compiled or run.",
+ "state": "written, not compiled"
+}

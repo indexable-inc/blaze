@@ -328,7 +328,20 @@ impl<'a> Listed<'a> for Bind<'a> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Ask<'a> {
     /// The first message: which program this process is, and the target its code is for.
-    Hello { program: ProgramId, pid: u64, arch: Arch, os: Os, page: u32 },
+    /// `holds`: the check word of the start image this launcher holds already (read from the
+    /// program's start file, `<program>.blaze-start`), or `None`. `running`: whether the
+    /// program's `main` was already started from that image, so the launcher joins a daemon
+    /// at a first call no image held, rather than waiting for its answer before it runs.
+    /// Read from a map of 5 (a launcher before these two) as `None, false`.
+    Hello {
+        program: ProgramId,
+        pid: u64,
+        arch: Arch,
+        os: Os,
+        page: u32,
+        holds: Option<[u8; 32]>,
+        running: bool,
+    },
     /// A stub fired: `thread` called `slot`, which has no code here, and waits for it. The
     /// answer is a [`Tell::Edit`] that binds the slot, or a [`Tell::Refused`].
     Need { slot: Slot, thread: Thread },
@@ -397,8 +410,9 @@ impl<'a> Ask<'a> {
     /// leaves `out` as it was.
     pub fn encode<A: Allocator>(&self, id: u64, out: &mut Vec<u8, A>) -> Result<(), WireError> {
         frame(id, out, |to| match *self {
-            Ask::Hello { program, pid, arch, os, page } => {
-                variant(to, "Hello", 5);
+            Ask::Hello { program, pid, arch, os, page, holds, running } => {
+                // The keys in the order of their encodings: by length, then by bytes.
+                variant(to, "Hello", 7);
                 to.text("os");
                 to.text(match os {
                     Os::Linux => "Linux",
@@ -413,8 +427,15 @@ impl<'a> Ask<'a> {
                 });
                 to.text("page");
                 to.uint(u64::from(page));
+                to.text("holds");
+                match holds {
+                    Some(check) => to.bytes(&check),
+                    None => to.null(),
+                }
                 to.text("program");
                 to.bytes(&program.0);
+                to.text("running");
+                to.bool(running);
             }
             Ask::Need { slot, thread } => {
                 variant(to, "Need", 2);
@@ -471,7 +492,12 @@ impl<'a> Ask<'a> {
         let named = from.at();
         let ask = match from.text()? {
             "Hello" => {
-                from.map(5, "Hello, a map of 5")?;
+                // A map of 7, or of 5 from a launcher that says neither `holds` nor `running`.
+                let fields = match from.clone().map(7, "Hello, a map of 7") {
+                    Ok(()) => 7,
+                    Err(_) => 5,
+                };
+                from.map(fields, "Hello, a map of 5 or 7")?;
                 from.key("os")?;
                 let at = from.at();
                 let os = match from.text()? {
@@ -490,9 +516,26 @@ impl<'a> Ask<'a> {
                 };
                 from.key("page")?;
                 let page = from.uint32("a page size past 32 bits")?;
+                let holds = match fields {
+                    7 => {
+                        from.key("holds")?;
+                        match from.null() {
+                            true => None,
+                            false => Some(id32(&mut from, "a start image's check word is 32 bytes")?),
+                        }
+                    }
+                    _ => None,
+                };
                 from.key("program")?;
                 let program = ProgramId(id32(&mut from, "a program id is 32 bytes")?);
-                Ask::Hello { program, pid, arch, os, page }
+                let running = match fields {
+                    7 => {
+                        from.key("running")?;
+                        from.bool()?
+                    }
+                    _ => false,
+                };
+                Ask::Hello { program, pid, arch, os, page, holds, running }
             }
             "Need" => {
                 from.map(2, "Need, a map of 2")?;

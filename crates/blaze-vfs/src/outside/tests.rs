@@ -848,3 +848,64 @@ fn a_whole_directory_under_a_names_directory_hears_its_own_changes() {
     assert!(!dirs.unchanged_since(path("/home/out/debug/a.o"), generation));
     assert!(!dirs.quiet_since(generation));
 }
+
+/// The invariant: a look is in the list of the build it was made for and of no other
+/// ([`super::Looks`]), with no cap.
+#[test]
+fn outside_looks_of_two_builds_share_nothing_and_none_is_dropped() {
+    use super::{LookKind, Looks};
+    let (one, two) = (Looks::new(), Looks::new());
+    std::thread::scope(|scope| {
+        for (looks, name) in [(&one, "one"), (&two, "two")] {
+            scope.spawn(move || {
+                for at in 0..1000 {
+                    looks.push(Path::new(&format!("/{name}/{at}")), LookKind::File, Some([at as u8; 32]));
+                }
+            });
+        }
+    });
+    for (looks, name) in [(&one, "one"), (&two, "two")] {
+        let all = looks.all();
+        assert_eq!(all.len(), 1000, "every look of a build is kept, past any cap");
+        assert!(all.iter().all(|it| it.path.starts_with(format!("/{name}"))), "a look of another build");
+        assert!(all.is_sorted_by(|a, b| a.path <= b.path), "sorted by path, whatever the order pushed");
+    }
+    // A clone is the same list.
+    let clone = one.clone(); // clone: the test's second handle
+    clone.push(path("/one/more"), LookKind::Entry, None);
+    assert_eq!(one.len(), 1001);
+    assert_eq!(two.len(), 1000);
+}
+
+#[test]
+fn outside_looks_keep_a_path_at_two_answers_as_two_rows() {
+    use super::{LookKind, Looks};
+    let looks = Looks::new();
+    looks.push(path("/a/x.h"), LookKind::File, Some([1; 32]));
+    looks.push(path("/a/x.h"), LookKind::File, Some([1; 32]));
+    looks.push(path("/a/x.h"), LookKind::Entry, Some([1; 32]));
+    looks.push(path("/a/x.h"), LookKind::Listing, None);
+    let all = looks.all();
+    assert_eq!(all.len(), 3, "the same look twice is one row; another kind is another");
+    assert_eq!(Looks::twice(&all).count(), 0, "one answer a path and kind");
+    looks.push(path("/a/x.h"), LookKind::File, Some([2; 32]));
+    let all = looks.all();
+    assert_eq!(all.len(), 4);
+    let twice: Vec<_> = Looks::twice(&all).collect();
+    assert_eq!(twice.len(), 1);
+    assert_eq!((twice[0].0.kind, twice[0].0.answer, twice[0].1.answer), (LookKind::File, Some([1; 32]), Some([2; 32])));
+    assert!(twice[0].1.by.file().ends_with("tests.rs"), "a look names its caller");
+    // A build that used another's task holds that task's looks.
+    let other = Looks::new();
+    other.extend(&all);
+    assert_eq!(other.all(), all);
+}
+
+#[test]
+fn outside_looks_of_no_build_keep_nothing() {
+    use super::{LookKind, Looks};
+    let none = Looks::none();
+    none.push(path("/a/x.h"), LookKind::File, None);
+    none.extend(&Looks::new().all());
+    assert!(!none.keeps() && none.is_empty() && none.all().is_empty());
+}

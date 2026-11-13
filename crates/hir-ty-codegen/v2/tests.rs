@@ -2,6 +2,7 @@
 //! walk lists of what the IR builder asks for.
 
 mod db;
+mod witnessed;
 
 use base_db::Db;
 use blaze_codegen::{
@@ -4325,4 +4326,139 @@ fn a_wasm32_pair_is_returned_as_llvm_returns_it_whatever_blaze_was_built_with() 
     frontend
         .with(|db| built(db, &copied, target, false, Build::of(&spec())))
         .unwrap_or_else(|e| panic!("copied: {e}"));
+}
+
+/// What a build interns before the release: its closure captures a reference, so the arguments
+/// of `call` and of the closure hold regions `erase_regions` erases and keeps.
+const RELEASED: &str = r#"
+//- minicore: sized, fn
+pub struct P(pub u16);
+pub fn outer<T>(x: &T) -> &T { x }
+pub fn call<F: Fn() -> u16>(f: F) -> u16 { f() }
+pub fn roots() -> u16 {
+    let p = P(1);
+    let r = &p;
+    outer(&p);
+    call(|| r.0)
+}
+"#;
+
+/// What is built after the release, and in a fresh process: the same calls over other types, so
+/// a row a stale cache names after the release is another value than it was before.
+const AFTER_RELEASE: &str = r#"
+//- minicore: sized, fn
+pub struct Q(pub u64, pub u8);
+pub fn outer<T>(x: &T) -> &T { x }
+pub fn call<F: Fn() -> u8>(f: F) -> u8 { f() }
+pub fn roots() -> u8 {
+    let q = Q(1, 2);
+    let r = &q;
+    outer(&q);
+    call(|| r.1)
+}
+"#;
+
+/// The shapes of `text`'s `roots` and of every function it reaches, in the walk's order, built
+/// over a database the caller then drops as a daemon lets go of a kept one: counted kept, let go
+/// (`hir::evict::front_end_dropped`), dropped.
+fn shapes_let_go(text: &str) -> Vec<Shape> {
+    let db: TestDB = fixture::db(text).into_db();
+    let shapes = {
+        let frontend =
+            HirFrontend::new(Databases::new(&db), HashSource::ById(ById), BuildTime::default())
+                .with_policy(&policy(OptLevel::O0));
+        let root = frontend.root(function(&db, "roots"));
+        let reached = frontend.with(|db| {
+            refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk of the root")
+        });
+        let mut shapes = vec![shape(&frontend, &root)];
+        for it in reached {
+            if let FrontRef::Function(instance) = it {
+                shapes.push(shape(&frontend, &instance));
+            }
+        }
+        shapes
+    };
+    hir::evict::front_end_kept();
+    hir::evict::front_end_dropped(&db);
+    drop(db);
+    super::let_go_kept_walks();
+    assert_eq!(super::kept_walks(), 0);
+    shapes
+}
+
+/// What a child prints its shapes after, one line, for [`a_build_after_a_release_equals_a_fresh_build`].
+const SHAPES_AFTER: &str = "shapes of the build after: ";
+
+/// Builds [`RELEASED`], releases the process's tables, then builds [`AFTER_RELEASE`] and prints
+/// its shapes: run alone in a process by [`a_build_after_a_release_equals_a_fresh_build`], as a
+/// release needs no other test's task or database in the process.
+fn built_after_a_release() {
+    let before = shapes_let_go(RELEASED);
+    assert!(!before.is_empty());
+    let released = hir::evict::release_process_tables();
+    assert!(released.tables > 0, "{released:?}");
+    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_fresh() {
+    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_after_a_release() {
+    built_after_a_release();
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_after_a_release_keeping_erased() {
+    crate::plant::KEEPS_ERASED.store(true, std::sync::atomic::Ordering::Relaxed);
+    built_after_a_release();
+}
+
+/// Runs the child test `name` alone in a process of its own: whether it passed, and the shapes
+/// it printed.
+fn child(name: &str) -> (bool, Option<String>) {
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let path = format!("v2::tests::{name}");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", &path, "--ignored", "--nocapture", "--test-threads=1"])
+        .output()
+        .unwrap_or_else(|e| panic!("running {path}: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let shapes = stdout.lines().find_map(|line| line.strip_prefix(SHAPES_AFTER)).map(str::to_owned);
+    if out.status.success() && shapes.is_none() {
+        panic!(
+            "{path} passed and printed no shapes\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    (out.status.success(), shapes)
+}
+
+/// The refinement: building a fixture, dropping its database as a daemon does, releasing the
+/// trait solver's interner tables (`hir::evict::release_process_tables`) and building another
+/// fixture gives that one's shapes (hashes of its prepared IR's bytes) equal to those a fresh
+/// process builds: nothing in the process names a row the release freed. Each build runs alone
+/// in a child process, as a release refuses while another test's task runs.
+///
+/// Control: `plant::KEEPS_ERASED` keeps `erase_regions`' map across the release, so a row it
+/// names was another value when it was kept: that build differs or fails.
+#[test]
+fn a_build_after_a_release_equals_a_fresh_build() {
+    let (fresh_passed, fresh) = child("child_builds_fresh");
+    assert!(fresh_passed, "the fresh build failed");
+    let (after_passed, after) = child("child_builds_after_a_release");
+    assert!(after_passed, "the build after a release failed");
+    assert_eq!(after, fresh, "the build after a release differs from a fresh build");
+    let (kept_passed, kept) = child("child_builds_after_a_release_keeping_erased");
+    assert!(
+        !kept_passed || kept != fresh,
+        "the control: with `erase_regions`' map kept across the release the build is still \
+         the fresh one's, so the test does not see a stale row"
+    );
 }

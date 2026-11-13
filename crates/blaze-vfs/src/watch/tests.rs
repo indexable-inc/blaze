@@ -14,7 +14,7 @@ use blaze_core::{
 };
 
 use super::{Watched, Watcher, cmp_below, is_below, reference};
-use crate::{Mode, Op, Vfs, disk::Disks, section::Section};
+use crate::{Mode, Op, Plant, Vfs, disk::Disks, section::Section};
 
 /// A watcher under test: today's, or the reference it is held to.
 trait Watch {
@@ -61,7 +61,37 @@ macro_rules! watch {
     };
 }
 
-watch!(Watcher);
+/// The wall clock these tests give the watcher: far past every stamp the simulation makes (its
+/// clock counts changes), so none is racy and the watcher saves what the reference does. The
+/// racy window is `tests/stamps.rs`'s, on a disk with a coarse clock.
+const STEADY: u64 = u64::MAX;
+
+impl Watch for Watcher {
+    fn new(head: &str, dir: FileName, tags: u64) -> Self {
+        Watcher::new(head, dir, tags)
+    }
+    fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
+        Watcher::start(self, vfs, STEADY, effects)
+    }
+    fn stop(&mut self, effects: &mut Vec<Effect>) {
+        Watcher::stop(self, effects)
+    }
+    fn owns(&self, tag: Tag) -> bool {
+        Watcher::owns(self, tag)
+    }
+    fn idle(&self) -> bool {
+        Watcher::idle(self)
+    }
+    fn complete(
+        &mut self,
+        vfs: &mut Vfs,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Vec<Watched> {
+        Watcher::complete(self, vfs, completion, STEADY, effects)
+    }
+}
+
 watch!(reference::Watcher);
 
 const KINDS: [Journal; 3] = [Journal::None, Journal::FsEvents, Journal::Usn];
@@ -78,6 +108,10 @@ fn ws(path: &str) -> FileName {
 /// The watcher, its head, the simulated machine, and what the watcher asked of it.
 struct Run<W = Watcher> {
     sim: Sim,
+    /// The machine the VFS's journal is written on, apart from the watched one: the journal's
+    /// records (the watcher's `SEEN`s among them, which the reference makes none of) never
+    /// move what the watched machine draws, so both watchers meet the same disk.
+    journal: Sim,
     vfs: Vfs,
     watcher: W,
     effects: Vec<Effect>,
@@ -108,6 +142,7 @@ impl<W: Watch> Run<W> {
         sim.set_journal(kind);
         let mut run = Run {
             sim,
+            journal: Sim::new(seed ^ 0x6a6f_7572, Faults::default()),
             vfs: Vfs::recover(name("state/journal"), 0, &[]).0,
             watcher: W::new("disk", name("ws"), TAGS),
             effects: Vec::new(),
@@ -203,9 +238,22 @@ impl<W: Watch> Run<W> {
                     _ => {}
                 }
             }
+            let is_journal = |it: &Effect| {
+                matches!(
+                    it,
+                    Effect::Append { .. }
+                        | Effect::Sync { .. }
+                        | Effect::Write { .. }
+                        | Effect::Truncate { .. }
+                )
+            };
+            let mut journal: Vec<Effect> = self.effects.extract_if(.., |it| is_journal(it)).collect();
             self.log.extend(self.effects.iter().cloned());
             self.sim.submit(&mut self.effects);
-            if self.sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 && self.effects.is_empty() {
+            self.journal.submit(&mut journal);
+            let watched = self.sim.poll(&mut done, blaze_core::wait::Deadline::NEVER);
+            let written = self.journal.poll(&mut done, blaze_core::wait::Deadline::NEVER);
+            if watched + written == 0 && self.effects.is_empty() {
                 return;
             }
             for completion in done.drain(..) {
@@ -255,6 +303,7 @@ impl<W: Watch> Run<W> {
     fn restart(&mut self, down: impl FnOnce(&mut Run<W>)) {
         assert!(self.watcher.idle(), "stopped with looks in flight: {:?}", self.out);
         self.sim.crash();
+        self.journal.crash();
         down(self);
         let mut bytes = Vec::new();
         self.vfs.disks.encode(&mut bytes);
@@ -442,17 +491,12 @@ fn a_restart_with_nothing_changed_reads_and_commits_nothing() {
             assert_eq!(run.reads, Vec::<String>::new(), "{what}");
             assert_eq!(run.vfs.head("disk"), head, "{what}");
             assert!(!run.out.iter().any(|it| matches!(it, Watched::Committed(_))), "{what}");
-            match kind {
-                // No journal: one sweep of stamps, of every tracked name and nothing else.
-                Journal::None => {
-                    let swept: BTreeSet<&str> = run.stamped.iter().map(String::as_str).collect();
-                    assert!(swept.contains("ws/src/old/deep/three.rs"), "{what}: {swept:?}");
-                    assert!(swept.iter().all(|it| *it == "ws" || it.starts_with("ws/")), "{what}");
-                    assert_eq!(swept.len(), run.stamped.len(), "{what}: each name once");
-                }
-                // A journal: nothing is looked at.
-                _ => assert_eq!(run.stamped, Vec::<String>::new(), "{what}"),
-            }
+            // Every start, with a journal or not, sweeps the column once: one stamp of every
+            // tracked name and nothing else, and no read.
+            let swept: BTreeSet<&str> = run.stamped.iter().map(String::as_str).collect();
+            assert!(swept.contains("ws/src/old/deep/three.rs"), "{what}: {swept:?}");
+            assert!(swept.iter().all(|it| *it == "ws" || it.starts_with("ws/")), "{what}");
+            assert_eq!(swept.len(), run.stamped.len(), "{what}: each name once");
         }
     }
 }
@@ -480,14 +524,9 @@ fn what_changed_while_down_is_read_and_what_moved_is_not() {
             let want = BTreeSet::from(["src/a.rs", "src/new/b.rs", "Cargo.toml"]);
             assert_eq!(run.reads(), want, "{what}");
             assert!(run.lost().is_empty(), "{what}: {:?}", run.lost());
-            // A journal names what changed: nothing it did not name is stamped.
-            if kind != Journal::None {
-                assert!(
-                    !run.stamped.iter().any(|it| it == "ws/src/lib.rs"),
-                    "{what}: {:?}",
-                    run.stamped
-                );
-            }
+            // What did not change is stamped by the start's sweep alone, journal or not.
+            let lib = run.stamped.iter().filter(|it| *it == "ws/src/lib.rs").count();
+            assert_eq!(lib, 1, "{what}: {:?}", run.stamped);
             let commits = run.out.iter().filter(|it| matches!(it, Watched::Committed(_))).count();
             assert_eq!(commits, 1, "{what}: what changed while down is one transaction");
         }
@@ -532,7 +571,9 @@ fn a_lost_journal_is_named_and_only_its_subtree_is_swept() {
             assert_eq!(run.lost(), [("", Lost::Truncated)], "{what}");
             assert_eq!(run.reads(), BTreeSet::from(["README"]), "{what}");
 
-            // The system says to look at one subtree again: nothing outside it is stamped.
+            // The system says to look at one subtree again: past the start's own sweep of the
+            // column (every start's), nothing outside it is stamped.
+            let from = run.log.len();
             run.restart(|run| {
                 run.write("src/old/deep/three.rs", "three");
                 run.sim.lose_changes(&ws("src/old"), Lost::Rescan);
@@ -540,8 +581,15 @@ fn a_lost_journal_is_named_and_only_its_subtree_is_swept() {
             run.check(&what);
             assert!(run.lost().contains(&("src/old", Lost::Rescan)), "{what}: {:?}", run.lost());
             assert_eq!(run.reads(), BTreeSet::from(["src/old/deep/three.rs"]), "{what}");
-            let outside = run.stamped.iter().find(|it| !it.starts_with("ws/src/old"));
-            assert_eq!(outside, None, "{what}: stamped outside the lost subtree");
+            let mut stamps = run.log[from..].iter().filter_map(|it| match it {
+                Effect::Stamp { files, .. } => Some(files),
+                _ => None,
+            });
+            let sweep = stamps.next().expect("the start's sweep");
+            assert!(sweep.iter().any(|it| it == "ws/README"), "{what}: the start sweeps it all");
+            let outside: Vec<&str> =
+                stamps.flat_map(|it| it.iter()).filter(|it| !it.starts_with("ws/src/old")).collect();
+            assert_eq!(outside, Vec::<&str>::new(), "{what}: stamped outside the lost subtree");
         }
     }
 }
@@ -584,7 +632,7 @@ fn an_unnamed_change_lists_its_directory_alone() {
         caught_up: true,
     };
     let journal = Completion { tag: blaze_core::Tag(TAGS), done: Done::Journaled(Box::new(told)) };
-    let out = run.watcher.complete(&mut run.vfs, journal, &mut run.effects);
+    let out = run.watcher.complete(&mut run.vfs, journal, STEADY, &mut run.effects);
     run.out.extend(out);
     assert!(
         matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws("src")),
@@ -796,7 +844,11 @@ fn act<W: Watch>(run: &mut Run<W>, steps: &[Step], how: u64, kind: Journal) {
 /// Today's watcher, whose names are interned, and the reference it was rewritten from, each on
 /// its own machine with the same seed and told the same changes (live, across restarts, with a
 /// subtree lost or the journal reset): every effect either asks for, every output and every
-/// head is the same.
+/// head is the same. The column's own root, its `CHOSE` stamps and its `SEEN` records are
+/// today's alone and change no effect here: with no other writer every saved stamp vouches,
+/// the reference's rescans force every file of the head where today's take only the diff since
+/// the column's root (a forced name whose stamp is the saved one settles with no effect), and
+/// no step puts a file above a written path or over a directory.
 #[test]
 fn the_watcher_does_what_the_reference_did() {
     for kind in KINDS {
@@ -863,12 +915,12 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
         // Nothing changed: stamped, settled, no read and no commit.
         let completion = journaled(&run);
         let out = assert_at_most(budget(0), "a batch of unchanged files told", || {
-            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+            run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects)
         });
         assert!(out.is_empty(), "{out:?}");
         let completion = stamps(&mut run, 0);
         let out = assert_at_most(budget(0), "their stamps settled", || {
-            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+            run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects)
         });
         assert!(out.is_empty(), "{out:?}");
         assert!(run.effects.is_empty(), "nothing read or written: {:?}", run.effects);
@@ -877,13 +929,13 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
         // Every stamp moved (the same inode, a later mtime): each file is read.
         let completion = journaled(&run);
         assert_at_most(budget(0), "a batch of changed files told", || {
-            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+            run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects)
         });
         let completion = stamps(&mut run, 1);
         let Done::Stamped(moved) = &completion.done else { unreachable!() };
         let n = moved.len() as u64;
         assert_at_most(budget(n), "their stamps, a read asked for each", || {
-            run.watcher.complete(&mut run.vfs, completion, &mut run.effects)
+            run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects)
         });
         assert_eq!(
             run.effects.iter().filter(|it| matches!(it, Effect::ReadAll { .. })).count() as u64,
@@ -902,13 +954,13 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
             .collect();
         assert_at_most(budget(0), "their reads, and their stamps asked for again", || {
             for completion in reads {
-                let out = run.watcher.complete(&mut run.vfs, completion, &mut run.effects);
+                let out = run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects);
                 assert!(out.is_empty(), "{out:?}");
             }
         });
         // The stamps taken again are those taken before the reads: the bytes are committed.
         let completion = stamps(&mut run, 1);
-        run.watcher.complete(&mut run.vfs, completion, &mut run.effects);
+        run.watcher.complete(&mut run.vfs, completion, STEADY, &mut run.effects);
         run.pump();
         assert!(run.watcher.idle());
         assert_eq!(run.head(), run.disk, "the same bytes read make no change");
@@ -1223,7 +1275,7 @@ fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_vers
     let mut vfs = Vfs::recover(name("state/journal"), 0, &[]).0;
     let mut watcher = Watcher::new("disk", name("ws"), TAGS);
     let mut effects = Vec::new();
-    watcher.start(&vfs, &mut effects);
+    watcher.start(&vfs, wall_ns(), &mut effects);
     let read = |vfs: &Vfs| -> Option<Vec<u8>> {
         let root = vfs.root(vfs.head("disk")?).expect("a head's root");
         let (node, _) = vfs.tree.entry(root, MAIN)?;
@@ -1248,7 +1300,7 @@ fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_vers
             if vfs.owns(completion.tag) {
                 vfs.complete(completion, effects);
             } else if watcher.owns(completion.tag) {
-                for out in watcher.complete(vfs, completion, effects) {
+                for out in watcher.complete(vfs, completion, wall_ns(), effects) {
                     match out {
                         Watched::Committed(_) => {
                             let bytes = read(vfs).expect("src/main.rs is never deleted");
@@ -1377,4 +1429,301 @@ fn a_file_the_daemon_wrote_through_its_view_is_the_builds_own_when_reported() {
             assert_eq!(run.vfs.head("disk"), Some(built), "{what}");
         }
     }
+}
+
+/// The wall clock, for the test on the machine's own kernel: its stamps are the file system's.
+fn wall_ns() -> u64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.expect("the clock is past 1970").as_nanos() as u64
+}
+
+/// The kinds of journal whose watch hears changes live, so a look can be held in flight while
+/// another writer commits.
+const LIVE: [Journal; 2] = [Journal::FsEvents, Journal::Usn];
+const COLUMN_SEEDS: u64 = 40;
+
+/// What a check of the column's invariant found: how many names it held to the disk, or the
+/// first breach.
+type Checked = Result<u64, String>;
+
+/// The oracle of the column's invariant, on `vfs`'s column of the watched head: each name it
+/// vouches for (its stamp handed, not [`Stamp::UNKNOWN`]) whose stamp is the one the disk
+/// gives now, a file or a link, has in the column's root the bytes the disk holds there. The
+/// simulation's disk never leaves one stamp over two contents (its clock counts changes), so a
+/// stamp that is the disk's now was taken of the bytes the disk holds now. A column paired with
+/// no root vouches for nothing. The names it held to the disk.
+fn column_holds(vfs: &Vfs, sim: &mut Sim, disk: &BTreeMap<String, Vec<u8>>) -> Checked {
+    let Some(column) = vfs.column("disk") else { return Ok(0) };
+    let Some(root) = column.root else { return Ok(0) };
+    let node = vfs.root(root).expect("a column's root is a root of its tree");
+    let mut vouched = Vec::new();
+    column.each(|file, stamp| {
+        if !stamp.is_unknown() && !stamp.is_gone() && !stamp.is_dir() {
+            vouched.push((file.to_owned(), stamp));
+        }
+    });
+    let tree = &vfs.tree;
+    let mut checked = 0;
+    for (file, stamp) in vouched {
+        let Some(path) = file.strip_prefix("ws/") else { continue };
+        if sim.stamp(&name(&file)) != stamp {
+            continue;
+        }
+        checked += 1;
+        let held =
+            tree.entry(node, path).and_then(|(node, _)| tree.bytes(node).expect("not corrupt"));
+        let there = disk.get(path).map(Vec::as_slice);
+        if held != there {
+            return Err(format!(
+                "{file}: the column pairs {root:x} with {stamp:?}, the disk's stamp now, over \
+                 {:?}, and the root holds {:?}",
+                there.map(String::from_utf8_lossy),
+                held.map(String::from_utf8_lossy),
+            ));
+        }
+    }
+    Ok(checked)
+}
+
+/// The end of each record of a VFS journal's file, in order: where a crash can cut it (a cut
+/// inside a record recovers as the end before it, the torn record failing its checksum). Each
+/// record is framed again from its kind and payload ([`crate::journal::framed`]) and must be
+/// those bytes, so the layout is the journal's own; a file that is not whole records is a
+/// broken run, not a finding.
+fn record_ends(bytes: &[u8]) -> Vec<usize> {
+    let header = crate::journal::HEADER;
+    let mut ends = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let len = bytes
+            .get(at + 4..at + 8)
+            .and_then(|it| <[u8; 4]>::try_from(it).ok())
+            .unwrap_or_else(|| panic!("the journal's file ends inside a record's header at {at}"));
+        let len = u32::from_le_bytes(len) as usize;
+        let start = at + header;
+        let payload = bytes
+            .get(start..start + len)
+            .unwrap_or_else(|| panic!("the journal's file ends inside the record at {at}"));
+        let record = crate::journal::framed(bytes[at + header - 1], payload);
+        let end = at + record.len();
+        assert_eq!(bytes.get(at..end), Some(&record[..]), "the record at {at} is not whole");
+        ends.push(end);
+        at = end;
+    }
+    ends
+}
+
+/// The VFS journal's file as last checked, and how many of its records were: each cut past
+/// them is checked once, against the disk as the round that wrote it left it.
+#[derive(Default)]
+struct Cuts {
+    bytes: Vec<u8>,
+    ends: usize,
+}
+
+impl Cuts {
+    /// Every cut of the journal's file made since the last check, recovered as a start after
+    /// a crash there would: its column holds the invariant too.
+    fn check(&mut self, run: &mut Run) -> Checked {
+        let bytes = run.journal.contents(&name("state/journal"));
+        let ends = record_ends(&bytes);
+        // A rewrite replaced the file: every record of it is new.
+        let from = match bytes.starts_with(&self.bytes) {
+            true => self.ends,
+            false => 0,
+        };
+        let mut checked = 0;
+        for &end in &ends[from..] {
+            let (vfs, _) = Vfs::recover(name("state/journal"), 0, &bytes[..end]);
+            checked += column_holds(&vfs, &mut run.sim, &run.disk).map_err(|it| {
+                format!("recovered from the journal cut at byte {end} of {}: {it}", bytes.len())
+            })?;
+        }
+        (self.bytes, self.ends) = (bytes, ends.len());
+        Ok(checked)
+    }
+}
+
+/// One of `from`, drawn; `None` when it is empty.
+fn pick(rng: &mut Rng, from: Vec<String>) -> Option<String> {
+    match from.is_empty() {
+        true => None,
+        false => Some(from[rng.below(from.len() as u64) as usize].clone()), // clone: the pick
+    }
+}
+
+/// A commit to the watched head by another writer (a build's view committed, an agent's
+/// edit), onto the root it is at, its records asked to be written.
+fn another_writer(run: &mut Run, ops: &[Op]) {
+    let base = run.vfs.head("disk").expect("the head the watcher made");
+    if let Err(error) = run.vfs.commit("disk", base, ops) {
+        panic!("another writer's commit onto the head: {error}");
+    }
+    run.vfs.flush(&mut run.effects);
+}
+
+/// A conflict: the disk writes a file the head has, and while its read is in flight another
+/// writer commits other bytes there; the head keeps its own.
+fn conflict(run: &mut Run, rng: &mut Rng, what: &str) {
+    let head = run.head();
+    let both: Vec<String> = run.disk.keys().filter(|it| head.contains_key(*it)).cloned().collect();
+    let Some(path) = pick(rng, both) else { return };
+    run.write(&path, &format!("{what}: the disk's"));
+    let mut held = Vec::new();
+    run.pump_holding_reads(&mut held);
+    let bytes = format!("{what}: the head's").into_bytes();
+    another_writer(run, &[Op::Write { mode: Mode::Regular, path, bytes }]);
+    run.finish_reads(&mut held);
+}
+
+/// A move looked at again: the disk writes one file and renames another; while the write's
+/// read is in flight another writer deletes the renamed file's source and the tree drops its
+/// bytes, so the move has no node to take and its target is looked at again.
+fn moved_from_nothing(run: &mut Run, rng: &mut Rng, what: &str) {
+    const HELD: &str = "held.rs";
+    let head = run.head();
+    let mut sources = Vec::new();
+    for (path, bytes) in &run.disk {
+        // Its bytes no other file of the head has: dropped once its source is deleted.
+        let alone = head.values().filter(|it| *it == bytes).count() == 1;
+        if path != HELD && head.get(path) == Some(bytes) && alone {
+            sources.push(path.clone()); // clone: a candidate
+        }
+    }
+    let Some(source) = pick(rng, sources) else { return };
+    let target = format!("moved/{}", rng.below(1 << 32));
+    if run.disk.contains_key(&target) {
+        return;
+    }
+    run.write(HELD, &format!("{what}: held"));
+    run.rename(&source, &target);
+    let mut held = Vec::new();
+    run.pump_holding_reads(&mut held);
+    another_writer(run, &[Op::Delete { path: source }]);
+    run.vfs.collect(&[]);
+    run.finish_reads(&mut held);
+}
+
+/// Another writer's commit to the head with the disk unchanged: an edit, an add or a delete of
+/// a file; or an edit of a file the disk then renames (the head's bytes there are its own, not
+/// the disk's, so the rename is no move of the disk's bytes).
+fn outside(run: &mut Run, rng: &mut Rng, what: &str) {
+    let files: Vec<String> = run.head().into_keys().collect();
+    let bytes = format!("{what}: another writer's").into_bytes();
+    let how = rng.below(4);
+    let op = match how {
+        0 => {
+            let path = format!("outside/{}", rng.below(1 << 32));
+            Op::Write { mode: Mode::Regular, path, bytes }
+        }
+        _ => {
+            let Some(path) = pick(rng, files) else { return };
+            match how {
+                1 => Op::Delete { path },
+                _ => Op::Write { mode: Mode::Regular, path, bytes },
+            }
+        }
+    };
+    let renamed = match &op {
+        // clone: the path the disk renames after
+        Op::Write { path, .. } if how == 3 && run.disk.contains_key(path) => Some(path.clone()),
+        _ => None,
+    };
+    another_writer(run, &[op]);
+    run.pump();
+    if let Some(from) = renamed {
+        let to = format!("moved/{}", rng.below(1 << 32));
+        if !run.disk.contains_key(&to) {
+            run.rename(&from, &to);
+            run.pump();
+        }
+    }
+}
+
+/// A history of `seed` on a disk watched live by `kind`: rounds of the disk's own changes (live,
+/// across restarts, with a subtree lost or the journal reset), conflicts, moves looked at again
+/// and commits by another writer, the column held to the disk after each, live and at every cut
+/// of the journal since the last round. The names held to the disk, or the first breach.
+fn column_run(seed: u64, kind: Journal) -> Checked {
+    let mut rng = Rng::new(seed ^ 0x636f_6c75);
+    let mut run = Run::new(seed, kind, TREE);
+    let mut cuts = Cuts::default();
+    let mut checked = 0;
+    for round in 0..12 {
+        let what = format!("{kind:?} seed {seed} round {round}");
+        match rng.below(6) {
+            0 | 1 => {
+                let steps = steps(&mut rng, &run.disk, &what);
+                let how = rng.below(4);
+                act(&mut run, &steps, how, kind);
+            }
+            2 => conflict(&mut run, &mut rng, &what),
+            3 => moved_from_nothing(&mut run, &mut rng, &what),
+            _ => outside(&mut run, &mut rng, &what),
+        }
+        checked += column_holds(&run.vfs, &mut run.sim, &run.disk)
+            .map_err(|it| format!("{what}: the live column: {it}"))?;
+        checked += cuts.check(&mut run).map_err(|it| format!("{what}: {it}"))?;
+    }
+    Ok(checked)
+}
+
+/// The invariant: a column never pairs a root with a stamp of bytes other than the ones that
+/// root holds at that path; after any torn prefix of the VFS journal the restored column holds
+/// it too. Over watcher batches that meet a conflict (another writer's bytes committed while a
+/// read is in flight), moves looked at again (their source's node dropped before the commit)
+/// and commits by another writer (an edit, an add, a delete, an edit then renamed on the disk),
+/// mixed with the disk's own changes and restarts, for each live journal over many seeds.
+/// Controls: each of the three cases' fixes reverted ([`Plant`]) is caught.
+#[test]
+fn a_column_never_vouches_for_bytes_its_root_does_not_hold() {
+    let mut checked = 0;
+    for kind in LIVE {
+        for seed in 0..COLUMN_SEEDS {
+            match column_run(seed, kind) {
+                Ok(n) => checked += n,
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+    assert!(checked > 0, "the oracle held no name to the disk");
+}
+
+/// The first breach of the column's invariant over the histories, with `plant` in the code.
+fn caught(plant: Plant) -> Option<String> {
+    crate::PLANT.set(plant);
+    let caught = LIVE
+        .into_iter()
+        .find_map(|kind| (0..COLUMN_SEEDS).find_map(|seed| column_run(seed, kind).err()));
+    crate::PLANT.set(Plant::None);
+    caught
+}
+
+/// The control of the conflicts: a conflict's stamp saved as one that vouches pairs the head's
+/// root with the disk's stamp over the bytes the head did not take.
+#[test]
+fn the_oracle_catches_a_conflict_saved_as_vouching() {
+    assert!(caught(Plant::ConflictVouched).is_some(), "no history caught a vouching conflict");
+}
+
+/// The control of the moves looked at again: the target's stamp saved, and its removal in a
+/// record after the commit's, leaves a cut of the journal between them whose column vouches
+/// for a file its root lacks.
+#[test]
+fn the_oracle_catches_a_move_looked_at_again_recorded_apart() {
+    assert!(caught(Plant::AgainApart).is_some(), "no cut caught a move recorded apart");
+}
+
+/// The control of another writer's commits: a column left as it was, and paired with the
+/// head's root whatever it was kept against, vouches for the bytes the commit replaced.
+#[test]
+fn the_oracle_catches_a_column_left_behind_by_another_writer() {
+    assert!(caught(Plant::ColumnOfTheHead).is_some(), "no history caught the column left behind");
+}
+
+/// The control of moves: a rename from a name whose stamp the head chose against, taken as a
+/// move of the head's bytes, pairs the column's root with the stamp of the disk's bytes.
+#[test]
+fn the_oracle_catches_a_move_from_a_chosen_name() {
+    assert!(caught(Plant::MoveFromChosen).is_some(), "no history caught a move from a chosen name");
 }

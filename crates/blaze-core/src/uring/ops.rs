@@ -148,6 +148,10 @@ pub(super) const NOT_REGULAR: u8 = 1 << 3;
 /// ([`Kind::ReadInto`], [`Kind::WriteFrom`]): opened without `O_APPEND`, which on Linux puts a
 /// positional write at the end, and with [`DIRECT`] `O_DIRECT` (the bit [`WHOLE`] is).
 pub(super) const POSITIONAL: u8 = 1 << 3;
+/// A [`Kind::Open`] of a kept file for a sync or a barrier alone, of a name no request kept:
+/// `O_RDONLY`, as a file sealed read-only refuses an open for writing (`Kept::read_only`; the
+/// bit [`FINISHED`] is).
+pub(super) const READ_ONLY: u8 = 1 << 6;
 /// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
 pub(super) const IDLE: u8 = 1 << 3;
 
@@ -172,7 +176,8 @@ pub(super) struct Hot {
     /// [`ABANDONED`], [`STOPPING`], [`DIRECT`], [`STDERR`], [`SECOND`], [`ZERO_COPY`],
     /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`], [`NO_FOLLOW`] (a [`Kind::Stat`]'s) and
     /// [`NOT_REGULAR`] (a [`Kind::Clone`]'s). The last two share [`WHOLE`]'s (and [`STDERR`]'s)
-    /// bit, read only for those kinds.
+    /// bit, read only for those kinds; [`READ_ONLY`] (a [`Kind::Open`]'s) shares
+    /// [`FINISHED`]'s.
     pub flags: u8,
     /// The links asked of the kernel whose last completion is not in yet, a bit each.
     pub links: u8,

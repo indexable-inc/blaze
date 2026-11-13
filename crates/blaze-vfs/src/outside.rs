@@ -793,121 +793,130 @@ pub fn quiet_since(generation: u64) -> bool {
     DIRS.quiet_since(generation)
 }
 
-/// How many times this process looked at the disk for what a path outside every view is now,
-/// in place of an answer a watch vouched for ([`looked`]).
-static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What a look at the disk was of ([`Look`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum LookKind {
+    /// A file's content, links followed: the answer is its content's hash.
+    File,
+    /// The path itself, a link not followed: the answer is a hash of what it is (a
+    /// directory, or a file's or a link's id and mode).
+    Entry,
+    /// The names in a directory: the answer is the hash of its listing.
+    Listing,
+}
 
-/// Whether [`looked`] keeps the path it is told ([`name_looks`]).
-static NAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+impl std::fmt::Display for LookKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LookKind::File => "the file",
+            LookKind::Entry => "the entry",
+            LookKind::Listing => "the names in",
+        })
+    }
+}
 
-/// The last path [`looked`] was told while looks were named.
-static LAST_LOOK: Lock<PathBuf> = Lock::new("vfs.outside.last_look", PathBuf::new());
+/// One look at the disk for what `path`, outside every view, is now (a read, a `stat`, a
+/// listing), made because no watch vouched for the answer kept: the path, which question was
+/// asked of it, what the disk said (`None`: nothing is there), and the caller that looked.
+/// Made by each place that checks such a path (blaze-usercode's `inputs` and `roots`, base-db's
+/// `IncludedFile::read_now`, blaze-lints' `profile::load`, the daemon's pinned native layouts)
+/// and kept by the build it was made for ([`Looks`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Look {
+    pub path: PathBuf,
+    pub kind: LookKind,
+    pub answer: Option<[u8; 32]>,
+    pub by: &'static std::panic::Location<'static>,
+}
 
-/// Counts a look at the disk for what `path`, outside every view, is now (a `stat`, a read, a
-/// listing), made because no watch vouched for the answer kept. Called by each place that
-/// checks such a path: blaze-usercode's `inputs` (a traced file, entry or listing) and
-/// `roots` (a root resolved through a link), base-db's `IncludedFile::read_now` (a file an
-/// `include!` read), blaze-lints' `profile::load` (a lint profile) and the daemon's pinned
-/// native layouts. While looks are named ([`name_looks`]) the path is kept for
-/// [`last_look`].
-#[track_caller]
-pub fn looked(path: &Path) {
-    LOOKS.fetch_add(1, Ordering::Relaxed);
-    if NAMING.load(Ordering::Relaxed) {
-        let mut last = LAST_LOOK.lock();
-        last.clear();
-        last.push(path); // alloc: grows to the longest path looked at, then is used again
-        drop(last);
+/// The looks one build made, owned by that build: every place that looks at the disk is
+/// handed the `Looks` of the build it looks for and pushes its look there, so no look is kept
+/// by the process and none is another build's. A clone is the same list. No cap: a first
+/// build after a daemon start looks at every native input and traced path once.
+///
+/// The invariant: a look is in the list of the build it was made for and of no other, each
+/// distinct (path, kind, answer) once, in an order that depends on no thread's timing.
+#[derive(Clone)]
+pub struct Looks(Option<std::sync::Arc<Lock<Kept>>>);
+
+/// A build's looks by (path, kind, answer), sorted: the same set from any interleaving.
+type Kept = std::collections::BTreeMap<(PathBuf, LookKind, Option<[u8; 32]>), &'static std::panic::Location<'static>>;
+
+impl Looks {
+    /// An empty list, for one build.
+    pub fn new() -> Looks {
+        // alloc: once a build, the list its looks are kept in
+        Looks(Some(std::sync::Arc::new(Lock::new("vfs.outside.looks", Kept::new()))))
+    }
+
+    /// A handle that keeps nothing, for a caller with no build (a check at a certificate
+    /// hit, a test): such a caller uses the answer of its look itself.
+    pub const fn none() -> Looks {
+        Looks(None)
+    }
+
+    /// Whether this keeps what it is told ([`Looks::new`]).
+    pub fn keeps(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Keeps a look of `kind` at `path` that said `answer`. A second look that said the same
+    /// is the same row; one that said something else is a second row ([`Looks::twice`]).
+    #[track_caller]
+    pub fn push(&self, path: &Path, kind: LookKind, answer: Option<[u8; 32]>) {
+        let Some(kept) = &self.0 else { return };
         let by = std::panic::Location::caller();
-        let mut named = NAMED_LOOKS.lock();
-        match named.iter().position(|it| it.0 == path) {
-            Some(at) => named[at].1 += 1,
-            // alloc: at most `LOOKS_NAMED` paths a stretch of naming
-            None if named.len() < LOOKS_NAMED => named.push((path.to_path_buf(), 1, by)),
-            None => NAMED_MORE.store(true, Ordering::Relaxed),
+        // alloc: once a look at the disk, its path as the key it is kept by
+        kept.lock().entry((path.to_path_buf(), kind, answer)).or_insert(by);
+    }
+
+    /// Keeps each of `looks` too: a build that used a task another build ran holds that
+    /// task's looks as its own.
+    pub fn extend(&self, looks: &[Look]) {
+        let Some(kept) = &self.0 else { return };
+        let mut kept = kept.lock();
+        for look in looks {
+            // clone: a look copied to a second build, once per look per build
+            kept.entry((look.path.clone(), look.kind, look.answer)).or_insert(look.by);
         }
-        drop(named);
-        // Not yet said to be a file's look with an answer ([`looked_file`]).
-        FILE_LOOKS.lock().retain(|it| it.0 != path || it.1.is_some());
+    }
+
+    /// How many looks are kept.
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |kept| kept.lock().len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every look kept, sorted by path, kind and answer.
+    pub fn all(&self) -> Vec<Look> {
+        let Some(kept) = &self.0 else { return Vec::new() }; // alloc: none
+        // alloc: once a build's end, its looks; clone: each path, once
+        kept.lock()
+            .iter()
+            .map(|((path, kind, answer), by)| Look { path: path.clone(), kind: *kind, answer: *answer, by: *by })
+            .collect()
+    }
+
+    /// Each pair of looks in `looks` (sorted, as [`Looks::all`] gives them) of one path and
+    /// kind that said two things: what such a build cannot be checked again by.
+    pub fn twice(looks: &[Look]) -> impl Iterator<Item = (&Look, &Look)> {
+        looks.windows(2).filter(|it| it[0].path == it[1].path && it[0].kind == it[1].kind).map(|it| (&it[0], &it[1]))
     }
 }
 
-/// The most distinct paths [`looked`] keeps while looks are named ([`take_named_looks`]).
-pub const LOOKS_NAMED: usize = 64;
-
-/// More distinct paths were looked at than [`LOOKS_NAMED`] since looks were last taken.
-static NAMED_MORE: AtomicBool = AtomicBool::new(false);
-
-/// What each look of a file said while looks were named ([`looked_file`]): the path and the
-/// one answer every look of it gave (its content's hash, none for a file that is not
-/// there), or `None` once two looks of it differed.
-static FILE_LOOKS: Lock<Vec<(PathBuf, Option<Option<[u8; 32]>>)>> =
-    Lock::new("vfs.outside.file_looks", Vec::new());
-
-/// A look at the file `path` ([`looked`], told just before) said `answer`: kept while looks
-/// are named, for whoever keeps a build's answer to look again as it is asked
-/// ([`take_file_looks`]).
-pub fn looked_file(path: &Path, answer: Option<[u8; 32]>) {
-    if !NAMING.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut looks = FILE_LOOKS.lock();
-    match looks.iter().position(|it| it.0 == path) {
-        Some(at) if looks[at].1 == Some(answer) => {}
-        Some(at) => looks[at].1 = None,
-        // alloc: at most `LOOKS_NAMED` paths a stretch of naming
-        None if looks.len() < LOOKS_NAMED => looks.push((path.to_path_buf(), Some(answer))),
-        None => NAMED_MORE.store(true, Ordering::Relaxed),
+impl Default for Looks {
+    fn default() -> Looks {
+        Looks::new()
     }
 }
 
-/// Every look since the last call while looks were named, when each was a file's look that
-/// said one thing ([`looked_file`]) and none was dropped: each path with what was there.
-/// `None` when some look was of another kind (a listing, an entry), differed from another of
-/// its path, or was one too many to keep: such a stretch can't be checked again by looking.
-/// Call before [`take_named_looks`], which forgets what this compares with.
-pub fn take_file_looks() -> Option<Vec<(PathBuf, Option<[u8; 32]>)>> {
-    let files = std::mem::take(&mut *FILE_LOOKS.lock());
-    let named = NAMED_LOOKS.lock();
-    if NAMED_MORE.swap(false, Ordering::Relaxed) || files.len() != named.len() {
-        return None;
+impl std::fmt::Debug for Looks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.all().iter()).finish()
     }
-    files.into_iter().map(|(path, answer)| Some((path, answer?))).collect()
-}
-
-/// The first [`LOOKS_NAMED`] distinct paths looked at while looks were named, each with how
-/// many times.
-static NAMED_LOOKS: Lock<Vec<(PathBuf, u32, &'static std::panic::Location<'static>)>> = Lock::new("vfs.outside.named_looks", Vec::new());
-
-/// The distinct paths looked at since the last call while looks were named (the first
-/// [`LOOKS_NAMED`] of them), each with how many times, and forgets them: for whoever says
-/// why a build was not answered again, which the last look alone does not (one path named
-/// where a build looked at many kinds).
-pub fn take_named_looks() -> Vec<(PathBuf, u32, &'static std::panic::Location<'static>)> {
-    std::mem::take(&mut *NAMED_LOOKS.lock())
-}
-
-/// Has [`looked`] keep the path of each look from now on, or stop: on while someone will
-/// ask [`last_look`] (the daemon, while a build that may be answered again later walks), so
-/// a build no one asks about pays one load a look.
-pub fn name_looks(on: bool) {
-    NAMING.store(on, Ordering::Relaxed);
-    if on {
-        // A stretch of naming begins: the last look of an earlier stretch is not this one's
-        // (a build that looked at nothing named a path an earlier build had looked at).
-        LAST_LOOK.lock().clear();
-        NAMED_LOOKS.lock().clear();
-        FILE_LOOKS.lock().clear();
-        NAMED_MORE.store(false, Ordering::Relaxed);
-    }
-}
-
-/// The last path looked at while looks were named, for a person: which path no watch
-/// vouched for.
-pub fn last_look() -> Option<PathBuf> {
-    let last = LAST_LOOK.lock();
-    // clone: a reason, once a build asked about
-    (!last.as_os_str().is_empty()).then(|| last.clone())
 }
 
 /// Each directory wanted at or above `path` with its state, beside `generation` and the
@@ -978,13 +987,6 @@ pub fn why_looked(path: &Path) -> String {
             )
         }
     }
-}
-
-/// How many looks ([`looked`]) this process has made. A stretch of work across which it did
-/// not move checked no path outside every view on the disk: each it checked was vouched for by
-/// a watch, which [`quiet_since`] then covers.
-pub fn looks() -> u64 {
-    LOOKS.load(Ordering::Relaxed)
 }
 
 /// [`Dirs::unchanged_since`] of the process's table.

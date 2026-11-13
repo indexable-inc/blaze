@@ -107,7 +107,11 @@ use serde::{Deserialize, Serialize};
 /// and its home hold against their budget, on every build's end), `unkept` of
 /// [`Request::Gc`], and [`Status::placed_by`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
 /// request asked for. 53: [`Request::Store`] (not the `Request::Pack` that 48 removed: packs of store records, docs/remote-cache.md).
-pub const SCHEMA: u32 = 53;
+/// 54: [`Cargo::prebuilt`] (`--no-prebuilt`), by which a request takes no record from a pack source.
+/// 55: `pid` and `timed` of [`Request::ClientRows`] ([`Timed`]): the thin `blaze`'s spans, by name,
+/// sent on the request's own connection; a `ClientRows` of 54 (neither field) reads as pid 0 and
+/// no timed spans.
+pub const SCHEMA: u32 = 55;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -193,6 +197,11 @@ pub struct Cargo {
     /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
     /// none or with `-q`, which `args` says.
     pub verbose: u8,
+    /// Whether a record the home's store and the machine's layer miss may be fetched from a
+    /// pack source (packs.json's `remote`, an R2 bucket): `false` for blaze's `--no-prebuilt`,
+    /// which builds every such miss from source for this request, as packs.json's
+    /// `"prebuilt": false` does for every request.
+    pub prebuilt: bool,
 }
 
 /// [`Cargo::files`], each file's bytes one byte string.
@@ -227,6 +236,7 @@ impl std::fmt::Debug for Cargo {
             .field("width", &self.width)
             .field("verbose", &self.verbose)
             .field("refused", &self.refused)
+            .field("prebuilt", &self.prebuilt)
             .finish()
     }
 }
@@ -489,10 +499,24 @@ pub enum Request {
     /// which writes them as the client's process and gives the build's row the two times
     /// (`builds.client_started_ns`, `client_ended_ns`); answered with `Done { ok: true }` once
     /// written. A daemon that keeps no history answers at once and keeps nothing.
+    ///
+    /// `pid` is the client's process and `timed` its spans by name ([`Timed`]): what a client
+    /// with no flight recorder of its own sends (the thin `blaze`, which links no Arrow), made
+    /// the client's `spans` rows by the daemon. A client sends its spans one way: `spans` or
+    /// `timed`, never both (the daemon refuses both, naming the build).
+    ///
+    /// The fields are declared in their keys' order (by length, then bytes), as deterministic
+    /// CBOR writes them.
     ClientRows {
+        /// 0 in a `ClientRows` of schema 54, which had no such field.
+        #[serde(default)]
+        pid: u32,
         build: u64,
         #[serde(with = "blaze_protocol::bytes")]
         spans: Vec<u8>,
+        /// Empty in a `ClientRows` of schema 54, which had no such field.
+        #[serde(default)]
+        timed: Vec<Timed>,
         #[serde(with = "blaze_protocol::bytes")]
         events: Vec<u8>,
         #[serde(with = "blaze_protocol::bytes")]
@@ -500,6 +524,29 @@ pub enum Request {
         ended_ns: i64,
         started_ns: i64,
     },
+}
+
+/// One span of a client's, by its name, on the profile's clock (`blaze_profile::clock::mono_ns`):
+/// from `start_ns` to `end_ns` ([`Request::ClientRows::timed`]). The names are the client's
+/// fixed set (`client: connect`, ...), each said once a command.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Timed {
+    // In their keys' order, as deterministic CBOR writes them.
+    pub name: String,
+    pub end_ns: i64,
+    pub start_ns: i64,
+}
+
+impl Timed {
+    /// The name of the client's span that ends as it becomes the program (`exec`): its end is
+    /// the instant the program's `program: exec to Hello` starts at.
+    pub const ANSWER_TO_EXEC: &'static str = "client: answer to exec";
+
+    /// Where a `run`'s client became its program: the end of its [`Timed::ANSWER_TO_EXEC`],
+    /// `None` for a client that ran none (a `build`).
+    pub fn exec_of(timed: &[Timed]) -> Option<i64> {
+        timed.iter().find(|it| it.name == Timed::ANSWER_TO_EXEC).map(|it| it.end_ns)
+    }
 }
 
 /// [`Request::Rebuilt`]'s answer.
@@ -2032,6 +2079,69 @@ mod tests {
         assert_eq!(back.schema, SCHEMA);
     }
 
+    /// The invariant: a `ClientRows` written by schema 54 (no `pid`, no `timed`) reads as the
+    /// same rows with pid 0 and no timed spans, and one of 55 round-trips whole. Control: the
+    /// 55 value with its `timed` dropped is not equal to it, so the round trip would see a lost
+    /// field.
+    #[test]
+    fn client_rows_of_the_layout_before_timed_spans_still_read() {
+        #[derive(Serialize)]
+        enum Before {
+            ClientRows {
+                build: u64,
+                #[serde(with = "blaze_protocol::bytes")]
+                spans: Vec<u8>,
+                #[serde(with = "blaze_protocol::bytes")]
+                events: Vec<u8>,
+                #[serde(with = "blaze_protocol::bytes")]
+                folded: Vec<u8>,
+                ended_ns: i64,
+                started_ns: i64,
+            },
+        }
+        let before = Before::ClientRows {
+            build: 9,
+            spans: vec![1],
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&before).unwrap();
+        let read: Request = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        let old = Request::ClientRows {
+            build: 9,
+            spans: vec![1],
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+            pid: 0,
+            timed: Vec::new(),
+        };
+        assert_eq!(read, old);
+
+        let timed = vec![Timed { name: Timed::ANSWER_TO_EXEC.to_owned(), start_ns: 11, end_ns: 19 }];
+        let new = Request::ClientRows {
+            build: 9,
+            spans: Vec::new(),
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 20,
+            started_ns: 10,
+            pid: 41,
+            timed: timed.clone(), // clone: the spans, kept to compare, once a test
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&new).unwrap();
+        let back: Request = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        assert_eq!(back, new);
+        assert_eq!(Timed::exec_of(&timed), Some(19));
+        // clone: the request, to plant a lost span in, once a test
+        let Request::ClientRows { timed: mut planted, .. } = new.clone() else { unreachable!() };
+        planted.clear();
+        assert_ne!(Some(planted), Some(timed), "the control: a dropped span is seen");
+    }
+
     /// A run's output is one byte string; JSON shows it as the array of numbers it was.
     #[test]
     fn bytes_go_out_as_byte_strings() {
@@ -2073,12 +2183,15 @@ mod tests {
             command: "build".to_owned(),
             verbose: 2,
             refused: None,
+            prebuilt: false,
         };
         let bytes = blaze_protocol::cbor::to_vec(&cargo).unwrap();
         let files = [0x65, b'f', b'i', b'l', b'e', b's', 0x81, 0x82, 0x62, b'/', b'c', 0x42, 1, 2];
         assert!(bytes.windows(files.len()).any(|it| it == files), "{bytes:02x?}");
         let width = [0x65, b'w', b'i', b'd', b't', b'h', 0x18, 100];
         assert!(bytes.windows(width.len()).any(|it| it == width), "{bytes:02x?}");
+        let prebuilt = [0x68, b'p', b'r', b'e', b'b', b'u', b'i', b'l', b't', 0xf4];
+        assert!(bytes.ends_with(&prebuilt), "the longest key last: {bytes:02x?}");
         assert_eq!(blaze_protocol::cbor::from_slice::<Cargo>(&bytes).unwrap(), cargo);
         let json = serde_json::to_value(&cargo).unwrap();
         assert_eq!(json["files"], serde_json::json!([["/c", [1, 2]]]));

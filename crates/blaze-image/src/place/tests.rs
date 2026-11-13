@@ -16,7 +16,7 @@ use hegel::{Hegel, Settings, TestCase};
 use super::*;
 use crate::{Builder, Image, SectionId, serial};
 
-const IDS: [SectionId; 3] = [SectionId::VFS_BLOBS, SectionId::DB_BLOB, SectionId::PLANE_HISTORY];
+const IDS: [SectionId; 3] = [SectionId::VFS_DISKS, SectionId::VFS_TREE, SectionId::PLANE_HISTORY];
 
 /// The lengths a section takes: none, a few bytes, a unit and a bit, and several units, so
 /// images share whole units, grow, shrink and move their later sections.
