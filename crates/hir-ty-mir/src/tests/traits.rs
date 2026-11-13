@@ -162,18 +162,16 @@ async fn reproduction() -> usize {
 }
     "#,
     );
+    // #11815: an async block coerces to a boxed `dyn Future`. `Future::poll` takes
+    // `self: Pin<&mut Self>`, so `dyn Future` is dyn compatible only where `Pin<&mut T>` is
+    // `DispatchFromDyn` (rustc's `receiver_is_dispatchable`); the fixture had no
+    // `dispatch_from_dyn` lang item, and passed only while edition 2024's prelude had no
+    // `Future` and `dyn Future` did not resolve.
     check_no_mismatches(
         r#"
-//- minicore: future
-//#11815
-#[lang = "sized"]
-pub trait Sized {}
-
-#[lang = "unsize"]
-pub trait Unsize<T: ?Sized> {}
-
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T> {}
+//- minicore: future, sized, coerce_unsized, dispatch_from_dyn, send
+use core::marker::Unsize;
+use core::ops::CoerceUnsized;
 
 pub unsafe trait Allocator {}
 
@@ -192,6 +190,39 @@ fn send() ->  Box<dyn Future<Output = ()> + Send + 'static>{
 
 fn not_send() -> Box<dyn Future<Output = ()> + 'static> {
     Box(async move {}, Global)
+}
+    "#,
+    );
+    // The control: without `DispatchFromDyn` no future, an async block's or a struct's,
+    // coerces to `dyn Future`.
+    check(
+        r#"
+//- minicore: future, sized, coerce_unsized
+use core::marker::Unsize;
+use core::ops::CoerceUnsized;
+
+pub unsafe trait Allocator {}
+
+pub struct Global;
+unsafe impl Allocator for Global {}
+
+#[lang = "owned_box"]
+#[fundamental]
+pub struct Box<T: ?Sized, A: Allocator = Global>(T, A);
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+
+struct S;
+impl Future for S { type Output = (); }
+
+fn block() -> Box<dyn Future<Output = ()> + 'static> {
+    Box(async move {}, Global)
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^ expected Box<dyn Future<Output = ()> + 'static, Global>, got Box<impl Future<Output = ()>, Global>
+}
+
+fn plain() -> Box<dyn Future<Output = ()> + 'static> {
+    Box(S, Global)
+  //^^^^^^^^^^^^^^ expected Box<dyn Future<Output = ()> + 'static, Global>, got Box<S, Global>
 }
     "#,
     );
@@ -5538,3 +5569,4 @@ fn test() {
 "#,
     );
 }
+

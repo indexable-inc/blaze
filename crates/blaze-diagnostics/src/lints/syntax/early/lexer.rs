@@ -357,65 +357,61 @@ fn lexer_lint(
             }
             diag
         }
+        // rustc's `ReservedPrefixLint`, one diagnostic for what a later edition lexes as
+        // something else: its subject, what it becomes, the edition, and where a space avoids it.
         Lexed::UnknownPrefix { range } => {
-            let at = span(range);
-            let mut diag = Diag::lint(
+            // alloc: the lint's text, for a lint found
+            let subject = format!("`{}`", &text[range]);
+            reserved(
                 "rust_2021_prefixes_incompatible_syntax",
-                // alloc: the lint's text, for a lint found
-                format!("prefix `{}` is unknown", &text[range]),
-                // clone: a lint's span, for a lint found
-                at.clone(),
-            );
-            diag.span_label(at, "unknown prefix");
-            diag.suggestion(
+                &subject,
+                "prefix",
+                "2021",
+                span(range),
                 span(TextRange::empty(range.end())),
-                "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
-                " ",
-                Applicability::MachineApplicable,
-            );
-            diag
+            )
         }
-        Lexed::RawPrefix { range } => {
-            let at = span(range);
-            // clone: a lint's span, for a lint found
-            let mut diag = Diag::lint(
-                "rust_2021_prefixes_incompatible_syntax",
-                "prefix `'r` is reserved",
-                at.clone(),
-            );
-            diag.span_label(at, "reserved prefix");
-            diag.suggestion(
-                span(TextRange::empty(range.end())),
-                "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
-                " ",
-                Applicability::MachineApplicable,
-            );
-            diag
-        }
-        Lexed::Guarded { range, string, space } => {
-            let (message, help) = match string {
-                true => (
-                    "will be parsed as a guarded string in Rust 2024",
-                    "insert whitespace here to avoid this being parsed as a guarded string in Rust 2024",
-                ),
-                false => (
-                    "reserved token in Rust 2024",
-                    "insert whitespace here to avoid this being parsed as a forbidden token in Rust 2024",
-                ),
-            };
-            let mut diag =
-                Diag::lint("rust_2024_guarded_string_incompatible_syntax", message, span(range));
-            diag.suggestion(
-                span(TextRange::empty(space)),
-                help,
-                " ",
-                Applicability::MachineApplicable,
-            );
-            diag
-        }
+        Lexed::RawPrefix { range } => reserved(
+            "rust_2021_prefixes_incompatible_syntax",
+            "`r`",
+            "prefix",
+            "2021",
+            span(range),
+            span(TextRange::empty(range.end())),
+        ),
+        Lexed::Guarded { range, string, space } => reserved(
+            "rust_2024_guarded_string_incompatible_syntax",
+            "this",
+            if string { "guarded string literal" } else { "reserved token" },
+            "2024",
+            span(range),
+            span(TextRange::empty(space)),
+        ),
     };
     source_fact(cx, &mut diag, krate);
     Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate).buffered(Stage::Parsed)
+}
+
+/// rustc's `ReservedPrefixLint` of `lint` at `at`: "`subject` is parsed as a `kind` in Rust
+/// `edition` and onward", with the space at `space` that keeps today's reading.
+fn reserved(
+    lint: &'static str,
+    subject: &str,
+    kind: &str,
+    edition: &str,
+    at: Span,
+    space: Span,
+) -> Diag {
+    // alloc: the lint's text, for a lint found
+    let message = format!("{subject} is parsed as a {kind} in Rust {edition} and onward");
+    let mut diag = Diag::lint(lint, message, at);
+    diag.suggestion_verbose(
+        space,
+        "consider inserting whitespace here to avoid this",
+        " ",
+        Applicability::MachineApplicable,
+    );
+    diag
 }
 
 #[cfg(test)]

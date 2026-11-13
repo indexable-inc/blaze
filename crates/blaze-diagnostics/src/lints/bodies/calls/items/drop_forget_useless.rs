@@ -1,13 +1,16 @@
 //! rustc's `DropForgetUseless`: calls of `std::mem::drop` and `std::mem::forget` that do
 //! nothing, with a reference, a value of a `Copy` type or a `ManuallyDrop`
 //! (`dropping_references`, `dropping_copy_types`, `forgetting_references`,
-//! `forgetting_copy_types`, `undropped_manually_drops`). A `drop` that is the whole value of a
+//! `forgetting_copy_types`, `undropped_manually_drops`), and, since Rust 1.100
+//! (rust-lang/rust#160229), calls of `std::ptr::drop_in_place` and of a pointer's
+//! `drop_in_place` with a pointer to one. A `drop` that is the whole value of a
 //! `match` arm, of an argument that may have side effects, is how one keeps only the side
 //! effects, and is left alone.
 //!
 //! Follows rustc's `compiler/rustc_lint/src/drop_forget_useless.rs`, the diagnostics of
 //! `compiler/rustc_lint/src/lints.rs` (`DropRefDiag`, `DropCopyDiag`, `ForgetRefDiag`,
 //! `ForgetCopyDiag`, `UndroppedManuallyDropsDiag`, `UndroppedManuallyDropsSuggestion`,
+//! `DropInPlaceRefDiag`, `DropInPlaceCopyDiag`, `UndroppedManuallyDropsInPlaceDiag`,
 //! `UseLetUnderscoreIgnoreSuggestion`), `compiler/rustc_hir/src/hir.rs`
 //! (`Expr::can_have_side_effects`) and `compiler/rustc_span/src/lib.rs`
 //! (`Span::find_ancestor_inside_same_ctxt`) (MIT or Apache-2.0).
@@ -32,6 +35,10 @@ use crate::{
 
 const MEM_DROP: &str = "mem_drop";
 const MEM_FORGET: &str = "mem_forget";
+/// `core::ptr::drop_in_place`.
+const DROP_IN_PLACE: &str = "ptr_drop_in_place";
+/// `<*mut T>::drop_in_place`.
+const DROP_IN_PLACE_SELF: &str = "ptr_drop_in_place_self";
 
 const IGNORE: &str = "use `let _ = ...` to ignore the expression or result";
 
@@ -46,7 +53,7 @@ pub(crate) struct DropForgetUseless {
 impl Default for DropForgetUseless {
     fn default() -> DropForgetUseless {
         DropForgetUseless {
-            items: FnItems::new(&[MEM_DROP, MEM_FORGET]),
+            items: FnItems::new(&[MEM_DROP, MEM_FORGET, DROP_IN_PLACE, DROP_IN_PLACE_SELF]),
             arm_values: HashSet::new_in(Global),
             semi_stmt: None,
         }
@@ -62,7 +69,7 @@ impl LatePass for DropForgetUseless {
         "undropped_manually_drops",
     ]);
     const HOOKS: Hooks = Hooks::BODY.and(Hooks::STMT).and(Hooks::ARM);
-    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Call, ExprKind::MethodCall]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_, '_>, _out: &mut Vec<Found>) {
         self.arm_values.clear();
@@ -103,20 +110,52 @@ impl LatePass for DropForgetUseless {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        let Some([arg]) = util::call_args(b, expr) else { return };
-        let arg = *arg;
-        let Some((def, _)) = util::called_fn(b, expr) else { return };
+        // `function(<receiver>)`, or `<receiver>.method()`.
+        let (def, arg) = match b.store().expr(expr) {
+            Expr::Call { args, .. } => {
+                let [arg] = &args[..] else { return };
+                let Some((def, _)) = util::called_fn(b, expr) else { return };
+                (def, *arg)
+            }
+            Expr::MethodCall { receiver, .. } => {
+                let Some(def) = util::method_fn(b, expr) else { return };
+                (def, receiver)
+            }
+            _ => return,
+        };
         let Some(name) = self.items.of(b.db(), def) else { return };
         let arg_ty = util::ty(b, arg);
         let solver = util::Solver::of(b);
         let is_copy = solver.is_copy(arg_ty);
         let is_ref = matches!(arg_ty.kind(), TyKind::Ref(..));
+        // What a pointer given to `drop_in_place` points to.
+        let in_place = matches!(name, DROP_IN_PLACE | DROP_IN_PLACE_SELF);
+        let pointee = match arg_ty.kind() {
+            TyKind::RawPtr(inner, _) if in_place => Some(inner),
+            _ => None,
+        };
         let single_call_in_arm = self.arm_values.contains(&expr) && can_have_side_effects(b, arg);
+        // `std::ptr::drop_in_place` of the function, `drop_in_place` of the method.
+        let of = |function: &'static str, method: &'static str| match name == DROP_IN_PLACE {
+            true => function,
+            false => method,
+        };
         let (lint, message) = match name {
             MEM_DROP if is_ref && !single_call_in_arm => (
                 "dropping_references",
                 "calls to `std::mem::drop` with a reference instead of an owned value does nothing",
             ),
+            _ if pointee.is_some_and(|it| matches!(it.kind(), TyKind::Ref(..)))
+                && !single_call_in_arm =>
+            {
+                (
+                    "dropping_references",
+                    of(
+                        "calls to `std::ptr::drop_in_place` with a pointer to a reference instead of a pointer to an owned value does nothing",
+                        "calls to `drop_in_place` with a pointer to a reference instead of a pointer to an owned value does nothing",
+                    ),
+                )
+            }
             MEM_FORGET if is_ref => (
                 "forgetting_references",
                 "calls to `std::mem::forget` with a reference instead of an owned value does nothing",
@@ -125,6 +164,13 @@ impl LatePass for DropForgetUseless {
                 "dropping_copy_types",
                 "calls to `std::mem::drop` with a value that implements `Copy` does nothing",
             ),
+            _ if pointee.is_some_and(|it| solver.is_copy(it)) && !single_call_in_arm => (
+                "dropping_copy_types",
+                of(
+                    "calls to `std::ptr::drop_in_place` with a pointer to a value that implements `Copy` does nothing",
+                    "calls to `drop_in_place` with a pointer to a value that implements `Copy` does nothing",
+                ),
+            ),
             MEM_FORGET if is_copy => (
                 "forgetting_copy_types",
                 "calls to `std::mem::forget` with a value that implements `Copy` does nothing",
@@ -132,6 +178,10 @@ impl LatePass for DropForgetUseless {
             MEM_DROP if is_manually_drop(&solver, arg_ty) => (
                 "undropped_manually_drops",
                 "calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of the inner value does nothing",
+            ),
+            _ if pointee.is_some_and(|it| is_manually_drop(&solver, it)) => (
+                "undropped_manually_drops",
+                "calls to `drop_in_place` with a pointer to a `std::mem::ManuallyDrop` instead of the inner value does nothing",
             ),
             _ => return,
         };
@@ -145,7 +195,20 @@ impl LatePass for DropForgetUseless {
         let mut diag = Diag::lint(lint, message, call.clone());
         // alloc: the lint's diagnostic
         diag.span_label(arg_span.clone(), format!("argument has type `{arg_ty}`"));
-        if lint == "undropped_manually_drops" {
+        if lint == "undropped_manually_drops" && in_place {
+            diag.suggestion_with_style(
+                // alloc: the lint's diagnostic
+                vec![
+                    // alloc: the lint's diagnostic
+                    (call.with_hi(arg_span.lo), "std::mem::ManuallyDrop::drop(&mut *".to_owned()),
+                    // alloc: the lint's diagnostic
+                    (arg_span.with_lo(arg_span.hi).with_hi(call.hi), ")".to_owned()),
+                ],
+                "use `std::mem::ManuallyDrop::drop` to drop the inner value",
+                Applicability::MaybeIncorrect,
+                SuggestionStyle::ShowCode,
+            );
+        } else if lint == "undropped_manually_drops" {
             diag.suggestion_with_style(
                 // alloc: the lint's diagnostic
                 vec![

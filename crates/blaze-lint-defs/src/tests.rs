@@ -229,11 +229,11 @@ fn group_of_is_the_first_group_without_aliases() {
 #[test]
 fn counts_are_rustcs() {
     // 107 of the builtin passes and `foreign_modules`, 148 hardwired, at the pinned nightly
-    // (rustc 1.101.0-nightly 16d1ffac1): `HardwiredLints`' list in
-    // `compiler/rustc_lint_defs/src/builtin.rs`.
+    // (rustc 1.101.0-nightly 16d1ffac1), as `rustc.rs` is generated from its source: a bump
+    // that changes a count changes it here, on purpose.
     assert_eq!(lints().len(), 255);
     assert_eq!(internal_lints().len(), 17);
-    assert_eq!(internal_group().lints.len(), 16);
+    assert_eq!(internal_group().lints.len(), 15);
     assert_eq!(unregistered().len(), 3);
     let names: Vec<&str> = groups().iter().map(|it| it.name).collect();
     assert_eq!(
@@ -368,7 +368,7 @@ fn check_lint_name() {
     assert_eq!(store.check("internal", Some("rustc")), Checked::MissingTool);
     let store = Store { internal: true, registered_tools: Vec::new() };
     assert!(
-        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 16)
+        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 15)
     );
     assert_eq!(store.check("default_hash_type", Some("rustc")), Checked::NoLint { suggest: true });
     assert!(store.is_lint_group("warnings"));
