@@ -32,6 +32,14 @@ hn {
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $group_h, min: 0, max: 0}}
     Padding: {l: $label_inset, r: $tree_pad_r, t: 0, b: 0}
+    // This header represents devices::local, connected through this computer's daemon socket.
+    location : ui.Node {
+      Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      Fill: $tone_clear
+      Stroke: {dark: $tone_ink_faint.dark, light: $tone_ink_faint.light}
+      Vector: {d: "M2 2.5 H14 V11 H2 Z M8 11 V14 M5 14 H11", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $chat_ring_stroke}
+      Tooltip: {text: "Local machine · connected to the daemon on this computer"}
+    }
     name : ui.Lead, Faint {
       TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
     }

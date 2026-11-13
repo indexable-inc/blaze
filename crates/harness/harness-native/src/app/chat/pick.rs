@@ -1,9 +1,5 @@
-//! Den's model and effort picker in a chat's status bar under its composer (scene/widgets/chat.flecs `hn.ChatPick`,
-//! in hn.ChatPane's `foot.status`), its context meter, and its plan meter (plan.rs).
-//!
-//! The status bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
-//! model takes, those up to the effort lit) and a small chevron, on a wash under the pointer, its words and lit bars
-//! easing toward the ink. Its tooltip says the model and effort and how to change them; never while its menu is open.
+//! The model and effort selectors live inline on each chat's sidebar row. Their separate hit targets open the
+//! existing model menu or effort slider beside the row; the bottom status area retains context and plan meters.
 //!
 //! The effort moves without opening anything: a sideways two-finger swipe over the control steps it a stop per detent
 //! (harness_native_ui_view::level::Swipe: each `PickFeel::step` points the fingers travel, momentum never steps), with a
@@ -12,7 +8,7 @@
 //! moment after), sent `PickFeel::commit` after the last step (one switch for a swipe through several stops, never two
 //! requests racing), and dropped once the chat says it runs with it.
 //!
-//! A press opens the menu above it (hn.ChatPickMenu, a fixed width): the models (Command-/ opens them alone), then the
+//! A press opens the menu beside it (hn.ChatPickMenu, a fixed width): the models (Command-/ opens them alone), then the
 //! effort as a level slider (prims level.flecs `ui.LevelSlider`: press or drag to a stop, the arrows step it, a swipe
 //! over it steps it as over the control; the menu stays open). The models are searchable (search_menu.flecs's filter,
 //! harness_native_ui_view::search): typing filters them, the first match highlighted, up and down move, Return picks.
@@ -128,9 +124,6 @@ struct Label<'a> {
     cur: Option<&'a ModelChoice>,
     name: &'a str,
     effort: &'a str,
-    words: String,
-    level: Option<(usize, usize)>,
-    tip: String,
 }
 
 impl<'a> Label<'a> {
@@ -140,19 +133,7 @@ impl<'a> Label<'a> {
         let (model, effort) = shown(t, listed);
         let cur = current(t, models, model);
         let name = cur.map_or(model, |c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() });
-        // The model's name and its effort's level; an effort with no place among its model's said in words
-        // ("Opus · Medium"), and the model alone when the effort is unknown. The effort's name is the tooltip either way.
-        let level = level(cur, effort);
-        let words = match level {
-            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(effort)),
-            _ => name.to_owned(),
-        };
-        let tip = if effort.is_empty() {
-            "Model and effort  \u{2318}/".to_owned()
-        } else {
-            format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(effort))
-        };
-        Self { models, cur, name, effort, words, level, tip }
+        Self { models, cur, name, effort }
     }
 }
 
@@ -200,11 +181,16 @@ impl Capability {
 
 /// A sidebar's quiet model profile and its full explanation. The transcript and daemon listing resolve exactly as
 /// the model picker does; no effort or capability is invented for a model the agent has not described.
-pub(in crate::app) fn sidebar_model(
+#[cfg(test)]
+fn sidebar_model(
     transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>, listed: (&str, &str),
 ) -> (String, String, Option<(usize, usize)>) {
     let empty = Transcript::default();
     let label = Label::of(transcript.unwrap_or(&empty), kind, kept, listed);
+    sidebar_label(&label, label.effort)
+}
+
+fn sidebar_label(label: &Label<'_>, effort: &str) -> (String, String, Option<(usize, usize)>) {
     if label.name.is_empty() {
         return (String::new(), String::new(), None);
     }
@@ -217,10 +203,20 @@ pub(in crate::app) fn sidebar_model(
     if let Some(c) = capability {
         tip.push_str(&format!("\n{} capability tier (curated)", c.word()));
     }
-    if !label.effort.is_empty() {
-        tip.push_str(&format!("\n{} thinking effort", effort_word(label.effort)));
+    if !effort.is_empty() {
+        tip.push_str(&format!("\n{} thinking effort", effort_word(effort)));
     }
-    (family, tip, level(label.cur, label.effort))
+    (family, tip, level(label.cur, effort))
+}
+
+/// Find a chat's inline control by its action rather than coupling menus to the tree's keyed row storage.
+fn sidebar_control(w: WorldRef<'_>, sid: u64, page: Pick) -> Option<View<'_>> {
+    let name = format!("chat:pick:{sid}:{}", if page == Pick::Effort { "effort" } else { "model" });
+    let mut found = None;
+    w.new_query::<&Action>().each_entity(|e, action| {
+        if action.name.as_str() == name { found = Some(View::of(e)); }
+    });
+    found
 }
 
 /// A token count as the meter's popover says it: 950, 46.2k, 258k, 1M.
@@ -246,12 +242,7 @@ fn arc(f: f64) -> String {
     format!("M6 1 A5 5 0 {} 1 {x:.3} {y:.3}", u8::from(f > 0.5))
 }
 
-fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
-    let m = |x: f32, y: f32| x + (y - x) * k;
-    Rgba { r: m(a.r, b.r), g: m(a.g, b.g), b: m(a.b, b.b), a: m(a.a, b.a) }
-}
-
-/// The Fill of scene prefab `path` (`hn.ChatControlInk.rest`); the scene always has it.
+/// The Fill of scene prefab `path`; the scene always has it.
 pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
@@ -259,33 +250,6 @@ pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
 pub(super) fn set_fill(v: View<'_>, f: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(f) {
         v.set(f);
-    }
-}
-
-/// The status bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
-pub(super) struct ControlInk {
-    pub rest: Fill,
-    pub hot: Fill,
-    pub off: Fill,
-}
-
-impl ControlInk {
-    pub(super) fn of(w: WorldRef<'_>) -> Self {
-        Self {
-            rest: fill_of(w, "hn.ChatControlInk.rest"),
-            hot: fill_of(w, "hn.ChatControlInk.hot"),
-            off: fill_of(w, "hn.ChatControlInk.off"),
-        }
-    }
-
-    /// The ink of control `v` now: at rest eased toward hot by its hover spring (which starts with it).
-    pub(super) fn now(&self, v: View<'_>) -> Fill {
-        let e = v.entity();
-        if !e.has(HoverAmt::id()) {
-            e.set(HoverAmt::default());
-        }
-        let k = e.try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
-        Fill { dark: mix(self.rest.dark, self.hot.dark, k), light: mix(self.rest.light, self.hot.light, k) }
     }
 }
 
@@ -348,6 +312,18 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
 }
 
 impl App {
+    /// The inline row follows a pending effort immediately, using the same state as the menu and keyboard shortcut.
+    pub(in crate::app) fn sidebar_profile(
+        &self, sid: u64, transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>,
+        listed: (&str, &str), ended: bool,
+    ) -> (String, String, Option<(usize, usize)>) {
+        let empty = Transcript::default();
+        let t = transcript.unwrap_or(&empty);
+        let label = Label::of(t, kind, kept, listed);
+        let effort = self.chat.borrow_mut().entry(sid).or_default().effort.shown(t, ended, label.effort, self.time);
+        sidebar_label(&label, &effort)
+    }
+
     /// The status bar's picker, context meter and plan meter for chat `sid` (`bar`: hn.ChatPane's foot.status; transcript
     /// `t`, an agent of kind `kind`, `listed` the daemon's `(model, effort)` for it, `ended` when no agent runs it), and
     /// its menu while `open`.
@@ -361,36 +337,14 @@ impl App {
         let Label { models, cur, name, effort: said, .. } = Label::of(t, kind, &kept, listed);
         let effort = eff.shown(t, ended, said, self.time);
         let context = t.context.as_ref().filter(|c| c.window > 0);
-        let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
-        let ink = ControlInk::of(w);
-        // The model's name and its effort's level; an effort with no place among its model's said in words
-        // ("Opus · Medium"), and the model alone when the effort is unknown. While the effort moves, and a moment after,
-        // its name after the meter.
-        let level = level(cur, &effort);
-        let words = match level {
-            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(&effort)),
-            _ => name.to_owned(),
-        };
-        let feel = crate::look::pick_feel(w);
-        let moving = eff.wish.is_some() || eff.moved.is_some_and(|m| self.time - m < feel.word);
-        let word = (moving && level.is_some()).then(|| effort_word(&effort));
-        // Its tooltip says what it is and how to change it; none while the menu is open (it would cover the menu).
-        let tip = match (open, level.is_some()) {
-            (Some(_), _) => String::new(),
-            (None, true) => format!("{name} \u{b7} {} effort  \u{2318}/\nSwipe sideways here to change the effort", effort_word(&effort)),
-            (None, false) if !effort.is_empty() => format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(&effort)),
-            (None, false) => "Model and effort  \u{2318}/".to_owned(),
-        };
-        let shown = (!name.is_empty()).then_some(("model", "hn.ChatPick", ()));
-        view::for_each_of(pick, shown, |v, (), _| {
-            control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink, word.as_deref());
-        });
+        let Some(meter_slot) = bar.part("meter") else { return };
+        let ink = tone(w, "ink");
         // One ring: how full the context is, breathing while the agent works (the composer's one sign of work: Return sends,
         // Escape stops). Before the first turn says how full, a working agent's ring is an empty track.
         let working = t.busy && !ended;
         let shown = (context.is_some() || working).then_some(("context", "hn.ChatContext", ()));
         view::for_each_of(meter_slot, shown, |v, (), _| {
-            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink.hot);
+            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink);
             breathe(v, working);
             // A press opens the popover to the whole account (context.rs), another closes it.
             let action = Action { name: format!("chat:ctx:{sid}").as_str().into() };
@@ -411,8 +365,8 @@ impl App {
                 (self.pointer.x, self.pointer.y),
             );
         }
-        // Open, the menu floats above the control, its leading edge on the control's.
-        let trigger = open.and_then(|_| pick.part("model"));
+        // The menu belongs to the selected sidebar row, beside the model or effort control that opened it.
+        let trigger = open.and_then(|page| sidebar_control(w, sid, page));
         let Some(menu) = bar.part("menu") else { return };
         let page = open.filter(|_| trigger.is_some());
         view::for_each_of(menu, page.map(|_| ("plate", "hn.ChatPickMenu", ())), |_, (), _| {});
@@ -442,6 +396,8 @@ impl App {
         if self.external_session(sid).is_some() {
             return;
         }
+        self.genui_blur();
+        self.side_open = true;
         let mut states = self.chat.borrow_mut();
         for (s, st) in states.iter_mut() {
             if *s != sid {
@@ -459,7 +415,12 @@ impl App {
     pub(in crate::app) fn chat_pick_action(&mut self, rest: &str) {
         let Some((sid, page)) = rest.split_once(':') else { return };
         if let (Ok(sid), Some(page)) = (sid.parse(), Pick::parse(page)) {
-            self.chat_pick_toggle(sid, page);
+            if self.external_session(sid).is_some() { return; }
+            if let Some(entity) = self.entity_of(sid) {
+                self.select(Some(entity));
+                self.tree_focus = false;
+                self.chat_pick_toggle(sid, page);
+            }
         }
     }
 
@@ -772,16 +733,12 @@ impl App {
             over(w.entity_from_id(s)).then_some(*sid)
         });
         slider.or_else(|| {
-            self.panes().into_iter().find_map(|p| {
-                let o = model::shows(w, p)?;
-                if model::pane_kind(o) != model::PaneKind::Chat {
-                    return None;
-                }
-                if self.focused_pane() != Some(p) {
-                    return None;
-                }
-                let control = View::of(w.entity_from_id(self.ids.side_chat)).part("pick")?.part("model")?;
-                over(control.entity()).then(|| self.session_of(*o.id())).flatten()
+            let hovered = w.lookup(APP).target(Hovered::id(), 0)?;
+            std::iter::successors(Some(hovered), |e| e.parent()).take(64).find_map(|e| {
+                let action = e.try_cloned::<&Action>()?;
+                let mut parts = action.name.as_str().strip_prefix("chat:pick:")?.split(':');
+                let sid = parts.next()?.parse().ok()?;
+                (parts.next()? == "effort").then_some(sid)
             })
         })
     }
@@ -861,29 +818,6 @@ impl App {
             st.pick = Some(p);
             st.pick_nav.search.edit(Edit::Type(query));
         }
-    }
-}
-
-/// The picker's control: its action, its tooltip (none: empty), its words, its effort's level (`level`: the effort's
-/// place among how many) and, while the effort moves, its name after the meter (`word`); in the rest ink eased toward
-/// the hot one by its hover spring, a level's unlit bars faint.
-fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usize, usize)>, ink: &ControlInk, word: Option<&str>) {
-    v.action(action);
-    if v.entity().try_cloned::<&Tooltip>().is_none_or(|t| t.text.as_str() != tip) {
-        v.set(Tooltip { text: tip.into() });
-    }
-    let now = ink.now(v);
-    if let Some(p) = v.part("label") {
-        p.text(words);
-        set_fill(p, now);
-    }
-    if let Some(m) = v.part("effort") {
-        effort_meter(m, level, now, ink.off);
-    }
-    if let Some(slot) = v.part("word") {
-        view::for_each_of(slot, word.map(|w| ("word", "hn.ChatPickWord", w)), |p, w, _| {
-            p.text(w);
-        });
     }
 }
 
@@ -1358,14 +1292,14 @@ mod tests {
     #[test]
     fn a_new_chat_shows_its_remembered_choice_from_its_first_frame() {
         let kept = kept();
-        let said = |l: &Label<'_>| (l.words.clone(), l.level, l.tip.clone());
+        let said = |l: &Label<'_>| (l.name.to_owned(), level(l.cur, l.effort));
         let unseeded = Transcript::default();
         assert_eq!(Label::of(&unseeded, "claude", &kept, ("", "")).name, "", "the cause: nothing names a model yet");
 
         let mut t = Transcript::default();
         t.start_on(Some("opus"), Some("high"));
         let first = said(&Label::of(&t, "claude", &kept, ("", "")));
-        assert_eq!(first, ("Opus 5.5".to_owned(), Some((2, 4)), "Opus 5.5 \u{b7} High effort  \u{2318}/".to_owned()));
+        assert_eq!(first, ("Opus 5.5".to_owned(), Some((2, 4))));
 
         // The agent is up: its `session` names the model as it runs; then the daemon's listing; then its own list.
         let ev = |body: Body| Event { ts: 1, body };
@@ -1379,6 +1313,6 @@ mod tests {
         let mut c = Transcript::default();
         c.apply(&ev(Body::Choice { model: Some("opus".into()), effort: Some("low".into()) }));
         c.start_on(Some("opus"), Some("high"));
-        assert_eq!(Label::of(&c, "claude", &kept, ("", "")).level, Some((0, 4)));
+        assert_eq!(said(&Label::of(&c, "claude", &kept, ("", ""))).1, Some((0, 4)));
     }
 }

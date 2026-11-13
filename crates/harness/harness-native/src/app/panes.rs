@@ -705,6 +705,7 @@ impl App {
             self.web_drag_move();
             return;
         }
+        if self.palette.is_some() { self.palette_pointer_drag(); self.poke(); return; }
         // Over a live browser page, or holding a press on one: the page's (app/browser.rs).
         if self.browser_pointer_move(m) {
             self.poke();
@@ -774,6 +775,7 @@ impl App {
         // A press off the row whose name is being renamed saves the rename (chat/rename.rs), and does what it does.
         self.rename_press();
         if self.palette.is_some() {
+            if b == Button::Left { self.palette_pointer_down(clicks); }
             return;
         }
         // A press on a live browser page focuses it and goes there; one elsewhere takes the keyboard from it.
@@ -832,6 +834,10 @@ impl App {
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
+        }
+        if self.palette.is_some() {
+            if let Some(p) = self.palette.as_mut() { p.query_drag = None; }
+            return;
         }
         if self.browser_pointer_up(b, m) {
             self.poke();
@@ -1248,10 +1254,7 @@ impl App {
             return;
         }
         if self.palette.is_some() {
-            if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
-                p.query.push_str(text.lines().next().unwrap_or(""));
-            }
-            self.poke();
+            self.palette_type(&text.replace(['\n', '\r', '\t'], " "));
             return;
         }
         if self.archive_text(text) || self.chat_type(text) {

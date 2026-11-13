@@ -73,7 +73,7 @@ const HANDLERS: &[(&str, Handler)] = &[
         a.palette = if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Commands) {
             None
         } else {
-            Some(Palette::new())
+            Some(Palette::new(a.time))
         }
     }),
     ("Zoom", |a, act, _| {
@@ -113,14 +113,7 @@ const HANDLERS: &[(&str, Handler)] = &[
             a.choose(d);
         }
     }),
-    ("PaletteErase", |a, _, _| {
-        let time = a.time;
-        if let Some(p) = a.palette.as_mut() {
-            p.query.pop();
-            p.at = 0;
-            p.changed = time;
-        }
-    }),
+    ("PaletteErase", |a, _, _| a.palette_edit("backspace")),
     ("SearchClear", |a, _, _| a.archive_search(SearchEdit::Clear)),
     ("SearchErase", |a, _, _| a.archive_search(SearchEdit::Erase)),
     ("ArchiveOpenFirst", |a, _, _| a.archive_open_first()),
@@ -240,7 +233,7 @@ impl App {
         let names: &[&str] = if self.picking() {
             &[keys::PICKER]
         } else if self.palette.is_some() {
-            &[keys::PALETTE]
+            &[keys::PALETTE, keys::CHAT]
         } else if self.browser_focused() {
             &[keys::BROWSER]
         } else if self.archive_focused() {
