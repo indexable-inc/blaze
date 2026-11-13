@@ -22,6 +22,8 @@ main.intro[data-on] .wordmark canvas { display: block; }
 .doc.intro .dim { margin: 0; font-size: 13.5px; color: var(--ink-3); }
 .doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
 .doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+/* The last quiet line is the page's footer: the reference pages, at the bottom of the window, not under the button. */
+.doc.intro .intro-after > .dim:last-child { position: absolute; left: 0; right: 0; bottom: 18px; }
 
 /* A race (content/schema.flecs Race; render.rs): blaze and cargo building the same edit, two lanes of cells on one
    time scale, each with its time. The lit cells are how long each took: blaze's few in the fire's colour, cargo's

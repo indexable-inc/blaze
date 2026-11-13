@@ -536,8 +536,8 @@ mod tests {
 
 /// A race: blaze and cargo building the same edit, as two lanes of cells on one time scale (the slower fills its
 /// lane), each with its time. The times are the build's (`Raced`, from the benchmark history: gen/bench/race.ts), and
-/// the caption says which run: the edit, the project, the platform and the day, with the machine, the commit and
-/// the number of edits in its title. As rendered the lanes stand finished; client/intro.ts runs them in real time
+/// the caption is one line, the edit and the project, linking to every benchmark; which run it was (the blaze, the
+/// platform, the day, the machine, the commit and the number of edits) is in its title and on that page. As rendered the lanes stand finished; client/intro.ts runs them in real time
 /// from `data-blaze-ms` and `data-cargo-ms`.
 fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     let e = ctx.e(n);
@@ -579,7 +579,11 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     };
     let commit = field(Some(raced), "commit");
     let runs = js::to_number(raced.get("runs"));
-    let mut how = vec![field(Some(raced), "machine")];
+    let mut how = vec![
+        format!("{} on {}", of, field(ask, "platform")),
+        field(Some(raced), "date"),
+        field(Some(raced), "machine"),
+    ];
     if !commit.is_empty() {
         how.push(format!("blaze {}", js::slice_utf16(&commit, 10)));
     }
@@ -588,18 +592,15 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     }
     how.retain(|h| !h.is_empty());
     Ok(format!(
-        "<figure class=\"race\" data-blaze-ms=\"{}\" data-cargo-ms=\"{}\" title=\"{}\">{}{}<figcaption><span>{} in {}, then build</span> · <span>{} on {}</span> · <span>{}</span> · <a href=\"{}\">All benchmarks</a></figcaption></figure>",
+        "<figure class=\"race\" data-blaze-ms=\"{}\" data-cargo-ms=\"{}\" title=\"{}\">{}{}<figcaption><a href=\"{}\">{} in {}, then build</a></figcaption></figure>",
         js::number((blaze * 1000.0).round()),
         js::number((cargo * 1000.0).round()),
         esc(&how.join(", ")),
         lane("blaze", blaze),
         lane("cargo", cargo),
+        esc(&ctx.s.served.href(&to.url)),
         esc(&field(Some(raced), "edit")),
         esc(&field(Some(raced), "project")),
-        esc(&of),
-        esc(&field(ask, "platform")),
-        esc(&field(Some(raced), "date")),
-        esc(&ctx.s.served.href(&to.url)),
     ))
 }
 
