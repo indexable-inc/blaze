@@ -121,6 +121,10 @@ pub enum RowRead {
     /// reads its value was first made from, so it is handed over whole and not descended.
     /// The caller reads that record's own shape.
     Stored(Read),
+    /// A row it was told to descend through that let go of its reads behind the seal of a
+    /// library group ([`super::seal::Seals::let_go`]): what its value rests on is what that
+    /// group's seal vouches for, so it is handed over whole with its group, not descended.
+    Sealed(Read, super::SealGroup),
     /// A row it was told to descend through that could not be brought up to date in this
     /// view ([`super::Refreshed::Unsettled`]: on this task's stack, provisional): its kept
     /// reads are not what its value rests on now, so it is handed over whole.
@@ -167,7 +171,8 @@ impl Reads {
     ///   reads each row descended (the refresh records it), so it runs again when one of
     ///   them does and its kept reads change;
     /// - one that cannot be brought up to date is handed over as [`RowRead::Unsettled`], and
-    ///   one answered from a store as [`RowRead::Stored`]: neither is descended.
+    ///   one answered from a store, or one behind a library's seal that let go of its reads,
+    ///   as [`RowRead::Stored`]: neither is descended.
     ///
     /// An interned read records no edge, so none is given, here or in a row descended.
     ///
@@ -225,8 +230,19 @@ impl Reads {
                     continue;
                 }
                 let header = current_row(storage, &read, "to descend through it");
-                if header.meta.load(std::sync::atomic::Ordering::Relaxed) & STORED != 0 {
-                    if let ControlFlow::Break(out) = each(RowRead::Stored(read)) {
+                // A row answered from a store, or whose reads a seal pass let go
+                // ([`super::seal::Seals::let_go`]), is handed over whole: what its value rests
+                // on is the store's record, or what its group's seal vouches for; descended,
+                // its empty span would say it rests on nothing.
+                let handed = match header.meta.load(std::sync::atomic::Ordering::Relaxed) & STORED {
+                    0 if storage.seals.let_go(node) => {
+                        Some(RowRead::Sealed(read, storage.seals.sealed_group(node)))
+                    }
+                    0 => None,
+                    _ => Some(RowRead::Stored(read)),
+                };
+                if let Some(handed) = handed {
+                    if let ControlFlow::Break(out) = each(handed) {
                         rows.clear();
                         return ControlFlow::Break(out);
                     }
@@ -246,7 +262,9 @@ impl Storage {
     /// # Panics
     ///
     /// When the row is not current in this view, naming it: bring it up to date first
-    /// ([`super::refresh`]).
+    /// ([`super::refresh`]). When the row let go of its reads behind a library's seal
+    /// ([`super::seal::Seals::let_go`]), naming it: they are not kept, and an empty list would
+    /// say the row read nothing.
     pub fn row_reads<B>(
         &self,
         row: DatabaseKeyIndex,
@@ -254,6 +272,13 @@ impl Storage {
     ) -> Option<B> {
         let read = Read { key: row, kind: ReadKind::Function };
         let header = current_row(self, &read, "its own");
+        let node = header.node.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !self.seals.let_go(node),
+            "the reads of row {row:?} were let go behind its library's seal (a seal pass keeps \
+             no forward edges of a library's rows): row_reads cannot name them; key by the row \
+             itself, or ask for it after it has run again"
+        );
         let kept = header.edges.load(std::sync::atomic::Ordering::Acquire);
         for edge in span::start(kept)..span::start(kept) + span::len(kept) {
             if let ControlFlow::Break(out) = each(read_of_key(self.key_of(self.edge(edge)))) {

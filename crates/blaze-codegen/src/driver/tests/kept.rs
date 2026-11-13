@@ -749,7 +749,7 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     assert_eq!(counts(&first), (COUNT, 0, COUNT, 0));
     assert_eq!((first.fresh, asked), (Some(Fresh::Restart), (COUNT, 0)));
     assert!(first.whole.is_some(), "nothing was kept to patch");
-    assert_eq!(kept.len(), COUNT);
+    assert_eq!(kept.functions(), COUNT, "the kept walk's nodes, the one copy of its describes");
 
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").body = 0x12;
     program.touch(COUNT as u32);
@@ -783,11 +783,18 @@ fn a_build_that_keeps_no_walk_says_so() {
     assert_eq!((walk.fresh, walk.whole), (Some(Fresh::Unkept), Some("the build keeps no walk")));
 }
 
-/// The two rounds of a walk over a program with dyn facts keep their describes apart: the
-/// next build takes each round's, and a changed fact describes again only the body that read
-/// it, in the round against the facts.
+/// The invariant: a whole walk takes no describe from memory, so what a [`Kept`] holds of the
+/// front end's describes is its kept walks' nodes and nothing beside them. A program with dyn
+/// facts closes them, so each of its builds walks whole, both rounds; with no store to read
+/// records from, every build describes every function of both rounds again, and what is kept
+/// after any of them is the one walk of the program: an entry no root reaches any more
+/// (function 5, once the fact moves) is held by nothing.
+///
+/// Control: before 2026-11-13 the walk kept every describe in a table a round besides, by the
+/// instance; the second build then read `(0, 10, 5)` and `Kept` held 10 describes past its
+/// walk, which `functions` and these counts catch.
 #[test]
-fn each_round_of_a_walk_keeps_its_own_describes() {
+fn a_whole_walk_keeps_no_describe_beside_its_walk() {
     let mut program = program();
     program.dyn_sites.insert(2, 5);
     let kept = Kept::new();
@@ -797,11 +804,13 @@ fn each_round_of_a_walk_keeps_its_own_describes() {
     };
     let first = walk(&program);
     assert_eq!((first.described, first.verified, first.reached), (10, 0, 5));
+    assert!(kept.functions() <= first.reached, "{} kept past a walk of {}", kept.functions(), first.reached);
     let again = walk(&program);
-    assert_eq!((again.described, again.verified, again.reached), (0, 10, 5));
+    assert_eq!((again.described, again.verified, again.reached), (10, 0, 5));
     set_fact(&mut program, 2, 3);
     let flipped = walk(&program);
-    assert_eq!((flipped.described, flipped.verified, flipped.reached), (1, 9, 5));
+    assert_eq!((flipped.described, flipped.verified), (10, 0));
+    assert!(kept.functions() <= flipped.reached, "{} kept past a walk of {}", kept.functions(), flipped.reached);
 }
 
 /// A function's entry holds what the link reads of it beside its code: a leaf whose owner

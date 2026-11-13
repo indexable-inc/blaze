@@ -2,6 +2,9 @@
 //! roots and the crate graph.
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
@@ -480,6 +483,10 @@ fn not_there(error: &std::io::Error) -> bool {
 
 /// What [`IncludedFile::content_now`] last read of each path, with the generation of the
 /// watches outside every view ([`blaze_vfs::outside::generation`]) read before it looked.
+#[expect(
+    blaze::process_static,
+    reason = "one row per included path ever read, never pruned: the database that reads the files should own it"
+)]
 static VOUCHED: std::sync::LazyLock<
     blaze_core::lock::Lock<blaze_hash::HashMap<std::path::PathBuf, (u64, ContentId), Global>>,
 > = std::sync::LazyLock::new(|| {

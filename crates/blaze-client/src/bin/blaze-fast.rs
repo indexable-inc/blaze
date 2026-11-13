@@ -26,8 +26,7 @@ use blaze_api::{Envelope, Response, Severity, TestOutcome, Verb, json};
 use blaze_client::{Client, Connect, Error, Options, Start, WhyOptions, place};
 use blaze_report::{Caps, Report, Roots};
 
-const USAGE: &str = "\
-blaze-fast: build, check, test, why and status asked of blaze's daemon, with no compiler linked
+const USAGE: &str = r"blaze-fast: build, check, test, why and status asked of blaze's daemon, with no compiler linked
 
 usage: blaze-fast [--home DIR] [--blaze PROGRAM] [--within SECONDS] [--json] COMMAND [OPTIONS]
 

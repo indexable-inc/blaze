@@ -6,6 +6,9 @@
 //! from where is said at the top of each module; the plan is `docs/v2/plan.md`.
 
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod api;
 pub mod auth;

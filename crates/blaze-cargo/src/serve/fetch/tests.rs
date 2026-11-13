@@ -59,7 +59,7 @@ const WINDOWS: u32 = 16;
 /// every test leaks one.
 fn fetcher(fake: &Arc<Fake>) -> Kept {
     let dir = tempfile::tempdir().unwrap();
-    let driven = blaze_cas::Driven::open_reserving(dir.path(), blaze_cas::Loader::Pumped, WINDOWS);
+    let driven = blaze_cas::Driven::open_reserving(dir.path(), crate::serve::direct::pool::pumped(), WINDOWS);
     let driven = Box::leak(Box::new(driven.unwrap()));
     let store = Box::leak(Box::new(driven.handle()));
     let fetcher = Fetcher::with_http(fake.clone(), dir.path().join("scratch"))
@@ -142,11 +142,7 @@ fn fetch_crate(entries: &[Entry<'_>]) -> Result<Source, blaze_api::ApiError> {
 }
 
 fn file(path: &str, bytes: &[u8], mode: Mode) -> SourceFile {
-    SourceFile {
-        path: path.to_owned(),
-        bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes),
-        mode,
-    }
+    SourceFile::of(path.to_owned(), blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes), mode)
 }
 
 /// A fetched package is written on disk where it is mounted, whole, modes kept: a build script

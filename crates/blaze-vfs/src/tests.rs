@@ -124,6 +124,58 @@ fn the_same_files_hash_alike_however_they_were_made() {
     assert_eq!(tree.id(a), ContentId::of(FILE_DOMAIN, b""));
 }
 
+/// The invariant: files mounted with the IDs their reader made ([`Vfs::apply_known_files`])
+/// make the tree, the same root ID and the same file IDs, that hashing their bytes here
+/// ([`Vfs::apply_files`]) makes. Control: one file's bytes and ID changed changes the root in
+/// both, so the equality is not of two empty or unread trees.
+#[test]
+fn files_with_known_ids_make_the_tree_their_bytes_make() {
+    let listing: &[(&str, &[u8], Mode)] = &[
+        ("lib/core/src/lib.rs", b"pub mod num;", Mode::Regular),
+        ("lib/core/src/num.rs", b"pub fn f() {}", Mode::Regular),
+        ("bin/tool", b"#!/bin/sh", Mode::Executable),
+        ("lib/link", b"core", Mode::Symlink),
+    ];
+    fn mount(
+        listing: &[(&str, &[u8], Mode)],
+        known: bool,
+    ) -> (BTreeMap<String, Vec<u8>>, ContentId) {
+        let mut vfs = new_vfs();
+        let bytes = |it: &[u8]| crate::Bytes::from(std::sync::Arc::<[u8]>::from(it));
+        let root = match known {
+            false => vfs.apply_files(
+                vfs.empty(),
+                listing.iter().map(|&(path, it, mode)| (path.to_owned(), bytes(it), mode)),
+            ),
+            true => vfs.apply_known_files(
+                vfs.empty(),
+                listing.iter().map(|&(path, it, mode)| {
+                    (path.to_owned(), ContentId::of(FILE_DOMAIN, it), bytes(it), mode)
+                }),
+            ),
+        }
+        .unwrap();
+        (contents(&vfs, root), root)
+    }
+    let (hashed, hashed_root) = mount(listing, false);
+    let (known, known_root) = mount(listing, true);
+    assert_eq!(hashed_root, known_root);
+    assert_eq!(hashed, known);
+    assert_eq!(hashed.len(), listing.len());
+
+    let edited: Vec<(&str, &[u8], Mode)> = listing
+        .iter()
+        .map(|&(path, it, mode)| match path {
+            "lib/core/src/num.rs" => (path, &b"pub fn g() {}"[..], mode),
+            _ => (path, it, mode),
+        })
+        .collect();
+    let (_, edited_hashed) = mount(&edited, false);
+    let (_, edited_known) = mount(&edited, true);
+    assert_eq!(edited_hashed, edited_known);
+    assert_ne!(edited_known, known_root);
+}
+
 #[test]
 fn a_transaction_applies_whole_or_not_at_all() {
     let mut tree = Tree::new();

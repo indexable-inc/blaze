@@ -293,7 +293,9 @@ struct Scratch {
 
 impl Scratch {
     fn new(overlays: usize) -> Result<Scratch, String> {
-        let base = std::env::temp_dir();
+        // Not a `TempDir`: the profile names the canonical path, and a drop must first make
+        // writable what the program left unremovable.
+        let base = blaze_core::temp::base();
         let base = std::fs::canonicalize(&base).unwrap_or(base);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -343,6 +345,11 @@ impl Drop for Scratch {
 /// Runs `program` sandboxed as `spec` and `also` say, or with `None` makes the sandbox and runs
 /// nothing in it. What it ends with: its status, or 128 and the signal that ended it.
 #[allow(unsafe_code, reason = "fork")]
+#[expect(
+    blaze::tmp_path,
+    reason = "the profile answers the machine's /private/tmp from an empty directory of the \
+              run's own, so the real directory by name is the policy"
+)]
 pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
     let library = library()?;
     let scratch = Scratch::new(spec.overlays.len())?;
@@ -836,12 +843,11 @@ mod tests {
         let kept =
             |seen: Seen, what: &str| recorder.lines().any(|it| it.seen == seen && it.what == what);
         assert!(kept(Seen::Env, "HOME") && kept(Seen::Untraceable, "clock"));
-        let dir = std::env::temp_dir().join(format!("blaze-macos-merge-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-macos-merge-");
         let file = dir.join("record");
         recorder.write(&file);
         let text = std::fs::read_to_string(&file).unwrap();
-        _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 8, "{text}");
         assert_eq!(lines[0], "R\ta::b\t/w/data.txt");
@@ -868,9 +874,9 @@ mod tests {
 
     #[test]
     fn a_process_that_left_the_group_and_still_runs_makes_the_record_not_whole() {
-        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().map(stdx::JodChild).unwrap();
         let gone_pid = gone.id();
-        gone.wait().unwrap();
+        stdx::child::exit_within(&mut gone, "`/usr/bin/true`", std::time::Duration::from_secs(60));
         let mut recorder = Recorder::new(&Spec::default(), &[]);
         let raw = format!("S\t{gone_pid}\nS\t{}\n", std::process::id());
         assert_eq!(super::merge(&raw, &mut recorder), None);
@@ -963,8 +969,8 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().unwrap();
-        let dir = std::env::temp_dir().join(format!("blaze-macos-v2-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
+        let made = blaze_core::temp::TempDir::for_test("blaze-macos-v2-");
+        let dir = made.path().to_path_buf();
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("a"), "").unwrap();

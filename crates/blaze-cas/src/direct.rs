@@ -26,16 +26,16 @@
 //! simulation): `ReadInto` with `Cache::Kept` and `Priority::Demand`, and [`Effect::Map`].
 //!
 //! **The verification rule.** Every record is checked whole on every read and every map, with
-//! nothing remembered: its 96-byte header decodes (which checks the header's CRC-32C), names the
-//! key asked, and agrees with the index on its form, stored and raw lengths; its payload decodes
-//! to exactly `raw` bytes; and those bytes hash (BLAKE3) to the content the header records. The
-//! format (8) gives nothing cheaper: the header's CRC covers only the header, and the per-block
-//! CRC-32Cs of `checks-<n>` cover whole 4 KiB blocks, which a 256-byte record would have to read
-//! in full (16 times its bytes) to check. BLAKE3 at about 1 GB/s a core costs some 0.25 µs of a
-//! 256-byte record's 0.6 µs read: over the 10% this design is held to. The fix is the format's,
-//! not this module's: a CRC-32C of the payload in the record's header (the header grows from 96 to
-//! 112 bytes, format 8 to 9), checked on every read at some 3% of its cost, with BLAKE3 kept for
-//! values fetched from elsewhere and for a pack's unsynced tail after a crash.
+//! nothing remembered: its 96-byte header and its payload match the record's CRC-32C (format 9,
+//! [`RecordHeader::check`]), it names the key asked, it agrees with the index on its form, stored
+//! and raw lengths, and its payload decodes to exactly `raw` bytes. The CRC (hardware, some
+//! 0.03 ns a byte: about 20 ns of a 256-byte record's 0.6 µs read, 3%) replaces the BLAKE3 of the
+//! value (about 1 GB/s a core, some 0.25 µs, 40%) on the read path. BLAKE3 stays where no record's
+//! CRC covers the bytes: a format-8 record (its CRC covers its header only, read forward), a value
+//! in a file of its own, a format-8 chunked value made whole; and for the scrub and for bytes
+//! fetched from elsewhere. A chunked value is its list (a record, checked) and its chunks (each a
+//! record, checked), read in a second round of the call by their keys; a file of its own is read
+//! whole in that round.
 //!
 //! **Coalescing.** Two records of one file at most `plan::GAP_MOST` (4 KiB) apart are read as
 //! one run: the gap's bytes cost about 0.4 µs of copy at the page cache's ~10 GB/s, less than the
@@ -82,7 +82,7 @@ use std::{
 };
 
 use blaze_core::{
-    ABANDONED_SPAN, Completion, Done, Driver, Effect, FileName, IDLE_STALL, Mapping, Spans,
+    ABANDONED_SPAN, Completion, Done, Driver, Effect, Extent, FileName, IDLE_STALL, Mapping, Spans,
     spans::SpansFull, wait::Deadline,
 };
 use blaze_format::SchemaHash;
@@ -91,9 +91,8 @@ use blaze_ids::ContentId;
 
 use crate::{
     Key, Reader, Use, cold,
-    disk::{Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of},
-    flags::Flag,
-    read::{Found, Look, Place, Shared, View},
+    disk::{self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, Sealed, content_of},
+    read::{Found, Look, Place, Shared, View, whole_by_crc},
     table::Held,
 };
 
@@ -118,10 +117,13 @@ pub(crate) enum Plant {
     /// The values of a batch are put in the order their records lie on disk, while the places
     /// handed back say the caller's order.
     SortedOrder,
-    /// A record's bytes are not hashed.
+    /// A record is not checked: neither its CRC (format 9's covers the payload) nor a hash of
+    /// its value.
     NoCheck,
     /// A run is read one byte short of its end.
     RunEnd,
+    /// A chunked value's first chunk is put last.
+    ChunkOrder,
 }
 
 /// The sans-IO core: the reads a batch of records needs, and what came of them.
@@ -515,6 +517,8 @@ pub enum Failed {
     NotMappable { key: Key, file: Option<FileName>, at: u64, why: String },
     /// The driver completed nothing for [`IDLE_STALL`] with the record's read in flight.
     Stalled { key: Key, file: FileName, at: u64, waited: Duration },
+    /// The value is kept in chunks, and the read of one of them failed as `chunk` says.
+    Chunk { key: Key, chunk: Box<Failed> },
 }
 
 impl Failed {
@@ -526,7 +530,8 @@ impl Failed {
             | Failed::Index { key, .. }
             | Failed::Form { key, .. }
             | Failed::NotMappable { key, .. }
-            | Failed::Stalled { key, .. } => *key,
+            | Failed::Stalled { key, .. }
+            | Failed::Chunk { key, .. } => *key,
         }
     }
 }
@@ -586,6 +591,9 @@ impl fmt::Display for Failed {
                  (blaze_core::IDLE_STALL); the buffer it read into is given up to the kernel",
                 key.0
             ),
+            Failed::Chunk { key, chunk } => {
+                write!(f, "the value of {:x} is kept in chunks, and one is not read: {chunk}", key.0)
+            }
         }
     }
 }
@@ -656,6 +664,8 @@ struct Want {
     file: FileName,
     /// Its number in the plan.
     n: u32,
+    /// Its number among the round's targets.
+    target: u32,
     loc: Loc,
     tier: usize,
     /// Found in the live layer's tiers, not the reader's own.
@@ -699,6 +709,18 @@ pub struct Direct {
     one: Vec<Placed>,
     mapped: Option<Done>,
     mapping: bool,
+    // alloc: the call's second-round values (chunked, a file of their own), as `targets`
+    follows: Vec<(u32, Follow)>,
+    // alloc: a value made whole in the second round, kept and cleared between calls
+    whole: Vec<u8>,
+    // alloc: a chunked value's list, copied out of the caller's buffer, kept between calls
+    list: Vec<u8>,
+    // alloc: a chunked value's chunk keys, kept between calls
+    chunk_keys: Vec<Key>,
+    // alloc: the answers of a chunk round, kept between calls
+    chunk_places: Vec<Placed>,
+    /// A round of chunks: only a chunk's forms are read.
+    chunk_round: bool,
     counts: Counts,
     #[cfg(test)]
     plant: Plant,
@@ -735,6 +757,17 @@ impl Direct {
             one: Vec::new(),
             mapped: None,
             mapping: false,
+            // alloc: empty
+            follows: Vec::new(),
+            // alloc: empty
+            whole: Vec::new(),
+            // alloc: empty
+            list: Vec::new(),
+            // alloc: empty
+            chunk_keys: Vec::new(),
+            // alloc: empty
+            chunk_places: Vec::new(),
+            chunk_round: false,
             counts: Counts::default(),
             #[cfg(test)]
             plant: Plant::None,
@@ -790,6 +823,24 @@ impl Direct {
         places: &mut Vec<Placed, B>,
     ) {
         self.begin();
+        let base = places.len();
+        self.read_round(driver, keys, into, places);
+        self.follow_up(driver, keys, into, base, places);
+        self.end();
+    }
+
+    /// One round of reads: `keys` located, their records read and checked, each value (a
+    /// chunked value's list, a file of its own's nothing, until `follow_up`) appended to `into`.
+    fn read_round<D: Driver, A: Allocator + Clone, B: Allocator>(
+        &mut self,
+        driver: &mut D,
+        keys: &[Key],
+        into: &mut Vec<u8, A>,
+        places: &mut Vec<Placed, B>,
+    ) {
+        self.plan.begin();
+        self.targets.clear();
+        self.held.clear();
         // clone: a refcount, so a look borrows nothing of `self`
         let shared = Arc::clone(&self.reader.shared);
         {
@@ -803,7 +854,179 @@ impl Direct {
         let start = into.len();
         let fetched = self.fetch(driver, into, start, total);
         self.assemble(&shared, into, start, &fetched, places);
-        self.end();
+    }
+
+    /// The call's second round: each chunked value's chunks read by key and put together in
+    /// its list's place, and each file of its own read whole into its place; a failure of
+    /// either answers its key, and the places after it move with the bytes.
+    fn follow_up<D: Driver, A: Allocator + Clone, B: Allocator>(
+        &mut self,
+        driver: &mut D,
+        keys: &[Key],
+        into: &mut Vec<u8, A>,
+        base: usize,
+        places: &mut Vec<Placed, B>,
+    ) {
+        if self.follows.is_empty() {
+            return;
+        }
+        let mut follows = std::mem::take(&mut self.follows);
+        let mut whole = std::mem::take(&mut self.whole);
+        for (n, follow) in follows.drain(..) {
+            let n = base + n as usize;
+            let Placed::Found { at, len } = places[n] else { continue };
+            let key = keys[n - base];
+            whole.clear();
+            let made = match follow {
+                Follow::Chunks { file, at: offset, content, hash } => {
+                    self.list.clear();
+                    self.list.extend_from_slice(&into[at..at + len]);
+                    self.chunks_into(driver, key, (file, offset), content, hash, &mut whole)
+                }
+                Follow::External { file, raw, content } => self.external_into(driver, key, file, raw, content, &mut whole),
+            };
+            let made_len = if made.is_ok() { whole.len() } else { 0 };
+            // The value in the list's place: what follows it moved by the difference, in place.
+            let tail = at + len..into.len();
+            if made_len > len {
+                into.resize(into.len() + (made_len - len), 0);
+                into.copy_within(tail, at + made_len);
+            } else if made_len < len {
+                let end = into.len() - (len - made_len);
+                into.copy_within(tail, at + made_len);
+                into.truncate(end);
+            }
+            into[at..at + made_len].copy_from_slice(&whole[..made_len]);
+            for place in &mut places[base..] {
+                if let Placed::Found { at: there, .. } = place
+                    && *there > at
+                {
+                    *there = *there - len + made_len;
+                }
+            }
+            places[n] = match made {
+                Ok(()) => Placed::Found { at, len: made_len },
+                Err(failed) => Placed::Failed(failed),
+            };
+        }
+        self.follows = follows;
+        self.whole = whole;
+    }
+
+    /// The value of `key`, kept in the chunks `self.list` names, put together in `whole`: each
+    /// chunk read by its key in one round, checked as every record is.
+    fn chunks_into<D: Driver>(
+        &mut self,
+        driver: &mut D,
+        key: Key,
+        (file, at): (FileName, u64),
+        content: ContentId,
+        hash: bool,
+        whole: &mut Vec<u8>,
+    ) -> Result<(), Failed> {
+        // clone: the error's file name, the list's record's
+        let corrupt = |what: String| Failed::Corrupt { key, file: file.clone(), at, what };
+        let mut chunk_keys = std::mem::take(&mut self.chunk_keys);
+        chunk_keys.clear();
+        // The list was checked whole when it was read (`chunk_list`).
+        // alloc: the error's message
+        let listed = disk::decode_chunks(&self.list).map_err(|what| corrupt(what.to_owned()))?;
+        chunk_keys.extend(listed.map(|(chunk, _)| chunk));
+        let mut chunk_places = std::mem::take(&mut self.chunk_places);
+        chunk_places.clear();
+        self.chunk_round = true;
+        self.read_round(driver, &chunk_keys, whole, &mut chunk_places);
+        self.chunk_round = false;
+        let mut cursor = 0;
+        let mut made = Ok(());
+        let listed = disk::decode_chunks(&self.list).expect("decoded just above");
+        for ((chunk, len), place) in listed.zip(&chunk_places) {
+            made = match place {
+                // In list order, end to end: what `assemble` lays out for a round.
+                Placed::Found { at: there, len: read } if *read as u64 == len && *there == cursor => {
+                    cursor += *read;
+                    Ok(())
+                }
+                // alloc: the error's message
+                Placed::Found { .. } => Err(corrupt(format!("its chunk {:x} is of another length", chunk.0))),
+                // alloc: the error's message
+                Placed::Absent => Err(corrupt(format!("its chunk {:x} is not in the store", chunk.0))),
+                // clone: the chunk's failure, named under its value
+                Placed::Failed(failed) => Err(of_chunk(key, failed.clone())),
+            };
+            if made.is_err() {
+                break;
+            }
+        }
+        self.chunk_keys = chunk_keys;
+        self.chunk_places = chunk_places;
+        made?;
+        #[cfg(test)]
+        if self.plant == Plant::ChunkOrder
+            && let Some(first) = self.list.get(32..40)
+        {
+            // The planted bug: the first chunk put last.
+            let first = u64::from_le_bytes(first.try_into().expect("eight bytes")) as usize;
+            if first < whole.len() {
+                whole.rotate_left(first);
+            }
+        }
+        if hash {
+            let hashed = content_of(whole);
+            if hashed != content {
+                // alloc: the error's message
+                return Err(corrupt(format!("its chunks hash to {hashed:x}, not the {content:x} recorded")));
+            }
+        }
+        Ok(())
+    }
+
+    /// The value of `key`, kept in a file of its own, read whole into `whole` and hashed: no
+    /// record's CRC covers a file of its own.
+    fn external_into<D: Driver>(
+        &mut self,
+        driver: &mut D,
+        key: Key,
+        file: FileName,
+        raw: u64,
+        content: ContentId,
+        whole: &mut Vec<u8>,
+    ) -> Result<(), Failed> {
+        self.plan.begin();
+        let slot = self.slot(&file);
+        let n = self.plan.want(slot, 0, raw);
+        let total = self.plan.plan();
+        let fetched = self.fetch(driver, whole, 0, total);
+        // clone: the error's file name
+        let named = || file.clone();
+        match fetched {
+            Fetched::Read => {}
+            Fetched::Stalled(waited) => return Err(Failed::Stalled { key, file: named(), at: 0, waited }),
+            // alloc: the error's message
+            Fetched::Abandoned => return Err(Failed::Read { key, file: named(), at: 0, why: ABANDONED_SPAN.into() }),
+            // alloc: the error's message
+            Fetched::Unregistered(full) => return Err(Failed::Read { key, file: named(), at: 0, why: full.to_string() }),
+        }
+        let off = self.plan.outcome(n).map_err(|missed| match missed {
+            plan::Missed::Failed { at, why } => Failed::Read { key, file: named(), at, why },
+            plan::Missed::Short { at, asked, read } => Failed::Short { key, file: named(), at, asked, read },
+            plan::Missed::Unfinished { at } => Failed::Stalled { key, file: named(), at, waited: Duration::ZERO },
+        })?;
+        debug_assert_eq!(off, 0, "one want is the region's start");
+        if self.checks() {
+            let hashed = content_of(&whole[..]);
+            if hashed != content {
+                return Err(Failed::Corrupt {
+                    key,
+                    file: named(),
+                    at: 0,
+                    // alloc: the error's message
+                    what: format!("its file's bytes hash to {hashed:x}, not the {content:x} recorded"),
+                });
+            }
+        }
+        count(&mut self.counts.records, &RECORDS, 1);
+        Ok(())
     }
 
     /// The value of `key` read in place through a mapping: `None` when the store keeps nothing
@@ -858,15 +1081,18 @@ impl Direct {
                     });
                 }
             }
-            was_read(look, found, loc);
+            look.was_read(found);
             let slot = self.slot(&file);
             (loc, file, slot, found.tier, live)
         };
         let end = loc.offset + RECORD_HEADER + loc.stored;
         let pack = self.mapping_of(driver, key, slot, end)?;
         let record = &pack.bytes()[loc.offset as usize..end as usize];
-        let header = checked_header(record, key, loc)
+        let (header, sealed) = checked_header(record, key, loc, self.checks())
             .map_err(|what| Failed::Corrupt { key: *key, file: file.clone(), at: loc.offset, what })?; // clone: the error's file name
+        // A raw value in its pack is covered by its format-9 record's CRC, checked just above;
+        // a file of its own, or a format-8 record, is hashed below. Taken before `pack` moves.
+        let covered = loc.form == Form::Raw && whole_by_crc(&header, &record[RECORD_HEADER as usize..], sealed);
         let (mapping, start) = match loc.form {
             Form::External => {
                 let external = {
@@ -915,7 +1141,7 @@ impl Direct {
                 what: format!("its file is {} bytes, not the {len} recorded", mapping.bytes().len()),
             });
         }
-        if self.checks() {
+        if self.checks() && !covered {
             let hashed = content_of(value);
             if hashed != header.content {
                 return Err(Failed::Corrupt {
@@ -960,6 +1186,8 @@ impl Direct {
         self.held.clear();
         self.mapped = None;
         self.mapping = false;
+        self.follows.clear();
+        self.chunk_round = false;
     }
 
     /// The call's end: the file table back within [`FILES_MOST`], the least recently used
@@ -993,16 +1221,42 @@ impl Direct {
                 return Where::Failed(Failed::Index { key: *key, file: corrupt.pack, what: corrupt.what });
             }
         };
+        let form = found.place.form();
+        if self.chunk_round && !matches!(form, Form::Raw | Form::Lz4 | Form::Zstd) {
+            let at = match found.place {
+                Place::Pack(loc) => loc.offset,
+                Place::Segment(seg) => seg.offset,
+            };
+            return Where::Failed(Failed::Form { key: *key, file: None, at, form: form_name(form), rule: NOT_A_CHUNK });
+        }
         let loc = match found.place {
             Place::Pack(loc) => loc,
+            // A chunked value's list is memory already: copied out checked, its chunks read
+            // in the call's second round (`follow_up`).
             Place::Segment(seg) if seg.form == Form::Chunked => {
-                return Where::Failed(Failed::Form {
-                    key: *key,
-                    file: None,
-                    at: seg.offset,
-                    form: form_name(seg.form),
-                    rule: CHUNKED,
+                let listed = look.record_sealed(found, key).map_err(|corrupt| corrupt.what).and_then(|(header, list, sealed)| {
+                    chunk_list(&header, list)?;
+                    Ok((header, list, sealed))
                 });
+                return match listed {
+                    Ok((header, list, sealed)) => {
+                        look.was_read(found);
+                        let at = self.held.len();
+                        self.held.extend_from_slice(list);
+                        // The target this is: `read_round` pushes each as it is located.
+                        let n = self.targets.len() as u32;
+                        let hash = sealed != Sealed::Whole && self.checks();
+                        let file = look.file_of(found);
+                        self.follows.push((n, Follow::Chunks { file, at: seg.offset, content: header.content, hash }));
+                        Where::Held { at, len: list.len() }
+                    }
+                    Err(what) => Where::Failed(Failed::Corrupt {
+                        key: *key,
+                        file: look.file_of(found),
+                        at: seg.offset,
+                        what,
+                    }),
+                };
             }
             Place::Segment(seg) => {
                 return match look.value(found, key, Use::Read) {
@@ -1024,25 +1278,21 @@ impl Direct {
             Ok(file) => file,
             Err(failed) => return Where::Failed(failed),
         };
-        let rule = match loc.form {
-            Form::Chunked => Some(CHUNKED),
-            Form::External => Some("a file of its own: it is mapped, never copied (Direct::map)"),
-            Form::Dictionary => Some("a compression dictionary is no value"),
-            _ => None,
-        };
-        if let Some(rule) = rule {
+        // A dictionary's record is the store's, named by the records compressed with it: no
+        // key's value, as `Look::value` refuses it too.
+        if loc.form == Form::Dictionary {
             return Where::Failed(Failed::Form {
                 key: *key,
                 file: Some(file),
                 at: loc.offset,
                 form: form_name(loc.form),
-                rule,
+                rule: "a compression dictionary is the store's, no key's value",
             });
         }
-        was_read(look, found, loc);
+        look.was_read(found);
         let slot = self.slot(&file);
         let n = self.plan.want(slot, loc.offset, RECORD_HEADER + loc.stored);
-        Where::Want(Want { key: *key, file, n, loc, tier: found.tier, live })
+        Where::Want(Want { key: *key, file, n, target: self.targets.len() as u32, loc, tier: found.tier, live })
     }
 
     /// The call's reads, into `total` bytes of `into` from `start`.
@@ -1146,7 +1396,7 @@ impl Direct {
         }
         let file = open.name.clone(); // clone: a refcount
         // clone: a refcount
-        self.effects.push(Effect::Map { file: file.clone(), tag: self.plan.map_tag() });
+        self.effects.push(Effect::Map { file: file.clone(), extent: Extent::Whole, tag: self.plan.map_tag() });
         self.mapping = true;
         if let Err(waited) = self.drive(driver) {
             self.mapping = false;
@@ -1282,18 +1532,48 @@ impl Direct {
         let len = (RECORD_HEADER + loc.stored) as usize;
         let at = start + off as usize;
         let record = &into[at..at + len];
-        let header = checked_header(record, &key, loc).map_err(corrupt)?;
+        let (header, sealed) = checked_header(record, &key, loc, self.checks()).map_err(corrupt)?;
         let Some(view) = view else {
             // alloc: the error's message
             return Err(corrupt("the live layer it was found in is gone".into()));
         };
         let payload = &record[RECORD_HEADER as usize..];
+        let follow = match header.form {
+            Form::Chunked => {
+                chunk_list(&header, payload).map_err(corrupt)?;
+                let hash = sealed != Sealed::Whole && self.checks();
+                Some(Follow::Chunks { file: file(), at: loc.offset, content: header.content, hash })
+            }
+            Form::External => {
+                let external = view.tiers.get(want.tier).and_then(|it| it.externals.get(&header.content));
+                let Some(external) = external else {
+                    // alloc: the error's message
+                    return Err(corrupt(format!("its file {:x} is not in the head", header.content)));
+                };
+                // clone: a refcount of the file's name
+                Some(Follow::External { file: external.file.clone(), raw: header.raw, content: header.content })
+            }
+            _ => None,
+        };
+        if let Some(follow) = follow {
+            // The list (a chunked value's) or nothing (a file of its own's) stands in its
+            // place until `follow_up` reads the value.
+            let out = into.len();
+            let len = if header.form == Form::Chunked { payload.len() } else { 0 };
+            let from = at + RECORD_HEADER as usize;
+            into.extend_from_within(from..from + len);
+            self.follows.push((want.target, follow));
+            count(&mut self.counts.records, &RECORDS, 1);
+            return Ok((out, len));
+        }
         let value = decode(view, want.tier, &header, payload).map_err(corrupt)?;
         if value.len() as u64 != header.raw {
             // alloc: the error's message
             return Err(corrupt(format!("it is {} bytes, not the {} recorded", value.len(), header.raw)));
         }
-        if self.checks() {
+        // A format-9 record's CRC, checked above, covered the bytes the value is decoded from;
+        // a format-8 record's value is hashed.
+        if self.checks() && !whole_by_crc(&header, payload, sealed) {
             let hashed = content_of(&value);
             if hashed != header.content {
                 return Err(corrupt(format!(
@@ -1319,9 +1599,47 @@ impl Direct {
     }
 }
 
-/// What the brief's gap for a chunked value says.
-const CHUNKED: &str = "a list of chunks, each a value of its own: a direct read does not yet \
-                       read a value's chunks (read their keys); the store's pooled read still does";
+/// Why a record named by a chunked value's list is refused when it is no chunk.
+const NOT_A_CHUNK: &str = "a chunked value's list names it as a chunk, and a chunk is kept raw, \
+                           lz4 or zstd (`segment.rs`, a put of an output)";
+
+/// A chunked value's list of chunks checked against its header: whole entries, each no longer
+/// than a chunk, their lengths summing to the value's.
+fn chunk_list(header: &RecordHeader, list: &[u8]) -> Result<(), String> {
+    // alloc: the error's message
+    let chunks = disk::decode_chunks(list).map_err(|what| what.to_owned())?;
+    let mut total = 0u64;
+    for (chunk, len) in chunks {
+        if len > crate::chunk::MAX as u64 {
+            // alloc: the error's message
+            return Err(format!("its chunk {:x} is {len} bytes, longer than a chunk", chunk.0));
+        }
+        // alloc: the error's message
+        total = total.checked_add(len).ok_or_else(|| "its chunks' lengths overflow".to_owned())?;
+    }
+    if total != header.raw {
+        // alloc: the error's message
+        return Err(format!("its chunks are {total} bytes, not the {} recorded", header.raw));
+    }
+    Ok(())
+}
+
+/// A value read in a call's second round: what its first round read stands for.
+enum Follow {
+    /// A list of chunks (the value's record's payload, checked), each a record of its own,
+    /// read by key; `hash`: the whole value is hashed against `content` once made (a format-8
+    /// list, whose CRC did not cover it).
+    Chunks { file: FileName, at: u64, content: ContentId, hash: bool },
+    /// A file of its own, `raw` bytes, read whole and hashed against `content`: no record's
+    /// CRC covers it.
+    External { file: FileName, raw: u64, content: ContentId },
+}
+
+/// `failed`, a read of a chunk of `key`'s value, as a failure of `key`.
+fn of_chunk(key: Key, failed: Failed) -> Failed {
+    // alloc: the chunk's failure, boxed under its value's
+    Failed::Chunk { key, chunk: Box::new(failed) }
+}
 
 /// `key` found in `shared`'s own tiers, else in its live layer's: the look it was found by,
 /// whether that is the live layer's, and what was found.
@@ -1372,30 +1690,20 @@ fn committed(look: Look<'_>, found: Found<'_>, key: &Key, loc: Loc) -> Result<Fi
     Ok(pack.file.clone()) // clone: a refcount
 }
 
-/// A read of the own tier's record, as the pool's reads mark one (`Look::value`'s
-/// `was_read`, which is private to it; the two merge once the pool's path is gone): its flag
-/// of use, and its pack's time of use, each written only when it changes.
-fn was_read(look: Look<'_>, found: Found<'_>, loc: Loc) {
-    if found.tier != 0 {
-        return;
-    }
-    found.at.set(Flag::Read);
-    if let Some(pack) = look.view().tiers[0].packs.get(loc.pack as usize) {
-        let tick = look.shared.tick();
-        if pack.used.load(Ordering::Relaxed) != tick {
-            pack.used.store(tick, Ordering::Relaxed);
-        }
-    }
-}
-
-/// The header of `record`, checked: whole (its CRC), of `key`, and as the index says it is.
-fn checked_header(record: &[u8], key: &Key, loc: Loc) -> Result<RecordHeader, String> {
-    let header = record
-        .get(..RECORD_HEADER as usize)
+/// The header of `record` (header and payload), checked: whole (its CRC, over the payload too
+/// from format 9), of `key`, and as the index says it is; and what its CRC covered.
+/// `check` false is the planted bug's (`Plant::NoCheck`): the header decoded, nothing checked.
+fn checked_header(record: &[u8], key: &Key, loc: Loc, check: bool) -> Result<(RecordHeader, Sealed), String> {
+    let Some((header, payload)) = record.split_at_checked(RECORD_HEADER as usize) else {
         // alloc: the error's message
-        .ok_or_else(|| "it is shorter than a record's header".to_owned())?;
+        return Err("it is shorter than a record's header".to_owned());
+    };
+    let checked = match check {
+        true => RecordHeader::check(header, payload),
+        false => RecordHeader::decode(header).map(|it| (it, Sealed::Header)),
+    };
     // alloc: the error's message
-    let header = RecordHeader::decode(header).map_err(|what| format!("its header: {what}"))?;
+    let (header, sealed) = checked.map_err(|what| format!("its record: {what}"))?;
     if header.key != *key {
         // alloc: the error's message
         return Err(format!("it is the record of {:x}, another key", header.key.0));
@@ -1412,7 +1720,7 @@ fn checked_header(record: &[u8], key: &Key, loc: Loc) -> Result<RecordHeader, St
             loc.raw
         ));
     }
-    Ok(header)
+    Ok((header, sealed))
 }
 
 /// The value a record's payload holds, decoded as its form says. As `Look::value` decodes

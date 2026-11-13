@@ -13,12 +13,14 @@
 //!   the readers; the crates finished by then are let go with it, at no stop of their own.
 //! - **When no unit is open.** Every unit that began has compiled, so no reader is left to
 //!   wait for, and every MIR held is of a finished crate or of none.
-//! - **When memory is short** ([`Squeeze`]): blaze past its limit's line, or a subsystem a
-//!   release lowers past its share. The build stops its readers for it (each task under way
-//!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
-//!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
-//!   view. The walks codegen keeps for the next build go then too
-//!   ([`hir_ty_codegen::v2::let_go_kept_walks`]): a cold build of blaze held 13 GiB of them.
+//! - **When memory is short** ([`Release::pressed`]): the system says so, or the gate's core
+//!   is past its line with nothing cheaper left to give (`job::giving`,
+//!   `blaze_graph::giveback::Rung::Values`). The release waits for the readers under way
+//!   (none is cancelled or stopped: a task's own memory is the gate's to bound, by wounds),
+//!   and the front end's values kept by bytes are swept, every one
+//!   ([`blaze_query::db::Storage::sweep_values`] under caps of 0), not only at the next view.
+//!   The walks codegen keeps for the next build are the kept front end's
+//!   ([`hir_ty_codegen::v2::Walks`]) and go with it.
 //! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
@@ -27,8 +29,8 @@
 //!   and run by the task that stores the front end, which holds it alone as the writer did
 //!   (`Steps::release_kept`). It only lowers memory, so the checkout's next build never waits
 //!   for it: a request that waits for the front end has it handed back unreleased, and that
-//!   build's own releases, at the latest its end's, let the MIR go. When blaze is past its
-//!   limit's line the release runs all the same, before that build is given the front end:
+//!   build's own releases, at the latest its end's, let the MIR go. When the gate's core is
+//!   past its line the release runs all the same, before that build is given the front end:
 //!   memory short stays a reason that stops for nothing but the answer.
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
@@ -48,10 +50,9 @@
 //! `unit bodies` 782 ms. What is kept is bounded: the values of at most [`EDIT_CRATES`]
 //! crates a build, and of those only what the next two builds read again
 //! ([`blaze_query::db::Storage::end_epoch`], run at every build's end, lets go of what the
-//! last two did not read); memory short takes it all as before. Past its own wait with nothing
-//! to do ([`crate::serve::idle::front_after`]: 64 times its last remake, from 30 s to 30
-//! minutes), nothing is kept for the next edit: the daemon is held to
-//! [`crate::serve::idle::BUDGET`], and the front end goes whole (`job::giving`).
+//! last two did not read); memory short takes it all as before. Idleness takes none of it: a
+//! daemon in no edit loop exits whole instead (`crate::serve::idle`'s rule), past 64 times its
+//! front end's last remake (30 s to 30 minutes).
 //!
 //! **Every other build that compiles holds the inference of the workspace's crates it
 //! finished last** ([`Release::held`]): a cold build and a rebuild of many crates let go of a
@@ -67,8 +68,8 @@
 //! 5.7 s, each later one 0.95 s). The bound: a build holds the inference of at most
 //! [`EDIT_CRATES`] crates more than it did, from each one's last unit to the build's end and
 //! past it under [`blaze_query::db::Storage::end_epoch`]'s rule; memory short lets go of the
-//! held crates with the rest, and so does an idle daemon past the front end's wait
-//! ([`crate::serve::idle::front_after`]), with the whole front end. Its MIR goes at its end as before, every crate's by its tag
+//! held crates with the rest, and an idle daemon's exit with the whole process (`crate::serve::idle`).
+//! Its MIR goes at its end as before, every crate's by its tag
 //! (`hir::evict::drop_mir` keeps none by crate), so the first edit still lowers the edited
 //! crate's built and runtime MIR again where the lints read them: `mir_body_query` and
 //! `runtime_mir_body_query` under `evicted_asked` in that build's `query_counts`. A check
@@ -77,8 +78,8 @@
 //! A check (`JobKind::Check`) keeps its inference: what it made, and what the next check of the
 //! head reads again. Its MIR goes as its front end is kept, as every build's does, and memory
 //! makes a release of a check due mid-build as of any build: then the MIR, constant values and
-//! solver caches of every crate go and the values kept by bytes are swept under the squeeze's
-//! caps, but no crate's inference is let go by name. A check that let go of nothing (the
+//! solver caches of every crate go and the values kept by bytes are swept, but no crate's
+//! inference is let go by name. A check that let go of nothing (the
 //! release before slowcheck, and before this, a check under no limit) kept every MIR it made in
 //! the kept front end, for the next check and the one after (MIR queries are `lru = 0`: let go
 //! only when asked), so each check grew blaze's heap by what it made (build 19 of coord
@@ -90,18 +91,11 @@
 
 use std::{alloc::Global, hash::Hash, sync::atomic::{AtomicU32, Ordering}};
 
-/// What blaze must hold again before the daemon's next release for memory is due
-/// (`blaze_graph::admission::Squeeze::mark`), as its last one left it: each build's squeeze
-/// starts from it ([`Release::new`]), so a release that freed little is not repeated by the
-/// next build at the same footprint. 0 until one ran.
-static SQUEEZED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// The front end releases run since the daemon started, every build's: the build view's
 /// `releases` ([`crate::serve::job::doing::memory`]), a counter that only a release moves.
 pub(crate) static RELEASES: AtomicU32 = AtomicU32::new(0);
 
 use base_db::Crate;
-use blaze_graph::admission::{self, Pressure, Squeeze};
 use blaze_hash::HashMap;
 use blaze_lower::{Crates, Lowered};
 use blaze_query::db::{Database as _, MemoryUsage};
@@ -109,17 +103,32 @@ use blaze_query::db::{Database as _, MemoryUsage};
 #[cfg(test)]
 mod tests;
 
-/// Has every reader of `lowered`'s database unwind at its next query call
-/// (`blaze_query::db::Storage::stop_readers`): each task under way gives way
-/// (`super::cancellable`) and is posted again once the writer applied its release
-/// ([`resume_readers`]). The last thing given back for memory before a task fails
-/// (`blaze_graph::giveback::Rung::Running`); what the tasks had done is done again.
-pub(crate) fn stop_readers(lowered: &Lowered) {
-    lowered.db().storage().stop_readers();
+/// What the memory gate's core holds, and its size (`blaze_mem::gate`): what a release's line
+/// says before and after it. The core is where a front end's values live: what a release
+/// lowers, exactly (every commit is counted as it is made).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Core {
+    pub(crate) used: u64,
+    /// `u64::MAX` for a gate with no core size.
+    pub(crate) size: u64,
 }
 
-/// Clears [`stop_readers`]' stop, with the front end exclusive: no reader is left, so the
-/// stop did its work, and the tasks posted next read on. Nothing where none was made.
+impl Core {
+    /// The process's gate's core now: two atomic loads (`Gate::core`).
+    pub(crate) fn now() -> Core {
+        let (size, used) = blaze_mem::gate::process().core();
+        Core { used, size }
+    }
+
+    /// Whether it is past its give-back line (`blaze_graph::giveback::line`).
+    pub(crate) fn over(self) -> bool {
+        self.used > blaze_graph::giveback::line(self.size)
+    }
+}
+
+/// Clears a stop of `lowered`'s readers (`blaze_query::db::Storage::stop_readers`), with the
+/// front end exclusive: no reader is left, and the tasks posted next read on. Nothing where none
+/// was made: since the gate (2026-11-13) nothing here stops readers for memory.
 pub(crate) fn resume_readers(lowered: &mut Lowered) {
     let db = lowered.served_db();
     if db.storage().readers_stopped() {
@@ -128,64 +137,22 @@ pub(crate) fn resume_readers(lowered: &mut Lowered) {
 }
 
 /// What codegen's tasks left on the global heap and nobody freed: with no codegen task
-/// running, that is what codegen keeps between builds, its kept walks first
-/// ([`hir_ty_codegen::v2::let_go_kept_walks`]: 13 GiB of a cold build of blaze). An estimate
-/// and an upper bound (`blaze_graph::giveback::Rung::Caches`): the tag's heap also holds what
-/// a kept image's link state took from codegen.
+/// running, that is what codegen keeps between builds. Its kept walks are its kept front
+/// end's ([`hir_ty_codegen::v2::Walks`], in [`super::KeptParts`]) and leave with it; no process
+/// static holds one. An estimate and an upper bound (`blaze_graph::giveback::Rung::Caches`).
 pub(crate) fn kept_caches() -> u64 {
     blaze_mem::tag::snapshot().get(blaze_mem::Tag::Codegen).heap
 }
 
-/// Lets go of codegen's kept walks, every database's and configuration's; the bytes the
-/// codegen tag's heap fell by. The next walk over each begins with nothing kept and says why
-/// (`blaze_codegen::driver::Fresh::LetGo`). For the loop, while no task that may walk runs:
-/// a walk in flight would keep its own table until it ends.
+/// Gives back what codegen's freed heap the allocator still keeps; the bytes the codegen tag's
+/// heap fell by. Codegen's kept walks are not let go here: they are their kept front end's
+/// ([`hir_ty_codegen::v2::Walks`]) and leave whole with it, as nothing else names their ids.
 pub(crate) fn give_kept_caches() -> u64 {
     let before = kept_caches();
-    let describes = hir_ty_codegen::v2::let_go_kept_walks();
     blaze_mem::tag::give_back_heap();
     let gave = before.saturating_sub(kept_caches());
-    // None is left, nor an empty table put back in its place: the process tables
-    // ([`give_kept_tables`]) are released only while no walk is kept.
     let kept_walks = hir_ty_codegen::v2::kept_walks();
-    tracing::info!(target: "blaze", describes, gave, kept_walks, "codegen's kept walks were let go");
-    gave
-}
-
-/// What the process tables every front end's ids index hold: the type interner's tables and
-/// the trait solver's shared caches (the `intern` and `solver` tags, blaze-mem's and the
-/// heap's). No drop of a front end frees them: they are statics of the process
-/// (hir-ty's `next_solver::interner`), freed only by [`give_kept_tables`].
-pub(crate) fn kept_tables() -> u64 {
-    let snapshot = blaze_mem::tag::snapshot();
-    let of = |tag: blaze_mem::Tag| {
-        let it = snapshot.get(tag);
-        it.live.saturating_add(it.heap)
-    };
-    of(blaze_mem::Tag::Intern).saturating_add(of(blaze_mem::Tag::Solver))
-}
-
-/// Releases the process tables ([`kept_tables`]) as a fresh process has them
-/// (`hir::evict::release_process_tables`), then gives this thread's freed heap back; the
-/// bytes [`kept_tables`] fell by. For the loop only while nothing names an interned id: no
-/// front end kept or out, no walk kept or in flight, no link image kept, no task running
-/// (`job::giving` lists the source only then); the release itself refuses, by panic naming
-/// both counts, while a front end is kept or a task is entered.
-pub(crate) fn give_kept_tables() -> u64 {
-    let before = kept_tables();
-    let released = hir::evict::release_process_tables();
-    blaze_mem::tag::give_back_heap();
-    let after = kept_tables();
-    let gave = before.saturating_sub(after);
-    tracing::info!(
-        target: "blaze",
-        tables = released.tables,
-        released = released.bytes,
-        before,
-        after,
-        gave,
-        "the process tables were released: no front end, walk or image names an interned id"
-    );
+    tracing::info!(target: "blaze", gave, kept_walks, "codegen's freed heap was given back");
     gave
 }
 
@@ -375,8 +342,7 @@ impl<K: Copy + Eq + Hash> Finished<K> {
 /// Keyed by `K` as [`Finished`] is, a crate in the daemon.
 pub(crate) struct Release<K = Crate> {
     finished: Finished<K>,
-    squeeze: Squeeze,
-    /// Memory made a release due ([`Squeeze::due`], asked as each unit compiles).
+    /// Memory made a release due ([`Release::pressed`]).
     pressed: bool,
     /// Whether the build compiles code. A check's front end lets go mid-build only when memory
     /// makes a release due, and then of no crate's inference by name.
@@ -404,7 +370,7 @@ pub(crate) struct Plan<K> {
     /// (`ended` without `mir`) lets go of the trait solver's caches and the unread values
     /// alone.
     pub(crate) mir: bool,
-    /// Memory made it due: the values kept by bytes are swept under the squeeze's caps.
+    /// Memory made it due: the values kept by bytes are swept, every one.
     pub(crate) pressed: bool,
     /// The build is over ([`Release::end`]): its MIR goes with it.
     pub(crate) ended: bool,
@@ -415,22 +381,13 @@ impl Release<Crate> {
     /// check.
     pub(crate) fn new(crates: &Crates, units: usize, compiles: bool) -> Release {
         let of = (0..units).map(|unit| crates.krate(unit)).collect(); // alloc: a crate a unit, once per build
-        let mut release = Release::of(Finished::new(of), compiles);
-        // From where this daemon's last release for memory left off ([`SQUEEZED_AT`]).
-        release.squeeze = Squeeze::starting_after(SQUEEZED_AT.load(Ordering::Relaxed));
-        release
-    }
-
-    /// Unit `unit` compiled: whether memory makes a release due is asked now, once a unit,
-    /// with one snapshot of the tags.
-    pub(crate) fn compiled(&mut self, unit: usize) {
-        self.compiled_under(unit, Pressure::now);
+        Release::of(Finished::new(of), compiles)
     }
 
     /// With the front end exclusive (no reader alive): lets go of what the finished crates
     /// keep, and of every MIR when no unit is open or memory made this release due, then under
-    /// memory pressure sweeps the values kept by bytes under the squeeze's caps. A span names
-    /// what it let go and what blaze held before and after (rule 16).
+    /// memory pressure sweeps every value kept by bytes. A span names what it let go and what
+    /// the gate's core held before and after (rule 16).
     pub(crate) fn release(&mut self, lowered: &mut Lowered) {
         let db = lowered.served_db();
         let plan = {
@@ -440,7 +397,7 @@ impl Release<Crate> {
         };
         let Some(Plan { crates, mir, pressed, ended }) = plan else { return };
         RELEASES.fetch_add(1, Ordering::Relaxed);
-        let before = Pressure::now();
+        let before = Core::now();
         // Which crates' inference goes and which is held, by name: the counts alone did not
         // say whether the crate the next edit makes again was among them (rule 16).
         let (let_go, kept) = (names(db, &crates), names(db, self.held()));
@@ -454,9 +411,8 @@ impl Release<Crate> {
             kept_crates = self.held().len(),
             kept = kept.as_str(),
             mir,
-            held = before.held,
-            limit = before.limit,
-            over = before.over.map_or("", |it| it.name()),
+            core = before.used,
+            core_size = before.size,
             bodies = tracing::field::Empty,
             inference = tracing::field::Empty,
             mir_dropped = tracing::field::Empty,
@@ -476,12 +432,11 @@ impl Release<Crate> {
             dropped.solver_caches += hir::evict::drop_every_solver_cache(db);
         }
         if pressed {
-            db.storage_mut().sweep_values(&Squeeze::caps(before));
-            // The walks codegen keeps for the next build's are no longer let go here: they are
-            // the give-back's caches rung ([`give_kept_caches`], `blaze_graph::giveback`), asked
-            // in its order, measured, and only while no walk is in flight. Let go here, a
-            // release of a daemon at its line threw away 87,287 describes of a hello-world
-            // for 0.36 GiB, at every build (2026-11-12).
+            // Every value kept by bytes: a cap of 0 a tag. Each keeps its memo, so a read makes
+            // it again. Until 2026-11-13 the caps were each tag's fair share of the limit
+            // (`admission::Squeeze::caps`), a proportion the gate deleted: memory short now
+            // means the core is past its line with nothing cheaper left, or the system says so.
+            db.storage_mut().sweep_values(&[0; blaze_mem::Tag::COUNT]);
         }
         // The build is over: what neither it nor the build before it read of the front end's
         // evictable values goes, the results of revisions no edit since has asked for. Only
@@ -523,11 +478,7 @@ impl Release<Crate> {
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).
         blaze_mem::tag::give_back_heap();
-        let after = Pressure::now();
-        if pressed {
-            self.squeeze.released(after);
-            SQUEEZED_AT.store(self.squeeze.mark(), Ordering::Relaxed);
-        }
+        let after = Core::now();
         span.record("bodies", dropped.bodies);
         span.record("inference", dropped.inference);
         span.record("mir_dropped", dropped.mir);
@@ -535,11 +486,11 @@ impl Release<Crate> {
         span.record("solver_caches", dropped.solver_caches);
         span.record("intern_tables", dropped.intern_tables);
         span.record("unread", unread.values);
-        span.record("left", after.held);
+        span.record("left", after.used);
         // What the query storage still holds after the drops. On a release memory made due, by
         // ingredient (memcap6): its rows in use are a walk of every function's rows made, a
         // read of every row page, which the build's readers wait out (the front end is
-        // exclusive), so it runs only when that report is what the squeeze wants. Otherwise
+        // exclusive), so it runs only when memory is what made it due. Otherwise
         // the total alone, from counters.
         let storage = if pressed {
             let mut usage = Vec::new(); // alloc: the release's report, an entry an ingredient
@@ -550,7 +501,7 @@ impl Release<Crate> {
         };
         span.record("query_storage", storage.total);
         // One line each release in the daemon's log, on its standard error as the memory line
-        // is: why, what went, blaze's memory before and after against the limit (B5), and the
+        // is: why, what went, the gate's core before and after against its size (B5), and the
         // query storage's largest holders.
         crate::serve::said::logged!(INFO,
             "blaze serve: {}",
@@ -586,7 +537,8 @@ fn names(db: &base_db::Db, crates: &[Crate]) -> String {
 }
 
 /// The line a release says ([`Release::release`]): why it ran, what it let go and how much
-/// blaze held before and after it, against the limit, then what the query storage holds.
+/// the gate's core held before and after it, against its size, then what the query storage
+/// holds.
 pub(crate) struct Said {
     pub(crate) crates: usize,
     /// The workspace's crates whose inference the build holds for the next edit
@@ -599,8 +551,8 @@ pub(crate) struct Said {
     /// What the build's end let go of that two builds left unread
     /// ([`blaze_query::db::Storage::end_epoch`]).
     pub(crate) unread: blaze_query::db::Unread,
-    pub(crate) before: Pressure,
-    pub(crate) after: Pressure,
+    pub(crate) before: Core,
+    pub(crate) after: Core,
     pub(crate) storage: Holders,
 }
 
@@ -687,22 +639,16 @@ impl std::fmt::Display for Said {
             storage: _,
         } = self;
         f.write_str("front end release (")?;
-        match (*pressed, before.over) {
-            (true, _) if before.squeezed() => write!(
+        match *pressed {
+            true if before.over() => write!(
                 f,
-                "memory: blaze is past the limit's line of {:.2} GiB",
-                gib(before.limit - before.limit / admission::LINE)
+                "memory: blaze's core is past its line of {:.2} GiB",
+                gib(blaze_graph::giveback::line(before.size))
             )?,
-            (true, Some(tag)) => write!(
-                f,
-                "memory: {} is past its share of {:.2} GiB",
-                tag.name(),
-                gib(admission::fair_share(tag, before.limit))
-            )?,
-            (true, None) => f.write_str("memory")?,
-            (false, _) if *ended => f.write_str("the build is over")?,
-            (false, _) if *mir => f.write_str("no unit is open")?,
-            (false, _) => f.write_str("crates finished")?,
+            true => f.write_str("memory: the system is short of it")?,
+            false if *ended => f.write_str("the build is over")?,
+            false if *mir => f.write_str("no unit is open")?,
+            false => f.write_str("crates finished")?,
         }
         write!(
             f,
@@ -723,23 +669,23 @@ impl std::fmt::Display for Said {
             )?;
         }
         if *pressed {
-            f.write_str(", and swept the front end's values to their fair shares")?;
+            f.write_str(", and swept every value the front end keeps by bytes")?;
         }
         if unread.values != 0 {
             write!(f, ", and {} values the last two builds did not read", unread.values)?;
         }
-        write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
-        match before.held.checked_sub(after.held) {
+        write!(f, "; blaze's core held {:.2} GiB, now {:.2} GiB", gib(before.used), gib(after.used))?;
+        match before.used.checked_sub(after.used) {
             Some(freed) => write!(f, " ({:.2} freed)", gib(freed))?,
             None => write!(
                 f,
                 " ({:.2} more: other tasks grew meanwhile)",
-                gib(after.held - before.held)
+                gib(after.used - before.used)
             )?,
         }
-        match before.limit {
-            u64::MAX => f.write_str(", under no limit")?,
-            limit => write!(f, ", of a limit of {:.2} GiB", gib(limit))?,
+        match before.size {
+            u64::MAX => f.write_str(", of no core size")?,
+            size => write!(f, ", of a core of {:.2} GiB", gib(size))?,
         }
         write!(f, "; {}", self.storage)
     }
@@ -749,7 +695,6 @@ impl<K: Copy + Eq + Hash> Release<K> {
     pub(crate) fn of(finished: Finished<K>, compiles: bool) -> Release<K> {
         Release {
             finished,
-            squeeze: Squeeze::default(),
             pressed: false,
             compiles,
             ended: false,
@@ -772,30 +717,14 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.finished.kept(unit);
     }
 
-    /// Unit `unit` compiled, memory read by `now` (only if it can matter): a check's as any
-    /// build's, since memory past the limit stays past it until something is let go.
-    pub(crate) fn compiled_under(&mut self, unit: usize, now: impl FnOnce() -> Pressure) {
+    /// Unit `unit` compiled, a check's as any build's.
+    pub(crate) fn compiled(&mut self, unit: usize) {
         self.finished.compiled(unit);
-        if !self.pressed {
-            self.pressed = self.squeeze.due(now());
-        }
     }
 
-    /// The plane holds a task back for memory the process holds besides its tasks
-    /// (`blaze_graph::Plane::short`): a release is due if [`Squeeze::short`] says so, read
-    /// by `now` only if it can matter. Its sweep caps the values the front end keeps by bytes
-    /// at their fair shares and drops every MIR, as one memory made due does.
-    pub(crate) fn short_under(&mut self, now: impl FnOnce() -> Pressure) {
-        if !self.pressed {
-            self.pressed = self.squeeze.short(now());
-        }
-    }
-
-    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): a
-    /// release is due now, past [`Squeeze`]'s step, which counts only this daemon's growth. The
-    /// daemon asks at most once per [`blaze_graph::pressure::HOLD_NS`] of a run of events
-    /// ([`blaze_graph::pressure::Pressured::pressed`]), so a long run does not sweep the front
-    /// end over and over.
+    /// Memory is short: the system says so, or the gate's core is past its line with nothing
+    /// cheaper left to give (`job::giving`, which makes it due at most once a second). A
+    /// release is due now: every MIR goes and every value kept by bytes is swept.
     pub(crate) fn pressed(&mut self) {
         self.pressed = true;
     }

@@ -28,8 +28,8 @@ pub mod pages;
 
 pub use pages::encode;
 pub(super) use pages::{
-    all_inherent_into, all_traits_into, all_value_items, blanket, inherent, row, trait_into,
-    value_items,
+    all_inherent_into, all_traits_into, all_value_items, blanket, for_self_ty, inherent, row,
+    trait_into, value_items,
 };
 
 type R<T = ()> = Result<T, String>;

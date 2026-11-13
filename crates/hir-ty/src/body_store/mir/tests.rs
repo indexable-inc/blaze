@@ -699,10 +699,12 @@ pub fn owners() -> u32 {
 /// distinct, and the place `place_of` finds by an owner's schema is that owner's. `Err` names
 /// the first owner that breaks it.
 fn owners_apart() -> Result<(), String> {
-    use crate::body_store::entries::{mir_schema, place_of, places};
+    use crate::body_store::entries::{mir_schema, place_of};
     let db = db_of(OWNERS);
     let def = function(&db, "owners");
-    let places = places(&db, def);
+    // The owners' places as `place` files them (where the control plants its bug), not the
+    // lowering's (`entries::places`), which no owner is asked for.
+    let places: Vec<_> = super::owners(&db, def).into_iter().map(|(at, _)| at).collect();
     assert_eq!(places.len(), 3, "the body, its closure and its `async` block: {places:?}");
     for (n, &at) in places.iter().enumerate() {
         if places[..n].contains(&at) {
@@ -719,6 +721,50 @@ fn owners_apart() -> Result<(), String> {
 #[test]
 fn each_owner_of_a_body_has_its_own_place_and_schema() {
     owners_apart().unwrap();
+}
+
+/// Closures where the body's inference types them and where it does not: nested, in an inline
+/// `const` block (inferred inside the body), in an array length (a body of its own), an
+/// `async` closure, and an `async fn`, whose body is an `async` block.
+const PLACES: &str = r#"
+//- minicore: sized, copy, fn, future, async_fn
+//- /main.rs crate:main deps:core new_source_root:local
+pub fn places() -> u32 {
+    let outer = |x: u32| { let inner = move || x; inner() };
+    let k = const { let f = || 3u32; 4u32 };
+    let a = [0u8; { let g = || 5usize; 6 }];
+    let c = async |y: u32| y;
+    let _ = (a, c);
+    outer(k)
+}
+pub async fn later(n: u32) -> u32 { let h = |m: u32| m; h(n) }
+"#;
+
+/// The invariant `entries::places` states: the places the body's lowering gives, with no
+/// inference, are those of the MIR owners its inference gives (`owners`), in order. The
+/// control: a lowering that takes an array length's closure for the body's own (the walk with
+/// no anonymous constant left out) gives a place no owner is at, and the two lists differ.
+#[test]
+fn the_lowering_gives_the_places_the_inference_does() {
+    use crate::body_store::lowering;
+    let db = db_of(PLACES);
+    for name in ["places", "later"] {
+        let def = function(&db, name);
+        let owned: Vec<_> = super::owners(&db, def).into_iter().map(|(at, _)| at).collect();
+        let lowered: Vec<_> = lowering(&db, def).places().collect();
+        assert_eq!(lowered, owned, "`{name}`: the lowering's places and the inference's");
+        assert!(owned.len() > 1, "`{name}` has closures: {owned:?}");
+        // The control: every closure taken as the body's own.
+        let every: Vec<_> = crate::body_store::Lowered {
+            closures: lowering(&db, def).closures.iter().map(|it| crate::body_store::Closure { own: true, ..*it }).collect(),
+            ..lowering(&db, def).clone()
+        }
+        .places()
+        .collect();
+        if name == "places" {
+            assert_ne!(every, owned, "the array length's closure taken for the body's went unseen");
+        }
+    }
 }
 
 /// The control: owners all filed at one place ([`ONE_PLACE`]) share it, and the oracle finds

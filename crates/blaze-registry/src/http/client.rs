@@ -364,6 +364,10 @@ impl Requests {
     /// One range `from..=to` of `url`, collected, asked again from where it stopped when the
     /// transfer is lost, at most [`PIECE_TRIES`] times. A 200 (the body changed since the first
     /// answer, as `if_range` says) or a range other than asked is refused.
+    #[expect(
+        blaze::retry,
+        reason = "a range whose transfer is lost is asked again from where it stopped, up to PIECE_TRIES times: the first lost transfer must be the fetch's typed error"
+    )]
     async fn piece(
         self,
         url: String,

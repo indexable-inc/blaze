@@ -3,7 +3,9 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 // Unsafe code is in `llvm` (LLVM's C API) and `lent` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 
@@ -1035,16 +1037,19 @@ type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
     compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn instance_rows(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> Vec<Row> {
     compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
+#[blaze::renders_positions]
 fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
     // alloc: empty, allocates nothing
     let Some(source) = &compiled.source else { return Vec::new() };
@@ -1846,6 +1851,12 @@ fn instance_body<'db>(
 /// coroutine's by the body it is written in), and the lowering error in words, which for a call
 /// with no function is the callee as written, where the call is and why it resolved to nothing,
 /// in the body it was met in (rule 19).
+#[expect(
+    blaze::reads_positions,
+    reason = "the codegen query words a lowering error, where the call is included, inside itself: the \
+              `CodegenError` must carry the `MirLowerError` and be worded by `blaze_items::lowering::write` at \
+              the edge"
+)]
 fn mir_failed(
     db: &Db,
     owner: MirOwner<'_>,
@@ -2061,6 +2072,11 @@ fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
 /// it; or its value points to memory allocated while evaluating it; or it calls a function whose
 /// body blaze could not lower, which is named with where it was called. `None` for any other
 /// error.
+#[expect(
+    blaze::reads_positions,
+    reason = "the static's compile words a refused evaluation, where the refused call is included, inside the \
+              query: the `CodegenError` must carry the error and its span, worded at the edge"
+)]
 fn refused_const_eval(
     db: &Db,
     of: GeneralConstId<'_>,
@@ -2169,6 +2185,7 @@ fn refused_const_eval(
 /// macro is called only if the macro is another crate's or the compiler's, and of where the
 /// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
 /// the body when there is none, where that is itself what the macro writes.
+#[blaze::renders_positions]
 fn row_location_in_file(
     db: &Db,
     owner: DefWithBodyId,
@@ -2219,6 +2236,7 @@ fn written_place(
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
 #[blaze_query::tracked]
+#[blaze::renders_positions]
 fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u32, u32)> {
     let source = written_node(db, func.lookup(db));
     location_of(db, source.file_id, written_range(source.value))
@@ -2226,6 +2244,7 @@ fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u
 
 /// The node `loc` is written as, viewed in the tree the database keeps for its file: what
 /// `source(db)` is, with no handle made.
+#[blaze::renders_positions]
 fn written_node<'db>(db: &'db Db, loc: &impl HasSource) -> InFile<syntax::view::Node<'db>> {
     let InFile { file_id, value } = loc.ast_ptr(db);
     InFile::new(file_id, syntax::view::to_node(value.syntax_node_ptr(), file_id.root(db)))
@@ -3442,6 +3461,10 @@ fn root_body<'db>(
     Ok((body, env))
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread relocation buffers reused from one function to the next, uncapped: they keep the most relocations one function had"
+)]
 thread_local! {
     /// The relocations of the function [`ObjectCodegen::define_code`] puts in the object, and
     /// those of them Cranelift is given: kept by the thread from one function to the next. A

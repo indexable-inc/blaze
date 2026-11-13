@@ -427,6 +427,10 @@ fn under<P: Put + ?Sized>(
 }
 
 /// `entries` (in key order, all under one node at `depth`) as a subtree: its key.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a leaf is written only when it holds at most LEAF (64) entries or at DEEPEST, where all 64 nibbles of distinct keys agree so it holds one: the count fits a u16"
+)]
 fn pack<P: Put + ?Sized>(
     store: &mut P,
     entries: Vec<(ContentId, Vec<u8>)>,

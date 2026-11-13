@@ -5,8 +5,8 @@
 #[allow(unsafe_code, reason = "mmap and MapViewOfFile, and the byte view of what they map")]
 mod mapped;
 
-pub(crate) use mapped::map;
-pub use mapped::{Advice, MapOptions, Mapped};
+pub(crate) use mapped::{map, map_extent};
+pub use mapped::{Advice, MapOptions, Mapped, granularity};
 
 mod private;
 
@@ -597,7 +597,7 @@ pub(crate) fn open_positional(path: &Path, write: bool, cache: crate::Cache) -> 
 /// How many times one read or write at an offset is asked again after the system cut it short
 /// with `EINTR` before it fails: a bound on the loop (rule bounded-progress), far past what a
 /// signal storm makes of a regular file's read.
-const INTERRUPTS: u32 = 64;
+pub(crate) const INTERRUPTS: u32 = 64;
 
 /// `into` filled from `at` of `file` (opened by [`open_positional`]): how many bytes were read,
 /// fewer than `into` only at the end of the file. Around the page cache, a read that ends short
@@ -1249,7 +1249,7 @@ fn created_mode() -> io::Result<u32> {
     if let Some(&mode) = MODE.get() {
         return Ok(mode);
     }
-    let probe = temporary_next_to(&std::env::temp_dir().join("blaze-umask"));
+    let probe = temporary_next_to(&crate::temp::base().join("blaze-umask"));
     let made = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1481,11 +1481,9 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-fs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A new empty directory for the test `name`, removed when the guard drops.
+    fn dir(name: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-fs-{name}-"))
     }
 
     /// Pins C1 of review 4: a seal of a symbolic link is refused, naming the link, and the

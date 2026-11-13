@@ -502,8 +502,8 @@ fn a_field_fact_names_its_field() {
 fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     let mut db = fixture::db("//- /lib.rs\npub fn f() {}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let dir = std::env::temp_dir().join(format!("blaze-items-unread-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let held = blaze_core::temp::TempDir::for_test("blaze-items-unread-");
+    let dir = held.join("included");
     let path = base_db::AbsPathBuf::assert_utf8(dir.clone());
     let file = db.files().included_file(&db, krate, &path, blaze_query::db::Durability::LOW);
     assert!(file.read(&db).is_err(), "the file is gone");
@@ -512,6 +512,5 @@ fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     std::fs::create_dir_all(&dir).expect("the temporary directory");
     assert!(db.reload_included_file(&path, &base_db::Looks::none()), "a directory is another error");
     let directory = val(&db, fact);
-    std::fs::remove_dir_all(&dir).expect("the temporary directory");
     assert_ne!(gone, directory, "two errors are two values");
 }

@@ -242,6 +242,7 @@ pub struct Program {
 /// A planted bug the simulation's oracle must catch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// A build rebinds no slot: launchers run on the code they have.

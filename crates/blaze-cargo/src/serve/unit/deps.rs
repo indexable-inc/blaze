@@ -353,7 +353,7 @@ struct Lookups {
 /// What each step of the item store is called in a note and an event, by `body_store::Step`
 /// as an index.
 const ITEM_STEPS: [&str; body_store::Step::COUNT] =
-    ["inference", "MIR", "borrow check", "constant"];
+    ["inference", "MIR", "borrow check", "constant", "lowering"];
 
 /// Says what the lookups through one store kept in `blaze_record`'s form came to, as one kept
 /// event `record lookups` in the profile: the `store` (`goals`, `items`, `dep images`,
@@ -504,13 +504,14 @@ impl Session {
 pub(crate) fn session(
     lowered: &Lowered,
     store: &blaze_cas::Reader,
+    stores: &Arc<crate::serve::direct::Stores>,
     macros: &Arc<blaze_macro_eval::Macros>,
     env: &[(String, String)],
 ) -> Result<Session, ApiError> {
     let mut read = EnvReads::default();
     let items_mode = items_in(&mut read, env)?;
     // alloc: setup, once per database; clone: an `Arc` each
-    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)));
+    let images = Arc::new(Images::new(store.clone(), Arc::clone(stores), Arc::clone(macros)));
     // dyn: the goal store keeps both for the database's life; called once per database
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
     // dyn: hir-ty's goal store takes its facts as `dyn` (blaze-items depends on hir-ty, which can't name `Goals`); made once per database
@@ -582,7 +583,7 @@ pub(crate) fn item_errors(session: &Session) -> Result<(), ApiError> {
 
 impl Session {
     /// What this build's item store lookups found, step by step; None with no item store.
-    pub(crate) fn item_steps(&self) -> Option<[body_store::StepCounts; 4]> {
+    pub(crate) fn item_steps(&self) -> Option<[body_store::StepCounts; body_store::Step::COUNT]> {
         self.items.as_ref().map(body_store::Installed::steps)
     }
 
@@ -676,6 +677,28 @@ pub(crate) fn store(
     let wrote = stored.iter().flat_map(|stored| &stored.filed).map(|(krate, filed)| (*krate, *filed));
     // alloc: once per front end stored, one per crate imaged
     let imaged: Vec<(Crate, ContentId)> = found.chain(wrote).collect();
+    // The found record's key of each crate whose image this store wrote and that has a plan
+    // key (restore.md, "Restart reads records (d)", C): where a lowering that finds the plan
+    // key unchanged reads what its image is filed under, before it resolves anything. A crate
+    // with no plan key (a root outside its package, a symlink in it, a dependency with none)
+    // has no record and is lowered from its files, as before.
+    let found_keys = match &stored {
+        None => Vec::new(), // alloc: none
+        Some(stored) => {
+            let front = front_end()?;
+            // alloc: once per front end stored, one per image written
+            let mut written: Vec<Crate> = stored.filed.keys().copied().collect();
+            written.sort_unstable();
+            let plans = lowered.plan_keys(&written);
+            written
+                .into_iter()
+                .filter_map(|krate| match plans.get(&krate) {
+                    Some(Ok(plan)) => Some((krate, hir_def::deps::found::found_key(*plan, front))),
+                    _ => None,
+                })
+                .collect() // alloc: as `written`
+        }
+    };
     // alloc: once per front end stored, one entry a crate walked
     let mut sealed = HashMap::new_in(Global);
     // alloc: once per front end stored, the keys of the sealed crates' front-end records
@@ -684,6 +707,9 @@ pub(crate) fn store(
         if !hir_def::deps::sealed_in(db, krate, &mut sealed) {
             continue;
         }
+        // Its found record, pinned and layered with the records it names: a second home
+        // finds the crate by its plan key and writes nothing.
+        let found_key = found_keys.iter().find(|(it, _)| *it == krate).map(|(_, key)| Key(*key));
         // The crate's front-end records, from the one list of their keys, and the
         // read-filing records its image is found through (a slot that holds nothing names
         // no record, and a pin of it keeps nothing).
@@ -691,7 +717,7 @@ pub(crate) fn store(
             .and_then(|kept| kept.served.keys.get(&krate))
             .into_iter()
             .flat_map(|key| crate::serve::collect::filing_keys(*key));
-        let keys = crate::serve::collect::front_keys(filed).chain(slots);
+        let keys = crate::serve::collect::front_keys(filed).chain(slots).chain(found_key);
         // alloc: once per sealed crate imaged, its few keys
         let keys: Vec<blaze_cas::Key> = keys.collect();
         layered.extend(keys.iter().copied());
@@ -769,6 +795,38 @@ pub(crate) fn store(
         );
     }
     stage("the kept roots of a dependency crate");
+    // Each found record, now that what was put under the filed key is known: the image's
+    // families as `hir_def::deps::store` wrote them, and the impl tables unless they did not
+    // encode. A record that will not encode is a bug of the lowering's (a path not under the
+    // package): said, naming the crate, and the build's store stops (no record half-said).
+    if let Some(stored) = &stored {
+        use hir_def::deps::found::{Found, family};
+        for &(krate, key) in &found_keys {
+            let Some(&filed) = stored.filed.get(&krate) else { continue };
+            let tables = match untabled.iter().any(|(it, _)| *it == krate) {
+                true => 0,
+                false => family::IMPL_TABLES,
+            };
+            let named = || format!("{}", krate.named(db)); // alloc: error path
+            let files = lowered.found_files(krate).ok_or_else(|| {
+                ApiError::new(
+                    format!("the crate {} has a plan key and no files the lowering planned", named()),
+                    Some(root.to_owned()),
+                )
+            })?;
+            let bytes = Found::new(filed, stored.families | tables, lowered.own_surface(krate), files)
+                .and_then(|found| found.encode())
+                .map_err(|why| {
+                    ApiError::new(
+                        format!("the found record of the crate {}: {why}", named()),
+                        Some(root.to_owned()),
+                    )
+                })?;
+            ImageStore::put(images, key, bytes)
+                .map_err(|why| ApiError::new(why, Some(root.to_owned())))?;
+        }
+    }
+    stage("the found record of a dependency crate");
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {
@@ -852,6 +910,60 @@ pub(crate) fn store(
     Ok((puts, Flushes { goals, items }))
 }
 
+/// Reads the found record (restore.md, "Restart reads records (d)", C; written by [`store`])
+/// of each crate of `lowered`'s plan that has a plan key ([`Lowered::plan_keys`]), from
+/// `store` under the key of that plan key and this front end, and gives the lowering what
+/// each says ([`Lowered::take_found`]): before any crate is identified, keyed or resolved,
+/// and before [`Lowered::give_surfaces`]. A crate with no plan key or no record is lowered
+/// from its files, as one always was. Bytes under a record's key that do not decode are a
+/// corrupt store (the key covers the layout): an error naming the crate, never read as none.
+///
+/// **Cost.** One lookup a crate of the plan, and the record's bytes (a few hundred bytes and
+/// its own surface) for each found; the plan keys are made from the tree's nodes. The floor
+/// is one lookup a crate.
+pub(crate) fn find(lowered: &mut Lowered, store: &blaze_cas::Reader) -> Result<(), ApiError> {
+    use hir_def::deps::found::{Found, found_key};
+    let _span = tracing::info_span!(target: "blaze", "found records").entered();
+    let front = front_end()?;
+    let crates = lowered.crates().named();
+    let plans = lowered.plan_keys(&crates);
+    let (mut asked, mut hits) = (0u64, 0u64);
+    for krate in crates {
+        let Some(Ok(plan)) = plans.get(&krate) else { continue };
+        asked += 1;
+        let key = found_key(*plan, front);
+        let named = |lowered: &Lowered| format!("{}", krate.named(lowered.db())); // alloc: error path
+        let bytes = {
+            let guard = blaze_cas::enter();
+            match store.get(&guard, &Key(key)) {
+                Ok(None) => continue,
+                // alloc: the record's bytes, once a crate found
+                Ok(Some(entry)) => entry.bytes.to_vec(),
+                Err(corrupt) => {
+                    return Err(ApiError::new(
+                        // alloc: error path
+                        format!("the found record of the crate {}: {corrupt}", named(lowered)),
+                        None,
+                    ));
+                }
+            }
+        };
+        let found = Found::decode(&bytes).map_err(|why| {
+            ApiError::new(
+                // alloc: error path
+                format!("the found record of the crate {}: {why}", named(lowered)),
+                None,
+            )
+        })?;
+        lowered
+            .take_found(krate, found.filed(), found.own_surface())
+            .map_err(super::lower_error)?;
+        hits += 1;
+    }
+    tracing::info!(target: "blaze", asked, hits, "found records");
+    Ok(())
+}
+
 /// What [`store`]'s flushes did: the goal store's, and the item store's when one is installed.
 pub(crate) struct Flushes {
     pub(crate) goals: goal_store::Flushed,
@@ -896,7 +1008,7 @@ impl Flushes {
 /// found, step by step (`steps`, from [`Session::item_steps`]). None when there is neither.
 pub(crate) fn noted(
     flushes: Option<&Flushes>,
-    steps: Option<&[body_store::StepCounts; 4]>,
+    steps: Option<&[body_store::StepCounts; body_store::Step::COUNT]>,
 ) -> Option<Diagnostic> {
     let note = flushes.map(|it| flushed(&it.goals));
     let mut message = String::new();
@@ -1321,6 +1433,9 @@ pub(crate) fn record_makers() -> Result<crate::serve::RecordMakers, ApiError> {
 /// The store as [`hir_def::deps`] and the goal store read and write it.
 struct Images {
     store: blaze_cas::Reader,
+    /// The daemon's stores as its tasks read them ([`crate::serve::direct`]): a record read
+    /// from pages is mapped or read through them, with no page pool.
+    stores: Arc<crate::serve::direct::Stores>,
     /// The daemon's proc macros, whose kept expansions' reads [`ImageStore::reads_now`] works
     /// out again.
     macros: Arc<blaze_macro_eval::Macros>,
@@ -1347,11 +1462,16 @@ struct Puts {
 }
 
 impl Images {
-    fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
+    fn new(
+        store: blaze_cas::Reader,
+        stores: Arc<crate::serve::direct::Stores>,
+        macros: Arc<blaze_macro_eval::Macros>,
+    ) -> Images {
         let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
         let entries = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
         Images {
             store,
+            stores,
             macros,
             puts: Lock::new("serve.deps.images.puts", puts),
             entries: Lock::new("serve.deps.images.entries", entries),
@@ -1385,17 +1505,24 @@ impl Images {
         key: ContentId,
         value: std::borrow::Cow<'_, [u8]>,
     ) -> Result<(), String> {
+        use crate::serve::direct::{self, Which};
         use hir_def::nameres::frozen::entries::differ;
-        let guard = blaze_cas::enter();
-        match self.store.get(&guard, &Key(key)) {
-            Ok(Some(entry)) if entry.bytes[..] == *value => return Ok(()),
-            Ok(Some(entry)) => {
-                let differ = differ(&entry.bytes[..], &value);
-                // alloc: error path
-                return Err(format!("the store holds other bytes under {key:?}: {differ}"));
+        // What the store holds under it, read into the task's frame (or mapped) and compared
+        // in the scope.
+        let held = blaze_mem::frame::current(|frame| {
+            match direct::value(&self.stores, Which::Home, &Key(key), frame) {
+                Ok(Some(entry)) if entry[..] == *value => Ok(true),
+                Ok(Some(entry)) => {
+                    let differ = differ(&entry[..], &value);
+                    // alloc: error path
+                    Err(format!("the store holds other bytes under {key:?}: {differ}"))
+                }
+                Ok(None) => Ok(false),
+                Err(failed) => Err(failed.to_string()),
             }
-            Ok(None) => {}
-            Err(corrupt) => return Err(corrupt.to_string()),
+        })?;
+        if held {
+            return Ok(());
         }
         let mut puts = into.lock();
         let Puts { list, at } = &mut *puts;
@@ -1433,15 +1560,16 @@ impl hir_def::nameres::frozen::entries::Entries for Images {
         key: &ContentId,
         with: &mut dyn FnMut(&[u8]),
     ) -> Result<bool, String> {
-        let guard = blaze_cas::enter();
-        match self.store.get(&guard, &Key(*key)) {
+        use crate::serve::direct::{self, Which};
+        // One direct read into the task's frame, handed to `with` in the scope.
+        blaze_mem::frame::current(|frame| match direct::value(&self.stores, Which::Home, &Key(*key), frame) {
             Ok(Some(entry)) => {
-                with(&entry.bytes[..]);
+                with(&entry[..]);
                 Ok(true)
             }
             Ok(None) => Ok(false),
-            Err(corrupt) => Err(corrupt.to_string()),
-        }
+            Err(failed) => Err(failed.to_string()),
+        })
     }
 
     fn put(&self, _set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
@@ -1458,49 +1586,138 @@ pub(crate) fn entries(lowered: &mut Lowered, session: &Session) {
     hir_def::nameres::frozen::entries::set(lowered.served_db(), held);
 }
 
-/// A value of the store held in place past the read ([`blaze_cas::Reader::pinned`]): verified
-/// against its content hash, at a 16-byte boundary, and unmoved while it lives.
-struct InStore(blaze_cas::Pinned);
+/// An image of the store held past the read, with no page pool (`blaze_cas::direct`):
+/// verified against its content hash, at a [`blaze_format::ALIGN`] boundary, unmoved while it
+/// lives. It outlives the task that read it (a front end holds it for every crate it serves),
+/// so it is never the task's frame bytes.
+enum InStore {
+    /// Read in place through a mapping of its file (a value of
+    /// [`blaze_cas::direct::MAP_FROM`] bytes or more): the kernel's page cache is the one copy.
+    Mapped(blaze_cas::direct::Mapped),
+    /// A shorter one (compressed or under `MAP_FROM`, which `direct` reads and never maps), or
+    /// a mapped one whose bytes do not start at `ALIGN` in its file: one aligned copy, owned.
+    Copied(blaze_format::Aligned),
+}
 
 impl Held for InStore {
     #[inline]
     fn bytes(&self) -> &[u8] {
-        &self.0
+        match self {
+            InStore::Mapped(mapped) => mapped,
+            InStore::Copied(copied) => copied,
+        }
     }
 }
 
-/// A record of the store read a part at a time ([`blaze_cas::Reader::part`]): each read pins
-/// the pages its part is on for as long as the read runs, and nothing between reads, so the
-/// pool's sweep and its idle give-back take the pages no reader came back to.
-struct InPool {
-    store: blaze_cas::Reader,
+impl InStore {
+    /// The image of `key` in `stores`' home store: `None` when it keeps none.
+    fn of(stores: &crate::serve::direct::Stores, key: Key) -> Result<Option<InStore>, String> {
+        use crate::serve::direct::{self, Which};
+        use blaze_cas::direct::Failed;
+        match direct::map(stores, Which::Home, &key) {
+            Ok(Some(mapped)) if (mapped.as_ptr() as usize).is_multiple_of(blaze_format::ALIGN) => {
+                Ok(Some(InStore::Mapped(mapped)))
+            }
+            // An image's parts are read in place at `ALIGN`: one whose bytes start off it in
+            // their file (a pack's record header before them) is copied once, aligned.
+            Ok(Some(mapped)) => Ok(Some(InStore::Copied(blaze_format::Aligned::copy_from(&mapped)))),
+            Ok(None) => Ok(None),
+            // `direct`'s rule: a value under `MAP_FROM`, compressed or in a writer's segment is
+            // read, not mapped. Read into the task's frame, verified, and copied out aligned.
+            Err(Failed::NotMappable { .. }) => blaze_mem::frame::current(|frame| {
+                match direct::read(stores, Which::Home, &key, frame) {
+                    // alloc: an aligned copy, once per image under `MAP_FROM` a front end holds
+                    Ok(found) => Ok(found.map(|bytes| InStore::Copied(blaze_format::Aligned::copy_from(bytes)))),
+                    Err(failed) => Err(failed.to_string()),
+                }
+            }),
+            Err(failed) => Err(failed.to_string()),
+        }
+    }
+}
+
+/// A record of pages (a crate's def map or impl tables) as a database reads it, with no page
+/// pool (`blaze_cas::direct`): one of [`blaze_cas::direct::MAP_FROM`] bytes or more mapped
+/// once, read in place through the mapping (the kernel's page cache the one copy, no
+/// footprint of its own); a shorter one read once, verified, and held (under 16 KiB a crate).
+/// A part's read is a slice of either: no system call, nothing pinned across tasks, and the
+/// floor of a lookup (the bytes its window and entry are on) touched and nothing else.
+struct PagedRecord {
     key: Key,
-    len: u64,
-    /// Keeps the record from the store's collector while a database reads it: its flags of
-    /// use last two periods and its pack's age an hour, and a database may read no part for
-    /// longer. Taken as the record is found, which is during the build that serves its crate
-    /// (`blaze_cas::collect::Keep`'s rule).
+    bytes: Pages,
+    /// Keeps the record from the store's collector while a database reads it: a mapping
+    /// keeps an unlinked pack's bytes alive, but a record read again after a restart is asked
+    /// by its key. Taken before the record is read (`blaze_cas::collect::Keep`'s rule).
     _kept: blaze_cas::collect::Keep,
 }
 
-impl hir_def::deps::PageSource for InPool {
+/// What a [`PagedRecord`] reads its parts from.
+enum Pages {
+    Mapped(blaze_cas::direct::Mapped),
+    // alloc: a record under `MAP_FROM` bytes, once per crate served from pages
+    Held(Box<[u8]>),
+}
+
+impl PagedRecord {
+    /// The record of `key` in `stores`' home store: `None` when it keeps none.
+    fn of(
+        stores: &crate::serve::direct::Stores,
+        key: Key,
+        kept: blaze_cas::collect::Keep,
+    ) -> Result<Option<PagedRecord>, String> {
+        use crate::serve::direct::{self, Which};
+        use blaze_cas::direct::Failed;
+        let bytes = match direct::map(stores, Which::Home, &key) {
+            Ok(Some(mapped)) => Pages::Mapped(mapped),
+            Ok(None) => return Ok(None),
+            // The record is under `MAP_FROM` or still in a writer's segment: `direct`'s rule
+            // is that such a one is read, not mapped. Read whole once, verified.
+            Err(Failed::NotMappable { .. }) => {
+                let read = blaze_mem::frame::current(|frame| {
+                    direct::read(stores, Which::Home, &key, frame)
+                        // alloc: the record held, once per crate served from pages
+                        .map(|found| found.map(|bytes| Pages::Held(Box::from(bytes))))
+                });
+                match read.map_err(|failed| failed.to_string())? {
+                    Some(held) => held,
+                    // Found by the map's lookup and not by the read's, under a keep: a bug in
+                    // the collector or the keep. Said, never read as empty.
+                    // alloc: error path
+                    None => return Err(format!("the store no longer holds {:?}", key.0)),
+                }
+            }
+            Err(failed) => return Err(failed.to_string()),
+        };
+        Ok(Some(PagedRecord { key, bytes, _kept: kept }))
+    }
+
+    fn all(&self) -> &[u8] {
+        match &self.bytes {
+            Pages::Mapped(mapped) => mapped,
+            Pages::Held(held) => held,
+        }
+    }
+}
+
+impl hir_def::deps::PageSource for PagedRecord {
     fn size(&self) -> u64 {
-        self.len
+        self.all().len() as u64
     }
 
     // dyn: hir-def's reader of one segment, once per read
     fn read(&self, at: u64, len: u64, with: &mut dyn FnMut(&[u8])) -> Result<(), String> {
-        let guard = blaze_cas::enter();
-        match self.store.part(&guard, &self.key, at, len) {
-            Ok(Some(bytes)) => {
-                with(bytes);
+        let all = self.all();
+        let part = usize::try_from(at)
+            .ok()
+            .zip(usize::try_from(len).ok())
+            .and_then(|(at, len)| all.get(at..at.checked_add(len)?));
+        match part {
+            Some(part) => {
+                with(part);
                 Ok(())
             }
-            // A record that was there when its crate was served and is not now, though this
-            // holds a keep of it: a bug in the collector or the keep. Said, never read as empty.
             // alloc: error path
-            Ok(None) => Err(format!("the store no longer holds {:?}", self.key.0)),
-            Err(corrupt) => Err(corrupt.to_string()),
+            None => Err(format!("bytes {at}+{len} of the {} of record {:?}", all.len(), self.key.0)),
         }
     }
 }
@@ -1508,29 +1725,18 @@ impl hir_def::deps::PageSource for InPool {
 impl ImageStore for Images {
     // dyn: hir-def's holder of one record, once per crate per front end
     fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn hir_def::deps::PageSource>>, String> {
-        let guard = blaze_cas::enter();
-        // The one whole read of the record: it is checked against its content hash here, so
-        // every part read after is of bytes that were. Its pages are let go with the guard.
-        match self.store.get(&guard, &Key(*key)) {
-            Ok(Some(entry)) => {
-                let len = entry.bytes.len() as u64;
-                // clone: a count of the store's reader; alloc: one holder per crate read from pages
-                let _kept = self.store.keep(Key(*key));
-                Ok(Some(Arc::new(InPool { store: self.store.clone(), key: Key(*key), len, _kept })))
-            }
-            Ok(None) => Ok(None),
-            Err(corrupt) => Err(corrupt.to_string()),
-        }
+        // The keep first, so the collector takes nothing between the lookup and the read.
+        let kept = self.store.keep(Key(*key));
+        // The record mapped or read once, verified against its content hash as it is: every
+        // part read after is a slice of bytes that were.
+        let record = PagedRecord::of(&self.stores, Key(*key), kept)?;
+        // alloc: one holder per crate read from pages
+        Ok(record.map(|it| Arc::new(it) as Arc<dyn hir_def::deps::PageSource>))
     }
 
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
-        let guard = blaze_cas::enter();
-        match self.store.pinned(&guard, &Key(*key)) {
-            // dyn: hir-def's holder of one image, once per crate per front end
-            Ok(Some(pinned)) => Ok(Some(Arc::new(InStore(pinned)))),
-            Ok(None) => Ok(None),
-            Err(corrupt) => Err(corrupt.to_string()),
-        }
+        // dyn: hir-def's holder of one image, once per crate per front end
+        Ok(InStore::of(&self.stores, Key(*key))?.map(|held| Arc::new(held) as ImageBuf))
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {

@@ -148,6 +148,10 @@ impl<'a, 'db> LevelCx<'a, 'db> {
         &self.sources[id.0 as usize]
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a `SourceId` is a u32; a crate naming 2^32 lint sources needs a typed refusal from the builder"
+    )]
     fn add_source(&mut self, source: Source) -> SourceId {
         let id = SourceId(u32::try_from(self.sources.len()).expect("fewer than 2^32 lint names"));
         self.sources.push(source);
@@ -562,6 +566,10 @@ impl<'db> Levels<'db> {
     }
 
     /// A new set inside `parent`, the last, for [`Levels::insert`].
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a set's first level is a u32 index; a crate with 2^32 lint levels needs a typed refusal from the builder"
+    )]
     fn open(&mut self, parent: SetId) -> SetId {
         let set = SetId::try_from(self.start.len()).expect("fewer than 2^32 sets");
         self.start.push(u32::try_from(self.ids.len()).expect("fewer than 2^32 levels"));

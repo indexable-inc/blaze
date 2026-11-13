@@ -18,6 +18,9 @@
 //! ASCII the bytes start with is skipped 64 bytes at a time.
 
 #![feature(allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
 
@@ -45,9 +48,17 @@ pub struct Bytes {
 enum Owner {
     Heap(Arc<[u8]>),
     /// Bytes kept past any request in their tag's blocks, the count beside them.
-    Kept(#[allow(dead_code)] Arc<[u8], Kept>),
+    Kept(
+        #[allow(dead_code)]
+        #[expect(blaze::unwired, reason = "wired: held only for its drop, which gives the blocks back")]
+        Arc<[u8], Kept>,
+    ),
     // dyn: the owner of an image's range, named by the crate that maps it; only ever dropped
-    Held(#[allow(dead_code)] Arc<dyn Send + Sync>),
+    Held(
+        #[allow(dead_code)]
+        #[expect(blaze::unwired, reason = "wired: held only for its drop, which lets the range go")]
+        Arc<dyn Send + Sync>,
+    ),
     Static,
 }
 

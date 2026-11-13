@@ -442,6 +442,10 @@ impl Journal {
 
     /// Starts the next effect if none is in flight: a rewrite if one was asked for, else the cut
     /// recovery asked for, else an append of what was recorded since the last.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "frame_seen counts a disk's overlay in u32 and nothing caps an overlay's names: an overlay past 2^32 names needs a typed refusal where it is staged"
+    )]
     pub(crate) fn flush(
         &mut self,
         tree: &Tree,
@@ -817,6 +821,10 @@ fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) -> Res
 
 /// Appends the record of a file whose content ID is `id`: its checksum is over the ID, so
 /// its bytes are copied and not hashed again.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the tree refuses a file over MOST_FILE_BYTES when it is staged (OpError::TooLarge), so every file framed here fits the record's u32 length"
+)]
 fn frame_file(out: &mut Vec<u8>, id: &ContentId, bytes: &[u8]) {
     debug_assert_eq!(*id, ContentId::of(FILE_DOMAIN, bytes), "a file record's ID");
     out.reserve(HEADER + bytes.len() + CHECKSUM);

@@ -570,6 +570,11 @@ impl<'db> ViewCtx<'db, '_> {
     /// The tokens `span` maps down to in `macro_file`'s expansion, pushed onto `out`, with the
     /// expansion's tree recorded: how many were pushed, `None` when the expansion maps nothing
     /// down from its file.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the count pushed is bounded by one expansion's tokens, which come from a file's \
+                  text that nothing checks is under 4 GiB: returning a usize would remove it"
+    )]
     pub(super) fn map_range_down(
         &mut self,
         macro_file: MacroCallId,

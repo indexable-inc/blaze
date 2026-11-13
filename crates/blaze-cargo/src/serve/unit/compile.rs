@@ -45,6 +45,13 @@ pub(super) mod doctest;
         reason = "the record of a unit's read parts and its check; the trace that fills it from a unit's making is not built (docs/v2/plan/design/store.md, \"Early cutoff between crates\")"
     )
 )]
+#[cfg_attr(
+    not(test),
+    expect(
+        blaze::unwired,
+        reason = "unwired until the trace that fills it from a unit's making is built (docs/v2/plan/design/store.md, \"Early cutoff between crates\")"
+    )
+)]
 pub(super) mod parts;
 
 use std::{fmt, sync::Arc};
@@ -76,6 +83,7 @@ use super::{
     portable::{self, Places},
     reads, say, script,
 };
+use crate::serve::direct::{self, Which};
 use crate::serve::work::{Compiled, Failed, JobKind, KeptPut, Linking, Output, Phase, Put, PutInto};
 
 type Image = crate::serve::work::Image<Real>;
@@ -532,7 +540,6 @@ fn quotes_slot(narrow: Key) -> Key {
 /// The names in the slot under `narrow` ([`quotes_slot`]): none when the store has none. A
 /// read that fails or bytes that do not decode are an error naming the slot (rule 3).
 fn quotes(job: &Job, narrow: Key) -> Result<Option<Vec<String>>, ApiError> {
-    let guard = blaze_cas::enter();
     let slot = quotes_slot(narrow);
     let failed = |why: String| {
         // alloc: error path
@@ -544,14 +551,15 @@ fn quotes(job: &Job, narrow: Key) -> Result<Option<Vec<String>>, ApiError> {
             None,
         )
     };
-    match job.input.store.get(&guard, &slot) {
+    // One direct read into the task's frame, decoded before the frame scope ends.
+    blaze_mem::frame::current(|frame| match direct::read(&job.input.reads, Which::Home, &slot, frame) {
         Ok(None) => Ok(None),
         // alloc: the few names of a record's quoted files, once per lookup of a unit that has any
-        Ok(Some(entry)) => blaze_protocol::cbor::from_slice(entry.bytes)
+        Ok(Some(bytes)) => blaze_protocol::cbor::from_slice(bytes)
             .map(Some)
             .map_err(|error| failed(format!("they do not decode: {error}"))), // alloc: error path
         Err(error) => Err(failed(error.to_string())), // alloc: error path
-    }
+    })
 }
 
 /// The base key of a record whose diagnostics point into the files `names`: its narrow key
@@ -797,6 +805,7 @@ fn drawn_for(job: &Job, unit: usize, said: &Said) -> Result<Vec<Diagnostic>, Api
 /// beside it), under which the record of the same tokens is found after lines moved. Until
 /// then such an edit misses the unit's record and links whole.
 #[allow(dead_code, reason = "the link lane's input, defined before either lane makes or takes it")]
+#[expect(blaze::unwired, reason = "the link lane's input: unwired until a lane makes it and the link takes it")]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct SpansMoved {
     /// The key of the record whose code this unit's is: every template it names and every
@@ -908,20 +917,22 @@ fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
 /// not decode is an error naming the unit and its key (rule 3).
 fn kept_check(job: &Job, unit: usize) -> Result<Option<(Vec<Diag>, bool)>, ApiError> {
     let Some(base) = check_key(job, unit)? else { return Ok(None) };
-    let guard = blaze_cas::enter();
-    let Some((_, entry, body)) = filed_in(job, &job.input.store, &guard, base)? else {
-        return Ok(None);
-    };
-    let checked = Checked::decoded(entry.bytes, body).map_err(|why| {
-        // alloc: error path
-        ApiError::new(
-            format!(
-                "unit {unit}: its check's outcome under {:x} in the daemon's store does not decode: {why}",
-                base.0
-            ),
-            None,
-        )
+    let checked = blaze_mem::frame::current(|frame| {
+        let Some((_, entry, body)) = filed_in(job, frame, base)? else {
+            return Ok(None);
+        };
+        Checked::decoded(&entry, body).map(Some).map_err(|why| {
+            // alloc: error path
+            ApiError::new(
+                format!(
+                    "unit {unit}: its check's outcome under {:x} in the daemon's store does not decode: {why}",
+                    base.0
+                ),
+                None,
+            )
+        })
     })?;
+    let Some(checked) = checked else { return Ok(None) };
     let diags = match &checked.placed {
         Some(placed) => replaced(job, unit, placed)?,
         None => Vec::new(), // alloc: empty, allocates nothing
@@ -982,17 +993,25 @@ fn check_puts(
         true => places.here(base),
         false => base,
     };
-    let filing = {
-        let guard = blaze_cas::enter();
+    // Every slot of `base` read at once into the task's frame at the first slot asked
+    // (`direct::slots`), a slot that does not read taken as not kept, as the pooled walk took it.
+    let filing = blaze_mem::frame::current(|frame| {
+        let mut slots: Option<direct::Slots<'_>> = None;
         reads::file(
             base,
             read,
             &job.input.config.invocation.env,
             &|manifest| job.units().is_primary_manifest(manifest),
-            |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
+            |slot| {
+                slots
+                    .get_or_insert_with(|| {
+                        direct::slots(&job.input.reads, (0..reads::SLOTS).map(|n| reads::slot(base, n)), frame)
+                    })
+                    .bytes(slot)
+            },
         )
-        .map_err(failed)?
-    };
+    })
+    .map_err(failed)?;
     let Some(reads::Filing { key, slot }) = filing else { return Ok(none) };
     let mut puts = vec![Put { key, kind: Kind::Query, bytes }]; // alloc: once per check entry kept
     puts.extend(slot.map(|(key, bytes)| Put { key, kind: Kind::Query, bytes }));
@@ -1200,15 +1219,16 @@ pub(crate) struct Filed {
     pub(crate) refused: Vec<ApiError>,
 }
 
-/// On a worker, after the build's answer: each of `records` encoded and filed against the
-/// store of its build (`store`, read for the slots of its key) under the request's
+/// On a worker (or on the loop, its driver lent: `job::file_unkept`), after the build's
+/// answer: each of `records` encoded and filed against the store of its build (`store`, read
+/// for the slots of its key, every slot of a key in one direct read) under the request's
 /// environment (`config`) and units (`units`), the values its reads are filed by. One
 /// record's failure fails that record alone (panics-fail-one-job).
 pub(crate) fn file_records(
     records: Vec<Box<PendingRecord>>,
     config: &BuildConfig,
     units: &Units,
-    store: &blaze_cas::Reader,
+    store: &direct::Stores,
 ) -> Filed {
     let mut filed = Filed {
         // alloc: once per after-answer task, a record and its slot each
@@ -1231,7 +1251,7 @@ fn file_record(
     record: PendingRecord,
     config: &BuildConfig,
     units: &Units,
-    store: &blaze_cas::Reader,
+    store: &direct::Stores,
     puts: &mut Vec<KeptPut>,
 ) -> Result<Option<blaze_kernel::Miss>, ApiError> {
     let PendingRecord {
@@ -1312,9 +1332,17 @@ fn file_record(
     let filing = {
         let _span =
             tracing::info_span!(target: "blaze", "unit record file", unit = unit as u64).entered();
-        let guard = blaze_cas::enter();
-        reads::file(base, &read, &config.invocation.env, &primary, |slot| {
-            store.get(&guard, slot).ok().flatten().map(|it| it.bytes)
+        // Every slot of `base` in one direct read into the task's frame, at the first slot
+        // asked; a slot that does not read is taken as not kept, as before.
+        blaze_mem::frame::current(|frame| {
+            let mut slots: Option<direct::Slots<'_>> = None;
+            reads::file(base, &read, &config.invocation.env, &primary, |slot| {
+                slots
+                    .get_or_insert_with(|| {
+                        direct::slots(store, (0..reads::SLOTS).map(|n| reads::slot(base, n)), frame)
+                    })
+                    .bytes(slot)
+            })
         })
         // alloc: error path
         .map_err(|why| ApiError::new(format!("filing the record of {item}: {why}"), None))?
@@ -1453,8 +1481,11 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
         }
         // What the record was looked for under past its key: each slot's reads with the
         // values they have now, said for the `unit_reads` view.
-        {
-            let guard = blaze_cas::enter();
+        // Every slot in one direct read into the task's frame, a slot that does not read
+        // taken as not kept.
+        blaze_mem::frame::current(|frame| {
+            let read =
+                direct::slots(&job.input.reads, (0..reads::SLOTS).map(|n| reads::slot(looked, n)), frame);
             let slots = reads::looked_under(
                 looked,
                 &job.input.config.invocation.env,
@@ -1463,7 +1494,7 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
                 // Said for `blaze why`, of a record already missed: a look no output rests on,
                 // kept by no build.
                 |path| base_db::IncludedFile::content_now(std::path::Path::new(path), &base_db::Looks::none()),
-                |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
+                |slot| read.bytes(slot),
             );
             match slots {
                 Ok(slots) => {
@@ -1473,7 +1504,7 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
                 }
                 Err(why) => say_reads(&item, "looked", None, Err(why)),
             }
-        }
+        });
         let mut miss = Miss::of_parts("unit", subject, item.clone(), key.0, parts); // clone: once a miss
         miss.beyond = Some(FILED_BEYOND);
         Ok(miss)
@@ -2095,6 +2126,10 @@ fn hash_cbor<T: Serialize + ?Sized>(
     })
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread hash buffers cleared on each use, uncapped: they keep the largest key encoded on the thread"
+)]
 thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     /// What [`hash_cbor`] hashes: [`SCRATCH`] written against the build's directories.
@@ -2115,12 +2150,11 @@ fn machine_file(
 /// not fresh, and the unit's compile, looking again, fails naming why ([`kept`]).
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Ok(keys) = record_keys(job, unit) else { return false };
-    let guard = blaze_cas::enter();
     // A sealed unit's record (std's, any sealed tree's) is in the machine's layer, which the
     // daemon's store reads behind its own records: one lookup finds either.
-    keys.into_iter()
-        .flatten()
-        .any(|base| matches!(filed_in(job, &job.input.store, &guard, base), Ok(Some(_))))
+    blaze_mem::frame::current(|frame| {
+        keys.into_iter().flatten().any(|base| matches!(filed_in(job, frame, base), Ok(Some(_))))
+    })
 }
 
 /// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
@@ -2132,8 +2166,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
 /// (`UnitWriter::still`); read in place, as [`fresh`] reads.
 pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
     let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
-    let guard = blaze_cas::enter();
-    matches!(filed_in(job, &job.input.store, &guard, narrow), Ok(Some(_)))
+    blaze_mem::frame::current(|frame| matches!(filed_in(job, frame, narrow), Ok(Some(_))))
 }
 
 /// The narrowed identities of library crates the writer worked out and no unit gave the loop
@@ -2150,60 +2183,76 @@ fn library_puts(job: &Job) -> Vec<Put> {
 /// its CBOR body starts. An error names the slot that does not decode or whose reads can't be
 /// worked out, or the key a read of failed: a store that can't be read is never a record not
 /// kept (rule 3). A sealed crate's record is found the same way, in the machine's layer the
-/// store reads behind its own (`serve::sealed`).
-fn filed_in<'g>(
+/// store reads behind its own (`serve::sealed`). Every read is a direct read into `frame`, the
+/// reading task's ([`direct`]); the record found is its bytes there, or a mapping of it.
+fn filed_in<'f>(
     job: &Job,
-    store: &'g blaze_cas::Reader,
-    guard: &'g blaze_cas::Guard,
+    frame: &'f blaze_mem::frame::Frame,
     base: Key,
-) -> Result<Option<(reads::Found, blaze_cas::Entry<'g>, usize)>, ApiError> {
+) -> Result<Option<(reads::Found, direct::Value<'f>, usize)>, ApiError> {
     // Under its key, then under its key here ([`Places::here`]): where a record is that is
     // tied to the directories of the build that made it ([`tied`]).
     let places = Places::of(job);
-    if let Some(found) = filed_under(job, &places, store, guard, base)? {
+    if let Some(found) = filed_under(job, &places, frame, base)? {
         return Ok(Some(found));
     }
-    filed_under(job, &places, store, guard, places.here(base))
+    filed_under(job, &places, frame, places.here(base))
 }
 
 /// [`filed_in`] under `base` itself.
-fn filed_under<'g>(
+fn filed_under<'f>(
     job: &Job,
     places: &Places,
-    store: &'g blaze_cas::Reader,
-    guard: &'g blaze_cas::Guard,
+    frame: &'f blaze_mem::frame::Frame,
     base: Key,
-) -> Result<Option<(reads::Found, blaze_cas::Entry<'g>, usize)>, ApiError> {
+) -> Result<Option<(reads::Found, direct::Value<'f>, usize)>, ApiError> {
+    let stores = &*job.input.reads;
     let mut hit = None;
     // The first read that failed, with its key; `find` goes on with it as missing, and its
     // answer is not used.
-    let failed: std::cell::Cell<Option<(Key, blaze_cas::Corrupt)>> = std::cell::Cell::new(None);
-    let fail = |key: &Key, error: blaze_cas::Corrupt| {
+    let failed: std::cell::Cell<Option<(Key, blaze_cas::direct::Failed)>> = std::cell::Cell::new(None);
+    let fail = |key: &Key, error: blaze_cas::direct::Failed| {
         let first = failed.take();
         failed.set(first.or(Some((*key, error))));
     };
+    // Every slot of `base` read at once, at the first slot `find` asks: one `read_many` where
+    // the walk read a slot at a time (a record under `base` itself reads no slot at all).
+    let mut slots: Option<direct::Slots<'f>> = None;
     let at = reads::find(
         base,
         &job.input.config.invocation.env,
         &|manifest| job.units().is_primary_manifest(manifest),
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
         |path| base_db::IncludedFile::content_now(std::path::Path::new(path), &job.input.looks),
-        |slot| match store.get(guard, slot) {
-            // Lane packs-1112: a slot not kept is asked of the packs, then read again.
-            Ok(None) if crate::serve::packs::missed(slot) => match store.get(guard, slot) {
-                Ok(it) => it.map(|it| it.bytes),
-                Err(error) => {
-                    fail(slot, error);
+        |slot| {
+            let read = slots.get_or_insert_with(|| {
+                direct::slots(stores, (0..reads::SLOTS).map(|n| reads::slot(base, n)), frame)
+            });
+            match read.get(slot) {
+                Some(Ok(Some(bytes))) => Some(*bytes),
+                // Lane packs-1112: a slot not kept is asked of the packs, then read again.
+                Some(Ok(None)) if crate::serve::packs::missed(slot) => {
+                    match direct::read(stores, Which::Home, slot, frame) {
+                        Ok(it) => it,
+                        Err(error) => {
+                            fail(slot, error);
+                            None
+                        }
+                    }
+                }
+                Some(Ok(None)) => None,
+                Some(Err(error)) => {
+                    fail(slot, error.clone()); // clone: an error, once
                     None
                 }
-            },
-            Ok(it) => it.map(|it| it.bytes),
-            Err(error) => {
-                fail(slot, error);
-                None
+                // `find` asks only the slots of `base`, all of which were read.
+                None => panic!(
+                    "unit::reads::find asked {:x}, no slot of record key {:x} (compile::filed_under)",
+                    slot.0, base.0
+                ),
             }
         },
-        |key| match found(places, store, guard, key, &job.input.looks) {
+        |key| match found(places, stores, frame, key, &job.input.looks) {
             Ok(it) => {
                 hit = it;
                 hit.is_some()
@@ -2269,23 +2318,27 @@ fn shipped() -> Result<&'static [crate::serve::sealed::Placed], ApiError> {
 /// A native input's path is written against the directories of the build that made the record
 /// ([`Places::text`]) and read against this build's `places`: one that names a directory this
 /// build has none of is a native input that is not as it was.
-fn found<'g>(
+fn found<'f>(
     places: &Places,
-    store: &'g blaze_cas::Reader,
-    guard: &'g blaze_cas::Guard,
+    stores: &direct::Stores,
+    frame: &'f blaze_mem::frame::Frame,
     key: &Key,
     looks: &base_db::Looks,
-) -> Result<Option<(blaze_cas::Entry<'g>, usize)>, blaze_cas::Corrupt> {
+) -> Result<Option<(direct::Value<'f>, usize)>, blaze_cas::direct::Failed> {
     // Lane packs-1112: a record not kept is asked of the packs, then read again; so is each
-    // output it names (`has`, below).
-    let entry = match store.get(guard, key)? {
+    // output it names (`has`, below). The record is read whole into the task's frame, or
+    // mapped where the store keeps it as a file of its own ([`direct::value`]).
+    let entry = match direct::value(stores, Which::Home, key, frame)? {
         Some(entry) => entry,
-        None if crate::serve::packs::missed(key) => match store.get(guard, key)? {
+        None if crate::serve::packs::missed(key) => match direct::value(stores, Which::Home, key, frame)? {
             Some(entry) => entry,
             None => return Ok(None),
         },
         None => return Ok(None),
     };
+    // `has` reads only the index, which the pool never held: it stays a guarded look.
+    let store = stores.home();
+    let guard = &blaze_cas::enter();
     // Each look at a native input is the build's own ([`crate::serve::work::JobInput::looks`]).
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new(), looks);
     let mut on_disk = machine_file(&mut disk);
@@ -2294,7 +2347,7 @@ fn found<'g>(
         on_disk(std::path::Path::new(std::str::from_utf8(&real).ok()?))
     };
     let has = |key: &Key| store.has(guard, key) || crate::serve::packs::missed(key);
-    let body = header::check(entry.bytes, has, &mut file);
+    let body = header::check(&entry, has, &mut file);
     Ok(body.map(|body| (entry, body)))
 }
 
@@ -2345,14 +2398,14 @@ pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiE
             name()
         )));
     };
-    let guard = blaze_cas::enter();
-    let mut found = None;
-    for base in keys.into_iter().flatten() {
-        if let Some((_, entry, _)) = filed_in(job, &job.input.store, &guard, base)? {
-            found = Some(recorded_in(job, unit, base, entry.bytes)?);
-            break;
+    let found = blaze_mem::frame::current(|frame| {
+        for base in keys.into_iter().flatten() {
+            if let Some((_, entry, _)) = filed_in(job, frame, base)? {
+                return recorded_in(job, unit, base, &entry).map(Some);
+            }
         }
-    }
+        Ok::<_, ApiError>(None)
+    })?;
     Ok(match found {
         Some(profiles) => Recorded::Read(profiles),
         // alloc: an error
@@ -2444,7 +2497,6 @@ fn pin_kept(job: &Job, unit: usize, at: &reads::Found, record: &Record) {
 
 /// [`kept`] under the base key `base`, one of the unit's ([`record_keys`]).
 fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiError> {
-    let guard = blaze_cas::enter();
     // A record that is there and does not decode is an error naming the unit, the key and the
     // store, never read as one not kept (rule 3): a record format change is the key's to cover.
     // The unit's name and package, or, when it can't be looked up, its index and why: the
@@ -2465,13 +2517,18 @@ fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiErro
         )
     };
     let places = Places::of(job);
-    if let Some((at, entry, body)) = filed_in(job, &job.input.store, &guard, base)? {
-        let record: Record = decoded(&places, &entry.bytes[body..])
-            .map_err(|error| undecoded("the daemon's store", error))?;
+    // The record read into the task's frame (or mapped), decoded before the scope ends.
+    let kept = blaze_mem::frame::current(|frame| {
+        let Some((at, entry, body)) = filed_in(job, frame, base)? else { return Ok(None) };
+        let record: Record =
+            decoded(&places, &entry[body..]).map_err(|error| undecoded("the daemon's store", error))?;
         pin_kept(job, unit, &at, &record);
-        let profiles = recorded_in(job, unit, base, entry.bytes)?;
+        let profiles = recorded_in(job, unit, base, &entry)?;
         // alloc: none
-        return Ok(Some(Kept { record, puts: Vec::new(), profiles }));
+        Ok::<_, ApiError>(Some(Kept { record, puts: Vec::new(), profiles }))
+    })?;
+    if kept.is_some() {
+        return Ok(kept);
     }
     // A std unit's record, and any sealed tree's, is in the machine's sealed layer, which the
     // daemon's store reads behind its own records (`serve::sealed`): the `get` above found it
@@ -2503,7 +2560,6 @@ fn unported(
     if record.ported.is_empty() {
         return Ok(());
     }
-    let guard = blaze_cas::enter();
     for &at in &record.ported {
         let Some((path, key, _)) = record.outputs.get_mut(at as usize) else {
             // alloc: error path
@@ -2521,11 +2577,13 @@ fn unported(
         };
         let real = match puts.iter().find(|it| it.key == *key) {
             Some(put) => places.real(&put.bytes).map(|it| it.into_owned()),
-            None => match job.input.store.get(&guard, key) {
-                Ok(Some(entry)) => places.real(entry.bytes).map(|it| it.into_owned()),
+            // The output read into the task's frame, or mapped where it is kept as a file of
+            // its own, and written against this build's directories into a put of its own.
+            None => blaze_mem::frame::current(|frame| match direct::value(&job.input.reads, Which::Home, key, frame) {
+                Ok(Some(entry)) => places.real(&entry).map(|it| it.into_owned()),
                 Ok(None) => Err("the store has it not".to_owned()), // alloc: error path
-                Err(corrupt) => Err(corrupt.to_string()),           // alloc: error path
-            },
+                Err(failed) => Err(failed.to_string()),             // alloc: error path
+            }),
         }
         .map_err(failed)?;
         let here = output_key(&real);
@@ -2541,7 +2599,6 @@ fn unported(
 /// out of `compiled`'s puts (the home keeps none of it) or, made by an earlier build of this
 /// home, read from the store.
 fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, ApiError> {
-    let guard = blaze_cas::enter();
     let mut share = Vec::with_capacity(compiled.outputs.len() + 2); // alloc: once per sealed unit made
     for output in &compiled.outputs {
         // Two outputs of the same bytes are one put.
@@ -2550,7 +2607,10 @@ fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, Ap
         }
         let put = match compiled.puts.iter().position(|it| it.key == output.key) {
             Some(at) => compiled.puts.remove(at),
-            None => match job.input.store.get(&guard, &output.key) {
+            // Lane M3: still the pooled read. The put needs the value's kind (an output is
+            // `Kind::Output` or, a linked image's recipe, `Kind::Derived`), which a direct read
+            // does not say: it moves once `blaze_cas::direct` answers with the header's kind.
+            None => match job.input.store.get(&blaze_cas::enter(), &output.key) {
                 // alloc: a copy for the layer, once per output of a sealed unit an earlier build made
                 Ok(Some(it)) => Put { key: output.key, kind: it.kind, bytes: it.bytes.to_vec() },
                 Ok(None) => {
@@ -3911,10 +3971,10 @@ impl Module<'_> {
                     // alloc: once per proc macro kept for wasm, the module's bytes for its load
                     Some(put) => (path, put.bytes.clone()),
                     None => {
-                        let guard = blaze_cas::enter();
-                        match job.input.store.get(&guard, &output.key) {
+                        // One direct read into the module's own buffer.
+                        match direct::owned(&job.input.reads, Which::Home, &output.key) {
                             // alloc: as above
-                            Ok(Some(it)) => (path, it.bytes.to_vec()),
+                            Ok(Some(bytes)) => (path, bytes),
                             // alloc: error path
                             Ok(None) => {
                                 return Err(ModuleError::NotInStore { path: path.to_owned() });
@@ -4047,10 +4107,10 @@ fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Optio
                 // alloc: as above
                 Some(put) => put.bytes.clone(),
                 None => {
-                    let guard = blaze_cas::enter();
-                    match job.input.store.get(&guard, &output.key) {
+                    // One direct read into the MSL's own buffer.
+                    match direct::owned(&job.input.reads, Which::Home, &output.key) {
                         // alloc: as above
-                        Ok(Some(it)) => it.bytes.to_vec(),
+                        Ok(Some(bytes)) => bytes,
                         Ok(None) => return Err(error(format!("the store does not hold its kept output {:x}", output.key.0))),
                         Err(corrupt) => return Err(error(format!("reading its kept output {:x}: {corrupt}", output.key.0))),
                     }
@@ -4421,7 +4481,7 @@ fn assemble(
             // Lint `blaze::vecreport`: what the optimized code still does in its loops, at
             // the source line, in the order of the positions.
             let reported = generated
-                .report(&job.input.store)
+                .report(&job.input.reads)
                 .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?;
             for it in reported {
                 // alloc: a finding's text, once each

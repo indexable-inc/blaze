@@ -1,5 +1,9 @@
 //! Missing batteries for standard libraries.
 
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 use std::borrow::Cow;
 use std::io as sio;
 use std::process::Command;
@@ -8,6 +12,7 @@ use std::{cmp::Ordering, ops, time::Instant};
 mod macros;
 
 pub mod assert;
+pub mod child;
 pub mod edit_distance;
 pub mod file_lock;
 pub mod lend;

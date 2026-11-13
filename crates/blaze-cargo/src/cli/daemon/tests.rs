@@ -365,7 +365,7 @@ fn a_daemon_of_this_very_file_is_this_build_with_nothing_hashed() {
 #[test]
 fn a_daemon_of_another_file_with_the_same_bytes_is_this_build() {
     let a = build(1, "/opt/blaze", 10);
-    let copy = build(1, "/tmp/blaze", 11);
+    let copy = build(1, "/elsewhere/blaze", 11);
     let mut daemon = OfBuild { build: a, asked: Vec::new(), settings: Vec::new() };
     let got = builds(&mut daemon, Path::new(SOCKET), &copy.exe, &[], || Ok(copy.clone())).unwrap();
     assert_eq!(got, Builds::Same);

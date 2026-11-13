@@ -1299,6 +1299,10 @@ impl Optimization {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "the errors LLVM diagnosed since the thread's Machine was last asked to work, taken at each ask: one function's diagnostics"
+)]
 thread_local! {
     /// The errors LLVM diagnosed in the context of this thread's [`Machine`] since it was
     /// last asked to work.

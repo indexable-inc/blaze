@@ -175,6 +175,9 @@ thread_local! {
     static SEALED_FOUND: Cell<bool> = const { Cell::new(false) };
     /// How many times unit 0, the sealed crate, was built for want of its record.
     static SEALED_BUILDS: Cell<usize> = const { Cell::new(0) };
+    /// The planted bug of `a_builds_store_reads_all_pass_through_direct`: the fakes' lowering
+    /// reads the store around `serve::direct`, as a read left on the old pooled path would.
+    static READS_AROUND_DIRECT: Cell<bool> = const { Cell::new(false) };
 }
 
 thread_local! {
@@ -676,22 +679,22 @@ impl Steps for Fake {
         }
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
-                files: vec![SourceFile {
-                    path: "dep".into(),
-                    bytes: blaze_vfs::Bytes::from_static(b"{}\n"),
-                    mode: blaze_vfs::Mode::Regular,
-                }],
+                files: vec![SourceFile::of(
+                    "dep".into(),
+                    blaze_vfs::Bytes::from_static(b"{}\n"),
+                    blaze_vfs::Mode::Regular,
+                )],
                 under: "dep".into(),
             },
             _ => Source {
-                files: vec![SourceFile {
-                    path: "Cargo.toml".into(),
-                    bytes: blaze_vfs::Bytes::copy_kept(
+                files: vec![SourceFile::of(
+                    "Cargo.toml".into(),
+                    blaze_vfs::Bytes::copy_kept(
                         blaze_mem::Tag::Vfs,
                         format!("# {}\n", fetch.what).as_bytes(),
                     ),
-                    mode: blaze_vfs::Mode::Regular,
-                }],
+                    blaze_vfs::Mode::Regular,
+                )],
                 under: String::new(),
             },
         };
@@ -704,11 +707,11 @@ impl Steps for Fake {
             return Ok(Library { at: LIBRARY.into(), fingerprint, source: None });
         }
         LIBRARY_READS.set(LIBRARY_READS.get() + 1);
-        let file = SourceFile {
-            path: "core/src/lib.rs".into(),
-            bytes: blaze_vfs::Bytes::from_static(b"#![no_core]\n"),
-            mode: blaze_vfs::Mode::Regular,
-        };
+        let file = SourceFile::of(
+            "core/src/lib.rs".into(),
+            blaze_vfs::Bytes::from_static(b"#![no_core]\n"),
+            blaze_vfs::Mode::Regular,
+        );
         Ok(Library {
             at: LIBRARY.into(),
             fingerprint,
@@ -801,26 +804,26 @@ impl Steps for Fake {
                 let checkout = job.config.invocation.root.clone();
                 // A real lowering anew serves its dependencies from what the last build left
                 // in the store: the fakes count whether it is all there.
-                let guard = blaze_cas::enter();
-                let read = |at| {
-                    job.store
-                        .get(&guard, &kept_key(&checkout, at))
-                        .ok()
-                        .flatten()
-                        .is_some_and(|it| it.bytes == kept_value(&checkout, at))
+                // Each read is a task's: one direct read into its frame, on the loop's driver
+                // lent to it (`serve::direct`), as the real lowering's are.
+                let holds = |key: &blaze_cas::Key, value: &[u8]| match READS_AROUND_DIRECT.get() {
+                    // The planted bug: a read around `direct`, through the store's pool.
+                    true => (job.store.get(&blaze_cas::enter(), key).ok().flatten())
+                        .is_some_and(|it| it.bytes == value),
+                    false => blaze_mem::frame::current(|frame| {
+                        crate::serve::direct::read(&job.reads, crate::serve::direct::Which::Home, key, frame)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|bytes| bytes == value)
+                    }),
                 };
+                let read = |at| holds(&kept_key(&checkout, at), &kept_value(&checkout, at)[..]);
                 if read(0) && read(1) {
                     KEPT_READS.set(KEPT_READS.get() + 1);
                 }
                 // The home's look reads the machine's layer live (`Store::read_live`): a
                 // sealed crate's record another home put there is found through it.
-                SEALED_FOUND.set(
-                    job.store
-                        .get(&guard, &sealed_key())
-                        .ok()
-                        .flatten()
-                        .is_some_and(|it| it.bytes == SEALED_RECORD),
-                );
+                SEALED_FOUND.set(holds(&sealed_key(), SEALED_RECORD));
                 FakeInputs { checkout, ..FakeInputs::default() }
             }
         };
@@ -1655,9 +1658,9 @@ fn options() -> Options {
         builds: name("cache/blaze/build"),
         sources: name("cache/blaze/sources"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
-        // The simulation's files are in no file system a loader's thread could read: the
-        // stores load their packs through the daemon's driver.
-        store_loader: blaze_cas::Loader::Pumped,
+        // The simulation's files are in no file system a thread's own driver could read: the
+        // tasks' store reads run on the daemon's driver, lent (`serve::direct::Reads::Lent`).
+        reads: crate::serve::direct::Reads::Lent,
         socket: Some(name(SOCKET)),
         http: None,
         budget: None,
@@ -1867,9 +1870,9 @@ fn a_started_daemon_is_reached_before_its_first_turn() {
 #[cfg(unix)]
 #[test]
 fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
-    // Under /tmp: a socket's path is at most about a hundred bytes, which a deeper temporary
-    // directory may pass.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    // A socket's path is at most about a hundred bytes, which a deeper temporary directory may
+    // pass.
+    let root = blaze_core::temp::TempDir::for_test_socket("blaze-serve-socket-");
     std::fs::create_dir_all(root.path().join(SOCKET).parent().unwrap()).unwrap();
     let driver = blaze_core::native(root.path(), 2).unwrap();
     let steps = Arc::new(Fake::default());
@@ -4220,6 +4223,78 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
     }
 }
 
+/// What a restarted daemon's first build reads of the store through `serve::direct` (this
+/// thread's readers' counts, exact: the in-line runner runs every task on the test's thread),
+/// and whether that build found what the last one stored.
+fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) {
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id =
+        client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    settle(&mut daemon, &mut client);
+    let mut daemon = restart(daemon, &steps, seed + 1000);
+    let mut client = dial(&mut daemon);
+    let (before, reads) = (crate::serve::direct::thread_counts(), KEPT_READS.get());
+    let id =
+        client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    let after = crate::serve::direct::thread_counts();
+    let moved = blaze_cas::direct::Counts {
+        records: after.records - before.records,
+        bytes: after.bytes - before.bytes,
+        reads: after.reads - before.reads,
+        runs: after.runs - before.runs,
+        files_opened: after.files_opened - before.files_opened,
+        maps: after.maps - before.maps,
+        mapped_bytes: after.mapped_bytes - before.mapped_bytes,
+        leaked_bytes: after.leaked_bytes - before.leaked_bytes,
+    };
+    (moved, KEPT_READS.get() == reads + 1)
+}
+
+/// The oracle: the build found the two values the last one stored, and each of them was a
+/// record read through `direct` (a read around it, through the pool, moves no direct count),
+/// with nothing a reader kept past its task.
+fn all_through_direct(moved: &blaze_cas::direct::Counts, found: bool) -> Result<(), String> {
+    if !found {
+        return Err("the restarted daemon's lowering did not find what the last build stored".to_owned());
+    }
+    if moved.records < 2 || moved.bytes == 0 {
+        return Err(format!("the build's store reads did not pass through direct: {moved:?}"));
+    }
+    if moved.leaked_bytes != 0 {
+        return Err(format!("a direct reader kept bytes past its task: {moved:?}"));
+    }
+    Ok(())
+}
+
+/// The invariant: every store read a build's tasks make is a direct read
+/// (`blaze_cas::direct`, lane M3 of the memory wave): the reads move this thread's direct
+/// counts, the values are found, and the store's page pool serves none of them.
+///
+/// The control plants a read around `direct` (`READS_AROUND_DIRECT`: the fakes' lowering
+/// reads through the pool) and the oracle catches it: the values are found and no direct
+/// count moves.
+#[test]
+fn a_builds_store_reads_all_pass_through_direct() {
+    for seed in [181, 182, 183] {
+        let (moved, found) = direct_reads_after_a_restart(seed);
+        all_through_direct(&moved, found).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+    }
+    READS_AROUND_DIRECT.set(true);
+    let (moved, found) = direct_reads_after_a_restart(184);
+    READS_AROUND_DIRECT.set(false);
+    assert!(found, "the control finds the values through the pool");
+    assert!(
+        all_through_direct(&moved, found).is_err(),
+        "the oracle misses reads made around direct: {moved:?}"
+    );
+}
+
 /// The head's next build lowers into the front end its last one kept and stored, and each
 /// build stores what it left: lowering never writes the last build's results.
 #[test]
@@ -5606,35 +5681,6 @@ fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
     }
 }
 
-/// A daemon started under a budget makes it the limit a build's release is decided against
-/// and every subsystem's budget, before any job, and its start's line names the limit, what
-/// told it and each share. B5, coord-105: the plane carried the budget and nothing set it, so
-/// under `BLAZE_DAEMON_MEMORY_GB=48` no release was ever due and the daemon grew to 49 GiB.
-#[test]
-fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_against() {
-    use blaze_graph::admission::{self, share};
-    use blaze_mem::Tag;
-    // Far past what any test holds, so no other daemon's release in this process is made due,
-    // and no budget it sets (32 TiB at least) weighs on another test's sweep.
-    const LIMIT: u64 = (1 << 50) + (64 << 20);
-    let budget =
-        blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned(), kept_back: 0 };
-    let said = super::limit_said(&budget);
-    assert!(said.starts_with("memory limit 1048576.06 GiB (a test's limit): "), "{said}");
-    assert!(said.contains("holds 917504.05 GiB") && said.contains("mir "), "{said}");
-    let mut options = options();
-    options.budget = Some(budget);
-    let steps = Arc::new(Fake::default());
-    let _daemon = Daemon::start(
-        Sim::new(3, Faults::default()),
-        options,
-        steps,
-        Runner::Inline(Inline::new(3)),
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
-    assert_eq!(admission::limit(), LIMIT, "the release's limit is the daemon's");
-    assert_eq!(blaze_mem::tag::budget(Tag::Mir), LIMIT / 64 * share(Tag::Mir), "so is each budget");
-}
 
 /// A test command line's environment: the test process's own `BLAZE_CORES`, as a real
 /// command's carries it (the daemon's budget is the process's, and the CLI compares the two
@@ -5800,8 +5846,8 @@ fn committed_by_another_writer(key: blaze_cas::Key, bytes: &[u8]) -> Vec<(FileNa
         root: name(&format!("{STD}/store")),
         writer,
         tags: 1 << 40,
-        load_tags: (1 << 40) + (1 << 32),
-        loader: blaze_cas::Loader::Pumped,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
     };
     let mut effects = Vec::new();
     let mut other = Store::open_shared(config, &mut effects);

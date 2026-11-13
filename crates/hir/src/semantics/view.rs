@@ -74,6 +74,10 @@ fn tree_key(node: Node<'_>) -> usize {
     ptr::from_ref::<FlatTree>(node.file()).addr()
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "one emptied map per thread, the spare allocation of the last Semantics dropped there, uncapped in capacity"
+)]
 thread_local! {
     /// The `roots` of the last `Semantics` dropped on this thread, emptied: the next one takes
     /// its allocation, as the source-to-def tables are carried (`SourceToDefCache::take`).

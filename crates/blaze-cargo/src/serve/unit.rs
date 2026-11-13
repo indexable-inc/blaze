@@ -374,14 +374,6 @@ impl Steps for Real {
         release::give_kept_caches()
     }
 
-    fn kept_tables(&self) -> u64 {
-        release::kept_tables()
-    }
-
-    fn give_tables(&self) -> u64 {
-        release::give_kept_tables()
-    }
-
     fn serve_needs(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
         run::launch::serve_needs(kept, &self.shared.launches, wanted)
             .into_iter()
@@ -435,7 +427,7 @@ impl Steps for Real {
         // A request of the checkout waits for this front end: it goes back now, and that
         // build's own releases let go of what this one would have, unless memory is short,
         // when the release is due before more work is admitted.
-        if wanted.load(Ordering::Acquire) && !blaze_graph::admission::Pressure::now().squeezed() {
+        if wanted.load(Ordering::Acquire) && !release::Core::now().over() {
             tracing::info_span!(
                 target: "blaze",
                 "front end release left to the checkout's next build, which waits for the front end",
@@ -516,8 +508,8 @@ impl Steps for Real {
                 // seen before costs nothing. Until 2026-11-12 the plan's units were the front
                 // end's identity (`unkept`), and every switch lowered the workspace again, the
                 // standard library included (hello-world: 4.5 s a switch, 820,026 queries).
-                let (mut lowered, session, seeded) = match kept.map(KeptLowered::into_parts) {
-                    Some(KeptParts { session, mut lowered, seeds, units: kept_units, .. }) => {
+                let (mut lowered, session, seeded, walks) = match kept.map(KeptLowered::into_parts) {
+                    Some(KeptParts { walks, session, mut lowered, seeds, units: kept_units, .. }) => {
                         let same_plan =
                             Arc::ptr_eq(&kept_units, &input.units) || kept_units == input.units;
                         // Why the front end can't take this request, when it can't.
@@ -552,7 +544,7 @@ impl Steps for Real {
                                 }
                             };
                         match moved {
-                            None => (lowered.into_inner(), Some(session), seeds),
+                            None => (lowered.into_inner(), Some(session), seeds, Some(walks)),
                             Some(why) => {
                                 let why = why.as_str();
                                 let checkout = input.config.invocation.root.as_str();
@@ -563,13 +555,22 @@ impl Steps for Real {
                                     crate::serve::said::logged!(WARN,
                                         "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
                                     );
-                                    drop((session, lowered, seeds));
+                                    // The walks first: they name the database's ids.
+                                    drop((walks, session, lowered, seeds));
                                 }
-                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
+                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new(), None)
                             }
                         }
                     }
-                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
+                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new(), None),
+                };
+                // What codegen's walks over this database keep for its next build: the kept
+                // front end's, while its database is the one refreshed into; a new database
+                // (lowered anew, or made again by a refresh) begins with none.
+                let walks = match walks {
+                    Some(walks) if walks.is_of(lowered.db()) => walks,
+                    // alloc: once per database lowered, its walks' owner
+                    _ => Arc::new(hir_ty_codegen::v2::Walks::new(lowered.db())),
                 };
                 // How the front end's identities write paths, told before any is asked: against
                 // the build's directories ([`portable::Places`]), so a unit's record key does
@@ -587,6 +588,14 @@ impl Steps for Real {
                 // first key is asked: the lowering's own writes give it from here on. A
                 // front end kept from the last build holds them already, and nothing is
                 // written.
+                //
+                // A database lowered anew reads the found record of each crate whose plan key
+                // it has first (restore.md, "Restart reads records (d)", C): what its image is
+                // filed under, and its own surface, which `give_surfaces` then takes in place
+                // of parsing the crate's files. A kept front end found them when it was made.
+                if session.is_none() {
+                    deps::find(&mut lowered, &input.store)?;
+                }
                 lowered.give_surfaces();
                                 // Before any key is resolved: two crates of one key would take each other's items.
                 blaze_items::key::check_crate_keys(lowered.db()).map_err(|clash| {
@@ -619,6 +628,7 @@ impl Steps for Real {
                     None => deps::session(
                         &lowered,
                         &input.store,
+                        &input.reads,
                         &input.macros,
                         &input.config.invocation.env,
                     )?,
@@ -667,6 +677,7 @@ impl Steps for Real {
                     input.kind != JobKind::Check,
                 );
                 let writer = UnitWriter {
+                    walks,
                     session,
                     front: Held::new(Arc::new(lowered), "a job's front end"),
                     job,
@@ -991,7 +1002,7 @@ impl KeptDb for KeptLowered {
 /// the next build of the head lowers into it only when it lowers the same.
 ///
 /// Counted while it is kept (`hir::evict::front_end_kept`), so the process tables every
-/// front end's ids index are released only once none is (`release::give_kept_tables`), and
+/// front end's ids index are released only once none is, and
 /// its drop retires its database's shared solver caches (`hir::evict::front_end_dropped`),
 /// which no drop of a database did before. The next build of its head takes its parts
 /// ([`KeptLowered::into_parts`]), which ends the count the same way.
@@ -1056,6 +1067,10 @@ pub enum Stored {
 
 /// What a [`KeptLowered`] keeps.
 pub struct KeptParts {
+    /// What codegen's walks over its database keep for the next build of it
+    /// ([`hir_ty_codegen::v2::Walks`]): held here and nowhere else, so they leave with the kept
+    /// front end. Declared first: they name the database's ids, and drop before it.
+    walks: Arc<hir_ty_codegen::v2::Walks>,
     /// What its database keeps of the store ([`deps::session`]), its goals flushed as it is
     /// stored ([`Steps::store_kept`]). Declared first: its goal store is uninstalled before the
     /// database it is keyed to drops.
@@ -1093,6 +1108,9 @@ pub struct KeptParts {
 /// lowered front end, as it stood when the loop posted the task. Its database is read by
 /// reference, never cloned.
 pub struct UnitReader {
+    /// What codegen's walks over the database keep ([`KeptParts::walks`]): a unit's codegen
+    /// patches its program's kept walk in it and keeps its own there.
+    walks: Arc<hir_ty_codegen::v2::Walks>,
     front: Arc<Lowered>,
     /// The dependencies' check outcomes its database was served ([`deps::serve`]): written
     /// with the front end, only while no reader holds it.
@@ -1104,6 +1122,11 @@ pub struct UnitReader {
 impl UnitReader {
     pub(crate) fn db(&self) -> &Db {
         self.front.db()
+    }
+
+    /// What codegen's walks over the database keep for its next build.
+    pub(crate) fn walks(&self) -> &hir_ty_codegen::v2::Walks {
+        &self.walks
     }
 
     /// What unit `unit`'s identity is made of ([`Lowered::identity_parts`]), for `blaze why`.
@@ -1186,6 +1209,9 @@ impl UnitReader {
 /// the writes asked for and not yet applied, and as each build script's run is applied, the
 /// identities of the units it was the last run in the closure of.
 pub struct UnitWriter {
+    /// What codegen's walks over the database keep ([`KeptParts::walks`]), declared first as
+    /// there.
+    walks: Arc<hir_ty_codegen::v2::Walks>,
     /// What the front end's database keeps of the store ([`deps::session`]), declared first
     /// as in [`KeptLowered`].
     session: deps::Session,
@@ -1230,6 +1256,7 @@ impl Writer<Real> for UnitWriter {
     fn reader(&self) -> Option<UnitReader> {
         (!self.waiting())
             .then(|| UnitReader {
+                walks: Arc::clone(&self.walks),
                 front: Arc::clone(&self.front),
                 checks: self.session.checks(),
                 bodies: self.session.bodies(),
@@ -1270,18 +1297,8 @@ impl Writer<Real> for UnitWriter {
         self.release.compiled(unit);
     }
 
-    fn short(&mut self) {
-        self.release.short_under(blaze_graph::admission::Pressure::now);
-    }
-
     fn pressed(&mut self) {
         self.release.pressed();
-    }
-
-    fn stop_for_memory(&mut self) {
-        self.release.pressed();
-        self.job.gives_way.store(true, Ordering::Release);
-        release::stop_readers(&self.front);
     }
 
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
@@ -1296,8 +1313,7 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
-        // The readers stopped for memory ([`Writer::stop_for_memory`]) are all gone: what is
-        // posted after this apply reads on.
+        // The readers stopped for this apply are all gone: what is posted after it reads on.
         release::resume_readers(lowered);
         self.job.gives_way.store(false, Ordering::Release);
         // First, with the readers stopped for it or for the writes below: what the crates
@@ -1657,7 +1673,7 @@ impl Writer<Real> for UnitWriter {
         // before the build's answer: the release is kept with the front end and run by the
         // task that stores it, after the answer ([`Steps::release_kept`]).
         self.release.end();
-        let UnitWriter { session, front, job, deps, retractions, release, .. } = self;
+        let UnitWriter { walks, session, front, job, deps, retractions, release, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
@@ -1669,6 +1685,7 @@ impl Writer<Real> for UnitWriter {
             job.memo_used.iter().filter_map(|it| it.get()).flatten().copied().collect();
         let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered::new(KeptParts {
+            walks,
             session,
             lowered: Held::new(lowered, "a kept front end"),
             units: job.input.units.clone(),
@@ -1690,8 +1707,9 @@ impl UnitWriter {
     /// The error of a front end [`Writer::keep`] refuses, which it lets go of here: the panic
     /// of that drop, if it panics, is said with the refusal and fails the job with it.
     fn refused(self, what: &str) -> ApiError {
-        let UnitWriter { session, front, .. } = self;
-        drop(session);
+        let UnitWriter { walks, session, front, .. } = self;
+        // The walks first: they name the database's ids.
+        drop((walks, session));
         match front.let_go() {
             Ok(()) => ApiError::new(what, None),
             // alloc: an error, once
@@ -1771,11 +1789,13 @@ fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError>
     if let Some(slot) = job.narrowed.get(unit as usize) {
         let _span = tracing::info_span!(target: "blaze", "unit narrowed identity", unit).entered();
         let front_end = deps::front_end()?;
-        let guard = blaze_cas::enter();
-        let kept = |key: &ContentId| match job.input.store.get(&guard, &blaze_cas::Key(*key)) {
-            // alloc: a narrowed identity's few bytes, once per library crate per front end
-            Ok(found) => Ok(found.map(|entry| entry.bytes.to_vec())),
-            Err(corrupt) => Err(corrupt.to_string()), // alloc: error path
+        // One direct read into the identity's own few bytes, which the front end keeps.
+        let kept = |key: &ContentId| {
+            match super::direct::owned(&job.input.reads, super::direct::Which::Home, &blaze_cas::Key(*key)) {
+                // alloc: a narrowed identity's few bytes, once per library crate per front end
+                Ok(found) => Ok(found),
+                Err(failed) => Err(failed.to_string()), // alloc: error path
+            }
         };
         lowered.library_narrows(unit as usize, &front_end, kept).map_err(lower_error)?;
         let made = lowered.take_library_narrows();
@@ -1847,7 +1867,9 @@ fn library_from_texts(
                 mapping.bytes().len()
             ))
         })?;
-        files.push(SourceFile { path: entry.path, bytes, mode: entry.mode });
+        // The listing's ID, made from these bytes when the texts file was written: the mount
+        // hashes nothing (`Vfs::apply_known_files`).
+        files.push(SourceFile { path: entry.path, id: entry.id, bytes, mode: entry.mode });
     }
     Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
 }
@@ -1881,7 +1903,7 @@ fn library_files(
         #[cfg(not(unix))]
         let executable = false;
         let mode = if executable { blaze_vfs::Mode::Executable } else { blaze_vfs::Mode::Regular };
-        into.push(SourceFile { path, bytes, mode });
+        into.push(SourceFile::of(path, bytes, mode));
     }
     Ok(())
 }
@@ -2020,8 +2042,9 @@ pub(crate) struct Job {
     /// on it is forecast by before its own walk starts, since a top crate reaches at least
     /// what its largest dependency did (docs/v2/plan/design/memory.md, "Forecasts").
     pub(crate) reached: Box<[OnceLock<u64>]>,
-    /// Set while the job's tasks are stopped for memory ([`Writer::stop_for_memory`]), from
-    /// the stop until the release it is for is applied: a task that reads it set gives way
+    /// Set while the job's tasks are stopped for memory, from the stop until the release it
+    /// is for is applied; nothing sets it since the gate (2026-11-13) deleted the running
+    /// tasks' rung, and it goes with its readers. A task that reads it set gives way
     /// ([`Failed::Again`]) as it does for a cancel, and is posted again whole. The codegen
     /// walk reads it before every visit (its front end's stop), so a walk in a stretch with
     /// no query call leaves as soon as one that makes them.

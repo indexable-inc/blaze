@@ -139,16 +139,9 @@ mod tests {
     use super::*;
 
     fn read(text: &str) -> Result<GcSettings, String> {
-        let dir = std::env::temp_dir().join(format!(
-            "blaze-gc-settings-{}-{}",
-            std::process::id(),
-            crate::record::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-gc-settings-");
         std::fs::write(dir.join(SETTINGS), text).unwrap();
-        let read = GcSettings::read(&dir, Levels::default());
-        std::fs::remove_dir_all(&dir).unwrap();
-        read
+        GcSettings::read(dir.path(), Levels::default())
     }
 
     #[test]

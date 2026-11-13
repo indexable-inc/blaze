@@ -5,6 +5,10 @@ use super::ui_core;
 use crate::tests::{assert_reports, error, ui};
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_missing_argument_is_provided() {
     // tests/ui/error-codes/E0061.rs
     let source = "fn f(a: u16, b: &str) {}

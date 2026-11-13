@@ -253,6 +253,16 @@ impl Baseline {
 /// The file of a baselines directory that names the target its counts are of.
 pub const TARGET_FILE: &str = "TARGET";
 
+/// The file of a baselines directory that holds the allocation ratchet's count per crate of the
+/// lines that carry `// alloc: <why>`: `scripts/src/bin/allocs.rs` reads and writes it, and it
+/// is no lint's baseline, so [`read`] passes it by.
+pub const ALLOC_SITES_FILE: &str = "alloc-sites.txt";
+
+/// Whether `name`, a file of a baselines directory, is one that is not a lint's baseline.
+fn not_a_baseline(name: &std::ffi::OsStr) -> bool {
+    name == TARGET_FILE || name == ALLOC_SITES_FILE
+}
+
 /// The target the baselines in `dir` count, from its [`TARGET_FILE`]; none when it has none.
 pub fn target_of(dir: &Path) -> Result<Option<String>, BaselineError> {
     let path = dir.join(TARGET_FILE);
@@ -311,7 +321,7 @@ pub fn read(dir: &Path) -> Result<BTreeMap<String, Baseline>, BaselineError> {
     let mut baselines = BTreeMap::new();
     for entry in entries {
         let path = entry.map_err(|error| read_error(dir, error))?.path();
-        if path.file_name().is_some_and(|it| it == TARGET_FILE) {
+        if path.file_name().is_some_and(not_a_baseline) {
             continue;
         }
         let lint = path.file_name().and_then(|it| it.to_str()).and_then(lint_of);
@@ -554,9 +564,8 @@ mod tests {
 
     #[test]
     fn a_run_is_checked_against_and_blesses_the_baselines_of_a_directory() {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-lints-baselines-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let held = blaze_core::temp::TempDir::for_test("blaze-lints-baselines-");
+        let dir = held.path();
         let types = dir.join("clippy.disallowed_types.txt");
         std::fs::write(&types, "a\t3\nb\t2\n").unwrap();
         let clock = dir.join("blaze.wall_clock.txt");
@@ -595,6 +604,17 @@ mod tests {
         std::fs::write(dir.join(TARGET_FILE), "x86_64-unknown-linux-gnu\n").unwrap();
         assert_eq!(target_of(&dir).unwrap().as_deref(), Some("x86_64-unknown-linux-gnu"));
         assert!(check(&dir, &Counts::new()).is_ok(), "the target file is not a lint's");
+        std::fs::write(dir.join(ALLOC_SITES_FILE), "blaze-core\t12\n").unwrap();
+        assert!(
+            check(&dir, &Counts::new()).is_ok(),
+            "the allocation ratchet's counts are not a lint's baseline"
+        );
+        std::fs::write(dir.join("alloc-sites.txt.bak"), "").unwrap();
+        assert!(
+            matches!(check(&dir, &Counts::new()), Err(BaselineError::Lint { .. })),
+            "only the ratchet's own file name is passed by"
+        );
+        std::fs::remove_file(dir.join("alloc-sites.txt.bak")).unwrap();
         std::fs::write(dir.join(TARGET_FILE), "a b\n").unwrap();
         assert!(matches!(target_of(&dir), Err(BaselineError::Line { .. })));
         std::fs::write(dir.join("clippy.no_such_lint.txt"), "").unwrap();

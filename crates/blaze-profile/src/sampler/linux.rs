@@ -343,6 +343,10 @@ pub(super) fn run(hz: u32) {
 }
 
 /// Why the sampler's loop ended, if it did: its tick's wait failed. Said in every dump after.
+#[expect(
+    blaze::process_static,
+    reason = "set once, as the sampler's loop ends: one message"
+)]
 static STOPPED: Lock<Option<String>> = Lock::unrecorded("profile.sampler.stopped", None);
 
 /// What the sampler counted that a dump should say: samples older than their context log,

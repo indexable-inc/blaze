@@ -27,6 +27,9 @@
 // and calls it.
 #![deny(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod arch;
 pub mod buf;

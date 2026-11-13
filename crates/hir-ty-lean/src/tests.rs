@@ -894,14 +894,14 @@ fn a_proof_key_covers_the_model_the_proof_and_the_check() {
 #[test]
 fn lean_checks_the_first_proof_and_its_axioms() {
     let db = db(&fnv1a_fixture());
-    let out = std::env::temp_dir().join(format!("blaze-hir-ty-lean-{}", std::process::id()));
-    let config = crate::Config::from_env(out.clone()).unwrap_or_else(|err| panic!("{err}"));
+    let out = blaze_core::temp::TempDir::for_test("blaze-hir-ty-lean-");
+    let config = crate::Config::from_env(out.path().to_path_buf()).unwrap_or_else(|err| panic!("{err}"));
     let proof = crate::ProofFile {
         root: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-graph/lean"),
         module: "BlazeGraph.Ledger".to_owned(),
     };
     let proved = crate::check(&db, fnv1a(&db), &proof, &config);
-    let _ = std::fs::remove_dir_all(&out);
+    drop(out);
     let proved = proved.unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(proved.theorem, "blaze_graph.ledger.fnv1a_from.spec");
     assert!(proved.axioms.iter().all(|it| crate::ALLOWED_AXIOMS.contains(&it.as_str())));

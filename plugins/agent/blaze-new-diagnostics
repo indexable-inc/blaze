@@ -1,0 +1,10 @@
+#!/bin/sh
+# blaze-new-diagnostics FILE: the errors and warnings `blaze check` has for the package that owns
+# FILE that its last run from this shorthand did not (plugins/agent/README.md). Prints them as
+# `path:line:col: level[code]: message` lines; exits 1 when there is a new error, blaze failed,
+# timed out, or is missing where the project pins it, else 0.
+# The launcher any agent calls; install.py '{"agent": "generic", "scope": "user"}' links it
+# into ~/.local/bin.
+set -eu
+self=$(readlink -f "$0")
+exec python3 -I "$(dirname "$self")/blaze_new_diagnostics.py" --text "$@"

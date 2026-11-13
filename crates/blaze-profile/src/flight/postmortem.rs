@@ -72,6 +72,10 @@
 //! it; the hash names the blaze the crashed builds ran (`builds.blaze`).
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+#![cfg_attr(
+    not(unix),
+    expect(blaze::unwired, reason = "wired on Unix; on other targets parts of it have no caller")
+)]
 
 #[cfg(test)]
 use std::{fs::File, io::Read as _};
@@ -1257,7 +1261,11 @@ pub struct Recovered {
 static RECOVERING: Lock<()> = Lock::unrecorded("profile.postmortem.recovering", ());
 
 /// A postmortem's hold on [`super::RECOVERED`]: the names it gave are let go as it drops.
-struct Session(#[allow(dead_code, reason = "held for its drop")] LockGuard<'static, ()>);
+struct Session(
+    #[allow(dead_code, reason = "held for its drop")]
+    #[expect(blaze::unwired, reason = "wired: the guard is held only for its drop, which ends the session")]
+    LockGuard<'static, ()>,
+);
 
 impl Session {
     fn begin() -> Session {
@@ -1808,12 +1816,12 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-postmortem-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh directory for `name`: the guard, which removes it with all it holds when it
+    /// drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-postmortem-{name}-"));
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     /// A pid no live process has: only the file's name, and a lock no one holds once the
@@ -1838,7 +1846,7 @@ mod tests {
     /// before the flush's marks) and sites, and the build that was running.
     #[test]
     fn a_dead_process_s_rows_past_its_last_flush_read_back_whole() {
-        let dir = scratch("rows");
+        let (_tmp, dir) = scratch("rows");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         let scale = clock::Scale::now();
         mapping.set_clock(&scale);
@@ -1962,14 +1970,12 @@ mod tests {
         drop(recovered);
         assert_eq!(name(thread_name), None, "a postmortem's names go with it");
         found.into_iter().next().unwrap().remove().unwrap();
-        assert!(dead(&dir).unwrap().is_empty(), "the file is gone once read");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert!(dead(&dir).unwrap().is_empty(), "the file is gone once read");    }
 
     /// A file of another layout is refused with an error naming it, and left in place.
     #[test]
     fn a_mapping_of_another_layout_is_refused_naming_its_file() {
-        let dir = scratch("layout");
+        let (_tmp, dir) = scratch("layout");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         mapping.set_clock(&clock::Scale::now());
         drop(mapping);
@@ -1996,16 +2002,14 @@ mod tests {
             "the error names the file: {refused}"
         );
         drop(found);
-        assert!(path.exists(), "a refused file stays");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert!(path.exists(), "a refused file stays");    }
 
     /// A flush marked pending is read past only once the manifest says it committed: a crash
     /// between its commit and its mark never writes its rows twice, and one before its commit
     /// never loses them.
     #[test]
     fn a_pending_flush_is_read_past_only_once_the_manifest_says_it_committed() {
-        let dir = scratch("pending");
+        let (_tmp, dir) = scratch("pending");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         mapping.set_clock(&clock::Scale::now());
         mapping.site(9, "compile", "blaze::unit", "INFO");
@@ -2027,9 +2031,7 @@ mod tests {
         let rows = |committed| found[0].read(committed).unwrap().read.counters.len();
         assert_eq!(rows(None), 20, "no manifest names it: past the last commit the mapping saw");
         assert_eq!(rows(Some(4)), 20, "the manifest has flush 4: flush 5 did not commit");
-        assert_eq!(rows(Some(5)), 10, "the manifest has flush 5: its rows are in files");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(rows(Some(5)), 10, "the manifest has flush 5: its rows are in files");    }
 
     /// What the reservation promises, checked from outside the mapping: the file is as long
     /// as its fixed part and every store handed out, and the disk holds that many bytes of
@@ -2058,7 +2060,7 @@ mod tests {
     /// holds no store's disk before it is handed out.
     #[test]
     fn a_store_s_disk_is_reserved_as_it_is_handed_out_and_not_before() {
-        let dir = scratch("reserve");
+        let (_tmp, dir) = scratch("reserve");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         let len = || fs::metadata(&mapping.path).unwrap().len();
         assert_eq!(len(), file_bytes(0), "no store's disk before one is handed out");
@@ -2080,29 +2082,25 @@ mod tests {
         let Err(PostmortemError::Full { most, .. }) = mapping.reserve(MAPPED_RINGS + 1) else {
             panic!("a store past the mapping's room is refused");
         };
-        assert_eq!(most, MAPPED_RINGS);
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(most, MAPPED_RINGS);    }
 
     #[test]
     fn the_oracle_catches_a_store_handed_out_with_no_disk_under_it() {
-        let dir = scratch("reserve-plant");
+        let (_tmp, dir) = scratch("reserve-plant");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         mapping.plant_no_reserve.store(true, Ordering::Relaxed);
         // Claimed, never written: its pages are past the file's end, and a write to them is
         // the SIGBUS the reservation is there to prevent.
         assert_eq!(mapping.claim(&mut mapping.given.lock()).unwrap(), 0);
         let said = disk_is_under_every_store(&mapping).expect_err("no disk under the store");
-        assert!(said.contains("1 stores are handed out"), "{said}");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert!(said.contains("1 stores are handed out"), "{said}");    }
 
     /// A file of the layout's earlier length (every store's room reserved up front, the file
     /// [`FILE_MOST`] long whatever was handed out, as blaze made it until 2026-11-11) reads
     /// back as one that ends after its last store does: the same rows.
     #[test]
     fn a_file_of_the_previous_length_reads_back_the_same_rows() {
-        let dir = scratch("previous-length");
+        let (_tmp, dir) = scratch("previous-length");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         mapping.set_clock(&clock::Scale::now());
         let store = mapping.store(1).unwrap();
@@ -2122,18 +2120,14 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), file_bytes(1));
         fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(FILE_MOST).unwrap();
         assert_eq!(read(&dir), now);
-        assert!(now.len() > 2, "{now}");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert!(now.len() > 2, "{now}");    }
 
     /// A mapping its process holds is not a dead one.
     #[test]
     fn a_live_mapping_is_left_alone() {
-        let dir = scratch("live");
+        let (_tmp, dir) = scratch("live");
         let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
         assert!(dead(&dir).unwrap().is_empty());
         drop(mapping);
-        assert_eq!(dead(&dir).unwrap().len(), 1);
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(dead(&dir).unwrap().len(), 1);    }
 }

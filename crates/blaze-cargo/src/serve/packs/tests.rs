@@ -39,7 +39,7 @@ const WINDOWS: u32 = 16;
 /// A store on disk under `root` holding `count` records, pinned as `toolchain`.
 fn origin(root: &Path, count: u64) -> Driven {
     fs::create_dir_all(root).unwrap();
-    let mut driven = Driven::open_reserving(root, blaze_cas::Loader::Pumped, WINDOWS).unwrap();
+    let mut driven = Driven::open_reserving(root, crate::serve::direct::pool::pumped(), WINDOWS).unwrap();
     for n in 0..count {
         driven.store().put(key(n), kind(n), &value(n)).unwrap();
     }
@@ -51,7 +51,7 @@ fn origin(root: &Path, count: u64) -> Driven {
 
 fn empty(root: &Path) -> Driven {
     fs::create_dir_all(root).unwrap();
-    Driven::open_reserving(root, blaze_cas::Loader::Pumped, WINDOWS).unwrap()
+    Driven::open_reserving(root, crate::serve::direct::pool::pumped(), WINDOWS).unwrap()
 }
 
 /// The invariant: a pin exported and imported into an empty store leaves, under every key,
@@ -334,8 +334,8 @@ fn imported_then_collected(pin: bool) -> (Vec<bool>, u64) {
         dir: name("home/v2/store"),
         layers: Vec::new(),
         tags: 1 << 40,
-        load_tags: (1 << 40) + (1 << 32),
-        loader: blaze_cas::Loader::Pumped,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
     };
     let mut sim = blaze_core::sim::Sim::new(31, blaze_core::sim::Faults::default());
     let mut effects = Vec::new();
@@ -357,7 +357,8 @@ fn imported_then_collected(pin: bool) -> (Vec<bool>, u64) {
     simmed.flush().unwrap();
     // The records go unused for periods, and everything unrooted is asked to go.
     periods(&mut simmed, 4);
-    let gone = std::env::temp_dir().join(format!("blaze-packs-none-{}", std::process::id()));
+    let made = blaze_core::temp::TempDir::for_test("blaze-packs-none-");
+    let gone = made.join("none");
     let pace = Pace { grace: Duration::ZERO, ..Pace::default() };
     let mut collects =
         crate::serve::collect::Collects::new(&gone, crate::serve::settle::Compress::Inline, pace);

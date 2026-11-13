@@ -18,7 +18,9 @@
 //! [`Bodies`] is what the driver gives `hir_ty::body_store::install`.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 
 pub mod identity;
 pub mod impls;
@@ -72,6 +74,16 @@ impl BodyFacts for RecordedNames {
         Bodies.value(db, def, fact)
     }
 
+    fn sealed(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        group: blaze_query::db::SealGroup,
+        facts: &mut Vec<FactRef>,
+    ) -> bool {
+        reads::sealed(db, def, group, facts)
+    }
+
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
         Bodies.def_key(db, body, def)
     }
@@ -105,6 +117,16 @@ impl BodyFacts for Bodies {
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
         values::value_in(db, def, fact)
+    }
+
+    fn sealed(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        group: blaze_query::db::SealGroup,
+        facts: &mut Vec<FactRef>,
+    ) -> bool {
+        reads::sealed(db, def, group, facts)
     }
 
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {

@@ -69,19 +69,20 @@ fn line(name: &str, version: &str, extra: &str) -> String {
 struct Fixture {
     server: Arc<Server>,
     home: PathBuf,
+    /// The directory `home` is, removed with all it holds when the fixture drops.
+    _tmp: blaze_core::temp::TempDir,
 }
 
 impl Fixture {
     fn new(name: &str) -> Fixture {
-        let home = std::env::temp_dir().join(format!("blaze-query-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-query-{name}-"));
+        let home = tmp.path().to_path_buf();
         let server = Arc::new(Server::default());
         server
             .files
             .lock()
             .insert(format!("{BASE}config.json"), br#"{"dl":"https://dl.example.com"}"#.to_vec());
-        Fixture { server, home }
+        Fixture { server, home, _tmp: tmp }
     }
 
     fn sources(&self, offline: bool) -> Sources {

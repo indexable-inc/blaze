@@ -1033,9 +1033,7 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) env: ParamEnv<'db>,
     pub(crate) krate: Crate,
     pub(crate) store: &'a ExpressionStore,
-    #[allow(dead_code)]
     pub(crate) infer: &'a InferenceResult<'db>,
-    #[allow(dead_code)]
     pub(crate) mode: Mode,
     /// The user variable each local is, if it is one.
     pub(crate) bindings: FMap<'a, LocalId, BindingId>,

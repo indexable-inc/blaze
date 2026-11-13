@@ -301,11 +301,15 @@ fn base_key(db: &base_db::Db, part: Key, krate: base_db::Crate, name: &str) -> K
 /// input as it was: none when there is none. A store that can't be read, or a record that is
 /// not an image's, is the error, naming the key.
 fn found(job: &Job, base: Key) -> Result<Option<Found>, ApiError> {
-    let guard = blaze_cas::enter();
-    let Some((_, entry, _)) = super::filed_in(job, &job.input.store, &guard, base)? else {
-        return Ok(None);
-    };
-    match header::outputs_natives(entry.bytes) {
+    // The record read into the task's frame (`super::filed_in`), its header read in the scope.
+    let outputs = blaze_mem::frame::current(|frame| {
+        let Some((_, entry, _)) = super::filed_in(job, frame, base)? else {
+            return Ok::<_, ApiError>(None);
+        };
+        Ok(Some(header::outputs_natives(&entry)))
+    })?;
+    let Some(outputs) = outputs else { return Ok(None) };
+    match outputs {
         Some((outputs, natives)) if outputs.len() == 1 => {
             Ok(Some(Found { output: outputs[0], natives }))
         }
@@ -616,15 +620,29 @@ pub(super) fn link(
                 let _span =
                     tracing::info_span!(target: "blaze", "doctest image record", function = %name)
                         .entered();
-                let guard = blaze_cas::enter();
+                // Every slot of the key in one direct read into the task's frame, at the
+                // first slot asked; a slot that does not read is taken as not kept.
                 let filed = reads::Reads::of(reader.db(), krate).and_then(|read| {
-                    reads::file(
-                        *base,
-                        &read,
-                        env,
-                        &|manifest| job.units().is_primary_manifest(manifest),
-                        |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
-                    )
+                    blaze_mem::frame::current(|frame| {
+                        let mut slots: Option<crate::serve::direct::Slots<'_>> = None;
+                        reads::file(
+                            *base,
+                            &read,
+                            env,
+                            &|manifest| job.units().is_primary_manifest(manifest),
+                            |slot| {
+                                slots
+                                    .get_or_insert_with(|| {
+                                        crate::serve::direct::slots(
+                                            &job.input.reads,
+                                            (0..reads::SLOTS).map(|n| reads::slot(*base, n)),
+                                            frame,
+                                        )
+                                    })
+                                    .bytes(slot)
+                            },
+                        )
+                    })
                 });
                 match filed {
                     Ok(filing) => filing,

@@ -37,6 +37,7 @@ pub(super) enum Tie {
 /// A bug planted for the controls of the property test: the safeguard it removes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(not(test), expect(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(super) enum Plant {
     #[default]
     None,

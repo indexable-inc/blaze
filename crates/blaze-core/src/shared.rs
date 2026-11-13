@@ -12,18 +12,10 @@
 //! that is no ledger is for the person to remove.
 //!
 //! [`Shared::wait`] sleeps while a word's low 32 bits hold a value, until a [`Shared::wake_all`]
-//! of that word from any process or a deadline, through [`crate::wait::until`] (the time left
-//! recomputed from the clock before every call, interrupted and spurious returns retried, the
-//! wait named in the wait-for graph). The kernel compares the word in the same step as it
-//! blocks, so a wake between the caller's look and its wait is not lost:
-//! - Linux: `futex(FUTEX_WAIT)` and `futex(FUTEX_WAKE)` without `FUTEX_PRIVATE_FLAG`, which key
-//!   the wait by the mapped page, so processes that map one file meet on one word;
-//! - macOS: `os_sync_wait_on_address_with_timeout` and `os_sync_wake_by_address_all` with
-//!   `OS_SYNC_WAIT_ON_ADDRESS_SHARED` / `OS_SYNC_WAKE_BY_ADDRESS_SHARED` (<os/os_sync_wait_on_address.h>,
-//!   macOS 14.4): the same, keyed by the shared mapping.
-//!
-//! Each wait is one system call with the time left of an absolute deadline, computed from the
-//! clock before the call: never a relative timeout carried across a retry (rule deadline-waits).
+//! of that word from any process or a deadline, through the one deadline wait's shared-address
+//! wait ([`crate::wait::wait_shared`] and [`crate::wait::wake_shared`], rule deadline-waits):
+//! the futex or address wait without its private flag, keyed by the mapping, an absolute
+//! deadline recomputed from the clock before every call. This module makes no wait of its own.
 
 use std::{
     ffi::OsString,
@@ -34,10 +26,9 @@ use std::{
     path::{Path, PathBuf},
     ptr::NonNull,
     sync::atomic::AtomicU64,
-    time::Duration,
 };
 
-use crate::wait::{Clock, Deadline, Once, WaitError, Waited, until};
+use crate::wait::{Clock, Deadline, WaitError, Waited};
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("the shared file's words are little-endian, and a wait reads a word's low half at its address");
@@ -130,13 +121,12 @@ impl Shared {
         deadline: Deadline,
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
-        let word = &self.words()[index];
-        until(what, clock, Some(deadline), |left| wait_once(word, expected, left))
+        crate::wait::wait_shared(what, &self.words()[index], expected, deadline, clock)
     }
 
     /// Wakes every thread of every process sleeping on word `index`.
     pub fn wake_all(&self, index: usize) {
-        wake_all(&self.words()[index]);
+        crate::wait::wake_shared(&self.words()[index]);
     }
 }
 
@@ -200,161 +190,6 @@ fn map(file: &File, len: usize) -> io::Result<NonNull<AtomicU64>> {
     NonNull::new(at.cast()).ok_or_else(|| io::Error::other("mmap returned the null address"))
 }
 
-// --- Linux: the futex, shared ----------------------------------------------------------------
-
-/// One wait on `word`'s low half: `FUTEX_WAIT` without `FUTEX_PRIVATE_FLAG`, so the kernel keys it
-/// by the mapped file's page and a wake from another process's mapping finds it. The timeout is
-/// relative, the time left of the caller's absolute deadline as `until` computed it just now.
-#[cfg(target_os = "linux")]
-fn wait_once(word: &AtomicU64, expected: u32, left: Option<Duration>) -> io::Result<Once<()>> {
-    let timeout = left.map(|left| libc::timespec {
-        tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
-        tv_nsec: libc::c_long::from(left.subsec_nanos() as i32),
-    });
-    let timeout_ptr = timeout.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
-    // SAFETY: a futex wait on a live, aligned word of a shared mapping; the kernel only reads it.
-    let got = unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            word.as_ptr().cast::<u32>(),
-            libc::FUTEX_WAIT,
-            expected,
-            timeout_ptr,
-            std::ptr::null::<u32>(),
-            0u32,
-        )
-    };
-    if got == 0 {
-        return Ok(Once::Ready(()));
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        // The word no longer held `expected`: the caller looks again.
-        Some(libc::EAGAIN) => Ok(Once::Ready(())),
-        Some(libc::EINTR) => Ok(Once::Interrupted),
-        Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-        // alloc: an error
-        _ => Err(io::Error::new(error.kind(), format!("futex(FUTEX_WAIT), shared: {error}"))),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wake_all(word: &AtomicU64) {
-    // A wake of a live aligned word cannot fail; the count woken is not needed.
-    // SAFETY: a futex wake of a word of a shared mapping; the kernel reads no memory of it.
-    _ = unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            word.as_ptr().cast::<u32>(),
-            libc::FUTEX_WAKE,
-            i32::MAX,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<u32>(),
-            0u32,
-        )
-    };
-}
-
-// --- macOS: the address wait, shared ---------------------------------------------------------
-
-// macOS's futex across processes (rule macos-private-apis: the public one is the better here).
-// `os_sync_wait_on_address_with_timeout` and `os_sync_wake_by_address_all` with the `SHARED`
-// flag are the documented face of the private `__ulock_wait2`/`__ulock_wake` with
-// `UL_COMPARE_AND_WAIT_SHARED`: the kernel keys the wait by the shared mapping's object, so
-// processes that map one file meet on one word, and compares the word as it blocks. They win
-// over the `__ulock` calls because their signatures and flags are a header's, where the
-// `__ulock` operation numbers are XNU's to change; over a kqueue `EVFILT_USER` or a pipe because
-// there is no descriptor to share or to pass, only the word already in the file. The deadline
-// form (`_with_deadline`, the one `wait/macos.rs` uses for a park) takes an absolute Mach time
-// that module computes privately; this takes the time left of the absolute deadline, computed by
-// `until` before each call, so no relative time is carried across a retry. Both move into
-// `wait/macos.rs` beside the park's when the ledger's driver lands.
-//
-// There is no other cross-process wait on macOS (rule no-fallback): the test below resolves each
-// symbol at run time, so a system that drops one fails CI naming it.
-//
-// SAFETY: the signatures are the header's: the flags and `os_clockid_t` are `uint32_t`, `size` a
-// `size_t`, the timeout a `uint64_t` of nanoseconds; each returns an `int`, -1 with `errno` set.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn os_sync_wait_on_address_with_timeout(
-        addr: *mut libc::c_void,
-        value: u64,
-        size: usize,
-        flags: u32,
-        clockid: u32,
-        timeout_ns: u64,
-    ) -> libc::c_int;
-    fn os_sync_wait_on_address(
-        addr: *mut libc::c_void,
-        value: u64,
-        size: usize,
-        flags: u32,
-    ) -> libc::c_int;
-    fn os_sync_wake_by_address_all(addr: *mut libc::c_void, size: usize, flags: u32)
-    -> libc::c_int;
-}
-
-/// `OS_SYNC_WAIT_ON_ADDRESS_SHARED` and `OS_SYNC_WAKE_BY_ADDRESS_SHARED`: a word other processes
-/// map too.
-#[cfg(target_os = "macos")]
-const SHARED: u32 = 1;
-/// `OS_CLOCK_MACH_ABSOLUTE_TIME` (<os/clock.h>): the one clock a timeout may be on.
-#[cfg(target_os = "macos")]
-const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
-/// The size of the half waited on.
-#[cfg(target_os = "macos")]
-const HALF: usize = size_of::<u32>();
-
-#[cfg(target_os = "macos")]
-fn wait_once(word: &AtomicU64, expected: u32, left: Option<Duration>) -> io::Result<Once<()>> {
-    let addr = word.as_ptr().cast::<libc::c_void>();
-    let value = u64::from(expected);
-    let got = match left {
-        Some(left) => {
-            let ns = u64::try_from(left.as_nanos()).unwrap_or(u64::MAX).max(1);
-            // SAFETY: a wait on a live, aligned word of a shared mapping; the kernel only reads
-            // it, and blocks until a wake of the word, a signal or the timeout.
-            unsafe {
-                os_sync_wait_on_address_with_timeout(
-                    addr,
-                    value,
-                    HALF,
-                    SHARED,
-                    OS_CLOCK_MACH_ABSOLUTE_TIME,
-                    ns,
-                )
-            }
-        }
-        // SAFETY: as above, with no limit (a caller of `Shared::wait` always has one).
-        None => unsafe { os_sync_wait_on_address(addr, value, HALF, SHARED) },
-    };
-    // Woken, or the word no longer held `expected`: the caller looks again.
-    if got >= 0 {
-        return Ok(Once::Ready(()));
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EINTR) => Ok(Once::Interrupted),
-        Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-        // The header's transient returns under low memory: waited for again.
-        Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
-        // alloc: an error
-        _ => Err(io::Error::new(
-            error.kind(),
-            format!("os_sync_wait_on_address_with_timeout, shared: {error}"),
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn wake_all(word: &AtomicU64) {
-    // `ENOENT`, nobody waits on the word, is not an error of a wake; nothing else can fail a
-    // wake of a live aligned word.
-    // SAFETY: a wake of a word of a shared mapping; the kernel reads no memory of it.
-    _ = unsafe { os_sync_wake_by_address_all(word.as_ptr().cast(), HALF, SHARED) };
-}
-
 // --- Errors ----------------------------------------------------------------------------------
 
 /// What went wrong with which shared file.
@@ -413,7 +248,6 @@ impl std::error::Error for SharedError {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::PathBuf,
         sync::{Arc, atomic::Ordering::SeqCst},
         time::Duration,
     };
@@ -424,40 +258,17 @@ mod tests {
     const LEN: usize = 16;
     const HEADER: [u64; 4] = [0x6e68_6361_6d7a_6c62, 1, 4096, 8];
 
-    /// A directory of this test's own.
-    fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-shared-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a test's directory is made");
-        dir
-    }
-
-    /// The symbols the cross-process wait is built on resolve at run time (rule
-    /// macos-private-apis): a macOS without one (before 14.4, or an update that removes it)
-    /// fails here, naming it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_shared_address_waits_resolve() {
-        for name in [
-            c"os_sync_wait_on_address_with_timeout",
-            c"os_sync_wait_on_address",
-            c"os_sync_wake_by_address_all",
-        ] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-            assert!(
-                !found.is_null(),
-                "{name:?} is gone from this macOS (it is there from 14.4): blaze_core::shared \
-                 needs it, and there is no other cross-process wait"
-            );
-        }
+    /// A directory of this test's own, removed when the guard drops: hold it for the test.
+    fn dir(name: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-shared-{name}-"))
     }
 
     /// The invariant: the first process stamps the header and zeros the rest, and a second
     /// mapping of the file sees it and the first's writes.
     #[test]
     fn the_first_process_stamps_the_header_and_others_see_it() {
-        let path = dir("stamp").join("machine.1");
+        let held = dir("stamp");
+        let path = held.join("machine.1");
         let first = Shared::open_or_create(&path, &HEADER, LEN, 2).expect("the file is made");
         let words: Vec<u64> = first.words().iter().map(|word| word.load(SeqCst)).collect();
         assert_eq!(&words[..4], &HEADER);
@@ -476,7 +287,8 @@ mod tests {
     /// The invariant: a file of another length is refused naming it, and left as it is.
     #[test]
     fn a_file_of_another_length_is_refused_and_left_whole() {
-        let path = dir("length").join("machine.1");
+        let held = dir("length");
+        let path = held.join("machine.1");
         std::fs::write(&path, [7u8; 10]).unwrap();
         let Err(error) = Shared::open_or_create(&path, &HEADER, LEN, 2) else {
             panic!("a file of 10 bytes was mapped as {LEN} words");
@@ -490,7 +302,8 @@ mod tests {
     /// word.
     #[test]
     fn a_file_of_another_identity_is_refused() {
-        let path = dir("identity").join("machine.1");
+        let held = dir("identity");
+        let path = held.join("machine.1");
         drop(Shared::open_or_create(&path, &HEADER, LEN, 2).expect("the file is made"));
         let Err(error) = Shared::open_or_create(&path, &[HEADER[0], 2], LEN, 2) else {
             panic!("a file of layout 1 was mapped as layout 2");
@@ -501,7 +314,8 @@ mod tests {
     /// A wait on a word that holds what is expected, with no wake, ends at its deadline.
     #[test]
     fn a_wait_nobody_wakes_ends_at_its_deadline() {
-        let path = dir("deadline").join("machine.1");
+        let held = dir("deadline");
+        let path = held.join("machine.1");
         let shared = Shared::open_or_create(&path, &HEADER, LEN, 2).expect("the file is made");
         let clock = Monotonic::new();
         let wait = Duration::from_millis(30);
@@ -517,7 +331,8 @@ mod tests {
     /// its deadline.
     #[test]
     fn a_wait_is_woken_through_another_mapping() {
-        let path = dir("wake").join("machine.1");
+        let held = dir("wake");
+        let path = held.join("machine.1");
         let waiter_side = Arc::new(Shared::open_or_create(&path, &HEADER, LEN, 2).unwrap());
         let waker_side = Shared::open_or_create(&path, &HEADER, LEN, 2).unwrap();
         let waiter = std::thread::Builder::new()

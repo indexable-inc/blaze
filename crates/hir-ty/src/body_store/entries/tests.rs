@@ -52,7 +52,7 @@ use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
 use super::{
-    ANY_KIND, ANY_REVISION, BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, Exact, HELD,
+    ANY_KIND, ANY_REVISION, BodyDelta, answering, BodyKey, BodyWorld, BorrowckEntry, DROPPED, Exact, HELD,
     How, InferEntry, KEEP_ALL, Keyed, MirEntry, OWN_FACTS_ONLY, Of, OwnerKey, Place, RUNS,
     Written, borrowck_schema, claim_keeps, fact_read, join, key_of, keyed, places, reads,
     register, run_infer, serve, stamp, unpost, written,
@@ -781,7 +781,8 @@ fn said(carried: &Carried, kind: ReadKind) -> Option<How> {
 #[test]
 fn a_leaf_body_edit_reruns_its_three_entries_and_no_callers() {
     let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Says::Exact);
-    assert_eq!(leaf.runs, [1, 1, 1, 0], "the edited body's inference, MIR and borrow check, once each");
+    // By `Step` as an index: no constant and no lowering is a kernel entry, so neither runs one.
+    assert_eq!(leaf.runs, [1, 1, 1, 0, 0], "the edited body's inference, MIR and borrow check, once each");
     assert_eq!(said(&leaf, reads::IDENTITY), Some(How::Exact("a test's column")), "{:?}", leaf.said);
     leaf.fresh.expect("every entry is what a fresh run gives");
 }
@@ -914,7 +915,7 @@ fn a_mir_entry_that_read_a_struct_s_size_is_kept_when_the_struct_is_not_edited()
     let first = format!("{LEAF}{SIZED}");
     let kept = adt_carried(&first, &first.replace("{ 2 }", "{ 5 }"), None);
     assert!(kept.layout > 0, "each body's MIR entry read the layout's fact");
-    assert_eq!(kept.runs, [1, 1, 1, 0], "the edited body's three entries alone: {:?}", kept.runs);
+    assert_eq!(kept.runs, [1, 1, 1, 0, 0], "the edited body's three entries alone: {:?}", kept.runs);
     kept.fresh.expect("every entry is what a fresh run gives");
 }
 
@@ -926,7 +927,7 @@ fn a_mir_entry_that_read_an_enum_s_layout_is_kept_until_a_variant_gains_a_field(
     let first = format!("{LEAF}{ENUMED}");
     let kept = adt_carried(&first, &first.replace("{ 2 }", "{ 5 }"), None);
     assert!(kept.layout > 0, "each body's MIR entry read the layout's fact");
-    assert_eq!(kept.runs, [1, 1, 1, 0], "the edited body's three entries alone: {:?}", kept.runs);
+    assert_eq!(kept.runs, [1, 1, 1, 0, 0], "the edited body's three entries alone: {:?}", kept.runs);
     kept.fresh.expect("every kept entry is what a fresh run gives");
     let grown = adt_carried(&first, &format!("{LEAF}{ENUM_GROWN}"), None);
     assert_eq!(grown.runs[Step::Infer as usize], 0, "no inference names the enum: {:?}", grown.runs);
@@ -965,15 +966,19 @@ fn a_second_session_with_a_new_database_hits_every_entry() {
 }
 
 /// Every body's three entries got in `session`, each served to the tree's database
-/// (`entries::serve`), as the driver serves every entry it gets.
-fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memory, tree: &Tree) {
+/// (`entries::serve`), as the driver serves every entry it gets. The MIR owners' places are
+/// found in `places_of`'s database (a tree of the same files): finding them infers the body
+/// (`mir::owners`), and in `tree`'s database that is a lookup of the row just posted, a hit
+/// counted in its item store and a memo of the served answer, so a test that counts what its
+/// later asks found, or asks at a later revision, gives a tree other than `tree`.
+fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memory, tree: &Tree, places_of: &Tree) {
     // clone: the test's keys, so the tree is lent whole
     let keys = tree.keys.clone();
     let off = &Setting::OFF;
     for key in &keys {
         let got = kernel.get_in::<InferEntry<Tree>, _>(session, store, tree, key, off).unwrap();
         serve(tree, key, Of::Infer, &got).unwrap();
-        for owner in owners(tree, key) {
+        for owner in owners(places_of, key) {
             let got = kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, &owner, off).unwrap();
             serve(tree, key, Of::Mir(owner.place), &got).unwrap();
         }
@@ -986,7 +991,13 @@ fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memor
 /// store, gets them in a new session (each a hit, nothing run) and serves them; with
 /// `moved`, its database then moves to another revision (a comment edit, which changes no
 /// identity and no fact). Then each body's inference and borrow check is asked of the second
-/// database: what its item store counted of those, by step.
+/// database: what its item store counted of those asks alone, by step.
+///
+/// The count is of the asks alone ([`counted_since`]), and the serve infers nothing in the
+/// second database (its MIR places are found in the first's, [`ask_and_serve`]): before,
+/// finding the places there looked up each inference just posted, six hits at the serve's
+/// revision that every later count included, and whose memos then answered the asks with no
+/// lookup at all, so a stale row could neither show in the count nor be ruled out by it.
 fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
     let kernel = kernel();
     let mut store = Memory::default();
@@ -1000,22 +1011,33 @@ fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
     {
         let mut session = Session::new(&second);
         reset_runs();
-        ask_and_serve(&kernel, &mut session, &mut store, &second);
+        ask_and_serve(&kernel, &mut session, &mut store, &second, &first);
         assert_eq!(runs(), [0; Step::COUNT], "no entry runs in the second session: each is the store's");
     }
     if moved {
         second.edit("leaf.rs", &format!("{LEAF}// a comment\n"));
     }
+    let before = second.installed.steps();
     let db = second.db();
     for &def in second.bodies.values() {
         let _ = InferenceResult::of(db, def);
         let _ = lookup_passed(db, def, CHECKER, || panic!("no store here verifies"));
     }
     second.installed.errors().expect("no served answer disagrees with the database");
-    let steps = second.installed.steps();
+    let steps = counted_since(before, second.installed.steps());
     let flushed = second.installed.flush().unwrap();
     assert_eq!(flushed.written, 0, "a served step offers nothing to the item store's flush: {flushed:?}");
     steps
+}
+
+/// What an item store counted between two reads of its counts (`Installed::steps`, which
+/// counts from the last flush): each step's hits, runs and refusals since `before`.
+fn counted_since(before: [StepCounts; Step::COUNT], after: [StepCounts; Step::COUNT]) -> [StepCounts; Step::COUNT] {
+    std::array::from_fn(|at| StepCounts {
+        hits: after[at].hits - before[at].hits,
+        ran: after[at].ran - before[at].ran,
+        refused: after[at].refused - before[at].refused,
+    })
 }
 
 /// A second database served every entry (as [`answered_in_a_second_database`]), then
@@ -1025,7 +1047,11 @@ fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
 /// second database. The invariant: every row the carry did not reach (`main.rs`'s bodies)
 /// answers at the new revision with no step run, every other runs, and no answer disagrees
 /// with the database (`Installed::errors`, which checks each served answer's identity and
-/// facts again). `Err` names what broke it.
+/// facts again). And, asked of the rows themselves with no query run ([`answering`]): every
+/// row that answers at the new revision was verified with the body's identity now, so a
+/// stale row is caught whether or not the engine still holds a memo of its step (the carry
+/// runs the edited bodies' steps before the stamp, and their memos would hide a stale row
+/// from any count). `Err` names what broke it.
 fn carried_rows_answer() -> Result<(), String> {
     let kernel = kernel();
     let mut store = Memory::default();
@@ -1037,13 +1063,14 @@ fn carried_rows_answer() -> Result<(), String> {
     // clone: a counted reference
     let mut second = Tree::with_defs(first.defs.clone());
     let mut session = Session::new(&second);
-    ask_and_serve(&kernel, &mut session, &mut store, &second);
+    ask_and_serve(&kernel, &mut session, &mut store, &second, &first);
     let (_, since) = second.db().nonce_and_revision();
     let edited: Vec<DefWithBodyId> =
         second.bodies.iter().filter(|((file, _), _)| file == "leaf.rs").map(|(_, def)| *def).collect();
     let others = BODIES - edited.len();
     let from = second.pin();
     second.edit("leaf.rs", &LEAF.replace("{ 1 }", "{ 3 }"));
+    let before = second.installed.steps();
     let mut changed = Changed::between(from, second.pin());
     BodyDelta::default().say(&session, &mut changed);
     let carry = kernel.carry(&mut session, &mut store, &second, &changed, &Setting::OFF).map_err(|it| it.to_string())?;
@@ -1057,15 +1084,33 @@ fn carried_rows_answer() -> Result<(), String> {
     for (_, krate) in FILES {
         stamp(db, crate_named(db, krate), since);
     }
+    for &def in second.bodies.values() {
+        let now = crate::body_store::with_store(db, |store| store.facts.identity(db, def))
+            .ok_or("the test database has an item store")?;
+        for (step, schema) in [(Step::Infer, super::infer_schema()), (Step::Borrowck, borrowck_schema(db, def, CHECKER))] {
+            if let Some(verified) = answering(db, def, step, schema)
+                && Some(verified) != now
+            {
+                return Err(format!(
+                    "{def:?}'s {step:?} row answers at the new revision, verified with identity {verified:x}; the body's is {now:?}"
+                ));
+            }
+        }
+    }
     reset_runs();
     for &def in second.bodies.values() {
         let _ = InferenceResult::of(db, def);
         let _ = lookup_passed(db, def, CHECKER, || panic!("no store here verifies"));
     }
     second.installed.errors().map_err(|it| format!("a served answer disagrees with the database: {it:?}"))?;
-    let infer = second.installed.steps()[Step::Infer as usize];
-    if infer.hits != others as u64 {
-        return Err(format!("{} inferences answered from rows, {others} not reached by the edit", infer.hits));
+    let infer = counted_since(before, second.installed.steps())[Step::Infer as usize];
+    if (infer.hits, infer.ran) != (others as u64, edited.len() as u64) {
+        return Err(format!(
+            "{} inferences answered from rows and {} ran, of {others} the edit did not reach and {} it did",
+            infer.hits,
+            infer.ran,
+            edited.len()
+        ));
     }
     Ok(())
 }
@@ -1362,7 +1407,7 @@ fn reruns_after_a_mir_fact() -> Result<(), String> {
     {
         let mut session = Session::new(&second);
         reset_runs();
-        ask_and_serve(&kernel, &mut session, &mut store, &second);
+        ask_and_serve(&kernel, &mut session, &mut store, &second, &second);
         assert_eq!(runs(), [0; Step::COUNT], "no entry runs in the second session: each is the store's");
     }
     assert_eq!(checks_ran(&second), 0, "each borrow check is its served verdict");

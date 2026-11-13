@@ -969,12 +969,22 @@ impl Generated<'_> {
     /// that does not read, is an error naming the function.
     pub(crate) fn report(
         &self,
-        store: &blaze_cas::Reader,
+        store: &crate::serve::direct::Stores,
     ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
         if !self.policy.report {
             return Ok(Vec::new());
         }
-        let guard = blaze_cas::enter();
+        // Each side table the store holds is one direct read into the task's frame, read for
+        // its rows in the scope.
+        blaze_mem::frame::current(|frame| self.report_in(store, frame))
+    }
+
+    fn report_in(
+        &self,
+        store: &crate::serve::direct::Stores,
+        frame: &blaze_mem::frame::Frame,
+    ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
+        use crate::serve::direct::{self, Which};
         let workspace = &self.built.editable;
         // alloc: once per unit reported, a function each
         let mut reports = Vec::new();
@@ -986,8 +996,8 @@ impl Generated<'_> {
             let named = || format!("{:?}", function.key); // alloc: an error's name
             let bytes = match self.built.puts.iter().find(|it| it.key == key) {
                 Some(put) => &put.bytes[..],
-                None => match store.get(&guard, &key) {
-                    Ok(Some(entry)) => entry.bytes,
+                None => match direct::read(store, Which::Home, &key, frame) {
+                    Ok(Some(bytes)) => bytes,
                     // alloc: an error
                     Ok(None) => {
                         return Err(format!("the side table of {} is not in the store", named()));
@@ -1032,13 +1042,16 @@ impl Generated<'_> {
 
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
 /// thread of the build reads the one database of the task's reader by reference: the query
-/// engine's reads take `&self`, so none waits on another and none is cloned.
+/// engine's reads take `&self`, so none waits on another and none is cloned. What its walks
+/// keep for the next build of the database is the reader's ([`UnitReader::walks`]), held by
+/// the kept front end and let go with it.
 fn frontend<'db>(
     reader: &'db UnitReader,
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
     frontend_over(reader.db(), reader.paths(), reader.spellings(), mounted, build_time)
+        .with_walks(reader.walks())
 }
 
 /// [`frontend`] over the database `db`, whose files are `paths` and whose crates' roots cargo

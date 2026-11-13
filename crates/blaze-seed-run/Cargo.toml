@@ -28,6 +28,7 @@ wasmtime.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 # The binary of a test's module.
 wat = "1.263.0"
 

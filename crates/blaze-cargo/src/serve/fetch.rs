@@ -162,11 +162,11 @@ impl<H: Http + 'static> Fetcher<H> {
                 None,
             ));
         }
-        files.push(SourceFile {
-            path: PACKAGE_SOURCE_LOCK.to_owned(),
-            bytes: blaze_vfs::Bytes::from_static(br#"{"v":1}"#),
-            mode: Mode::Regular,
-        });
+        files.push(SourceFile::of(
+            PACKAGE_SOURCE_LOCK.to_owned(),
+            blaze_vfs::Bytes::from_static(br#"{"v":1}"#),
+            Mode::Regular,
+        ));
         blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
         Ok(Source { files, under: String::new() })
     }
@@ -186,7 +186,7 @@ impl<H: Http + 'static> Fetcher<H> {
             true => Vec::new(),
             false => {
                 let bytes = blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, &answer.body);
-                vec![SourceFile { path: name.to_owned(), bytes, mode: Mode::Regular }]
+                vec![SourceFile::of(name.to_owned(), bytes, Mode::Regular)]
             }
         };
         Ok(Source { files, under: name.to_owned() })
@@ -233,13 +233,9 @@ pub fn on_disk_id<'a>(files: impl Iterator<Item = (&'a str, Mode, ContentId)>) -
     hasher.finish()
 }
 
-/// [`on_disk_id`] of a fetched source's files.
+/// [`on_disk_id`] of a fetched source's files, by the IDs they carry.
 pub fn source_on_disk_id(source: &Source) -> ContentId {
-    on_disk_id(
-        source.files.iter().map(|it| {
-            (it.path.as_str(), it.mode, ContentId::of(blaze_vfs::FILE_DOMAIN, &it.bytes))
-        }),
-    )
+    on_disk_id(source.files.iter().map(|it| (it.path.as_str(), it.mode, it.id)))
 }
 
 /// The id `dir`'s [`ON_DISK_MARK`] holds: `Ok(None)` for no mark, an error for one that is

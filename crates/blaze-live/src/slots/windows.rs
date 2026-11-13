@@ -28,6 +28,7 @@ use super::{
 
 #[repr(C)]
 #[allow(dead_code)]
+#[expect(blaze::unwired, reason = "wired: a Win32 ABI layout `VirtualQuery` fills, read in part")]
 struct MemoryBasicInformation {
     base: *mut c_void,
     allocation_base: *mut c_void,
@@ -41,6 +42,7 @@ struct MemoryBasicInformation {
 
 #[repr(C)]
 #[allow(dead_code)]
+#[expect(blaze::unwired, reason = "wired: a Win64 unwind-table ABI layout the system reads")]
 struct RuntimeFunction {
     begin: u32,
     end: u32,

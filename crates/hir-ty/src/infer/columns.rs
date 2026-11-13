@@ -180,6 +180,7 @@ impl<'f, K: DenseKey, V> DenseMap<'f, K, V> {
     }
 
     #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    #[expect(blaze::unwired, reason = "kept so DenseMap has all of the ArenaMap API it replaces")]
     pub(crate) fn get_mut(&mut self, key: K) -> Option<&mut V> {
         self.slots.get_mut(key.to_index())?.as_mut()
     }
@@ -192,6 +193,7 @@ impl<'f, K: DenseKey, V> DenseMap<'f, K, V> {
 
     /// The keys with a value and their values, taken out in key order: `ArenaMap::into_iter`.
     #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    #[expect(blaze::unwired, reason = "kept so DenseMap has all of the ArenaMap API it replaces")]
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = (K, V)> {
         (self.slots.drain(..).enumerate())
             .filter_map(|(index, slot)| Some((K::from_index(index), slot?)))

@@ -971,6 +971,18 @@ impl MacroId {
 
     /// The name the macro is declared by: a derive's by the trait it derives.
     pub fn name(self, db: &Db) -> hir_expand::name::Name {
+        // Kept as an entry of the macro's item, keyed by its header (`deps::facts`).
+        let (kind, at) = match self {
+            MacroId::Macro2Id(it) => (11, deps::facts::at(db, it)),
+            MacroId::MacroRulesId(it) => (10, deps::facts::at(db, it)),
+            MacroId::ProcMacroId(it) => (12, deps::facts::at(db, it)),
+        };
+        let header = deps::facts::Part::Header;
+        deps::facts::fact(db, "macro name", "", kind, Some(at), header, || (self.name_made(db), true))
+    }
+
+    /// [`MacroId::name`] off the macro's syntax.
+    fn name_made(self, db: &Db) -> hir_expand::name::Name {
         use hir_expand::name::{AsName as _, Name};
         use src::HasSource as _;
         use syntax::view::HasName as _;
@@ -1000,6 +1012,16 @@ impl ExternCrateId {
     /// The name the crate is reached by from where the item is written: its alias, its own name
     /// with none, and no name for `extern crate krate as _`.
     pub fn alias_or_name(self, db: &Db) -> Option<hir_expand::name::Name> {
+        // Kept as an entry of the item, keyed by its header (`deps::facts`).
+        let at = deps::facts::at(db, self);
+        let header = deps::facts::Part::Header;
+        deps::facts::fact(db, "extern crate name", "", 15, Some(at), header, || {
+            (self.alias_or_name_made(db), true)
+        })
+    }
+
+    /// [`ExternCrateId::alias_or_name`] off the item's syntax.
+    fn alias_or_name_made(self, db: &Db) -> Option<hir_expand::name::Name> {
         use hir_expand::name::{AsName as _, Name};
         use src::HasSource as _;
         use syntax::view::HasName as _;
@@ -1845,10 +1867,6 @@ impl Complete {
 // return: macro call id and include file id
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, EditionedFileId)]> {
-    // A crate whose items are read from pages: the record's list, and no scope is decoded.
-    if let Some(served) = crate::nameres::frozen::items::includes(db, krate) {
-        return served;
-    }
     blaze_mem::frame::current(|frame| {
         let mut found = Vec::new_in(frame);
         found.extend(

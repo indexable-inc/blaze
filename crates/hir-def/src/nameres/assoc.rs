@@ -47,10 +47,6 @@ impl TraitItems {
 
     #[blaze_query::tracked(returns(ref))]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
-        // A crate whose items are read from pages: the record's, and no syntax is made.
-        if let Some(served) = crate::nameres::frozen::items::trait_items(db, tr) {
-            return served;
-        }
         // The trait's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::trait_items(db, tr, || Self::collected(db, tr))
     }
@@ -137,10 +133,6 @@ impl ImplItems {
     #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
-        // A crate whose items are read from pages: the record's, and no syntax is made.
-        if let Some(served) = crate::nameres::frozen::items::impl_items(db, id) {
-            return served;
-        }
         // The impl's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::impl_items(db, id, || Self::collected(db, id))
     }

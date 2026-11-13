@@ -301,7 +301,7 @@ fn written(effects: &mut Vec<Effect>) -> (FileName, Vec<u8>, Tag) {
 fn mapped(effects: &mut Vec<Effect>) -> (FileName, Tag) {
     assert_eq!(effects.len(), 1, "{effects:?}");
     match effects.pop() {
-        Some(Effect::Map { file, tag }) => (file, tag),
+        Some(Effect::Map { file, tag, .. }) => (file, tag),
         other => panic!("not a map: {other:?}"),
     }
 }

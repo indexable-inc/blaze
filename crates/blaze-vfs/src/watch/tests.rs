@@ -1267,8 +1267,8 @@ fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_vers
     use blaze_core::wait::Deadline;
 
     const FLUSHES: u64 = TAGS + (1 << 33);
-    let root = std::env::temp_dir().join(format!("blaze-vfs-renames-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-vfs-renames-");
+    let root = held.path();
     std::fs::create_dir_all(root.join("ws/src")).unwrap();
     std::fs::create_dir_all(root.join("state")).unwrap();
     let main = root.join("ws/src/main.rs");
@@ -1372,7 +1372,6 @@ fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_vers
     watcher.stop(&mut effects);
     driver.submit(&mut effects);
     drop(driver);
-    _ = std::fs::remove_dir_all(&root);
     assert!(crossed >= 100, "only {crossed} of 500 renames fell between a stamp and its read");
 }
 

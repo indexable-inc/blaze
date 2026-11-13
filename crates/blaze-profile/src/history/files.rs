@@ -35,7 +35,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::{Completion, Done, Effect, FileName, IoError, LockMode, Mapping, Meta, Tag};
+use blaze_core::{Completion, Done, Effect, Extent, FileName, IoError, LockMode, Mapping, Meta, Tag};
 use parquet::file::properties::WriterProperties;
 
 use super::{
@@ -689,7 +689,7 @@ impl Read {
                     self.names.sort_unstable();
                     for at in 0..self.names.len() {
                         let file = cx.file(&self.names[at]);
-                        cx.ask(Wait::Files, |tag| Effect::Map { file, tag });
+                        cx.ask(Wait::Files, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                     }
                     if self.legacy {
                         let file = cx.file(manifest::LEGACY_RETIRED);
@@ -1845,7 +1845,7 @@ impl Compact {
                     let Some(merge) = self.merges.pop_front() else { return Step::Ready(Ok(())) };
                     for input in &merge.inputs {
                         let file = cx.file(input);
-                        cx.ask(Wait::Merge, |tag| Effect::Map { file, tag });
+                        cx.ask(Wait::Merge, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                     }
                     self.merge = Some(merge);
                     self.stage = Merging::Map;
@@ -2131,7 +2131,7 @@ impl Recover {
                                 cx.locks.push(lock);
                                 self.locks.push((pid, lock));
                                 let file = cx.file(&postmortem::file_name(pid));
-                                cx.ask(Wait::Files, |tag| Effect::Map { file, tag });
+                                cx.ask(Wait::Files, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                             }
                             // Its process is alive, or another reader holds it.
                             Done::Contended => {}

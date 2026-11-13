@@ -215,29 +215,14 @@ fn a_stack_that_repeats_a_frame_reads_back_from_pprof_with_both() {
     assert_eq!(back, view);
 }
 
-/// A new directory under the system's temporary one, removed when dropped.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new(what: &str) -> TempDir {
-        let dir = std::env::temp_dir().join(format!(
-            "ix-prof-{what}-{}-{}",
-            std::process::id(),
-            crate::nonce()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // ix-prof refuses a directory open to group or other.
-        #[cfg(unix)]
-        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-        TempDir(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A new directory of this user's alone, removed with all it holds when dropped.
+fn private_dir(what: &str) -> blaze_core::temp::TempDir {
+    let dir = blaze_core::temp::TempDir::for_test(&format!("ix-prof-{what}-"));
+    // ix-prof refuses a directory open to group or other.
+    #[cfg(unix)]
+    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .unwrap();
+    dir
 }
 
 fn quiet_config() -> crate::Config {
@@ -258,12 +243,12 @@ fn a_start_that_fails_leaves_nothing_running_and_the_next_start_works() {
     {
         // Fails after the ticker and the server started: `http.endpoint` cannot be renamed over
         // a directory that holds a file. Both are stopped, and the server's port is free again.
-        let dir = TempDir::new("start-fails");
-        std::fs::create_dir_all(dir.0.join(crate::endpoint::FILE).join("in-the-way")).unwrap();
+        let dir = private_dir("start-fails");
+        std::fs::create_dir_all(dir.join(crate::endpoint::FILE).join("in-the-way")).unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let failed = crate::start(crate::Config {
             http: Some(port.to_string()),
-            dir: Some(dir.0.clone()),
+            dir: Some(dir.path().to_path_buf()),
             ..quiet_config()
         });
         assert!(matches!(failed, Err(crate::Error::Write { .. })), "{:?}", failed.err());
@@ -282,9 +267,9 @@ fn a_start_that_fails_leaves_nothing_running_and_the_next_start_works() {
 #[test]
 fn two_runs_with_the_same_program_and_pid_write_two_profiles() {
     let _globals = crate::TEST_GLOBALS.lock();
-    let dir = TempDir::new("names");
+    let dir = private_dir("names");
     let config = crate::Config {
-        dir: Some(dir.0.clone()),
+        dir: Some(dir.path().to_path_buf()),
         program: Some("same".to_owned()),
         ..quiet_config()
     };
@@ -303,8 +288,8 @@ fn two_runs_with_the_same_program_and_pid_write_two_profiles() {
 #[test]
 fn the_samplers_last_batch_is_in_the_profile() {
     let _globals = crate::TEST_GLOBALS.lock();
-    let dir = TempDir::new("tail");
-    let config = crate::Config { dir: Some(dir.0.clone()), cpu_hz: Some(1000), ..quiet_config() };
+    let dir = private_dir("tail");
+    let config = crate::Config { dir: Some(dir.path().to_path_buf()), cpu_hz: Some(1000), ..quiet_config() };
     let guard = crate::start(config).unwrap();
     let until = std::time::Instant::now() + std::time::Duration::from_millis(40);
     let mut x = 0u64;
@@ -326,8 +311,8 @@ fn the_samplers_last_batch_is_in_the_profile() {
 fn the_profile_and_its_directory_are_readable_by_this_user_only() {
     use std::os::unix::fs::PermissionsExt as _;
     let _globals = crate::TEST_GLOBALS.lock();
-    let tmp = TempDir::new("private");
-    let dir = tmp.0.join("made-by-ix-prof");
+    let tmp = private_dir("private");
+    let dir = tmp.join("made-by-ix-prof");
     let config = crate::Config { dir: Some(dir.clone()), ..quiet_config() };
     let path = crate::start(config).unwrap().finish().unwrap().expect("a path");
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;

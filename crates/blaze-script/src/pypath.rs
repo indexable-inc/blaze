@@ -283,13 +283,12 @@ mod tests {
 
     #[test]
     fn a_glob_finds_what_python_finds() {
-        let root = std::env::temp_dir().join(format!("blaze-script-glob-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::TempDir::for_test("blaze-script-glob-");
         for dir in ["crates/a", "crates/b", "crates/.hidden", "tools/x"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         std::fs::write(root.join("crates/README.md"), "").unwrap();
-        let at = root.to_string_lossy().into_owned();
+        let at = root.path().to_string_lossy().into_owned();
         let mut found = glob(&format!("{at}/crates/*"));
         found.sort();
         let named: Vec<String> = found.iter().map(|it| relpath(it, &at)).collect();
@@ -299,6 +298,5 @@ mod tests {
         let mut deep = glob(&format!("{at}/*/a"));
         deep.sort();
         assert_eq!(deep, [format!("{at}/crates/a")]);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

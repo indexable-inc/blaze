@@ -662,6 +662,11 @@ impl<'a, 'db> Checker<'a, 'db> {
     /// last, of what would be reported: a body with nothing to report is checked without
     /// building its source map. An expression's is the store's fact
     /// ([`ExpressionStore::is_synthesized`]); only a pattern's reads the map.
+    #[expect(
+        blaze::reads_positions,
+        reason = "whether a pattern was written is read off the source map: the store must keep its \
+                  synthesized patterns as it keeps its synthesized expressions (`is_synthesized`)"
+    )]
     fn written(&self, span: MirSpan) -> bool {
         match span {
             MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => !self.store.is_synthesized(expr),
@@ -673,6 +678,11 @@ impl<'a, 'db> Checker<'a, 'db> {
 
     /// The source map of the store the body's expressions are in: the body's own, or for an
     /// anonymous constant the store of the body or signature it is written in.
+    #[expect(
+        blaze::reads_positions,
+        reason = "`const_check` reads the store's source map for a pattern's being written and a call's \
+                  wording: both must be facts of the store, or worded by a marked reporter outside the check"
+    )]
     fn source_map(&self) -> &'db ExpressionStoreSourceMap {
         ExpressionStore::with_source_map(self.db, self.owner.expression_store_owner(self.db)).1
     }

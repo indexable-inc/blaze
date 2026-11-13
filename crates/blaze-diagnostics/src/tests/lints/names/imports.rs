@@ -151,6 +151,10 @@ fn hidden_glob_reexports() {
 /// `issue-107563-ambiguous-glob-reexports.rs`'s `ambiguous_glob_reexports`, as its `.stderr`
 /// has them; its `E0659` is name resolution's error, not a lint.
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn ambiguous_glob_reexports() {
     let source = include_str!("imports/issue-107563-ambiguous-glob-reexports.rs");
     let stderr = ui("issue-107563-ambiguous-glob-reexports.rs", "2015", source);

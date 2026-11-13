@@ -689,6 +689,11 @@ struct Key {
 }
 
 impl Key {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "`handle` is at most MAX_HANDLE (128) bytes: `Handle::bytes` slices to it and the \
+                  copy into the fixed KEY-byte array below would refuse more"
+    )]
     fn of(fsid: &[u8], kind: i32, handle: &[u8]) -> Key {
         let mut key = Key { bytes: [0; KEY], len: 0 };
         let size = u32::try_from(handle.len()).expect("a handle of at most MAX_HANDLE bytes");
@@ -965,12 +970,10 @@ mod tests {
     /// with no file system marked, as outside).
     #[test]
     fn known_places_answer_until_a_directory_moves() {
-        let root = std::env::temp_dir().join(format!("blaze-fanotify-seen-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let fd = OwnedFd::from(std::fs::File::open(&root).unwrap());
+        let root = crate::temp::TempDir::for_test("blaze-fanotify-seen-");
+        let fd = OwnedFd::from(std::fs::File::open(root.path()).unwrap());
         let mut room = Room::new().unwrap();
-        room.root = root.clone();
+        room.root = root.path().to_path_buf();
         room.dir.push_str("src");
         let mut watch = Fanotify { fd, room };
         let fsid = [3; 8];
@@ -1018,8 +1021,7 @@ mod tests {
     /// the first's room hears the same.
     #[test]
     fn hears_what_is_under_the_watched_directory_only() {
-        let root = std::env::temp_dir().join(format!("blaze-fanotify-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let root = crate::temp::TempDir::for_test("blaze-fanotify-");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let src = FileName::new("src").unwrap();
         let mut room = None;

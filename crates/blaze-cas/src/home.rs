@@ -41,7 +41,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use blaze_core::{Done, Effect, Mapping};
+use blaze_core::{Done, Effect, Extent, Mapping};
 use blaze_ids::ContentId;
 
 use crate::{
@@ -207,7 +207,7 @@ impl Store {
     fn ask_home_map(&mut self, content: ContentId, round: u64, effects: &mut Vec<Effect>) {
         let file = self.placed_file(&content);
         let tag = self.tags.ask(Op::HomeMapped { content, round });
-        effects.push(Effect::Map { file, tag });
+        effects.push(Effect::Map { file, extent: Extent::Whole, tag });
     }
 
     /// The whole file of `content`, synced, mapped: its records move to it now, or as each

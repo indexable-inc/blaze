@@ -137,6 +137,7 @@ pub struct Placed {
 /// oracle fail. Always `None` outside tests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// An edit whose binds must switch together stores its words straight to the new bodies.

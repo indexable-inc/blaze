@@ -570,21 +570,19 @@ pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 /// request named, never by widening a rule here.
 const REFUSALS: &[(&str, &str)] = &[
     ("closure_exprs", "read for another body's closures"),
-    // A const's value, a leak the signature hash marks (design section 4): `ConstValue` names
-    // a const evaluated as itself only.
-    ("const_eval_query", "a const with arguments or an environment"),
-    ("anon_const_eval", "an anonymous const: ConstValue names none"),
-    // A whole-crate walk: no fact names it.
-    ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
+    // A walk of every module of a published crate outside `inherent_assoc_types` (which is
+    // its own fact now, `InherentAssocTypes`).
     ("modules", "a walk of every module of a published crate (DefMap::table)"),
-    // Positions: the identity has no spans.
+    // Positions: the identity has no spans. A signature's source map is no longer here: its
+    // signature is the `Signature` fact and no answer holds a position (`reads::RULES`).
     ("Body::source_map", "a source map: positions"),
     ("Body::relative", "a source map: positions"),
-    ("FunctionSignature::with_source_map", "a source map: positions"),
-    ("FunctionSignature::relative", "a source map: positions"),
-    // From other bodies' borrow checks (firewall E3): no fact yet.
-    ("coroutine_witnesses_query", "an async body's witness types"),
-    ("opaque_variances_query", "an opaque type's variances"),
+    // Gone from this list with a rule each (2026-11-13, claude-opus-5-5): `const_eval_query`
+    // with arguments and `anon_const_eval_query` (read through), `table` (its reader
+    // `inherent_assoc_types` is a fact), `FunctionSignature::{with_source_map, relative}`
+    // (`Signature`), `coroutine_witnesses_query` and `opaque_variances_query` (read through,
+    // another body's MIR a step fact of that body). A read refused below one of them is
+    // refused by its own name, which this list then has to give a reason for.
 ];
 
 /// Lane item-hash's side, with a body's identity its debug name (one database only) and every
@@ -1851,4 +1849,171 @@ fn solver_query_traces_are_the_same_in_any_order() {
     }
     assert_eq!(by_order[0], by_order[1], "the traces depend on the order (forward, reversed)");
     assert_eq!(by_order[0], by_order[2], "the traces depend on the order (forward, shuffled)");
+}
+
+fn adt_named(db: &Db, name: &str) -> AdtId {
+    match named(db, name) {
+        ItemId::Adt(it) => it,
+        _ => panic!("`{name}` is no ADT"),
+    }
+}
+
+/// The invariant of `InherentAssocTypes`: the fact of an ADT changes when an associated type
+/// of its inherent impls is added, renamed or moved to another impl of it, and not when
+/// another item, or another ADT's inherent alias, is. The control is the pair that renames
+/// the alias: a value made of the impls alone (a planted fact that ignored the rows' names)
+/// would leave it equal, and `check` fails on it.
+#[test]
+fn inherent_assoc_types_fact_changes_with_the_list_and_only_then() {
+    check(&[
+        Pair {
+            what: "an inherent alias added",
+            before: "pub struct S;\nimpl S { pub fn f() {} }",
+            after: "pub struct S;\nimpl S { pub fn f() {} pub type A = u8; }",
+            changes: true,
+            of: |db| values::inherent_assoc_types(db, adt_named(db, "S")),
+        },
+        Pair {
+            what: "an inherent alias renamed",
+            before: "pub struct S;\nimpl S { pub type A = u8; }",
+            after: "pub struct S;\nimpl S { pub type B = u8; }",
+            changes: true,
+            of: |db| values::inherent_assoc_types(db, adt_named(db, "S")),
+        },
+        Pair {
+            what: "an inherent alias moved to another impl of the ADT",
+            before: "pub struct S;\nimpl S { pub type A = u8; }\nimpl S { pub fn f() {} }",
+            after: "pub struct S;\nimpl S { }\nimpl S { pub fn f() {} pub type A = u8; }",
+            changes: true,
+            of: |db| values::inherent_assoc_types(db, adt_named(db, "S")),
+        },
+        Pair {
+            what: "a function added",
+            before: "pub struct S;\nimpl S { pub type A = u8; }",
+            after: "pub struct S;\nimpl S { pub type A = u8; }\npub fn g() {}",
+            changes: false,
+            of: |db| values::inherent_assoc_types(db, adt_named(db, "S")),
+        },
+        Pair {
+            what: "another ADT's inherent alias added",
+            before: "pub struct S;\npub struct T;\nimpl S { pub type A = u8; }",
+            after: "pub struct S;\npub struct T;\nimpl S { pub type A = u8; }\nimpl T { pub type A = u8; }",
+            changes: false,
+            of: |db| values::inherent_assoc_types(db, adt_named(db, "S")),
+        },
+    ]);
+}
+
+/// The value of `fact`, the local crate seeing it, in a database of `source` with an item
+/// store of [`crate::Bodies`] installed (a body's step value is its answer in the store's
+/// encoding, which names items through the store's facts).
+fn step_fact_value(source: &str, fact: fn(&Db) -> FactRef) -> Option<ContentId> {
+    let db = db_of(&format!("{PRELUDE}{source}"));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        Arc::new(crate::Bodies),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    let value = values::value(&db, local_crate(&db), fact(&db));
+    drop(installed);
+    value
+}
+
+fn k_infer(db: &Db) -> FactRef {
+    values::step_fact_of(db, body_named(db, "k"), Step::Infer).expect("an inference step fact")
+}
+
+fn k_mir(db: &Db) -> FactRef {
+    values::step_fact_of(db, body_named(db, "k"), Step::Mir).expect("a MIR step fact")
+}
+
+/// The invariant of another body's step fact (`Rule::OwnStep` of another body: a `const fn`
+/// evaluated, a coroutine's witnesses): its value is the hash of that body's answer, so it
+/// changes exactly when the answer does. A literal changed is the same inference and another
+/// MIR; a return type changed is another inference; another body's edit changes neither.
+/// The control is the literal pair under the inference: a value made of the body's text (a
+/// planted fact keyed by its source, not its answer) would change there, and the assertion
+/// fails on it.
+#[test]
+fn another_bodys_step_fact_changes_with_its_answer_and_only_then() {
+    let cases: [(&str, &str, &str, fn(&Db) -> FactRef, bool); 4] = [
+        ("a literal, the MIR", "pub const fn k() -> u32 { 1 }", "pub const fn k() -> u32 { 2 }", k_mir, true),
+        ("a literal, the inference", "pub const fn k() -> u32 { 1 }", "pub const fn k() -> u32 { 2 }", k_infer, false),
+        ("a return type, the inference", "pub fn k() -> u32 { 1 }", "pub fn k() -> u64 { 1 }", k_infer, true),
+        (
+            "another body edited, the MIR",
+            "pub fn k() -> u32 { 1 }\npub fn j() -> u32 { 1 }",
+            "pub fn k() -> u32 { 1 }\npub fn j() -> u32 { 3 }",
+            k_mir,
+            false,
+        ),
+    ];
+    for (what, before, after, fact, changes) in cases {
+        let (was, is) = (step_fact_value(before, fact), step_fact_value(after, fact));
+        assert!(was.is_some() && is.is_some(), "{what}: a step fact with no value: {was:?} {is:?}");
+        assert_eq!(was != is, changes, "{what}");
+    }
+}
+
+/// The library of a fixture: its one crate that is not local (minicore's `core`).
+fn library(db: &Db) -> Crate {
+    *all_crates(db).iter().find(|it| !it.data(db).origin.is_local()).expect("a library crate")
+}
+
+/// What a row behind a library's seal stands for (`reads::sealed`) in `fixture`, read by `f`.
+fn sealed_facts(fixture: &str) -> (Db, Vec<FactRef>) {
+    let db = db_of(fixture);
+    let group = library(&db).seal_group_of(&db).expect("the library has a seal group");
+    // alloc: test facts, once per fixture.
+    let mut facts = Vec::new();
+    assert!(reads::sealed(&db, body_named(&db, "f"), group, &mut facts), "the row is refused");
+    (db, facts)
+}
+
+/// The invariant (keys-cover-every-input): a row read behind a library's seal stands for that
+/// library's `Crate` fact and the build's facts of the inputs no group holds, so a step that
+/// read it keeps its trace, and the trace's value moves with the library and not with what
+/// the reader's own crate changed. The controls: a group no crate the body sees has is
+/// refused (a seal of a crate outside the body's graph vouches for nothing it read), and a
+/// change to the reader's crate leaves the value as it was, which a fact keyed by the reading
+/// crate (a planted `whole_crate` of the body's own crate) would fail.
+#[test]
+fn a_sealed_library_row_is_its_crates_fact_and_changes_with_it() {
+    let reader = "pub fn f() -> u32 { 1 }";
+    let (db, facts) = sealed_facts(&format!("{PRELUDE}{reader}"));
+    let core = library(&db);
+    let crate_fact = FactRef {
+        kind: blaze_items::kinds::CRATE,
+        subject: key::crate_key(&db, core),
+        object: FactObject::None,
+    };
+    assert_eq!(facts, [crate_fact, values::field_order(), values::setting("borrowck_debug").unwrap()]);
+
+    // Another library: the `Crate` fact's value changes.
+    let value = |db: &Db, facts: &[FactRef]| {
+        values::value(db, local_crate(db), facts[0]).expect("the library's `Crate` fact has a value")
+    };
+    let other = "//- minicore: sized, copy, clone, add, send, sync, option\n";
+    let (changed, changed_facts) = sealed_facts(&format!("{other}{reader}"));
+    assert_ne!(value(&db, &facts), value(&changed, &changed_facts), "another library, the same value");
+
+    // Control: the reader's own crate edited, the same value.
+    let (edited, edited_facts) = sealed_facts(&format!("{PRELUDE}pub fn f() -> u32 {{ 2 }}"));
+    assert_eq!(value(&db, &facts), value(&edited, &edited_facts), "the reader's edit moved the value");
+
+    // Control: a group of no crate the body sees is refused.
+    use blaze_query::db::Database as _;
+    let mut db = db;
+    let def = body_named(&db, "f");
+    let stray = db.storage_mut().seal_group(
+        "test: a group of no crate",
+        blaze_query::db::SealKind::Library,
+        &[],
+    );
+    // alloc: test facts, once.
+    let mut none = Vec::new();
+    assert!(!reads::sealed(&db, def, stray, &mut none), "a stray group stood for {none:?}");
 }

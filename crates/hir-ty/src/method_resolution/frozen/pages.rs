@@ -11,10 +11,11 @@
 //! | traits | a trait | its blanket impls, and where its rows are (one run of the record) | [`blanket`], [`trait_into`] |
 //! | inherent | a simplified self type | the type's inherent impls | [`inherent`] |
 //! | names | a name's text | each trait of the crate with a function or constant of that name, and the item | [`value_items`] |
+//! | selfs | a simplified self type | where each row of a trait for the type is | [`for_self_ty`] |
 //!
 //! | segment | read when |
 //! |---|---|
-//! | header (88 bytes), files | the crate's tables are first asked |
+//! | header (100 bytes), files | the crate's tables are first asked |
 //! | a window of four slots | a key is looked up |
 //! | an entry | its key is looked up |
 //!
@@ -22,6 +23,14 @@
 //! two reads of a few dozen bytes where the table has no collision, whatever the crate's
 //! size. A key that is not there ends at an empty slot of its window: a definite "none" from
 //! one read, with no scan. A table with no key at all answers from the header alone.
+//!
+//! What each lookup reads, against its floor (an oracle that reads only what it returns):
+//! a row, a type's inherent impls, a trait's blanket impls and a name's items read a window
+//! and one entry, two reads (the floor is the one entry). Every trait impl for a self type
+//! ([`for_self_ty`]) reads a window, the type's entry and each of its rows: `k + 2` reads for
+//! `k` rows, where the floor is `k`. A row is written once, under its trait, and the type's
+//! entry names its place: a copy of the impls under the type would make it `2` reads and
+//! double the rows' bytes on disk.
 //!
 //! The whole of a table is read only by a reader of all of it ([`all_traits_into`],
 //! [`all_inherent_into`], [`all_value_items`]), which goes over the slots.
@@ -69,11 +78,12 @@ const MAGIC: [u8; 8] = *b"blzimpg\0";
 
 /// The layout of a record: it changes with every change to the header, the slots, which
 /// tables there are or what an entry holds. What an id is written as is
-/// `hir_def::nameres::frozen::ENCODING`'s, which the header names as well.
-pub const LAYOUT: u32 = 1;
+/// `hir_def::nameres::frozen::ENCODING`'s, which the header names as well. Layout 1 had no
+/// table of self types; its header is refused by this number.
+pub const LAYOUT: u32 = 2;
 
 /// Bytes of the header.
-const HEADER: usize = 88;
+const HEADER: usize = 100;
 /// Bytes of a table's slot.
 const SLOT: usize = 16;
 /// The slots a lookup reads at once: a key is in the first of them unless that many keys
@@ -176,7 +186,15 @@ struct Header {
     traits: Table,
     inherent: Table,
     names: Table,
+    selfs: Table,
+    /// Facts of the whole crate, a bit each ([`DECLARES_SEALED`]).
+    flags: u32,
 }
+
+/// The flag of a crate that declares a `#[blaze::sealed]` trait (`traits::declares_sealed`):
+/// asked of every crate of a graph, it is the header's for a served crate, not a walk of its
+/// modules and impls.
+const DECLARES_SEALED: u32 = 1;
 
 impl Header {
     fn write(&self, out: &mut Vec<u8>) {
@@ -187,12 +205,12 @@ impl Header {
         for it in [self.files_len, self.body_at, self.total] {
             out.extend_from_slice(&it.to_le_bytes());
         }
-        for table in [self.rows, self.traits, self.inherent, self.names] {
+        for table in [self.rows, self.traits, self.inherent, self.names, self.selfs] {
             for it in [table.at, table.slots, table.keys] {
                 out.extend_from_slice(&it.to_le_bytes());
             }
         }
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
     }
 
     /// The header in `bytes`, or why they are no pages this blaze reads: another record, a
@@ -240,12 +258,22 @@ impl Header {
             traits: table(48),
             inherent: table(60),
             names: table(72),
+            selfs: table(84),
+            flags: u32_at(bytes, 96),
         };
+        if header.flags & !DECLARES_SEALED != 0 {
+            // alloc: error path
+            return Err(format!(
+                "impl table pages with flags {:#x}, of which this blaze knows {DECLARES_SEALED:#x}",
+                header.flags
+            ));
+        }
         for (name, table) in [
             ("rows", header.rows),
             ("traits", header.traits),
             ("inherent", header.inherent),
             ("names", header.names),
+            ("self types", header.selfs),
         ] {
             if table.slots != 0 && !table.slots.is_power_of_two() {
                 // alloc: error path
@@ -516,6 +544,9 @@ thread_local! {
     pub(crate) static SCANS_FOR_ABSENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The bug a test planted: rows are written with no slot, so none is ever found.
     pub(crate) static WRITES_NO_ROW_SLOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bug a test planted: self types are written with no slot, so a type's rows are
+    /// never found from it.
+    pub(crate) static WRITES_NO_SELF_SLOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The impls of `trait_` for `self_ty` in the served crate `krate`, each given to `each`:
@@ -785,11 +816,60 @@ pub(in crate::method_resolution) fn all_value_items(
     }
 }
 
+/// Every trait impl of the served crate `krate` for `self_ty`, each given to `each`: per
+/// row, its impls and then its built-in derives, the rows in the order of their traits'
+/// fingerprints (no database's). What `TraitImpls::for_self_ty` gives of the crate's whole
+/// table, from the type's entry and its rows alone: `k + 2` reads for `k` rows (the module
+/// doc). A type with no trait impl is known from its slot alone.
+pub(in crate::method_resolution) fn for_self_ty<'db>(
+    db: &'db Db,
+    krate: Crate,
+    self_ty: &SimplifiedType<'db>,
+    mut each: impl FnMut(Either<ImplId, BuiltinDeriveImplId>),
+) {
+    let pages = Pages::of(db, krate);
+    let Some(hash) = self_ty_hash(db, self_ty) else { return };
+    let found = pages.find(pages.head.header.selfs, hash, |dec| {
+        if read_simplified(dec)? != *self_ty {
+            return Ok(None);
+        }
+        // alloc: the places of one type's rows, once per lookup of the type
+        dec.many(|dec| Ok((dec.u32()?, dec.u32()?))).map(Some)
+    });
+    let read = found.and_then(|rows| {
+        rows.unwrap_or_default().into_iter().try_for_each(|(at, len)| {
+            pages.entry(at, len, |dec| {
+                trait_of(dec)?;
+                if read_simplified(dec)? != *self_ty {
+                    // alloc: error path
+                    return Err("a row of another self type among a type's rows".to_owned());
+                }
+                row_rest(dec, &mut each)
+            })
+        })
+    });
+    if let Err(why) = read {
+        pages.refuse(format_args!("the trait impls for {self_ty:?}"), why)
+    }
+}
+
+/// Whether the served crate `krate` declares a `#[blaze::sealed]` trait, as its header
+/// says: written from `traits::declares_sealed` when the pages were.
+pub fn declares_sealed(db: &Db, krate: Crate) -> bool {
+    impl_pages_head(db, krate).header.flags & DECLARES_SEALED != 0
+}
+
 /// How many keys each table of the pages of the served crate `krate` has: rows, traits,
-/// inherent self types, names. From the head alone.
-pub fn counts(db: &Db, krate: Crate) -> [u32; 4] {
+/// inherent self types, names, self types with a row. From the head alone.
+pub fn counts(db: &Db, krate: Crate) -> [u32; 5] {
     let header = &impl_pages_head(db, krate).header;
-    [header.rows.keys, header.traits.keys, header.inherent.keys, header.names.keys]
+    [
+        header.rows.keys,
+        header.traits.keys,
+        header.inherent.keys,
+        header.names.keys,
+        header.selfs.keys,
+    ]
 }
 
 fn impl_ids(enc: &mut Enc<'_>, impls: &[ImplId]) -> R {
@@ -813,10 +893,15 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let mut inherent_slots: Vec<(u64, (u32, u32))> = Vec::new();
     // alloc: encoding, as above
     let mut name_slots: Vec<(u64, (u32, u32))> = Vec::new();
+    // alloc: encoding, as above
+    let mut self_slots: Vec<(u64, (u32, u32))> = Vec::new();
+    // Each row's self type and place, for the table of self types.
+    // alloc: encoding, once per write of a crate's pages
+    let mut rows_of_selfs: Vec<(SimplifiedType<'_>, (u32, u32))> = Vec::new();
     #[cfg(test)]
-    let no_row_slot = WRITES_NO_ROW_SLOT.get();
+    let (no_row_slot, no_self_slot) = (WRITES_NO_ROW_SLOT.get(), WRITES_NO_SELF_SLOT.get());
     #[cfg(not(test))]
-    let no_row_slot = false;
+    let (no_row_slot, no_self_slot) = (false, false);
 
     // Each trait in the order of its fingerprint, and its rows in the order of their self
     // types': the order of no database's ids, so two databases write the same bytes.
@@ -849,6 +934,7 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
             if !no_row_slot {
                 row_slots.push((row_hash(of_trait, of_self), place));
             }
+            rows_of_selfs.push((*self_ty, place));
         }
         let blanket = trait_impls.blanket_impls(trait_);
         let place = writer.segment(|enc| {
@@ -911,6 +997,32 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
         name_slots.push((name_hash(text), place));
     }
 
+    // Each self type with a row, in the order of its fingerprint, and the places of its rows
+    // in the order of their traits' (the sort is stable, so a type's rows stay in the order
+    // the traits were written in): an entry a type, which names the rows and copies none.
+    let rows_of_selfs =
+        writer.enc().sorted(rows_of_selfs.into_iter(), |enc, it| write_simplified(enc, it))?;
+    let mut at = 0;
+    while at < rows_of_selfs.len() {
+        let self_ty = rows_of_selfs[at].0;
+        let run = rows_of_selfs[at..].iter().take_while(|it| it.0 == self_ty).count();
+        let places = &rows_of_selfs[at..at + run];
+        at += run;
+        let place = writer.segment(|enc| {
+            write_simplified(enc, &self_ty)?;
+            enc.usize(places.len())?;
+            for &(_, (row_at, row_len)) in places {
+                enc.u32(row_at);
+                enc.u32(row_len);
+            }
+            Ok(())
+        })?;
+        if !no_self_slot {
+            let hash = self_ty_hash(db, &self_ty).ok_or("a self type with no hash")?;
+            self_slots.push((hash, place));
+        }
+    }
+
     let mut table = |slots: &[(u64, (u32, u32))]| -> R<Table> {
         let (count, bytes) = table_of(slots);
         let at = writer.raw(&bytes)?;
@@ -920,6 +1032,7 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let traits = table(&trait_slots)?;
     let inherent = table(&inherent_slots)?;
     let names = table(&name_slots)?;
+    let selfs = table(&self_slots)?;
 
     let written = writer.finish()?;
     let body_at = HEADER + written.files.len();
@@ -932,6 +1045,11 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
         traits,
         inherent,
         names,
+        selfs,
+        flags: match crate::traits::declares_sealed(db, krate) {
+            true => DECLARES_SEALED,
+            false => 0,
+        },
     };
     // alloc: the record, once per crate per write of its pages
     let mut out = Vec::with_capacity(total as usize);

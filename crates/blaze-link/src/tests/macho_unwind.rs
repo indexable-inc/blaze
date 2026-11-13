@@ -114,8 +114,7 @@ fn an_fde_whose_pc_begin_subtracts_a_symbol_of_eh_frame_links_and_unwinds() {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("blaze-link-macho-unwind-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-link-macho-unwind-");
     let program = dir.join("eh_fde");
     std::fs::write(&program, &bytes).unwrap();
     #[cfg(unix)]
@@ -124,7 +123,6 @@ fn an_fde_whose_pc_begin_subtracts_a_symbol_of_eh_frame_links_and_unwinds() {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let status = std::process::Command::new(&program).status().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     // `_main` returns which of bit 0 (`_middle` seen) and bit 1 (`_main` seen) the walk missed.
     assert_eq!(
         status.code(),

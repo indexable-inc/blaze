@@ -275,6 +275,69 @@ impl FutexCalls for Kernel {
     }
 }
 
+/// The shared-address wait of [`super::wait_shared`] on the direct driver: one
+/// `futex(FUTEX_WAIT_BITSET)` without `FUTEX_PRIVATE_FLAG` per call, so the kernel keys the wait
+/// by the mapped file's page and a wake from another process's mapping finds it, to the
+/// absolute `CLOCK_MONOTONIC` time of what is left of `deadline` on `clock` now.
+pub(crate) fn wait_shared(
+    what: &'static str,
+    word: &std::sync::atomic::AtomicU64,
+    expected: u32,
+    deadline: Deadline,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    // The low half of a little-endian word is at its address.
+    let low = word.as_ptr().cast::<u32>().cast_const();
+    until(what, clock, Some(deadline), |left| {
+        let at = monotonic()?.saturating_add(left.unwrap_or_default());
+        let ts = timespec(at);
+        // SAFETY: `low` is the live, aligned low half of a word of a shared mapping, which the
+        // kernel only reads; the timespec is a live local it reads, an absolute
+        // `CLOCK_MONOTONIC` time; no pointer is kept after the call.
+        let waited = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                low,
+                libc::FUTEX_WAIT_BITSET,
+                expected,
+                ptr::from_ref(&ts),
+                ptr::null::<u32>(),
+                FUTEX_ANY,
+            )
+        };
+        if waited == 0 {
+            return Ok(Once::Ready(()));
+        }
+        let error = errno();
+        match error.raw_os_error() {
+            // The word no longer held `expected`: the caller looks again.
+            Some(libc::EAGAIN) => Ok(Once::Ready(())),
+            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            // alloc: an error.
+            _ => Err(io::Error::new(error.kind(), format!("futex(FUTEX_WAIT_BITSET), shared: {error}"))),
+        }
+    })
+}
+
+/// The wake of [`super::wake_shared`], on either driver: one `futex(FUTEX_WAKE)` without
+/// `FUTEX_PRIVATE_FLAG` of every waiter on `word`'s low half, in any process.
+pub(crate) fn wake_shared(word: &std::sync::atomic::AtomicU64) {
+    // A wake of a live aligned word cannot fail; the count woken is not needed.
+    // SAFETY: a futex wake of a word of a shared mapping; the kernel reads no memory of it.
+    _ = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr().cast::<u32>(),
+            libc::FUTEX_WAKE,
+            i32::MAX,
+            ptr::null::<libc::timespec>(),
+            ptr::null::<u32>(),
+            0u32,
+        )
+    };
+}
+
 impl ChildCalls for Kernel {
     type Reaped = (libc::c_int, libc::rusage);
     type Pidfd = OwnedFd;
@@ -564,6 +627,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        blaze::untied_child,
+        reason = "reaped by pid through `reaping::reap`, which is what is tested: a guard's kill on drop would signal a pid already reaped"
+    )]
     fn a_childs_exit_waited_for_past_a_deadline_leaves_it_to_be_reaped() {
         let mut running = child("exec sleep 600");
         let pid = i32::try_from(running.id()).unwrap();
@@ -583,12 +650,17 @@ mod tests {
             Waited::Deadline => panic!("a killed child was not reaped within 60 s"),
         }
         // Reaped: it is no child any more.
-        let again = Direct(&Kernel).exited("a test's child", pid, true, None, &clock);
+        let deadline = Some(Deadline::after(clock.now(), LONG));
+        let again = Direct(&Kernel).exited("a test's child", pid, true, deadline, &clock);
         let error = again.expect_err("a reaped child was waited for again");
         assert_eq!(error.io_error().and_then(io::Error::raw_os_error), Some(libc::ECHILD));
     }
 
     #[test]
+    #[expect(
+        blaze::untied_child,
+        reason = "reaped by pid through `reaping::reap`, which is what is tested: a guard's kill on drop would signal a pid already reaped"
+    )]
     fn a_child_that_exits_is_reaped_with_its_status() {
         let exiting = child("sleep 0.05; exit 7");
         let pid = i32::try_from(exiting.id()).unwrap();

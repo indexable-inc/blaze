@@ -11,9 +11,16 @@
 //! with no way out is a service loop, not a wait, and is left to `clippy::infinite_loop`; a `for`
 //! loop runs over its items and is bounded by them.
 //!
+//! A panic (a call that never returns: `panic!`, a failed `assert!`) on a compared condition
+//! bounds the loop too, `if start.elapsed() > timeout { panic!(..) }`, but a loop whose only way
+//! out is a panic is still a service loop.
+//!
 //! Calls are resolved, so a renamed import (`use std::thread::sleep as nap`) and a loop a macro
 //! writes count. A `?` or an unguarded `break` in a match arm ends the loop on what it matched,
 //! not on a bound, and does not make it bounded.
+//!
+//! `unbounded_test_wait` asks the same of a test's loops around `Child::try_wait`, through
+//! [`first_wait`], [`exits`], [`panics`] and [`compares`].
 
 use base_db::Db;
 use hir::AsAssocItem as _;
@@ -71,7 +78,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let parents = parents.get_or_insert_with(|| Parents::of(body));
         let exits = exits(body, parents, id, inner, label, source);
         if exits.is_empty()
-            || exits.iter().any(|&guard| guard.is_some_and(|it| compares(analysis, it)))
+            || exits
+                .iter()
+                .chain(&panics(analysis, parents, id, inner))
+                .any(|&guard| guard.is_some_and(|it| compares(analysis, it)))
         {
             continue;
         }
@@ -98,7 +108,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// The first wait of the loop body `inner`, outside the loops and closures in it, with what it
 /// is as the message names it.
-fn first_wait(
+pub(super) fn first_wait(
     cx: &Cx<'_, '_>,
     analysis: &hir::BodyAnalysis<'_>,
     inner: ExprId,
@@ -154,7 +164,7 @@ fn waits_with(cx: &Cx<'_, '_>, db: &Db, f: FunctionId) -> Option<String> {
 /// The ways out of the loop `id` (its body `inner`), each with the condition it is taken on:
 /// the `while` condition, and for each `break` of the loop and `return` in it the nearest `if`
 /// condition or match guard around it inside the loop, `None` when there is none.
-fn exits(
+pub(super) fn exits(
     body: &Body,
     parents: &Parents,
     id: ExprId,
@@ -190,6 +200,35 @@ fn exits(
     out
 }
 
+/// The panics in the loop `id` (its body `inner`), outside the closures in it: each call that
+/// never returns, with the nearest `if` condition or match guard it is taken on inside the loop,
+/// `None` when there is none.
+pub(super) fn panics(
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &Parents,
+    id: ExprId,
+    inner: ExprId,
+) -> Vec<Option<ExprId>> {
+    let body = analysis.body();
+    let infer = analysis.infer();
+    // alloc: the panics of one loop, a few
+    let mut out = Vec::new();
+    let mut stack = vec![inner]; // alloc: the expressions of one loop body
+    while let Some(at) = stack.pop() {
+        match body.expr(at) {
+            Expr::Closure { .. } => continue,
+            Expr::Call { .. } | Expr::MethodCall { .. }
+                if analysis.ty(infer.expr_ty(at)).is_never() =>
+            {
+                out.push(guard_of(body, parents, at, id));
+            }
+            _ => {}
+        }
+        body.walk_child_exprs(at, |child| stack.push(child));
+    }
+    out
+}
+
 /// The nearest `if` condition or match guard that `exit` is taken on, inside the loop `id`.
 fn guard_of(body: &Body, parents: &Parents, exit: ExprId, id: ExprId) -> Option<ExprId> {
     let mut child = exit;
@@ -215,7 +254,7 @@ fn guard_of(body: &Body, parents: &Parents, exit: ExprId, id: ExprId) -> Option<
 
 /// Whether `condition` compares something: an ordering comparison, or an equality of
 /// integers, outside the closures in it.
-fn compares(analysis: &hir::BodyAnalysis<'_>, condition: ExprId) -> bool {
+pub(super) fn compares(analysis: &hir::BodyAnalysis<'_>, condition: ExprId) -> bool {
     let body = analysis.body();
     let infer = analysis.infer();
     let mut stack = vec![condition]; // alloc: the expressions of one condition

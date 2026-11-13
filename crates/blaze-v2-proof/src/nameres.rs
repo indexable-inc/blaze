@@ -235,6 +235,10 @@ fn differ(before: &Trace, after: &Trace, kind: QueryKind) -> (Vec<QueryKey>, boo
 ///
 /// One pass over each counted kind's keys, one join of the incremental build's reruns against
 /// the build before, and [`under`]'s one pass: the traces are read once each.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the keys that differ are a subset of one trace's keys, which a trace indexes by u32, so their count fits a u32"
+)]
 pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) -> Vec<Finding> {
     let watched = |kind: QueryKind| {
         kinds::RESOLVER.contains(&kind.0) || case.expect.iter().any(|e| e.kind == kind)

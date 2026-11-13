@@ -1,4 +1,4 @@
-//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>`,
+//! The comments that keep a cost on a line: `// clone: <why>`,
 //! `// dyn: <why>`, `// seqcst: <why>`, `// durable: <why>`, `// wakes: <who>` and
 //! `// identity: <why>`, on a line of the finding or on the line above it, with a reason that isn't
 //! empty. Read from the text of the tree walked, nothing allocated.
@@ -12,7 +12,6 @@ use super::Lint;
 const fn tag(lint: Lint) -> Option<&'static str> {
     match lint {
         Lint::HotClone => Some("clone"),
-        Lint::HotAlloc | Lint::HotAllocCall | Lint::ImplicitAllocator => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
         Lint::SeqcstUnexplained => Some("seqcst"),
         Lint::DurableWrite => Some("durable"),
@@ -20,7 +19,14 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::CombinedIdentity => Some("identity"),
         // `relaxed_publish` reads it on either side and on the atomic's declaration itself.
         Lint::RelaxedPublish => Some("relaxed"),
-        Lint::Parallelizable
+        // No comment stands in for an allocator (rule bump-allocate): the global heap is named
+        // where it is used (`Vec::new_in(Global)`), or the item says why with `#[expect(..)]`,
+        // which the ratchet counts. `// alloc: <why>` keeps nothing; the lines that still carry
+        // it are what `scripts/src/bin/allocs.rs` counts down to zero.
+        Lint::HotAlloc
+        | Lint::HotAllocCall
+        | Lint::ImplicitAllocator
+        | Lint::Parallelizable
         | Lint::SerialDependence
         | Lint::FiberBoundary
         | Lint::ErrorDebug
@@ -155,7 +161,26 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // A type's declaration and where it is held: kept with `#[expect(..)]` on the item.
         | Lint::ProgramLifetime
         | Lint::CouldBeProgramLifetime
-        | Lint::CouldBeRef32 => None,
+        | Lint::CouldBeRef32
+        // Kept with `#[expect(..)]` on the function: where a setting is read is the item's
+        // choice, and the allowed modules are named in `clippy.toml`.
+        | Lint::EnvRead
+        // Kept with `#[expect(..)]` on the item: a child's owner, a test's bound, a reader of
+        // positions (or `#[blaze::renders_positions]`) and a format's field order are the
+        // item's choice. In a test the code under test is the waker, so `// wakes:` keeps no
+        // `unbounded_test_wait` finding.
+        | Lint::UntiedChild
+        | Lint::UnboundedTestWait
+        | Lint::ReadsPositions
+        | Lint::CborFieldOrder
+        // Kept with `#[expect(..)]` on the item: a literal's alignment, a count, a silenced
+        // design, a policy path, a bounded length and a bounded static are the item's choice.
+        | Lint::GappedLiteral
+        | Lint::Retry
+        | Lint::Unwired
+        | Lint::TmpPath
+        | Lint::NarrowedLen
+        | Lint::ProcessStatic => None,
     }
 }
 
@@ -224,11 +249,11 @@ mod tests {
 
     #[test]
     fn an_empty_reason_or_another_tag_does_not() {
-        let text = "// clone:\nlet a = x.clone();\n// clone:    \nlet b = y.clone();\n// alloc: why\nlet c = z.clone();\n";
+        let text = "// clone:\nlet a = x.clone();\n// clone:    \nlet b = y.clone();\n// dyn: why\nlet c = z.clone();\n";
         assert!(!exempt(text, at(text, "x.clone()"), Lint::HotClone));
         assert!(!exempt(text, at(text, "y.clone()"), Lint::HotClone));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotClone));
-        assert!(exempt(text, at(text, "z.clone()"), Lint::HotAlloc));
+        assert!(exempt(text, at(text, "z.clone()"), Lint::HotDyn));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::DefaultHasher));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotDyn));
     }
@@ -243,9 +268,20 @@ mod tests {
 
     #[test]
     fn every_line_of_a_finding_counts() {
-        let text = "let v = vec![\n    1, // alloc: setup\n];\nlet w = 0;\n// alloc: below\n";
-        assert!(exempt(text, at(text, "vec![\n    1, // alloc: setup\n]"), Lint::HotAlloc));
-        assert!(!exempt(text, at(text, "let w = 0;"), Lint::HotAlloc));
-        assert!(!exempt("x", TextRange::empty(TextSize::new(0)), Lint::HotAlloc));
+        let text = "let v = f(\n    1, // dyn: setup\n);\nlet w = 0;\n// dyn: below\n";
+        assert!(exempt(text, at(text, "f(\n    1, // dyn: setup\n)"), Lint::HotDyn));
+        assert!(!exempt(text, at(text, "let w = 0;"), Lint::HotDyn));
+        assert!(!exempt("x", TextRange::empty(TextSize::new(0)), Lint::HotDyn));
+    }
+
+    /// The rule: no comment stands in for an allocator. `// alloc: <why>`, with a reason,
+    /// keeps no finding of `implicit_allocator`, `hot_alloc` or `hot_alloc_call`.
+    #[test]
+    fn an_alloc_comment_keeps_no_allocation_finding() {
+        let text = "// alloc: handed to the caller\nlet v = Vec::new();\nlet w = Vec::new(); // alloc: setup\n";
+        for lint in [Lint::ImplicitAllocator, Lint::HotAlloc, Lint::HotAllocCall] {
+            assert!(!exempt(text, at(text, "Vec::new();\nlet"), lint));
+            assert!(!exempt(text, at(text, "let w = Vec::new();"), lint));
+        }
     }
 }

@@ -350,12 +350,11 @@ mod tests {
     /// `clippy.toml`, and one after [`Setups::forget`] reads it again.
     #[test]
     fn a_setup_is_kept_until_forgotten() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-setups-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-setups-");
         std::fs::write(dir.join("clippy.toml"), "msrv = \"1.60\"\n").unwrap();
         let package = |flags: &[&str]| Package {
             name: "p".to_owned(),
-            manifest_dir: dir.clone(),
+            manifest_dir: dir.path().to_path_buf(),
             flags: flags.iter().map(|it| (*it).to_owned()).collect(),
             conf_dir: None,
             rust_version: None,
@@ -384,6 +383,5 @@ mod tests {
         setups.forget();
         setups.load(&plain);
         assert_eq!(msrv(&setups, &plain), Ok(Some(crate::conf::Version(1, 70, 0))));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -194,6 +194,10 @@ struct Walked {
     /// asked again by a walk while the word stands, named as changed whenever reached, and
     /// never taken as clean ([`clean`]). Replaced whole by a walk that ended.
     apart: Arc<Vec<(u32, u32)>>,
+    /// Rows whose edges a seal pass let go and whose group stopped holding
+    /// ([`super::seal::Seals::take_assumed`]), not run since: no reverse edge reaches them,
+    /// so every walk names each as changed and sets it apart until it has run again.
+    shed: Vec<u32>,
     work: ChangedSetWork,
 }
 
@@ -319,11 +323,24 @@ pub(crate) enum Plant {
     /// moved ([`super::seal::Seals::moved_readers`]): the grain of what is redone is the
     /// crate.
     BrokenSealNamesEveryRow,
-    /// A walk that enters a group whose seal broke hands out the readers of the imports that
-    /// moved and not those of what had changed before the group's rows could be found (a row
-    /// behind the seal that a pull ran again first): the bug the refinement's simulation
-    /// found on 2026-11-12.
+    /// A walk gathers the readers of what changed before it checks the seals and indexes the
+    /// groups whose seal broke: the readers of a row behind the seal that a pull ran again
+    /// first are not found, the first stale answer the refinement's simulation found
+    /// (2026-11-12). The walk now checks every seal before it traverses a row (rule 2 of the
+    /// rebuild), which leaves this bug no place to be; the plant puts one gathering back in
+    /// front of the check.
     BrokenGroupMissesEarlierChanges,
+    /// The walk works out its reach before it checks the seals, and the reach proves a row
+    /// made in a sealed group after the seal as a row of its group
+    /// ([`super::seal::Seals::reach_proves`]'s rule 3 taken out): a row that reads a seal
+    /// which breaks in this walk is in neither the seal nor the reach and answers its old
+    /// value, the third stale answer the refinement found (2026-11-13).
+    ReachBeforeSealsChecked,
+    /// A library group that stops holding (opened by a write, or its seal broken) queues
+    /// none of its rows whose edges were let go ([`super::seal::Seals::assume`] taken out):
+    /// no reverse edge reaches them, so the walk passes them over and they answer their old
+    /// value.
+    LetGoRowsNotAssumed,
     /// A settle that left nothing makes its view the floor whether or not a row with an
     /// untracked read has run in the view ([`nothing_to_walk`]'s test taken out), as it did
     /// until 2026-11-12: a row that reads such a row is proved from the floor with its old
@@ -451,6 +468,7 @@ impl Storage {
     pub(crate) fn plant_in_changed_set(&mut self, plant: Plant) {
         self.frontier.plant = plant;
         self.seals.admit_second_claims(plant == Plant::SecondClaimAdmitted);
+        self.seals.forget_assumed(plant == Plant::LetGoRowsNotAssumed);
     }
 
     /// Plants [`Plant::ForgetsReadersOfWritten`] in this storage's changed set: for the
@@ -962,6 +980,9 @@ struct Taken<'a> {
     /// The nodes that had said they changed, taken off the queue by this walk: put back if
     /// it unwinds, so the next walk asks their readers (until 2026-11-12 they were lost).
     said: Vec<u32>,
+    /// [`Walked::shed`]: put back whether the walk ends or unwinds, since a row leaves it
+    /// only by running again.
+    shed: Vec<u32>,
 }
 
 impl Drop for Taken<'_> {
@@ -972,6 +993,14 @@ impl Drop for Taken<'_> {
         let mut walked = self.frontier.walked.lock();
         walked.written = std::mem::take(&mut self.written);
         walked.untracked = std::mem::take(&mut self.untracked);
+        // A settle may have queued more meanwhile (it holds `&mut`, so not during a walk;
+        // appended all the same, the next walk dedups).
+        let shed = std::mem::take(&mut self.shed);
+        if walked.shed.is_empty() {
+            walked.shed = shed;
+        } else {
+            walked.shed.extend_from_slice(&shed); // alloc: the rows without edges, a word each
+        }
     }
 }
 
@@ -1041,6 +1070,95 @@ fn verify(db: Db, storage: &Storage, node: u32, plant: Plant) -> Seen1 {
     }
 }
 
+/// The walk's lists, lent to [`check_seals`].
+struct Lists<'a> {
+    changed: &'a mut Vec<ChangedIn>,
+    found: &'a mut Vec<u32>,
+    suspects: &'a mut Vec<u32>,
+    unwound: &'a mut Vec<(u32, u32)>,
+    apart_now: &'a mut Seen,
+    entered: &'a mut Vec<u16>,
+    shed: &'a mut Vec<u32>,
+}
+
+/// Checks every seal a write may have reached, in dependency order
+/// ([`super::seal::resolve_all`]), indexes the groups whose seal broke, and hands out what
+/// they make changed: the rows that read an import that moved, as suspects, and every row
+/// without edges of a group that stopped holding ([`Walked::shed`]), named as changed and
+/// set apart. Idempotent within a walk: a group is entered once, a row without edges named
+/// once.
+///
+/// Its cost: one check a group a write reached (what its imports read from outside it), the
+/// edges of a broken group's rows once (its index), and a word a row without edges. The
+/// floor is the same checks: an oracle that knew which groups a write reached would make
+/// them too, and the rows without edges are what letting their edges go traded for.
+fn check_seals(
+    db: *const (),
+    storage: &Storage,
+    plant: Plant,
+    plan: &mut Plan,
+    work: &mut ChangedSetWork,
+    lists: &mut Lists<'_>,
+) {
+    if storage.seals.unsettled() {
+        let (checked, broken) = super::seal::resolve_all(db, storage, &*lists.apart_now);
+        work.groups_checked += checked;
+        work.groups_broken += broken;
+        // A seal that broke is the quick check that failed, never the grain of what is
+        // redone: the group's rows are indexed (its own edges, no row verified), and only
+        // the rows that read an import that moved are handed out, to be verified as any
+        // suspect; their readers follow as any row's.
+        //
+        // Once a walk, each group: a walk that unwound after a group was indexed left its
+        // rows unverified, and the next walk hands them out again.
+        storage.seals.index_broken(storage);
+        for group in storage.seals.broken() {
+            if lists.entered.contains(&group) {
+                continue;
+            }
+            lists.entered.push(group); // alloc: the groups whose seal broke in this view, few
+            if plant == Plant::BrokenSealNamesEveryRow {
+                let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the control's list, every row of the group
+                storage.seals.every_row_behind(storage, group, &mut rows);
+                for (node, word) in rows {
+                    lists.changed.push((node, ASSUMED));
+                    lists.found.push(node);
+                    if lists.apart_now.insert(node) {
+                        lists.unwound.push((node, word)); // alloc: the rows set apart
+                    }
+                    work.marked += 1;
+                }
+                continue;
+            }
+            let suspects = &mut *lists.suspects;
+            super::seal::moved_readers(db, storage, group, &*lists.apart_now, |reader| {
+                if plan.ask(reader) {
+                    suspects.push(reader); // alloc: a walk's list, the rows it reaches
+                }
+            });
+        }
+        lists.suspects.sort_unstable();
+    }
+    // The rows without edges whose group stopped holding: no reverse edge reaches them, so
+    // each is named as changed and set apart, in this walk and every walk after it until it
+    // has run again (or its group is sealed again and holds). A row named once a walk: one
+    // already set apart in this walk is passed over.
+    storage.seals.take_assumed(&mut *lists.shed);
+    lists.shed.sort_unstable();
+    lists.shed.dedup();
+    lists.shed.retain(|&node| storage.seals.let_go(node) && !storage.seals.proves(node));
+    for &node in lists.shed.iter() {
+        let Some((header, _, _)) = row_of(storage, node) else { continue };
+        let word = header.verified.load(Ordering::Acquire);
+        if lists.apart_now.insert(node) {
+            lists.changed.push((node, ASSUMED));
+            lists.found.push(node);
+            lists.unwound.push((node, word)); // alloc: the rows set apart
+            work.marked += 1;
+        }
+    }
+}
+
 /// One walk: see the module. Runs holding the walk's flight.
 fn walk(db: *const (), storage: &Storage) {
     let frontier = &storage.frontier;
@@ -1053,6 +1171,7 @@ fn walk(db: *const (), storage: &Storage) {
             written: std::mem::take(&mut walked.written),
             untracked: std::mem::take(&mut walked.untracked),
             said: Vec::new(),
+            shed: std::mem::take(&mut walked.shed),
         };
         (taken, Arc::clone(&walked.apart)) // clone: a count
     };
@@ -1127,11 +1246,6 @@ fn walk(db: *const (), storage: &Storage) {
             work.said += 1;
         }
     }
-    // The reach, before any row is verified: a verification under this walk proves a row
-    // outside it with one look ([`unreached`]), where it walked everything the row read.
-    if plant != Plant::WalksWithNoReach {
-        reach(storage, &changed, &taken.untracked, &mut work);
-    }
     // The rows set apart, by node: those kept from the walks before and this walk's.
     let mut apart_now = Seen::with_hasher(blaze_hash::FixedState);
     apart_now.extend(unwound.iter().map(|it| it.0)); // alloc: as above
@@ -1145,6 +1259,31 @@ fn walk(db: *const (), storage: &Storage) {
         Plant::ContainsEveryUnwind => u64::MAX,
         _ => UNWOUND_MOST,
     };
+    // Rule 2 of the rebuild (end-state.md): every seal a write may have reached is checked,
+    // in dependency order, before any row is traversed, so no seal changes state while rows
+    // are, and a group whose seal broke is indexed before the readers of anything are
+    // gathered (until 2026-11-13 the seals were checked when the rows came to rest, and a
+    // replay of what the walk had found stood in for the order: the first stale answer).
+    // Then the reach, from what was written and said and from the rows the seals hand out
+    // without edges: a verification under this walk proves a row outside it with one look
+    // ([`unreached`]), where it walked everything the row read.
+    if plant == Plant::ReachBeforeSealsChecked {
+        reach(storage, &changed, &taken.untracked, &mut work);
+    }
+    if plant != Plant::BrokenGroupMissesEarlierChanges {
+        check_seals(db, storage, plant, &mut plan, &mut work, &mut Lists {
+            changed: &mut changed,
+            found: &mut found,
+            suspects: &mut suspects,
+            unwound: &mut unwound,
+            apart_now: &mut apart_now,
+            entered: &mut entered,
+            shed: &mut taken.shed,
+        });
+    }
+    if plant != Plant::WalksWithNoReach && plant != Plant::ReachBeforeSealsChecked {
+        reach(storage, &changed, &taken.untracked, &mut work);
+    }
     loop {
         // What said it changed by this walk's verifications, or by a pull meanwhile.
         if plant != Plant::StopsAtChangedReader {
@@ -1168,72 +1307,21 @@ fn walk(db: *const (), storage: &Storage) {
             if !frontier.changed.is_empty() && plant != Plant::StopsAtChangedReader {
                 continue;
             }
-            // The rows are at rest. Each sealed group a write may have reached is checked
-            // now, once, by what its rows read from outside it ([`super::seal`]): a group
-            // that holds answers for all its rows; one whose seal broke has its rows set
-            // apart and named, as past a wide level, and their readers are asked in turn.
+            // The rows are at rest. The seals were checked before the walk traversed a row;
+            // a group can still wait for its check here only when a pull claimed it as the
+            // walk began (it is broken now), or under the control that takes the first check
+            // out ([`Plant::BrokenGroupMissesEarlierChanges`]). Once more, and on only if it
+            // handed out something.
             if storage.seals.unsettled() {
-                let (checked, broken) = {
-                    super::seal::resolve_all(db, storage, &apart_now)
-                };
-                work.groups_checked += checked;
-                work.groups_broken += broken;
-                // A seal that broke is the quick check that failed, never the grain of what
-                // is redone: the group's rows are indexed (its own edges, no row verified),
-                // and only the rows that read an import that moved are handed out, to be
-                // verified as any suspect; their readers follow as any row's.
-                //
-                // Once a walk, each group: a walk that unwound after a group was indexed
-                // left its rows unverified, and the next walk hands them out again.
-                storage.seals.index_broken(storage);
-                for group in storage.seals.broken() {
-                    if entered.contains(&group) {
-                        continue;
-                    }
-                    entered.push(group); // alloc: as above
-                    if plant == Plant::BrokenSealNamesEveryRow {
-                        let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the control's list, every row of the group
-                        storage.seals.every_row_behind(storage, group, &mut rows);
-                        for (node, word) in rows {
-                            changed.push((node, ASSUMED));
-                            found.push(node);
-                            if apart_now.insert(node) {
-                                unwound.push((node, word)); // alloc: as above
-                            }
-                            work.marked += 1;
-                        }
-                        continue;
-                    }
-                    super::seal::moved_readers(db, storage, group, &apart_now, |reader| {
-                        if plan.ask(reader) {
-                            suspects.push(reader); // alloc: a walk's list, the rows it reaches
-                        }
-                    });
-                    // And what changed before the group's rows could be found as readers: a
-                    // row behind the seal that a pull ran again before this walk (the pull
-                    // broke the seal, or met another task's claim), and any node this walk
-                    // gathered while the group was still sealed. The plan gathers a node once
-                    // a stamp, so its readers behind the seal are asked for here, by the
-                    // plan's own rule (a reader verified since the change has seen it).
-                    // Without this a row that reads a changed row of its own group was never
-                    // reached, and the walk's end proved it unchanged (found by the
-                    // refinement's simulation, 2026-11-12: "row 2 is 4, from scratch 2").
-                    let earlier = match plant {
-                        Plant::BrokenGroupMissesEarlierChanges => &[][..],
-                        _ => &found[..],
-                    };
-                    for &node in earlier.iter().chain(&taken.written) {
-                        let (_, since) = changed_in(storage, node, plant);
-                        storage.seals.readers_in_group(group, node, |reader| {
-                            if (since == ASSUMED || verified_in(storage, reader) < since)
-                                && plan.ask(reader)
-                            {
-                                suspects.push(reader); // alloc: as above
-                            }
-                        });
-                    }
-                }
-                suspects.sort_unstable();
+                check_seals(db, storage, plant, &mut plan, &mut work, &mut Lists {
+                    changed: &mut changed,
+                    found: &mut found,
+                    suspects: &mut suspects,
+                    unwound: &mut unwound,
+                    apart_now: &mut apart_now,
+                    entered: &mut entered,
+                    shed: &mut taken.shed,
+                });
                 if !suspects.is_empty()
                     || !changed.is_empty()
                     || (!frontier.changed.is_empty() && plant != Plant::StopsAtChangedReader)
@@ -1599,6 +1687,13 @@ fn nothing_to_walk(storage: &Storage) -> bool {
     while let Some(node) = frontier.untracked.pop() {
         walked.untracked.push(node); // alloc: the untracked rows, a word each
     }
+    // A row without edges whose group stopped holding is reached by no reverse edge: only a
+    // walk names it, so a settle makes no floor over it until it has run again.
+    storage.seals.take_assumed(&mut walked.shed);
+    walked.shed.retain(|&node| storage.seals.let_go(node) && !storage.seals.proves(node));
+    if !walked.shed.is_empty() {
+        return false;
+    }
     !walked.untracked.iter().any(|&node| {
         row_of(storage, node).is_some_and(|(header, _, _)| {
             let word = header.verified.load(Ordering::Acquire);
@@ -1779,10 +1874,14 @@ fn outside_reach(storage: &Storage, node: u32) -> bool {
 }
 
 /// [`unreached`] for a row read with its header: `false` for one whose last run made an
-/// untracked read (it runs again in every view).
+/// untracked read (it runs again in every view), and for one whose edges a seal pass let go
+/// (no reverse edge reaches it, so being outside the reach proves nothing of it: only its
+/// seal does, [`super::seal::Seals::let_go`]).
 #[inline]
 pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
-    header.meta.load(Ordering::Relaxed) & UNTRACKED == 0 && unreached(storage, node)
+    header.meta.load(Ordering::Relaxed) & UNTRACKED == 0
+        && !storage.seals.let_go(node)
+        && unreached(storage, node)
 }
 
 #[cold]

@@ -358,6 +358,11 @@ fn run(name: &str) {
 /// The oracle's case of `turns` under this driver (seed 0: every draw is the sequence's
 /// own, which Hegel shrinks). A failure is written as a case under `BLAZE_ORACLE_OUT` (the
 /// system's temporary directory otherwise) before it is reported.
+#[expect(
+    blaze::tmp_path,
+    reason = "a failing case is kept past the test to be rerun, so no TempDir that drops it; the default \
+              place should move from the system's temporary directory to the build's own once there is one"
+)]
 fn oracle(turns: &[generate::Turn]) {
     let parts = generate::Parts::LIBRARY;
     let test = generate::test(&generate::name(parts, turns), parts, turns, &["sim"]);

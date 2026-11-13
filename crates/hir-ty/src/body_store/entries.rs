@@ -178,6 +178,10 @@ const SUBJECT: &str = "blaze v2 body entry 1";
 
 /// `key`'s stable bytes: the length of its file's key (two bytes, big-endian), the file's key
 /// as `items(file)` is keyed, the item's id, then the crate's name.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the entry key frames its file key's length in two bytes; a file key of 64 KiB or more (a very long path) needs a typed refusal or a wider frame"
+)]
 fn key_of<W: BodyWorld + ?Sized + 'static>(key: &BodyKey, out: &mut Vec<u8>) {
     let at = out.len();
     out.extend_from_slice(&[0, 0]);
@@ -367,9 +371,20 @@ pub fn run_infer(db: &Db, def: DefWithBodyId) -> SchemaHash {
 /// then each closure and `async` coroutine written in it, in the order of their expressions.
 /// Not here, so no entry: an inline constant's MIR, a by-move coroutine's and a `gen`
 /// coroutine's (a later step that reads one is refused by the item store already).
+///
+/// Read from the body's lowering ([`super::lowering`], [`super::Lowered::places`]), with no
+/// inference: found by its key, nothing of the body is lowered either. Why the places are the
+/// same as [`super::mir::owners`]' (which types each closure by the body's inference): the
+/// inference of a closure expression interns its owner with the kind as written
+/// (`infer::closure`, `InternedClosure { owner, expr, kind: closure_kind }`), an `async`
+/// closure's closure is the same interned location (`as_closure`), and an inline `const { .. }`
+/// block is inferred inside the body with the body as owner, while any other anonymous constant
+/// is a body of its own whose closures the body's inference does not type. So each own closure
+/// of a keyed kind is an owner at the place its expression and its written kind give. Checked
+/// where both are had: [`run_mir`] refuses a body whose two lists differ, naming it.
 pub fn places(db: &Db, def: DefWithBodyId) -> Vec<Place> {
     // alloc: the body's places, a handful
-    super::mir::owners(db, def).into_iter().map(|(place, _)| place).collect()
+    super::lowering(db, def).places().collect()
 }
 
 /// The schema [`BodyWorld::run`] gives for the built MIR of `def`'s owner at `place`.
@@ -386,7 +401,17 @@ pub fn place_of(db: &Db, def: DefWithBodyId, schema: SchemaHash) -> Option<Place
 /// Asks `db` for the built MIR of `def`'s owner at `place`: the run of [`BodyWorld::run`] for
 /// [`Of::Mir`]. An error for a place no owner [`places`] gives is at.
 pub fn run_mir(db: &Db, def: DefWithBodyId, place: Place) -> Result<SchemaHash, String> {
-    let Some((_, owner)) = super::mir::owners(db, def).into_iter().find(|(at, _)| *at == place) else {
+    let owners = super::mir::owners(db, def);
+    // The proof [`places`] states, checked where the inference is had anyway.
+    if !owners.iter().map(|(at, _)| *at).eq(super::lowering(db, def).places()) {
+        // alloc: error path
+        return Err(format!(
+            "{def:?}: the MIR owners its inference gives ({:?}) are not the places its lowering gives ({:?})",
+            owners.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            super::lowering(db, def).places().collect::<Vec<_>>(),
+        ));
+    }
+    let Some((_, owner)) = owners.into_iter().find(|(at, _)| *at == place) else {
         // alloc: error path
         return Err(format!(
             "{def:?} has no MIR owner at {place:?} that an entry keys (not an inline const's, by-move or `gen` MIR)"
@@ -722,6 +747,16 @@ impl Posted {
             None => rows.push((step, schema, served)),
         }
     }
+}
+
+/// The identity the row of `step` of `def` under `schema` was verified with, if a row answers
+/// in `db` at its revision now (posted now, or under its crate's stamp): what a test's oracle
+/// compares with the body's identity now, with no query asked, so what answers is checked
+/// whether or not the engine still holds a memo of the step.
+#[cfg(test)]
+pub(super) fn answering(db: &Db, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<ContentId> {
+    let (_, now) = db.nonce_and_revision();
+    with_store(db, |store| store.served.lock().get(now, def, step, schema).map(|it| it.identity)).flatten()
 }
 
 /// Drops every row of `def` in `db`'s item store: the driver's word that the entries they

@@ -535,6 +535,10 @@ fn atomic_ordering_false_positive() {
 /// A `drop` of a value with side effects that is a whole arm of a `match` is kept, and one
 /// given an argument with none is linted.
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_drop_that_is_an_arm_with_side_effects_is_not_linted() {
     let source = "\
 #![warn(dropping_copy_types)]
@@ -575,6 +579,10 @@ warning: 1 warning emitted
 
 /// The bytes are read through an immutable `let` and a `const`, not a `let mut`.
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn from_utf8_reads_through_lets_and_consts_but_not_mutable_ones() {
     let source = "\
 #![deny(invalid_from_utf8)]

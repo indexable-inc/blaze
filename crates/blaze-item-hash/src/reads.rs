@@ -56,12 +56,34 @@ pub(crate) enum Rule {
     /// for a name the scope lacks is "nothing", so an item that later supplies or shadows the
     /// name changes it.
     Names,
-    /// Keyed by a body, as a `DefWithBodyId` or its `InferBodyId`: covered when it is the
-    /// body's own (its HIR, scopes and upvars are of its codec bytes and resolutions, and
-    /// whether its macro calls expanded as rustc parses them is of the calls the identity
-    /// hashes; a body whose expansion is refused builds no MIR to store), refused for
-    /// another's.
+    /// Keyed by a body, as a `DefWithBodyId` or its `InferBodyId`: refused for another's.
+    /// The body's own under [`Names::Identity`]: covered (its HIR, scopes and upvars are of
+    /// its codec bytes and resolutions, and whether its macro calls expanded as rustc parses
+    /// them is of the calls the identity hashes; a body whose expansion is refused builds no
+    /// MIR to store). The body's own under [`Names::Facts`], whose key is made of the item's
+    /// text and so covers nothing the lowering resolved:
+    /// - read by the lowering step itself (`Step::Lower`): read through, so what the lowering
+    ///   read (its names, macros, the item's own syntax) is each a fact or covered by its own
+    ///   rule, and anything else refuses the lowering by name;
+    /// - read by any other step, a row the lowering reads and nothing else does
+    ///   (`Body::of`, `Body::has_lowering_errors`, the lowering itself; [`Rule::OwnStore`]'s
+    ///   closures): the body's `STEP_LOWER` fact, valued by the digest of what the lowering
+    ///   read, so it changes exactly when something the lowering read does;
+    /// - any other such row (the scopes, the upvars, failed expansions, line literals, which
+    ///   read more than the lowering): read through, each of its reads by its own rule.
     OwnBody,
+    /// A row of a body's own syntax that its lowering reads (`hir_def::expr_store::body`'s
+    /// `file_body_syntax`, an item's `syntax`, `placed_body_syntax`): covered when it is the
+    /// body's own (`own_syntax_read`; `placed_body_syntax` keyed by the body itself), as the
+    /// key under [`Names::Facts`] hashes the item's text; refused for another's.
+    OwnSyntax,
+    /// A row of the body's own that only its lowering step may read: `Body::relative`, which
+    /// `has_lowering_errors` reads for the diagnostics of its source map. Its spans are
+    /// relative to the body's anchor, and the lowering's answer holds none of them. Under
+    /// [`Names::Identity`] covered, under [`Names::Facts`] read through, for the lowering step
+    /// of the body itself; refused for any other step and any other body: a position reaching
+    /// an answer is what no fact covers.
+    LowerOnly,
     /// A field of the `Crate` input: covered for the body's crate (the identity hashes its
     /// inputs), another crate's `Crate` fact.
     CrateInput,
@@ -122,20 +144,48 @@ pub(crate) enum Rule {
     OwnStore,
     /// `const_eval_query(const, args, env)`: the const's `ConstValue` fact when it is the
     /// evaluation lane items hashes, of a const without generics, with no arguments and no
-    /// environment; refused for any other.
+    /// environment. Any other (an associated const in generic code, evaluated with arguments or
+    /// in an environment) is read through ([`Classified::Through`]), as [`Rule::Through`]'s
+    /// rows are and for the same reason: `const_eval_query` is a tracked function, so its kept
+    /// reads are every input its value has besides its key; its key (the const, the arguments,
+    /// the environment) is made by the step from what the step read; and what it reads is the
+    /// const's own inference and MIR (another body's step, [`Rule::OwnStep`]'s fact of that
+    /// body), the callees' MIR the interpreter runs (the same), layouts and solver goals (read
+    /// through again). The one input it has outside the engine, a dependency's kept value
+    /// (`consteval::deps::cached`), is taken only with no arguments, and its read of the kept
+    /// set (`KeptConsts`) has no rule, so such a row is refused by that name, never kept
+    /// under facts that do not cover the store's answer.
     ConstEval,
-    /// A step of the body itself (its inference; its MIR, or that of a closure or an async
-    /// coroutine written in it): that step's fact, the body named as `values::OWN`, for a
-    /// later step of the same body. Refused
-    /// for another body's, for an inline const's, for a coroutine kind whose MIR the step's
-    /// value leaves out, and for the same or a later step.
+    /// A step of a body, as a read of `infer_body_query`, `mir_body_query` or the MIR of a
+    /// closure or coroutine. Of the body itself (its inference; its MIR, or that of a closure
+    /// or an async coroutine written in it): that step's fact, the body named as
+    /// `values::OWN`, for a later step of the same body; refused for the same or a later step,
+    /// and for a coroutine kind whose MIR the step's value leaves out. Of another body (a
+    /// `const fn` evaluated, a closure's signature, a coroutine's witnesses): that body's
+    /// step fact by its key, whose value is the hash of its answer in the item store's
+    /// encoding (`body_store::step_value`), equal in two databases exactly when the answers
+    /// are, so a change to that body that changes its answer misses the reader, and no other
+    /// does. Of an inline or array-length constant written in the body itself: read through,
+    /// its row's reads classified for this body (its own text, its paths, the facts its
+    /// inference and MIR read), as it is part of the body's text and its own inference and
+    /// MIR are tracked functions with every input kept. Refused for a constant of another
+    /// body or of a signature, whose paths are not the body's.
     OwnStep(Step),
+    /// `inherent_assoc_types(adt)`: the ADT's `InherentAssocTypes` fact
+    /// ([`values::inherent_assoc_types`]), whose value is the query's whole result by item
+    /// key. Not read through: the query iterates every module of the ADT's crate.
+    InherentAssocTypes,
     /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
     /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
     OwnMatchCheck,
     /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact
     /// under [`Names::Facts`].
     TraitsInScope,
+    /// `Modules`' `table`, every module of a crate: what `name_read` says of it
+    /// (`NameRead::AllModules`, a block's `WholeScope`) in either mode, a [`Classified::Scan`].
+    /// Never covered: the identity hashes what the body's paths resolve to, and an iteration
+    /// of every module is none of them.
+    AllModules,
     /// A row whose value is a function of what it read and nothing else, with no fact of its
     /// own: a type's layout (`layout_of_ty_query`, `layout_of_adt_query`, keyed by a type and
     /// an environment, which no fact names and whose interned ids are one process's), and the
@@ -246,13 +296,23 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("BlockIdLt", "hir-def/src/lib.rs", Rule::Names),
     ("Body::has_lowering_errors", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::of", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
+    ("Body::relative", "hir-def/src/expr_store/body.rs", Rule::LowerOnly),
     ("ConstSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    // A signature lowered again with its source map (`relative`, `with_source_map`): the
+    // signature is `kept`'s (`Kept::with_map`), which the `Signature` fact hashes; the map is
+    // where each part is written, and no answer holds a position (inference and MIR name
+    // expressions and type references by id, `mir::persist`'s spans are ids, a location
+    // literal is a slot), so nothing of it reaches a kept value.
+    ("ConstSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    ("ConstSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     ("CrateResolution::module", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("DefMapPair", "hir-def/src/nameres.rs", Rule::Names),
     ("EnumSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("EnumVariants::of", "hir-def/src/signatures.rs", Rule::Fields(Of::Enum)),
     ("ExprScopes::body_expr_scopes", "hir-def/src/expr_store/scope.rs", Rule::OwnBody),
     ("FunctionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("FunctionSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
+    ("FunctionSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
     ("ImplItems::of", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Impl)),
     ("ImplSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("InherentImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
@@ -273,6 +333,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("ScopeInput::name", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("ScopeInput::traits", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("StaticSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StructSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("TraitImpls::blanket_in_crate_and_deps", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Trait)),
     ("TraitImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
@@ -286,6 +348,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("TraitItems::query_with_diagnostics", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Trait)),
     ("TraitSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("TypeAliasSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TypeAliasSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TypeAliasSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
     ("UnionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
     ("UnstableFeatures::query", "hir-def/src/unstable_features.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("VariantFields::field_visibilities", "hir-def/src/visibility.rs", Rule::Signature(Of::Variant)),
@@ -297,6 +361,13 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // Whether an ADT with its identity arguments is an auto trait by the shape walk, in a
     // crate: the walk reads the ADT's impls of the trait (`Implements`), its fields'
     // types and the impls' where clauses, each a fact read through.
+    // An anonymous constant evaluated (an array length, a const argument, a `const { .. }`
+    // block) with arguments and an environment: a tracked function, read through as
+    // `const_eval_query` with arguments is ([`Rule::ConstEval`]). Its reads are the constant's
+    // inference and MIR, read through again when the constant is written in the body itself
+    // and refused when it is another body's or a signature's ([`Rule::OwnStep`]), and what the
+    // interpreter reads (callees' MIR, another body's step fact; layouts and goals, through).
+    ("anon_const_eval_query", "hir-ty/src/consteval.rs", Rule::Through),
     ("auto_trait_depth", "hir-ty/src/next_solver/global_goals/shape.rs", Rule::Through),
     ("bit_width_of", "hir-ty/src/layout/bits.rs", Rule::Through),
     ("bits_layout_query", "hir-ty/src/layout/bits.rs", Rule::Through),
@@ -319,6 +390,13 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // Whether a non-generic ADT has one plain impl of `Copy` or `Clone`, in a crate: it reads
     // the impls of the trait for the ADT (`Implements`) and that impl's signature.
     ("copy_clone_impl", "hir-ty/src/next_solver/global_goals/shape.rs", Rule::Through),
+    // The types an `async` block holds across a yield (an auto-trait goal on a future): a
+    // tracked function of the coroutine, whose reads are the MIR of the coroutine's body
+    // (another body's `STEP_MIR` fact, [`Rule::OwnStep`]; the body's own is refused below
+    // its MIR step), the solver's goals and the layouts it meets (read through again). Its
+    // key, the interned coroutine, came to the step through what the step read (a hidden
+    // type, `rpit_hidden_types`, a leak fact).
+    ("coroutine_witnesses_query", "hir-ty/src/providers.rs", Rule::Through),
     ("crate_field_types", "hir-ty/src/lower/batch.rs", Rule::Items),
     ("crate_impl_predicates", "hir-ty/src/lower/batch.rs", Rule::Items),
     ("crate_impl_self_tys", "hir-ty/src/lower/batch.rs", Rule::Items),
@@ -360,6 +438,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("failed_expansion", "hir-ty-mir/src/mir/lower.rs", Rule::OwnBody),
     ("field_ranks", "hir-ty/src/layout/field_order.rs", Rule::Through),
     ("field_types_of_variant", "hir-ty/src/lower.rs", Rule::Items),
+    ("file_body_syntax", "hir-def/src/expr_store/body.rs", Rule::OwnSyntax),
     ("fn_sig_for_enum_variant_constructor", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_fn", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_struct_constructor", "hir-ty/src/lower.rs", Rule::Items),
@@ -381,6 +460,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // The outlives requirements an ADT's fields infer for its parameters: its fields' types and
     // the requirements of the ADTs they name, each a fact read through.
     ("inferred_outlives", "hir-ty-wfcheck/src/outlives.rs", Rule::Through),
+    // `Type::Name` of an ADT: the associated types of its inherent impls, a list made by
+    // iterating every module of its crate (`Modules::table` and each scope's impls), which
+    // no lookup fact covers: a fact of the list itself.
+    ("inherent_assoc_types", "hir-ty/src/lower/path.rs", Rule::InherentAssocTypes),
     ("inherent_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     // Which of an impl's parameters are arbitrary-width integers: its trait reference and
     // where clauses (`impl_trait_of_impl`, `generic_predicates_of`) and its crate's lang items,
@@ -403,6 +486,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // clauses), the selected impl's items (`ImplItems::of`, `Fields`), and with opaque
     // types revealed, their hidden types (`rpit_hidden_types`, a leak fact).
     ("lookup_impl_method_stored", "hir-ty/src/method_resolution.rs", Rule::Through),
+    // The body's lowering step (`hir_ty::body_store::lowering`): as its rows, `Body::of`'s.
+    ("lowering", "hir-ty/src/body_store/lower.rs", Rule::OwnBody),
     ("macros_writing_impls", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("match_check", "hir-ty-matchck/src/lib.rs", Rule::OwnMatchCheck),
     ("may_specialize", "hir-ty/src/specialization.rs", Rule::Items),
@@ -425,11 +510,17 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // in it (rustc's writeback taint): the same reads as `normalize_query`'s, for every
     // projection the signature names.
     ("normalizes_to_error_query", "hir-ty-borrowck/src/regions.rs", Rule::Through),
+    // An `impl Trait`'s variances (a goal relating two opaque types): a tracked function of
+    // the interned opaque, whose reads are its function's signature (generics, `use<..>`,
+    // the opaque's bounds) and its container's trait reference, each a `Signature` or
+    // `Items` fact; it resolves no path.
+    ("opaque_variances_query", "hir-ty/src/next_solver/opaque_variances.rs", Rule::Through),
     ("orphan_rules_hold", "hir-ty/src/traits.rs", Rule::Coherence),
     // The variable each path of a body's store names: the body's own HIR and scopes
     // (`Body::of`, `ExprScopes`, covered for the body's own and refused for another's) and
     // name resolution of its own paths, which the identity hashes ([`Rule::Names`]).
     ("path_bindings", "hir-ty-borrowck/src/regions.rs", Rule::Through),
+    ("placed_body_syntax", "hir-def/src/expr_store/body.rs", Rule::OwnSyntax),
     ("plan", "hir-ty/src/layout/field_order.rs", Rule::FieldOrder),
     ("predicates", "hir-ty/src/builtin_derive.rs", Rule::Derive),
     // A trait goal proved in an environment, with the region constraints that records: the
@@ -452,7 +543,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("struct_flags", "hir-ty/src/layout.rs", Rule::Through),
     ("struct_tail_may_be_unsized", "hir-ty/src/layout.rs", Rule::Through),
     ("supertraits_info", "hir-ty/src/lower.rs", Rule::Items),
-    ("table", "hir-def/src/nameres.rs", Rule::Names),
+    ("syntax", "hir-def/src/expr_store/body.rs", Rule::OwnSyntax),
+    // The table of every module of a crate: an iteration of all of them, a scan of the
+    // crate in either mode (`hir_def::nameres::NameRead::AllModules`).
+    ("table", "hir-def/src/nameres.rs", Rule::AllModules),
     ("tait_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
     ("target_data_layout_query", "hir-ty/src/layout/target.rs", Rule::OwnCrate(Else::Items)),
     ("target_features", "hir-def/src/attrs.rs", Rule::Attrs(Of::Function)),
@@ -588,7 +682,7 @@ fn apply(
         Rule::Names | Rule::TraitsInScope if names == Names::Identity => {
             return Classified::Covered;
         }
-        Rule::Names => return name_fact(db, def, read, kind),
+        Rule::Names | Rule::AllModules => return name_fact(db, def, read, kind),
         Rule::Through => {
             #[cfg(test)]
             if planted::QUERIES_COVERED.get() && planted::QUERIES.contains(&name) {
@@ -606,9 +700,27 @@ fn apply(
                 Some(body) => body == def,
                 None => arg::<InferBodyId<'_>>(db, key) == Some(InferBodyId::DefWithBodyId(def)),
             };
+            return match (own, names) {
+                (false, _) => Classified::Refused,
+                (true, Names::Identity) => Classified::Covered,
+                (true, Names::Facts) => own_lowering(step, name),
+            };
+        }
+        Rule::OwnSyntax => {
+            let own = match name {
+                "placed_body_syntax" => arg::<DefWithBodyId>(db, key) == Some(def),
+                _ => hir_def::expr_store::body::own_syntax_read(db, def, name, key),
+            };
             return match own {
                 true => Classified::Covered,
                 false => Classified::Refused,
+            };
+        }
+        Rule::LowerOnly => {
+            return match (step, arg::<DefWithBodyId>(db, key) == Some(def), names) {
+                (Step::Lower, true, Names::Identity) => Classified::Covered,
+                (Step::Lower, true, Names::Facts) => Classified::Through,
+                _ => Classified::Refused,
             };
         }
         Rule::CrateInput => match arg::<Crate>(db, key) {
@@ -685,17 +797,21 @@ fn apply(
         .map(|item| values::fields(db, item)),
         Rule::OwnStore => {
             return match hir_ty::db::closure_exprs::arguments(db, key) {
-                Some((owner, ())) if owner == ExpressionStoreOwnerId::Body(def) => {
-                    Classified::Covered
-                }
+                Some((owner, ())) if owner == ExpressionStoreOwnerId::Body(def) => match names {
+                    Names::Identity => Classified::Covered,
+                    Names::Facts => own_lowering(step, name),
+                },
                 _ => Classified::Refused,
             };
         }
-        Rule::OwnStep(earlier) => {
-            if earlier >= step || !is_own_step(db, def, key) {
-                return Classified::Refused;
-            }
-            values::step_fact(earlier)
+        Rule::OwnStep(earlier) => match step_of(db, def, key) {
+            StepOf::Own if step.reads(earlier) => values::step_fact(earlier),
+            StepOf::Own | StepOf::Not => return Classified::Refused,
+            StepOf::Other(body) => values::step_fact_of(db, body, earlier),
+            StepOf::OwnConst => return Classified::Through,
+        },
+        Rule::InherentAssocTypes => {
+            arg::<AdtId>(db, key).map(|adt| values::inherent_assoc_types(db, adt))
         }
         Rule::OwnMatchCheck => match arg::<DefWithBodyId>(db, key) {
             Some(body) if body == def => Some(values::match_check()),
@@ -708,7 +824,8 @@ fn apply(
             {
                 Some(item_fact(db, items::CONST_VALUE, ItemId::Const(konst)))
             }
-            _ => None,
+            Some(_) => return Classified::Through,
+            None => None,
         },
     };
     match found {
@@ -736,6 +853,70 @@ fn apply(
     }
 }
 
+/// What a read by a step of `def` of a row behind the seal of the library group `group`
+/// stands for, the row having let go of its reads (`hir_ty::body_store::BodyFacts::sealed`):
+/// the `Crate` fact of the crate whose group, or whose source root's group, `group` is, among
+/// `def`'s crate and the crates it depends on, and the build's facts of the inputs no group
+/// holds (the field order plan, the borrow check's debug setting). `false` when no such crate
+/// has the group: the read is refused by the row's name.
+///
+/// Why this covers every input of the row's value (keys-cover-every-input): the row is a
+/// tracked function, so its value is a function of its key and its reads at its last run; its
+/// key is made by the step from what the step read, so the step's other facts cover it. The
+/// engine put the row in `group` because every read of it in a group is in `group` or in a
+/// group `group` depends on (`blaze_query::db::seal`'s `join_of`; a row whose reads no one
+/// group covers is loose and never sealed). A crate's group depends on its dependencies'
+/// groups, and a source root's group holds that root's files, so every grouped read is of an
+/// input `crate_inputs` hashes into the crate's `Crate` fact: each crate it depends on, its
+/// content, its source root's files and its proc macros, with the files and variables its
+/// macros read outside the database. The reads in no group are the build's inputs, each a
+/// fact of its own added here. The seal is what lets the row go unread in this database; the
+/// facts are what make the step's key say so in another, so a change to the library (a new
+/// version, another toolchain) changes its `Crate` fact and misses the step, as the seal
+/// breaking reruns the row here.
+pub fn sealed(
+    db: &Db,
+    def: DefWithBodyId,
+    group: blaze_query::db::SealGroup,
+    facts: &mut Vec<FactRef>,
+) -> bool {
+    let krate = def.krate(db);
+    let found = std::iter::once(&krate).chain(krate.transitive_deps(db)).find(|&&it| {
+        it.seal_group_of(db) == Some(group) || it.seal_root_group_of(db) == Some(group)
+    });
+    let Some(&found) = found else { return false };
+    facts.push(whole_crate(db, found)); // alloc: the step's scratch list, reused
+    facts.push(values::field_order()); // alloc: as above
+    match values::setting("borrowck_debug") {
+        Some(fact) => facts.push(fact), // alloc: as above
+        None => return false,
+    }
+    true
+}
+
+/// The rows of a body's own that its lowering step (`hir_ty::body_store::lowering`) reads and
+/// whose value is a function of what it read: a read of one by another step of the body is
+/// the body's `STEP_LOWER` fact ([`own_lowering`]). `closure_exprs` is the closures of the
+/// store `Body::of` made.
+const LOWERING_ROWS: [&str; 4] =
+    ["Body::of", "Body::has_lowering_errors", "closure_exprs", "lowering"];
+
+/// What a read of a row of the body's own ([`Rule::OwnBody`], [`Rule::OwnStore`]) made by
+/// `step` stands for under [`Names::Facts`]: read through by the lowering itself, so each of
+/// its reads is classified in its place; by another step, the lowering's fact for a row of
+/// [`LOWERING_ROWS`], and read through for any other (the scopes and upvars, which read
+/// name resolution of their own).
+fn own_lowering(step: Step, name: &str) -> Classified {
+    match step {
+        Step::Lower => Classified::Through,
+        _ if LOWERING_ROWS.contains(&name) => match values::step_fact(Step::Lower) {
+            Some(fact) => Classified::Fact(fact),
+            None => Classified::Refused,
+        },
+        _ => Classified::Through,
+    }
+}
+
 /// The fact a read of one of name resolution's rows stands for ([`Names::Facts`]): refused
 /// when `hir_def::nameres::name_read` does not know the row, so a row added there is listed
 /// by the flush until it is answered for.
@@ -756,6 +937,9 @@ fn name_fact(
             return Classified::Scan(values::relative(db, def, values::whole_scope(db, module)));
         }
         Some(NameRead::Crate(krate)) => values::crate_names(db, krate),
+        Some(NameRead::AllModules(krate)) => {
+            return Classified::Scan(values::relative(db, def, whole_crate(db, krate)));
+        }
     };
     Classified::Fact(values::relative(db, def, fact))
 }
@@ -791,31 +975,57 @@ fn item_of(db: &Db, key: Id, of: Of) -> Option<ItemId> {
     })
 }
 
-/// Whether `key`, of a [`Rule::OwnStep`] read, names `def` itself or a closure or async
-/// coroutine written in it whose MIR is part of `def`'s MIR step value
-/// (`hir_ty::body_store::step_value`).
-fn is_own_step(db: &Db, def: DefWithBodyId, key: Id) -> bool {
-    let own = InferBodyId::DefWithBodyId(def);
+/// Whose step a [`Rule::OwnStep`] read is of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepOf {
+    /// `def` itself, or a closure or async coroutine written in it whose MIR is part of
+    /// `def`'s MIR step value (`hir_ty::body_store::step_value`).
+    Own,
+    /// Another body, or such a closure or coroutine of it: that body's step value covers it.
+    Other(DefWithBodyId),
+    /// An anonymous constant written in `def`'s own body: read through.
+    OwnConst,
+    /// Anything else: a constant of another body or of a signature, a coroutine kind no step
+    /// value covers, a key of no body.
+    Not,
+}
+
+/// Whose step `key`, of a [`Rule::OwnStep`] read made by a step of `def`, is of.
+fn step_of(db: &Db, def: DefWithBodyId, key: Id) -> StepOf {
+    let of = |body: InferBodyId<'_>| match body {
+        InferBodyId::DefWithBodyId(body) if body == def => StepOf::Own,
+        InferBodyId::DefWithBodyId(body) => StepOf::Other(body),
+        InferBodyId::AnonConstId(it) => match it.loc(db).owner {
+            ExpressionStoreOwnerId::Body(body) if body == def => StepOf::OwnConst,
+            _ => StepOf::Not,
+        },
+    };
+    // A closure's or coroutine's MIR is in its body's step value only for the kinds
+    // `body_store::mir::owners` lists; and a constant's closure is in no step value.
+    let covered = |owner: InferBodyId<'_>, yes: bool| match (of(owner), yes) {
+        (StepOf::Own | StepOf::Other(_), true) => of(owner),
+        _ => StepOf::Not,
+    };
     if let Some(body) = arg::<DefWithBodyId>(db, key) {
-        return body == def;
+        return of(InferBodyId::DefWithBodyId(body));
     }
     if let Some(body) = arg::<InferBodyId<'_>>(db, key) {
-        return body == own;
+        return of(body);
     }
     if let Some(closure) = arg::<InternedClosureId<'_>>(db, key) {
         let loc = closure.loc(db);
-        return loc.owner == own
-            && matches!(
-                loc.kind,
-                ClosureKind::Closure | ClosureKind::CoroutineClosure(CoroutineKind::Async)
-            );
+        let kind = matches!(
+            loc.kind,
+            ClosureKind::Closure | ClosureKind::CoroutineClosure(CoroutineKind::Async)
+        );
+        return covered(loc.owner, kind);
     }
     if let Some(coroutine) = arg::<InternedCoroutineId<'_>>(db, key) {
         let loc = coroutine.loc(db);
-        return loc.owner == own
-            && matches!(loc.kind, ClosureKind::Coroutine { kind: CoroutineKind::Async, .. });
+        let kind = matches!(loc.kind, ClosureKind::Coroutine { kind: CoroutineKind::Async, .. });
+        return covered(loc.owner, kind);
     }
-    false
+    StepOf::Not
 }
 
 /// The crate a [`Rule::DepCrate`] read's arguments name.

@@ -51,6 +51,11 @@ impl From<cursor::Error> for BlobError {
     }
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "the template blob holds u32 lengths: a template part of 4 GiB or more needs a typed \
+              refusal from the encoder"
+)]
 fn put_len(out: &mut Vec<u8>, len: usize) {
     out.put_u32(u32::try_from(len).expect("a template's parts are under 4 GiB"));
 }

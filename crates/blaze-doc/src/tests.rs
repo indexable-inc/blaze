@@ -627,9 +627,8 @@ fn unresolved_links_warn() {
 #[test]
 fn writes_pages_sources_and_search() {
     let (_db, model) = load();
-    let out = std::env::temp_dir().join(format!("blaze-doc-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
-    let written = crate::html::write(&model, &out).expect("written");
+    let out = blaze_core::temp::TempDir::for_test("blaze-doc-test-");
+    let written = crate::html::write(&model, out.path()).expect("written");
     assert!(written.pages > 20, "{written:?}");
     assert!(written.source_pages >= 3, "{written:?}");
     for path in [
@@ -675,15 +674,13 @@ fn writes_pages_sources_and_search() {
     let index = text(&std::fs::read_to_string(out.join("fixture/index.html")).unwrap());
     assert!(index.contains("let thing = fixture::Thing::new(1);"), "the example is there: {index}");
     assert!(!index.contains("let hidden"), "hidden example lines are not");
-    let _ = std::fs::remove_dir_all(&out);
 }
 
 #[test]
 fn a_crate_not_documented_is_linked_at_its_html_root_url() {
     let (_db, model) = load_with(true, false);
-    let out = std::env::temp_dir().join(format!("blaze-doc-test-remote-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
-    crate::html::write(&model, &out).expect("written");
+    let out = blaze_core::temp::TempDir::for_test("blaze-doc-test-remote-");
+    crate::html::write(&model, out.path()).expect("written");
     assert!(!out.join("dep").exists(), "--no-deps");
     let thing = std::fs::read_to_string(out.join("fixture/struct.Thing.html")).unwrap();
     assert!(
@@ -692,7 +689,6 @@ fn a_crate_not_documented_is_linked_at_its_html_root_url() {
         ),
         "where it is declared, which its docs redirect from"
     );
-    let _ = std::fs::remove_dir_all(&out);
 }
 
 #[test]

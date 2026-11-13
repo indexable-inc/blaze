@@ -451,6 +451,9 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
         ("Body::of", OwnBody),
         // 3.3: whether lowering found an error, which the HIR part hashes beside the HIR.
         ("Body::has_lowering_errors", OwnBody),
+        // 3.3: the lowering step's answer (`hir_ty::body_store::lowering`): the sizes of the
+        // HIR, its closures and whether lowering failed, all of the HIR hashed here.
+        ("lowering", OwnBody),
         // 3.3: the scopes are a function of the HIR.
         ("ExprScopes::body_expr_scopes", OwnBody),
         // 3.3: the closures and what they capture are of the HIR's expressions and bindings.
@@ -510,10 +513,10 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
         ("ModuleIdLt", Any),
         ("BlockIdLt", Any),
         // The same reads through the other arms of a module's scope: the maintainer's input
-        // (`ScopeInput`'s fields), a crate read from pages (its scope memos), and the table of
-        // a collected def map's modules.
+        // (`ScopeInput`'s fields) and a crate read from pages (its scope memos). The table of
+        // a collected def map's modules is not covered: it is every module, a scan
+        // (`reads::Rule::AllModules`).
         ("module", Any),
-        ("table", Any),
         ("name_memo", Any),
         ("legacy_macro_memo", Any),
         ("scope_memo", Any),

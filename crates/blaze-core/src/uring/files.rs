@@ -437,8 +437,8 @@ impl Uring {
         Ok(())
     }
 
-    /// Starts [`Effect::Map`] (with `kind` [`Kind::Map`]) or [`Effect::Stat`] (with
-    /// [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag` of `file`.
+    /// Starts [`Effect::Stat`] (with [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag`
+    /// of `file` ([`Uring::map`] starts a [`Kind::Map`]).
     pub(super) fn look(
         &mut self,
         tag: Tag,
@@ -458,6 +458,25 @@ impl Uring {
             hot.flags |= NO_FOLLOW;
         }
         self.named(hot, ops::NO_BYTES, Cold::EMPTY, push, file)?;
+        Ok(())
+    }
+
+    /// Starts [`Effect::Map`] `tag` of `extent` of `file`: the open on the ring, the map at its
+    /// completion ([`Uring::mapped`]), a range's offset and length kept in the cold record.
+    pub(super) fn map(&mut self, tag: Tag, file: &FileName, extent: crate::Extent) -> io::Result<()> {
+        let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
+            at[0] = push_c(names, path.as_os_str().as_bytes())?;
+            Ok(())
+        };
+        let mut hot = Hot::new(tag, Kind::Map, 0);
+        let mut cold = Cold::EMPTY;
+        if let crate::Extent::Range { at, len } = extent {
+            hot.flags |= ops::RANGE;
+            cold.at = at;
+            cold.names[3] = len as u32;
+            cold.names[4] = (len >> 32) as u32;
+        }
+        self.named(hot, ops::NO_BYTES, cold, push, file)?;
         Ok(())
     }
 
@@ -1194,6 +1213,11 @@ impl Uring {
             }
             self.on_open.remove(at);
             let (tag, whole) = (hot.tag, hot.flags & WHOLE != 0);
+            // A part of a batched read ends into its batch (`WHOLE` is `IDLE` on a read into
+            // memory, so it is read only for a `Kind::Read`).
+            let part = (hot.kind == Kind::ReadInto && hot.flags & ops::PART != 0)
+                .then(|| self.ops.cold(id).names[3]);
+            let whole = whole && hot.kind == Kind::Read;
             let Some((res, why)) = failed else {
                 self.queue(id);
                 continue;
@@ -1202,7 +1226,10 @@ impl Uring {
                 true => Done::Read(mem::take(self.ops.buf_mut(id))),
                 false => Done::Failed(IoError(why.to_owned())), // alloc: clone: an error.
             };
-            self.ready.push(Completion { tag, done });
+            match part {
+                Some(index) => self.read_part_ended(tag, index, done),
+                None => self.ready.push(Completion { tag, done }),
+            }
             self.end(id);
         }
     }
@@ -1339,12 +1366,27 @@ impl Uring {
         }
         // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
         let file = File::from(unsafe { OwnedFd::from_raw_fd(res) });
-        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect
-        // writes, appends to or truncates it in place; the store and the image replace a file
+        let hot = *self.ops.get(id).expect("in flight");
+        let cold = self.ops.cold(id);
+        let range = (hot.flags & ops::RANGE != 0)
+            .then(|| (cold.at, u64::from(cold.names[3]) | u64::from(cold.names[4]) << 32));
+        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, the bytes
+        // below the length it had when mapped are never written again and it is never
+        // truncated (it may be appended to); the store and the image otherwise replace a file
         // only by renaming another over it.
-        let done = match unsafe { crate::fs::Mapped::map(&file) } {
+        let mapped = unsafe {
+            match range {
+                None => crate::fs::Mapped::map(&file),
+                Some((at, len)) => crate::fs::MapOptions::new().map_range(&file, at, len),
+            }
+        };
+        let done = match mapped {
             Ok(mapped) => Done::Mapped(crate::Mapping::file(mapped)),
-            Err(error) => Done::Failed(IoError(error.to_string())), // alloc: an error.
+            Err(error) => {
+                // alloc: an error.
+                let path = self.name_of(id, 0).to_string_lossy().into_owned();
+                Done::Failed(IoError(format!("{path}: {error}")))
+            }
         };
         Step::Ends(Some(done))
     }

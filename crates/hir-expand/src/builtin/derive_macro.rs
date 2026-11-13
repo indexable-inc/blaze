@@ -750,6 +750,10 @@ fn push_fields(
     })
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "field and parameter counts of a derive input are u32; an item with 2^32 fields needs a typed refusal from the derive"
+)]
 fn len_u32(len: usize) -> u32 {
     u32::try_from(len).expect("fewer than 2^32 fields")
 }

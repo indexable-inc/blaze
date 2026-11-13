@@ -79,17 +79,16 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-identity-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+    fn scratch(name: &str) -> blaze_core::temp::TempDir {
+        let dir = blaze_core::temp::TempDir::for_test(&format!("blaze-identity-{name}-"));
         fs::create_dir_all(dir.join("src")).unwrap();
         dir
     }
 
     #[test]
     fn a_trees_digest_changes_with_a_source_file_and_not_with_its_outputs() {
-        let dir = scratch("tree");
+        let tmp = scratch("tree");
+        let dir = tmp.path();
         fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let before = tree_digest(&dir).unwrap();
         assert_eq!(before.len(), 64);
@@ -102,8 +101,7 @@ mod tests {
         assert_eq!(tree_digest(&dir).unwrap(), before, "outputs and git's files are not the tree");
 
         fs::write(dir.join("src/lib.rs"), "pub fn f() { }\n").unwrap();
-        assert_ne!(tree_digest(&dir).unwrap(), before, "an edited source file is another tree");
-        _ = fs::remove_dir_all(&dir);
+        assert_ne!(tree_digest(dir).unwrap(), before, "an edited source file is another tree");
     }
 
     #[test]

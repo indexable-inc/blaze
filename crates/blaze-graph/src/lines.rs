@@ -5,9 +5,9 @@
 //!
 //! | line | at | what happens there | whose |
 //! |---|---|---|---|
-//! | [`Lines::release`] | limit - limit/8 | a build's front end releases what no task to come needs ([`crate::admission::LINE`]) | the daemon's |
+//! | [`Lines::release`] | limit - limit/8 | a build's front end releases what no task to come needs | the daemon's |
 //! | [`Lines::give`] | limit - limit/16 | the give-back ladder begins (`serve::job::giving`) | the daemon's |
-//! | [`Lines::fail`] | limit - limit/32 | a task running alone, with nothing left to give, fails typed ([`crate::footprint::past_ceiling`]) | the daemon's, the typed exit |
+//! | [`Lines::fail`] | limit - limit/32 | a task running alone, with nothing left to give, fails typed (the gate's `blaze_mem::budget::TooBig`) | the daemon's, the typed exit |
 //! | [`Kernel::throttle`] | nowhere (`memory.high` = `max`) | the kernel would slow every allocating thread | the kernel's |
 //! | [`Kernel::kill`] | the limit | `memory.max` or jetsam ends the daemon; its own watch ends it typed (`MEMORY_CEILING`) | the kernel's and the guard's |
 //!
@@ -53,6 +53,9 @@ const GIVE: u64 = 16;
 /// call and unwind before the ceiling's guard would end the daemon.
 const FAIL: u64 = 32;
 
+/// The release line: the limit less this part of it, an eighth, below the give-back line.
+const RELEASE: u64 = 8;
+
 impl Lines {
     pub const fn of(limit: u64) -> Lines {
         Lines { limit }
@@ -71,9 +74,9 @@ impl Lines {
         }
     }
 
-    /// Where a build's front end releases ([`crate::admission::Pressure::squeezed`]).
+    /// Where a build's front end releases what no task to come needs.
     pub const fn release(self) -> u64 {
-        self.less(crate::admission::LINE)
+        self.less(RELEASE)
     }
 
     /// Where the give-back ladder begins: the limit its planner is told.

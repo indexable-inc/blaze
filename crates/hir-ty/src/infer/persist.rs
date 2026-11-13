@@ -810,6 +810,10 @@ impl Columns {
 
 impl InferenceRecord {
     /// `result` with its types written into `tys`.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the inference record's columns hold u32 tuple lengths and a u32 diagnostic count; a body past 2^32 of either needs a typed refusal from the write"
+    )]
     fn of<'db>(result: &InferenceResult<'db>, tys: &mut impl TyEncode<'db>) -> InferenceRecord {
         let InferenceResult {
             method_resolutions,
@@ -1727,6 +1731,10 @@ impl Sink {
         self.word(u32::from(value));
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the inference record writes a side-table list's count as one u32 word; a list of 2^32 entries needs a typed refusal from the write"
+    )]
     fn len(&mut self, len: usize) {
         self.word(u32::try_from(len).expect("a side table list of 2^32 entries"));
     }
@@ -2204,6 +2212,10 @@ impl Sink {
 
     /// A lowering diagnostic in `lower::persist`'s words, after their count, so that
     /// [`Source::lowering_words`] reads exactly them.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a lowering diagnostic's word count is one u32 word in the record; a diagnostic of 2^32 words needs a typed refusal from the write"
+    )]
     fn lowering_words(&mut self, put: impl FnOnce(&mut Vec<u32>)) {
         let at = self.words.len();
         self.word(0);

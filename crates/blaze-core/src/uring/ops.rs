@@ -154,6 +154,14 @@ pub(super) const POSITIONAL: u8 = 1 << 3;
 pub(super) const READ_ONLY: u8 = 1 << 6;
 /// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
 pub(super) const IDLE: u8 = 1 << 3;
+/// A [`Kind::ReadInto`] that is one part of an [`crate::Effect::ReadMany`]: its tag is the
+/// batch's, its part's index is in its cold record's `names[3]`, and its end is told to the
+/// batch, not as a completion of its own (the bit [`SECOND`] is; a read has no path names).
+pub(super) const PART: u8 = 1 << 4;
+/// A [`Kind::Map`] of a range of the file, its offset in the cold record's `at` and its length
+/// in `names[3]` (low half) and `names[4]` (high half) (the bit [`FINISHED`] and [`READ_ONLY`]
+/// are, a send's and an open's).
+pub(super) const RANGE: u8 = 1 << 6;
 
 /// In [`Cold::slots`]: none.
 pub(super) const NO_SLOT: u32 = u32::MAX;

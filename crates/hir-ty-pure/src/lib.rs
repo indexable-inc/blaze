@@ -22,7 +22,9 @@
 //! other. That is the design, not a fallback.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 
 pub mod drop_effects;
 pub mod effect_attrs;

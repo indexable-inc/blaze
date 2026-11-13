@@ -449,6 +449,10 @@ impl Disks {
     /// its head, its directory, its cursor, its root (a byte saying whether, then 32), its count
     /// of names, its names' length, each name's end (past its NUL), each stamp, the names, each
     /// with a NUL after it.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the image holds a disk's names' length in u32 and nothing caps a disk's saved names: names past 4 GiB need a typed refusal when the image is written"
+    )]
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.put_bytes(&MAGIC);
         // alloc: once per image written.

@@ -503,6 +503,12 @@ impl Storage {
             counts::proved(key_parts(row.key()).0, by);
             return true;
         }
+        // A row whose edges a seal pass let go is reached by no reverse edge, so the walk's
+        // reach and end say nothing of it: past its seal, its durability and its summary
+        // (none of which reads an edge), it runs again ([`super::seal::Seals::let_go`]).
+        if self.seals.let_go(node) {
+            return false;
+        }
         // Or the changed set's walk of this view says so: it ended, or the row is outside
         // its reach. It counts its own proofs ([`counts::PROVED_WALK_END`],
         // [`counts::PROVED_REACH`]).

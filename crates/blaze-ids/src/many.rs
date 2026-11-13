@@ -399,6 +399,16 @@ fn compress_lanes<const N: usize>(
     )),
     expect(dead_code, reason = "blake3-servil's way alone, and it doesn't build for this target")
 )]
+#[cfg_attr(
+    not(all(
+        target_endian = "little",
+        any(
+            all(target_arch = "x86_64", target_os = "linux"),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+        ),
+    )),
+    expect(blaze::unwired, reason = "wired on the targets blake3-servil builds for, unused on this one")
+)]
 pub(crate) fn leading_lanes(
     key: &[u32; 8],
     inputs: &[&[u8]],
@@ -429,6 +439,16 @@ pub(crate) fn leading_lanes(
         ),
     )),
     expect(dead_code, reason = "blake3-servil's way alone, and it doesn't build for this target")
+)]
+#[cfg_attr(
+    not(all(
+        target_endian = "little",
+        any(
+            all(target_arch = "x86_64", target_os = "linux"),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+        ),
+    )),
+    expect(blaze::unwired, reason = "wired on the targets blake3-servil builds for, unused on this one")
 )]
 #[inline(always)]
 fn leading_lanes_of<const N: usize>(

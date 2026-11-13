@@ -85,7 +85,13 @@ impl<T: Tree> Mounts<'_, T> {
 
     /// What `path` is, symlinks followed.
     fn node(&self, path: &str) -> Result<Node, LowerError> {
+        self.resolve(path).map(|(node, _)| node)
+    }
+
+    /// What `path` is, symlinks followed, and whether one was.
+    fn resolve(&self, path: &str) -> Result<(Node, bool), LowerError> {
         let mut path = path.to_owned();
+        let mut followed = false;
         for _ in 0..=MAX_LINKS {
             let (root, under) = self.locate(&path)?;
             let file = self.tree.file(root, &under).map_err(|corrupt| {
@@ -100,13 +106,15 @@ impl<T: Tree> Mounts<'_, T> {
                         )
                     })?;
                     path = follow(&path, target);
+                    followed = true;
                 }
-                Some((id, _, bytes)) => return Ok(Node::File(id, bytes)),
+                Some((id, _, bytes)) => return Ok((Node::File(id, bytes), followed)),
                 None => {
-                    return Ok(match self.tree.read_dir(root, &under, &mut |_| {}) {
+                    let node = match self.tree.read_dir(root, &under, &mut |_| {}) {
                         true => Node::Dir(path),
                         false => Node::None,
-                    });
+                    };
+                    return Ok((node, followed));
                 }
             }
         }
@@ -115,13 +123,16 @@ impl<T: Tree> Mounts<'_, T> {
 
     /// Every file under the directory `dir`, by its path under `dir` as cargo names it, but
     /// those under a path of `skipped`. A symlink is read as what it points to; one that points
-    /// to nothing is no file, as on the disk.
+    /// to nothing is no file, as on the disk. True when the walk followed a symlink: what it
+    /// read is then not all under `dir`'s own tree node, so the directory's plan key
+    /// (`found::dir_key`) does not cover it and no found record is written of its crates.
     pub(crate) fn walk(
         &self,
         dir: &str,
         skipped: &[String],
         out: &mut Vec<Loaded>,
-    ) -> Result<(), LowerError> {
+    ) -> Result<bool, LowerError> {
+        let mut followed = false;
         // Each directory as named, where its entries are read from, and the symlinks followed
         // to reach it.
         let mut dirs: Vec<(String, String, u32)> = vec![(dir.to_owned(), dir.to_owned(), 0)];
@@ -143,7 +154,9 @@ impl<T: Tree> Mounts<'_, T> {
                     dirs.push((child, child_real, links));
                     continue;
                 }
-                match self.node(&child_real)? {
+                let (node, linked) = self.resolve(&child_real)?;
+                followed |= linked;
+                match node {
                     Node::File(id, bytes) => out.push(Loaded { path: child, id, bytes }),
                     Node::Dir(target) if links < MAX_LINKS => dirs.push((child, target, links + 1)),
                     Node::Dir(_) => {
@@ -158,7 +171,7 @@ impl<T: Tree> Mounts<'_, T> {
                 }
             }
         }
-        Ok(())
+        Ok(followed)
     }
 }
 

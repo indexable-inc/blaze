@@ -1703,8 +1703,6 @@ struct Walking<'w, I, S> {
     /// Writes the walk's entries refused, as errors: none, but for a bug of the walk.
     refused: SegQueue<CodegenError>,
     counts: &'w kept::Counts,
-    /// Which round of the walk, from 0 ([`Build::described`]).
-    round: usize,
     /// How far the round is, said on the walk's span while it runs.
     progress: progress::Progress,
 }
@@ -1801,6 +1799,7 @@ impl<I, S> Hints<I, S> {
 /// of [`patch`] or [`lists`], and the refinement's oracle must find the difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), expect(dead_code, reason = "made only by the controls of the tests"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 enum Planted {
     /// A referrer of a function whose key changed keeps the function it was made of.
     KeptTemplates,
@@ -2100,50 +2099,24 @@ impl<'a, B: Prepare> Build<'a, B> {
         })
     }
 
-    /// What the front end says of `asked`, a function and whose code asks for it, in the
-    /// walk's round `round` (from 0): the describe an earlier walk kept, where the front end
-    /// says a describe now would give it ([`Frontend::redescribe`]); else a describe, kept
-    /// for the next walk. A describe that fails is the build's error and nothing is kept of
-    /// it, so the next walk asks again.
+    /// What the front end says of `asked`, a function and whose code asks for it, as a walk
+    /// that visits it takes it: the store's record of it, else a describe
+    /// ([`Self::found_or_described`]). Nothing is kept of it but the walk's node, so between
+    /// builds the record is its one holder (docs/v2/plan/design/end-state/memory.md 4.4): a
+    /// describe is never held a second time by the instance it is of. A describe that fails
+    /// is the build's error.
     fn described(
         &self,
         asked: &(FrontInstance<B>, Origin),
-        round: usize,
         counts: &kept::Counts,
     ) -> Result<Arc<Described<FrontInstance<B>, FrontStatic<B>>>, CodegenError> {
         let (instance, requester) = asked;
-        let now = match self.kept.and_then(|kept| kept.function(round, asked)) {
-            Some(was) if !self.asks => {
-                counts.verified();
-                return Ok(was);
-            }
-            Some(was) => match self.frontend.redescribe(instance, requester, &was) {
-                Ok(None) => {
-                    counts.verified();
-                    return Ok(was);
-                }
-                Ok(Some(now)) => {
-                    counts.described();
-                    now
-                }
-                Err(why) => {
-                    counts.described();
-                    return Err(why);
-                }
-            },
-            None => self.found_or_described(instance, requester, counts)?,
-        };
-        // alloc: once per describe, shared by the walk's node and the walk kept
-        let now = Arc::new(now);
-        if let Some(kept) = self.kept {
-            // clone: a reference count, once per describe
-            kept.keep(round, asked, now.clone());
-        }
-        Ok(now)
+        // alloc: once per function a walk visits, its node's, freed with the node
+        Ok(Arc::new(self.found_or_described(instance, requester, counts)?))
     }
 
-    /// The describe of `instance` for `requester`, which no walk before this one kept: the
-    /// store's record of it where the build reads records ([`Build::recording`]) and the
+    /// The describe of `instance` for `requester`, as a whole walk or a frontier form visits
+    /// it: the store's record of it where the build reads records ([`Build::recording`]) and the
     /// front end has a content key for it ([`Frontend::record_key`]); else the front end's
     /// describe, with its record pushed for the build's puts where the front end can write
     /// one. A record that is there and does not read is the build's error, naming the
@@ -2240,7 +2213,6 @@ impl<'a, B: Prepare> Build<'a, B> {
             hints: Hints::new(),
             refused: SegQueue::new(),
             counts,
-            round,
             progress: progress::Progress::here(),
         };
         // alloc: none unless the check refuses
@@ -2331,7 +2303,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Some(made) => made,
                     None => {
                         let made = self
-                            .described(&entry.asked, walking.round, walking.counts)
+                            .described(&entry.asked, walking.counts)
                             .and_then(|it| self.node(&entry.asked.0, entry.asked.1, it));
                         match entry.made.set(made) {
                             Ok(made) => made,
@@ -2957,10 +2929,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
         }
         drop(resolving);
-        let (described, verified) = counts.get();
         let walk = Walk {
-            described,
-            verified,
+            described: counts.described_so_far(),
+            // A whole walk takes no describe from memory: each is a record's or a describe.
+            verified: 0,
             found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,

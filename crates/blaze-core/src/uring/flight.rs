@@ -12,7 +12,7 @@ use std::{
 };
 
 use super::{
-    ops::{ABANDONED, DIRECT, FINISHED, LINKS, STDERR, STOPPING, ZERO_COPY},
+    ops::{ABANDONED, DIRECT, FINISHED, LINKS, PART, STDERR, STOPPING, ZERO_COPY},
     *,
 };
 
@@ -482,6 +482,8 @@ impl Uring {
                 | Kind::Wake
                 | Kind::Open
                 | Kind::Close => {}
+                // A part of a batched read fails with its batch, below.
+                Kind::ReadInto if hot.flags & PART != 0 => {}
                 // The kernel may still read or write the asker's memory: the failure says so, and
                 // the span is never to be used again (`crate::ABANDONED_SPAN`).
                 Kind::ReadInto | Kind::WriteFrom => {
@@ -497,6 +499,25 @@ impl Uring {
                 }
                 _ => ready.push(failed(hot.tag)),
             }
+        }
+        // Each batched read in flight is told once: a part already in keeps how it went, and
+        // every other fails, its span the kernel's still (`crate::ABANDONED_SPAN`).
+        // alloc: the error path, once: the batches in tag order, so they are told the same way
+        // every run.
+        let mut batches: Vec<(Tag, Batch)> = self.batches.drain().collect();
+        batches.sort_unstable_by_key(|it| it.0.0);
+        for (tag, mut batch) in batches {
+            for part in batch.parts.iter_mut().filter(|it| it.got == crate::Got::Asked) {
+                // alloc: the error path, once per part in flight.
+                part.got = crate::Got::Failed(IoError(format!(
+                    "{} at {} ({} bytes): {why}: {}",
+                    part.file,
+                    part.at,
+                    part.into.len,
+                    crate::ABANDONED_SPAN
+                )));
+            }
+            self.ready.push(Completion { tag, done: Done::ReadMany(batch.parts) });
         }
         // Timers need no ring, but end with it as everything in flight does.
         self.timers.drain(|_, tag| self.ready.push(failed(tag)));
@@ -546,6 +567,9 @@ impl Uring {
             hot.links &= !(1 << link);
         }
         let (tag, kind) = (hot.tag, hot.kind);
+        // A part of a batched read ends into its batch, told once the batch's last part is in.
+        let is_part = kind == Kind::ReadInto && hot.flags & PART != 0;
+        let part = is_part.then(|| self.ops.cold(id).names[3]);
         // A zero-copy send's result carries `CQE_F_MORE` for the notification that follows: it
         // is not a multishot request, and its step says when it is asked again.
         let more = flags & CQE_F_MORE != 0 && kind != Kind::Send;
@@ -563,8 +587,10 @@ impl Uring {
             }
             Step::Held => {}
             Step::Ends(done) => {
-                if let Some(done) = done {
-                    self.ready.push(Completion { tag, done });
+                match (done, part) {
+                    (Some(done), Some(index)) => self.read_part_ended(tag, index, done),
+                    (Some(done), None) => self.ready.push(Completion { tag, done }),
+                    (None, _) => {}
                 }
                 self.end(id);
             }

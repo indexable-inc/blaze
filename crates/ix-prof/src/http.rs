@@ -571,15 +571,16 @@ fn handle(
     }
 }
 
-const INDEX: &str = "ix-prof /debug/pprof (every request: `Authorization: Bearer <token>`, or a browser's &token=<token>)\n\
-profile?seconds=30   CPU profile of the next N seconds (pprof)\n\
-heap                 live allocations by stack (pprof)\n\
-allocs               all allocations by stack (pprof)\n\
-spans?seconds=N      span self time (pprof)\n\
-waits?seconds=N      time waiting, by what is waited on (pprof)\n\
-threads              each thread's open spans now\n\
-ixprof?last=N        a window snapshot (.ixprof; format=pprof|chrome)\n\
-live?cursor=C        the live stream\n";
+const INDEX: &str = r"ix-prof /debug/pprof (every request: `Authorization: Bearer <token>`, or a browser's &token=<token>)
+profile?seconds=30   CPU profile of the next N seconds (pprof)
+heap                 live allocations by stack (pprof)
+allocs               all allocations by stack (pprof)
+spans?seconds=N      span self time (pprof)
+waits?seconds=N      time waiting, by what is waited on (pprof)
+threads              each thread's open spans now
+ixprof?last=N        a window snapshot (.ixprof; format=pprof|chrome)
+live?cursor=C        the live stream
+";
 
 type Answer = Result<(&'static str, Vec<u8>), (&'static str, String)>;
 
@@ -767,12 +768,12 @@ mod tests {
         s
     }
 
-    fn scratch(what: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "ix-prof-{what}-{}-{}",
-            std::process::id(),
-            crate::nonce()
-        ))
+    /// A path ix-prof is to make, in a directory removed with all it holds when the first
+    /// drops.
+    fn scratch(what: &str) -> (blaze_core::temp::TempDir, std::path::PathBuf) {
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("ix-prof-{what}-"));
+        let dir = tmp.join("prof");
+        (tmp, dir)
     }
 
     #[test]
@@ -823,7 +824,7 @@ mod tests {
     #[test]
     fn a_connection_over_the_cap_evicts_the_oldest_unchecked_one() {
         let _g = crate::TEST_GLOBALS.lock();
-        let dir = scratch("evict");
+        let (_tmp, dir) = scratch("evict");
         let (guard, addr, token) = start_serving(&dir);
         // Each would hold its place until the deadline: they send nothing.
         let idle: Vec<TcpStream> =
@@ -859,7 +860,6 @@ mod tests {
             t.elapsed()
         );
         drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn only_a_request_with_the_token_is_answered() {
         let _g = crate::TEST_GLOBALS.lock();
-        let dir = scratch("gate");
+        let (_tmp, dir) = scratch("gate");
         let (guard, addr, token) = start_serving(&dir);
         let mode = std::fs::metadata(dir.join(crate::endpoint::FILE)).unwrap().permissions().mode()
             & 0o777;
@@ -965,7 +965,6 @@ mod tests {
         assert!(ok.starts_with("HTTP/1.1 200"), "the token as a bearer: {ok}");
         drop(guard);
         assert!(TcpStream::connect(&addr).is_err(), "port released after the guard drops");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S5 and S6: the address and the token are one file, written with one rename (no
@@ -974,7 +973,7 @@ mod tests {
     #[test]
     fn the_endpoint_is_one_file_and_stopping_takes_it_back() {
         let _g = crate::TEST_GLOBALS.lock();
-        let dir = scratch("retract");
+        let (_tmp, dir) = scratch("retract");
         let (guard, addr, token) = start_serving(&dir);
         let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -990,7 +989,6 @@ mod tests {
             !dir.join(crate::endpoint::FILE).exists(),
             "http.endpoint is still there after the stop"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S1, the server's half, from the review's `review_an_existing_world_writable_symlinked_dir_is_used_as_is`:
@@ -1000,7 +998,7 @@ mod tests {
     #[test]
     fn an_ix_prof_dir_that_is_a_link_or_open_to_others_is_refused() {
         let _g = crate::TEST_GLOBALS.lock();
-        let root = scratch("shared-dir");
+        let (_tmp, root) = scratch("shared-dir");
         let shared = root.join("shared");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1023,7 +1021,6 @@ mod tests {
         let group = start(&shared);
         let left: Vec<_> =
             std::fs::read_dir(&shared).unwrap().map(|it| it.unwrap().file_name()).collect();
-        let _ = std::fs::remove_dir_all(&root);
         let link_s = link.display().to_string();
         let shared_s = shared.display().to_string();
         assert!(
@@ -1052,7 +1049,7 @@ mod tests {
     #[test]
     fn a_fifo_planted_as_the_endpoint_does_not_hang_the_stop() {
         let _g = crate::TEST_GLOBALS.lock();
-        let dir = scratch("fifo");
+        let (_tmp, dir) = scratch("fifo");
         let (guard, _, _) = start_serving(&dir);
         let file = dir.join(crate::endpoint::FILE);
         std::fs::remove_file(&file).unwrap();
@@ -1066,9 +1063,6 @@ mod tests {
         });
         let ended = stopped.recv_timeout(Duration::from_secs(10)).is_ok();
         let still = std::fs::symlink_metadata(&file).is_ok();
-        if ended {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
         assert!(ended, "the stop hung on a FIFO at {}", file.display());
         assert!(still, "the FIFO, not this session's file, was removed");
     }

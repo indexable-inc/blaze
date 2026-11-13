@@ -124,6 +124,10 @@ fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
     })
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread scratch cleared on each use, uncapped: it keeps the most requests one function held"
+)]
 thread_local! {
     /// [`data_of`]'s `known`, one per thread and reused.
     static KNOWN: RefCell<Vec<Option<ContentId>>> = RefCell::default();

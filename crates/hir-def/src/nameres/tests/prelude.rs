@@ -45,7 +45,8 @@ fn alone(text: &str) -> Vec<(String, PreludeError)> {
         CrateOrigin::Local { repo: None, name: None },
         Vec::new(),
         TargetKind::Lib { is_proc_macro: false },
-        Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+        // No proc macro runs here: the cwd is only hashed, so the crate's own directory.
+        Arc::new(AbsPathBuf::assert_utf8(env!("CARGO_MANIFEST_DIR").into())),
         Arc::new(CrateWorkspaceData {
             target: Err("no target in tests".into()),
             toolchain: None,

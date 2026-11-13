@@ -25,6 +25,7 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-core.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
 hegeltest.workspace = true

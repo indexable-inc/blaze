@@ -66,6 +66,7 @@
 
 mod host;
 mod journal;
+mod kept;
 #[cfg(test)]
 mod pages;
 pub mod seeds;
@@ -182,6 +183,8 @@ impl Default for Faults {
 const OWNER_WRITES: u32 = 0o200;
 /// What the system says of an open for writing it refuses (`EACCES`), as `io::Error` prints it.
 const PERMISSION_DENIED: &str = "Permission denied (os error 13)";
+/// What a failure the simulation injected says ([`Faults::fail_one_in`]).
+const FAULT: &str = "injected by the simulation";
 
 #[derive(Debug)]
 struct SimFile {
@@ -537,6 +540,10 @@ pub struct Sim {
     epoch: u64,
     /// What a test under seeds armed it with ([`Sim::arm`]): its power cuts, trace and counts.
     armed: Option<Box<seeds::Armed>>,
+    /// The descriptors a real driver keeps for reads into memory, modelled
+    /// (`crate::descriptors`): a file opened once, the least recently read closed past the
+    /// bound, an unlinked file read as the bytes it held.
+    descriptors: kept::Descriptors,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -626,10 +633,29 @@ impl Sim {
             bytes_forced: 0,
             epoch: 0,
             armed: None,
+            descriptors: kept::Descriptors::new(crate::descriptors::MOST),
         };
         // The disk's clock is the wall clock from the start, so its first stamps are of then.
         sim.disk.at(sim.wall_ns());
         sim
+    }
+
+    /// How many files reads into memory opened, and how many descriptors closed, as a real
+    /// driver's table counts them ([`crate::Threads::opens`]).
+    pub fn opens(&self) -> crate::Opens {
+        self.descriptors.opens()
+    }
+
+    /// How many descriptors the modelled table keeps open now.
+    pub fn descriptors_kept(&self) -> usize {
+        self.descriptors.len()
+    }
+
+    /// The table of descriptors keeps at most `bound` from now on (a real driver's is
+    /// `blaze_core`'s 1024, or a quarter of `RLIMIT_NOFILE`): for a test of what happens at
+    /// the bound. Past it the least recently read closes; a read is never refused.
+    pub fn bound_descriptors(&mut self, bound: usize) {
+        self.descriptors.bound(bound);
     }
 
     /// The bytes every effect that completed wrote into files, ever: appends, whole-file
@@ -762,6 +788,8 @@ impl Sim {
         }
         self.held.clear();
         self.held_reads.clear();
+        // The process ended: every descriptor it kept is closed.
+        self.descriptors.crash();
         self.hold_reads = None;
         self.fail_reads = None;
         self.short_reads = None;
@@ -1305,6 +1333,8 @@ impl Sim {
 
     /// The file removed by something outside the state machine.
     pub fn delete(&mut self, file: &FileName) {
+        // A descriptor kept of it holds its inode, and reads the bytes it held.
+        self.orphan_kept(file);
         self.files.remove(file);
         self.unlink_locks(file);
         self.changed(file);
@@ -1437,6 +1467,12 @@ impl Sim {
 
     /// `from` renamed over `to` by something outside the state machine.
     pub fn rename(&mut self, from: &FileName, to: &FileName) {
+        // A descriptor kept of `to` holds the inode renamed over, which it reads as it was; one
+        // of `from` holds the inode that moved, whose bytes are those it held.
+        if self.files.contains_key(from) {
+            self.orphan_kept(to);
+            self.orphan_kept(from);
+        }
         if let Some(sim) = self.files.remove(from) {
             // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
@@ -1634,6 +1670,14 @@ impl Sim {
         {
             span.with_mut(|bytes| bytes.fill(SCRIBBLE));
         }
+        if let Effect::ReadMany { parts, cache, .. } = effect {
+            for part in parts {
+                let what = "a batched read into memory of";
+                if let Ok(span) = Sim::resolve(&part.into, &part.file, part.at, *cache, what) {
+                    span.with_mut(|bytes| bytes.fill(SCRIBBLE));
+                }
+            }
+        }
     }
 
     /// Whether `file` is under the directory of a fault drawn once in its count.
@@ -1643,7 +1687,18 @@ impl Sim {
         })
     }
 
-    /// [`Effect::ReadInto`] of `into` from `at` of `file`, done now against the file as it is.
+    /// The descriptors kept of `file` and what is under it read the bytes each file holds now,
+    /// from now on: another process unlinks it or renames over it.
+    fn orphan_kept(&mut self, file: &FileName) {
+        for name in self.descriptors.live_under(file) {
+            let bytes = self.contents(&name);
+            self.descriptors.orphan(&name, &bytes);
+        }
+    }
+
+    /// [`Effect::ReadInto`] of `into` from `at` of `file`, done now through its kept
+    /// descriptor: the file at the name, opened at its first read, or the bytes the file held
+    /// when another process unlinked it.
     fn read_into(&mut self, file: &FileName, at: u64, into: &Span, cache: Cache) -> Done {
         let span = match Sim::resolve(into, file, at, cache, "a read into memory of") {
             Ok(span) => span,
@@ -1653,18 +1708,36 @@ impl Sim {
             Ok(followed) => followed,
             Err(why) => return Done::Failed(why),
         };
+        let asked = file;
         let file = followed.as_ref().unwrap_or(file);
-        if !self.files.contains_key(file) {
-            // alloc: an error's message.
-            return Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)")));
-        }
+        let orphan = match self.descriptors.read(asked, cache) {
+            Some(orphan) => orphan,
+            None => {
+                if !self.files.contains_key(file) {
+                    // alloc: an error's message.
+                    return Done::Failed(IoError(format!(
+                        "{file}: No such file or directory (os error 2)"
+                    )));
+                }
+                // Opened and kept; the least recently read closes past the bound.
+                self.descriptors.open(asked, cache);
+                None
+            }
+        };
         if Sim::drawn(&mut self.rng, &self.fail_reads, file) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
         }
-        let bytes = match self.read(file, at, span.len()) {
-            Ok(bytes) => bytes,
-            Err(why) => return Done::Failed(why),
+        let bytes = match orphan {
+            Some(held) => {
+                let from = usize::try_from(at).unwrap_or(usize::MAX).min(held.len());
+                // alloc: the read's bytes, as `Sim::read` makes them.
+                held[from..from.saturating_add(span.len()).min(held.len())].to_vec()
+            }
+            None => match self.read(file, at, span.len()) {
+                Ok(bytes) => bytes,
+                Err(why) => return Done::Failed(why),
+            },
         };
         let mut len = bytes.len();
         if len > 0 && Sim::drawn(&mut self.rng, &self.short_reads, file) {
@@ -1706,7 +1779,7 @@ impl Sim {
     fn fail(&mut self, tag: Tag) -> Completion {
         seeds::injected(self);
         // alloc: an injected failure's message.
-        Completion { tag, done: Done::Failed(IoError("injected by the simulation".into())) }
+        Completion { tag, done: Done::Failed(IoError(FAULT.into())) }
     }
 
     /// `done` of `tag`, ready after a delay, and after everything told of the same tag before.
@@ -1808,7 +1881,8 @@ impl Sim {
         if let Some(done) = self.refused_write(&effect) {
             return Completion { tag, done };
         }
-        if !matches!(effect, Effect::Timer { .. })
+        // A batched read's faults are drawn a part at a time, each failing its part alone.
+        if !matches!(effect, Effect::Timer { .. } | Effect::ReadMany { .. })
             && self.rng.one_in(u64::from(self.faults.fail_one_in))
         {
             if let Some(spawn) = spawn {
@@ -1830,6 +1904,7 @@ impl Sim {
             Ok(effect) => effect,
             Err(done) => return Completion { tag, done },
         };
+        let changed = crate::threads::changes(&effect);
         let done = match effect {
             Effect::ReadAll { file, .. } => match self.read(&file, 0, usize::MAX) {
                 Ok(bytes) => {
@@ -1852,6 +1927,30 @@ impl Sim {
                     self.bytes_read += u64::from(*len);
                 }
                 done
+            }
+            Effect::ReadMany { mut parts, cache, .. } => {
+                for part in &mut parts {
+                    part.got = match self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+                        // alloc: an error's message.
+                        true => crate::Got::Failed(IoError(format!(
+                            "{} at {} ({} bytes): {}",
+                            part.file, part.at, part.into.len, FAULT
+                        ))),
+                        false => match self.read_into(&part.file, part.at, &part.into, cache) {
+                            Done::ReadInto { len } => {
+                                self.bytes_read += u64::from(len);
+                                crate::Got::Read(len)
+                            }
+                            // alloc: an error's message, naming the part's offset.
+                            Done::Failed(why) => crate::Got::Failed(IoError(format!(
+                                "{} at {} ({} bytes): {}",
+                                part.file, part.at, part.into.len, why.0
+                            ))),
+                            other => unreachable!("a read into memory ends as one: {other:?}"),
+                        },
+                    };
+                }
+                Done::ReadMany(parts)
             }
             Effect::WriteFrom { file, at, from, cache, .. } => {
                 match Sim::bytes_of(&from, &file, at, cache) {
@@ -2146,11 +2245,32 @@ impl Sim {
             Effect::MakeDir { dir, .. } => self.make_dir(dir),
             Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
             Effect::Timer { .. } => Done::Fired,
-            Effect::Map { file, .. } => {
+            Effect::Map { file, extent, .. } => {
                 let bytes = self.contents(&file);
-                self.bytes_read += bytes.len() as u64;
-                // alloc: the mapping, which the completion carries.
-                Done::Mapped(crate::Mapping::copy(&bytes))
+                let range = match extent {
+                    crate::Extent::Whole => Ok(&bytes[..]),
+                    // As a driver maps a range: inside the file, or refused naming it.
+                    crate::Extent::Range { at, len } => at
+                        .checked_add(len)
+                        .filter(|end| *end <= bytes.len() as u64)
+                        .map(|end| &bytes[at as usize..end as usize])
+                        .ok_or_else(|| {
+                            // alloc: an error's message.
+                            IoError(format!(
+                                "{file}: a mapping of {len} bytes at {at} runs past the file's \
+                                 end at {}: a range is mapped only inside the file",
+                                bytes.len()
+                            ))
+                        }),
+                };
+                match range {
+                    Ok(range) => {
+                        self.bytes_read += range.len() as u64;
+                        // alloc: the mapping, which the completion carries.
+                        Done::Mapped(crate::Mapping::copy(range))
+                    }
+                    Err(why) => Done::Failed(why),
+                }
             }
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
@@ -2184,6 +2304,11 @@ impl Sim {
                 )
             }
         };
+        // The names this effect changed: their kept descriptors close, as the real drivers'
+        // do once the effect is done (`threads::run`).
+        for name in changed.iter().flatten() {
+            self.descriptors.forget(name);
+        }
         Completion { tag, done }
     }
 
@@ -2545,9 +2670,14 @@ impl Driver for Sim {
             }
             // The kernel may write a read's span from now until it completes.
             Sim::scribble(&effect);
-            if let (Effect::ReadInto { file, .. }, Some(dir)) = (&effect, &self.hold_reads)
-                && file.is_under(dir)
-            {
+            let held = match (&effect, &self.hold_reads) {
+                (Effect::ReadInto { file, .. }, Some(dir)) => file.is_under(dir),
+                (Effect::ReadMany { parts, .. }, Some(dir)) => {
+                    parts.iter().any(|part| part.file.is_under(dir))
+                }
+                _ => false,
+            };
+            if held {
                 self.held_reads.push(effect);
                 continue;
             }

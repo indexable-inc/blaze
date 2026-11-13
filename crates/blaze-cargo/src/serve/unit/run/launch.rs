@@ -274,6 +274,7 @@ impl Core {
 /// A planted bug the tests' oracle must catch: always `Plant::None` outside them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 enum Plant {
     None,
     /// A restore takes the image under the mark's key as the build the mark names, without
@@ -1837,6 +1838,8 @@ fn made_here(front: &KeptLowered, held: &Held, need: &Need, puts: &mut Vec<Put>)
     };
     let lowered = &front.lowered;
     let frontend = codegen::frontend_over(lowered.db(), lowered.paths(), lowered.spellings(), &serving.mounted, serving.build_time)
+        // What the builds of this database found and witnessed, kept with its front end.
+        .with_walks(&front.walks)
         .with_policy(&serving.policy)
         .with_image(false);
     // The program's portable ask, read in this front end's database; else the one kept in

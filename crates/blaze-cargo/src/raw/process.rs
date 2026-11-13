@@ -574,11 +574,12 @@ mod tests {
 
     /// A child that runs until its standard input is closed.
     #[cfg(unix)]
-    fn until_closed() -> std::process::Child {
+    fn until_closed() -> stdx::JodChild {
         std::process::Command::new("/bin/sh")
             .args(["-c", "read line"])
             .stdin(std::process::Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap()
     }
 
@@ -596,7 +597,7 @@ mod tests {
             assert!(ended_within(child.id(), Duration::from_secs(60)).unwrap());
         });
         assert!(started.elapsed() < Duration::from_secs(10), "ended after {:?}", started.elapsed());
-        child.wait().unwrap();
+        stdx::child::exit_within(&mut child, "the child that ended", Duration::from_secs(60));
         assert!(
             ended_within(child.id(), Duration::from_secs(60)).unwrap(),
             "one reaped and gone has ended"
@@ -611,7 +612,7 @@ mod tests {
         assert!(!ended_within(child.id(), Duration::from_millis(50)).unwrap());
         assert!(started.elapsed() >= Duration::from_millis(50));
         drop(child.stdin.take());
-        child.wait().unwrap();
+        stdx::child::exit_within(&mut child, "the child whose stdin closed", Duration::from_secs(60));
     }
 
     #[cfg(unix)]

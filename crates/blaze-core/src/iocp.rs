@@ -93,6 +93,7 @@ use self::{
 use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
     IoError, RECV_MOST, Sandbox, Tag,
+    descriptors::Descriptors,
     handoff::Wake,
     journal::barrier::{At, Barrier, Decision},
     wait::{self, Clock as _, Deadline, Monotonic},
@@ -621,11 +622,14 @@ impl Iocp {
         let woken = Arc::new(Wake::new());
         #[cfg(test)]
         let thread_allocations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // alloc: setup, the descriptors the threads keep for reads into memory.
+        let descriptors = Arc::new(Descriptors::new());
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (root, queue, port, sender) =
                     (root.clone(), queue.clone(), port.clone(), sender.clone()); // clone: setup.
                 let woken = woken.clone(); // clone: setup, what each thread is given.
+                let kept = descriptors.clone(); // clone: as above.
                 #[cfg(test)]
                 let counted = thread_allocations.clone();
                 std::thread::Builder::new()
@@ -633,9 +637,9 @@ impl Iocp {
                     .name(format!("blaze-iocp-{n}"))
                     .spawn(move || {
                         #[cfg(test)]
-                        work_on(&root, &queue, &port, &sender, &woken, &counted);
+                        work_on(&root, &kept, &queue, &port, &sender, &woken, &counted);
                         #[cfg(not(test))]
-                        work_on(&root, &queue, &port, &sender, &woken);
+                        work_on(&root, &kept, &queue, &port, &sender, &woken);
                     })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -913,6 +917,7 @@ impl Iocp {
             // one fails there, as Windows has no IO class per read.
             effect @ (Effect::ReadAll { .. }
             | Effect::ReadInto { .. }
+            | Effect::ReadMany { .. }
             | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
@@ -2478,6 +2483,7 @@ struct Kept {
 
 fn work_on(
     root: &Path,
+    descriptors: &Descriptors,
     queue: &Receiver<Work>,
     port: &Port,
     back: &Sender<Back>,
@@ -2495,11 +2501,12 @@ fn work_on(
             Work::File(effect) => {
                 let tag = effect.tag();
                 #[cfg(test)]
-                let (done, used) = blaze_alloc_count::measure(|| file(root, effect, &mut kept));
+                let (done, used) =
+                    blaze_alloc_count::measure(|| file(root, descriptors, effect, &mut kept));
                 #[cfg(test)]
                 counted.fetch_add(used.allocations, std::sync::atomic::Ordering::Relaxed);
                 #[cfg(not(test))]
-                let done = file(root, effect, &mut kept);
+                let done = file(root, descriptors, effect, &mut kept);
                 // alloc: an error path.
                 let done = done.unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
                 back.send(Back::Done(Completion { tag, done }))
@@ -2553,7 +2560,18 @@ fn joined<'a>(into: &'a mut PathBuf, root: &Path, file: &FileName) -> &'a Path {
 }
 
 /// A file effect that blocks, as Windows does it.
-fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
+fn file(root: &Path, descriptors: &Descriptors, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
+    // The names this effect changes, whose kept descriptors close once it is done, so the next
+    // read opens the file there then (`threads::run` does the same for what it runs).
+    let changed = crate::threads::changes(&effect);
+    let done = file_kept(root, descriptors, effect, kept);
+    for name in changed.iter().flatten() {
+        descriptors.forget(name);
+    }
+    done
+}
+
+fn file_kept(root: &Path, descriptors: &Descriptors, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
     let Kept { at, to, paths } = kept;
     match effect {
         Effect::ReadAll { file, .. } => match paths.of(&file).and_then(files::read_whole) {
@@ -2590,8 +2608,10 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
         Effect::Clone { from, to: into, .. } => {
             files::clone(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Cloned)
         }
-        Effect::Map { file, .. } => files::map(joined(at, root, &file)).map(Done::Mapped),
-        effect => crate::threads::run(root, effect),
+        Effect::Map { file, extent, .. } => {
+            files::map_extent(joined(at, root, &file), extent).map(Done::Mapped)
+        }
+        effect => crate::threads::run(root, descriptors, effect),
     }
 }
 
@@ -2644,11 +2664,10 @@ mod tests {
         FileName::new(it).unwrap()
     }
 
-    fn dir(what: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-iocp-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A new empty directory for the test `what`, removed when the guard drops: hold it for as
+    /// long as a driver works in it.
+    fn dir(what: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-iocp-{what}-"))
     }
 
     fn system() -> PathBuf {
@@ -2662,7 +2681,7 @@ mod tests {
             program: system().join(program),
             args: args.iter().map(|it| OsString::from(*it)).collect(),
             env: vec![("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap())],
-            dir: std::env::temp_dir(),
+            dir: crate::temp::base(),
             stdin: stdin.to_vec(),
             sandbox: Sandbox::Off,
             memory: None,
@@ -2857,7 +2876,7 @@ mod tests {
                     (TINY.into(), "1".into()),
                     ("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap()),
                 ],
-                dir: std::env::temp_dir(),
+                dir: crate::temp::base(),
             })
         }
 
@@ -2937,6 +2956,10 @@ mod tests {
 
     /// `PING` run in `job` until it ends: its code, or [`crate::exit::Exit::CouldNot`] where it
     /// could not join the job.
+    #[expect(
+        blaze::untied_child,
+        reason = "every path kills or waits for the ping with nothing that panics between; blaze-core is below stdx and cannot name `stdx::JodChild`"
+    )]
     fn hold(job: &OwnedHandle) -> i32 {
         let could_not = crate::exit::Exit::CouldNot.code();
         let ping = std::process::Command::new(system().join("PING.EXE"))
@@ -2969,7 +2992,7 @@ mod tests {
             program: PathBuf::from("tiny-run"),
             args: vec![code.to_string().into(), wait_ms.to_string().into()],
             env: Vec::new(),
-            dir: std::env::temp_dir(),
+            dir: crate::temp::base(),
             stdin: stdin.to_vec(),
             sandbox: Sandbox::On {
                 read: Vec::new(),
@@ -3242,7 +3265,8 @@ mod tests {
 
     #[test]
     fn timers_fire_in_their_order() {
-        let mut driver = Iocp::new(&dir("timers"), 1).unwrap();
+        let root = dir("timers");
+        let mut driver = Iocp::new(root.path(), 1).unwrap();
         let mut effects: Vec<Effect> = (0..3)
             .map(|n| Effect::Timer { after: Duration::from_millis(10 * (3 - n)), tag: Tag(n) })
             .collect();
@@ -3257,7 +3281,8 @@ mod tests {
 
     #[test]
     fn a_wait_ends_at_its_time() {
-        let mut driver = Iocp::new(&dir("wait"), 1).unwrap();
+        let root = dir("wait");
+        let mut driver = Iocp::new(root.path(), 1).unwrap();
         driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(60), tag: Tag(1) }]);
         let began = Instant::now();
         let mut out = Vec::new();
@@ -3284,8 +3309,8 @@ mod tests {
         let seen = run(
             &mut driver,
             vec![
-                Effect::Map { file, tag: Tag(2) },
-                Effect::Map { file: name("missing"), tag: Tag(3) },
+                Effect::Map { file, extent: crate::Extent::Whole, tag: Tag(2) },
+                Effect::Map { file: name("missing"), extent: crate::Extent::Whole, tag: Tag(3) },
             ],
         );
         match &seen[&2] {
@@ -3965,7 +3990,8 @@ mod tests {
 
     #[test]
     fn a_warm_timer_allocates_nothing() {
-        let mut driver = Iocp::new(&dir("budget-timer"), 1).unwrap();
+        let root = dir("budget-timer");
+        let mut driver = Iocp::new(root.path(), 1).unwrap();
         let mut effects = Vec::with_capacity(4);
         let mut out = Vec::with_capacity(16);
         for round in 0..4 {

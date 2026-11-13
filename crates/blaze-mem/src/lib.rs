@@ -33,6 +33,10 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
+//! Every page any of them commits passes one gate first ([`gate`], driving [`budget`]): core
+//! regions ask its core owner, a task's frame asks for its task, so the process's committed
+//! memory stays under the ceiling [`gate::install`] set (or one sized from the machine).
+//!
 //! The store's buffer pool reads and gives back pages of one sparse [`Region`] by ranges
 //! ([`Region::reuse`], [`Region::evict`]), counted to [`Tag::Pool`], and copies bytes the evictor
 //! may drop meanwhile through [`racy`]'s atomic copies (docs/v2/plan/design/store-pool.md).
@@ -57,6 +61,7 @@ pub mod chunks;
 pub mod column;
 mod error;
 pub mod frame;
+pub mod gate;
 pub mod handle;
 pub mod huge;
 mod os;

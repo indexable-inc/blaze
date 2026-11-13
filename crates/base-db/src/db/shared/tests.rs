@@ -40,7 +40,7 @@ fn a_write_stops_a_held_reader_and_waits_for_it_to_let_go() {
         drop(reader);
         ran
     });
-    has_started.recv().unwrap();
+    has_started.recv_timeout(Duration::from_secs(60)).expect("the reader thread said it started");
     shared.write().set_file_text(file, "fn other() {}\n");
     assert!(matches!(thread.join().unwrap(), Err(Cancelled::PendingWrite)));
     assert!(!shared.storage().readers_stopped(), "the write clears the stop");

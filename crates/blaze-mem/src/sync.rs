@@ -1,15 +1,11 @@
-//! The atomics the lock-free stacks, pools, counters and [`crate::swiss::Index`] use, and the
-//! lock and condition variable of the frame cap: `std`'s, or under `cfg(blaze_check)` the model
-//! checker's (docs/v2/plan/design/model-checker.md "The switch"). The lock is std's, not
-//! `parking_lot`'s, because this is the allocator: `parking_lot`'s parking table would allocate
-//! from within an allocation.
+//! The atomics the lock-free stacks, pools, counters and [`crate::swiss::Index`] use: `std`'s,
+//! or under `cfg(blaze_check)` the model checker's (docs/v2/plan/design/model-checker.md "The
+//! switch"). The memory gate's lock ([`crate::gate`]) is std's directly: it is process-wide,
+//! outside any model, and this is the allocator, where `parking_lot`'s parking table would
+//! allocate from within an allocation.
 
 #[cfg(not(blaze_check))]
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-mem is a dependency of blaze-core, and the allocator's lock is std's"
-)]
-pub(crate) use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic};
+pub(crate) use std::sync::{OnceLock, atomic};
 
 #[cfg(blaze_check)]
-pub(crate) use blaze_check::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic};
+pub(crate) use blaze_check::sync::{OnceLock, atomic};

@@ -267,6 +267,10 @@ impl Store {
 
     /// Tier `at` of a shared store could not be opened as its head said: what it was before is
     /// kept for readers, and its head is read again, at most [`FAILURES_MOST`] times running.
+    #[expect(
+        blaze::retry,
+        reason = "a peer tier whose head fails to open is read again up to FAILURES_MOST times: the first failure must break the look with a typed error naming the tier"
+    )]
     pub(crate) fn peer_failed(&mut self, at: usize, file: FileName, why: String) {
         let peers = self.peers.as_mut().expect("a peer is of a shared store");
         let tries = peers.tries.entry(at).or_default();

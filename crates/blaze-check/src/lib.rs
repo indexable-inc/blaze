@@ -11,6 +11,8 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_ext)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod cell;
 mod clock;

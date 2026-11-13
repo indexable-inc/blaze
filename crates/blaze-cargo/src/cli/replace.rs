@@ -174,7 +174,8 @@ mod tests {
 
     #[test]
     fn edits_are_made_in_order_in_each_file_and_a_path_outside_is_refused() {
-        let root = std::env::temp_dir().join(format!("blaze-replace-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-replace-");
+        let root = made.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "use std::sync::Mutex;\nfn f(_: Mutex) {}\n")
             .unwrap();

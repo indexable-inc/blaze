@@ -24,8 +24,12 @@ use crate::{
     snapshot::Kept,
 };
 
-fn temp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("blaze-ci-runtime-{}-{name}", std::process::id()))
+/// A path `name` in a directory of the test's own, removed with all it holds when the first
+/// drops.
+fn temp(name: &str) -> (blaze_core::temp::TempDir, std::path::PathBuf) {
+    let dir = blaze_core::temp::TempDir::for_test("blaze-ci-runtime-");
+    let path = dir.join(name);
+    (dir, path)
 }
 
 fn cost(op: &Op) -> usize {
@@ -109,7 +113,7 @@ fn a_path_longer_than_a_request_is_refused_naming_it() {
 
 #[test]
 fn the_state_file_round_trips_and_is_empty_at_first() {
-    let path = temp("state.json");
+    let (_dir, path) = temp("state.json");
     let _ = std::fs::remove_file(&path);
     assert_eq!(load(&path).unwrap(), State::default());
     let mut state = State::default();
@@ -200,7 +204,7 @@ impl Write for Wire<'_> {
 
 #[test]
 fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
-    let path = temp("webhook-budget-secret");
+    let (_dir, path) = temp("webhook-budget-secret");
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Secret::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -380,7 +384,8 @@ fn github_errors_are_retried_five_times() {
         posts.send(Post::Create { run: RunId(3), check: run_check() }).unwrap();
         drop(posts);
         post(&github, &receive, &service, Duration::ZERO);
-        let Ok(Input::Created { run, result }) = inputs.recv() else { panic!("nothing created") };
+        // `post` has returned: what it said is queued, or it said nothing.
+        let Ok(Input::Created { run, result }) = inputs.try_recv() else { panic!("nothing created") };
         assert_eq!(run, RunId(3));
         assert_eq!(result.is_ok(), created, "{failing}: {result:?}");
         if let Err(what) = result {
@@ -428,7 +433,8 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
     let recorded = github.lock();
     assert_eq!(recorded.created, ["blaze/check"]);
     assert_eq!(recorded.updated, [(33, CheckStatus::InProgress), (11, CheckStatus::Success)]);
-    assert!(matches!(inputs.recv(), Ok(Input::Created { run: RunId(2), result: Ok(101) })));
+    // `post` has returned: what it said is queued.
+    assert!(matches!(inputs.try_recv(), Ok(Input::Created { run: RunId(2), result: Ok(101) })));
 }
 
 #[test]
@@ -578,7 +584,7 @@ fn deliver(at: std::net::SocketAddr, id: &str, signature: &str, body: &[u8]) -> 
 
 #[test]
 fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
-    let path = temp("webhook-secret");
+    let (_dir, path) = temp("webhook-secret");
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Secret::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -618,7 +624,7 @@ fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
 
 fn loopback_listener()
 -> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel::Receiver<Input>, Arc<Listener>) {
-    let path = temp(&format!("webhook-secret-{:?}", thread::current().id()));
+    let (_dir, path) = temp("webhook-secret");
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Arc::new(Secret::read(&path).unwrap());
     std::fs::remove_file(&path).unwrap();

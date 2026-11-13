@@ -36,7 +36,9 @@ use crate::lock::{Lock, LockGuard, Signal};
 use blaze_mem::{Slab, Tag as MemTag};
 
 use crate::{
-    Completion, Confine, Done, Driver, Effect, IoError, Tag, fs,
+    Completion, Confine, Done, Driver, Effect, IoError, Tag,
+    descriptors::Descriptors,
+    fs,
     wait::Deadline,
     wheel::{self, Wheel},
 };
@@ -67,6 +69,10 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 #[cfg_attr(
     target_os = "wasi",
     allow(dead_code, reason = "WASI keeps no spawns, watches or listens")
+)]
+#[cfg_attr(
+    target_os = "wasi",
+    expect(blaze::unwired, reason = "wired off WASI; WASI keeps no spawns, watches or listens")
 )]
 pub(crate) mod tagged {
     use blaze_hash::HashMap;
@@ -292,6 +298,10 @@ impl<T> Mailbox<T> {
         target_os = "wasi",
         allow(dead_code, reason = "WASI has no IO threads to take file effects")
     )]
+    #[cfg_attr(
+        target_os = "wasi",
+        expect(blaze::unwired, reason = "wired off WASI, which has no IO threads to take file effects")
+    )]
     fn pop(&self) -> Option<T> {
         let mut state = lock(&self.state);
         loop {
@@ -363,6 +373,8 @@ struct Shared {
     errand: Signal,
     #[cfg(test)]
     off: OffThread,
+    /// The descriptors the threads keep for reads into memory: a file opened once.
+    descriptors: Descriptors,
 }
 
 /// What the driver's threads allocated, for the allocation-budget tests: each file effect and
@@ -432,6 +444,10 @@ pub struct Threads {
     /// Where each sandboxed spawn gets a directory of its own: the root, or the directory
     /// [`Threads::scratch`] made.
     #[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI refuses every spawn"))]
+    #[cfg_attr(
+        target_os = "wasi",
+        expect(blaze::unwired, reason = "wired off WASI, which refuses every spawn")
+    )]
     spawn_dirs: Arc<Path>,
     #[cfg(unix)]
     spawns: Tagged<Arc<Life>>,
@@ -475,6 +491,7 @@ impl Threads {
             errand: Signal::new("core.threads.errand_ready"),
             #[cfg(test)]
             off: OffThread::default(),
+            descriptors: Descriptors::new(),
         });
         // alloc: once per driver, shared with each spawn's errand.
         let spawn_dirs: Arc<Path> = Arc::from(shared.root.as_path());
@@ -536,6 +553,17 @@ impl Threads {
             },
             in_flight: 0,
         }
+    }
+
+    /// How many files the threads opened for reads into memory, and closed.
+    pub fn opens(&self) -> crate::Opens {
+        self.shared.descriptors.opens()
+    }
+
+    /// The table of kept descriptors, for the tests that count and bypass it.
+    #[cfg(test)]
+    pub(crate) fn descriptors(&self) -> &Descriptors {
+        &self.shared.descriptors
     }
 
     /// The same driver, making the sandbox of each spawn whose sandbox is on with `confine`.
@@ -968,7 +996,8 @@ fn work(shared: &Shared, effect: Effect) -> bool {
     let tag = effect.tag();
     let done = shared.counted(|| {
         // alloc: an error's message.
-        run(&shared.root, effect).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
+        run(&shared.root, &shared.descriptors, effect)
+            .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
     });
     shared.done.push(Told::Done(Completion { tag, done })).is_ok()
 }
@@ -987,8 +1016,161 @@ fn at<R>(
 }
 
 /// A file effect done with blocking calls, for this driver's threads and for the drivers that
-/// keep their file calls on threads. Allocates only what its completion carries.
-pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
+/// keep their file calls on threads. Allocates only what its completion carries. Reads into
+/// memory read through `kept`'s descriptors; an effect that changes what is under a name closes
+/// that name's descriptor once it is done, so the next read opens the file there then.
+pub(crate) fn run(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
+    let changed = changes(&effect);
+    let done = run_kept(root, kept, effect);
+    for name in changed.iter().flatten() {
+        kept.forget(name);
+    }
+    done
+}
+
+/// The names `effect` changes what is under: whose kept descriptors no longer read what the
+/// name holds. A write in place (`WriteAt`, `WriteFrom`) changes the bytes of the inode a
+/// descriptor reads, which it then reads too, so it closes none.
+pub(crate) fn changes(effect: &Effect) -> [Option<crate::FileName>; 2] {
+    // clone: each a refcount
+    match effect {
+        Effect::Write { file, .. }
+        | Effect::WriteUnsynced { file, .. }
+        | Effect::Truncate { file, .. }
+        | Effect::Remove { file, .. }
+        | Effect::Prewarm { file, .. } => [Some(file.clone()), None],
+        Effect::RemoveDir { dir, .. } => [Some(dir.clone()), None],
+        Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
+            [Some(from.clone()), Some(to.clone())]
+        }
+        Effect::Clone { to, .. } | Effect::CopyData { to, .. } | Effect::Link { to, .. } => {
+            [Some(to.clone()), None]
+        }
+        _ => [None, None],
+    }
+}
+
+/// The most parts of one run read by one `preadv`: 1 KiB of `iovec`s on the stack, far below
+/// `IOV_MAX` (1024 on Linux and macOS). A longer run is more calls of this many.
+pub(crate) const RUN_MOST: usize = 64;
+
+/// The parts of an [`Effect::ReadMany`] read through `kept`'s descriptors, each part's `got`
+/// set: a run of parts of one file, each at where the last ended, is one `preadv` on Unix. A
+/// part fails alone: its span refused, its file missing, or the call of its run failed.
+fn read_many(root: &Path, kept: &Descriptors, parts: &mut [crate::ReadPart], cache: crate::Cache) {
+    let mut first = 0;
+    while first < parts.len() {
+        let mut end = first + 1;
+        let mut next = parts[first].at + u64::from(parts[first].into.len);
+        while end < parts.len()
+            && end - first < RUN_MOST
+            && parts[end].file == parts[first].file
+            && parts[end].at == next
+        {
+            next += u64::from(parts[end].into.len);
+            end += 1;
+        }
+        read_run(root, kept, &mut parts[first..end], cache);
+        first = end;
+    }
+}
+
+/// One run of parts of one file, adjacent in it, read: its spans resolved (one refused fails
+/// alone and splits the run), its file's kept descriptor taken once, and each stretch of
+/// resolved spans read by one call.
+fn read_run(root: &Path, kept: &Descriptors, run: &mut [crate::ReadPart], cache: crate::Cache) {
+    use crate::{Got, ReadPart};
+    let file = run[0].file.clone(); // clone: a refcount
+    let opened = match kept.file(root, &file, cache) {
+        Ok(opened) => opened,
+        Err(error) => {
+            for part in run.iter_mut() {
+                part.got = Got::Failed(part_error(part, &error));
+            }
+            return;
+        }
+    };
+    let mut resolved = [None; RUN_MOST];
+    for (slot, part) in resolved.iter_mut().zip(run.iter_mut()) {
+        match crate::spans::resolve(&part.into, &part.file, part.at, cache, "a batched read into memory of") {
+            Ok(span) => *slot = Some(span),
+            Err(why) => part.got = Got::Failed(why),
+        }
+    }
+    // Each stretch of parts whose spans resolved, read by one call.
+    let mut first = 0;
+    while first < run.len() {
+        if resolved[first].is_none() {
+            first += 1;
+            continue;
+        }
+        let mut end = first;
+        let mut spans = [None; RUN_MOST];
+        while end < run.len() && let Some(span) = resolved[end] {
+            spans[end - first] = Some(span);
+            end += 1;
+        }
+        let stretch: &mut [ReadPart] = &mut run[first..end];
+        let read = read_stretch(&opened, stretch, &spans[..end - first], cache);
+        match read {
+            Ok(mut left) => {
+                for part in stretch.iter_mut() {
+                    let got = left.min(part.into.len as usize);
+                    part.got = Got::Read(u32::try_from(got).expect("at most a span's u32 length"));
+                    left -= got;
+                }
+            }
+            Err(error) => {
+                for part in stretch.iter_mut() {
+                    part.got = Got::Failed(part_error(part, &error));
+                }
+            }
+        }
+        first = end;
+    }
+}
+
+/// The parts of a stretch read into their spans, adjacent in the file from its first part's
+/// offset: one `preadv` on Unix (more where it is cut short before the end); how many bytes in
+/// all, fewer only at the file's end.
+#[cfg(unix)]
+fn read_stretch(
+    opened: &std::fs::File,
+    stretch: &[crate::ReadPart],
+    spans: &[Option<crate::spans::Resolved>],
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let spans = spans.iter().map(|span| span.expect("a stretch is of resolved spans"));
+    crate::spans::read_run(opened, stretch[0].at, spans, cache)
+}
+
+/// Windows and WASI have no `preadv` blaze calls: each part is one read of the kept descriptor.
+#[cfg(not(unix))]
+fn read_stretch(
+    opened: &std::fs::File,
+    stretch: &[crate::ReadPart],
+    spans: &[Option<crate::spans::Resolved>],
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let mut read = 0;
+    for (part, span) in stretch.iter().zip(spans) {
+        let span = span.expect("a stretch is of resolved spans");
+        let got = span.with_mut(|bytes| fs::read_into(opened, bytes, part.at, cache))?;
+        read += got;
+        if got < span.len() {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+/// `error` of `part`, naming its file and offset.
+fn part_error(part: &crate::ReadPart, error: &io::Error) -> IoError {
+    // alloc: an error path.
+    IoError(format!("{} at {} ({} bytes): {error}", part.file, part.at, part.into.len))
+}
+
+fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
     match effect {
         Effect::ReadAll { file, .. } => match at(root, &file, |path| std::fs::read(path)) {
             Ok(bytes) => Ok(Done::Read(bytes)),
@@ -1004,14 +1186,20 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
                 // alloc: an error path.
                 .map_err(|why| io::Error::other(why.0))?;
-            let read = at(root, &file, |path| {
-                let opened = fs::open_positional(path, false, cache)?;
-                at_priority(priority, || {
-                    span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
-                })
+            // The kept descriptor: an open only at the file's first read (`descriptors`).
+            let opened = kept.file(root, &file, cache)?;
+            let read = at_priority(priority, || {
+                span.with_mut(|bytes| fs::read_into(&opened, bytes, from, cache))
             })
             .map_err(|error| named(&file, &error))?;
             Ok(Done::ReadInto { len: u32::try_from(read).expect("at most a span's u32 length") })
+        }
+        Effect::ReadMany { mut parts, cache, priority, .. } => {
+            at_priority(priority, || {
+                read_many(root, kept, &mut parts, cache);
+                Ok(())
+            })?;
+            Ok(Done::ReadMany(parts))
         }
         Effect::WriteFrom { file, at: offset, from, cache, .. } => {
             let span = crate::spans::resolve(&from, &file, offset, cache, "a write from memory to")
@@ -1131,7 +1319,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
             .map(|()| Done::RemovedDir)
             .map_err(|error| named(&dir, &error)),
-        Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
+        Effect::Map { file, extent, .. } => Ok(Done::Mapped(
+            at(root, &file, |path| fs::map_extent(path, extent)).map_err(|error| named(&file, &error))?,
+        )),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
         }

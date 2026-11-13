@@ -14,7 +14,15 @@ use super::Db;
 const ORDER_KEPT: usize = 300;
 
 /// By ingredient index ([`blaze_query::db::Storage::ingredient_name`] names one).
+#[expect(
+    blaze::process_static,
+    reason = "only while RUSTD_TRACE is set, one row per query ingredient (a fixed set), taken after each request"
+)]
 static RAN: Lock<Option<HashMap<u32, u32, Global>>> = Lock::new("db.trace.ran", None);
+#[expect(
+    blaze::process_static,
+    reason = "only while RUSTD_TRACE is set, capped at ORDER_KEPT rows and taken after each request"
+)]
 static ORDER: Lock<Vec<u32>> = Lock::new("db.trace.order", Vec::new()); // alloc: empty until traced
 
 /// Whether a database made now counts its executions.

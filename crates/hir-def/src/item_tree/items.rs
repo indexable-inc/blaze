@@ -528,6 +528,10 @@ fn item_keys(
     anchors.extend(starts.iter().zip(pairs).map(|(&start, &[ast_id, _])| [start, ast_id]));
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "ast ids are u32 and a file's text is under 4 GiB (a `TextSize`); a file with 2^32 ast ids would need a typed refusal from the parse"
+)]
 fn id(len: usize) -> u32 {
     u32::try_from(len).expect("a file of more than `u32` ast ids")
 }

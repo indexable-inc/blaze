@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use blaze_codegen::settings::Sanitizers;
+use blaze_core::temp::TempDir;
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
@@ -110,14 +110,15 @@ fn jobs(dirs: &[&Path]) -> Result<String, String> {
     Ok(printed)
 }
 
-fn temp(name: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "blaze-link-target-{}-{name}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+/// A test's own directory, under which [`temp`] makes the ones it names: removed, with
+/// them, when it drops.
+fn top() -> TempDir {
+    TempDir::for_test("blaze-link-target-")
+}
+
+/// A new directory `name` under `top`, as long as `top` lives.
+fn temp(top: &TempDir, name: &str) -> PathBuf {
+    let dir = top.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -164,10 +165,13 @@ struct Glibc {
     libc: PathBuf,
     loader: &'static str,
     answers: Answers,
+    /// The directory `gcc` and `libc` are in, removed with them when this drops.
+    _top: TempDir,
 }
 
 fn glibc(target: Target) -> Glibc {
-    let root = temp("glibc");
+    let top = top();
+    let root = temp(&top, "glibc");
     let gcc = root.join("gcc");
     let libc = root.join("libc");
     let (loader, _, _) = loader(target);
@@ -217,7 +221,7 @@ fn glibc(target: Target) -> Glibc {
         );
     }
     let answers = answers.answer(DRIVER, jobs(&[]));
-    Glibc { gcc, libc, loader, answers }
+    Glibc { gcc, libc, loader, answers, _top: top }
 }
 
 fn dylib(name: &str) -> NativeLib {
@@ -474,7 +478,8 @@ fn a_shared_library_has_its_name_and_exports_and_asks_no_toolchain() {
 
 #[test]
 fn a_macos_executable_says_its_sdk_and_the_minimum_os() {
-    let sdk = temp("sdk");
+    let top = top();
+    let sdk = temp(&top, "sdk");
     touch(
         &sdk.join("SDKSettings.json"),
         br#"{"CanonicalName":"macosx15.2","VersionMap":{"Version":"1.0","macOS_iOSMac":{"15.2":"18.2"}},"Version":"15.2","MinimalDisplayName":"15.2"}"#,
@@ -510,7 +515,8 @@ fn a_macos_executable_says_its_sdk_and_the_minimum_os() {
 
 #[test]
 fn without_sdkroot_the_sdk_is_where_xcrun_says() {
-    let sdk = temp("xcrun");
+    let top = top();
+    let sdk = temp(&top, "xcrun");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version": "14.0"}"#);
     let answers = Answers::new()
         .answer("xcrun --sdk macosx --show-sdk-path", Ok(format!("{}\n", sdk.display())))
@@ -556,7 +562,8 @@ fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
     assert_eq!(output.stack, Some(64 << 20));
     // No wasi-libc: an empty toolchain is enough, and the `libc` crate's `c` is not searched
     // for, where any other library still is.
-    let empty = temp("wasm64-sysroot");
+    let top = top();
+    let empty = temp(&top, "wasm64-sysroot");
     let located = locate_with(
         &Cache::new(),
         &Answers::new(),
@@ -616,7 +623,8 @@ fn a_linux_line_is_the_c_runtime_around_the_libraries_with_libcs_script_followed
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
     let output = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
-    let mine = temp("mine");
+    let top = top();
+    let mine = temp(&top, "mine");
     touch(&mine.join("libfoo.a"), ARCHIVE);
     let libs = vec![static_lib("foo", true), dylib("gcc_s"), dylib("c")];
     let search = vec![mine.clone()];
@@ -700,7 +708,8 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
     let output = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
     // Two crates' build scripts each make a `libasm.a` in their own `OUT_DIR`, of other
     // symbols, and a third library only the link's directories have.
-    let (one, two, link) = (temp("own-one"), temp("own-two"), temp("own-link"));
+    let top = top();
+    let (one, two, link) = (temp(&top, "own-one"), temp(&top, "own-two"), temp(&top, "own-link"));
     touch(&one.join("libasm.a"), ARCHIVE);
     touch(&two.join("libasm.a"), ARCHIVE);
     touch(&link.join("libshared.a"), ARCHIVE);
@@ -746,7 +755,8 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
     let output = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
-    let (a, b) = (temp("a"), temp("b"));
+    let top = top();
+    let (a, b) = (temp(&top, "a"),temp(&top, "b"));
     touch(&a.join("libx.a"), ARCHIVE);
     touch(&b.join("libx.so"), &elf(3));
     touch(&a.join("liby.so"), &elf(3));
@@ -801,7 +811,8 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
 
 #[test]
 fn a_search_directory_is_listed_with_its_names_case_folded() {
-    let dir = temp("listing");
+    let top = top();
+    let dir = temp(&top, "listing");
     touch(&dir.join("LibFoo.A"), ARCHIVE);
     std::fs::create_dir_all(dir.join("Sub.framework")).unwrap();
     let names = listing(&dir).unwrap();
@@ -863,7 +874,8 @@ fn no_c_toolchain_is_an_error_naming_what_was_tried() {
 
 #[test]
 fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
-    let sdk = temp("sdk-line");
+    let top = top();
+    let sdk = temp(&top, "sdk-line");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
@@ -899,10 +911,11 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
 /// to the linker from `NIX_LDFLAGS`, as rustc's link through `cc` gets it.
 #[test]
 fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
-    let sdk = temp("sdk-driver");
+    let top = top();
+    let sdk = temp(&top, "sdk-driver");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
-    let (nix, profile, mine) = (temp("nix-libiconv"), temp("nix-profile"), temp("mine"));
+    let (nix, profile, mine) = (temp(&top, "nix-libiconv"), temp(&top, "nix-profile"), temp(&top, "mine"));
     touch(&nix.join("libiconv.dylib"), &stub("/nix/libiconv.dylib", &[]));
     touch(&profile.join("libiconv.dylib"), &stub("/profile/libiconv.dylib", &[]));
     let missing = nix.join("missing");
@@ -962,10 +975,11 @@ fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
 /// the error names the directory that has it and why it was left out.
 #[test]
 fn a_library_only_on_a_nix_ldflags_path_the_c_driver_left_out_is_not_found_and_says_why() {
-    let sdk = temp("sdk-unpassed");
+    let top = top();
+    let sdk = temp(&top, "sdk-unpassed");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
-    let (nix, passed) = (temp("nix-libiconv-unpassed"), temp("nix-libsystem"));
+    let (nix, passed) = (temp(&top, "nix-libiconv-unpassed"), temp(&top, "nix-libsystem"));
     touch(&nix.join("libiconv.tbd"), &stub("/nix/libiconv.dylib", &[]));
     let flags = format!("-L{} -L {} -Lrelative", passed.display(), nix.display());
     let answers = Answers::new()
@@ -999,11 +1013,12 @@ fn a_library_only_on_a_nix_ldflags_path_the_c_driver_left_out_is_not_found_and_s
 /// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
 #[test]
 fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
-    let sdk = temp("sdk-reexport");
+    let top = top();
+    let sdk = temp(&top, "sdk-reexport");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
     touch(&sdk.join("usr/lib/libfake.1.tbd"), &stub("/usr/lib/libfake.1.dylib", &[]));
-    let (iconv, charset) = (temp("nix-iconv"), temp("nix-charset"));
+    let (iconv, charset) = (temp(&top, "nix-iconv"), temp(&top, "nix-charset"));
     let installed = charset.join("libcharset.1.dylib");
     let installed = installed.to_str().unwrap();
     let reexports = [installed, "/usr/lib/libfake.1.dylib"];
@@ -1076,7 +1091,8 @@ fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
 
 #[test]
 fn a_windows_line_is_searched_in_lib_and_its_libraries_are_read_as_archives() {
-    let (a, b) = (temp("lib-a"), temp("lib-b"));
+    let top = top();
+    let (a, b) = (temp(&top, "lib-a"),temp(&top, "lib-b"));
     touch(&a.join("kernel32.lib"), ARCHIVE);
     touch(&b.join("foo.lib"), ARCHIVE);
     let answers = Answers::new().var("LIB", format!("{};{};", a.display(), b.display()));
@@ -1126,7 +1142,8 @@ fn ar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 #[test]
 fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
-    let (vc, kits) = (temp("vc"), temp("kits"));
+    let top = top();
+    let (vc, kits) = (temp(&top, "vc"), temp(&top, "kits"));
     let crt = coff(
         " /DEFAULTLIB:vcruntime /DEFAULTLIB:\"ucrt.lib\" /DEFAULTLIB:libcmt /NODEFAULTLIB:LIBCMT /FAILIFMISMATCH:a=b",
     );
@@ -1168,7 +1185,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
         "an archive's content is read for its libraries once"
     );
 
-    let mine = temp("mine-vc");
+    let mine = temp(&top, "mine-vc");
     touch(&mine.join("vcruntime.lib"), ARCHIVE);
     let located =
         locate_plain(&cache, &answers, &output, &libs, std::slice::from_ref(&mine)).unwrap();
@@ -1201,7 +1218,8 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
 
 #[test]
 fn a_default_library_is_found_with_its_case_ignored() {
-    let dir = temp("caseless");
+    let top = top();
+    let dir = temp(&top, "caseless");
     touch(&dir.join("ucrt.lib"), ARCHIVE);
     assert_eq!(caseless(&dir, "UCRT.LIB"), Some(dir.join("ucrt.lib")));
     assert_eq!(caseless(&dir, "ucrt.lib"), Some(dir.join("ucrt.lib")));
@@ -1211,7 +1229,8 @@ fn a_default_library_is_found_with_its_case_ignored() {
 
 #[test]
 fn without_lib_the_msvc_and_sdk_directories_are_found_as_find_msvc_tools_finds_them() {
-    let root = temp("msvc");
+    let top = top();
+    let root = temp(&top, "msvc");
     let install = root.join("vs");
     touch(
         &install.join("VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"),
@@ -1255,7 +1274,8 @@ fn without_lib_the_msvc_and_sdk_directories_are_found_as_find_msvc_tools_finds_t
 
 #[test]
 fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
-    let sysroot = temp("sysroot");
+    let top = top();
+    let sysroot = temp(&top, "sysroot");
     let dir = sysroot.join("lib/rustlib/wasm32-wasip1/lib/self-contained");
     touch(&dir.join("crt1-command.o"), b"\0asm\x01\0\0\0");
     touch(&dir.join("libc.a"), ARCHIVE);
@@ -1280,7 +1300,7 @@ fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
     let located = locate_with(&cache, &answers, &output, &[], &[], &sysroot).unwrap();
     assert_eq!(line(&located), [(dir.join("libc.a"), ARCHIVED)], "a cdylib has no command start");
 
-    let empty = temp("no-wasi-libc");
+    let empty = temp(&top, "no-wasi-libc");
     let output = executable(&cache, &answers, "wasm32-wasip1").unwrap();
     let error = locate_with(&cache, &answers, &output, &[], &[], &empty).unwrap_err();
     assert!(
@@ -1289,7 +1309,7 @@ fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
         error.what
     );
 
-    let no_libc = temp("no-wasi-libc-archive");
+    let no_libc = temp(&top, "no-wasi-libc-archive");
     touch(
         &no_libc.join("lib/rustlib/wasm32-wasip1/lib/self-contained/crt1-command.o"),
         b"\0asm\x01\0\0\0",
@@ -1303,7 +1323,8 @@ fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
 
 #[test]
 fn a_wasm_proc_macro_links_as_a_wasi_reactor() {
-    let sysroot = temp("reactor-sysroot");
+    let top = top();
+    let sysroot = temp(&top, "reactor-sysroot");
     let dir = sysroot.join("lib/rustlib/wasm32-wasip1/lib/self-contained");
     touch(&dir.join("crt1-command.o"), b"\0asm\x01\0\0\0");
     touch(&dir.join("libc.a"), ARCHIVE);
@@ -1362,7 +1383,8 @@ fn autolinking(options: &[&[&'static str]]) -> Vec<u8> {
 
 #[test]
 fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
-    let (sdk, mine) = (temp("sdk-autolink"), temp("mine-autolink"));
+    let top = top();
+    let (sdk, mine) = (temp(&top, "sdk-autolink"), temp(&top, "mine-autolink"));
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
@@ -1461,7 +1483,8 @@ const SANITIZERS: [(Sanitizers, &str, &str); 3] = [
 fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
-    let sysroot = temp("sanitize-linux");
+    let top = top();
+    let sysroot = temp(&top, "sanitize-linux");
     let dir = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
     for (_, name, _) in SANITIZERS {
         touch(&dir.join(format!("librustc-nightly_rt.{name}.a")), ARCHIVE);
@@ -1495,7 +1518,7 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
         "an ELF shared library leaves the runtime to its executable"
     );
 
-    let empty = temp("sanitize-linux-empty");
+    let empty = temp(&top, "sanitize-linux-empty");
     for (sanitizer, name, what) in SANITIZERS {
         let output = sanitized(plain.clone(), sanitizer);
         let error = locate_with(&cache, &glibc.answers, &output, &[], &[], &empty).unwrap_err();
@@ -1514,13 +1537,14 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
 
 #[test]
 fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
-    let sdk = temp("sanitize-sdk");
+    let top = top();
+    let sdk = temp(&top, "sanitize-sdk");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
     touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
     let answers =
         Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
-    let sysroot = temp("sanitize-macos");
+    let sysroot = temp(&top, "sanitize-macos");
     let dir = sysroot.join("lib/rustlib/aarch64-apple-darwin/lib");
     for name in ["asan", "tsan"] {
         touch(
@@ -1562,7 +1586,7 @@ fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
         &sanitized(plain, Sanitizers::ADDRESS),
         &[],
         &[],
-        &temp("sanitize-macos-empty"),
+        &temp(&top, "sanitize-macos-empty"),
     )
     .unwrap_err();
     assert!(
@@ -1581,7 +1605,8 @@ fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
 
 #[test]
 fn a_sanitizer_on_windows_or_wasm_is_an_error() {
-    let sysroot = temp("sanitize-other");
+    let top = top();
+    let sysroot = temp(&top, "sanitize-other");
     let cache = Cache::new();
     let answers = Answers::new();
     for (sanitizer, _, what) in SANITIZERS {

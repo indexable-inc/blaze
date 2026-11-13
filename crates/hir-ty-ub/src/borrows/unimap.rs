@@ -52,6 +52,10 @@ impl<K: Hash + Eq> UniKeyMap<K> {
 
     /// A fresh index for `key`, reusing a freed one first. Panics if `key` has one.
     #[track_caller]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "UniMap indices are u32; a borrow-tracking map past 2^32 live keys needs a typed refusal from the checker"
+    )]
     pub(super) fn insert(&mut self, key: K) -> UniIndex {
         let idx = self.deassigned.pop().unwrap_or_else(|| {
             u32::try_from(self.mapping.len()).expect("UniMap ran out of useable keys")

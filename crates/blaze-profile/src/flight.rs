@@ -241,6 +241,10 @@ const _: () = assert!(FOREIGN_FROM + FOREIGN_MAX <= u16::MAX as usize, "a foreig
 static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; FOREIGN_MAX];
 /// The [`FOREIGN`] slots of each hash of a text ([`foreign_key`]), and how many are taken.
 // alloc: none until a postmortem names a site; grows to the distinct sites of dead processes
+#[expect(
+    blaze::process_static,
+    reason = "indexes the FOREIGN slots, so at most FOREIGN_MAX entries in all"
+)]
 static FOREIGN_BY_TEXT: Lock<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
     Lock::unrecorded("profile.flight.foreign_by_text", (0, None));
 
@@ -815,10 +819,6 @@ pub enum Plot {
     /// Bytes purges gave back so far, each one's footprint before less its footprint after
     /// once every worker gave back its heaps (`blaze_cargo::raw::memory::purged_bytes`).
     AllocatorPurgedBytes,
-    /// Bytes of footprint an idle daemon holds past its idle budget while its planner's last
-    /// look found nothing more it may give (`serve::idle::BUDGET`, outcome `FloorOver`); 0
-    /// otherwise. What should read 0 a minute into an idle daemon.
-    IdleOverBytes,
     /// Bytes the live fibers' stacks hold, each to the deepest page it switched out from
     /// (`blaze_graph::sched::stack::resident`): the part of [`Plot::AllocatorKeptBytes`] that
     /// is stacks, not an allocator's pages. Sampled with the memory's breakdown.
@@ -829,7 +829,7 @@ pub enum Plot {
 }
 
 impl Plot {
-    pub const ALL: [Plot; 35] = [
+    pub const ALL: [Plot; 34] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -862,7 +862,6 @@ impl Plot {
         Plot::Named,
         Plot::AllocatorKeptBytes,
         Plot::AllocatorPurgedBytes,
-        Plot::IdleOverBytes,
         Plot::StackBytes,
         Plot::Threads,
     ];
@@ -901,7 +900,6 @@ impl Plot {
             Plot::Named => "named",
             Plot::AllocatorKeptBytes => "allocator kept bytes",
             Plot::AllocatorPurgedBytes => "allocator purged bytes",
-            Plot::IdleOverBytes => "idle over bytes",
             Plot::StackBytes => "stack bytes",
             Plot::Threads => "threads",
         }
@@ -1097,6 +1095,10 @@ struct Parked {
 }
 
 // alloc: none here; grows to the most jobs parked at once, then is kept.
+#[expect(
+    blaze::process_static,
+    reason = "slots of the jobs parked now, reused through `free`: at most the most jobs parked at once"
+)]
 static PARKED: Lock<Parked> = Lock::unrecorded("profile.flight.parked", Parked { jobs: Vec::new(), free: Vec::new() });
 
 /// Moves the parking job's enter stack and build off this thread, leaving it inside no span and
@@ -2912,6 +2914,10 @@ fn slot_of(id: u64) -> usize {
 
 /// Every ring, in the order made: a ring's number is its place here plus one.
 // alloc: once a process
+#[expect(
+    blaze::process_static,
+    reason = "one leaked ring per thread that recorded, at most RINGS_MAX numbered: the flight recorder is the process's by design"
+)]
 static RINGS: Lock<Vec<&'static Ring>> = Lock::unrecorded("profile.flight.rings", Vec::new());
 /// Every ring by its number, read with no lock by a span closed on another thread.
 static BY_NUMBER: [OnceLock<&'static Ring>; RINGS_MAX] = [const { OnceLock::new() }; RINGS_MAX];
@@ -2942,6 +2948,10 @@ impl Drop for Held {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread text buffers: TEXT grows to the thread's longest field value, REST to FIELDS_TEXT_MAX at most"
+)]
 thread_local! {
     /// This thread's ring, read by every span: no destructor, so it is there to the end.
     static MINE: Cell<Option<&'static Ring>> = const { Cell::new(None) };
@@ -4954,6 +4964,21 @@ pub fn dump(window: Duration) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// How long a test's thread waits for another's word before the test fails.
+    const WAIT: Duration = Duration::from_secs(60);
+
+    /// The next message on `rx`, or `None` once its senders are gone; past [`WAIT`] the test
+    /// fails naming `what` it waited for.
+    fn heard<T>(rx: &crossbeam_channel::Receiver<T>, what: &str) -> Option<T> {
+        match rx.recv_timeout(WAIT) {
+            Ok(it) => Some(it),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                panic!("waited {WAIT:?} for {what}")
+            }
+        }
+    }
+
     fn plot_row(i: u64) -> [u64; WORDS] {
         [i, i, i, i, KIND_PLOT << 62, i, i, i]
     }
@@ -5246,22 +5271,22 @@ mod tests {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
                 // Ends when the asker says it asks, or when its thread ended without asking.
-                _ = is_asking.recv();
+                _ = heard(&is_asking, "the asker to say it asks");
                 blaze_graph::spin::busy(Duration::from_millis(300));
                 Ok(5)
             });
             ran_out.send(()).unwrap();
-            _ = has_asked_out.recv();
+            _ = heard(&has_asked_out, "the asker to end");
             (crate::sampler::os_tid() as u32, got)
         });
-        has_started.recv().unwrap();
+        has_started.recv_timeout(WAIT).expect("the runner started its run");
         let asker = std::thread::spawn(move || {
             let asking = tracing::info_span!(target: "blaze", "flight asking").entered();
             let asking_id = asking.id().unwrap().into_u64();
             asking_now.send(()).unwrap();
             let got = flights.get_or_run_named(key, named, || Ok(0));
             drop(asking);
-            has_ran_out.recv().unwrap();
+            has_ran_out.recv_timeout(WAIT).expect("the runner's run ended");
             (crate::sampler::os_tid() as u32, asking_id, got)
         });
         let (asker, asking_id, asked) = asker.join().unwrap();
@@ -5340,13 +5365,13 @@ mod tests {
             let ending_ns = crate::clock::mono_ns();
             hold.end(&9);
             ended.send(()).unwrap();
-            _ = has_waited.recv();
+            _ = heard(&has_waited, "the waiter to end");
             (crate::sampler::os_tid() as u32, ending_ns)
         });
-        has_held.recv().unwrap();
+        has_held.recv_timeout(WAIT).expect("the holder took its hold");
         let waiter = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, |it| it.push_str("codegen round 3"), || Ok(0));
-            has_ended.recv().unwrap();
+            has_ended.recv_timeout(WAIT).expect("the holder ended its hold");
             (crate::sampler::os_tid() as u32, got)
         });
         let (waiter, got) = waiter.join().unwrap();
@@ -5456,10 +5481,10 @@ mod tests {
                 std::thread::spawn(move || {
                     took.send(ring().unwrap().number).unwrap();
                     // The span to close here, or none.
-                    drop(close.recv().unwrap());
+                    drop(close.recv_timeout(WAIT).expect("the test said which span to close"));
                 }),
             ));
-            if taken.recv().unwrap() == ring_of_maker {
+            if taken.recv_timeout(WAIT).expect("the holder said which ring it took") == ring_of_maker {
                 taker = Some(holders.len() - 1);
             }
         }
@@ -5741,7 +5766,7 @@ mod tests {
             },
             move |got| first.send(got.unwrap()).unwrap(),
         );
-        has_started.recv().unwrap();
+        has_started.recv_timeout(WAIT).expect("the first job started its run");
         pool.submit(
             None,
             move || {
@@ -5751,8 +5776,9 @@ mod tests {
             },
             move |got| second.send(got.unwrap()).unwrap(),
         );
-        let (got, ran_on) = first_done.recv().unwrap();
-        let (asked, asked_on, resumed_on) = second_done.recv().unwrap();
+        let (got, ran_on) = first_done.recv_timeout(WAIT).expect("the pool ran the first job");
+        let (asked, asked_on, resumed_on) =
+            second_done.recv_timeout(WAIT).expect("the pool ran the second job");
         assert_eq!((got, asked), (Ok(5), Ok(5)), "the second job waited for the first's run");
         drop(pool);
 
@@ -5946,7 +5972,7 @@ mod tests {
         let creator = giver.id().unwrap().into_u64();
         pool.submit(None, tid, move |on| done.send(on.unwrap()).unwrap());
         drop(giver);
-        let on = ran.recv().unwrap();
+        let on = ran.recv_timeout(WAIT).expect("the pool ran the job");
         drop(pool);
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
@@ -6335,12 +6361,12 @@ mod tests {
             // wait in its row.
             drop(tracing::info_span!(target: "blaze", "cpu waits inner").entered());
             ready.send(()).unwrap();
-            has_read.recv().unwrap();
+            has_read.recv_timeout(WAIT).expect("the test read once");
             spend(1);
             // A root closing past `cpu::ROOT_AGE`: the boundary the inner span waits for.
             drop(outer);
         });
-        is_ready.recv().unwrap();
+        is_ready.recv_timeout(WAIT).expect("the thread closed its inner span");
         let mut before = Read::default();
         self::read(&mut cursor, &mut before);
         read_once.send(()).unwrap();

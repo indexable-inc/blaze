@@ -1339,6 +1339,10 @@ impl<'db> Sink<'db> for StepSink<'db, '_> {
         &self.local
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a step's op log is indexed by u32; a step making 2^32 ops needs a typed refusal from collection"
+    )]
     fn apply(&mut self, op: DeclOp) {
         let op = match op {
             DeclOp::Macro(directive) if directive.module == self.module => {

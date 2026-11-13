@@ -191,6 +191,7 @@ fn a_previous_layout_of_assoc_items_is_refused_by_name() {
     // The three assoc items written in `impl S0`: `f`, `g` and `C0`.
     let listed = stored::index::of(&db, file, lib).assoc_items(first.lookup(&db).id.value.erase());
     assert_eq!(listed.len(), 3);
+    let file = hir_expand::HirFileId::FileId(file);
     // alloc: a test's bytes
     let mut bytes = (LAYOUT + 1).to_le_bytes().to_vec();
     bytes.extend_from_slice(&0u32.to_le_bytes());

@@ -51,6 +51,11 @@ impl Workspace {
         Workspace::made(what, false, false, true)
     }
 
+    #[expect(
+        blaze::tmp_path,
+        reason = "the fixture is linked into the programs' build scripts, which take no blaze-core: it \
+                  moves onto blaze_core::temp::TempDir once it is behind a test-only feature of this crate"
+    )]
     fn made(what: &str, reversed: bool, llvm: bool, solver: bool) -> Workspace {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(

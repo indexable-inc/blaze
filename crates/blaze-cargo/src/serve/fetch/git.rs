@@ -79,7 +79,7 @@ fn checkout<H: Http + 'static>(
     // The repository kept with the tree, read from the clone before it goes.
     for (path, bytes) in checkout.repository()? {
         let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &bytes);
-        files.push(SourceFile { path, bytes, mode: Mode::Regular });
+        files.push(SourceFile::of(path, bytes, Mode::Regular));
     }
     blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
     Ok(files)
@@ -166,7 +166,7 @@ pub(super) fn read_tree(root: &Path, skip: impl Fn(&str) -> bool) -> anyhow::Res
                 let target = std::fs::read_link(&at)
                     .with_context(|| format!("failed to read `{}`", at.display()))?;
                 let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &link_bytes(target, &at)?);
-                files.push(SourceFile { path, bytes, mode: Mode::Symlink });
+                files.push(SourceFile::of(path, bytes, Mode::Symlink));
             } else if kind.is_file() {
                 let metadata = entry
                     .metadata()
@@ -174,7 +174,7 @@ pub(super) fn read_tree(root: &Path, skip: impl Fn(&str) -> bool) -> anyhow::Res
                 let bytes = SourceFile::read(&at, metadata.len())
                     .with_context(|| format!("failed to read `{}`", at.display()))?;
                 let mode = if is_executable(&metadata) { Mode::Executable } else { Mode::Regular };
-                files.push(SourceFile { path, bytes, mode });
+                files.push(SourceFile::of(path, bytes, mode));
             } else {
                 bail!("`{}` is neither a file, a directory nor a symlink", at.display());
             }

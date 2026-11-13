@@ -24,6 +24,7 @@ mod breakdown;
 pub mod ceiling;
 mod daemon;
 pub mod dev_toolchain;
+pub(crate) mod direct;
 mod fetch;
 mod fetch_url;
 #[blaze::sans_io]
@@ -63,6 +64,7 @@ pub mod observe;
 /// The seed's one-shot build: this engine in the CLI's process, for its command alone.
 #[cfg(not(feature = "native"))]
 pub(crate) mod once;
+mod owed_puts;
 mod plane;
 mod settle;
 mod pulse;
@@ -577,25 +579,16 @@ fn told_machine(var: Option<std::ffi::OsString>) -> anyhow::Result<Option<(u64, 
     told_memory(machine::MACHINE_VAR, &text).map(Some)
 }
 
-/// What a start says of the limit it runs under (`budget`, [`blaze_graph::arena::machine_budget`]'s):
-/// its bytes and what told it, and when a build's release is due under it
-/// ([`blaze_graph::admission::Squeeze`]): past the limit's line, or one subsystem a release
-/// lowers past its fair share.
+/// What a start says of the limit it runs under (`budget`, [`blaze_graph::arena::machine_budget`]'s,
+/// cut to the machine's ledger): its bytes and what told it. Every page a task commits passes the
+/// one gate under it ([`blaze_mem::budget::Budget`]), so there is no release line or share to say.
 pub(crate) fn limit_said(budget: &blaze_graph::Budget) -> String {
-    use blaze_graph::admission::{LINE, RELEASED, fair_share};
     let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
     // alloc: the start's line, once per daemon start
-    let shares = RELEASED
-        .iter()
-        .map(|&tag| format!("{} {:.2}", tag.name(), gib(fair_share(tag, budget.bytes))))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // alloc: as `shares`
     format!(
-        "memory limit {:.2} GiB ({}): a build lets go of its front end once blaze holds {:.2} GiB, or once one of these holds past its share (GiB): {shares}",
+        "memory limit {:.2} GiB ({}): every page a task commits passes the gate under it",
         gib(budget.bytes),
         budget.from,
-        gib(budget.bytes - budget.bytes / LINE),
     )
 }
 
@@ -1200,6 +1193,41 @@ pub(crate) fn engine(
     };
     #[cfg(not(unix))]
     let (_, before) = (ready, Before::None);
+    // The limit as told (`--memory-gb` first), read once: what the budget is made of and what
+    // the daemon says it was started with ([`settings`]), so a client asking another is told.
+    let told = told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?;
+    let settings = settings::of_daemon(told.as_ref(), |name| std::env::var_os(name));
+    // The machine's ledger joined (docs/v2/plan/design/end-state/memory.md, section 4.5): the
+    // machine budget every blaze process of this user shares, this process's ceiling under it,
+    // and its pools' core tokens registered. A ledger that cannot be joined stops the start,
+    // naming it. First, before anything of the start that may run on a pool (the history's
+    // thread, hashing blaze itself, the sweep): a pool made before the tokens are registered
+    // is refused (`blaze_graph::pool::set_tokens`), never left to run untokened.
+    #[cfg(all(unix, feature = "native"))]
+    let (machine, budget) = {
+        let _s = tracing::info_span!(target: "blaze", "daemon start: join the machine's ledger").entered();
+        let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
+        let joined = machine::Machine::join(told_machine, told)
+            .context("joining the machine's ledger")?;
+        tracing::info!(target: "blaze", "{}", joined.machine.said());
+        (Some(joined.machine), joined.ceiling)
+    };
+    #[cfg(not(all(unix, feature = "native")))]
+    let (machine, budget) = (
+        None,
+        blaze_graph::arena::machine_budget(1 << 30, told)
+            .context("the memory the daemon's tasks may hold")?,
+    );
+    // The process's one gate installed under that ceiling before any task runs (memory.md
+    // 4.1): every page a task commits passes it, and the plane admits under it
+    // (`daemon::Daemon::start`, which refuses a gate installed under another ceiling).
+    blaze_mem::gate::install(blaze_mem::gate::config_under(budget.bytes)).map_err(|why| {
+        anyhow::anyhow!(
+            "the process's memory gate refused the ceiling of {} bytes ({}): {why:?}",
+            budget.bytes,
+            budget.from
+        )
+    })?;
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
     // directories.
     let stalls = state.join("stalls");
@@ -1281,7 +1309,8 @@ pub(crate) fn engine(
     // either writes there is made by the same code from the same inputs (AGENTS.md rule 25).
     let lease_span = tracing::info_span!(target: "blaze", "daemon start: lease the shared store").entered();
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
-    let std = machine()?.join("std").join(format!("{:x}", makers.id()));
+    // `self::machine`, the machine's directory: the ledger's `machine`, joined above, shadows it.
+    let std = self::machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| {
         format!("making the standard library's shared directory {}", std.display())
     })?;
@@ -1313,28 +1342,6 @@ pub(crate) fn engine(
     if let Some(first) = swept.first() {
         tracing::info!(target: "blaze", removed = swept.len(), first = %first.display(), "half-written fetched packages removed");
     }
-    // The limit as told (`--memory-gb` first), read once: what the budget is made of and what
-    // the daemon says it was started with ([`settings`]), so a client asking another is told.
-    let told = told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?;
-    let settings = settings::of_daemon(told.as_ref(), |name| std::env::var_os(name));
-    // The machine's memory ledger joined (docs/memory-budget.md, section 7): the machine
-    // budget every daemon of this user shares, and this daemon's ceiling under it, the plane's
-    // budget. A ledger that cannot be joined stops the start, naming it.
-    #[cfg(all(unix, feature = "native"))]
-    let (machine, budget) = {
-        let _s = tracing::info_span!(target: "blaze", "daemon start: join the machine's memory ledger").entered();
-        let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
-        let joined = machine::Machine::join(told_machine, told, &crate::version(), &build, &root()?)
-            .context("joining the machine's memory ledger")?;
-        tracing::info!(target: "blaze", "{}", joined.machine.said());
-        (Some(joined.machine), joined.ceiling)
-    };
-    #[cfg(not(all(unix, feature = "native")))]
-    let (machine, budget) = (
-        None,
-        blaze_graph::arena::machine_budget(1 << 30, told)
-            .context("the memory the daemon's tasks may hold")?,
-    );
     // Read once: a daemon that exits once no connection holds it ([`unheld`]). The one-shot
     // build listens on nothing and is held by its own command, so there it is said, by name,
     // to do nothing.
@@ -1357,8 +1364,8 @@ pub(crate) fn engine(
         sources: file_name(&sources)?,
         writer: writer_of(&paths.state)?,
         // The root of the native driver the daemon runs on, made below: its stores' file
-        // names are under it.
-        store_loader: blaze_cas::Loader::Thread { root: std::path::PathBuf::from("/") },
+        // names are under it, and each worker's own driver for its store reads is over it too.
+        reads: direct::Reads::Native { root: std::sync::Arc::from(std::path::Path::new("/")) },
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
         budget: Some(budget),

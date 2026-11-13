@@ -12,8 +12,8 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
         dir: FileName::new("store").unwrap(),
         layers: Vec::new(),
         tags: 1 << 40,
-        load_tags: (1 << 40) + (1 << 32),
-        loader: blaze_cas::Loader::Pumped,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
     };
     let mut effects = Vec::new();
     let mut store = blaze_cas::Store::open(config, &mut effects);
@@ -26,8 +26,31 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
     store
 }
 
+/// `reader`'s store as a session's tasks read it (`serve::direct`): on the simulation's
+/// driver, which a test lends to them (`serve::direct::lend`), as the loop's runner does.
+pub(crate) fn stores_of(reader: &blaze_cas::Reader) -> Arc<crate::serve::direct::Stores> {
+    // clone: a count of the store's reader, twice
+    crate::serve::direct::Stores::new(
+        reader.clone(),
+        reader.clone(),
+        crate::serve::direct::Reads::Lent,
+    )
+}
+
+/// `f` as a session's task runs it: in a frame of its own, with `sim` lent to its store reads
+/// (`serve::direct::lend`), as the daemon's in-line runner lends its driver. A read here asks
+/// only the store's own files, so the lend hands back no completion of anything else.
+pub(crate) fn as_task<R>(sim: &mut Sim, f: impl FnOnce() -> R) -> R {
+    let mut back = Vec::new();
+    let out = crate::serve::direct::lend(sim, &mut back, || {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |_| f())
+    });
+    assert!(back.is_empty(), "a store read was handed completions it did not ask: {back:?}");
+    out
+}
+
 /// Proc macros that keep nothing: these tests read no expansion's reads.
-pub(crate) fn no_macros() -> Arc<blaze_macro_eval::Macros> {
+pub(crate) fn no_macros()-> Arc<blaze_macro_eval::Macros> {
     blaze_macro_eval::Macros::nothing("a test of the images alone")
 }
 
@@ -55,15 +78,17 @@ fn each_daemons_images_work_out_an_expansions_reads_with_its_own_macros_and_none
     let shape = blaze_usercode::index::Shape::of(&traced).encode();
     let reported = blaze_usercode::index::VALUES.traced(&traced);
     let call = Env::default();
-    let one = Images::new(store.reader(), macros_of(&store, "/one/bin"));
-    let other = Images::new(store.reader(), macros_of(&store, "/other/bin"));
+    let stores = stores_of(&store.reader());
+    let one = Images::new(store.reader(), Arc::clone(&stores), macros_of(&store, "/one/bin"));
+    let other = Images::new(store.reader(), Arc::clone(&stores), macros_of(&store, "/other/bin"));
     assert_eq!(one.reads_now(&call, &shape), Ok(reported));
     assert_ne!(
         other.reads_now(&call, &shape),
         Ok(reported),
         "one daemon's images read another's shell"
     );
-    let refused = Images::new(store.reader(), no_macros()).reads_now(&call, &shape).unwrap_err();
+    let refused =
+        Images::new(store.reader(), stores, no_macros()).reads_now(&call, &shape).unwrap_err();
     assert!(refused.contains("not kept here"), "{refused}");
 }
 
@@ -76,12 +101,14 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     let mut sim = Sim::new(1, Faults::default());
     let mut store = opened(&mut sim);
     let reader = store.reader();
-    let images = Images::new(reader.clone(), no_macros());
-    assert!(images.get(&key(1)).unwrap().is_none());
-    images.put(key(1), b"image one".to_vec()).unwrap();
-    images.put(key(1), b"image one".to_vec()).unwrap();
-    assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two values"));
-    images.put(key(2), b"image two".to_vec()).unwrap();
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    as_task(&mut sim, || {
+        assert!(images.get(&key(1)).unwrap().is_none());
+        images.put(key(1), b"image one".to_vec()).unwrap();
+        images.put(key(1), b"image one".to_vec()).unwrap();
+        assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two values"));
+        images.put(key(2), b"image two".to_vec()).unwrap();
+    });
     let puts = images.take_puts();
     assert!(images.take_puts().is_empty(), "a take empties what was asked for");
     let keys: Vec<Key> = puts.iter().map(|it| it.key).collect();
@@ -92,11 +119,13 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     for put in puts {
         store.put(put.key, put.kind, &put.bytes).unwrap();
     }
-    let images = Images::new(reader, no_macros());
-    let found = images.get(&key(1)).unwrap().expect("put by the loop");
-    assert_eq!(found.bytes(), b"image one");
-    images.put(key(2), b"image two".to_vec()).unwrap();
-    assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    as_task(&mut sim, || {
+        let found = images.get(&key(1)).unwrap().expect("put by the loop");
+        assert_eq!(found.bytes(), b"image one");
+        images.put(key(2), b"image two".to_vec()).unwrap();
+        assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
+    });
     assert!(images.puts.into_inner().list.is_empty());
 }
 
@@ -114,19 +143,21 @@ fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
     let mut sim = Sim::new(1, Faults::default());
     let mut store = opened(&mut sim);
     let reader = store.reader();
-    let images = Images::new(reader.clone(), no_macros());
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
     let read = |images: &Images, set: u8, at: u8| {
         let mut found = Vec::new();
         let held = Entries::get(images, &key(set), &key(at), &mut |bytes| found.extend_from_slice(bytes));
         held.unwrap().then_some(found)
     };
-    assert_eq!(read(&images, 9, 1), None, "the control: nothing is kept yet");
-    Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
-    Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
-    let twice = Entries::put(&images, &key(9), key(1), b"another").unwrap_err();
-    assert!(twice.contains("two values") && twice.contains("first differ at byte 0"), "{twice}");
-    assert!(twice.contains("is 9 bytes and the one given 7"), "{twice}");
-    assert_eq!(read(&images, 9, 1), None, "asked, not yet put by the loop");
+    as_task(&mut sim, || {
+        assert_eq!(read(&images, 9, 1), None, "the control: nothing is kept yet");
+        Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+        Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+        let twice = Entries::put(&images, &key(9), key(1), b"another").unwrap_err();
+        assert!(twice.contains("two values") && twice.contains("first differ at byte 0"), "{twice}");
+        assert!(twice.contains("is 9 bytes and the one given 7"), "{twice}");
+        assert_eq!(read(&images, 9, 1), None, "asked, not yet put by the loop");
+    });
     assert!(images.take_puts().is_empty(), "an entry is no put of a flush");
     let puts = images.take_entries();
     assert!(images.take_entries().is_empty(), "a take empties what was asked for");
@@ -135,11 +166,13 @@ fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
     for put in puts {
         store.put(put.key, put.kind, &put.bytes).unwrap();
     }
-    assert_eq!(read(&images, 9, 1).as_deref(), Some(&b"entry one"[..]));
-    assert_eq!(read(&images, 8, 1).as_deref(), Some(&b"entry one"[..]), "under a set that moved");
-    Entries::put(&images, &key(8), key(1), b"entry one").unwrap();
+    as_task(&mut sim, || {
+        assert_eq!(read(&images, 9, 1).as_deref(), Some(&b"entry one"[..]));
+        assert_eq!(read(&images, 8, 1).as_deref(), Some(&b"entry one"[..]), "under a set that moved");
+        Entries::put(&images, &key(8), key(1), b"entry one").unwrap();
+    });
     assert!(images.take_entries().is_empty(), "held by the store: not asked for again");
-    let other = Entries::put(&images, &key(8), key(1), b"changed").unwrap_err();
+    let other = as_task(&mut sim, || Entries::put(&images, &key(8), key(1), b"changed").unwrap_err());
     assert!(other.contains("other bytes") && other.contains("first differ at byte 0"), "{other}");
 }
 
@@ -289,12 +322,13 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
     let items = body_store::Flushed {
         written: 2,
         kept: 9,
-        // By step: inference, MIR, borrow check, constant.
+        // By step: inference, MIR, borrow check, constant, lowering.
         lookups: [
             looked(7, 6, 6, 40),
             looked(7, 5, 6, 31),
             looked(0, 0, 0, 0),
             looked(5, 4, 4, 9),
+            looked(3, 2, 2, 5),
         ],
         refused: vec![("crate_env", 3)],
         no_identity: 4,
@@ -306,6 +340,7 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
         body_store::StepCounts { hits: 5, ran: 2, refused: 1 },
         body_store::StepCounts::default(),
         body_store::StepCounts { hits: 4, ran: 1, refused: 0 },
+        body_store::StepCounts { hits: 2, ran: 1, refused: 1 },
     ];
     let note = noted(Some(&Flushes { goals, items: Some(items) }), Some(&steps)).unwrap();
     assert_eq!(
@@ -316,10 +351,11 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
          inference (7 lookups, 6 hit, 6 read-lists read, 40 reads valued), \
          MIR (7 lookups, 5 hit, 6 read-lists read, 31 reads valued), \
          borrow check (0 lookups, 0 hit, 0 read-lists read, 0 reads valued), \
-         constant (5 lookups, 4 hit, 4 read-lists read, 9 reads valued); steps kept out by reads of \
+         constant (5 lookups, 4 hit, 4 read-lists read, 9 reads valued), \
+         lowering (3 lookups, 2 hit, 2 read-lists read, 5 reads valued); steps kept out by reads of \
          `crate_env` (3); 4 of bodies with no identity; the item store, this build: inference 6 hit, \
          1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; borrow check 0 hit, 0 ran, 0 refused; \
-         constant 4 hit, 1 ran, 0 refused"
+         constant 4 hit, 1 ran, 0 refused; lowering 2 hit, 1 ran, 1 refused"
     );
     assert_eq!(note.rendered, format!("note: {}\n", note.message));
 }
@@ -327,11 +363,12 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
 #[test]
 fn a_first_build_notes_its_steps_alone() {
     assert!(noted(None, None).is_none());
-    let steps = [body_store::StepCounts { hits: 0, ran: 3, refused: 0 }; 4];
+    let steps = [body_store::StepCounts { hits: 0, ran: 3, refused: 0 }; body_store::Step::COUNT];
     let note = noted(None, Some(&steps)).unwrap();
     assert_eq!(
         note.message,
         "the item store, this build: inference 0 hit, 3 ran, 0 refused; MIR 0 hit, 3 ran, 0 refused; \
-         borrow check 0 hit, 3 ran, 0 refused; constant 0 hit, 3 ran, 0 refused"
+         borrow check 0 hit, 3 ran, 0 refused; constant 0 hit, 3 ran, 0 refused; \
+         lowering 0 hit, 3 ran, 0 refused"
     );
 }

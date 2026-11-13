@@ -1663,8 +1663,7 @@ fn a_lap_keeps_what_was_read_again_and_the_next_lap_gives_it_back() {
 /// `Region::evict`), and pinned again, loading again.
 #[test]
 fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
-    let root = std::env::temp_dir().join(format!("blaze-pool-loader-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let root = blaze_core::temp::TempDir::for_test("blaze-pool-loader-");
     std::fs::create_dir_all(root.join("pool")).unwrap();
     let spec = Spec { sizes: vec![300, 30 << 10, 150 << 10, 5000], fill: 5, rank: Rank::Plain };
     let (bytes, records) = file_bytes(&spec);
@@ -1672,7 +1671,7 @@ fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
     let pool = Pool::new(8, Kernel).unwrap();
     let mut windows = Windows::new(8);
     let window = windows.open(&pool, FileId::Pack(0), bytes.len() as u64, Rank::Plain).unwrap();
-    let theirs = root.clone();
+    let theirs = root.path().to_path_buf();
     let made = move || Ok(blaze_core::threads::Threads::new(theirs, 2));
     let loader = Loader::start(pool, made, TAGS, Cache::Kept).unwrap();
     loader.open(Opened { window, name: FileName::new("pool/pack-0").unwrap(), checks: checks_of(&bytes) });
@@ -1686,7 +1685,6 @@ fn the_loader_pins_a_file_s_records_and_loads_them_again_after_eviction() {
         assert_eq!(loader.pool().held(), 0, "round {round}: every page given back ({swept:?})");
     }
     drop(loader);
-    _ = std::fs::remove_dir_all(&root);
 }
 
 /// The census is the words' own count: loaded pages, those pinned, and what an eviction could

@@ -78,10 +78,15 @@ pub enum Tag {
     /// loaded, counted as each run is made the process's ([`crate::Region::reuse`]) and given
     /// back ([`crate::Region::evict`]). [`Tag::Store`] keeps the store's tables and segments.
     Pool,
+    /// The general heap's arena: the global allocator's pages, which it commits through
+    /// [`crate::Region::reuse`] of a region of this tag, from inside its own commit hook, so
+    /// they pass the memory gate's core. Counted in blaze-mem's committed bytes, so
+    /// [`Snapshot::heap_footprint`] takes them off what the allocator says it committed.
+    Heap,
 }
 
 impl Tag {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 24;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -107,6 +112,7 @@ impl Tag {
         Tag::Other,
         Tag::Solver,
         Tag::Pool,
+        Tag::Heap,
     ];
 
     pub const fn index(self) -> usize {
@@ -138,6 +144,7 @@ impl Tag {
             Tag::Other => "other",
             Tag::Solver => "solver",
             Tag::Pool => "pool",
+            Tag::Heap => "heap",
         }
     }
 
@@ -873,9 +880,12 @@ impl Snapshot {
     /// What the global heap takes of the footprint, given its live bytes `live`
     /// (`blaze_graph::arena::held`): what its allocator committed where it says, which covers the
     /// live blocks and the free pages it keeps; `live` where it does not say, which is all that is
-    /// known of it there.
+    /// known of it there. Less what its arena holds in [`Tag::Heap`] regions: those pages are in
+    /// blaze-mem's committed bytes ([`Snapshot::resident_committed`]) already, and
+    /// [`Snapshot::footprint`] adds both, so they are counted once.
     pub fn heap_footprint(&self, live: u64) -> u64 {
-        self.heap_committed.map_or(live, |committed| committed.max(live))
+        let said = self.heap_committed.map_or(live, |committed| committed.max(live));
+        said.saturating_sub(self.get(Tag::Heap).live)
     }
 
     /// What blaze itself takes of the process's footprint, at most: the global heap's part

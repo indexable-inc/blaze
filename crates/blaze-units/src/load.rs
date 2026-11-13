@@ -47,6 +47,10 @@ pub use self::files::normal_text;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 pub use crate::Read;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread key buffer, uncapped: it keeps the largest key the thread hashed"
+)]
 thread_local! {
     // alloc: grown once to the largest key the thread hashes, then reused by every key.
     static KEY_BYTES: RefCell<(cbor::Writer, Vec<u8>)> = RefCell::new((cbor::Writer::new(), Vec::new()));

@@ -781,6 +781,10 @@ impl Code {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread print buffer, uncapped: it keeps the longest unwind rules printed on the thread"
+)]
 thread_local! {
     /// What [`Code::hash_with`] prints unwind rules into, kept for the thread's next function.
     // alloc: empty, allocates nothing until the first print, then grows to the longest

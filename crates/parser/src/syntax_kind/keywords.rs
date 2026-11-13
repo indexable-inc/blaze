@@ -201,6 +201,10 @@ struct StrictEntry {
 
 /// The first odd multiplier, in a fixed sequence, that sends every strict keyword to a slot of
 /// its own among 256. The sequence is a constant, so the table is the same in every build.
+#[expect(
+    blaze::retry,
+    reason = "not a retry: `tries` bounds a compile-time search over multipliers, and the bound's assert fails the build"
+)]
 const STRICT_MULTIPLIER: u64 = {
     assert!(STRICT_LENGTHS.0 >= 2 && STRICT_LENGTHS.1 <= 8, "a window holds 2 to 8 bytes");
     assert!(STRICT.len() < 256, "an entry's index, the empty slots' included, is a u8");

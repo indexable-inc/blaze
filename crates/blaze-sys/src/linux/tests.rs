@@ -15,6 +15,10 @@ struct Scratch {
 }
 
 impl Scratch {
+    #[expect(
+        blaze::tmp_path,
+        reason = "blaze-sys sits below blaze-core, so its tests cannot use blaze_core::temp::TempDir; this Scratch removes its directory when it drops"
+    )]
     fn new(name: &str) -> Scratch {
         let path = std::env::temp_dir().join(format!("blaze-sys-{name}-{}", getpid()));
         _ = std::fs::remove_dir_all(&path);

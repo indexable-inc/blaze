@@ -21,6 +21,9 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 extern crate rustc_lexer;
 
@@ -262,6 +265,10 @@ impl<T> Parse<T> {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread parse scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The lists a parse's errors are gathered in, kept at the largest they grew to.
     static ERRORS: RefCell<Scratch<SyntaxError>> = const { RefCell::new(Scratch::new()) };

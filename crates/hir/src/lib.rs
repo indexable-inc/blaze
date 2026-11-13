@@ -18,6 +18,9 @@
 //! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![recursion_limit = "512"]
 
 extern crate rustc_type_ir;
@@ -4071,8 +4074,12 @@ impl Impl {
                 .filter_map(|block| TraitImpls::for_block(db, block))
                 .for_each(|impls| impls.for_self_ty(&simplified_ty, &mut extend_with_impls));
         }
+        // Each crate's trait impls for the type alone: of a crate read from impl table pages,
+        // the type's entry and its rows, not the crate's whole table.
+        let key = method_resolution::SelfTyKey(simplified_ty);
         for &seen in method_resolution::loaded_crates(db, krate.id) {
-            TraitImpls::for_crate(db, seen).for_self_ty(&simplified_ty, &mut extend_with_impls);
+            let impls = TraitImpls::in_crate_for_self_ty(db, seen, key);
+            result.extend(impls.iter().copied().map(|id| Impl { id }));
         }
         // An impl in a block is one of its crate as well as of the block.
         let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
