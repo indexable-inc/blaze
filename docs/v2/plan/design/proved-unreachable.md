@@ -13,9 +13,10 @@ fn get(v: &[u32], i: usize) -> u32 {
 
 `blaze::unreachable!()` is an opt-in extension (rule `superset-of-rust`): it compiles only when
 blaze proves no path reaches it. Otherwise it is an error at the site naming the function and
-what is missing: "`get`: can't show this `blaze::unreachable!()` is never reached: the path
-through line 2 (`i < v.len()` is false) leads here". There is no fallback: what the prover
-cannot show is refused, never passed (rule `no-fallback`).
+what is missing: "`get`: can't prove this `blaze::unreachable!()` is never reached: can't show
+`i < v.len()` here: no check before this branch rules the path out". There is no fallback:
+what the prover cannot show is refused, never passed (rule `no-fallback`), and a body it
+cannot analyse (it does not lower, its proof does not settle) is refused saying so.
 
 The same prover discharges panic sites. `#[blaze::nopanic]` (effects.md) and the lints that
 count a body's panics (`general_facts::panic_sites`: `panic_in_drop`, `unwind_across_ffi`) stop
@@ -32,9 +33,12 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
   blaze::unreachable!()")`: at run time it is a panic, never undefined behaviour, so a build
   that skipped the check is still sound. A proved site is dead code the optimizer may delete
   (not built: `SpendFacts` reads the proof, facts.md).
-- **The check.** The lint `blaze::unreachable`, `forbid` (an `allow` of it is an error): one
-  finding per unproved site. Sites are found by resolution (the call's macro is the builtin),
-  never by text.
+- **The check.** The lint `blaze::unreachable` (`blaze-lints`, `proved_unreachable.rs`),
+  `deny` by default as `nopanic` is (it fires only where the code wrote the macro): one finding
+  per unproved site. Sites are found by resolution (the call's macro is the builtin), never by
+  text. An `#[expect(blaze::unreachable)]` is a written waiver; the site then panics if
+  reached. Losing alternative: a hard error outside the lints (`hir::diagnostics`), which no
+  level could waive but which would be a second place panic proofs are reported.
 - **The prover.** `hir_ty_pure::reach` (rule `semantics-in-front-end`; beside `loops`, the other
   analysis the effect walk reads). `reach::prove(db, env, body) -> Reach` is a function of one
   body's runtime MIR (after drop elaboration and `transform::asserts`, before any optimization)
@@ -60,19 +64,25 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
    - the type of a term: an unsigned integer is `>= 0`, a length is `>= 0`, a discriminant of
      `Option`/`Result` is 0 or 1;
    - the models (`reach/models.rs`): what a few std functions return, by path, as
-     `effect_attrs::ROWS` are. `len`/`is_empty` of a slice, array, `str`, `Vec`, `String`
+     `effect_attrs::ROWS` are. `len`/`is_empty` of a slice, `str`, `Vec`, `String`
      (`Len`), `Option::{is_some, is_none}`, `Result::{is_ok, is_err}` (`Discr`),
-     `<[T]>::{first, last, get}` (`Some` exactly when the length allows), `NonZero::get`
-     (`!= 0`), `Range<int>`'s `Iterator::next` (`Some(x)` implies `start <= x < end`), and
-     `IntoIterator::into_iter` of a `Range` (itself). A model also states when a call panics:
+     `<[T]>::{first, last, get}` (`Some` exactly when the length allows), `Vec`'s and
+     `String`'s `deref`/`as_slice`/`as_str` (a view of the same length), `NonZero::get`
+     (`!= 0`), `Range<int>`'s `Iterator::next` (`Some(x)` implies `start <= x < end`, and the
+     end stays), and `IntoIterator::into_iter` of a `Range` (itself). A model also states when a call panics:
      `Option::{unwrap, expect}` unless `Some`, `Result::{unwrap, expect}` unless `Ok`,
      `{unwrap_err, expect_err}` unless `Err`, `Index::index`/`IndexMut::index_mut` of a slice,
      array or `Vec` by `usize` unless `i < len`.
 
    A site is discharged when the state before it entails its condition (an `Assert`'s, a
    model's panic condition) or when no feasible edge reaches its block. Entailment is small and
-   decidable: syntactic equality of terms, constant bounds from the facts and the types, one
-   step of transitivity, and implications whose premise holds.
+   decidable: syntactic equality of terms, constant bounds from the facts and the types (one
+   step through a relation: `i < n` and `n <= MAX` give `i <= MAX - 1`), one step of
+   transitivity, and implications whose premise holds. An overflow check (`i += 1` in a crate
+   that keeps them) is discharged when the exact result fits the type for every value within
+   the operands' bounds; `usize` is the target's width, never a guess. A `bool` two paths
+   write (`a && b` is lowered to one) keeps, as implications, what each of its values meant
+   on the paths that gave it.
 
    **Soundness of the memory model.** A term is a value, not a place. A shared borrow `&p`
    is a reference *to the value `p` has then* (`RefTo(v)`): safe code cannot change `p` while
@@ -83,9 +93,11 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
    a `&mut` or a raw pointer took. A slice's length is the reference's own metadata, so it
    survives the epoch. An unknown made at a program point is forgotten (with every fact that
    mentions it) when the point runs again; where two paths meet, a local with two values gets
-   one unknown per (block, local) and only the facts both paths hold survive, so a loop is
-   iterated to a fixed point. A coroutine body and a `for const` loop are not analysed.
-   Arithmetic is not followed in this slice (`i + 1` is an unknown).
+   one unknown per (block, local) (per field for aggregates of one shape, so a range's end
+   survives its loop) and only the facts both paths hold survive, so a loop is iterated to a
+   fixed point; a joined value's constant bounds are widened after one turn. A coroutine body,
+   inline assembly and a `for const` loop are not analysed (refused). Arithmetic is not
+   followed in this slice (`i + 1` is an unknown).
 3. **Contracts** (spec only). `#[blaze::requires(i < self.len())]` on a function is a
    precondition every caller must prove at the call with tier 2's entailment (a refusal names
    the call and the clause), and a fact the callee's body starts with; `ensures` is a fact at
@@ -153,9 +165,14 @@ function, the type the expression must have (inference's type at the site) and, 
 what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`; in scope:
 `cached`". The prover never discharges a `todo!()`: it is unfinished, not dead.
 
-- **The gate decides, not the profile.** Every local build, dev and `--release`, warns. The
-  merge gate and a build for a release deny it: they run `blaze check` with
-  `--deny blaze::todo` (`.github/workflows/blaze.yaml`'s workspace check, `release.yaml`).
+- **The gate decides, not the profile.** Every local build, dev and `--release`, warns
+  (`blaze::todo` is a `blaze::general` lint; the profile is not an input of it). The merge
+  gate and a build for a release deny it with the lint's level, `--deny blaze::todo`. Built:
+  the lint and its levels (tests: a warning with and without `debug_assertions`, an error
+  under `--deny=blaze::todo`, test code allowed). Not built: the line in
+  `.github/workflows/blaze.yaml`'s workspace check and in `release.yaml` that passes the
+  level. blaze's own workspace already denies every general lint through its
+  `lints-ratchet` (docs/lints.md), locally too, and has no `todo!()` outside fixtures.
   Test code (`#[test]`, `#[cfg(test)]`) is allowed.
 - **At run time** a reached `todo!()` fails only its job with a typed error naming the site
   (rule `panics-fail-one-job`): the panic payload is `blaze_core::Todo { file, line, function }`,
@@ -167,8 +184,10 @@ what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`;
 ## Proof and tests
 
 `crates/blaze-lints/src/blaze/reach_tests.rs`: per discharged pattern one test that it passes
-and one near miss that is still reported (the check is on another index, the guard does not
-dominate, the value is reassigned between guard and use, the vector is changed between). The
+and near misses that are still reported (the check is on another index, slice or option, the
+guard does not dominate, the value is reassigned between guard and use, the vector is cleared
+between, the loop's bound is another length), for `nopanic`, for `panic_in_drop` and for
+`blaze::unreachable!()` itself; a crate's own `blaze::unreachable!` keeps its meaning. The
 invariant: *a site the prover discharges is not reached, or its condition holds, in every run
 of the MIR*. Next level of evidence (not built): a Hegel test that runs random small bodies in
 the MIR evaluator and checks no discharged site fails, with a planted bug (a fact kept across a

@@ -41,10 +41,12 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   "error_union_widen"]`, which a coercion to a union calls) and a blanket `From<S>` for a
 #   union over them, which no type but an error union can satisfy. Unstable under
 #   `blaze_error_unions`; nothing else in library/ refers to it.
-# - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own attribute
+# - core/src/blaze.rs (new) with its `pub mod blaze;` in core/src/lib.rs: blaze's own
 #   macros, `contract_test` (`#[rustc_builtin_macro]`, expanded by blaze's `hir-expand`), which
-#   the attribute path `blaze::contract_test` names in every crate. Unstable under
-#   `blaze_verify`; nothing else in library/ refers to it
+#   the attribute path `blaze::contract_test` names in every crate, and `unreachable`
+#   (`#[rustc_builtin_macro(blaze_unreachable)]`), which the call `blaze::unreachable!()` names
+#   where the path names nothing else (docs/v2/plan/design/proved-unreachable.md). Unstable
+#   under `blaze_verify` and `blaze_unreachable`; nothing else in library/ refers to it
 #   (docs/v2/plan/design/contracts.md, part 2). It also holds `ConstExprs`, unstable under
 #   `blaze_const_exprs`, which only puts that language feature's name in the library's table of
 #   features (docs/v2/plan/design/ownership.md).
