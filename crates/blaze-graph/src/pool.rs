@@ -2167,7 +2167,8 @@ impl Shared {
                     self.idle.0.fetch_add(SEARCHING.wrapping_sub(SLEEPING), Ordering::SeqCst);
                     #[cfg(not(blaze_check))]
                     slot.parker.unpark();
-                    #[cfg(blaze_check)]
+                    // A driven worker sleeps in its driving thread's park (`block`), which no
+                    // parker reaches: that thread is unparked too, as `unpark_workers` does.
                     if let Some(thread) = slot.thread.get() {
                         thread.unpark();
                     }
