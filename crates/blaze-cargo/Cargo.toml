@@ -46,7 +46,9 @@ blaze-new.workspace = true
 blaze-tree = { workspace = true, optional = true }
 blaze-metadata = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# `preserve_order`: `blaze agents install` merges into an agent's settings.json and keeps the
+# order of what was there (`cli/agents.rs`).
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing.workspace = true
 cfg.workspace = true
 intern.workspace = true

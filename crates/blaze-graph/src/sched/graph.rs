@@ -926,9 +926,14 @@ impl Graph {
     /// build that stopped names, as a parked job's own spans are on no thread while it waits.
     pub(crate) fn waiting(&self, into: &mut Vec<(JobId, StallWait)>) {
         into.clear();
+        self.waiting_each(|job, wait| into.push((job, wait)));
+    }
+
+    /// Each job that waits in the graph and what on, given to `each`; allocates nothing.
+    pub(crate) fn waiting_each(&self, mut each: impl FnMut(JobId, StallWait)) {
         for j in self.jobs.ids() {
             if let Some(wait) = self.wait_of(j as u32) {
-                into.push((JobId(j as u32), wait));
+                each(JobId(j as u32), wait);
             }
         }
     }
@@ -1010,6 +1015,25 @@ impl Graph {
             self.unlink(job.0);
             into.push((job, wait, cycle));
         }
+    }
+
+    /// `job`'s wait ends, ended by no one, for it to wake and fail: the task watchdog found it
+    /// stuck. Its wait, or `None` where waking it is not safe or there is no wait: a job that
+    /// stops a pool of its own (see [`Graph::unwait_member`]), and one that waits on a counter
+    /// whose jobs still run, which borrow its scope's frame until they end.
+    pub(crate) fn unwait_one(&mut self, job: JobId) -> Option<StallWait> {
+        let wait = self.wait_of(job.0)?;
+        match self.jobs[job.0 as usize].wait {
+            Target::Member(_) => return None,
+            Target::Counter(counter)
+                if self.counters[counter as usize].left != self.counters[counter as usize].held =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        self.unlink(job.0);
+        Some(wait)
     }
 
     /// `job`, waiting, leaves its wait's list of waiters: its wait is over, ended by no one.

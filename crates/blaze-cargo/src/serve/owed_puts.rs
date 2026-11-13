@@ -1,14 +1,18 @@
 //! [`OwedPuts`]: a batch of store puts someone still owes the store. A worker never writes the
 //! store; it hands its puts on to the loop, which does. A batch that is dropped on the way (an
 //! early return, a `?`, a `let _ =`) is lost, and when a saved session already names the
-//! entries in it, every later build that reads through that session fails. So a batch is a
-//! value that must be spent: [`OwedPuts::hand_on`] gives the puts to whoever stores them,
-//! [`OwedPuts::discard`] drops them saying why that is right. Dropped any other way, it is a
-//! bug named by where the batch was made: a panic in a debug build, and in a release build an
-//! error logged and counted ([`dropped`]).
+//! entries in it, every later build that reads through that session fails ("its entry is not
+//! in the store"). So a batch is a value that must be spent: [`OwedPuts::hand_on`] gives the
+//! puts to whoever stores them, [`OwedPuts::discard`] drops them saying why that is right.
 //!
-//! Not `#[blaze::sans_io]`: its `Drop` asks `std::thread::panicking()`, which the sans-IO lint
-//! counts as a thread effect.
+//! The type is `#[blaze::linear]` (crates/hir-ty-linear, docs/v2/plan/design/linear.md): a
+//! path that drops a batch any other way is a compile error, refused with the borrow check,
+//! naming the batch, the exit that drops it (`return` or `?` at its line, a scope's end, an
+//! arm that does not move it) and the two functions that spend it. It has no `Drop` impl on
+//! purpose: a `Drop` would be its abandonment path, which lets an error exit (`?`, a returned
+//! `Err`) drop a live batch silently, and a failed build loses puts a session names as surely
+//! as a finished one. A panic is not checked; unwinding drops the puts with the batch.
+#![blaze::sans_io]
 #![expect(
     dead_code,
     reason = "made ahead of its callers: `Phases::body_puts`, `BodyPuts::puts` and `CarryOut::puts` move to it next"
@@ -18,28 +22,17 @@
     reason = "unwired until `Phases::body_puts`, `BodyPuts::puts` and `CarryOut::puts` move onto it"
 )]
 
-use std::{
-    panic::Location,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::panic::Location;
 
 use super::work::Put;
 
-/// Batches of puts dropped without being handed on or discarded since the process started.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// How many batches of puts were dropped while still owed, since the process started: zero in
-/// a correct blaze.
-pub(crate) fn dropped() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
-}
-
-/// A batch of puts owed to the store, with where it was made. `#[must_use]`, and checked on
-/// drop: spend it with [`OwedPuts::hand_on`] or [`OwedPuts::discard`].
+/// A batch of puts owed to the store, with where it was made. Spend it with
+/// [`OwedPuts::hand_on`] or [`OwedPuts::discard`]; nothing else ends one.
 ///
-/// The invariant: a non-empty batch leaves only through `hand_on` or `discard`; any other drop
-/// is counted in [`dropped`], and panics in a debug build unless a panic is already unwinding.
-/// An empty batch owes nothing and drops freely.
+/// The invariant: a batch, empty or not, leaves a body only through `hand_on`, `discard`, a
+/// move into a function that takes it by value, or the body's return value; checked by the
+/// front end on every path that does not unwind.
+#[blaze::linear]
 #[must_use = "store puts are owed: hand them on to the loop (`hand_on`) or `discard` them with a reason"]
 #[derive(Debug)]
 pub(crate) struct OwedPuts {
@@ -78,65 +71,39 @@ impl OwedPuts {
     }
 
     /// Hands the puts on to the one who stores them: the batch is paid.
-    pub(crate) fn hand_on(mut self) -> Vec<Put> {
-        std::mem::take(&mut self.puts)
+    #[blaze::consumes]
+    pub(crate) fn hand_on(self) -> Vec<Put> {
+        let OwedPuts { puts, made: _ } = self;
+        puts
     }
 
     /// Drops the puts on purpose; `reason` says why nothing is lost by it ("the test drops a
     /// serve's puts, as a loop that never puts them would").
-    pub(crate) fn discard(mut self, reason: &'static str) {
-        if !self.puts.is_empty() {
+    #[blaze::consumes]
+    pub(crate) fn discard(self, reason: &'static str) {
+        let OwedPuts { puts, made } = self;
+        if !puts.is_empty() {
             tracing::debug!(
                 target: "blaze",
-                puts = self.puts.len() as u64,
-                made = %self.made,
+                puts = puts.len() as u64,
+                made = %made,
                 "store puts discarded: {reason}"
             );
         }
-        self.puts.clear();
     }
 }
 
 impl Default for OwedPuts {
-    /// An empty batch: owes nothing.
+    /// An empty batch: owed all the same, spent like any other.
     #[track_caller]
     fn default() -> OwedPuts {
         OwedPuts::new(Vec::new())
     }
 }
 
-impl Drop for OwedPuts {
-    fn drop(&mut self) {
-        if self.puts.is_empty() {
-            return;
-        }
-        // Never a second panic while one unwinds: that aborts the process and hides the first.
-        lost(self.made, self.puts.len(), cfg!(debug_assertions) && !std::thread::panicking());
-    }
-}
-
-/// A batch of `puts` puts made at `made` was dropped while owed: counted, then a panic when
-/// `panic` (a debug build, not unwinding), else an error logged.
-fn lost(made: &'static Location<'static>, puts: usize, panic: bool) {
-    DROPPED.fetch_add(1, Ordering::Relaxed);
-    if panic {
-        panic!(
-            "{puts} store puts made at {made} were dropped without being handed on or discarded \
-             (`OwedPuts`): the store never gets them, while what named them may be kept"
-        );
-    }
-    tracing::error!(
-        target: "blaze",
-        puts = puts as u64,
-        made = %made,
-        "store puts made at {made} were dropped without being handed on or discarded (`OwedPuts`): \
-         the store never gets them, while what named them may be kept"
-    );
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{OwedPuts, Put, dropped, lost};
+    use super::{OwedPuts, Put};
 
     fn puts(n: u8) -> Vec<Put> {
         (0..n)
@@ -153,6 +120,7 @@ mod tests {
         let made = puts(3);
         let owed = OwedPuts::new(made.clone()); // clone: compared below
         assert_eq!(owed.len(), 3);
+        assert_eq!(owed.made().file(), file!());
         assert_eq!(owed.hand_on(), made);
     }
 
@@ -166,42 +134,6 @@ mod tests {
     #[test]
     fn discarded_with_a_reason_is_fine() {
         OwedPuts::new(puts(2)).discard("the test drops them on purpose");
-    }
-
-    #[test]
-    fn an_empty_batch_drops_freely() {
-        drop(OwedPuts::default());
-        drop(OwedPuts::new(Vec::new()));
-    }
-
-    /// The invariant: a batch dropped while owed panics in a debug build, naming the line that
-    /// made it. The control is [`handed_on_gives_every_put_back`]: the same batch, spent.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn dropped_bare_panics_naming_where_it_was_made() {
-        let mut made = None;
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let owed = OwedPuts::new(puts(1));
-            made = Some(owed.made());
-            drop(owed);
-        }));
-        let made = made.expect("the batch was made before the drop");
-        assert_eq!(made.file(), file!());
-        let payload = caught.expect_err("a batch dropped while owed panics in a debug build");
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .expect("the panic carries a message");
-        let at = format!("{}:{}:{}", made.file(), made.line(), made.column()); // alloc: a test's expected text
-        assert!(message.contains(&at), "the panic names {at}: {message}");
-    }
-
-    /// The release path, through the function the `Drop` calls, without the panic: counted.
-    #[test]
-    fn dropped_in_release_is_counted() {
-        let before = dropped();
-        lost(std::panic::Location::caller(), 4, false);
-        assert!(dropped() > before, "a lost batch is counted");
+        OwedPuts::default().discard("an empty batch, spent like any other");
     }
 }

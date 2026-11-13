@@ -6,9 +6,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["-I", "${CLAUDE_PLUGIN_ROOT}/claude/hooks/check.py"],
+            "command": "blaze agents hook claude",
             "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "blaze agents hook claude",
+            "timeout": 5
           }
         ]
       }

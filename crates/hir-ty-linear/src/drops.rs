@@ -313,7 +313,9 @@ fn report<'db>(
     if let Exit::Early(_, _) = exit {
         labels.push((state.span, "and dropped here, at the end of its scope".to_owned())); // alloc: error path
     }
-    let mut notes = vec![CONSUME.to_owned()]; // alloc: error path
+    let mut notes = Vec::new(); // alloc: error path
+    notes.extend(names::consumed_by(types, ty));
+    notes.push(CONSUME.to_owned()); // alloc: error path
     if by_try {
         notes.push(ABANDON.to_owned()); // alloc: error path
     }
@@ -428,6 +430,9 @@ pub(crate) fn check_coroutine<'db>(
         }
         let value = names::place(types.db, body, local, &[]);
         let shown = names::ty(types.db, body, ty);
+        let mut notes = Vec::new(); // alloc: error path
+        notes.extend(names::consumed_by(types, ty));
+        notes.push(CONSUME.to_owned()); // alloc: error path
         let span = match names::binding_of(body, local) {
             Some(binding) => MirSpan::BindingId(binding),
             None => first_use(body, local),
@@ -438,8 +443,8 @@ pub(crate) fn check_coroutine<'db>(
                 "`{value}` holds a `#[blaze::linear]` `{shown}` in an `async` body: the future \
                  may be dropped at any `.await`, which drops it without consuming it"
             ),
-            labels: Vec::new(),              // alloc: error path, empty
-            notes: vec![CONSUME.to_owned()], // alloc: error path
+            labels: Vec::new(), // alloc: error path, empty
+            notes,
         });
     }
 }

@@ -1337,7 +1337,8 @@ fn left_to_the_next() -> Result<(), String> {
         (def, Step::Mir, MIR_SCHEMA),
         (def, Step::Borrowck, borrowck_schema(db, def, CHECKER)),
     ];
-    drop(claim);
+    // The keep failed: its claim gives its runs back (a `Claim` is linear: never a bare drop).
+    claim.give_back();
     let next = claim_keeps(db).expect("an item store");
     let lost: Vec<_> = runs.iter().filter(|run| !kept.contains(*run) && !next.steps.contains(*run)).collect();
     if !lost.is_empty() {

@@ -75,6 +75,8 @@ pub(crate) mod signals;
 mod still;
 #[cfg(all(unix, feature = "native"))]
 mod stop;
+#[cfg(all(unix, feature = "native"))]
+mod stuck;
 #[cfg(test)]
 mod tests;
 // A daemon that exits once no connection holds it (`BLAZE_DAEMON_EXIT_UNHELD`).
@@ -1265,14 +1267,11 @@ pub(crate) fn engine(
         blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
     tracing::info!(target: "blaze", "{cores}");
     let threads = cores.budget.get();
-    // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
-    let duckdb =
-        observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
-    // Unset: the pinned DuckDB, where a reader of the history has laid it out (`cli/duckdb.rs`
-    // fetches it on first use; the daemon's start fetches nothing).
-    let duckdb = duckdb.or_else(|| {
-        observe::Pin::host().map(|pin| pin.laid_out(&paths.state)).filter(|it| it.is_file())
-    });
+    // Read once, unchecked: the DuckDB the explorer runs, resolved when it starts
+    // (`observe::Profiling::duckdb`; unset, the pin a reader of the history laid out). A value
+    // naming nothing fails the explorer's queries alone, never this start or a build (a daemon
+    // refused to start on a `BLAZE_DUCKDB` naming a deleted store path, 2026-11-13).
+    let duckdb = std::env::var_os(observe::DUCKDB);
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
@@ -1617,6 +1616,9 @@ fn listen(
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
+    // The task watchdog: a task that makes no progress for its bound is named, with what it
+    // waits on and who holds it, and its job fails (`stuck`).
+    let tasks_watch = stuck::arm(daemon.pulse(), blaze_graph::exec::shared().workers())?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
     #[cfg(unix)]
@@ -1659,6 +1661,7 @@ fn listen(
             break;
         }
     }
+    tasks_watch.disarm();
     guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),

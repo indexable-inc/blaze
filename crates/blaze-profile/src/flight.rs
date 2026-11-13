@@ -4868,6 +4868,67 @@ pub fn threads_now() -> Vec<ThreadNow> {
     threads
 }
 
+/// A thread running a scheduler job now, as the task watchdog reads it ([`crate::tasks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub tid: u64,
+    /// The job running on it, as `blaze_graph::sched::observed` numbers it.
+    pub job: u64,
+    /// Its innermost open span (0 for none), and when that opened, on [`clock::mono_ns`].
+    pub span: u64,
+    pub span_since_ns: u64,
+    /// The build its innermost span is for, 0 for none.
+    pub build: u32,
+    /// The plane node of the innermost daemon `task` span it is inside, if any.
+    pub node: Option<u64>,
+    /// Its own CPU time, where the system lets another thread read it.
+    pub cpu_ns: Option<u64>,
+}
+
+/// Every live thread running a job now into `into` (cleared first), with `rings` as scratch:
+/// atomics and each ring's leave lock, nothing allocated once both have grown. A thread running
+/// no job (a pool worker between jobs, a driver's thread) is no task of the watchdog's: its
+/// waits are for work, and work that comes is no progress of its own.
+pub(crate) fn running_into(rings: &mut Vec<&'static Ring>, into: &mut Vec<Running>) {
+    rings.clear();
+    rings.extend(lock(&RINGS).iter().copied());
+    into.clear();
+    let scale = clock::Scale::now();
+    for ring in rings.iter() {
+        let job = ring.job.load(Ordering::Relaxed);
+        if job == 0 || !ring.live.load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = (ring.depth.load(Ordering::Acquire) as usize).min(OPEN_MAX);
+        let innermost = ring.innermost();
+        let now_ticks = clock::ticks();
+        let now_ns = clock::mono_ns() as u64;
+        let (mut since_ns, mut build) = (now_ns, 0);
+        let opened = |id: u64| {
+            (id != 0 && id != UNRECORDED).then(|| by_number(ring_of(id))?.opened(id)).flatten()
+        };
+        if let Some(opened) = opened(innermost) {
+            since_ns = now_ns.saturating_sub(scale.ns(now_ticks.saturating_sub(opened.start)));
+            build = opened.build;
+        }
+        let node = ring.entered[..depth]
+            .iter()
+            .rev()
+            .find_map(|it| opened(it.load(Ordering::Relaxed))?.said().value::<span::col::Node>());
+        let (tid, _) = ring.current();
+        let cpu_ns = lock(&ring.sampled).cpu_ns();
+        into.push(Running {
+            tid: u64::from(tid),
+            job,
+            span: innermost,
+            span_since_ns: since_ns,
+            build,
+            node,
+            cpu_ns,
+        });
+    }
+}
+
 // --- The Chrome trace of a window ---------------------------------------------------------
 
 /// Microseconds since the Unix epoch of instants, from one reading of both clocks.

@@ -1087,8 +1087,55 @@ pub struct Seen {
     pub hash: Option<[u8; 32]>,
 }
 
+/// What a job's write waits with ([`Writer::write_wait`]): the writes asked and not applied,
+/// and the readers it waits for. What `blaze debug inspect` shows of a job whose readers are
+/// held, and what a stall of a write names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteWait {
+    /// Build scripts' runs asked for.
+    pub runs: u32,
+    /// Proc macros' loads asked for.
+    pub macros: u32,
+    /// Device builds' MSL asked for.
+    pub msls: u32,
+    /// The front end asks to let go of what nothing still to compile reads
+    /// (`unit::release::Release::due`).
+    pub release: bool,
+    /// The readers of the front end alive besides the writer's own hold: tasks', and any
+    /// that outlived its task.
+    pub readers: u32,
+}
+
+/// One job's write that waits, as `blaze debug inspect` and a stall show it
+/// (`job::Jobs::write_waits`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteWaiting {
+    /// The job's workspace root.
+    pub root: String,
+    /// How long it has waited, on the loop's clock.
+    pub waited_ms: u64,
+    /// What it waits with.
+    pub wait: WriteWait,
+    /// The tasks the loop holds until it applies.
+    pub held: u32,
+    /// The node of the task applying it, while one is.
+    pub applying: Option<u32>,
+}
+
+/// What a run of user code asks of its job's front end ([`Runs`]): a build script's run
+/// applied, as [`Writer::ran`]. The job's writer, or the loop's record of what is asked while
+/// a task holds the writer (`job::Writing`), which hands it to the writer as it comes back.
+pub trait Asks {
+    /// As [`Writer::ran`]: checked now, or as the writer comes back, and applied by its next
+    /// [`Writer::apply`].
+    fn ran(&mut self, run: usize, ran: blaze_lower::Ran) -> Result<(), ApiError>;
+}
+
 /// What of a job's front end only the loop writes. Its writes are asked for, then applied
-/// together by [`Writer::apply`] once no [`Steps::Reader`] of it is alive (the module's docs).
+/// together by [`Writer::apply`] once no [`Steps::Reader`] of it is alive (the module's docs),
+/// on a task of the job that holds the writer (`job::Does::Write`), never on the loop.
 pub trait Writer<S: Steps>: Send + 'static {
     /// A reader of the front end as it stands, for one task about to be posted; none while a
     /// write is asked for and not applied, when the loop holds the task instead.
@@ -1112,6 +1159,16 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
     /// loop posts no reading task of the job until [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
+    /// Whether no reader of the front end is alive, every task's dropped: one load of a
+    /// reference count. The loop posts the write [`Writer::waiting`] asks for, as a task that
+    /// holds the writer, only then (`job::Does::Write`), so [`Writer::apply`] runs off the loop
+    /// and never finds a reader.
+    fn idle(&self) -> bool;
+    /// What a write that waits waits with, for the loop's status and its stall to say
+    /// ([`WriteWait`]): read only, no query.
+    fn write_wait(&self) -> WriteWait {
+        WriteWait::default()
+    }
     /// On the loop, as unit `unit`'s first task starts: it is open until [`Writer::compiled`].
     fn began(&mut self, unit: usize) {
         let _ = unit;
@@ -1441,13 +1498,14 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
 /// User code of a job run through the loop's driver: it asks with effects whose tags are in
 /// the range it was given (`tags..tags + 2^32`), takes their completions, and reports. Each
 /// method that can end it says so with `Some(ok)`; after that it is asked nothing more. A
-/// build script's is given its job's [`Writer`] to apply its run with; tests and runs, none.
+/// build script's is given what asks its job's [`Writer`] to apply its run ([`Asks`]); tests
+/// and runs, none.
 pub trait Runs<S: Steps>: Send + 'static {
     /// Asks for what it runs first; it may end at once (a result the store kept).
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut S::Writer>,
+        writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;
@@ -1456,7 +1514,7 @@ pub trait Runs<S: Steps>: Send + 'static {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut S::Writer>,
+        writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;

@@ -11,6 +11,7 @@
 
 mod alloc;
 mod arc_clone_only_borrowed;
+mod as_cast;
 mod async_fn;
 mod blocking_in_async;
 mod blocking_on_pool;
@@ -86,11 +87,15 @@ mod lenient_deserialize;
 mod lenient_deserialize_tests;
 mod lock_across_query;
 mod lock_held_across_slow;
+mod lock_order;
+#[cfg(test)]
+mod lock_order_tests;
 mod loops;
 mod implicit_overflow;
+#[allow(dead_code, reason = "its check is `as_cast`'s now; `implicit_overflow` reads its facts until the two share one module")]
+mod lossy_as;
 #[cfg(test)]
 mod implicit_overflow_tests;
-mod lossy_as;
 mod many_bools;
 mod missing_size_hint;
 mod mut_ref;
@@ -128,6 +133,9 @@ mod reads_positions;
 mod relaxed_publish;
 mod retry;
 mod sans_io_core;
+mod roles;
+#[cfg(test)]
+mod roles_tests;
 mod scratch_in_loop;
 mod seqcst_unexplained;
 mod shared_collection_lock;
@@ -150,6 +158,7 @@ mod todo;
 #[cfg(test)]
 mod thread_local_tests;
 mod tmp_path;
+mod truncating_cast;
 mod unbounded_from_input;
 mod unbounded_test_wait;
 mod unbounded_wait;
@@ -284,7 +293,7 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
-    LossyAs,
+    AsCast,
     ImplicitOverflow,
     GlobalState,
     AsyncFn,
@@ -322,6 +331,13 @@ pub enum Lint {
     TmpPath,
     NarrowedLen,
     ProcessStatic,
+    // docs/v2/plan/design/effect-summary.md: the lints of the one effect summary.
+    LoopTurnEffects,
+    SyncOnAnswerPath,
+    LockOrder,
+    LockAcrossWait,
+    // docs/lints.md#as_cast: the wrapping operations `as_cast`'s fix writes.
+    TruncatingCast,
 }
 
 /// Which workspaces a lint is for.
@@ -368,6 +384,13 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::ProgramLifetime,
     // Fires only on a `blaze::unreachable!()`.
     Lint::Unreachable,
+    // Fire only on a function marked with its role (docs/v2/plan/design/effect-summary.md).
+    Lint::LoopTurnEffects,
+    Lint::SyncOnAnswerPath,
+    // Not asked for: a lock-order cycle is a deadlock and a guard across a thread's wait a
+    // convoy wherever they are written.
+    Lint::LockOrder,
+    Lint::LockAcrossWait,
 ];
 
 /// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
@@ -396,7 +419,7 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::StdUse, false),
     // What the edition removes or respells, and the marks it writes: a workspace getting ready
     // for the edition turns the group on.
-    (Lint::LossyAs, false),
+    (Lint::AsCast, false),
     // Its advice (`checked_*`, `wrapping_*`, `try_from`) is Rust's; a workspace or crate turns
     // it on where arithmetic must mean one thing in every profile (`blaze-std`, `blaze-mem`).
     (Lint::ImplicitOverflow, false),
@@ -471,7 +494,8 @@ pub(crate) const YIELDS_TO_INTERNAL: &[Lint] = &[Lint::DosHasherOnInput];
 
 /// The old names of renamed lints, after `blaze::`, and what each stands for now; the compile's
 /// registry has them as renamed too (`blaze_lint_defs`' `RENAMED`).
-pub(crate) const RENAMED: &[(&str, Lint)] = &[("std_hashmap", Lint::DefaultHasher)];
+pub(crate) const RENAMED: &[(&str, Lint)] =
+    &[("std_hashmap", Lint::DefaultHasher), ("lossy_as", Lint::AsCast)];
 
 /// The `clippy.toml` key of the modules `env_read` allows, which the configuration's load
 /// checks is a list of paths.
@@ -565,7 +589,7 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
-        Lint::LossyAs,
+        Lint::AsCast,
         Lint::ImplicitOverflow,
         Lint::GlobalState,
         Lint::AsyncFn,
@@ -603,6 +627,11 @@ impl Lint {
         Lint::TmpPath,
         Lint::NarrowedLen,
         Lint::ProcessStatic,
+        Lint::LoopTurnEffects,
+        Lint::SyncOnAnswerPath,
+        Lint::LockOrder,
+        Lint::LockAcrossWait,
+        Lint::TruncatingCast,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -656,6 +685,14 @@ impl Lint {
             | Lint::Noalloc
             | Lint::Nonblocking
             | Lint::Pure
+            // Fire only on functions marked with their role (`#[blaze::bounded_turn]`,
+            // `#[blaze::answers_request]`), `deny` there.
+            | Lint::LoopTurnEffects
+            | Lint::SyncOnAnswerPath
+            // A lock-order cycle is a deadlock and a guard across a thread's wait a convoy in
+            // any code that takes std's or `lock_api`'s locks.
+            | Lint::LockOrder
+            | Lint::LockAcrossWait
             // Fires only in a crate with `#![blaze::capabilities]`, `deny` there.
             | Lint::Capabilities
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
@@ -675,7 +712,7 @@ impl Lint {
             }
             // What the blaze edition removes or respells; right for any crate getting ready
             // for it.
-            Lint::LossyAs | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
+            Lint::AsCast | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
             // Arithmetic whose meaning is the profile's, which the edition removes.
             Lint::ImplicitOverflow => Kind::Edition,
             // What the blaze edition writes at a crate's border: an effect the code already has.
@@ -770,7 +807,10 @@ impl Lint {
             | Lint::Unwired
             | Lint::TmpPath
             | Lint::NarrowedLen
-            | Lint::ProcessStatic => Kind::Internal,
+            | Lint::ProcessStatic
+            // The wrapping operations `as_cast`'s fix writes: a list of places to decide,
+            // allowed in blaze's ratchet too.
+            | Lint::TruncatingCast => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -889,7 +929,7 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
-            Lint::LossyAs => "lossy_as",
+            Lint::AsCast => "as_cast",
             Lint::ImplicitOverflow => "implicit_overflow",
             Lint::GlobalState => "global_state",
             Lint::AsyncFn => "async_fn",
@@ -925,6 +965,11 @@ impl Lint {
             Lint::TmpPath => "tmp_path",
             Lint::NarrowedLen => "narrowed_len",
             Lint::ProcessStatic => "process_static",
+            Lint::LoopTurnEffects => "loop_turn_effects",
+            Lint::SyncOnAnswerPath => "sync_on_answer_path",
+            Lint::LockOrder => "lock_order",
+            Lint::LockAcrossWait => "lock_across_wait",
+            Lint::TruncatingCast => "truncating_cast",
         }
     }
 
@@ -1022,7 +1067,7 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
-            Lint::LossyAs => concat!(general_docs!(), "#lossy_as"),
+            Lint::AsCast => concat!(general_docs!(), "#as_cast"),
             Lint::ImplicitOverflow => concat!(general_docs!(), "#implicit_overflow"),
             Lint::GlobalState => concat!(general_docs!(), "#global_state"),
             Lint::AsyncFn => concat!(general_docs!(), "#async_fn"),
@@ -1058,6 +1103,13 @@ impl Lint {
             Lint::TmpPath => concat!(docs!(), "#tmp_path"),
             Lint::NarrowedLen => concat!(docs!(), "#narrowed_len"),
             Lint::ProcessStatic => concat!(docs!(), "#process_static"),
+            Lint::TruncatingCast => concat!(docs!(), "#truncating_cast"),
+            Lint::LoopTurnEffects | Lint::SyncOnAnswerPath => {
+                concat!(general_docs!(), "#loop_turn_effects-sync_on_answer_path")
+            }
+            Lint::LockOrder | Lint::LockAcrossWait => {
+                concat!(general_docs!(), "#lock_order-lock_across_wait")
+            }
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -1161,6 +1213,21 @@ impl Lint {
             }
             Lint::ProcessStatic => {
                 "give the state an owner with a lifetime (the daemon, a build, a task) that drops it, or say what bounds it with `#[expect(blaze::process_static, reason = \"..\")]`"
+            }
+            Lint::LoopTurnEffects => {
+                "hand work that blocks, does IO or syncs to the driver as an effect or to a plane task on a worker, mark the accessor of a lock only the loop takes `#[blaze::bounded_turn(trusted = \"why\")]`, or take `#[blaze::bounded_turn]` off"
+            }
+            Lint::SyncOnAnswerPath => {
+                "sync after the reply is handed to the driver, mark a callee proven not to sync `#[blaze::answers_request(trusted = \"why\")]`, or take `#[blaze::answers_request]` off"
+            }
+            Lint::LockOrder => {
+                "take the locks in one order everywhere (the outer one first), or drop the one held before taking the other"
+            }
+            Lint::LockAcrossWait => {
+                "copy out what the wait needs and drop the guard before the call, or hand the guard to the wait (`signal.wait(&mut guard)` releases it)"
+            }
+            Lint::TruncatingCast => {
+                "where a value that doesn't fit is a bug, convert with `T::try_from(x)` and a typed error naming the thing; where wrapping is meant, say why with `#[expect(blaze::truncating_cast, reason = \"..\")]`"
             }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
@@ -1375,8 +1442,8 @@ impl Lint {
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
             }
-            Lint::LossyAs => {
-                "convert with `From` where it can't lose (`u64::from(x)`), `T::try_from(x)` where it can, or the method that names the loss (`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`); or say why with `#[expect(blaze::lossy_as, reason = \"..\")]`"
+            Lint::AsCast => {
+                "write the operation the cast is (`T::from(x)`, `x.truncate::<T>()`, `cast_signed`, `cast_unsigned`, blaze-cast's named casts, `p.cast::<T>()`, `ptr::from_ref`), as `blaze check --fix` does; or say why with `#[expect(blaze::as_cast, reason = \"..\")]`"
             }
             Lint::ImplicitOverflow => {
                 "say what overflow means here: `checked_*` with `?` (or a typed error) where it is a failure, `wrapping_*` or `Wrapping<T>` where the wrap is meant, `saturating_*`, `overflowing_*`, `T::try_from(x)` for a cast; or bound the operands with a check blaze can see (`i < v.len()`, `if a <= b`); or say why with `#[expect(blaze::implicit_overflow, reason = \"..\")]`"
@@ -1601,6 +1668,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         thread_local_in_waiting_fn::check(cx);
         lock_across_query::check(cx);
         lock_held_across_slow::check(cx);
+        lock_order::check(cx);
+        roles::check(cx);
         blocking_on_pool::check(cx);
         unnamed_wait::check(cx);
         shared_collection_lock::check(cx);
@@ -1647,8 +1716,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
-        lossy_as::check(cx);
+        as_cast::check(cx);
         implicit_overflow::check(cx);
+        truncating_cast::check(cx);
         build_script_ambient::check(cx);
         not_latest_edition::check(cx);
         std_use::check(cx);

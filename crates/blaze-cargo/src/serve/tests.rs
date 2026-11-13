@@ -38,9 +38,9 @@ use super::{
     job::{DURABLE_WITHIN, ENDED_LOST, ENDED_ROWS, RECHECK},
     plane::{Inline, Runner},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
-        Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
-        applying_fallible,
+        Asks, Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb,
+        KeptPut, Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps,
+        Writer, applying_fallible,
     },
 };
 
@@ -83,6 +83,9 @@ thread_local! {
     static FAILS_FETCHES: Cell<bool> = const { Cell::new(false) };
     /// How many times a writer applied what was asked of it.
     static APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// How many of a writer's applies ran outside a write's task (`job::IN_WRITE_TASK`): on
+    /// the loop, in its turn.
+    static LOOP_APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The build script's run whose write fails with an error as it is applied, as a real
@@ -979,6 +982,18 @@ impl Writer<Fake> for FakeWriter {
         !self.asked.is_empty()
     }
 
+    fn idle(&self) -> bool {
+        Arc::strong_count(&self.inputs) == 1
+    }
+
+    fn write_wait(&self) -> crate::serve::work::WriteWait {
+        crate::serve::work::WriteWait {
+            runs: self.asked.len() as u32,
+            readers: (Arc::strong_count(&self.inputs) - 1) as u32,
+            ..crate::serve::work::WriteWait::default()
+        }
+    }
+
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
         Ok(Vec::new()) // the fakes read no dependency from the store
     }
@@ -990,6 +1005,10 @@ impl Writer<Fake> for FakeWriter {
     fn apply(&mut self) -> Result<bool, ApiError> {
         if self.asked.is_empty() {
             return Ok(true);
+        }
+        // A write with something to apply, as `UnitWriter::apply` does only then.
+        if !super::job::IN_WRITE_TASK.get() {
+            LOOP_APPLIES.with(|it| it.set(it.get() + 1));
         }
         if FAILS_APPLY.get() {
             return Err(ApiError::new(
@@ -1066,7 +1085,7 @@ impl Runs<Fake> for FakeRuns {
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1093,7 +1112,7 @@ impl Runs<Fake> for FakeRuns {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1134,7 +1153,7 @@ impl Runs<Fake> for Script {
     fn start(
         &mut self,
         _: &Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1150,7 +1169,7 @@ impl Runs<Fake> for Script {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1178,7 +1197,7 @@ impl Runs<Fake> for Slow {
     fn start(
         &mut self,
         _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1194,7 +1213,7 @@ impl Runs<Fake> for Slow {
         &mut self,
         _: Completion,
         _: &mut Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1221,7 +1240,7 @@ impl Runs<Fake> for Lost {
     fn start(
         &mut self,
         _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1236,7 +1255,7 @@ impl Runs<Fake> for Lost {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1273,7 +1292,7 @@ impl Runs<Fake> for Keeps {
     fn start(
         &mut self,
         _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1290,7 +1309,7 @@ impl Runs<Fake> for Keeps {
         &mut self,
         _: Completion,
         store: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1330,7 +1349,7 @@ impl Runs<Fake> for Over {
     fn start(
         &mut self,
         _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1346,7 +1365,7 @@ impl Runs<Fake> for Over {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1881,6 +1900,38 @@ fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
     let reached = std::os::unix::net::UnixStream::connect(root.path().join(SOCKET));
     assert!(reached.is_ok(), "a CLI that connects as start returns finds no socket: {reached:?}");
     drop(daemon);
+}
+
+/// A `BLAZE_DUCKDB` naming a file that is gone is not the start's to check (a daemon refused
+/// to start on one, `BLAZE_DUCKDB=/nix/store/..../duckdb: No such file or directory`, and a
+/// whole `blaze check` died on it, 2026-11-13): a daemon whose history was kept with one
+/// starts and serves, and only its explorer's queries say what is missing.
+#[test]
+fn a_daemon_started_with_blaze_duckdb_naming_a_missing_file_starts_and_serves() {
+    crate::release::for_tests();
+    let state = tempfile::tempdir().unwrap();
+    let gone = state.path().join("gone").join("bin").join("duckdb");
+    let (profiling, _keeper) = super::observe::keep_history(
+        state.path(),
+        Some(gone.clone().into_os_string()), // clone: a test's path
+        blaze_profile::logs::Policy::default(),
+    )
+    .unwrap_or_else(|why| panic!("the history is kept whatever the DuckDB: {why}"));
+    let unfound = profiling.duckdb().unwrap_err();
+    assert!(
+        unfound.contains(&format!("BLAZE_DUCKDB={}", gone.display()))
+            && unfound.contains("unset BLAZE_DUCKDB"),
+        "{unfound}"
+    );
+    let sim = Sim::new(64, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let options = Options { profiling: Some(profiling), ..options() };
+    let mut daemon = Daemon::start(sim, options, steps.clone(), Runner::Inline(Inline::new(64)))
+        .unwrap_or_else(|why| panic!("a missing DuckDB stopped the daemon's start: {why}"));
+    let mut client = dial(&mut daemon);
+    let status = client.send(&mut daemon, Request::Status);
+    let said = client.wait(&mut daemon, status);
+    assert!(said.iter().any(|it| matches!(it, Response::Status(_))), "{said:#?}");
 }
 
 #[test]
@@ -5358,6 +5409,52 @@ fn no_reader_posted_after_a_write_sees_the_inputs_before_it_over_many_seeds() {
     }
 }
 
+/// One wave's build under `seed`, the planted bug set or not: how many applies ran on the loop,
+/// and how many in all.
+fn wave_applies(seed: u64, scripts: usize, plant: bool) -> (usize, usize) {
+    SEEN.with(|it| it.borrow_mut().clear());
+    APPLIES.set(0);
+    LOOP_APPLIES.set(0);
+    super::job::PLANT_WRITE_ON_LOOP.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, &format!("wave {scripts}\n"));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    super::job::PLANT_WRITE_ON_LOOP.set(false);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    let all: Vec<usize> = (1..=scripts).collect();
+    assert_eq!(seen(), vec![(0, Vec::new()), (scripts + 1, all)], "seed {seed}");
+    (LOOP_APPLIES.get(), APPLIES.get())
+}
+
+/// The loop applies no front-end write in its turn: until 2026-11-13 a job's write (a proc
+/// macro's load with its harnesses' identities and its dependencies' serve, seconds a crate
+/// under a fresh store) ran whole on the loop, so one turn lasted as long as the write, every
+/// other job and client behind it, and the readers it waited on could not be told from a hang.
+/// Now it is a task of the job holding the writer (`job::Does::Write`), and the loop only posts
+/// it and takes its result, so its turn is bounded by its own work whatever a write costs.
+///
+/// The invariant: for a wave of `N` build scripts over many seeds (each seed another order of
+/// the scripts' ends, so writes of one run up to all `N`), every apply of the writer runs on a
+/// write's task, none on the loop, and the build is the one it was: done, and the program reads
+/// every run. The control: the planted bug (`job::PLANT_WRITE_ON_LOOP`, the loop's apply of
+/// before) builds the same and the oracle sees its applies on the loop.
+#[test]
+fn the_loop_applies_no_front_end_write_over_many_seeds() {
+    const SCRIPTS: usize = 6;
+    for seed in 0..32 {
+        let (on_loop, applies) = wave_applies(seed, SCRIPTS, false);
+        assert_eq!(on_loop, 0, "seed {seed}: {on_loop} of {applies} applies ran on the loop");
+        assert!((1..=SCRIPTS).contains(&applies), "seed {seed}: {applies} writes");
+    }
+    let (on_loop, _) = wave_applies(3, SCRIPTS, true);
+    assert!(on_loop > 0, "the planted bug's applies on the loop went unseen");
+}
+
 #[test]
 fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_end() {
     let mut sim = Sim::new(11, Faults::default());
@@ -6076,4 +6173,84 @@ fn a_crash_after_the_answer_leaves_no_certificate_without_its_record() {
         planted.iter().any(|(_, _, answered, missing)| *answered && !missing.is_empty()),
         "the certificate written first never answered over a lost record: {planted:?}"
     );
+}
+
+/// The task watchdog's end of a lost wake (`serve::stuck`): a thread task whose thread never
+/// comes back (held on the runner, as a worker parked on a wake that never comes) is named
+/// stuck by the watchdog, here planted as its one word to the loop (`Pulse::say_stuck` with
+/// `lost`), and the loop fails its plane node with the line (`Plane::abandon`): the build ends
+/// failed, saying what was stuck, rather than hang, its other tasks are let go, the lost task's
+/// late end is dropped, and a second build is served. The control: drop the loop's take of
+/// the watchdog's word (`Daemon::take_stuck`), or make `Plane::abandon` do nothing, and the
+/// held node stays running, so the turn bound below names it.
+///
+/// The invariant: a thread task the watchdog says is lost ends its build failed with the
+/// watchdog's line, and the daemon goes on serving.
+#[test]
+fn a_lost_wake_fails_its_build_with_the_stuck_line_and_the_next_build_is_served() {
+    use blaze_graph::admission::kinds;
+    use super::pulse::StuckSaid;
+    let held = [
+        kinds::PLAN,
+        kinds::LOWER,
+        kinds::COMPILE,
+        kinds::UNIT_NAMES,
+        kinds::UNIT_BODIES,
+        kinds::UNIT_LINK,
+        kinds::PROGRAM,
+        kinds::PROGRAM_LINK,
+    ];
+    let mut sim = Sim::new(7, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 7);
+    for kind in held {
+        daemon.hold_tasks_for_test(kind, true);
+    }
+    let mut client = dial(&mut daemon);
+    let first = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let mut running = Vec::new();
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        running = daemon.running_thread_tasks_for_test();
+        !running.is_empty() || client.done(first)
+    });
+    let Some(&(request, node)) = running.first() else {
+        panic!("no thread task of the build ran, held: {:#?}", client.of(first))
+    };
+    let said = blaze_protocol::now::Stuck {
+        what: "compile of app 0.0.0".into(),
+        cycle: Vec::new(),
+        waits: "signal test.lost_wake".into(),
+        for_ms: 240_000,
+        inside: None,
+        held_by: None,
+    };
+    daemon.pulse().say_stuck(StuckSaid {
+        build: request.0,
+        node: Some(u64::from(node.0)),
+        lost: true,
+        said,
+    });
+    // The loop takes the word at its next look at the builds: then the node no longer runs.
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        !daemon.running_thread_tasks_for_test().iter().any(|it| it.1 == node)
+    });
+    // The lost thread comes back late, and the build's other held tasks run.
+    for kind in held {
+        daemon.hold_tasks_for_test(kind, false);
+    }
+    let got = client.wait(&mut daemon, first);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let all = format!("{got:?}");
+    assert!(
+        all.contains("stuck 4 min: compile of app 0.0.0 waits on signal test.lost_wake"),
+        "the build says what was stuck: {got:#?}"
+    );
+    let second = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, second);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the next build is served: {got:#?}");
 }

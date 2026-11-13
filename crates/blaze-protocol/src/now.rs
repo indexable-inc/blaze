@@ -79,6 +79,11 @@ pub struct Now {
     /// running`), as `blaze_core::lock::stall::Stall::line` says it. Its loop watchdog
     /// (`serve::stop`) checks each look once a wait passes its threshold; `None` for none.
     pub stall: Option<String>,
+    /// The tasks of this build the daemon's task watchdog (`blaze_profile::stuck`) found
+    /// stuck, each failed with a typed error: what each does, waits on and who holds that. A
+    /// view says them first. Empty while nothing is stuck.
+    #[serde(default)]
+    pub stuck: Vec<Stuck>,
     pub tally: Tally,
     /// The pool's workers; those not in `busy` are idle.
     pub workers: u32,
@@ -107,7 +112,61 @@ pub struct Now {
     /// The proc-macro expansion threads: how many there are and what the busy ones expand.
     pub expanding: Expansion,
 }
-keys [busy, at_ms, phase, stage, stall, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
+keys [busy, at_ms, phase, stage, stall, stuck, tally, memory, recent, running, slowest, workers, blockers, failures, quiet_ms, downloads, expanding]
+}
+
+crate::in_key_order! {
+/// A task the daemon's task watchdog found stuck: still (its span unchanged and its CPU not
+/// moving) past the bound of what it waits on, and failed with a typed error. Said
+/// `blaze: stuck 4 min: codegen of seq-macro 0.3.6 waits on lock store.packs, held by <task>
+/// inside <spans>`.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stuck {
+    /// What it is doing: its innermost span that names what it is of.
+    pub what: String,
+    /// For a cycle of waits, each edge (`A waits on X, held by B`); empty otherwise.
+    pub cycle: Vec<String>,
+    /// What it waits on: a lock, a signal, a task, a child process, a store read, or nothing.
+    pub waits: String,
+    /// How long it has not moved.
+    pub for_ms: u64,
+    /// What the holder of what it waits on is inside, if a thread inside spans holds it.
+    pub inside: Option<String>,
+    /// Who holds what it waits on, if anyone does.
+    pub held_by: Option<String>,
+}
+keys [what, cycle, waits, for_ms, inside, held_by]
+}
+
+impl std::fmt::Display for Stuck {
+    /// `stuck 4 min: <what> waits on <waits>, held by <held_by> inside <inside>`, or for a
+    /// cycle `stuck 4 min: a cycle of waits: <edge>; <edge>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.for_ms / 1000;
+        if secs >= 120 {
+            write!(f, "stuck {} min: ", secs / 60)?;
+        } else {
+            write!(f, "stuck {secs} s: ")?;
+        }
+        if !self.cycle.is_empty() {
+            f.write_str("a cycle of waits: ")?;
+            for (i, edge) in self.cycle.iter().enumerate() {
+                if i > 0 {
+                    f.write_str("; ")?;
+                }
+                f.write_str(edge)?;
+            }
+            return Ok(());
+        }
+        write!(f, "{} waits on {}", self.what, self.waits)?;
+        if let Some(held_by) = &self.held_by {
+            write!(f, ", held by {held_by}")?;
+        }
+        if let Some(inside) = &self.inside {
+            write!(f, " inside {inside}")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for Phase {
@@ -791,6 +850,8 @@ impl Fold {
             stage: look.stage.to_owned(),
             // alloc: the look's answer owns its strings; a stall's line, rare.
             stall: look.stall.map(str::to_owned),
+            // The daemon's task watchdog's, set on the look's answer by the daemon.
+            stuck: Vec::new(),
             tally,
             workers: look.workers,
             busy,

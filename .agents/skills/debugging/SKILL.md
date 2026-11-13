@@ -137,13 +137,22 @@ after from the same query.
 
 ## Running DuckDB
 
-blaze never links DuckDB and never looks for it on `PATH`. `BLAZE_DUCKDB` names the binary as
-an absolute path; `nix develop` sets it. Unset, `blaze slow`, `blaze explain <view>` and
-`blaze debug sql` run the DuckDB blaze pins (1.5.5, by SHA-256 per host in
-`crates/blaze-cargo/src/serve/observe.rs`, the version `flake.nix` asserts too), which the
-first of them fetches through the daemon's store and lays out under the state directory
-(`<state>/duckdb/1.5.5-<sha256>/duckdb`, `crates/blaze-cargo/src/cli/duckdb.rs`). To run it by
-hand, set `BLAZE_DUCKDB` to that path.
+No setup is needed. `blaze explain memory` needs no DuckDB at all: it reads the Parquet itself
+and aggregates in Rust (`blaze_profile::memory`, held to each `memory_*` view's SQL by a test).
+The commands that run SQL (`blaze slow`, the problems `blaze why` adds, `blaze explain <view>`,
+`blaze debug sql`) find DuckDB in this order, never on `PATH` (blaze never links it):
+
+1. `BLAZE_DUCKDB`, an absolute path to a DuckDB 1.5.5 CLI (`nix develop` sets it). Set wrong
+   (relative, empty, missing), it is that command's error, naming the variable, the path and
+   `unset BLAZE_DUCKDB`; nothing else is tried.
+2. Unset: the DuckDB blaze pins (1.5.5, by SHA-256 per host in `DUCKDB_PINS`,
+   `crates/blaze-cargo/src/serve/observe.rs`), fetched once through the daemon's store with a
+   line saying so and laid out at `<state>/duckdb/1.5.5-<sha16>/duckdb`
+   (`crates/blaze-cargo/src/cli/duckdb.rs`). A failed fetch names the URL and the file.
+
+A bad `BLAZE_DUCKDB` never stops a daemon or a build: no daemon start reads it, and it is not
+a daemon setting, so a client whose value differs from the daemon's is not refused. To run
+DuckDB by hand, set `BLAZE_DUCKDB` to the laid-out path.
 
 - `blaze debug sql "<query>"` runs one query over the history with every table and view of
   `crates/blaze-profile/sql/views.sql` defined. `--json` prints rows as JSON for a script or a

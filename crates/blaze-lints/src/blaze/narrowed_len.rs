@@ -8,7 +8,7 @@
 //! name has one of the `_`-separated words `len`, `length`, `size`, `offset`, `count` or
 //! `bytes`. `usize` and `isize` count as 32 bits wide as a target and 64 as a source, so
 //! `usize` to `u32` and `u64` to `usize` narrow and `u32` to `usize` does not. An `as` cast is
-//! `blaze::lossy_as`'s; a conversion whose error is handled (`map_err(..)?`, `unwrap_or(..)`)
+//! `blaze::as_cast`'s; a conversion whose error is handled (`map_err(..)?`, `unwrap_or(..)`)
 //! is not a finding.
 //!
 //! There is no fix the lint can write: the function returns a typed error naming the thing and

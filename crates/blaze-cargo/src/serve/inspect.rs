@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use super::{flightrec, pulse::Pulse};
 
 /// The version of [`Asked`] and [`Answer`]. A change to any type here is a new number.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 /// How long the scheduler's lock is waited for.
 const WAITS_READ: Duration = Duration::from_secs(1);
@@ -98,6 +98,28 @@ pub struct Inspected {
     pub lock_waits: Vec<LockWait>,
     /// Why [`Inspected::tasks`] is empty though the plane may have tasks: the table was held.
     pub tasks_unread: Option<String>,
+    /// Each job's write of its front end that waits, longest first, as the loop last looked
+    /// (once a second while a build runs): what it waits with, its readers alive, the tasks
+    /// the loop holds for it and the node applying it.
+    pub writes: Vec<super::work::WriteWaiting>,
+    /// The proc macros' expansion threads; `None` when their lock was held as it was read.
+    pub expansion: Option<Expansion>,
+}
+
+/// The proc macros' expansion threads (`blaze_macro_eval::expansion_counts`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Expansion {
+    /// Threads alive, idle ones included.
+    pub alive: u64,
+    /// Of them, waiting for an expansion.
+    pub idle: u64,
+    /// Expansions waiting for a thread.
+    pub queued: u64,
+    /// Threads blocked on `macro.thread.replied`, waiting for their job's answer.
+    pub asking: u64,
+    /// The most threads kept.
+    pub cap: u64,
 }
 
 /// The loop's turns and the pool's workers.
@@ -474,10 +496,20 @@ impl Inspector {
             job_waits,
             lock_waits,
             tasks_unread,
+            writes: self.pulse.writes(),
+            expansion: blaze_macro_eval::expansion_counts().map(|it| Expansion {
+                alive: it.alive as u64,
+                idle: it.idle as u64,
+                queued: it.queued as u64,
+                asking: it.asking as u64,
+                cap: it.cap as u64,
+            }),
         }
     }
 
-    /// The answer to `asked`.
+    /// The answer to `asked`. An answer path: nothing under it syncs a file
+    /// (`blaze::sync_on_answer_path`, docs/v2/plan/design/effect-summary.md).
+    #[blaze::answers_request]
     pub fn answer(&self, asked: Asked) -> Answer {
         if asked.schema != SCHEMA {
             // alloc: a refusal, once
@@ -695,6 +727,20 @@ mod tests {
             job_waits: "no job waits".to_owned(),
             lock_waits: Vec::new(),
             tasks_unread: None,
+            writes: vec![super::super::work::WriteWaiting {
+                root: "/ws".to_owned(),
+                waited_ms: 12_000,
+                wait: super::super::work::WriteWait {
+                    runs: 0,
+                    macros: 3,
+                    msls: 0,
+                    release: false,
+                    readers: 1,
+                },
+                held: 40,
+                applying: None,
+            }],
+            expansion: Some(Expansion { alive: 4, idle: 0, queued: 0, asking: 4, cap: 256 }),
         };
         assert_eq!(inspected.memory.admission, "near");
         let answer = Answer::Inspected(Box::new(inspected));

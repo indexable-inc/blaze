@@ -283,7 +283,7 @@ fn nonblocking_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
 }
 
 /// What a kind is said as in these effects' refusals.
-fn says(rule: Rule) -> &'static str {
+pub(crate) fn says(rule: Rule) -> &'static str {
     match rule {
         Rule::Panic => "may panic or abort",
         Rule::Overflow => {
@@ -495,6 +495,7 @@ pub(crate) fn foreign_kinds(db: &Db, func: FunctionId, link: &str) -> EffectSet 
 pub(crate) fn foreign_row(symbol: &str) -> Option<EffectSet> {
     FOREIGN.iter().find(|(it, _)| *it == symbol).map(|&(_, kind)| match kind {
         Foreign::Block => EffectSet::one(Rule::Block),
+        Foreign::Sync => EffectSet::of(&[Rule::Block, Rule::Sync]),
         Foreign::Alloc => EffectSet::one(Rule::Alloc),
         Foreign::Panic => EffectSet::one(Rule::Panic),
         Foreign::Clean => EffectSet::EMPTY,
@@ -541,11 +542,14 @@ pub(crate) struct Row {
     /// The crates.io name of its crate.
     krate: &'static str,
     at: At,
+    /// What a call counts as: [`Rule::Thread`] and [`Rule::Block`], with [`Rule::Lock`] for a
+    /// lock's acquire and [`Rule::Io`] and [`Rule::Sync`] for a sync to the disk.
+    kinds: EffectSet,
 }
 
 impl Row {
     pub(crate) fn kinds(&self) -> EffectSet {
-        EffectSet::of(&[Rule::Thread, Rule::Block])
+        self.kinds
     }
 }
 
@@ -559,7 +563,17 @@ enum At {
 }
 
 const fn row(what: &'static str, krate: &'static str, at: At, says: &'static str) -> Row {
-    Row { what, says, krate, at }
+    Row { what, says, krate, at, kinds: EffectSet::of(&[Rule::Thread, Rule::Block]) }
+}
+
+/// A lock's acquire: a [`row`] that also takes a lock ([`Rule::Lock`]).
+const fn lock_row(what: &'static str, krate: &'static str, at: At) -> Row {
+    Row { what, says: LOCK, krate, at, kinds: crate::effects::LOCKS }
+}
+
+/// A sync of a file's bytes to the disk ([`crate::effects::SYNCS`]).
+const fn sync_row(what: &'static str, krate: &'static str, at: At, says: &'static str) -> Row {
+    Row { what, says, krate, at, kinds: crate::effects::SYNCS }
 }
 
 const LOCK: &str = "waits for the lock";
@@ -574,17 +588,34 @@ const ONCE: &str = "waits for another thread's initialization";
 /// `crate::effects::MODELS` rows; any other crate's waits reach a [`FOREIGN`] leaf (`futex`,
 /// `read`).
 pub(crate) const ROWS: &[Row] = &[
-    row(
+    lock_row(
         "blaze_core::lock::Lock::{lock, try_lock_for}",
         "blaze_core",
         At::Methods(&["lock", "Lock"], &["lock", "try_lock_for"]),
-        LOCK,
     ),
-    row(
+    lock_row(
         "blaze_core::lock::ReadLock::{read, write}",
         "blaze_core",
         At::Methods(&["lock", "ReadLock"], &["read", "write"]),
-        LOCK,
+    ),
+    // blaze's own syscall wrappers of a sync to the disk (docs/v2/plan/design/effect-summary.md).
+    sync_row(
+        "blaze_sys::linux::fs::fsync",
+        "blaze_sys",
+        At::Fn(&["linux", "fs", "fsync"]),
+        "syncs the file to the disk",
+    ),
+    sync_row(
+        "blaze_sys::linux::fs::fdatasync",
+        "blaze_sys",
+        At::Fn(&["linux", "fs", "fdatasync"]),
+        "syncs the file's data to the disk",
+    ),
+    sync_row(
+        "blaze_sys::linux::fs::sync_file_range",
+        "blaze_sys",
+        At::Fn(&["linux", "fs", "sync_file_range"]),
+        "writes a range of the file out to the disk",
     ),
     row(
         "blaze_core::lock::Signal::wait*",
@@ -596,18 +627,16 @@ pub(crate) const ROWS: &[Row] = &[
         CONDVAR,
     ),
     row("parking_lot_core::park", "parking_lot_core", At::Fn(&["park"]), PARK),
-    row("lock_api::Mutex::lock", "lock_api", At::Methods(&["Mutex"], &["lock"]), LOCK),
-    row(
+    lock_row("lock_api::Mutex::lock", "lock_api", At::Methods(&["Mutex"], &["lock"])),
+    lock_row(
         "lock_api::ReentrantMutex::lock",
         "lock_api",
         At::Methods(&["ReentrantMutex"], &["lock"]),
-        LOCK,
     ),
-    row(
+    lock_row(
         "lock_api::RwLock::{read, write, upgradable_read, read_recursive}",
         "lock_api",
         At::Methods(&["RwLock"], &["read", "write", "upgradable_read", "read_recursive"]),
-        LOCK,
     ),
     row(
         "parking_lot::Condvar::wait*",
@@ -669,7 +698,7 @@ pub(crate) const ROWS: &[Row] = &[
 /// The workspace crates rows are of, known by their crate name: blaze's lock home
 /// (docs/v2/plan/design/named-locks.md), whose `Lock::lock` and `ReadLock::{read, write}` are
 /// lock acquires as `lock_api`'s are.
-const WORKSPACE_ROW_CRATES: &[&str] = &["blaze_core"];
+const WORKSPACE_ROW_CRATES: &[&str] = &["blaze_core", "blaze_sys"];
 
 /// The row of `func`, a function of a crate a row of [`ROWS`] names. A registry crate is known
 /// by its crates.io name, and only with a registry origin, so a workspace crate named
@@ -790,6 +819,9 @@ fn item(db: &Db, root: ModuleId, path: &[&str], types: bool) -> Option<ModuleDef
 pub(crate) enum Foreign {
     /// May block the thread.
     Block,
+    /// Syncs a file's bytes to the disk, and so blocks ([`crate::effects::SYNCS`] but `Io`:
+    /// a foreign call is no std IO model).
+    Sync,
     /// Is or calls the global heap.
     Alloc,
     /// Panics or aborts.
@@ -798,7 +830,7 @@ pub(crate) enum Foreign {
     Clean,
 }
 
-use Foreign::{Alloc as FA, Block as FB, Clean as FC, Panic as FP};
+use Foreign::{Alloc as FA, Block as FB, Clean as FC, Panic as FP, Sync as FS};
 
 /// Foreign functions by the symbol they link to. A syscall on a file descriptor is `Block`
 /// whatever the descriptor: the check can't prove one `O_NONBLOCK`, so a wrapper that knows says
@@ -913,8 +945,11 @@ pub(crate) const FOREIGN: &[(&str, Foreign)] = &[
     ("openat", FB),
     ("openat64", FB),
     ("close", FB),
-    ("fsync", FB),
-    ("fdatasync", FB),
+    ("fsync", FS),
+    ("fdatasync", FS),
+    ("sync_file_range", FS),
+    ("syncfs", FS),
+    ("FlushFileBuffers", FS),
     ("flock", FB),
     ("lockf", FB),
     ("fcntl", FB),

@@ -94,10 +94,12 @@ impl<T> Link<T> {
         }
     }
 
-    /// The job's reply to `question`, the expansion thread blocked until it comes.
+    /// The job's reply to `question`, the expansion thread blocked until it comes, counted in
+    /// [`ASKING`] for as long as it waits.
     fn ask(&self, question: Question) -> Result<Reply, Stop> {
         self.post(|board| board.question = Some(question));
         let mut board = self.board.lock();
+        let _asking = Asking::now();
         // wakes: the job's reply and the link's end (`gone`) each notify `replied`
         self.replied.wait_while(&mut board, |it| it.reply.is_none() && !it.gone);
         board.reply.take().ok_or_else(|| {
@@ -215,6 +217,57 @@ static THREADS: Lock<Threads> =
 /// view shows (`proc macros 3 of 32 expanding`).
 pub fn alive() -> usize {
     THREADS.lock().started
+}
+
+/// The expansion threads blocked in [`Link::ask`] now, on `macro.thread.replied`: each waits
+/// for the job that runs its expansion to answer a question of the database.
+static ASKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One count of [`ASKING`], given back however the wait ends.
+struct Asking;
+
+impl Asking {
+    fn now() -> Asking {
+        ASKING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Asking
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        ASKING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The expansion threads at one look: what `blaze debug inspect` and a stall say of the
+/// proc-macro lane, so a build stopped in an expansion shows whether its threads run, wait for
+/// a thread, or wait on their jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Threads alive, idle ones included.
+    pub alive: usize,
+    /// Of them, waiting for an expansion.
+    pub idle: usize,
+    /// Expansions handed in and waiting for a thread, the cap's threads all running others.
+    pub queued: usize,
+    /// Threads blocked on `macro.thread.replied`, each waiting for its job's answer.
+    pub asking: usize,
+    /// The most threads kept ([`cap`]).
+    pub cap: usize,
+}
+
+/// The expansion threads now, read without waiting: `None` while the pool's lock is held, so
+/// a reader off the loop never waits on an expansion thread's hand-off (`blaze debug inspect`
+/// answers while everything else is stuck).
+pub fn counts() -> Option<Counts> {
+    let threads = THREADS.try_lock()?;
+    Some(Counts {
+        alive: threads.started,
+        idle: threads.idle.len(),
+        queued: threads.queued.len(),
+        asking: ASKING.load(std::sync::atomic::Ordering::Relaxed),
+        cap: cap(),
+    })
 }
 
 /// The most expansion threads kept: twice the process's workers, so every worker's job can

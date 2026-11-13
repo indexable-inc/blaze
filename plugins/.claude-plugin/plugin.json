@@ -2,7 +2,7 @@
   "name": "blaze",
   "displayName": "blaze",
   "version": "0.1.0",
-  "description": "After every Write or Edit of a Rust file or Cargo.toml, tells Claude the errors and warnings blaze check has that are new since the last check of that package.",
+  "description": "After every Write or Edit of a Rust file or Cargo.toml, tells Claude the errors and warnings blaze check has that are new since the last check of that package, and points cargo and rustc commands at blaze. The hooks run `blaze agents hook claude`.",
   "author": { "name": "indexable-inc" },
   "repository": "https://github.com/indexable-inc/blaze",
   "license": "MIT OR Apache-2.0",

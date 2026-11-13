@@ -16,6 +16,8 @@ use crate::{BodyKind, LinearDiagnostic, check_body};
 
 use hir_ty_mir as _;
 
+mod owed;
+
 type TestDB = base_db::Db;
 
 /// The functions with a body of every module and impl of every crate. A function declared
@@ -73,6 +75,13 @@ fn with_nested<'db>(db: &'db TestDB, body: &'db MirBody<'db>, out: &mut Vec<&'db
 /// character for the end of an expression (a scope's closing brace).
 #[track_caller]
 fn check(src: &str) -> Vec<(String, String)> {
+    diagnostics(src).into_iter().map(|(it, at)| (it.message, at)).collect()
+}
+
+/// Each error of every body in `src`, whole (its notes too), with the text its span covers as
+/// [`check`] gives it.
+#[track_caller]
+fn diagnostics(src: &str) -> Vec<(LinearDiagnostic, String)> {
     let fixture_text = format!(
         "//- minicore: sized, drop, fn, result, option, try, from, future, async_fn\n\
          #![feature(register_tool)]\n#![register_tool(blaze)]\n{src}"
@@ -114,7 +123,10 @@ fn check(src: &str) -> Vec<(String, String)> {
                 let kind = if index == 0 { BodyKind::Item(def) } else { BodyKind::Nested };
                 let mut out: Vec<LinearDiagnostic> = Vec::new();
                 check_body(&db, body, kind, &mut out);
-                found.extend(out.into_iter().map(|it| (it.message, at(it.span))));
+                found.extend(out.into_iter().map(|it| {
+                    let span = at(it.span);
+                    (it, span)
+                }));
             }
         }
         found

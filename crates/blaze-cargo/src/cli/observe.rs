@@ -23,7 +23,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
 use blaze_core::exit::Exit;
 use blaze_profile::{
-    history, live, schema, slow, sql,
+    history, live, memory, schema, slow, sql,
     time::{load, report::By},
     views,
 };
@@ -52,14 +52,15 @@ const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
 
-/// The parts of `blaze explain memory`, each a view of `sql/examples.sql`, with its heading.
-const MEMORY_PARTS: [(&str, &str, &str); 6] = [
-    ("timeline", "memory_timeline", "the memory, minute by minute"),
-    ("peak_tasks", "memory_peak_tasks", "the tasks that held the most at once"),
-    ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
-    ("held", "memory_held", "what the global heap held at the footprint's peak, by call site"),
-    ("sites", "memory_sites", "what churns the global heap, by call site"),
-    ("give_backs", "memory_give_backs", "what was given back because memory was short"),
+/// The parts of `blaze explain memory`, each a view of `sql/examples.sql` answered without
+/// DuckDB (`blaze_profile::memory`), with its JSON name and heading, in the order printed.
+const MEMORY_PARTS: [(memory::Part, &str, &str); 6] = [
+    (memory::Part::Timeline, "timeline", "the memory, minute by minute"),
+    (memory::Part::PeakTasks, "peak_tasks", "the tasks that held the most at once"),
+    (memory::Part::AtPeak, "at_peak", "the memory by area at the footprint's peak"),
+    (memory::Part::Held, "held", "what the global heap held at the footprint's peak, by call site"),
+    (memory::Part::Sites, "sites", "what churns the global heap, by call site"),
+    (memory::Part::GiveBacks, "give_backs", "what was given back because memory was short"),
 ];
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--unexplained] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
@@ -1056,13 +1057,6 @@ fn no_edit_work(args: &Map<String, Value>) -> Result<(), Refusal> {
 /// The last build of the history.
 const LAST_BUILD: &str = "SELECT max(build_id) AS build FROM builds";
 
-/// The last build that has rows `blaze explain memory` reads: a counter tagged with it, a
-/// task's peak, or an allocation sample.
-const LAST_MEMORY_BUILD: &str = "SELECT max(build_id) AS build FROM (\
-    SELECT build_id FROM counters WHERE build_id IS NOT NULL \
-    UNION ALL SELECT build_id FROM spans WHERE name = 'task' AND peak_bytes IS NOT NULL \
-    UNION ALL SELECT build_id FROM alloc_samples WHERE build_id IS NOT NULL)";
-
 /// The one number `sql` gives: its first row's first column; none for no row, or a null.
 fn number(sql: &str) -> Result<Option<u64>, Refusal> {
     let rows = json(&run(sql)?)?;
@@ -1116,8 +1110,10 @@ fn no_problems(args: &Map<String, Value>, shape: Shape) -> Result<(), Refusal> {
 /// heap, blaze-mem, kept), the tasks with the largest peaks with their crate and unit, the
 /// breakdown by tag at the footprint's peak, and the call sites that allocated the most. Each
 /// part is a view of its own (`memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
-/// `memory_sites`); the build is the last one unless named. With `--json`, a line a row, each
-/// with its `part`.
+/// `memory_held`, `memory_sites`, `memory_give_backs`), answered without DuckDB
+/// (`blaze_profile::memory`, held to each view's SQL by its test), so the command needs no
+/// setup; the build is the last one unless named. With `--json`, a line a row, each with its
+/// `part`.
 fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
     let (mut build, mut limit, mut json) = (None, None, false);
     for word in words {
@@ -1141,10 +1137,14 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
     // With no build named: the last build that has memory rows, said when it is not the
     // last build (a no-op, or a build of a daemon that had just started, records none, and
     // four empty tables read as "no memory was used"). A history with none is an error.
+    // No DuckDB: the history's Parquet read and aggregated in Rust, each part held to its
+    // view's SQL by blaze_profile::memory's test.
+    let dir = history_dir()?;
+    let native = |error: blaze_profile::tables::TableError| Refusal::Failed(format!("`blaze explain memory`: {error}"));
     let mut out = String::new();
     let build = match build {
         Some(build) => build,
-        None => match (number(LAST_MEMORY_BUILD)?, number(LAST_BUILD)?) {
+        None => match (memory::last_with_memory(&dir).map_err(native)?, memory::last_build(&dir).map_err(native)?) {
             (Some(with), Some(last)) if with != last => {
                 let note = format!(
                     "build {with}: the last build with memory rows (the last build, {last}, has none: it \
@@ -1168,18 +1168,15 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
             }
         },
     };
+    let answers = memory::answer(&dir, build, limit.unwrap_or(memory::DEFAULT_LIMIT)).map_err(native)?;
     let mut rows = 0;
-    for (part, name, heading) in MEMORY_PARTS {
-        let view = views::find(name).map_err(|error| error.to_string())?;
-        let mut args = Map::new();
-        args.insert("build".to_owned(), Value::from(build));
-        if let Some(limit) = limit
-            && view.args.iter().any(|it| it.name == "limit")
-        {
-            args.insert("limit".to_owned(), Value::from(limit));
+    for ((asked, part, heading), (answered, batches)) in MEMORY_PARTS.into_iter().zip(answers) {
+        if asked != answered {
+            return Err(Refusal::Failed(format!(
+                "`blaze explain memory`: the part {asked:?} was answered by {answered:?} (a bug: MEMORY_PARTS is not in memory::Part::ALL's order)"
+            )));
         }
-        let sql = views::render(view, &args).map_err(|error| error.to_string())?;
-        let batches = run(&sql)?;
+        let name = asked.view();
         rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if json {
             let rows = self::json(&batches)?;
@@ -1329,6 +1326,12 @@ fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
 /// missing.
 pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
     let duckdb = super::duckdb::path()?;
+    Ok((duckdb, history_dir()?))
+}
+
+/// The history in the daemon's state directory, flushed (see [`history_source`]): what a
+/// reader that needs no DuckDB (`blaze explain memory`) reads.
+fn history_dir() -> Result<PathBuf, String> {
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     let dir = history::dir_in(&state);
     if let Some(pid) = history::writer(&dir) {
@@ -1360,7 +1363,7 @@ pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
             format!("writing the rows a dead daemon left in the profile history {}: {error}", dir.display())
         })?;
     }
-    Ok((duckdb, dir))
+    Ok(dir)
 }
 
 fn print(batches: &[RecordBatch], shape: Shape) -> Result<(), Refusal> {

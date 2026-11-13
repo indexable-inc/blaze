@@ -119,8 +119,8 @@ fn lines(reached: Option<&Reach>, now: ContentId) -> String {
     text
 }
 
-/// The root `word` names: 64 hex digits.
-fn root_of(word: &str) -> Option<ContentId> {
+/// The root `word` names: 64 hex digits (and `blaze diagnostics`'s token, written the same).
+pub(super) fn root_of(word: &str) -> Option<ContentId> {
     let bytes = word.as_bytes();
     if bytes.len() != 64 {
         return None;

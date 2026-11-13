@@ -49,6 +49,10 @@ pub struct WaitRow {
     pub span: u64,
     /// When the wait began, on the probe's clock.
     pub since_ns: u64,
+    /// When the wait ends by itself if nothing wakes it, on the probe's clock: `None` for a
+    /// wait with no deadline (a lock, a plain signal wait, [`crate::wait::Deadline::NEVER`]).
+    /// The task watchdog judges a wait with one by it.
+    pub deadline_ns: Option<u64>,
     pub on: Blocked,
     /// Who holds what it waits on, by thread mark, when that is a lock someone holds.
     pub holder: Option<u64>,

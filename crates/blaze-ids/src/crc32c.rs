@@ -63,7 +63,9 @@ fn word(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
 }
 
-/// The register (no initial or final inversion) after `bytes`, starting from `state`.
+/// The register (no initial or final inversion) after `bytes`, starting from `state`: table
+/// lookups only, on every record and page group the store checks (`#[blaze::noalloc]`).
+#[blaze::noalloc]
 fn portable(mut state: u32, bytes: &[u8]) -> u32 {
     let mut words = bytes.chunks_exact(8);
     for bytes in &mut words {

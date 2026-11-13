@@ -221,6 +221,9 @@ pub struct Screen {
     built_at: u64,
     /// What the whole build waits on now ([`Event::Waits`]).
     waits: Option<String>,
+    /// What each stuck task the daemon's task watchdog named was doing (`Now::stuck`), said
+    /// once each as a line that stays: `blaze: stuck 4 min: ... waits on ..., held by ...`.
+    stuck_said: Vec<String>,
     /// The build's last line was said.
     ended: bool,
     /// Nothing live is left.
@@ -255,6 +258,7 @@ impl Screen {
             built: None,
             built_at: 0,
             waits: None,
+            stuck_said: Vec::new(),
             ended: false,
             cleared: false,
             tests: Tests::default(),
@@ -312,6 +316,15 @@ impl Screen {
                 self.caps.rows = rows;
             }
             Event::Now(now) => {
+                // A stuck task stays said, quiet or not: its job fails, and this is why.
+                for stuck in &now.stuck {
+                    let key = format!("{}{}", stuck.what, stuck.waits); // alloc: a stuck task, once a look
+                    if self.stuck_said.contains(&key) {
+                        continue;
+                    }
+                    self.stuck_said.push(key); // alloc: once a stuck task
+                    self.above.push(Line::new().with(Role::Failed, format!("blaze: {stuck}"))); // alloc: as above
+                }
                 self.model = Some(now);
                 self.model_at = self.now_ms;
                 let due = self.now_ms.saturating_sub(self.plain_at) >= PLAIN_EVERY_MS;
@@ -1481,6 +1494,9 @@ pub fn progress_fields(now: &Now, elapsed_ms: u64) -> String {
     }
     if let Some(stall) = &now.stall {
         line.push_str(&format!(" stall={}", text::value(stall))); // alloc: as above
+    }
+    if let Some(first) = now.stuck.first() {
+        line.push_str(&format!(" stuck={} first={}", now.stuck.len(), text::value(&first.to_string()))); // alloc: as above
     }
     line
 }

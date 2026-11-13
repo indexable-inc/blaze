@@ -160,6 +160,7 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Tables { view }
         | Request::Doc { view, .. }
         | Request::Lock { view, .. }
+        | Request::Diagnostics { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
         Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
@@ -181,6 +182,7 @@ pub fn runs_user_code(request: &Request) -> bool {
     matches!(
         request,
         Request::Check { .. }
+            | Request::Diagnostics { .. }
             | Request::Build { .. }
             | Request::Test { .. }
             | Request::Run { .. }

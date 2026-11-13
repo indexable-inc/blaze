@@ -165,10 +165,18 @@ pub fn until<T>(
     // thread is blocked on, so a convoy whose head sits in a kernel wait names it.
     let probe = crate::lock::installed();
     let registered = probe.map(|probe| {
+        let now_ns = probe.now_ns();
+        // The deadline on `clock` said on the probe's clock, by the time left to it; none for
+        // `Deadline::NEVER`, whose wait ends only when what it waits for is ready.
+        let deadline_ns = deadline.filter(|it| *it != Deadline::NEVER).map(|it| {
+            let left = it.get().saturating_sub(clock.now());
+            now_ns.saturating_add(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX))
+        });
         crate::lock::graph::register(
             crate::lock::stall::Blocked::Wait(what),
             probe.span(),
-            probe.now_ns(),
+            now_ns,
+            deadline_ns,
             None,
             None,
         )

@@ -89,6 +89,9 @@ pub enum Why {
     LoopStalled,
     /// A stop made no progress for the stall bound.
     StopStalled,
+    /// The task watchdog found a task that made no progress for its bound (`serve::stuck`),
+    /// or more threads stuck for good than its bound of lost workers.
+    Stuck,
     /// `blaze debug inspect --record`.
     Asked,
 }

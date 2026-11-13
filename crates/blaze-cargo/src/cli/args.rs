@@ -475,6 +475,11 @@ pub enum Asked {
     Slow(Vec<OsString>),
     /// `blaze doctor`, with the words after it ([`super::doctor::main`]).
     Doctor(Vec<OsString>),
+    /// `blaze diagnostics`, with the words after it ([`super::diagnostics::main`]).
+    Diagnostics(Vec<OsString>),
+    /// `blaze agents install|hook|status|remove`, with the words after `agents`
+    /// ([`super::agents::main`]).
+    Agents(Vec<OsString>),
     /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
     Pprof(Vec<OsString>),
     /// `blaze perf record|runs|diff ...`, with the words after it ([`super::perf::main`]).
@@ -849,6 +854,8 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("reach") => return Ok(Asked::Reach(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("doctor") => return Ok(Asked::Doctor(words.collect())),
+            Some("diagnostics") => return Ok(Asked::Diagnostics(words.collect())),
+            Some("agents") => return Ok(Asked::Agents(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),

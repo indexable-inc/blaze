@@ -41,7 +41,8 @@ use rustc_type_ir::{FloatTy, IntTy, UintTy, inherent::IntoKind as _};
 use super::{Finding, Lint, facts, general_facts};
 use crate::check::Cx;
 
-const LINT: Lint = Lint::LossyAs;
+// The lint is `as_cast` now; this module stays for what `implicit_overflow` reads of it.
+const LINT: Lint = Lint::AsCast;
 
 /// The bits of a `char`'s largest value, `char::MAX`.
 const CHAR_BITS: u64 = 21;

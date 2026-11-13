@@ -112,7 +112,9 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     let puts = images.take_puts();
     assert!(images.take_puts().is_empty(), "a take empties what was asked for");
     let keys: Vec<Key> = puts.iter().map(|it| it.key).collect();
-    assert_eq!(keys, [Key(key(1)), Key(key(2))]);
+    let mut sorted = [Key(key(1)), Key(key(2))];
+    sorted.sort_unstable_by_key(|it| it.0);
+    assert_eq!(keys, sorted, "each key once, by key");
     assert!(puts.iter().all(|it| it.kind == Kind::Query));
 
     // Once the loop has put them, they are read in place and not asked for again.
@@ -126,7 +128,66 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
         images.put(key(2), b"image two".to_vec()).unwrap();
         assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
     });
-    assert!(images.puts.into_inner().list.is_empty());
+    assert!(images.take_puts().is_empty());
+}
+
+/// The invariant: values asked at once from many threads (a build's tasks resolving files and
+/// reading macro definitions) are each taken once, under their own key, with the bytes asked,
+/// sorted by key whatever order the threads asked in; two asks of one key with other bytes are
+/// the error naming it; and an ask that races a take is in that take or the next, never lost
+/// and never twice in one. No ask waits on another: the table is lock-free ([`Asked`]), where
+/// a lock (`serve.deps.images.entries`) had 55 workers queued behind one asker.
+///
+/// The control is the error: other bytes asked under a key asked since the last take are
+/// refused, so a take that hands back one value per key is not an ask that kept none.
+#[test]
+fn values_asked_at_once_from_many_threads_are_each_taken_once_by_key() {
+    const THREADS: usize = 16;
+    const KEYS: u8 = 64;
+    let asked = Asked::default();
+    let value = |n: u8| vec![n; 1 + usize::from(n) % 7];
+    let taken = std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let asked = &asked;
+            scope.spawn(move || {
+                // Each thread asks every key, starting at its own, each twice: the asks of one
+                // key from all threads meet.
+                for at in 0..2 * usize::from(KEYS) {
+                    let n = u8::try_from((thread + at) % usize::from(KEYS)).unwrap();
+                    asked.ask(key(n), std::borrow::Cow::Owned(value(n))).unwrap();
+                }
+            });
+        }
+        // Takes race the asks: what each takes is added up below.
+        let mut taken = Vec::new();
+        for _ in 0..8 {
+            taken.push(asked.take());
+            std::thread::yield_now();
+        }
+        taken
+    });
+    let mut taken = taken;
+    taken.push(asked.take());
+    for one in &taken {
+        assert!(
+            one.windows(2).all(|it| it[0].key.0 < it[1].key.0),
+            "a take is sorted by key, each key once"
+        );
+        for put in one {
+            let n = (0..KEYS).find(|&n| key(n) == put.key.0).expect("a key that was asked");
+            assert_eq!(put.bytes, value(n), "key {n}'s bytes");
+            assert_eq!(put.kind, Kind::Query);
+        }
+    }
+    // Every key reached some take: a race with a take loses none.
+    for n in 0..KEYS {
+        assert!(taken.iter().flatten().any(|it| it.key.0 == key(n)), "key {n} was never taken");
+    }
+    assert!(asked.take().is_empty(), "a take empties what was asked");
+    // The control: other bytes under a key asked since the last take are refused.
+    asked.ask(key(0), std::borrow::Cow::Owned(value(0))).unwrap();
+    let other = asked.ask(key(0), std::borrow::Cow::Borrowed(b"other")).unwrap_err();
+    assert!(other.contains("two values"), "{other}");
 }
 
 /// The invariant: a per-item entry is found by its key alone, under any set, once the loop
