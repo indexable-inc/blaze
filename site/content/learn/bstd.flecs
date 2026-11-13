@@ -45,7 +45,7 @@ site {
         Code frame(lang: "rust", text: `let name«: String<&Frame>» = format_in!(cx.frame(), "hi, \{who}");
         let mut ids«: Vec<u32, &Frame>» = Vec::new_in(cx.frame());`)
         P heap("No hidden global heap: `String::new()` and `Vec::new()` don't exist. A string lives in an allocator you pass, here the task's **frame**, freed in one go when the task ends.")
-        Dim now("Until bstd's own runtime lands, the global heap is still underneath; using it is flagged as an effect.")
+        Dim now("Not finished yet: Rust's global allocator is still linked underneath until bstd has its own runtime. bstd itself uses it in a few places (the buffers of its IO requests, error messages), each marked with an `// alloc:` line saying why; what it hands you is always in your allocator.")
       }
 
       Step memory_q("Check: where do the bytes go?") {
