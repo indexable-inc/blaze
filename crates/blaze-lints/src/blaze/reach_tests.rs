@@ -90,6 +90,13 @@ pub fn both(v: &[u32], i: usize, j: usize) -> u32 {
     if i < v.len() && j < v.len() { v[i] ^ v[j] } else { 0 }
 }
 #[blaze::nopanic]
+pub fn either(v: &[u32], i: usize, j: usize) -> u32 {
+    if i >= v.len() || j >= v.len() {
+        return 0;
+    }
+    v[i] ^ v[j]
+}
+#[blaze::nopanic]
 pub fn other_index(v: &[u32], i: usize, j: usize) -> u32 {
     if i < v.len() { v[j] } else { 0 }
 }
@@ -456,11 +463,21 @@ pub fn reassigned(mut o: Option<u32>, p: Option<u32>) -> u32 {
         0
     }
 }
+pub fn beside_an_item(n: u32) -> u32 {
+    fn helper(n: u32) -> u32 {
+        n
+    }
+    if helper(n) == 2 {
+        blaze::unreachable!();
+    }
+    0
+}
 "#,
         "-A clippy::all",
     );
     let found = findings(&out, "unreachable");
-    assert_eq!(found.len(), 5, "{out}");
+    assert_eq!(found.len(), 6, "{out}");
+    assert!(found[5].contains("`beside_an_item`"), "{out}");
     assert!(found.iter().all(|it| it.starts_with("error")), "{out}");
     assert!(
         found[0].contains("`bare`: can't prove this `blaze::unreachable!()` is never reached"),
@@ -616,4 +633,50 @@ pub fn dead(o: Option<u32>) -> u32 {
         "-A clippy::all",
     );
     assert_eq!(findings(&out, "todo").len(), 1, "{out}");
+}
+
+/// In a crate that keeps overflow checks, a counter's `i += 1` under `i < v.len()` cannot
+/// overflow (`i` is below a length, which is at most `usize::MAX`), so the counted loop is no
+/// panic. Near misses: a step of 2 can pass the maximum; a counter with no bound.
+#[test]
+fn an_overflow_check_the_bounds_rule_out_is_no_panic() {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std cfg:overflow_checks\n{}",
+        r#"
+#[blaze::nopanic]
+pub fn counted(v: &[u32]) -> u32 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < v.len() {
+        sum ^= v[i];
+        i += 1;
+    }
+    sum
+}
+#[blaze::nopanic]
+pub fn by_two(v: &[u32]) -> u32 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < v.len() {
+        sum ^= v[i];
+        i += 2;
+    }
+    sum
+}
+#[blaze::nopanic]
+pub fn unbounded(n: usize) -> usize {
+    n + 1
+}
+"#
+        .trim_start_matches('\n')
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::nopanic");
+    let names: Vec<&str> = out
+        .lines()
+        .filter(|line| line.contains("is `#[blaze::nopanic]`"))
+        .filter_map(|line| line.split('`').nth(1))
+        .map(|name| name.rsplit("::").next().unwrap_or(name))
+        .collect();
+    assert_eq!(names, ["by_two", "unbounded"], "{out}");
+    assert!(out.contains("with overflow checks"), "{out}");
 }

@@ -1134,31 +1134,6 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let value = self.operand(state, operand);
                 self.not(value)
             }
-            Rvalue::BinaryOp(op, left, right) => {
-                let rel = match op {
-                    BinOp::Lt | BinOp::Gt => Some(Rel::Lt),
-                    BinOp::Le | BinOp::Ge => Some(Rel::Le),
-                    BinOp::Eq => Some(Rel::Eq),
-                    BinOp::Ne => Some(Rel::Ne),
-                    _ => None,
-                };
-                // Integers only: a float's `!(a < b)` is not `b <= a`.
-                let integral =
-                    self.operand_ty(left).is_some_and(|it| int_range(it, self.word).is_some());
-                match rel {
-                    Some(rel) if integral => {
-                        let (a, b) = (self.operand(state, left), self.operand(state, right));
-                        match op {
-                            BinOp::Gt | BinOp::Ge => self.cmp(rel, b, a),
-                            _ => self.cmp(rel, a, b),
-                        }
-                    }
-                    _ => {
-                        let ty = self.place_ty(to);
-                        self.fresh(Some(ty))
-                    }
-                }
-            }
             // `(a op b, overflowed)`: when the exact result fits the type whatever the operands
             // are within their bounds, the flag is false and the check after it holds.
             Rvalue::BinaryOp(
@@ -1201,6 +1176,31 @@ impl<'a, 'db> Solver<'a, 'db> {
                         self.term(Term::Agg(NO_VARIANT, Box::new([value, flag])), ANY)
                     }
                     _ => self.fresh(None),
+                }
+            }
+            Rvalue::BinaryOp(op, left, right) => {
+                let rel = match op {
+                    BinOp::Lt | BinOp::Gt => Some(Rel::Lt),
+                    BinOp::Le | BinOp::Ge => Some(Rel::Le),
+                    BinOp::Eq => Some(Rel::Eq),
+                    BinOp::Ne => Some(Rel::Ne),
+                    _ => None,
+                };
+                // Integers only: a float's `!(a < b)` is not `b <= a`.
+                let integral =
+                    self.operand_ty(left).is_some_and(|it| int_range(it, self.word).is_some());
+                match rel {
+                    Some(rel) if integral => {
+                        let (a, b) = (self.operand(state, left), self.operand(state, right));
+                        match op {
+                            BinOp::Gt | BinOp::Ge => self.cmp(rel, b, a),
+                            _ => self.cmp(rel, a, b),
+                        }
+                    }
+                    _ => {
+                        let ty = self.place_ty(to);
+                        self.fresh(Some(ty))
+                    }
                 }
             }
             Rvalue::Aggregate(kind, operands) => {
@@ -1303,7 +1303,9 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let applied = model.and_then(|model| self.apply(state, model, args, destination));
                 match applied {
                     Some(call) => {
-                        out.safe = call.requires.is_none_or(|goal| self.entails(state, goal));
+                        // Safe means its stated condition is shown: a model that states
+                        // none (`len`) says nothing of whether its function can panic.
+                        out.safe = call.requires.is_some_and(|goal| self.entails(state, goal));
                         if !out.safe {
                             out.goal = call.requires;
                         }
