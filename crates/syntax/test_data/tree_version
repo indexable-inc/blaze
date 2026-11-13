@@ -1,5 +1,5 @@
-3
-generated/runner.rs c853fcd571c75413cf80ddb25cdc8f8f
+4
+generated/runner.rs 38f41f7891a37c98c7def586b8366ec4
 lexer/err/byte_char_literals.rs c3ef3de877abe1fdf49a5cda3579186e
 lexer/err/byte_strings.rs 9c68adca42c9076b385aab193ff38d25
 lexer/err/c_strings.rs affc87d2b069777973d6b87590381e5a
@@ -223,6 +223,7 @@ parser/inline/ok/async_trait_bound.rs 4269a005d306a44e3d536e18d1731d66
 parser/inline/ok/attr_on_expr_stmt.rs 1c6e785a3fb06fcc9d47e74672b6246e
 parser/inline/ok/await_expr.rs 4a4a9062d9b5111bc69fd39f327185aa
 parser/inline/ok/bare_dyn_types_with_leading_lifetime.rs 51302931a08a36948f648f7233d7aad2
+parser/inline/ok/bare_pattern_type.rs c7e3ca0d77ae1af73c8c4c7323304106
 parser/inline/ok/become_expr.rs 438a53d2a80838c43fcdbf0bd3f19136
 parser/inline/ok/bind_pat.rs 147e571a87dd6c04c182407f98bffa01
 parser/inline/ok/binop_resets_statementness.rs 891d04cd345fddb8698d7cf1394862b4
@@ -375,6 +376,7 @@ parser/inline/ok/path_part.rs 4baa2a8161a35bd9c515597cb069bdd9
 parser/inline/ok/path_type.rs 2c5f532c16bf4b555c865052d4a9ffa5
 parser/inline/ok/path_type_with_bounds.rs 2e8c60ecd9e9cb568d200ba84fecf938
 parser/inline/ok/pattern_type.rs 8c7e2fb13049e5baddf332b0c974a06c
+parser/inline/ok/pattern_type_base.rs 7b02510d742722ef95ce0c46c8629336
 parser/inline/ok/placeholder_pat.rs a42e9e9213ac0c9ab7c55fe388c0aad7
 parser/inline/ok/placeholder_type.rs 7a86bc4f068ba8b9f592a354a2f1d0f4
 parser/inline/ok/pointer_type_mut.rs 7cf9c5d232d19cca665df4d2fc55004b
