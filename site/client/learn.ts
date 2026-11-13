@@ -333,6 +333,10 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 			finish();
 		}
 		store(saved);
+		// The URL names the screen in view (`#<step>`, `#done` at the end), so a reload or a copied link opens it.
+		const anchor = i < n ? steps[i]!.id : 'done';
+		if (decodeURIComponent(location.hash.slice(1)) !== anchor)
+			history.replaceState(history.state, '', `${location.pathname}${location.search}#${encodeURIComponent(anchor)}`);
 		const q = questions.get(s);
 		if (q && answered(s)) feedback('ok', 'Answered', s.querySelector('details.answer p')?.innerHTML ?? '');
 		else feedback('');
@@ -467,9 +471,19 @@ function player(main: HTMLElement, signal: AbortSignal): () => void {
 	// Where to open: a link to one step (search results link to `#<step>`), else where the reader left off, else the
 	// first step.
 	const hash = decodeURIComponent(location.hash.slice(1));
-	const linked = steps.findIndex((s) => s.id === hash);
+	const linked = hash === 'done' && me.done ? n : steps.findIndex((s) => s.id === hash);
 	main.dataset.on = '';
 	show(linked >= 0 ? linked : !me.done && me.step >= 1 && me.step <= n ? me.step - 1 : 0, 0);
+	// A link to another step of this page (a search result, a pasted URL) moves the player there.
+	addEventListener(
+		'hashchange',
+		() => {
+			const h = decodeURIComponent(location.hash.slice(1));
+			const i = h === 'done' && me.done ? n : steps.findIndex((s) => s.id === h);
+			if (i >= 0 && i !== at) show(i, i > at ? 1 : -1);
+		},
+		{ signal },
+	);
 
 	return () => {
 		for (const q of questions.values()) q.stop();

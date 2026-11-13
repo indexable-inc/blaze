@@ -1,5 +1,5 @@
 // Lesson: bstd, blaze's own standard library (crates/blaze-std, library name `bstd`; docs/v2/plan/design/std.md):
-// on core and alloc, capabilities handed to `main` as an `Io`, a `Cx` per task, one sans-IO core over io_uring,
+// on core and alloc, capabilities and allocators handed to `main` as an `Io`, a `Cx` per task, one sans-IO core over io_uring,
 // kqueue, IOCP or the deterministic simulation. The `fn main(io: Io)` edition and `#![no_std]` are planned; today a
 // crate takes it as an ordinary dependency.
 site {
@@ -10,7 +10,7 @@ site {
       (InTheme, themes.beyond)
       (Requires, site.learn.extensions)
       Title: {"bstd, its own std"}
-      Description: {"bstd: blaze's own standard library, built on core and alloc, where IO is a capability you pass and every task runs under simulation too."}
+      Description: {"bstd: blaze's own standard library, built on core and alloc, where IO and memory are handed to you and every task runs under simulation too."}
 
       Step ambient("Anything can touch anything") {
         P std("In `std`, any function can open a file or read the clock, and its signature won't tell you.")
@@ -19,14 +19,20 @@ site {
       Step handed("Handed, not taken") {
         Art cap(piece: "capability", label: "main hands one box to a function. The function reaches that box; its tries at the others stop at a wall.")
         Code main(lang: "rust", text: `fn main(cx: &Cx, io: Io) -> Result<(), Error> \{
-            let data = io.fs().open_dir(cx, path!("data"))?;
-            save(&data, &doc) // save can touch data, and only data
+            let fs«: Fs» = io.need_fs()?;
+            let data«: Dir<ReadWrite>» = fs.open_dir(cx, path!("data"))?;
+            save(cx, &data)
+        }
+
+        fn save(cx: &Cx, dir: &Dir<ReadWrite>) -> Result<(), Error> \{
+            let out«: File<ReadWrite>» = dir.create(cx, path!("out.json"))?;
+            ..
         }`)
-        P io("**bstd**, blaze's own std on `core` and `alloc`: IO is a value you pass.")
+        P io("**bstd**, blaze's own std on `core` and `alloc`: IO is a value you pass. `save` was handed one directory, and that is all it can reach.")
       }
 
       Step handed_q("Check: what can it touch?") {
-        Quiz q(prompt: "`fn save(dir: &Dir<ReadWrite>, doc: &Doc)` is written with bstd. What can `save` reach?") {
+        Quiz q(prompt: "`fn save(cx: &Cx, dir: &Dir<ReadWrite>)` is written with bstd. What can `save` reach?") {
           Choice all("Any file on the machine, like any Rust function.", "Not in bstd: there is no global way in. It can reach only what its arguments give it.")
           Choice dir("Only the directory it was handed.", "Right. Its signature is the full list of what it can touch.") {
             Right
@@ -35,9 +41,27 @@ site {
         }
       }
 
+      Step memory("Memory is handed too") {
+        Code frame(lang: "rust", text: `let name«: String<&Frame>» = format_in!(cx.frame(), "hi, \{who}");
+        let mut ids«: Vec<u32, &Frame>» = Vec::new_in(cx.frame());`)
+        P heap("No hidden global heap: `String::new()` and `Vec::new()` don't exist. A string lives in an allocator you pass, here the task's **frame**, freed in one go when the task ends.")
+        Dim now("Until bstd's own runtime lands, the global heap is still underneath; using it is flagged as an effect.")
+      }
+
+      Step memory_q("Check: where do the bytes go?") {
+        Quiz q(prompt: "In bstd, where does a `String` keep its bytes?") {
+          Choice global("In the global heap, like std's `String`.", "bstd has no `String::new()`: there is no hidden heap to put them in.")
+          Choice handed("In the allocator it was made in, such as the task's frame.", "Right. Every byte belongs to something you can name, and a test can count it.") {
+            Right
+          }
+          Choice stack("On the stack.", "Only its handle. The text itself is in the allocator you passed to `new_in` or `format_in!`.")
+        }
+      }
+
       Step sim("The same code, simulated") {
         Art sim(piece: "remote", label: "One block hands work to several; each finishes in its own time and the results come back in an order a seed decides.")
         P one("One `Io` runs on io_uring, kqueue, IOCP, or a **deterministic simulation** from one seed: crash a write a thousand ways, replay the one that broke.")
+        Dim tb("The same idea [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md) tests its database with; in bstd every program gets it, because no code can reach the real world around its `Io`.")
       }
 
       Step status("Where it stands") {

@@ -64,6 +64,8 @@ main.lesson[data-on] > section.step strong { color: var(--ink-1); font-weight: 6
 main.lesson[data-on] > section.step > p.dim { font-size: 15px; line-height: 1.55; color: var(--ink-3); }
 main.lesson[data-on] > section.step .art { margin: 22px 0; }
 main.lesson[data-on] > section.step > :is(.codeblock, .cmd, .table-wrap, table) { margin-block: 18px; }
+/* The URL names the step in view (client/learn.ts); the browser's jump to it on a reload stops at the page's top. */
+main.lesson[data-on] > section { scroll-margin-top: 100vh; }
 
 /* A step slides in from the side it comes from. */
 main.lesson[data-on] > section.step.in-fwd { animation: lp-in 240ms cubic-bezier(0.2, 0.7, 0.3, 1); }

@@ -43,3 +43,6 @@
 .code-roles .hljs-comment { color: var(--syn-comment); }
 .code-roles .hljs-punctuation,
 .code-roles .hljs-operator { color: var(--ink-3); }
+
+/* Inlay hints (gen/highlight.ts): a type the editor would show, faded and boxed, never copied. */
+.code-roles .inlay { margin: 0 1px; padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, var(--ink-4) 18%, transparent); color: var(--ink-3); font-size: 0.94em; user-select: none; }
