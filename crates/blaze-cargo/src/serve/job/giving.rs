@@ -1082,7 +1082,8 @@ impl<S: Steps> Jobs<S> {
                 // footprint is within the limit again.
                 giveback::set_short(true);
                 crate::serve::said::logged!(WARN,
-                    "blaze serve: memory: the tasks of the builds under way are stopped and run again, {:.0} s of their work with them:                      the footprint is {:.2} GiB of a limit's line of {:.2} GiB and nothing cheaper is left to give",
+                    "blaze serve: memory: the tasks of the builds under way are stopped and run again, {:.0} s of their work with them: \
+                     the footprint is {:.2} GiB of a limit's line of {:.2} GiB and nothing cheaper is left to give",
                     give.remake_ns as f64 / 1e9,
                     give.footprint as f64 / f64::from(1u32 << 30),
                     give.limit as f64 / f64::from(1u32 << 30)
@@ -1308,6 +1309,12 @@ impl<S: Steps> Jobs<S> {
     /// task was posted: none when the checkout keeps no front end now, or the plane refused
     /// it (said; the front end is dropped with the task, as a refused store's is).
     pub(super) fn store_members(&mut self, w: &mut World<'_, S>, root: u32) -> bool {
+        // A store that broke makes nothing durable again (the daemon stops, failed naming it):
+        // pages put now could only be lost, and the loss of what answered builds left is said
+        // already. The front end stays the checkout's, and goes with the daemon.
+        if w.store.broken().is_some() {
+            return false;
+        }
         let Some(front) = self.roots.fronts.get_mut(root as usize).and_then(Option::take) else {
             return false;
         };

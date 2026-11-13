@@ -278,6 +278,13 @@ pub(crate) struct Writing {
     /// build ends, and a prewarm of it would read from the disk, each edit, whatever of it
     /// the system held.
     pub(crate) warm: bool,
+    /// Whether a program is started from the path ([`crate::Store::starts`]): the staged file
+    /// is then made executable ([`EXECUTABLE_MODE`], [`Step::Mode`]) before its look, so the
+    /// look is of the file as it is renamed and stays, and a daemon started later finds it
+    /// unchanged.
+    pub(crate) executable: bool,
+    /// Its mode is set ([`Step::Mode`]).
+    moded: bool,
     /// The second path made another name of the file, if one is.
     pub(crate) also: Option<Also>,
     /// The runs, until the cut is made and they go to their writes.
@@ -369,6 +376,8 @@ pub(crate) enum Step {
     AlsoClear,
     /// The staged file given the second path's staged name as another name ([`Also`]).
     Link,
+    /// The staged file made executable, before its look ([`Writing::executable`]).
+    Mode,
     /// The staged file looked at once, whole, before its rename.
     Stamp,
     /// The staged file renamed onto the path (and the second path's, onto it).
@@ -426,6 +435,8 @@ impl Writing {
             len,
             base,
             warm: base == Base::Clone,
+            executable: false,
+            moded: false,
             also: None,
             runs,
             left: 0,
@@ -573,6 +584,16 @@ impl Writing {
                 Next::Going
             }
             (Step::Link, Done::Linked) => self.stamp(ask, effects),
+            (Step::Mode, Done::Moded) => {
+                self.moded = true;
+                self.stamp(ask, effects)
+            }
+            // alloc: an error, once per place that fails
+            (Step::Mode, done) => Next::Failed(format!(
+                "making {} executable before its look: {}",
+                self.temp,
+                crate::describe(done)
+            )),
             (Step::Stamp, done) => match looked(done) {
                 Ok(stamp) => {
                     self.looked = Some(stamp);
@@ -676,6 +697,13 @@ impl Writing {
     /// rename. The store's look at the path after the rename must find it again
     /// ([`crate::Store::vouch`]).
     fn stamp(&mut self, mut ask: impl FnMut(Step) -> Tag, effects: &mut Vec<Effect>) -> Next {
+        if self.executable && !self.moded {
+            // clone: the effect owns the name; once per place
+            let file = self.temp.clone();
+            self.span = step_span(&self.to, "make it executable", 0);
+            effects.push(Effect::Mode { file, mode: EXECUTABLE_MODE, tag: ask(Step::Mode) });
+            return Next::Going;
+        }
         self.span = step_span(&self.to, "look at it", 0);
         effects.push(look(&self.temp, ask(Step::Stamp)));
         Next::Going
@@ -758,6 +786,10 @@ impl Writing {
     }
 }
 
+/// The mode of a placed file a program is started from ([`crate::Store::starts`]), set on its
+/// staged file before the look its stamp is: owner read, write and run; others read and run.
+pub(crate) const EXECUTABLE_MODE: u32 = 0o755;
+
 /// What a path is to hold ([`crate::Store::publish`]).
 pub(crate) enum Content {
     /// These bytes: written where they go. `how`: `write`.
@@ -831,6 +863,7 @@ mod tests {
             Effect::Remove { .. } => Step::Clear,
             Effect::Clone { .. } | Effect::CopyData { .. } => Step::Clone,
             Effect::Stamp { .. } => Step::Stamp,
+            Effect::Mode { .. } => Step::Mode,
             Effect::Link { .. } => Step::Link,
             Effect::Truncate { .. } => Step::Cut,
             Effect::WriteAt { .. } => Step::Write,
@@ -871,6 +904,7 @@ mod tests {
                 Step::Rename => Done::Renamed,
                 Step::AlsoClear => Done::Removed,
                 Step::Link => Done::Linked,
+                Step::Mode => Done::Moded,
                 Step::Stamp => Done::Stamped(vec![Stamp { ino: 9, size: 64, mtime_ns: 1, ctime_ns: 1, mode: 0o100644 }]),
             };
             events.push(Event::Told(step));

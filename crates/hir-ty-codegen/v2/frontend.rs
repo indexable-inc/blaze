@@ -863,7 +863,6 @@ impl<'db> HirFrontend<'db> {
         let owner = self.owner(db, &instance.0);
         let walking =
             super::devirt::walking(db, world, instance, inlined, || owner).map_err(fail)?;
-        let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 21). A
         // copy of it built into a caller is built against none: `built_in_code`.
         let read = refs::read(db, instance, walking).map_err(fail)?;
@@ -871,10 +870,18 @@ impl<'db> HirFrontend<'db> {
             self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
         // What its compiled function reads of names beside its code (the files its `file!()`
         // names, its told locals' types) is in every key of it (rule 21), its link code's as
-        // its template code's: read once, folded into both ([`with_names`]).
+        // its template code's: read once, folded into both ([`with_names`]). Folded into its
+        // body's own code once: `built_in_code` holds the untold names already, so the code is
+        // made from `code_of`, not from it, and equals it where nothing is told and no dyn fact
+        // is read, as a caller's `inlined` names it.
         let body = kind_body(&instance.0);
         let names = body.map(|body| hashes.names_read(db, body, told)).transpose().map_err(fail)?;
-        let code = with_names(super::devirt::code(built_in_code, read), names.map(|it| it.0));
+        let own = code_of(db, hashes, &instance.0).map_err(fail)?;
+        let built_in_code = match told {
+            false => with_names(own, names.map(|it| it.0)),
+            true => built_in_code(db, hashes, &instance.0).map_err(fail)?,
+        };
+        let code = with_names(super::devirt::code(own, read), names.map(|it| it.0));
         // Its template is kept under its template code, which holds no name and no place, when
         // all its positions are its own tables' and its code is its body's alone: none inlined
         // from another body (`inlined`, a unit's inliner; `lang`, the library's bodies, which

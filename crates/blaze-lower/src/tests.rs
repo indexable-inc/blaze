@@ -613,7 +613,11 @@ fn readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities() {
     // Taking away the run identity brings back the clash and its diagnostic names the runs.
     let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
     same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
-    second.set_extra_data(built.lowered.served_db(), same);
+    // One change, in the batch that names it (`Db::require_batches`).
+    built.lowered.served_db().batch(
+        base_db::Trigger::named("the test takes away the run identity"),
+        |db| second.set_extra_data(db, same),
+    );
     let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
     assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
 }
@@ -2973,8 +2977,10 @@ fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
         assert_eq!(own.kept().as_slice(), bytes.as_slice());
     }
 
-    // A value cut short, and one with a flag no narrowed identity has.
-    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] |= 0x80] {
+    // A value cut short, and one whose flags say it has no code text where it holds one's
+    // hash. (Each of the flags byte's eight bits is a flag since `names_location`, 0x80, came
+    // with the surface text, 0fbf2ca128, so no bit is one no narrowed identity has.)
+    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] &= !1] {
         let mut spoiled = kept.clone();
         spoil(&mut spoiled[0].1);
         let tree = MemTree::default();

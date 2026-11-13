@@ -16,7 +16,10 @@
 //! by blaze and checked file by file against the digest it is named by) is sealed; the same
 //! package at a path a person edits (a path dependency into a checkout, `crates/blaze-std` of
 //! blaze's own tree, a workspace member) is not, whatever it holds, and its crates are built
-//! and kept in its home like any other path crate's. [`Placed::sealed_at`] is that test.
+//! and kept in its home like any other path crate's. [`Placed::sealed_at`] is that test. A
+//! tree a build reads through a mount of blaze's own is told by that mount too
+//! ([`Placed::mounted`]): std's crates are named `/rustc/<commit>/library/...` in every plan,
+//! never by the placed directory.
 //!
 //! **The cover.** A sealed tree's records are found by the key each asker already computes;
 //! the [`Cover`] says which pack holds them and which layer it is installed as: the hash of
@@ -30,6 +33,25 @@
 //! its `store`), one writer directory in it a cover (`w-<writer(cover)>`, [`writer`]): what
 //! blaze-cas's shared stores already are, so a home's store reads every installed cover as a
 //! layer behind its own records and never writes it.
+//!
+//! **What a build puts into the layer, and when another home sees it.** A sealed unit a home
+//! builds (every crate of std, by [`pin`]) goes into that daemon's writer of the layer alone
+//! (`World::std`), never its home: its outputs as the unit ends (`Compiled::share`, put on the
+//! loop), its record and slot after the build's answer (`work::PutInto::Layer`, filed by the
+//! after-answer task), and its crate's front-end records with its kept front end. One writer,
+//! put in that order, so any commit that holds a record holds every output it names (and a
+//! reader takes a record only with its outputs there: `unit::compile`'s `found`). Nothing on
+//! the path that answers the build waits for the layer: the job's end flushes it, and its
+//! tickets settle after the answer (`Jobs`' `Settling::layer`, checked with the layer's own
+//! `durable`); the build's certificate is written only once they have, so the daemon says a
+//! build kept only after its layer records are durable. Another home reads only what a commit
+//! made durable (a writer's head names its packs; its own daemon alone reads it live,
+//! `Store::read_live`): while the first home is still committing, a second home's lookup is a
+//! miss and it builds the unit itself, putting equal bytes under the same key into its own
+//! writer; never a torn record. Other bytes under a key the layer holds are the store's typed
+//! refusal (`blaze_cas::Mismatch`). Proved by the simulation
+//! `two_homes_building_std_at_once_leave_a_second_home_every_record_they_reported_kept`
+//! (blaze-cas `tests/layers.rs`).
 //!
 //! **One lookup, in order** ([`Install`]): the layer (one `exists` of its head); then, unless
 //! prebuilt records are turned off (`"prebuilt": false` in `packs.json`), each configured
@@ -97,12 +119,16 @@ pub fn writer_dir(shared: &std::path::Path, cover: Cover) -> PathBuf {
     shared.join("store").join(format!("w-{:x}", writer(cover)))
 }
 
-/// A sealed tree placed on this machine: its directory, the digest it is named by and its
-/// cover.
+/// A sealed tree placed on this machine: its directory, where builds name its crates when
+/// that is not it, the digest it is named by and its cover.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placed {
     /// The tree's directory, `<machine>/<tree>/<digest>`.
     pub dir: PathBuf,
+    /// Where a build names the tree's crates when it reads them through a mount of blaze's
+    /// own rather than from [`Placed::dir`] ([`Tree::mounted`]): the library, mounted at
+    /// `/rustc/<commit>/library` from its texts file, so every crate of std is named there.
+    pub mounted: Option<PathBuf>,
     /// The digest it is named by, as [`Tree::digest`] states it.
     pub digest: String,
     pub cover: Cover,
@@ -146,23 +172,36 @@ impl Pin<'_> {
 
 /// What pins `package`'s sources, or none: the one rule of what is sealed (AGENTS.md rule 30).
 /// `sources` is where this home keeps fetched packages (`BuildConfig::sources`); `shipped`
-/// lists the trees the toolchain ships, asked only for a package no checksum or commit pins.
-/// A workspace member never is; then, in order, a package whose manifest is under a shipped
-/// tree, one with a registry checksum, one of a git source read from the checkout of a whole
+/// lists the trees the toolchain ships, asked only for a package no checksum or commit pins
+/// and for a workspace member.
+/// A workspace member never is, but one read through a shipped tree's mount ([`Placed::mounted`]);
+/// then, in order, a package whose manifest is under a shipped tree (its directory or its
+/// mount), one with a registry checksum, one of a git source read from the checkout of a whole
 /// commit. Any other (a path dependency, whatever its origin, a directory source) is not.
+///
+/// The member that is sealed: the library is loaded as one more workspace (`-Zbuild-std`'s
+/// graph, `blaze_units::stdlib`), so `std`, `sysroot` and `blaze_inproc_rt`, members of
+/// `library/Cargo.toml`, are members in the plan (`blaze_lower::crates::proc_macro_cwd`
+/// relies on it). They are read through blaze's mount of the placed library, which no person
+/// edits (its files are the texts file's, checked against the digest as the tree was placed),
+/// so they are sealed as `core` and `alloc` are. Until 2026-11-13 no crate of std was sealed:
+/// the plan names them under the mount (`/rustc/<commit>/library/...`) and the test compared
+/// the placed directory alone, so every std unit's record and outputs went into each home and
+/// a second home built std again (a hello-world's cold build, 7.6 s of 7.7, in every new home).
+/// A member under a tree's placed directory (a person building in it) is still not sealed.
 pub fn pin<'a, 's: 'a, E>(
     package: &'a blaze_units::query::PackagePlan,
     sources: &std::path::Path,
     shipped: impl FnOnce() -> Result<&'s [Placed], E>,
 ) -> Result<Option<Pin<'a>>, E> {
+    let manifest = std::path::Path::new(&package.manifest_path);
+    let dir = manifest.parent().unwrap_or(std::path::Path::new(""));
     if package.is_member {
-        return Ok(None);
+        return Ok(Placed::mounted_at(shipped()?, dir).map(Pin::Shipped));
     }
     if let Some(sum) = &package.checksum {
         return Ok(Some(Pin::Registry(sum)));
     }
-    let manifest = std::path::Path::new(&package.manifest_path);
-    let dir = manifest.parent().unwrap_or(std::path::Path::new(""));
     let git = package.source.as_deref().is_some_and(|it| it.contains("://"));
     if git && let Some(commit) = checkout_commit(sources, dir) {
         return Ok(Some(Pin::Git(commit)));
@@ -185,8 +224,19 @@ fn checkout_commit<'d>(sources: &std::path::Path, dir: &'d std::path::Path) -> O
 impl Placed {
     /// The cover of the sealed tree the crate whose manifest is in `dir` is read from, or none:
     /// the crate is not sealed (a path a person edits), and is built and kept in its home.
+    /// `dir` is under the tree's directory or where builds mount it ([`Placed::mounted`]).
     pub fn sealed_at<'p>(placed: &'p [Placed], dir: &std::path::Path) -> Option<&'p Placed> {
-        placed.iter().find(|it| dir.starts_with(&it.dir))
+        placed.iter().find(|it| dir.starts_with(&it.dir) || it.mounts(dir))
+    }
+
+    /// The sealed tree whose mount `dir` is under, or none: of a workspace member, the one
+    /// way it is sealed ([`pin`]).
+    pub fn mounted_at<'p>(placed: &'p [Placed], dir: &std::path::Path) -> Option<&'p Placed> {
+        placed.iter().find(|it| it.mounts(dir))
+    }
+
+    fn mounts(&self, dir: &std::path::Path) -> bool {
+        self.mounted.as_deref().is_some_and(|at| dir.starts_with(at))
     }
 }
 
@@ -199,6 +249,12 @@ pub struct Tree {
     /// `<machine>/<tree>/<digest>` for a shipped tree; a registry package's unpacked directory,
     /// checked against its lock file's checksum as it was unpacked.
     pub dir: PathBuf,
+    /// Where builds name its crates when they read them through a mount of blaze's own, not
+    /// at `dir`: the library blaze placed, mounted at `/rustc/<commit>/library`
+    /// (`blaze_units::stdlib::library_at`, as `serve::unit`'s `library` mounts it). None for
+    /// any other tree, and for a library blaze did not place (one `BLAZE_LIBRARY` names: a
+    /// developer's tree, never sealed by its mount).
+    pub mounted: Option<PathBuf>,
     /// `library/DIGEST`, a shipped tree's digest, a registry package's `.crate` checksum.
     pub digest: String,
     /// Indexes, in the same list, of the trees its crates depend on: each before it.
@@ -225,8 +281,8 @@ pub fn placed(trees: &[Tree], makers: ContentId, host: &str) -> Result<Vec<Place
             }
         }
         let cover = cover(&CoverOf { tree: &tree.digest, on: &on, makers, host });
-        // clone: once a tree, the list owns its directory and digest
-        out.push(Placed { dir: tree.dir.clone(), digest: tree.digest.clone(), cover });
+        // clone: once a tree, the list owns its directories and digest
+        out.push(Placed { dir: tree.dir.clone(), mounted: tree.mounted.clone(), digest: tree.digest.clone(), cover });
     }
     Ok(out)
 }
@@ -277,7 +333,7 @@ pub fn registry(
             on.extend(deps[at].iter().filter_map(|dep| index[*dep]));
             index[at] = Some(first + trees.len());
             // clone: once a package, the tree owns its digest
-            trees.push(Tree { dir: dir_of(it)?, digest: it.checksum.clone(), on });
+            trees.push(Tree { dir: dir_of(it)?, mounted: None, digest: it.checksum.clone(), on });
         }
         if trees.len() == locked.len() {
             break;

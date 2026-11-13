@@ -359,6 +359,12 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::UnmarkedNoalloc, false),
     (Lint::UnmarkedNonblocking, false),
     (Lint::MutRef, false),
+    // docs/v2/plan/design/facts.md: `program_lifetime` checks what the code declared and is
+    // `deny` where it fires ([`DENY_BY_DEFAULT`], which wins over this); the two that say where
+    // the attribute and `Ref32` would pay wait for the group, as blaze-lint-defs has them.
+    (Lint::ProgramLifetime, false),
+    (Lint::CouldBeProgramLifetime, false),
+    (Lint::CouldBeRef32, false),
 ];
 
 /// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate

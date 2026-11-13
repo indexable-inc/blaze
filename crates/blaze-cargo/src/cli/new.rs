@@ -390,7 +390,7 @@ mod tests {
                 format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"),
             );
             let source = std::fs::read_to_string(cwd.join(name).join("src/main.rs")).unwrap();
-            assert_eq!(source, "fn main() {\n    blaze_report::outln!(\"Hello, world!\");\n}\n");
+            assert_eq!(source, "fn main() {\n    println!(\"Hello, world!\");\n}\n");
         }
         let refused =
             asked(false, &read(&["--rust", "--edition", "blaze-2026.11", "x"])).unwrap().unwrap_err();

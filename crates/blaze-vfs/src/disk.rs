@@ -113,14 +113,22 @@ pub(crate) fn put_entry(out: &mut Vec<u8>, name: &str, stamp: Stamp) {
 
 /// A `SEEN` record's payload, the one home of its layout: `head str_u32 | dir str_u32 | cursor
 /// (25 B) | root: u8 flag + 32 B | count u32 | count x (name str_u32, stamp 36 B)`, the entries
-/// ([`put_entry`]'s, `count` of them) in the order they were applied, and `disk`'s cursor and
-/// root as they are now.
-pub(crate) fn encode_seen(out: &mut Vec<u8>, head: &str, disk: &Disk, count: u32, entries: &[u8]) {
+/// ([`put_entry`]'s, `count` of them) in the order they were applied, `disk`'s cursor as it is
+/// now, and `root` (the disk's, or none for all but the last of a split record:
+/// `journal::frame_seen`).
+pub(crate) fn encode_seen(
+    out: &mut Vec<u8>,
+    head: &str,
+    disk: &Disk,
+    root: Option<ContentId>,
+    count: u32,
+    entries: &[u8],
+) {
     out.put_bytes_u32(head.as_bytes());
     out.put_bytes_u32(disk.dir.as_str().as_bytes());
     disk.cursor.encode(out);
-    out.put_u8(u8::from(disk.root.is_some()));
-    out.put_bytes(&disk.root.unwrap_or_default().0);
+    out.put_u8(u8::from(root.is_some()));
+    out.put_bytes(&root.unwrap_or_default().0);
     out.put_u32(count);
     out.put_bytes(entries);
 }
@@ -302,8 +310,8 @@ impl Disk {
         }
     }
 
-    /// Calls `f` with every name seen directly in `dir` and its stamp as the disk gave it
-    /// ([`plain`]), in no set order. The column's subtree of each child is skipped by a search,
+    /// Calls `f` with every name seen directly in `dir` and its stamp as saved, [`CHOSE`] and
+    /// all (the watcher takes [`vouches`] of it with the name), in no set order. The column's subtree of each child is skipped by a search,
     /// not walked.
     pub(crate) fn children(&self, dir: &str, mut f: impl FnMut(&str, Stamp)) {
         let direct = |it: &str| {
@@ -313,7 +321,7 @@ impl Disk {
         };
         for (it, stamp) in &self.over {
             if direct(it) && !stamp.is_gone() {
-                f(it, plain(*stamp));
+                f(it, *stamp);
             }
         }
         let Some(base) = &self.base else { return };
@@ -327,7 +335,7 @@ impl Disk {
             match rest.find('/') {
                 None => {
                     if !self.over.contains_key(it) {
-                        f(it, plain(base.stamp(at)));
+                        f(it, base.stamp(at));
                     }
                     at += 1;
                 }
@@ -353,8 +361,9 @@ impl Disk {
         (count + self.over.len(), bytes + over)
     }
 
-    /// Every name seen at or under `name` into `names`, in name order, and its stamp as the disk
-    /// gave it ([`plain`]) into `stamps`. Every name the column holds was checked as it was
+    /// Every name seen at or under `name` into `names`, in name order, and its stamp as saved,
+    /// [`CHOSE`] and all, into `stamps` (the watcher compares [`plain`] of it with the disk's and
+    /// takes [`vouches`] of it as it sweeps). Every name the column holds was checked as it was
     /// opened or set. The whole
     /// directory of a column with nothing changed since it was mapped (a restart's sweep) is
     /// one copy of its names; any other sweep of the whole directory sizes its buffers once.
@@ -366,12 +375,12 @@ impl Disk {
                 && self.over.is_empty()
             {
                 *names = base.all();
-                stamps.extend((0..base.count).map(|at| plain(base.stamp(at))));
+                stamps.extend((0..base.count).map(|at| base.stamp(at)));
                 return;
             }
             *names = Names::with_capacity(count, bytes);
         }
-        self.under(name, |it, stamp| {
+        self.under_saved(name, |it, stamp| {
             names.push_checked(it);
             stamps.push(stamp);
         });
@@ -689,7 +698,8 @@ mod tests {
     }
 
     /// A restart's sweep of a mapped column is one copy of its names, and gives what the
-    /// merging walk gives, name for name and stamp for stamp; so does every sweep after a change.
+    /// merging walk gives, name for name and stamp for stamp as saved (a stamp the head chose
+    /// against keeps its [`CHOSE`]); so does every sweep after a change.
     #[test]
     fn a_sweep_of_a_mapped_column_is_its_names_as_they_are() {
         let mut disks = Disks::default();
@@ -699,9 +709,10 @@ mod tests {
         for (n, it) in names.into_iter().enumerate() {
             disk.set(it, stamp(n as u64 + 1));
         }
+        disk.set("w/a.c", chose(stamp(4)));
         let walked = |disk: &Disk, under: &str| {
             let (mut names, mut stamps) = (Names::default(), Vec::new());
-            disk.under(under, |it, stamp| {
+            disk.under_saved(under, |it, stamp| {
                 names.push_checked(it);
                 stamps.push(stamp);
             });
@@ -717,6 +728,7 @@ mod tests {
         assert_eq!(disk.size(), (names.len(), names.iter().map(|it| it.len() + 1).sum()));
         let whole = swept(&disk, "w");
         assert_eq!(whole, walked(&disk, "w"));
+        assert!(whole.1.iter().any(|it| !vouches(it)), "the chosen stamp is swept as saved");
         assert_eq!(whole.0.iter().collect::<Vec<_>>(), names);
         assert_eq!(swept(&disk, "w/a"), walked(&disk, "w/a"));
         disk.set("w/a/new.rs", stamp(9));

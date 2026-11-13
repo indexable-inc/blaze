@@ -3748,10 +3748,13 @@ fn long_running_lint_counts_loop_turns_not_blocks() {
 
 /// Each `const { .. }` block of a constant's value is a constant of its own to
 /// `long_running_const_eval`, as rustc evaluates an inline const by an evaluation of its own:
-/// three blocks of 700,000 steps each (350,000 turns of a loop that makes a call) are 2,100,000
-/// steps together and none of them is long, where the same calls written in the constant's
-/// own body are one evaluation of 2,100,000 steps, which rustc denies too (blaze-profile's
-/// `VIEWS`, a `const { .. }` per view, was refused while the blocks spent `VIEWS`'s count).
+/// three blocks of 700,002 steps each (77,778 turns of a loop that makes eight calls, nine
+/// steps a turn) are 2,100,006 steps together and none of them is long, where the same calls
+/// written in the constant's own body are one evaluation of 2,100,006 steps, which rustc
+/// denies too (blaze-profile's `VIEWS`, a `const { .. }` per view, was refused while the blocks
+/// spent `VIEWS`'s count). Eight calls a turn keep the blocks run (every one, the fixture's
+/// budget of 10,000,000) near two a step, so the budget is never what stops it: a turn of one
+/// call runs about ten blocks for its two steps, and 2,100,000 steps of those are over it.
 #[test]
 fn long_running_lint_counts_each_inline_const_on_its_own() {
     let turns = r#"
@@ -3759,7 +3762,7 @@ fn long_running_lint_counts_each_inline_const_on_its_own() {
     const fn turns(n: usize) -> usize {
         let mut i = 0;
         while i < n {
-            i = same(i) + 1;
+            i = same(same(same(same(same(same(same(same(i)))))))) + 1;
         }
         i
     }
@@ -3768,27 +3771,27 @@ fn long_running_lint_counts_each_inline_const_on_its_own() {
         &format!(
             "{turns}
     const GOAL: usize =
-        const {{ turns(350_000) }} + const {{ turns(350_001) }} + const {{ turns(350_002) }};
+        const {{ turns(77_778) }} + const {{ turns(77_779) }} + const {{ turns(77_780) }};
     "
         ),
-        1_050_003,
+        233_337,
     );
     // In an array of another constant, as `VIEWS` has them.
     check_number(
         &format!(
             "{turns}
     const PARTS: [usize; 3] =
-        [const {{ turns(350_000) }}, const {{ turns(350_001) }}, const {{ turns(350_002) }}];
+        [const {{ turns(77_778) }}, const {{ turns(77_779) }}, const {{ turns(77_780) }}];
     const GOAL: usize = PARTS[0] + PARTS[1] + PARTS[2];
     "
         ),
-        1_050_003,
+        233_337,
     );
     // The control: without the blocks it is one constant, and long.
     check_fail(
         &format!(
             "{turns}
-    const GOAL: usize = turns(350_000) + turns(350_001) + turns(350_002);
+    const GOAL: usize = turns(77_778) + turns(77_779) + turns(77_780);
     "
         ),
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::LongRunning { at: Some(_) })),

@@ -44,11 +44,15 @@
 #![feature(allocator_ext)]
 // `memory.grow` on wasm64 (`os.rs`), whose intrinsics are not stable there yet.
 #![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (the budget); inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 pub mod align;
 pub mod append;
 pub mod arena;
 pub mod blocks;
+pub mod budget;
 pub mod chunks;
 pub mod column;
 mod error;

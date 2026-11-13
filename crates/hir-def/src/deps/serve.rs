@@ -212,6 +212,21 @@ pub struct Served {
     /// the slots read, and a read valued for each slot whose set of reads was worked out
     /// again. A crate found under its key alone is not among them.
     pub lookups: blaze_record::Counts,
+    /// The crates a [`store`] of this serve wrote: a later store of it (the [`Which::All`] a
+    /// front end makes before it is let go, after its build's end made the [`Which::Sealed`]
+    /// one) writes none of them again, each written under the key this serve gave it.
+    pub stored: StoredOf,
+}
+
+/// The crates the stores of one [`Served`] wrote, behind a lock: [`store`] has the serve by
+/// `&`, as a front end kept for later holds it.
+#[derive(Debug)]
+pub struct StoredOf(blaze_core::lock::Lock<HashSet<Crate, Global>>);
+
+impl Default for StoredOf {
+    fn default() -> StoredOf {
+        StoredOf(blaze_core::lock::Lock::new("deps.served.stored", HashSet::new_in(Global)))
+    }
 }
 
 /// Why [`store`] wrote no image of a crate. Each is an input the key and the reads do not
@@ -425,7 +440,15 @@ pub fn serve(
     if order.is_empty() && left_held.is_empty() {
         hits.sort_unstable_by_key(|krate| keys[krate]);
         // alloc: none: an empty `Vec` holds no buffer
-        return Ok(Served { keys, hits, stale: Vec::new(), old_layout: Vec::new(), build, lookups });
+        return Ok(Served {
+            keys,
+            hits,
+            stale: Vec::new(),
+            old_layout: Vec::new(),
+            build,
+            lookups,
+            stored: StoredOf::default(),
+        });
     }
     // clone: what was served before, once per serve that fetches a crate, to add to
     let mut served = (*before).clone();
@@ -489,7 +512,8 @@ pub fn serve(
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
     if !changed {
-        return Ok(Served { keys, hits, stale, old_layout, build, lookups });
+        let stored = StoredOf::default();
+        return Ok(Served { keys, hits, stale, old_layout, build, lookups, stored });
     }
     // What this serve changes of how each crate is read, named: a crate that gains an image
     // is read from it from here on, and one that loses its image is resolved again. Either
@@ -532,7 +556,7 @@ pub fn serve(
     // A served crate's modules are the decoded map's, not the ones its dependents were
     // maintained against: the maintainers run again over the crates now served.
     db.note_crates_changed();
-    Ok(Served { keys, hits, stale, old_layout, build, lookups })
+    Ok(Served { keys, hits, stale, old_layout, build, lookups, stored: StoredOf::default() })
 }
 
 /// The frozen bytes a database was given, to add to.
@@ -841,8 +865,11 @@ pub fn store(
     images: &dyn ImageStore,
     which: Which,
 ) -> Result<Stored, String> {
+    // The crates read from an image and those an earlier store of this serve wrote: neither
+    // is written again.
     // alloc: setup: once per session
-    let hits: HashSet<Crate, Global> = served.hits.iter().copied().collect();
+    let mut hits: HashSet<Crate, Global> = served.hits.iter().copied().collect();
+    hits.extend(served.stored.0.lock().iter().copied());
     // alloc: setup: one entry a crate walked, once per store with `Which::Sealed`
     let mut sealed = HashMap::new_in(Global);
     let named = |krate: &Crate, sealed: &mut HashMap<Crate, bool, Global>| match which {
@@ -888,6 +915,7 @@ pub fn store(
             Ok(filed) => {
                 stored.written.push(krate);
                 stored.filed.insert(krate, filed);
+                served.stored.0.lock().insert(krate);
             }
             Err(why) => {
                 // Said, a crate each: a crate with no image is resolved again by every daemon

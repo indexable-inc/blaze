@@ -475,29 +475,43 @@ fn every_route(seed: u64, plant: PlacePlant) -> Result<(), String> {
         store.put(key(3), Kind::Code, &text(3, 900)).unwrap();
         flush(&mut sim, &mut store);
         let mut effects = Vec::new();
+        // Each answer is checked against a look as its places end: a later place may replace
+        // the path's file (the patch of `target/app` replaces the maker's), and the stamp it
+        // answered is the file it placed, not the one after it.
+        let mut placed = Vec::new();
         for n in [1, 2, 3] {
             store.place(&key(n), name(&format!("out/{n}")), &mut effects).ok_or("no value to place")?;
         }
         drive(&mut sim, &mut store, &mut effects);
+        let now = store.placed();
+        stamps_whole(&mut sim, &now)?;
+        placed.extend(now);
         let writes = vec![(4096, noise(300, seed + 2)), (40_960, noise(100, seed + 3))];
         let recipe = derived::encode(&key(2), base.len() as u64, &writes).unwrap();
         store.put(key(4), Kind::Derived, &recipe).unwrap();
         flush(&mut sim, &mut store);
         store.place(&key(4), name("out/4"), &mut effects).ok_or("no derived value to place")?;
         drive(&mut sim, &mut store, &mut effects);
+        let now = store.placed();
+        stamps_whole(&mut sim, &now)?;
+        placed.extend(now);
         // A maker's runs, then a patch of them (cloned, or the kernel's copy).
         let to = name("target/app");
         let made = Sparse { len: 32 << 10, runs: vec![(0, noise(2000, seed + 4))] };
         store.place_made(to.clone(), made, &mut effects); // clone: the path is looked at below
         drive(&mut sim, &mut store, &mut effects);
+        let now = store.placed();
+        stamps_whole(&mut sim, &now)?;
+        placed.extend(now);
         let patch = Sparse { len: 30 << 10, runs: vec![(100, noise(64, seed + 5))] };
         store.place_patched(to, patch, false, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
-        let placed = store.placed();
+        let now = store.placed();
+        stamps_whole(&mut sim, &now)?;
+        placed.extend(now);
         if placed.len() != 6 {
             return Err(format!("{} answers of 6 places: {placed:?}", placed.len()));
         }
-        stamps_whole(&mut sim, &placed)?;
         answers.extend(placed.into_iter().map(|it| it.to));
     }
     match answers.len() {

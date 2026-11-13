@@ -18,7 +18,7 @@
 //! - a fetch ends as the first answer of its key says, answers coming in any order and filter
 //!   frames among them: `Kept` only for a whole answer whose bytes hash to the content it names,
 //!   and then the store reads those bytes; `Missing` only for a whole answer that says so;
-//!   `Refused` for the rest, and for every fetch still waiting at a frame that is neither a
+//!   `Refused` for the rest (machine code among them, whatever its bytes), and for every fetch still waiting at a frame that is neither a
 //!   whole filter nor a whole answer of a key still waiting; damage is never other bytes;
 //! - a server sends whole frames: first a full filter its store's every key is in, then answers
 //!   that decode, answering each whole ask in order as `Answer::of` its store does (its values
@@ -98,9 +98,15 @@ fn check(data: &[u8]) {
             let fetched = fetch_all(&keys, &stream, piece);
             if stream == frames {
                 for (value, (key, fetched)) in values.iter().zip(&fetched) {
+                    // Machine code a server holds is refused by a fetch (`Store::take_fetched`).
+                    let ended = match value.kind {
+                        Kind::Machine => matches!(fetched, Fetched::Refused(_)),
+                        _ => matches!(fetched, Fetched::Kept(_)),
+                    };
                     assert!(
-                        *key == value.key && matches!(fetched, Fetched::Kept(_)),
-                        "round trip: a value the server holds is kept, not {fetched:?}"
+                        *key == value.key && ended,
+                        "round trip: a value the server holds is kept (refused, machine code), \
+                         not {fetched:?}"
                     );
                 }
                 assert!(
@@ -161,6 +167,9 @@ fn expected(keys: &[Key], stream: &[u8]) -> Vec<Expect> {
         }
         let (key, expect) = match Answer::decode(body) {
             Ok(Answer::Missing { key }) => (key, Expect::Missing),
+            // Machine code is never kept from a fetch, whatever its bytes: only the daemon's
+            // own compile keeps it (`Store::take_fetched`).
+            Ok(Answer::Value { key, kind: Kind::Machine, .. }) => (key, Expect::Refused),
             Ok(Answer::Value { key, content, bytes, .. }) => {
                 match shared::content_of(&bytes) == content {
                     true => (key, Expect::Kept(bytes)),

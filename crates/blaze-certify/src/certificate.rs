@@ -334,7 +334,8 @@ impl fmt::Display for Undecoded {
                 write!(f, "the request certificate is of layout {n}, which this blaze does not know (it reads layout {LAYOUT})")
             }
             Undecoded::Malformed(field) => {
-                write!(f, "the request certificate's bytes end or go on wrongly at `{field}`")
+                let field = blaze_report::say::Code(field);
+                f.write_str(&blaze_report::say!("the request certificate's bytes end or go on wrongly at ", field).flat())
             }
         }
     }

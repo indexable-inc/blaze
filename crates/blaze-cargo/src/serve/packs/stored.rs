@@ -113,10 +113,13 @@ pub(crate) fn pin_grown(store: &mut Store, name: &str, keys: &[Key]) -> Result<(
     match store.pin_add(name, WHY, blaze_gc::record::now_ns(), keys) {
         Ok(blaze_cas::collect::PinAdded::Written(_) | blaze_cas::collect::PinAdded::Unchanged) => Ok(()),
         // alloc: error path
-        Ok(blaze_cas::collect::PinAdded::NotRead) => Err(format!(
-            "the pin `{name}` was not written: the store has not read its pins since it opened"
-        )),
-        Err(mismatch) => Err(format!("the pin `{name}` was not written: {mismatch:?}")), // alloc: error path
+        Ok(blaze_cas::collect::PinAdded::NotRead) => Err(
+            blaze_report::say!("the pin ", blaze_report::say::Code(name), " was not written: the store has not read its pins since it opened").flat(),
+        ),
+        // alloc: error path
+        Err(mismatch) => {
+            Err(blaze_report::say!("the pin ", blaze_report::say::Code(name), " was not written: ", blaze_report::say::Words(&format!("{mismatch:?}"))).flat())
+        }
     }
 }
 
@@ -315,7 +318,9 @@ pub(crate) fn export(
         false => match records.pinned(pin)? {
             Ok(keys) => keys,
             // alloc: error path
-            Err(known) => return Err(format!("the store has no pin `{pin}` (its pins: {})", known.join(", "))),
+            Err(known) => {
+                return Err(blaze_report::say!("the store has no pin ", blaze_report::say::Code(pin), " (its pins: ", blaze_report::say::Words(&known.join(", ")), ")").flat());
+            }
         },
     };
     let mut listed = Vec::with_capacity(keys.len()); // alloc: once an export
@@ -336,10 +341,14 @@ pub(crate) fn export(
             Some(_) if holds && all => held += 1,
             Some(_) if holds => {
                 // alloc: error path
-                return Err(format!(
-                    "the pin `{pin}` keeps the record of key {}, whose bytes hold a directory of this machine: it is of use here alone and does not travel; nothing was written",
-                    id_of(key)
-                ));
+                return Err(blaze_report::say!(
+                    "the pin ",
+                    blaze_report::say::Code(pin),
+                    " keeps the record of key ",
+                    blaze_report::say::Words(&id_of(key).to_string()),
+                    ", whose bytes hold a directory of this machine: it is of use here alone and does not travel; nothing was written"
+                )
+                .flat());
             }
             Some((kind, content, len)) if admit.contains(&kind.code()) => {
                 listed.push(Record { key: id_of(key), kind: kind.code(), len, content: Id(content.0) });
@@ -354,12 +363,18 @@ pub(crate) fn export(
             // Of a pin, every record it keeps is: one that may not travel refuses the pack.
             Some((kind, _, _)) => {
                 // alloc: error path
-                return Err(format!(
-                    "the pin `{pin}` keeps the record of key {}, of kind `{}`, which does not travel ({}): nothing was written",
-                    id_of(key),
-                    kind.name(),
-                    if kind == Kind::Machine { "machine code, in an unsigned pack: sign it with `--sign-key`" } else { "a pin or the daemon's image" }
-                ));
+                return Err(blaze_report::say!(
+                    "the pin ",
+                    blaze_report::say::Code(pin),
+                    " keeps the record of key ",
+                    blaze_report::say::Words(&id_of(key).to_string()),
+                    ", of kind ",
+                    blaze_report::say::Code(&kind.name().to_string()),
+                    ", which does not travel (",
+                    if kind == Kind::Machine { "machine code, in an unsigned pack: sign it with `--sign-key`" } else { "a pin or the daemon's image" },
+                    "): nothing was written"
+                )
+                .flat());
             }
         }
     }
@@ -441,7 +456,9 @@ pub(crate) fn import(
     unsigned: bool,
 ) -> Result<Option<Imported>, String> {
     let Some(head) = base.head(scope, pin)? else { return Ok(None) };
-    let named = |why: String| format!("the pack of pin `{pin}` at {}: {why}", base.named()); // alloc: error path
+    let named = |why: String| {
+        blaze_report::say!("the pack of pin ", blaze_report::say::Code(pin), " at ", blaze_report::say::Words(&base.named()), ": ", blaze_report::say::Words(&why)).flat() // alloc: error path
+    };
     let vouched = head.vouched(trust, &Ed25519, unsigned).map_err(|refused| named(refused.to_string()))?;
     let manifest = base.manifest(&head)?;
     let admit = admitted(matches!(vouched, Vouched::Signer(_)));

@@ -2,11 +2,17 @@
 //! `nameres::frozen`): read back, they equal what finding them gives, impls in bodies and in
 //! the blocks of macro expansions too.
 
+use std::sync::Arc;
+
 use blaze_core::lock::Lock;
+use blaze_format::Aligned;
 
 use base_db::{Crate, all_crates};
 use blaze_hash::HashMap;
-use hir_def::nameres::frozen::{self as frozen_def, Frozen, Mode};
+use hir_def::nameres::frozen::{
+    self as frozen_def, Frozen, Mode,
+    pages::{PageSource, Paged, Whole},
+};
 use hir_expand::fixture;
 use std::alloc::Global;
 
@@ -97,7 +103,7 @@ fn frozen() -> Bytes {
     blaze_query::db::attach(&db, || {
         let all = crates(&db);
         Bytes {
-            def_maps: each(&db, &all, |it| frozen_def::encode(&db, it)),
+            def_maps: each(&db, &all, |it| frozen_def::pages::encode(&db, it)),
             lang_items: each(&db, &all, |it| frozen_def::encode_lang_items(&db, it)),
             impls: each(&db, &all, |it| frozen_impls::encode(&db, it)),
         }
@@ -119,13 +125,39 @@ fn by_crate(
         .collect()
 }
 
+/// Gives `db` each crate's def map record `bytes` (its pages, as `frozen_def::pages::encode`
+/// writes them) in `mode`, as `hir_def::deps::serve` gives a crate's records: the pages to
+/// read the crate from under [`Mode::Serve`] and [`Mode::Verify`], the record whole to compare
+/// with under [`Mode::Check`] and [`Mode::Verify`]. Under [`Mode::Check`] the crate is
+/// resolved and what it resolved to is written as pages and compared.
+fn give_def_maps(db: &mut TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) {
+    if mode != Mode::Serve {
+        let maps = by_crate(db, mode, bytes);
+        frozen_def::set(db, maps);
+    }
+    if mode != Mode::Check {
+        let crates = crates(db);
+        let maps: HashMap<Crate, Paged, Global> = bytes
+            .iter()
+            .map(|(name, bytes)| {
+                let krate = *crates.iter().find(|&&it| self::name(db, it) == *name).unwrap();
+                let key = blaze_ids::ContentId::of("blaze test def map pages", bytes);
+                let held = Arc::new(Aligned::copy_from(bytes));
+                // dyn: a test's holder of one record, one a crate
+                let source: Arc<dyn PageSource> = Arc::new(Whole(held));
+                (krate, Paged { key, source })
+            })
+            .collect();
+        frozen_def::pages::set(db, maps);
+    }
+}
+
 /// A fresh database with the impls and lang items of [`Bytes`] in `mode`, and the def maps
 /// too when `def_maps`.
 fn with(mode: Mode, bytes: &Bytes, def_maps: bool) -> TestDB {
     let mut db = fixture::db(FIXTURE).into_db();
     if def_maps {
-        let maps = by_crate(&db, mode, &bytes.def_maps);
-        frozen_def::set(&mut db, maps);
+        give_def_maps(&mut db, mode, &bytes.def_maps);
     }
     let lang_items = by_crate(&db, mode, &bytes.lang_items);
     frozen_def::set_lang_items(&mut db, lang_items);
@@ -238,8 +270,9 @@ fn def_maps_with_procedural_macros_read_back_as_resolved() {
     let _turn = TURN.lock();
     let db = fixture::db(PROC_MACROS).into_db();
     let bytes: Vec<(String, Vec<u8>)> = blaze_query::db::attach(&db, || {
-        let encoded =
-            |it| frozen_def::encode(&db, it).map_err(|why| format!("{}: {why}", name(&db, it)));
+        let encoded = |it| {
+            frozen_def::pages::encode(&db, it).map_err(|why| format!("{}: {why}", name(&db, it)))
+        };
         crates(&db)
             .into_iter()
             .map(|it| Ok((name(&db, it), encoded(it)?)))
@@ -249,8 +282,7 @@ fn def_maps_with_procedural_macros_read_back_as_resolved() {
     assert!(bytes.iter().any(|(name, _)| name == "proc_macros"), "{bytes:?}");
     for mode in [Mode::Check, Mode::Verify] {
         let mut db = fixture::db(PROC_MACROS).into_db();
-        let maps = by_crate(&db, mode, &bytes);
-        frozen_def::set(&mut db, maps);
+        give_def_maps(&mut db, mode, &bytes);
         blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 _ = hir_def::nameres::crate_def_map(&db, krate);

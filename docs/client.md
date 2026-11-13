@@ -150,9 +150,9 @@ Everything else is the engine's, never done a second way:
 | When | What the thin `blaze` does |
 |---|---|
 | A word it does not read exactly as the CLI's parser does (anything but `build`/`b`/`run`/`r` with `-q`, `--quiet`, `-r`, `--release`, and `run`'s program arguments), or `--version` with more words | runs the engine with the command line as typed |
-| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME`, or `IX_PROF` | the same |
+| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD`, or `IX_PROF` | the same |
 | No current pin lookup is kept for the directory, the workspace pins another blaze, or `default` in blaze's home names another release | the same: the engine's launcher decides and keeps the lookup |
-| No daemon listens, or the daemon is not the engine beside it | the same: the engine starts or replaces the daemon, saying so |
+| No daemon listens, or the daemon is not the engine beside it, or was started with another `BLAZE_DAEMON_EXIT_UNHELD` than the command sets (its `Status` says, blaze-thin's `route::drifted`) | the same: the engine starts or replaces the daemon, saying so, or refuses the difference naming both values; a daemon the engine starts inherits the command's `BLAZE_DAEMON_EXIT_UNHELD` |
 | The request is sent and the answer is more than cargo's status lines (a diagnostic, a report, an error, a failure; for a `build` that is not quiet, which says why it recomputed what it did, a unit compiled), or has not ended 150 ms after it was sent | becomes the engine, handing it the connection and the answer read so far (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks its own request against the one sent, byte for byte, and prints the whole answer; the daemon is asked once |
 
 `blaze-thin --thin-route WORDS...` says which of the first three rows a command line falls

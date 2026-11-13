@@ -660,6 +660,7 @@ dependencies = [
  "blaze-ids",
  "blaze-protocol",
  "blaze-record",
+ "blaze-report",
  "blaze-vfs",
  "hegeltest",
 ]
@@ -745,6 +746,7 @@ dependencies = [
  "blaze-kernel",
  "blaze-mem",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
  "blaze-store-check",
  "crossbeam-channel",
@@ -815,6 +817,7 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
  "cfg",
  "either",
@@ -1089,6 +1092,7 @@ dependencies = [
  "blaze-cas",
  "blaze-ids",
  "blaze-kernel",
+ "blaze-report",
  "blaze-store-check",
  "hegeltest",
  "hir-expand",
@@ -1428,6 +1432,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-record",
+ "blaze-report",
  "blaze-store-check",
  "hegeltest",
 ]
@@ -1453,6 +1458,7 @@ dependencies = [
  "blaze-items",
  "blaze-launch",
  "blaze-link",
+ "blaze-report",
  "hegeltest",
 ]
 
@@ -1553,6 +1559,7 @@ dependencies = [
  "blaze-phf",
  "blaze-profile",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
  "blaze-vfs",
  "cfg",
@@ -1755,6 +1762,9 @@ dependencies = [
 [[package]]
 name = "blaze-pack"
 version = "0.0.0"
+dependencies = [
+ "blaze-report",
+]
 
 [[package]]
 name = "blaze-phf"
@@ -1778,6 +1788,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-report",
  "blaze-serde",
  "blaze-v2-proof",
  "bytes",
@@ -1826,6 +1837,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-query-macros",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
  "blaze-vfs",
  "crossbeam-channel",
@@ -1847,6 +1859,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-hash",
  "blaze-query",
+ "blaze-report",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -2028,6 +2041,24 @@ dependencies = [
  "naga",
  "rustc_abi",
  "rustc_type_ir",
+]
+
+[[package]]
+name = "blaze-solo"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-core",
+ "blaze-front-items",
+ "blaze-ids",
+ "blaze-kernel",
+ "blaze-store-check",
+ "blaze-vfs",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "syntax",
+ "tracing",
 ]
 
 [[package]]
@@ -2248,6 +2279,7 @@ name = "blaze-usercode"
 version = "0.0.0"
 dependencies = [
  "aho-corasick",
+ "base-db",
  "blaze-alloc-count",
  "blaze-build-script",
  "blaze-cas",
@@ -2303,6 +2335,7 @@ dependencies = [
  "blaze-mem",
  "blaze-protocol",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
  "hashbrown 0.17.1",
  "serde",
@@ -3680,6 +3713,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-query",
+ "blaze-report",
  "cfg",
  "either",
  "expect-test",

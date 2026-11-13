@@ -469,8 +469,14 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             _ => "variable",
         };
         // alloc: the edge, a lint that fires
-        let message =
-            format!("useless assignment of {what} of type `{}` to itself", self.print(owner, ty));
+        let message = blaze_report::say!(
+            "useless assignment of ",
+            blaze_report::say::Words(what),
+            " of type ",
+            blaze_report::say::Code(&self.print(owner, ty)),
+            " to itself"
+        )
+        .flat();
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
         self.found.push(Found::lint(diag, Phase::Late, at));

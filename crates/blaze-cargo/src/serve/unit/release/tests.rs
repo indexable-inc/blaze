@@ -263,9 +263,10 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     );
 }
 
-/// A release's line ends with what the query storage holds and its eight largest holders,
-/// most held first (a tie by name), each with its rows made and, where fewer, its rows in use,
-/// so a function's pages made for keys it never ran read apart (memcap6).
+/// A release's line ends with what the query storage holds and its largest holders (at most
+/// [`Holders::SHOWN`], 32 since 805d575755), most held first (a tie by name), each with its rows
+/// made and, where fewer, its rows in use, so a function's pages made for keys it never ran
+/// read apart (memcap6).
 #[test]
 fn the_query_storage_s_largest_holders_are_said_with_their_rows_made_and_used() {
     let usage = |name: &'static str, rows, used, row_bytes, value_bytes| MemoryUsage {
@@ -286,13 +287,26 @@ fn the_query_storage_s_largest_holders_are_said_with_their_rows_made_and_used() 
         usage("dependency edges", 10_000_000, 10_000_000, 3 << 29, 0),
         usage("Crate", 950, 950, 1 << 26, 0),
     ]);
-    assert_eq!(holders.total, 3_012_558_848, "every holder, the ninth not said included");
+    assert_eq!(holders.total, 3_012_558_848, "every holder");
     assert_eq!(
         holders.to_string(),
         "the query storage holds 2.81 GiB: dependency edges 1.50 (10.00M rows), infer 0.50 (2.0k rows made, 1.5k used), \
          source_place 0.50 (3.19M rows made, 400.0k used), dependency nodes 0.19 (4.00M rows), Crate 0.06 (950 rows), \
-         captured reads 0.03 (0 rows), a 0.02 (1.0k rows made, 3 used), b 0.01 (1.0k rows)"
+         captured reads 0.03 (0 rows), a 0.02 (1.0k rows made, 3 used), b 0.01 (1.0k rows), c 0.00 (1 rows)"
     );
+    // Past the bound the least held go unsaid, and still count in the total.
+    let many: Vec<MemoryUsage> = (0..=Holders::SHOWN as u64)
+        .map(|at| {
+            let name: &'static str = Box::leak(format!("h{at:02}").into_boxed_str());
+            usage(name, 1, 1, (Holders::SHOWN as u64 + 1 - at) << 20, 0)
+        })
+        .collect();
+    let many = Holders::of(many);
+    let said = many.to_string();
+    assert_eq!(said.matches(" rows)").count(), Holders::SHOWN, "{said}");
+    assert!(said.contains(&format!("h{:02} ", Holders::SHOWN - 1)), "{said}");
+    assert!(!said.contains(&format!("h{:02} ", Holders::SHOWN)), "the least held is not said: {said}");
+    assert_eq!(many.total, (1..=Holders::SHOWN as u64 + 1).sum::<u64>() << 20);
 }
 
 /// A count of rows is said in the unit it rounds to: one that rounds up past a unit's last

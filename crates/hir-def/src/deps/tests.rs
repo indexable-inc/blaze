@@ -114,11 +114,11 @@ fn keyed_across_edits(libraries: usize) -> [Vec<String>; 3] {
     db.set_file_text(inner, &edited);
     let moved = walk(&db);
     let after_library = take_keyed(&db);
-    // The refinement: the memo's keys are those of a walk from scratch over the same text.
-    let whole = text.replace(
-        &format!("pub fn f{}() {{}}\n", libraries - 1),
-        &edited,
-    );
+    // The refinement: the memo's keys are those of a walk from scratch over the same text,
+    // the member's edit too (a member is keyed since key domain 9, `super::key::KEY_DOMAIN`).
+    let whole = text
+        .replace(&format!("pub fn f{}() {{}}\n", libraries - 1), &edited)
+        .replace("fn main() {}\n", "fn main() { let _ = 1; }\n");
     let fresh = fixture::db(&whole).into_db();
     let from_scratch: Vec<ContentId> =
         sorted(&keys(&fresh, &all(&fresh), BUILD)).into_iter().map(|it| it.1).collect();
@@ -803,6 +803,11 @@ fn reading_db_of(fixture: &str) -> TestDB {
     let macros = crate_named(&db, "proc_macros");
     let mut data = macros.data(&db).clone();
     data.origin = CrateOrigin::Library { repo: None, name: intern::Symbol::intern("proc_macros") };
+    // A registry's library is pinned by its planner (`base_db::CrateData::sealed`): the
+    // fixture pins only the crates it makes as libraries, and it makes `proc_macros` a member,
+    // so it is pinned here with its origin, or nothing above it is sealed and a build's end
+    // (`Which::Sealed`) stores none of them.
+    data.sealed = Some(ContentId::of("blaze v2 test pin of proc_macros 1", &[]));
     macros.set_data(&mut db, data);
     db
 }

@@ -1027,7 +1027,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                                     Operand::const_zst(ty.as_ref())
                                 }
                                 _ => not_supported!(
-                                    "inline assembly with a `sym` that is not a static or a                                      function without parameters"
+                                    "inline assembly with a `sym` that is not a static or a \
+                                     function without parameters"
                                 ),
                             };
                             operands.push(super::AsmOperand::Sym(named));
@@ -1127,6 +1128,20 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let name = &FunctionSignature::of(self.db, f).name;
                         // clone: error path
                         return Err(MirLowerError::TraitFunctionDefinition(t, name.clone()));
+                    }
+                    let signature = FunctionSignature::of(self.db, f);
+                    if !signature.has_body() {
+                        // A function declared without a body (a `#[rustc_intrinsic]` declaration
+                        // such as `mem::transmute`, an `extern` item): whoever asked for its MIR
+                        // should have taken the intrinsic or foreign path, so say which function.
+                        // FIXME(claude-opus-5-5): a typed `MirLowerError` variant for this, in
+                        // hir-ty's `mir.rs`, beside `TraitFunctionDefinition`.
+                        let edition = self.edition();
+                        let name = hir_ty_print::rustc_function_name(self.db, f, &[])
+                            .unwrap_or_else(|| signature.name.display(self.db, edition).to_string());
+                        return Err(MirLowerError::ImplementationError(format!(
+                            "the body of `{name}` was asked for, a function declared without one"
+                        )));
                     }
                 }
                 Err(MirLowerError::IncompleteExpr)

@@ -944,7 +944,10 @@ mod tests {
     /// LLVM's default.
     #[test]
     fn frame_pointers_are_forced_or_the_abis() {
-        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu"] {
+        // x86-64 Mach-O is no target blaze emits code for (`Target::parse`), so its rule is
+        // not asked here.
+        assert!(Target::of("x86_64-apple-darwin").is_err());
+        for apple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu"] {
             let apple = Target::of(apple).expect("a target");
             assert!(apple.requires_frame_pointers());
             assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());

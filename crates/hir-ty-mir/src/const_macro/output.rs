@@ -258,7 +258,7 @@ fn build(
             out.splice(from, span, table, i)?;
         } else {
             let node = SyntaxKind::from(kind_below_last(kind).ok_or_else(|| no_node(i, kind))?);
-            if kind < SyntaxKind::ABI as u16 || !node.text().is_empty() {
+            if kind < SyntaxKind::ABI as u16 || node.fixed_text().is_some() {
                 return Err(no_node(i, kind));
             }
             out.builder.start_node(node);

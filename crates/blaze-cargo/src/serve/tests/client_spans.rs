@@ -144,7 +144,11 @@ fn warm_run(seed: u64, planted: bool) -> Result<u64, String> {
     CLIENT_ROWS.with_borrow_mut(Vec::clear);
     // The program's artifact, which a `run` the thin client answers execs.
     OUTPUT.set(true);
+    // A load that warns has every answer say it, which the thin client hands to the engine
+    // to print: the run this test times is the one answered here.
+    QUIET_LOAD.set(true);
     let ran = warm_run_of(seed, planted);
+    QUIET_LOAD.set(false);
     OUTPUT.set(false);
     DROPS_A_CLIENT_SPAN.set(false);
     ran

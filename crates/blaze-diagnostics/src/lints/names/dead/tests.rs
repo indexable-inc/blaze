@@ -303,13 +303,17 @@ fn lists(
 }
 
 /// `check` given each fixture: every UI test's source and [`SHAPES`], each the one file of a
-/// crate with core, the crate's context made as a check makes it.
+/// crate with core, the crate's context made as a check makes it. The crate's target is
+/// `other`, as the UI tests' (`crate:other:main`): an executable unless a `#![crate_type]`
+/// says otherwise, as compiletest builds a UI test, so `main` is the entry that seeds
+/// liveness. A fixture crate of no kind is a library, whose private `main` is dead with every
+/// body only it reaches: no self-assignment would be linted and no such body walked.
 fn each_fixture(mut check: impl FnMut(&str, &Cx<'_, '_>)) {
     const CORE: &str = "copy, clone, fmt, derive, default, eq, ord, future, fn, from, \
                         unary_ops, builtin_impls, phantom_data, panic, coerce_unsized, \
                         dispatch_from_dyn";
     for &(name, source) in UI.iter().chain([("shapes", SHAPES), ("marks", MARKS)].iter()) {
-        let fixture = format!("//- minicore: {CORE}\n//- /main.rs crate:main edition:2021\n{source}");
+        let fixture = format!("//- minicore: {CORE}\n//- /main.rs crate:other:main edition:2021\n{source}");
         let (db, names, _) = crate::tests::fixture_db(&fixture, "");
         blaze_query::db::attach(&db, || {
             let krate = hir::check::workspace_crates(&db)[0];
@@ -444,8 +448,13 @@ pub(super) fn planted_text_len(db: &Db, owner: ExpressionStoreOwnerId) -> Option
 }
 
 /// The edit loop's fixture: a body edited last in the file (so no other store moves), the
-/// pass finding a dead function and a self-assignment elsewhere.
-const EDITED: &str = r#"//- /main.rs crate:main edition:2021
+/// pass finding a dead function and a self-assignment elsewhere. An executable (`other`, no
+/// `#![crate_type]`), so `main` is the entry and the bodies it reaches are walked.
+// With core: `p.x = p.x` reads a `Copy` field, and a crate with no core (`#![no_core]`, as a
+// fixture with no `minicore` is) has no `Copy`, so the move out of `*p` would be an error and
+// the late passes, dead code's among them, would not run.
+const EDITED: &str = r#"//- minicore: copy
+//- /main.rs crate:other:main edition:2021
 struct Point { x: i32, y: i32 }
 fn unused() {}
 fn helper(p: &mut Point) { p.x = p.x; }

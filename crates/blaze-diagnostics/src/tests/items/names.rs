@@ -92,11 +92,24 @@ macro_rules! select {
 }
 fn main() { let _unique = select!(_ _ _); let _first = select!(_ _); let _second = select!(_ _); }
 "#;
-    let messages = checked(fixture).messages();
+    // `main.rs`'s alone: the fixture's stand-in for the proc macros' crate
+    // (`auxiliary/proc_macros.rs`) is a workspace crate of its own whose source names
+    // `TokenStream` with no `proc_macro` crate to give it, which is not what this test reads.
+    let checked = checked(fixture);
+    let messages: Vec<String> = checked
+        .diags
+        .iter()
+        .filter(|it| it.span.primary.iter().any(|span| span.file == "main.rs"))
+        .map(|it| match &it.code {
+            Some(code) => format!("{}: {}", code.as_str(), it.message),
+            None => it.message.clone(),
+        })
+        .collect();
     let names = ["E0425", "E0412", "E0433"];
     assert!(
         !messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))),
-        "{messages:?}"
+        "{:?}",
+        checked.messages()
     );
 }
 

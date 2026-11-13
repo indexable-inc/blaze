@@ -113,7 +113,9 @@ pub(crate) fn generic_arg(p: &mut Parser<'_>) -> bool {
                     } else {
                         m.precede(p).complete(p, PATH_TYPE)
                     };
-                    types::opt_type_bounds_as_dyn_trait_type(p, m).precede(p).complete(p, TYPE_ARG);
+                    let m = types::opt_type_bounds_as_dyn_trait_type(p, m);
+                    // blaze, under `#![blaze::error_unions]`: `Result<(), A | io::Error>`.
+                    types::opt_union_after(p, m).precede(p).complete(p, TYPE_ARG);
                 }
             }
         }

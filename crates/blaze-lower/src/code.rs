@@ -111,7 +111,9 @@ const INTERFACE_TEXT: &str = "blaze v2 file interface text 2";
 /// ([`ported_crate`], [`base_db::Files::ported`]).
 const OWN_NARROW: &str = "blaze v2 crate own narrow 2";
 /// The domain of a file's surface text ([`CodeText::surface`]).
-const SURFACE_TEXT: &str = "blaze v2 file surface text 1";
+/// 2: a placed region (a macro's definition, a call of a macro not the standard library's)
+/// is its tokens with their lines and columns, not its bytes.
+const SURFACE_TEXT: &str = "blaze v2 file surface text 2";
 
 /// `krate`'s settings as a portable key holds them ([`Crate::ported_content`]), each crate it
 /// depends on by its own: the database's memo, so a crate's is made once and made again only
@@ -379,8 +381,9 @@ fn calls_other_macro(bang: &SyntaxToken) -> bool {
     let Some(name) = before.next().filter(|it| it.kind() == SyntaxKind::IDENT) else {
         return false;
     };
+    // Among a token tree's tokens `::` is two `:` (the lexer's, which no parser glued).
     !PLAIN_MACROS.contains(&name.text())
-        || before.next().is_some_and(|it| it.kind() == SyntaxKind::COLON2)
+        || before.next().is_some_and(|it| matches!(it.kind(), SyntaxKind::COLON2 | SyntaxKind::COLON))
 }
 
 /// Whether the `use` item `node` could give a name of [`PLAIN_MACROS`] or [`SHADOWABLE`]
@@ -1148,21 +1151,28 @@ struct Surface {
     skip: usize,
     /// Whether whitespace or a comment parts the next token from the one before.
     spaced: bool,
+    /// Where the region [`Surface::placed`] began ends: each token before it is hashed with
+    /// its line and column, and no comment or whitespace is.
+    placed: usize,
+    /// Whether anything is hashed yet: whitespace or a comment before the file's first token
+    /// parts it from none, so it is no part of the text (a comment heading the file).
+    started: bool,
 }
 
 impl Surface {
     fn new() -> Surface {
-        Surface { hasher: Hasher::new(SURFACE_TEXT), skip: 0, spaced: false }
+        Surface { hasher: Hasher::new(SURFACE_TEXT), skip: 0, spaced: false, placed: 0, started: false }
     }
 
     /// The body at `start..end` of `text` as a mark: a byte no token's record starts with
     /// (each starts with 0 or 1), and nothing of its lines. With the planted bug its count of
     /// lines' ends, as the interface text keeps it.
     fn left_out(&mut self, text: &str, start: usize, end: usize) {
-        if start < self.skip {
+        if start < self.skip || start < self.placed {
             return;
         }
         self.hasher.update(&[0xFE]);
+        self.started = true;
         if planted(Plant::Lines) {
             self.hasher.update(&(text[start..end].matches('\n').count() as u64).to_le_bytes());
         }
@@ -1181,17 +1191,19 @@ impl Surface {
             .part(&text.as_bytes()[place.line_start.min(start)..start]);
     }
 
-    /// The region `start..end` of `text` with where it is and its bytes as they are: a
-    /// macro's definition or a call of a macro that is not the standard library's, whose
-    /// expansion may hold the position of any token of it.
+    /// The region `start..end` of `text` with where it is, and each of its tokens with its
+    /// line and column ([`Surface::token`]): a macro's definition or a call of a macro that is
+    /// not the standard library's, whose expansion may hold the position of any token of it.
+    /// A `//` comment and the spaces before a line's end are no token a macro is given and
+    /// move none, so they are not in it (its bytes as they are were, until 2026-11-13).
     fn placed(&mut self, text: &str, place: Place, start: usize, end: usize) {
-        if start < self.skip {
+        if start < self.skip || start < self.placed {
             return;
         }
         self.hasher.update(&[0xFB]);
+        self.started = true;
         self.at(text, place, start);
-        self.hasher.part(&text.as_bytes()[start..end]);
-        self.skip = end;
+        self.placed = end;
         self.spaced = false;
     }
 
@@ -1210,10 +1222,24 @@ impl Surface {
         if start < self.skip {
             return;
         }
+        if start < self.placed {
+            // In a placed region: every token but whitespace and a `//` or block comment
+            // (none of which a macro is given) with its line and its column, in bytes.
+            if !matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT) {
+                let column = start - place.line_start.min(start);
+                self.hasher
+                    .update(&[0xF9])
+                    .update(&place.line.to_le_bytes())
+                    .update(&(column as u64).to_le_bytes())
+                    .part(token.text().as_bytes());
+            }
+            return;
+        }
         match token.kind() {
-            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => self.spaced = true,
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => self.spaced = self.started,
             kind @ (SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT) if !seen => {
                 self.hasher.update(&[0xFC, u8::from(kind == SyntaxKind::INNER_DOC_COMMENT)]);
+                self.started = true;
                 self.spaced = true;
             }
             _ => {
@@ -1222,6 +1248,7 @@ impl Surface {
                     self.at(text, place, start);
                 }
                 self.hasher.update(&[u8::from(self.spaced)]).part(token.text().as_bytes());
+                self.started = true;
                 self.spaced = false;
             }
         }

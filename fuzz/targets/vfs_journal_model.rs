@@ -284,6 +284,7 @@ impl Run {
             }
             Err(CommitError::UnknownBase(root)) => panic!("{root:x} is a root the tree has"),
             Err(CommitError::Conflict { .. } | CommitError::Op(_)) => {}
+            Err(CommitError::Record(error)) => panic!("the model's records are small: {error}"),
         }
     }
 

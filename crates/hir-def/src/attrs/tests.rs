@@ -2415,3 +2415,54 @@ fn no_two_attr_flags_share_a_bit() {
         owner[bit] = Some(name);
     }
 }
+
+/// The function `name` of the crate of `db`'s fixture.
+fn function_named(db: &TestDB, name: &str) -> FunctionId {
+    let def_map = crate_def_map(db, db.fetch_test_crate());
+    def_map
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>()) // alloc: test
+        .find_map(|def| match def {
+            ModuleDefId::FunctionId(it)
+                if crate::signatures::FunctionSignature::of(db, it).name.as_str() == name =>
+            {
+                Some(it)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no function `{name}`"))
+}
+
+/// The invariant: the flags of a function's generic parameters are read off the item's
+/// outline, so an edit of its body leaves `generic_params_attr_flags`'s row verified, not run
+/// (it read the file's live parse before, and ran again on every edit of the file). The
+/// control: an edit of the parameter list itself runs it, so the log is seen to hold it.
+#[test]
+fn a_body_edit_leaves_the_generic_parameters_flags_verified() {
+    let fx = fixture::db("fn f<#[cfg(all())] T>(t: T) -> u32 { 1 }\nfn g() {}\n");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
+    let f = function_named(&db, "f");
+    _ = AttrFlags::query_generic_params(&db, f.into());
+    let file = file.file_id(&db);
+    let ran = |db: &mut TestDB, text: &str| {
+        db.executed_in_write(|db| {
+            db.set_file_text(file, text);
+            _ = AttrFlags::query_generic_params(db, f.into());
+        })
+        .iter()
+        .any(|it| it.contains("generic_params_attr_flags"))
+    };
+    assert!(
+        !ran(&mut db, "fn f<#[cfg(all())] T>(t: T) -> u32 { 2 }\nfn g() {}\n"),
+        "an edit of `f`'s body ran its generic parameters' flags again"
+    );
+    assert!(
+        !ran(&mut db, "fn f<#[cfg(all())] T>(t: T) -> u32 { 2 }\nfn g() { let _ = 1; }\n"),
+        "an edit of another function's body ran `f`'s generic parameters' flags again"
+    );
+    assert!(
+        ran(&mut db, "fn f<#[cfg(all())] T, U>(t: T) -> u32 { 2 }\nfn g() { let _ = 1; }\n"),
+        "control: an edit of the parameter list did not run the flags again"
+    );
+}

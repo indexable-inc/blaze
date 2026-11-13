@@ -293,7 +293,15 @@ fn spans_batch(build: u64, pid: u32, mut recorded: Vec<flight::SpanRow>, timed: 
     // target blaze's steps' (`blaze`).
     let schema = batch.schema();
     let column = |named: &str| {
-        schema.index_of(named).map_err(|error| format!("the spans table has no `{named}` column: {error}"))
+        schema.index_of(named).map_err(|error| {
+            blaze_report::say!(
+                "the spans table has no ",
+                blaze_report::say::Code(named),
+                " column: ",
+                blaze_report::say::Words(&error.to_string())
+            )
+            .flat()
+        })
     };
     let (name, target) = (column("name")?, column("target")?);
     let names = renamed(&batch, name, before, timed.iter().map(|it| it.name.as_str()))?;
@@ -317,11 +325,15 @@ fn renamed<'a>(
     let column = batch
         .column(at)
         .as_dictionary_opt::<UInt32Type>()
-        .ok_or_else(|| format!("the spans table's `{field}` is not a dictionary of u32 keys"))?;
+        .ok_or_else(|| {
+            blaze_report::say!("the spans table's ", blaze_report::say::Code(field), " is not a dictionary of u32 keys").flat()
+        })?;
     let values = column
         .values()
         .as_string_opt::<i32>()
-        .ok_or_else(|| format!("the spans table's `{field}` is not a dictionary of strings"))?;
+        .ok_or_else(|| {
+            blaze_report::say!("the spans table's ", blaze_report::say::Code(field), " is not a dictionary of strings").flat()
+        })?;
     let made = column.keys().iter().take(before).map(|key| key.map(|key| values.value(key as usize)));
     Ok(made.chain(after.map(Some)).collect())
 }

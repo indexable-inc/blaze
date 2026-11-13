@@ -574,7 +574,13 @@ mod tests {
         assert_eq!(of(&asked, blaze::Lint::StdUse), Level::Warn);
         assert_eq!(of(&asked, blaze::Lint::BuildScriptAmbient), of(&none, blaze::Lint::BuildScriptAmbient));
         assert_eq!(capabilities_asks_for(), blaze::Lint::StdUse);
-        assert_eq!(Target::blaze(CAPABILITIES), None, "an attribute, not a lint's or a group's name");
+        // The attribute shares its name with the lint it makes `deny` at the crate's root
+        // (`blaze::capabilities`), so a level set by that name is the lint's, no group's.
+        assert_eq!(
+            Target::blaze(CAPABILITIES),
+            Some(blaze::Lint::Capabilities.bit()),
+            "the attribute's name is its lint's, not a group's"
+        );
     }
 
     #[test]

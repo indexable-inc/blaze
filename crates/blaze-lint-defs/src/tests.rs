@@ -257,7 +257,6 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]

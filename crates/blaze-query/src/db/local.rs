@@ -1295,12 +1295,17 @@ impl Local {
     /// row holds, so a reader of them could be proved by reads that are not its own.
     pub(crate) fn occurrence(&mut self, ingredient: u32, identity_hash: u64) -> Option<u32> {
         if self.frames.last().is_some_and(|it| matches!(it.kind, Kind::Witness { .. })) {
-            panic!(
-                "a tracked struct `{}` was made inside a witnessed or covered run \
-                 (`blaze_query::db::witnessed`, `covered`): its fields would rest on reads no row \
-                 holds; make it in a tracked function the run calls",
-                super::ingredient::name(ingredient)
+            use blaze_report::say::Code;
+            let said = blaze_report::say!(
+                "a tracked struct ",
+                Code(super::ingredient::name(ingredient)),
+                " was made inside a witnessed or covered run (",
+                Code("blaze_query::db::witnessed"),
+                ", ",
+                Code("covered"),
+                "): its fields would rest on reads no row holds; make it in a tracked function the run calls",
             );
+            panic!("{}", said.flat());
         }
         let serial = self.frames.last().filter(|it| it.kind == Kind::Run)?.serial;
         let count = self.occurrences.entry((serial, ingredient, identity_hash)).or_insert(0);

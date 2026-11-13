@@ -3,9 +3,9 @@
 //!
 //! - The first request on a checkout imports it: a [`Watcher`] of its directory scans it into
 //!   the head named by its path and keeps the head current. What a build writes and what is no
-//!   source is not taken in: a `target/` at the root (cargo's, or a `--target-dir` named
-//!   there; blaze's own build directories are under blaze's root, never in the checkout) and
-//!   every `.git`.
+//!   source is not taken in: the watcher leaves out the root's `target/`, every `.git` and
+//!   every directory a `CACHEDIR.TAG` marks, at any depth (`blaze_vfs::watch::view`); a file
+//!   over `blaze_vfs::MOST_FILE_BYTES` is named and left out.
 //! - The request that starts a checkout's watch asks no flush: it waits for the watcher's own
 //!   look (its start sweeps the column, [`Watcher::start`]), and is handed on once that look
 //!   has committed. Sound because the look's every stamp is asked after the request arrived
@@ -77,8 +77,6 @@ struct Held {
 struct Checkout {
     head: String,
     watcher: Watcher,
-    /// Its directory under the driver's root, then `/`: what its files' paths start with.
-    below: String,
     /// The tag of its watcher's watch, which a flush names.
     watch: Tag,
     /// Flushes asked of its watch, by number: whether each has been told. Dropped once told
@@ -194,21 +192,6 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::WillTest { .. }
             | Request::WillSave { .. }
     )
-}
-
-/// Whether the file at `rel` of a checkout is out of its view: a `target/` at the root, which
-/// cargo or a `--target-dir` there writes (blaze's default build directory is never in the
-/// checkout), and every `.git`.
-pub fn excluded(rel: &str) -> bool {
-    rel.strip_prefix("target").is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        || (rel.contains(".git") && rel.split('/').any(|part| part == ".git"))
-}
-
-impl Checkout {
-    /// Whether `file` is in the view: outside the checkout, or not [`excluded`].
-    fn keeps(&self, file: &FileName) -> bool {
-        file.as_str().strip_prefix(self.below.as_str()).is_none_or(|rel| !excluded(rel))
-    }
 }
 
 impl Heads {
@@ -379,21 +362,31 @@ impl Heads {
         let path = head.trim_end_matches('/');
         let Some(dir) = FileName::new(path.trim_start_matches('/')) else {
             return Err(ApiError::new(
-                format!("the head `{head}` names no directory a checkout can be in"),
+                blaze_report::say!("the head ", blaze_report::say::Code(head), " names no directory a checkout can be in").flat(),
                 Some(head.to_owned()),
             ));
         };
         let slot = u32::try_from(self.checkouts.len()).expect("under 2^32 checkouts");
         let tags = self.watchers + u64::from(slot) * WATCHER_TAGS;
         assert!(tags < self.watcher_end, "the daemon has watched every checkout its tags allow");
-        let mut watcher = Watcher::new(head, dir.clone(), tags);
+        let mut watcher = Watcher::new(head, dir, tags).map_err(|error| {
+            ApiError::new(
+                blaze_report::say!(
+                    "watching the checkout ",
+                    blaze_report::say::Code(head),
+                    ": its looks in flight can't be reserved: ",
+                    blaze_report::say::Words(&error.to_string())
+                )
+                .flat(),
+                Some(head.to_owned()),
+            )
+        })?;
         // The journal is asked before any flush of it, in the same effects: a flush names a
         // watch in flight.
         watcher.start(vfs, wall_ns, effects);
         let checkout = Checkout {
             head: head.to_owned(),
             watcher,
-            below: format!("{dir}/"),
             // The tag of the watcher's journal: its first ([`Watcher::new`]).
             watch: Tag(tags),
             flushes: HashMap::new_in(Global),
@@ -465,27 +458,7 @@ impl Heads {
         else {
             return;
         };
-        let done = match completion.done {
-            Done::Journaled(mut batch) => {
-                // A lost subtree under `target/` or `.git` is not rescanned, nor is an excluded
-                // directory listed into.
-                batch.files.retain(|it| checkout.keeps(it));
-                batch.lost.retain(|(it, _)| checkout.keeps(it));
-                Done::Journaled(batch)
-            }
-            Done::Entries(mut entries) => {
-                entries.retain(|(it, _)| checkout.keeps(it));
-                Done::Entries(entries)
-            }
-            done => done,
-        };
-        let watched =
-            checkout.watcher.complete(
-                vfs,
-                Completion { tag: completion.tag, done },
-                wall_ns,
-                effects,
-            );
+        let watched = checkout.watcher.complete(vfs, completion, wall_ns, effects);
         let head = &checkout.head;
         let mut ended = None;
         for it in watched {
@@ -494,6 +467,11 @@ impl Heads {
                     out.push(Out::Moved { head: head.clone(), root: commit.root })
                 }
                 Watched::Lost { .. } | Watched::Scanned => {}
+                Watched::TooLarge { path, size, most } => {
+                    crate::serve::said::logged!(WARN,
+                        "blaze serve: {head}/{path} is {size} bytes, over the {most} one file of a head may hold; it is left out of the head"
+                    );
+                }
                 Watched::Conflict { path } => {
                     crate::serve::said::logged!(WARN,
                         "blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's"
@@ -506,6 +484,11 @@ impl Heads {
                     ended.get_or_insert_with(|| {
                         format!("{head}/{path} changed and can't be read: {error}")
                     });
+                }
+                Watched::Refused(error) => {
+                    ended = Some(format!(
+                        "the disk's changes to the checkout {head} do not apply to its head, so its watch stopped and the next one reads every file again: {error}"
+                    ));
                 }
                 Watched::Ended(error) => {
                     ended.get_or_insert_with(|| match error {
@@ -600,19 +583,6 @@ mod tests {
     /// The wall clock the tests' driver reads: a real epoch's, long after every stamp they
     /// answer with (`mtime_ns: 1`), so none of those is racy.
     const NOW_NS: u64 = 1_700_000_000_000_000_000;
-
-    #[test]
-    fn the_build_dir_and_git_are_out_of_the_view() {
-        assert!(excluded("target"));
-        assert!(excluded("target/debug/foo"));
-        assert!(excluded(".git/HEAD"));
-        assert!(excluded("vendor/x/.git/config"));
-        assert!(!excluded("src/target.rs"));
-        assert!(!excluded("targets/a.rs"));
-        assert!(!excluded("crates/target/src/lib.rs"));
-        assert!(!excluded(".cargo/config.toml"));
-        assert!(!excluded("src/.gitignore.rs"));
-    }
 
     #[test]
     fn what_waits_is_what_reads_a_checkout() {

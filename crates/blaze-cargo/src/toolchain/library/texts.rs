@@ -111,7 +111,8 @@ impl fmt::Display for Refused {
                 write!(f, "it is {found} bytes, and its header and listing say {wanted}")
             }
             Refused::Order { path } => {
-                write!(f, "its listing has `{path}` out of name order, or twice")
+                let said = blaze_report::say!("its listing has ", blaze_report::say::Code(path), " out of name order, or twice");
+                f.write_str(&said.flat())
             }
         }
     }
@@ -139,9 +140,14 @@ pub(crate) fn encode(digest: &str, files: &[(String, Mode, &[u8])]) -> Vec<u8> {
     for pair in files.windows(2) {
         assert!(
             pair[0].0.as_bytes() < pair[1].0.as_bytes(),
-            "a tree's texts are given in name order, each path once: `{}` then `{}`",
-            pair[0].0,
-            pair[1].0
+            "{}",
+            blaze_report::say!(
+                "a tree's texts are given in name order, each path once: ",
+                blaze_report::say::Code(&pair[0].0),
+                " then ",
+                blaze_report::say::Code(&pair[1].0)
+            )
+            .flat()
         );
     }
     let header = 8 + 4 + digest.len() + 32 + 8;

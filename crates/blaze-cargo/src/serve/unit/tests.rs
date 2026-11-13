@@ -2629,8 +2629,9 @@ fn root_values(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> Vec<Str
 /// script runs again and gives another cfg) is served again under its new key, so it resolves
 /// with the cfg its run gives now, never as its image of the old cfg has it (rule 21). Without
 /// the serve after the run is applied, what a kept job did before, the old cfg's def map is
-/// what every dependent resolves against. The new cfg's image is then written, and a run giving
-/// either cfg again finds its image.
+/// what every dependent resolves against. The new cfg's image is then written: a run giving
+/// either cfg again resolves `d` as that cfg has it, and a database that never asked for `d`
+/// finds that cfg's image.
 #[test]
 fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
@@ -2644,7 +2645,9 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
                     session: &mut super::deps::Session,
                     served: hir_def::deps::Served| {
         let kept = super::deps::Kept { served, mode };
-        let (puts, _) = super::deps::store(lowered, Some(&kept), session, &[], "/w", hir_def::deps::Which::Sealed).unwrap();
+        // `d` is unsealed (`blaze_lower::unsealed`): its image is written as a front end let go
+        // writes it (`Which::All`); a build's end writes only the sealed crates'.
+        let (puts, _) = super::deps::store(lowered, Some(&kept), session, &[], "/w", hir_def::deps::Which::All).unwrap();
         for it in puts {
             store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
         }
@@ -2695,14 +2698,33 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     assert_eq!(root_values(&kept, d), ["fast"], "`d` resolves with the cfg its run gives now");
     keep(&kept, &mut session, served);
 
-    // Either cfg again finds its own image.
+    // Either cfg again resolves as its run gives it. This database asked for `d` before and
+    // holds its state (resolved since the `fast` run), so it is not served again but kept up
+    // by deltas (`hir_def::deps::serve`'s `Asked`, R3 rule (a): serving it would drop that
+    // state and pay a cold run at the next edit): no hit, and never stale.
     for (cfgs, values) in [(&[][..], ["slow"]), (&["fast"][..], ["fast"])] {
         kept.ran(1, &d_ran(cfgs)).unwrap();
         let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
             .unwrap()
             .expect("`d`'s key moved");
-        assert_eq!(served.hits, [d], "{cfgs:?}");
+        assert_eq!(served.hits, Vec::new(), "{cfgs:?}: asked before and maintained");
         assert_eq!(root_values(&kept, d), values, "{cfgs:?}");
+    }
+    drop((session, kept));
+
+    // A database that never asked for `d` finds each cfg's own image: the old cfg's from the
+    // first daemon, the new one's written after the serve that resolved it.
+    for (cfgs, values) in [(&[][..], ["slow"]), (&["fast"][..], ["fast"])] {
+        let mut fresh = script_cfg_front();
+        fresh.ran(1, &d_ran(cfgs)).unwrap();
+        let d = fresh.krate(2).unwrap();
+        let mut session = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+        let served = super::deps::images(&mut fresh, &[d], build, &mut session, mode)
+            .unwrap()
+            .expect("`d` is keyed");
+        assert_eq!(served.hits, [d], "{cfgs:?}");
+        assert_eq!(root_values(&fresh, d), values, "{cfgs:?}");
+        drop((session, fresh));
     }
 }
 
@@ -2801,7 +2823,8 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
         .expect("`d` is keyed");
     assert_eq!(root_values(&first, d), ["one"]);
     let kept = super::deps::Kept { served, mode };
-    let (puts, _) = super::deps::store(&first, Some(&kept), &mut session, &[], "/w", hir_def::deps::Which::Sealed).unwrap();
+    // `d` is unsealed: written as a front end let go writes it (`Which::All`).
+    let (puts, _) = super::deps::store(&first, Some(&kept), &mut session, &[], "/w", hir_def::deps::Which::All).unwrap();
     for it in puts {
         store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
     }
@@ -3359,7 +3382,7 @@ fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Sto
     let first = std::sync::Arc::new(core_front(lib));
     let session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
     ask_bodies_steps(&first);
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader)
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new())
         .unwrap_or_else(|error| panic!("the first build's keep: {}", error.what));
     assert!(did.kept > 0, "the first build kept its bodies' entries: {did:?}");
     for it in kept.puts {
@@ -3404,7 +3427,7 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     // its entry.
     assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
     let ran_steps: u64 = BODY_STEPS.iter().map(|&step| ran[step].ran).sum();
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader).unwrap();
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
     assert_eq!(did.kept as u64, ran_steps, "every step run is kept: {did:?}");
     assert_eq!((did.refused, did.unkeyed), (0, 0), "{did:?}");
     assert_eq!((did.outside, did.in_macros, did.unmapped), (0, 0, 0), "{did:?}");
@@ -3461,10 +3484,10 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().unwrap();
     let ran_steps: u64 = BODY_STEPS.iter().map(|&step| ran[step].ran).sum();
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader).unwrap();
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
     assert_eq!(did.kept as u64, ran_steps, "the MIR that reads a layout keeps its entry too: {did:?}");
     assert_eq!((did.refused, did.unkeyed), (0, 0), "{did:?}");
-    let (again, twice) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader).unwrap();
+    let (again, twice) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
     assert_eq!((twice.kept, again.puts.len()), (0, 0), "a run is kept once: {twice:?}");
     for it in kept.puts {
         store.put(it.key, it.kind, &it.bytes).unwrap();
@@ -3659,24 +3682,34 @@ fn the_oracle_catches_a_world_blind_to_a_leak() {
 /// the item store's error (a served answer that disagrees with its database), or a serve that
 /// failed.
 fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
-    let (_sim, _store, reader) = built_and_kept(seed, OWNERS);
+    let (_sim, mut store, reader) = built_and_kept(seed, OWNERS);
     let macros = super::deps::tests::no_macros();
     let sessions = BodySessions::default();
     let marks = no_marks();
     let mut next = std::sync::Arc::new(core_front(OWNERS));
     let served = super::deps::session(&next, &reader, &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    let (_, first) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+    let (puts, first) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
         .map_err(|error| format!("the first serve: {}", error.what))?;
     if first.session != Opened::New {
         return Err(format!("the first serve had a session already: {first:?}"));
+    }
+    // The serve's puts, its session's save among them, put as the loop puts a unit's
+    // `Compiled::puts`: a saved session keeps none of its nodes in memory
+    // (`blaze_kernel::Session::save`), so the carry reads them from the store.
+    for it in puts.puts {
+        store.put(it.key, it.kind, &it.bytes).map_err(|error| format!("the first serve's put: {error:?}"))?;
     }
     ask_bodies_steps(&next);
     let edited = OWNERS.replace("c.bump(1)", "c.bump(2)");
     {
         let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
         let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
-        lowered.served_db().set_file_text(root, &edited);
+        // One change, in one batch: a build's database takes every write so
+        // (`Db::require_batches`, which blaze-lower sets once its crate graph is written).
+        lowered
+            .served_db()
+            .batch(base_db::Trigger::named("the test's edit of `uses`"), |db| db.set_file_text(root, &edited));
     }
     let (_, second) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
         .map_err(|error| format!("the second serve: {}", error.what))?;
@@ -3710,6 +3743,85 @@ fn an_unedited_bodys_entries_are_carried_to_the_next_revision() {
     assert!(did.carried > 0, "the unedited bodies' rows stayed posted: {did:?}");
     assert!(did.carry.valued > 0, "the carry valued the session's reads: {did:?}");
     assert_eq!(did.carry.dropped, None, "{did:?}");
+}
+
+/// [`OWNERS`] built and kept; a new database served by one [`BodySessions`], then a comment
+/// edit served, then a body edit served, each by the same sessions, and none of the first two
+/// serves' puts ever put: as a unit whose record was kept (or that failed) handed none of them
+/// to the loop. The third serve's [`bodies::Did`], or an error naming what broke the invariant:
+/// a serve that failed, a session dropped as naming an entry the store lacks, or a function's
+/// steps other than a database of the edited tree served nothing has.
+fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
+    let (_sim, _store, reader) = built_and_kept(seed, OWNERS);
+    let macros = super::deps::tests::no_macros();
+    let sessions = BodySessions::default();
+    let marks = no_marks();
+    let mut next = std::sync::Arc::new(core_front(OWNERS));
+    let served = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let krate = next.krate(0).unwrap();
+    let edit = |next: &mut std::sync::Arc<blaze_lower::Lowered>, text: &str, why: &'static str| -> Result<(), String> {
+        let lowered = std::sync::Arc::get_mut(next).ok_or("the front end is held past its serve")?;
+        let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
+        lowered.served_db().batch(base_db::Trigger::named(why), |db| db.set_file_text(root, text));
+        Ok(())
+    };
+    // alloc: a test's texts
+    let commented = format!("// a comment\n{OWNERS}");
+    let edited = commented.replace("c.bump(1)", "c.bump(2)");
+    let mut last = None;
+    for (at, text) in [None, Some((&commented, "the test's comment edit")), Some((&edited, "the test's body edit"))]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some((text, why)) = text {
+            edit(&mut next, text, why)?;
+        }
+        // Its puts are dropped: the loop never puts them.
+        let (_lost, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            .map_err(|error| format!("serve {at}: {}", error.what))?;
+        if at > 0 && did.session != Opened::Kept {
+            return Err(format!("serve {at} did not serve from the kept session: {did:?}"));
+        }
+        ask_bodies_steps(&next);
+        last = Some(did);
+    }
+    super::deps::item_errors(&served).map_err(|error| format!("the served database's item store: {}", error.what))?;
+    let fresh = std::sync::Arc::new(core_front(&edited));
+    let _fresh = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+    ask_bodies_steps(&fresh);
+    for name in ["bump", "id", "uses"] {
+        let (now, run) = (steps_of(&next, name), steps_of(&fresh, name));
+        if now != run {
+            return Err(format!("`{name}`: served {now:?}, a database served nothing has {run:?}"));
+        }
+    }
+    last.ok_or_else(|| "no serve ran".to_owned())
+}
+
+/// A body edit after comment edits whose serves' puts never reached the store is served: the
+/// crate's kept session carries its unput entries as `Kept::pending`, and whoever takes it reads
+/// through them and hands them on (the release build's "its entry is not in the store: a
+/// session is of one store" after two comment edits and a body edit).
+///
+/// The invariant: a body entries' session never names an entry that neither the store nor the
+/// overlay its taker reads through holds (end-state.md's I1: every session entry is indexed in
+/// the same transition that admits it); every serve after the first is of the kept session,
+/// and its answers are a fresh database's.
+#[test]
+fn a_body_edit_after_comment_edits_whose_puts_were_lost_is_served() {
+    for seed in [11, 12, 13] {
+        let did = served_past_lost_puts(seed).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert_eq!(did.session, Opened::Kept, "seed {seed}: {did:?}");
+    }
+}
+
+/// The control of [`a_body_edit_after_comment_edits_whose_puts_were_lost_is_served`]: a session
+/// put back with no pending puts (`bodies::NO_PENDING`) names entries the store never got, and
+/// the oracle says so.
+#[test]
+fn the_oracle_catches_a_session_put_back_without_its_puts() {
+    let _planted = Planted::set(&bodies::NO_PENDING);
+    assert!(served_past_lost_puts(14).is_err(), "the oracle passed a session that ran ahead of its puts");
 }
 
 /// The control of [`an_unedited_bodys_entries_are_carried_to_the_next_revision`]: a driver that

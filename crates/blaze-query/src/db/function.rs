@@ -957,9 +957,14 @@ pub fn refresh_by_key<D: Database>(db: &D, key: DatabaseKeyIndex) -> Refreshed {
     // storage's one database type.
     assert!(
         db_type() == std::any::TypeId::of::<D>(),
-        "`{}` was asked to refresh with a database of another type ({})",
-        vtable.name,
-        std::any::type_name::<D>()
+        "{}",
+        blaze_report::say!(
+            blaze_report::say::Code(vtable.name),
+            " was asked to refresh with a database of another type (",
+            blaze_report::say::Words(std::any::type_name::<D>()),
+            ")",
+        )
+        .flat()
     );
     #[cfg(test)]
     if probe::REFRESH_UNVERIFIED.with(Cell::get)

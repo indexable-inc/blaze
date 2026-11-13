@@ -48,6 +48,7 @@ use std::{
 
 use blaze_hash::FixedState;
 use blaze_mem::{Tag, frame::Frame};
+use blaze_report::say::{Code, Words};
 
 use super::{
     Database, Storage,
@@ -224,14 +225,15 @@ impl<'f> Scope<'f> {
     fn check_view<F: Scoped>(&self, storage: &Storage, key: &F::Key) {
         if self.view != storage.view_bits() {
             // alloc: the panic's text
-            refuse(format!(
-                "task-scoped `{}`({}) was asked for in view {} of a scope opened in view {}: a \
-                 scope's values are of its view",
-                F::NAME,
-                key_text::<F>(key),
-                storage.view_bits(),
-                self.view
-            ));
+            refuse(
+                blaze_report::say!(
+                    "task-scoped ",
+                    Code(F::NAME),
+                    Words(&format!("({}) was asked for in view {} of a scope opened in view {}", key_text::<F>(key), storage.view_bits(), self.view)), // alloc: as above
+                    ": a scope's values are of its view",
+                )
+                .flat(),
+            );
         }
     }
 }
@@ -361,13 +363,17 @@ pub fn fetch_scoped<F: Scoped, R>(
     let storage = db.storage();
     let Some(scope) = local::with(|local| open_scope(local, storage)) else {
         // alloc: the panic's text
-        refuse(format!(
-            "task-scoped `{}`({}) was asked for with no task scope open on this task: open one \
-             with `blaze_query::db::task_scope` at the task's entry (a scoped function keeps no \
-             row to fall back on)",
-            F::NAME,
-            key_text::<F>(&key)
-        ));
+        refuse(
+            blaze_report::say!(
+                "task-scoped ",
+                Code(F::NAME),
+                Words(&format!("({})", key_text::<F>(&key))), // alloc: as above
+                " was asked for with no task scope open on this task: open one with ",
+                Code("blaze_query::db::task_scope"),
+                " at the task's entry (a scoped function keeps no row to fall back on)",
+            )
+            .flat(),
+        );
     };
     // SAFETY: the scope is open on this task, so its `task_scope` call is below this one on
     // the task's stack and the scope lives until after this returns.
@@ -411,11 +417,16 @@ fn reenter<F: Scoped, R>(
 ) -> R {
     if F::CYCLE != CycleKind::Fixpoint {
         // alloc: the panic's text
-        refuse(format!(
-            "task-scoped `{}`({}) was asked for while it runs, and has no `cycle_initial`",
-            F::NAME,
-            key_text::<F>(key)
-        ));
+        refuse(
+            blaze_report::say!(
+                "task-scoped ",
+                Code(F::NAME),
+                Words(&format!("({})", key_text::<F>(key))), // alloc: as above
+                " was asked for while it runs, and has no ",
+                Code("cycle_initial"),
+            )
+            .flat(),
+        );
     }
     let run = scope.runs.borrow()[at as usize];
     let crossed = local::with(|local| {
@@ -430,12 +441,15 @@ fn reenter<F: Scoped, R>(
             None => "<a frame gone>".to_owned(), // alloc: the panic's text
         };
         // alloc: the panic's text
-        refuse(format!(
-            "a cycle through task-scoped `{}`({}) goes through the persistent query {through}: \
-             a scoped fixpoint cannot hold a persistent row to its rounds",
-            F::NAME,
-            key_text::<F>(key)
-        ));
+        refuse(
+            blaze_report::say!(
+                "a cycle through task-scoped ",
+                Code(F::NAME),
+                Words(&format!("({}) goes through the persistent query {through}", key_text::<F>(key))), // alloc: as above
+                ": a scoped fixpoint cannot hold a persistent row to its rounds",
+            )
+            .flat(),
+        );
     }
     let value = match run.provisional {
         Some(value) => value.cast::<F::Value>(),
@@ -645,11 +659,14 @@ fn execute<F: Scoped, R>(
         }
         if run.round >= MAX_ROUNDS {
             // alloc: the panic's text
-            refuse(format!(
-                "the fixpoint of task-scoped `{}`({}) did not converge in {MAX_ROUNDS} rounds",
-                F::NAME,
-                key_text::<F>(&key)
-            ));
+            refuse(
+                blaze_report::say!(
+                    "the fixpoint of task-scoped ",
+                    Code(F::NAME),
+                    Words(&format!("({}) did not converge in {MAX_ROUNDS} rounds", key_text::<F>(&key))), // alloc: as above
+                )
+                .flat(),
+            );
         }
         let next = table.keep(scope.frame, new);
         let mut runs = scope.runs.borrow_mut();

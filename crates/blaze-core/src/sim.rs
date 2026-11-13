@@ -1100,6 +1100,15 @@ impl Sim {
         self.changed(file);
     }
 
+    /// `file` grown or cut to `len` bytes (a hole past its end), by something outside the state
+    /// machine: its stamp says `len` and watches of it hear of it, and nothing is allocated
+    /// until something reads it. Not durable: a crash takes the change back. For a file larger
+    /// than a test can hold (one past the 4 GiB a VFS file may be).
+    pub fn grow(&mut self, file: &FileName, len: u64) {
+        file_mut(&mut self.files, file).push_op(Op::Cut(len));
+        self.changed(file);
+    }
+
     /// `file` made a symbolic link to `target`, durably, by something outside the state
     /// machine (a checkout): watches of it hear of it.
     pub fn symlink(&mut self, file: &FileName, target: &str) {

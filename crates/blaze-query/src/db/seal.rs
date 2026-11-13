@@ -890,7 +890,14 @@ impl Storage {
         let number = self.seals.groups.len();
         assert!(
             number < GROUP as usize,
-            "the query database ran out of seal groups ({GROUP}) making one for `{name}`"
+            "{}",
+            blaze_report::say!(
+                "the query database ran out of seal groups (",
+                blaze_report::say::Count(u64::from(GROUP)),
+                ") making one for ",
+                blaze_report::say::Code(name),
+            )
+            .flat()
         );
         self.seals.groups.push(Group::new(name, kind)); // alloc: a group, once a crate
         let group = SealGroup(number as u16);
@@ -909,8 +916,15 @@ impl Storage {
             let dep = dep.0 as usize;
             assert!(
                 dep != 0 && dep < seals.groups.len(),
-                "seal group {dep}, given as a dependency of `{}`, is no group of this storage",
-                seals.groups[at].name
+                "{}",
+                blaze_report::say!(
+                    "seal group ",
+                    blaze_report::say::Count(dep as u64),
+                    ", given as a dependency of ",
+                    blaze_report::say::Code(&seals.groups[at].name),
+                    ", is no group of this storage",
+                )
+                .flat()
             );
             if dep == at {
                 continue;

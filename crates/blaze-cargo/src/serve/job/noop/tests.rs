@@ -542,7 +542,7 @@ impl Daemon {
         }
         self.watches.layout = world.layout;
         let inputs = self.inputs(world);
-        let shape = inputs.config_id;
+        let shape = shape(&inputs);
         let own_output = world.output_path();
         // What the daemon reads of the files, only where the answer's view is another root.
         let read = match self.answers.held_mut(&shape) {
@@ -614,7 +614,7 @@ impl Daemon {
             Some(Bug::EchoIsAChange) => asked_on,
             _ => (self.inputs(world), world.files()),
         };
-        let shape = inputs.config_id;
+        let shape = shape(&inputs);
         self.answers.begin(&shape);
         let key = Hasher::new("the model's plan").id(&inputs.view).id(&inputs.config_id).finish();
         let planned = self.plans.get(&shape) != Some(&key);
@@ -723,6 +723,13 @@ impl Daemon {
             self.answers.keep(shape, last, Some(files));
         }
     }
+}
+
+/// The request's shape as the daemon keys its answers and plans by it (`job::shape_of`), of
+/// the model's plan's config: the config less its environment, as the model's plan reads no
+/// variable.
+fn shape(inputs: &Inputs) -> ContentId {
+    super::super::shape_of(&inputs.config_id.0)
 }
 
 /// Runs `ops` on `world` with `bug` planted: the first answer said again that a walk would
@@ -1347,7 +1354,7 @@ fn the_answers_kept_are_bounded_and_weighed() {
 /// daemon's one other write is its own stall trace under its state directory. A new
 /// `Effect::Write` in either file fails here until it is routed through the view or shown
 /// to be outside every checkout. Outputs are placed by the store, under build directories
-/// the checkout's view leaves out (`heads::excluded`).
+/// the checkout's view leaves out (`blaze_vfs::watch::fixed_out`).
 #[test]
 fn the_daemon_writes_into_a_checkout_only_through_the_builds_view() {
     const WRITE: &str = "Effect::Write {";
@@ -1358,13 +1365,23 @@ fn the_daemon_writes_into_a_checkout_only_through_the_builds_view() {
     let written = include_str!("../written.rs");
     assert_eq!(written.matches(WRITE).count(), 1, "one `Effect::Write`, in `ViewWrite::effect`");
     assert_eq!(written.matches("ViewWrite {").count(), 4, "the type, its impl and its two makings, both in `new`");
+    // daemon.rs writes one file, the stall trace under its state directory; the only other
+    // `Effect::Write` there is the planted bug of the solo rows' take's control
+    // (`LEAVES_TAKEN_SOLO_ROWS`, a test build's alone), which writes a taken record back under
+    // the state directory too.
     let daemon = include_str!("../../daemon.rs");
-    assert_eq!(daemon.matches(WRITE).count(), 1, "daemon.rs writes one file");
-    let at = daemon.find(WRITE).expect("counted above");
-    assert!(
-        daemon[..at].rfind("stalls/").is_some_and(|stall| at - stall < 400),
-        "and it is the stall trace under the daemon's state directory"
-    );
+    let near = |at: usize, what: &str| daemon[..at].rfind(what).is_some_and(|it| at - it < 400);
+    let (mut stalls, mut planted) = (0, 0);
+    for (at, _) in daemon.match_indices(WRITE) {
+        if near(at, "stalls/") {
+            stalls += 1;
+        } else if near(at, "LEAVES_TAKEN_SOLO_ROWS.get()") && near(at, "#[cfg(test)]") {
+            planted += 1;
+        } else {
+            panic!("daemon.rs writes a file at byte {at} that is neither its stall trace nor the planted control's");
+        }
+    }
+    assert_eq!((stalls, planted), (1, 1), "daemon.rs writes one file, the stall trace under the daemon's state directory");
 }
 
 /// A walk that looked at `/root` (a name directly under the file system's root, which no

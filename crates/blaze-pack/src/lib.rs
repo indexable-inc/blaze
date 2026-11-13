@@ -28,8 +28,8 @@
 //!
 //! Every core here is sans-IO: a synchronous state machine that opens no file and no socket,
 //! reads no clock (the fetch is told the time) and computes no hash of its own: its driver
-//! hands it the hash ([`Hashes`]) and the signature check ([`Signatures`]), so this crate has
-//! no dependency at all.
+//! hands it the hash ([`Hashes`]) and the signature check ([`Signatures`]), so its one
+//! dependency is `blaze-report`, whose `say!` writes its messages.
 //!
 //! It is `no_std` on `core` and `alloc` alone. It is not on bstd
 //! (docs/v2/plan/design/std.md) yet, by decision D25 of docs/v2/plan/decisions.json: bstd uses
@@ -58,8 +58,13 @@ pub mod spans;
 #[cfg(test)]
 mod tests;
 
-use alloc::string::String;
+use alloc::string::{String, ToString as _};
 use core::fmt;
+
+use blaze_report::{
+    say,
+    say::{Code, Count, Words},
+};
 
 pub use fetch::Fetch;
 pub use head::{Head, Trust};
@@ -165,11 +170,17 @@ impl fmt::Display for Refused {
             Refused::Malformed { what, at, why } => {
                 write!(f, "{what} is refused at byte {at}: {why}")
             }
-            Refused::Name { what, name } => write!(
-                f,
-                "{what} `{}` is refused: a name is 1 to {} of a-z, 0-9, `.`, `_` and `-`, and starts with none of `.` and `-`",
-                name.escape_default(),
-                layout::NAME_MOST
+            // alloc: an error's text
+            Refused::Name { what, name } => f.write_str(
+                &say!(
+                    Words(what),
+                    " ",
+                    Code(&name.escape_default().to_string()),
+                    " is refused: a name is 1 to ",
+                    Count(layout::NAME_MOST as u64),
+                    " of a-z, 0-9, `.`, `_` and `-`, and starts with none of `.` and `-`"
+                )
+                .flat(),
             ),
             Refused::Record { key, index, want, got } => write!(
                 f,

@@ -3431,9 +3431,21 @@ fn store(
     if let Some(slot) = job.counted.get(unit) {
         slot.get_or_init(Box::default);
     }
+    // A unit whose record is kept still hands on what its bodies phase served and what its
+    // check ran: the crate's body entries' session names those entries from the serve on, so
+    // a record kept never drops their puts (the edit after a comment edit read an `items`
+    // entry the store never got).
     if matches!(phases.linked, Some(Linked::Kept(_)))
-        && let Some(Linked::Kept(kept)) = phases.linked.take()
+        && let Some(Linked::Kept(mut kept)) = phases.linked.take()
     {
+        // A unit that only stands (`stand`) served nothing: no keep on the no-op path.
+        if !phases.body_puts.is_empty() || !phases.body_sessions.is_empty() {
+            kept.body_sessions.extend(std::mem::take(&mut phases.body_sessions));
+            let served = std::mem::take(&mut phases.body_puts);
+            let bodies = super::deps::keep_bodies(job, reader, unit, served)?;
+            kept.puts.extend(bodies.puts);
+            kept.body_sessions.extend(bodies.sessions);
+        }
         return Ok(kept);
     }
     let u = job.unit(unit)?;
@@ -3850,9 +3862,10 @@ fn store(
     // only as the keep returns, so it is the last thing done here. Nothing fallible runs after
     // it, and a kept claim's puts reach the loop; a keep or anything before it that fails lets
     // the claim go to the next unit's keep.
-    compiled.puts.extend(std::mem::take(&mut phases.body_puts));
+    // The serve's puts go through the keep, which reads through them and gives them back with
+    // its own, each once.
     compiled.body_sessions.extend(std::mem::take(&mut phases.body_sessions));
-    let kept = super::deps::keep_bodies(job, reader, unit)?;
+    let kept = super::deps::keep_bodies(job, reader, unit, std::mem::take(&mut phases.body_puts))?;
     compiled.puts.extend(kept.puts);
     // A later root of one crate replaces an earlier one where the loop marks them
     // (`Jobs::body_sessions`): the keep's save is after the serve's.

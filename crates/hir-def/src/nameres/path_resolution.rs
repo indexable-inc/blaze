@@ -409,8 +409,12 @@ impl DefMap {
                     if original_module != current_map.root && current_map.block.is_some() {
                         // A module inside a block. Do not resolve items declared in upper blocks, but we do need to get
                         // the prelude items (which are not inserted into blocks because they can be overridden there).
-                        original_module = current_map.root;
+                        // They are looked up from the crate's root, a module of the crate's map:
+                        // the block's root is not one, and the rest of a path a prelude starts
+                        // (`proc_macros::pass` from a `mod` in a block) is checked against the
+                        // map it is looked up in.
                         current_map = crate_def_map(q.db, self.krate);
+                        original_module = current_map.root;
 
                         let new = current_map.resolve_in_all_preludes(
                             q,

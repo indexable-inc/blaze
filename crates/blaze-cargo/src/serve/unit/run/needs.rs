@@ -249,24 +249,38 @@ enum Holds {
 /// from every state a queued need is served by a task or refused once, within [`BUILD`].
 pub(crate) struct Front {
     holds: Holds,
+    /// Whether the build the daemon sent itself has not ended yet ([`Front::built`]), whatever
+    /// became of what it was asked for: one refused late, or one whose link's task let the
+    /// front end go, is still under way, and no second is sent beside it. Its end is the only
+    /// one [`Front::built`] hears, so it never ends a build asked after it.
+    running: bool,
     pub(crate) plant: FrontPlant,
 }
 
 impl Front {
     pub(crate) fn new() -> Front {
-        Front { holds: Holds::None, plant: FrontPlant::None }
+        Front { holds: Holds::None, running: false, plant: FrontPlant::None }
     }
 
     /// A first call no record answers, at `now`: [`Want::Build`] when none holds or was asked
-    /// (and it is asked from then), else [`Want::Queue`].
+    /// and no build the daemon sent itself is still under way (and it is asked from then),
+    /// else [`Want::Queue`]. With one under way (refused late, or its task let go) the need
+    /// waits for that build, bounded by [`BUILD`] from now: its link holds the front end, or
+    /// its end refuses the need ([`Front::built`]).
     pub(crate) fn want(&mut self, now: Duration) -> Want {
         match self.holds {
+            Holds::None if self.running => {
+                self.holds = Holds::Asked { at: now };
+                Want::Queue
+            }
             Holds::None => {
                 self.holds = Holds::Asked { at: now };
+                self.running = true;
                 Want::Build
             }
             Holds::Asked { .. } if self.plant == FrontPlant::AsksTwice => {
                 self.holds = Holds::Asked { at: now };
+                self.running = true;
                 Want::Build
             }
             Holds::Asked { .. } | Holds::Held => Want::Queue,
@@ -297,6 +311,7 @@ impl Front {
     /// The daemon's own request ended, `ok` or not: where it never held the front end, the
     /// queued needs are refused ([`Refuse::Failed`], [`Refuse::NoStart`]) and none holds it.
     pub(crate) fn built(&mut self, ok: bool) -> Option<Refuse> {
+        self.running = false;
         if !self.is_asked() {
             return None;
         }

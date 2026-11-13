@@ -158,7 +158,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.launch.due.retain(|it| it.name != name);
                     #[cfg(test)]
                     if MARKS_BEFORE_DURABLE.get() {
-                        self.mark_launch(&name, &mark);
+                        // The planted bug marks as the real path does once durable, flush
+                        // included: a mark left unflushed in the journal reaches the disk only
+                        // after the image does, and the control would plant nothing.
+                        if self.mark_launch(&name, &mark) {
+                            self.vfs.flush(&mut self.effects);
+                        }
                         continue;
                     }
                     let mut beside = vec![image.program]; // alloc: once an image, its one or two paths

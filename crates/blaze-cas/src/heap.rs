@@ -113,7 +113,13 @@ impl Store {
         for tier in &mut self.tiers {
             tier.externals.shrink_to_fit();
             for pack in &mut tier.packs {
-                if pack.memory.is_empty() {
+                // The planted bug keeps the drained room through the trim as well, or the
+                // trim would undo it and the oracle would see no bug to catch.
+                #[cfg(test)]
+                let keeps = self.plant_heap == HeapPlant::KeepsPackMemory;
+                #[cfg(not(test))]
+                let keeps = false;
+                if pack.memory.is_empty() && !keeps {
                     // alloc: empty, allocates nothing; it lets go of the pack's drained room
                     pack.memory = Vec::new();
                 }

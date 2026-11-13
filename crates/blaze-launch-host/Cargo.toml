@@ -24,6 +24,8 @@ blaze-items.workspace = true
 blaze-launch.workspace = true
 # A `Location`'s layout and a span table's encoding are the linker's (`blaze_link::position`).
 blaze-link.workspace = true
+# `say!`: an error's message, its code typed.
+blaze-report.workspace = true
 # A record's id: the BLAKE3 hash of its bytes, as the launcher checks it.
 blake3.workspace = true
 

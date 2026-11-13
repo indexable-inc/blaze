@@ -395,7 +395,9 @@ fn main() {
     let _ = r#matc;
 }
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0425", "r#match"])]);
+    // Line 3 of main.rs: the fixture's header is not a line of the file (as `r#Widget(1)` is
+    // line 4 above, after a blank line).
+    assert_reports(&super::ui_fixture(fixture), &[error(3, &["E0425", "r#match"])]);
 }
 
 #[test]

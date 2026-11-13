@@ -570,14 +570,6 @@ pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 /// request named, never by widening a rule here.
 const REFUSALS: &[(&str, &str)] = &[
     ("closure_exprs", "read for another body's closures"),
-    // Of a type or a goal in an environment: no fact names one.
-    ("lookup_impl_method_stored", "a method's impl, selected in an environment"),
-    ("is_copy_query", "a type in an environment"),
-    ("drop_glue_query", "a type in an environment"),
-    ("prove_query", "a goal in an environment"),
-    ("normalize_query", "a type in an environment"),
-    ("auto_trait_depth", "an ADT's auto trait, for a crate"),
-    ("copy_clone_impl", "an ADT's Copy or Clone impl, for a crate"),
     // A const's value, a leak the signature hash marks (design section 4): `ConstValue` names
     // a const evaluated as itself only.
     ("const_eval_query", "a const with arguments or an environment"),
@@ -599,6 +591,17 @@ const REFUSALS: &[(&str, &str)] = &[
 /// classification kept.
 struct Probe {
     seen: Lock<Vec<Seen>>,
+    /// Answer a refused read as covered, so the store walks on past it and keeps the step
+    /// (what was seen still records the read as refused). The store's walk stops at the first
+    /// refused read, so a test of what the reads after one stand for needs this; a test of
+    /// what is refused never sets it.
+    answer_refused: bool,
+}
+
+impl Probe {
+    fn new(answer_refused: bool) -> Probe {
+        Probe { seen: Lock::new("test.itemhash.seen", Vec::new()), answer_refused }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -632,7 +635,10 @@ impl BodyFacts for Probe {
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
         self.seen.lock().push(Seen { def, step, read, kind, name, class });
-        class
+        match class {
+            Classified::Refused if self.answer_refused => Classified::Covered,
+            _ => class,
+        }
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
@@ -687,7 +693,7 @@ fn steps_seen() -> (Db, Vec<Seen>) {
 
 /// [`steps_seen`] of every body of `db`'s local crate.
 fn steps_seen_in(db: Db) -> (Db, Vec<Seen>) {
-    let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
+    let probe = Arc::new(Probe::new(false));
     let installed = body_store::install(
         &db,
         Arc::new(Memory::default()),
@@ -1333,7 +1339,13 @@ fn bodies_in(db: &Db, order: Order) -> Vec<DefWithBodyId> {
 /// [`steps_seen_in`] with the goal store installed too and the bodies asked in `order`: every
 /// body's inference, then every MIR, then every borrow check.
 fn steps_seen_ordered(db: Db, order: Order) -> (Db, Vec<Seen>) {
-    let probe = Arc::new(Probe { seen: Lock::new("test.itemhash.seen", Vec::new()) });
+    steps_seen_ordered_with(db, order, false)
+}
+
+/// [`steps_seen_ordered`] with the probe answering a refused read as covered where
+/// `answer_refused` ([`Probe::answer_refused`]).
+fn steps_seen_ordered_with(db: Db, order: Order, answer_refused: bool) -> (Db, Vec<Seen>) {
+    let probe = Arc::new(Probe::new(answer_refused));
     let goals = hir_ty::next_solver::goal_store::install(
         &db,
         Arc::new(Memory::default()),
@@ -1500,4 +1512,343 @@ fn the_oracle_catches_an_implements_fact_that_ignores_an_added_impl() {
     let moved = own_impl_fact_moves_with_an_added_impl();
     reads::planted::SELF_TY_IGNORED.set(false);
     assert!(!moved, "the planted bug went unseen: the fact moved with the type's impls ignored");
+}
+
+/// Bodies whose borrow checks read the solver queries the borrow check asks in an
+/// environment of its own: `moves` moves a value of a type that is not `Copy`
+/// (`is_copy_query`), `promoted` borrows a const for `'static` (`drop_glue_query`, whether
+/// the const may be promoted), `copies` copies a generic ADT whose `Copy` impl has a where
+/// clause (`prove_query`), and `item` names an associated type in its signature and in an
+/// annotated `let` (`normalize_query`). `other` is read by none.
+const SOLVER_QUERIES: &str = r#"
+//- minicore: sized, copy, clone, add, send, sync, drop
+pub trait Marker {}
+impl Marker for u8 {}
+pub struct W<T>(pub T);
+pub fn moves(w: W<u16>) -> W<u16> { let v = w; v }
+pub struct D { pub a: u8 }
+pub const DC: D = D { a: 1 };
+pub fn promoted() -> &'static D { &DC }
+pub struct G<T>(pub T);
+impl<T: Copy> Clone for G<T> { fn clone(&self) -> G<T> { *self } }
+impl<T: Copy> Copy for G<T> {}
+pub fn copies(g: G<u8>) -> (G<u8>, G<u8>) { (g, g) }
+pub trait It { type Item; }
+pub struct I;
+impl It for I { type Item = u8; }
+pub fn item(x: <I as It>::Item) -> <I as It>::Item { let y: <I as It>::Item = x; y }
+pub fn other() -> u8 { 1 }
+"#;
+
+/// A change a query sees, made to [`SOLVER_QUERIES`]: the body whose borrow check reads the
+/// query, the query, the change, and whether it changes nothing else that body's steps
+/// read (its identity, its inference and its MIR stay as they were), so only the query's
+/// facts can tell the old trace from the new program.
+struct SeenChange {
+    body: &'static str,
+    query: &'static str,
+    change: fn(&str) -> String,
+    isolating: bool,
+}
+
+const SEEN_CHANGES: [SeenChange; 5] = [
+    // A new `impl Copy` for the moved type's shape: `W<u16>` stays not `Copy`, but the impls
+    // of `Copy` for `W` the goal read are others.
+    SeenChange {
+        body: "moves",
+        query: "is_copy_query",
+        change: |source| {
+            format!(
+                "{source}impl Clone for W<u8> {{ fn clone(&self) -> W<u8> {{ W(self.0) }} }}\nimpl Copy for W<u8> {{}}\n"
+            )
+        },
+        isolating: true,
+    },
+    // A new `Drop` impl for the promoted const's type: the borrow is no longer promotable.
+    SeenChange {
+        body: "promoted",
+        query: "drop_glue_query",
+        change: |source| format!("{source}impl Drop for D {{ fn drop(&mut self) {{}} }}\n"),
+        isolating: true,
+    },
+    // A where clause on the impl that proves `G<u8>: Copy`: it still holds, by other means.
+    SeenChange {
+        body: "copies",
+        query: "prove_query",
+        change: |source| {
+            source.replace("impl<T: Copy> Copy for G<T>", "impl<T: Copy + Marker> Copy for G<T>")
+        },
+        isolating: true,
+    },
+    // A where clause on the impl that gives the associated type.
+    SeenChange {
+        body: "item",
+        query: "normalize_query",
+        change: |source| source.replace("impl It for I {", "impl It for I where u8: Marker {"),
+        isolating: true,
+    },
+    // The associated type itself, which inference sees too.
+    SeenChange {
+        body: "item",
+        query: "normalize_query",
+        change: |source| source.replace("type Item = u8;", "type Item = u16;"),
+        isolating: false,
+    },
+];
+
+/// A change no query of [`SOLVER_QUERIES`]' bodies sees: another body's edit.
+fn unseen_change(source: &str) -> String {
+    source.replace("pub fn other() -> u8 { 1 }", "pub fn other() -> u8 { 2 }")
+}
+
+/// Runs inference, MIR building and the borrow check of every body of `db`'s local crate with
+/// an item store installed whose probe answers refused reads as `answer_refused` says, flushes
+/// it, and gives what was seen to `then` while the store is still installed (a step fact's
+/// value is read through it).
+fn with_steps_run<R>(db: &Db, answer_refused: bool, then: impl FnOnce(&[Seen]) -> R) -> R {
+    let probe = Arc::new(Probe::new(answer_refused));
+    let installed = body_store::install(
+        db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    let bodies = crate_body_owners(db, local_crate(db));
+    for &def in &bodies {
+        let _ = InferenceResult::of(db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(db, def);
+    }
+    installed.flush().expect("the test store flushes");
+    let seen = std::mem::take(&mut *probe.seen.lock());
+    let out = then(&seen);
+    drop(installed);
+    out
+}
+
+/// A borrow check's trace as the store keeps it: the body by name, its identity, and each fact
+/// its reads stand for (through the rows read through) with the value it had.
+struct KeptTrace {
+    body: &'static str,
+    identity: ContentId,
+    facts: Vec<(FactRef, Option<ContentId>)>,
+    /// The queries the trace read through.
+    through: Vec<&'static str>,
+}
+
+/// `body`'s borrow-check trace in `source`. Refused reads are answered as covered, so the
+/// trace holds every fact its reads stand for even where one read (a source map's
+/// positions) keeps it out of a real store; what is compared here is what the facts see.
+fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, body);
+    let identity = crate::identity::identity(&db, def)
+        .unwrap_or_else(|it| panic!("`{body}` has no identity: {it:?}"));
+    with_steps_run(&db, true, |seen| {
+        let mut facts: Vec<(FactRef, Option<ContentId>)> = Vec::new(); // alloc: test
+        let mut through: Vec<&'static str> = Vec::new(); // alloc: test
+        for it in seen.iter().filter(|it| it.def == def && it.step == Step::Borrowck) {
+            match it.class {
+                Classified::Fact(fact) | Classified::Scan(fact) => {
+                    facts.push((fact, values::value_in(&db, def, fact)));
+                }
+                Classified::Through => through.push(it.name),
+                Classified::Covered | Classified::Refused => {}
+            }
+        }
+        assert!(!facts.is_empty(), "`{body}`'s borrow check read no fact: it did not run");
+        facts.sort_unstable();
+        facts.dedup();
+        through.sort_unstable();
+        through.dedup();
+        KeptTrace { body, identity, facts, through }
+    })
+}
+
+/// Whether `kept` would be reused in `source`: its body's identity is the same and every fact
+/// it lists has the value it had (the store's hit check, `hir_ty::body_store`).
+fn reused(kept: &KeptTrace, source: &str) -> bool {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, kept.body);
+    let probe = Arc::new(Probe::new(false));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe,
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the changed database");
+    let same = crate::identity::identity(&db, def).ok() == Some(kept.identity)
+        && kept.facts.iter().all(|&(fact, value)| values::value_in(&db, def, fact) == value);
+    drop(installed);
+    same
+}
+
+/// What of `kept` tells it apart in `source`: its identity, and each fact whose value is
+/// another there. Empty where [`reused`] holds.
+fn seen_by(kept: &KeptTrace, source: &str) -> Vec<String> {
+    let db = super::perturb::db(source);
+    let def = body_named(&db, kept.body);
+    let probe = Arc::new(Probe::new(false));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe,
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the changed database");
+    let mut seen: Vec<String> = Vec::new(); // alloc: test
+    if crate::identity::identity(&db, def).ok() != Some(kept.identity) {
+        seen.push(String::from("the body's identity")); // alloc: test
+    }
+    for &(fact, value) in &kept.facts {
+        if values::value_in(&db, def, fact) != value {
+            seen.push(format!("{fact:?}")); // alloc: test
+        }
+    }
+    drop(installed);
+    seen
+}
+
+/// Each body of [`SOLVER_QUERIES`] reads its query through, never refused, and every fact
+/// below it has a value.
+#[test]
+fn the_borrow_checks_solver_queries_are_read_through() {
+    for case in &SEEN_CHANGES {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        assert!(
+            kept.through.iter().any(|&name| reads::cmp_listed(case.query, name).is_eq()),
+            "`{}`'s borrow check did not read `{}` through (read through: {:?}): the fixture misses the path",
+            case.body,
+            case.query,
+            kept.through,
+        );
+        for (fact, value) in &kept.facts {
+            assert!(value.is_some(), "`{}`: {fact:?} has no value", case.body);
+        }
+    }
+}
+
+/// Clean bodies, each with what lowering makes the source does not write (a `for` loop's
+/// iterator calls, `?`'s branch, a closure, `let else`, a destructuring assignment): every
+/// one a store would keep the borrow check's verdict of.
+const CLEAN_BODIES: &str = r#"
+//- minicore: sized, copy, clone, add, iterator, range, try, option, result, fn
+pub struct P { pub x: u32, pub y: u32 }
+pub fn plain(n: u32) -> u32 { let m = n + 1; m }
+pub fn loops(n: u32) -> u32 { let mut t = 0; for i in 0..n { t = t + i; } t }
+pub fn question(o: Option<u32>) -> Option<u32> { let v = o?; Some(v + 1) }
+pub fn closures(n: u32) -> u32 { let f = |x: u32| x + n; f(1) }
+pub fn let_else(o: Option<u32>) -> u32 { let Some(v) = o else { return 0; }; v }
+pub fn swaps(p: &mut P) { let (mut a, mut b) = (p.x, p.y); (a, b) = (b, a); p.x = a; p.y = b; }
+"#;
+
+/// The bodies of [`CLEAN_BODIES`].
+const CLEAN: [&str; 6] = ["plain", "loops", "question", "closures", "let_else", "swaps"];
+
+/// The invariant: a clean function body's borrow check reads no refused row, so its verdict
+/// is kept. In particular it reads no source map (`Body::relative`, `Body::source_map`): which
+/// expressions lowering made up is the store's fact (`ExpressionStore::is_synthesized`, read
+/// with `Body::of`), and positions are read only to render an error. The failure lists every
+/// read of the step, by ingredient and class, so a new refusal names itself.
+#[test]
+fn a_clean_bodys_borrow_check_reads_no_refused_row() {
+    let db = db_of(CLEAN_BODIES);
+    with_steps_run(&db, false, |seen| {
+        for name in CLEAN {
+            let def = body_named(&db, name);
+            let mut reads: Vec<(&'static str, String)> = seen // alloc: test
+                .iter()
+                .filter(|it| it.def == def && it.step == Step::Borrowck)
+                .map(|it| (it.name, format!("{:?}", it.class))) // alloc: test
+                .collect();
+            reads.sort_unstable();
+            reads.dedup();
+            assert!(!reads.is_empty(), "`{name}`'s borrow check read nothing: it did not run");
+            assert!(
+                reads.iter().all(|(_, class)| class != "Refused"),
+                "`{name}`'s borrow check read a refused row, so its verdict is not kept: {reads:#?}"
+            );
+            assert!(
+                reads.iter().any(|&(read, _)| reads::cmp_listed("Body::of", read).is_eq()),
+                "`{name}`'s borrow check did not read its body (`Body::of`), which holds the \
+                 synthesized expressions: {reads:#?}"
+            );
+        }
+    });
+}
+
+/// The invariant: a borrow-check trace kept under its solver queries' facts is not reused
+/// after a change one of those queries sees (a new `impl Copy`, a new `Drop` impl, an impl's
+/// where clause the goal was proved by, an associated type or its impl), and is reused after
+/// a change none of its reads sees (another body's edit).
+#[test]
+fn a_borrow_check_trace_misses_on_what_its_solver_queries_see_and_only_then() {
+    for case in &SEEN_CHANGES {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        let changed = (case.change)(SOLVER_QUERIES);
+        assert_ne!(changed, SOLVER_QUERIES, "the change to `{}` changed nothing", case.body);
+        assert!(
+            !reused(&kept, &changed),
+            "`{}`'s borrow check was reused after a change `{}` sees",
+            case.body,
+            case.query,
+        );
+        assert!(
+            reused(&kept, &unseen_change(SOLVER_QUERIES)),
+            "`{}`'s borrow check missed after another body's edit",
+            case.body,
+        );
+    }
+}
+
+/// The control: with the planted bug (the solver queries covered with no fact, as if
+/// they read nothing outside the body), each change that only those queries see leaves the
+/// trace reused, stale, so the oracle above catches a rule that drops their reads.
+#[test]
+fn the_oracle_catches_solver_queries_kept_under_no_fact() {
+    reads::planted::QUERIES_COVERED.set(true);
+    let mut missed: Vec<(&str, Vec<String>)> = Vec::new(); // alloc: test
+    for case in SEEN_CHANGES.iter().filter(|case| case.isolating) {
+        let kept = borrowck_trace(SOLVER_QUERIES, case.body);
+        let changed = (case.change)(SOLVER_QUERIES);
+        if !reused(&kept, &changed) {
+            missed.push((case.query, seen_by(&kept, &changed)));
+        }
+    }
+    reads::planted::QUERIES_COVERED.set(false);
+    assert!(
+        missed.is_empty(),
+        "with the queries covered, a change still missed (another read saw it, so the case does not isolate its query), each with what saw it: {missed:#?}"
+    );
+}
+
+/// The invariant: the borrow checks' traces through the solver queries, and whether each step
+/// is stored, are byte for byte the same whichever order the bodies ran in, with the goal
+/// store solving goals for whichever ran first.
+#[test]
+fn solver_query_traces_are_the_same_in_any_order() {
+    let mut by_order: Vec<Vec<Trace>> = Vec::new(); // alloc: test
+    for order in [Order::Forward, Order::Reversed, Order::Shuffled] {
+        let (db, seen) = steps_seen_ordered_with(db_of(SOLVER_QUERIES), order, true);
+        for query in reads::planted::QUERIES {
+            assert!(
+                seen.iter().any(|it| it.step == Step::Borrowck
+                    && it.class == Classified::Through
+                    && reads::cmp_listed(query, it.name).is_eq()),
+                "{order:?}: no borrow check read `{query}` through"
+            );
+        }
+        by_order.push(traces(&db, &seen));
+    }
+    assert_eq!(by_order[0], by_order[1], "the traces depend on the order (forward, reversed)");
+    assert_eq!(by_order[0], by_order[2], "the traces depend on the order (forward, shuffled)");
 }

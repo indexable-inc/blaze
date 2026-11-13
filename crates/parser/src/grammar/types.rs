@@ -58,12 +58,30 @@ fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
         m.abandon(p);
         return;
     }
+    union_members(p, allow_bounds);
+    m.complete(p, UNION_TYPE);
+}
+
+/// After a type `first` the grammar parsed on its own (a generic argument that starts with a
+/// name, which `generic_args::generic_arg` reads before it knows it is a type): under
+/// `#![blaze::error_unions]` the rest of an error union `first | B | C`, as [`type_`] reads
+/// one. The type itself, or the union it begins.
+pub(super) fn opt_union_after(p: &mut Parser<'_>, first: CompletedMarker) -> CompletedMarker {
+    if !p.unions() || !at_union_bar(p) {
+        return first;
+    }
+    let m = first.precede(p);
+    union_members(p, true);
+    m.complete(p, UNION_TYPE)
+}
+
+/// The `| B | C` of an error union, each member a type that is no union itself.
+fn union_members(p: &mut Parser<'_>, allow_bounds: bool) {
     // blaze, under `#![blaze::error_unions]`: `type E = io::Error | ParseIntError;`
     while at_union_bar(p) {
         p.bump(T![|]);
         p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
     }
-    m.complete(p, UNION_TYPE);
 }
 
 /// Whether the parser is at the `|` between two members of an error union: a lone `|`, not

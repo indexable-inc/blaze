@@ -46,24 +46,21 @@ use std::borrow::Cow;
 
 use blaze_cas::Key;
 use blaze_ids::Hasher;
-use blaze_usercode::roots::{Role, Roots};
+use blaze_usercode::roots::{Role, Roots, port::Dirs};
 
 use super::Job;
 
 /// The directories of one build that its keys and records are written against, each by what
 /// it is.
+/// The front end's port of them is [`Dirs`] (blaze-usercode, in the front end's code identity):
+/// what writes the paths a front-end record holds; this adds what a unit's record key does.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Places {
-    roots: Vec<(Role, String)>,
+    dirs: Dirs,
 }
 
 /// The domain of [`Places::here`].
 const HERE: &str = "blaze v2 cargo unit record here 1";
-
-/// What starts a path in a package id (`path+file:///w/p#0.1.0`): the root after it starts
-/// no path as [`Roots::port`] reads one (a `/` is before it), so a string is ported in the
-/// pieces these end.
-const URL: &[u8] = b"file://";
 
 impl Places {
     /// The roots of a build of the workspace at `workspace` whose build directory is `target`,
@@ -87,13 +84,7 @@ impl Places {
             (Role::Launcher, launcher.to_str()),
             (Role::Sources, sources.to_str()),
         ];
-        // alloc: once per job's places, a root each
-        let roots = given
-            .into_iter()
-            .filter_map(|(role, path)| Some((role, path?.trim_end_matches('/').to_owned())))
-            .filter(|(_, path)| path.starts_with('/') && path.len() > 1)
-            .collect();
-        Places { roots }
+        Places { dirs: Dirs::new(given) }
     }
 
     /// The roots of `job`'s build.
@@ -109,33 +100,23 @@ impl Places {
     }
 
     fn view(&self) -> Roots<'_> {
-        Roots::new(self.roots.iter().map(|(role, path)| (*role, path.as_str())))
+        self.dirs.view()
     }
 
-    /// `text` with each root that starts a path in it as its placeholder ([`Roots::port`]), a
-    /// root after `file://` among them: lent when it holds none.
+    /// The front end's port of these directories ([`base_db::Port`]).
+    pub(crate) fn port(&self) -> Dirs {
+        // clone: once a lowering, a root each
+        self.dirs.clone()
+    }
+
+    /// `text` with each root that starts a path in it as its placeholder ([`Dirs::text`]).
     pub(crate) fn text<'t>(&self, text: &'t [u8]) -> Cow<'t, [u8]> {
-        let roots = self.view();
-        if !text.windows(URL.len()).any(|it| it == URL) {
-            return roots.ported(text);
-        }
-        // alloc: a string that names a file by URL (a path package's id), once as it is keyed
-        let mut out = Vec::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(at) = rest.windows(URL.len()).position(|it| it == URL) {
-            let (head, tail) = rest.split_at(at + URL.len());
-            roots.port(head, |piece| out.extend_from_slice(piece));
-            rest = tail;
-        }
-        roots.port(rest, |piece| out.extend_from_slice(piece));
-        Cow::Owned(out)
+        self.dirs.text(text)
     }
 
-    /// What `text`, written by [`Places::text`] in some build, is in this one: each
-    /// placeholder this build's root. An error for a placeholder of a root this build has
-    /// none of.
+    /// What `text`, written by [`Places::text`] in some build, is in this one ([`Dirs::real`]).
     pub(crate) fn real<'t>(&self, text: &'t [u8]) -> Result<Cow<'t, [u8]>, String> {
-        self.view().unport(text).map_err(|why| why.to_string())
+        self.dirs.real(text)
     }
 
     /// `encoded`, one value in CBOR, appended to `out` with every text string of it written by
@@ -180,25 +161,10 @@ impl Places {
     pub(crate) fn here(&self, base: Key) -> Key {
         let mut hasher = Hasher::new(HERE);
         hasher.id(&base.0);
-        for (role, root) in &self.roots {
+        for (role, root) in self.dirs.roots() {
             hasher.update(&[role.tag()]).part(root.as_bytes());
         }
         Key(hasher.finish())
-    }
-}
-
-impl base_db::Port for Places {
-    fn ported<'b>(&self, bytes: &'b [u8]) -> Cow<'b, [u8]> {
-        self.text(bytes)
-    }
-
-    fn placed<'b>(&self, bytes: &'b [u8]) -> Result<Cow<'b, [u8]>, String> {
-        self.real(bytes)
-    }
-
-    /// The one searcher of a root left in bytes (`Roots::embedded`, as [`Places::tied`]).
-    fn held(&self, bytes: &[u8]) -> Option<&'static str> {
-        self.view().embedded(bytes).iter().next().map(Role::name)
     }
 }
 
@@ -355,7 +321,7 @@ pub(crate) fn planted(places: &Places) -> Option<&str> {
     #[cfg(test)]
     {
         if PLANTED_PATH.get() {
-            return places.roots.iter().find(|it| it.0 == Role::Workspace).map(|it| it.1.as_str());
+            return places.dirs.roots().find(|it| it.0 == Role::Workspace).map(|it| it.1);
         }
     }
     let _ = places;

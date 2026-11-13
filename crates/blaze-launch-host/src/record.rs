@@ -192,7 +192,9 @@ impl<'a, P: Positions> Maker<'a, P> {
     }
 
     fn refuse(&self, what: std::fmt::Arguments<'_>) -> String {
-        format!("`{}` cannot run under the launcher: {what}", self.name) // alloc: an error
+        let what = what.to_string(); // alloc: an error
+        blaze_report::say!(blaze_report::say::Code(&self.name), " cannot run under the launcher: ", blaze_report::say::Words(&what))
+            .flat()
     }
 
     /// The datum of `id`, added when it is not there yet.

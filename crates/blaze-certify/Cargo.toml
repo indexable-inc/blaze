@@ -29,6 +29,8 @@ blaze-ids.workspace = true
 blaze-protocol.workspace = true
 # The record's one form: base, read-lists, answer, over a store handed in.
 blaze-record.workspace = true
+# `say!`: an error's message, its code typed.
+blaze-report.workspace = true
 # `racy`, the racy window's one home; `outside::LookKind`, the kind a planted bug drops.
 blaze-vfs.workspace = true
 

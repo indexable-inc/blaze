@@ -368,7 +368,7 @@ fn table_of<'s, S: Ask<World = W>, W: World + ?Sized>(
         .get(&entry)
         .map_err(failed)?
         // alloc: an error
-        .ok_or_else(|| failed("its entry is not in the store: a session is of one store".to_owned()))?;
+        .ok_or_else(|| failed(crate::NOT_IN_STORE.to_owned()))?;
     let entry = Entry::read(bytes, entry, &identity).map_err(failed)?;
     Table::read(entry.value).map_err(failed)
 }

@@ -96,6 +96,7 @@ use blaze_launch::image as placed;
 use blaze_launch::record::{Place, Record, What};
 use blaze_launch::wire::{self, Ask, List, RecordId, Tell};
 use blaze_launch::{CodeId, Slot, Tier, Txn};
+use blaze_report::say::{Code, Words};
 
 use crate::bind::{Bound, Names, symbols_id};
 use crate::start::{self, Of};
@@ -299,7 +300,7 @@ struct Applied {
 /// What a refusal calls `bound`: its record's name.
 fn called(bound: &Bound) -> String {
     match Record::decode(&bound.made.bytes) {
-        Ok(record) => format!("`{}`", record.name), // alloc: an error
+        Ok(record) => blaze_report::say!(Code(&record.name)).flat(),
         Err(why) => format!("the record of slot identity {:?} (which does not read: {why})", bound.slot), // alloc: an error
     }
 }
@@ -372,34 +373,41 @@ impl Program {
             };
             if !kind {
                 // alloc: an error
-                return Err(format!(
-                    "`{}` is given as a {} and its record is {:?} of slot identity {:?}",
-                    record.name,
+                return Err(blaze_report::say!(
+                    Code(&record.name),
+                    " is given as a ",
                     if function { "function" } else { "static" },
-                    record.what,
-                    bound.slot
-                ));
+                    " and its record is ",
+                    Words(&format!("{:?} of slot identity {:?}", record.what, bound.slot)), // alloc: an error
+                )
+                .flat());
             }
             let numbered = record.places.iter().filter(Place::numbered);
             if record.numbered() != bound.names.len() {
                 // alloc: an error
-                return Err(format!(
-                    "`{}`'s record numbers {} places, and its bind names {}: a static or a function it names is \
-                     left out",
-                    record.name,
-                    record.numbered(),
-                    bound.names.len()
-                ));
+                return Err(blaze_report::say!(
+                    Code(&record.name),
+                    "'s record numbers ",
+                    Words(&record.numbered().to_string()), // alloc: an error
+                    " places, and its bind names ",
+                    Words(&bound.names.len().to_string()), // alloc: an error
+                    ": a static or a function it names is left out",
+                )
+                .flat());
             }
             for (number, (place, names)) in numbered.zip(&bound.names).enumerate() {
                 let resolved = match names {
                     Names::Symbol(name) => match symbol(name) {
                         Some(Names::Symbol(_)) | None => {
                             // alloc: an error
-                            return Err(format!(
-                                "`{}` names `{name}` as the program's own symbol, and the program defines no `{name}`",
-                                record.name
-                            ));
+                            return Err(blaze_report::say!(
+                                Code(&record.name),
+                                " names ",
+                                Code(name),
+                                " as the program's own symbol, and the program defines no ",
+                                Code(name),
+                            )
+                            .flat());
                         }
                         Some(it) => it,
                     },
@@ -410,17 +418,25 @@ impl Program {
                     (Place::Static, Names::Static { id, .. }) if has(id) => {}
                     (Place::Static, Names::Static { id, .. }) => {
                         // alloc: an error
-                        return Err(format!(
-                            "`{}` names the static {id:?}, which its piece does not give and the program does not hold",
-                            record.name
-                        ));
+                        return Err(blaze_report::say!(
+                            Code(&record.name),
+                            " names the static ",
+                            Words(&format!("{id:?}")), // alloc: an error
+                            ", which its piece does not give and the program does not hold",
+                        )
+                        .flat());
                     }
                     _ => {
                         // alloc: an error
-                        return Err(format!(
-                            "place {number} of `{}` is a {place:?}, and it is named {names:?}",
-                            record.name
-                        ));
+                        return Err(blaze_report::say!(
+                            "place ",
+                            Words(&number.to_string()), // alloc: an error
+                            " of ",
+                            Code(&record.name),
+                            " is a ",
+                            Words(&format!("{place:?}, and it is named {names:?}")), // alloc: an error
+                        )
+                        .flat());
                     }
                 }
             }
@@ -780,10 +796,14 @@ impl Program {
                     Ok(at) => &symbols[at].1,
                     Err(_) => {
                         // alloc: an error
-                        return Err(format!(
-                            "{} names `{name}` as the program's own symbol, and the program defines no `{name}`",
-                            called(bound)
-                        ));
+                        return Err(blaze_report::say!(
+                            Words(&called(bound)),
+                            " names ",
+                            Code(name),
+                            " as the program's own symbol, and the program defines no ",
+                            Code(name),
+                        )
+                        .flat());
                     }
                 },
                 other => other,
@@ -798,7 +818,7 @@ impl Program {
                     }
                 },
                 Names::Symbol(name) => {
-                    return Err(format!("the program's symbol `{name}` is named as another symbol")); // alloc: an error
+                    return Err(blaze_report::say!("the program's symbol ", Code(name), " is named as another symbol").flat());
                 }
             });
         }
@@ -1092,7 +1112,7 @@ impl Program {
         let mut symbols = symbols;
         symbols.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if let Some(twice) = symbols.windows(2).find(|it| it[0].0 == it[1].0) {
-            return Err(format!("the program defines the symbol `{}` twice", twice[0].0)); // alloc: an error
+            return Err(blaze_report::say!("the program defines the symbol ", Code(&twice[0].0), " twice").flat());
         }
         self.check(&piece, &symbols, false)?;
         let given_entry = piece.functions.iter().find(|it| it.slot == entry);

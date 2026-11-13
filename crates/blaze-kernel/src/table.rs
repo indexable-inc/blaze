@@ -973,7 +973,7 @@ mod tests {
         let edited = table.edit(&[(&b"key 437"[..], Some(&b"changed"[..]))]).expect("one edit");
         let edit = hashed::take();
         assert!(edited == built(&numbered(1000, Some(437))));
-        println!("one part of 1000: a build makes {build} digests, an edit {edit}");
+        blaze_report::outln!("one part of 1000: a build makes {build} digests, an edit {edit}");
         // The part and its key (2), the leaf (its 2 digests and a key's hash for each of its
         // entries, at most 16) and 2 for each branch over it; a build makes 2 an entry and 2
         // a node.

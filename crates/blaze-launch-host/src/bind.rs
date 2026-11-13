@@ -50,6 +50,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_launch::record::{Place, Record, What};
 use blaze_launch::wire::RecordId;
+use blaze_report::say::{Code, Words};
 
 use crate::program::Plant;
 use crate::record::{Made, Named};
@@ -378,8 +379,16 @@ pub(crate) fn read(bytes: &[u8], plant: Plant) -> Result<Bound, String> {
             return Err(from.refuse(
                 what_at,
                 format_args!(
-                    "it is of kind {what} with slot identity {slot:?}, and its launch record `{}` is {:?}",
-                    record.name, record.what
+                    "{}",
+                    blaze_report::say!(
+                        "it is of kind ",
+                        Words(&format!("{what} with slot identity {slot:?}")), // alloc: an error
+                        ", and its launch record ",
+                        Code(&record.name),
+                        " is ",
+                        Words(&format!("{:?}", record.what)), // alloc: an error
+                    )
+                    .flat()
                 ),
             ));
         }
@@ -387,7 +396,18 @@ pub(crate) fn read(bytes: &[u8], plant: Plant) -> Result<Bound, String> {
     if record.align != align {
         return Err(from.refuse(
             align_at,
-            format_args!("its alignment is {align}, and its launch record `{}`'s {}", record.name, record.align),
+            format_args!(
+                "{}",
+                blaze_report::say!(
+                    "its alignment is ",
+                    Words(&align.to_string()), // alloc: an error
+                    ", and its launch record ",
+                    Code(&record.name),
+                    "'s ",
+                    Words(&record.align.to_string()), // alloc: an error
+                )
+                .flat()
+            ),
         ));
     }
     let numbered: Vec<Place<'_>> = record.places.iter().filter(Place::numbered).collect(); // alloc: as above
@@ -395,10 +415,16 @@ pub(crate) fn read(bytes: &[u8], plant: Plant) -> Result<Bound, String> {
         return Err(from.refuse(
             record_at,
             format_args!(
-                "its launch record `{}` numbers {} places, and it names {}",
-                record.name,
-                numbered.len(),
-                names.len()
+                "{}",
+                blaze_report::say!(
+                    "its launch record ",
+                    Code(&record.name),
+                    " numbers ",
+                    Words(&numbered.len().to_string()), // alloc: an error
+                    " places, and it names ",
+                    Words(&names.len().to_string()), // alloc: an error
+                )
+                .flat()
             ),
         ));
     }
@@ -412,7 +438,18 @@ pub(crate) fn read(bytes: &[u8], plant: Plant) -> Result<Bound, String> {
             _ => {
                 return Err(from.refuse(
                     *at,
-                    format_args!("place {number} of `{}` is a {place:?}, and it names {names_one:?}", record.name),
+                    format_args!(
+                        "{}",
+                        blaze_report::say!(
+                            "place ",
+                            Words(&number.to_string()), // alloc: an error
+                            " of ",
+                            Code(&record.name),
+                            " is a ",
+                            Words(&format!("{place:?}, and it names {names_one:?}")), // alloc: an error
+                        )
+                        .flat()
+                    ),
                 ));
             }
         }

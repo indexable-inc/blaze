@@ -1,6 +1,7 @@
 //! The watcher as it was before its names were interned (each slot a `String` and a
 //! `FileName`, cloned into every list it joins): kept, unchanged but for its tests and the rules
-//! changed since (a start sweeps whatever the cursor, 2026-11-12), as the reference
+//! changed since (a start sweeps whatever the cursor, 2026-11-12; what is out of the view and
+//! files over the bound, 2026-11-13, by the same rule, [`super::view`]), as the reference
 //! [`super::Watcher`] is held to, effect for effect and output for output.
 
 use std::{collections::VecDeque, sync::Arc};
@@ -13,10 +14,13 @@ use blaze_ids::ContentId;
 use blaze_mem::Slab;
 use std::alloc::Global;
 
-use super::Watched;
+use super::{
+    Watched, read, too_large,
+    view::{Caches, TAG_NAME, is_tag, may_be_tag, probe, tag_of},
+};
 use crate::{
-    Mode, Op, Vfs,
-    disk::Disk,
+    MOST_FILE_BYTES, Mode, Op, Vfs,
+    disk::{Disk, chose, plain},
     tree::{NodeId, Tree, ancestors, op_paths},
 };
 
@@ -45,6 +49,10 @@ enum Look {
     /// Its stamp is the one saved and the head has it: not read.
     Same,
     Unreadable,
+    /// Out of the view: under a directory a tag pruned, or that directory's tag.
+    Hidden,
+    /// A file of this many bytes, over [`MOST_FILE_BYTES`]: not read.
+    TooLarge(u64),
 }
 
 struct Slot {
@@ -91,6 +99,10 @@ struct Batch {
     /// from before the watch.
     cursor: Option<Cursor>,
     caught_up: bool,
+    /// The directories a tag pruned in this batch, with their tag's stamp.
+    pruned: Vec<(FileName, Stamp)>,
+    /// A rescan that lists its root whatever its stamp.
+    list_root: bool,
 }
 
 impl Batch {
@@ -114,6 +126,9 @@ impl Batch {
             gone: HashMap::new_in(Global),
             cursor: None,
             caught_up: false,
+            // alloc: none until a tag prunes a directory.
+            pruned: Vec::new(),
+            list_root: false,
         }
     }
 
@@ -213,6 +228,10 @@ enum Pending {
     Read(u64, usize),
     /// The stamps of a batch's read files, taken again (`super::VERIFIES`).
     Verify(u64),
+    /// The signature of the tag at a slot of a batch whose stamp moved.
+    Probe(u64, usize),
+    /// The signature of the tag a listing found, with the listing's entries and the tag's stamp.
+    Listing(u64, FileName, Vec<(FileName, Stamp)>, Stamp),
 }
 
 pub struct Watcher {
@@ -232,6 +251,8 @@ pub struct Watcher {
     pending: Slab<Pending>,
     /// What this watcher's commits left at each path, while batches told before them wait.
     ours: HashMap<String, Seen, Global>,
+    /// The cache directories out of the view, relative to `dir`.
+    caches: Caches,
 }
 
 impl Watcher {
@@ -253,6 +274,7 @@ impl Watcher {
             pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)
                 .unwrap_or_else(|error| panic!("the looks in flight of a watch: {error}")),
             ours: HashMap::new_in(Global),
+            caches: Caches::default(),
         }
     }
 
@@ -263,6 +285,8 @@ impl Watcher {
     pub fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
         assert!(!self.watching, "{} is watched already", self.dir);
         self.watching = true;
+        self.caches =
+            Caches::from_column(self.disk(vfs), &vfs.tree, self.head_root(vfs), self.below.len());
         let since = vfs
             .disks
             .get(&self.head)
@@ -271,7 +295,7 @@ impl Watcher {
         // clone: once per watch.
         effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
         // clone: once per watch.
-        self.rescan(vfs, &self.dir.clone(), effects);
+        self.rescan_at(vfs, &self.dir.clone(), effects);
     }
 
     /// Stops the watch: it ends with [`Watched::Ended`]. Looks in flight still commit.
@@ -297,6 +321,11 @@ impl Watcher {
             Some(rest) => Some(rest),
             None => (*file == self.dir).then_some(""),
         }
+    }
+
+    /// Whether `file` is under the watched directory and out of its view.
+    fn hidden(&self, file: &FileName) -> bool {
+        self.rel(file).is_some_and(|rel| self.caches.hides(rel))
     }
 
     fn head_root(&self, vfs: &Vfs) -> NodeId {
@@ -370,8 +399,12 @@ impl Watcher {
                 if let Some(batch) = self.batch(number)
                     && let Batch { slots, verify, .. } = batch
                     && let Some(slot) = slots.get_mut(at)
+                    && !matches!(slot.look, Some(Look::Hidden))
                 {
                     slot.look = Some(match done {
+                        Done::Read(bytes) if bytes.len() as u64 > MOST_FILE_BYTES => {
+                            Look::TooLarge(bytes.len() as u64)
+                        }
                         Done::Read(bytes) => {
                             if super::VERIFIES {
                                 verify.push(at);
@@ -385,6 +418,21 @@ impl Watcher {
                         }
                         done => unreachable!("a read of {} completed with {done:?}", slot.file),
                     });
+                }
+            }
+            (Pending::Probe(number, at), done) => {
+                self.probed(vfs, number, at, done, effects, &mut out);
+            }
+            (Pending::Listing(number, dir, entries, stamp), done) => {
+                match matches!(&done, Done::Read(bytes) if is_tag(bytes)) {
+                    true => {
+                        let Some(batch) = self.batch(number) else {
+                            unreachable!("a listing of no batch")
+                        };
+                        batch.open -= 1;
+                        self.prune(number, &dir, stamp);
+                    }
+                    false => self.listed_now(vfs, number, &dir, entries, effects),
                 }
             }
             (Pending::Verify(number), Done::Stamped(stamps)) => {
@@ -478,6 +526,9 @@ impl Watcher {
         }
         self.told(vfs, files, effects);
         for (under, why) in lost {
+            if self.hidden(&under) {
+                continue;
+            }
             let Some(path) = self.rel(&under).map(str::to_owned) else { continue };
             out.push(Watched::Lost { path, why });
             match why {
@@ -511,6 +562,9 @@ impl Watcher {
             let Some(path) = self.rel(&file).filter(|it| !it.is_empty()).map(str::to_owned) else {
                 continue;
             };
+            if self.caches.hides(&path) {
+                continue;
+            }
             let saved = disk.and_then(|it| it.get(file.as_str()));
             let was = seen(&vfs.tree, head, &path);
             slots.push(Slot { path, file, was, saved, stamp: None, look: None });
@@ -525,6 +579,13 @@ impl Watcher {
     /// as they are ([`Batch::names`]); of the head, only what changed since the column held all
     /// of it is added (all of it when the column never did).
     pub fn rescan(&mut self, vfs: &Vfs, under: &FileName, effects: &mut Vec<Effect>) {
+        if self.hidden(under) {
+            return;
+        }
+        self.rescan_at(vfs, under, effects);
+    }
+
+    fn rescan_at(&mut self, vfs: &Vfs, under: &FileName, effects: &mut Vec<Effect>) {
         let Some(root) = self.rel(under).map(str::to_owned) else { return };
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
@@ -533,6 +594,10 @@ impl Watcher {
         let mut names = Names::default();
         if let Some(disk) = disk {
             disk.sweep(under.as_str(), &mut names, &mut batch.saved);
+            // The column's stamps as the disk gave them: the sweep hands them as saved.
+            for it in &mut batch.saved {
+                *it = plain(*it);
+            }
         }
         batch.swept = names.len();
         // alloc: one per rescan, shared with the driver's sweep of it.
@@ -618,7 +683,8 @@ impl Watcher {
                 let path = name[below..].to_owned();
                 let was = seen(&vfs.tree, head, &path);
                 index.insert(name.into(), slots.len());
-                slots.push(Slot { path, file, was, saved: Some(saved), stamp: None, look: None });
+                let saved = Some(plain(saved));
+                slots.push(Slot { path, file, was, saved, stamp: None, look: None });
             });
         }
         if let Some(node) = vfs.tree.lookup(head, &root)
@@ -684,12 +750,20 @@ impl Watcher {
         let mut reads = Vec::new();
         // alloc: none unless a path changed.
         let mut lists = Vec::new();
+        // alloc: none unless a cache directory's tag is no tag now.
+        let mut uncached: Vec<FileName> = Vec::new();
         let mut stop = false;
         {
-            let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
+            let Watcher { batches, first, caches, .. } = self;
+            let Some(batch) =
+                number.checked_sub(*first).and_then(|it| batches.get_mut(it as usize))
+            else {
+                unreachable!("stamps of no batch")
+            };
             let swept = batch.swept;
             assert_eq!(stamps.len(), swept + batch.slots.len(), "a stamp per name");
             let rescan = batch.rescan.is_some();
+            let list_root = batch.rescan.clone().filter(|_| batch.list_root);
             batch.open -= 1;
             let (of_swept, of_slots) = stamps.split_at(swept);
             for (slot, stamp) in batch.slots.iter_mut().zip(of_slots) {
@@ -714,6 +788,22 @@ impl Watcher {
             let mut changed = Vec::new();
             for (at, slot) in batch.slots.iter_mut().enumerate() {
                 let stamp = slot.stamp.expect("stamped above");
+                if caches.hides(&slot.path) {
+                    slot.look = Some(Look::Hidden);
+                    continue;
+                }
+                let is_cache = caches.is_cache(&slot.path);
+                let cache = tag_of(&slot.path).filter(|dir| caches.is_cache(dir));
+                if let Some(dir) = cache
+                    && !may_be_tag(&stamp)
+                {
+                    caches.remove(dir);
+                    let dir = FileName::new(&slot.file.as_str()[..below + dir.len()])
+                        .expect("a directory's name is a name");
+                    if !uncached.contains(&dir) {
+                        uncached.push(dir);
+                    }
+                }
                 if stamp.is_gone() {
                     if slot.path.is_empty() {
                         out.push(Watched::Unreadable {
@@ -730,7 +820,9 @@ impl Watcher {
                 } else if stamp.is_dir() {
                     slot.look = Some(Look::Dir);
                     let list = match slot.saved {
+                        _ if is_cache => false,
                         None => true,
+                        _ if list_root.as_deref() == Some(slot.path.as_str()) => true,
                         Some(saved) if rescan => saved.moved(&stamp),
                         Some(saved) => saved.ino != stamp.ino,
                     };
@@ -738,6 +830,8 @@ impl Watcher {
                         // clone: per directory whose stamp moved.
                         lists.push(slot.file.clone());
                     }
+                } else if cache.is_some() && slot.saved == Some(stamp) {
+                    slot.look = Some(Look::Hidden);
                 } else if slot.saved == Some(stamp) && slot.was.is_some() {
                     slot.look = Some(Look::Same);
                 } else {
@@ -748,44 +842,181 @@ impl Watcher {
                 batch.indexed();
             }
             batch.went(disk, &vfs.tree, head, below);
+            for slot in &batch.slots {
+                let stamp = slot.stamp.expect("stamped above");
+                if !stamp.is_dir() && caches.is_cache(&slot.path) {
+                    caches.remove(&slot.path);
+                }
+            }
             for at in changed {
                 let slot = &batch.slots[at];
                 let stamp = slot.stamp.expect("stamped above");
+                let tag = tag_of(&slot.path).is_some() && may_be_tag(&stamp);
+                if !tag && too_large(&stamp) {
+                    batch.slots[at].look = Some(Look::TooLarge(stamp.size));
+                    continue;
+                }
                 // A new name, or one another file was renamed over (it has another inode).
                 let from = match slot.saved {
+                    _ if tag => None,
                     Some(saved) if saved.ino == stamp.ino => None,
                     _ => batch.moved(&stamp),
                 };
                 match from {
                     Some(from) => batch.slots[at].look = Some(Look::Moved(from)),
                     // alloc: per changed path, beside its read and hash.
-                    None => reads.push((at, slot.file.clone(), stamp.is_link())),
+                    None => reads.push((at, slot.file.clone(), stamp, tag)),
                 }
             }
             batch.open += lists.len() as u32;
         }
-        for (at, file, link) in reads {
-            let tag = self.tag(Pending::Read(number, at));
-            effects.push(if link {
-                Effect::ReadLink { file, tag }
-            } else {
-                Effect::ReadAll { file, tag }
-            });
+        for (at, file, stamp, tag) in reads {
+            match tag {
+                true => {
+                    let tag = self.tag(Pending::Probe(number, at));
+                    effects.push(probe(file, tag));
+                }
+                false => {
+                    let tag = self.tag(Pending::Read(number, at));
+                    effects.push(read(file, stamp, tag));
+                }
+            }
         }
         for dir in lists {
             // clone: per directory whose stamp moved.
             let tag = self.tag(Pending::Entries(number, dir.clone()));
             effects.push(Effect::Entries { dir, tag });
         }
+        for dir in uncached {
+            self.uncache(vfs, &dir, effects);
+        }
         if stop {
             self.stop(effects);
+        }
+    }
+
+    /// The directory `dir` pruned by its tag, stamped `tag`, in the batch `number`: every slot
+    /// under it, in this batch and those told after it, is out of the view.
+    fn prune(&mut self, number: u64, dir: &FileName, tag: Stamp) {
+        let Some(rel) = self.rel(dir).map(str::to_owned) else { return };
+        if self.caches.hides(&rel) {
+            return;
+        }
+        self.caches.insert(&rel);
+        let Some(from) = number.checked_sub(self.first) else { return };
+        for batch in self.batches.iter_mut().skip(from as usize) {
+            for slot in &mut batch.slots {
+                if self.caches.hides(&slot.path) {
+                    slot.look = Some(Look::Hidden);
+                }
+            }
+        }
+        if let Some(batch) = self.batch(number) {
+            // clone: per directory pruned.
+            batch.pruned.push((dir.clone(), tag));
+        }
+    }
+
+    /// A directory whose tag is no tag now: looked at again, and listed whatever its stamp.
+    fn uncache(&mut self, vfs: &Vfs, dir: &FileName, effects: &mut Vec<Effect>) {
+        let count = self.batches.len();
+        self.rescan_at(vfs, dir, effects);
+        if self.batches.len() == count {
+            return;
+        }
+        let batch = self.batches.back_mut().expect("the rescan just pushed");
+        batch.list_root = true;
+        if let Ok(at) = batch.swept(dir.as_str())
+            && let Err(to) = batch.forced.binary_search(&(at as u32))
+        {
+            batch.forced.insert(to, at as u32);
+        }
+    }
+
+    /// A tag's signature, read for the slot `at` of the batch `number`.
+    fn probed(
+        &mut self,
+        vfs: &Vfs,
+        number: u64,
+        at: usize,
+        done: Done,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Watched>,
+    ) {
+        let below = self.below.len();
+        let Some(batch) = self.batch(number) else { return };
+        let Some(slot) = batch.slots.get_mut(at) else { return };
+        if slot.look.is_some() {
+            return;
+        }
+        // clone: per tag probed.
+        let (file, path, stamp) =
+            (slot.file.clone(), slot.path.clone(), slot.stamp.expect("a probed tag is stamped"));
+        let len = tag_of(&path).expect("a probe is of a tag").len();
+        let dir = FileName::new(&file.as_str()[..below + len]).expect("a directory's name is a name");
+        match done {
+            Done::Read(bytes) if is_tag(&bytes) => {
+                slot.look = Some(Look::Hidden);
+                self.prune(number, &dir, stamp);
+            }
+            Done::Read(_) => {
+                match too_large(&stamp) {
+                    true => slot.look = Some(Look::TooLarge(stamp.size)),
+                    false => {
+                        let tag = self.tag(Pending::Read(number, at));
+                        effects.push(read(file, stamp, tag));
+                    }
+                }
+                if self.caches.remove(&path[..len]) {
+                    self.uncache(vfs, &dir, effects);
+                }
+            }
+            Done::Failed(error) => {
+                slot.look = Some(Look::Unreadable);
+                out.push(Watched::Unreadable { path, error });
+            }
+            done => unreachable!("a probe of {file} completed with {done:?}"),
+        }
+    }
+
+    /// A listing of `dir`: what is out of the view is dropped, and a directory holding a file
+    /// that may be its tag waits for the tag's signature.
+    fn listed(
+        &mut self,
+        vfs: &Vfs,
+        number: u64,
+        dir: &FileName,
+        mut entries: Vec<(FileName, Stamp)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let below = self.below.len();
+        let rel = self.rel(dir).unwrap_or_default().to_owned();
+        self.caches.remove(&rel);
+        let caches = &self.caches;
+        entries.retain(|(file, _)| file.as_str().get(below..).is_none_or(|it| !caches.hides(it)));
+        let tag = match rel.is_empty() {
+            true => None,
+            false => entries.iter().position(|(file, stamp)| {
+                file.as_str().get(below..).and_then(tag_of) == Some(rel.as_str())
+                    && may_be_tag(stamp)
+            }),
+        };
+        match tag {
+            Some(at) => {
+                // clone: the probe's name.
+                let (file, stamp) = (entries[at].0.clone(), entries[at].1);
+                // clone: per listing that waits on its tag.
+                let tag = self.tag(Pending::Listing(number, dir.clone(), entries, stamp));
+                effects.push(probe(file, tag));
+            }
+            None => self.listed_now(vfs, number, dir, entries, effects),
         }
     }
 
     /// A listing of a directory of a batch: each name the batch has not looked at is new to it,
     /// moved there if it has a gone file's stamp, else read if a file and listed if a
     /// directory. The listing of a relisted directory first settles what was in it.
-    fn listed(
+    fn listed_now(
         &mut self,
         vfs: &Vfs,
         number: u64,
@@ -824,6 +1055,9 @@ impl Watcher {
                         slot.look = Some(Look::Same);
                     } else if slot.saved == Some(now) && slot.was.is_some() {
                         slot.look = Some(Look::Same);
+                    } else if too_large(&now) {
+                        slot.stamp = Some(now);
+                        slot.look = Some(Look::TooLarge(now.size));
                     } else {
                         slot.stamp = Some(now);
                         // alloc: per changed path, beside its read and hash.
@@ -848,6 +1082,8 @@ impl Watcher {
                     asks.push((None, file.clone()));
                     batch.open += 1;
                     Some(Look::Dir)
+                } else if too_large(&stamp) {
+                    Some(Look::TooLarge(stamp.size))
                 } else if let Some(from) = batch.moved(&stamp) {
                     Some(Look::Moved(from))
                 } else {
@@ -876,7 +1112,7 @@ impl Watcher {
             }
         }
         for under in rescans {
-            self.rescan(vfs, &under, effects);
+            self.rescan_at(vfs, &under, effects);
         }
     }
 
@@ -903,7 +1139,7 @@ impl Watcher {
                 let path =
                     self.rel(&file).expect("a slot's name is under the directory").to_owned();
                 out.push(Watched::Lost { path, why: Lost::Rescan });
-                self.rescan(vfs, &file, effects);
+                self.rescan_at(vfs, &file, effects);
             }
         }
         if self.batches.is_empty() {
@@ -948,20 +1184,34 @@ impl Watcher {
         // alloc: once per batch.
         let mut deleting = vec![false; batch.slots.len()];
         for (at, slot) in batch.slots.iter_mut().enumerate() {
-            if slot.path.is_empty() || matches!(slot.look, Some(Look::Same | Look::Unreadable)) {
+            if slot.path.is_empty()
+                || matches!(slot.look, Some(Look::Same | Look::Unreadable | Look::Hidden))
+            {
                 continue;
             }
             let entry = tree.entry(base, &slot.path);
             let node = entry.map(|it| it.0);
             let now = entry.map(|(node, mode)| (tree.id(node), mode));
-            if now != slot.was && !self.made(&slot.path, now) {
+            if let Some(Look::TooLarge(size)) = slot.look {
+                // alloc: an output's path.
+                let path = slot.path.clone();
+                out.push(Watched::TooLarge { path, size, most: MOST_FILE_BYTES });
+            }
+            // A directory seen on the disk conflicts only where the head now has something else:
+            // its own node changes with every file under it, each judged by its own slot.
+            let same_dir =
+                matches!(slot.look, Some(Look::Dir)) && node.is_some_and(|it| tree.is_dir(it));
+            if now != slot.was && !same_dir && !self.made(&slot.path, now) {
                 // alloc: per changed path, beside its read and hash.
                 out.push(Watched::Conflict { path: slot.path.clone() });
                 continue;
             }
             let is_file = node.is_some_and(|it| !tree.is_dir(it));
             match slot.look.take().expect("a looked-at path") {
-                Look::Same | Look::Unreadable => unreachable!("skipped above"),
+                Look::Same | Look::Unreadable | Look::Hidden => unreachable!("skipped above"),
+                // alloc: per changed path, beside its read and hash.
+                Look::TooLarge(_) if node.is_some() => deletes.push(slot.path.clone()),
+                Look::TooLarge(_) => {}
                 Look::Gone if node.is_some() => {
                     // alloc: per changed path, beside its read and hash.
                     deletes.push(slot.path.clone());
@@ -997,6 +1247,14 @@ impl Watcher {
             }
             // alloc: per changed path, beside its read and hash.
             taken.push(slot.path.clone());
+        }
+        for (dir, _) in &batch.pruned {
+            let path = &dir.as_str()[self.below.len()..];
+            if tree.lookup(base, path).is_some() {
+                // alloc: per directory pruned.
+                deletes.push(path.to_owned());
+                taken.push(path.to_owned());
+            }
         }
 
         // alloc: none unless a path changed.
@@ -1103,10 +1361,13 @@ impl Watcher {
     }
 
     /// Whether this watcher's commits left `path` as `now`: it put that there, or `path` is gone
-    /// because it replaced or deleted something above it.
+    /// because it replaced or deleted something above it, or the last thing below it (a
+    /// directory goes with its last file).
     fn made(&self, path: &str, now: Seen) -> bool {
         self.ours.get(path) == Some(&now)
-            || (now.is_none() && ancestors(path).any(|up| self.ours.contains_key(up)))
+            || (now.is_none()
+                && (ancestors(path).any(|up| self.ours.contains_key(up))
+                    || self.ours.keys().any(|it| super::is_below(it, path))))
     }
 }
 
@@ -1131,7 +1392,13 @@ fn save(disk: &mut Disk, batch: &Batch) {
     for slot in &batch.slots {
         let Some(stamp) = slot.stamp else { continue };
         match slot.look {
-            Some(Look::Unreadable) | None => {}
+            Some(Look::Unreadable | Look::Hidden) | None => {}
+            Some(Look::TooLarge(_)) => {
+                if disk.get(slot.file.as_str()).is_some_and(|it| it.is_dir()) {
+                    disk.remove_under(slot.file.as_str());
+                }
+                disk.set(slot.file.as_str(), chose(stamp));
+            }
             Some(Look::Gone) => disk.remove_under(slot.file.as_str()),
             Some(Look::Same) => {}
             Some(Look::Dir | Look::File(_) | Look::Moved(_)) => disk.set(slot.file.as_str(), stamp),
@@ -1141,6 +1408,20 @@ fn save(disk: &mut Disk, batch: &Batch) {
         if matches!(batch.slots[at].look, Some(Look::File(_))) {
             disk.set(batch.slots[at].file.as_str(), Stamp::UNKNOWN);
         }
+    }
+    for (dir, tag) in &batch.pruned {
+        // alloc: per directory pruned.
+        let tag_name = format!("{dir}/{TAG_NAME}");
+        let mut gone: Vec<String> = Vec::new();
+        disk.children(dir.as_str(), |name, _| {
+            if name != tag_name {
+                gone.push(name.to_owned());
+            }
+        });
+        for name in gone {
+            disk.remove_under(&name);
+        }
+        disk.set(&tag_name, chose(*tag));
     }
     if let Some(cursor) = batch.cursor {
         disk.cursor = cursor;

@@ -13,9 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# No dependency: `core` and `alloc` alone. Not bstd yet (src/lib.rs says why and when it moves).
-# The hash and the signature check are its driver's, handed in (`Hashes`, `Signatures`).
+# `core` and `alloc`, and `blaze-report` for its messages (`say!`). Not bstd yet (src/lib.rs
+# says why and when it moves). The hash and the signature check are its driver's, handed in
+# (`Hashes`, `Signatures`).
 [dependencies]
+blaze-report.workspace = true
 
 [lints]
 workspace = true

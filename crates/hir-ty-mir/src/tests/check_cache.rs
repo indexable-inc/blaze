@@ -136,8 +136,9 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
         (db, dep)
     }
 
-    /// The MIR owners of `dep`'s functions: each function, then the closures its runtime
-    /// body names.
+    /// The MIR owners of `dep`'s functions, each with its runtime body lowered: each
+    /// function, then the closures its runtime body names. A function's runtime body names its
+    /// closures without lowering theirs, so each closure's is asked here too.
     fn owners<'db>(db: &'db Db, dep: Crate) -> Vec<MirOwner<'db>> {
         let mut owners = Vec::new();
         for name in NAMES {
@@ -146,7 +147,12 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
             owners.push(owner);
             let body = mir_at(db, owner, MirStage::Runtime)
                 .unwrap_or_else(|error| panic!("`{name}` lowers: {error:?}"));
-            owners.extend(body.closures.iter().map(|&closure| MirOwner::Closure(closure)));
+            for &closure in body.closures.iter() {
+                let closure = MirOwner::Closure(closure);
+                mir_at(db, closure, MirStage::Runtime)
+                    .unwrap_or_else(|error| panic!("a closure of `{name}` lowers: {error:?}"));
+                owners.push(closure);
+            }
         }
         owners
     }

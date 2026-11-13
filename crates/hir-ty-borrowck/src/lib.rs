@@ -64,6 +64,8 @@ mod missing_body_tests;
 #[cfg(test)]
 mod rpitit_tests;
 #[cfg(test)]
+mod tainted_tests;
+#[cfg(test)]
 mod views_tests;
 #[cfg(test)]
 mod kept_tests;
@@ -495,37 +497,53 @@ fn check_def<'db>(
             Some("a body that is written but lowered to no expression: nothing to check".into());
         return result;
     }
-    let owner = InferBodyId::DefWithBodyId(def);
-    let infer = InferenceResult::of(db, owner);
-    if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
-        result.not_checked = Some(NotChecked::TypeErrors);
+    if let Some(why) = tainted_by_errors(db, def) {
+        result.not_checked = Some(why);
         return result;
     }
-    // rustc borrow checks no body its lowering or type check found an error in, which an
-    // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    // A query of whether there was one, which reads no position: an edit elsewhere in the
-    // file checks the body again only if it changes that.
+    let owner = InferBodyId::DefWithBodyId(def);
+    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
+    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
+    if root.is_none() {
+        drop_early::add_notes(db, def, mode, &mut result);
+    }
+    result
+}
+
+/// Why `def`'s body has no meaningful MIR, by the first error found before MIR is built in it
+/// or in a closure, coroutine or `const { .. }` block in it; `None` when it has none.
+///
+/// The rule, rustc's `tainted_by_errors`: an error reported in a body before borrow checking
+/// (type checking, E0063's missing fields among its errors, lowering, a macro call that did not
+/// expand, match checking, `check_tail_calls`, an unsized `static`) gives it rustc's error
+/// body, which nothing borrow checks, const-checks or evaluates. The user sees that error once,
+/// and never a second one saying the body could not be checked. The one place this is asked:
+/// the borrow check ([`borrowck`]) and every other consumer of a body's MIR that may only run
+/// on a body without errors (`hir`'s evaluation of a `const` or `static`).
+pub fn tainted_by_errors(db: &Db, def: DefWithBodyId) -> Option<NotChecked> {
+    let owner = InferBodyId::DefWithBodyId(def);
+    if type_check_failed(InferenceResult::of(db, owner)) {
+        return Some(NotChecked::TypeErrors);
+    }
+    // A query of whether lowering found an error (a cast that is not one, `..base` in a
+    // destructuring assignment), which reads no position: an edit elsewhere in the file checks
+    // the body again only if it changes that.
     if hir_def::expr_store::Body::has_lowering_errors(db, def) {
-        result.not_checked = Some(NotChecked::LoweringErrors);
-        return result;
+        return Some(NotChecked::LoweringErrors);
     }
     if hir_ty_mir::mir::has_failed_expansion(db, owner) {
-        result.not_checked = Some(NotChecked::ExpansionErrors);
-        return result;
+        return Some(NotChecked::ExpansionErrors);
     }
     if hir_ty_matchck::match_check(db, def).failed {
-        result.not_checked = Some(NotChecked::MatchErrors);
-        return result;
+        return Some(NotChecked::MatchErrors);
     }
-    // rustc's `check_tail_calls` refused a `become` of the body or a closure in it, whose
-    // error MIR taints the body's borrow check. One bit of the store first, so a body without
-    // a `become` reads no more.
+    // One bit of the store first, so a body without a `become` reads no more.
+    let body = hir_def::expr_store::Body::of(db, def);
     if hir_ty_tailck::has_become(body) && hir_ty_tailck::tail_call_check(db, def).failed() {
-        result.not_checked = Some(NotChecked::TailCallErrors);
-        return result;
+        return Some(NotChecked::TailCallErrors);
     }
-    // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
-    // borrow checked; a `const` is checked all the same.
+    // A `static` of a type that is not `Sized` is rustc's E0277; a `const` is checked all the
+    // same.
     if let DefWithBodyId::StaticId(it) = def
         && let Some(ty) = db.value_ty(it.into())
         && {
@@ -537,15 +555,15 @@ fn check_def<'db>(
             )
         }
     {
-        result.not_checked = Some(NotChecked::UnsizedStatic);
-        return result;
+        return Some(NotChecked::UnsizedStatic);
     }
-    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
-    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
-    if root.is_none() {
-        drop_early::add_notes(db, def, mode, &mut result);
-    }
-    result
+    None
+}
+
+/// Whether type checking a body (an item's or a constant of a signature's) reported an error in
+/// it, which taints it: [`tainted_by_errors`]'s first question.
+fn type_check_failed(infer: &InferenceResult<'_>) -> bool {
+    infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty()
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -563,8 +581,7 @@ pub fn borrowck_anon_const<'db>(
     }
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         let owner = InferBodyId::AnonConstId(konst);
-        let infer = InferenceResult::of(db, owner);
-        if infer.has_type_mismatches() || infer.is_erroneous() {
+        if type_check_failed(InferenceResult::of(db, owner)) {
             return BorrowckResult {
                 not_checked: Some(NotChecked::TypeErrors),
                 ..Default::default()

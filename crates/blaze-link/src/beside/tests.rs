@@ -80,7 +80,9 @@ impl DebugProgram {
         let rows = (0..count)
             .map(|row| {
                 let at = (row * 3).min(size as u32 - 1);
-                (at, (seed + row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
+                // In u32: a seed of 255 and a row past 0 overflow a u8.
+                let of_file = ((u32::from(seed) + row) % 2) as u8;
+                (at, of_file, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
             })
             .collect();
         let name = (seed % 7 != 6).then(|| format!("_RNvCs{n}_1f{}", "x".repeat(seed as usize % 3)));

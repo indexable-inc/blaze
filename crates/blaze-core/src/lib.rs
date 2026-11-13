@@ -84,6 +84,12 @@ pub mod children {
 )]
 mod raw;
 pub mod reaped;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    unsafe_code,
+    reason = "a file mapped shared as atomic words, and the cross-process address waits on them"
+)]
+pub mod shared;
 pub mod signal;
 pub mod sim;
 #[allow(

@@ -4,6 +4,10 @@
 
 use std::{collections::BTreeMap, format, path::Path, string::String, vec::Vec};
 
+use blaze_report::{
+    say,
+    say::{Code, Words},
+};
 use hegel::{TestCase, generators as gs};
 use hir_expand::declarative::stored::index;
 use span::AstIdMap;
@@ -53,7 +57,12 @@ fn check_file(name: &str, text: &str) -> usize {
     for (key, bytes) in items.iter().filter(|(key, _)| !ItemId(**key).is_list() && ItemId(**key) != ItemId::ROOT) {
         let entry = Entry::read(bytes).unwrap_or_else(|what| panic!("{name}: {what}"));
         let row = ItemLines::read(&lines[key]).unwrap_or_else(|what| panic!("{name}: {what}"));
-        assert_eq!(entry.has_body(), items.bodies.contains_key(key), "{name}: {:?} `{}`", entry.kind, entry.name);
+        assert_eq!(
+            entry.has_body(),
+            items.bodies.contains_key(key),
+            "{}",
+            say!(Words(name), ": ", Words(&format!("{:?}", entry.kind)), " ", Code(entry.name)).flat()
+        );
         if entry.kind != Kind::Variant {
             let old = mine.insert((row.start, row.len), (entry.kind, entry.is(UNSPLIT), entry.has_body()));
             assert!(old.is_none(), "{name}: two entries at byte {}", row.start);
@@ -219,7 +228,11 @@ fn an_edit_changes_exactly_the_entries_its_class_says(tc: TestCase) {
         assert!(matches!(container.kind, Kind::File | Kind::Mod | Kind::Impl | Kind::Fn));
         for key in &only {
             let entry = Entry::read(a.get(key).or(b.get(key)).expect("in one")).expect("an entry");
-            assert!(entry.name == name || entry.name == "fresh" || entry.name == "inner", "`{}` came or went", entry.name);
+            assert!(
+                entry.name == name || entry.name == "fresh" || entry.name == "inner",
+                "{}",
+                say!(Code(entry.name), " came or went").flat()
+            );
         }
         assert!(expected.iter().all(|key| only.contains(key)), "the removed item is gone");
     }
@@ -236,7 +249,7 @@ impl ModuleReads for Files {
     type Error = String;
 
     fn part(&mut self, file: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let items = items_of(self.files.get(file).ok_or_else(|| format!("no file `{file}`"))?).items;
+        let items = items_of(self.files.get(file).ok_or_else(|| say!("no file ", Code(file)).flat())?).items;
         let table = Table::read(ITEMS, &items).map_err(|error| format!("{error}"))?;
         Ok(table.get(key).map_err(|error| format!("{error}"))?.map(<[u8]>::to_vec))
     }
@@ -302,7 +315,7 @@ fn modules_follow_declarations_and_read_both_candidates() {
         ]
     );
     for both in ["src/a.rs", "src/a/mod.rs", "src/b.rs", "src/b/mod.rs"] {
-        assert!(world.asked.iter().any(|asked| asked == both), "`{both}` was read, there or not");
+        assert!(world.asked.iter().any(|asked| asked == both), "{}", say!(Code(both), " was read, there or not").flat());
     }
     world.files.insert("src/a/mod.rs", "");
     let second = read(&mut world);

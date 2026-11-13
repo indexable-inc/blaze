@@ -100,9 +100,9 @@ pub fn body_of<'db>(
 /// allocation site of 18.85 GiB of `mir`). The interpreter, which runs one instance's body many
 /// times, is what [`body_of`]'s memo is for.
 ///
-/// The same value as [`body_of`]'s: both instantiate the runtime body's memo by
-/// [`monomorphization::monomorphized`](super::monomorphization::monomorphized). A body that
-/// needs itself to lower is the generic memo's error ([`MirLowerError::Loop`]), as there.
+/// The same value as [`body_of`]'s: both instantiate the runtime body's memo, here through the
+/// one home of a body read once ([`hir_ty::providers::monomorphized_once`]). A body that needs
+/// itself to lower is the generic memo's error ([`MirLowerError::Loop`]), as there.
 pub fn body_once<'db>(
     db: &'db Db,
     env: &StoredParamEnvAndCrate,
@@ -115,8 +115,7 @@ pub fn body_once<'db>(
         Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),
         Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)),
     };
-    let generic = db.mir(owner, MirStage::Runtime)?;
-    super::monomorphization::monomorphized(db, generic, args, env)
+    hir_ty::providers::monomorphized_once(db, owner, MirStage::Runtime, args, env)
 }
 
 /// The body that is the `poll` of the future `ty`, when that is one of an `async` block, and

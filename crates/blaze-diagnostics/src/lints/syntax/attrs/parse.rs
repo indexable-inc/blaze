@@ -707,7 +707,7 @@ pub(crate) fn crate_level(
     {
         let root_name = cx.file_name(root.file_id(cx.db));
         // alloc: as above
-        diag.help(format!("the crate root is at `{root_name}`"));
+        diag.help(blaze_report::say!("the crate root is at ", blaze_report::say::Code(&root_name)).flat());
     }
     diag
 }

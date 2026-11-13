@@ -506,7 +506,8 @@ pub(crate) fn decode(bytes: &[u8], program: &[u8; 32], plant: Plant) -> Result<(
         let name = from.str(len, "a symbol's name")?.to_owned(); // alloc: the name, held by the program
         let names = bind::get_names(&mut from)?;
         if restored.symbols.last().is_some_and(|it| it.0 >= name) {
-            return Err(from.refuse(at, format_args!("its symbol `{name}` is not after the last, once")));
+            let said = blaze_report::say!("its symbol ", blaze_report::say::Code(&name), " is not after the last, once");
+            return Err(from.refuse(at, format_args!("{}", said.flat())));
         }
         restored.symbols.push((name, names));
     }

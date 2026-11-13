@@ -146,7 +146,7 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
     .unwrap();
     let places = at.places();
     // clone: the test's places, told the front end as the daemon tells it
-    lowered.set_port(Arc::new(places.clone()));
+    lowered.set_port(Arc::new(places.port()));
     Checkout { lowered, units, places }
 }
 

@@ -102,8 +102,15 @@ impl Part for Duration {
 #[macro_export]
 macro_rules! say {
     ($($part:expr),* $(,)?) => {
-        $crate::Text(::std::vec![$($crate::say::Part::span($part)),*]) // alloc: a message, once
+        $crate::Text($crate::say::spans([$($crate::say::Part::span($part)),*]))
     };
+}
+
+/// The spans of [`say!`]'s parts, in order. A function of this crate, so the macro names no
+/// path of `std` and a crate on `core` and `alloc` (`no_std`) writes its messages with it too.
+#[doc(hidden)]
+pub fn spans<const N: usize>(parts: [Span; N]) -> Vec<Span> {
+    Vec::from(parts) // alloc: a message, once
 }
 
 /// Every span of `more` at the end of `text`.

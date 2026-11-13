@@ -49,20 +49,30 @@ fn sorted(
         let root = listing && path.is_empty();
         if !root && path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
             // alloc: an error, once
-            return Err(format!(
-                "the plan read the {what} `{path}`, which is no path relative to the view's root: \
-                 its changes could not be told"
-            ));
+            return Err(blaze_report::say!(
+                "the plan read the ",
+                blaze_report::say::Words(what),
+                " ",
+                blaze_report::say::Code(path),
+                ", which is no path relative to the view's root: its changes could not be told"
+            )
+            .flat());
         }
     }
     reads.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     for pair in reads.windows(2) {
         if pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1 {
             // alloc: an error, once
-            return Err(format!(
-                "the plan read the {what} `{}` at two ids, {} and {}, in one view",
-                pair[0].0, pair[0].1, pair[1].1
-            ));
+            return Err(blaze_report::say!(
+                "the plan read the ",
+                blaze_report::say::Words(what),
+                " ",
+                blaze_report::say::Code(&pair[0].0),
+                " at two ids, ",
+                blaze_report::say::Words(&format!("{} and {}", pair[0].1, pair[1].1)),
+                ", in one view"
+            )
+            .flat());
         }
     }
     reads.dedup_by(|a, b| a.0 == b.0);

@@ -1656,7 +1656,8 @@ impl fmt::Display for PoolError {
                 let (window, at) = page_of(*page);
                 write!(
                     f,
-                    "a commit could not take the store's pool page at {at} of window {window} to append to its                      file: no file commits it, and it is {word:?}"
+                    "a commit could not take the store's pool page at {at} of window {window} to append to its \
+                     file: no file commits it, and it is {word:?}"
                 )
             }
             PoolError::Starved { page, waits } => {

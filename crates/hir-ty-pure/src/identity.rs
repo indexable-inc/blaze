@@ -30,7 +30,7 @@ use std::alloc::Global;
 use crate::{
     models::tag,
     values::evaluate,
-    walk::{Def, Instance, body_of},
+    walk::{Def, Instance, body_once},
 };
 
 pub(crate) const DOMAIN: &str = "blaze v2 pure script identity 1";
@@ -108,7 +108,8 @@ pub(crate) fn content_in(
     let args = share::args(db, instance.args.as_ref())
         .map_err(|it| format!("its type arguments have no identity: {it}"))?; // alloc: an impure script's reason, once
     h.id(&args);
-    let body = match body_of(db, &env, &instance) {
+    // Read once and dropped as the part is made: the row keeps the part, never the body.
+    let body = match body_once(db, &env, &instance) {
         Some(Ok(body)) => body,
         // alloc: an impure script's reason, once
         Some(Err(error)) => {
@@ -120,7 +121,7 @@ pub(crate) fn content_in(
     let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::Codegen);
     let mut facts =
         Facts { db, infcx, env, h, tys: HashSet::new_in(Global), statics: HashSet::new_in(Global) };
-    facts.body(body)?;
+    facts.body(&body)?;
     Ok(facts.h.finish())
 }
 

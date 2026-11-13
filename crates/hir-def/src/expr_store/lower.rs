@@ -2052,7 +2052,7 @@ impl<'db> ExprCollector<'db> {
                             && src.value.text_range().contains_range(it.value.text_range())
                     });
                     if widen {
-                        self.store.expr_map_back.insert(inner, src.map(AstPtr::wrap_left));
+                        self.store.map_expr_back(inner, src.map(AstPtr::wrap_left));
                     }
                 }
                 inner
@@ -4541,15 +4541,16 @@ impl<'db> ExprCollector<'db> {
     }
     /// The source maps of an expression just allocated for `ptr`.
     fn map_expr(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
+        let src = self.expander.in_file(ptr);
+        self.store.map_expr_back(id, src.map(AstPtr::wrap_left));
         if self.store.record {
-            let src = self.expander.in_file(ptr);
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
             self.store.expr_map.push((src, id.into()));
         }
         id
     }
-    // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed.
-    // Migrate to alloc_expr_desugared_with_ptr and then rename back
+    /// An expression lowering makes that the source does not write, with no syntax of its own:
+    /// one of the store's synthesized expressions ([`ExpressionStore::is_synthesized`]), as is
+    /// every expression no [`ExpressionStoreBuilder::map_expr_back`] gives syntax.
     fn alloc_expr_desugared(&mut self, expr: Expr<'_>) -> ExprId {
         self.store.alloc_expr(expr)
     }
@@ -4559,12 +4560,18 @@ impl<'db> ExprCollector<'db> {
     }
     /// The back map of a desugared expression just allocated for `ptr`.
     fn map_expr_desugared(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
-        if self.store.record {
-            let src = self.expander.in_file(ptr);
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
-            // We intentionally don't fill this as it could overwrite a non-desugared entry
-            // self.store.expr_map.push((src, id));
+        let src = self.expander.in_file(ptr).map(AstPtr::wrap_left);
+        #[cfg(test)]
+        if planted::DESUGARED_SYNTAX_FORGOTTEN.get() {
+            // The planted bug: the syntax is given, but not through `map_expr_back`, so the
+            // store calls the expression synthesized while the map has its syntax.
+            if self.store.record {
+                self.store.expr_map_back.insert(id, src);
+            }
+            return id;
         }
+        // The forward map is not filled: it could overwrite a non-desugared entry.
+        self.store.map_expr_back(id, src);
         id
     }
     fn missing_expr(&mut self) -> ExprId {
@@ -4598,10 +4605,10 @@ impl<'db> ExprCollector<'db> {
 
     /// The source maps of an expression just allocated for the pattern `ptr`.
     fn map_expr_from_pat(&mut self, id: ExprId, ptr: PatPtr) -> ExprId {
+        let src = self.expander.in_file(ptr);
+        self.store.map_expr_back(id, src.map(AstPtr::wrap_right));
         if self.store.record {
-            let src = self.expander.in_file(ptr);
             self.store.pat_map.push((src, id.into()));
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_right));
         }
         id
     }
@@ -4903,4 +4910,19 @@ pub fn hir_generic_arg_to_ast_view<'t>(
             ast::GenericArg::ConstArg(_) | ast::GenericArg::TypeArg(_) => true,
         })
         .nth(arg_idx as usize - has_self_arg as usize)
+}
+
+/// Bugs planted for the controls of the tests of lowering, each off but in the test that plants
+/// it.
+#[cfg(test)]
+pub(crate) mod planted {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// A desugared expression lowering maps to the syntax it stands for (the `for` loop's
+        /// `into_iter` call, the `?`'s branch) is given that syntax in the source map but not
+        /// through `map_expr_back`, so the store still lists it as synthesized
+        /// (`tests::body::synthesized::the_oracle_catches_a_desugared_expression_given_syntax_unrecorded`).
+        pub(crate) static DESUGARED_SYNTAX_FORGOTTEN: Cell<bool> = const { Cell::new(false) };
+    }
 }

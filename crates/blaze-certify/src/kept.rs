@@ -157,7 +157,10 @@ pub fn put_timed(out: &mut Vec<u8>, timed: &[Timed]) -> Result<(), String> {
     out.extend_from_slice(&(timed.len() as u16).to_be_bytes());
     for span in timed {
         let len = u16::try_from(span.name.len())
-            .map_err(|_| format!("the span name `{}` is longer than a client's rows hold", span.name))?;
+            .map_err(|_| {
+                let name = blaze_report::say::Code(&span.name);
+                blaze_report::say!("the span name ", name, " is longer than a client's rows hold").flat()
+            })?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(span.name.as_bytes());
         out.extend_from_slice(&span.start_ns.to_be_bytes());

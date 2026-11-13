@@ -655,7 +655,13 @@ impl<S: Steps> plane::Work for Step<S> {
                 let laid = steps.native(input, &self.cancelled).and_then(|dir| {
                     native_shared(dir, posted_by).map_err(|why| {
                         // alloc: an error, once
-                        ApiError::new(format!("pinned native input `{}`: {why}", input.name), Some(input.pin.clone()))
+                        let what = blaze_report::say!(
+                            "pinned native input ",
+                            blaze_report::say::Code(&input.name),
+                            ": ",
+                            blaze_report::say::Words(&why.to_string())
+                        );
+                        ApiError::new(what.flat(), Some(input.pin.clone()))
                     })
                 });
                 self.settle(laid.map_err(Failed::Error), |it| Value::Native(*key, it))
@@ -1671,6 +1677,12 @@ fn config_id(encoded: &[u8]) -> ContentId {
 /// on and whatever else its environment holds. What a checkout keeps one plan
 /// ([`keep_plan`]) and one no-op answer ([`noop::Answers`]) of.
 fn shape_of(planned: &[u8]) -> ContentId {
+    // The planted bug of the no-op lane's control ([`noop::Plant::IgnoresConfig`]): every
+    // request is of one shape, so a request of other features or another profile is asked of
+    // the answer another config left.
+    if noop::planted(noop::Plant::IgnoresConfig) {
+        return Hasher::new("blaze v2 serve request shape").finish();
+    }
     Hasher::new("blaze v2 serve request shape").part(planned).finish()
 }
 
@@ -3447,15 +3459,21 @@ impl<S: Steps> Settling<S> {
         match (stored, checkout) {
             // alloc: a loss, once
             (true, Some(checkout)) => format!(
-                "what the build of {checkout} left for the store or read from it (dependency images, check                  outcomes, goals; store ticket {ticket}) was put and is not durable, so a restarted daemon would                  work it out again: {why}"
+                "what the build of {checkout} left for the store or read from it (dependency images, check \
+                 outcomes, goals; store ticket {ticket}) was put and is not durable, so a restarted daemon would \
+                 work it out again: {why}"
             ),
             // alloc: a loss, once
             (true, None) => format!(
-                "what job {job} (`{command}`, on the view of root {view}) read from the store, or the loop put                  before it (store ticket {ticket}), was put and is not durable, so a restarted daemon would work                  it out again: {why}"
+                "what job {job} (`{command}`, on the view of root {view}) read from the store, or the loop put \
+                 before it (store ticket {ticket}), was put and is not durable, so a restarted daemon would work \
+                 it out again: {why}"
             ),
             // alloc: a loss, once
             (false, _) => format!(
-                "what job {job} (`{command}`) put itself (a build script's or test's results, a retraction, the                  record of where a verified value's roots are; store ticket {ticket}) is not durable, so a                  restarted daemon would work it out, or give it, again: {why}"
+                "what job {job} (`{command}`) put itself (a build script's or test's results, a retraction, the \
+                 record of where a verified value's roots are; store ticket {ticket}) is not durable, so a \
+                 restarted daemon would work it out, or give it, again: {why}"
             ),
         }
     }
@@ -4280,11 +4298,6 @@ enum Own {
     Certify { job: JobId, ask: u32 },
     /// A request slot's writer, its list of the slots directory, or a removal past the bound (certify.rs's `slot_told`).
     Slot { slot: u32 },
-    /// An executable's mode set, then its placement recorded.
-    /// `stamp`, the store's look at the file it placed ([`Placement::stamp`]).
-    /// No stamp of the store's: the mode moves the file's change time and mode bits past its
-    /// look, so the record's look is the daemon's own ([`Jobs::record`] with none).
-    Mode { job: JobId, path: u32, key: blaze_cas::Key },
     /// A placed output's file looked at: placed again unless it is as it was placed.
     Look { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
     /// The file at a path looked at before a link's patch of it is placed there
@@ -4849,7 +4862,8 @@ impl<S: Steps> Jobs<S> {
         if let Some(&root) = checkout.and_then(|it| self.roots.ids.get(it)) {
             // alloc: a loss, once
             self.roots.lost[root as usize] = Some(format!(
-                "the last build of {of} (`{command}`) answered before what it left for the store was durable,                  and it was not kept: {what}"
+                "the last build of {of} (`{command}`) answered before what it left for the store was durable, \
+                 and it was not kept: {what}"
             ));
         }
         if self.lost.len() == LOST_SHOWN {
@@ -6868,7 +6882,9 @@ impl<S: Steps> Jobs<S> {
             return Ok((prep, Some(written)));
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return Err(()) };
-        if job.locked.is_some() {
+        // Only a view this job already wrote the files into is refused: another of its views
+        // (a reach's second view of the checkout, opened apart) takes them as the first did.
+        if job.relocated.iter().any(|it| it.0 == prep.opened.view.root) {
             // alloc: an error, once
             let path = written.files[0].path.clone();
             let error = ApiError::new(
@@ -6894,7 +6910,7 @@ impl<S: Steps> Jobs<S> {
     /// The ops that write `lock`'s files into the view `opened` of the checkout at
     /// `root_dir`, each whole as the watcher will commit it (with the mode the view's file
     /// has, else regular). None when one of them is no file of the view: outside the
-    /// checkout, or under what its view leaves out ([`super::heads::excluded`]).
+    /// checkout, or under what its view leaves out ([`blaze_vfs::watch::fixed_out`]).
     fn lock_ops(
         vfs: &Vfs,
         root_dir: &str,
@@ -6906,7 +6922,7 @@ impl<S: Steps> Jobs<S> {
         let mut ops = Vec::with_capacity(lock.files.len());
         for file in &lock.files {
             let rel = file.path.strip_prefix(under)?.strip_prefix('/')?;
-            if super::heads::excluded(rel) {
+            if blaze_vfs::watch::fixed_out(rel) {
                 return None;
             }
             // A file the view has keeps its mode, as the watcher's commit of it does.
@@ -6949,11 +6965,16 @@ impl<S: Steps> Jobs<S> {
         .entered();
         let opened = Opened { view: blaze_vfs::View { root }, ..was };
         job.locked = Some((key, written.clone())); // clone: the lock files' text, once
-        job.relocated.push((root, root_dir.to_owned())); // alloc: the checkout's path, once a lock write
+        // Another view of the job at the root this one goes to (a reach's two views of one
+        // checkout) wrote the same files there already: they are asked of the driver once.
+        let again = job.relocated.iter().any(|it| it.0 == root);
+        if !again {
+            job.relocated.push((root, root_dir.to_owned())); // alloc: the checkout's path, once a lock write
+        }
         if let Some(view) = job.views.iter_mut().find(|it| **it == was) {
             *view = opened;
         }
-        if !self.write_locks(w, id, written, root, root_dir) {
+        if !again && !self.write_locks(w, id, written, root, root_dir) {
             return;
         }
         drop(_span);
@@ -8708,6 +8729,9 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        // An executable is started from its path: its staged file gets its mode before its
+        // look and rename, and a clone is prewarmed (`blaze_cas::Store::starts`).
+        w.store.starts(&file, executable);
         // A further path of a file whose place from its maker's bytes is in flight: another
         // name of that file, made beside its rename.
         let first = self.firsts.iter().find(|(it, _)| Arc::ptr_eq(it, made)).map(|(_, tag)| *tag);
@@ -8922,16 +8946,11 @@ impl<S: Steps> Jobs<S> {
                 continue;
             }
             match result {
-                Ok(()) if executable => match self.own_tag(Own::Mode { job: id, path, key }) {
-                    Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
-                    Err(error) => {
-                        self.end_placing(id, path);
-                        self.placing_failed(id, path, error);
-                    }
-                },
+                // An executable's staged file had its mode set before its look and rename
+                // (`blaze_cas::Store::starts`): the store's stamp is the file's, whichever.
                 Ok(()) => {
                     self.end_placing(id, path);
-                    self.record(w, id, path, key, false, stamp);
+                    self.record(w, id, path, key, executable, stamp);
                 }
                 Err(why) => {
                     self.end_placing(id, path);
@@ -9047,7 +9066,7 @@ impl<S: Steps> Jobs<S> {
                     self.place_made_as(w, id, path, key, executable, &made, over);
                 }
             }
-            Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
+            Own::Write { job: id, path } => {
                 let failed = match &done {
                     Done::Failed(error) => {
                         let name = &self.paths.names[path as usize];
@@ -9062,12 +9081,6 @@ impl<S: Steps> Jobs<S> {
                 self.end_placing(id, path);
                 if let Some(error) = failed {
                     self.placing_failed(id, path, error);
-                } else if let Own::Mode { key, .. } = own
-                    && self.owned(id)
-                {
-                    // The mode moved the file's change time and mode bits past the store's
-                    // look: a stamp of it would never match the file again, so none is kept.
-                    self.record(w, id, path, key, true, None);
                 }
             }
         }
@@ -10343,11 +10356,17 @@ impl<S: Steps> Jobs<S> {
                         None => true,
                         Some(why) => {
                             // alloc: a loss, once
-                            let what = format!(
-                                "what job {} (`{}`) put into the machine's sealed layer (a sealed crate's records; \
-                                 layer ticket {ticket}) is not durable, so another home would build it again: {why}",
-                                it.job, it.command
-                            );
+                            let what = blaze_report::say!(
+                                "what job ",
+                                blaze_report::say::Words(&it.job.to_string()),
+                                " (",
+                                blaze_report::say::Cmd(&it.command),
+                                ") put into the machine's sealed layer (a sealed crate's records; layer ticket ",
+                                blaze_report::say::Words(&ticket.to_string()),
+                                ") is not durable, so another home would build it again: ",
+                                blaze_report::say::Words(&why.to_string())
+                            )
+                            .flat();
                             // clone: a loss's names, once
                             lost.push((it.job, it.command.clone(), it.checkout.clone(), what));
                             it.layer = blaze_cas::Tickets::default();

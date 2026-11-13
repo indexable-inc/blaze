@@ -347,10 +347,23 @@ fn wants(meta: &'static tracing::Metadata<'static>) -> bool {
     Recorder::wanted(meta) && flight::register(meta).is_some()
 }
 
+/// The site of a callsite [`Recorder::enabled`] said yes to, given it here if it has none yet.
+/// tracing registers a callsite on the first thread to reach it; another thread that reaches
+/// it while that registration runs is asked [`Recorder::enabled`] instead and goes on to make
+/// its span or event at once, before [`flight::register`] gave the site. Until 2026-11-13 such
+/// a span read as no site's and was not recorded: of six threads opening one span at once,
+/// only the registering thread's was in the profile
+/// (`batches::tests::names_given_on_many_threads_read_back_from_parquet_as_recorded`).
+/// [`flight::register`] waits for the registration under way and gives its site. `None` for a
+/// callsite not wanted, or past the flight recorder's table.
+fn site_of(meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+    flight::site(meta).or_else(|| if Recorder::wanted(meta) { flight::register(meta) } else { None })
+}
+
 /// The id of a span beginning now: [`flight::UNRECORDED`] for a callsite past the flight
 /// recorder's table.
 fn opened(span: &tracing::span::Attributes<'_>) -> u64 {
-    let Some(site) = flight::site(span.metadata()) else { return flight::UNRECORDED };
+    let Some(site) = site_of(span.metadata()) else { return flight::UNRECORDED };
     flight::opened(span, site)
 }
 
@@ -397,7 +410,7 @@ impl tracing::Subscriber for Recorder {
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
-        if let Some(site) = flight::site(event.metadata()) {
+        if let Some(site) = site_of(event.metadata()) {
             flight::evented(event, site);
         }
     }

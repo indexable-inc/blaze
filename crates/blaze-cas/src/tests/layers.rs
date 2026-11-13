@@ -248,10 +248,13 @@ fn build_sealed(
     copy: bool,
 ) -> Result<(), String> {
     for (key, kind, bytes) in values {
-        layer.put(*key, *kind, bytes).map_err(|why| format!("{key:?}: {why:?}"))?;
+        // The copy is put first, as the home-and-share put wrote it: put after the share, the
+        // home finds the value in the layer it reads live and keeps nothing (the second home's
+        // invariant below), so the control would plant no copy at all.
         if copy {
             home.put(*key, *kind, bytes).map_err(|why| format!("{key:?}: {why:?}"))?;
         }
+        layer.put(*key, *kind, bytes).map_err(|why| format!("{key:?}: {why:?}"))?;
     }
     let reader = home.reader();
     for (key, _, bytes) in values {
@@ -319,7 +322,11 @@ fn a_second_home_finds_what_the_first_built_on_their_layer_and_writes_nothing_of
         c.read_live(&c_layer.reader()).unwrap();
         let copied = sealed_values(seed + 100, 31);
         let caught = build_sealed(&mut sim, &mut c, &mut c_layer, &copied, true);
-        assert!(caught.is_err_and(|why| why.contains("keeps 2 records")), "seed {seed}: the oracle missed a home that copies");
+        // Its records: the query's and the output's, and the output's chunks (`CHUNK_FROM`).
+        assert!(
+            caught.as_ref().is_err_and(|why| why.contains("records of a sealed crate a layer holds")),
+            "seed {seed}: the oracle missed a home that copies: {caught:?}"
+        );
     }
 }
 
@@ -340,4 +347,290 @@ fn a_store_reads_live_only_one_writer_of_its_layers() {
     assert!(second.contains("live already"), "{second}");
     let me = mine.reader();
     assert!(mine.read_live(&me).is_err(), "a store is no live layer of its own");
+}
+
+/// One std unit as a home's build leaves it in the machine's layer: its outputs, then its
+/// record, which names them (`unit::compile::store` puts the outputs as the unit ends, the
+/// record is filed after the build's answer). The same bytes in every home: the keys cover
+/// every input, so two homes that build it put equal bytes under one key.
+struct StdUnit {
+    record: (Key, Vec<u8>),
+    outputs: Vec<(Key, Vec<u8>)>,
+}
+
+fn std_units(seed: u64, count: u64) -> Vec<StdUnit> {
+    (0..count)
+        .map(|n| StdUnit {
+            record: (key(7_000 + n), text(seed * 64 + n, 2_000 + (n as usize) * 300)),
+            outputs: vec![
+                (key(8_000 + 2 * n), noise(24 << 10, seed * 64 + n)),
+                (key(8_001 + 2 * n), text(seed * 64 + 32 + n, 900)),
+            ],
+        })
+        .collect()
+}
+
+/// A bug a control plants in a home's build of std into the layer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LayerPlant {
+    None,
+    /// The job ends without the layer's flush and says its records kept as they are put
+    /// (what `Jobs`' answer did were the layer's tickets dropped at the job's end).
+    DroppedAtJobEnd,
+    /// Each record put and committed before its outputs are put.
+    RecordFirst,
+}
+
+/// What one home's build asks of its writer of the layer, in order.
+#[derive(Clone, Copy, Debug)]
+enum LayerOp {
+    /// Unit `.0`'s output `.1`, or its record when `.1` is none.
+    Put(usize, Option<usize>),
+    /// The job's end: the layer flushed, its commit a task after the answer.
+    Flush,
+}
+
+fn build_ops(units: usize, plant: LayerPlant) -> Vec<LayerOp> {
+    let mut ops = Vec::new();
+    for unit in 0..units {
+        if plant == LayerPlant::RecordFirst {
+            ops.extend([LayerOp::Put(unit, None), LayerOp::Flush, LayerOp::Put(unit, Some(0)), LayerOp::Put(unit, Some(1))]);
+            continue;
+        }
+        ops.extend([LayerOp::Put(unit, Some(0)), LayerOp::Put(unit, Some(1)), LayerOp::Put(unit, None)]);
+    }
+    if plant == LayerPlant::None {
+        ops.push(LayerOp::Flush);
+    }
+    ops
+}
+
+/// Delivers what `stores` asked, `polls` times (none: until nothing is in flight), each
+/// completion to the store that owns it. Bounded on the simulation's clock: a poll that
+/// completes nothing by its deadline is the error.
+fn pump_all(sim: &mut Sim, stores: &mut [&mut Store], effects: &mut Vec<Effect>, polls: Option<u64>) -> Result<(), String> {
+    let mut left = polls;
+    let mut done = Vec::new();
+    while left != Some(0) {
+        sim.submit(effects);
+        if sim.in_flight() == 0 {
+            break;
+        }
+        let end = blaze_core::wait::Deadline::after(sim.now(), Duration::from_secs(600));
+        sim.poll(&mut done, end);
+        if done.is_empty() {
+            return Err(format!("{} effects in flight and none completed by {end:?}", sim.in_flight()));
+        }
+        for completion in done.drain(..) {
+            if let Some(store) = stores.iter_mut().find(|it| it.owns(completion.tag)) {
+                store.complete(completion, effects);
+            }
+        }
+        left = left.map(|it| it - 1);
+    }
+    sim.submit(effects);
+    Ok(())
+}
+
+/// The oracle, as a second home that opens after the crash (or the builds' end) sees the
+/// layer: every record a home reported kept (its layer ticket durable, what the job's settling
+/// waits for before the certificate says the build is kept) is a hit with equal bytes; a
+/// record that was not yet durable may be a miss, which that home builds itself, never a
+/// record torn or refused; and a record it finds has every output it names, whole.
+fn second_home_sees(sim: &mut Sim, units: &[StdUnit], kept: &[(u64, usize)]) -> Result<(), String> {
+    let second = open_with(sim, home("second", &["std"]));
+    let got = |key: &Key| -> Result<Option<Vec<u8>>, String> {
+        second.get(key).map(|it| it.map(|it| it.bytes.to_vec())).map_err(|why| format!("{key:?} is refused: {why}"))
+    };
+    for (writer, unit) in kept {
+        let (key, bytes) = &units[*unit].record;
+        match got(key)? {
+            Some(found) if found == *bytes => {}
+            Some(found) => {
+                return Err(format!("home {writer} reported {key:?} kept; the second home reads {} other bytes", found.len()));
+            }
+            None => {
+                return Err(format!("home {writer} reported the record {key:?} of unit {unit} kept, and the second home misses it"));
+            }
+        }
+    }
+    for (n, unit) in units.iter().enumerate() {
+        let (key, bytes) = &unit.record;
+        let Some(found) = got(key)? else { continue };
+        if found != *bytes {
+            return Err(format!("the record of unit {n} reads {} bytes, not the {} put", found.len(), bytes.len()));
+        }
+        for (output, want) in &unit.outputs {
+            match got(output)? {
+                Some(it) if it == *want => {}
+                Some(it) => return Err(format!("unit {n}'s output {output:?} reads {} other bytes", it.len())),
+                None => return Err(format!("the record of unit {n} is visible to the second home before its output {output:?}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two homes on one machine build std at once, each through its own writer of the machine's
+/// layer (each daemon's `std`, `serve::daemon`), their puts, job-end flushes and IO
+/// completions interleaved by `seed`, and the machine may lose power at any step. Then the
+/// oracle ([`second_home_sees`]). Home 1 builds one unit home 2 does not: once both are
+/// idle (no crash came), home 2, having looked again, is refused other bytes under that
+/// unit's record key: the typed refusal of two values under one key ([`Mismatch`]).
+fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
+    const UNITS: u64 = 5;
+    let mut sim = Sim::new(seed, Faults { max_latency: Duration::from_micros(400), ..Faults::default() });
+    let units = std_units(seed, UNITS);
+    let mut writers = [open_writer(&mut sim, "std", 1), open_writer(&mut sim, "std", 2)];
+    let ops = [build_ops(UNITS as usize, plant), build_ops(UNITS as usize - 1, plant)];
+    let mut next = [0usize; 2];
+    // Each home's record tickets not yet durable, and what it reported kept.
+    let mut waiting: [Vec<(usize, Ticket)>; 2] = [Vec::new(), Vec::new()];
+    let mut kept: Vec<(u64, usize)> = Vec::new();
+    let mut effects = Vec::new();
+    let mut rng = Rng::new(seed ^ 0x5eed);
+    let total = (ops[0].len() + ops[1].len()) as u64;
+    // A crash at a step of the builds, for the race; the controls' at their end.
+    let crash_at = (plant == LayerPlant::None && rng.below(4) != 0).then(|| rng.below(total + 2));
+    let mut crashed = false;
+    for step in 0.. {
+        if crash_at == Some(step) {
+            sim.crash();
+            crashed = true;
+            break;
+        }
+        let open: Vec<usize> = (0..2).filter(|it| next[*it] < ops[*it].len()).collect();
+        if open.is_empty() {
+            break;
+        }
+        let home = open[rng.below(open.len() as u64) as usize];
+        let op = ops[home][next[home]];
+        next[home] += 1;
+        let writer = &mut writers[home];
+        match op {
+            LayerOp::Put(unit, which) => {
+                let (key, kind, bytes) = match which {
+                    Some(at) => (units[unit].outputs[at].0, Kind::Output, &units[unit].outputs[at].1),
+                    None => (units[unit].record.0, Kind::Query, &units[unit].record.1),
+                };
+                let ticket = writer
+                    .put(key, kind, bytes)
+                    .map_err(|why| format!("home {}'s put of equal bytes under {key:?} was refused: {why:?}", home + 1))?;
+                if which.is_none() {
+                    match plant {
+                        LayerPlant::DroppedAtJobEnd => kept.push((home as u64 + 1, unit)),
+                        _ => waiting[home].push((unit, ticket)),
+                    }
+                }
+            }
+            LayerOp::Flush => writer.flush(&mut effects),
+        }
+        let [one, two] = &mut writers;
+        pump_all(&mut sim, &mut [one, two], &mut effects, Some(rng.below(3)))?;
+        for (home, writer) in writers.iter().enumerate() {
+            waiting[home].retain(|(unit, ticket)| {
+                let durable = writer.durable(*ticket);
+                if durable {
+                    kept.push((home as u64 + 1, *unit));
+                }
+                !durable
+            });
+        }
+    }
+    if !crashed {
+        let [one, two] = &mut writers;
+        pump_all(&mut sim, &mut [one, two], &mut effects, None)?;
+        for (home, writer) in writers.iter().enumerate() {
+            kept.extend(waiting[home].iter().filter(|(_, ticket)| writer.durable(*ticket)).map(|(unit, _)| (home as u64 + 1, *unit)));
+        }
+        if plant == LayerPlant::None {
+            // Both idle: home 2 looks again and finds home 1's commit; other bytes under a
+            // key home 1 alone built are refused, naming the key.
+            let mut asked = Vec::new();
+            let look = writers[1].look_again(&mut asked);
+            let [one, two] = &mut writers;
+            pump_all(&mut sim, &mut [one, two], &mut asked, None)?;
+            if writers[1].looked() < look {
+                return Err(format!("home 2's look of the layer did not come in: {:?}", writers[1].broken()));
+            }
+            let (alone, _) = &units[UNITS as usize - 1].record;
+            match writers[1].put(*alone, Kind::Query, b"other bytes under one key") {
+                Err(mismatch) if mismatch.key == *alone => {}
+                other => return Err(format!("other bytes under {alone:?}, which home 1 committed, came to {other:?}")),
+            }
+        }
+        // The machine goes down once the builds are answered: what is durable stays.
+        sim.crash();
+    }
+    drop(writers);
+    second_home_sees(&mut sim, &units, &kept)?;
+    // The writers' directories open again after the crash, each at its last durable state.
+    let mut again = open_writer(&mut sim, "std", 1);
+    flush(&mut sim, &mut again);
+    Ok(())
+}
+
+/// The invariant: two homes on one machine building std at once into the machine's layer,
+/// each through its own writer, under every interleaving of their puts and commits and a power
+/// loss at any step (each seed): a second home's lookup of a record either home reported kept
+/// is a hit with equal bytes (the first was durable before it said kept); one not yet durable
+/// is a miss the second home builds itself, never a torn record; a record it finds has every
+/// output it names; both homes' puts of one key are equal bytes and keep one value, and other
+/// bytes under a key the layer holds are the typed refusal ([`Mismatch`]). The controls plant
+/// the two ways this breaks: [`the_oracle_catches_layer_puts_dropped_at_job_end`],
+/// [`the_oracle_catches_a_record_visible_before_its_outputs`].
+#[test]
+fn two_homes_building_std_at_once_leave_a_second_home_every_record_they_reported_kept() {
+    for seed in 0..48 {
+        assert_eq!(std_race(seed, LayerPlant::None), Ok(()), "seed {seed}");
+    }
+}
+
+/// Control: a job that ends without the layer's flush and says its records kept as they are
+/// put (the layer's tickets dropped at the job's end) leaves records a second home misses
+/// after the machine goes down: the oracle names one.
+#[test]
+fn the_oracle_catches_layer_puts_dropped_at_job_end() {
+    for seed in 0..6 {
+        let caught = std_race(seed, LayerPlant::DroppedAtJobEnd);
+        assert!(caught.as_ref().is_err_and(|why| why.contains("misses it")), "seed {seed}: {caught:?}");
+    }
+}
+
+/// Control: a record committed before its outputs are put is visible to a second home with an
+/// output it names missing once the machine goes down before the outputs' commit: the oracle
+/// names the output.
+#[test]
+fn the_oracle_catches_a_record_visible_before_its_outputs() {
+    for seed in 0..6 {
+        let caught = std_race(seed, LayerPlant::RecordFirst);
+        assert!(caught.as_ref().is_err_and(|why| why.contains("before its output")), "seed {seed}: {caught:?}");
+    }
+}
+
+/// The invariant: a writer directory of the machine's layer in another layout (its head's
+/// magic naming another format, as an older blaze's store of the same makers would leave) is
+/// refused by name: the home that reads the layer stops, naming that head and the format,
+/// and reads nothing of it another way. The control: the same directory as written opens.
+#[test]
+fn a_layer_writer_of_another_layout_is_refused_by_name() {
+    let mut sim = Sim::new(52, quiet());
+    let mut std = open_writer(&mut sim, "std", 1);
+    std.put(key(1), Kind::Query, b"a std unit's record").unwrap();
+    flush(&mut sim, &mut std);
+    drop(std);
+    let mine = open_with(&mut sim, home("home", &["std"]));
+    assert_eq!(bytes_of(&mine, &key(1)).unwrap(), b"a std unit's record", "the control: the layer as written opens");
+    drop(mine);
+
+    let head = name(&format!("{}/head", writer_dir("std", 1)));
+    let mut older = sim.contents(&head);
+    older[7] = older[7].wrapping_sub(1);
+    sim.change(&head, &older);
+    let mut effects = Vec::new();
+    let mut mine = Store::open(home("home", &["std"]), &mut effects);
+    drive(&mut sim, &mut mine, &mut effects);
+    let broken = mine.broken().expect("a layer's writer of another layout stops the home");
+    assert_eq!(broken.file, head, "{broken}");
+    assert!(broken.what.contains("not the head of a store of this format"), "{broken}");
 }

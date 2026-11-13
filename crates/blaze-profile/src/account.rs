@@ -84,11 +84,14 @@ impl Writer {
             "AllCrates" | "Crate" | "PrimaryCrates" | "LibraryRoots" | "LocalRoots"
             | "SourceRootInput" | "FileSourceRootInput" | "FrontSettings" | "NamedPaths"
             | "PathBucket" | "FrontEnd" => Writer::Plan,
+            // Where the database keeps its entries and macro definitions: set once by the
+            // driver as it opens the store, as a plan's setting is.
+            "EntryStore" | "KeptDefs" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
             | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
-            | "PagedDefMaps" | "ScopeInput" | "ServedBodies" | "SliceDirectory"
-            | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
+            | "PagedDefMaps" | "PagedItems" | "FrozenKept" | "ScopeInput" | "ServedBodies"
+            | "SliceDirectory" | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
             // `CrateSlot` (base-db: one input a thing given to one crate) is written by a
             // plan and by blaze's own publications alike: its writes are attributed by the
             // slot's kind ([`Writer::of_slot`], [`Seen::slots`]), never by this name.
@@ -107,7 +110,8 @@ impl Writer {
             // What blaze publishes of the crate from its own results, and the slot a served or
             // withdrawn dependency's entry has beside each of its maps.
             "CrateResolution" | "DirectorySlot" | "ImageSlot" | "DefMapSlot" | "LangItemsSlot"
-            | "PagesSlot" | "ImplTablesSlot" | "ItemPagesSlot" => Writer::Derived,
+            | "PagesSlot" | "ImplTablesSlot" | "ItemPagesSlot" | "SurfaceSlot" | "RuntimeSlot"
+            | "KeptSlot" => Writer::Derived,
             _ => Writer::Unattributed,
         }
     }

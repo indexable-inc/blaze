@@ -437,8 +437,11 @@ mod tests {
         let twice = [plan.clones()[0].clone(), plan.clones()[1].clone(), plan.clones()[0].clone()];
         let why = distinct(plan.unit(), &twice).expect_err("the oracle missed a set kept twice");
         assert!(why.contains("clones `avx2` and `avx2` have one set"), "{why}");
+        // The `avx512f` clone alone: beside it the `avx2` clone, a subset of this unit, would
+        // be caught first, as lacking a feature of its unit.
         let unit = plan.clones()[1].features;
-        let why = distinct(&unit, plan.clones()).expect_err("the oracle missed the unit's own set");
+        let why =
+            distinct(&unit, &plan.clones()[1..]).expect_err("the oracle missed the unit's own set");
         assert!(why.contains("clone `avx512f` is compiled as the baseline is"), "{why}");
     }
 

@@ -206,12 +206,19 @@ fn refuse(storage: &Storage, what: &'static str, refused: Refused) -> ! {
             let barrier = local::barrier();
             let key = super::key_text(storage, ingredient, super::Id::from_u32(id));
             drop(barrier);
-            panic!(
-                "{what}: held to `Durability::HIGH` reads (`blaze_query::db::covered`), it read a \
-                 provisional row of the cycle headed by `{}`({key}): a cover stands for values, not \
-                 a round of one",
-                super::ingredient::name(ingredient)
-            )
+            use blaze_report::say::{Code, Words};
+            let said = blaze_report::say!(
+                Words(what),
+                ": held to ",
+                Code("Durability::HIGH"),
+                " reads (",
+                Code("blaze_query::db::covered"),
+                "), it read a provisional row of the cycle headed by ",
+                Code(super::ingredient::name(ingredient)),
+                Words(&format!("({key})")), // alloc: the panic's text
+                ": a cover stands for values, not a round of one",
+            );
+            panic!("{}", said.flat())
         }
         Refused::Unshareable => panic!(
             "{what}: held to `Durability::HIGH` reads (`blaze_query::db::covered`), it was told \

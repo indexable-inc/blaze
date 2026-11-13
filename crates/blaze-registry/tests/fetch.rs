@@ -72,9 +72,12 @@ impl Http for Server {
 }
 
 /// A store of its own in `dir`, kept for the rest of the test process as the daemon's store
-/// is; what is put is read at once, before any commit.
+/// is; what is put is read at once, before any commit. Its pool reserves the few windows its
+/// packs take, not a store's 4 TiB, since every store a test makes is kept.
 fn store(dir: &Path) -> &'static blaze_cas::Handle {
-    let driven = Box::leak(Box::new(blaze_cas::Driven::open(dir).unwrap()));
+    let driven = Box::leak(Box::new(
+        blaze_cas::Driven::open_reserving(dir, blaze_cas::Loader::Pumped, 16).unwrap(),
+    ));
     Box::leak(Box::new(driven.handle()))
 }
 
@@ -316,7 +319,7 @@ fn refuses_what_cargo_refuses() {
 
     let outside = fixture.publish("outside", &[("other-1.0.0/a", b"a", 0o644)]);
     let e = format!("{:#}", registry.fetch(&[outside]).unwrap_err());
-    assert!(e.contains("isn't under \"outside-1.0.0\""), "{e}");
+    assert!(e.contains("`other-1.0.0/a` is not under `outside-1.0.0`, the top directory"), "{e}");
 
     let mut builder = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
@@ -331,7 +334,7 @@ fn refuses_what_cargo_refuses() {
     fixture.server.put(&format!("https://dl.example.com/link/1.0.0/{lower}/{sum}"), &bytes, "x");
     let link = Package { name: "link".to_owned(), version: Version::new(1, 0, 0), checksum: sum };
     let e = format!("{:#}", registry.fetch(&[link]).unwrap_err());
-    assert!(e.contains("with invalid type Symlink"), "{e}");
+    assert!(e.contains("`escape` is a Symlink entry, which this archive may not hold"), "{e}");
 
     let offline = fixture.registry(true);
     let missing = fixture.publish("missing", &[("missing-1.0.0/a", b"a", 0o644)]);

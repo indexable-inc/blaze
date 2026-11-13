@@ -40,6 +40,10 @@ use std::fmt;
 use blaze_cas::{Key, Kind, content_of};
 use blaze_ids::{ContentId, Hasher};
 use blaze_record::{AnswerKey, Doing, Filing, Placed, Slot, Walked, keep_answer, list_key, walk};
+use blaze_report::{
+    say,
+    say::{Code, Count, Words},
+};
 use blaze_store_check::{Setting, VerifyError};
 
 mod entry;
@@ -463,7 +467,9 @@ pub struct Of {
 
 impl fmt::Display for Of {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} of `{}` (identity {:x})", self.step, self.label, self.identity)
+        let identity = format!("{:x}", self.identity); // alloc: an error's text
+        // alloc: an error's text
+        f.write_str(&say!(Words(self.step), " of ", Code(&self.label), " (identity ", Words(&identity), ")").flat())
     }
 }
 
@@ -523,7 +529,24 @@ pub enum KernelError {
     Input { step: &'static str, key: String, why: String },
 }
 
+/// Why a session's entry could not be read: the store it reads has no value under the entry's
+/// key ([`KernelError::missing_entry`]). A session names entries of one store, and a driver
+/// that advances a session before the puts of its entries reach that store breaks that.
+pub const NOT_IN_STORE: &str = "its entry is not in the store: a session is of one store";
+
 impl KernelError {
+    /// The entry a session named that the store it reads does not hold, when that is what this
+    /// says, through any [`KernelError::Child`]: the error a session that ran ahead of its
+    /// store's puts gives. Its holder drops the session, saying so, and makes a new one, whose
+    /// every answer is looked up in the store again and verified by its reads.
+    pub fn missing_entry(&self) -> Option<Key> {
+        match self {
+            KernelError::Store { key, why, .. } if why == NOT_IN_STORE => Some(*key),
+            KernelError::Child { child, .. } => child.missing_entry(),
+            _ => None,
+        }
+    }
+
     /// Whether it says only that a step's value cannot be had now. During a lookup that makes
     /// the read-list that named the step not hold (`nest`'s doc says why); during a run it is
     /// the run's error.
@@ -555,18 +578,38 @@ impl KernelError {
 impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KernelError::Unregistered { step, name, holder: None } => {
-                write!(f, "the kernel has no step `{name}` (step {}): register it first", step.0)
-            }
-            KernelError::Unregistered { step, name, holder: Some(holder) } => write!(
-                f,
-                "step {} is `{holder}` in the kernel, not `{name}`: one number is one step (blaze_kernel::steps)",
-                step.0
+            // alloc: an error's text
+            KernelError::Unregistered { step, name, holder: None } => f.write_str(
+                &say!("the kernel has no step ", Code(name), " (step ", Count(u64::from(step.0)), "): register it first")
+                    .flat(),
             ),
-            KernelError::Twice { first, second } => write!(
-                f,
-                "two kernel steps share a number or a name: `{}` (step {}) and `{}` (step {})",
-                first.1, first.0.0, second.1, second.0.0
+            // alloc: an error's text
+            KernelError::Unregistered { step, name, holder: Some(holder) } => f.write_str(
+                &say!(
+                    "step ",
+                    Count(u64::from(step.0)),
+                    " is ",
+                    Code(holder),
+                    " in the kernel, not ",
+                    Code(name),
+                    ": one number is one step (blaze_kernel::steps)"
+                )
+                .flat(),
+            ),
+            // alloc: an error's text
+            KernelError::Twice { first, second } => f.write_str(
+                &say!(
+                    "two kernel steps share a number or a name: ",
+                    Code(first.1),
+                    " (step ",
+                    Count(u64::from(first.0.0)),
+                    ") and ",
+                    Code(second.1),
+                    " (step ",
+                    Count(u64::from(second.0.0)),
+                    ")"
+                )
+                .flat(),
             ),
             KernelError::Store { of, key, why } => {
                 write!(f, "{of}: the store at {:x}: {why}", key.0)

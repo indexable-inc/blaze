@@ -566,16 +566,13 @@ impl<'db> ExprCollector<'db> {
         let new_fn = match new_fn {
             Some(new_fn) => {
                 let new_fn = self.store.alloc_path_expr(new_fn);
-                if self.store.record
-                    && let Some(arg_ptr) = arg_ptr
-                {
+                if let Some(arg_ptr) = arg_ptr {
                     // Trait errors (the argument does not implement the expected fmt trait) will show
                     // on this path, so to not end up with synthetic syntax we insert this mapping. We
                     // don't want to insert the other way's mapping in order to not override the source
                     // for the argument.
-                    self.store
-                        .expr_map_back
-                        .insert(new_fn, self.expander.in_file(arg_ptr.wrap_left()));
+                    let src = self.expander.in_file(arg_ptr.wrap_left());
+                    self.store.map_expr_back(new_fn, src);
                 }
                 new_fn
             }

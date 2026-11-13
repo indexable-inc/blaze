@@ -4,8 +4,8 @@
 //!
 //! [`store`] is a store of expressions, patterns and types whose every column holds something:
 //! an expression root returning a tuple of a missing expression and `_`, a wild pattern, an
-//! arm, a tuple type, hygiene, a block scope, an edition and a closure that inherits overflow
-//! checks. [`source_map`] points each kind of id at syntax in a file and in a macro file. Their
+//! arm, a tuple type, hygiene, a block scope, an edition, a closure that inherits overflow
+//! checks and the missing expression as the one synthesized. [`source_map`] points each kind of id at syntax in a file and in a macro file. Their
 //! side tables, bindings, labels, lifetimes, statements, paths, macro calls and record fields
 //! are empty: those are words and names the decode reads as values, or columns no other column
 //! here names.
@@ -42,7 +42,7 @@ const MACRO_FILE: u32 = 2;
 /// Where a store's columns went, in `StoreRoot`'s order.
 pub struct StoreCols {
     placed: Placed,
-    columns: [Col; 34],
+    columns: [Col; 35],
     side: u32,
     ty_side: u32,
     flags: u32,
@@ -96,6 +96,8 @@ pub fn store(build: &mut Build) -> StoreCols {
     let field_hygiene = build.column::<[u32; 2]>(&[], true);
     let block_editions = build.column::<[u32; 2]>(&[[3, Edition::CURRENT as u32]], true);
     let overflow_inheriting = build.column::<u32>(&[2], true);
+    // The missing expression is the one lowering made with no syntax of its own.
+    let synthesized = build.column::<u32>(&[1], true);
     let spec_clauses = build.column::<[u32; 2]>(&[], true);
     // The root, and where its expressions, patterns and bindings end.
     let expr_roots = build.column::<[u32; 4]>(&[[3, 4, 1, 0]], true);
@@ -134,6 +136,7 @@ pub fn store(build: &mut Build) -> StoreCols {
             field_hygiene,
             block_editions,
             overflow_inheriting,
+            synthesized,
             spec_clauses,
             expr_roots,
             type_hygiene,

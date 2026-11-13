@@ -90,7 +90,11 @@ fn ambient_refuses_a_file_read_with_its_path() {
 //- /app.rs crate:app deps:std
 #![blaze::capabilities]
 fn load() -> bool {
-    std::fs::read("config").is_ok()
+    // The stand-in core's `Result` has no `is_ok`: a match says the same.
+    match std::fs::read("config") {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 pub fn start() -> bool {
     load()

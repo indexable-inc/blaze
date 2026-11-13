@@ -557,6 +557,56 @@ fn checks_wants_and_rounds_allocate_nothing() {
     assert!(!cover.unchanged_since(generation));
 }
 
+/// The invariant: the changes kept by path are the newest heard, in order, each with the bytes
+/// it was heard with: the two rings let the oldest go, by count past [`super::CHANGES_KEPT`]
+/// and by bytes past [`super::CHANGE_BYTES`], and never write a path over one kept. And they
+/// keep nearly all they can: once one is let go for room, the paths kept fill the ring's bytes
+/// but for less than three of the longest. The reference model is every change heard, with
+/// what was let go of cut from its front.
+#[test]
+fn the_changes_kept_are_the_newest_with_their_bytes() {
+    const LONGEST: usize = 4000;
+    let mut changes = super::Changes::new(blaze_mem::Tag::Vfs).expect("its regions reserved");
+    // alloc: the reference model, a test's.
+    let mut model: std::collections::VecDeque<(u64, Option<Vec<u8>>)> =
+        std::collections::VecDeque::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut let_go = false;
+    for generation in 1..40_000_u64 {
+        state =
+            state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let len = match state >> 60 {
+            0 => 0,
+            1 => LONGEST,
+            2 | 3 => 1000,
+            _ => 1 + (state >> 32) as usize % 300,
+        };
+        let path: Vec<u8> =
+            (0..len).map(|at| b'a' + ((generation as usize + at) % 26) as u8).collect();
+        let named = (len > 0).then_some(path);
+        changes.hear(generation, named.as_deref());
+        model.push_back((generation, named));
+        let kept: Vec<(u64, Option<Vec<u8>>)> =
+            changes.kept().map(|(heard, path)| (heard, path.map(<[u8]>::to_vec))).collect();
+        while model.len() > kept.len() {
+            let (gone, _) = model.pop_front().expect("more heard than kept");
+            assert!(changes.from >= gone, "generation {generation}: {gone} let go of");
+            let_go = true;
+        }
+        let want: Vec<(u64, Option<Vec<u8>>)> = model.iter().cloned().collect();
+        assert!(kept == want, "generation {generation}: kept as heard");
+        let bytes: usize = kept.iter().filter_map(|(_, it)| it.as_ref()).map(Vec::len).sum();
+        assert!(bytes <= super::CHANGE_BYTES);
+        let full = kept.len() == super::CHANGES_KEPT;
+        assert!(
+            !let_go || full || bytes + 3 * LONGEST >= super::CHANGE_BYTES,
+            "generation {generation}: {bytes} bytes kept of {}",
+            super::CHANGE_BYTES
+        );
+    }
+    assert!(let_go, "the history never filled the rings");
+}
+
 /// Wants past every column's high-water mark (its first commit step and the index's tables
 /// growing level by level) commit pages of the table's own regions and never call the global
 /// allocator; what was found before the growth is found after it, at the same address.
@@ -687,7 +737,7 @@ fn changes_are_set_aside_by_path_and_never_what_cannot_be_named() {
     // Past what the table keeps, a generation from before the oldest kept is refused.
     let old = dirs.generation();
     for at in 0..super::CHANGES_KEPT + 1 {
-        dirs.hear(old + 1 + at as u64, Some(path("/tc/lib/c.h").to_owned()));
+        dirs.hear(old + 1 + at as u64, Some(path("/tc/lib/c.h").as_os_str().as_encoded_bytes()));
     }
     assert!(!dirs.only_since(old, |_| true), "a change since then was let go of");
     assert!(dirs.only_since(old + 1, |_| true));

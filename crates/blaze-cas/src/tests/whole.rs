@@ -14,7 +14,8 @@ struct Disk {
     files: BTreeSet<ContentId>,
     /// Whole files written and not yet synced: a crash loses them.
     unsynced: BTreeSet<ContentId>,
-    /// The listing of names, replaced whole by a rename: always the last one renamed.
+    /// The listing of names, written whole with no sync: the last one written, or what a
+    /// crash left of it ([`World::step`]).
     listing: Vec<u8>,
 }
 
@@ -64,6 +65,15 @@ impl World {
             self.crashes += 1;
             self.disk.unsynced.clear();
             self.making = None;
+            // The listing is written with no sync: the crash may cut it. Cut, it names nothing
+            // (its check fails, or nothing is left), and the oracle then knows no live place:
+            // each path holds a clone of its own, so a whole file is a cache the paths' bytes
+            // do not depend on, and the open's sweep may take every one.
+            if !self.disk.listing.is_empty() && self.rng.next_u64() % 3 == 0 {
+                let cut = self.rng.next_u64() % self.disk.listing.len() as u64;
+                self.disk.listing.truncate(cut as usize);
+                self.live.clear();
+            }
             return Err(Crashed);
         }
         Ok(())
@@ -108,7 +118,9 @@ impl World {
     fn reopen(&mut self) -> Result<(), String> {
         loop {
             let plant = self.names.plant_one_name;
-            self.names = Names::decode(&self.disk.listing).map_err(|why| format!("the listing: {why}"))?;
+            self.names = Names::decode(&self.disk.listing)
+                .map_err(|why| format!("the listing: {why}"))?
+                .unwrap_or_default();
             self.names.plant_one_name = plant;
             if self.names.paths_listed() != self.live {
                 return Err(format!("the listing names {:?}, the answered places {:?}", self.names.paths_listed(), self.live));
@@ -120,7 +132,7 @@ impl World {
         }
     }
 
-    /// The listing written and renamed in one step: once it is, the op is answered.
+    /// The listing written in one step: once it is, the op is answered.
     fn commit(&mut self) -> Result<(), Crashed> {
         self.step()?;
         self.disk.listing = self.names.listing();
@@ -187,7 +199,7 @@ fn run(seed: u64, ops: u32, plant: bool) -> Result<World, String> {
 /// crash coming before any step; and once a place is answered and its removals are done, and
 /// after every open, no file nothing names is on disk: so `placed/` holds a file for each
 /// path's current output and each pin, never one for every build. The listing an open reads
-/// names exactly the places answered.
+/// names exactly the places answered, or, cut by the crash, nothing.
 #[test]
 fn no_named_whole_file_is_removed_and_no_unnamed_one_outlives_the_next_place() {
     let (mut crashes, mut removed) = (0, 0);
@@ -218,23 +230,58 @@ fn the_oracle_catches_a_file_removed_while_a_second_place_names_it() {
     assert!((0..400).any(|seed| run(seed, 60, true).is_err()), "no seed caught the planted bug");
 }
 
-/// The invariant: a listing decodes to the names it was made of, the same bytes for the same
-/// names, and a listing cut short or with bytes after it is refused naming the offset.
+/// The invariant: a listing decodes to the names and keys it was made of, the same bytes for
+/// the same names; written with no sync, any part of one a crash leaves (every prefix but the
+/// empty one, which is none written yet; one with a byte changed; bytes after it) fails its
+/// check and names nothing, never names
+/// something else; and a listing of layout 1 (paths and files, no keys, no check) still
+/// reads, its paths holding no key. The control: a listing that passes its check and is not
+/// one is refused naming the offset.
 #[test]
-fn a_listing_round_trips_and_a_torn_one_is_refused() {
+fn a_listing_round_trips_and_a_torn_one_names_nothing() {
     let mut names = Names::default();
     for (at, path) in PATHS.iter().enumerate() {
         names.making(file(at as u64));
         names.placed(path, file(at as u64), true).unwrap();
+        // Every second path holds a key; a path with a key and no file is listed too.
+        if at % 2 == 0 {
+            assert_eq!(names.hold(path, Some(crate::Key(file(100 + at as u64)))), None);
+        }
     }
+    assert_eq!(names.hold("elsewhere/small", Some(crate::Key(file(200)))), None);
     let listing = names.listing();
-    let decoded = Names::decode(&listing).unwrap();
+    let decoded = Names::decode(&listing).unwrap().expect("it passes its check");
     assert_eq!(decoded.listing(), listing);
     assert_eq!(decoded.paths_listed(), names.paths_listed());
-    assert_eq!(Names::decode(b"").unwrap().listing(), Names::default().listing());
-    let torn = Names::decode(&listing[..listing.len() - 3]).unwrap_err();
-    assert!(torn.starts_with("at "), "{torn}");
+    let keys = |it: &Names| it.held_keys().copied().collect::<Vec<_>>();
+    assert_eq!(keys(&decoded), keys(&names));
+    assert!(decoded.holds(&crate::Key(file(200))));
+    assert_eq!(Names::decode(b"").unwrap().unwrap().listing(), Names::default().listing());
+    for cut in 1..listing.len() {
+        assert!(Names::decode(&listing[..cut]).unwrap().is_none(), "cut at {cut}");
+    }
+    let mut changed = listing.clone();
+    changed[20] ^= 1;
+    assert!(Names::decode(&changed).unwrap().is_none());
     let mut long = listing.clone();
     long.push(0);
-    assert!(Names::decode(&long).unwrap_err().contains("follow the last path"));
+    assert!(Names::decode(&long).unwrap().is_none());
+    // The control: bytes after the last path, under a check that holds, are a bug, not a tear.
+    let mut wrong = listing[..listing.len() - 4].to_vec();
+    wrong.push(0);
+    let check = blaze_ids::crc32c::crc32c(&wrong);
+    wrong.extend_from_slice(&check.to_le_bytes());
+    assert!(Names::decode(&wrong).unwrap_err().contains("follow the last path"));
+    // Layout 1: the magic, the count, then each path's length, the path and its file.
+    let mut one = b"BZPLACE1".to_vec();
+    one.extend_from_slice(&2u32.to_le_bytes());
+    for (at, path) in ["a/app", "b/app"].iter().enumerate() {
+        one.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        one.extend_from_slice(path.as_bytes());
+        one.extend_from_slice(&file(at as u64).0);
+    }
+    let old = Names::decode(&one).unwrap().expect("layout 1 has no check to fail");
+    let paths: Vec<(String, ContentId)> = old.paths_listed().into_iter().collect();
+    assert_eq!(paths, [("a/app".to_owned(), file(0)), ("b/app".to_owned(), file(1))]);
+    assert_eq!(old.held_keys().count(), 0, "layout 1 lists no keys");
 }

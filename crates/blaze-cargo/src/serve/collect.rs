@@ -173,7 +173,9 @@ impl StoreEntries {
                 .sets
                 .root(&set)
                 // alloc: error path
-                .ok_or_else(|| format!("the set {set:?} is kept as `{name}` before it was listed"))?;
+                .ok_or_else(|| {
+                    blaze_report::say!(blaze_report::say::Words(&format!("the set {set:?} is kept as ")), blaze_report::say::Code(name), " before it was listed").flat()
+                })?;
             match kept.insert((name, set), root) {
                 Some(old) if old == root => {}
                 Some(old) => {
@@ -712,13 +714,19 @@ impl Collects {
         let mut pins = 0;
         for pin in store.pins() {
             pins += 1;
-            out.push_str(&format!(
-                "kept: pin `{}`: {} keys, {} ({})\n",
-                pin.name,
-                pin.keys.len(),
-                size_text(store.stored_bytes(&pin.keys)),
-                pin.why,
-            ));
+            out.push_str(
+                &blaze_report::say!(
+                    "kept: pin ",
+                    blaze_report::say::Code(&pin.name),
+                    blaze_report::say::Words(&format!(
+                        ": {} keys, {} ({})\n",
+                        pin.keys.len(),
+                        size_text(store.stored_bytes(&pin.keys)),
+                        pin.why,
+                    ))
+                )
+                .flat(),
+            );
         }
         if pins == 0 {
             out.push_str("kept: no pin\n");

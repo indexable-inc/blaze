@@ -485,7 +485,7 @@ fn an_unfulfilled_word_is_refused_on_every_function_that_writes_its_list() {
 fn private(x: u32) -> u32 { x }
 #[blaze::expect(alloc)]
 pub fn public(x: u32) -> u32 { private(x) }
-#[blaze::expect(alloc)]
+#[blaze::expect(alloc, diverge)]
 pub fn grows() { let _ = alloc::vec::Vec::<u32>::with_capacity(4); }
 "#;
     let out = expect_of(" cfg:overflow_checks", MAIN);
@@ -497,12 +497,14 @@ pub fn grows() { let _ = alloc::vec::Vec::<u32>::with_capacity(4); }
         assert!(it.contains("in its `#[blaze::expect(alloc)]`"), "{out}");
         assert!(it.contains("no call or operation in it allocates from the global heap"), "{out}");
     }
-    assert!(out.contains("blaze::unfulfilled_effect"), "{out}");
+    // The lint as the command line names it, as rustc writes a flag's lint.
+    assert!(out.contains("`-D blaze::unfulfilled-effect`"), "{out}");
     assert_eq!(saying(&out, UNDECLARED), Vec::<&str>::new(), "{out}");
-    // The fix takes the word off, and leaves `grows`, which allocates, as it is.
+    // The fix takes the word off, and leaves `grows`, which has both effects it lists (it
+    // allocates, and `Vec::with_capacity_in`'s loop is not known to end), as it is.
     let text = fixed(" cfg:overflow_checks", MAIN);
     assert_eq!(text.matches("#[blaze::expect()]").count(), 2, "{text}");
-    assert!(text.contains("#[blaze::expect(alloc)]\npub fn grows()"), "{text}");
+    assert!(text.contains("#[blaze::expect(alloc, diverge)]\npub fn grows()"), "{text}");
 
     super::expect::PRIVATE_ONLY.set(true);
     let planted = expect_of(" cfg:overflow_checks", MAIN);
@@ -579,7 +581,7 @@ pub mod defaulted {
     #![blaze::may(panic)]
     pub fn plain(x: u32) -> u32 { x }
 }
-#[blaze::may(alloc)]
+#[blaze::may(alloc, diverge)]
 pub fn grows() { let _ = alloc::vec::Vec::<u32>::with_capacity(4); }
 "#;
     let out = expect_of(" cfg:overflow_checks", MAIN);
@@ -588,7 +590,7 @@ pub fn grows() { let _ = alloc::vec::Vec::<u32>::with_capacity(4); }
     assert!(found.iter().any(|it| it.contains("`#[blaze::may(..)]` is deleted") && it.contains("`#[blaze::expect(..)]`")), "{out}");
     assert!(found.iter().any(|it| it.contains("`#![blaze::may(..)]` is deleted")), "{out}");
     let text = fixed(" cfg:overflow_checks", MAIN);
-    assert!(text.contains("#[blaze::expect(alloc)]\npub fn grows()"), "{text}");
+    assert!(text.contains("#[blaze::expect(alloc, diverge)]\npub fn grows()"), "{text}");
     assert!(text.contains("#![blaze::expect(panic)]"), "{text}");
     assert!(!text.contains("blaze::may"), "{text}");
 

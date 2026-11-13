@@ -1601,10 +1601,15 @@ pub(crate) fn prepare<L: Lookup + ?Sized>(
             && runs_at_start(section)
         {
             if !(section.contains("init_array") || section.contains("__mod_init_func")) {
-                return Err(format!(
-                    "{path}: static {:?} is in section `{section}`, a finalizer array, which the launcher does not run yet",
-                    value.id.0
-                ));
+                return Err(blaze_report::say!(
+                    blaze_report::say::At(&path),
+                    ": static ",
+                    blaze_report::say::Words(&format!("{:?}", value.id.0)),
+                    " is in section ",
+                    blaze_report::say::Code(section),
+                    ", a finalizer array, which the launcher does not run yet"
+                )
+                .flat());
             }
             inits.push(value.id);
         }

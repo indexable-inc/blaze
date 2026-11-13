@@ -1,0 +1,50 @@
+[package]
+name = "blaze-solo"
+description = "A command alone drives blaze v2's kernel, with no daemon: the checkout's leaf table, the sweep against it, the session root's two slots, the carry and the front end's asks, as sans-IO cores and one thin driver"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-solo"
+path = "src/bin/solo.rs"
+
+[features]
+# The planted bugs of the controls (`PLANT`): only tests turn them on.
+plants = []
+
+[dependencies]
+# `Store`, `Config`, `Loader`: the binary's store; `Key`, `Kind`, `Mismatch`: the kernel's.
+blaze-cas.workspace = true
+# Effects, completions, `Stamp`, `Names`, the native driver and the simulation.
+blaze-core.workspace = true
+# `parse` and `items` as kernel steps, `FileKey`, `Reading`, the read kinds.
+blaze-front-items.workspace = true
+# `ContentId`, `Hasher`, `crc32c`.
+blaze-ids.workspace = true
+# The kernel: `World`, `Session`, `Changed`, `carry`, `get_in`.
+blaze-kernel.workspace = true
+# `Setting::OFF`, the kernel's verify setting.
+blaze-store-check.workspace = true
+# `racy` (the racy window's one home), `watch::fixed_out`, `FILE_DOMAIN`.
+blaze-vfs.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# `Edition`, `Extensions`: a file's reading.
+syntax.workspace = true
+# The driver's waits, each in a span naming it (rule 15).
+tracing.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

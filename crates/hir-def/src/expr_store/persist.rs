@@ -166,6 +166,8 @@ blaze_format::record! {
         /// The block and its edition, by block in increasing order.
         pub(crate) block_editions: Slice<IdPair>,
         pub(crate) overflow_inheriting: Slice<u32>,
+        /// The expressions lowering made with no syntax of their own, in increasing order.
+        pub(crate) synthesized: Slice<u32>,
         /// blaze_verify's clause groups and their kinds, by group in increasing order.
         pub(crate) spec_clauses: Slice<IdPair>,
         pub(crate) expr_roots: Slice<ExprRootRec>,
@@ -852,6 +854,7 @@ struct StoreColumns {
     field_hygiene: Column,
     block_editions: Column,
     overflow_inheriting: Column,
+    synthesized: Column,
     spec_clauses: Column,
     expr_roots: Column,
     type_hygiene: Column,
@@ -956,6 +959,8 @@ impl StoreColumns {
         });
         let inheriting = expr_only.map_or(&[][..], |it| &*it.overflow_inheriting);
         let overflow_inheriting = push_mapped(out, u32s, inheriting, |&closure| raw(closure));
+        let synthesized = expr_only.map_or(&[][..], |it| &*it.synthesized);
+        let synthesized = push_mapped(out, u32s, synthesized, |&expr| raw(expr));
         let clauses = expr_only.map_or(&[][..], |it| &*it.spec_clauses);
         let spec_clauses = push_mapped(out, pairs, clauses, |&(group, kind)| IdPair {
             a: raw(group),
@@ -1009,6 +1014,7 @@ impl StoreColumns {
             field_hygiene,
             block_editions,
             overflow_inheriting,
+            synthesized,
             spec_clauses,
             expr_roots,
             type_hygiene: type_hygiene_column,
@@ -1052,6 +1058,7 @@ impl StoreColumns {
             block_editions: self.block_editions.slice(field(offset_of!(StoreRoot, block_editions))),
             overflow_inheriting: (self.overflow_inheriting)
                 .slice(field(offset_of!(StoreRoot, overflow_inheriting))),
+            synthesized: self.synthesized.slice(field(offset_of!(StoreRoot, synthesized))),
             spec_clauses: self.spec_clauses.slice(field(offset_of!(StoreRoot, spec_clauses))),
             expr_roots: self.expr_roots.slice(field(offset_of!(StoreRoot, expr_roots))),
             type_hygiene: self.type_hygiene.slice(field(offset_of!(StoreRoot, type_hygiene))),
@@ -1099,6 +1106,7 @@ pub struct ExpressionStoreRef<'a> {
     field_hygiene: &'a [IdPair],
     block_editions: &'a [IdPair],
     overflow_inheriting: &'a [u32],
+    synthesized: &'a [u32],
     spec_clauses: &'a [IdPair],
     expr_roots: &'a [ExprRootRec],
     type_hygiene: &'a [IdPair],
@@ -1141,6 +1149,7 @@ impl<'a> ExpressionStoreRef<'a> {
             field_hygiene: root.field_hygiene.follow(buffer)?,
             block_editions: root.block_editions.follow(buffer)?,
             overflow_inheriting: root.overflow_inheriting.follow(buffer)?,
+            synthesized: root.synthesized.follow(buffer)?,
             spec_clauses: root.spec_clauses.follow(buffer)?,
             expr_roots: root.expr_roots.follow(buffer)?,
             type_hygiene: root.type_hygiene.follow(buffer)?,
@@ -1211,6 +1220,7 @@ impl<'a> ExpressionStoreRef<'a> {
                 && self.field_hygiene.is_empty()
                 && self.block_editions.is_empty()
                 && self.overflow_inheriting.is_empty()
+                && self.synthesized.is_empty()
                 && self.spec_clauses.is_empty()
                 && self.expr_roots.is_empty();
             ensure(empty, root, buffer, "expression columns in a store without expressions")?;
@@ -1267,6 +1277,10 @@ impl<'a> ExpressionStoreRef<'a> {
         ascending(self.overflow_inheriting, |&it| it, buffer, "closures out of order")?;
         for closure in self.overflow_inheriting {
             ensure(*closure < exprs, closure, buffer, "a closure past the expressions")?;
+        }
+        ascending(self.synthesized, |&it| it, buffer, "synthesized expressions out of order")?;
+        for expr in self.synthesized {
+            ensure(*expr < exprs, expr, buffer, "a synthesized expression past the expressions")?;
         }
         ascending(self.spec_clauses, |it| it.a, buffer, "clause groups out of order")?;
         for pair in self.spec_clauses {
@@ -1380,6 +1394,11 @@ impl<'a> ExpressionStoreRef<'a> {
     /// As [`ExpressionStore::inherits_overflow_checks`].
     pub fn inherits_overflow_checks(self, closure: ExprId) -> bool {
         self.overflow_inheriting.binary_search(&raw(closure)).is_ok()
+    }
+
+    /// As [`ExpressionStore::is_synthesized`].
+    pub fn is_synthesized(self, expr: ExprId) -> bool {
+        self.synthesized.binary_search(&raw(expr)).is_ok()
     }
 
     /// As [`ExpressionStore::block_edition`].
@@ -1574,6 +1593,8 @@ impl<'a> ExpressionStoreRef<'a> {
                     .collect(),
                 // alloc: the decode's one copy of the column.
                 overflow_inheriting: self.overflow_inheriting.iter().map(|&it| idx(it)).collect(),
+                // alloc: the decode's one copy of the column.
+                synthesized: self.synthesized.iter().map(|&it| idx(it)).collect(),
                 spec_clauses: (self.spec_clauses.iter())
                     .filter_map(|pair| {
                         let kind = SpecClauseKind::of_u8(u8::try_from(pair.b).ok()?)?;
@@ -1659,7 +1680,8 @@ impl Persist for ExpressionStore {
         // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
         // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
         // words of `extra` and one per field).
-        Part::U64(15),
+        // 16: the expressions lowering made with no syntax of their own (`synthesized`).
+        Part::U64(16),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1743,7 +1765,8 @@ impl Persist for Body {
         // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
         // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
         // words of `extra` and one per field).
-        Part::U64(15),
+        // 16: the expressions lowering made with no syntax of their own (`synthesized`).
+        Part::U64(16),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -3412,5 +3435,124 @@ fn main() { let _ = m!(x); }
         let expected = (vec![vec![false], vec![]], 1);
         assert_eq!(marked(&body), expected);
         assert_eq!(marked(&decoded), expected);
+    }
+
+    /// The layout of version 15, the one before `synthesized`: `StoreRoot` and `BodyRoot` as
+    /// that version declared them (the same names, fields, offsets and versions), so that their
+    /// schemas are the ones a buffer that version wrote names in its header.
+    #[allow(dead_code, reason = "records kept only for their schemas, never built")]
+    mod v15 {
+        use blaze_format::Slice;
+
+        use super::super::{ArmRec, ExprRootRec, FieldRec, IdPair, Node, WordsRec};
+
+        blaze_format::record! {
+            #[derive(Clone, Copy)]
+            pub(crate) struct StoreRoot: 7 {
+                pub(crate) expr_kind: Slice<u8>,
+                pub(crate) expr_data: Slice<u32>,
+                pub(crate) pat_kind: Slice<u8>,
+                pub(crate) pat_data: Slice<u32>,
+                pub(crate) extra: Slice<u32>,
+                pub(crate) expr_lists: Slice<u32>,
+                pub(crate) pat_lists: Slice<u32>,
+                pub(crate) stmt_kind: Slice<u8>,
+                pub(crate) stmt_data: Slice<u32>,
+                pub(crate) arms: Slice<ArmRec>,
+                pub(crate) record_fields: Slice<FieldRec>,
+                pub(crate) field_pats: Slice<FieldRec>,
+                pub(crate) type_lists: Slice<u32>,
+                pub(crate) bindings: Slice<Node>,
+                pub(crate) labels: Slice<Node>,
+                pub(crate) ty_kind: Slice<u8>,
+                pub(crate) ty_data: Slice<u32>,
+                pub(crate) ty_extra: Slice<u32>,
+                pub(crate) ty_lists: Slice<u32>,
+                pub(crate) path_kind: Slice<u8>,
+                pub(crate) path_data: Slice<u32>,
+                pub(crate) path_extra: Slice<u32>,
+                pub(crate) path_slots: Slice<u32>,
+                pub(crate) lifetimes: Slice<Node>,
+                pub(crate) binding_owners: Slice<u32>,
+                pub(crate) block_scopes: Slice<u64>,
+                pub(crate) macro_calls: Slice<u64>,
+                pub(crate) ident_hygiene: Slice<IdPair>,
+                pub(crate) field_hygiene: Slice<IdPair>,
+                pub(crate) block_editions: Slice<IdPair>,
+                pub(crate) overflow_inheriting: Slice<u32>,
+                pub(crate) spec_clauses: Slice<IdPair>,
+                pub(crate) expr_roots: Slice<ExprRootRec>,
+                pub(crate) type_hygiene: Slice<IdPair>,
+                pub(crate) words: WordsRec,
+                pub(crate) side: u32,
+                pub(crate) ty_side: u32,
+                pub(crate) flags: u32,
+            }
+        }
+
+        blaze_format::record! {
+            #[derive(Clone, Copy)]
+            pub(crate) struct BodyRoot: 3 {
+                pub(crate) store: StoreRoot,
+                pub(crate) params: Slice<IdPair>,
+                pub(crate) self_param: Slice<IdPair>,
+            }
+        }
+    }
+
+    /// `bytes` with the schema in its header replaced by `schema`.
+    fn with_schema(bytes: &[u8], schema: SchemaHash) -> Aligned {
+        let at = offset_of!(blaze_format::Header, schema);
+        let mut bytes = bytes.to_vec(); // alloc: a test's copy of a buffer
+        bytes[at..at + size_of::<SchemaHash>()].copy_from_slice(&schema.0.0);
+        Aligned::copy_from(&bytes)
+    }
+
+    /// The invariant: a store or a body of the previous layout (version 15, before the
+    /// `synthesized` column) is refused by name, its schema found against the one wanted, and
+    /// never read as this layout: a reader of version 16 would take its spec clauses for the
+    /// synthesized expressions and every later column one field off. The schemas of version 15
+    /// are recomputed from that version's records ([`v15`]), so the test fails if the bump is
+    /// undone or the new column left out of the schema. The control: the same bytes under the
+    /// current schema read.
+    #[test]
+    fn a_store_or_body_of_the_previous_layout_is_refused_by_name() {
+        let (db, defs) = bodies("fn f(a: u32) -> u32 { for _ in 0..a {} format_args!(\"{a}\"); a }");
+        let body = Body::of(&db, defs[0]);
+        assert!(!body.store.synthesized_exprs().is_empty(), "the body has a synthesized expression");
+
+        let store_v15 = schema_of(&[
+            Part::Str("ExpressionStore"),
+            Part::U64(15),
+            Part::Schema(<v15::StoreRoot as Record>::SCHEMA),
+        ]);
+        let body_v15 = schema_of(&[
+            Part::Str("Body"),
+            Part::U64(15),
+            Part::Schema(<v15::BodyRoot as Record>::SCHEMA),
+        ]);
+        let wanted_store = <ExpressionStore as Persist>::SCHEMA;
+        let wanted_body = <Body as Persist>::SCHEMA;
+        assert!(store_v15 != wanted_store && body_v15 != wanted_body, "the layout moved its schema");
+
+        let store = blaze_format::to_bytes(&body.store);
+        assert!(ExpressionStore::read(&with_schema(&store, wanted_store)).is_ok(), "the control");
+        match ExpressionStore::read(&with_schema(&store, store_v15)) {
+            Err(FormatError::Schema { found, wanted }) => {
+                assert!(found == store_v15 && wanted == wanted_store);
+            }
+            Err(other) => panic!("a store of version 15 refused for another reason: {other}"),
+            Ok(_) => panic!("a store of version 15 read as version 16"),
+        }
+
+        let whole = blaze_format::to_bytes(&*body);
+        assert!(Body::read(&with_schema(&whole, wanted_body)).is_ok(), "the control");
+        match Body::read(&with_schema(&whole, body_v15)) {
+            Err(FormatError::Schema { found, wanted }) => {
+                assert!(found == body_v15 && wanted == wanted_body);
+            }
+            Err(other) => panic!("a body of version 15 refused for another reason: {other}"),
+            Ok(_) => panic!("a body of version 15 read as version 16"),
+        }
     }
 }

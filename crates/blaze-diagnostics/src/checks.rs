@@ -69,10 +69,17 @@ pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, syntax_cx: &Cx<'_, 'db>) -> Vec<Found
         let given = cx.settings();
         assert!(
             *given == read,
-            "the settings of crate `{}` its root's outline gives a piece's probe, {given:?}, \
-             are not those its walk reads, {read:?}: a by-piece check would run its passes \
-             with other settings than the whole check",
-            cx.crate_name(cx.krate),
+            "{}",
+            blaze_report::say!(
+                "the settings of crate ",
+                blaze_report::say::Code(&cx.crate_name(cx.krate)),
+                " its root's outline gives a piece's probe, ",
+                blaze_report::say::Words(&format!("{given:?}")),
+                ", are not those its walk reads, ",
+                blaze_report::say::Words(&format!("{read:?}")),
+                ": a by-piece check would run its passes with other settings than the whole check",
+            )
+            .flat(),
         );
         (owners, session, found)
     });

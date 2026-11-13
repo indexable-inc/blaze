@@ -1084,7 +1084,7 @@ mod tests {
 
     use super::{
         super::{Places, tests::names_fixtures},
-        Binding, Entry, Ns, Used, Uses, entry,
+        Binding, Entry, Ns, TreeKind, Used, Uses, entry,
     };
     use crate::{Files, cx::Cx, lints::syntax::Walk};
 
@@ -1105,6 +1105,7 @@ mod tests {
                         | SyntaxKind::MACRO_CALL
                 ) || ast::Adt::can_cast(kind)
             };
+            self.dummy_bindings();
             for tree in &walk.trees {
                 for node in tree.of_kind(read) {
                     self.node(cx, walk, tree.file, node);
@@ -1113,6 +1114,33 @@ mod tests {
             for tree in &walk.trees {
                 for item in tree.replaced.iter().filter_map(|&it| ast::Item::cast(it)) {
                     self.attr_macro(cx, InFile::new(tree.file, item));
+                }
+            }
+        }
+
+        /// rustc's `import_dummy_binding`: an import that resolved to nothing is bound to a
+        /// dummy and recorded used (`record_use(.., Used::Other)` of a single import, the
+        /// `import_use_map` entry of a glob whose module is unknown), so it is never linted
+        /// unused; E0432 reports it. The front end's def map records such an import the same
+        /// way (`NameRecords::unresolved`). The syntax walk the model was moved from left them
+        /// out of `used` and its lint skipped them instead, which the names fixtures'
+        /// `use std::..` with no `std` (`dead/tuple-struct-field.rs`) shows.
+        fn dummy_bindings(&mut self) {
+            for item in &self.items {
+                for tree in &item.trees {
+                    let Some(binding) = tree.binding else { continue };
+                    let nothing = match tree.kind {
+                        TreeKind::Glob => tree.source.is_none(),
+                        TreeKind::Simple => {
+                            let it = &tree.imported;
+                            it.types.is_none() && it.values.is_none() && it.macros.is_none()
+                        }
+                        TreeKind::List => false,
+                    };
+                    if nothing {
+                        let was = self.used.entry(binding).or_insert(Used::Other);
+                        *was = (*was).max(Used::Other);
+                    }
                 }
             }
         }
@@ -1188,7 +1216,17 @@ mod tests {
         fn derive<'db>(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>) {
             let Some(scope) = cx.vsema.scope(owner) else { return };
             let module = ModuleId::from(scope.module());
-            let resolved = cx.vsema.resolve_derive_macro(meta).unwrap_or_default();
+            // A `#[derive]` that is no call of the builtin derive (`derive` names no macro in
+            // scope, as in a `#![no_core]` crate with no prelude) is a call of no macro, whose
+            // paths are not resolved: rustc's "cannot find attribute `derive`".
+            let Some(resolved) = cx.vsema.resolve_derive_macro(meta) else {
+                if let ast::Meta::TokenTreeMeta(it) = &meta
+                    && let Some(name) = it.path().and_then(|it| it.as_single_name_ref())
+                {
+                    self.macros_unknown.insert(name.as_name());
+                }
+                return;
+            };
             let mut next = 0usize;
             crate::cx::derive_path_tokens_view(meta, |_, tokens| {
                 let k = next;
@@ -1563,7 +1601,12 @@ mod tests {
         match binding {
             Binding::Import(ImportId { use_, idx }) | Binding::Glob(GlobId { use_, idx }) => {
                 let text = use_tree_to_view(db, use_.lookup(db).id, idx).to_string();
-                format!("{binding:?} `{text}`")
+                blaze_report::say!(
+                    blaze_report::say::Words(&format!("{binding:?}")),
+                    " ",
+                    blaze_report::say::Code(&text)
+                )
+                .flat()
             }
             Binding::ExternCrate(_) => format!("{binding:?}"),
         }

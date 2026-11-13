@@ -451,7 +451,8 @@ impl Driver {
         let geometry = image.geometry;
         if (geometry.thunks, geometry.thunk, geometry.area) != (self.thunks as u64, THUNK as u64, self.area as u64) {
             return Err(refuse(format!(
-                "made for a mapping whose thunks are at {} ({} bytes each) and whose area is at {}, and this                  launcher's are at {} ({THUNK} bytes each) and {}",
+                "made for a mapping whose thunks are at {} ({} bytes each) and whose area is at \
+                 {}, and this launcher's are at {} ({THUNK} bytes each) and {}",
                 geometry.thunks, geometry.thunk, geometry.area, self.thunks, self.area
             )));
         }
@@ -478,7 +479,8 @@ impl Driver {
                 let body = &image.bodies[bind as usize];
                 if (range.at, range.len) != (body.at, body.len) {
                     return Err(refuse(format!(
-                        "`{}` is at {} of the area in the image ({} bytes), and this launcher's core puts it at {}                          ({} bytes)",
+                        "`{}` is at {} of the area in the image ({} bytes), and this launcher's \
+                         core puts it at {} ({} bytes)",
                         body.name, body.at, body.len, range.at, range.len
                     )));
                 }

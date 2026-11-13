@@ -223,11 +223,12 @@ impl Steps for Real {
     ) -> Result<std::path::PathBuf, ApiError> {
         let Some(native) = &self.native else {
             return Err(ApiError::new(
-                format!(
-                    "pinned native input `{}` is laid out under blaze's home, and the daemon has none: \
-                     set BLAZE_HOME (or HOME) where it starts",
-                    input.name
-                ),
+                blaze_report::say!(
+                    "pinned native input ",
+                    blaze_report::say::Code(&input.name),
+                    " is laid out under blaze's home, and the daemon has none: set BLAZE_HOME (or HOME) where it starts"
+                )
+                .flat(),
                 Some(input.pin.clone()), // clone: an error's place, once
             ));
         };
@@ -580,7 +581,7 @@ impl Steps for Real {
                     &self.shared.tools,
                     &self.shared.launcher,
                     &self.shared.sources,
-                )));
+                ).port()));
                 // Each crate's surface, which a crate above it enters its image key by
                 // (`hir_def::deps::key`), given now that the port is told and before the
                 // first key is asked: the lowering's own writes give it from here on. A
@@ -956,11 +957,13 @@ pub(crate) fn answer_macros_built(
     blaze_items::macros_built(db, krate).map_err(|pending| {
         Failed::Error(ApiError::new(
             // alloc: error path
-            format!(
-                "the {work}'s answer in `{target}` can't be told before its proc macros are built, and it was posted \
-                 with one not built (the job builds the proc macros and build scripts each view applies first): {}",
-                pending.describe(db)
-            ),
+            blaze_report::say!(
+                blaze_report::say::Words(&format!("the {work}'s answer in ")),
+                blaze_report::say::Code(target),
+                " can't be told before its proc macros are built, and it was posted with one not built (the job builds the proc macros and build scripts each view applies first): ",
+                blaze_report::say::Words(&pending.describe(db).to_string())
+            )
+            .flat(),
             Some(work.to_owned()),
         ))
     })
@@ -1601,7 +1604,12 @@ impl Writer<Real> for UnitWriter {
             let Some(krate) = self.front.krate(at) else { continue };
             let Some(src) = unit.target.src_path.to_str() else {
                 // alloc: an error
-                return Err(format!("unit {at}'s root `{}` is not UTF-8", unit.target.src_path.display()));
+                return Err(blaze_report::say!(
+                    blaze_report::say::Words(&format!("unit {at}'s root ")),
+                    blaze_report::say::Code(&unit.target.src_path.display().to_string()),
+                    " is not UTF-8"
+                )
+                .flat());
             };
             // A crate whose root is outside the view is another root's (a dependency's).
             let Some(root) = job.mounted.in_view(src) else { continue };
@@ -1609,7 +1617,9 @@ impl Writer<Real> for UnitWriter {
                 .packages
                 .binary_search_by(|it| it.id.as_str().cmp(&unit.pkg_id))
                 .map(|place| units.packages[place].name.as_str())
-                .map_err(|_| format!("unit {at}'s package `{}` is not in the plan", unit.pkg_id))?; // alloc: an error
+                .map_err(|_| {
+                    blaze_report::say!(blaze_report::say::Words(&format!("unit {at}'s package ")), blaze_report::say::Code(&unit.pkg_id.to_string()), " is not in the plan").flat()
+                })?; // alloc: an error
             let edition = blaze_lower::unit_edition(unit).map_err(|error| error.to_string())?;
             // alloc: once a crate a build
             let what = format!("{package} {} {}{}", unit.target.name, unit.target.kind.join(","), match unit.checked_as_test || unit.mode == Mode::Test {
@@ -2190,7 +2200,7 @@ pub(crate) fn package_of<'a>(
         .binary_search_by(|it| it.id.as_str().cmp(&unit.pkg_id))
         .ok()
         .map(|at| &units.packages[at])
-        .ok_or_else(|| ApiError::new(format!("the build has no package `{}`", unit.pkg_id), None))
+        .ok_or_else(|| ApiError::new(blaze_report::say!("the build has no package ", blaze_report::say::Code(&unit.pkg_id.to_string())).flat(), None))
 }
 
 /// A unit's target, as cargo's JSON messages give it. Its kind is cargo's first word for it
@@ -2200,7 +2210,7 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
     let target = &unit.target;
     let Some(first) = target.kind.first() else {
         return Err(ApiError::new(
-            format!("target `{}` has no kind in cargo's unit graph", target.name),
+            blaze_report::say!("target ", blaze_report::say::Code(&target.name), " has no kind in cargo's unit graph").flat(),
             None,
         ));
     };
@@ -2212,10 +2222,8 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
             CrateType::named(word).ok_or_else(|| {
                 // alloc: error path
                 ApiError::new(
-                    format!(
-                        "target `{}` has the crate type `{word}`, which rustc doesn't know",
-                        target.name
-                    ),
+                    blaze_report::say!("target ", blaze_report::say::Code(&target.name), " has the crate type ", blaze_report::say::Code(word), ", which rustc doesn't know")
+                        .flat(),
                     None,
                 )
             })

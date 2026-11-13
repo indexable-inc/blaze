@@ -34,6 +34,10 @@ use blaze_kernel::{
     Ask, Compute, Fact, Read, ReadKind, Reads, Seen, Step, StepError, StepId, Subject, World,
     WorldError, steps as ids,
 };
+use blaze_report::{
+    say,
+    say::{Code, Count, Words},
+};
 use syntax::{Edition, Extensions};
 
 use crate::{
@@ -186,7 +190,7 @@ fn file_input(key: &[u8]) -> Result<FileKey, String> {
 
 fn file_label(what: &str, input: &FileKey) -> String {
     // alloc: an error's or a check's label, never on a hit's path
-    format!("{what} of `{}` (edition {})", input.name, input.reading.edition.number())
+    say!(Words(what), " of ", Code(&input.name), " (edition ", Count(input.reading.edition.number() as u64), ")").flat()
 }
 
 /// The text of `input`'s file, read and recorded. No such file is refused naming it.
@@ -197,7 +201,7 @@ fn text_of<'w, W: Source + ?Sized>(
     match ctx.get::<FileText>(&input.name)? {
         Some(text) => Ok(text),
         // alloc: error path
-        None => Err(StepError::Refused(format!("no file `{}` in the pinned tree", input.name))),
+        None => Err(StepError::Refused(say!("no file ", Code(&input.name), " in the pinned tree").flat())),
     }
 }
 
@@ -266,9 +270,9 @@ fn parts<W: Source + ?Sized + 'static>(
     let text = text_of(ctx, input)?;
     let parsed = tree(&record, text, input.reading)
         // alloc: error path
-        .map_err(|what| StepError::Refused(format!("`{}`: {what}", input.name)))?;
+        .map_err(|what| StepError::Refused(say!(Code(&input.name), ": ", Words(&what)).flat()))?;
     // alloc: error path
-    file_items(parsed.root()).map_err(|what| StepError::Refused(format!("`{}`: {what}", input.name)))
+    file_items(parsed.root()).map_err(|what| StepError::Refused(say!(Code(&input.name), ": ", Words(&what)).flat()))
 }
 
 impl<W: Source + ?Sized + 'static> Compute for Items<W> {
@@ -317,7 +321,7 @@ impl<W: Source + ?Sized + 'static> Step for Modules<W> {
 
     fn label(input: &CrateKey) -> String {
         // alloc: an error's or a check's label, never on a hit's path
-        format!("modules of crate `{}` from `{}`", input.krate, input.root.name)
+        say!("modules of crate ", Code(&input.krate), " from ", Code(&input.root.name)).flat()
     }
 }
 

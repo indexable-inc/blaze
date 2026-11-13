@@ -72,6 +72,7 @@ disallowed-macros = [
 ]
 
 disallowed-methods = [
+    { path = "blaze_cargo::serve::heads::excluded", replacement = "blaze_vfs::watch::fixed_out", reason = "one home for what a checkout's view leaves out by name (rule one-concept-one-home): the watcher's `blaze_vfs::watch::fixed_out`, with cache directories (a `CACHEDIR.TAG`) at any depth beside it in `blaze_vfs::watch::view`; `heads::excluded` was its copy (removed 2026-11-13)", allow-invalid = true },
     { path = "blaze_query::db::unrecorded", reason = "drops reads from the running capture: only a cache's own bookkeeping (goal_store offer/lookup)", allow-invalid = true },
     { path = "blaze_query::db::recorded_if", reason = "drops reads from the running capture: only a cache's own bookkeeping (goal_store offer/lookup)", allow-invalid = true },
     { path = "blaze_vfs::outside::looked", replacement = "blaze_vfs::outside::Looks::push", reason = "a look at the disk outside every view is pushed to the `blaze_vfs::outside::Looks` of the build it is made for, handed to the place that looks; no process-wide list of looks is kept (docs/v2/plan/design/end-state/daemon.md, AGENTS.md rule 30)", allow-invalid = true },

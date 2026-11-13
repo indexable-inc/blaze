@@ -143,7 +143,7 @@ impl Store {
         // alloc: empty, no layers: allocates nothing
         let config =
             Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader };
-        let mut store = Store::new(config, Some(peers));
+        let mut store = Store::new(config, Some(peers), crate::pool::WINDOWS);
         store.ask_private(effects);
         store
     }

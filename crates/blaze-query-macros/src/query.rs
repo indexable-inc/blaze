@@ -80,7 +80,14 @@ impl Query<'_> {
         let name = &self.name;
         let refuse = |span: proc_macro2::Span, why: &str| {
             // alloc: expansion time, the error's message
-            Err(syn::Error::new(span, format!("task-scoped `{name}`: {why}")))
+            let name = name.to_string(); // alloc: as above
+            let said = blaze_report::say!(
+                "task-scoped ",
+                blaze_report::say::Code(&name),
+                ": ",
+                blaze_report::say::Words(why),
+            );
+            Err(syn::Error::new(span, said.flat()))
         };
         match &options.returns {
             Some((_, Mode::Clone | Mode::Copy)) => {}
