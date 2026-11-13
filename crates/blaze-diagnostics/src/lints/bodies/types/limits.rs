@@ -38,8 +38,8 @@ use crate::{
 /// only the source can tell apart (a pattern's literal, whose `-` the lowering folded in).
 /// Nothing is allocated on the path that doesn't lint; the per-crate caches are filled once.
 pub(crate) struct TypeLimits {
-    /// rustc's `negated_expr_id`: the last `-` visited, and its operand. Its span is built only
-    /// when the operand overflows.
+    /// rustc's `last_visited_negation`: the last `-` visited, and its operand. Its span is
+    /// built only when the operand overflows.
     last_negation: Option<(ExprId, ExprId)>,
     /// The literals of the pattern last visited: a literal pattern's, or a range's ends. The
     /// walker visits them right after their pattern.
@@ -253,9 +253,11 @@ impl LatePass for TypeLimits {
                 }
             }
             Expr::UnaryOp { expr: operand, op: UnaryOp::Neg } => {
-                if self.last_negation.is_none_or(|(_, negated)| negated != expr) {
-                    self.last_negation = Some((expr, operand));
-                }
+                // A literal is negative when the `-` is right above it, however many more
+                // are above that one (`--128_i8` is `-(-128)`: the literal fits, the outer
+                // negation is `arithmetic_overflow`'s), as rustc has it since 1.99
+                // (rust-lang/rust#158302).
+                self.last_negation = Some((expr, operand));
             }
             Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(op)) } => {
                 let op = Cmp::of(op);
