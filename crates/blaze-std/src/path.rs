@@ -7,7 +7,7 @@ use alloc::{borrow::ToOwned, string::String};
 use alloc::alloc::Global;
 use core::fmt;
 
-use blaze_core::FileName;
+use blaze_core::{FileName, StaticName};
 
 use crate::{
     mem::{self, OutOfMemory},
@@ -16,8 +16,52 @@ use crate::{
 
 /// A relative path: `/`-separated parts, each non-empty and none `.` or `..`, with no root, no
 /// `\` and no NUL.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)] // clone: a refcount, no allocation
-pub struct Path(FileName);
+#[derive(Clone)] // clone: a refcount or a pointer, no allocation
+pub struct Path(Text);
+
+/// A path's text: a literal's ([`crate::path!`]), checked as its crate compiled and kept as
+/// it is, or one made at run time, held as blaze-core's name of it. The literal is behind
+/// one pointer so that a `Path` stays two words, as a name is.
+#[derive(Clone)] // clone: a refcount or a pointer, no allocation
+enum Text {
+    Literal(&'static Literal),
+    Name(FileName),
+}
+
+const _: () = assert!(size_of::<Path>() == size_of::<FileName>());
+
+/// A literal [`Path::literal`] checked: the one way to [`Path::of_literal`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Literal(StaticName);
+
+// Equality, order and hash are the text's, whichever way the path holds it.
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Path) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Path {}
+
+impl core::hash::Hash for Path {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Path) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Path {
+    fn cmp(&self, other: &Path) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
 
 /// What [`Path::new`] refused.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
@@ -121,26 +165,19 @@ const fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
     }
 }
 
-/// [`Path::new`]'s check of a literal, what [`crate::path!`] evaluates in a `const`: why the
-/// literal is no path, or `None`. The macro turns a refusal into a compile error saying it.
-pub const fn literal_refused(raw: &str) -> Option<&'static str> {
-    match refused(raw, false) {
-        Some(why) => Some(why.says()),
-        None => None,
-    }
-}
-
 /// A [`Path`] from a string literal, checked as the crate compiles: `path!("data/log")`. A bad
-/// literal (`path!("../x")`) is a compile error saying why. What it gives is [`Path::new`]'s
-/// `Result`: a checked literal is refused only by [`PathWhy::NoName`], a bug, which is still
-/// said rather than panicked on.
+/// literal (`path!("../x")`) is a compile error saying why. It is a [`Path`], not a `Result`:
+/// the check is done, and the path keeps the literal itself, so it allocates nothing and
+/// nothing is left that could fail.
 #[macro_export]
 macro_rules! path {
     ($raw:literal) => {{
-        const _: () = if let Some(why) = $crate::path::literal_refused($raw) {
-            panic!("{}", why)
+        const LITERAL: $crate::path::Literal = match $crate::path::Path::literal($raw) {
+            Ok(literal) => literal,
+            Err(why) => panic!("{}", why),
         };
-        $crate::path::Path::new($raw)
+        const PATH: $crate::path::Path = $crate::path::Path::of_literal(&LITERAL);
+        PATH
     }};
 }
 
@@ -186,9 +223,29 @@ impl Path {
         // alloc: once per path, blaze-core's `FileName`, which it makes infallibly
         // (blaze-core is not ported to fallible allocation).
         match FileName::new(raw) {
-            Some(name) => Ok(Path(name)),
+            Some(name) => Ok(Path(Text::Name(name))),
             None => Err(refuse(PathWhy::NoName)),
         }
+    }
+
+    /// [`Path::new`]'s check of a literal, what [`crate::path!`] evaluates in a `const`: the
+    /// literal, checked by this rule and by blaze-core's rule for a name, or why it is no
+    /// path. The macro turns a refusal into a compile error saying it.
+    #[doc(hidden)]
+    pub const fn literal(raw: &'static str) -> Result<Literal, &'static str> {
+        if let Some(why) = refused(raw, false) {
+            return Err(why.says());
+        }
+        match FileName::checked(raw) {
+            Some(name) => Ok(Literal(name)),
+            None => Err(PathWhy::NoName.says()),
+        }
+    }
+
+    /// The path of a checked literal: it keeps the literal itself, so it allocates nothing.
+    #[doc(hidden)]
+    pub const fn of_literal(literal: &'static Literal) -> Path {
+        Path(Text::Literal(literal))
     }
 
     /// `raw` with `..` let through, for the test that plants [`crate::Plant::LexicalParent`]:
@@ -203,7 +260,10 @@ impl Path {
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        match &self.0 {
+            Text::Literal(literal) => literal.0.as_str(),
+            Text::Name(name) => name.as_str(),
+        }
     }
 
     /// `self` then `more`: two paths beneath a directory make one beneath it. With no room
@@ -218,19 +278,30 @@ impl Path {
             text.push_str(tail)
         })
         .map_err(|error| refuse(PathWhy::OutOfMemory(error)))?;
-        joined.map(Path).ok_or_else(|| refuse(PathWhy::NoName))
+        joined.map(Path::of).ok_or_else(|| refuse(PathWhy::NoName))
     }
 
-    pub(crate) fn name(&self) -> &FileName {
-        &self.0
+    /// The path as blaze-core's name of it, for an effect: a refcount of the one it holds,
+    /// or, for a literal, the name made of it now (its check was done as the crate compiled).
+    pub(crate) fn to_name(&self) -> FileName {
+        match &self.0 {
+            // alloc: once per use of a literal path as a name, in blaze-core's `FileName`,
+            // which it makes infallibly (blaze-core is not ported to fallible allocation).
+            Text::Literal(literal) => FileName::of_static(literal.0),
+            // clone: a refcount.
+            Text::Name(name) => name.clone(),
+        }
     }
 
     pub(crate) fn into_name(self) -> FileName {
-        self.0
+        match self.0 {
+            Text::Literal(_) => self.to_name(),
+            Text::Name(name) => name,
+        }
     }
 
     pub(crate) fn of(name: FileName) -> Path {
-        Path(name)
+        Path(Text::Name(name))
     }
 }
 

@@ -34,11 +34,11 @@
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
 use alloc::{alloc::Global, boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{convert::Infallible, fmt, time::Duration};
+use core::{fmt, time::Duration};
 
 use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag,
-    lock::Lock,
+    lock::{Lock, LockGuard},
     sim::{Faults, Sim},
     wait::Deadline,
 };
@@ -118,13 +118,17 @@ impl Limits {
 /// other numbers than the simulation's own scheduler.
 const RNG_SALT: u64 = 0x6273_7464_2e72_6e67;
 
+/// The simulation of a simulated world. It is shared: the world's driver holds one handle,
+/// and whoever made the world to steer it (`#[bstd::test]`'s runner, [`Io::steered`]) holds
+/// the other, so steering asks no "is this world simulated?" that could be answered no.
+pub(crate) type SimHandle = Arc<Lock<Sim>>;
+
 /// The driver inside an [`Io`].
 enum Backend {
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     // alloc: once per process, the driver.
     Native(Box<blaze_core::Native>),
-    // alloc: once per simulated world.
-    Sim(Box<Sim>),
+    Sim(SimHandle),
 }
 
 impl Backend {
@@ -132,7 +136,7 @@ impl Backend {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.submit(effects),
-            Backend::Sim(sim) => sim.submit(effects),
+            Backend::Sim(sim) => sim.lock().submit(effects),
         }
     }
 
@@ -140,7 +144,7 @@ impl Backend {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.poll(out, until),
-            Backend::Sim(sim) => sim.poll(out, until),
+            Backend::Sim(sim) => sim.lock().poll(out, until),
         }
     }
 
@@ -148,7 +152,7 @@ impl Backend {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.now(),
-            Backend::Sim(sim) => sim.now(),
+            Backend::Sim(sim) => sim.lock().now(),
         }
     }
 
@@ -160,6 +164,7 @@ impl Backend {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(_) => {}
             Backend::Sim(sim) => {
+                let mut sim = sim.lock();
                 let now = sim.now();
                 if !until.passed(now) {
                     sim.advance(until.get().saturating_sub(now));
@@ -172,15 +177,16 @@ impl Backend {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.in_flight(),
-            Backend::Sim(sim) => sim.in_flight(),
+            Backend::Sim(sim) => sim.lock().in_flight(),
         }
     }
 
-    fn sim(&mut self) -> Option<&mut Sim> {
+    /// The simulation, held until the guard is dropped; `None` on a real driver.
+    fn sim(&mut self) -> Option<LockGuard<'_, Sim>> {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(_) => None,
-            Backend::Sim(sim) => Some(sim),
+            Backend::Sim(sim) => Some(sim.lock()),
         }
     }
 }
@@ -537,9 +543,17 @@ impl Io {
 
     /// `world` with `plant` planted: [`Plant::None`] but for the tests' controls.
     pub(crate) fn planted(world: SimWorld, plant: Plant) -> Result<Io, SimError> {
-        Ok(Io::over(Start {
-            // alloc: once per simulated world.
-            driver: Backend::Sim(heap::boxed(Sim::new(world.seed, world.faults))?),
+        Io::steered(world, plant).map(|(io, _sim)| io)
+    }
+
+    /// As [`Io::planted`], with the world's simulation itself: the handle `#[bstd::test]`'s
+    /// runner arms, heals and reads between a program's starts.
+    pub(crate) fn steered(world: SimWorld, plant: Plant) -> Result<(Io, SimHandle), SimError> {
+        // alloc: once per simulated world, its simulation, shared with whoever steers it.
+        let sim = heap::shared(Lock::new("bstd.io.sim", Sim::new(world.seed, world.faults)))?;
+        let io = Io::over(Start {
+            // clone: the driver's handle to the simulation, a refcount.
+            driver: Backend::Sim(Arc::clone(&sim)),
             seed: world.seed ^ RNG_SALT,
             env: world.env,
             args: world.args,
@@ -551,7 +565,8 @@ impl Io {
             // alloc: once per simulated world, its disk's ledger.
             disk: Some(heap::boxed(Disk::new(world.seed))?),
             plant,
-        })?)
+        })?;
+        Ok((io, sim))
     }
 
     /// The target's own driver over `world.root`.
@@ -960,7 +975,7 @@ impl Io {
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
     /// hold a lock); `None` on a real driver.
     pub fn with_sim<R>(&self, f: impl FnOnce(&mut Sim) -> R) -> Option<R> {
-        self.world.lock().driver.sim().map(f)
+        self.world.lock().driver.sim().map(|mut sim| f(&mut sim))
     }
 
     /// The simulated machine loses power ([`Sim::crash`]): every effect in flight is gone,
@@ -970,10 +985,10 @@ impl Io {
     pub fn crash(&self) -> bool {
         let mut world = self.world.lock();
         let World { driver, got, abandoned, polled, effects, disk, .. } = &mut *world;
-        let Some(sim) = driver.sim() else { return false };
+        let Some(mut sim) = driver.sim() else { return false };
         sim.crash();
         if let Some(disk) = disk {
-            disk.crashed(sim);
+            disk.crashed(&mut sim);
         }
         got.clear();
         abandoned.clear();
@@ -1005,28 +1020,35 @@ impl Io {
     }
 
     /// The process ends with `status`: a real one exits; the simulated one remembers it and
-    /// unwinds the calling task with an [`Exit`] payload. It returns only an error: a later
-    /// exit of a simulated world, whose first payload was caught already, found no room for
-    /// its own; the world then has not exited again and nothing unwinds.
-    pub(crate) fn exit(&self, status: i32) -> Result<Infallible, Stopped> {
-        let payload = {
-            let mut world = self.world.lock();
-            if world.driver.sim().is_none() {
-                drop(world);
-                crate::rt::exit(status);
-            }
-            let payload = match world.exit.take() {
-                Some(mut payload) => {
-                    payload.status = status;
-                    payload
-                }
-                // alloc: a later exit's payload, the first one's having been caught already.
-                None => heap::boxed(Exit { status })?,
-            };
-            world.exited = Some(status);
-            payload
-        };
+    /// unwinds the calling task with an [`Exit`] payload. It returns only an error: a
+    /// simulated world's exit whose payload was not given back ([`Io::keep_exit`]) found no
+    /// room for another; the world then has not exited again and nothing unwinds.
+    pub(crate) fn exit(&self, status: i32) -> Result<!, Stopped> {
+        if self.world.lock().driver.sim().is_none() {
+            crate::rt::exit(status);
+        }
+        let payload = self.exit_payload(status)?;
+        self.world.lock().exited = Some(status);
         crate::rt::resume_unwind(payload)
+    }
+
+    /// The payload a simulated world's unwind carries (its exit, a power cut): the one the
+    /// world keeps, with `status`, or with that one out, a new one.
+    pub(crate) fn exit_payload(&self, status: i32) -> Result<Box<Exit>, Stopped> {
+        match self.world.lock().exit.take() {
+            Some(mut payload) => {
+                payload.status = status;
+                Ok(payload)
+            }
+            // alloc: a later unwind's payload, the kept one being out.
+            None => Ok(heap::boxed(Exit { status })?),
+        }
+    }
+
+    /// Gives a caught unwind's payload back to the world, for its next one: a world whose
+    /// payloads come back allocates one, once.
+    pub(crate) fn keep_exit(&self, payload: Box<Exit>) {
+        self.world.lock().exit = Some(payload);
     }
 
     /// The driver's clock.
@@ -1078,7 +1100,7 @@ impl Io {
         // above, and it is as it was when it refuses.
         // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
         if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {
-            disk.submitted(sim, &effect)?;
+            disk.submitted(&sim, &effect)?;
         }
         if *record {
             touch(touched, &effect)?;
@@ -1089,10 +1111,12 @@ impl Io {
         driver.submit(effects);
         // Under `bstd::test` the armed simulation cuts the power at an effect of its seed's: the
         // world crashes and the program's start ends here, unwound, with the lock let go first.
-        let cut = driver.sim().is_some_and(Sim::cut_due);
+        let cut = driver.sim().is_some_and(|mut sim| sim.cut_due());
         drop(world);
         if cut {
-            crate::simtest::power_lost(self);
+            // It returns only when the cut found no room to unwind with: the machine is off
+            // all the same, and the caller is told why its effect went nowhere.
+            crate::simtest::power_lost(self)?;
         }
         Ok(tag)
     }

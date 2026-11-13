@@ -86,9 +86,42 @@ fn host_ports_by_example() {
 
 #[test]
 fn literals_are_checked_as_the_crate_compiles() {
-    assert_eq!(crate::path!("data/log").expect("a test path"), Path::new("data/log").expect("a path"));
+    assert_eq!(crate::path!("data/log"), Path::new("data/log").expect("a path"));
     assert_eq!(crate::var!("HOME"), VarName::new("HOME").expect("a variable name"));
-    assert_eq!(crate::host!("api.stripe.com:443").expect("a test host"), HostPort::new("api.stripe.com", 443).expect("a host"));
+    assert_eq!(crate::host!("api.stripe.com:443"), HostPort::new("api.stripe.com", 443).expect("a host"));
     let why = |raw: &str| VarName::new(raw).err().map(|error| error.why);
     assert_eq!((why(""), why("A=B"), why("A\0")), (Some(VarNameWhy::Empty), Some(VarNameWhy::Equals), Some(VarNameWhy::Nul)));
+}
+
+/// A literal is a value, not a `Result`: each of these is a `const`, which cannot allocate, so
+/// nothing is left to fail where the literal is used. It is the same path, name or host
+/// as the one made at run time: equal, ordered and hashed alike, and a literal path is a name
+/// a directory opens under.
+#[test]
+fn a_checked_literal_is_a_constant_that_allocates_nothing() {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    const LOG: Path = crate::path!("data/log");
+    const HOME: VarName = crate::var!("HOME");
+    const API: HostPort = crate::host!("api.stripe.com:443");
+
+    // A `const` initializer cannot allocate: that these three are constants is the proof.
+    let (path, host) = (crate::path!("data/log"), crate::host!("[::1]:443"));
+    assert_eq!((path.as_str(), host.host(), host.port()), ("data/log", "[::1]", 443));
+
+    let made = Path::new("data/log").expect("a path");
+    let hash = BuildHasherDefault::<DefaultHasher>::default();
+    assert_eq!((LOG.cmp(&made), hash.hash_one(&LOG)), (std::cmp::Ordering::Equal, hash.hash_one(&made)));
+    assert_eq!(HOME.as_str(), "HOME");
+    let parsed = HostPort::parse("api.stripe.com:443").expect("a host");
+    assert_eq!((API.cmp(&parsed), hash.hash_one(&API)), (std::cmp::Ordering::Equal, hash.hash_one(&parsed)));
+    assert_eq!(API.to_string(), "api.stripe.com:443");
+
+    let io = crate::io::Io::sim(11).expect("a world");
+    let cx = super::root(&io);
+    let dir = io.need_fs().expect("a file tree").open_dir(&cx, &crate::path!("data")).expect("a directory");
+    super::write_synced(&cx, &dir, &crate::path!("log"), b"kept").expect("a file beneath the literal");
+    let mut read = cx.bytes();
+    let took = dir.read_all(&cx, &crate::path!("log"), &mut read).expect("the file read back");
+    assert_eq!((took.get(), read.as_slice()), (4, &b"kept"[..]));
 }

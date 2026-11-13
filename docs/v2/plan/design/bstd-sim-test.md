@@ -75,7 +75,10 @@ bstd's alone: a sans-IO core driven on `Sim` directly runs under it too (its own
   the disk ledger with it) and unwinds the program as the simulated exit does (an `Exit`
   payload, which scopes pass on), so nothing of the program runs after the cut.
 - `#[bstd::test]`, a `macro_rules!` attribute rule (nightly `macro_attr`): no proc macro and no
-  compiler feature of bstd's own. It expands to a `#[test]` that calls `bstd::test::run`.
+  compiler feature of bstd's own. It expands to a `#[test]` that returns what
+  `bstd::test::run` returns: a failure is the test's `Err`, its report (`bstd::test::Report`),
+  not a panic. A seed whose world cannot be made fails that seed, naming it and why
+  ([fallible-bstd](fallible-bstd.md), decision D29).
   blaze's `mbe` dropped an attr rule's arguments; it matches them now (`mbe::MacroCall`),
   which `without(..)` needs.
 

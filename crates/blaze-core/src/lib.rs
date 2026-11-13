@@ -224,11 +224,43 @@ impl FileName {
         FileName::is_valid(name).then(|| FileName(name.into()))
     }
 
-    /// Whether [`FileName::new`] takes `name`, without making one.
-    pub(crate) fn is_valid(name: &str) -> bool {
-        !name.is_empty()
-            && !name.starts_with('/')
-            && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..")
+    /// Whether [`FileName::new`] takes `name`, without making one: it is not empty, has no
+    /// root, and each of its `/`-separated parts is something other than `.` and `..`. A
+    /// `const fn`, so a literal is checked as the crate that writes it compiles
+    /// ([`FileName::checked`]).
+    pub(crate) const fn is_valid(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        // Where the part being read starts, and how many bytes of it were read.
+        let (mut at, mut start) = (0, 0);
+        loop {
+            if at == bytes.len() || bytes[at] == b'/' {
+                let part = at - start;
+                let dots = (part == 1 && bytes[start] == b'.')
+                    || (part == 2 && bytes[start] == b'.' && bytes[start + 1] == b'.');
+                // An empty part is an empty name, a root, `a//b` or a trailing `/`.
+                if part == 0 || dots {
+                    return false;
+                }
+                if at == bytes.len() {
+                    return true;
+                }
+                start = at + 1;
+            }
+            at += 1;
+        }
+    }
+
+    /// `name` as a checked literal, or `None` where [`FileName::new`] would refuse it: for a
+    /// name written in the source, checked in a `const` so the proof is made once, as the
+    /// crate compiles, and [`FileName::of_static`] cannot fail.
+    pub const fn checked(name: &'static str) -> Option<StaticName> {
+        if FileName::is_valid(name) { Some(StaticName(name)) } else { None }
+    }
+
+    /// The name of a checked literal.
+    pub fn of_static(name: StaticName) -> FileName {
+        // alloc: once per name made; its clones share it
+        FileName(name.0.into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -238,6 +270,17 @@ impl FileName {
     /// Whether `self` is `dir` or under it.
     pub fn is_under(&self, dir: &FileName) -> bool {
         self.0 == dir.0 || self.0.strip_prefix(&*dir.0).is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+/// A `'static` text [`FileName::checked`] took: a name that needs no copy and no check until
+/// it is handed to an effect ([`FileName::of_static`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct StaticName(&'static str);
+
+impl StaticName {
+    pub const fn as_str(self) -> &'static str {
+        self.0
     }
 }
 

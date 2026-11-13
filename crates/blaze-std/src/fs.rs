@@ -736,12 +736,10 @@ impl Fs {
     /// The directory `path` under the driver's root, read and write. It may not be there yet
     /// (a file made under it makes it); a file there is refused.
     pub fn open_dir(&self, cx: &Cx, path: &Path) -> Result<Dir<ReadWrite>, FsError> {
-        match stat(&self.io, cx, FsOp::OpenDir, path.name())? {
-            Some(Meta { dir: false, .. }) => {
-                Err(FsError::new(FsOp::OpenDir, path.name(), FsKind::NotADirectory))
-            }
-            // clone: the directory's name, a refcount.
-            Some(_) | None => Ok(Dir { io: self.io.clone(), base: path.name().clone(), quota: None, rights: PhantomData }),
+        let name = path.to_name();
+        match stat(&self.io, cx, FsOp::OpenDir, &name)? {
+            Some(Meta { dir: false, .. }) => Err(FsError::new(FsOp::OpenDir, &name, FsKind::NotADirectory)),
+            Some(_) | None => Ok(Dir { io: self.io.clone(), base: name, quota: None, rights: PhantomData }),
         }
     }
 }

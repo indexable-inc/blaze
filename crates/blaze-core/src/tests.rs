@@ -1683,3 +1683,36 @@ fn a_host_effect_that_fails_names_what_it_is_about() {
         other => panic!("a second bind at {local} ended {other:?}"),
     }
 }
+
+/// The refinement: `FileName`'s rule as a `const fn` (what a literal is checked by as its
+/// crate compiles) takes exactly the names the rule written with `split` takes.
+#[hegel::test]
+fn the_const_rule_for_a_name_is_the_rule_by_parts(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    let alphabet = [b'a', b'.', b'/', b'b', b'-'];
+    let picks: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().max_value(4)).max_size(12));
+    let name: String = picks.iter().map(|at| char::from(alphabet[usize::from(*at)])).collect();
+    let by_parts =
+        !name.is_empty() && !name.starts_with('/') && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..");
+    assert_eq!(crate::FileName::is_valid(&name), by_parts, "{name:?}");
+    assert_eq!(crate::FileName::new(&name).is_some(), by_parts, "{name:?}");
+}
+
+/// A literal checked in a `const` is a name with no check left: the planted bad ones are
+/// `None` as the crate compiles, and the good one is the name `new` makes.
+#[test]
+fn a_name_checked_as_the_crate_compiles_is_the_name_new_makes() {
+    const GOOD: Option<crate::StaticName> = crate::FileName::checked("data/log");
+    const BAD: [Option<crate::StaticName>; 5] = [
+        crate::FileName::checked(""),
+        crate::FileName::checked("/data"),
+        crate::FileName::checked("data//log"),
+        crate::FileName::checked("data/../log"),
+        crate::FileName::checked("data/"),
+    ];
+    assert_eq!(BAD, [None; 5]);
+    let good = GOOD.expect("a name");
+    assert_eq!(crate::FileName::of_static(good), crate::FileName::new("data/log").expect("a name"));
+    assert_eq!(good.as_str(), "data/log");
+}

@@ -88,7 +88,7 @@ impl Host {
     ///
     /// It never returns `Ok`: what it returns is why a simulated world could not exit, a
     /// later exit that found no room on the global heap for its unwind's payload.
-    pub fn exit(&self, status: i32) -> Result<core::convert::Infallible, crate::Stopped> {
+    pub fn exit(&self, status: i32) -> Result<!, crate::Stopped> {
         self.io.exit(status)
     }
 }

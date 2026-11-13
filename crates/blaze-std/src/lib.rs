@@ -365,7 +365,7 @@ pub mod test {
         seeds::{Broke, Counts, Ended, Failed, Fault, Given, Passed, Plan, Replay, Run, Seeds},
     };
 
-    pub use crate::simtest::{BUDGET, Outcome, one, run, seeded};
+    pub use crate::simtest::{BUDGET, Outcome, Report, one, run, seeded};
 
     /// The model checker's shims, with std's API: a crate's code switches to them under
     /// `cfg(blaze_check)`.

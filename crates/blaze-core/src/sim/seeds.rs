@@ -33,6 +33,7 @@
 mod tests;
 
 use std::{
+    borrow::Cow,
     fmt::{self, Write as _},
     hash::Hasher as _,
     time::Duration,
@@ -443,9 +444,10 @@ pub enum Ended {
     /// It ran to its end and says all is well.
     Well,
     /// It gave up with an error: under a fault, a program that stops loudly is restarted.
-    GaveUp(String),
+    /// The text is owned, or fixed where its world had no room to keep the error's own.
+    GaveUp(Cow<'static, str>),
     /// It panicked: an assertion of the test's, or a bug.
-    Panicked(String),
+    Panicked(Cow<'static, str>),
     /// Its machine lost power under it ([`Sim::cut_due`]).
     PowerLost,
 }
@@ -498,10 +500,27 @@ pub struct Run {
 
 /// Runs `seed`: a world of it from `boot`, armed with its plan under `seeds`, and the program
 /// started until it ends well with nothing left to survive, or breaks (the module's doc has
-/// the rule). At most `restarts_most + 2` starts.
-pub fn one<W: World>(seed: u64, seeds: &Seeds, boot: &mut impl FnMut(u64) -> W) -> Run {
+/// the rule). At most `restarts_most + 2` starts. A world `boot` could not make breaks the
+/// seed before any start (start 0), naming the seed and what `boot` said.
+pub fn one<W: World, E: fmt::Display>(
+    seed: u64,
+    seeds: &Seeds,
+    boot: &mut impl FnMut(u64) -> Result<W, E>,
+) -> Run {
     let plan = Plan::of(seed, seeds);
-    let mut world = boot(seed);
+    let mut world = match boot(seed) {
+        Ok(world) => world,
+        Err(error) => {
+            return Run {
+                plan,
+                // alloc: a failure's message.
+                verdict: Err(Broke { start: 0, why: format!("the world of seed {seed} could not be made: {error}") }),
+                starts: 0,
+                counts: Counts::default(),
+                trace: String::new(),
+            };
+        }
+    };
     world.with_sim(|sim| sim.arm(&plan));
     // A seed that injects nothing has nothing to heal: the program's first end is its last.
     let unkind = plan.fail_one_in != 0 || plan.crash_one_in != 0;
@@ -561,8 +580,22 @@ pub fn one<W: World>(seed: u64, seeds: &Seeds, boot: &mut impl FnMut(u64) -> W) 
 pub struct Name<'a> {
     /// The package the test is in, as `-p` takes it.
     pub package: &'a str,
-    /// The test's path, as the test harness lists it.
+    /// The module the test is in, as `module_path!()` says it: the crate's name first.
+    pub module: &'a str,
+    /// The test function's name.
     pub test: &'a str,
+}
+
+impl Name<'_> {
+    /// The test's path as the test harness lists it: its module's path without the crate's
+    /// name, then its own.
+    pub fn listed(&self) -> String {
+        match self.module.split_once("::") {
+            // alloc: a failure's name of the test.
+            Some((_, path)) => format!("{path}::{}", self.test),
+            None => self.test.to_owned(),
+        }
+    }
 }
 
 /// Every seed passed.
@@ -689,17 +722,17 @@ fn diverged(first: &str, second: &str) -> Replay {
 /// Runs the test `name` under `seeds`, or under what was `given` from outside in their place:
 /// each seed a world from `boot` ([`one`]). The first seed that breaks is run again and
 /// compared, then reported; when all pass, what they did is counted.
-pub fn run<W: World>(
+pub fn run<W: World, E: fmt::Display>(
     seeds: Seeds,
     given: Given,
     name: Name<'_>,
-    mut boot: impl FnMut(u64) -> W,
+    mut boot: impl FnMut(u64) -> Result<W, E>,
 ) -> Result<Passed, Failed> {
     let (first, count) = match given {
         Given { seed: Some(seed), .. } => (seed, 1),
         Given { seed: None, count } => (seeds.first, count.unwrap_or(seeds.count)),
     };
-    let (package, test) = (name.package, name.test);
+    let (package, test) = (name.package, name.listed());
     let mut passed = Passed { seeds: 0, starts: 0, counts: Counts::default() };
     for at in 0..count {
         let seed = first.wrapping_add(u64::from(at));
@@ -716,7 +749,7 @@ pub fn run<W: World>(
             };
             return Err(Failed::Seed {
                 package: package.to_owned(),
-                test: test.to_owned(),
+                test,
                 at: at + 1,
                 of: count,
                 // alloc: once per failure.
@@ -732,7 +765,7 @@ pub fn run<W: World>(
         passed.counts.cuts += run.counts.cuts;
     }
     if passed.counts.effects == 0 {
-        return Err(Failed::Idle { package: package.to_owned(), test: test.to_owned(), seeds: count });
+        return Err(Failed::Idle { package: package.to_owned(), test, seeds: count });
     }
     Ok(passed)
 }

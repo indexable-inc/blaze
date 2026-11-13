@@ -25,7 +25,7 @@ const RECORD: usize = 8;
 /// Records a start of the ledger adds.
 const BATCH: u64 = 3;
 
-const NAME: Name<'static> = Name { package: "blaze-core", test: "sim::seeds::tests::ledger" };
+const NAME: Name<'static> = Name { package: "blaze-core", module: "blaze_core::sim::seeds::tests", test: "ledger" };
 
 /// A safeguard of the ledger's removed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,12 +149,12 @@ impl World for Ledger {
         match catch_unwind(AssertUnwindSafe(|| ledger(machine))) {
             Ok(Ok(())) => Ended::Well,
             Ok(Err(Stop::PowerLost)) => Ended::PowerLost,
-            Ok(Err(Stop::Failed(error))) => Ended::GaveUp(error),
+            Ok(Err(Stop::Failed(error))) => Ended::GaveUp(error.into()),
             Err(payload) => Ended::Panicked(match payload.downcast::<String>() {
-                Ok(message) => *message,
+                Ok(message) => (*message).into(),
                 Err(payload) => match payload.downcast::<&'static str>() {
-                    Ok(message) => (*message).to_owned(),
-                    Err(_) => "a panic with no message".to_owned(),
+                    Ok(message) => (*message).into(),
+                    Err(_) => "a panic with no message".into(),
                 },
             }),
         }
@@ -169,8 +169,8 @@ impl World for Ledger {
     }
 }
 
-fn boot(plant: Plant) -> impl FnMut(u64) -> Ledger {
-    move |seed| Ledger(Machine { sim: Sim::new(seed, Faults::default()), next: 0, plant })
+fn boot(plant: Plant) -> impl FnMut(u64) -> Result<Ledger, !> {
+    move |seed| Ok(Ledger(Machine { sim: Sim::new(seed, Faults::default()), next: 0, plant }))
 }
 
 /// The run that broke, or a panic saying the plant was not caught.
@@ -341,24 +341,42 @@ impl World for Fixed {
 /// gives up once every fault is healed fails with its error; and a panic fails at its start.
 #[test]
 fn a_run_that_tests_nothing_and_one_that_never_ends_well_fail_by_name() {
-    let fixed = |ended: Ended| move |seed| Fixed(Sim::new(seed, Faults::default()), ended.clone()); // clone: a test's fixed end
+    let fixed = |ended: Ended| move |seed| Ok::<_, !>(Fixed(Sim::new(seed, Faults::default()), ended.clone())); // clone: a test's fixed end
     let idle = run(Seeds::DEFAULT, Given::NOTHING, NAME, fixed(Ended::Well)).unwrap_err();
     assert_eq!(
         idle,
-        Failed::Idle { package: "blaze-core".to_owned(), test: NAME.test.to_owned(), seeds: 256 }
+        Failed::Idle { package: "blaze-core".to_owned(), test: NAME.listed(), seeds: 256 }
     );
     assert!(idle.to_string().contains("asked the simulation for nothing in any of its 256 seeds"), "{idle}");
 
-    let gave_up = run(Seeds::DEFAULT, Given::NOTHING, NAME, fixed(Ended::GaveUp("no room".to_owned()))).unwrap_err();
+    let gave_up = run(Seeds::DEFAULT, Given::NOTHING, NAME, fixed(Ended::GaveUp("no room".into()))).unwrap_err();
     let broke = gave_up.broke().expect("a seed broke");
     let why = &broke.verdict.as_ref().unwrap_err().why;
     assert_eq!(why, "with no fault left to blame, the program gave up: no room");
     // Bounded: at most `restarts_most` starts under faults, and the one after they heal.
     assert!(broke.starts <= Seeds::DEFAULT.restarts_most + 1, "{gave_up}");
 
-    let panicked = run(Seeds::DEFAULT, Given::NOTHING, NAME, fixed(Ended::Panicked("boom".to_owned()))).unwrap_err();
+    let panicked = run(Seeds::DEFAULT, Given::NOTHING, NAME, fixed(Ended::Panicked("boom".into()))).unwrap_err();
     let broke = panicked.broke().expect("a seed broke");
     assert_eq!(broke.verdict, Err(Broke { start: 1, why: "panicked: boom".to_owned() }));
+}
+
+/// A world that cannot be made is its seed's failure, before any start: the report names the
+/// seed and what the maker said, and the seed replays.
+#[test]
+fn a_world_that_cannot_be_made_fails_its_seed_naming_it_and_why() {
+    let refused = |seed: u64| match seed {
+        3 => Err("no room for the simulated host"),
+        _ => Ok(Ledger(Machine { sim: Sim::new(seed, Faults::default()), next: 0, plant: Plant::None })),
+    };
+    let failed = run(Seeds::DEFAULT, Given::NOTHING, NAME, refused).unwrap_err();
+    let Failed::Seed { at, run: broke, replay, .. } = &failed else { panic!("a seed broke: {failed}") };
+    assert_eq!((*at, broke.plan.seed, broke.starts, replay), (4, 3, 0, &Replay::Same));
+    assert_eq!(
+        broke.verdict,
+        Err(Broke { start: 0, why: "the world of seed 3 could not be made: no room for the simulated host".to_owned() })
+    );
+    assert!(failed.to_string().contains("failed at seed 3 (seed 4 of 256), start 0: the world of seed 3 could not be made"), "{failed}");
 }
 
 /// A machine whose power was cut takes no effect and tells no completion until it is turned

@@ -61,6 +61,19 @@ workspace ported in the same change.
 A formatting trait that returns an error though its writer took every byte is
 `FormatError::Trait` (std's `format!` panics there).
 
+A literal checked as the crate compiles is a value, never a `Result`: `path!`, `var!` and
+`host!` give a `const` that keeps the literal's own text (a `Path` over blaze-core's
+`StaticName`, a `HostPort` over the literal's host and port), so they allocate nothing and
+nothing is left to fail. A literal path's `FileName` is made when it is handed to an effect.
+
+A function that only ever returns to say why it could not do what it does returns
+`Result<!, E>`: `Host::exit` (a simulated exit with no room for its unwind's payload) and the
+power cut of `#[bstd::test]`. `#[bstd::test]` itself is under the rule: its runner's world
+factory is fallible (`blaze_core::sim::seeds` takes `FnMut(u64) -> Result<W, E>`, and a world
+that cannot be made fails its seed, naming the seed and the error), the simulation is steered
+through a handle of its own (`Io::steered`), so no start asks whether its world is simulated,
+and a failed test returns its report (`Result<(), Report>`) to the test harness.
+
 `Clone` and `Extend` are not implemented for these collections: both are infallible traits that
 allocate. `clone_in_place` and `extend` are their fallible forms.
 
@@ -155,13 +168,18 @@ Left in bstd:
 | what | where | why it is left |
 |---|---|---|
 | a `where const` bound's message is a compile-time panic | `own/reach.rs` (`refuse`) | const evaluation has no other way to refuse with a message; never runs at run time |
-| the checks of `path!`, `var!`, `host!` panic in their own `const` blocks | `path.rs`, `env.rs`, `net.rs` | compile time only; `net::check_literal` is a public hidden `const fn` whose `assert!` would run if called at run time |
+| the checks of `path!`, `var!`, `host!` panic in their own `const` blocks | `path.rs`, `env.rs`, `net.rs` | compile time only: a `const` item's initializer, which is how a bad literal stops the crate's compilation saying why |
 | hashbrown's `insert` and `entry` after a successful reserve | `map.rs` (two `#[expect]`) | hashbrown has no insert that says in its type it cannot allocate |
 | `Arc<str>` and `Arc<[T]>` are made infallibly | `host.rs`; blaze-core's `FileName::new` | `alloc` has no fallible constructor for them; names bstd makes itself are `Arc<String>` |
 | blaze-core's effects and simulation copy bytes and names infallibly; blaze-http's h1 grows its own buffers and builds error strings | called from `fs.rs`, `disk.rs`, `requests.rs` | those crates are outside this decision; bstd reserves ahead where it can |
 | `TaskError` derives `Clone` over an owned message | `task.rs` | a copy of an error allocates unchecked; bstd's own copies go through a fallible one |
 | the shared map and set are papaya's | `map.rs` re-exports | papaya takes no allocator and has no fallible form |
 | errors are up to 232 bytes (`large-error-threshold = 256` in bstd's `clippy.toml`) | every bstd error with an `Excerpt` | the text an error names is kept inline so making an error allocates nothing; how errors compose is another lane's |
+
+Outside the two crates, the callers of blaze-mem that cannot return its error stop where
+they call it, with the message they had before (`unwrap_or_else(|error| panic!("{error}"))`,
+195 lines in 24 crates). That is the interim: an unwrap ratchet for the rest of blaze follows
+this decision and is not part of it.
 
 Not done: the cost table's "1.0" for a push with room is from the source, not from generated
 code. `MemoLimit.bytes` in `eval.rs` is still a `usize`.

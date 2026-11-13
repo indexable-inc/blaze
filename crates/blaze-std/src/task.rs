@@ -367,7 +367,7 @@ fn task_cx(live: &Live, name: &'static str, scratch: ByteLen) -> Result<Cx, Stop
 }
 
 /// What a task's error said, as its `Display` writes it, or why that text could not be kept.
-fn message(error: &impl fmt::Display) -> Cow<'static, str> {
+pub(crate) fn message(error: &impl fmt::Display) -> Cow<'static, str> {
     // alloc: an error's message, on the global heap because the task's frame is gone.
     match heap::format(format_args!("{error}")) {
         Ok(said) => Cow::Owned(said),

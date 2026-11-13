@@ -8,8 +8,6 @@
 
 use core::fmt;
 
-use blaze_core::FileName;
-
 use crate::{
     fs::{Dir, ReadWrite},
     io::Io,
@@ -85,9 +83,7 @@ impl User {
 
     /// The home directory, read and write.
     pub fn home(&self) -> Dir<ReadWrite> {
-        let name: &FileName = self.facts.home.name();
-        // clone: the directory's name, a refcount.
-        Dir::at(&self.io, name.clone())
+        Dir::at(&self.io, self.facts.home.to_name())
     }
 }
 

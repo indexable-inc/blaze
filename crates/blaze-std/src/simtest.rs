@@ -30,14 +30,21 @@
 //!   as scopes pass on. Nothing of the program runs after the cut but its destructors, and
 //!   the machine is off: what they ask is dropped.
 //! - The attribute, [`crate::test!`]: a `macro_rules!` attribute rule (`macro_attr`), no proc
-//!   macro. It turns the function into a `#[test]` that calls [`run`] with its package, its
-//!   path and its seeds.
+//!   macro. It turns the function into a `#[test]` that returns what [`run`] does with its
+//!   package, its path and its seeds: a failure is the test's `Err`, a [`Report`], which the
+//!   test harness prints.
+//!
+//! Nothing here panics or allocates infallibly (decision D29): a world that cannot be made
+//! is its seed's failure, naming the seed and why; the simulation is steered through its
+//! own handle ([`Io::steered`]), so no start asks whether its world is simulated; a power
+//! cut that finds no room to unwind with is the submit's [`Stopped`]; and a message with no
+//! room on the global heap is a fixed one saying so.
 //!
 //! A test that needs a world of its own making (scripted devices, an environment, a withheld
 //! capability) is not this attribute's yet: it makes its `Io` and loops its seeds, as the
 //! tests of this crate do.
 
-use alloc::{boxed::Box, format, string::String, string::ToString};
+use alloc::borrow::Cow;
 use core::{fmt, panic::AssertUnwindSafe, time::Duration};
 
 use blaze_core::sim::{
@@ -46,12 +53,13 @@ use blaze_core::sim::{
 };
 
 use crate::{
+    Plant, Stopped,
     cx::Cx,
     host::Exit,
-    io::Io,
+    io::{Io, Limits, SimError, SimHandle, SimWorld},
     mem::TASK_FRAME,
     rt::{catch_unwind, resume_unwind},
-    task::said,
+    task::{message, said},
 };
 
 /// The budget of a start's root context, on the simulation's clock: an hour, longer than any
@@ -60,27 +68,55 @@ pub const BUDGET: Duration = Duration::from_secs(3600);
 
 /// How a test's program ended, by what it returned.
 pub trait Outcome {
-    /// `None` when all is well, else the error it gave up with, as it says itself.
-    fn gave_up(self) -> Option<String>;
+    /// `None` when all is well, else the error it gave up with, as it says itself (or, with
+    /// no room on the global heap for that, a fixed text saying so).
+    fn gave_up(self) -> Option<Cow<'static, str>>;
 }
 
 impl Outcome for () {
-    fn gave_up(self) -> Option<String> {
+    fn gave_up(self) -> Option<Cow<'static, str>> {
         None
     }
 }
 
 impl<T, E: fmt::Display> Outcome for Result<T, E> {
-    fn gave_up(self) -> Option<String> {
-        // alloc: an error's message.
-        self.err().map(|error| error.to_string())
+    fn gave_up(self) -> Option<Cow<'static, str>> {
+        self.err().map(|error| message(&error))
     }
 }
 
-/// A simulated world and the program a test runs in it.
+/// A simulated world, its simulation and the program a test runs in it.
 struct Program<'p, P> {
     io: Io,
+    /// The world's simulation itself: what the runner arms, heals and reads.
+    sim: SimHandle,
     program: &'p P,
+}
+
+impl<'p, P> Program<'p, P> {
+    /// The world of `seed`, as [`Io::sim`] makes it, with `program` to run in it.
+    fn of(seed: u64, program: &'p P) -> Result<Program<'p, P>, SimError> {
+        let (io, sim) = Io::steered(SimWorld::new(seed, Limits::USUAL), Plant::None)?;
+        Ok(Program { io, sim, program })
+    }
+}
+
+/// A start's failure before the program ran: no root context.
+struct NoRoot(Stopped);
+
+impl fmt::Display for NoRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bstd::test: a start's root context: {}", self.0)
+    }
+}
+
+/// A simulated exit with a status other than zero.
+struct Exited(i32);
+
+impl fmt::Display for Exited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the process exited with status {}", self.0)
+    }
 }
 
 impl<P, R> World for Program<'_, P>
@@ -91,8 +127,7 @@ where
     fn run(&mut self) -> Ended {
         let cx = match self.io.cx(BUDGET, TASK_FRAME) {
             Ok(cx) => cx,
-            // alloc: a failure's message.
-            Err(stopped) => return Ended::Panicked(format!("bstd::test: a start's root context: {stopped}")),
+            Err(stopped) => return Ended::Panicked(message(&NoRoot(stopped))),
         };
         // clone: the program's own handle to its world, as `main` is handed one.
         let io = self.io.clone();
@@ -104,14 +139,19 @@ where
                 Some(error) => Ended::GaveUp(error),
             },
             Err(payload) => match payload.downcast::<Exit>() {
-                Ok(_) if self.with_sim(|sim| sim.is_off()) => Ended::PowerLost,
-                Ok(exit) => match exit.status {
-                    0 => Ended::Well,
-                    // alloc: an error's message.
-                    status => Ended::GaveUp(format!("the process exited with status {status}")),
-                },
-                // alloc: a panic's message, for the seed's report.
-                Err(payload) => Ended::Panicked(said(payload).into_owned()),
+                Ok(exit) => {
+                    let status = exit.status;
+                    // The payload goes back to the world: its next cut or exit unwinds with
+                    // this one, so a world allocates a payload once.
+                    self.io.keep_exit(exit);
+                    match status {
+                        _ if self.sim.lock().is_off() => Ended::PowerLost,
+                        0 => Ended::Well,
+                        status => Ended::GaveUp(message(&Exited(status))),
+                    }
+                }
+                // A panic's message, moved out of its payload: nothing is copied.
+                Err(payload) => Ended::Panicked(said(payload)),
             },
         }
     }
@@ -121,33 +161,27 @@ where
     }
 
     fn with_sim<T>(&mut self, f: impl FnOnce(&mut Sim) -> T) -> T {
-        self.io.with_sim(f).expect("a bstd::test's world is Io::sim's: simulated")
+        f(&mut self.sim.lock())
     }
 }
 
 /// The armed simulation cut the power at the effect just handed to it ([`Sim::cut_due`]): the
 /// world crashes and the calling task is unwound with an [`Exit`] payload, which a scope
 /// passes on, so the program's start ends here. Called by [`Io`]'s submit, its lock let go.
-pub(crate) fn power_lost(io: &Io) -> ! {
+///
+/// It returns only an error: the world's payload was out and there was no room for another.
+/// The machine is off all the same (nothing the program asks reaches it), and the submit
+/// that met the cut returns this to its caller.
+pub(crate) fn power_lost(io: &Io) -> Result<!, Stopped> {
     io.crash();
-    // alloc: once a cut, the unwind's payload.
-    resume_unwind(Box::new(Exit { status: KILLED }))
-}
-
-/// The name the test harness lists a test by: its module's path without the crate's name,
-/// then its own.
-fn listed(module: &str, test: &str) -> String {
-    match module.split_once("::") {
-        // alloc: a failure's name of the test.
-        Some((_, path)) => format!("{path}::{test}"),
-        None => test.to_string(),
-    }
+    let payload = io.exit_payload(KILLED)?;
+    resume_unwind(payload)
 }
 
 /// `program` under `seeds`, or under the seed or the count `given` in their place: what
 /// [`run`] runs, as a value. `package` is the test's package and `module` and `test` its path
 /// (`module_path!()` and the function's name), for what a failure says and the line that
-/// replays it.
+/// replays it. A seed whose world cannot be made fails, naming the seed and why.
 pub fn seeded<P, R>(
     package: &str,
     module: &str,
@@ -160,9 +194,8 @@ where
     P: Fn(&Cx, Io) -> R,
     R: Outcome,
 {
-    let listed = listed(module, test);
-    let name = Name { package, test: &listed };
-    seeds::run(seeds, given, name, |seed| Program { io: Io::sim(seed), program: &program })
+    let name = Name { package, module, test };
+    seeds::run(seeds, given, name, |seed| Program::of(seed, &program))
 }
 
 /// One seed of `program` under `seeds`: its verdict, its counts and its trace.
@@ -171,25 +204,40 @@ where
     P: Fn(&Cx, Io) -> R,
     R: Outcome,
 {
-    seeds::one(seed, &seeds, &mut |seed| Program { io: Io::sim(seed), program: &program })
+    seeds::one(seed, &seeds, &mut |seed| Program::of(seed, &program))
 }
 
+/// Why a `#[bstd::test]` failed, as the test harness prints a test's `Err`: the runner's
+/// report (its seed, its plan, the end of its trace, the line that replays it).
+pub struct Report(pub Failed);
+
+impl fmt::Debug for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bstd::test: {}", self.0)
+    }
+}
+
+impl core::error::Error for Report {}
+
 /// What `#[bstd::test]` expands to: `program` under `seeds`, or under what the person running
-/// the test gave in the environment ([`seeds::SEED_VAR`], [`seeds::SEEDS_VAR`]); a failure
-/// panics with its report, which the test harness prints.
-pub fn run<P, R>(package: &str, module: &str, test: &str, seeds: Seeds, program: P)
+/// the test gave in the environment ([`seeds::SEED_VAR`], [`seeds::SEEDS_VAR`]); a failure is
+/// its [`Report`], which the test returns and the test harness prints.
+pub fn run<P, R>(package: &str, module: &str, test: &str, seeds: Seeds, program: P) -> Result<(), Report>
 where
     P: Fn(&Cx, Io) -> R,
     R: Outcome,
 {
-    let failed = match Given::from_env() {
-        Ok(given) => match seeded(package, module, test, seeds, given, program) {
-            Ok(_) => return,
-            Err(failed) => failed,
-        },
-        Err(why) => Failed::Given(why),
-    };
-    panic!("bstd::test: {failed}");
+    let given = Given::from_env().map_err(|why| Report(Failed::Given(why)))?;
+    match seeded(package, module, test, seeds, given, program) {
+        Ok(_passed) => Ok(()),
+        Err(failed) => Err(Report(failed)),
+    }
 }
 
 /// The attribute of a simulation test (the module's doc): `#[bstd::test]` on a function
@@ -204,7 +252,7 @@ macro_rules! test {
     ) => {
         $(#[$meta])*
         #[::core::prelude::v1::test]
-        $vis fn $name() {
+        $vis fn $name() -> ::core::result::Result<(), $crate::test::Report> {
             fn $name($($params)*) $(-> $returns)? $body
             $crate::test::run(
                 ::core::env!("CARGO_PKG_NAME"),

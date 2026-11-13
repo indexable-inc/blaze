@@ -51,8 +51,7 @@ impl Addr {
     fn address(&self) -> Option<Address> {
         match self {
             Addr::Tcp(at) => at.socket_addr().map(Address::Tcp),
-            // clone: the socket's name, a refcount.
-            Addr::Unix(path) => Some(Address::Unix(path.name().clone())),
+            Addr::Unix(path) => Some(Address::Unix(path.to_name())),
         }
     }
 
@@ -78,10 +77,53 @@ pub const HOST_MOST: usize = 253;
 /// neither starting nor ending in `-`), an IPv4 address, or an IPv6 address in brackets; then
 /// a port from 1. Made by [`HostPort::new`], [`HostPort::parse`] or, for a literal,
 /// [`crate::host!`] as the crate compiles.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)] // clone: a refcount and a copy
-pub struct HostPort {
-    host: Arc<String>,
+#[derive(Clone)] // clone: a refcount or a pointer, and a copy
+pub struct HostPort(Held);
+
+/// How a [`HostPort`] is held: a literal's ([`crate::host!`]), checked as its crate compiled
+/// and kept as it is behind one pointer, or one made at run time. Two words either way.
+#[derive(Clone)] // clone: a refcount or a pointer, no allocation
+enum Held {
+    Literal(&'static Literal),
+    Made { host: Arc<String>, port: u16 },
+}
+
+const _: () = assert!(size_of::<HostPort>() == 2 * size_of::<usize>());
+
+/// A literal [`HostPort::literal`] checked: the one way to [`HostPort::of_literal`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Literal {
+    host: &'static str,
     port: u16,
+}
+
+// Equality, order and hash are the host's text and the port, whichever way the host is held.
+
+impl PartialEq for HostPort {
+    fn eq(&self, other: &HostPort) -> bool {
+        (self.host(), self.port()) == (other.host(), other.port())
+    }
+}
+
+impl Eq for HostPort {}
+
+impl core::hash::Hash for HostPort {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        (self.host(), self.port()).hash(state);
+    }
+}
+
+impl PartialOrd for HostPort {
+    fn partial_cmp(&self, other: &HostPort) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HostPort {
+    fn cmp(&self, other: &HostPort) -> core::cmp::Ordering {
+        (self.host(), self.port()).cmp(&(other.host(), other.port()))
+    }
 }
 
 /// What [`HostPort::new`] or [`HostPort::parse`] refused.
@@ -281,18 +323,6 @@ pub const fn refused(raw: &str) -> Option<HostPortWhy> {
     }
 }
 
-/// [`refused`], as a compile-time error: what [`crate::host!`] evaluates in a `const`, where a
-/// refused literal stops the crate's compilation saying why. It is for that `const` alone.
-#[doc(hidden)]
-pub const fn check_literal(raw: &str) {
-    let why = refused(raw);
-    let says = match why {
-        Some(why) => why.says(),
-        None => "",
-    };
-    assert!(why.is_none(), "{}", says);
-}
-
 /// The error of the host and port `given` (joined as `host:port`) refused for `why`.
 fn refuse(given: Excerpt, why: HostPortWhy) -> HostPortError {
     HostPortError { given, why }
@@ -351,28 +381,52 @@ impl HostPort {
         if let Some(why) = why {
             return Err(refuse(given_of(host, port), why));
         }
-        Ok(HostPort { host: kept(host, || given_of(host, port))?, port })
+        Ok(HostPort(Held::Made { host: kept(host, || given_of(host, port))?, port }))
     }
 
     /// `host:port`, checked: `api.stripe.com:443`, `127.0.0.1:8080`, `[::1]:443`.
     pub fn parse(raw: &str) -> Result<HostPort, HostPortError> {
         let (host, port) = parts(raw).map_err(|why| refuse(Excerpt::of(raw), why))?;
-        Ok(HostPort { host: kept(host, || Excerpt::of(raw))?, port })
+        Ok(HostPort(Held::Made { host: kept(host, || Excerpt::of(raw))?, port }))
+    }
+
+    /// [`HostPort::parse`]'s check of a literal, what [`crate::host!`] evaluates in a
+    /// `const`: the literal's host and port, or why it is none. The macro turns a refusal
+    /// into a compile error saying it.
+    #[doc(hidden)]
+    pub const fn literal(raw: &'static str) -> Result<Literal, &'static str> {
+        match parts(raw) {
+            Ok((host, port)) => Ok(Literal { host, port }),
+            Err(why) => Err(why.says()),
+        }
+    }
+
+    /// The host and port of a checked literal: it keeps the literal's own text, so it
+    /// allocates nothing.
+    #[doc(hidden)]
+    pub const fn of_literal(literal: &'static Literal) -> HostPort {
+        HostPort(Held::Literal(literal))
     }
 
     /// The host, an IPv6 address with its brackets.
     pub fn host(&self) -> &str {
-        self.host.as_str()
+        match &self.0 {
+            Held::Literal(literal) => literal.host,
+            Held::Made { host, .. } => host.as_str(),
+        }
     }
 
     pub fn port(&self) -> u16 {
-        self.port
+        match &self.0 {
+            Held::Literal(literal) => literal.port,
+            Held::Made { port, .. } => *port,
+        }
     }
 
     /// `host:port` as its `Display` writes it, as a std `String` on the global heap (for an
     /// interface that owns one, as blaze-http's h1 does its `Host`).
     pub(crate) fn joined(&self) -> Result<String, OutOfMemory> {
-        joined(self.host(), self.port)
+        joined(self.host(), self.port())
     }
 
     /// The socket address it names when its host is an IP address; `None` for a DNS name,
@@ -381,19 +435,19 @@ impl HostPort {
         let host = self.host();
         let host = host.strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(host);
         let ip: core::net::IpAddr = host.parse().ok()?;
-        Some(SocketAddr::new(ip, self.port))
+        Some(SocketAddr::new(ip, self.port()))
     }
 }
 
 impl fmt::Display for HostPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        write!(f, "{}:{}", self.host(), self.port())
     }
 }
 
 impl fmt::Debug for HostPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HostPort({}:{})", self.host, self.port)
+        write!(f, "HostPort({}:{})", self.host(), self.port())
     }
 }
 
@@ -406,14 +460,18 @@ impl TryFrom<&str> for HostPort {
 }
 
 /// A [`HostPort`] from a string literal, checked as the crate compiles:
-/// `host!("api.stripe.com:443")?`. A bad literal (`host!("a..b:443")`) is a compile error
-/// saying why. It is a `Result` all the same: keeping the host takes the global heap, which
-/// may have no room ([`HostPortWhy::OutOfMemory`]), the one error it can still be.
+/// `host!("api.stripe.com:443")`. A bad literal (`host!("a..b:443")`) is a compile error
+/// saying why. It is a [`HostPort`], not a `Result`: the check is done, and the value keeps
+/// the literal's own text, so it allocates nothing and nothing is left that could fail.
 #[macro_export]
 macro_rules! host {
     ($raw:literal) => {{
-        const _: () = $crate::net::check_literal($raw);
-        $crate::net::HostPort::parse($raw)
+        const LITERAL: $crate::net::Literal = match $crate::net::HostPort::literal($raw) {
+            Ok(literal) => literal,
+            Err(why) => panic!("{}", why),
+        };
+        const HOST: $crate::net::HostPort = $crate::net::HostPort::of_literal(&LITERAL);
+        HOST
     }};
 }
 
