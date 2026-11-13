@@ -227,11 +227,13 @@ fn group_of_is_the_first_group_without_aliases() {
 
 #[test]
 fn counts_are_rustcs() {
-    // 108 of the builtin passes and `foreign_modules`, 141 hardwired.
-    assert_eq!(lints().len(), 249);
+    // 107 of the builtin passes and `foreign_modules`, 148 hardwired, at the pinned nightly
+    // (rustc 1.101.0-nightly 16d1ffac1): `HardwiredLints`' list in
+    // `compiler/rustc_lint_defs/src/builtin.rs`.
+    assert_eq!(lints().len(), 255);
     assert_eq!(internal_lints().len(), 17);
     assert_eq!(internal_group().lints.len(), 16);
-    assert_eq!(unregistered().len(), 2);
+    assert_eq!(unregistered().len(), 3);
     let names: Vec<&str> = groups().iter().map(|it| it.name).collect();
     assert_eq!(
         names,
@@ -254,15 +256,17 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
         ]
     );
-    assert_eq!(group("unused").unwrap().lints.len(), 24);
+    // With `repeated_reprs`, since Rust 1.100.
+    assert_eq!(group("unused").unwrap().lints.len(), 25);
     // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
     assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
-    assert_eq!(removed().len(), 66);
+    // With `no_mangle_generic_items` (an error since 1.99) and
+    // `dependency_on_unit_never_type_fallback` (the never type's stabilization, 1.100).
+    assert_eq!(removed().len(), 68);
 }
 
 #[test]

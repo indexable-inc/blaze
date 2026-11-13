@@ -10,10 +10,7 @@ use edition::Edition::{Edition2018, Edition2021, Edition2024};
 use super::{
     Level::{Allow, Deny, Warn},
     Lint, ready,
-    Reason::{
-        Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
-        EditionSemanticsChange, FutureReleaseError,
-    },
+    Reason::{Custom, EditionError, EditionSemanticsChange, FutureReleaseError},
 };
 
 const fn l(name: &'static str, level: super::Level, desc: &'static str) -> Lint {
@@ -90,14 +87,18 @@ pub(super) const BUILTIN: &[Lint] = &[
     l(
         "dropping_references",
         Warn,
-        "calls to `std::mem::drop` with a reference instead of an owned value",
+        "calls to `drop` and `drop_in_place` where the dropped type is a reference instead of an owned value",
     ),
     l(
         "forgetting_references",
         Warn,
         "calls to `std::mem::forget` with a reference instead of an owned value",
     ),
-    l("dropping_copy_types", Warn, "calls to `std::mem::drop` with a value that implements Copy"),
+    l(
+        "dropping_copy_types",
+        Warn,
+        "calls to `drop` and `drop_in_place` where the dropped value implements Copy",
+    ),
     l(
         "forgetting_copy_types",
         Warn,
@@ -106,7 +107,7 @@ pub(super) const BUILTIN: &[Lint] = &[
     l(
         "undropped_manually_drops",
         Deny,
-        "calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of it's inner value",
+        "calls to `drop` and `drop_in_place` where the dropped value is `std::mem::ManuallyDrop`",
     ),
     l("improper_ctypes", Warn, "proper use of libc types in foreign modules"),
     l("improper_ctypes_definitions", Warn, "proper use of libc types in foreign item definitions"),
@@ -178,7 +179,6 @@ pub(super) const BUILTIN: &[Lint] = &[
         "variables, methods, functions, lifetime parameters and modules should have snake case names",
     ),
     l("no_mangle_const_items", Deny, "const items will not have their symbols exported"),
-    l("no_mangle_generic_items", Warn, "generic items must be mangled"),
     l("unreachable_pub", Allow, "`pub` items not reachable from crate root"),
     l("explicit_outlives_requirements", Allow, "outlives requirements can be inferred"),
     l(
@@ -339,7 +339,7 @@ pub(super) const BUILTIN: &[Lint] = &[
     // rustc_lint_defs::builtin::hardwired
     l(
         "aarch64_softfloat_neon",
-        Warn,
+        Deny,
         "detects code that could be affected by ABI issues on aarch64 softfloat targets",
     )
     .fcw_deps(FutureReleaseError(134375)),
@@ -349,6 +349,11 @@ pub(super) const BUILTIN: &[Lint] = &[
         "fully qualified paths that start with a module name instead of `crate`, `self`, or an extern crate name",
     )
     .fcw(EditionError(Edition2018, "path-changes")),
+    l(
+        "aligned_fields_in_packed",
+        Deny,
+        "`repr(C, align)` types nested inside `repr(C, packed)` types do not always have a C-compatible layout",
+    ),
     l("ambiguous_associated_items", Deny, "ambiguous associated items")
         .fcw(FutureReleaseError(57644)),
     l(
@@ -420,13 +425,6 @@ pub(super) const BUILTIN: &[Lint] = &[
         "detect public items in executable crates that are never used",
     )
     .crate_level(),
-    l(
-        "dependency_on_unit_never_type_fallback",
-        Deny,
-        "never type fallback affecting unsafe function calls",
-    )
-    .fcw_deps(EditionAndFutureReleaseError(Edition2024, "never-type-fallback"))
-    .external(),
     l("deprecated", Warn, "detects use of deprecated items").external(),
     l(
         "deprecated_in_future",
@@ -445,6 +443,12 @@ pub(super) const BUILTIN: &[Lint] = &[
         "duplicate features found in crate-level `#[feature]` directives",
     ),
     l("duplicate_macro_attributes", Warn, "duplicated attribute"),
+    l(
+        "duplicate_tools",
+        Deny,
+        "duplicate tools found in crate-level `#[register_tools]` directives",
+    )
+    .gate("register_tool", Some(66079)),
     l("elided_lifetimes_in_paths", Allow, "hidden lifetime parameters in types are deprecated"),
     l("explicit_builtin_cfgs_in_flags", Deny, "detects builtin cfgs set via the `--cfg`"),
     l(
@@ -484,6 +488,12 @@ pub(super) const BUILTIN: &[Lint] = &[
     .fcw_deps(FutureReleaseError(57571))
     .crate_level(),
     l("incomplete_include", Deny, "trailing content in included file"),
+    l(
+        "ineffective_unstable_reexports",
+        Deny,
+        "detects ineffective `#[unstable]` attributes on re-exports",
+    )
+    .gate("staged_api", None),
     l(
         "ineffective_unstable_trait_impl",
         Deny,
@@ -529,13 +539,15 @@ pub(super) const BUILTIN: &[Lint] = &[
         "linker_info",
         Allow,
         "linker warnings known to be informational-only and not indicative of a problem",
-    ),
+    )
+    .crate_level(),
     l(
         "linker_messages",
         Warn,
         "warnings emitted at runtime by the target-specific linker program",
     )
-    .ignore_deny_warnings(),
+    .ignore_deny_warnings()
+    .crate_level(),
     l("long_running_const_eval", Deny, "detects long const eval operations").external(),
     l(
         "macro_expanded_macro_exports_accessed_by_absolute_paths",
@@ -592,8 +604,6 @@ pub(super) const BUILTIN: &[Lint] = &[
         Deny,
         "never type fallback affecting unsafe function calls",
     )
-    .fcw_deps(EditionAndFutureReleaseSemanticsChange(Edition2024, "never-type-fallback"))
-    .edition(Edition2024, Deny)
     .external(),
     l(
         "non_contiguous_range_endpoints",
@@ -617,6 +627,13 @@ pub(super) const BUILTIN: &[Lint] = &[
         Warn,
         "detects range patterns with overlapping endpoints",
     ),
+    l(
+        "partial_stack_protector",
+        Warn,
+        "partial use of stack-protector that was previously accepted and used in practice",
+    )
+    .fcw(FutureReleaseError(154613))
+    .crate_level(),
     l(
         "patterns_in_fns_without_body",
         Deny,
@@ -664,6 +681,7 @@ pub(super) const BUILTIN: &[Lint] = &[
         "impl trait in impl method signature does not match trait method signature",
     ),
     l("renamed_and_removed_lints", Warn, "lints that have been renamed or removed"),
+    l("repeated_reprs", Warn, "detects repeated representations in `#[repr(..)]` attributes"),
     l(
         "repr_c_enums_larger_than_int",
         Warn,
@@ -699,7 +717,7 @@ pub(super) const BUILTIN: &[Lint] = &[
         Allow,
         "identifiers that will be parsed as a prefix in Rust 2021",
     )
-    .fcw(EditionError(Edition2021, "reserving-syntax"))
+    .fcw(EditionSemanticsChange(Edition2021, "reserving-syntax"))
     .crate_level(),
     l(
         "rust_2021_prelude_collisions",
@@ -743,7 +761,7 @@ pub(super) const BUILTIN: &[Lint] = &[
         Warn,
         "trailing semicolon in macro body used as expression",
     )
-    .fcw_deps(FutureReleaseError(79813)),
+    .fcw(FutureReleaseError(79813)),
     l(
         "shadowing_supertrait_items",
         Allow,
@@ -799,6 +817,12 @@ pub(super) const BUILTIN: &[Lint] = &[
     )
     .fcw(FutureReleaseError(124559)),
     l(
+        "unevaluated_default_field_value",
+        Warn,
+        "detects default field values on types that have const parameters",
+    )
+    .gate("default_field_values", Some(132162)),
+    l(
         "unexpected_cfgs",
         Warn,
         "detects unexpected names and values in `#[cfg]` conditions",
@@ -842,6 +866,8 @@ pub(super) const BUILTIN: &[Lint] = &[
     .fcw(EditionError(Edition2024, "unsafe-op-in-unsafe-fn"))
     .unexplained()
     .edition(Edition2024, Warn),
+    l("unstable_imports", Deny, "lints on accidentally allowed unstable imports")
+        .fcw_deps(FutureReleaseError(163160)),
     l(
         "unstable_name_collisions",
         Warn,
@@ -892,6 +918,12 @@ pub(super) const BUILTIN: &[Lint] = &[
     )
     .fcw_deps(FutureReleaseError(145544)),
     l("warnings", Warn, "mass-change the level for lints which produce warnings"),
+    l(
+        "x86_softfloat_sse",
+        Deny,
+        "detects code that could be affected by LLVM backend issues on x86 softfloat targets",
+    )
+    .fcw_deps(FutureReleaseError(117938)),
 ];
 
 /// The lints of the tool `blaze`, blaze's own, always registered: rustc has none of them. The
@@ -1148,6 +1180,12 @@ pub(super) const UNREGISTERED: &[Lint] = &[
         "use of unsupported calling convention for function pointer",
     )
     .fcw_deps(FutureReleaseError(130260)),
+    l(
+        "unsafe_panic_handlers",
+        Warn,
+        "detects unsafe functions with the `#[panic_handler]` attribute",
+    )
+    .fcw(FutureReleaseError(163263)),
 ];
 
 /// `register_internals`: the internal early pass's, then the internal late pass's.
