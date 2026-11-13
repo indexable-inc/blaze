@@ -345,22 +345,42 @@ mod tests {
         format!("{:032x}", hasher.finish().fingerprint().0)
     }
 
-    /// `test_data/tree_version` is the version and the digest of each file of the parser's
-    /// test data under it: a file whose trees changed under the same [`TREE_VERSION`] fails
-    /// here, as stored trees of the old parser would be read as this one's. Bumping the
-    /// version (or a new file) records the digests again; the first run records them.
+    /// The digest of `text` itself: a file of the test data that was edited (an inline test
+    /// added to `generated/runner.rs`) has new trees because it is new text, not because the
+    /// parser changed.
+    fn text_digest(text: &str) -> String {
+        let mut hasher = blaze_ids::Hasher::new("blaze v2 syntax tree version guard text 1");
+        hasher.part(text.as_bytes());
+        format!("{:032x}", hasher.finish().fingerprint().0)
+    }
+
+    /// `test_data/tree_version` is the version and, for each file of the parser's test data,
+    /// the digest of its text and of its trees under it: a file whose text is the same but
+    /// whose trees changed under the same [`TREE_VERSION`] fails here, as stored trees of the
+    /// old parser would be read as this one's. An edited file is no change of the parser: its
+    /// line is recorded again, as is every line after a bump (or a new file); the first run
+    /// records them.
     #[test]
     fn the_tree_version_names_the_trees_parsed() {
         let path = project_root().into_std_path_buf().join("crates/syntax/test_data/tree_version");
-        let digests: BTreeMap<String, String> =
-            par::map(corpus(), |(name, text)| (name, digest(&text))).into_iter().collect();
+        let digests: BTreeMap<String, (String, String)> =
+            par::map(corpus(), |(name, text)| (name, (text_digest(&text), digest(&text))))
+                .into_iter()
+                .collect();
         let stored = fs::read_to_string(&path).unwrap_or_default();
         let mut lines = stored.lines();
         if lines.next() == Some(TREE_VERSION.to_string().as_str()) {
             let changed: Vec<&str> = lines
-                .filter_map(|line| line.split_once(' '))
-                .filter(|(name, was)| digests.get(*name).is_some_and(|now| now != was))
-                .map(|(name, _)| name)
+                .filter_map(|line| {
+                    let mut fields = line.split(' ');
+                    Some((fields.next()?, fields.next()?, fields.next()?))
+                })
+                .filter(|(name, text, trees)| {
+                    digests.get(*name).is_some_and(|(now_text, now_trees)| {
+                        now_text == text && now_trees != trees
+                    })
+                })
+                .map(|(name, ..)| name)
                 .collect();
             assert!(
                 changed.is_empty(),
@@ -369,8 +389,8 @@ mod tests {
             );
         }
         let mut now = format!("{TREE_VERSION}\n");
-        for (name, digest) in &digests {
-            now.push_str(&format!("{name} {digest}\n"));
+        for (name, (text, trees)) in &digests {
+            now.push_str(&format!("{name} {text} {trees}\n"));
         }
         if now != stored {
             fs::write(&path, now).unwrap();

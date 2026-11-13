@@ -259,11 +259,25 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
             crate::raw::process::ended_within(pid, ENDING)
                 .context("waiting for the daemon that closed its pipe to end")?;
             let status = child.try_wait().context("asking how the daemon it started ended")?;
-            Err(match status.and_then(reaped) {
-                Some(ended) => DaemonError::Exited { socket, log, pid, phase, ended },
-                None => DaemonError::Closed { socket, log, pid, phase, inside },
+            match status.and_then(reaped) {
+                // Another command started a daemon of this home at the same time, and that one
+                // took the state and listens (`serve::Served`): this command is its client.
+                Some(Reaped::Code(code)) if code == blaze_core::exit::Exit::Served.code() => {
+                    let client = Client::unix(&socket)
+                        .map_err(|error| DaemonError::Connect { socket: socket.clone(), error })?;
+                    match this_build(client, &socket)? {
+                        Some(client) => Ok(Some(client)),
+                        None => anyhow::bail!(
+                            "the daemon another command started at {} at the same time as this one's (pid {pid}) \
+                             was another build of blaze, and was stopped: run this command again to start this \
+                             build's",
+                            socket.display()
+                        ),
+                    }
+                }
+                Some(ended) => Err(DaemonError::Exited { socket, log, pid, phase, ended }.into()),
+                None => Err(DaemonError::Closed { socket, log, pid, phase, inside }.into()),
             }
-            .into())
         }
         Heard::Nothing { phase, inside } => {
             Err(DaemonError::NotListening { socket, log, pid, phase, inside }.into())
@@ -2143,8 +2157,9 @@ mod refusals {
             )),
             "{text}"
         );
+        // The log's last line and the reading come before the recording, which ends the text.
         assert!(
-            text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside"),
+            text.contains("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside\nits flight recording"),
             "{text}"
         );
         let inside = blaze_profile::reading::Reading {

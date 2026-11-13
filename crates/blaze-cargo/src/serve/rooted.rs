@@ -138,9 +138,14 @@ mod tests {
                 continue;
             }
             named += 1;
+            // A name is there when the simulation holds it as a file, or it is one of the two
+            // directories (the simulation's directories are implied by their files, so
+            // `Sim::exists` says nothing of one). A file the failed place staged and then
+            // removed (`.app.<id>-<n>.placing`) is named in a directory that is there.
             let file = name(rest);
+            let there = |it: &FileName| sim.exists(it) || dirs.contains(it);
             assert!(
-                sim.exists(&file) || sim.exists(&dir_of(&file).unwrap()) || file == dirs[1] || file == dirs[0],
+                there(&file) || dir_of(&file).is_some_and(|dir| there(&dir)),
                 "`/{rest}` is named and is not there: {said}"
             );
         }

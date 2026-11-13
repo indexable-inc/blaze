@@ -13,8 +13,11 @@ use blaze_core::{
     sim::{Faults, Journal, Rng, Sim},
 };
 
-use super::{Watched, Watcher, cmp_below, is_below, reference};
-use crate::{Mode, Op, Plant, Vfs, disk::Disks, section::Section};
+use super::{
+    Watched, Watcher, cmp_below, is_below, reference,
+    view::{Caches, SIGNATURE, TAG_NAME, fixed_out, tag_of},
+};
+use crate::{MOST_FILE_BYTES, Mode, Op, Plant, Vfs, disk::Disks, section::Section, tree::ancestors};
 
 /// A watcher under test: today's, or the reference it is held to.
 trait Watch {
@@ -68,7 +71,7 @@ const STEADY: u64 = u64::MAX;
 
 impl Watch for Watcher {
     fn new(head: &str, dir: FileName, tags: u64) -> Self {
-        Watcher::new(head, dir, tags)
+        Watcher::new(head, dir, tags).expect("a watcher's looks in flight reserved")
     }
     fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
         Watcher::start(self, vfs, STEADY, effects)
@@ -671,7 +674,7 @@ fn a_cursor_is_saved_only_with_what_it_covers() {
 #[test]
 fn looks_in_flight_reuse_their_slots_without_allocating() {
     const N: usize = 4096;
-    let mut watcher = Watcher::new("disk", name("ws"), TAGS);
+    let mut watcher = Watcher::new("disk", name("ws"), TAGS).expect("its looks in flight reserved");
     let mut tags = Vec::with_capacity(N);
     for round in 0..2 {
         let mut ask_and_take = || {
@@ -1273,7 +1276,7 @@ fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_vers
 
     let mut driver = blaze_core::native(&root, 2).unwrap();
     let mut vfs = Vfs::recover(name("state/journal"), 0, &[]).0;
-    let mut watcher = Watcher::new("disk", name("ws"), TAGS);
+    let mut watcher = Watcher::new("disk", name("ws"), TAGS).expect("its looks in flight reserved");
     let mut effects = Vec::new();
     watcher.start(&vfs, wall_ns(), &mut effects);
     let read = |vfs: &Vfs| -> Option<Vec<u8>> {
@@ -1576,9 +1579,11 @@ fn conflict(run: &mut Run, rng: &mut Rng, what: &str) {
     run.finish_reads(&mut held);
 }
 
-/// A move looked at again: the disk writes one file and renames another; while the write's
-/// read is in flight another writer deletes the renamed file's source and the tree drops its
-/// bytes, so the move has no node to take and its target is looked at again.
+/// A move looked at again: the disk writes one file and renames another, told as one batch (a
+/// live journal tells each change apart, and a rename split over two batches is never paired,
+/// so the watch is stopped and the test tells it); while the write's read is in flight another
+/// writer deletes the renamed file's source and the tree drops its bytes, so the move has no
+/// node to take and its target is looked at again. Then blaze restarts, watching again.
 fn moved_from_nothing(run: &mut Run, rng: &mut Rng, what: &str) {
     const HELD: &str = "held.rs";
     let head = run.head();
@@ -1595,13 +1600,17 @@ fn moved_from_nothing(run: &mut Run, rng: &mut Rng, what: &str) {
     if run.disk.contains_key(&target) {
         return;
     }
+    run.watcher.stop(&mut run.effects);
+    run.pump();
     run.write(HELD, &format!("{what}: held"));
     run.rename(&source, &target);
+    run.tell(&[HELD, source.as_str(), target.as_str()]);
     let mut held = Vec::new();
     run.pump_holding_reads(&mut held);
     another_writer(run, &[Op::Delete { path: source }]);
     run.vfs.collect(&[]);
     run.finish_reads(&mut held);
+    run.restart(|_| {});
 }
 
 /// Another writer's commit to the head with the disk unchanged: an edit, an add or a delete of
@@ -1726,4 +1735,316 @@ fn the_oracle_catches_a_column_left_behind_by_another_writer() {
 #[test]
 fn the_oracle_catches_a_move_from_a_chosen_name() {
     assert!(caught(Plant::MoveFromChosen).is_some(), "no history caught a move from a chosen name");
+}
+
+/// The fixed names out of every view, and how a cache directory's names are told apart: its
+/// tag is a name of the view (how the directory leaves the set), what else is under it is not.
+#[test]
+fn the_build_dir_git_and_tagged_directories_are_out_of_the_view() {
+    assert!(fixed_out("target"));
+    assert!(fixed_out("target/debug/foo"));
+    assert!(fixed_out(".git/HEAD"));
+    assert!(fixed_out("vendor/x/.git/config"));
+    assert!(!fixed_out("src/target.rs"));
+    assert!(!fixed_out("targets/a.rs"));
+    assert!(!fixed_out("crates/target/src/lib.rs"));
+    assert!(!fixed_out(".cargo/config.toml"));
+    assert!(!fixed_out("src/.gitignore.rs"));
+    assert_eq!(tag_of("crates/harness/target/CACHEDIR.TAG"), Some("crates/harness/target"));
+    assert_eq!(tag_of("CACHEDIR.TAG"), None, "the watched directory is never pruned");
+    assert_eq!(tag_of("a/xCACHEDIR.TAG"), None);
+    assert_eq!(tag_of("a/CACHEDIR.TAG/b"), None);
+    let mut caches = Caches::default();
+    caches.insert("crates/harness/target");
+    assert!(caches.hides("crates/harness/target/debug/build/x/out/a.o"));
+    assert!(!caches.hides("crates/harness/target/CACHEDIR.TAG"));
+    assert!(!caches.hides("crates/harness/target"));
+    assert!(!caches.hides("crates/harness/targets/a.rs"));
+    assert!(!caches.hides("crates/harness/src/lib.rs"));
+    assert!(caches.remove("crates/harness/target"));
+    assert!(!caches.hides("crates/harness/target/debug/a"));
+}
+
+/// What cargo writes in every target directory, and two files of the same name that are no tag.
+const VALID_TAG: &str =
+    "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n";
+const WRONG_TAG: &str = "Signature: 0123456789abcdef0123456789abcdef\n# no tag\n";
+const SHORT_TAG: &str = "Signature: 8a477f";
+
+/// A checkout with a cache directory (`c`, a nested one under it), a directory whose tag has
+/// the wrong signature (`e`), the root's `target` and `.git`s, and a tag at the root (never a
+/// cache: the watched directory is never pruned).
+const CACHE_TREE: &[(&str, &str)] = &[
+    ("s/a.rs", "pub fn a() {}"),
+    ("c/CACHEDIR.TAG", VALID_TAG),
+    ("c/x", "x"),
+    ("c/d/y", "y"),
+    ("c/d/CACHEDIR.TAG", VALID_TAG),
+    ("e/CACHEDIR.TAG", WRONG_TAG),
+    ("e/w", "w"),
+    ("target/t", "t"),
+    (".git/HEAD", "ref: main"),
+    ("v/.git/config", "[core]"),
+    ("CACHEDIR.TAG", VALID_TAG),
+];
+
+/// Where [`cache_steps`] writes, deletes and renames: tags appearing, disappearing, rewritten
+/// with or without the signature, and made a directory (`c/CACHEDIR.TAG/z`), and files under
+/// them.
+const CACHE_PATHS: &[&str] = &[
+    "c/CACHEDIR.TAG",
+    "c/CACHEDIR.TAG/z",
+    "c/x",
+    "c/d/y",
+    "c/d/CACHEDIR.TAG",
+    "e/CACHEDIR.TAG",
+    "e/CACHEDIR.TAG/z",
+    "e/w",
+    "f/CACHEDIR.TAG",
+    "f/g",
+    "f/h/i",
+    "target/t",
+    ".git/x",
+    "s/a.rs",
+    "CACHEDIR.TAG",
+];
+
+/// Whether `dir` of `disk` is a cache directory: it holds a regular `CACHEDIR.TAG` that starts
+/// with the signature.
+fn cache_dir(disk: &BTreeMap<String, Vec<u8>>, dir: &str) -> bool {
+    disk.get(&format!("{dir}/{TAG_NAME}")).is_some_and(|it| it.starts_with(SIGNATURE))
+}
+
+/// What of `disk` is in the view: not under the root's `target` or a `.git`, and not under a
+/// cache directory (its tag included).
+fn in_view(disk: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    let out = |path: &str| fixed_out(path) || ancestors(path).any(|dir| cache_dir(disk, dir));
+    disk.iter().filter(|(path, _)| !out(path)).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Up to 6 random changes among [`CACHE_PATHS`] to a disk holding `disk`: a tag is written
+/// with the signature, the wrong one or too short; anything else with `mark`.
+fn cache_steps(rng: &mut Rng, disk: &BTreeMap<String, Vec<u8>>, mark: &str) -> Vec<Step> {
+    let clash = |disk: &BTreeMap<String, Vec<u8>>, path: &str| {
+        disk.keys().any(|k| is_below(path, k) || is_below(k, path))
+    };
+    let mut disk = disk.clone();
+    let mut steps = Vec::new();
+    for step in 0..1 + rng.below(6) {
+        let path = CACHE_PATHS[rng.below(CACHE_PATHS.len() as u64) as usize];
+        let there = disk.contains_key(path);
+        match rng.below(4) {
+            0 if there => {
+                disk.remove(path);
+                steps.push((0, path.to_owned(), String::new()));
+            }
+            1 if there => {
+                let Some(to) =
+                    CACHE_PATHS.iter().find(|it| !disk.contains_key(**it) && !clash(&disk, it))
+                else {
+                    continue;
+                };
+                let bytes = disk.remove(path).expect("there");
+                disk.insert((*to).to_owned(), bytes);
+                steps.push((1, path.to_owned(), (*to).to_owned()));
+            }
+            _ if !there && clash(&disk, path) => {}
+            _ => {
+                let bytes = match path.ends_with(TAG_NAME) {
+                    true => [VALID_TAG, WRONG_TAG, SHORT_TAG][rng.below(3) as usize].to_owned(),
+                    false => format!("{mark}:{step}"),
+                };
+                disk.insert(path.to_owned(), bytes.clone().into_bytes());
+                steps.push((3, path.to_owned(), bytes));
+            }
+        }
+    }
+    steps
+}
+
+/// The invariant of the view, after a round whose disk began as `before` and changed by
+/// `steps`: the head is what of the disk is in the view; a tag is only ever read for its
+/// signature; and nothing under the root's `target`, a `.git`, or a directory that was a cache
+/// before and after the round with its tag untouched is read, nor stamped but its tag (`log`
+/// is every effect the round asked for).
+fn view_holds<W: Watch>(
+    run: &Run<W>,
+    before: &BTreeMap<String, Vec<u8>>,
+    steps: &[Step],
+    what: &str,
+) -> Result<(), String> {
+    let want = in_view(&run.disk);
+    let head = run.head();
+    if head != want {
+        return Err(format!("{what}: the head {:?} is not the view {:?}", head.keys(), want.keys()));
+    }
+    if !run.watcher.idle() {
+        return Err(format!("{what}: not idle: {:?}", run.out));
+    }
+    let odd = run.out.iter().find(|it| {
+        !matches!(it, Watched::Committed(_) | Watched::Scanned | Watched::Lost { .. })
+    });
+    if let Some(odd) = odd {
+        return Err(format!("{what}: {odd:?}"));
+    }
+    let touched = |tag: &str| steps.iter().any(|(_, path, arg)| path == tag || arg == tag);
+    let stable = |dir: &str| {
+        cache_dir(before, dir)
+            && cache_dir(&run.disk, dir)
+            && !touched(&format!("{dir}/{TAG_NAME}"))
+    };
+    let rel = |name: &str| name.strip_prefix("ws/").unwrap_or("").to_owned();
+    for effect in &run.log {
+        match effect {
+            Effect::ReadAll { file, .. } | Effect::ReadLink { file, .. } => {
+                let path = rel(file.as_str());
+                if fixed_out(&path) || ancestors(&path).any(|dir| stable(dir)) {
+                    return Err(format!("{what}: {path} is out of the view and was read"));
+                }
+            }
+            Effect::Read { file, at, len, .. } => {
+                let path = rel(file.as_str());
+                if tag_of(&path).is_none() || *at != 0 || *len != SIGNATURE.len() {
+                    return Err(format!("{what}: {path} read at {at} for {len}: not a probe"));
+                }
+                if ancestors(&path).any(|dir| stable(dir) && tag_of(&path) != Some(dir)) {
+                    return Err(format!("{what}: {path} is under a cache and was probed"));
+                }
+            }
+            Effect::Stamp { files, .. } => {
+                for name in files.iter() {
+                    let path = rel(name);
+                    let under =
+                        ancestors(&path).any(|dir| stable(dir) && tag_of(&path) != Some(dir));
+                    if fixed_out(&path) || under {
+                        return Err(format!("{what}: {path} is out of the view and was stamped"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A history of `seed` on a disk watched by `kind`, today's watcher and the reference side by
+/// side: rounds of tags appearing, disappearing, rewritten with the wrong signature or made a
+/// directory, and files under them changing, live and across restarts, with a subtree lost or
+/// the journal reset. Both ask for the same effects and give the same outputs and heads, and
+/// today's holds [`view_holds`] after every round. The first breach.
+fn cache_history(seed: u64, kind: Journal) -> Result<(), String> {
+    let mut rng = Rng::new(seed ^ 0x6361_6368);
+    let mut new: Run = Run::with(seed, kind, CACHE_TREE);
+    let mut old: Run<reference::Watcher> = Run::with(seed, kind, CACHE_TREE);
+    let mut before = new.disk.clone();
+    let mut steps = Vec::new();
+    for round in 0..8 {
+        let what = format!("{kind:?} seed {seed} round {round}");
+        view_holds(&new, &before, &steps, &what)?;
+        if new.log != old.log {
+            return Err(format!("{what}: other effects than the reference's"));
+        }
+        if new.out != old.out {
+            return Err(format!("{what}: {:?} where the reference gave {:?}", new.out, old.out));
+        }
+        if new.vfs.head("disk") != old.vfs.head("disk") {
+            return Err(format!("{what}: another head than the reference's"));
+        }
+        (new.log.clear(), old.log.clear(), new.out.clear(), old.out.clear());
+        before = new.disk.clone();
+        steps = cache_steps(&mut rng, &new.disk, &what);
+        // With no journal a change is found by a look, not told live.
+        let how = match rng.below(4) {
+            0 if kind == Journal::None => 1,
+            how => how,
+        };
+        act(&mut new, &steps, how, kind);
+        act(&mut old, &steps, how, kind);
+    }
+    view_holds(&new, &before, &steps, &format!("{kind:?} seed {seed} at the end"))
+}
+
+/// The invariant: a directory holding a `CACHEDIR.TAG` with the spec's signature, at any depth
+/// but the root, is out of the view with everything under it, as are the root's `target` and
+/// every `.git`; a directory whose tag goes, loses its signature or becomes a directory comes
+/// back whole; nothing under a cache is stamped or read, and its tag is read for its 43 bytes
+/// alone. The reference held to the same rule effect for effect. Controls: a tag's signature
+/// unchecked, and tags ignored ([`Plant::TagUnchecked`], [`Plant::TagIgnored`]), are caught.
+#[test]
+fn a_cache_directory_is_out_of_the_view_and_comes_back_without_its_tag() {
+    for kind in KINDS {
+        for seed in 0..30 {
+            if let Err(error) = cache_history(seed, kind) {
+                panic!("{error}");
+            }
+        }
+    }
+}
+
+/// The first breach of the view's invariant with `plant` in the code.
+fn cache_caught(plant: Plant) -> Option<String> {
+    crate::PLANT.set(plant);
+    let caught = KINDS
+        .into_iter()
+        .find_map(|kind| (0..4).find_map(|seed| cache_history(seed, kind).err()));
+    crate::PLANT.set(Plant::None);
+    caught
+}
+
+/// The control of the signature: any `CACHEDIR.TAG` taken as a tag prunes `e`, whose tag has
+/// the wrong signature, and the head misses what is in view under it.
+#[test]
+fn the_oracle_catches_a_tag_whose_signature_is_unchecked() {
+    assert!(cache_caught(Plant::TagUnchecked).is_some(), "no history caught an unchecked tag");
+}
+
+/// The control of the rule itself: tags ignored, a cache directory's files are read and taken
+/// into the head.
+#[test]
+fn the_oracle_catches_tags_ignored() {
+    assert!(cache_caught(Plant::TagIgnored).is_some(), "no history caught tags ignored");
+}
+
+/// A file one byte past what a file of the tree may hold (its length faked by the simulation,
+/// never allocated), told with an edit beside it: it is named with its size and the bound,
+/// never read, and dropped from the head (which had it small); the edit commits; nothing panics.
+#[test]
+fn a_file_over_the_bound_is_named_never_read_and_its_batch_commits() {
+    let big = MOST_FILE_BYTES + 1;
+    let mut run: Run = transcript(5, &[(MAIN, OLD), ("big.bin", "small")]);
+    // The start read `big.bin` while it was small; only reads from here on count.
+    run.reads.clear();
+    run.sim.grow(&ws("big.bin"), big);
+    run.write(MAIN, NEW);
+    run.tell(&["big.bin", MAIN]);
+    run.pump();
+    assert!(!run.reads.iter().any(|it| it == "big.bin"), "{:?}", run.reads);
+    let named = Watched::TooLarge { path: "big.bin".into(), size: big, most: MOST_FILE_BYTES };
+    assert!(run.out.contains(&named), "{:?}", run.out);
+    assert!(run.out.iter().any(|it| matches!(it, Watched::Committed(_))), "{:?}", run.out);
+    let head = run.head();
+    assert_eq!(head[MAIN], NEW.as_bytes());
+    assert!(!head.contains_key("big.bin"));
+    assert!(run.watcher.idle());
+    // Told again, unchanged: named again, still never read.
+    run.out.clear();
+    run.tell(&["big.bin"]);
+    run.pump();
+    assert!(!run.reads.iter().any(|it| it == "big.bin"), "{:?}", run.reads);
+    assert!(run.out.contains(&named), "{:?}", run.out);
+}
+
+/// The control of the bound: a file over it is read whole. The read is held, never done (it
+/// would allocate the 4 GiB the bound is there to refuse).
+#[test]
+fn the_oracle_catches_a_file_over_the_bound_read() {
+    let mut run: Run = transcript(5, &[(MAIN, OLD)]);
+    run.sim.grow(&ws("big.bin"), MOST_FILE_BYTES + 1);
+    crate::PLANT.set(Plant::TooLargeRead);
+    run.tell(&["big.bin"]);
+    let mut held = Vec::new();
+    run.pump_holding_reads(&mut held);
+    crate::PLANT.set(Plant::None);
+    let read = |it: &Effect| matches!(it, Effect::ReadAll { file, .. } if *file == ws("big.bin"));
+    assert!(held.iter().any(read), "the planted read was not asked for: {held:?}");
 }

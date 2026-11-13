@@ -71,13 +71,132 @@ const PATH_BYTES: usize = 64 * MOST as usize;
 /// oldest go, and a caller asking from before them is told no.
 pub const CHANGES_KEPT: usize = 4096;
 
-/// The changes heard, by path, oldest first ([`Dirs::only_since`]).
+/// The most bytes of the kept changes' paths together: 256 a path at [`CHANGES_KEPT`], address
+/// space committed as it fills. Past it the oldest go as past [`CHANGES_KEPT`]. A path longer
+/// than all of it is kept as a change with no path, which no caller sets aside.
+const CHANGE_BYTES: usize = 256 * CHANGES_KEPT;
+
+/// A change kept: its generation, and where its path's bytes are in [`Changes::bytes`].
+#[derive(Clone, Copy)]
+struct Heard {
+    generation: u64,
+    at: u32,
+    len: u32,
+    /// Whether it names a path: not for one that names nothing a caller could set aside (a
+    /// lost report, a directory replaced, a watch that stopped vouching).
+    named: bool,
+}
+
+/// The changes heard, by path, oldest first ([`Dirs::only_since`]): two rings over regions
+/// reserved once, so a change heard allocates nothing. Each path's bytes are contiguous in
+/// `bytes`, written from `end` onward, or from 0 once they would run past [`CHANGE_BYTES`]; a
+/// path goes in only where no kept path is, the oldest let go of until there is room.
 struct Changes {
     /// The generation of the newest change let go of: what is kept is every change after it.
     from: u64,
-    /// Each change's generation and path; no path for one that names nothing a caller could
-    /// set aside (a lost report, a directory replaced, a watch that stopped vouching).
-    heard: std::collections::VecDeque<(u64, Option<PathBuf>)>,
+    /// At most [`CHANGES_KEPT`], the oldest at `first`, `count` of them.
+    heard: RegionVec<Heard>,
+    first: usize,
+    count: usize,
+    /// How many of the kept are named.
+    named: usize,
+    bytes: RegionVec<u8>,
+    /// Where the next path's bytes go.
+    end: usize,
+    /// How many of the named kept were written before the bytes last went back to 0: while
+    /// any is, they are the oldest named, from where the oldest is to where it went back, and
+    /// the newer are from 0 to `end`.
+    before_wrap: usize,
+}
+
+impl Changes {
+    fn new(tag: blaze_mem::Tag) -> Result<Changes, MemError> {
+        Ok(Changes {
+            from: 0,
+            heard: RegionVec::new(CHANGES_KEPT, tag)?,
+            first: 0,
+            count: 0,
+            named: 0,
+            bytes: RegionVec::new(CHANGE_BYTES, tag)?,
+            end: 0,
+            before_wrap: 0,
+        })
+    }
+
+    /// Each kept change, oldest first, with its path's bytes if it names one.
+    fn kept(&self) -> impl Iterator<Item = (u64, Option<&[u8]>)> {
+        (0..self.count).map(move |at| {
+            let it = self.heard[(self.first + at) % CHANGES_KEPT];
+            let at = it.at as usize;
+            (it.generation, it.named.then(|| &self.bytes[at..at + it.len as usize]))
+        })
+    }
+
+    /// The oldest kept let go of.
+    fn let_go(&mut self) {
+        let gone = self.heard[self.first];
+        self.first = (self.first + 1) % CHANGES_KEPT;
+        self.count -= 1;
+        self.from = self.from.max(gone.generation);
+        if gone.named {
+            self.named -= 1;
+            self.before_wrap = self.before_wrap.saturating_sub(1);
+        }
+    }
+
+    /// Where the oldest named path's bytes begin.
+    fn oldest_at(&self) -> usize {
+        (0..self.count)
+            .map(|at| self.heard[(self.first + at) % CHANGES_KEPT])
+            .find(|it| it.named)
+            .map_or(self.end, |it| it.at as usize)
+    }
+
+    /// A change heard at `generation` kept, by `path` if it names one: the oldest go while
+    /// there is no room.
+    fn hear(&mut self, generation: u64, path: Option<&[u8]>) {
+        if self.count == CHANGES_KEPT {
+            self.let_go();
+        }
+        let path = path.filter(|it| it.len() <= CHANGE_BYTES);
+        let mut heard = Heard { generation, at: 0, len: 0, named: false };
+        if let Some(path) = path {
+            let len = path.len();
+            let at = loop {
+                if self.named == 0 {
+                    self.end = 0;
+                    self.before_wrap = 0;
+                }
+                if self.before_wrap == 0 {
+                    // The named kept are from the oldest's start to `end`: after `end` is free.
+                    if self.end + len <= CHANGE_BYTES {
+                        break self.end;
+                    }
+                    self.before_wrap = self.named;
+                    self.end = 0;
+                } else if self.end + len <= self.oldest_at() {
+                    // Between `end` and the oldest's start is free.
+                    break self.end;
+                } else {
+                    self.let_go();
+                }
+            };
+            let have = self.bytes.len();
+            // `at` is never past what was written: `end` is the end of the last path written.
+            let inside = (have - at).min(len);
+            self.bytes[at..at + inside].copy_from_slice(&path[..inside]);
+            self.bytes.extend_from_slice(&path[inside..]);
+            self.end = at + len;
+            self.named += 1;
+            heard = Heard { generation, at: at as u32, len: len as u32, named: true };
+        }
+        let next = (self.first + self.count) % CHANGES_KEPT;
+        match next < self.heard.len() {
+            true => self.heard[next] = heard,
+            false => _ = self.heard.push(heard),
+        }
+        self.count += 1;
+    }
 }
 
 /// A directory watched: its two generations, the directory wanted later that covers it, and
@@ -325,11 +444,7 @@ impl Dirs {
             paths: AppendVec::new(PATH_BYTES, tag)?,
             places: AppendVec::new(PLACES, tag)?,
             adding: Lock::new("vfs.outside.adding", ()),
-            changes: Lock::new(
-                "vfs.outside.changes",
-                // alloc: none until the first change heard
-                Changes { from: 0, heard: std::collections::VecDeque::new() },
-            ),
+            changes: Lock::new("vfs.outside.changes", Changes::new(tag)?),
             names: Lock::new(
                 "vfs.outside.names",
                 blaze_hash::HashMap::new_in(std::alloc::Global),
@@ -459,7 +574,7 @@ impl Dirs {
                 hit = true;
             }
             if hit {
-                self.hear(generation, Some(path.clone())); // clone: a path a change heard, kept
+                self.hear(generation, Some(path.as_os_str().as_encoded_bytes()));
             }
             hit |= before;
         }
@@ -716,15 +831,10 @@ impl Dirs {
         self.hot.settled.store(settled, Ordering::Release);
     }
 
-    /// A change heard at `generation` kept by `path`; `None` for one no caller can set aside.
-    fn hear(&self, generation: u64, path: Option<PathBuf>) {
-        let mut changes = self.changes.lock();
-        if changes.heard.len() == CHANGES_KEPT
-            && let Some((gone, _)) = changes.heard.pop_front()
-        {
-            changes.from = changes.from.max(gone);
-        }
-        changes.heard.push_back((generation, path)); // alloc: grows to `CHANGES_KEPT`, then is used again
+    /// A change heard at `generation` kept by `path`'s bytes; `None` for one no caller can set
+    /// aside.
+    fn hear(&self, generation: u64, path: Option<&[u8]>) {
+        self.changes.lock().hear(generation, path);
     }
 
     /// Whether everything heard under any watched directory since `generation` was read is a
@@ -742,9 +852,10 @@ impl Dirs {
         }
         let changes = self.changes.lock();
         changes.from <= generation
-            && changes.heard.iter().filter(|(heard, _)| *heard > generation).all(|(_, path)| {
-                path.as_deref().is_some_and(&mut aside)
-            })
+            && changes
+                .kept()
+                .filter(|(heard, _)| *heard > generation)
+                .all(|(_, path)| path.is_some_and(|it| aside(as_path(it))))
     }
 
     /// Whether a directory at or above `path` has been watched without a break since before

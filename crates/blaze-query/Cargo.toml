@@ -24,6 +24,8 @@ blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-query-macros.workspace = true
 blaze-reclaim.workspace = true
+# `say!`: a refusal's message, its code typed.
+blaze-report.workspace = true
 blaze-serde.workspace = true
 blaze-vfs.workspace = true
 crossbeam-queue.workspace = true

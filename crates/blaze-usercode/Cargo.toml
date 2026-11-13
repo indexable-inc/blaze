@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 aho-corasick.workspace = true
+base-db.workspace = true
 blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true

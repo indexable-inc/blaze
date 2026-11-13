@@ -844,25 +844,22 @@ mod tests {
         an_inlined_function(n)
     }
 
-    /// The address `return_address`'s call returns to, read from its frame record (frame
-    /// pointers are kept: blaze's samplers walk them).
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[inline(never)]
-    fn return_address() -> u64 {
-        let fp: u64;
-        // SAFETY: reads the frame pointer register into a local; no memory touched.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags))
-        };
-        // SAFETY: as above.
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
-        };
-        // SAFETY: this function's frame record, which its prologue wrote at `fp`: the caller's
-        // frame pointer, then the return address.
-        unsafe { (fp as *const u64).add(1).read() }
+    /// The address its call returns to, read on entry, before any prologue: the link register
+    /// (aarch64) or the word at the stack pointer (x86_64). Naked, so no frame record is
+    /// assumed: a leaf function need not write one (aarch64-apple-darwin keeps frame records
+    /// for non-leaf functions alone), and `x29` read in one is its caller's record, whose
+    /// return address is in the test, not in `a_caller_of_it`.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    extern "C" fn return_address() -> u64 {
+        std::arch::naked_asm!("mov x0, x30", "ret")
+    }
+
+    /// As the aarch64 one: the return address is the word at the stack pointer on entry.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    extern "C" fn return_address() -> u64 {
+        std::arch::naked_asm!("mov rax, qword ptr [rsp]", "ret")
     }
 
     /// A return address names the functions it is in, by name with no offset: the inlined one

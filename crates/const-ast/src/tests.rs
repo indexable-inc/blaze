@@ -697,7 +697,7 @@ fn kinds_are_the_grammars() {
         let number = kind as u16;
         // A kind is a token's when it is before `ABI` or has a fixed text: the grammar numbers
         // a few contextual keywords after its nodes.
-        let token = if number < first_node || !kind.text().is_empty() { " | TOKEN" } else { "" };
+        let token = if number < first_node || kind.fixed_text().is_some() { " | TOKEN" } else { "" };
         let want = format!("pub(crate) const {name}: u16 = {number}{token};");
         if line != want {
             wrong.push(format!("{line}  (the grammar's: {want})"));
@@ -901,7 +901,7 @@ fn a_splice_is_one_element_naming_the_input() {
 fn kinds_not_public(kinds_rs: &str, names: &[&str]) -> Vec<String> {
     let nodes: Vec<String> = (SyntaxKind::ABI as u16..SyntaxKind::__LAST as u16)
         .map(SyntaxKind::from)
-        .filter(|it| it.text().is_empty())
+        .filter(|it| it.fixed_text().is_none())
         .map(|it| format!("{it:?}"))
         .collect();
     let in_file: Vec<&str> = kinds_rs

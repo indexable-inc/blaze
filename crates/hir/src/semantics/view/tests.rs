@@ -649,6 +649,12 @@ fn main() {
 /// [`an_enum_that_maps_to_no_def_is_named_not_walked_past`] is of the `macro_rules!` shape:
 /// under the planted bug the first `select!`'s `enum Out`, which the proc macro declares, maps
 /// to no def, and asking for the scope of its `_0` stops naming the enum.
+///
+/// The expansions are found before the bug is planted, by a `Semantics` of their own: under
+/// it the first `select!`'s proc-macro call is looked up in the other expansion's module, so
+/// the first expansion is never found from the syntax and none of its nodes would be asked.
+/// The planted `Semantics` reads each file's tree from the file's ID, not through the map
+/// under test, and its own maps are made with the bug in.
 #[test]
 #[should_panic(expected = "maps to no def")]
 fn planted_blocks_of_any_file_stop_at_the_enum_a_proc_macro_declares() {
@@ -656,9 +662,15 @@ fn planted_blocks_of_any_file_stop_at_the_enum_a_proc_macro_declares() {
     let file_id = fx.only_file();
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
+        let files: Vec<HirFileId> = {
+            let vsema = Semantics::new(&db);
+            roots(&vsema, file_id).into_iter().map(|(file, _)| file).collect()
+        };
+        assert_eq!(files.len(), 5, "main.rs, two `select!` and two proc-macro calls: {files:?}");
         let _planted = BlocksOfAnyFile::planted();
         let vsema = Semantics::new(&db);
-        for (_, root) in roots(&vsema, file_id) {
+        for file in files {
+            let root = vsema.parse_or_expand(file);
             for ty in root.descendants().filter_map(view::PathType::cast) {
                 let _ = vsema.scope(ty.syntax());
             }
@@ -699,6 +711,60 @@ fn main() {
             );
         }
         assert_eq!(asked, 4, "the two `u8` of each removed function");
+    });
+}
+
+/// The invariant: an item written in a block of a type (an anonymous constant of a signature:
+/// an array's length, a const argument; of a function, a type alias, a struct's field, an
+/// impl's header) maps to the def made from it, as one in a body's block does, and a node in it
+/// is read in its own scope, never in the one around the type. The signature's store has
+/// blocks of its own, which the map of the signature lists as a body's lists its blocks.
+#[test]
+fn an_item_in_a_block_of_a_type_maps_to_its_def() {
+    let fx = fixture::db(
+        r#"
+//- /main.rs crate:main
+pub struct A<const N: usize>;
+pub trait Tr {}
+fn ret() -> [u8; { fn in_return() -> usize { 1 } in_return() }] { loop {} }
+fn param(_: A<{ fn in_param<T>(_: T) -> usize { 1 } 1 }>) {}
+type Alias = [u8; { fn in_alias() {} 1 }];
+pub struct Field { a: [u8; { fn in_field() {} 1 }] }
+impl Tr for A<{ fn in_impl() {} 1 }> {}
+"#,
+    );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let vsema = Semantics::new(&db);
+        let root = vsema.parse(file_id).syntax();
+        let mut fns = 0u32;
+        for node in root.descendants().filter_map(view::Fn::cast) {
+            fns += 1;
+            let def = vsema.to_fn_def(node).unwrap_or_else(|| {
+                panic!("`fn` at {:?} maps to its def", node.syntax().text_range())
+            });
+            let source = vsema.source(def).expect("the function's source");
+            assert_eq!(
+                source.value.syntax().text_range(),
+                node.syntax().text_range(),
+                "the `fn` at {:?} maps to the function made from it",
+                node.syntax().text_range()
+            );
+        }
+        assert_eq!(fns, 7, "`ret`, `param` and the five in blocks of types");
+        let t = root
+            .descendants()
+            .filter_map(view::PathType::cast)
+            .find(|it| it.syntax().text() == "T")
+            .expect("`T` of `in_param`");
+        assert!(
+            matches!(
+                vsema.resolve_path(t.path().expect("a path type has a path")),
+                Some(crate::PathResolution::TypeParam(_))
+            ),
+            "`T` in `in_param` is its own parameter"
+        );
     });
 }
 

@@ -73,6 +73,14 @@ pub use crate::{
 };
 
 pub const FILE_DOMAIN: &str = "blaze v2 vfs file 1";
+
+/// The most bytes one file of the tree holds: the VFS journal's file record carries its
+/// payload's length in 32 bits. A commit of a longer file is refused by name
+/// ([`OpError::TooLarge`]), and the watcher refuses one before it reads it
+/// ([`watch::Watched::TooLarge`]), so no record is ever framed over it. Lifted once a file is
+/// recorded by its content ID and its bytes stream to the store
+/// (docs/v2/plan/design/lazy-file-ids.md).
+pub const MOST_FILE_BYTES: u64 = u32::MAX as u64;
 pub const DIR_DOMAIN: &str = "blaze v2 vfs directory 2";
 
 /// What kind of file an entry is, as git's tree says: hashed into the directory's entry with
@@ -183,6 +191,12 @@ pub enum OpError {
         section: u32,
         group: u32,
     },
+    /// The file at `path` would be `size` bytes, more than `most` ([`MOST_FILE_BYTES`]).
+    TooLarge {
+        path: String,
+        size: u64,
+        most: u64,
+    },
 }
 
 impl fmt::Display for OpError {
@@ -203,6 +217,10 @@ impl fmt::Display for OpError {
             OpError::Corrupt { section, group } => {
                 write!(f, "page group {group} of image section {section:#x} is corrupt")
             }
+            OpError::TooLarge { path, size, most } => write!(
+                f,
+                "{path} is {size} bytes, over the {most} one file of the tree may hold"
+            ),
         }
     }
 }
@@ -253,7 +271,33 @@ pub enum CommitError {
         path: String,
     },
     Op(OpError),
+    /// The journal could not record the commit: the head did not move.
+    Record(RecordTooLarge),
 }
+
+/// The most bytes of one journal record's payload: the record carries its length in 32 bits.
+pub const MOST_RECORD_BYTES: u64 = u32::MAX as u64;
+
+/// A journal record refused for a payload of `len` bytes, over [`MOST_RECORD_BYTES`]: nothing of
+/// it is written. `what` names what it records (a directory by its content ID and its count of
+/// entries, a head by its name).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RecordTooLarge {
+    pub what: String,
+    pub len: u64,
+}
+
+impl fmt::Display for RecordTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the journal's record of {} is {} bytes, over the {MOST_RECORD_BYTES} a record's 32-bit length holds (blaze-vfs MOST_RECORD_BYTES)",
+            self.what, self.len
+        )
+    }
+}
+
+impl std::error::Error for RecordTooLarge {}
 
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -261,6 +305,7 @@ impl fmt::Display for CommitError {
             CommitError::UnknownBase(root) => write!(f, "no root {root} is known"),
             CommitError::Conflict { path } => write!(f, "{path} changed since the base"),
             CommitError::Op(error) => fmt::Display::fmt(error, f),
+            CommitError::Record(error) => fmt::Display::fmt(error, f),
         }
     }
 }
@@ -326,7 +371,7 @@ impl Column<'_> {
     }
 }
 
-/// A mark [`Vfs::mark`] refused: more than [`MARK_MOST`] bytes.
+/// A mark [`Vfs::mark`] refused: its bytes, or its name, more than [`MARK_MOST`] bytes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MarkTooLarge {
     pub name: String,
@@ -335,10 +380,11 @@ pub struct MarkTooLarge {
 
 impl fmt::Display for MarkTooLarge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = blaze_report::say!("the mark ", blaze_report::say::Code(&self.name)).flat();
         write!(
             f,
-            "the mark `{}` is {} bytes, over the {MARK_MOST} a mark holds (blaze-vfs MARK_MOST)",
-            self.name, self.len
+            "{name} (its bytes or its name) is {} bytes, over the {MARK_MOST} a mark holds (blaze-vfs MARK_MOST)",
+            self.len
         )
     }
 }
@@ -361,9 +407,11 @@ impl Vfs {
     /// already `bytes` records nothing, its ticket given with the next batch. Refused, naming
     /// it, over [`MARK_MOST`] bytes.
     pub fn mark(&mut self, name: &str, bytes: &[u8]) -> Result<Ticket, MarkTooLarge> {
-        if bytes.len() > MARK_MOST {
+        // Its name too, so a mark's record is always under a journal record's bound.
+        let len = bytes.len().max(name.len());
+        if len > MARK_MOST {
             // alloc: once per refusal, the name it is about.
-            return Err(MarkTooLarge { name: name.to_owned(), len: bytes.len() });
+            return Err(MarkTooLarge { name: name.to_owned(), len });
         }
         if self.marks.get(name).unwrap_or_default() == bytes {
             return Ok(self.journal.ticket());
@@ -546,10 +594,7 @@ impl Vfs {
         } else {
             disk.root = None;
         }
-        // alloc: per such commit, the record's payload.
-        let mut seen = Vec::new();
-        disk::encode_seen(&mut seen, head, disk, count, &entries);
-        self.journal.record_seen(&seen);
+        self.journal.record_seen(head, disk, count, &entries);
     }
 
     fn move_head<'o>(
@@ -561,13 +606,14 @@ impl Vfs {
     ) -> Result<Commit, CommitError> {
         let root = self.tree.apply_all(at, ops)?;
         self.tree.reclaim();
+        // Recorded first: a head the journal refuses does not move.
+        let ticket = self.journal.record_head(&self.tree, head, root).map_err(CommitError::Record)?;
         match self.heads.get_mut(head) {
             Some(node) => *node = root,
             None => {
                 self.heads.insert(head.into(), root);
             }
         }
-        let ticket = self.journal.record_head(&self.tree, head, root);
         Ok(Commit { root: self.tree.id(root), rebased, ticket })
     }
 
@@ -575,8 +621,8 @@ impl Vfs {
     pub fn set_head(&mut self, head: &str, root: ContentId) -> Result<Ticket, CommitError> {
         let node = self.root(root).ok_or(CommitError::UnknownBase(root))?;
         let from = self.heads.get(head).copied().unwrap_or(self.tree.empty());
+        let ticket = self.journal.record_head(&self.tree, head, node).map_err(CommitError::Record)?;
         self.heads.insert(head.into(), node);
-        let ticket = self.journal.record_head(&self.tree, head, node);
         self.rechain(head, from);
         Ok(ticket)
     }
@@ -799,6 +845,13 @@ pub(crate) enum Plant {
     /// A file renamed from a name the head chose other bytes for (or the column vouches no
     /// root) is taken as a move of the head's bytes, not read, as before 2026-11-12.
     MoveFromChosen,
+    /// Any `CACHEDIR.TAG` prunes its directory, its signature unchecked.
+    TagUnchecked,
+    /// No `CACHEDIR.TAG` prunes its directory: what is under a cache directory is read, as
+    /// before 2026-11-13.
+    TagIgnored,
+    /// A file over [`MOST_FILE_BYTES`] is read, as before 2026-11-13.
+    TooLargeRead,
 }
 
 #[cfg(test)]

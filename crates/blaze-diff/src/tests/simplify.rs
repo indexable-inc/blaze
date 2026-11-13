@@ -411,13 +411,15 @@ fn the_exact_rewrites_simplify_what_they_say() {
     let f = graph.unary(Op::Sin, two);
     let out = simplify(&graph, &[a, b, c, d, e, f], &Options::default());
     let g = &out.graph;
-    let [a, b, c, d, e, f] = out.roots[..] else { panic!("six roots") };
-    assert_eq!(g.as_var(a), Some(0));
-    assert_eq!(g.node(b).op, Op::Add);
-    assert_eq!(g.node(c).op, Op::Sub);
-    assert_eq!((g.node(d).op, g.as_var(g.node(d).args[0])), (Op::Neg, Some(0)));
-    assert_eq!(g.as_const(e), Some(6.0));
-    assert_eq!(g.node(f).op, Op::Sin);
+    // The roots in `out.graph`, named apart from the input's: `b` and `c` are simplified again
+    // below, from `graph`, which only the input's ids index.
+    let [a_out, b_out, c_out, d_out, e_out, f_out] = out.roots[..] else { panic!("six roots") };
+    assert_eq!(g.as_var(a_out), Some(0));
+    assert_eq!(g.node(b_out).op, Op::Add);
+    assert_eq!(g.node(c_out).op, Op::Sub);
+    assert_eq!((g.node(d_out).op, g.as_var(g.node(d_out).args[0])), (Op::Neg, Some(0)));
+    assert_eq!(g.as_const(e_out), Some(6.0));
+    assert_eq!(g.node(f_out).op, Op::Sin);
     for name in ["mul-one", "add-minus-zero", "neg-neg", "mul-minus-one"] {
         assert!(out.ran.contains(&name), "`{name}` did not run: {:?}", out.ran);
     }

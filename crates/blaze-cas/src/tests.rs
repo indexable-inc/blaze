@@ -68,12 +68,37 @@ fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) -> Vec<Tic
     durable
 }
 
+/// How many opens in a row [`open_with`] lets the clone probe stop on an injected failure
+/// before it says the store never opens.
+const PROBE_OPENS_MOST: u32 = 64;
+
+/// The store at `config`, opened. The clone probe is one attempt ([`Store::ask_shares`]): an
+/// injected failure in it stops that open, as it stops a daemon, which is started again; so
+/// a store stopped there, and only there, is opened again, up to [`PROBE_OPENS_MOST`] times.
 fn open_with(sim: &mut Sim, config: Config) -> Store {
-    let mut effects = Vec::new();
-    let mut store = Store::open(config, &mut effects);
-    drive(sim, &mut store, &mut effects);
-    assert!(store.ready(), "{:?}", store.broken());
-    store
+    for _ in 0..PROBE_OPENS_MOST {
+        let mut effects = Vec::new();
+        let again = Config {
+            // clone: the config, kept for an open the probe stopped; a test's, once an open
+            dir: config.dir.clone(),
+            layers: config.layers.clone(),
+            tags: config.tags,
+            load_tags: config.load_tags,
+            loader: config.loader.clone(),
+        };
+        let mut store = Store::open(again, &mut effects);
+        drive(sim, &mut store, &mut effects);
+        let probe_failed = store.broken().is_some_and(|it| {
+            it.what.starts_with("trying one clone in the store's directory")
+                && it.what.ends_with("injected by the simulation")
+        });
+        if probe_failed {
+            continue;
+        }
+        assert!(store.ready(), "{:?}", store.broken());
+        return store;
+    }
+    panic!("the clone probe met an injected failure in {PROBE_OPENS_MOST} opens in a row")
 }
 
 fn open(sim: &mut Sim, dir: &str) -> Store {
@@ -2320,6 +2345,10 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
                 Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
             }
             Effect::RenameUnsynced { to: onto, .. } if *onto == to => Some("rename".to_owned()),
+            // The staged clone's look, whose stamp the place answers (`tests::place_copy`).
+            Effect::Stamp { files, .. } if files.iter().any(|it| it.ends_with(".placing")) => {
+                Some("look".to_owned())
+            }
             _ => None,
         };
         let mut log: Vec<(String, Option<String>)> =
@@ -2342,20 +2371,22 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
     // No file at the path yet: prewarmed all the same (of nothing), and placed.
     store.starts(&name("target/app"), true);
     let first = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "look", "rename"]);
     assert_eq!(sim.contents(&name("target/app")), big);
-    // Over the file there: the prewarm is asked as the clone completed, the rename as the
-    // prewarm did.
+    // Over the file there: the prewarm is asked as the clone completed, the staged clone's
+    // look as the prewarm did, and the rename as the look did (since 2026-11-12 a place
+    // answers the stamp its clone has: `tests::place_copy`).
     let again = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "look", "rename"]);
     assert_eq!(again[1].1.as_deref(), Some("Cloned"), "{again:?}");
     assert!(again[2].1.as_deref().is_some_and(|it| it.starts_with("Prewarmed")), "{again:?}");
+    assert!(again[3].1.as_deref().is_some_and(|it| it.starts_with("Stamped")), "{again:?}");
     // The control: a path nothing is started from, and the same path once it is said so.
     let other = placed_logged(&mut sim, &mut store, "target/app.debug");
-    assert_eq!(asked(&other), ["clone", "rename"]);
+    assert_eq!(asked(&other), ["clone", "look", "rename"]);
     store.starts(&name("target/app"), false);
     let unstarted = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&unstarted), ["clone", "rename"]);
+    assert_eq!(asked(&unstarted), ["clone", "look", "rename"]);
 }
 
 /// The first places of an output are its bytes written where they go, while the store's own
@@ -2400,8 +2431,9 @@ fn an_output_is_written_where_it_goes_first_and_cloned_once_its_file_is_written_
     assert_eq!(sim.contents(&name("three/build/a")), out);
     assert_eq!(sim.mode(&name("three/build/a")), Some(0o644), "a clone is a written file's mode");
     assert_eq!((own(sim.bytes_written(), &store) - wrote, sim.bytes_forced()), (0, 0));
-    // Each path placed again from another value: the whole file stays while a path names it
-    // and goes with the last; the value stays, and placing it again writes it again.
+    // Each path placed again from another value: the whole file stays while a path names it.
+    // Synced, it is its value's one home (`home`), so once the last path lets go it goes with
+    // its record, forgotten between builds, never alone; put again, placing it writes it again.
     store.put(key(9), Kind::Output, b"another value").unwrap();
     flush(&mut sim, &mut store);
     for to in ["one/build/a", "two/build/a"] {
@@ -2409,7 +2441,11 @@ fn an_output_is_written_where_it_goes_first_and_cloned_once_its_file_is_written_
         assert!(sim.exists(&file), "three/build/a still names it after {to}");
     }
     assert_eq!(place_key(&mut sim, &mut store, key(9), "three/build/a").result, Ok(()));
-    assert!(!sim.exists(&file), "no path names it");
+    assert!(sim.exists(&file), "key 1's home: it goes with its record, never alone");
+    assert_eq!(forgets_due(&mut sim, &mut store).forgotten, vec![key(1)], "no path names it");
+    assert!(!sim.exists(&file), "no path names it, and its record is forgotten");
+    store.put(key(1), Kind::Output, &out).unwrap();
+    flush(&mut sim, &mut store);
     let again = store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
@@ -2571,7 +2607,8 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
 /// A whole file of the store an earlier run left that is not what its name says (other
 /// bytes, or another length): the place that would clone it is refused, naming the file,
 /// what it holds and the command that repairs it; the file is left as it is and nothing is
-/// placed another way (rule no-fallback).
+/// placed another way (rule no-fallback). The repair forgets the record the file was the one
+/// home of ([`Store::forget_corrupt`]), and the build after makes it again.
 #[test]
 fn a_placed_file_with_other_bytes_refuses_its_place_naming_the_repair() {
     for (seed, shorter) in [(14, false), (15, true)] {
@@ -2594,8 +2631,19 @@ fn a_placed_file_with_other_bytes_refuses_its_place_naming_the_repair() {
         assert_eq!(sim.contents(&file), other, "the file is left as it was found");
         assert!(!sim.exists(&name("two/build/a")), "nothing was placed another way");
         assert!(store.problems().iter().any(|it| it.contains(said)), "{:?}", store.problems());
-        // What `blaze store verify` does: the wrong file removed. The next place writes it.
-        sim.delete(&file);
+        // What `blaze store verify` does (`cli::cache`): the file was its value's one home
+        // (`home`), so the record whose bytes it held is forgotten, never left naming bytes
+        // that are gone; then the wrong file, if the forget's head has not taken it, removed.
+        let forgot = store.forget_corrupt();
+        assert_eq!(forgot.forgotten, vec![key(1)], "{forgot:?}");
+        flush(&mut sim, &mut store);
+        assert!(bytes_of(&store, &key(1)).is_none(), "the record is forgotten");
+        if sim.exists(&file) {
+            sim.delete(&file);
+        }
+        // The next build makes the output again, and its place writes the file.
+        store.put(key(1), Kind::Output, &out).unwrap();
+        flush(&mut sim, &mut store);
         let placed = place_one(&mut sim, &mut store, "two/build/a");
         assert_eq!(placed.result, Ok(()));
         assert_eq!(placed.bytes.written, out.len() as u64, "written again");
@@ -2645,8 +2693,8 @@ fn a_placed_file_swapped_for_a_symbolic_link_refuses_its_place_and_is_never_clon
 }
 
 /// The invariant: a whole file a place in flight clones is not removed when the path that
-/// named it is placed from another value meanwhile, and one is removed once no path names it,
-/// whatever key of its bytes each path was placed from.
+/// named it is placed from another value meanwhile, and one is removed once no path names it
+/// and its records are forgotten, whatever key of its bytes each path was placed from.
 #[test]
 fn a_placed_file_stays_while_a_place_or_a_path_names_it_and_goes_with_the_last() {
     let mut sim = Sim::new(17, quiet());
@@ -2669,7 +2717,11 @@ fn a_placed_file_stays_while_a_place_or_a_path_names_it_and_goes_with_the_last()
     assert_eq!(place_key(&mut sim, &mut store, key(9), "two/build/a").result, Ok(()));
     assert!(sim.exists(&file), "three/build/a, placed from another key of its bytes, names it");
     assert_eq!(place_key(&mut sim, &mut store, key(9), "three/build/a").result, Ok(()));
-    assert!(!sim.exists(&file), "no path names it");
+    // The home of its keys' records (`home`): it goes with them, forgotten between builds.
+    assert!(sim.exists(&file), "a home goes with its records, never alone");
+    let forgot = forgets_due(&mut sim, &mut store);
+    assert!(forgot.forgotten.contains(&key(1)), "no path names it: {forgot:?}");
+    assert!(!sim.exists(&file), "no path names it, and its records are forgotten");
 }
 
 #[test]
@@ -2715,9 +2767,17 @@ fn a_place_while_the_open_looks_through_placed_waits_for_the_look_and_is_not_swe
 #[test]
 fn a_placed_directory_that_cannot_be_looked_through_breaks_the_store() {
     let mut sim = Sim::new(20, quiet());
-    let (store, _, file) = placed_once(&mut sim, 200);
+    let (mut store, out, file) = placed_once(&mut sim, 200);
+    // Its whole file is key 1's home (`home`), which the head names: forgotten, so `placed/`
+    // holds nothing of the store's own, and put again into a pack.
+    store.put(key(9), Kind::Output, b"another value").unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(place_key(&mut sim, &mut store, key(9), "one/build/a").result, Ok(()));
+    assert_eq!(forgets_due(&mut sim, &mut store).forgotten, vec![key(1)]);
+    assert!(!sim.exists(&file), "a forgotten home goes");
+    store.put(key(1), Kind::Output, &out).unwrap();
+    flush(&mut sim, &mut store);
     drop(store);
-    sim.delete(&file);
     sim.change(&name("store/placed"), b"not a directory");
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
@@ -2785,7 +2845,8 @@ fn a_look_through_placed_that_keeps_failing_breaks_the_store_naming_it() {
 
 /// Pins L1 of round 4: a place answered while the open's look through `placed/` runs lets go
 /// of nothing until the look has read the listing and ends, so no Remove there races the
-/// listing; the file it let go of goes then.
+/// listing. The file it let go of is its value's home (`home`), synced before the open, so it
+/// goes with its record, never by its path alone: still there once the look ends.
 #[test]
 fn a_place_answered_while_the_open_looks_through_placed_removes_nothing_until_the_look_ends() {
     let mut sim = Sim::new(24, quiet());
@@ -2811,7 +2872,7 @@ fn a_place_answered_while_the_open_looks_through_placed_removes_nothing_until_th
     sim.release_lists();
     drive(&mut sim, &mut store, &mut effects);
     assert!(store.broken().is_none(), "{:?}", store.broken());
-    assert!(!sim.exists(&kept), "the file the place let go of goes once the look ends");
+    assert!(sim.exists(&kept), "a home goes with its record, never by its path alone");
 }
 
 /// Pins L3 of round 4 (and C2 of review 4): a place held for the open's look is refused, naming
@@ -3502,6 +3563,8 @@ fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack()
     let last = bytes.len() - 1;
     bytes[last] = 1;
     sim.change(&pack, &bytes);
+    // Its checks fixed up too, so the block checks pass it and the pack's own check meets it.
+    recheck(&mut sim, &pack);
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);
@@ -4231,6 +4294,8 @@ fn a_pack_whose_header_names_another_unit_stops_the_store() {
     let mut bytes = sim.contents(&pack);
     bytes[8] = 0;
     sim.change(&pack, &bytes);
+    // Its checks fixed up too, so the block checks pass it and the pack's own check meets it.
+    recheck(&mut sim, &pack);
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);

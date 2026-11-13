@@ -61,11 +61,14 @@ pub(crate) const EXIT_AFTER: Duration = Duration::from_secs(600);
 /// answers alone from then on.
 pub(crate) const EXIT_UNWORKED: Duration = BUDGET_AFTER;
 
-/// Whether a daemon idle for `idle_for` exits now: no launcher is connected to it
-/// (`launchers`), nothing it holds is undurable (`undurable`: a save, an image's place, a slot
-/// being written), and it has waited [`EXIT_AFTER`] where it `worked` (built something or took
-/// a save since its start) or [`EXIT_UNWORKED`] where not. A plain function of what the loop
-/// knows: the loop asks it where it makes its idle looks and exits through `Daemon::stop`.
+/// Whether a daemon idle for `idle_for` exits now: no client or launcher is connected to it
+/// (`launchers`, the connections open at the API's socket and the launchers': a daemon never
+/// hangs up on a connected client, a live feed's or a waiting script's, for being idle),
+/// nothing it holds is undurable (`undurable`: a save, an image's place, a slot being written),
+/// and it has waited [`EXIT_AFTER`] where it `worked` (built something or took a save since its
+/// start) or [`EXIT_UNWORKED`] where not. A plain function of what the loop knows: the loop asks
+/// it where it makes its idle looks and exits through `Daemon::stop`. A daemon started to exit
+/// once nothing holds it decides that apart ([`super::unheld`]).
 pub(crate) fn exit_due(idle_for: Duration, worked: bool, launchers: usize, undurable: bool) -> bool {
     launchers == 0 && !undurable && idle_for >= if worked { EXIT_AFTER } else { EXIT_UNWORKED }
 }

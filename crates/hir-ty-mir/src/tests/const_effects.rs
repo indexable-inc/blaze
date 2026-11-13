@@ -195,11 +195,14 @@ through_pointer: fn pointer call
 /// With blaze's `#![feature(blaze_comptime)]` a call through a function pointer or of a `dyn`
 /// method is checked when it is evaluated, and a `const static { .. }` block not at all: none of
 /// them is a non-const call here. The same calls of a direct callee are still refused.
+/// `dispatch_from_dyn`: without its lang items a `&self` method is not dispatchable, so `Tr`
+/// would not be dyn-compatible and `t.m()` no vtable call (as in
+/// `tests/mir/const_check.rs`'s `comptime_defers_fn_pointer_and_dyn_calls_to_evaluation`).
 #[test]
 fn comptime_defers_dispatch_and_skips_const_static_blocks() {
     check(
         r#"
-//- minicore: fn
+//- minicore: fn, dispatch_from_dyn
 #![feature(blaze_comptime)]
 trait Tr { fn m(&self) -> u8; }
 fn helper() -> u8 { 3 }

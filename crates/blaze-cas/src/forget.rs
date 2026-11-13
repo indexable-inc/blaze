@@ -104,7 +104,7 @@ impl Store {
     }
 
     fn forget_one(&mut self, key: &Key) -> Outcome {
-        if self.place_keys.values().any(|it| it == key) {
+        if self.names.holds(key) {
             return Outcome::Kept("a path is placed from it");
         }
         if self.naming.values().any(|it| it.key == Some(*key)) {
@@ -113,6 +113,71 @@ impl Store {
         if !self.collecting.unrooted(key, self.shared.kept_changes()) {
             return Outcome::Kept("a pin, a set, a record that names it or a reader's keep roots it");
         }
+        self.forget_record(key)
+    }
+
+    /// `blaze store verify`'s repair, with no daemon on the store: every own record whose
+    /// bytes are not what it records ([`Store::verify`]) forgotten now, whatever roots it,
+    /// since no root is served by bytes that are wrong. A placed output whose whole file is
+    /// its one home ([`crate::home`]) and was changed outside the daemon (or by a disk that
+    /// damages files) is such a record: its file was its only copy, so the record is
+    /// forgotten rather than left naming bytes that are gone, and the next build makes the
+    /// output again. Its file goes with the head that lists it removed, as a forget's does.
+    /// In memory at once; on disk with the next head ([`Store::flush`]). The corrupt values
+    /// that are no record of this store's (an index, a dictionary, a layer's) are kept, with
+    /// why; `waiting` counts those still in a writer's segment, which are not queued.
+    pub fn forget_corrupt(&mut self) -> Forgot {
+        self.tidy();
+        let mut out = Forgot::default();
+        if self.broken.is_some() || !self.tiers[0].opened {
+            return out;
+        }
+        let nothing = Key(blaze_ids::ContentId::default());
+        for corrupt in self.verify(None) {
+            if corrupt.key == nothing || out.forgotten.contains(&corrupt.key) {
+                continue;
+            }
+            // The file of its own its bytes were read from, if any: no record may read it again.
+            let external = {
+                let look = self.look();
+                match look.find(&corrupt.key) {
+                    Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
+                        look.record(found, &corrupt.key).ok().map(|(header, _)| header.content)
+                    }
+                    _ => None,
+                }
+            };
+            match self.forget_record(&corrupt.key) {
+                Outcome::Forgotten => {
+                    out.forgotten.push(corrupt.key);
+                    // Dropped whatever count of keys the store has of it (one opened has none
+                    // yet, `External::keys`): a put of the same content after this must write
+                    // its bytes again, never take back a file whose bytes are wrong (until
+                    // 2026-11-13 it took the dropped file back, mapping and all). The head
+                    // after lists it removed, and the file goes with it.
+                    if let Some(content) = external
+                        && let Some(it) = self.tiers[0].externals.get_mut(&content)
+                        && it.committed
+                    {
+                        it.keys = 0;
+                        it.dropped = true;
+                    }
+                }
+                Outcome::Kept(why) => out.kept.push((corrupt.key, why)),
+                Outcome::Waits => out.waiting += 1,
+            }
+        }
+        if !out.forgotten.is_empty() {
+            self.forgot = true;
+            self.publish_view();
+        }
+        out
+    }
+
+    /// The record under `key` forgotten alone, its pack kept (the module's second point): what
+    /// [`Store::forget_due`] does to a record no root names, and [`Store::forget_corrupt`] to
+    /// one whose bytes are wrong.
+    fn forget_record(&mut self, key: &Key) -> Outcome {
         let look = self.look();
         let found = match look.find(key) {
             None => return Outcome::Kept("the store holds nothing of it"),

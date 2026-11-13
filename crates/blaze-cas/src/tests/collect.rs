@@ -290,6 +290,13 @@ impl World {
         if self.build.is_some() {
             return Ok(());
         }
+        // An index swap's flags of use are carried over first, as the daemon's worker does:
+        // while a carry waits no scan of the pins is given (`Store::pins_take`), so no mark
+        // holds and every forget would wait.
+        if let Some(mut carry) = self.store.carry_take() {
+            carry.run();
+            self.store.carry_put(carry);
+        }
         if self.scan.is_none()
             && let Some(mut scan) = self.store.pins_take()
         {

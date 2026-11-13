@@ -6,16 +6,19 @@
 //! ([`Form::External`], no bytes stored, the head listing the file as placed,
 //! [`disk::ExternalRef::placed`]), and the pack's copy is dead bytes the collector gives back.
 //!
-//! - **Durable first.** The file is written with no sync ([`blaze_core::Effect::WriteUnsynced`]),
-//!   its write-back is no barrier, and the rename that names it is not made durable, so a crash
-//!   may leave any part of it. Nothing names it as a home before an [`Effect::Sync`] of it and
-//!   an [`Effect::SyncDir`] of `placed/` have both answered ([`Store::home_synced`]); then it is
-//!   mapped, and only then are records moved to it, so a reader of a moved record always finds
-//!   its mapping ([`Store::home_due`]). A crash before the commit that writes the moved records
-//!   leaves the pack's copy, which the old head names; after it, the file, synced before.
+//! - **Durable first.** The file is written with no sync under its writing name, cloned from
+//!   there once written back, and given its content's name only once a sync of it completed
+//!   ([`Store::name_staged`]), by a rename that is not made durable: a crash leaves the name
+//!   holding the content, or no name. Nothing names it as a home before the file's sync and
+//!   an [`Effect::SyncDir`] of `placed/` after its rename have both answered
+//!   ([`Store::home_synced`]); then it is mapped, and only then are records moved to it, so a
+//!   reader of a moved record always finds its mapping ([`Store::home_due`]). A crash before
+//!   the commit that writes the moved records leaves the pack's copy, which the old head
+//!   names; after it, the file, synced before.
 //! - **Off the answer's path.** A place answers as it does without this (its bytes written
-//!   where they go, or the file cloned); the two syncs are asked only once the file is there
-//!   and written back ([`crate::PlacedFile::There`]), and the records move on a later
+//!   where they go, or the file cloned); the syncs are asked only once the file is there under
+//!   its name ([`crate::PlacedFile::There`]) and no place made of it is in flight, and the
+//!   records move on a later
 //!   completion. No answer waits for a sync: the span `placed file made its value's home`
 //!   says what the syncs, the mapping and the move took, apart from every request.
 //! - **The record goes by the forget, never the file alone.** A home is not let go when no path
@@ -114,10 +117,19 @@ impl Store {
         }
     }
 
-    /// The whole file of `content` is there and written back: the syncs that make it durable
-    /// are asked, where a home of it is wanted and none is begun. Nothing waits for them.
+    /// The whole file of `content` is there under its content's name: the syncs that make it
+    /// durable are asked, where a home of it is wanted and none is begun, once no place made
+    /// of it is in flight, so no answer comes after a sync asked for its file (asked again as
+    /// each such place ends, [`Store::names_step`]). Nothing waits for them. Both are asked
+    /// though the file's bytes were synced before it was named ([`Store::name_staged`]): the
+    /// rename was not, and a name is durable only once the file under it and its directory
+    /// are synced (until 2026-11-13 the file's was skipped, and a crash after the head could
+    /// undo the rename, leaving the head naming a file not there).
     pub(crate) fn home_ready(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
-        if !self.home_file_there(&content) {
+        if !self.home_file_there(&content)
+            || self.staged_files.contains(&content)
+            || self.names.in_flight(&content) > 0
+        {
             return;
         }
         let Some(homing) = self.homing.get_mut(&content) else { return };
@@ -134,6 +146,11 @@ impl Store {
             return self.ask_home_map(content, round, effects);
         }
         homing.step = Step::Syncing { round, left: 2, failed: None, span };
+        // The file under its content's name, after the rename that gave it (its bytes were
+        // synced before, [`Store::name_staged`], so this writes no data): with the sync of
+        // `placed/`, what makes the name durable. The rename was asked with no sync, so until
+        // both answered a crash may leave the file under its writing name and the content's
+        // name absent, never present with other bytes; a head names it only after.
         let file = self.placed_file(&content);
         let tag = self.tags.ask(Op::HomeSynced { content, round });
         // durable: the file becomes the one home of its value's bytes, which a head will name

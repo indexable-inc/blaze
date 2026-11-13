@@ -74,6 +74,14 @@ exits! {
     /// tag, and what each thread was inside, then ended it rather than let it take the machine
     /// down.
     MemoryCeiling = 77, "MEMORY_CEILING", "its footprint passed its memory ceiling";
+    /// The daemon was started to exit once nothing holds it (`BLAZE_DAEMON_EXIT_UNHELD`,
+    /// `serve::unheld`), and no client or launcher connection was open for its grace: it
+    /// stopped itself as `blaze stop` stops it, its image written.
+    Unheld = 78, "UNHELD", "no connection held it for its grace, and it stopped itself, its image written";
+    /// A daemon started while another held its state found that one listening at its socket
+    /// (two commands started one at once): it started none over it, and the command that
+    /// started it connects to the one listening (`serve::hold`, `cli::daemon::connect`).
+    Served = 79, "SERVED", "another daemon of its state listens at its socket, so it started none";
     /// A build or test failed, or the CLI met an error of its own: cargo's code for both.
     Failed = 101, "FAILED", "a build or test failed, or blaze met an error of its own";
     /// A sandbox launcher could not make the sandbox, so the program it was given did not run:

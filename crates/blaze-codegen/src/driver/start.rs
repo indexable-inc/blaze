@@ -197,8 +197,11 @@ impl<B: Prepare> Build<'_, B> {
         store: &L,
     ) -> Result<Start<FrontInstance<B>, FrontStatic<B>>, Vec<CodegenError>> {
         // alloc: an error's name of the entry
-        self.launched_only(&format!("the start of the program whose entry is `{entry}`"))
-            .map_err(|why| vec![why])?;
+        let what = blaze_report::say!(
+            "the start of the program whose entry is ",
+            blaze_report::say::Code(entry)
+        );
+        self.launched_only(&what.flat()).map_err(|why| vec![why])?;
         let counts = kept::Counts::default();
         // alloc: none unless the start fails
         let mut errors = Vec::new();
@@ -288,7 +291,8 @@ impl<B: Prepare> Build<'_, B> {
         let Some(entry_node) = entry_node else {
             let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
             // alloc: an error
-            errors.push(error(none.0, none.1, format!("the build defines no `{entry}`: it is no program")));
+            let what = blaze_report::say!("the build defines no ", blaze_report::say::Code(entry), ": it is no program");
+            errors.push(error(none.0, none.1, what.flat()));
             return None;
         };
         let entry_key = entry_node.unit.instance.key();

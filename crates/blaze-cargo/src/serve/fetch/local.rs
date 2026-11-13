@@ -6,7 +6,7 @@
 //! covers its files. Called on an IO thread of the plane ([`crate::serve::work::Steps::local`]).
 //!
 //! A directory is read whole, its root `target/` and every `.git` left out as a checkout's view
-//! leaves them ([`crate::serve::heads::excluded`]), and its canonical path is watched outside
+//! leaves them ([`blaze_vfs::watch::fixed_out`]), and its canonical path is watched outside
 //! views ([`blaze_vfs::outside::want`]): the job reads it again before a later build unless the
 //! watch vouches nothing under it changed since it was read. One file, or a path that is not
 //! there, is read again by every job.
@@ -19,7 +19,6 @@ use blaze_api::ApiError;
 use blaze_vfs::Mode;
 
 use super::git::{is_executable, read_tree};
-use crate::serve::heads::excluded;
 use crate::serve::work::{LocalRead, Source, SourceFile};
 
 /// The most files one local mount holds: a directory with more is refused naming it, never
@@ -102,7 +101,7 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
             // vouches only for what the watch heard from before the read on.
             blaze_vfs::outside::want(&canonical);
             let generation = blaze_vfs::outside::generation();
-            let files = read_tree(path, excluded)
+            let files = read_tree(path, blaze_vfs::watch::fixed_out)
                 .map_err(|error| failed(format!("reading the directory `{at}`, outside the view, that the load reads: {error:#}")))?;
             if files.len() > MOST_FILES {
                 return Err(failed(format!(

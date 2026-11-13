@@ -148,6 +148,10 @@ pub struct Files {
     /// directory), with the generation read before it listed.
     listings: blaze_core::lock::Lock<blaze_hash::HashMap<PathBuf, Listed, std::alloc::Global>>,
     dirs: &'static Dirs,
+    /// The wall clock a stamp is judged racy against ([`Stamp::racy`]): [`wall_ns`], or a
+    /// test's own ([`Files::with_clock`]), so a file just written is not racy to a test that
+    /// says its clock is past the racy window.
+    clock: fn() -> i128,
 }
 
 thread_local! {
@@ -335,7 +339,14 @@ impl Files {
                 blaze_hash::HashMap::new_in(std::alloc::Global),
             ),
             dirs,
+            clock: wall_ns,
         }
+    }
+
+    /// The same table judging stamps against `clock` in place of the wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_clock(self, clock: fn() -> i128) -> Files {
+        Files { clock, ..self }
     }
 
     /// The one table of the process.
@@ -457,7 +468,7 @@ impl Files {
         let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
         let settled = after == Some(stamp);
         // Kept only under a stamp no later write can share ([`Stamp::racy`]).
-        if settled && !stamp.racy(wall_ns()) {
+        if settled && !stamp.racy((self.clock)()) {
             self.stamped.intern(key, || hash);
         }
         Ok((Some(hash), settled))
@@ -571,7 +582,7 @@ impl Files {
         // A file changed while it was read is hashed again at its next check.
         // And kept only under a stamp no later write can share ([`Stamp::racy`]).
         if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp)
-            && !stamp.racy(wall_ns())
+            && !stamp.racy((self.clock)())
         {
             self.stamped.intern(key, || id.0);
         }
@@ -1086,7 +1097,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a");
         std::fs::write(&path, b"one").unwrap();
-        let files = Files::new();
+        // A clock past the racy window of the writes here, so each hash is kept under its
+        // stamp ([`Stamp::racy`], which `a_stamp_a_later_write_can_share_is_not_kept` tests).
+        let files = Files::new().with_clock(|| wall_ns() + 10 * RACY_NS);
         let (one, two) = (Env::new(vec![("X".into(), "1".into())]), Env::default());
         let hashes: Vec<_> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)

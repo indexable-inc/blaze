@@ -148,8 +148,9 @@ fn value<'a>(words: &mut std::slice::Iter<'a, &'a str>) -> Result<&'a str, Strin
     words.next().copied().ok_or_else(|| USAGE_TEXT.to_owned())
 }
 
-/// This home's store, opened here: no daemon is on the home ([`asked`] looked).
-fn opened() -> Result<blaze_cas::Driven, String> {
+/// This home's store, opened here: no daemon is on the home ([`asked`] looked; `blaze store
+/// verify`'s caller too, `cli::cache`).
+pub(super) fn opened() -> Result<blaze_cas::Driven, String> {
     let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     // Pages are loaded as they are read, within the pool's budget: a store is not read
     // whole into memory to export a pin of it.
@@ -193,21 +194,27 @@ fn export(words: &[&str], records: &mut impl Records) -> Result<String, String> 
     let scope = packs::scope()?;
     let places = packs::home_places()?;
     let done = stored::export(records, pin, &scope, &out, seed.as_ref(), all, raw, &|bytes| places.tied(bytes))?;
-    Ok(format!(
-        "exported {} as pin `{pin}` for {scope}: pack {}, {} records, {} bytes, {} head, under {}{}\n",
+    Ok(blaze_report::say!(
+        "exported ",
         if all { "every record that may travel" } else { "the store's pin" },
-        done.pack,
-        done.records,
-        done.bytes,
-        if done.signed { "a signed" } else { "an unsigned" },
-        out.display(),
-        match (done.absent, done.held) {
-            (0, 0) => String::new(),
-            (absent, held) => format!(
-                "; not in the pack: {absent} keys the pin names with no record in the store, {held} records that hold a directory of this machine"
-            ),
-        }
-    ))
+        " as pin ",
+        blaze_report::say::Code(pin),
+        blaze_report::say::Words(&format!(
+            " for {scope}: pack {}, {} records, {} bytes, {} head, under {}{}\n",
+            done.pack,
+            done.records,
+            done.bytes,
+            if done.signed { "a signed" } else { "an unsigned" },
+            out.display(),
+            match (done.absent, done.held) {
+                (0, 0) => String::new(),
+                (absent, held) => format!(
+                    "; not in the pack: {absent} keys the pin names with no record in the store, {held} records that hold a directory of this machine"
+                ),
+            }
+        ))
+    )
+    .flat())
 }
 
 /// The packs of `pins` at `base`, imported: a line for each.
@@ -222,10 +229,11 @@ fn imported(
     let mut said = String::new();
     for pin in pins {
         match stored::import(records, base, &scope, pin, trust, unsigned)? {
-            None => said.push_str(&format!("{} has no pack of pin `{pin}` for {scope}\n", base.named())),
-            Some(done) => said.push_str(&format!(
-                "imported pin `{}` (pack {}) from {}: {} records put ({} bytes), {} already there; vouched for by {}\n",
-                done.pin,
+            None => said.push_str(
+                &blaze_report::say!(blaze_report::say::Words(&base.named()), " has no pack of pin ", blaze_report::say::Code(pin), blaze_report::say::Words(&format!(" for {scope}\n"))).flat(),
+            ),
+            Some(done) => said.push_str(&blaze_report::say!("imported pin ", blaze_report::say::Code(&done.pin), blaze_report::say::Words(&format!(
+                " (pack {}) from {}: {} records put ({} bytes), {} already there; vouched for by {}\n",
                 done.pack,
                 base.named(),
                 done.summary.put,
@@ -235,7 +243,8 @@ fn imported(
                     Vouched::Signer(key) => format!("the trusted key {}", Id(key)),
                     Vouched::User => "you (`--unsigned`)".to_owned(),
                 }
-            )),
+            )))
+            .flat()),
         }
     }
     Ok(said)
@@ -393,15 +402,27 @@ fn shipped_trees() -> Result<(PathBuf, Vec<sealed::Tree>), String> {
     let library = crate::toolchain::library::digest();
     // Where this process reads the library from (a release's `share/blaze/library`, a
     // `BLAZE_LIBRARY`), else where it is placed once a machine.
-    let dir = match crate::toolchain::library::found() {
-        Ok(found) => found.dir.parent().map_or_else(|| found.dir.clone(), Path::to_path_buf),
-        Err(_) => crate::toolchain::library::tree_dir("library", library)?,
+    // And where every build names its crates: the daemon mounts the library it fetched at
+    // `/rustc/<commit>/library` (`serve::unit`'s `library`), so a std package's manifest is
+    // there in the plan, never under `dir` ([`sealed::Tree::mounted`]). Only for the library
+    // blaze placed ([`crate::toolchain::library::owned`]); not yet found, it is the one the
+    // daemon's fetch places, of this blaze's own commit.
+    let mounted = |commit: &str| Some(PathBuf::from(blaze_units::stdlib::library_at(commit)));
+    let (dir, mounted) = match crate::toolchain::library::found() {
+        Ok(found) => (
+            found.dir.parent().map_or_else(|| found.dir.clone(), Path::to_path_buf),
+            crate::toolchain::library::owned(found).and_then(|_| mounted(&found.commit)),
+        ),
+        Err(_) => (
+            crate::toolchain::library::tree_dir("library", library)?,
+            mounted(crate::toolchain::library::built_commit()),
+        ),
     };
     // alloc: once a command, a tree a shipped one
-    let mut trees = vec![sealed::Tree { dir, digest: library.to_owned(), on: Vec::new() }];
+    let mut trees = vec![sealed::Tree { dir, mounted, digest: library.to_owned(), on: Vec::new() }];
     if let Some(bstd) = blaze_new::BSTD_DIGEST {
         let dir = crate::toolchain::library::tree_dir("bstd", bstd)?;
-        trees.push(sealed::Tree { dir, digest: bstd.to_owned(), on: vec![0] });
+        trees.push(sealed::Tree { dir, mounted: None, digest: bstd.to_owned(), on: vec![0] });
     }
     Ok((shared, trees))
 }

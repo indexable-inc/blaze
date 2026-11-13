@@ -36,6 +36,11 @@ use alloc::{
     vec::Vec,
 };
 
+use blaze_report::{
+    Span, say,
+    say::{Code, Words},
+};
+
 use crate::{Id, Manifest, Refused, Signatures, cbor, layout, manifest};
 
 const MAGIC: &str = "blaze pack head";
@@ -212,32 +217,45 @@ impl Head {
             None if unsigned => Ok(Vouched::User),
             None => Err(Refused::Untrusted {
                 // alloc: an error's text
-                what: format!(
-                    "the head of pin `{}` (pack {}) is unsigned; a pack is taken when a trusted key signed its head, or when you import its file yourself with `--unsigned`",
-                    self.pin, self.pack
-                ),
+                what: say!(
+                    "the head of pin ",
+                    Code(&self.pin),
+                    " (pack ",
+                    Span::Hash(self.pack.to_string()),
+                    ") is unsigned; a pack is taken when a trusted key signed its head, or when you import its file yourself with ",
+                    Code("--unsigned")
+                )
+                .flat(),
             }),
             Some((signer, signature)) => {
                 if !trust.trusts(signer) {
                     return Err(Refused::Untrusted {
                         // alloc: an error's text
-                        what: format!(
-                            "the head of pin `{}` (pack {}) is signed by {}, which is not among the keys you trust",
-                            self.pin,
-                            self.pack,
-                            Id(*signer)
-                        ),
+                        what: say!(
+                            "the head of pin ",
+                            Code(&self.pin),
+                            " (pack ",
+                            Span::Hash(self.pack.to_string()),
+                            ") is signed by ",
+                            Words(&Id(*signer).to_string()),
+                            ", which is not among the keys you trust"
+                        )
+                        .flat(),
                     });
                 }
                 if !signatures.verify(signer, &self.message(signer), signature) {
                     return Err(Refused::Untrusted {
                         // alloc: an error's text
-                        what: format!(
-                            "the signature on the head of pin `{}` (pack {}) is not {}'s",
-                            self.pin,
-                            self.pack,
-                            Id(*signer)
-                        ),
+                        what: say!(
+                            "the signature on the head of pin ",
+                            Code(&self.pin),
+                            " (pack ",
+                            Span::Hash(self.pack.to_string()),
+                            ") is not ",
+                            Words(&Id(*signer).to_string()),
+                            "'s"
+                        )
+                        .flat(),
                     });
                 }
                 Ok(Vouched::Signer(*signer))

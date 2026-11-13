@@ -253,8 +253,9 @@ fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
 
 #[test]
 fn every_command_suggested_is_one() {
-    // `blaze daemon` alone is no command: it takes a verb.
-    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+    // `blaze daemon` alone is no command: it takes a verb. `blaze serve` is the daemon itself,
+    // started by `main` before the command line is parsed (`cli::main`), never by `args::parse`.
+    for name in COMMANDS.iter().filter(|it| !matches!(**it, "daemon" | "serve")) {
         assert_ne!(
             args::parse(vec![OsString::from(*name)]),
             Ok(Asked::Unknown((*name).to_owned())),
@@ -719,12 +720,17 @@ fn a_request_of_other_words_is_other_bytes() {
 }
 
 /// Every setting the daemon keeps for its life is read from a variable the thin `blaze`
-/// leaves to the engine (blaze-thin's `route::refuses`): the engine's check that the daemon
-/// keeps what the command sets is never skipped for a command that sets one.
+/// leaves to the engine (blaze-thin's `route::refuses`), or one it holds to the daemon's
+/// itself (`route::CHECKED_HERE`, `route::drifted`): the check that the daemon keeps what the
+/// command sets is never skipped for a command that sets one.
 #[test]
 fn every_setting_the_daemon_keeps_is_a_variable_the_thin_blaze_leaves_to_the_engine() {
     for name in crate::serve::settings::STARTED_WITH {
-        assert!(blaze_thin::route::refuses(name), "{name}");
+        let checked = blaze_thin::route::CHECKED_HERE.contains(name);
+        assert!(blaze_thin::route::refuses(name) != checked, "{name}");
+    }
+    for name in blaze_thin::route::CHECKED_HERE {
+        assert!(crate::serve::settings::STARTED_WITH.contains(name), "{name} is no daemon setting");
     }
     for name in [client_rows::PROFILE, client_rows::LAUNCHED, blaze_core::cores::VAR, "BLAZE_STATS", "BLAZE_UI"] {
         assert!(blaze_thin::route::refuses(name), "{name}");

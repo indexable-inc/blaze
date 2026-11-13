@@ -100,17 +100,27 @@ pub(crate) enum Undecoded {
 impl fmt::Display for Undecoded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Undecoded::Layout { name, found } => write!(
-                f,
-                "the local mark `{}` is of layout {found}, not the {LAYOUT} this blaze reads \
-                 (serve/local.rs LAYOUT)",
-                name.escape_debug()
+            Undecoded::Layout { name, found } => f.write_str(
+                &blaze_report::say!(
+                    "the local mark ",
+                    blaze_report::say::Code(&name.escape_debug().to_string()), // alloc: an error's words
+                    " is of layout ",
+                    blaze_report::say::Count(u64::from(*found)),
+                    ", not the ",
+                    blaze_report::say::Count(u64::from(LAYOUT)),
+                    " this blaze reads (serve/local.rs LAYOUT)"
+                )
+                .flat(),
             ),
-            Undecoded::Length { name, len } => write!(
-                f,
-                "the local mark `{}` is {len} bytes, not the length its layout has \
-                 (serve/local.rs)",
-                name.escape_debug()
+            Undecoded::Length { name, len } => f.write_str(
+                &blaze_report::say!(
+                    "the local mark ",
+                    blaze_report::say::Code(&name.escape_debug().to_string()), // alloc: an error's words
+                    " is ",
+                    blaze_report::say::Count(*len as u64),
+                    " bytes, not the length its layout has (serve/local.rs)"
+                )
+                .flat(),
             ),
         }
     }

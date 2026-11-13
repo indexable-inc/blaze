@@ -420,8 +420,14 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             _ => "variable",
         };
         // alloc: the edge, a lint that fires
-        let message =
-            format!("useless assignment of {what} of type `{}` to itself", self.print(ty));
+        let message = blaze_report::say!(
+            "useless assignment of ",
+            blaze_report::say::Words(what),
+            " of type ",
+            blaze_report::say::Code(&self.print(ty)),
+            " to itself"
+        )
+        .flat();
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
         self.m.found.push(Found::lint(diag, Phase::Late, at));

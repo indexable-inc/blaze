@@ -38,6 +38,10 @@ use hir_def::{
     attrs::{EffectWord, ExpectWord, PureAttr},
     signatures::FunctionSignature,
 };
+use blaze_report::{
+    say,
+    say::{Code, Words as Prose},
+};
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
 use hir_ty_pure::{
     Refusal,
@@ -196,7 +200,7 @@ fn may_do(word: ExpectWord) -> &'static str {
 
 /// The words in backticks: "`panic`, `alloc`".
 fn ticked(words: Words) -> String {
-    words.iter().map(|it| format!("`{}`", it.text())).collect::<Vec<_>>().join(", ") // alloc: a message's part
+    words.iter().map(|it| say!(Code(it.text())).flat()).collect::<Vec<_>>().join(", ") // alloc: a message's part
 }
 
 impl Site<'_> {
@@ -284,10 +288,13 @@ fn undeclared(site: &Site<'_>) -> Option<Found> {
     if let Some(text) = declared.expect.as_ref().and_then(|it| it.malformed.as_ref()) {
         return Some(finding(
             Lint::UndeclaredEffect,
-            format!(
-                "`#[blaze::expect{}]` on `{name}`: the list is words of `panic`, `alloc`, `block` and `diverge` separated by commas, each once, then at most `trusted = \"why\"`",
-                text.as_str()
-            ),
+            say!(
+                Code(&format!("#[blaze::expect{}]", text.as_str())), // alloc: a message's part
+                " on ",
+                Code(name),
+                ": the list is words of `panic`, `alloc`, `block` and `diverge` separated by commas, each once, then at most `trusted = \"why\"`"
+            )
+            .flat(),
         ));
     }
     if declared.expect.is_some() && declared.has_negative() {
@@ -338,17 +345,26 @@ fn undeclared(site: &Site<'_>) -> Option<Found> {
     let does: Vec<&str> = missing.iter().map(may_do).collect(); // alloc: a message's parts
     let mut found = finding(
         Lint::UndeclaredEffect,
-        format!(
-            "`fn {name}` may {}, which {} does not allow: it {}: {}; add `{}` to its `#[blaze::expect(..)]`, or handle it",
-            does.join(", and may "),
-            site.allowance(),
-            refusal.says,
-            refusal.witness(),
-            first.text()
-        ),
+        say!(
+            Code(&format!("fn {name}")), // alloc: a message's part
+            " may ",
+            Prose(&does.join(", and may ")),
+            ", which ",
+            Prose(&site.allowance()),
+            " does not allow: it ",
+            Prose(refusal.says),
+            ": ",
+            Prose(&refusal.witness()),
+            "; add ",
+            Code(first.text()),
+            " to its `#[blaze::expect(..)]`, or handle it"
+        )
+        .flat(),
     );
     for (word, refusal) in &refused[1..] {
-        found.notes.push(format!("`{}`: it {}: {}", word.text(), refusal.says, refusal.witness())); // alloc: a note
+        found.notes.push(
+            say!(Code(word.text()), ": it ", Prose(refusal.says), ": ", Prose(&refusal.witness())).flat(),
+        ); // alloc: a note
     }
     if matches!(first, ExpectWord::Panic) {
         let profile = if overflow_checks { "with" } else { "without" };
@@ -389,17 +405,21 @@ fn unfulfilled(site: &Site<'_>, fixed: bool) -> Option<Found> {
     }
     let why: Vec<String> = unfulfilled
         .iter()
-        .map(|word| format!("`{}`: {}", word.text(), known_not(word)))
+        .map(|word| say!(Code(word.text()), ": ", Prose(known_not(word))).flat())
         .collect(); // alloc: a message's parts, at most four
     let mut found = finding(
         Lint::UnfulfilledEffect,
-        format!(
-            "`fn {}` expects {} in its `{}` and is proved not to: {}; a function's own list is exact, each word an effect it has",
-            site.name,
-            ticked(unfulfilled),
-            own.attribute(),
-            why.join("; ")
-        ),
+        say!(
+            Code(&format!("fn {}", site.name)), // alloc: a message's part
+            " expects ",
+            Prose(&ticked(unfulfilled)),
+            " in its ",
+            Code(&own.attribute()),
+            " and is proved not to: ",
+            Prose(&why.join("; ")),
+            "; a function's own list is exact, each word an effect it has"
+        )
+        .flat(),
     );
     if !fixed {
         found.fix = site.write(own.without(unfulfilled));
@@ -434,12 +454,14 @@ fn negative(site: &Site<'_>) -> Option<Found> {
         .fold(Words::NONE, |words, word| words.union(Words::one(word)));
     let mut found = finding(
         Lint::NegativeEffect,
-        format!(
-            "`fn {}` says what it may not do ({}); where effects are declared, a function says what it may do: `{}`",
-            site.name,
-            ticked_negatives(declared),
-            words.attribute()
-        ),
+        say!(
+            Code(&format!("fn {}", site.name)), // alloc: a message's part
+            " says what it may not do (",
+            Prose(&ticked_negatives(declared)),
+            "); where effects are declared, a function says what it may do: ",
+            Code(&words.attribute())
+        )
+        .flat(),
     );
     // A spelling taken at its word (`trusted`) has no list that means the same for it alone.
     let checked = declared

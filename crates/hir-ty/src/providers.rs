@@ -154,6 +154,29 @@ pub fn mir_at<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Kept<'
     }
 }
 
+/// [`monomorphized_mir_at`]'s value made for the caller and kept by nothing: the generic body at
+/// `stage` from its memo (one per body, whatever its instances), instantiated into a value the
+/// caller owns and drops. For a reader that reads one instance's body once and keeps only what
+/// it worked out of it (a coroutine's layout, its debug type, a walk's summary): the memo keeps
+/// one body per instance on the global heap until the build lets every MIR go, so a program's
+/// instances are a program's bodies (docs/v2/plan/design/end-state/memory.md 4.3: "a value read
+/// once is frame scratch, not a record and not a memo"). The interpreter, which runs one
+/// instance's body many times and takes it by `&'db`, is what the memo is for.
+///
+/// Its reads are the caller's: the generic memo's and those instantiating makes, so the
+/// caller's own verification covers every input of the body (rule 21). A body that needs itself
+/// to lower is the generic memo's error ([`MirLowerError::Loop`]), as there.
+pub fn monomorphized_once<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: &StoredGenericArgs,
+    env: &StoredParamEnvAndCrate,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let generic = mir_at(db, owner, stage).map_err(Clone::clone)?;
+    (mir().monomorphize)(db, generic, subst, env)
+}
+
 /// `owner`'s body at `stage` with `subst` in place of its generic parameters, from the memo of
 /// the query that keeps it.
 pub fn monomorphized_mir_at<'db>(

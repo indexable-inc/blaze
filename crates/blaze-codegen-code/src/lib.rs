@@ -318,6 +318,10 @@ pub const FRONT_END: Identity = Identity {
 pub const FRONT_END_EXTRA: &[(&str, &str)] = &[
     ("hir-ty", "../../harness/toolchain"),
     ("blaze-macro-eval", "../../library/proc_macro/src/bridge"),
+    // `#[path]` modules outside their package (dep-info says so): blaze-inproc-rt's whole
+    // runtime, and the derive half of the std provider blaze-usercode compiles in.
+    ("blaze-inproc-rt", "../../library/blaze_inproc_rt/src"),
+    ("blaze-usercode", "../../library/std/src/sys/provider/derive.rs"),
 ];
 
 /// The front end's hook traits past [`FRONT_END`]'s closure: every trait of the closure it names
@@ -352,6 +356,36 @@ pub const FRONT_END_REVIEWED: &[Hook] = &[
         hook: "Local",
         why: "`Once` carries the one-shot build's frames to the daemon in its own process: the \
               front end sends none",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Entries",
+        why: "`StoreEntries` and `Images` keep and find hir-def's per-item entries in the store by \
+              the key hir-def makes, verified as the store reads them: a store, which makes no value",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "PageSource",
+        why: "`InPool` reads a part of an image record from the store's pool, checked as the store \
+              checks what it reads: the bytes kept under the image's key, never others",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Texts",
+        why: "`StoreTexts` keeps and gives the VFS's file texts by content ID, and the VFS checks a \
+              text is its ID's before it uses it: a store, which makes no value",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Get",
+        why: "`Overlay` reads the store under the kernel's keys, its own puts first: what it gives \
+              is what was put under the key",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Put",
+        why: "`Overlay` keeps the kernel's puts until the loop writes them, and refuses a key it \
+              holds with other bytes: a store, which makes no value",
     },
     Hook {
         package: "blaze-engine",
@@ -390,12 +424,33 @@ pub const RECORD_CUT: &[Cut] = &[
         package: "blaze-explore",
         why: "the explorer's server, started by `serve::observe` on the first request for it: it serves \
               the history, spans and SQL of builds to a browser and hands blaze-cargo nothing back",
-        named_in: &[NamedIn {
-            package: "blaze-cargo",
-            file: "src/serve/observe.rs",
-            why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
-                  answers to a client about finished builds, past every record",
-        }],
+        named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/daemon.rs",
+                why: "hands `blaze debug inspect` the explorer's task table (`Daemon::tasks`): a \
+                      handle passed on, read by no unit",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/inspect.rs",
+                why: "`blaze debug inspect` reads the queued and running tasks from the explorer's \
+                      table (`blaze_explore::Tasks`) to show a stuck daemon: a report, never an input",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/observe.rs",
+                why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
+                      answers to a client about finished builds, past every record",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/plane.rs",
+                why: "the plane's folds copy each node's record into the explorer's task table \
+                      (`Folds::said`) after the plane said it: written for viewers, read back by \
+                      nothing that orders or makes a unit",
+            },
+        ],
     },
     Cut {
         package: "blaze-history",
@@ -436,11 +491,6 @@ pub const RECORD_CUT: &[Cut] = &[
             },
             NamedIn {
                 package: "blaze-cargo",
-                file: "src/cli/live.rs",
-                why: "the client's live test view (`blaze test`): what it draws, never what ran",
-            },
-            NamedIn {
-                package: "blaze-cargo",
                 file: "src/cli/inspect.rs",
                 why: "`blaze inspect` writes what the daemon answered as JSON or CBOR, on the client",
             },
@@ -448,6 +498,64 @@ pub const RECORD_CUT: &[Cut] = &[
                 package: "blaze-cargo",
                 file: "src/cli/observe.rs",
                 why: "`blaze why` and the hot list, rendered on the client from the daemon's answer",
+            },
+        ],
+    },
+    Cut {
+        package: "blaze-thin",
+        why: "the thin client: the request and answer framing, its words and its version (from \
+              `BLAZE_GIT_*`, `BLAZE_RELEASE` and the git HEAD); the client's side of a request, and \
+              no record's bytes depend on it",
+        named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli.rs",
+                why: "the client's command line: the handover word and what the thin client began (`handover::Began`), before any request is sent",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/client_rows.rs",
+                why: "names the thin client's handover (`handover::Held`) in a doc comment: the client's own timing rows of a resumed process",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/place.rs",
+                why: "`request::color`: whether the client's terminal is drawn in colour, hashed as how it is drawn (`drawn_id`), never into a record",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/print.rs",
+                why: "`answer::placed` and `answer::on_disk`: the size of the program the daemon placed, said on the client after the answer",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/resume.rs",
+                why: "reads the request and answer the thin client handed over (`handover::Held`) in the client's own process",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/run.rs",
+                why: "`answer::shown_exe`: how the client names the program it runs",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/say.rs",
+                why: "the client's words and colours (`say`): how a status line is drawn on the terminal",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/terminal.rs",
+                why: "`request::color_flag`: the client's `--color` word",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/lib.rs",
+                why: "`REFUSED_SHOWN`, how many refused functions a client is shown: a drawing input hashed into the request's drawn id (`serve::job::drawn_id`), never into a unit's record",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/daemon.rs",
+                why: "`talk::ON_THE_WIRE`, the name of the client's span on the wire, which the daemon filters out of the spans it answers with",
             },
         ],
     },
@@ -462,6 +570,8 @@ pub const RECORD_EXTRA: &[(&str, &str)] = &[
     ("blaze-cargo", "../../library/DIGEST"),
     ("blaze-cargo", "../../library/UPSTREAM"),
     ("blaze-macro-eval", "../../library/proc_macro/src/bridge"),
+    ("blaze-inproc-rt", "../../library/blaze_inproc_rt/src"),
+    ("blaze-usercode", "../../library/std/src/sys/provider/derive.rs"),
 ];
 
 /// [`RECORD`]'s hooks past its closure besides every trait of the closure it names `dyn`: the
@@ -620,6 +730,42 @@ pub const REVIEWED_HOOKS: &[Hook] = &[
               generator compiles of them is keyed by the HIR made of it",
     },
     Hook {
+        package: "blaze-cargo",
+        hook: "Entries",
+        why: "`StoreEntries` and `Images` keep and find hir-def's per-item entries in the store by \
+              the key hir-def makes, verified as the store reads them: a store, which makes no value",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "PageSource",
+        why: "`InPool` reads a part of an image record from the store's pool, checked as the store \
+              checks what it reads: the bytes kept under the image's key, never others",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Texts",
+        why: "`StoreTexts` keeps and gives the VFS's file texts by content ID, and the VFS checks a \
+              text is its ID's before it uses it: a store, which makes no value",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Get",
+        why: "`Overlay` reads the store under the kernel's keys, its own puts first: what it gives \
+              is what was put under the key",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Put",
+        why: "`Overlay` keeps the kernel's puts until the loop writes them, and refuses a key it \
+              holds with other bytes: a store, which makes no value",
+    },
+    Hook {
+        package: "blaze-profile",
+        hook: "Probe",
+        why: "`Recorder` records the locks' waits in the profile: a lock is taken and let go as it \
+              would be with no probe, and the code generator reads nothing it records",
+    },
+    Hook {
         package: "blaze-usercode",
         hook: "Confine",
         why: "`Launcher` starts a user program (a build script, a test) in blaze's sandbox: the \
@@ -660,6 +806,11 @@ pub const READ_ENV: &[&str] = &[
     "RING_PREGENERATE_ASM",
     "WINAPI_NO_BUNDLED_LIBRARIES",
     "WINAPI_STATIC_NOBUNDLE",
+    // icu_normalizer_data's and icu_properties_data's build scripts (`rerun-if-env-changed`):
+    // set, it is where their data is read from.
+    "ICU4X_DATA_DIR",
+    // blaze-fmt's `option_env!` of its release channel, which its output can name.
+    "CFG_RELEASE_CHANNEL",
 ];
 /// Where cranelift-codegen's build script reads its ISLE from, when set, in place of its own
 /// files: a directory the identity does not hash, so a build with it set is refused.

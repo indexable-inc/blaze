@@ -499,10 +499,13 @@ impl fmt::Display for NeverGiven {
             )?,
             None => f.write_str("; asked from outside any query")?,
         }
-        write!(
-            f,
-            ", on thread `{thread}`; the call stack of the ask:\n{backtrace}"
-        )
+        let said = blaze_report::say!(
+            ", on thread ",
+            blaze_report::say::Code(thread),
+            "; the call stack of the ask:\n",
+            blaze_report::say::Words(backtrace),
+        );
+        f.write_str(&said.flat())
     }
 }
 

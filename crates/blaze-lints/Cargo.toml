@@ -26,6 +26,8 @@ blaze-mem.workspace = true
 blaze-phf.workspace = true
 # The rule of which spans the flight recorder keeps, for `blaze::unrecorded_span`.
 blaze-profile.workspace = true
+# Messages written with `say!`, whose parts are typed (`blaze_report::say`).
+blaze-report.workspace = true
 blaze-serde.workspace = true
 # Keeps the read of a lint profile as a look at the disk no watch vouches for, in the
 # build's own list (`blaze_vfs::outside::Looks`).

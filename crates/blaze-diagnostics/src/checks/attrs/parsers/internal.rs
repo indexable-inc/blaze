@@ -798,7 +798,8 @@ mod tests {
     #[test]
     fn lang_items_are_sorted_by_their_bytes() {
         assert!(LANG_ITEMS.windows(2).all(|it| it[0].0.as_bytes() < it[1].0.as_bytes()));
-        assert_eq!(LANG_ITEMS.len(), 230);
+        // 231 since f119ec6daa added blaze's `blaze_memo_point` (the `#[blaze::memo]` trait).
+        assert_eq!(LANG_ITEMS.len(), 231);
     }
 
     #[test]

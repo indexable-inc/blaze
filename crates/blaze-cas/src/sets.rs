@@ -70,9 +70,13 @@ const ROOT_FIXED: usize = 8 + 4 + 4 + 4 + 32;
 const SHARDS: usize = 64;
 
 /// Whether `key` is the last of its leaf: decided by the key alone, so the leaves of a set
-/// depend only on which keys it holds.
+/// depend only on which keys it holds. Decided by its last two bytes, never its first: the
+/// keys are in a leaf in ascending order, so the first bytes rise along the set, and a test of
+/// them ends leaves only where they are 0 or 128 (until 2026-11-13: one leaf held every key
+/// from `01..` to `7f..`, half the set, written again whole for one item put among them,
+/// 793,584 bytes of 50,001 items). The last bytes are the hash's own, uniform at every place.
 pub fn ends_leaf(key: &Key) -> bool {
-    u16::from_le_bytes([key.0.0[0], key.0.0[1]]) % LEAF_EVERY == 0
+    u16::from_le_bytes([key.0.0[30], key.0.0[31]]) % LEAF_EVERY == 0
 }
 
 /// A listing read: what it names inside the store.

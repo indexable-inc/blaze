@@ -176,6 +176,9 @@ fn edit(g2: &CompiledFunction) -> Change<'_> {
     }
 }
 
+/// A page of zeros: what a [`Sparse`] page it has not got reads as.
+static ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
+
 /// A file as pages, most of an incremental image being room nothing has written.
 #[derive(Clone, Default, Debug)]
 struct Sparse {
@@ -192,8 +195,9 @@ impl Sparse {
             let n = (PAGE as usize - from).min(bytes.len() - done);
             let chunk = &bytes[done..done + n];
             // A page it has not got reads as zeros: zeros written there change nothing, and a
-            // gigabyte of zeroed code costs no memory.
-            if !self.pages.contains_key(&(addr / PAGE)) && chunk.iter().all(|it| *it == 0) {
+            // gigabyte of zeroed code costs no memory. Compared as slices (a `memcmp`), not byte
+            // by byte: a link writes hundreds of MiB here, and the test is built unoptimized.
+            if !self.pages.contains_key(&(addr / PAGE)) && chunk == &ZERO_PAGE[..n] {
                 done += n;
                 continue;
             }
@@ -213,8 +217,7 @@ impl Sparse {
     }
 
     fn page(&self, page: u64) -> &[u8] {
-        static ZERO: [u8; PAGE as usize] = [0; PAGE as usize];
-        self.pages.get(&page).map_or(&ZERO[..], |it| &it[..])
+        self.pages.get(&page).map_or(&ZERO_PAGE[..], |it| &it[..])
     }
 
     /// Whether two files have the same bytes.

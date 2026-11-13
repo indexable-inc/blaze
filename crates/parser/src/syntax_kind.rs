@@ -20,6 +20,15 @@ impl From<SyntaxKind> for u16 {
 }
 
 impl SyntaxKind {
+    /// The fixed text of a punctuation or keyword kind. A kind without one (a node, a literal,
+    /// an identifier, trivia) panics: ask [`SyntaxKind::fixed_text`] where that can happen.
+    pub const fn text(self) -> &'static str {
+        match self.fixed_text() {
+            Some(text) => text,
+            None => panic!("no text for these `SyntaxKind`s"),
+        }
+    }
+
     #[inline]
     pub fn is_trivia(self) -> bool {
         matches!(self, SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)

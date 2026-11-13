@@ -592,6 +592,10 @@ pub struct Options {
     pub without: Without,
     /// The premises of every request slot this daemon writes ([`Premises`]).
     pub premises: Premises,
+    /// Its grace when it exits once no connection holds it ([`super::unheld`],
+    /// `BLAZE_DAEMON_EXIT_UNHELD`): it stops itself once no client or launcher connection was
+    /// open for this long. `None` exits only as [`super::idle::exit_due`] says, or when told.
+    pub unheld: Option<Duration>,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
@@ -617,17 +621,23 @@ impl Without {
                 "history" => without.history = true,
                 // alloc: an error's text, once a start
                 "database" | "trees" | "carries" => {
-                    return Err(format!(
-                        "{RESTORE_WITHOUT} names `{word}`, which no start reads any more: a start \
-                         restores no engine state, so the only part it can leave unused is `history`"
-                    ));
+                    return Err(blaze_report::say!(
+                        blaze_report::say::Words(RESTORE_WITHOUT),
+                        " names ",
+                        blaze_report::say::Code(word),
+                        ", which no start reads any more: a start restores no engine state, so the only part it can leave unused is `history`"
+                    )
+                    .flat());
                 }
                 // alloc: an error's text, once a start
                 _ => {
-                    return Err(format!(
-                        "{RESTORE_WITHOUT} names `{word}`, which is no part of the daemon image \
-                         a start can leave unused: the one part is `history`"
-                    ));
+                    return Err(blaze_report::say!(
+                        blaze_report::say::Words(RESTORE_WITHOUT),
+                        " names ",
+                        blaze_report::say::Code(word),
+                        ", which is no part of the daemon image a start can leave unused: the one part is `history`"
+                    )
+                    .flat());
                 }
             }
         }
@@ -651,8 +661,9 @@ struct LayerDir {
     dirs: Vec<FileName>,
     /// The one stated or made now; `None` while the directory itself is stated first.
     at: Option<usize>,
-    /// The make of `dirs[at]` failed and it is being stated again.
-    again: bool,
+    /// The make of `dirs[at]` failed, with this, and it is being stated again: the error, if
+    /// it is still not there, says why the make failed.
+    again: Option<String>,
 }
 
 /// What [`LayerDir`] asks next.
@@ -677,7 +688,7 @@ impl LayerDir {
             .filter_map(FileName::new)
             .collect();
         // clone: the effect owns the name
-        (LayerDir { dirs, at: None, again: false }, Effect::Stat { file: dir.clone(), tag: LAYER_DIR })
+        (LayerDir { dirs, at: None, again: None }, Effect::Stat { file: dir.clone(), tag: LAYER_DIR })
     }
 
     fn stat(&self, at: usize) -> LayerStep {
@@ -687,7 +698,7 @@ impl LayerDir {
 
     /// The next of `at`, or [`LayerStep::There`] past the last.
     fn next(&mut self, at: usize) -> LayerStep {
-        self.again = false;
+        self.again = None;
         match at + 1 < self.dirs.len() {
             true => {
                 self.at = Some(at + 1);
@@ -712,14 +723,16 @@ impl LayerDir {
                 self.stat(0)
             }
             (Some(at), Done::Stat(Some(_))) => self.next(at),
-            (Some(at), Done::Stat(None)) if self.again => {
-                LayerStep::Failed(format!("/{}: its make failed and it is not there", named(&self.dirs, at)))
-            }
+            (Some(at), Done::Stat(None)) if self.again.is_some() => LayerStep::Failed(format!(
+                "/{}: its make failed ({}) and it is not there",
+                named(&self.dirs, at),
+                self.again.as_deref().unwrap_or_default()
+            )),
             // clone: the effect owns the name
             (Some(at), Done::Stat(None)) => LayerStep::Ask(Effect::MakeDir { dir: self.dirs[at].clone(), tag: LAYER_DIR }),
             (Some(at), Done::MadeDir) => self.next(at),
-            (Some(at), Done::Failed(_)) if !self.again => {
-                self.again = true;
+            (Some(at), Done::Failed(why)) if self.again.is_none() => {
+                self.again = Some(why.to_string()); // alloc: error path, once a failed make
                 self.stat(at)
             }
             (at, Done::Failed(error)) => {
@@ -768,6 +781,9 @@ enum Woken {
     Durable,
     /// A live feed's next frame, or the deadline of a `blaze why` waiting on the history.
     Observe,
+    /// The end of the grace of a daemon that exits once no connection holds it
+    /// ([`super::unheld`]): nothing else may wake it then.
+    Unheld,
 }
 
 impl Woken {
@@ -792,6 +808,9 @@ impl Woken {
             ),
             Woken::Observe => WaitOn::Io(
                 "daemon loop: the driver's io, or a live feed's frame or a `blaze why`'s deadline",
+            ),
+            Woken::Unheld => WaitOn::Io(
+                "daemon loop: a client's connection, or the end of its grace with no connection open (BLAZE_DAEMON_EXIT_UNHELD)",
             ),
         }
     }
@@ -932,6 +951,11 @@ pub struct Daemon<D: Driver, S: Steps> {
     given_back: Duration,
     /// Whether this stretch with nothing to do gave its warm memory back ([`super::idle`]).
     idle: super::idle::Idle,
+    /// The countdown of a daemon that exits once no connection holds it ([`super::unheld`],
+    /// [`Options::unheld`]): `None` for one that does not.
+    unheld: Option<super::unheld::Unheld>,
+    /// It stopped because nothing held it for its grace ([`Daemon::ended_unheld`]).
+    ended_unheld: bool,
     /// When this stretch with nothing to do last gave the stores' pool pages back: again
     /// each [`super::idle::POOL_AFTER`] of it.
     pool_idle: super::idle::Idle,
@@ -1561,10 +1585,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if !activated && let Some(socket) = &options.socket {
             effects.push(Effect::Connect { at: Address::Unix(socket.clone()), tag: DIAL });
         }
-        // The home store opens once its layer's directory is there ([`LayerDir`]).
+        // The home store opens once its layer's directory is there ([`LayerDir`]). The walk
+        // begins once the std store, whose directory the layer is, has opened: the std store's
+        // open writes and removes files of its own under it, and a walk beside it could find a
+        // directory there by one of those files (a disk that keeps no empty directory it did
+        // not make, the simulation's) and gone by the next step, its make below then refused
+        // for a parent that is not there.
         let layer = under(&options.std, "store");
         let (mut layer_dir, first) = LayerDir::new(&layer);
-        effects.push(first);
+        let mut layer_first = Some(first);
         let store_config =
             blaze_cas::Config {
                 dir: under(&state, "store"),
@@ -1607,6 +1636,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let opened = |it: &Store| it.ready() || it.broken().is_some();
             if read_all && store.as_ref().is_some_and(opened) && opened(&std) {
                 break;
+            }
+            if opened(&std)
+                && let Some(first) = layer_first.take()
+            {
+                effects.push(first);
             }
             driver.submit(&mut effects);
             driver.poll(
@@ -1920,7 +1954,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // The system's memory pressure, watched for the daemon's life: it fails at once where
         // there is no source ([`Daemon::pressure`]).
         effects.push(Effect::Pressure { tag: PRESSURE });
+        // Its countdown starts with it: a daemon no client connects to within its grace stops.
+        let unheld = options.unheld.map(|grace| super::unheld::Unheld::new(grace, driver.now()));
         Ok(Daemon {
+            unheld,
+            ended_unheld: false,
             driver,
             effects,
             done,
@@ -2062,6 +2100,50 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Whether it was asked to stop: by a signal, a client's Stop, or its own end.
     pub fn stopping(&self) -> bool {
         self.stopping.is_some()
+    }
+
+    /// Whether it stopped itself because no connection held it for its grace
+    /// ([`Options::unheld`]): `blaze serve` then ends with `Exit::Unheld`.
+    pub fn ended_unheld(&self) -> bool {
+        self.ended_unheld
+    }
+
+    /// Its grace when it exits once nothing holds it ([`Options::unheld`]).
+    pub fn unheld_grace(&self) -> Option<Duration> {
+        self.unheld.as_ref().map(super::unheld::Unheld::grace)
+    }
+
+    /// A safeguard of its countdown taken out, for the tests' controls.
+    #[cfg(test)]
+    pub(super) fn plant_unheld(&mut self, plant: super::unheld::Plant) {
+        if let Some(unheld) = &mut self.unheld {
+            unheld.plant = plant;
+        }
+    }
+
+    /// The look of a daemon that exits once no connection holds it ([`super::unheld`]), each
+    /// turn: the connections open at the API's socket and the launchers' are what holds it,
+    /// counted where the kernel says each ended, so a client killed however it dies lets go.
+    /// Once none was open for its grace it stops as `blaze stop` stops it, image first.
+    fn look_unheld(&mut self) {
+        if self.stopping.is_some() {
+            return;
+        }
+        let Some(unheld) = &mut self.unheld else { return };
+        let held = self.server.connections() + self.steps.launchers_connected();
+        if !unheld.look(self.driver.now(), held) {
+            return;
+        }
+        let grace = unheld.grace();
+        tracing::info!(
+            target: "blaze",
+            grace_s = grace.as_secs(),
+            "the daemon exits: no client or launcher connection was open for its grace of {} s ({})",
+            grace.as_secs(),
+            super::unheld::VAR
+        );
+        self.ended_unheld = true;
+        self.stop();
     }
 
     pub fn failed(&self) -> Option<&Failed> {
@@ -2367,6 +2449,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
         // A save's quiet running out: its build ahead is due ([`super::ahead::QUIET`]).
         sooner(self.ahead.deadline(now).map(Deadline::at), Woken::Idle);
+        // The grace of a daemon nothing holds running out: it stops then, on time.
+        if self.stopping.is_none() {
+            sooner(self.unheld.as_ref().and_then(super::unheld::Unheld::deadline).map(Deadline::at), Woken::Unheld);
+        }
         if let Some(settles) = &self.settles {
             // A batch out comes back over a channel no driver wakes for, and a plan under way
             // takes a step a turn while the daemon is between requests.
@@ -2491,6 +2577,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.watch();
         self.doing();
         self.plot();
+        self.look_unheld();
         self.look_for_solo_rows();
         drop(part);
         step.next("after the answers");
@@ -2513,7 +2600,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 predict: self.plane.predict(),
                 effects: &mut self.effects,
             };
+            let was = self.images.done();
             self.images.step(parts, idle);
+            self.images_ended(was);
         }
         self.between();
         self.settle_turn();
@@ -3061,7 +3150,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.trim_idle_pools();
         }
         // Longest: a daemon in no edit loop exits, once nothing it holds is undurable and no
-        // launcher is connected; a run with nothing changed is answered by its client alone.
+        // client or launcher is connected; a run with nothing changed is answered by its
+        // client alone.
         let working = working || !self.jobs.idle() || self.jobs.storing() > 0;
         let idle_for = match working {
             true => {
@@ -3070,9 +3160,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             false => now.saturating_sub(*self.idle_since.get_or_insert(now)),
         };
-        let undurable = self.jobs.storing() > 0 || self.launch.undurable() || self.jobs.slots_writing();
+        // What an answered build left counts until it settles: its puts wait on the store's
+        // commit, which may be slow but moving well past the exit's wait, and a stop gives up
+        // what has not settled within its own bound (`STOP_SETTLES_WITHIN`).
+        let undurable = self.jobs.storing() > 0
+            || self.jobs.settling() > 0
+            || self.launch.undurable()
+            || self.jobs.slots_writing();
         if self.stopping.is_none()
-            && super::idle::exit_due(idle_for, self.worked, self.steps.launchers_connected(), undurable)
+            && super::idle::exit_due(
+                idle_for,
+                self.worked,
+                self.server.connections() + self.steps.launchers_connected(),
+                undurable,
+            )
         {
             tracing::info!(target: "blaze", "the daemon exits: no edit loop is live");
             self.stop();
@@ -3164,7 +3265,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     fn dispatch(&mut self, completion: Completion) {
         match completion.tag.0 {
             _ if self.images.owns(completion.tag) => {
-                self.images.complete(&mut self.vfs, completion, &mut self.effects)
+                let was = self.images.done();
+                self.images.complete(&mut self.vfs, completion, &mut self.effects);
+                self.images_ended(was);
             }
             _ if completion.tag == PRESSURE => self.pressure(completion),
             SERVER..VFS => {
@@ -3511,6 +3614,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.jobs.durable(&mut world!(self, said), tickets);
         self.said(said);
         self.after_session();
+    }
+
+    /// Every image asked was made or failed just now (it was not before, `was`): the jobs
+    /// wound up, so a snapshot waiting for it answers. Nothing else need move then: the
+    /// image is often the last of what a snapshot waits for (its journal ticket and the
+    /// store's puts durable before it), and no ticket or commit step follows it to wake the
+    /// snapshot.
+    fn images_ended(&mut self, was: bool) {
+        if !was && self.images.done() {
+            self.after_session();
+        }
     }
 
     /// After a session call: the VFS flushed, what the session asked of the build started,
@@ -4176,9 +4290,10 @@ mod tests {
         assert_eq!(Without::parse(" , "), Ok(Without::default()));
         for word in ["database", "trees", "carries"] {
             let Err(why) = Without::parse(&format!("history,{word}")) else {
-                panic!("`{word}` was taken")
+                panic!("{}", blaze_report::say!(blaze_report::say::Code(word), " was taken").flat())
             };
-            assert!(why.contains(&format!("`{word}`, which no start reads any more")), "{why}");
+            let said = blaze_report::say!(blaze_report::say::Code(word), ", which no start reads any more").flat();
+            assert!(why.contains(&said), "{why}");
         }
         let Err(why) = Without::parse("memos") else { panic!("`memos` was taken") };
         assert!(why.contains("no part of the daemon image"), "{why}");

@@ -344,7 +344,9 @@ pub(crate) fn name_ids(text: String) -> String {
             .rev()
             .take_while(|it| it.is_ascii_alphanumeric() || **it == b'_')
             .count();
-        if end == digits || word == 0 || bytes.get(end) != Some(&b')') {
+        // A row is the whole `Word(Id(n))`: the ID's own `)` and the row's after it. Text cut
+        // before the row's `)` is not a row's `Debug`, so nothing in it is named.
+        if end == digits || word == 0 || bytes.get(end..end + 2) != Some(b"))".as_slice()) {
             continue;
         }
         let Some(id) = text[digits..end].parse::<u32>().ok().and_then(Id::new) else { continue };

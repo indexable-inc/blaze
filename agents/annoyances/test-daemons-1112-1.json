@@ -1,0 +1,14 @@
+{
+ "id": "test-daemons-1112-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane test-daemons-1112, int-1112",
+ "where": "crates/blaze-engine/tests/repro.rs Case; crates/blaze-cargo/src/serve.rs hold; crates/blaze-cargo/src/serve/idle.rs exit_due",
+ "what": "nextest on the Mac ran about 44 blaze daemons at once (load about 200) and left 8 orphaned (3 to 7 GB each, 4 ignoring SIGTERM): every repro case started a daemon in a home of its own and only its `Drop` stopped it, which never runs when nextest kills a test at its time cap. Found on the way: two commands auto-starting one home's daemon at once made the second daemon wait up to 300 s for the first to END (serve.lock), so its command hung and then failed with StillRuns; and exit_due ignored API connections, so a daemon that never built could hang up on a connected idle client after 30 s.",
+ "cost": "a machine at load 200, 20 to 40 GB of orphaned daemons per run, and std built once per case instead of once per run",
+ "cause": "a daemon's life tied to a destructor in its client, which the client's death skips; a start race resolved by waiting for the winner to end instead of using it",
+ "class": "a resource whose release is the holder's cleanup code, not something the kernel does when the holder dies",
+ "prevention": "BLAZE_DAEMON_EXIT_UNHELD (serve/unheld.rs): the daemon counts connections at its socket, which the kernel closes for a killed client, and stops itself after a grace with none, with a whole-daemon DST (serve::tests::unheld) and two planted-bug controls; a losing daemon start ends with Exit::Served and its client connects to the winner; repro cases share one home per test-binary build",
+ "workaround": "pkill -f 'blaze serve' after a run",
+ "fix": "serve/unheld.rs, serve/daemon.rs look_unheld, serve.rs hold and Served, cli/daemon.rs connect, blaze-core exit.rs UNHELD/SERVED, tests/repro.rs Case::new/Case::own, tests/revisions/real.rs UNHELD; blaze-thin route.rs CHECKED_HERE/drifted and talk.rs is_ours keep a typed command that sets BLAZE_DAEMON_EXIT_UNHELD on the thin's path, held to the daemon's Status::settings",
+ "state": "written, not yet built"
+}

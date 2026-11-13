@@ -59,8 +59,6 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lock_across_query", Allow, "detects a lock guard held across a query call")
         .externally_loaded(),
-    l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
-        .externally_loaded(),
     l("blaze::blocking_on_pool", Allow, "detects a blocking call on a pool thread or fiber")
         .externally_loaded(),
     l("blaze::unnamed_wait", Allow, "detects a wait with no span naming what it waits for")
@@ -202,6 +200,9 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::thread_local_in_waiting_fn", Allow, "detects a thread-local read in, or inlinable into, a function that may park the fiber, which can keep the first thread's address after resuming on another")
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
+        .externally_loaded(),
+    // In blaze-lints' `Lint::ALL` order (its discriminant), after the lints added before it.
+    l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
         .externally_loaded(),
     l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
         .externally_loaded(),

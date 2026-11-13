@@ -43,6 +43,7 @@ mod cold;
 pub mod collect;
 mod copy;
 pub mod derived;
+pub mod direct;
 use blaze_ids::crc32c as crc;
 mod disk;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -842,10 +843,16 @@ enum PlacedFile {
         lost: bool,
         after: Vec<Waiter>,
         owed: u64,
+        /// Under its writing name: the round of its sync's ask, once asked
+        /// ([`Store::ask_staged_sync`]).
+        sync_asked: Option<u64>,
+        /// Synced under its writing name while clones of it were in flight: it takes its
+        /// content's name once they ended ([`Store::name_staged`]).
+        naming_due: bool,
     },
-    /// Written under its writing name ([`Store::placed_file`]), sealed and written back:
-    /// being renamed to its own name, the one step that makes it a file a later run takes.
-    /// `doomed`, let go of meanwhile.
+    /// Written under its writing name ([`Store::placed_file`]), sealed, written back and
+    /// synced: being renamed to its own name, the one step that makes it a file a later run
+    /// takes ([`Store::name_staged`]). `doomed`, let go of meanwhile.
     Naming {
         waiting: Vec<Waiter>,
         written: u64,
@@ -910,6 +917,10 @@ pub(crate) enum PlacePlant {
     /// No placed file is ever made its value's home: the pack keeps the bytes as well
     /// (`tests::home`).
     HomesNothing,
+    /// An executable's mode is set after the look its stamp is, on its path after the
+    /// rename, as before 2026-11-13: the stamp the place answers is not of the file as it
+    /// stays, and a daemon started later hashes it again (`tests::place_crash`).
+    ModeAfterLook,
 }
 
 /// Whether a value can be the base of a derived one ([`Reader::derivable`]).
@@ -968,10 +979,11 @@ impl fmt::Display for NoBase {
 }
 
 /// What a refusal over a whole file of the store that is not what its name says ends with:
-/// the command that checks those files and removes the wrong ones (`blaze store verify`,
-/// crates/blaze-cargo/src/cli/cache.rs), after which the next build writes them again. The
+/// the command that forgets the records whose one home such a file was
+/// ([`Store::forget_corrupt`]) and removes the wrong files (`blaze store verify`,
+/// crates/blaze-cargo/src/cli/cache.rs), after which the next build makes them again. The
 /// store itself writes none again on its own (rule no-fallback).
-pub const VERIFY_PLACED: &str = "stop the daemon (`blaze stop`) and run `blaze store verify`: it checks the store's placed files against their names and removes the ones that are wrong, and the next build writes them again";
+pub const VERIFY_PLACED: &str = "stop the daemon (`blaze stop`) and run `blaze store verify`: it checks the store's placed files against their names, forgets each record whose only copy of its bytes was such a file (so no record is left naming bytes that are gone), and removes the wrong files; the next build makes those outputs again";
 
 /// How the bytes of an output get to the path it is placed at: one way for a store, decided
 /// once as it opens by trying a clone inside its own directory ([`Store::ask_shares`]), said
@@ -1200,9 +1212,14 @@ pub struct Store {
     /// [`Store::settle_step`] has made yet.
     moves: Option<Moves>,
     /// The whole files this run is writing that are still under their writing names
-    /// ([`Store::placed_file`]), by content: each takes its own name by one rename, once its
-    /// bytes are written back, so a crash leaves a whole file under a content's name or none.
+    /// ([`Store::placed_file`]), by content: each takes its own name by one rename, once a
+    /// sync of its bytes has completed, so a crash leaves a whole file under a content's name
+    /// or none ([`Store::name_staged`]). Cloned from under the writing name meanwhile.
     staged_files: ByHashSet<ContentId, Global>, // alloc: the store's own table, for its life
+    /// The whole files this run synced before giving them their content's names
+    /// ([`Store::name_staged`]): the gate of the rename, which needs this sync first. A home
+    /// of one still syncs the file again under its name and `placed/` ([`crate::home`]).
+    synced_files: ByHashSet<ContentId, Global>, // alloc: the store's own table, for its life
     /// How an output's bytes get to a path, decided once as the store opens, before its look
     /// through `placed/` and so before any place ([`PlaceBy`], [`Store::ask_shares`]).
     place_by: Option<PlaceBy>,
@@ -1220,11 +1237,6 @@ pub struct Store {
     /// Places answered whose change of `names` is not yet made: until the open's look read
     /// the listing, and otherwise until the step that ends the call ([`Store::names_step`]).
     renamed: Vec<(FileName, Naming, bool)>,
-    /// The key each path was last placed from by [`Store::place`], as answered: the
-    /// collector's placed roots. Two paths of one key are two entries, so replacing one leaves
-    /// the key to the other (the planted bug of `Collecting::placed`, a set, until
-    /// 2026-11-12, dropped it).
-    place_keys: HashMap<FileName, Key, Global>, // alloc: the store's own table, a name a path placed
     /// The keys whose records are to be forgotten alone once nothing roots them
     /// ([`Store::forget`], [`Store::forget_due`]).
     forgets: Vec<Key>, // alloc: the store's own list, the records a build's places let go of
@@ -1235,7 +1247,8 @@ pub struct Store {
     listing: Listing,
     /// The placed files being made their values' one home, by content ([`Store::home_placed`]).
     homing: ByHash<ContentId, home::Homing, Global>, // alloc: the store's own table, a few words a placed output
-    /// Asks of a home's syncs and mapping so far: what tells a stale answer from the current.
+    /// Asks of a home's syncs and mapping, and of a staged file's sync, so far: what tells a
+    /// stale answer from the current.
     home_rounds: u64,
     /// Some home in `homing` is mapped and has records not yet moved to it (still in a
     /// segment, or a commit in flight): [`Store::homes_due`] after each completion.
@@ -1947,6 +1960,24 @@ enum Op {
         staged: Staged,
         bytes: PlacedBytes,
     },
+    /// `staged`'s clone, of a path a program is started from ([`Store::starts`]), made
+    /// executable before its look ([`publish::EXECUTABLE_MODE`]), so the look is of the file
+    /// as it is renamed and stays.
+    StagedMode {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+    },
+    /// The planted bug [`PlacePlant::ModeAfterLook`]: the path's mode set after its rename,
+    /// then the look that vouches for it.
+    #[cfg(test)]
+    ModeAfterLook {
+        asked: Tag,
+        to: FileName,
+        bytes: PlacedBytes,
+        staged: Stamp,
+    },
     /// `staged`'s clone, whole, looked at once before its rename onto `to` ([`Store::vouch`]).
     StagedLook {
         asked: Tag,
@@ -2054,6 +2085,11 @@ enum Op {
     PatchWarm {
         asked: Tag,
     },
+    /// The staged file of the output place `asked` derives, of a path a program is started
+    /// from, made executable before its look, as [`Op::StagedMode`].
+    PatchMode {
+        asked: Tag,
+    },
     /// The staged file of the output place `asked` derives looked at once, whole, before its
     /// rename ([`Store::vouch`]).
     PatchLook {
@@ -2103,6 +2139,13 @@ enum Op {
     /// ([`PlacedFile::Naming`]).
     NameFile {
         content: ContentId,
+    },
+    /// The sync of the whole file of `content` under its writing name, after which it takes
+    /// its own ([`Store::name_staged`]); `round`, which ask of it this answers (a file removed
+    /// and written again meanwhile is another file, whose bytes this sync did not cover).
+    StagedSynced {
+        content: ContentId,
+        round: u64,
     },
     /// A sync of the whole file of `content` or of `placed/`, asked so the file can be its
     /// value's one home ([`Store::home_placed`]); `round`, which ask of it this answers.
@@ -2533,15 +2576,24 @@ fn describe(done: &Done) -> String {
 impl Store {
     /// A store that is opening: it asks to map its index and packs.
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
+        Store::open_reserving(config, pool::WINDOWS, effects)
+    }
+
+    /// [`Store::open`], its buffer pool reserving `windows` windows of address space (each as
+    /// long as a pack may grow) where a store reserves `pool::WINDOWS`: a test's or a tool's
+    /// store, which opens a few packs, reserves what it needs, so many of them at once (or one
+    /// leaked per case of a property test) do not run a process out of address space. A store
+    /// that needs more windows than it reserved stops, naming the pool as full.
+    pub fn open_reserving(config: Config, windows: u32, effects: &mut Vec<Effect>) -> Store {
         // Its layers are shared directories whose writers it reads behind its own records
         // ([`peers`]): none, and it reads its own directory alone.
         let layers = peers::Peers::of_layers(&config);
-        let mut store = Store::new(config, layers);
+        let mut store = Store::new(config, layers, windows);
         store.ask_private(effects);
         store
     }
 
-    fn new(config: Config, peers: Option<peers::Peers>) -> Store {
+    fn new(config: Config, peers: Option<peers::Peers>, windows: u32) -> Store {
         assert!(
             config.tags_apart(),
             "the store in {} is given tags from {} and its pool's loads tags from {}: the two \
@@ -2556,7 +2608,7 @@ impl Store {
         let columns = Arc::<Encodings>::default();
         // clone: setup, once per store
         let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
-        let hot = hot::Hot::new(config.load_tags, &config.loader);
+        let hot = hot::Hot::new(config.load_tags, &config.loader, windows);
         // alloc: setup, once per store
         // clone: setup, once per store: the layers a live layer must be a writer of
         let shared = Arc::new(Shared::new(view, hot.side(), config.layers.clone()));
@@ -2615,13 +2667,13 @@ impl Store {
             epoch: 0,
             periods: 0,
             staged_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
+            synced_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
             place_by: None,
             held_asks: Vec::new(), // alloc: empty, allocates nothing
             also: HashMap::new_in(Global), // alloc: the store's own table, for its life
             names: whole::Names::default(),
             naming: HashMap::new_in(Global), // alloc: the store's own table, for its life
             renamed: Vec::new(), // alloc: empty, allocates nothing
-            place_keys: HashMap::new_in(Global), // alloc: the store's own table, a name a path placed
             forgets: Vec::new(), // alloc: empty, allocates nothing
             forgot: false,
             listing: Listing::default(),
@@ -4211,21 +4263,21 @@ impl Store {
             };
             let_go.extend(was);
             if made {
-                let held = match key {
-                    Some(key) => {
-                        let held = self.place_keys.insert(to, key);
-                        if held != Some(key) {
-                            // The mark made before does not hold the key the path holds now.
-                            self.collecting.rooted();
-                        }
-                        held.filter(|it| *it != key)
-                    }
-                    None => self.place_keys.remove(&to),
-                };
-                unrooted.extend(held);
+                if key.is_some_and(|key| !self.names.holds(&key)) {
+                    // The mark made before does not hold the key the path holds now.
+                    self.collecting.rooted();
+                }
+                unrooted.extend(self.names.hold(to.as_str(), key));
             }
         }
-        self.write_listing(effects);
+        // The listing is written when a path's name moved: a step whose places named nothing
+        // new (made outputs, refusals) asks for no write.
+        if self.names.take_changed() {
+            self.write_listing(effects);
+        }
+        // A home waits for the places made of its file to be answered ([`Store::home_ready`]).
+        // clone: the files the step's places ended for, a few
+        let ended = let_go.clone();
         for content in self.names.doomed(let_go) {
             // A value that is a file of its own goes with its record, never by its file
             // alone: the record is forgotten (below), and the file is removed once the head
@@ -4235,12 +4287,15 @@ impl Store {
             }
             self.let_go(content, effects);
         }
-        // A key no path holds any more whose value is a file of its own that nothing names:
-        // its record is asked to be forgotten, which happens once no root names it either
-        // ([`Store::forget_due`]): the file is the record's one home, and a home holds the
-        // current program's, not every build's.
+        // A key no path holds any more whose value is a file of its own: its record is asked
+        // to be forgotten, which happens once no root names it either ([`Store::forget_due`]):
+        // the file is the record's one home, and a home holds the current program's, not
+        // every build's. Whatever else names the file: a path placed from another key of the
+        // same bytes holds that key's record, which keeps the file. (Until 2026-11-13 it was
+        // asked only when nothing named the file, so a key let go of while a path of another
+        // key named its file was never asked again, and its record kept the file for good.)
         for key in unrooted {
-            if self.place_keys.values().any(|it| *it == key) {
+            if self.names.holds(&key) {
                 continue;
             }
             let look = self.look();
@@ -4250,17 +4305,19 @@ impl Store {
                 }
                 _ => None,
             };
-            if let Some(content) = external
-                && self.names.names(&content) == 0
-            {
+            if external.is_some() {
                 self.forget(key);
             }
         }
+        for content in ended {
+            self.ask_staged_sync(content, effects);
+            self.home_ready(content, effects);
+        }
     }
 
-    /// Asks for the listing of the names to be written over `placed/names`, whole and
-    /// durably ([`Effect::Write`]), or for one more once the write in flight ends: one write
-    /// at a time, the last asked holding the names as they are when it is asked.
+    /// Asks for the listing of the names to be written over `placed/names`, whole and with no
+    /// sync ([`Effect::WriteUnsynced`]), or for one more once the write in flight ends: one
+    /// write at a time, the last asked holding the names as they are when it is asked.
     fn write_listing(&mut self, effects: &mut Vec<Effect>) {
         if self.listing.writing {
             self.listing.again = true;
@@ -4274,7 +4331,10 @@ impl Store {
         {
             self.listing.asked = bytes.len() as u64;
         }
-        effects.push(Effect::Write { file: self.names_file(), bytes, tag });
+        // Not synced: a cache of what keeps whole files, which no answer waits for, checked
+        // as it is read ([`whole::Names::decode`]); so an edit's place asks for no write that
+        // waits for a device.
+        effects.push(publish::write(self.names_file(), bytes, Durable::No, tag));
     }
 
     /// The listing of the names of `placed/`'s whole files ([`whole::Names::listing`]).
@@ -4354,7 +4414,22 @@ impl Store {
                         false => vec![(0, bytes)], // alloc: the one run's slot, once per place
                     },
                 };
+                // The planted bugs of a made output are of a maker's runs
+                // ([`Store::place_made`]), not of a value's bytes written where they go: a cold
+                // place's output, written so since 2026-11-12, keeps its own route under them,
+                // so the forced bytes a plant is caught by are the made output's alone.
+                #[cfg(test)]
+                let plant = match self.plant {
+                    PlacePlant::MadeClonesUnflushed | PlacePlant::MadeWaitsForWriteBack => {
+                        std::mem::replace(&mut self.plant, PlacePlant::None)
+                    }
+                    it => it,
+                };
                 self.write_runs(asked, to, file, publish::Base::Holes, false, written, effects);
+                #[cfg(test)]
+                {
+                    self.plant = plant;
+                }
             }
             Content::Sparse(file) => {
                 self.write_runs(asked, to, file, publish::Base::Holes, false, written, effects);
@@ -4437,9 +4512,11 @@ impl Store {
             publish::Base::Copy => self.plant_linked.get(&to).cloned(),
             publish::Base::Clone | publish::Base::Holes => None,
         };
+        let executable = self.mode_first(&to);
         let (mut writing, clear) = publish::Writing::begin(to, temp, file, base, asked);
         // Only a clone is prewarmed: a copy's pages are in the cache as it is made.
         writing.warm = base == publish::Base::Clone && started;
+        writing.executable = executable;
         writing.written = written;
         // The second path asked of it before it began ([`Store::place_also`]).
         if let Some((tag, also)) = self.also.remove(&asked) {
@@ -4469,6 +4546,15 @@ impl Store {
         if self.plant == PlacePlant::StampsStaged {
             let stamp = Some(PlacedStamp { stamp: staged, looked_ns: 1 });
             return self.answer(Placed { tag: asked, to, result: Ok(()), bytes, stamp });
+        }
+        // The planted bug: an executable's mode set on its path after the look, before the
+        // look that vouches for it.
+        #[cfg(test)]
+        if self.plant == PlacePlant::ModeAfterLook && self.started.contains(&to) {
+            // clone: the effect and the op each own the name; a test's planted bug
+            let file = to.clone();
+            let tag = self.tags.ask(Op::ModeAfterLook { asked, to, bytes, staged });
+            return effects.push(Effect::Mode { file, mode: publish::EXECUTABLE_MODE, tag });
         }
         let tag = self.tags.ask(Op::VouchNow { asked, to, bytes, staged });
         effects.push(Effect::Now { tag });
@@ -4576,10 +4662,7 @@ impl Store {
                         let tag = self.tags.ask(Op::PatchWarm { asked });
                         effects.push(Effect::Prewarm { like, file, tag });
                     }
-                    None => {
-                        let tag = self.tags.ask(Op::PatchLook { asked });
-                        effects.push(publish::look(&patching.temp, tag));
-                    }
+                    None => self.patch_look(asked, effects),
                     Some(why) => {
                         // alloc: an error, once per place that fails
                         let why = format!("writing its ranges into its base's clone: {why}");
@@ -4588,12 +4671,11 @@ impl Store {
                 }
             }
             Op::PatchWarm { asked } => {
-                let Some(patching) = self.patching.get(&asked) else { return };
+                if !self.patching.contains_key(&asked) {
+                    return;
+                }
                 match done {
-                    Done::Prewarmed { .. } => {
-                        let tag = self.tags.ask(Op::PatchLook { asked });
-                        effects.push(publish::look(&patching.temp, tag));
-                    }
+                    Done::Prewarmed { .. } => self.patch_look(asked, effects),
                     done => {
                         // alloc: an error, once per place that fails
                         let why = format!(
@@ -4604,6 +4686,18 @@ impl Store {
                     }
                 }
             }
+            Op::PatchMode { asked } => match done {
+                Done::Moded => {
+                    let Some(patching) = self.patching.get(&asked) else { return };
+                    let tag = self.tags.ask(Op::PatchLook { asked });
+                    effects.push(publish::look(&patching.temp, tag));
+                }
+                done => {
+                    // alloc: an error, once per place that fails
+                    let why = format!("making its staged file executable before its look: {}", describe(&done));
+                    self.patch_failed(asked, &why, effects)
+                }
+            },
             // The staged file whole, looked at once, then renamed onto its path.
             Op::PatchLook { asked } => {
                 let Some(patching) = self.patching.get(&asked) else { return };
@@ -5196,7 +5290,41 @@ impl Store {
     ) {
         // clone: the effect's name and the op's staged file, once per place
         let file = staged.temp.clone();
+        if self.mode_first(&to) {
+            let tag = self.tags.ask(Op::StagedMode { asked, to, staged, bytes });
+            effects.push(Effect::Mode { file, mode: publish::EXECUTABLE_MODE, tag });
+            return;
+        }
         let tag = self.tags.ask(Op::StagedLook { asked, to, staged, bytes });
+        effects.push(publish::look(&file, tag));
+    }
+
+    /// Whether the staged file placed at `to` is made executable before its look: `to` is a
+    /// path a program is started from ([`Store::starts`]). Its mode is then part of the look
+    /// the place's stamp is, so the stamp is of the file as it stays: a mode set after the
+    /// look moves its change time and mode past the stamp, and a daemon started later would
+    /// find it changed and hash it again.
+    fn mode_first(&self, to: &FileName) -> bool {
+        #[cfg(test)]
+        if self.plant == PlacePlant::ModeAfterLook {
+            return false;
+        }
+        self.started.contains(to)
+    }
+
+    /// The staged file of the output place `asked` derives looked at once, whole, before its
+    /// rename; made executable first when a program is started from its path
+    /// ([`Store::mode_first`]).
+    fn patch_look(&mut self, asked: Tag, effects: &mut Vec<Effect>) {
+        let Some(patching) = self.patching.get(&asked) else { return };
+        // clone: the effect owns the name; once per place
+        let file = patching.temp.clone();
+        if self.mode_first(&patching.to) {
+            let tag = self.tags.ask(Op::PatchMode { asked });
+            effects.push(Effect::Mode { file, mode: publish::EXECUTABLE_MODE, tag });
+            return;
+        }
+        let tag = self.tags.ask(Op::PatchLook { asked });
         effects.push(publish::look(&file, tag));
     }
 
@@ -5261,10 +5389,92 @@ impl Store {
         FileName::new(&name).expect("a hidden name beside a file's name is a name")
     }
 
+    /// The sync of the whole file of `content`, written back under its writing name, is asked,
+    /// once no place made of it is in flight (asked again as each such place ends,
+    /// [`Store::names_step`]), so no answer comes after a sync asked for its file: an edit's
+    /// answer pays no fsync. Once, and waited for by nothing.
+    pub(crate) fn ask_staged_sync(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
+        if !self.staged_files.contains(&content) || self.names.in_flight(&content) > 0 {
+            return;
+        }
+        let Some(PlacedFile::There { lost: false, sync_asked, .. }) = self.files.get_mut(&content) else {
+            return;
+        };
+        if sync_asked.is_some() {
+            return;
+        }
+        let round = self.home_rounds;
+        self.home_rounds += 1;
+        *sync_asked = Some(round);
+        let tag = self.tags.ask(Op::StagedSynced { content, round });
+        // durable: a content's name is given only to bytes a sync made durable, so no crash
+        // leaves other bytes under it
+        effects.push(Effect::Sync { file: self.placed_file(&content), tag });
+    }
+
+    /// The sync of the whole file of `content` under its writing name ended
+    /// ([`Store::ask_staged_sync`]): it takes its content's name. A sync that failed
+    /// leaves it under its writing name for this run, still cloned from, and no home of its
+    /// value is made of it; the next open sweeps it, and a place after writes it again. A file
+    /// removed or named meanwhile asks nothing.
+    fn staged_synced(&mut self, content: ContentId, round: u64, done: &Done, effects: &mut Vec<Effect>) {
+        let there = matches!(
+            self.files.get(&content),
+            Some(PlacedFile::There { lost: false, sync_asked: Some(asked), .. }) if *asked == round
+        );
+        if !there || !self.staged_files.contains(&content) {
+            return;
+        }
+        if !matches!(done, Done::Synced) {
+            let file = self.placed_file(&content);
+            // alloc: a problem reported
+            return self.placed_problem(format!(
+                "syncing {file}, the store's whole file of an output, before it takes its content's name: {}. It keeps its writing name for this run, and no home of its value is made of it",
+                describe(done)
+            ));
+        }
+        self.synced_files.insert(content);
+        self.name_staged(content, effects);
+    }
+
+    /// The whole file of `content`, synced under its writing name, takes its content's name
+    /// by a rename with no sync of `placed/` (its home's sync of `placed/` makes the name
+    /// durable, [`crate::home`]): at once when no clone of it is in flight, else once the
+    /// last ended ([`Store::cloned`]), since a clone asked under the writing name must find
+    /// it there. Meanwhile ([`PlacedFile::Naming`]) a place writes its bytes where they go,
+    /// as while the file is written, and one that can be made only of a clone of it waits for
+    /// the rename alone. The rule this keeps: a content's name is given only to bytes a
+    /// completed sync made durable, so after any crash it holds that content or is not there,
+    /// and the open needs to check nothing it did not need to before.
+    pub(crate) fn name_staged(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
+        if !self.staged_files.contains(&content) || !self.synced_files.contains(&content) {
+            return;
+        }
+        let Some(PlacedFile::There { cloning, lost, naming_due, .. }) = self.files.get_mut(&content) else {
+            return;
+        };
+        if *lost {
+            return;
+        }
+        if *cloning > 0 {
+            *naming_due = true;
+            return;
+        }
+        let Some(PlacedFile::There { after, owed, doomed, .. }) = self.files.remove(&content) else {
+            unreachable!("matched above")
+        };
+        let from = self.placed_file(&content);
+        self.staged_files.remove(&content);
+        let to = self.placed_file(&content);
+        let tag = self.tags.ask(Op::NameFile { content });
+        effects.push(publish::rename(from, to, Durable::No, tag));
+        self.files.insert(content, PlacedFile::Naming { waiting: after, written: owed, doomed });
+    }
+
     /// A clone of the whole file of `content` ended: it goes once it is let go of (or found gone)
     /// and no other clone of it is in flight.
     fn cloned(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
-        let Some(PlacedFile::There { cloning, doomed, lost, after, .. }) =
+        let Some(PlacedFile::There { cloning, doomed, lost, after, naming_due, .. }) =
             self.files.get_mut(&content)
         else {
             return;
@@ -5273,6 +5483,8 @@ impl Store {
         if *cloning == 0 && (*doomed || *lost) {
             let after = std::mem::take(after);
             self.remove_file(content, after, effects);
+        } else if *cloning == 0 && *naming_due {
+            self.name_staged(content, effects);
         }
     }
 
@@ -5327,6 +5539,7 @@ impl Store {
         let file = self.placed_file(&content);
         // Whatever name it had: the next one made begins under its writing name again.
         self.staged_files.remove(&content);
+        self.synced_files.remove(&content);
         self.files.insert(content, PlacedFile::Removing(waiting));
         let tag = self.tags.ask(Op::Unplace { content });
         effects.push(Effect::Remove { file, tag });
@@ -5376,9 +5589,14 @@ impl Store {
                     let written = std::mem::take(&mut written);
                     self.publish(asked, to, copy, written, effects);
                 }
-                // Written under its writing name: it takes the content's name by a rename
-                // only once it is sealed and written back, so no crash leaves other bytes
-                // under that name. (The planted bug writes it in place.)
+                // Written under its writing name, with no sync: it is cloned from under that
+                // name once it is sealed and written back, and takes the content's name only
+                // once a sync of it has completed, asked then and waited for by nothing
+                // ([`Store::name_staged`]). A write-back orders nothing (a rename after one may
+                // reach the disk before the data), so the sync is what makes "a content's name
+                // holds that content after any crash" true: a file there with other bytes was
+                // changed outside the daemon, refused naming `blaze store verify`. (The
+                // planted bug writes it in place.)
                 #[cfg(test)]
                 let in_place = self.plant == PlacePlant::WritesInPlace;
                 #[cfg(not(test))]
@@ -5391,7 +5609,7 @@ impl Store {
                 self.files.insert(content, PlacedFile::Writing(waiting));
                 let tag = self.tags.ask(Op::MakeFile { content, written });
                 // Not synced: its write-back is begun once it is sealed
-                // ([`Store::flush_file`]), and its rename follows that.
+                // ([`Store::flush_file`]), its sync once that ended.
                 effects.push(publish::write(file, bytes, Durable::Started, tag));
             }
             Err(why) => self.refuse_waiting(waiting, &why),
@@ -5799,6 +6017,8 @@ impl Store {
             after: Vec::new(),
             // Made ahead of any place: the first to come reports what making it wrote.
             owed: if waiting.is_empty() { written } else { 0 },
+            sync_asked: None,
+            naming_due: false,
         };
         self.files.insert(content, there);
         for waiter in waiting.iter().filter(|it| it.base_of.is_none()) {
@@ -5901,18 +6121,14 @@ impl Store {
                 // The witness: only this completion, of this file's write-back, makes the
                 // file one a clone is asked of ([`publish::Written::flushed`]).
                 match file.flushed(&done) {
-                    // Clean, and still under its writing name: the rename that gives it
-                    // its own, after which it may be cloned.
-                    Ok(_) if self.staged_files.contains(&content) => {
-                        let from = self.placed_file(&content);
-                        self.staged_files.remove(&content);
-                        let to = self.placed_file(&content);
-                        let tag = self.tags.ask(Op::NameFile { content });
-                        effects.push(publish::rename(from, to, Durable::No, tag));
-                        self.files.insert(content, PlacedFile::Naming { waiting, written, doomed });
+                    // The file is clean, and may be cloned: under its writing name, where it
+                    // is still under it, whose sync is asked once no place made of it is in
+                    // flight and waited for by nothing; once it ended the file takes its
+                    // content's name ([`Store::name_staged`]).
+                    Ok(file) => {
+                        self.there(content, &file, waiting, written, doomed, effects);
+                        self.ask_staged_sync(content, effects);
                     }
-                    // The file is clean, and may be cloned.
-                    Ok(file) => self.there(content, &file, waiting, written, doomed, effects),
                     Err(file) => {
                         // Not known written back, so never cloned from: it goes, what waited
                         // for it is refused by name, and the next place writes it again.
@@ -5983,6 +6199,10 @@ impl Store {
             }
             (Op::NameFile { .. }, PlacedFile::Naming { waiting, .. }, done) => {
                 self.shared.settled(&content);
+                // Under no name of its own, it is no home: one wanted of it is let go of, and
+                // the next place of it makes the file again.
+                self.homing.remove(&content);
+                self.synced_files.remove(&content);
                 // alloc: an error, once per place that fails
                 let why = format!(
                     "renaming the store's whole file of an output to {file}: {}",
@@ -6282,6 +6502,30 @@ impl Store {
             Op::Recheck { content, waiter, why } => {
                 self.rechecked(content, waiter, &why, &done, effects)
             }
+            Op::StagedMode { asked, to, staged, bytes } => match done {
+                Done::Moded => {
+                    // clone: the effect's name and the op's staged file, once per place
+                    let file = staged.temp.clone();
+                    let tag = self.tags.ask(Op::StagedLook { asked, to, staged, bytes });
+                    effects.push(publish::look(&file, tag));
+                }
+                done => {
+                    // clone: the effect and the op each own the name; once per place that fails
+                    let tag = self.tags.ask(Op::Discard { file: staged.temp.clone() });
+                    effects.push(Effect::Remove { file: staged.temp, tag });
+                    // alloc: an error, once per place that fails
+                    let result = Err(format!(
+                        "making the clone placed at {to} executable before its look: {}",
+                        describe(&done)
+                    ));
+                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default(), stamp: None });
+                }
+            },
+            #[cfg(test)]
+            Op::ModeAfterLook { asked, to, bytes, staged } => {
+                let tag = self.tags.ask(Op::VouchNow { asked, to, bytes, staged });
+                effects.push(Effect::Now { tag });
+            }
             Op::StagedLook { asked, to, staged, bytes } => match publish::looked(&done) {
                 Ok(looked) => self.rename_staged(asked, to, staged, bytes, looked, effects),
                 Err(why) => {
@@ -6392,7 +6636,19 @@ impl Store {
                 // None written yet reads as empty: no names.
                 Done::Read(bytes) => match whole::Names::decode(&bytes) {
                     Ok(listed) => {
-                        self.names.opened(listed);
+                        if let Some(listed) = listed {
+                            self.names.opened(listed);
+                        } else {
+                            // Written with no sync, it is what a crash left of a write: it
+                            // names nothing, so the look keeps only the homes the head names,
+                            // and no path holds a key until it is placed again. What a crash
+                            // may leave, so no problem of the store's: said, not kept.
+                            tracing::info!(
+                                target: "blaze",
+                                file = %self.names_file(),
+                                "the listing of the names of the store's whole files fails its check (a crash cut its write): it names nothing, and the whole files no home needs are removed"
+                            );
+                        }
                         let tag = self.tags.ask(Op::ListPlaced);
                         effects.push(Effect::List { dir: self.placed_dir(), tag });
                     }
@@ -6413,8 +6669,9 @@ impl Store {
                     self.listing.written += self.listing.asked;
                 }
                 if !matches!(done, Done::Written) {
-                    // The next change of the names writes them whole again; until then the
-                    // open after a crash keeps what the last listing written names.
+                    // The next step that answers a place writes them whole again; until then
+                    // the open after a crash keeps what the last listing written names.
+                    self.names.unwritten();
                     // alloc: a problem reported
                     self.placed_problem(format!(
                         "{}, the listing of the names of the store's whole files, was not written: {}",
@@ -6444,12 +6701,14 @@ impl Store {
             | Op::NameFile { .. }) => {
                 self.file_step(op, done, effects);
             }
+            Op::StagedSynced { content, round } => self.staged_synced(content, round, &done, effects),
             Op::HomeSynced { content, round } => self.home_synced(content, round, &done, effects),
             Op::HomeMapped { content, round } => self.home_mapped(content, round, done, effects),
             op @ (Op::PatchClear { .. }
             | Op::PatchClone { .. }
             | Op::PatchWrite { .. }
             | Op::PatchWarm { .. }
+            | Op::PatchMode { .. }
             | Op::PatchLook { .. }
             | Op::PatchRename { .. }) => {
                 self.patch_step(op, done, effects);
@@ -8241,9 +8500,10 @@ impl Store {
         let tier = &mut self.tiers[at];
         match what {
             Mapped::External { content, batch } => {
+                let mut changed_home = None;
                 if let Some(external) = tier.externals.get_mut(&content) {
                     let named = external.len;
-                    if len != named {
+                    if len != named && !external.placed {
                         return self.tier_failed(
                             at,
                             file,
@@ -8251,14 +8511,35 @@ impl Store {
                             format!("it is {len} bytes, not the {named} its head names"),
                         );
                     }
-                    external.mapping = Some(mapping);
-                    #[cfg(test)]
-                    let keeps = self.plant_heap == heap::HeapPlant::KeepsExternalMemory;
-                    #[cfg(not(test))]
-                    let keeps = false;
-                    if !keeps {
-                        external.memory = None;
+                    if len != named {
+                        // A placed output's whole file that is its value's one home
+                        // ([`crate::home`]) was synced under its name before any head named
+                        // it, so no crash leaves it another length: it was changed outside
+                        // the daemon. Its value alone is wrong, not the store: it is left
+                        // unmapped, so every read of it is refused as corrupt naming the file
+                        // (`read::Look::record`) and a scrub finds it ([`Store::verify`]),
+                        // and the repair the problem names forgets its record
+                        // ([`Store::forget_corrupt`]). Until 2026-11-13 the whole store
+                        // stopped here, so `blaze store verify`, which opens the store to
+                        // forget that record, could not run.
+                        drop(mapping);
+                        changed_home = Some(named);
+                    } else {
+                        external.mapping = Some(mapping);
+                        #[cfg(test)]
+                        let keeps = self.plant_heap == heap::HeapPlant::KeepsExternalMemory;
+                        #[cfg(not(test))]
+                        let keeps = false;
+                        if !keeps {
+                            external.memory = None;
+                        }
                     }
+                }
+                if let Some(named) = changed_home {
+                    // alloc: a problem reported
+                    self.placed_problem(format!(
+                        "{file}, the store's whole file of an output and the one home of its value's bytes, is {len} bytes, not the {named} its head names (a file changed outside the daemon): its value reads as corrupt. {VERIFY_PLACED}"
+                    ));
                 }
                 self.mapped_for(batch);
             }
@@ -8517,8 +8798,12 @@ fn open_tier(tier: &mut Tier, look: Look<'_>) -> Result<(), (FileName, String)> 
                         ))
                     },
                 )?;
-            // A record forgotten alone ([`forget`]) is no key's: its key finds what else there is.
-            if header.form != Form::Dictionary && !pack.forgot(at) {
+            // A record forgotten alone ([`forget`]) is still its key's last record: its spot
+            // is kept, as the run that forgot it kept it, and finds nothing
+            // ([`read::TierView::spot_gone`]). Skipped, an older record of the key (the copy a
+            // home replaced, a value a settle moved) would be the key's again: a forgotten
+            // record back from the dead after an open.
+            if header.form != Form::Dictionary {
                 let loc = Loc {
                     pack: number as u32,
                     kind: header.kind,

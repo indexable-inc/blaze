@@ -24,6 +24,10 @@
 //!   lookup. Any name added to the module changes it; it is per module, never per crate.
 //! - `FieldOrder`: the field order plan every layout reads (`hir_ty::layout::field_order`), by
 //!   its content ID, or that there is none: one fact for the build, no subject but a tag.
+//! - `Setting(field)`: a field of the front end's settings (`base_db::FrontSettings`) a step
+//!   reads, by the field's name: one fact for the build. Only `borrowck_debug` is read by a
+//!   step: the borrow check prints its regions where it is set, so a verdict kept without it
+//!   is checked again, and printed, with it.
 //!
 //! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
 //! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
@@ -83,6 +87,8 @@ pub mod kinds {
     pub const CRATE_NAMES: QueryKind = QueryKind(0x1808);
     /// The build's field order plan, which every ADT's layout reads.
     pub const FIELD_ORDER: QueryKind = QueryKind(0x1809);
+    /// A field of the build's front-end settings, which a step reads.
+    pub const SETTING: QueryKind = QueryKind(0x180a);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -94,6 +100,11 @@ const TRAITS_DOMAIN: &str = "blaze v2 item-hash traits in scope 1";
 const WHOLE_SCOPE_DOMAIN: &str = "blaze v2 item-hash whole scope 1";
 const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
+const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
+
+/// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
+/// no key is. The settings are one for the build, so the fact names nothing else.
+const BORROWCK_DEBUG_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: borrowck dbg");
 
 /// The subject of the [`kinds::FIELD_ORDER`] fact: a tag, which no key is. The plan is one
 /// for the build, so the fact names nothing else.
@@ -174,6 +185,8 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
         }
     } else if kind == kinds::FIELD_ORDER {
         (fact.subject == FIELD_ORDER_SUBJECT).then(|| field_order_of(db))
+    } else if kind == kinds::SETTING {
+        (fact.subject == BORROWCK_DEBUG_SUBJECT).then(|| borrowck_debug_of(db))
     } else if kind == kinds::TRAITS_IN_SCOPE || kind == kinds::WHOLE_SCOPE {
         match key::resolve(db, ItemKey(fact.subject)) {
             None => Some(absent(kind)),
@@ -200,6 +213,29 @@ fn field_order_of(db: &Db) -> ContentId {
     let mut h = Hasher::new(FIELD_ORDER_DOMAIN);
     match plan {
         Some(id) => h.update(&[1]).id(&id),
+        None => h.update(&[0]),
+    };
+    h.finish()
+}
+
+/// The `Setting` fact a read of the front end's setting `name` stands for (an ingredient's
+/// debug name, a field of `base_db::FrontSettings`); `None` for a field no step is known to
+/// read, which is then refused.
+pub fn setting(name: &str) -> Option<FactRef> {
+    let subject = match name {
+        "borrowck_debug" => BORROWCK_DEBUG_SUBJECT,
+        _ => return None,
+    };
+    Some(FactRef { kind: kinds::SETTING, subject, object: FactObject::None })
+}
+
+/// `BLAZE_BORROWCK_DEBUG` as the build has it, or that it has none: what the borrow check
+/// reads of it.
+fn borrowck_debug_of(db: &Db) -> ContentId {
+    let mut h = Hasher::new(SETTING_DOMAIN);
+    h.part(b"borrowck_debug");
+    match base_db::FrontSettings::try_get(db).and_then(|it| it.borrowck_debug(db).as_deref()) {
+        Some(it) => h.update(&[1]).part(it.as_bytes()),
         None => h.update(&[0]),
     };
     h.finish()

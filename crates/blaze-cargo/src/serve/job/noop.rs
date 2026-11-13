@@ -562,7 +562,7 @@ thread_local! {
 }
 
 /// Whether the test on this thread planted `plant`; never outside a test.
-fn planted(plant: Plant) -> bool {
+pub(super) fn planted(plant: Plant) -> bool {
     #[cfg(test)]
     let planted = PLANTED.get() == Some(plant);
     #[cfg(not(test))]

@@ -975,6 +975,12 @@ mod tests {
                 blaze_core::wait::sleep_until("the test's next look at the give-back", next, &clock)
                     .expect("the test sleeps");
             };
+            // The purge after every maker, as `blaze_cargo::raw::memory::purge` does (its step
+            // 3): a maker's own forced purge skips every arena while another maker holds
+            // mimalloc's purge guard, so the pages it gave back are reached only by a purge
+            // that begins after the last one gave.
+            // SAFETY: `mi_collect` reads and writes no memory of ours; callable from any thread.
+            unsafe { mi_collect(true) };
             let end = committed_now();
             stop.store(true, Ordering::Release);
             Committed { start, end, settle }
@@ -982,7 +988,9 @@ mod tests {
     }
 
     /// The invariant: once every thread that holds pages of freed blocks gave back for a
-    /// give-back asked after the frees, [`committed_now`] is within 8 MiB of what it was before
+    /// give-back asked after the frees, and the arenas were purged after the last of them (the
+    /// daemon's purge, `blaze_cargo::raw::memory::purge`, steps 2 and 3), [`committed_now`] is
+    /// within 8 MiB of what it was before
     /// the blocks were made: 256 MiB made on four threads and freed on a fifth leave mimalloc's
     /// count, as [`committed_now`]'s doc says a purge does. The control, by removing the cause:
     /// with one maker that never gives back the give-back never settles and its 64 MiB part

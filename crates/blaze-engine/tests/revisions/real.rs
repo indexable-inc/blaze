@@ -14,6 +14,12 @@
 //! no-op lane off), with the store check forced on (`BLAZE_VERIFY_STORE=1`), and its exit
 //! status and output are read.
 //!
+//! Each test keeps a home and daemon of its own, not one shared by the run as `tests/repro.rs`
+//! shares one: what it checks is the daemon's own account of each build (what reran, what
+//! missed, how many daemons started), which another test's build on the same daemon would
+//! change, and it stops, kills and rehomes its daemon. Its daemon is started with
+//! `BLAZE_DAEMON_EXIT_UNHELD` ([`UNHELD`]) so that a killed test leaves none.
+//!
 //! `blaze` is the thin `blaze` (crates/blaze-thin) with the engine beside it, as an install
 //! lays them out ([`install`]): every command goes through the thin's route, and a case of
 //! its own path ([`Test::as_typed`]) runs its commands as a person types them, so the thin's
@@ -45,6 +51,10 @@ const DEADLINE: Duration = Duration::from_secs(600);
 /// reserves a large address range, and many at once fail with ENOMEM. `BLAZE_REVISIONS_JOBS`
 /// sets another bound.
 const JOBS: u32 = 4;
+
+/// What a test's daemon is started with: it stops itself once no connection has been open at
+/// its socket for its grace of 20 s, longer than any [`Step::Wait`] a case takes.
+const UNHELD: (&str, &str) = ("BLAZE_DAEMON_EXIT_UNHELD", "on");
 
 static RUNNING: (Mutex<u32>, Condvar) = (Mutex::new(0), Condvar::new());
 
@@ -316,7 +326,8 @@ impl Real {
     /// and the programs [`Expect::as_built`](super::spec::Expect::as_built) runs alike.
     /// `whole`: with the driver's own settings of blaze (`BLAZE_LOCK`, `BLAZE_VERIFY_STORE`,
     /// `BLAZE_DUCKDB`); without them it is a person's, whose command the thin `blaze` reads
-    /// (any `BLAZE_*` but `BLAZE_HOME` sends it to the engine, blaze-thin's `route::env`).
+    /// (any `BLAZE_*` but `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD` sends it to the engine,
+    /// blaze-thin's `route::env`).
     fn environ(&self, command: &mut Command, env: &BTreeMap<String, String>, whole: bool) {
         command.env_clear();
         let passed: &[&str] = if whole { &["HOME", "BLAZE_DUCKDB"] } else { &["HOME"] };
@@ -328,6 +339,12 @@ impl Real {
         if whole {
             command.env("BLAZE_LOCK", "write").env("BLAZE_VERIFY_STORE", "1");
         }
+        // The daemon exits once no command holds it (`crates/blaze-cargo/src/serve/unheld.rs`),
+        // so a test nextest killed at its time cap, before its `Drop`, leaves none. On every
+        // command, a typed one too: the thin `blaze` keeps a typed command that sets it on its
+        // own path (blaze-thin's `route::CHECKED_HERE`), and the engine it hands a command to
+        // starts the daemon with it.
+        command.env(UNHELD.0, UNHELD.1);
         command
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("TMPDIR", self.root.join("t"))

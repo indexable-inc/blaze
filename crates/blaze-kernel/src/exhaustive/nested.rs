@@ -562,7 +562,7 @@ fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
         let (explored, failure) = explore(Bug::None, start, says);
         assert_eq!(failure, None, "{start:?} {says:?}");
         assert_eq!(explored.sequences, WAYS.pow(STEPS));
-        println!(
+        blaze_report::outln!(
             "{start:?} {says:?}: {} sequences, {} hits, {} computed, {} early cutoffs, {} gets after a carry, carries {:?}",
             explored.sequences,
             explored.hits,

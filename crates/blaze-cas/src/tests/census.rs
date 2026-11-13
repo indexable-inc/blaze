@@ -7,6 +7,9 @@ use crate::read::Place;
 
 /// A value of every kind, each in the encoding its kind's readers expect.
 fn every_kind() -> Vec<(Key, Kind, Vec<u8>)> {
+    // A leaf's keys ascend (`sets::encode_leaf`): keys are hashes, so sorted here.
+    let mut leaf = [key(1), key(2)];
+    leaf.sort_unstable();
     let pin = crate::collect::Pin { name: "a pin".into(), why: "a census test".into(), when: 1, keys: vec![key(1)] };
     vec![
         (key(1), Kind::Query, text(1, 3_000)),
@@ -18,7 +21,7 @@ fn every_kind() -> Vec<(Key, Kind, Vec<u8>)> {
         (key(7), Kind::Machine, noise(12 << 10, 7)),
         (key(8), Kind::Derived, crate::derived::encode(&key(5), 2 << 10, &[(16, b"written over".to_vec())]).unwrap()),
         (key(9), Kind::Pin, pin.encode()),
-        (key(10), Kind::Set, crate::sets::encode_leaf(&[key(1), key(2)])),
+        (key(10), Kind::Set, crate::sets::encode_leaf(&leaf)),
     ]
 }
 

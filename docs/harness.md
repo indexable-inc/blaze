@@ -630,8 +630,9 @@ so both must be files on that filesystem.
 
 A case is of the thin `blaze`'s own path when a revision states `daemon_after`, `starts`,
 `at_once` or `run the file` (spec.rs `Test::as_typed`). Its `build`, `run`, `check` and `test`
-run with no `--message-format` and no `BLAZE_*` but `BLAZE_HOME` (any other sends the command to
-the engine, blaze-thin's `route::env`), so a daemon such a command starts runs without
+run with no `--message-format` and no `BLAZE_*` but `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD`
+(any other sends the command to the engine, blaze-thin's `route::env`; the second is on every
+command of the real driver, so a killed test leaves no daemon), so a daemon such a command starts runs without
 `BLAZE_VERIFY_STORE=1` and `BLAZE_LOCK=write`: what such a case loses is the store's read-back
 check. The driver's own reads (`why`, `explain`, `stop`, `store`) keep the whole environment.
 

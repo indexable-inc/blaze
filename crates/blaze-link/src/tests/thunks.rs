@@ -588,7 +588,12 @@ impl Far {
 /// three edits, each a leaf filled again under its own key. A splice refused must be the
 /// typed one for a thunk out of reach, and the link from scratch that takes its place is
 /// held to the same oracle. Each case links 200 MiB, so there are few.
-#[hegel::test(test_cases = 4)]
+///
+/// `TooSlow` is suppressed because its cost is the body's, not the drawing's: a case must lay
+/// out more code than a `bl` reaches (128 MiB) to test the thunks at all, and with four cases,
+/// fewer than the ten the health check waits for, the check sums the whole run, so four
+/// unoptimized 200 MiB links on a loaded machine pass 30 s with draws that take microseconds.
+#[hegel::test(test_cases = 4, suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn every_call_reaches_the_code_an_edit_left(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let direct = tc.draw(gs::integers::<u8>().max_value(1)) == 1;

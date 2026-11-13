@@ -15,7 +15,7 @@
 
 use std::{path::Path, time::Duration};
 
-use blaze_api::{Envelope, Executable, Request, Response};
+use blaze_api::{Envelope, Request, Response, Status};
 
 use crate::{
     answer::{Exec, Plain, Shown, Step},
@@ -145,18 +145,19 @@ pub enum Ended {
     Said { said: String, exec: Option<Exec> },
 }
 
-/// One command's talk on `link`: the daemon asked which engine it is (`is_engine` says whether
-/// its executable is the one beside this program), the request sent, its answer taken, and a
+/// One command's talk on `link`: the daemon asked which engine it is and what it was started
+/// with (`is_ours` says whether its status names the engine beside this program and the
+/// settings this command keeps, `crate::route::drifted`), the request sent, its answer taken, and a
 /// `run`'s launch asked. `took` is the time since the command began, read as the answer ends.
 /// `timings` gets the request's time on the wire ([`ON_THE_WIRE`]) and its build's id.
 pub fn talk<L: Link>(
     link: &mut L,
     spoken: &Spoken<'_>,
-    is_engine: impl FnOnce(&Executable) -> Result<(), String>,
+    is_ours: impl FnOnce(&Status) -> Result<(), String>,
     took: impl FnOnce() -> Duration,
     timings: &mut Timings,
 ) -> Ended {
-    match before(link, is_engine) {
+    match before(link, is_ours) {
         Ok(()) => {}
         Err(why) => return Ended::Engine(why),
     }
@@ -233,11 +234,12 @@ pub fn said(spoken: &Spoken<'_>, plain: Plain, took: Duration) -> Result<(String
     Ok((said, Some(Exec::of(executable, cargo_env, &asked.program, spoken.cwd))))
 }
 
-/// No request of this blaze runs on another's daemon: the daemon says which engine it is,
-/// and any but the one beside this program is the engine's to replace.
+/// No request of this blaze runs on another's daemon, or on one started with another value of
+/// a setting it keeps: the daemon says which engine it is and what it was started with, and
+/// any but the one `is_ours` takes is the engine's to replace or refuse.
 fn before<L: Link>(
     link: &mut L,
-    is_engine: impl FnOnce(&Executable) -> Result<(), String>,
+    is_ours: impl FnOnce(&Status) -> Result<(), String>,
 ) -> Result<(), String> {
     link.send(STATUS, &Request::Status)?;
     let mut status = None;
@@ -253,7 +255,7 @@ fn before<L: Link>(
         }
     }
     let status = status.ok_or("the daemon answered its status with no status")?;
-    is_engine(&status.build.exe)?;
+    is_ours(&status)?;
     if link.held() != 0 {
         return Err("the daemon sent more after its status".to_owned());
     }
@@ -294,7 +296,7 @@ mod tests {
     use std::{collections::VecDeque, ffi::OsString};
 
     use blaze_api::{
-        Artifact, Build, LinkHow, LinkKind, Linked, PlacedBytes, Status, UnitStarted, Verb, Worked,
+        Artifact, Build, Executable, LinkHow, LinkKind, Linked, PlacedBytes, UnitStarted, Verb, Worked,
     };
 
     use super::*;

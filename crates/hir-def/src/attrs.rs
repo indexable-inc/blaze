@@ -93,6 +93,20 @@ fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAtt
     )
 }
 
+/// The generic parameter list of the item `lookup` is, off the item's outline
+/// ([`item_node`] with [`Tree::Outline`]): what an edit of a body of its file leaves equal.
+fn outline_generic_params<'db, N: AstIdNode + Typed>(
+    db: &'db Db,
+    lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule> + Copy,
+) -> Option<ast::GenericParamList<'db>>
+where
+    for<'t> N::Of<'t>: ast::HasGenericParams<'t>,
+{
+    let loc = lookup.lookup(db);
+    let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
+    ast::HasGenericParams::generic_param_list(&node)
+}
+
 /// The node at `id`, an item of `module`, off the tree `tree` says: for [`Tree::Outline`], an
 /// item of a block of a body is read off that body's syntax.
 fn item_node<'db, N: AstIdNode + Typed>(
@@ -2193,9 +2207,20 @@ impl AttrFlags {
                     attr_flags
                 };
                 // One walk of the written params, each zipped with its id in order, as
-                // `HasChildSourceView` finds one of them.
+                // `HasChildSourceView` finds one of them. The list is read off the item's
+                // outline ([`Tree::Outline`]), never the file's live parse, so an edit of a
+                // body of the file (this item's or another's) leaves this query's row as it was.
                 let generic_params = GenericParams::of(db, def);
-                let (_, list) = def.file_id_and_params_of_view(db);
+                let list = match def {
+                    GenericDefId::FunctionId(it) => outline_generic_params(db, it),
+                    GenericDefId::TypeAliasId(it) => outline_generic_params(db, it),
+                    GenericDefId::AdtId(AdtId::StructId(it)) => outline_generic_params(db, it),
+                    GenericDefId::AdtId(AdtId::UnionId(it)) => outline_generic_params(db, it),
+                    GenericDefId::AdtId(AdtId::EnumId(it)) => outline_generic_params(db, it),
+                    GenericDefId::TraitId(it) => outline_generic_params(db, it),
+                    GenericDefId::ImplId(it) => outline_generic_params(db, it),
+                    GenericDefId::ConstId(_) | GenericDefId::StaticId(_) => None,
+                };
 
                 let mut lifetimes = Vec::new_in(frame);
                 let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
@@ -2212,7 +2237,9 @@ impl AttrFlags {
                 if let GenericDefId::TraitId(id) = def
                     && let Some(self_id) = ids.next()
                 {
-                    let attr_flags = flags_of(id.lookup(db).source_view(db).value.attrs());
+                    let loc = id.lookup(db);
+                    let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
+                    let attr_flags = flags_of(node.attrs());
                     if !attr_flags.is_empty() {
                         type_and_consts.push((self_id, attr_flags));
                     }

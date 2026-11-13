@@ -29,7 +29,8 @@ fn parts_read(store: &Store, value: &[u8], when: &str) {
 fn a_part_of_a_value_is_that_range_of_it_wherever_it_is_kept() {
     let mut sim = Sim::new(7, quiet());
     let mut store = open(&mut sim, "store");
-    let value = noise(200_000, 9);
+    // Under `EXTERNAL_FROM`, so it is a raw record of a pack, not a file of its own.
+    let value = noise(EXTERNAL_FROM - 6_000, 9);
     store.put(key(1), Kind::Query, &value).unwrap();
     parts_read(&store, &value, "in its segment");
     flush(&mut sim, &mut store);

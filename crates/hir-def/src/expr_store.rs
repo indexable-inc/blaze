@@ -174,6 +174,13 @@ struct ExpressionOnlyStore {
     /// The closures written with `#[rustc_inherit_overflow_checks]`, in increasing order.
     overflow_inheriting: Col<ExprId>,
 
+    /// The expressions lowering made with no syntax of their own, in increasing order: the
+    /// parts of a desugaring (`for`, `?`, `.await`, `format_args!`, an `async fn`'s parameter
+    /// copies, `let else`), and a missing expression ([`ExpressionStore::is_synthesized`]). A
+    /// fact of the lowered body with no position in it, the same whether lowering recorded the
+    /// source map or not, so that what asks it reads [`Body::of`] and not the map.
+    synthesized: Col<ExprId>,
+
     /// blaze_verify's clause groups ([`ExpressionStore::spec_clause`]), by group in increasing
     /// order.
     spec_clauses: Col<(ExprId, SpecClauseKind)>,
@@ -260,6 +267,10 @@ pub struct ExpressionStoreBuilder {
 
     /// The closures written with `#[rustc_inherit_overflow_checks]`.
     overflow_inheriting: HashSet<ExprId, Global>,
+    /// A bit per expression, by id, set when lowering gives it syntax of its own
+    /// ([`Self::map_expr_back`]), recorded with or without the source map: `finish` makes the
+    /// store's `synthesized` of the expressions whose bit is clear.
+    with_syntax: Vec<u64>,
     /// blaze_verify's clause groups, in lowering order.
     pub(crate) spec_clauses: Vec<(ExprId, SpecClauseKind)>,
     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
@@ -716,6 +727,7 @@ struct Scratch {
     type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: HashMap<ExprId, Edition, Global>,
     overflow_inheriting: HashSet<ExprId, Global>,
+    with_syntax: Vec<u64>,
     spec_clauses: Vec<(ExprId, SpecClauseKind)>,
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
     pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
@@ -747,6 +759,8 @@ struct Packing {
     field_hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
     editions: Vec<(ExprId, Edition)>,
     inheriting: Vec<ExprId>,
+    /// The synthesized expressions, gathered in increasing order.
+    synthesized: Vec<ExprId>,
     /// The radix sorts' buffers.
     editions_sort: Vec<(ExprId, Edition)>,
     inheriting_sort: Vec<ExprId>,
@@ -760,6 +774,7 @@ impl Packing {
             field_hygiene,
             editions,
             inheriting,
+            synthesized,
             editions_sort,
             inheriting_sort,
         } = self;
@@ -768,6 +783,7 @@ impl Packing {
         field_hygiene.clear();
         editions.clear();
         inheriting.clear();
+        synthesized.clear();
         editions_sort.clear();
         inheriting_sort.clear();
     }
@@ -778,6 +794,7 @@ impl Packing {
             + self.field_hygiene.capacity()
             + self.editions.capacity()
             + self.inheriting.capacity()
+            + self.synthesized.capacity()
             + self.editions_sort.capacity()
             + self.inheriting_sort.capacity()
     }
@@ -840,6 +857,7 @@ impl Scratch {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            with_syntax,
             spec_clauses,
             expr_map,
             pat_map,
@@ -872,6 +890,7 @@ impl Scratch {
         type_hygiene.clear();
         block_editions.clear();
         overflow_inheriting.clear();
+        with_syntax.clear();
         spec_clauses.clear();
         expr_map.clear();
         pat_map.clear();
@@ -906,6 +925,7 @@ impl Scratch {
             + self.type_hygiene.capacity()
             + self.block_editions.capacity()
             + self.overflow_inheriting.capacity()
+            + self.with_syntax.capacity()
             + self.spec_clauses.capacity()
             + self.expr_map.capacity()
             + self.pat_map.capacity()
@@ -944,6 +964,7 @@ impl ExpressionStoreBuilder {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            with_syntax,
             spec_clauses,
             expr_map,
             pat_map,
@@ -977,6 +998,7 @@ impl ExpressionStoreBuilder {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            with_syntax,
             spec_clauses,
             inference_roots: None,
             expr_map,
@@ -1020,6 +1042,7 @@ impl ExpressionStoreBuilder {
             type_hygiene: mem::take(&mut self.type_hygiene),
             block_editions: mem::take(&mut self.block_editions),
             overflow_inheriting: mem::take(&mut self.overflow_inheriting),
+            with_syntax: mem::take(&mut self.with_syntax),
             spec_clauses: mem::take(&mut self.spec_clauses),
             expr_map: mem::take(&mut self.expr_map),
             pat_map: mem::take(&mut self.pat_map),
@@ -1044,6 +1067,24 @@ impl ExpressionStoreBuilder {
     /// Lowers without recording the source map (see `record`).
     pub(crate) fn skip_source_map(&mut self) {
         self.record = false;
+    }
+
+    /// Gives the expression `id` the syntax `src`: the one way lowering maps an expression back
+    /// to where it is written. It marks `id` as written with or without the source map, so the
+    /// store's synthesized expressions ([`ExpressionStore::is_synthesized`]) are those no call
+    /// of this gave syntax, which are those the map has none for, by construction; with the map
+    /// it records `src` too, a later call for an id replacing an earlier one.
+    #[inline]
+    pub(crate) fn map_expr_back(&mut self, id: ExprId, src: ExprOrPatSource) {
+        let at = id.into_raw().into_u32() as usize;
+        let word = at / u64::BITS as usize;
+        if self.with_syntax.len() <= word {
+            self.with_syntax.resize(word + 1, 0);
+        }
+        self.with_syntax[word] |= 1 << (at % u64::BITS as usize);
+        if self.record {
+            self.expr_map_back.insert(id, src);
+        }
     }
 
     #[inline]
@@ -1401,6 +1442,7 @@ impl ExpressionStoreBuilder {
                     field_hygiene,
                     block_editions,
                     overflow_inheriting,
+                    with_syntax,
                     spec_clauses,
                     packing,
                     ..
@@ -1430,6 +1472,7 @@ impl ExpressionStoreBuilder {
                     |it| it.into_raw().into_u32(),
                     &mut packing.inheriting_sort,
                 );
+                synthesized_of(with_syntax, columns.expr_count(), &mut packing.synthesized);
                 // Every element type here is 4-byte aligned, so no padding between columns.
                 let mut layout = SlabLayout::default();
                 layout.add::<BlockId>(block_scopes.len());
@@ -1438,6 +1481,7 @@ impl ExpressionStoreBuilder {
                 layout.add::<(ExprId, Edition)>(packing.editions.len());
                 layout.add::<u32>(packing.owners.len());
                 layout.add::<ExprId>(packing.inheriting.len());
+                layout.add::<ExprId>(packing.synthesized.len());
                 // Lowered in order, so already sorted but for a group lowered inside another's.
                 spec_clauses.sort_unstable_by_key(|&(group, _)| group.into_raw().into_u32());
                 layout.add::<(ExprId, SpecClauseKind)>(spec_clauses.len());
@@ -1448,6 +1492,7 @@ impl ExpressionStoreBuilder {
                 let block_editions = slab.copy(&packing.editions[..]);
                 let binding_owners = slab.copy(&packing.owners[..]);
                 let overflow_inheriting = slab.copy(&packing.inheriting[..]);
+                let synthesized = slab.copy(&packing.synthesized[..]);
                 let spec_clauses = slab.copy(&spec_clauses[..]);
                 // Once per store, boxed to keep signature-only stores small.
                 Some(ExpressionOnlyStore::kept(ExpressionOnlyStore {
@@ -1461,6 +1506,7 @@ impl ExpressionStoreBuilder {
                     field_hygiene,
                     block_editions,
                     overflow_inheriting,
+                    synthesized,
                     spec_clauses,
                     expr_roots: expr_roots
                         .expect("should always finish with a `Some(_)` expr_roots"),
@@ -1475,6 +1521,24 @@ impl ExpressionStoreBuilder {
         let macro_calls = ThinVec::from_iter(scratch.macro_calls.iter().copied());
         scratch.give();
         (ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls }, source_map)
+    }
+}
+
+/// The expressions of `0..exprs` whose bit in `with_syntax` is clear, in increasing order, into
+/// `out`: those lowering gave no syntax ([`ExpressionStoreBuilder::map_expr_back`]).
+fn synthesized_of(with_syntax: &[u64], exprs: usize, out: &mut Vec<ExprId>) {
+    let bits = u64::BITS as usize;
+    for word in 0..exprs.div_ceil(bits) {
+        let mut clear = !with_syntax.get(word).copied().unwrap_or(0);
+        let past = (word + 1) * bits;
+        if past > exprs {
+            clear &= u64::MAX >> (past - exprs);
+        }
+        while clear != 0 {
+            let at = word * bits + clear.trailing_zeros() as usize;
+            out.push(ExprId::from_raw(la_arena::RawIdx::from_u32(at as u32)));
+            clear &= clear - 1;
+        }
     }
 }
 
@@ -1504,6 +1568,7 @@ impl ExpressionOnlyStore {
             field_hygiene,
             block_editions,
             overflow_inheriting,
+            synthesized,
             spec_clauses,
             expr_roots,
         } = self;
@@ -1520,6 +1585,7 @@ impl ExpressionOnlyStore {
             + field_hygiene.heap_bytes()
             + block_editions.heap_bytes()
             + overflow_inheriting.heap_bytes()
+            + synthesized.heap_bytes()
             + spec_clauses.heap_bytes()
             + roots
     }
@@ -2029,6 +2095,20 @@ impl ExpressionStore {
         self.assert_expr_only().overflow_inheriting.binary_search(&closure).is_ok()
     }
 
+    /// Whether lowering made `expr` with no syntax of its own: a part of a desugaring (rustc's
+    /// `DesugaringKind` spans) or a missing expression. The one home of the question: it is
+    /// exactly the expressions the source map has no syntax for (`expr_syntax` is `Err`), but
+    /// read from the store, so a step that asks it reads no position and a body that moves in
+    /// its file keeps its answers (`hir_def::expr_store::tests::body::synthesized`).
+    pub fn is_synthesized(&self, expr: ExprId) -> bool {
+        self.synthesized_exprs().binary_search(&expr).is_ok()
+    }
+
+    /// The expressions [`Self::is_synthesized`] holds of, in increasing order.
+    pub fn synthesized_exprs(&self) -> &[ExprId] {
+        self.expr_only.as_deref().map_or(&[], |it| &it.synthesized[..])
+    }
+
     /// blaze_verify: the clause `group` is, when it is one: an expression statement that
     /// [`lower`](crate::expr_store::lower) made of a function's or a loop's clauses
     /// (docs/v2/plan/design/verus.md). The program erases it: MIR lowering skips it.
@@ -2437,7 +2517,7 @@ mod scratch_tests {
         }
         builder.pat_map.push((src(0, false, SyntaxKind::WILDCARD_PAT, 4, 5), wild.into()));
         builder.types_map.push((src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9), tuple));
-        builder.expr_map_back.insert(call, src(0, false, SyntaxKind::CALL_EXPR, shift, shift + 2));
+        builder.map_expr_back(call, src(0, false, SyntaxKind::CALL_EXPR, shift, shift + 2));
         builder.types_map_back.insert(tuple, src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9));
     }
 

@@ -163,7 +163,9 @@ impl Tree {
         while let Some(dir) = pending.pop() {
             let Some(names) = pinned.list(root, &dir) else {
                 // alloc: an error
-                return Err(FrontError::Tree(format!("the pinned root {root:x} has no directory `{dir}`")));
+                return Err(FrontError::Tree(
+                    blaze_report::say!("the pinned root ", blaze_report::say::Words(&format!("{root:x}")), " has no directory ", blaze_report::say::Code(&dir)).flat(),
+                ));
             };
             for (name, is_dir) in names {
                 let path = if dir.is_empty() { name.to_owned() } else { format!("{dir}/{name}") }; // alloc: one path a file
@@ -204,7 +206,7 @@ impl Tree {
         };
         let Some(cfg) = self.crates.get(krate) else {
             // alloc: an error
-            return Err(WorldError::new(read, format!("no crate `{krate}` in this checkout's builds")));
+            return Err(WorldError::new(read, blaze_report::say!("no crate ", blaze_report::say::Code(krate), " in this checkout's builds").flat()));
         };
         holds(cfg, predicate).map_err(|why| WorldError::new(read, why))
     }
@@ -215,9 +217,13 @@ fn held(pinned: &blaze_vfs::Pinned<'_>, root: ContentId, path: &str) -> Result<H
         Ok(Some((id, Mode::Symlink, _))) => Ok(Held::Link(id)),
         Ok(Some((id, _, bytes))) => Ok(Held::File(id, bytes)),
         // alloc: an error
-        Ok(None) => Err(FrontError::Tree(format!("`{path}` is listed under the pinned root {root:x} and is not a file of it"))),
+        Ok(None) => Err(FrontError::Tree(
+            blaze_report::say!(blaze_report::say::Code(path), " is listed under the pinned root ", blaze_report::say::Words(&format!("{root:x}")), " and is not a file of it").flat(),
+        )),
         // alloc: an error
-        Err(corrupt) => Err(FrontError::Tree(format!("`{path}` of the pinned root {root:x} is corrupt in the image: {corrupt:?}"))),
+        Err(corrupt) => Err(FrontError::Tree(
+            blaze_report::say!(blaze_report::say::Code(path), blaze_report::say::Words(&format!(" of the pinned root {root:x} is corrupt in the image: {corrupt:?}"))).flat(),
+        )),
     }
 }
 
@@ -228,12 +234,12 @@ fn holds(cfg: &CfgOptions, predicate: &str) -> Result<bool, String> {
     let text = format!("#[cfg({predicate})] fn f() {{}}"); // alloc: one predicate's text, on a modules run
     let parse = syntax::SourceFile::parse(&text, Edition::CURRENT);
     if !parse.errors().is_empty() {
-        return Err(format!("`{predicate}` is not a cfg predicate")); // alloc: an error
+        return Err(blaze_report::say!(blaze_report::say::Code(predicate), " is not a cfg predicate").flat()); // alloc: an error
     }
     let Some(view) = parse.root().descendants().find_map(syntax::view::CfgPredicate::cast) else {
-        return Err(format!("`{predicate}` is not a cfg predicate")); // alloc: an error
+        return Err(blaze_report::say!(blaze_report::say::Code(predicate), " is not a cfg predicate").flat()); // alloc: an error
     };
-    cfg.check(&CfgExpr::parse_from_view(view)).ok_or_else(|| format!("`{predicate}` is not a valid cfg predicate")) // alloc: an error
+    cfg.check(&CfgExpr::parse_from_view(view)).ok_or_else(|| blaze_report::say!(blaze_report::say::Code(predicate), " is not a valid cfg predicate").flat()) // alloc: an error
 }
 
 impl World for Tree {
@@ -553,14 +559,18 @@ impl Carry {
             match by_name.get(krate.name.as_str()) {
                 Some(kept) if kept.root != krate.root || kept.edition != krate.edition => {
                     // alloc: an error
-                    return Err(FrontError::Crates(format!(
-                        "two crates named `{}`, rooted at `{}` ({}) and at `{}` ({})",
-                        krate.name,
-                        kept.root,
-                        kept.edition.number(),
-                        krate.root,
-                        krate.edition.number()
-                    )));
+                    return Err(FrontError::Crates(
+                        blaze_report::say!(
+                            "two crates named ",
+                            blaze_report::say::Code(&krate.name),
+                            ", rooted at ",
+                            blaze_report::say::Code(&kept.root),
+                            blaze_report::say::Words(&format!(" ({}) and at ", kept.edition.number())),
+                            blaze_report::say::Code(&krate.root),
+                            blaze_report::say::Words(&format!(" ({})", krate.edition.number()))
+                        )
+                        .flat(),
+                    ));
                 }
                 Some(_) => {}
                 None => {
@@ -593,10 +603,12 @@ impl Carry {
                 }
                 // clone: once a crate whose modules moved
                 self.modules.insert(krate.krate.clone(), hash);
-                let table = Table::read(MODULES, value).map_err(|error| FrontError::Modules(format!("`{}`: {error}", krate.krate)))?;
+                let table = Table::read(MODULES, value)
+                    .map_err(|error| FrontError::Modules(blaze_report::say!(blaze_report::say::Code(&krate.krate), ": ", blaze_report::say::Words(&error.to_string())).flat()))?;
                 for row in table.iter() {
-                    let (_, bytes) = row.map_err(|error| FrontError::Modules(format!("`{}`: {error}", krate.krate)))?;
-                    let module = Module::read(bytes).map_err(|why| FrontError::Modules(format!("`{}`: {why}", krate.krate)))?;
+                    let (_, bytes) = row.map_err(|error| FrontError::Modules(blaze_report::say!(blaze_report::say::Code(&krate.krate), ": ", blaze_report::say::Words(&error.to_string())).flat()))?;
+                    let module = Module::read(bytes)
+                        .map_err(|why| FrontError::Modules(blaze_report::say!(blaze_report::say::Code(&krate.krate), ": ", blaze_report::say::Words(&why.to_string())).flat()))?;
                     if module.status == Status::Found {
                         // alloc: one file's name, once it is new to the asked set
                         files.push((module.file.to_owned(), module.reading));
@@ -655,6 +667,23 @@ pub(crate) struct Overlay<'a, G: Get + ?Sized> {
 impl<'a, G: Get + ?Sized> Overlay<'a, G> {
     pub(crate) fn new(base: &'a G) -> Overlay<'a, G> {
         Overlay { base, puts: BTreeMap::new() }
+    }
+
+    /// An overlay over `base` that holds `puts` already: puts made over another overlay of the
+    /// same task and not yet in the store, readable here and handed on with this one's.
+    pub(crate) fn seeded(base: &'a G, puts: Vec<super::work::Put>) -> Overlay<'a, G> {
+        let puts = puts.into_iter().map(|put| (put.key, (put.kind, put.bytes))).collect();
+        Overlay { base, puts }
+    }
+
+    /// The puts held so far, in key order (rule 25), copied: what a body entries' session
+    /// saved over this overlay names and the store may not hold yet (`bodies::Kept::pending`).
+    pub(crate) fn pending(&self) -> Vec<super::work::Put> {
+        self.puts
+            .iter()
+            // clone: once a session put back, each put the store may not hold yet
+            .map(|(key, (kind, bytes))| super::work::Put { key: *key, kind: *kind, bytes: bytes.clone() })
+            .collect()
     }
 
     /// The puts, in key order (rule 25).
@@ -755,7 +784,8 @@ pub(crate) mod bodies {
         next_solver::goal_store::FactRef,
     };
 
-    use super::{CrateRoot, EXISTS_DOMAIN, FrontError, code};
+    use super::{CrateRoot, EXISTS_DOMAIN, FrontError, Overlay, code};
+    use crate::serve::work::Put as StorePut;
 
     /// The pin's domain: of every file's path and content, and the database's revision (a
     /// dependency's edit moves facts under files that are equal, so the revision is in it).
@@ -786,6 +816,20 @@ pub(crate) mod bodies {
         /// identity reads exactly, with none differing (`by: "a planted bug"`), as a producer
         /// that says every identity is unchanged.
         pub(crate) static CLEAN_IDENTITIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The planted bug of `serve::unit::tests`' lost puts control: a session is put back
+        /// with no pending puts ([`Kept::pending`]), as a driver that advances a session before
+        /// its puts reach the store.
+        pub(crate) static NO_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// What a session put back over `store` names that the store may not hold yet
+    /// ([`Kept::pending`]); none under the planted bug [`NO_PENDING`].
+    fn pending_of<G: Get + ?Sized>(store: &Overlay<'_, G>) -> Vec<StorePut> {
+        #[cfg(test)]
+        if NO_PENDING.get() {
+            return Vec::new();
+        }
+        store.pending()
     }
 
     #[cfg(test)]
@@ -975,7 +1019,12 @@ pub(crate) mod bodies {
         fn fill(&mut self, found: Vec<(String, Vec<u8>, Vec<u8>)>) -> Result<(), FrontError> {
             for (path, items, lines) in found {
                 // alloc: an error
-                let parts = entries::keyed(&items, &lines).map_err(|why| FrontError::Tree(format!("`{path}`: {why}")))?;
+                let parts = entries::keyed(&items, &lines).map_err(|why| {
+                    FrontError::Tree(
+                        blaze_report::say!(blaze_report::say::Code(&path), ": ", blaze_report::say::Words(&why.to_string()))
+                            .flat(),
+                    )
+                })?;
                 if let Some(file) = self.files.get_mut(&path) {
                     file.keyed = Some(parts);
                 }
@@ -1180,7 +1229,7 @@ pub(crate) mod bodies {
     pub(crate) fn kind_name(kind: ReadKind) -> &'static str {
         use blaze_item_hash::values::kinds as hashed;
         use blaze_items::kinds as items;
-        const FACTS: [(blaze_query::QueryKind, &str); 36] = [
+        const FACTS: [(blaze_query::QueryKind, &str); 37] = [
             (items::SIGNATURE, "signature"),
             (items::LAYOUT, "layout"),
             (items::FIELD, "field"),
@@ -1217,6 +1266,7 @@ pub(crate) mod bodies {
             (hashed::WHOLE_SCOPE, "whole scope"),
             (hashed::CRATE_NAMES, "crate names"),
             (hashed::FIELD_ORDER, "field order"),
+            (hashed::SETTING, "setting"),
         ];
         if kind == reads::FILE {
             return "file";
@@ -1247,11 +1297,42 @@ pub(crate) mod bodies {
     /// posted (its id in the database, each served step's entry, and whether every step of it
     /// was served), by its file and item. `since`: the revision from which every row of the
     /// crate posted is in `posted` (the stamp's, [`entries::stamp`]).
+    ///
+    /// `pending`: every put of the overlay the session was last advanced over (its entries'
+    /// values and its save), which the loop puts only when the unit that made them hands them
+    /// on, and never when that unit fails, is dropped or its record is kept. Whoever takes the
+    /// session puts them into its own overlay first ([`repend`]): those the store holds by then
+    /// go, the rest travel on with the taker's puts, so the session never names an entry that
+    /// neither the store nor its reader's overlay holds.
     pub(crate) struct Kept {
         session: Session,
         files: BTreeMap<String, Mapped>,
         posted: BTreeMap<(String, ItemId), (DefWithBodyId, Vec<Row>, bool)>,
         since: View,
+        pending: Vec<StorePut>,
+    }
+
+    /// The invariant of [`Kept::pending`]: a taken session's pending puts put into `store`, the
+    /// taker's overlay, before anything reads the session's entries. A put the store already
+    /// holds is no put of the overlay's ([`Overlay`]'s `put`), so what was put meanwhile goes.
+    fn repend<G: Get + ?Sized>(store: &mut Overlay<'_, G>, pending: Vec<StorePut>) -> Result<(), FrontError> {
+        for StorePut { key, kind, bytes } in pending {
+            store.put(key, kind, bytes).map_err(|mismatch| {
+                // alloc: an error
+                FrontError::Tree(format!(
+                    "a body entries' session names an entry under {key:?} that the store holds other bytes under now: {mismatch:?}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The entry a session named that the store does not hold ([`KernelError::missing_entry`]).
+    fn missing_entry(error: &FrontError) -> Option<blaze_cas::Key> {
+        match error {
+            FrontError::Kernel(error) => error.missing_entry(),
+            _ => None,
+        }
     }
 
     enum Slot {
@@ -1516,14 +1597,14 @@ pub(crate) mod bodies {
     /// crate's stamp ([`entries::stamp`]) with nothing looked up; any other body is unposted
     /// and served from its entries. Gives what it did and the crate's stable name with the
     /// root its session was saved under (none where nothing was served).
-    pub(crate) fn serve<P: Put + ?Sized>(
+    pub(crate) fn serve<G: Get + ?Sized>(
         kernel: &Kernel<Bodies>,
         front: &Arc<Lowered>,
         krate: Crate,
         in_view: &impl Fn(&str) -> Option<String>,
         sessions: &Sessions,
         marks: &BTreeMap<String, blaze_cas::Key>,
-        store: &mut P,
+        store: &mut Overlay<'_, G>,
     ) -> Result<(Did, Option<(String, blaze_cas::Key)>), FrontError> {
         match entries::claim_serve(front.db(), krate) {
             Some(true) => {}
@@ -1534,7 +1615,10 @@ pub(crate) mod bodies {
         let (_, now) = db.nonce_and_revision();
         let mut lent = sessions.take(krate);
         let (last, held) = match lent.kept.take() {
-            Some(Kept { session, files, posted, since }) => (Some(files), Some((session, posted, since))),
+            Some(Kept { session, files, posted, since, pending }) => {
+                repend(store, pending)?;
+                (Some(files), Some((session, posted, since)))
+            }
             None => (None, None),
         };
         // clone: a counted reference, the world's
@@ -1569,12 +1653,22 @@ pub(crate) mod bodies {
                     did.session = Opened::Unreadable;
                     session = Session::new(&world);
                 }
+                // The kept session names an entry neither the store nor this overlay holds: its
+                // puts were lost past `Kept::pending` (a bug, said loudly). Sound to go on: the
+                // session is dropped whole, and a new one answers only what it looks up in the
+                // store and verifies by its reads; a body it cannot is served by nothing and runs.
+                Err(error) if missing_entry(&error).is_some() => {
+                    let entry = missing_entry(&error);
+                    tracing::error!(target: "blaze", krate = %name, entry = ?entry, "the crate's body entries' session named an entry the store does not hold, so it is dropped and its bodies are served by a new one: {error}");
+                    did.session = Opened::Unreadable;
+                    session = Session::new(&world);
+                }
                 Err(error) => return Err(error),
             }
         }
         // alloc: once a serve, the bodies posted now, by key (rule 25)
         let mut now_posted = BTreeMap::new();
-        let looked: &P = store;
+        let looked: &Overlay<'_, G> = store;
         blaze_query::db::attach(db, || -> Result<(), FrontError> {
             for key in world.keys() {
                 let def = world.body(&key).map_err(FrontError::Tree)?;
@@ -1601,7 +1695,7 @@ pub(crate) mod bodies {
         // entry moved was unposted above: what is left answers at this revision.
         entries::stamp(db, krate, since);
         let root = session.save(store)?;
-        lent.put(Kept { session, files: world.into_files(), posted: now_posted, since });
+        lent.put(Kept { session, files: world.into_files(), posted: now_posted, since, pending: pending_of(store) });
         Ok((did, Some((name, root))))
     }
 
@@ -1637,12 +1731,12 @@ pub(crate) mod bodies {
     /// a debug event, and the keep goes on. Any other error is the keep's, and the claim's
     /// drop lets every run it claimed go to the next keep. The claim is kept last, once
     /// nothing here can fail: a caller hands the puts on with nothing fallible after.
-    pub(crate) fn keep<P: Put + ?Sized>(
+    pub(crate) fn keep<G: Get + ?Sized>(
         kernel: &Kernel<Bodies>,
         front: &Arc<Lowered>,
         in_view: &impl Fn(&str) -> Option<String>,
         sessions: &Sessions,
-        store: &mut P,
+        store: &mut Overlay<'_, G>,
     ) -> Result<(Did, Vec<(String, blaze_cas::Key)>), FrontError> {
         let db = front.db();
         let Some(claim) = entries::claim_keeps(db) else {
@@ -1669,14 +1763,14 @@ pub(crate) mod bodies {
 
     /// [`keep`] of `steps`, the claimed runs of `krate`'s bodies.
     #[expect(clippy::too_many_arguments, reason = "one crate's part of `keep`, which lends it each")]
-    fn keep_crate<P: Put + ?Sized>(
+    fn keep_crate<G: Get + ?Sized>(
         kernel: &Kernel<Bodies>,
         front: &Arc<Lowered>,
         krate: Crate,
         steps: &[(DefWithBodyId, Step, SchemaHash)],
         in_view: &impl Fn(&str) -> Option<String>,
         sessions: &Sessions,
-        store: &mut P,
+        store: &mut Overlay<'_, G>,
         did: &mut Did,
         saved: &mut Vec<(String, blaze_cas::Key)>,
     ) -> Result<(), FrontError> {
@@ -1685,7 +1779,8 @@ pub(crate) mod bodies {
         let mut lent = sessions.take(krate);
         let (last, held) = match lent.kept.take() {
             // Served at this revision: its files are the world's, and its session is of this pin.
-            Some(Kept { session, files, posted, since }) if session.pin() == pin_of(&files, now) => {
+            Some(Kept { session, files, posted, since, pending }) if session.pin() == pin_of(&files, now) => {
+                repend(store, pending)?;
                 (Some(files), Some((session, posted, since)))
             }
             // Of another pin: left for the crate's next serve, as it was.
@@ -1734,13 +1829,13 @@ pub(crate) mod bodies {
             });
             for (key, of) in todo {
                 let got = match of {
-                    Of::Infer => kernel.get_in::<InferEntry<Bodies>, P>(&mut session, store, &world, key, &Setting::OFF).map(drop),
+                    Of::Infer => kernel.get_in::<InferEntry<Bodies>, Overlay<'_, G>>(&mut session, store, &world, key, &Setting::OFF).map(drop),
                     Of::Mir(place) => {
                         // clone: a body's key, once an owner kept
                         let owner = OwnerKey { body: key.clone(), place };
-                        kernel.get_in::<MirEntry<Bodies>, P>(&mut session, store, &world, &owner, &Setting::OFF).map(drop)
+                        kernel.get_in::<MirEntry<Bodies>, Overlay<'_, G>>(&mut session, store, &world, &owner, &Setting::OFF).map(drop)
                     }
-                    Of::Borrowck => kernel.get_in::<BorrowckEntry<Bodies>, P>(&mut session, store, &world, key, &Setting::OFF).map(drop),
+                    Of::Borrowck => kernel.get_in::<BorrowckEntry<Bodies>, Overlay<'_, G>>(&mut session, store, &world, key, &Setting::OFF).map(drop),
                 };
                 match got {
                     Ok(()) => did.kept += 1,
@@ -1758,7 +1853,7 @@ pub(crate) mod bodies {
         if let Some((posted, since)) = kept {
             let root = session.save(store)?;
             let name = world.crates.first().map(|(_, name)| name.to_string());
-            lent.put(Kept { session, files: world.into_files(), posted, since });
+            lent.put(Kept { session, files: world.into_files(), posted, since, pending: pending_of(store) });
             if let Some(name) = name {
                 saved.push((name, root));
             }

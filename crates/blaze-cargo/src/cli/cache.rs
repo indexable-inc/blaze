@@ -12,8 +12,12 @@
 //! `blaze store verify [--dry-run]` checks the whole files the store keeps to place outputs by
 //! cloning (`<root>/v2/store/placed/<content>`) against their names and removes the ones that
 //! are wrong: what the store names when it refuses a place over such a file
-//! (`blaze_cas::VERIFY_PLACED`). It runs with no daemon on the home (the daemon holds those
-//! files in memory as it found them); the next build writes what was removed again.
+//! (`blaze_cas::VERIFY_PLACED`). Such a file may be the one home of its value's bytes (the
+//! pack keeps none of them, `blaze_cas::home`), so the store is opened first and forgets every
+//! record whose bytes are not what it records (`Store::forget_corrupt`): a record is never
+//! left naming bytes that are gone, which would refuse every place of it for good. It runs
+//! with no daemon on the home (the daemon holds the store and those files as it found them);
+//! the next build makes what was forgotten and removed again.
 //!
 //! The CLI knows no daemon's live heads, so it keeps more than the daemon would: every build
 //! dir whose checkout still exists counts as a head's. Everything else holds as in the daemon:
@@ -233,7 +237,50 @@ fn verify(dry_run: bool) -> Result<String, String> {
         Err(error) => return Err(format!("{error:#}")),
     }
     let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
-    verify_placed(&state.join("store").join("placed"), dry_run)
+    let store = state.join("store");
+    // The records first: a wrong file that was a record's one home goes with its record, and
+    // what is left wrong is a cache the scan below removes.
+    let mut out = match store.exists() {
+        true => forget_corrupt(dry_run)?,
+        false => String::new(),
+    };
+    out.push_str(&verify_placed(&store.join("placed"), dry_run)?);
+    Ok(out)
+}
+
+/// The home's store opened, with no daemon on it, and every record of it whose bytes are not
+/// what it records forgotten (`Store::forget_corrupt`), durable before this returns; only said
+/// under `dry_run`. What it did, as it prints.
+fn forget_corrupt(dry_run: bool) -> Result<String, String> {
+    let mut driven = super::store::opened()?;
+    let mut out = String::new();
+    if dry_run {
+        let corrupt = driven.store().verify(None);
+        for it in &corrupt {
+            out.push_str(&format!("{it}: its record would be forgotten\n"));
+        }
+        out.push_str(&format!("{} values of the store read bytes that are not theirs\n", corrupt.len()));
+        return Ok(out);
+    }
+    let forgot = driven.store().forget_corrupt();
+    driven.flush()?;
+    for key in &forgot.forgotten {
+        out.push_str(&format!("the record of {:?} read bytes that are not its own: forgotten\n", key.0));
+    }
+    for (key, why) in &forgot.kept {
+        out.push_str(&format!("the value of {:?} reads bytes that are not its own and is kept: {why}\n", key.0));
+    }
+    if forgot.waiting > 0 {
+        return Err(format!(
+            "{out}{} records that read bytes not their own are still in a writer's segment: run `blaze store verify` again",
+            forgot.waiting
+        ));
+    }
+    out.push_str(&format!(
+        "{} records of the store read bytes that are not their own and are forgotten\n",
+        forgot.forgotten.len()
+    ));
+    Ok(out)
 }
 
 /// What is said of the store when no daemon holds the home: only its daemon collects it.

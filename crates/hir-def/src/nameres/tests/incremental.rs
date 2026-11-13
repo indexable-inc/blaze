@@ -21,7 +21,10 @@ fn check_def_map_is_not_recomputed(
     let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     // The fixture's write resolved the crate: the first read takes what the maintainer
-    // published.
+    // published. `crate_local_def_map` runs for the first time here, and so do the two slot
+    // reads it asks first: whether the crate is read from pages (`paged`) and, after it took
+    // the published resolution, whether a frozen record is to be checked against it
+    // (`frozen_def_map`).
     execute_assert_events(
         &db,
         || {
@@ -206,7 +209,9 @@ fn no() {}
         &expect![[r#"
             [
                 "crate_local_def_map",
+                "paged",
                 "resolution_of",
+                "frozen_def_map",
             ]
         "#]],
         // `use E::*` binds `E`'s variants, which no round-0 log holds: the maintainer reads
@@ -256,7 +261,9 @@ pub struct S {}
         &expect![[r#"
             [
                 "crate_local_def_map",
+                "paged",
                 "resolution_of",
+                "frozen_def_map",
             ]
         "#]],
         &expect![[r#"
@@ -298,7 +305,9 @@ fn f() { foo }
         &expect![[r#"
             [
                 "crate_local_def_map",
+                "paged",
                 "resolution_of",
+                "frozen_def_map",
             ]
         "#]],
         &expect![[r#"
@@ -402,7 +411,9 @@ pub struct S {}
         &expect![[r#"
             [
                 "crate_local_def_map",
+                "paged",
                 "resolution_of",
+                "frozen_def_map",
             ]
         "#]],
         &expect![[r#"
@@ -492,7 +503,9 @@ m!(Z);
         &expect![[r#"
             [
                 "crate_local_def_map",
+                "paged",
                 "resolution_of",
+                "frozen_def_map",
                 "CrateResolution::module",
             ]
         "#]],

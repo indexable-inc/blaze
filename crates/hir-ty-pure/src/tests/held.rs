@@ -1,4 +1,5 @@
-//! What the walk keeps of the bodies it reads: nothing an instance. A summary reads its
+//! What the walk keeps of the bodies it reads: nothing an instance, for a summary or for an
+//! instance's identity part. A summary reads its
 //! instance's monomorphized body once and keeps the summary; the body is made for that run and
 //! dropped with it (`dispatch::body_once`). Until 2026-11-12 it came from the memo that keeps
 //! one body an instance until the build lets every MIR go, and a cold build of tempo held
@@ -14,7 +15,7 @@ use super::{
 };
 use crate::{
     function::generic,
-    walk::{Def, Instance, plant, summary},
+    walk::{Def, Instance, identity_parts, plant, summary},
 };
 
 /// A crate whose `root` calls one generic function, `leaf`, with `instances` different type
@@ -66,4 +67,40 @@ fn the_walk_holds_no_body_an_instance() {
 fn the_oracle_catches_a_walk_that_keeps_each_instances_body() {
     let (few, many) = (held_after_the_walk(8, true), held_after_the_walk(64, true));
     assert!(many >= few + 56, "the memoized walk held {few} MIR values for 8 instances and {many} for 64");
+}
+
+/// How many MIR values the database holds once each instance the walk from `root` reaches has
+/// its part of a script's identity (`identity::content`, a row an instance).
+fn held_after_the_identity(instances: usize, keeps_bodies: bool) -> usize {
+    let db: Db = db_with(&ladder(instances));
+    let krate = crate_named(&db, "kernel");
+    let root = fn_named(&db, krate, "root");
+    blaze_query::db::attach(&db, || {
+        let parts = || _ = identity_parts(&db, root);
+        match keeps_bodies {
+            true => plant::keeping_bodies(parts),
+            false => parts(),
+        }
+    });
+    db.storage().values_of(blaze_mem::Tag::Mir)
+}
+
+/// The invariant: an instance's identity part keeps the part, never the body it was read
+/// from: the parts of 8 instances of one generic and of 64 leave the same number of MIR values
+/// held.
+#[test]
+fn the_identity_holds_no_body_an_instance() {
+    let (few, many) = (held_after_the_identity(8, false), held_after_the_identity(64, false));
+    assert_eq!(few, many, "MIR values held after the parts of 8 instances and of 64");
+}
+
+/// The planted bug: each part (and summary) reads its body from the memo that keeps it, as
+/// `identity::content_in` did until 2026-11-13: 56 more instances hold at least 56 more bodies.
+#[test]
+fn the_oracle_catches_an_identity_that_keeps_each_instances_body() {
+    let (few, many) = (held_after_the_identity(8, true), held_after_the_identity(64, true));
+    assert!(
+        many >= few + 56,
+        "the memoized parts held {few} MIR values for 8 instances and {many} for 64"
+    );
 }

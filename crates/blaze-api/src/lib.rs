@@ -145,6 +145,10 @@ pub enum ViewRef {
 /// What to build or run.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Targets {
+    /// What the request waits for (`--goal edit|max`); `None` for the profile's own
+    /// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). A check compiles no program,
+    /// so nothing of it reads this.
+    pub goal: Option<Goal>,
     /// Everything a cargo command line says beyond the fields below, for `blaze build`,
     /// `run`, `test`, `check` and `cargo blaze`; `None` for an agent's request, built as cargo
     /// builds the fields below with its defaults. Where both say something, this wins. A
@@ -153,10 +157,6 @@ pub struct Targets {
     /// A target triple; `None` for the machine's.
     pub target: Option<String>,
     pub profile: String,
-    /// What the request waits for (`--goal edit|max`); `None` for the profile's own
-    /// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). A check compiles no program,
-    /// so nothing of it reads this.
-    pub goal: Option<Goal>,
     pub features: Vec<String>,
     /// Packages by name; empty for the workspace's default members.
     pub packages: Vec<String>,
@@ -434,8 +434,8 @@ pub enum Request {
     /// forgets every record no pin and no root keeps, whatever the budget and its pack's age.
     /// Answered by the daemon's loop, which holds the collectors.
     Gc {
-        dry_run: bool,
         unkept: bool,
+        dry_run: bool,
     },
     /// `blaze store export|import|install ...` (docs/remote-cache.md, "Packs") while a daemon
     /// holds the home's store: `words` are the command's words after `store`, run by the
@@ -1119,13 +1119,13 @@ pub struct UnitOf {
     /// The unit is a library's doc tests (cargo's `CompileMode::Doctest`), named
     /// `` `foo` (lib doctest) `` in "could not compile", never as the library itself.
     pub doctest: bool,
-    pub package_id: String,
-    pub manifest_path: String,
     /// The unit's package is one the request asked for (cargo's `is_primary_package`), not
     /// one built or checked only because such a package depends on it. `check --fix` edits
     /// the files of these alone: a dependency in the checkout (another member, a vendored
     /// crate) is checked, and its diagnostics shown, but it is not what was asked to be fixed.
     pub primary: bool,
+    pub package_id: String,
+    pub manifest_path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -1311,6 +1311,10 @@ pub struct Worked {
     pub links: Vec<Linked>,
     /// Queries executed.
     pub reran: u64,
+    /// The build's goal and how much of the code of the images it linked is optimized
+    /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
+    /// asked for compiles a program.
+    pub tiers: Option<Tiers>,
     /// The steps it computed again instead of reusing, each once: the misses `blaze why`
     /// explains and [`Rebuilt::summary`] sums up. 0 says that summary is empty, so the
     /// build's client asks for none ([`Request::Rebuilt`] with `build`).
@@ -1320,6 +1324,10 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
+    /// What the daemon's store and its home hold against their budget as the build ends.
+    /// `None` from a daemon that collects nothing (a test's, or one that is not `blaze
+    /// serve`'s).
+    pub storage: Option<Storage>,
     /// The build's id in the daemon's profile history (`builds.build_id`): what the client
     /// tags the rows it sends with ([`Request::ClientRows`]), what `build-finished` carries
     /// and what `blaze slow --build N` and `blaze debug sql` take. `None` for work no build
@@ -1332,40 +1340,32 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
-    /// The build's goal and how much of the code of the images it linked is optimized
-    /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
-    /// asked for compiles a program.
-    pub tiers: Option<Tiers>,
-    /// What the daemon's store and its home hold against their budget as the build ends.
-    /// `None` from a daemon that collects nothing (a test's, or one that is not `blaze
-    /// serve`'s).
-    pub storage: Option<Storage>,
 }
 
 /// What blaze holds on disk as a build ends, against its budget (docs/gc.md, "The store's
 /// budget and collector"): data on every build, for whoever renders it. Bytes.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Storage {
-    /// The daemon's store, and how much it grew or shrank since the build before ended.
-    pub store_bytes: u64,
-    pub store_delta_bytes: i64,
-    /// Everything the home holds (its build dirs, its store, its image), and its budget: the
-    /// tightest of an absolute size, a share of the volume and what leaves the volume's floor
-    /// free. The share used is `held_bytes / budget_bytes`. A budget of 0: not measured yet.
-    pub held_bytes: u64,
-    pub budget_bytes: u64,
-    /// What the store's collector could give back: dead bytes, and records no root keeps.
-    pub collectable_bytes: u64,
-    /// The volume's free space.
-    pub volume_free_bytes: u64,
-    /// The collector looked at everything and what is held is still at the budget or past
-    /// it: what is left is in use or kept.
-    pub over_budget: bool,
     /// One line to print, when the daemon's policy says this build should say something
     /// (held at 85% of the budget or more, or the volume low; at most once in six hours, once
     /// an hour when over): it names the command that raises the budget and the one that
     /// frees space. `None`: nothing to say.
     pub warning: Option<String>,
+    /// Everything the home holds (its build dirs, its store, its image), and its budget: the
+    /// tightest of an absolute size, a share of the volume and what leaves the volume's floor
+    /// free. The share used is `held_bytes / budget_bytes`. A budget of 0: not measured yet.
+    pub held_bytes: u64,
+    /// The collector looked at everything and what is held is still at the budget or past
+    /// it: what is left is in use or kept.
+    pub over_budget: bool,
+    /// The daemon's store, and how much it grew or shrank since the build before ended.
+    pub store_bytes: u64,
+    pub budget_bytes: u64,
+    /// What the store's collector could give back: dead bytes, and records no root keeps.
+    pub collectable_bytes: u64,
+    pub store_delta_bytes: i64,
+    /// The volume's free space.
+    pub volume_free_bytes: u64,
 }
 
 /// What a build left unchecked ([`Response::Unchecked`]): said once a unit failed and any
@@ -1771,15 +1771,15 @@ pub struct Status {
     pub settings: Vec<Setting>,
     /// Every download in flight in the daemon (`blaze_fetch::downloads`), oldest first.
     pub downloads: Vec<Downloading>,
+    /// How the daemon's store places outputs, decided once as it opened (by cloning where
+    /// its file system shares blocks, else by copying), in one sentence; `None` until it has
+    /// decided, and from a daemon that says none.
+    pub placed_by: Option<String>,
     /// How long the daemon has run, on its driver's clock (which starts with it), as of this
     /// answer.
     pub uptime_ms: u64,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
-    /// How the daemon's store places outputs, decided once as it opened (by cloning where
-    /// its file system shares blocks, else by copying), in one sentence; `None` until it has
-    /// decided, and from a daemon that says none.
-    pub placed_by: Option<String>,
 }
 
 /// One build under way ([`Status::builds`]). Its fields are declared in the order CBOR writes

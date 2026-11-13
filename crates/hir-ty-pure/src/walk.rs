@@ -96,6 +96,21 @@ pub(crate) struct Instance {
     pub(crate) args: StoredGenericArgs,
 }
 
+/// The body it runs (the function a leaf models) and what its arguments name: whose a query
+/// keyed by it is ([`blaze_query::db::Storage::ids_of`]), as hir-ty-identity's `Instance`
+/// says it, so an edit's firewall tells the instances of the edited body from another's.
+impl blaze_query::db::NamesIds for Instance {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        match self.def {
+            Def::Body(Body::Fn(it)) | Def::Leaf(it, _) => out.push(it.as_id()),
+            Def::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
+                out.push(it)
+            }
+        }
+        blaze_query::db::NamesIds::names_ids(&self.args, out);
+    }
+}
+
 /// A leaf whose arguments depend on the instance's parameters: each caller applies it again
 /// with its own values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,7 +568,7 @@ pub(crate) fn summarized(
     let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
     let cx = Cx::within(db, env, within.cloned()); // clone: two reference counts
     // The body is read here once and only the summary is kept: made for this run and dropped
-    // with it ([`dispatch::body_once`]), never the memo [`body_of`] reads, which would keep one
+    // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
     // monomorphized body an instance the walk reaches until the build lets every MIR go.
     #[cfg(test)]
     if plant::keeps_bodies() {
@@ -698,17 +713,25 @@ impl Own {
     }
 }
 
-/// The monomorphized body of `instance` in `env`; none for a leaf, which has no body walked.
-pub(crate) fn body_of<'db>(
+/// The monomorphized body of `instance` in `env`, made for the caller and dropped by it
+/// ([`dispatch::body_once`]); none for a leaf, which has no body walked. Each reader keeps what
+/// it worked out of the body (an instance's identity part, a refusal's place), never the body:
+/// a memo of it would hold one body an instance the walk reaches.
+pub(crate) fn body_once<'db>(
     db: &'db Db,
     env: &StoredParamEnvAndCrate,
     instance: &Instance,
-) -> Option<Result<&'db MirBody<'db>, MirLowerError<'db>>> {
-    match instance.def {
-        // clone: handles of interned values, for the body query's key
-        Def::Body(body) => Some(dispatch::body_of(db, env.clone(), body, instance.args.clone())),
-        Def::Leaf(..) => None,
+) -> Option<Result<MirBody<'db>, MirLowerError<'db>>> {
+    let Def::Body(body) = instance.def else { return None };
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count tests: the memoized body, as until 2026-11-13.
+        // clone: the body query's keys, reference counts; the memo's body, a planted bug's copy
+        return Some(
+            dispatch::body_of(db, env.clone(), body, instance.args.clone()).map(Clone::clone),
+        );
     }
+    Some(dispatch::body_once(db, env, body, &instance.args))
 }
 
 /// What the queries of one environment share.

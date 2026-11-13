@@ -44,6 +44,8 @@ blaze-lint-defs.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
+# Messages written with `say!`, whose parts are typed (`blaze_report::say`).
+blaze-report.workspace = true
 cfg.workspace = true
 hir.workspace = true
 hir-def.workspace = true

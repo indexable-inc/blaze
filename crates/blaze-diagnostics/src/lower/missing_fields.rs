@@ -54,10 +54,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingFields) -> Vec<Found> {
     };
     // alloc: empty, allocates nothing
     let Some(mut diag) = found else { return vec![] };
+    // E0797 (`..` with no base, without `default_field_values`) is rustc's AST lowering's
+    // (`rustc_ast_lowering`'s `BaseExpressionDoubleDot`), given before type checking runs on
+    // any body; every other error here is type checking's (`check_expr_struct_fields`).
+    let phase = match diag.code.as_ref().map(|it| it.as_str()) {
+        Some("E0797") => Phase::Lower,
+        _ => Phase::Bodies,
+    };
     adt_fact(cx, &mut diag, variant);
     code_fact(cx, &mut diag, InFile::new(record.file, ast::ptr(record.node)));
     // alloc: the error's parts, for an error hir found
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, phase)]
 }
 
 /// Whether the parser recovered from an error in the fields, where rustc reports no field

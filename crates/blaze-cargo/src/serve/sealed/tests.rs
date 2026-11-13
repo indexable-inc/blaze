@@ -232,8 +232,8 @@ fn hello(machine: &Path) -> (Vec<Placed>, Vec<(&'static str, PathBuf)>) {
     let lib = cover(&CoverOf { tree: "lib-digest", on: &[], makers, host });
     let second = cover(&CoverOf { tree: "second-digest", on: &[lib], makers, host });
     let placed = vec![
-        Placed { dir: machine.join("library/lib-digest"), digest: "lib-digest".to_owned(), cover: lib },
-        Placed { dir: machine.join("bstd/second-digest"), digest: "second-digest".to_owned(), cover: second },
+        Placed { dir: machine.join("library/lib-digest"), mounted: None, digest: "lib-digest".to_owned(), cover: lib },
+        Placed { dir: machine.join("bstd/second-digest"), mounted: None, digest: "second-digest".to_owned(), cover: second },
     ];
     let crates = vec![
         ("core", machine.join("library/lib-digest/library/core")),
@@ -289,7 +289,7 @@ fn registry_covers(checksums: [&str; 4], plant_flat: bool) -> Vec<(String, Cover
         locked("c", checksums[2], &[]),
         locked("d", checksums[3], &[]),
     ];
-    let library = Tree { dir: PathBuf::from("/m/library/L"), digest: "L".to_owned(), on: Vec::new() };
+    let library = Tree { dir: PathBuf::from("/m/library/L"), mounted: None, digest: "L".to_owned(), on: Vec::new() };
     let mut trees = vec![library];
     let mut packages = registry(&lock, &[0], 1, |it| Ok(PathBuf::from(format!("/src/{}-{}", it.name, it.version)))).unwrap();
     if plant_flat {
@@ -324,7 +324,7 @@ fn a_registry_package_is_sealed_by_its_checksum_and_its_cover_follows_its_depend
     let cycle = [locked("x", "cx", &["y"]), locked("y", "cy", &["x"])];
     let refused = registry(&cycle, &[], 0, |_| Ok(PathBuf::from("/src"))).unwrap_err();
     assert!(refused.contains("cycle") && (refused.contains("x 1.0.0") || refused.contains("y 1.0.0")), "{refused}");
-    let ahead = [Tree { dir: PathBuf::from("/t"), digest: "t".to_owned(), on: vec![0] }];
+    let ahead = [Tree { dir: PathBuf::from("/t"), mounted: None, digest: "t".to_owned(), on: vec![0] }];
     assert!(placed(&ahead, ContentId([7; 32]), "h").unwrap_err().contains("not listed before it"));
 
     // The control: a cover on no dependency misses the change below it.
@@ -355,7 +355,7 @@ const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
 fn shipped_trees() -> Vec<Placed> {
     let makers = ContentId([7; 32]);
-    let trees = [Tree { dir: PathBuf::from("/m/bstd/d1"), digest: "d1".to_owned(), on: Vec::new() }];
+    let trees = [Tree { dir: PathBuf::from("/m/bstd/d1"), mounted: None, digest: "d1".to_owned(), on: Vec::new() }];
     placed(&trees, makers, "aarch64-apple-darwin").unwrap()
 }
 
@@ -415,4 +415,42 @@ fn a_git_dependencys_cover_moves_with_its_commit() {
     };
     assert_ne!(cover_of(&one), cover_of(&moved), "another commit is another cover");
     assert_eq!(cover_of(&one), cover_of(&two), "the commit alone pins it");
+}
+
+/// The invariant: every crate of the library blaze placed is sealed as a build names it, under
+/// the mount the daemon reads it through (`/rustc/<commit>/library`, `serve::unit`'s
+/// `library`), never by the placed directory alone: `core` (no member) and `std` (a member of
+/// `library/Cargo.toml`, as the plan of the library's own workspace says) both pin the
+/// library's tree, so their records and outputs go into the machine's layer and a second home
+/// finds them. A member under the placed directory (a person building in it), a member of the
+/// build's own workspace and a path dependency still are not. The control is the list as it was
+/// until 2026-11-13, with no mount: no crate of std is sealed, which is what put every std
+/// record into each home (`a_second_home_on_one_machine_compiles_no_std_crate`).
+#[test]
+fn every_crate_of_the_placed_library_is_sealed_where_builds_name_it() {
+    let library = blaze_units::stdlib::library_at(COMMIT);
+    let tree = |mounted: Option<PathBuf>| {
+        let trees = [Tree { dir: PathBuf::from("/m/library/L"), mounted, digest: "L".to_owned(), on: Vec::new() }];
+        placed(&trees, ContentId([7; 32]), "aarch64-apple-darwin").unwrap()
+    };
+    let shipped = tree(Some(PathBuf::from(&library)));
+    let core = package(&format!("{library}/core/Cargo.toml"), Some(format!("({library}/core)").as_str()), None, false);
+    let std = package(&format!("{library}/std/Cargo.toml"), None, None, true);
+    let placed_member = package("/m/library/L/library/std/Cargo.toml", None, None, true);
+    let own_member = package("/home/a/w/Cargo.toml", None, None, true);
+    let path = package("/home/a/w/vendor/p/Cargo.toml", Some("(/home/a/w/vendor/p)"), None, false);
+    assert_eq!(pinned(&core, &shipped), Some(Pin::Shipped(&shipped[0])), "core, under the mount");
+    assert_eq!(pinned(&std, &shipped), Some(Pin::Shipped(&shipped[0])), "std, a member of the library's own workspace");
+    assert_eq!(pinned(&placed_member, &shipped), None, "a member under the placed directory");
+    assert_eq!(pinned(&own_member, &shipped), None, "a member of the build's workspace");
+    assert_eq!(pinned(&path, &shipped), None, "a path dependency");
+    // Another commit's mount is another library: none of it is this tree's.
+    let other = blaze_units::stdlib::library_at(OTHER_COMMIT);
+    let elsewhere = package(&format!("{other}/core/Cargo.toml"), Some(format!("({other}/core)").as_str()), None, false);
+    assert_eq!(pinned(&elsewhere, &shipped), None, "a library mounted for another commit");
+
+    // The control: the list with the placed directory alone seals no crate of std.
+    let unmounted = tree(None);
+    assert_eq!(pinned(&core, &unmounted), None, "the planted bug sealed core: the oracle tests nothing");
+    assert_eq!(pinned(&std, &unmounted), None, "the planted bug sealed std: the oracle tests nothing");
 }

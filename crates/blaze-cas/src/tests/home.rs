@@ -63,6 +63,8 @@ fn a_place_is_answered_before_its_file_is_synced_as_a_home() {
         store.put(key(1), Kind::Output, &out).unwrap();
         flush(&mut sim, &mut store);
         let file = name(&format!("store/placed/{:x}", content_of(&out)));
+        // Synced under its writing name before it takes its content's ([`Store::name_staged`]).
+        let writing = name(&format!("store/placed/{:x}{WRITING_SUFFIX}", content_of(&out)));
         let mut effects = Vec::new();
         let tag = store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
         let (mut answered, mut synced_before, mut synced) = (false, false, false);
@@ -71,7 +73,7 @@ fn a_place_is_answered_before_its_file_is_synced_as_a_home() {
         loop {
             for effect in &effects {
                 if let Effect::Sync { file: it, .. } = effect
-                    && *it == file
+                    && (*it == file || *it == writing)
                 {
                     synced = true;
                     synced_before |= !answered;

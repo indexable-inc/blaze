@@ -102,9 +102,11 @@ impl Reference<'_> {
                     map = parent.def_map(db);
                     res = res.merge(self.single(map, module, kind, segments));
                 }
+                // A proper module of a block: the preludes, from the crate's root (a module of
+                // the crate's map, never the block's root).
                 Some(_) => {
                     let root = crate_def_map(db, map.krate);
-                    return res.merge(self.preludes(root, map.root, kind, segments));
+                    return res.merge(self.preludes(root, root.root_module_id(), kind, segments));
                 }
                 None => return res,
             }
@@ -648,6 +650,56 @@ fn paths_match_reference_on_random_crates() {
         total += check_fixture(&fixture, &mut || (0..30).map(|_| gen_path(&mut rng)).collect());
     }
     assert!(total > 1000, "only {total} lookups resolved");
+}
+
+/// The invariant: a path a prelude starts, written in a `mod` inside a block, is looked up in
+/// the preludes from the crate's root and goes on into the crate it names: from `mb`,
+/// `proc_macros::identity` is the proc macro, as from the block itself (the control, which
+/// reaches the preludes through the crate's map). tokio's `select!` writes
+/// `mod __tokio_select_util` in its block and calls a proc macro by such a path there. Until
+/// 2026-11-13 the preludes were asked of the crate's map with the block's root, a module of
+/// the block's map only, and the visibility check that a crate of procedural macros gets
+/// (`resolve_remaining_segments`) stopped with "ModuleId not found in ModulesMap".
+#[test]
+fn a_path_into_a_proc_macro_crate_from_a_module_in_a_block() {
+    let fixture = r#"
+//- proc_macros: identity
+//- /main.rs crate:main
+fn fb() {
+    $0
+    mod mb {}
+}
+"#;
+    let fx = fixture::db(fixture);
+    let position = fx.position();
+    let db = fx.into_db();
+    let db = &db;
+    let block_root = db.module_at_position(position);
+    let map = block_root.def_map(db);
+    assert!(map.block.is_some() && block_root == map.root, "`$0` is in the block");
+    let mb = (map.modules(db).map(|(id, _)| id))
+        .find(|it| it.name(db).is_some_and(|it| it.as_str() == "mb"))
+        .expect("`mb` is a module of the block's map");
+    let local = crate_local_def_map(db, mb.krate(db)).local(db);
+    let path = ModPath::from_segments(PathKind::Plain, [name("proc_macros"), name("identity")]);
+    for (from, module) in [("the block", block_root), ("`mb`", mb)] {
+        let res = map.resolve_path_fp_with_macro(
+            local,
+            db,
+            ResolveMode::Other,
+            module,
+            &path,
+            BuiltinShadowMode::Module,
+            None,
+        );
+        assert_eq!(res.segment_index, None, "from {from}");
+        assert!(res.prefix_info.differing_crate, "from {from}");
+        assert!(
+            matches!(res.resolved_def.take_macros(), Some(crate::MacroId::ProcMacroId(_))),
+            "from {from}: {:?}",
+            res.resolved_def
+        );
+    }
 }
 
 const THREE_SEGMENTS: &str = r#"

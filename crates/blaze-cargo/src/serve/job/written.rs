@@ -29,7 +29,7 @@ impl ViewWrite {
     /// the checkouts watched now, each by its absolute path.
     ///
     /// Made when `path` is in no watched checkout's view (outside all of them, or under what
-    /// a view leaves out: `heads::excluded`), or when it is a file of the build's own
+    /// a view leaves out: `blaze_vfs::watch::fixed_out`), or when it is a file of the build's own
     /// checkout and `view` holds it with exactly `bytes`: then the watcher's report of the
     /// write is of a file the build's view has. Else the reason: the write would come back
     /// as a change to a view that does not hold it.
@@ -44,7 +44,7 @@ impl ViewWrite {
     ) -> Result<ViewWrite, String> {
         let rel_under = |dir: &str| {
             let rest = path.strip_prefix(dir.trim_end_matches('/'))?.strip_prefix('/')?;
-            (!crate::serve::heads::excluded(rest)).then_some(rest)
+            (!blaze_vfs::watch::fixed_out(rest)).then_some(rest)
         };
         let Some(watched) = checkouts.find(|dir| rel_under(dir).is_some()) else {
             return Ok(ViewWrite { file, bytes });

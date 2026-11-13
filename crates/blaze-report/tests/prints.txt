@@ -3,7 +3,7 @@
 # (`blaze_report::out`). `tests/prints.rs` holds each crate to its number: it only goes down.
 blaze-alloc-count 1
 blaze-bench 4
-blaze-cargo 100
+blaze-cargo 98
 blaze-ci 7
 blaze-client 3
 blaze-codegen-code 9

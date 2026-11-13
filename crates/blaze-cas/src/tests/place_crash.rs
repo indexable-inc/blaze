@@ -54,6 +54,11 @@ enum Op {
     Crash,
     /// Everything in flight ended, the store dropped and opened again.
     Reopen,
+    /// One byte of the whole file of value `value` in `placed/` changed outside the daemon
+    /// ([`Sim::rot`]): what the check of a file found at an open is for. Never drawn: the
+    /// store's own files are synced before they take their names, so no crash leaves one
+    /// with other bytes, and a control plants it.
+    Rot { value: u8 },
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +69,9 @@ struct Case {
 }
 
 const PATHS: [&str; 3] = ["one/build/a", "two/build/a", "one/build/b"];
+
+/// The path a program is started from ([`Store::starts`]): an executable, placed with its mode.
+const STARTED: usize = 0;
 
 /// A value put: its key, the bytes a place of it must give, whether the store keeps a whole
 /// file of it (so it can be a base), and for a derived value the value it is derived from.
@@ -96,12 +104,19 @@ struct World {
     /// Whether each path was placed well since the last crash: until it is, the listing a
     /// crash left may still name a file of a value it held before.
     fresh: [bool; PATHS.len()],
+    /// Whether each path was placed well since the store last opened: a derived value's whole
+    /// file is swept at every open (nothing says its bytes are right but having made them),
+    /// so only until then must it be there while a path names it.
+    since_open: [bool; PATHS.len()],
     /// `placed/` was ever filled: a whole file's write may then have failed, so a path's file
     /// need not be there.
     filled: bool,
     /// Every value a place was ever asked of at each path.
     ever: [Vec<usize>; PATHS.len()],
     asked: Vec<Asked>,
+    /// The stamp the last place of [`STARTED`] that ended well answered, until a crash: what a
+    /// daemon started later checks the path against before it trusts it unhashed.
+    stamped: Option<blaze_core::Stamp>,
 }
 
 fn path(n: usize) -> FileName {
@@ -115,6 +130,7 @@ impl World {
         let mut store = open(&mut sim, "store");
         store.plant = plant;
         store.names.plant_one_name = plant == PlacePlant::OneName;
+        store.starts(&path(STARTED), true);
         World {
             sim,
             store: Some(store),
@@ -124,9 +140,11 @@ impl World {
             holds: [None, None, None],
             last: [None; PATHS.len()],
             fresh: [true; PATHS.len()],
+            since_open: [false; PATHS.len()],
             filled: false,
             ever: [Vec::new(), Vec::new(), Vec::new()],
             asked: Vec::new(),
+            stamped: None,
         }
     }
 
@@ -187,10 +205,15 @@ impl World {
                             placed.bytes
                         ));
                     }
+                    if n == STARTED {
+                        let stamp = placed.stamp.map(|it| it.stamp);
+                        self.stamped = Some(Self::executable_stamped(&mut self.sim, stamp)?);
+                    }
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
                     self.last[n] = Some(value);
                     self.fresh[n] = true;
+                    self.since_open[n] = true;
                 }
                 // A place may fail (a full `placed/`): then its path is as it was.
                 Err(_) => {}
@@ -200,6 +223,46 @@ impl World {
         match steps.is_none() && self.asked.is_empty() {
             true => self.bounded(),
             false => Ok(()),
+        }
+    }
+
+    /// The oracle of an executable placed ([`STARTED`]): it has its mode, and the place
+    /// answered a stamp that is the path's file as it is now, change time and mode too, so
+    /// a daemon started later finds it unchanged and does not hash it again.
+    ///
+    /// Of the simulation alone, not the case: its caller holds the store and a value's bytes.
+    fn executable_stamped(sim: &mut Sim, stamp: Option<blaze_core::Stamp>) -> Result<blaze_core::Stamp, String> {
+        let at = path(STARTED);
+        if sim.mode(&at).map(|it| it & 0o7777) != Some(0o755) {
+            return Err(format!(
+                "{} was placed as an executable and has the mode {:?}",
+                PATHS[STARTED],
+                sim.mode(&at).map(|it| format!("{it:o}"))
+            ));
+        }
+        let now = sim.stamp(&at);
+        match stamp {
+            Some(stamp) if stamp == now => Ok(stamp),
+            stamp => Err(format!(
+                "{} was placed as an executable and answered the stamp {stamp:?}, not its file's \
+                 {now:?}: a daemon started later would hash it again",
+                PATHS[STARTED]
+            )),
+        }
+    }
+
+    /// The restart's check of [`STARTED`]: the file there is the one the last place's stamp
+    /// says, unchanged.
+    fn restart_finds_stamped(&mut self) -> Result<(), String> {
+        let Some(stamp) = self.stamped else { return Ok(()) };
+        let now = self.sim.stamp(&path(STARTED));
+        match now == stamp {
+            true => Ok(()),
+            false => Err(format!(
+                "after a restart {} is {now:?}, not the {stamp:?} its place answered: it is \
+                 hashed again",
+                PATHS[STARTED]
+            )),
         }
     }
 
@@ -217,7 +280,8 @@ impl World {
     /// flight: every whole file there is the file of a value a path holds, or (a path not
     /// placed since a crash, whose name the listing the crash left may hold) of one it was
     /// ever placed with; and, `placed/` never filled, every path placed since the last crash
-    /// with a whole output names a file that is there, whatever was placed at the other paths.
+    /// with a whole output names a file that is there, whatever was placed at the other paths,
+    /// and every path placed since the last open with a derived value names its file.
     fn bounded(&mut self) -> Result<(), String> {
         let mut listed = None;
         let mut effects = vec![Effect::List { dir: name("store/placed"), tag: Tag(u64::MAX - 7) }];
@@ -259,7 +323,8 @@ impl World {
         }
         for n in 0..PATHS.len() {
             let Some(value) = self.last[n] else { continue };
-            if self.filled || !self.fresh[n] || self.values[value].base.is_some() {
+            let derived = self.values[value].base.is_some();
+            if self.filled || !self.fresh[n] || (derived && !self.since_open[n]) {
                 continue;
             }
             if let Some(file) = self.whole_name(value)
@@ -275,6 +340,7 @@ impl World {
     /// place that ended well left (or nothing); one with a place in flight holds that or the
     /// new value whole.
     fn look(&self) -> Result<(), String> {
+        self.executable_moded("")?;
         for n in 0..PATHS.len() {
             let there = self.sim.exists(&path(n)).then(|| self.sim.contents(&path(n)));
             if there == self.holds[n] {
@@ -299,12 +365,14 @@ impl World {
 
     /// The oracle after a crash: each path holds nothing, or the whole of a value once placed
     /// there, or what a place of one that the power cut short may leave, since no part of a
-    /// place is synced: of a value written where it goes, any of its sectors; of a derived
+    /// place is synced: of a value written where it goes, any of its sectors, or its file
+    /// cut to length with a prefix of its bytes written and holes after; of a derived
     /// value made of a clone of its base with its ranges written, the base's bytes with any
     /// of the value's written over them (each byte the value's, the base's, or a zero where
     /// the file grew), no longer than the longer of the two. Never bytes of anything else.
     /// What it holds is what it is then known to hold.
     fn look_after_crash(&mut self) -> Result<(), String> {
+        self.executable_moded("after a crash ")?;
         for n in 0..PATHS.len() {
             let there = self.sim.exists(&path(n)).then(|| self.sim.contents(&path(n)));
             let allowed = match &there {
@@ -316,6 +384,15 @@ impl World {
                             sector == &bytes[at * SECTOR..at * SECTOR + sector.len()]
                                 || sector.iter().all(|it| *it == 0)
                         });
+                    // A value's bytes are one run written into a staged file of holes cut to
+                    // its length (`publish::Writing`, since 2026-11-12): a crash may keep the
+                    // cut and a prefix of the write, the rest holes.
+                    // A derived value's file is a clone of its base with its ranges written, never
+                    // one run: `over_base` says what a crash leaves of it.
+                    let cut_and_prefix = base.is_none() && found.len() == bytes.len() && {
+                        let apart = found.iter().zip(bytes).position(|(a, b)| a != b);
+                        apart.is_none_or(|at| found[at..].iter().all(|it| *it == 0))
+                    };
                     let over_base = base.is_some_and(|base| {
                         let base = &self.values[base].bytes;
                         found.len() <= bytes.len().max(base.len())
@@ -323,7 +400,7 @@ impl World {
                                 bytes.get(at) == Some(it) || base.get(at) == Some(it) || *it == 0
                             })
                     });
-                    found == bytes || sectors || over_base
+                    found == bytes || sectors || cut_and_prefix || over_base
                 }),
             };
             if !allowed {
@@ -340,6 +417,18 @@ impl World {
             self.holds[n] = there;
         }
         Ok(())
+    }
+
+    /// [`STARTED`] is absent or has its mode, whatever is in flight and after any crash: its
+    /// staged file is made executable before it is renamed there.
+    fn executable_moded(&self, when: &str) -> Result<(), String> {
+        match self.sim.mode(&path(STARTED)).map(|it| it & 0o7777) {
+            None | Some(0o755) => Ok(()),
+            Some(mode) => Err(format!(
+                "{when}{} is placed as an executable and has the mode {mode:o}",
+                PATHS[STARTED]
+            )),
+        }
     }
 
     fn put(
@@ -363,6 +452,7 @@ impl World {
     /// The store dropped, as its process ends, and opened again; `Err` if it does not open.
     fn open(&mut self) -> Result<(), String> {
         self.store = None;
+        self.since_open = [false; PATHS.len()];
         let mut effects = Vec::new();
         let mut store = Store::open(config("store"), &mut effects);
         drive(&mut self.sim, &mut store, &mut effects);
@@ -371,6 +461,7 @@ impl World {
         }
         store.plant = self.plant;
         store.names.plant_one_name = self.plant == PlacePlant::OneName;
+        store.starts(&path(STARTED), true);
         self.store = Some(store);
         Ok(())
     }
@@ -442,6 +533,19 @@ impl World {
                 self.pump(steps)?;
             }
             Op::Settle => self.pump(None)?,
+            Op::Rot { value } => {
+                if self.values.is_empty() {
+                    return Ok(());
+                }
+                let value = usize::from(value) % self.values.len();
+                if let Some(file) = self.whole_name(value).map(|it| name(&it))
+                    && self.sim.exists(&file)
+                {
+                    let at = self.values[value].bytes.len() / 2;
+                    let flipped = self.sim.contents(&file)[at] ^ 1;
+                    self.sim.rot(&file, at as u64, &[flipped]);
+                }
+            }
             Op::Fill { room } => {
                 self.filled = true;
                 self.sim.fill(name("store/placed"), u64::from(room))
@@ -450,6 +554,8 @@ impl World {
                 self.sim.crash();
                 self.effects.clear();
                 self.asked.clear();
+                // What the crash left at the path is placed again by the build after it.
+                self.stamped = None;
                 self.fresh = [false; PATHS.len()];
                 self.open()?;
                 self.homes()?;
@@ -464,6 +570,7 @@ impl World {
                 self.open()?;
                 self.homes()?;
                 self.look()?;
+                self.restart_finds_stamped()?;
             }
         }
         match self.store.as_ref().and_then(Store::broken) {
@@ -604,24 +711,42 @@ fn caught(ops: &[Op], seeds: std::ops::Range<u64>, plant: PlacePlant) -> Option<
 
 /// The planted-bug control: the names of the whole files kept as a set, as the collector's
 /// placed keys were: a path placed again from another value removes the file a second path
-/// still names, and the bound's oracle says so.
+/// still names, and the bound's oracle says so. On a derived value's file: an output's whole
+/// file is its value's home ([`crate::home`], since 2026-11-12), which goes only with its
+/// record, so no path's place removes it, planted or not; a derived value's goes with the
+/// last name of it.
 #[test]
 fn the_oracle_catches_a_whole_file_removed_while_a_second_path_names_it() {
-    let ops = [whole(1), place(0, 0), place(0, 1), whole(2), place(1, 0)];
+    let derived = Op::Derived { base: 0, seed: 3, ranges: 2, len: Len::Same };
+    let ops = [whole(1), place(0, 0), derived, place(1, 0), place(1, 1), whole(2), place(2, 0)];
     let (seed, why) = caught(&ops, 0..8, PlacePlant::OneName)
         .expect("the oracle missed a whole file removed while a second path names it");
     assert!(why.contains("was removed while two/build/a names it"), "seed {seed}: {why}");
 }
 
-/// The planted-bug control: a whole file found after a crash and cloned from without its
-/// bytes being hashed against its name. The file was written with no sync, so on some seed
-/// the crash tears it at its full length, and the place after gives the torn bytes.
+/// The planted-bug control: a whole file found as the store opens and cloned from without
+/// its bytes being hashed against its name. A crash leaves none with other bytes (each is
+/// synced before it takes its name, [`Store::name_staged`]), so one is changed outside the
+/// daemon between the open and the place: the store as it is refuses that place, the planted
+/// one gives the changed bytes.
 #[test]
 fn the_oracle_catches_a_placed_file_used_after_a_crash_unchecked() {
-    let ops = [whole(1), place(0, 0), Op::Crash, place(0, 1)];
+    let ops = [whole(1), place(0, 0), Op::Reopen, Op::Rot { value: 0 }, place(0, 1)];
     let (seed, why) = caught(&ops, 0..64, PlacePlant::UncheckedFile)
-        .expect("the oracle missed a torn whole file cloned from unchecked");
+        .expect("the oracle missed a changed whole file cloned from unchecked");
     assert!(why.contains("was placed with value 0 and holds"), "seed {seed}: {why}");
+}
+
+/// The planted-bug control: an executable's mode set on its path after the look its place's
+/// stamp is, as before 2026-11-13 (blaze-cargo set it once the place was answered). The
+/// stamp is then not of the file as it stays, and the restart's check of it says so.
+#[test]
+fn the_oracle_catches_an_executables_mode_set_after_the_look() {
+    let derived = Op::Derived { base: 0, seed: 5, ranges: 2, len: Len::Same };
+    let ops = [whole(5), place(0, STARTED as u8), derived, place(1, STARTED as u8), Op::Reopen];
+    let (seed, why) = caught(&ops, 0..4, PlacePlant::ModeAfterLook)
+        .expect("the oracle missed an executable's mode set after its look");
+    assert!(why.contains("a daemon started later would hash it again"), "seed {seed}: {why}");
 }
 
 /// The planted-bug control: a derived value's whole file renamed to its name, and cloned to
@@ -788,8 +913,14 @@ fn a_warm_edits_placement_writes_its_ranges_and_forces_no_write_back() {
     );
     assert!(read < 64 << 10, "a derive read {read} bytes: none of its 10 MiB base is read");
     assert_eq!(sim.bytes_forced(), 0, "no clone was of a file with data to write back");
-    // The base's whole file went once the derives had cloned it: one whole file is kept.
-    assert!(!sim.exists(&name(&format!("store/placed/{:x}", content_of(&base)))));
+    // The base's whole file stays though no path names it: it is its value's one home
+    // (`crate::home`, since 2026-11-12), the record's bytes, not a second copy of them.
+    let base_id = content_of(&base);
+    assert!(sim.exists(&name(&format!("store/placed/{base_id:x}"))));
+    assert!(
+        store.tiers[0].externals.get(&base_id).is_some_and(|it| it.placed && !it.dropped),
+        "the base's file stays only as its value's home"
+    );
     assert!(sim.exists(&name(&format!("store/placed/{:x}{DERIVED_SUFFIX}", key(2).0))));
     assert!(store.problems().is_empty(), "{:?}", store.problems());
 

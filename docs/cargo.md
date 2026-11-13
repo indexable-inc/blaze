@@ -1060,8 +1060,12 @@ phase of its start (reading its state, setting up its store), then a newline onc
 bound; the command connects only after that newline, and gives each phase 60 s. A start that
 stops short is an error naming the phase it reached and, when the daemon ended, its exit code
 or signal; or systemd or launchd start it on the first connection
-after `blaze daemon install` (socket activation; `blaze daemon uninstall` removes the units). It does not exit
-when idle: it stops on `blaze stop` or SIGTERM, letting go of its socket first and then writing its state. `blaze stop` and `blaze status` say `no daemon is running` only when nothing listens at the
+after `blaze daemon install` (socket activation; `blaze daemon uninstall` removes the units). It stops on
+`blaze stop` or SIGTERM, letting go of its socket first and then writing its state; by itself
+only when idle with no client or launcher connected (`crates/blaze-cargo/src/serve/idle.rs`:
+after 30 s if it never built, after 600 s otherwise), or, started with
+`BLAZE_DAEMON_EXIT_UNHELD`, once no connection has been open for that grace
+(`crates/blaze-cargo/src/serve/unheld.rs`; it ends with exit status 78, `UNHELD`). `blaze stop` and `blaze status` say `no daemon is running` only when nothing listens at the
 socket and no daemon holds the state either: the state's lock (`serve.lock`, held by the kernel
 for the daemon's life, naming its pid) is asked, never the socket alone, since the socket's
 path follows `XDG_RUNTIME_DIR` and the state's does not. A daemon that holds the state and
@@ -1073,7 +1077,9 @@ its schema and pid and what stops it (`absent` and `other_schema` in
 A daemon holds `serve.lock` in its state directory, which names its pid, for as long as it runs.
 One started while the one before it still ends (writing its image) says so on the pipe and
 waits at most 300 s for that lock, then stops with an error naming the other's pid; it never
-starts over a live daemon. A listener removes its socket's file only while that file is still
+starts over a live daemon. Two commands that start a daemon at once race the same way: the
+second's daemon, finding the first listening at its socket while it waits, ends at once with
+exit status 79 (`SERVED`), and its command connects to the first. A listener removes its socket's file only while that file is still
 the socket it bound, so an ending daemon never removes the next one's. A command that finds a
 daemon of another build tells it to stop and waits for its process to end before starting
 its own.
@@ -1465,6 +1471,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | `https://blaze-releases.ix.dev` |
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
 | `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
+| `BLAZE_DAEMON_EXIT_UNHELD` | the daemon stops itself once no client or launcher connection has been open at its socket for a grace: `on` for 20 s, or a whole number of seconds above 0. It never stops while one is open, a connection inside the grace ends the countdown, and it stops as `blaze stop` does (writing its image), logging why and ending with exit status 78 (`UNHELD`). For test runs and scripts whose clients may be killed before they could stop it. A daemon setting: a command that sets another value than the running daemon's is refused ([The daemon](#the-daemon)) | unset: it exits only as below |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code

@@ -28,7 +28,7 @@ use hashbrown::{HashTable, hash_table};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, ImageUse, Mode, Op, OpError,
+    Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, ImageUse, MOST_FILE_BYTES, Mode, Op, OpError,
     image::Bytes,
     reader::Reader,
     settle::Unsettled,
@@ -775,6 +775,7 @@ impl Tree {
         bytes: Bytes,
         mode: Mode,
     ) -> Result<(), OpError> {
+        too_large(&path, bytes.len())?;
         if ancestors(&path).any(|up| self.file_now(base, pending, up).is_some()) {
             // alloc: the error's path
             return Err(OpError::NotADirectory(path.into_owned()));
@@ -841,6 +842,7 @@ impl Tree {
                         size,
                     });
                 }
+                too_large(path, (size - *len) as usize + bytes.len())?;
                 let (at, end) = (*at as usize, (*at + *len) as usize);
                 // alloc: the edited file's bytes, made once and kept as they are.
                 let new = adopt([&old[..at], bytes, &old[end..]].concat());
@@ -1328,6 +1330,17 @@ fn put_owned(pending: &mut Pending, path: Cow<'_, str>, blob: Option<Blob>) {
 /// base's contents there are gone.
 fn shadowed(pending: &Pending, path: &str) -> bool {
     ancestors(path).any(|up| pending.contains_key(up))
+}
+
+/// Refuses a file of `len` bytes at `path` over [`MOST_FILE_BYTES`]: the journal could not
+/// record it.
+fn too_large(path: &str, len: usize) -> Result<(), OpError> {
+    let size = len as u64;
+    match size > MOST_FILE_BYTES {
+        // alloc: the error's path
+        true => Err(OpError::TooLarge { path: path.to_owned(), size, most: MOST_FILE_BYTES }),
+        false => Ok(()),
+    }
 }
 
 /// `a/b/c` -> `a/b`, `a`.

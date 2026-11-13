@@ -10,7 +10,10 @@ use hir_ty::{
     db::{InternedClosureId, InternedCoroutineId},
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_mir::mir::dispatch::{Body, LONGEST, body_of};
+use hir_ty_mir::mir::{
+    MirBody, MirLowerError,
+    dispatch::{Body, LONGEST},
+};
 use std::alloc::Global;
 
 use crate::dispatch::{Cx, Instance, Marked, Target, Unseen, sites};
@@ -47,11 +50,14 @@ pub(crate) struct Summary {
 #[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
 pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let cx = Cx::new(db, env);
-    let body = match body_of(db, cx.stored, instance.def, instance.args) {
+    let body = match body_once(db, &cx.stored, &instance) {
         Ok(body) => body,
         Err(_) => return Summary { unseen: Some(Unseen::NoMir), ..Summary::default() },
     };
-    let sites = sites(&cx, body);
+    // The body is read for the sites alone and dropped before the callees are asked: the
+    // depth-first walk holds one summary a level, never one body a level.
+    let sites = sites(&cx, &body);
+    drop(body);
     let mut best: Option<Hop> = None;
     let mut driver = false;
     let mut seen = HashSet::new_in(Global);
@@ -95,6 +101,47 @@ pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
         }
     }
     Summary { suspends: best, callees: callees.into_boxed_slice(), unseen: sites.unseen, driver }
+}
+
+/// The monomorphized body of `instance` in `env`, made for the caller and dropped by it
+/// (`dispatch::body_once`): each reader (the summary, the instance's check) keeps what it
+/// worked out of the body, never the body, which a memo would hold one of an instance the walk
+/// reaches until the build lets every MIR go (agents/annoyances/monowalk-1112-1.json).
+pub(crate) fn body_once<'db>(
+    db: &'db Db,
+    env: &StoredParamEnvAndCrate,
+    instance: &Instance,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count test: the memoized body, as until 2026-11-13.
+        // clone: the memo's body, a planted bug's copy
+        return hir_ty_mir::mir::dispatch::body_of(db, *env, instance.def, instance.args)
+            .map(Clone::clone);
+    }
+    hir_ty_mir::mir::dispatch::body_once(db, env, instance.def, &instance.args)
+}
+
+/// What a test plants in the check.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn keeps_bodies() -> bool {
+        KEEPS_BODIES.with(Cell::get)
+    }
+
+    /// `work` with every body read on this thread from the memo that keeps one an instance.
+    pub(crate) fn keeping_bodies<R>(work: impl FnOnce() -> R) -> R {
+        KEEPS_BODIES.with(|it| it.set(true));
+        let made = work();
+        KEEPS_BODIES.with(|it| it.set(false));
+        made
+    }
 }
 
 /// Whether what `target` reaches may park the fiber.

@@ -42,7 +42,7 @@ use rustc_type_ir::{
 use crate::{
     effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index, trusted_trait},
     memory::MemoryEffects,
-    walk::{Cx, Def, How, Instance, Summary, body_of, never_returns, summary},
+    walk::{Cx, Def, How, Instance, Summary, body_once, never_returns, summary},
 };
 
 /// What a check found of an instance.
@@ -494,8 +494,9 @@ const CHAIN: usize = 64;
 /// body inlined into it.
 fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     let db = cx.db;
-    let body = body_of(db, &cx.stored, instance)?.ok()?;
-    let (span, _) = source_span(body, span);
+    // Read once, for a refusal's text, and dropped with it.
+    let body = body_once(db, &cx.stored, instance)?.ok()?;
+    let (span, _) = source_span(&body, span);
     let owner = match body.owner {
         InferBodyId::DefWithBodyId(owner) => owner,
         InferBodyId::AnonConstId(_) => return None,

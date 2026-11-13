@@ -378,6 +378,10 @@ impl Run {
     }
 
     fn up(&mut self) {
+        // A daemon that runs stays: only a world that is down is taken to start one.
+        if !matches!(self.world, Some(World::Down(_))) {
+            return;
+        }
         if let Some(World::Down(sim)) = self.world.take() {
             let daemon = self.begin(sim);
             self.world = Some(World::Up(daemon));

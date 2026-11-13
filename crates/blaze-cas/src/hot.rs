@@ -42,7 +42,7 @@ use blaze_reclaim::Grace;
 use crate::{
     pool::{
         Append, Ended, FileId, Kernel, Load, LoadFailure, Loads, Opened, PAGE, Pins, Pool,
-        PoolError, Rank, ReadStep, Reading, Run, Tail, WINDOW, WINDOWS, Window, Windows, counts,
+        PoolError, Rank, ReadStep, Reading, Run, Tail, WINDOW, Window, Windows, counts,
         drive,
         evict::{Census, Sweep, Swept, census},
         loads::DEMAND_SLOTS,
@@ -597,9 +597,10 @@ impl Hot {
     /// thread of its own on this target's native driver over the loader's root, or by the
     /// store's own driver, its loads asking with tags `load_tags..load_tags + 2^32`. A
     /// reservation the system refused, or a loader that did not start, is kept as why
-    /// ([`Hot::refused`]): the store stops, naming it, and nothing is read another way.
-    pub(crate) fn new(load_tags: u64, loader: &crate::Loader) -> Hot {
-        let open = Pool::new(WINDOWS, Kernel)
+    /// ([`Hot::refused`]): the store stops, naming it, and nothing is read another way. The
+    /// pool reserves `windows` windows ([`crate::pool::WINDOWS`] for a store; fewer for a test's).
+    pub(crate) fn new(load_tags: u64, loader: &crate::Loader, windows: u32) -> Hot {
+        let open = Pool::new(windows, Kernel)
             // alloc: the error that stops the store
             .map_err(|err| err.to_string())
             .and_then(|pool| {
@@ -624,7 +625,7 @@ impl Hot {
                         (Some(started.map_err(|err| err.to_string())?), None)
                     }
                 };
-                let gate = Gate { windows: Windows::new(WINDOWS), sweep: Sweep::new() };
+                let gate = Gate { windows: Windows::new(windows), sweep: Sweep::new() };
                 Ok(Open {
                     // alloc: what the store and its readers share of the pool, once per store
                     side: Arc::new(Side { pool, loader, gate: Lock::new("store.pool.windows", gate) }),

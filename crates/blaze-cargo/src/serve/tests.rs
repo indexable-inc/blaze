@@ -45,6 +45,8 @@ use super::{
 };
 
 const SOCKET: &str = "run/blaze/v2.sock";
+/// The socket of a second home's daemon on the same machine.
+const OTHER_SOCKET: &str = "run/blaze/other.sock";
 const STATE: &str = "cache/blaze/v2";
 /// [`Options::std`]: the machine's, outside every state directory.
 const STD: &str = "cache/blaze/std/0b";
@@ -150,6 +152,9 @@ thread_local! {
     static SIDE_OUTPUT: Cell<bool> = const { Cell::new(false) };
     /// Whether the program's compile warns twice, as its unit.
     static WARNS: Cell<bool> = const { Cell::new(false) };
+    /// Whether the fake load says no warning: by default it warns its manifest's text, which
+    /// every answer then says (and which the thin client hands to the engine to print).
+    static QUIET_LOAD: Cell<bool> = const { Cell::new(false) };
     /// Whether a writer's apply fails as a whole, an error of the writer's own that no unit's
     /// write owns: it ends the job.
     static FAILS_APPLY: Cell<bool> = const { Cell::new(false) };
@@ -611,7 +616,10 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             files: vec![LockFile { path: format!("{root}/Cargo.lock"), text: "# a lock\n".into() }],
             said: Vec::new(),
         }),
-        warnings: vec![manifest],
+        warnings: match QUIET_LOAD.get() {
+            true => Vec::new(),
+            false => vec![manifest],
+        },
         notes: Vec::new(),
         target_dir: format!("{root}/target"),
         build_dir: format!("{root}/target"),
@@ -1670,6 +1678,7 @@ fn options() -> Options {
         machine: None,
         without: super::daemon::Without::default(),
         premises: super::daemon::Premises::of_this_process().expect("the test's own executable"),
+        unheld: None,
     }
 }
 
@@ -1696,8 +1705,13 @@ struct Client {
 }
 
 fn dial(daemon: &mut SimDaemon) -> Client {
+    dial_at(daemon, SOCKET)
+}
+
+/// [`dial`] for a daemon listening at `socket`, another than [`SOCKET`] (a second home's).
+fn dial_at(daemon: &mut SimDaemon, socket: &str) -> Client {
     for _ in 0..TURNS {
-        if let Ok(conn) = daemon.driver().dial(&Address::Unix(name(SOCKET))) {
+        if let Ok(conn) = daemon.driver().dial(&Address::Unix(name(socket))) {
             return Client { conn, frames: Frames::new(), next: 1, got: Vec::new() };
         }
         daemon.turn();
@@ -2114,7 +2128,7 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
 
     let other = Options {
         state: name("cache/blaze/v2-other"),
-        socket: Some(name("run/blaze/other.sock")),
+        socket: Some(name(OTHER_SOCKET)),
         writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
         ..options()
     };
@@ -2125,10 +2139,14 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
         second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
         Some(SHARED.to_vec())
     );
-    assert!(
-        second.store().get(&shared_key()).unwrap().is_none(),
-        "the home's own store has none of it"
+    // The home's look finds it in place, through the machine's layer it reads behind its own
+    // records (`Config::layers`), and its own tier holds none of it.
+    assert_eq!(
+        second.store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
+        Some(SHARED.to_vec()),
+        "the home's look finds the layer's record"
     );
+    assert_eq!(second.store().stored_bytes(&[shared_key()]), 0, "the home's own store has none of it");
 }
 
 /// What two daemons of two homes on one machine layer did with the sealed crate unit 0 is,
@@ -2148,6 +2166,9 @@ fn sealed_across_homes(seed: u64, into: crate::serve::work::PutInto) -> SealedAc
     let holds = |store: &Store| {
         store.get(&sealed_key()).unwrap().is_some_and(|it| it.bytes == SEALED_RECORD)
     };
+    // A home's look finds what its layers hold too (`Config::layers`, read in place behind
+    // its own records): a home holds the record only with it committed in its own tier.
+    let home_holds = |store: &Store| holds(store) && store.stored_bytes(&[sealed_key()]) > 0;
     let stopped = |daemon: &mut SimDaemon| {
         daemon.stop();
         let mut turns = 0;
@@ -2171,12 +2192,12 @@ fn sealed_across_homes(seed: u64, into: crate::serve::work::PutInto) -> SealedAc
     // The stop stores the kept front end and waits for its puts, the layer's on the layer.
     stopped(&mut first);
     assert!(first.lost().is_empty(), "seed {seed}: {:#?}", first.lost());
-    let first_home = holds(first.store());
+    let first_home = home_holds(first.store());
     let first_built = SEALED_BUILDS.get() - builds;
 
     let other = Options {
         state: name("cache/blaze/v2-other"),
-        socket: Some(name("run/blaze/other.sock")),
+        socket: Some(name(OTHER_SOCKET)),
         writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
         ..options()
     };
@@ -2187,7 +2208,7 @@ fn sealed_across_homes(seed: u64, into: crate::serve::work::PutInto) -> SealedAc
         Runner::Inline(Inline::new(seed + 1)),
     )
     .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
-    let mut client = dial(&mut second);
+    let mut client = dial_at(&mut second, OTHER_SOCKET);
     let id = client
         .send(&mut second, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut second, id);
@@ -2200,7 +2221,7 @@ fn sealed_across_homes(seed: u64, into: crate::serve::work::PutInto) -> SealedAc
         built: (first_built, SEALED_BUILDS.get() - builds - first_built),
         first_home,
         layer: holds(second.std_store()),
-        second_home: holds(second.store()),
+        second_home: home_holds(second.store()),
     }
 }
 
@@ -3750,14 +3771,34 @@ fn a_commit_step_that_answers_at_the_bound_counts_whatever_else_answers_then() {
             "seed {seed}: the wait's deadline is {after:?} away"
         );
         daemon.driver().record(vec![store_dir(), name("placed")]);
-        daemon.driver().slow_writes(name("placed"), after);
-        daemon.driver().release_held(after);
+        // A place of a value's bytes is steps (blaze-cas `publish::Writing`): a clear of its
+        // staged name, which takes the disk's own latency, a cut to its length, then its
+        // writes. The cut and the writes are slowed; the writes, asked as the cuts end, are
+        // timed from where the first clears ended so that they end at the deadline itself.
+        let cut = after / 4;
+        daemon.driver().slow_writes(name("placed"), cut);
+        let asked = daemon.driver().now();
         for at in 0..4 {
             assert!(
                 daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{at}"))).is_some(),
                 "a placement asked"
             );
         }
+        for _ in 0..TURNS {
+            if daemon.driver().now() > asked {
+                break;
+            }
+            daemon.turn();
+            client.take(&mut daemon);
+        }
+        let cleared = daemon.driver().now();
+        assert!(
+            cleared > asked && cleared - asked < cut,
+            "seed {seed}: the first clears were told {:?} after the placements were asked",
+            cleared - asked
+        );
+        daemon.driver().slow_writes(name("placed"), deadline - cleared - cut);
+        daemon.driver().release_held(deadline - cleared);
         settle(&mut daemon, &mut client);
         assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
         assert_eq!(dones(&client, id), 1, "seed {seed}");
@@ -5434,14 +5475,14 @@ fn every_request_ends_once_over_many_seeds() {
 fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the_state() {
     use std::io::Read as _;
     let state = tempfile::tempdir().unwrap();
-    let a = super::hold(state.path(), None).unwrap();
+    let a = super::hold(state.path(), None, None).unwrap();
     let lock = state.path().join("serve.lock");
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
     let (mut heard, said) = std::io::pipe().unwrap();
     let said: std::os::fd::OwnedFd = said.into();
     let said = super::Ready::new(std::fs::File::from(said)).unwrap();
     let path = state.path().to_owned();
-    let b = std::thread::spawn(move || super::hold(&path, Some(&said)).map(drop));
+    let b = std::thread::spawn(move || super::hold(&path, None, Some(&said)).map(drop));
     let mut byte = [0u8; 1];
     heard.read_exact(&mut byte).unwrap();
     assert_eq!(super::Phase::of(byte[0]), Some(super::Phase::Waiting));
@@ -5462,7 +5503,7 @@ fn the_states_lock_says_whether_a_daemon_runs_and_which() {
     let state = tempfile::tempdir().unwrap();
     assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "no daemon ever ran here");
     assert!(!state.path().join("serve.lock").exists(), "asking creates nothing");
-    let held = super::hold(state.path(), None).unwrap();
+    let held = super::hold(state.path(), None, None).unwrap();
     let lock = state.path().join("serve.lock");
     assert_eq!(
         super::holder(state.path()).unwrap(),
@@ -5474,7 +5515,7 @@ fn the_states_lock_says_whether_a_daemon_runs_and_which() {
     drop(held);
     assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "let go of as the daemon ends");
     // And asking left the lock free: a daemon starts on the state at once.
-    let again = super::hold(state.path(), None).unwrap();
+    let again = super::hold(state.path(), None, None).unwrap();
     assert!(matches!(again.1, super::Before::Ended(pid) if pid == std::process::id()));
 }
 
@@ -5611,6 +5652,7 @@ mod launched_restart;
 mod solo;
 mod client_spans;
 mod solo_rows;
+mod unheld;
 
 /// The checkout's one crate as the front end's carry is given it: rooted at `src/main.rs` of
 /// the view's tree.

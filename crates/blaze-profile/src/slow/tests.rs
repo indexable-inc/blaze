@@ -814,7 +814,12 @@ fn a_builds_account_and_its_warnings_are_said_before_the_findings() {
     };
     let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
     let spans = || vec![span(1, 1, None, "job", 0, 100, 1)];
-    let said = |facts: &Facts| text(&report(switches(), spans(), 100, facts), 10);
+    // The report of build 1, as the account's row is: a `Facts` left at its default says
+    // build 0, the id of no build.
+    let said = |facts: &Facts| {
+        let facts = Facts { build: BuildFacts { id: 1, ..BuildFacts::default() }, ..facts.clone() };
+        text(&report(switches(), spans(), 100, &facts), 10)
+    };
     let wrote = Account::of(1, &[QueryCountRow { written: 53, ..quiet }], &[], Seen::default());
     let warned = said(&Facts { account: Some(wrote.row), ..workers([1]) });
     assert!(warned.contains("  account: 53 inputs written (0 source, 0 environment, 0 plan, 53 derived, 0 unattributed)"), "{warned}");

@@ -757,3 +757,57 @@ pub fn calm() -> u32 {
         },
     );
 }
+
+/// Crate `x` whose `root` calls one generic function, `leaf`, with `instances` different type
+/// arguments (`u8`, `(u8,)`, `((u8,),)`, ...): two bodies whatever `instances` is, and each
+/// instance of `leaf` checked in `x` (a generic body instantiated there).
+fn ladder(instances: usize) -> String {
+    let mut ty = String::from("u8");
+    let mut calls = String::new();
+    for _ in 0..instances {
+        calls.push_str(&format!("    n = leaf::<{ty}>(n);\n"));
+        ty = format!("({ty},)");
+    }
+    format!(
+        "\n//- /x.rs crate:x deps:engine\n\
+         fn leaf<T>(x: u32) -> u32 {{\n    x\n}}\n\n\
+         pub fn root(mut n: u32) -> u32 {{\n{calls}    n\n}}\n"
+    )
+}
+
+/// How many MIR values the database holds once crate `x` of [`ladder`] is checked: every
+/// instance summarized and the instances of `x` checked, each reading its body.
+fn held_after_the_check(instances: usize, keeps_bodies: bool) -> usize {
+    use blaze_query::db::Database as _;
+    // alloc: a test's fixture text
+    let db = &fixture::db(&format!("{ENGINE}{}", ladder(instances))).into_db();
+    blaze_query::db::attach(db, || {
+        let check = || _ = suspend_check(db, crate_named(db, "x"));
+        match keeps_bodies {
+            true => crate::summary::plant::keeping_bodies(check),
+            false => check(),
+        }
+    });
+    db.storage().values_of(blaze_mem::Tag::Mir)
+}
+
+/// The invariant: the check keeps what it worked out of each instance's body (a summary, an
+/// instance's points), never the body: checking 8 instances of one generic and 64 leaves the
+/// same number of MIR values held.
+#[test]
+fn the_check_holds_no_body_an_instance() {
+    let (few, many) = (held_after_the_check(8, false), held_after_the_check(64, false));
+    assert_eq!(few, many, "MIR values held after checking 8 instances and 64");
+}
+
+/// The planted bug: each summary and instance check reads its body from the memo that keeps
+/// one an instance, as both did until 2026-11-13: 56 more instances hold at least 56 more
+/// bodies.
+#[test]
+fn the_oracle_catches_a_check_that_keeps_each_instances_body() {
+    let (few, many) = (held_after_the_check(8, true), held_after_the_check(64, true));
+    assert!(
+        many >= few + 56,
+        "the memoized check held {few} MIR values for 8 instances and {many} for 64"
+    );
+}

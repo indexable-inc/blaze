@@ -32,6 +32,9 @@ use blaze_api::Setting;
 pub const STARTED_WITH: &[&str] = &[
     // The memory limit (`serve::engine`, `told_limit`): `--memory-gb` wins where given.
     super::MEMORY_VAR,
+    // Whether, and after what grace, it exits once no connection holds it (`serve::engine`,
+    // read once; `serve::unheld`).
+    super::unheld::VAR,
     // The cores the plane and the worker pool are sized to, and the process's priority
     // (blaze-core's `cores::get`, read once and lowered at the start): compared by the budget
     // and priority each gives ([`same`]).

@@ -260,6 +260,10 @@ mod tests {
             ContentMap::<Half, Global>::with_capacity_in(256, Global) // alloc: measured
         });
         assert_eq!(made.allocations, 1);
+        // The process's first hash sets up the BLAKE3 backend once (CPU detection, the
+        // kernels' self-test, the domain's key): that is the hasher's, not the map's, so it
+        // happens before the count.
+        content_of(&Half(0, 0));
         let ((), used) = blaze_alloc_count::measure(|| {
             for it in 0..=255u8 {
                 let id = map.insert(Half(it, 0));

@@ -1473,6 +1473,7 @@ pub mod kinds {
         // Imports.
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
         USES_FN_CACHE = 0x24c1, "uses_fn_cache";
+        BODY_TRAIT_USES = 0x24c2, "body_trait_uses";
 
         // Bodies served from the check cache.
         SERVED_PART = 0x24f0, "served_part";
@@ -1480,6 +1481,11 @@ pub mod kinds {
         LOCATION_LITERALS = 0x24f2, "location_literals";
         INFERENCE_VALUE = 0x24f3, "inference_value";
         MIR_VALUE = 0x24f4, "mir_value";
+        // A body's runtime MIR entry of its crate's value (`check_cache/runtime`), by owner.
+        BODY_ENTRY = 0x24f5, "body_entry";
+        CLOSURE_ENTRY = 0x24f6, "closure_entry";
+        COROUTINE_ENTRY = 0x24f7, "coroutine_entry";
+        COROUTINE_BY_MOVE_ENTRY = 0x24f8, "coroutine_by_move_entry";
 
         // Goals answered from the crate's own impls (`next_solver/global_goals`).
         AUTO_TRAIT_DEPTH = 0x2500, "auto_trait_depth";
@@ -1489,6 +1495,9 @@ pub mod kinds {
         EXPLICIT_SUPER_CLAUSES = 0x2510, "explicit_super_clauses_of";
         EXPLICIT_IMPLIED_CLAUSES = 0x2511, "explicit_implied_clauses_of";
         IMPL_METHOD_HYBRID_PREDICATES = 0x2512, "impl_method_hybrid_predicates";
+        // A record function's parameter defaults (`lower/record`).
+        RECORD_PARAM_DEFAULTS = 0x2513, "record_param_defaults";
+        RECORD_PARAM_DEFAULT = 0x2514, "record_param_default";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
@@ -1496,12 +1505,12 @@ pub mod kinds {
         INHERENT_SLICE_INPUT = 0x25e2, "InherentSlice";
         CANDIDATE_SLICE_INPUT = 0x25e3, "CandidateSlice";
         SLICE_DIRECTORY = 0x25e4, "SliceDirectory";
-        IMPL_SLICES = 0x25e5, "ImplSlices";
+        // 0x25e5 was `ImplSlices` and 0x25ea `LibraryImplSlices`, both gone 2026-11-12
+        // (`method_resolution/delta/publish`); neither number is given again.
         IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
         SERVED_BODIES = 0x25e7, "ServedBodies";
         KEPT_CONSTS = 0x25e8, "KeptConsts";
         DIRECTORY_SLOT = 0x25e9, "DirectorySlot";
-        LIBRARY_IMPL_SLICES = 0x25ea, "LibraryImplSlices";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";

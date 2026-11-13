@@ -1434,7 +1434,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     debug!(?remaining_fields);
 
-                    // FIXME: Emit an error: missing fields.
+                    // rustc's `report_missing_fields`: E0063 is a type check error, so it taints
+                    // the body (and the item a closure with it is in) as every other one here
+                    // does, and nothing builds MIR of it. In the order of the variant's fields.
+                    let missed_fields: Vec<hir_def::LocalFieldId> = variant_fields
+                        .fields()
+                        .iter()
+                        .filter(|(_, field)| remaining_fields.contains_key(&field.name))
+                        .map(|(id, _)| id)
+                        .collect(); // alloc: the diagnostic's own list, only when fields are missing
+                    self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
+                        record: expr.into(),
+                        variant,
+                        missed_fields,
+                    });
                 }
             }
         }

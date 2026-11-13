@@ -352,15 +352,23 @@ mod unix {
         timings.span(talk::CONNECT, connect_ns, kernel::mono_ns());
         let mut daemon = Daemon::new(stream);
         // The whole of what is said to the daemon, on this one connection ([`talk::talk`]).
-        let is_engine = |theirs: &blaze_api::Executable| match engine.is(theirs) {
-            true => Ok(()),
-            false => Err(format!(
-                "the daemon is {}, not the engine beside this program, {}",
-                theirs.path,
-                engine.path.display()
-            )),
+        // The engine beside this program, started with the daemon settings this command keeps
+        // (`route::CHECKED_HERE`); else the engine's, which replaces the daemon or refuses.
+        let is_ours = |status: &blaze_api::Status| {
+            let theirs = &status.build.exe;
+            if !engine.is(theirs) {
+                return Err(format!(
+                    "the daemon is {}, not the engine beside this program, {}",
+                    theirs.path,
+                    engine.path.display()
+                ));
+            }
+            match route::drifted(var, &status.settings) {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
         };
-        match talk::talk(&mut daemon, &spoken, is_engine, || started.elapsed(), &mut timings) {
+        match talk::talk(&mut daemon, &spoken, is_ours, || started.elapsed(), &mut timings) {
             Ended::Engine(why) => Err(why),
             Ended::HandOver { request } => {
                 let held = Handed { request: &request, timed: timings.timed, started_ns };

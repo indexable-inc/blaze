@@ -113,7 +113,10 @@ impl<'db> ExprValidator<'db> {
         }
 
         for (id, expr) in body.exprs() {
-            let missing = record_literal_missing_fields(db, body, self.infer, id, expr)
+            // A struct expression with no `..` that leaves a field out is type checking's E0063
+            // (`InferenceDiagnostic::RecordMissingFields`, which taints the body); here only
+            // the forms of `..` with no base.
+            let missing = record_literal_defaults_missing_fields(db, body, self.infer, id, expr)
                 .or_else(|| Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new())));
             if let Some((variant, missed_fields)) = missing {
                 self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
@@ -424,15 +427,17 @@ impl<'db> FilterMapNextChecker<'db> {
     }
 }
 
-pub fn record_literal_missing_fields<'db>(
+/// The fields without a default value a struct expression with `..` and no base
+/// (`S { a: 1, .. }`) leaves out. One with no `..` is type checking's (`check_record_expr_fields`).
+pub fn record_literal_defaults_missing_fields<'db>(
     db: &'db Db,
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,
     id: ExprId,
     expr: Expr<'_>,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
-    let (fields, spread) = match expr {
-        Expr::RecordLit { fields, spread, .. } => (fields, spread),
+    let fields = match expr {
+        Expr::RecordLit { fields, spread: RecordSpread::FieldDefaults, .. } => fields,
         _ => return None,
     };
 
@@ -451,22 +456,12 @@ pub fn record_literal_missing_fields<'db>(
             VariantFields::name_written(db, variant_def, f.name, hygiene)
         })
         .collect();
-    // don't show missing fields if:
-    // - has ..expr
-    // - or has default value + ..
-    // - or already in code
+    // Those neither written nor with a default value.
     let missed_fields: Vec<LocalFieldId> = variant_data
         .fields()
         .iter()
         .filter_map(|(f, d)| {
-            if specified_fields.contains(&d.name)
-                || matches!(spread, RecordSpread::Expr(_))
-                || (d.default_value.is_some() && matches!(spread, RecordSpread::FieldDefaults))
-            {
-                None
-            } else {
-                Some(f)
-            }
+            (!specified_fields.contains(&d.name) && d.default_value.is_none()).then_some(f)
         })
         .collect();
     if missed_fields.is_empty() {

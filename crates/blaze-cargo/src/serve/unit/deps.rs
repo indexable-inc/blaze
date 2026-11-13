@@ -59,7 +59,8 @@ impl Kept {
     /// What a later [`serve`] of the same front end served, added: a crate's latest key holds,
     /// and a crate keyed again is a hit or stale only as that serve found it.
     fn add(&mut self, more: Served) {
-        let Served { keys, hits, stale, old_layout, build, lookups } = more;
+        // A serve just made has stored nothing: what this front end's stores wrote stays its own.
+        let Served { keys, hits, stale, old_layout, build, lookups, stored: _ } = more;
         // Every serve of one front end is by one blaze: what `store` makes the keys again with.
         self.served.build = build;
         // Over the front end's life here; a build's are the session's, which `store` says.
@@ -269,7 +270,7 @@ pub(crate) fn images(
     session.walked.note(at, build, crates.iter().chain(keys.keys()));
     // Written: what was walked stands again only once [`serve`] is done and stamps its view.
     session.walked.at = None;
-    let Served { keys, hits, stale, old_layout, build, lookups } = served;
+    let Served { keys, hits, stale, old_layout, build, lookups, stored } = served;
     // What this serve's searches of the store came to, for the build's count ([`store`]).
     session.lookups.images.add(lookups);
     let of_moved = |krate: &Crate| moved.binary_search(krate).is_ok();
@@ -281,6 +282,7 @@ pub(crate) fn images(
         old_layout: old_layout.into_iter().filter(of_moved).collect(),
         build,
         lookups,
+        stored,
     }))
 }
 
@@ -981,7 +983,12 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         // Who read a whole scope (a listing, not a lookup of a name): each is a read no finer
         // than a module, so the rows that do it are named.
         let by: Vec<String> =
-            scans.iter().map(|(step, row, count)| format!("`{row}` in {step} ({count})")).collect(); // alloc: as above
+            scans
+                .iter()
+                .map(|(step, row, count)| {
+                    blaze_report::say!(blaze_report::say::Code(&row.to_string()), blaze_report::say::Words(&format!(" in {step} ({count})"))).flat()
+                })
+                .collect(); // alloc: as above
         message.push_str(&format!("; whole scopes read by {}", by.join(", "))); // alloc: as above
     }
     if *failed > 0 {
@@ -990,7 +997,7 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
     }
     if !refused.is_empty() {
         let by: Vec<String> =
-            refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
+            refused.iter().map(|(read, count)| blaze_report::say!(blaze_report::say::Code(&read.to_string()), blaze_report::say::Words(&format!(" ({count})"))).flat()).collect(); // alloc: as above
         message.push_str(&format!("; steps kept out by reads of {}", by.join(", "))); // alloc: as above
     }
     for (count, why) in [
@@ -1033,7 +1040,10 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
     message.push_str(&format!("; {lookups}")); // alloc: as above
     if !inexpressible.is_empty() {
         let by: Vec<String> =
-            inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above
+            inexpressible
+                .iter()
+                .map(|(query, count)| blaze_report::say!(blaze_report::say::Code(&query.to_string()), blaze_report::say::Words(&format!(" ({count})"))).flat())
+                .collect(); // alloc: as above
         message.push_str(&format!("; goals kept out by {}", by.join(", "))); // alloc: as above
     }
     for (count, why) in [
@@ -1207,7 +1217,16 @@ pub(crate) fn serve_bodies_of(
 /// `Compiled::puts`, which the loop puts. A worker never writes the store. A keep that fails
 /// lets its claim go, so the next keep finds the runs again. A crate served at this revision
 /// keeps through its kept session, whose root is given to mark.
-pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<BodyPuts, ApiError> {
+///
+/// `served`: the puts of the unit's serve ([`serve_bodies`]), not in the store yet; the keep
+/// reads through them (the crate's session it keeps through names their entries) and gives
+/// them back with its own, each once.
+pub(crate) fn keep_bodies(
+    job: &Job,
+    reader: &super::UnitReader,
+    unit: usize,
+    served: Vec<Put>,
+) -> Result<BodyPuts, ApiError> {
     let span = tracing::info_span!(
         target: "blaze",
         "body entries kept",
@@ -1223,22 +1242,24 @@ pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) ->
     );
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
-    let (puts, did) = keep_bodies_of(&reader.front, &in_view, reader.bodies(), &job.input.store)?;
+    let (puts, did) = keep_bodies_of(&reader.front, &in_view, reader.bodies(), &job.input.store, served)?;
     record_did(&span, &did);
     Ok(puts)
 }
 
-/// [`keep_bodies`] of `front`, over `store`, the view's paths given by `in_view`.
+/// [`keep_bodies`] of `front`, over `store` and the puts `served` not in it yet, the view's paths
+/// given by `in_view`.
 pub(crate) fn keep_bodies_of(
     front: &Arc<Lowered>,
     in_view: &impl Fn(&str) -> Option<String>,
     sessions: &bodies::Sessions,
     store: &blaze_cas::Reader,
+    served: Vec<Put>,
 ) -> Result<(BodyPuts, bodies::Did), ApiError> {
     let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
     let guard = blaze_cas::enter();
     let reading = blaze_kernel::Reading { reader: store, guard: &guard };
-    let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
+    let mut overlay = crate::serve::front_carry::Overlay::seeded(&reading, served);
     let (did, sessions) = bodies::keep(&kernel, front, in_view, sessions, &mut overlay).map_err(body_error)?;
     Ok((BodyPuts { puts: overlay.into_puts(), sessions }, did))
 }

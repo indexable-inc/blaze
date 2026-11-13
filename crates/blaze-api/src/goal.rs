@@ -70,12 +70,12 @@ impl fmt::Display for Goal {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tiers {
     pub goal: Goal,
-    /// Of `functions`, those whose linked code is the optimized tier's (LLVM at `-O2` or
-    /// `-O3`).
-    pub optimized: u64,
     /// The functions of the images the build linked, each image's counted once; 0 for a
     /// build that linked none (everything it placed came from the store as it was).
     pub functions: u64,
+    /// Of `functions`, those whose linked code is the optimized tier's (LLVM at `-O2` or
+    /// `-O3`).
+    pub optimized: u64,
 }
 
 impl Tiers {

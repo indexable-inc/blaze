@@ -115,7 +115,9 @@ impl<'a, 'db> Ctx<'a, 'db> {
         Some(self.store[binding].name.as_str())
     }
 
-    /// The place as rustc writes it in a message, or `None` for a temporary.
+    /// The place as rustc writes it in a message, or `None` for a temporary. Asked only while
+    /// an error is drafted, never to decide one: it reads the body's source map
+    /// ([`Self::from_external_macro`]), and a body with an error has no verdict kept.
     pub(super) fn describe(
         &self,
         body: &MirBody<'db>,
@@ -170,7 +172,11 @@ impl<'a, 'db> Ctx<'a, 'db> {
 
     /// Whether a macro of another crate, or an attribute or derive, wrote the name of
     /// `binding`, as `pinned` of `pin!`: rustc's `in_external_macro`, whose variables its
-    /// messages call temporaries.
+    /// messages call temporaries. The error path: it reads the source map and the macro
+    /// expansion's spans, positions no verdict may read (a read of them keeps the check's
+    /// trace out of the item store), so only [`Self::describe`], which renders an error,
+    /// calls it; what decides whether there is an error reads facts of the lowered body
+    /// ([`hir_def::expr_store::ExpressionStore::is_synthesized`]).
     fn from_external_macro(&self, binding: BindingId) -> bool {
         let InferBodyId::DefWithBodyId(def) = self.owner else { return false };
         let source_map = Body::unmoved_source_map(self.db, def);

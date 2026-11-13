@@ -10,13 +10,14 @@ use hir_ty::{
     ParamEnvAndCrate,
     db::HirDatabase,
     facts::{Fact, FactItem, facts_of},
-    next_solver::GenericArgs,
+    next_solver::{GenericArgs, TyKind},
 };
 use hir_ty_mir::mir::{
     MirBody, MirOptLevel, MirOptions, OperandKind, TerminatorKind, interpret_mir,
     relied_on_own_no_unwind, set_interpreter_mir_opt_level,
 };
 use intern::Symbol;
+use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{
     fixture::{crate_named, db_with},
@@ -143,19 +144,24 @@ fn call_edges(body: &MirBody<'_>) -> Vec<bool> {
         .collect()
 }
 
-/// The calls by name of a function (not a pointer in a local) in the body.
+/// The calls by name of a function (not a pointer in a local) in the body: the callee is a
+/// function item, as a constant (`Operand::fn_item`, which an `Allocation` of the item's
+/// zero-sized type is too: MIR building writes a function item so) or as a whole local of the
+/// item's type that the body copied it into.
 fn named_calls(body: &MirBody<'_>) -> usize {
+    let fn_item = |func: &hir_ty_mir::mir::Operand| match &func.kind {
+        OperandKind::Copy(place) | OperandKind::Move(place) => {
+            let place = place.as_ref();
+            place.projection.as_slice().is_empty()
+                && matches!(body.locals[place.local].ty.as_ref().kind(), TyKind::FnDef(..))
+        }
+        _ => func.fn_item().is_some(),
+    };
     body.basic_blocks
         .iter()
-        .filter(|(_, block)| {
-            matches!(
-                block.terminator.as_ref().map(|it| &it.kind),
-                Some(TerminatorKind::Call {
-                    func: hir_ty_mir::mir::Operand { kind: OperandKind::Constant { .. }, .. },
-                    intrinsic: None,
-                    ..
-                })
-            )
+        .filter(|(_, block)| match block.terminator.as_ref().map(|it| &it.kind) {
+            Some(TerminatorKind::Call { func, intrinsic: None, .. }) => fn_item(func),
+            _ => false,
         })
         .count()
 }

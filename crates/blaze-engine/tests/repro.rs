@@ -1,8 +1,19 @@
 //! Each failure blaze hit building a real crate, reduced to a minimal crate under
 //! `tests/repro/<property>/` (by `tools/v2/repro/repro.py`) and a test named for the property it
-//! broke. A test copies its crate out of the tree, runs this package's `blaze` on it with a
-//! `BLAZE_HOME` of its own, and checks what makes the build right: it succeeds and the program
-//! prints what the program says it prints.
+//! broke. A test copies its crate out of the tree, runs this package's `blaze` on it, and checks
+//! what makes the build right: it succeeds and the program prints what the program says it
+//! prints.
+//!
+//! A case that only builds its crate and checks what that prints ([`Case::new`]) runs on the
+//! one daemon of this test binary's run: one `BLAZE_HOME` and one `XDG_CACHE_HOME` that every
+//! test process of the binary finds by itself ([`shared_root`]), so std is built once a run, not
+//! once a case, and the machine runs one daemon for them, not one each (44 at once took an
+//! 18-core Mac to a load of 200 on 2026-11-13). A case that tests the daemon's own life (it
+//! stops or kills it, starts a second home, reads its log, or asserts on what the daemon built
+//! before it) has a home of its own ([`Case::own`]). Every daemon here is started with
+//! `BLAZE_DAEMON_EXIT_UNHELD` ([`UNHELD`]), so it exits by itself once no test holds a
+//! connection to it, whether or not the tests that used it ended well: nextest kills a test
+//! at its time cap before its `Drop` runs.
 //!
 //! Every case builds std, which is compiled at opt-level 3, so only a blaze with LLVM can build
 //! one: in the seed profile (no `native`) this target is empty.
@@ -15,22 +26,87 @@ use std::{
     process::{Command, Stdio},
     sync::atomic::{AtomicU32, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 /// Longer than any of these builds takes with the standard library built cold; a build still
 /// running then is a hang, and fails the test instead of holding the run.
 const DEADLINE: Duration = Duration::from_secs(900);
 
+/// What every daemon these tests start is started with: it exits once no connection has been
+/// open at its socket for its grace (`crates/blaze-cargo/src/serve/unheld.rs`), so a run that
+/// ended, or was killed, leaves none.
+const UNHELD: (&str, &str) = ("BLAZE_DAEMON_EXIT_UNHELD", "on");
+
+/// The longest a Unix socket's path may be on macOS (`sun_path`), its terminating zero
+/// included.
+const SOCKET_MOST: usize = 104;
+
+/// The directory every case on the shared daemon is under, the same in every process of this
+/// test binary and of no other build of it: `/tmp/blaze-repro-<hash>`, the hash of the
+/// binary's path, modification time and length. nextest runs each test in a process of its
+/// own, and these agree on it without talking to each other. Under `/tmp`, not `TMPDIR`: the
+/// daemon's socket, `<home>/v2.sock`, must stay under [`SOCKET_MOST`] bytes, and a `TMPDIR` such
+/// as nix-shell's is most of that already.
+fn shared_root() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let meta = fs::metadata(&exe).unwrap();
+    let modified = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    // FNV-1a: no dependency, and stable for a binary as long as the binary is.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let (modified, len) = (modified.to_le_bytes(), meta.len().to_le_bytes());
+    let bytes = exe.as_os_str().as_encoded_bytes().iter().chain(&modified).chain(&len);
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    Path::new("/tmp").join(format!("blaze-repro-{hash:016x}"))
+}
+
+/// How long a past run's shared root ([`shared_root`]) is kept with no case made or removed in
+/// it and no daemon at its socket: then it is another build's of this binary, done.
+const PAST_RUN_KEPT: Duration = Duration::from_secs(60 * 60);
+
+/// Every past run's shared root but `current` removed: one whose daemon has exited (nothing
+/// listens at its socket) and whose `cases` has not changed for [`PAST_RUN_KEPT`]. Each build of
+/// the test binary has a root of its own, which holds a built std, so without this every build
+/// would leave one. Once a process.
+fn sweep_past_runs(current: &Path) {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let Ok(entries) = fs::read_dir("/tmp") else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(hash) = name.to_str().and_then(|it| it.strip_prefix("blaze-repro-")) else { continue };
+            if path == current || hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            if std::os::unix::net::UnixStream::connect(path.join("home/v2.sock")).is_ok() {
+                continue;
+            }
+            let quiet = fs::metadata(path.join("cases"))
+                .or_else(|_| fs::metadata(&path))
+                .and_then(|it| it.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|it| it > PAST_RUN_KEPT));
+            if quiet {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    });
+}
+
 struct Case {
     root: PathBuf,
     dir: PathBuf,
     home: PathBuf,
-    /// `XDG_CACHE_HOME` of every blaze it runs, under `root`: the machine's shared store
-    /// (`<cache>/blaze`) is the case's own, never the real one.
+    /// `XDG_CACHE_HOME` of every blaze it runs: the machine's shared store (`<cache>/blaze`) is
+    /// the run's ([`Case::new`]) or the case's own ([`Case::own`]), never the real one.
     cache: PathBuf,
     /// Whether dropping it removes `root`: a [`Case::second_home`] shares its case's.
     owns_root: bool,
+    /// Whether its daemon is its own, which dropping it stops: not the shared one, which serves
+    /// the run's other cases and exits once none holds it.
+    owns_daemon: bool,
 }
 
 struct Out {
@@ -39,16 +115,41 @@ struct Out {
     stderr: String,
 }
 
+/// A number no other case of this process has, for its directory's name.
+fn next() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Case {
+    /// A case on the run's one daemon ([`shared_root`]): its crate copied into a directory of
+    /// its own, which is all it removes as it drops.
     fn new(property: &str) -> Case {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let shared = shared_root();
+        sweep_past_runs(&shared);
+        let (home, cache) = (shared.join("home"), shared.join("cache"));
+        let socket = home.join("v2.sock");
+        assert!(
+            socket.as_os_str().len() < SOCKET_MOST,
+            "the shared daemon's socket {} is {} bytes, past macOS's {SOCKET_MOST}",
+            socket.display(),
+            socket.as_os_str().len()
+        );
+        let root = shared.join("cases").join(format!("{}-{}", std::process::id(), next()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join(property);
+        copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/repro").join(property), &dir);
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        Case { root, dir, home, cache, owns_root: true, owns_daemon: false }
+    }
+
+    /// A case with a `BLAZE_HOME` and machine cache of its own, so a daemon of its own: for a
+    /// test of the daemon's own life, or of what one daemon built before.
+    fn own(property: &str) -> Case {
         // The daemon's socket is `<home>/v2.sock`, and a Unix socket's path is at most 104 bytes
         // on macOS: a `TMPDIR` such as nix-shell's is already most of that.
-        let root = Path::new("/tmp").join(format!(
-            "blaze-repro-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = Path::new("/tmp").join(format!("blaze-repro-{}-{}", std::process::id(), next()));
         let _ = fs::remove_dir_all(&root);
         let dir = root.join(property);
         let home = root.join("home");
@@ -56,12 +157,13 @@ impl Case {
         copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/repro").join(property), &dir);
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&cache).unwrap();
-        Case { root, dir, home, cache, owns_root: true }
+        Case { root, dir, home, cache, owns_root: true, owns_daemon: true }
     }
 
     /// The same crate and machine cache under a `BLAZE_HOME` of its own: a second daemon on the
-    /// machine.
+    /// machine. Of a case with a home of its own.
     fn second_home(&self) -> Case {
+        assert!(self.owns_daemon, "a second home is of a case with a home of its own (`Case::own`)");
         let home = self.root.join("home2");
         fs::create_dir_all(&home).unwrap();
         // clone: the case's paths, shared by the second home
@@ -71,6 +173,7 @@ impl Case {
             home,
             cache: self.cache.clone(),
             owns_root: false,
+            owns_daemon: true,
         }
     }
 
@@ -91,6 +194,7 @@ impl Case {
             .current_dir(&dir)
             .env("BLAZE_HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)
+            .env(UNHELD.0, UNHELD.1)
             .env_remove("CARGO_TARGET_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -107,7 +211,11 @@ impl Case {
             if began.elapsed() > DEADLINE {
                 child.kill().unwrap();
                 child.wait().unwrap();
-                self.kill_daemon();
+                // The shared daemon serves the run's other cases: it is left to them, and exits
+                // once none holds it.
+                if self.owns_daemon {
+                    self.kill_daemon();
+                }
                 panic!(
                     "`blaze {}` in {} ran {} s without finishing: a hang\n{}",
                     args.join(" "),
@@ -145,11 +253,14 @@ impl Case {
     }
 
     fn stop(&self) {
+        assert!(self.owns_daemon, "only a case with a home of its own (`Case::own`) stops its daemon");
         self.ok(&["stop"]);
     }
 
     /// The daemon `home`'s log last says is listening, killed: one a test left hung or broken.
+    /// Of a case with a home of its own.
     fn kill_daemon(&self) {
+        assert!(self.owns_daemon, "only a case with a home of its own (`Case::own`) kills its daemon");
         let Ok(log) = fs::read_to_string(self.home.join("v2/serve.log")) else { return };
         let Some(pid) = log.rsplit("(pid ").next().and_then(|it| it.split(')').next()) else {
             return;
@@ -160,19 +271,25 @@ impl Case {
     }
 }
 
+/// A case on the shared daemon removes its own directory alone and never stops the daemon,
+/// which serves the run's other cases and exits once none holds it. One with a home of its own
+/// stops its daemon, killing it if the stop fails, then removes its root.
 impl Drop for Case {
     fn drop(&mut self) {
-        let stopped = Command::new(env!("CARGO_BIN_EXE_blaze"))
-            .arg("stop")
-            .current_dir(&self.dir)
-            .env("BLAZE_HOME", &self.home)
-            .env("XDG_CACHE_HOME", &self.cache)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|it| it.success());
-        if !stopped {
-            self.kill_daemon();
+        if self.owns_daemon {
+            let stopped = Command::new(env!("CARGO_BIN_EXE_blaze"))
+                .arg("stop")
+                .current_dir(&self.dir)
+                .env("BLAZE_HOME", &self.home)
+                .env("XDG_CACHE_HOME", &self.cache)
+                .env(UNHELD.0, UNHELD.1)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|it| it.success());
+            if !stopped {
+                self.kill_daemon();
+            }
         }
         if self.owns_root && !thread::panicking() {
             let _ = fs::remove_dir_all(&self.root);
@@ -216,7 +333,8 @@ fn an_edited_crate_rebuilds_on_one_daemon() {
 /// The same crate after `blaze stop`, on the daemon started from the image the stop wrote.
 #[test]
 fn a_crate_rebuilds_after_its_daemon_restarts() {
-    let case = Case::new("a_crate_rebuilds_after_its_daemon_restarts");
+    // A home of its own: it stops its daemon.
+    let case = Case::own("a_crate_rebuilds_after_its_daemon_restarts");
     assert_eq!(case.ok(&["run"]), "before\n");
     case.stop();
     case.write("src/main.rs", AFTER);
@@ -247,7 +365,9 @@ const RESTART_EDIT_BOUND: Duration = Duration::from_secs(120);
 #[test]
 fn an_edit_after_a_restart_answers_within_its_bound_as_a_fresh_build_does_with_no_panic_caught() {
     const THIRD: &str = "fn main() {\n    println!(\"a third\");\n}\n";
-    let case = Case::new("a_crate_rebuilds_after_its_daemon_restarts");
+    // A home of its own: it stops and kills its daemon, starts a second home, and reads its
+    // daemon's log for panics, which another case's build would add to.
+    let case = Case::own("a_crate_rebuilds_after_its_daemon_restarts");
     assert_eq!(case.ok(&["run"]), "before\n");
     // Once more, warm: the image the next daemon restores is written with nothing to build.
     assert_eq!(case.ok(&["run"]), "before\n");
@@ -296,7 +416,9 @@ fn an_edit_after_a_restart_answers_within_its_bound_as_a_fresh_build_does_with_n
 /// crates. It used to build std again for each workspace, a cold std's minutes each time.
 #[test]
 fn a_second_workspace_on_one_daemon_compiles_no_std_crate() {
-    let case = Case::new("a_second_workspace_on_one_daemon_compiles_no_std_crate");
+    // A home of its own: what it asserts is what this daemon built before the second
+    // workspace, which on a shared daemon another case's build would be.
+    let case = Case::own("a_second_workspace_on_one_daemon_compiles_no_std_crate");
     assert_eq!(case.ok_in("one", &["run"]).stdout, "one\n");
     let second = case.ok_in("two", &["run"]);
     assert_eq!(second.stdout, "two\n");
@@ -310,7 +432,9 @@ fn a_second_workspace_on_one_daemon_compiles_no_std_crate() {
 /// workspace's package.
 #[test]
 fn a_second_home_on_one_machine_compiles_no_std_crate() {
-    let case = Case::new("a_second_home_on_one_machine_compiles_no_std_crate");
+    // A home and machine cache of its own: it starts a second home, and asserts that std
+    // came from the store its first home's daemon put it in.
+    let case = Case::own("a_second_home_on_one_machine_compiles_no_std_crate");
     assert_eq!(case.ok_in("one", &["run"]).stdout, "one\n");
     let other = case.second_home();
     let second = other.ok_in("two", &["run"]);

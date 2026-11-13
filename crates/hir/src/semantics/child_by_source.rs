@@ -24,7 +24,7 @@ use hir_def::{
         DynMap,
         keys::{self, Key},
     },
-    expr_store::Body,
+    expr_store::{Body, ExpressionStore},
     hir::generics::GenericParams,
     item_scope::ItemScope,
     signatures::{EnumSignature, ImplSignature, TraitSignature},
@@ -95,7 +95,8 @@ impl ChildBySource for TraitId {
         data.items.iter().for_each(|&(_, item)| {
             add_assoc_item(db, res, item);
         });
-        let (_, source_map) = TraitSignature::with_source_map(db, *self);
+        let (signature, source_map) = TraitSignature::with_source_map(db, *self);
+        add_blocks(db, &signature.store, res);
         source_map.expansions().filter(|(ast, _)| ast.file_id == file_id).for_each(
             |(ast, &exp_id)| {
                 res.insert(keys::MACRO_CALL, *ast, exp_id);
@@ -123,7 +124,8 @@ impl ChildBySource for ImplId {
         data.items.iter().for_each(|&(_, item)| {
             add_assoc_item(db, res, item);
         });
-        let (_, source_map) = ImplSignature::with_source_map(db, *self);
+        let (signature, source_map) = ImplSignature::with_source_map(db, *self);
+        add_blocks(db, &signature.store, res);
         source_map.expansions().filter(|(ast, _)| ast.file_id == file_id).for_each(
             |(ast, &exp_id)| {
                 res.insert(keys::MACRO_CALL, *ast, exp_id);
@@ -241,7 +243,8 @@ impl ChildBySource for VariantId {
                 ),
             }
         }
-        let (_, sm) = self.fields_with_source_map(db);
+        let (variant_fields, sm) = self.fields_with_source_map(db);
+        add_blocks(db, &variant_fields.store, res);
         sm.expansions().filter(|(ast, _)| ast.file_id == file_id).for_each(|(ast, &exp_id)| {
             res.insert(keys::MACRO_CALL, *ast, exp_id);
         });
@@ -268,7 +271,8 @@ impl ChildBySource for EnumId {
             let ptr = ast_id_map.get(variant.lookup(db).id.value);
             res.insert(keys::ENUM_VARIANT, InFile::new(loc.id.file_id, ptr), variant);
         });
-        let (_, source_map) = EnumSignature::with_source_map(db, *self);
+        let (signature, source_map) = EnumSignature::with_source_map(db, *self);
+        add_blocks(db, &signature.store, res);
         source_map
             .expansions()
             .filter(|(ast, _)| ast.file_id == file_id)
@@ -290,17 +294,24 @@ impl ChildBySource for DefWithBodyId {
             res.insert(keys::MACRO_CALL, *ast, exp_id);
         });
 
-        for (block, def_map) in body.blocks(db) {
-            // All block expressions are merged into the same map, because they logically all add
-            // inner items to the containing `DefWithBodyId`.
-            def_map.module(db, def_map.root).scope(db).child_by_source_to(db, res);
-            // The blocks of a body are in its file and in every macro expansion in it; two
-            // expansions of the same text have a block at the same range each.
-            let ast_id = block.ast_id(db);
-            let block_file = if blocks_of_any_file() { file_id } else { ast_id.file_id };
-            if block_file == file_id {
-                res.insert(keys::BLOCK, InFile::new(block_file, ast_id.to_ptr(db)), block);
-            }
+        add_blocks(db, body, res);
+    }
+}
+
+/// The blocks of `store` and the items written in them, added to `res`: a body's, or a
+/// signature's, whose blocks are those of its anonymous constants (an array's length or a
+/// const argument in a type, `fn f() -> [u8; { fn g() {} 1 }]`). Every block is merged into
+/// the map of the store's owner, as each adds inner items to it.
+fn add_blocks(db: &Db, store: &ExpressionStore, res: &mut DynMap) {
+    let file_id = res.file();
+    for (block, def_map) in store.blocks(db) {
+        def_map.module(db, def_map.root).scope(db).child_by_source_to(db, res);
+        // The blocks of a store are in its file and in every macro expansion in it; two
+        // expansions of the same text have a block at the same range each.
+        let ast_id = block.ast_id(db);
+        let block_file = if blocks_of_any_file() { file_id } else { ast_id.file_id };
+        if block_file == file_id {
+            res.insert(keys::BLOCK, InFile::new(block_file, ast_id.to_ptr(db)), block);
         }
     }
 }
@@ -308,6 +319,8 @@ impl ChildBySource for DefWithBodyId {
 impl ChildBySource for GenericDefId {
     fn child_by_source_to(&self, db: &Db, res: &mut DynMap) {
         let file_id = res.file();
+        // Before the file is looked at: a block may be in a macro expansion in the signature.
+        add_blocks(db, ExpressionStore::of(db, (*self).into()), res);
         let (gfile_id, generic_params_list) = self.file_id_and_params_of_view(db);
         if gfile_id != file_id {
             return;

@@ -25,6 +25,7 @@ blaze-items.workspace = true
 blaze-kernel.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
+blaze-report.workspace = true
 blaze-serde.workspace = true
 blaze-store-check.workspace = true
 crossbeam-queue.workspace = true

@@ -523,11 +523,6 @@ pub(super) enum Unmapped {
     /// The item, or one around it, is the input of an attribute macro: the defs are made from
     /// the macro's expansion, and its nodes map to them.
     AttributeMacroInput,
-    /// The item is in a block of a type (an array's length, a const argument): such a block is
-    /// of a signature's store, whose blocks no map read here lists yet, so the item's defs
-    /// are not found from its syntax. A known gap, named so it is not taken for a wrong map:
-    /// the node is read in the scope around the type (`[u32; { impl T for S {} 1 }]`).
-    InABlockOfAType,
 }
 
 /// Whether `node` is of a kind [`ViewCtx::container_to_def`] maps to a container: one that
@@ -1038,7 +1033,7 @@ impl<'db> ViewCtx<'db, '_> {
         let head: String = item.value.text().chars().take(80).collect(); // alloc: the panic's text
         panic!(
             "{:?} `{head}` ({:?}, {:?}) maps to no def, and neither a `cfg` removes it, nor is \
-             it the input of an attribute macro, nor is it in a block of a type: the container of the {:?} at {:?} in {:?} \
+             it the input of an attribute macro: the container of the {:?} at {:?} in {:?} \
              would be read from an item further out, a scope the node is not in \
              (source_to_def's `find_container`)",
             item.value.kind(),
@@ -1077,15 +1072,7 @@ impl<'db> ViewCtx<'db, '_> {
         if let Some(why) = input(self, item) {
             return Some(why);
         }
-        if let Some(why) = self.parent_ancestors_with_macros(item, |this, node, _| input(this, node))
-        {
-            return Some(why);
-        }
-        self.parent_ancestors_with_macros(item, |_, node, _| {
-            (ast::ArrayType::can_cast(node.value.kind())
-                || ast::ConstArg::can_cast(node.value.kind()))
-            .then_some(Unmapped::InABlockOfAType)
-        })
+        self.parent_ancestors_with_macros(item, |this, node, _| input(this, node))
     }
 
     fn find_generic_param_container(&mut self, src: InFile<Node<'db>>) -> Option<GenericDefId> {

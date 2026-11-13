@@ -221,7 +221,7 @@ struct World {
 }
 
 fn watcher(plant: Plant) -> Watcher {
-    let mut watcher = Watcher::new("disk", name(DIR), TAGS);
+    let mut watcher = Watcher::new("disk", name(DIR), TAGS).expect("its looks in flight reserved");
     watcher.trusts_racy = plant == Plant::TrustsRacy;
     watcher.seen_before_head = plant == Plant::SeenBeforeHead;
     watcher.sweeps_only_without_cursor = plant == Plant::SweepsOnlyWithoutCursor;

@@ -32,10 +32,14 @@ fn kind(n: u64) -> Kind {
     [Kind::Code, Kind::Query, Kind::Debug][n as usize % 3]
 }
 
+/// Windows a test's store reserves in its pool: its few packs, where a store reserves 4 TiB of
+/// address space, and a property test opens stores case after case.
+const WINDOWS: u32 = 16;
+
 /// A store on disk under `root` holding `count` records, pinned as `toolchain`.
 fn origin(root: &Path, count: u64) -> Driven {
     fs::create_dir_all(root).unwrap();
-    let mut driven = Driven::open(root).unwrap();
+    let mut driven = Driven::open_reserving(root, blaze_cas::Loader::Pumped, WINDOWS).unwrap();
     for n in 0..count {
         driven.store().put(key(n), kind(n), &value(n)).unwrap();
     }
@@ -47,7 +51,7 @@ fn origin(root: &Path, count: u64) -> Driven {
 
 fn empty(root: &Path) -> Driven {
     fs::create_dir_all(root).unwrap();
-    Driven::open(root).unwrap()
+    Driven::open_reserving(root, blaze_cas::Loader::Pumped, WINDOWS).unwrap()
 }
 
 /// The invariant: a pin exported and imported into an empty store leaves, under every key,

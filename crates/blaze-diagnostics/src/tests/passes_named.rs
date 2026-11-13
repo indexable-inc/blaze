@@ -64,11 +64,15 @@ impl tracing::Subscriber for &'static Seen {
 }
 
 /// Every pass a check of a crate with nothing to say runs, in the order it opens them: the
-/// parse, `checks::check`'s statement groups, the early lints, the late ones, the levels.
-const PASSES: [&str; 28] = [
+/// parse, the sweep of the pieces (`pieces::pieces`), `checks::check`'s statement groups (with
+/// the owners of the pieces the sweep left unclean, `scoped owners`), the early lints, the late
+/// ones, the levels.
+const PASSES: [&str; 30] = [
     "parsed",
+    "pieces",
     "checks",
     "owners and features",
+    "scoped owners",
     "macros",
     "feature expansion",
     "ast validation",

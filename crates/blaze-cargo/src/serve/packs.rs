@@ -269,11 +269,11 @@ impl Config {
         let Value::Object(fields) = value else { return Err("it is not a JSON object".to_owned()) };
         let text_of = |what: &str, value: &Value| match value {
             Value::String(text) => Ok(text.clone()), // clone: once a setting read
-            _ => Err(format!("`{what}` is not a string")), // alloc: error path
+            _ => Err(blaze_report::say!(blaze_report::say::Code(what), " is not a string").flat()), // alloc: error path
         };
         let list_of = |what: &str, value: &Value| match value {
             Value::Array(items) => items.iter().map(|item| text_of(what, item)).collect::<Result<Vec<String>, String>>(),
-            _ => Err(format!("`{what}` is not a list")), // alloc: error path
+            _ => Err(blaze_report::say!(blaze_report::say::Code(what), " is not a list").flat()), // alloc: error path
         };
         let mut config = Config { prebuilt: true, ..Config::default() };
         for (name, value) in &fields {
@@ -304,7 +304,7 @@ impl Config {
                         };
                         let url = text_of("peers.url", url)?;
                         if !matches!(Base::parse(&url)?, Base::Url(_)) {
-                            return Err(format!("the peer `{}` is not an http(s) address", shown(&url))); // alloc: error path
+                            return Err(blaze_report::say!("the peer ", blaze_report::say::Code(&shown(&url)), " is not an http(s) address").flat()); // alloc: error path
                         }
                         let key = key_from_hex("a peer's `key`", &text_of("peers.key", key)?)?;
                         config.peers.push(PeerAt { url: url.trim_end_matches('/').to_owned(), key });
@@ -312,7 +312,7 @@ impl Config {
                 }
                 "serve" => {
                     let Value::Object(serve) = value else { return Err("`serve` is not an object".to_owned()) };
-                    let field = |name: &str| serve.get(name).ok_or_else(|| format!("`serve` has no `{name}`")); // alloc: error path
+                    let field = |name: &str| serve.get(name).ok_or_else(|| blaze_report::say!(blaze_report::say::Code("serve"), " has no ", blaze_report::say::Code(name)).flat()); // alloc: error path
                     if let Some(other) = serve.keys().find(|it| !matches!(it.as_str(), "bind" | "readers")) {
                         return Err(format!("`serve.{other}` is not a setting")); // alloc: error path
                     }
@@ -327,7 +327,7 @@ impl Config {
                     let Value::Bool(prebuilt) = value else { return Err("`prebuilt` is not true or false".to_owned()) };
                     config.prebuilt = *prebuilt;
                 }
-                other => return Err(format!("`{other}` is not a setting")), // alloc: error path
+                other => return Err(blaze_report::say!(blaze_report::say::Code(other), " is not a setting").flat()), // alloc: error path
             }
         }
         if config.key_file.is_none() && (config.serve.is_some() || !config.peers.is_empty()) {
@@ -405,7 +405,7 @@ impl Base {
             return Ok(Base::Dir(PathBuf::from(text)));
         }
         // alloc: error path
-        Err(format!("`{}` is neither an absolute directory nor an http(s) address", shown(text)))
+        Err(blaze_report::say!(blaze_report::say::Code(&shown(text)), " is neither an absolute directory nor an http(s) address").flat())
     }
 
     /// As it is named in a message.

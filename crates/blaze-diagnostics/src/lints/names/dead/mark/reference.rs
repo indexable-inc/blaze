@@ -83,6 +83,12 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                 continue;
             }
             for param in child.children() {
+                if let Id::Fn(function) = id
+                    && let Some(self_param) = ast::SelfParam::cast(param)
+                    && self_param.ty().is_none()
+                {
+                    self.implicit_self(function);
+                }
                 if param.kind() != SyntaxKind::PARAM {
                     self.walk(file, param, false);
                     continue;
@@ -95,6 +101,21 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             }
         }
         Some(owner)
+    }
+
+    /// The type of a `self`, `&self` or `&mut self` written with none: `Self`, which rustc's
+    /// AST lowering writes as a path (`TyKind::ImplicitSelf`) that `handle_res` meets as
+    /// `Res::SelfTyAlias` of the impl (so a method walked makes its impl live) or
+    /// `Res::SelfTyParam` of the trait. The syntax has no path to walk.
+    fn implicit_self(&mut self, function: hir_def::FunctionId) {
+        use hir_def::{ItemContainerId, Lookup as _, TypeParamId, resolver::TypeNs};
+        let defs = self.k.defs;
+        let res = match function.lookup(self.k.cx.db).container {
+            ItemContainerId::ImplId(it) => Res::ty(defs, TypeNs::SelfType(it), false),
+            ItemContainerId::TraitId(it) => Res::type_param(defs, TypeParamId::trait_self(it)),
+            ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => return,
+        };
+        self.handle_res(res);
     }
 
     /// The discriminants of the enum `def`, walked over its syntax with it: each an anonymous
@@ -649,8 +670,14 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             _ => "variable",
         };
         // alloc: the edge, a lint that fires
-        let message =
-            format!("useless assignment of {what} of type `{}` to itself", cx.ty(&ty.original));
+        let message = blaze_report::say!(
+            "useless assignment of ",
+            blaze_report::say::Words(what),
+            " of type ",
+            blaze_report::say::Code(&cx.ty(&ty.original)),
+            " to itself"
+        )
+        .flat();
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
         self.found.push(Found::lint(diag, Phase::Late, at));

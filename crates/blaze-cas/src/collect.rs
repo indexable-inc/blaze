@@ -273,7 +273,7 @@ impl Collecting {
         }
     }
 
-    /// A path holds a key it did not before (the store's placed roots, `Store::place_keys`):
+    /// A path holds a key it did not before (the store's placed roots, `whole::Names::hold`):
     /// the mark made before does not hold it.
     pub(crate) fn rooted(&mut self) {
         self.mark = None;
@@ -1300,7 +1300,7 @@ impl Store {
             // alloc: once a scan, a flag a pack
             passed: own.packs.iter().map(|it| it.removed || it.retiring).collect(),
             // alloc: once a scan, the keys the paths hold: a few
-            placed: self.place_keys.values().copied().collect(),
+            placed: self.names.held_keys().copied().collect(),
             done: false,
             demote: Vec::new(),  // alloc: empty, allocates nothing
             promote: Vec::new(), // alloc: empty, allocates nothing
@@ -1487,7 +1487,7 @@ impl Store {
         for pin in again {
             if let Err(mismatch) = self.pin(&pin.name, &pin.why, pin.when, &pin.keys) {
                 // alloc: a problem reported
-                self.problems.push(format!("the pin `{}` was not written again: {mismatch:?}", pin.name));
+                self.problems.push(format!("the pin {:?} was not written again: {mismatch:?}", pin.name));
             }
         }
         Moves { demote, demoted: 0, promote, promoted: 0 }
@@ -1954,6 +1954,11 @@ pub struct Collector {
     taken_at: u64,
     /// The packs this lap looked at.
     tried: Vec<usize>,
+    /// How many packs the store had when this lap took its first: a pack numbered past them
+    /// was made since, by this lap's own copies among others, and is the next lap's. Without
+    /// the bound a lap that keeps a record copies it into a new pack, which is fresh to the
+    /// lap, so it takes that one, and the next, without end (`bounded-progress`).
+    lap_packs: Option<usize>,
     lap: Lap,
     /// A lap was asked for (`blaze gc`): no gap between its packs.
     asked: bool,
@@ -1996,6 +2001,7 @@ impl Collector {
             phase: Phase::Rest,
             taken_at: 0,
             tried: Vec::new(), // alloc: empty, allocates nothing
+            lap_packs: None,
             lap: Lap::default(),
             asked: false,
             everything: false,
@@ -2028,6 +2034,7 @@ impl Collector {
         self.asked = true;
         self.everything = everything;
         self.tried.clear();
+        self.lap_packs = None;
         self.lap = Lap::default();
         self.dry = false;
         self.next_at = self.now;
@@ -2127,6 +2134,7 @@ impl Collector {
         self.laps += 1;
         self.last = std::mem::take(&mut self.lap);
         self.tried.clear();
+        self.lap_packs = None;
         self.asked = false;
         self.everything = false;
         self.dry = true;
@@ -2212,7 +2220,8 @@ impl Collector {
             self.everything || (it.used != 0 && self.facts.seconds.saturating_sub(it.used) >= grace)
         };
         let candidates = store.collect_candidates();
-        let fresh = || candidates.iter().filter(|it| !self.tried.contains(&it.pack));
+        let lap_packs = *self.lap_packs.get_or_insert(store.tiers[0].packs.len());
+        let fresh = || candidates.iter().filter(|it| it.pack < lap_packs && !self.tried.contains(&it.pack));
         let pick = fresh().find(|it| it.half_dead).or_else(|| {
             fresh().filter(|it| free && aged(it)).min_by_key(|it| (it.used, it.pack))
         });

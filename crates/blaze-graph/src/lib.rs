@@ -61,6 +61,7 @@ pub mod pressure;
 #[allow(unsafe_code)]
 pub mod pump;
 pub mod sched;
+pub mod shared_ledger;
 pub mod spin;
 mod sync;
 pub mod topology;

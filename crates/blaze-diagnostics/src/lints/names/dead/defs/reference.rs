@@ -582,9 +582,15 @@ fn anon_key<'t>(file: HirFileId, node: ast::Node<'t>) -> InFile<SyntaxNodePtr> {
 pub(in super::super) fn is_anon(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
-        SyntaxKind::BLOCK_EXPR => node
-            .children_with_tokens()
-            .any(|it| matches!(it.kind(), T![const] | T![async] | T![gen])),
+        SyntaxKind::BLOCK_EXPR
+            if node
+                .children_with_tokens()
+                .any(|it| matches!(it.kind(), T![const] | T![async] | T![gen])) =>
+        {
+            true
+        }
+        // A plain block is an expression like any other: an anonymous constant where it is an
+        // array's length or a const argument (`[(); { fn f() {} 1 }]`), below.
         kind if !ast::Expr::can_cast(kind) => false,
         _ => match node.parent() {
             Some(parent) => match parent.kind() {

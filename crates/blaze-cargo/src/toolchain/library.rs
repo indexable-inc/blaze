@@ -283,7 +283,7 @@ fn fetch_tree(dir: &Path, from: &str, name: &str, want: &str) -> anyhow::Result<
     // output is rustc's alone.
     let said = copied.is_none();
     if said {
-        eprintln!("Downloading blaze's {name} (digest {short}, once) from {from}...");
+        blaze_report::errln!("Downloading blaze's {name} (digest {short}, once) from {from}...");
     }
     let start = std::time::Instant::now();
     let staging = parent.join(format!(".{leaf}.unpacking"));
@@ -320,7 +320,7 @@ fn fetch_tree(dir: &Path, from: &str, name: &str, want: &str) -> anyhow::Result<
     }
     texts_unless_there(dir, want)?;
     if said {
-        eprintln!("Made blaze's {name} {short} in {:.1?}.", start.elapsed());
+        blaze_report::errln!("Made blaze's {name} {short} in {:.1?}.", start.elapsed());
     }
     Ok(())
 }

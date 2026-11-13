@@ -3581,7 +3581,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 self.collect_anon_const_valtree(source_map, konst);
             }
         }
-        self.collect_const_eval(def, body, infer, &placing);
+        self.collect_const_eval(def, body, &placing);
     }
 
     /// What `check_tail_calls` refuses of the body's `become`s, and the tail calls of
@@ -3623,7 +3623,6 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         &mut self,
         def: DefWithBodyId,
         body: &Body,
-        infer: &InferenceResult<'db>,
         placing: &Placing<'db>,
     ) {
         use hir_def::{
@@ -3652,7 +3651,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
             DefWithBodyId::FunctionId(_) | DefWithBodyId::VariantId(_) => return,
         };
-        if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
+        // rustc evaluates no body an error before MIR taints, whether or not it is borrow
+        // checked (`BLAZE_BORROWCK=off`).
+        if hir_ty_borrowck::tainted_by_errors(db, def).is_some() {
             return;
         }
         let borrowck = hir_ty_borrowck::borrowck(db, def);
@@ -5907,7 +5908,7 @@ fn unplaced_inference_text<'db>(
             "E0730: cannot pattern-match on an array without a fixed length".to_owned()
         }
         InferenceDiagnostic::ExpectedArrayOrSlicePat { found, .. } => {
-            format!("E0529: expected an array or slice, found `{}`", ty(found))
+            blaze_report::say!("E0529: expected an array or slice, found ", blaze_report::say::Code(&ty(found))).flat()
         }
         InferenceDiagnostic::InvalidRangePatType { .. } => {
             "E0029: only `char` and numeric types are allowed in range patterns".to_owned()

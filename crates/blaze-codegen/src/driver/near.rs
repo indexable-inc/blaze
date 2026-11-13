@@ -163,7 +163,8 @@ impl<B: Prepare> Build<'_, B> {
         asked: &(FrontInstance<B>, Origin),
     ) -> Result<Near<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
         // alloc: an error's name of the function
-        self.launched_only(&format!("`{}`", self.frontend.spell(&asked.0)))?;
+        let what = blaze_report::say!(blaze_report::say::Code(&self.frontend.spell(&asked.0)));
+        self.launched_only(&what.flat())?;
         let counts = kept::Counts::default();
         let root = self.described(asked, 0, &counts).and_then(|it| self.node(&asked.0, asked.1, it))?;
         self.near_from(root, &counts)

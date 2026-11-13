@@ -34,6 +34,10 @@
 use alloc::{format, string::String, vec::Vec};
 
 use blaze_kernel::table::Builder;
+use blaze_report::{
+    say,
+    say::{Code, Count, Words},
+};
 
 use crate::{
     entry::{self, DECLARED, Entry, Gate, ItemId, Kind},
@@ -281,12 +285,25 @@ pub fn modules<R: ModuleReads>(root: &str, reading: Reading, reads: &mut R) -> R
     while let Some(Todo { path, file, owns_dir, depth }) = todo.pop() {
         if depth > MOST_DEPTH || count > MOST_MODULES {
             // alloc: error path
-            return Err(R::refused(format!(
-                "module `{path}` (file `{file}`) is {depth} modules deep among {count} modules: past the bound of {MOST_DEPTH} deep and {MOST_MODULES} in all, as a `#[path]` cycle is"
-            )));
+            return Err(R::refused(say!(
+                "module ",
+                Code(&path),
+                " (file ",
+                Code(&file),
+                ") is ",
+                Count(u64::from(depth)),
+                " modules deep among ",
+                Count(count as u64),
+                " modules: past the bound of ",
+                Count(u64::from(MOST_DEPTH)),
+                " deep and ",
+                Count(MOST_MODULES as u64),
+                " in all, as a `#[path]` cycle is"
+            )
+            .flat()));
         }
         // alloc: error path
-        let refuse = |what: String| R::refused(format!("{} of `{file}`: {what}", ITEMS.name));
+        let refuse = |what: String| R::refused(say!(ITEMS.name, " of ", Code(&file), ": ", Words(&what)).flat());
         // One entry of the file's items, read as its own part.
         let entry_of = |reads: &mut R, id: ItemId| -> Result<Vec<u8>, R::Error> {
             reads
@@ -338,7 +355,11 @@ pub fn modules<R: ModuleReads>(root: &str, reading: Reading, reads: &mut R) -> R
             }
             let mut module = path.clone(); // clone: the parent's path starts the child's
             // alloc: error path
-            let outside = |rel: &str| R::refused(format!("`mod {}` in `{file}`: `#[path = \"{rel}\"]` names no file of the pinned tree", entry.name));
+            let outside = |rel: &str| {
+                // alloc: error path
+                let (declared, attribute) = (format!("mod {}", entry.name), format!("#[path = \"{rel}\"]"));
+                R::refused(say!(Code(&declared), " in ", Code(&file), ": ", Code(&attribute), " names no file of the pinned tree").flat())
+            };
             // alloc: the directory the declaration's file is looked up in
             let mut dir = if owns_dir { String::from(dir_of(&file)) } else { String::from(file.strip_suffix(".rs").unwrap_or(&file)) };
             for (name, inline_path) in around.iter().rev() {

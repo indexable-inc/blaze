@@ -1130,6 +1130,19 @@ fn commit_error(head: &str, base: ContentId, error: &CommitError) -> ApiError {
             format!("a commit to head `{head}` on {base:x}: {error}"),
             Some(op_path(error)),
         ),
+        CommitError::Record(error) => ApiError::new(
+            // alloc: error path, a commit the journal could not record.
+            blaze_report::say!(
+                "a commit to head ",
+                blaze_report::say::Code(head),
+                " on ",
+                blaze_report::say::Words(&format!("{base:x}")), // alloc: as above
+                " was not recorded, so the head did not move: ",
+                blaze_report::say::Words(&error.to_string()), // alloc: as above
+            )
+            .flat(),
+            Some(error.what.clone()), // clone: as above, what the record is of.
+        ),
     }
 }
 
@@ -1142,6 +1155,7 @@ fn op_path(error: &OpError) -> String {
         | OpError::NotADirectory(path)
         | OpError::Exists(path)
         | OpError::OutOfRange { path, .. }
+        | OpError::TooLarge { path, .. }
         // clone: error path, the error's own path.
         | OpError::BadLink { path, .. } => path.clone(),
         // alloc: error path, the root an op was given.

@@ -863,13 +863,18 @@ fn a_unit_that_names_its_code_keeps_it_under_its_code() {
     let plain = described_in(FORWARDERS, &policy(OptLevel::O0), "main", "via_one");
     assert!(plain.2, "the premise: a member's body at -O0 is held by table");
     assert_ne!(plain.0, plain.1, "under a template code of its own");
+    // A report is LLVM's alone (`Policy::choose`: stencil and Cranelift code reports
+    // nothing), and -O0 is stencils: its units put no row in their code, so the body is held by
+    // table as without one.
     let mut report = policy(OptLevel::O0);
     report.report = true;
+    let (template, code, anchored) = described_in(FORWARDERS, &report, "main", "via_one");
+    assert!(anchored && template != code, "a report at a stencil level names nothing");
     let mut pgo = policy(OptLevel::O0);
     pgo.pgo = blaze_codegen::settings::Pgo::Generate;
     let mut sanitize = policy(OptLevel::O0);
     sanitize.sanitize.sanitizers = blaze_codegen::settings::Sanitizers::ADDRESS;
-    for (why, policy) in [("a report", report), ("PGO", pgo), ("a sanitizer", sanitize)] {
+    for (why, policy) in [("PGO", pgo), ("a sanitizer", sanitize)] {
         let (template, code, anchored) = described_in(FORWARDERS, &policy, "main", "via_one");
         assert_eq!((template, anchored), (code, false), "under {why}, kept under its code");
     }
@@ -4430,7 +4435,13 @@ fn child(name: &str) -> (bool, Option<String>) {
         .output()
         .unwrap_or_else(|e| panic!("running {path}: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let shapes = stdout.lines().find_map(|line| line.strip_prefix(SHAPES_AFTER)).map(str::to_owned);
+    // Under `--nocapture` with one thread, libtest writes `test <name> ... ` and then the
+    // test's own output on the same line, so the shapes are found after the marker, not at
+    // the line's start.
+    let shapes = stdout
+        .lines()
+        .find_map(|line| line.find(SHAPES_AFTER).map(|at| &line[at + SHAPES_AFTER.len()..]))
+        .map(str::to_owned);
     if out.status.success() && shapes.is_none() {
         panic!(
             "{path} passed and printed no shapes\nstdout: {stdout}\nstderr: {}",
