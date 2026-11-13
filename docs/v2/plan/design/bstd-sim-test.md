@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "`#[bstd::test]` runs a test shaped like `main` (`fn(cx: &Cx, io: Io)`) on the deterministic simulation under 256 seeds by default, with IO failures, delays and power cuts on unless the test opts out of one by name; a failure prints its seed and a one-line replay command, and the seed replays to the same trace byte for byte. The runner is `blaze_core::sim::seeds`, on the one simulation; bstd adds the attribute and the unwind of a power cut."
+summary: The attribute `#[bstd::test]` runs a test shaped like `main` (it takes a `Cx` and an `Io`) on the deterministic simulation under 256 seeds by default, with IO failures, delays and power cuts on unless the test leaves one out by name; a failure prints its seed and a one-line replay command, and the seed replays to the same trace byte for byte. The runner is `blaze_core::sim::seeds`, on the one simulation; bstd adds the attribute and the unwind of a power cut.
 date: 2026-11-12
 ---
 # Simulation is the default test of a bstd program
@@ -76,6 +76,8 @@ bstd's alone: a sans-IO core driven on `Sim` directly runs under it too (its own
   payload, which scopes pass on), so nothing of the program runs after the cut.
 - `#[bstd::test]`, a `macro_rules!` attribute rule (nightly `macro_attr`): no proc macro and no
   compiler feature of bstd's own. It expands to a `#[test]` that calls `bstd::test::run`.
+  blaze's `mbe` dropped an attr rule's arguments; it matches them now (`mbe::MacroCall`),
+  which `without(..)` needs.
 
 **Lost alternative.** A Hegel test that draws the seed and the faults: it shrinks, but Hegel is
 a dev-dependency with a native engine, bstd cannot depend on it, and one integer that replays
@@ -90,12 +92,20 @@ trace: a line an effect, cut at 240 bytes with the rest hashed. Nothing when not
 
 ## Proof
 
-`crates/blaze-core/src/sim/seeds/tests.rs` (cargo runs it), a ledger written through `Sim`:
-(a) each planted bug (a commit before its data's sync; a failed sync ignored) is caught within
-the default 256 seeds; (b) the printed seed, given, replays to the same failure and the same
-trace byte for byte; (c) the correct ledger passes all 256; (d) one seed twice gives one trace.
-`crates/blaze-std/src/tests/simtest.rs` states the same four through `#[bstd::test]` on bstd's
-own files.
+`crates/blaze-core/src/sim/seeds/tests.rs`, which cargo runs (`cargo test -p blaze-core`, 225
+passed on 2026-11-12), a ledger written through `Sim`: (a) each planted bug is caught within the
+default 256 seeds (a commit before its data's sync at seed 2; a failed sync ignored at seed 16);
+(b) the printed seed, given back, is the same failure and the same trace byte for byte; (c) the
+correct ledger passes all 256, with failures injected and power cut; (d) one seed twice gives
+one trace. With crashes left out by name both plants pass: the crash is the cause.
+
+`crates/blaze-std/src/tests/simtest.rs` states the same through `#[bstd::test]` on bstd's own
+files (a counter in two files; a value published unsynced, a failed publish ignored). cargo
+cannot build bstd, and this lane ran no blaze, so it was run only in a scratch copy of the crate
+with the blaze-only syntax cut (the four contracts, `where const`, the reflection intrinsics'
+bodies, `Shares::join`): there its 9 tests pass, and the crate's other tests that rustc
+compiles pass or fail as they do on the commit before (132 passed, 3 failed, both times).
+**Still to do: `blaze test -p blaze-std simtest` on the build VM.**
 
 ## Not built
 
@@ -105,3 +115,6 @@ own files.
 - A notebook that survives the crash for the checker's memory: today an oracle has to be read
   from the disk (a commit record), or the test crashes its world itself (`io.crash()`).
 - In the blaze edition (S5) `#[test]` names this attribute.
+- A world of the test's own making under the attribute (scripted devices, an environment, a
+  withheld capability): such a test still makes its `Io` and calls `bstd::test::seeded`-like
+  code by hand.
