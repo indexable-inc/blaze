@@ -1,5 +1,5 @@
 // Update: a build script's kept run is found from any checkout, CI or remote; it was kept for its own checkout alone
-// (#1255, v0.20261028.9). Canary. Extends lesson 5.
+// (#1255, v0.20261028.9). Canary. Extends Sharing work.
 site {
   updates {
     "shared-build-scripts" : Page {
@@ -8,10 +8,10 @@ site {
       (InTheme, themes.canary)
       (Requires, site.learn.sharing)
       Title: {"Build scripts, shared"}
-      Description: {"Update to lesson 5: a build script's kept run is found from any checkout, not only the one that ran it."}
+      Description: {"Update to Sharing work: a build script's kept run is found from any checkout, not only the one that ran it."}
 
       Step before("Kept for one checkout") {
-        P one("Lesson 5 said blaze keeps its work in a store you can share. A build script's run was kept too, but only for the checkout that ran it: a second clone, or CI, ran every build script again.")
+        P one("*Sharing work* said blaze keeps its work in a store you can share. A build script's run was kept too, but only for the checkout that ran it: a second clone, or CI, ran every build script again.")
       }
 
       Step now("Found from anywhere") {
