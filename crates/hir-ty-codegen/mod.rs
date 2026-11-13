@@ -8735,7 +8735,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// The function a fn item type names, declared so its address can be taken.
+    /// The function a fn item type names, declared so its address can be taken: what a call of
+    /// it runs ([`dispatch::callee`]), as `call_direct` finds it. `Future::poll` of an `async`
+    /// block is the block's body, whose arguments are the pointer's; a method of `dyn Trait`,
+    /// one whose impl is the compiler's (`Clone::clone` of a tuple or closure, a method of
+    /// `FnPtr`), and a `#[track_caller]` one are a shim that calls it as a call would.
     fn fn_item(&mut self, fn_ty: Ty<'db>) -> Result<FuncId> {
         if let TyKind::Closure(..) = fn_ty.kind() {
             return self.closure_fn_pointer(fn_ty);
@@ -8751,28 +8755,33 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if FunctionSignature::is_intrinsic(db, func) {
             unsupported!("fn pointer to an intrinsic");
         }
-        if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
-            return self.reified(fn_ty, false);
-        }
-        let (callee, callee_args) =
-            impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
-        let callee = match callee {
-            either::Either::Left(callee) => callee,
-            either::Either::Right(derived) => {
-                let derived = unexpanded_derive(db, derived, generic_args.type_at(0));
+        let callee = dispatch::callee(&self.infcx, self.env, func, generic_args)
+            .map_err(|why| CodegenError::Refused(no_impl_method(db, func, generic_args, why)))?;
+        let (def, callee_args) = match callee {
+            dispatch::Callee::Fn(callee, callee_args) => {
+                // The function takes its caller's location as well, which the shim supplies.
+                if track_caller(db, callee) {
+                    return self.reified(fn_ty, false);
+                }
+                (InstanceDef::Fn(callee), callee_args)
+            }
+            dispatch::Callee::Poll(body, parent_args) => (instance_def(body), parent_args),
+            dispatch::Callee::Virtual
+            | dispatch::Callee::CloneBuiltin(_)
+            | dispatch::Callee::FnPtr(_) => return self.reified(fn_ty, false),
+            dispatch::Callee::Derived(impl_, method) => {
+                let derived = unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
                 unsupported!("fn pointer to {derived}");
             }
         };
-        // The function takes its caller's location as well, which the shim supplies.
-        if track_caller(db, callee) {
-            return self.reified(fn_ty, false);
-        }
         let sig = self.abi_sig(fn_ty)?;
         let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
         let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;
         let mut sig = self.signature(&abi.args, abi.ret);
-        self.declare_variadic(callee, &mut sig)?;
-        self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
+        if let InstanceDef::Fn(callee) = def {
+            self.declare_variadic(callee, &mut sig)?;
+        }
+        self.cg.callee(def, callee_args, self.env, &sig)
     }
 
     /// Makes `sig`, of the named parameters of `func`, the one `func` is defined with when it

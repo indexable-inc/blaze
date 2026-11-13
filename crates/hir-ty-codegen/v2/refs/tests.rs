@@ -749,6 +749,35 @@ fn a_track_caller_callee_lists_what_its_location_needs() {
     assert_reached(&db, &reached, &["here"]);
 }
 
+const REIFIED_BUILTIN: &str = r#"
+//- minicore: sized, copy, clone, builtin_impls, fn, future, pin
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+pub fn poll_of<F: Future>(_: F) -> fn(Pin<&mut F>, &mut Context<'_>) -> Poll<F::Output> {
+    <F as Future>::poll
+}
+pub fn roots() {
+    let poll = poll_of(async { 7u32 });
+    let clone: fn(&(u32, u64)) -> (u32, u64) = Clone::clone;
+    let _ = (poll, clone);
+}
+"#;
+
+/// A pointer to a method whose impl is the compiler's lists what a call of it would:
+/// `Future::poll` of an `async` block its body, `Clone::clone` of a tuple a shim that clones
+/// each field.
+#[test]
+fn a_pointer_to_a_builtin_impls_method_lists_what_a_call_would() {
+    let (_, reached) = reach_from(REIFIED_BUILTIN, "roots");
+    let coroutines = count(&reached, |def| {
+        matches!(def, InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_))
+    });
+    assert_eq!(coroutines, 1, "the async block's body: {reached:?}");
+    let shims = count(&reached, |def| matches!(def, InstanceDef::ReifyShim { receiver: false }));
+    assert_eq!(shims, 1, "the tuple's `clone` through a shim: {reached:?}");
+}
+
 const EXTERN: &str = r#"
 //- minicore: sized
 unsafe extern "C" {
