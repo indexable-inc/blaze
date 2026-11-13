@@ -22,35 +22,31 @@ main.intro[data-on] .wordmark canvas { display: block; }
 .doc.intro .dim { margin: 0; font-size: 13.5px; color: var(--ink-3); }
 .doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
 .doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
-/* The command (intro.ts): one line of mono, big, under the word. `cargo` burns off and `blaze` catches in its place;
-   the caret shows while something is being typed. */
-.doc.intro .lede:has(.cmd) { font-size: clamp(22px, 3vw, 30px); }
-.doc.intro .lede code.cmd { display: inline-flex; align-items: baseline; padding: 0.15em 0.5em; border-radius: 10px; background: var(--s-tint); color: var(--ink-1); font-size: 1em; white-space: pre; }
-.doc.intro .cmd .tool span { display: inline-block; }
-.doc.intro .cmd .tool .cmd-new { color: var(--ink-1); }
-.doc.intro .cmd .sub { display: inline-block; min-width: 5ch; text-align: left; color: var(--fire); }
-.doc.intro .cmd .caret { display: inline-block; width: 0.55em; height: 1.05em; margin-left: 1px; align-self: center; background: currentColor; opacity: 0; }
-.doc.intro .cmd .caret.on { opacity: 0.7; }
 /* The last quiet line is the page's footer: the reference pages, at the bottom of the window, not under the button. */
 .doc.intro .intro-after > .dim:last-child { position: absolute; left: 0; right: 0; bottom: 18px; }
 
-/* A race (content/schema.flecs Race; render.rs): blaze and cargo building the same edit, two lanes of cells on one
-   time scale, each with its time. The lit cells are how long each took: blaze's few in the fire's colour, cargo's
-   whole lane in the quiet ink. intro.ts lights them in real time. */
-.race { display: grid; gap: 6px; width: min(100%, 540px); margin: 0; }
-.race .lane { display: grid; grid-template-columns: 3.2em minmax(0, 1fr) 5.4em; align-items: center; gap: 12px; }
-.race .who { text-align: left; font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3); }
-.race .cells { display: block; width: 100%; height: auto; shape-rendering: crispEdges; }
-.race .cells rect { fill: var(--line); }
-.race .cells rect.on { fill: var(--ink-3); }
-.race .blaze .cells rect.on { fill: var(--fire); }
-.race .took { text-align: right; font-size: 14px; line-height: 1.2; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.race .took b { font-size: 25px; font-weight: 600; letter-spacing: -0.03em; }
-.race .blaze :is(.who, .took b) { color: var(--ink-1); }
-.race figcaption { margin-top: 4px; font-size: 12.5px; line-height: 1.45; color: var(--ink-3); text-wrap: balance; }
-/* Each part of the caption stays whole on a line: a narrow window breaks between them, never inside one. */
-.race figcaption span, .race figcaption a { white-space: nowrap; }
-.doc .race figcaption a { color: var(--ink-2); text-decoration-color: transparent; }
+/* A race (content/schema.flecs Race; render.rs): blaze and cargo building the same edit, two terminals side by side,
+   each with its clock. intro.ts types the commands and prints each line at the moment it was measured to. */
+.race { display: grid; gap: 10px; width: min(100%, 860px); margin: 0; }
+.race .terms { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 640px) { .race .terms { grid-template-columns: 1fr; } }
+.race .term { overflow: hidden; border-radius: 12px; background: var(--s-tint); box-shadow: inset 0 0 0 1px var(--line); text-align: left; }
+.race .term.blaze { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fire) 45%, transparent); }
+.race .bar { display: flex; align-items: baseline; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+.race .who { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3); }
+.race .blaze .who { color: var(--fire); }
+.race .took { font-size: 13px; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.race .took b { font-size: 22px; font-weight: 600; letter-spacing: -0.03em; color: var(--ink-2); }
+.race .blaze .took b { color: var(--ink-1); }
+.race .blaze .took.done b { color: var(--fire); }
+.race pre { min-height: 7.2em; margin: 0; padding: 12px 14px 14px; background: none; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; color: var(--ink-2); white-space: pre-wrap; word-break: break-word; }
+.race .ps { color: var(--ink-3); }
+.race .typed { color: var(--ink-1); }
+.race .st { font-weight: 600; color: #3fb950; }
+.race .caret { display: inline-block; width: 0.6em; height: 1.1em; margin-left: 1px; vertical-align: -0.2em; background: var(--ink-3); opacity: 0; }
+.race .caret.on { opacity: 0.8; }
+.race figcaption { font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
+.doc .race figcaption a { color: var(--ink-3); text-decoration-color: transparent; }
 .doc .race figcaption a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
 
 /* Chips (content/schema.flecs): small links to lessons, each with its lesson's glyph and, when the lesson's band of
