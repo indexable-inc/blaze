@@ -252,13 +252,13 @@ impl Ops {
     }
 
     pub(super) fn insert(&mut self, hot: Hot, buf: Vec<u8>, cold: Cold) -> Id {
-        let id = self.hot.insert(hot);
+        let id = self.hot.insert(hot).unwrap_or_else(|error| panic!("{error}"));
         let at = id.index() as usize;
         // A slab grows by one slot at a time, so a new slot is the columns' next.
         debug_assert!(at <= self.bufs.len());
         if at == self.bufs.len() {
-            self.bufs.push(buf);
-            self.cold.push(cold);
+            self.bufs.push(buf).unwrap_or_else(|error| panic!("{error}"));
+            self.cold.push(cold).unwrap_or_else(|error| panic!("{error}"));
         } else {
             self.bufs[at] = buf;
             self.cold[at] = cold;

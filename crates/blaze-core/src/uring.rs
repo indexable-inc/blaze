@@ -1881,7 +1881,7 @@ impl Uring {
             make,
             positional: false,
             direct: false,
-        });
+        }).map_err(io::Error::other)?;
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
         if let Err(error) = self.open(file, name, make) {
@@ -1913,7 +1913,7 @@ impl Uring {
             make: false,
             positional: true,
             direct,
-        });
+        }).map_err(io::Error::other)?;
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
         if let Err(error) = self.open(file, name, false) {
@@ -2561,7 +2561,7 @@ impl Driver for Uring {
                 Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
                     .and_then(|listener| {
                         no_delay(&listener)?;
-                        let listener = self.listeners.insert(listener);
+                        let listener = self.listeners.insert(listener).map_err(io::Error::other)?;
                         let id = self.start(
                             Hot::new(tag, Kind::Accept, listener.to_bits()),
                             ops::NO_BYTES,
@@ -2578,7 +2578,7 @@ impl Driver for Uring {
                             socket: Some(socket),
                             at: address,
                             tcp,
-                        });
+                        }).map_err(io::Error::other)?;
                         self.start(
                             Hot::new(tag, Kind::Connect, connecting.to_bits()),
                             ops::NO_BYTES,

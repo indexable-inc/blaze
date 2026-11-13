@@ -1019,7 +1019,7 @@ impl Uring {
             parts,
             exited: false,
             failed: None,
-        });
+        }).map_err(io::Error::other)?;
         self.spawning.insert(tag, spawn);
         let of = spawn.to_bits();
         self.start(Hot::new(tag, Kind::Exit, of), ops::NO_BYTES, Cold::EMPTY);
@@ -1054,7 +1054,7 @@ impl Uring {
             receiving: None,
             pausing: false,
             ended: None,
-        });
+        }).unwrap_or_else(|error| panic!("{error}"));
         Conn(conn.to_bits())
     }
 
@@ -1128,7 +1128,8 @@ impl Uring {
         let buffer = self.buffer();
         let journal = journal.then_some(dir);
         let watch =
-            self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal });
+            self.watchings.insert(Watching { tree, buffer, stopping: false, flushes, journal })
+                .map_err(io::Error::other)?;
         let id =
             self.start(Hot::new(tag, Kind::Watch, watch.to_bits()), ops::NO_BYTES, Cold::EMPTY);
         self.watches.insert(tag, id);

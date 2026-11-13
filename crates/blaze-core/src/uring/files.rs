@@ -196,7 +196,7 @@ fn push_zeros(into: &mut RegionVec<u8>, n: usize) -> io::Result<u32> {
 
 /// `bytes` at the end of the arena `into`, or an error naming it where it is full.
 fn put(into: &mut RegionVec<u8>, bytes: &[u8]) -> io::Result<()> {
-    into.try_extend_from_slice(bytes).map_err(|error| {
+    into.extend_from_slice(bytes).map_err(|error| {
         // alloc: an error path.
         io::Error::other(format!(
             "the names of the requests on paths in flight fill their arena: {error}"

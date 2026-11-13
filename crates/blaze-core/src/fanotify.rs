@@ -201,7 +201,7 @@ impl<V: Copy> Dirs<V> {
         let span = Span::joined(span, self.strings.push(name.as_bytes()));
         let entry = Entry { span, key: key.len() as u32, next: NONE, value };
         let at = match self.free {
-            NONE => self.entries.push_id(entry),
+            NONE => self.entries.push_id(entry).unwrap_or_else(|error| panic!("{error}")),
             at => {
                 self.free = self.entries[at as usize].next;
                 self.entries[at as usize] = entry;
