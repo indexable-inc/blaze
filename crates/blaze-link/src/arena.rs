@@ -19,13 +19,18 @@ pub(crate) fn stage_frame() -> Result<Frame, MemError> {
     Frame::with_reserve(STAGE_RESERVE, Tag::Link)
 }
 
-/// `items` collected into the frame: [`blaze_mem::frame::collect`], the frame last.
+/// `items` collected into the frame, its room the iterator's lower bound to start. It is
+/// `alloc`'s vector and `alloc`'s growth: blaze-mem's own `frame::collect` is fallible
+/// (decision D29) and gives blaze-mem's `Vec`, which the linker's stages do not use yet.
 #[inline]
 pub(crate) fn collect_in<'f, T>(
     items: impl IntoIterator<Item = T>,
     frame: &'f Frame,
 ) -> FrameVec<'f, T> {
-    blaze_mem::frame::collect(frame, items)
+    let items = items.into_iter();
+    let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
+    out.extend(items);
+    out
 }
 
 #[cfg(test)]
