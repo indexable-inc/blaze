@@ -59,6 +59,7 @@ pub(crate) mod trait_impl_missing_assoc_items;
 pub(crate) mod trait_impl_orphan;
 pub(crate) mod trait_impl_redundant_assoc_items;
 pub(crate) mod trait_impl_unstable_default_body;
+pub(crate) mod method_call_on_diverging_infer_var;
 pub(crate) mod tyvar_behind_raw_pointer;
 pub(crate) mod unimplemented_builtin_macro;
 pub(crate) mod unresolved_extern_crate;
@@ -254,6 +255,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
             whole_value_write_through_refinement::lower(cx, &d)
         }
         AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
+        AnyDiagnostic::MethodCallOnDivergingInferVar(d) => {
+            method_call_on_diverging_infer_var::lower(cx, &d)
+        }
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),

@@ -856,6 +856,13 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         span: Span,
     },
+    /// `method_call_on_diverging_infer_var` (warn by default, to be a hard error) of a method
+    /// called at `span` on a type variable a coercion of `!` made, which the probe set to `!`:
+    /// "method call on a diverging inference variable".
+    MethodCallOnDivergingInferVar {
+        #[type_visitable(ignore)]
+        span: Span,
+    },
     /// E0308 "mismatched types" of a `&mut` pattern `pat` matching an inherited shared
     /// reference (rustc's `error_inherited_ref_mutability_mismatch`, only under
     /// `ref_pat_eat_one_layer_2024*`): noted "cannot match inherited `&` with `&mut` pattern".
@@ -993,7 +1000,8 @@ impl InferenceDiagnostic {
             } => !is_lint(diag),
             InferenceDiagnostic::EditionDependentMethodCall { .. }
             | InferenceDiagnostic::FullyQualifiedCallFrom2018 { .. }
-            | InferenceDiagnostic::TyvarBehindRawPointer { .. } => false,
+            | InferenceDiagnostic::TyvarBehindRawPointer { .. }
+            | InferenceDiagnostic::MethodCallOnDivergingInferVar { .. } => false,
             _ => true,
         }
     }
@@ -3649,6 +3657,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::TyvarBehindRawPointer { span: at } if *at == span);
         if !self.diagnostics.any(reported) {
             self.push_diagnostic(InferenceDiagnostic::TyvarBehindRawPointer { span });
+        }
+    }
+
+    /// rustc's `method_call_on_diverging_infer_var` from `probe_op`, once per call at `span`.
+    pub(crate) fn lint_method_call_on_diverging_infer_var(&self, span: Span) {
+        let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::MethodCallOnDivergingInferVar { span: at } if *at == span);
+        if !self.diagnostics.any(reported) {
+            self.push_diagnostic(InferenceDiagnostic::MethodCallOnDivergingInferVar { span });
         }
     }
 
