@@ -15,16 +15,15 @@ site {
   updates {}
 
   // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line, the proof of it, and the way
-  // into the course. No sidebar here, so the last line is the way to the course map and the reference pages.
-  // Everything it claims is a measurement or something built and tested, with its source beside it; what the course
-  // calls experimental says so here too (a Chip takes its lesson's theme's tag).
+  // into the course, and as little text as that takes (Andrew, 2026-11-12: "less text and more clear it is an
+  // alternative to cargo build"). No sidebar here, so the last line is the way to the course map and the reference pages.
   index : Page {
     Hero
     Title: {"blaze"}
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
-    Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
+    Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
 
-    Lede is("`blaze build`. Edits rebuild in milliseconds.")
+    Lede is("A faster `cargo build`. Same projects, same commands.")
 
     // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
     // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
@@ -37,29 +36,6 @@ site {
     Race race(dir: "docs/benchmarks/history", platform: "Linux x86-64", project: "ripgrep/cranelift", edit: "body", of: "blaze v1", more: "/bench")
 
     Go start(label: "Start the course", href: "/start")
-
-    Chips built {
-      // Build scripts run in blaze's sandbox, no network and no writes outside their own folder: the hermetic lesson's
-      // "already run in a sandbox"; crates/blaze-cargo/src/sandbox.rs, and its Linux test
-      // `a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing` (sandbox/linux.rs). Proc macros run as
-      // wasm32-wasip1 modules under Wasmtime (crates/blaze-macro-eval/src/wasm.rs and wasm/tests.rs; docs/cargo.md,
-      // "Every build runs its proc macros as wasm32-wasip1 modules under Wasmtime").
-      Chip sandbox(label: "Sandboxed build scripts, proc macros", href: "/learn/hermetic")
-      // The effects lint (crates/blaze-lints/src/blaze/effects.rs, effects_tests.rs: `noalloc_refuses_the_global_allocator`
-      // and 18 more) and the linear checker (crates/hir-ty-linear, 40 tests:
-      // `a_value_left_at_the_end_of_its_scope_is_an_error`). Their designs are still `status: plan`; the lesson is in the
-      // experimental band, so the chip says Experimental.
-      Chip effects(label: "Effects and linear types", href: "/learn/extensions")
-      // lean/theorems.json lists 90 theorems; the `lean` job of .github/workflows/blaze.yaml builds them, refuses
-      // `sorry` and checks each one's axioms (harness/v2/lean_gate.py). They prove Lean models of about 13 MIR passes;
-      // only two of the Rust passes are tied to their model so far (lean/BlazeValidated/passes.lean), so the chip does
-      // not say the compiler's passes are proved. Experimental, by its lesson's band.
-      Chip proofs(label: "Lean proofs, checked in CI", href: "/learn/proofs")
-      // bstd is crates/blaze-std; its `#[bstd::test]` runs a test under 256 seeds with failed effects and power cuts
-      // (src/tests/simtest.rs `the_default_seeds_inject_and_the_counter_passes`, which asserts all three), with a
-      // planted-bug control beside it. Experimental, by its lesson's band.
-      Chip sim(label: "Simulation tests in bstd", href: "/learn/bstd")
-    }
 
     Dim more("[Course map](/learn) · [Install](/install) · [GitHub](https://github.com/indexable-inc/blaze)")
   }
