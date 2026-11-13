@@ -1,0 +1,11 @@
+{
+ "id": "explicit-arith-1",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane explicit-arith",
+ "where": "crates/blaze-lints/src/check.rs (upmap), a lint of expressions inside macro arguments",
+ "what": "An expression written in a macro call argument (`id!(a + 1)`) did not map back to the file: the node range of a `$e:expr` fragment includes the invisible group tokens, which carry the macro definition spans, so `Cx::upmap` refused the whole range as made up by the macro and the finding was dropped silently.",
+ "cost": "20 minutes",
+ "cause": "upmap asks every span of the range to share one anchor; the splice adds tokens of another",
+ "workaround": "Cx::written_range trims the macro-context spans off both ends before requiring one anchor",
+ "state": "fixed for implicit_overflow; other lints that use Cx::range on fragment expressions still drop them"
+}
