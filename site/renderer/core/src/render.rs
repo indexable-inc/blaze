@@ -511,9 +511,6 @@ fn go(n: Id, ctx: &Ctx) -> Result<String, String> {
     ))
 }
 
-/// How many cells a Race's lanes are long: the slower of the two fills them all.
-const RACE_CELLS: usize = 40;
-
 /// A time as a Race writes it: whole milliseconds under a second, else seconds to two places.
 fn took(seconds: f64) -> (String, &'static str) {
     let ms = (seconds * 1000.0).round();
@@ -534,11 +531,12 @@ mod tests {
     }
 }
 
-/// A race: blaze and cargo building the same edit, as two lanes of cells on one time scale (the slower fills its
-/// lane), each with its time. The times are the build's (`Raced`, from the benchmark history: gen/bench/race.ts), and
-/// the caption is one line, the edit and the project, linking to every benchmark; which run it was (the blaze, the
-/// platform, the day, the machine, the commit and the number of edits) is in its title and on that page. As rendered the lanes stand finished; client/intro.ts runs them in real time
-/// from `data-blaze-ms` and `data-cargo-ms`.
+/// A race: blaze and cargo building the same edit, as two terminals side by side, each typing its command and
+/// printing what the tool prints, with a clock. The times are the build's (`Raced`, from the benchmark history:
+/// gen/bench/race.ts). The caption is one line, the edit and the project, linking to every benchmark; which run it was
+/// (the blaze, the platform, the day, the machine, the commit and the number of edits) is in its title and on that
+/// page. As rendered both terminals stand finished; client/intro.ts runs them in real time from `data-blaze-ms` and
+/// `data-cargo-ms`. The `Finished` line is cargo's own wording, which blaze prints too (blaze-thin's answer.rs).
 fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     let e = ctx.e(n);
     let path = &e.path;
@@ -561,20 +559,21 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
         .iter()
         .find(|p| p.url == more)
         .ok_or_else(|| format!("{path}: Race more {more:?} is not a page of the site (/bench)"))?;
-    let scale = blaze.max(cargo);
-    let lane = |who: &str, seconds: f64| {
-        let lit = ((RACE_CELLS as f64 * seconds / scale).round() as usize).clamp(1, RACE_CELLS);
-        let cells: String = (0..RACE_CELLS)
-            .map(|i| {
-                format!(
-                    "<rect x=\"{i}.1\" y=\"0.1\" width=\"0.8\" height=\"0.8\"{}/>",
-                    if i < lit { " class=\"on\"" } else { "" }
-                )
-            })
-            .collect();
+    let project = field(Some(raced), "project");
+    // "ripgrep 15.1.0" is cargo's "ripgrep v15.1.0".
+    let crate_line = match project.rsplit_once(' ') {
+        Some((name, version)) if version.starts_with(|c: char| c.is_ascii_digit()) => format!("{name} v{version}"),
+        _ => project.clone(),
+    };
+    let term = |who: &str, seconds: f64, compiling: bool| {
         let (t, unit) = took(seconds);
+        let compiling = if compiling {
+            format!("<span class=\"out\" data-at=\"0\">\n<b class=\"st\">   Compiling</b> {}</span>", esc(&crate_line))
+        } else {
+            String::new()
+        };
         format!(
-            "<div class=\"lane {who}\" data-cells=\"{lit}\"><span class=\"who\">{who}</span><svg class=\"cells\" viewBox=\"0 0 {RACE_CELLS} 1\" aria-hidden=\"true\">{cells}</svg><span class=\"took\"><b>{t}</b> {unit}</span></div>"
+            "<div class=\"term {who}\"><div class=\"bar\"><span class=\"who\">{who}</span><span class=\"took\"><b>{t}</b> {unit}</span></div><pre><span class=\"line\"><span class=\"ps\">$ </span><span class=\"typed\">{who} build</span><span class=\"caret\"></span></span>{compiling}<span class=\"out\" data-at=\"end\">\n<b class=\"st\">    Finished</b> `dev` profile [unoptimized + debuginfo] target(s) in {seconds:.2}s</span></pre></div>"
         )
     };
     let commit = field(Some(raced), "commit");
@@ -592,15 +591,15 @@ fn race(n: Id, ctx: &Ctx) -> Result<String, String> {
     }
     how.retain(|h| !h.is_empty());
     Ok(format!(
-        "<figure class=\"race\" data-blaze-ms=\"{}\" data-cargo-ms=\"{}\" title=\"{}\">{}{}<figcaption><a href=\"{}\">{} in {}, then build</a></figcaption></figure>",
+        "<figure class=\"race\" data-blaze-ms=\"{}\" data-cargo-ms=\"{}\" title=\"{}\"><div class=\"terms\">{}{}</div><figcaption><a href=\"{}\">{} in {}, then build</a></figcaption></figure>",
         js::number((blaze * 1000.0).round()),
         js::number((cargo * 1000.0).round()),
         esc(&how.join(", ")),
-        lane("blaze", blaze),
-        lane("cargo", cargo),
+        term("blaze", blaze, false),
+        term("cargo", cargo, true),
         esc(&ctx.s.served.href(&to.url)),
         esc(&field(Some(raced), "edit")),
-        esc(&field(Some(raced), "project")),
+        esc(&project),
     ))
 }
 

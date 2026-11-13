@@ -7,12 +7,10 @@
  *   Once it is alight the rest of the page shows. A key or a press shows it at once.
  * - Every cell is a whole number of device pixels, and the canvas sits on a device pixel, so the pixels stay sharp
  *   at any zoom. The pointer's breath parts the flames and its sweep drags them.
- * - The command (the `Lede`, `cargo build` → `blaze build` as written): once the page lit it reads `cargo build`,
- *   then `cargo` burns off letter by letter and `blaze` catches in its place, then the subcommand cycles through
- *   blaze's own (build, check, test, run), each typed over the last. Same commands, another tool.
  * - The race (a `Race` block: blaze and cargo building the same edit, the two times a measurement from the benchmark
- *   history) runs in real time, over and over: both lanes start together, each fills at the pace it was measured at
- *   and stops on its time, so blaze is done before the eye has moved and cargo is still going.
+ *   history) is two terminals side by side, run in real time, over and over: both type their command, both start on
+ *   the same keystroke, each prints `Finished` at the moment it was measured to, a clock counting on each, so blaze is
+ *   done before the eye has moved and cargo is still compiling.
  * - Start: the page burns away (client/lib/burn.ts), from the bottom left up and across in about three quarters of a
  *   second, and then the lesson loads and fades in (the site's page transition, styles/shell.css). A key or a second
  *   press during it goes at once. Back brings the intro back whole, not burnt.
@@ -49,117 +47,52 @@ const WARM = 48;
 const KNOCK_WAIT = 120;
 /** A page that is still here this long after it burnt (the load was stopped, or failed) is put back, in ms. */
 const STRANDED = 5000;
-/** The command: when `cargo` starts to burn and each letter's lag, how long a letter burns, when `blaze` catches and
- * each letter's lag, how long a caught letter takes to cool, in seconds after the page lit. */
-const CMD_BURN = 0.9;
-const CMD_BURN_LAG = 0.09;
-const CMD_BURN_FOR = 0.4;
-const CMD_CATCH = 1.55;
-const CMD_CATCH_LAG = 0.07;
-const CMD_COOL = 0.5;
-/** Then the subcommands, from this moment, each held this long, typed and untyped this fast a letter (seconds). */
-const CMD_CYCLE_AT = 3.2;
-const CMD_HOLD = 1.7;
-const CMD_KEY = 0.055;
-/** blaze's commands, as blaze-thin and blaze-client route them (route.rs, ask.rs). */
-const SUBCOMMANDS = ['build', 'check', 'test', 'run'];
-/** The fire's ramp, hottest first: a letter burning goes down it; one catching comes up it and cools to the ink. */
-const RAMP = ['#fff4c4', '#ffd23f', '#ff9a26', '#e0461a', '#9a2c10'];
-
-/** The race: a beat with both lanes empty, the run, then the result held, in seconds. */
-const RACE_READY = 0.4;
-const RACE_HOLD = 2.6;
+/** The race: an empty prompt, the commands typed (seconds a key), the run, then the result held, in seconds. */
+const RACE_READY = 0.5;
+const RACE_KEY = 0.045;
+const RACE_ENTER = 0.25;
+const RACE_HOLD = 2.8;
 
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const light = matchMedia('(prefers-color-scheme: light)');
 
-type Lane = { ms: number; cells: number; rects: SVGRectElement[]; took: HTMLElement; lit: number; text: string };
+type Term = { ms: number; typed: HTMLElement; caret: HTMLElement; took: HTMLElement; outs: { el: HTMLElement; at: number }[]; text: string; word: string };
 
 /**
- * The race, run in real time. Each lane fills, cell by cell, at the pace its build was measured at (the lanes share
- * one scale: the slower one's time is the whole lane) and its counter stops on its time. `frame(t)` paints the
- * moment `t` seconds after the page lit; as rendered, and with motion reduced, the lanes stand finished.
+ * The race, run in real time (see the top). `frame(t)` paints the moment `t` seconds after the page lit; as rendered,
+ * and with motion reduced, both terminals stand finished.
  */
 function racer(fig: HTMLElement): (t: number) => void {
-	const lanes: Lane[] = [...fig.querySelectorAll<HTMLElement>('.lane')].flatMap((el) => {
+	const terms: Term[] = [...fig.querySelectorAll<HTMLElement>('.term')].flatMap((el) => {
 		const ms = Number(fig.dataset[el.classList.contains('blaze') ? 'blazeMs' : 'cargoMs']);
+		const typed = el.querySelector<HTMLElement>('.typed');
+		const caret = el.querySelector<HTMLElement>('.caret');
 		const took = el.querySelector<HTMLElement>('.took b');
-		const rects = [...el.querySelectorAll<SVGRectElement>('.cells rect')];
-		const cells = Number(el.dataset.cells);
-		return took && ms > 0 && cells > 0 ? [{ ms, cells, rects, took, lit: cells, text: took.textContent ?? '' }] : [];
+		if (!typed || !caret || !took || !(ms > 0)) return [];
+		const outs = [...el.querySelectorAll<HTMLElement>('.out')].map((o) => ({ el: o, at: o.dataset.at === 'end' ? ms : Number(o.dataset.at) }));
+		return [{ ms, typed, caret, took, outs, text: took.textContent ?? '', word: typed.textContent ?? '' }];
 	});
-	const whole = Math.max(...lanes.map((l) => l.ms));
-	const period = RACE_READY + whole / 1000 + RACE_HOLD;
+	const longest = Math.max(...terms.map((m) => m.word.length));
+	const go = RACE_READY + longest * RACE_KEY + RACE_ENTER;
+	const whole = Math.max(...terms.map((m) => m.ms));
+	const period = go + whole / 1000 + RACE_HOLD;
 	// A time as render.rs writes it: whole milliseconds under a second, else seconds to two places.
 	const show = (ms: number, final: number) => (final < 1000 ? String(Math.round(ms)) : (ms / 1000).toFixed(2));
+	for (const m of terms) m.typed.textContent = '';
 	return (t) => {
-		const ran = (((t % period) + period) % period) - RACE_READY;
-		for (const l of lanes) {
-			const at = Math.min(Math.max(0, ran * 1000), l.ms);
-			const lit = at >= l.ms ? l.cells : Math.min(l.cells, Math.floor((l.cells * at) / l.ms));
-			if (lit !== l.lit) {
-				for (let i = Math.min(lit, l.lit); i < Math.max(lit, l.lit); i++) l.rects[i]?.classList.toggle('on', i < lit);
-				l.lit = lit;
-			}
-			const text = show(at, l.ms);
-			if (text !== l.text) l.took.textContent = l.text = text;
+		const at = ((t % period) + period) % period;
+		const ran = (at - go) * 1000;
+		for (const m of terms) {
+			const keys = Math.max(0, Math.min(m.word.length, Math.floor((at - RACE_READY) / RACE_KEY)));
+			const typed = m.word.slice(0, keys);
+			if (m.typed.textContent !== typed) m.typed.textContent = typed;
+			const done = ran >= m.ms;
+			m.caret.classList.toggle('on', !done);
+			for (const o of m.outs) o.el.hidden = ran < o.at;
+			const text = show(Math.min(Math.max(0, ran), m.ms), m.ms);
+			if (text !== m.text) m.took.textContent = m.text = text;
+			m.took.parentElement?.classList.toggle('done', done);
 		}
-	};
-}
-
-/**
- * The command, run in real time (see the top). It takes over the `Lede`'s first `code` and paints the moment `t`
- * seconds after the page lit. `null` when the lede is not the command it expects, which leaves it as written.
- */
-function typer(lede: HTMLElement): ((t: number) => void) | null {
-	const codes = lede.querySelectorAll('code');
-	if (codes.length !== 2 || codes[0].textContent !== 'cargo build') return null;
-	const code = document.createElement('code');
-	code.className = 'cmd';
-	const old = [...'cargo'].map((c) => Object.assign(document.createElement('span'), { textContent: c }));
-	const now = [...'blaze'].map((c) => Object.assign(document.createElement('span'), { textContent: c, className: 'cmd-new' }));
-	const tool = document.createElement('span');
-	tool.className = 'tool';
-	tool.append(...old, ...now);
-	const sub = document.createElement('span');
-	sub.className = 'sub';
-	const caret = document.createElement('span');
-	caret.className = 'caret';
-	code.append(tool, ' ', sub, caret);
-	lede.replaceChildren(code);
-	const ramp = (u: number) => RAMP[Math.min(RAMP.length - 1, Math.max(0, Math.floor(u * RAMP.length)))];
-	const cycle = SUBCOMMANDS.length * CMD_HOLD;
-	let shown = '';
-	return (t) => {
-		old.forEach((el, i) => {
-			const u = (t - CMD_BURN - i * CMD_BURN_LAG) / CMD_BURN_FOR;
-			el.style.display = u >= 1 ? 'none' : '';
-			el.style.color = u <= 0 ? '' : ramp(u);
-			el.style.transform = u <= 0 ? '' : `translateY(${-u * 0.35}em)`;
-			el.style.opacity = u <= 0 ? '' : String(1 - u * u);
-		});
-		now.forEach((el, i) => {
-			const u = (t - CMD_CATCH - i * CMD_CATCH_LAG) / CMD_COOL;
-			el.style.display = u < 0 ? 'none' : '';
-			el.style.color = u >= 1 ? '' : ramp(1 - u);
-		});
-		// The subcommand: `build` until the cycle starts, then each typed over the last.
-		let word = 'build';
-		let typing = false;
-		if (t >= CMD_CYCLE_AT) {
-			const at = (t - CMD_CYCLE_AT) % cycle;
-			const k = Math.floor(at / CMD_HOLD);
-			const into = at - k * CMD_HOLD;
-			const from = SUBCOMMANDS[k];
-			const to = SUBCOMMANDS[(k + 1) % SUBCOMMANDS.length];
-			const out = from.length * CMD_KEY;
-			const back = CMD_HOLD - out - to.length * CMD_KEY;
-			if (into < back) word = from;
-			else if (into < back + out) ((word = from.slice(0, from.length - Math.ceil((into - back) / CMD_KEY))), (typing = true));
-			else ((word = to.slice(0, Math.ceil((into - back - out) / CMD_KEY))), (typing = true));
-		}
-		if (word !== shown) sub.textContent = shown = word;
-		caret.classList.toggle('on', typing || (t >= CMD_BURN && t < CMD_CYCLE_AT));
 	};
 }
 
@@ -214,9 +147,7 @@ onPage((signal) => {
 		main.dataset.lit = '';
 	};
 	const fig = main.querySelector<HTMLElement>('.race');
-	const race = fig && racer(fig);
-	const lede = main.querySelector<HTMLElement>('.lede');
-	const command = lede && !still.matches ? typer(lede) : null;
+	const race = fig && !still.matches ? racer(fig) : null;
 
 	const tick = (now: number) => {
 		frame = requestAnimationFrame(tick);
@@ -231,7 +162,6 @@ onPage((signal) => {
 		if (t >= LIT) reveal();
 		if (!Number.isNaN(lit)) {
 			race?.((now - lit) / 1000);
-			command?.((now - lit) / 1000);
 		}
 		// Every frame while a letter is falling or the word still shakes; after that only when the fire has stepped.
 		const moving = t < LANDED + 0.3;

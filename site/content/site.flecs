@@ -23,8 +23,6 @@ site {
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
     Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
 
-    Lede is("`cargo build` → `blaze build`")
-
     // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
     // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
     // 2026-10-22 (commit 2cf189feb6, AWS c7a.48xlarge pinned to 16 cores, median of 5 edits): ripgrep 15.1.0,
