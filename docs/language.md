@@ -136,11 +136,9 @@ for), **not checked**.
 | 1.80 zero-sized accesses through any pointer (#117329) | ok | R:v1_80_zero_sized_accesses_through_any_pointer |
 | 1.80 `Result` layout guarantee (#124870), maximum allocation size | not checked / n/a | |
 
-## What a bump should do
+## What a bump does
 
-The lint registry (`crates/blaze-lint-defs/src/lints.rs`) and the feature gates are hand copies
-of rustc's and had drifted from the pin (agents row `lang1100-2`). Three differences from the
-pinned nightly are left, each with new wording in rustc that blaze-diagnostics does not have:
-`linker_info` and `linker_messages` are crate-level lints there, `rust_2021_prefixes_incompatible_syntax`
-a semantics change, and `semicolon_in_expressions_from_non_local_macros` not in the dependency
-report.
+The lint registry is generated from rustc's source at the pinned commit
+(`scripts/src/bin/lint_table.rs`, [toolchain.md](toolchain.md) step 7) and the gate holds it to
+the pin; it was a hand copy of rustc 1.99's until this branch (agents row `lang1100-2`). The
+feature gates of blaze-diagnostics are still copied by hand.

@@ -210,10 +210,6 @@ fn unused(
         "allow" | "expect" | "warn" | "deny" | "forbid" => {
             let Args::List(tt) = attr.args() else { return None };
             let list = meta::list(tt)?;
-            let lints_named = |names: &[&str]| {
-                list.iter()
-                    .any(|it| it.item().is_some_and(|it| names.iter().any(|name| it.is(name))))
-            };
             if list.is_empty() {
                 // alloc: the diagnostic's text, as is each note below
                 format!("attribute `{name}` with an empty list has no effect")
@@ -223,23 +219,42 @@ fn unused(
             {
                 // alloc: as above
                 format!("attribute `{name}` without any lints has no effect")
-            } else if lints_named(&["linker_messages", "linker_info"]) {
-                if owner.target != Target::Crate {
-                    return Some(crate_level(cx, attr));
-                }
-                if types.needs_link != Some(false) {
-                    return None;
-                }
-                // alloc: as above
-                "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked".to_owned()
-            } else if owner.target == Target::Crate
-                && lints_named(&["dead_code_pub_in_binary"])
-                && types.executable == Some(false)
-            {
-                // alloc: as above
-                "the `dead_code_pub_in_binary` lint has no effect in library crates".to_owned()
             } else {
-                return None;
+                // rustc's `check_lint_check`, of each lint the attribute names, at its name.
+                // Below the crate's root the levels say `linker_messages` and `linker_info`
+                // are ignored (crate-level lints), so here they are the root's alone.
+                let named = |names: &[&str]| {
+                    list.iter()
+                        .filter_map(|it| it.item())
+                        .find(|it| names.iter().any(|name| it.is(name)))
+                        .map(|it| it.range)
+                };
+                let linker = named(&["linker_messages", "linker_info"])
+                    .filter(|_| owner.target == Target::Crate && types.needs_link == Some(false));
+                let pub_in_binary =
+                    named(&["dead_code_pub_in_binary"]).filter(|_| types.executable == Some(false));
+                let (range, note) = match (pub_in_binary, linker) {
+                    (Some(range), _) => (
+                        range,
+                        "the `dead_code_pub_in_binary` lint has no effect in library crates",
+                    ),
+                    (None, Some(range)) => (
+                        range,
+                        "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked",
+                    ),
+                    (None, None) => return None,
+                };
+                let span = cx.span(attr.in_file(range));
+                // clone: the diagnostic's span
+                let mut diag = Diag::lint("unused_attributes", "unused attribute", span.clone());
+                diag.suggestion(
+                    span,
+                    "remove this attribute",
+                    "",
+                    Applicability::MachineApplicable,
+                );
+                diag.note(note);
+                return Some(diag);
             }
         }
         "default_method_body_is_const" => {
@@ -254,42 +269,6 @@ fn unused(
     diag.suggestion(span, "remove this attribute", "", Applicability::MachineApplicable);
     diag.note(note);
     Some(diag)
-}
-
-/// `linker_messages` or `linker_info` set below the crate root: rustc's `OuterCrateLevelAttr`
-/// with its `!` to add, or `InnerCrateLevelAttr`.
-fn crate_level(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Diag {
-    let span = span_of(cx, attr);
-    if attr.inner {
-        return Diag::lint(
-            "unused_attributes",
-            "crate-level attribute should be in the root module",
-            span,
-        );
-    }
-    let bang = until_bracket(cx, &span).shrink_to_hi();
-    let mut diag =
-        Diag::lint("unused_attributes", "crate-level attribute should be an inner attribute", span);
-    // alloc: the diagnostic's text
-    diag.multipart_suggestion(
-        "add a `!`",
-        vec![(bang, "!".to_owned())],
-        Applicability::Unspecified,
-    );
-    diag
-}
-
-/// rustc's `span_until_char(span, '[')`: up to the first `[`, its white space trimmed; the
-/// whole span when that leaves nothing or more than one line.
-fn until_bracket(cx: &Cx<'_, '_>, span: &Span) -> Span {
-    // clone: the diagnostic's span (`crate_level`)
-    let Some(text) = cx.snippet(span) else { return span.clone() };
-    let before = text.split('[').next().unwrap_or_default().trim_end();
-    if before.is_empty() || before.contains('\n') {
-        // clone: as above
-        return span.clone();
-    }
-    span.with_hi(span.lo + before.len() as u32)
 }
 
 /// rustc's `check_inline`: `#[inline]`, `#[inline(always)]` on a function, an inherent method

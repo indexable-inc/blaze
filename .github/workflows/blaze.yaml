@@ -186,6 +186,12 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/lean_gate.py selftest
           uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
+      # blaze's registry of rustc's lints (crates/blaze-lint-defs/src/rustc.rs) is the one written
+      # from rustc's source at the commit library/UPSTREAM pins, unedited: a toolchain bump that
+      # does not write it again fails here (scripts/src/bin/lint_table.rs).
+      - run: |
+          "$BLAZE_SCRIPTS/lint_table" selftest
+          "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
       # Each hash domain in crates/ is written once outside tests (scripts/src/bin/domains.rs).
       - run: |
           "$BLAZE_SCRIPTS/domains" '{"root": "."}'
