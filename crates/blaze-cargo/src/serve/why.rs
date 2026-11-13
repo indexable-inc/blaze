@@ -1458,6 +1458,11 @@ const LEVEL: i32 = 3;
 /// `record` framed: its length, then its deterministic CBOR as one zstd frame. The CBOR is
 /// subjects' paths and part names over and over: hello-world's ledger after a cold build and
 /// five edits was 15.3 MB of it, 2.3 MB as zstd (2026-11-11).
+#[expect(
+    blaze::narrowed_len,
+    reason = "the ledger frames each record with a u32 length: a compressed record of 4 GiB \
+              needs a typed refusal from the history's writer"
+)]
 fn frame(record: &Record) -> Vec<u8> {
     let body = cbor::to_vec(record).expect("a ledger record is plain data, which CBOR encodes");
     let body = zstd::bulk::compress(&body, LEVEL).expect("zstd compresses any bytes into memory it allocates");

@@ -479,6 +479,25 @@ impl Db {
         })
     }
 
+    /// [`Db::set_view_root`] for a view read from a [`blaze_query::Tree`], whose IDs are not
+    /// hashed again: see [`Files::set_view_root_from_tree`].
+    pub fn set_view_root_from_tree(
+        &mut self,
+        view: ViewRoot<'_>,
+    ) -> Result<ViewChange, ViewError> {
+        let files = Arc::clone(&self.files);
+        self.write("Db::set_view_root_from_tree", |db| {
+            let change = files.set_view_root_from_tree(db, view)?;
+            db.note(Note::View {
+                set: &change.set,
+                added: &change.added,
+                removed: &change.removed,
+                roots: &change.roots,
+            });
+            Ok(change)
+        })
+    }
+
     /// The file of the VFS that `path` names relative to its anchor: in the anchor's source
     /// root, or else one another source root names (a `#[path]` module outside its package),
     /// tracked through [`crate::named`] so a root that names it later reruns the reader.

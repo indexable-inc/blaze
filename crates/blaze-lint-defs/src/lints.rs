@@ -1136,6 +1136,28 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::span_field_unrecorded", Allow, "detects a field of a `tracing` span or event of the target `blaze` that the profile keeps nothing of")
         .externally_loaded(),
+    l("blaze::env_read", Allow, "detects a read of the process's environment (`std::env::var`, `var_os`, `vars`, `vars_os`) outside the settings modules `env-read-allowed` names")
+        .externally_loaded(),
+    l("blaze::untied_child", Allow, "detects test code that starts a process whose `Child` no `stdx::JodChild` owns, or runs `blaze` without `BLAZE_DAEMON_EXIT_UNHELD` on its command")
+        .externally_loaded(),
+    l("blaze::unbounded_test_wait", Allow, "detects a test that waits with no deadline: a park, a condition wait, a channel `recv` or a child's `wait`, or a loop around `Child::try_wait` that compares no deadline")
+        .externally_loaded(),
+    l("blaze::reads_positions", Allow, "detects a function of the front end's query crates that reads where code is written (a source map, the live parse, an ast id's range) without being marked `#[blaze::renders_positions]`, so its result depends on every edit above it")
+        .externally_loaded(),
+    l("blaze::cbor_field_order", Allow, "detects a struct or struct variant deriving serde's `Serialize` in a `#![blaze::canonical_cbor]` module with its fields declared out of their keys' deterministic-CBOR order (shorter first, then bytewise), which makes the encoder sort and copy the map")
+        .externally_loaded(),
+    l("blaze::gapped_literal", Allow, "detects a string literal one line of which holds a run of eight or more spaces between two characters of its text: a lost `\\` line continuation, which prints the message with a gap")
+        .externally_loaded(),
+    l("blaze::retry", Allow, "detects an operation tried again up to a constant: a comparison of a count named for retries, attempts, tries or failures with a constant bound, or a `for` loop over such a range")
+        .externally_loaded(),
+    l("blaze::unwired", Allow, "detects `#[allow(dead_code)]` or `#[allow(unused)]` (or `expect`) on an item, field or variant outside tests: a design kept quiet instead of wired in or deleted")
+        .externally_loaded(),
+    l("blaze::tmp_path", Allow, "detects a path under `/tmp`, `/private/tmp` or `/var/tmp` named by hand, and a use of `std::env::temp_dir` outside `blaze_core::temp`, whose `TempDir` removes what it made when it drops")
+        .externally_loaded(),
+    l("blaze::narrowed_len", Allow, "detects a length narrowed to a smaller integer type by `try_from` or `try_into` with an `expect` or `unwrap`, which panics on a large input instead of refusing it with a typed error")
+        .externally_loaded(),
+    l("blaze::process_static", Allow, "detects a `static` or `thread_local!` key holding a growable collection beneath a lock or a cell, or a concurrent collection: state that grows for the process's life with no owner to drop it")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

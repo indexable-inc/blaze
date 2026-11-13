@@ -473,6 +473,10 @@ fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
 /// starts build 1, closes one span in it, enters a wait it never leaves, flushes, says it is
 /// ready, and sleeps until it is killed.
 #[cfg(unix)]
+#[expect(
+    blaze::unbounded_test_wait,
+    reason = "the child process's wait it never leaves, as the daemon it stands for; the parent test kills it within 60 s of its start"
+)]
 fn killed_daemon(dir: &std::path::Path) -> ! {
     use std::io::Write as _;
     crate::install();
@@ -555,9 +559,8 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     let duckdb = std::path::PathBuf::from(
         std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
     );
-    let dir = std::env::temp_dir().join(format!("blaze-slow-killed-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = blaze_core::temp::TempDir::for_test("blaze-slow-killed-");
+    let dir = tmp.path().to_path_buf();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running",
@@ -567,6 +570,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
         ])
         .env(CHILD, &dir)
         .spawn()
+        .map(stdx::JodChild)
         .unwrap();
     let pid = child.id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -605,14 +609,17 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     ] {
         assert!(text.contains(said), "the report says {said:?}:\n{text}");
     }
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Runs `fixture`, DuckDB's SQL writing a history's Parquet files into `dir` (`{d}`), beside the
-/// history's schema files.
-fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
+/// history's schema files. The guard returned beside the path removes it when it drops.
+fn history_of(
+    duckdb: &std::path::Path,
+    name: &str,
+    fixture: &str,
+) -> (blaze_core::temp::TempDir, std::path::PathBuf) {
+    let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-slow-{name}-"));
+    let dir = tmp.path().to_path_buf();
     crate::history::History::open(&dir, crate::history::CAP_MOST, crate::sampler::unsampled())
         .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
@@ -622,7 +629,7 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
         .unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
     crate::history::list_written(&dir);
-    dir
+    (tmp, dir)
 }
 
 /// Two daemons in one history, pid 7 and then pid 8, each with a build 1 (as every daemon
@@ -638,7 +645,7 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     );
     let builds = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
         AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n";
-    let mixed = history_of(
+    let (mixed_dir, mixed) = history_of(
         &duckdb,
         "mixed",
         &format!(
@@ -660,9 +667,9 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         }
         other => panic!("two daemons' build 1 read as one build: {other:?}"),
     }
-    _ = std::fs::remove_dir_all(&mixed);
+    drop(mixed_dir);
 
-    let apart = history_of(
+    let (_apart_dir, apart) = history_of(
         &duckdb,
         "apart",
         &format!(
@@ -688,7 +695,6 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         "another process's row of no build in the window is not the build's"
     );
     load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
-    _ = std::fs::remove_dir_all(&apart);
 }
 
 /// Every query `blaze slow` asks beside the time model (`load::facts`: the build's row, threads,
@@ -729,7 +735,7 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             (1, 8, 10, 1030, 'INFO', 'blaze', 'event job.rs:1', 'fine', 3), \
             (1, 8, 10, 1040, 'ERROR', 'blaze', 'event stop.rs:5', 'stall', 4)) \
             AS t(build_id, process, thread, t_ns, level, target, name, message, event_id)) TO '{d}/1-00000001.events.parquet';\n";
-    let dir = history_of(&duckdb, "facts", fixture);
+    let (_tmp, dir) = history_of(&duckdb, "facts", fixture);
     let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
     let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
         name: name.to_owned(),
@@ -780,7 +786,6 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             assert_eq!(facts.recorder.spans_made, Some(2), "the window's recorder");
         }
     }
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The proportionality warning reaches the person who asks why: a build whose account names

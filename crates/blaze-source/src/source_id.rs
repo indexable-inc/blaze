@@ -955,18 +955,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_sources() {
-        let path = SourceId::for_path(Path::new("/tmp/ws/crate")).unwrap();
-        assert_eq!(path.as_url().to_string(), "path+file:///tmp/ws/crate");
-        assert_eq!(path.to_string(), "/tmp/ws/crate");
-        assert_eq!(path.local_path(), Some(PathBuf::from("/tmp/ws/crate")));
-        assert_eq!(SourceId::from_url("path+file:///tmp/ws/crate").unwrap(), path);
+        let path = SourceId::for_path(Path::new("/srv/ws/crate")).unwrap();
+        assert_eq!(path.as_url().to_string(), "path+file:///srv/ws/crate");
+        assert_eq!(path.to_string(), "/srv/ws/crate");
+        assert_eq!(path.local_path(), Some(PathBuf::from("/srv/ws/crate")));
+        assert_eq!(SourceId::from_url("path+file:///srv/ws/crate").unwrap(), path);
 
-        let dir = SourceId::for_directory(Path::new("/tmp/vendor")).unwrap();
-        assert_eq!(dir.as_url().to_string(), "directory+file:///tmp/vendor");
-        assert_eq!(dir.to_string(), "dir /tmp/vendor");
-        let local = SourceId::for_local_registry(Path::new("/tmp/reg")).unwrap();
-        assert_eq!(local.as_url().to_string(), "local-registry+file:///tmp/reg");
-        assert_eq!(local.to_string(), "registry `/tmp/reg`");
+        let dir = SourceId::for_directory(Path::new("/srv/vendor")).unwrap();
+        assert_eq!(dir.as_url().to_string(), "directory+file:///srv/vendor");
+        assert_eq!(dir.to_string(), "dir /srv/vendor");
+        let local = SourceId::for_local_registry(Path::new("/srv/reg")).unwrap();
+        assert_eq!(local.as_url().to_string(), "local-registry+file:///srv/reg");
+        assert_eq!(local.to_string(), "registry `/srv/reg`");
         assert!(local.is_registry() && !local.is_remote_registry());
     }
 

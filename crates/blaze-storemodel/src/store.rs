@@ -898,6 +898,10 @@ pub fn damaged(
 /// with the names a clean open ends with: what the try left is removed, never kept or tripped
 /// over. `left` collects the names crashes left that the stopped store did not have, so a test
 /// can say the search saw them.
+#[expect(
+    blaze::retry,
+    reason = "not a retry: the model compares the injected failures left with those it planned, to know whether any was injected"
+)]
 pub fn run_open(
     disk: &Disk,
     ledger: &Ledger,

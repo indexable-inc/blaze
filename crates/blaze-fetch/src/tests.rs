@@ -66,7 +66,7 @@ impl Net for Fake {
         let ask = self.asks.fetch_add(1, Ordering::SeqCst);
         if let Some((started, gate)) = &self.gate {
             _ = started.try_send(());
-            gate.recv().unwrap();
+            gate.recv_timeout(Duration::from_secs(60)).expect("the test opened the fake's gate");
         }
         if ask < self.fail {
             // The body up to its middle, then a cut: a retry resumes from there.

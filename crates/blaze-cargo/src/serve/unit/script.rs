@@ -467,6 +467,11 @@ pub(crate) const TEMP_NAMES: &[&str] = &["NIX_BUILD_TOP", "TEMP", "TEMPDIR", "TM
 
 /// What a sandboxed run's [`TEMP_NAMES`] but `TMPDIR` are: the sandbox's own empty `/tmp`, the
 /// same in every shell.
+#[expect(
+    blaze::tmp_path,
+    reason = "inside the sandbox /tmp is its own empty directory, the same in every shell, so a \
+              run's temporary variables name it by that path"
+)]
 pub(crate) const SANDBOX_TEMP: &str = "/tmp";
 
 /// The environment a script is started in: the job's whole environment but [`JOB_ONLY`], what
@@ -1278,6 +1283,10 @@ struct LeftRun {
 
 /// Each run's directory this process left cargo's files in, by its path: a few dozen a
 /// build, scanned. In memory only: a restarted daemon writes each once.
+#[expect(
+    blaze::process_static,
+    reason = "one row per run directory the daemon left cargo's files in, never capped: the daemon should own it"
+)]
 static LEFT_RUNS: blaze_core::lock::Lock<Vec<(PathBuf, LeftRun)>> =
     blaze_core::lock::Lock::new("serve.unit.script.left_runs", Vec::new());
 

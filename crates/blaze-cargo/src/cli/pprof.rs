@@ -516,7 +516,8 @@ fn open_page(link: &str) -> Result<(&'static str, PathBuf), String> {
     // A random name of its own, not the token.
     let name =
         ix_prof::token::new().map_err(|why| format!("naming the page's directory: {why}"))?;
-    let dir = std::env::temp_dir().join(format!("blaze-pprof-{}-{name}", std::process::id()));
+    // Not a `TempDir`: the browser reads the page after this returns, so it outlives the guard.
+    let dir = blaze_core::temp::base().join(format!("blaze-pprof-{}-{name}", std::process::id()));
     // Not recursive: a directory someone else made there first is refused, not used.
     std::fs::DirBuilder::new()
         .mode(0o700)

@@ -172,14 +172,13 @@ fn the_oracle_catches_a_walk_in_the_order_its_describes_ran() {
 }
 
 /// No round stands between a describe and what it reached: `main` (1) calls 2 and 3, and 2
-/// calls 4. The describe of 3 waits until 4's describe is kept under its key, which a walk by
-/// levels never gets to (4 is of the level after 3's): here 4 is described, and visible by
-/// its key, while 3, reached a step before it, is still being described and long before the
-/// walk ends.
+/// calls 4. The describe of 3 waits until 4's describe has begun, which a walk by levels never
+/// gets to (4 is of the level after 3's): here 4 is described while 3, reached a step before
+/// it, is still being described and long before the walk ends.
 #[test]
-fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
+fn a_function_is_described_while_one_reached_before_it_still_is() {
     const LONG: Duration = Duration::from_secs(60);
-    let kept: Arc<Kept<u32, u32>> = Arc::new(Kept::new());
+    let four = Arc::new(AtomicBool::new(false));
     let waited = Arc::new(AtomicBool::new(false));
     let mut program = Program::default();
     program.function(1, 0x11, &[2, 3]);
@@ -187,11 +186,14 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     program.function(3, 0x33, &[]);
     program.function(4, 0x44, &[]);
     program.watch = Some(Box::new({
-        let (kept, waited) = (Arc::clone(&kept), Arc::clone(&waited));
+        let (four, waited) = (Arc::clone(&four), Arc::clone(&waited));
         move |id: u32| {
+            if id == 4 {
+                four.store(true, Ordering::Release);
+            }
             if id == 3 {
-                SpinWait::within("the describe of f4, kept while f3 is described", LONG, || {
-                    kept.function(0, &(4, member())).is_some()
+                SpinWait::within("the describe of f4, begun while f3 is described", LONG, || {
+                    four.load(Ordering::Acquire)
                 });
                 waited.store(true, Ordering::Release);
             }
@@ -201,7 +203,7 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     let reached = pool.install(|| {
         let policy = policy(OptLevel::O0, Mode::Output);
         let (machine, memo) = (Machine::default(), Memo::new());
-        let build = Build::new(&machine, &program, &policy, &memo).keeping(&kept);
+        let build = Build::new(&machine, &program, &policy, &memo);
         let mut errors = Vec::new();
         let (nodes, ..) = build.walk(&[(1, member())], &[], &[], None, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");

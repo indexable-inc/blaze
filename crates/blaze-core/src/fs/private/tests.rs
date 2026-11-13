@@ -1,20 +1,19 @@
 use std::path::PathBuf;
 
 use super::private;
-use crate::FileName;
+use crate::{FileName, temp::TempDir};
 
-/// A root of its own, and the store under it, not made yet.
-fn store(what: &str) -> (PathBuf, FileName) {
-    let root =
-        std::env::temp_dir().join(format!("blaze-core-private-{what}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    (root.join("store"), FileName::new("store").unwrap())
+/// A root of its own (the guard that removes it; hold it for the test), and the store under
+/// it, not made yet.
+fn store(what: &str) -> (TempDir, PathBuf, FileName) {
+    let root = TempDir::for_test(&format!("blaze-core-private-{what}-"));
+    let store = root.join("store");
+    (root, store, FileName::new("store").unwrap())
 }
 
 #[test]
 fn a_missing_directory_is_made_and_is_the_users_alone() {
-    let (dir, _) = store("missing");
+    let (_root, dir, _) = store("missing");
     assert_eq!(private(&dir.join("deep"), &FileName::new("store/deep").unwrap()).unwrap(), None);
     assert!(dir.join("deep").is_dir());
 }
@@ -36,14 +35,14 @@ mod unix {
 
     #[test]
     fn a_made_directory_is_the_users_to_read_too() {
-        let (dir, name) = store("made");
+        let (_root, dir, name) = store("made");
         assert_eq!(private(&dir, &name).unwrap(), None);
         assert_eq!(mode(&dir), 0o700);
     }
 
     #[test]
     fn a_directory_others_read_is_closed_to_them() {
-        let (dir, name) = store("closed");
+        let (_root, dir, name) = store("closed");
         std::fs::create_dir(&dir).unwrap();
         chmod(&dir, 0o755);
         assert_eq!(private(&dir, &name).unwrap(), None);
@@ -53,7 +52,7 @@ mod unix {
     #[test]
     fn a_directory_others_write_is_refused_and_left_as_it_is() {
         for refused in [0o770, 0o707, 0o777] {
-            let (dir, name) = store(&format!("open-{refused:o}"));
+            let (_root, dir, name) = store(&format!("open-{refused:o}"));
             std::fs::create_dir(&dir).unwrap();
             chmod(&dir, refused);
             assert_eq!(
@@ -67,7 +66,7 @@ mod unix {
 
     #[test]
     fn a_file_anyone_may_write_is_refused_by_its_name() {
-        let (dir, name) = store("file");
+        let (_root, dir, name) = store("file");
         std::fs::create_dir_all(dir.join("packs")).unwrap();
         std::fs::write(dir.join("packs/a"), b"a").unwrap();
         chmod(&dir.join("packs/a"), 0o646);
@@ -79,7 +78,7 @@ mod unix {
     /// reach the files, refused while it can.
     #[test]
     fn a_file_its_group_may_write_is_refused_only_while_the_group_gets_in() {
-        let (dir, name) = store("group");
+        let (_root, dir, name) = store("group");
         std::fs::create_dir(&dir).unwrap();
         chmod(&dir, 0o700);
         std::fs::write(dir.join("index"), b"i").unwrap();
@@ -92,7 +91,7 @@ mod unix {
 
     #[test]
     fn a_link_is_checked_by_what_it_points_at() {
-        let (dir, name) = store("link");
+        let (_root, dir, name) = store("link");
         std::fs::create_dir(&dir).unwrap();
         let outside = dir.parent().unwrap().join("outside");
         std::fs::write(&outside, b"o").unwrap();

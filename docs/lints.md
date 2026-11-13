@@ -1,6 +1,6 @@
 ---
 status: current
-summary: The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them; then the three guard lints of `blaze::internal` that ask for a stated reason on the line (`durable_write`, `unbounded_wait`, `combined_identity`).
+summary: The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them; then the three guard lints of `blaze::internal` that ask for a stated reason on the line (`durable_write`, `unbounded_wait`, `combined_identity`), and `implicit_allocator`, which no comment keeps: don't allocate where a borrow or a buffer does, else name the allocator, `Global` included, with a fix to the explicit form; the gate counts the `// alloc:` lines left to convert and the explicit `Global` uses.
 ---
 # The general lints
 
@@ -637,6 +637,36 @@ packed byte stream each value writes its tag and its own fields into, which keep
 enum.
 
 **Allowing it.** `#[expect(blaze::enum_vec_padded, reason = "..")]` on the struct.
+
+## `env_read`
+
+In `blaze::internal`; `deny` in blaze's workspace (the `lints-ratchet` table of Cargo.toml).
+
+**What it catches.** A read of the process's environment, `std::env::var`, `var_os`, `vars`
+or `vars_os`, in a module that `clippy.toml`'s `env-read-allowed` does not name. The function
+is found by what a path or a method call resolves to (through a `use`, an alias or a
+re-export), one finding per function per body, at its first use, with its count. A module
+named there is allowed itself, not the modules below it.
+
+**Why it matters.** A setting read where it is used is an input no key says (rule
+keys-cover-every-input), that a test can set only for the whole process, and that two reads of
+one name can default differently (rule no-fallback); `vars` is every such input at once. It
+was `.clippy.toml`'s `disallowed-methods` ban, at warn, where about 170 reads stood unremarked.
+
+**How to fix it.** Read the setting once, typed, with no default for a missing value, in a
+settings module (`base_db::settings`, `blaze_core::home`, `blaze_std::rt` are the ones named
+now), and hand it to the code that needs it. A process that hands its whole environment on (a
+client to its daemon, a runner to a child) says so where it reads it.
+
+**The instance.** `std::env::vars_os()` filtered to UTF-8 pairs in three places of
+blaze-cargo's command line (cli.rs, cli/clean.rs, cli/own.rs, whose `env()` is the one home)
+and two of blaze-thin's main.rs.
+
+**Not found.** A build script (`build_script_ambient` holds it), test code, `env!` and
+`option_env!` (the compile reads those, and keys by them).
+
+**Allowing it.** `#[expect(blaze::env_read, reason = "..")]` on the function, saying who
+the environment is handed to; or the module's path in `env-read-allowed`.
 
 ## `false_sharing`
 
@@ -1617,6 +1647,11 @@ which lints report the row in this one's place where they are on:
 | `std::collections::{BTreeMap, BTreeSet, VecDeque, BinaryHeap, LinkedList}::{new, with_capacity, from, from_iter, default}` | global-heap allocation | its `new_in(alloc)`, in the allocator the code was handed | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
 | `std::path::{PathBuf}::{new, with_capacity, from, default}` | global-heap allocation | `bstd::path::Path`, relative and beneath a `Dir`; an owned one is `mem::PathBuf<A>` in an allocator | no | `blaze::hot_alloc`, `blaze::implicit_allocator` |
 
+"fix" is this lint's. Where `blaze::implicit_allocator` reports a global-heap row in its place,
+its own fix writes the explicit `Global` form for `Vec`'s and `Box::new`'s rows, the empty
+`vec![]` and the collections with an `_in` constructor, in a crate with `allocator_api`, and for
+no `String`, `to_string`, `format!` or `PathBuf` row: [its table](#implicit_allocator) says which.
+
 Never found, because bstd re-exports it unchanged and it reaches nothing: `core::option`,
 `core::result`, `core::iter`, `core::slice`, `core::str`, `core::num`, `core::cmp`,
 `core::ops`, `core::mem`, `core::convert`, `core::fmt` and `core::time::Duration`. A function
@@ -1898,8 +1933,10 @@ widen it with `as usize` where it indexes; check the length where the container 
 
 Three lints of `blaze::internal` (allowed unless a workspace turns the group on, as blaze's own
 does) each hold a rule whose absence let bad code be written (rule `guard-the-cause`). Each asks
-for a comment that states a reason on the line, as `// alloc: <why>` does, read on the finding's
-line or the line above; an empty reason keeps nothing. None is linted in tests.
+for a comment that states a reason on the line (`// durable: <why>`, `// wakes: <who>`,
+`// identity: <why>`), read on the finding's line or the line above; an empty reason keeps
+nothing. None is linted in tests. `implicit_allocator`, the last below, is the exception: no
+comment keeps it, as no comment stands in for an allocator.
 
 ## `durable_write`
 
@@ -1983,3 +2020,409 @@ a bare integer or array with no `ContentId` in the function's signature or the o
 **Allowing it.** An XOR or a sum that makes no identity (a shard index, a checksum of one
 buffer, a hash function's own rounds) says so with `// identity: <why>`, or
 `#[expect(blaze::combined_identity, reason = "..")]`.
+
+## `implicit_allocator`
+
+**The rule.** In this order (rule `bump-allocate`, 2026-11-13): first, don't allocate where a
+borrow, a fixed buffer or the caller's buffer does; second, where an allocation is needed,
+allocate by lifetime and name the allocator: a task's frame (`Vec::new_in(frame)` from
+`blaze_mem::frame::current`), a request's `ArenaLocal`, an image value's `Kept`, or, for the
+global heap, `Global` itself (`Vec::new_in(Global)`). Never implied, and no comment stands in for
+it.
+
+**What it catches.**
+
+- A call that makes a default-allocator value none of its inputs holds: `Vec::new()`,
+  `Vec::with_capacity(n)`, `vec![..]`, `Box::new(..)`, `String::from(..)`, `format!(..)`,
+  `collect()`.
+- A copy, even of an input that already holds the type: a resolved `Clone::clone`,
+  `ToOwned::to_owned`, `ToString::to_string` or `<[T]>::to_vec` whose value holds one. A clone of
+  an `Arc` or `Rc` is a count, not a copy, and is not found.
+- A `let` whose binding holds what such a call made.
+- A written type of std's that takes no allocator and owns heap memory: `String`, `PathBuf`,
+  `OsString`, `CString`, std's `HashMap` and `HashSet`; a `Cow` of `str`, `[T]`, `Path`,
+  `OsStr` or `CStr`, whose `Owned` is one of them.
+- A type of a dependency that takes no allocator but holds one of these, found by walking its
+  fields transitively (cached per type, a cycle cut): `BufReader`, `BufWriter`, `Command`,
+  channels, `indexmap`, `smallvec`, `bytes`, `serde_json::Value`, `regex::Regex`. The message
+  names the field: "`X` takes no allocator but holds a `Vec` (its field `buf`), so it allocates
+  from the global heap". The workspace's own crates, whose allocations the lint finds where they
+  are made, and `papaya` are not walked.
+
+A type written with an allocator parameter left to its default, `Vec<T>` or `Box<T>`, is not a
+finding where it is written: `Vec<T>` is `Vec<T, Global>`, so the allocation is found where the
+value is made, and a signature need not change. A call given `Global` (`Vec::new_in(Global)`) is
+not a finding. The allocator parameter is found by what it is (bounded by `Allocator` or
+defaulting to `Global`), not by its name. It is `deny` in blaze's workspace, with
+`blaze::hot_alloc`.
+
+**Why it matters.** A value on the global heap belongs to no lifetime: it is freed object by
+object, whenever its last owner drops it, and no task's release frees it. A value in its task's
+frame goes, all at once, when the task does. An allocation not made costs nothing at all; one
+whose allocator is named can be moved to a frame later by changing one argument, and is counted
+until it is.
+
+**How to fix it.** Each finding's help leads with the form that does not allocate, where one
+exists:
+
+| found | first, no allocation | then, named |
+|---|---|---|
+| `to_owned`, `clone`, `to_vec` | a borrow (`&str`, `&[T]`, `&T`) | `slice.to_vec_in(alloc)`, `blaze_mem::String::from_str_in(s, alloc)` |
+| `format!`, `to_string` | `blaze_mem::format_into!(&mut buf, ..)` into the caller's buffer, or `write!` | `blaze_mem::format_in!(alloc, ..)` |
+| `vec![a, b, ..]` | an array `[a, b, ..]`, or the caller's slice | `Vec::with_capacity_in(n, alloc)` and its pushes |
+| `collect()` | pass the iterator on | `Vec::with_capacity_in(n, alloc)` and `extend` |
+| `Vec::new()`, `Box::new(..)`, `String::from(..)` | a fixed buffer or the caller's | `Vec::new_in(alloc)`, `Box::new_in(x, alloc)`, `blaze_mem::String::from_str_in(s, alloc)` |
+
+`blaze_mem::String<A>`, `PathBuf<A>`, `OsString<A>` and `blaze_hash::HashMap<K, V, A>` name an
+allocator where std's types do not.
+
+**The fix.** `blaze check --fix` writes the explicit global form, which keeps the meaning exactly:
+not allocating, or allocating in the task's frame, is the better change and is made by hand (the
+help says so). It is given where the crate root enables `#![feature(allocator_api)]` (a fix
+cannot add the gate from another file; 74 of 150 crates have it) and the type has the `_in`
+constructor:
+
+| std's row | the lint's fix |
+|---|---|
+| `Vec::new()`, `Vec::with_capacity(n)` | yes: `Vec::new_in(Global)`, `Vec::with_capacity_in(n, Global)` |
+| `vec![]` | the empty one only: `Vec::new_in(Global)`; the tree has no `vec_in!`, so `vec![a, b]` has none |
+| `Box::new(x)` | yes: `Box::new_in(x, Global)`; `Box::pin`, `from`, `default`: no |
+| `VecDeque`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, `LinkedList` `new`/`with_capacity` | yes, where the type has `new_in`/`with_capacity_in` |
+| `String`, `to_string`, `format!` | no: the explicit form is `blaze_mem::String`, another type (below) |
+| `PathBuf`, `OsString`, std's `HashMap`/`HashSet` | no: another type |
+| `collect()`, `clone`, `to_owned`, `to_vec` | no |
+
+`Global` is named as it resolves at the site: `Global` where it is in scope, the path to it
+where something else is, and where nothing is, the fix adds `use std::alloc::Global;` (by name
+resolution) before the first item of the innermost module. Many findings in one file each want
+that import; `--fix` applies one of them and the rest on its next pass (it runs up to four).
+
+**What a type change costs.** `Vec<T>` and `Vec<T, Global>` are one type, and so are `Box<T>`,
+`VecDeque<T>`, `BTreeMap<K, V>` and the rest with an allocator parameter: the fix changes a
+constructor and nothing else, and no signature or caller moves. It is not one type for `String`,
+`PathBuf`, `OsString` and std's `HashMap`/`HashSet`, which take no allocator: their explicit
+form is `blaze_mem::String<Global>`, `blaze_mem::PathBuf<Global>` or
+`blaze_hash::HashMap<K, V, Global>`, so the change reaches every signature the value passes
+through, a whole port (rule `whole-ports`), and no fix makes it.
+
+**Allowing it.** No comment: `// alloc: <why>` keeps nothing since 2026-11-13. An item that must
+keep the global heap implied says why with `#[expect(blaze::implicit_allocator, reason = "..")]`.
+`scripts/src/bin/allocs.rs`, a step of the gate's `scripts` job that needs no compiler, holds
+each crate, outside tests, to its row of `crates/blaze-lints/baselines/alloc-sites.txt`, in three
+columns:
+
+- `comments`: the `// alloc:` lines left to convert. It only goes down, to 0; once no crate has
+  a row, every such line anywhere is refused.
+- `expects`: the `allow`/`expect`s of this lint. It only goes down.
+- `global`: the lines whose code names `Global`, the number moving to frames brings down. It
+  rises while `// alloc:` lines are converted to it, and only goes down once none is left.
+
+A crate over a row fails, naming the new lines; a crate under one fails until the row is
+lowered (`{"command": "write"}`); a crate with no row, every new crate, is held to 0.
+
+## `untied_child`
+
+**The rule.** A process a test starts ends with the test: its `std::process::Child` is owned by
+`stdx::JodChild`, which kills and reaps it on drop, and a `blaze` it runs is told to let its
+daemon exit once nothing holds it (`BLAZE_DAEMON_EXIT_UNHELD`,
+crates/blaze-cargo/src/serve/unheld.rs `VAR`).
+
+**What it catches.** In test code (a body under `#[test]` or `#[cfg(test)]`, and every body of
+an integration test target): a call whose value is a `Child` or a `Result` of one, that is
+`std::process::Command::spawn` by name resolution or a function of the tree that wraps it (one
+whose return type is a `Child` or a `Result` of one), unless the value goes straight into a
+`JodChild` (`JodChild(cmd.spawn()?)`, `cmd.spawn().map(JodChild)`, through `?`, `unwrap`,
+`expect`, `map_err`, `context`) or is waited for there and then (`cmd.spawn()?.wait()`). A
+wrapper's own body is not linted; its callers are. And a `Command::new(env!("CARGO_BIN_EXE_blaze"))`
+in a body that sets no `BLAZE_DAEMON_EXIT_UNHELD`: the body is taken to set it when it calls
+`Command::env` with that key or a key that is not a literal, calls `Command::envs`, hands a
+`Command` to a function of the tree, or returns one. `status()` and `output()` wait for their
+child, but not for a daemon the child started, so this half applies to them too.
+
+**Why it matters.** A dropped `Child` is neither killed nor waited for, so a test that panics or
+fails on an assert before its `kill` leaves its process running, and a daemon a test's `blaze`
+starts outlives the test however it ended. 44 daemons ran at once and 8 were orphaned when
+tests were killed at their time cap.
+
+**The fix.** `stdx::JodChild::spawn(command)`, or `.spawn().map(stdx::JodChild)` on a spawn
+written in a chain (the fix offered, `MaybeIncorrect`, where the crate depends on `stdx`: a use
+of the child by value, such as `wait_with_output`, then goes through `into_inner`). A struct
+that keeps the child keeps the `JodChild`, not a `Child` with a hand-written `Drop` that kills
+it. On a command that runs `blaze`: `.env("BLAZE_DAEMON_EXIT_UNHELD", "on")`.
+
+**Not found.** A path to blaze held in a variable or a field (`Command::new(&self.blaze)`):
+what it names is known only at run time. A `Child` handed into a function or struct that wraps
+it in a `JodChild` (its type holds one) counts as owned.
+
+**Allowing it.** `#[expect(blaze::untied_child, reason = "..")]` naming what ends the process
+instead (a crate below `stdx`, which cannot name `JodChild`, is one).
+
+## `unbounded_test_wait`
+
+**The rule.** Every wait in a test has a deadline and fails naming what it waited for (rule
+`bounded-progress`). What a test waits on is the code under test, which is what may be broken.
+
+**What it catches.** In test code (a `#[test]` function, anything under `#[cfg(test)]`, every
+body of an integration test's crate): a call of `std::thread::park`; of `Condvar::wait` or
+`wait_while` (std's, `parking_lot`'s) or `blaze_core::lock::Signal`'s `wait` or `wait_while`; of a
+function of `blaze_core::wait` given `None` for its deadline, written out; of a channel's
+`Receiver::recv` (std's, `crossbeam_channel`'s); of `std::process::Child::wait` or
+`wait_with_output`, unless the same child was killed earlier in the same block. And a `loop` or
+`while` loop around `Child::try_wait` that neither sleeps nor waits (one that does is
+`open_wait_loop`'s) and compares no deadline or round count where it ends, by a `break`, a
+`return` or a panic. Calls are resolved by name, so a renamed import counts.
+
+**Why it matters.** A test sat ten hours in `thread::park`: the code under test never unparked
+it, and nothing said what it waited for, so the run held the machine until someone looked. A
+test that waits to a deadline fails in seconds and names the wait. This is `unbounded_wait`'s
+twin, not that lint widened: outside a test a channel's `recv` and a thread's `join` are ended by
+the other side's end, and `// wakes: <who>` can name what always wakes a park; in a test the
+other side is the code under test, whose bug is the hang, so neither answer holds and there is
+no `// wakes:` exemption. `unbounded_wait` leaves all test code to this lint.
+
+**The fix.** `rx.recv_timeout(WAIT).expect("<what was awaited>")`; for a child,
+`stdx::child::exit_within(&mut child, "<what>", WAIT)` or `stdx::child::output_within(child,
+"<what>", WAIT)`, which kill a child still running at the deadline and panic naming it; a park
+or condition wait to a deadline (`park_timeout`, `Condvar::wait_timeout`, `Signal::wait_for`) in
+a loop that compares `elapsed()`; a `blaze_core::wait` call given `Some(deadline)`; a `try_wait`
+loop that compares a deadline or a round count and panics naming what hung.
+
+**Not found.** `JoinHandle::join`: a joined thread hangs only in a wait of its own, found where it
+is written; every join would be about 450 findings, nearly all of threads that only compute.
+`Barrier::wait` (`.clippy.toml` bans `std::sync::Barrier`; the tests that keep one use it as a
+start gate). `Command::output` and `status`, which the tree's tests use for tools that end
+(`git`, `cc`, `kill`). A loop around `try_recv`, as often a drain as a wait. A deadline that is
+`None` only at run time, and a reap after a bounded wait already saw the child exit.
+
+**Allowing it.** `#[expect(blaze::unbounded_test_wait, reason = "<what bounds it>")]`, for a wait
+something the lint cannot see bounds (a reap after `wait::exited` saw the child exit).
+
+## `reads_positions`
+
+**The rule.** A query of the front end reads only position-free forms (the body, the
+signatures, the item tree, the outline); positions are read only by functions marked
+`#[blaze::renders_positions]`, whose output is about where code is written (rules
+`semantics-in-front-end` and `keys-cover-every-input`).
+
+**What it catches.** In `hir_def`, `hir_ty`, `hir_ty_mir`, `hir_ty_borrowck`, `hir_ty_unsafeck`,
+`hir_ty_pure`, `hir_ty_codegen`, `blaze_items` and `blaze_item_hash`, a call, closures included,
+from a function not marked `#[blaze::renders_positions]` of a reader: `EditionedFileId::parse`;
+`HirFileId::{root, parse_or_expand, ast_id_map}`; `InFile`'s (an `AstId`'s, an `InFile<AstPtr>`'s)
+`root`, `file_syntax`, `to_node`, `to_view`, `to_ptr`, `to_range`; any associated `source_map`,
+`relative`, `unmoved_source_map`, `unmoved` or `with_source_map` of `hir_def` (`Body`'s,
+`ExpressionStore`'s, each signature's, `VariantFields`', `GenericParams`'); a source map's
+`*_syntax` methods and `self_param`; any `source_view` or `*_source_view`; `HasSource::source`
+and `ast_ptr`; and any function marked `#[blaze::renders_positions]`. The allowance passes to a
+callee only through a marked function: an unmarked helper that reads a position is found even if
+only marked functions call it, and an unmarked function that calls a marked one is found.
+Not found: the base readers' own bodies; `hir_def`'s lowering modules (`item_tree`, `nameres`,
+`expr_store`, `signatures`, `src`), which build the position-free forms and their source maps from
+the syntax and are held to their firewalls by their own equality checks; tests; a reader passed
+as a value rather than called.
+
+**Why it matters.** A query that reads a position depends on every edit above it in its file, a
+comment included, so its result is never kept across one. Every borrow check read its body's
+source map, so no borrow-check result was ever kept; `const_check` and the attribute queries
+read the whole file's parse and reran on any edit of it.
+
+**The fix.** Read the fact the position stood in for from the lowered form:
+`ExpressionStore::is_synthesized` in place of `source_map.expr_syntax(e).is_err()`, an item's
+syntax off the outline (`signatures::outline_item`) in place of `AstId::to_view`. Where the output
+is about positions (a diagnostic's words, debug info, a link's span tables, an IDE lookup), mark
+the function `#[blaze::renders_positions]` (`#![feature(register_tool)]` and
+`#![register_tool(blaze)]` at the crate root), and record the span in the query so the wording
+happens in a marked function at the edge.
+
+**Allowing it.** `#[expect(blaze::reads_positions, reason = "<what must change>")]` on the
+function.
+
+## `cbor_field_order`
+
+**What it catches.** In a module marked `#![blaze::canonical_cbor]` (or under one: the marker on
+a crate root covers the crate), a struct, or a struct variant of an enum, that derives
+`Serialize` (serde's own, `serde::Serialize` or `serde_derive`'s, or `blaze_serde`'s, found by
+name resolution) with its fields declared out of the order of their keys' encoding: shorter
+key first, then bytewise. A field's key is its `#[serde(rename = "..")]` (the `serialize` side
+of `rename(..)`), else its name after the container's case rule (a struct's `rename_all`, a
+variant's own `rename_all`, else its enum's `rename_all_fields`). A `#[serde(skip)]` or
+`skip_serializing` field is no key. The message names the item, the first field out of place
+and the field it goes before, with both keys.
+
+**Why it matters.** RFC 8949's core deterministic CBOR (`blaze_protocol::cbor`) writes a map's
+keys in the bytewise order of their encodings. A type declared in that order is written as it
+comes; one declared in another has its entries found again, sorted and copied at the end of the
+map. blaze-api's module doc promised the order for every struct, and seven of its structs broke
+it: only the codec test's "written out of order" assertion
+(`crates/blaze-api/src/frames/identity.rs`) found them, by chance of what its generator built.
+serde's derive is crates.io's, not the tree's, so the promise is checked here, at the definition.
+
+**The fix.** Move each field's whole text (attributes, doc comments and the comments attached to
+it) into the order; `blaze check --fix` does, a skipped field keeping its place. The fix is
+offered as maybe-incorrect, with a note, when the type derives `PartialOrd`, `Ord` or `Hash`
+(the derived comparison or hash follows the declaration order, so the reorder changes what it
+computes) or when a comment between the fields belongs to neither (it stays where it is).
+
+**Not found.** A `#[serde(flatten)]` field, `#[serde(transparent)]`, `#[serde(into = "..")]`, a
+`#[serde(..)]` inside a `cfg_attr`, a case rule other than `lowercase`, `UPPERCASE`,
+`PascalCase`, `camelCase`, `snake_case`, `SCREAMING_SNAKE_CASE`, `kebab-case` and
+`SCREAMING-KEBAB-CASE`, and a rename that is not a plain string literal: the keys can't be told
+from the syntax. An internally tagged item's tag, which the derive writes first wherever its key
+sorts. Test code, an item a macro wrote (`blaze_protocol::in_key_order!`), an item in a function
+body.
+
+**Allowing it.** `#[expect(blaze::cbor_field_order, reason = "..")]` on the item (or the
+variant), naming what needs the declaration order (blaze-api's `Envelope` keeps `schema` first
+for its JSON line and writes its CBOR by hand in key order).
+
+## `gapped_literal`
+
+**What it catches.** A string literal written in the file (`".."`, `b".."`, `c".."`, in code
+or a macro call's input, tests included) with a run of eight or more spaces on one of its
+source lines between two characters of its text. Neither neighbour may be whitespace, the
+opening quote, an escape `\n`, `\r` or `\t`, or a format placeholder `{..}` (`{{` and `}}`
+count as text). A raw literal is never a finding.
+
+**Why it matters.** A `\` at the end of a literal's line skips the newline and the next line's
+leading whitespace. When the `\` and the newline are lost, the lines join and the value keeps
+the indentation, so the message prints with a gap. Two lanes' scripts broke continuations this
+way, and the gaps shipped (`agents/annoyances/lost-line-continuations.json`).
+
+**The fix.** Put the `\` and the newline back; the suggestion does it. It is machine-applicable
+when the run, less one space, is a whole indentation, which is the shape a joined continuation
+leaves. A table or a picture aligned on purpose becomes a raw literal where that keeps its value.
+
+**Allowing it.** `#[expect(blaze::gapped_literal, reason = "<what is aligned>")]` on the item
+holding the literal, for example a test of a diagnostic picture.
+
+## `retry`
+
+**What it catches.** Outside tests, either of these:
+- A comparison with a count whose name has a `_`-separated word `retry`, `retries`, `retried`,
+  `attempt`, `attempts`, `tries` or `failures`, against a constant bound. The bound is an
+  integer literal other than `0` and `1`, a `const` or `static`, or another count named the
+  same way.
+- A `for` loop over a range that ends at such a constant, or whose pattern binds such a name.
+
+**Why it matters.** Rule `no-fallback`: no retry, ever. A retry repeats the failure, hides its
+first cause, and makes how long an operation takes depend on how often it fails. blaze-cas's
+`FAILURES_MOST = 8` repeated failed IO eight times before it said anything.
+
+**The fix.** Remove the loop. The first failure is the error: typed, and naming what failed and
+where.
+
+**False positives.** Few are expected. One is a count of reported failures compared with a
+threshold for listing them, which is not a retry. `failures == 0` and `failures > 1` are not
+findings.
+
+**Allowing it.** `#[expect(blaze::retry, reason = "..")]` on the function, saying why it is not
+a retry or what must change.
+
+## `unwired`
+
+**What it catches.** Outside tests, an `#[allow(..)]` or `#[expect(..)]` whose list names
+`dead_code` or `unused`, outer or inner, written plainly or in a `cfg_attr` the build keeps. It
+must be on an item, an associated item, a field or a variant. Other lints of the `unused` group
+are not findings. Neither is the attribute on a `use`, on `extern crate`, on a statement, on an
+expression or on a parameter.
+
+**Why it matters.** Whole designs sat written and never wired in: `mod found`, and
+`job/certificate.rs`. The attribute hid that nothing called them, so they rotted unseen.
+
+**The fix.** Do one of these:
+- Wire the item where it was meant to be used.
+- Delete it.
+- If it is used only on some targets, give it their `cfg`.
+
+**Allowing it.** `#[expect(blaze::unwired, reason = "<what wires it, and when>")]` beside the
+attribute. This is the one way to keep one.
+
+## `tmp_path`
+
+**What it catches.** Either of these:
+- A string literal, raw or not, tests included, whose value starts with `/tmp`, `/private/tmp`
+  or `/var/tmp`, followed by the literal's end or a `/`.
+- A use of `std::env::temp_dir`, a call or the function named as a value, found by name
+  resolution, outside the module `temp` of `blaze_core`.
+
+**Why it matters.** Test homes made there by hand leaked, one per run. A reboot also wiped a
+round's notes that were kept there.
+
+**The fix.** `blaze_core::temp::TempDir` is the one helper. `TempDir::new(prefix)` makes a
+directory of its own, and `TempDir::for_test(prefix)` does the same in a test. Either is removed
+with everything it holds when it drops, so hold it for as long as the directory is used. A file
+that must sit beside the system's temporary files takes its directory from
+`blaze_core::temp::base()`. `stdx::tempfile::NamedTempDir` and `blaze_script::TempDir` were the
+same helper again, and they go.
+
+**Allowing it.** `#[expect(blaze::tmp_path, reason = "..")]` on the item, for a literal that names
+the real `/tmp` as policy, such as a sandbox profile or a mount table.
+
+## `narrowed_len`
+
+**What it catches.** Outside tests, `T::try_from(x)` or `x.try_into()` to an integer type
+narrower than `x`'s, unwrapped at once with `.expect(..)` or `.unwrap()`, where `x` names a
+length. That means `x` holds a call of `len`, `count`, `size` or `size_of`, or a path or field
+whose name has a `_`-separated word `len`, `length`, `size`, `offset`, `count` or `bytes`.
+`usize` and `isize` count as 32 bits wide as a target and 64 as a source. An `as` cast is
+`lossy_as`'s. A handled error (`map_err(..)?`, `unwrap_or(..)`) is not a finding.
+
+**Why it matters.** A 4 GiB file panicked the daemon's main thread at "a record under 4 GiB". A
+length is as large as its input.
+
+**The fix.** Return a typed error that names the thing and its size, such as
+`map_err(|_| Error::RecordTooLarge { what, len })?`.
+
+**Allowing it.** `#[expect(blaze::narrowed_len, reason = "<the bound and where it is checked>")]`
+on the function, where a check just before bounds the value.
+
+## `process_static`
+
+**What it catches.** Outside tests, a `static` or a key of a `thread_local!` whose resolved type
+holds either of these:
+- A growable collection (`Vec`, `VecDeque`, `BinaryHeap`, `LinkedList`, `String`, `PathBuf`,
+  `OsString`, and the hash and B-tree maps and sets of std, hashbrown, blaze_hash and indexmap)
+  beneath a lock or a cell. That means std's `Mutex`, `RwLock`, `RefCell`, `Cell` and
+  `UnsafeCell`, `blaze_core::lock`'s `Lock` and `ReadLock`, and any `*Lock` or `*Mutex` other
+  than `LazyLock` and `OnceLock`.
+- A concurrent collection: papaya's and dashmap's maps and sets, or crossbeam's `SegQueue`.
+
+The type is followed through once-cells, `Option`, `Arc`, `Rc`, `Box`, tuples, arrays and the
+fields of the tree's own types, up to four types deep. These are not findings: atomics, plain
+data, a collection that is set once and has no lock or cell inside (`OnceLock<Vec<T>>`), and an
+`ArrayQueue`. `global_state` names every interior-mutable static for the edition; this lint is
+the narrow deny of the ones that grow.
+
+**Why it matters.** Codegen's `KEPT`, `WITNESSES` and `FOUND` grew for the daemon's whole life,
+which is days. Every build after the first read what the earlier ones had left.
+
+**The fix.** Give the state an owner with a lifetime, such as the daemon, a build or a task, so
+that something drops it.
+
+**Allowing it.** `#[expect(blaze::process_static, reason = "<what bounds it>")]` on the static,
+or on the `thread_local!` call for one of its keys. A per-thread spare pool states its cap.
+
+## `hash_order_output`
+
+**What it catches.** A hash map's or set's iteration (`iter`, `keys`, `values`, `drain`,
+`into_iter`, and their forms) whose order reaches output, with no sort in between:
+- It is collected into a `Vec`, `VecDeque` or `String` that is returned, stored, or handed to a
+  call, directly or through its local.
+- That local, never sorted, has an element picked by its place (`first`, `last`, `get`, `pop`),
+  or is looped over by a loop that writes, hashes or pushes.
+- A `for` loop over it pushes, writes or hashes.
+- The chain ends in a method that picks one element by its place in the order: `next`, `last`,
+  `nth`, `find`, `find_map`, `position`, or `max_by`, `min_by` and their `_key` forms, which
+  keep the first or the last of a tie.
+- It is `extend`ed into an ordered collection that is not sorted after.
+
+`default_hasher` is the hasher's choice, not the order's.
+
+**Why it matters.** Rule `deterministic-output`: a hash table's order depends on its hasher and
+its history, so the output differs between runs. The picking ends and `extend` were added on
+2026-11-13 (lane A, class A7). Each of them took one element, or a whole order, from a table
+with no sort, and the lint did not see it.
+
+**The fix.** Sort what comes out, choose by key rather than by place, or keep the data in a
+`BTreeMap` or in an ordered `Vec`.
+
+**Allowing it.** `#[expect(blaze::hash_order_output, reason = "..")]` on the item.

@@ -477,6 +477,10 @@ pub struct Spans {
     contexts: Vec<SyntaxContext>,
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "one per-thread shelf holding the room of the last Spans dropped there, uncapped: it keeps the most spans one call grew"
+)]
 thread_local! {
     /// The room of the last [`Spans`] dropped on this thread.
     // alloc: none, an empty shelf; what it keeps is grown by the calls.
@@ -738,7 +742,8 @@ mod budget {
             store.complete(completion, effects);
         }).expect("the effects end");
         assert!(store.ready());
-        let lib = std::env::temp_dir().join(format!("blaze-kept-budget-{}", std::process::id()));
+        let held = blaze_core::temp::TempDir::for_test("blaze-kept-budget-");
+        let lib = held.join("lib");
         std::fs::write(&lib, b"a macro's library").unwrap();
         let hash = inputs::hash_reader(b"a macro's library".as_slice()).unwrap();
         let run = RunKey {
@@ -775,7 +780,7 @@ mod budget {
             &mut find
         ));
         drop(guard);
-        _ = std::fs::remove_file(&lib);
+        drop(held);
     }
 
     /// What an expansion that read a file reports is what [`reads_in`] works out of its shape
@@ -792,7 +797,8 @@ mod budget {
             store.complete(completion, effects);
         }).expect("the effects end");
         assert!(store.ready());
-        let read = std::env::temp_dir().join(format!("blaze-kept-reads-{}", std::process::id()));
+        let held = blaze_core::temp::TempDir::for_test("blaze-kept-reads-");
+        let read = held.join("read");
         std::fs::write(&read, b"included").unwrap();
         let hash = inputs::hash_reader(b"included".as_slice()).unwrap();
         let traced = Traced {
@@ -826,6 +832,6 @@ mod budget {
         assert_ne!(reads_in(&[], &other, &shape), Ok(reported));
         std::fs::write(&read, b"included, and changed").unwrap();
         assert_ne!(reads_in(&[], &call, &shape), Ok(reported));
-        _ = std::fs::remove_file(&read);
+        drop(held);
     }
 }

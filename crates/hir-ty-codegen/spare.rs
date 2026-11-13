@@ -28,6 +28,10 @@ const LARGEST: usize = super::SINGLE_PASS;
 /// kept, as a context of more than [`LARGEST`] instructions is.
 const LARGEST_ROWS: usize = 1 << 16;
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread spare shelves capped at KEPT of each kind, a context past LARGEST instructions or a list past LARGEST_ROWS let go"
+)]
 thread_local! {
     // alloc: none, an empty shelf
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };

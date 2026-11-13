@@ -1,0 +1,12 @@
+{
+  "name": "blaze",
+  "description": "blaze's plugins for coding agents.",
+  "owner": { "name": "indexable-inc", "url": "https://github.com/indexable-inc" },
+  "plugins": [
+    {
+      "name": "blaze",
+      "source": "./plugins",
+      "description": "After every write of a Rust file, the new errors and warnings blaze check has for it."
+    }
+  ]
+}

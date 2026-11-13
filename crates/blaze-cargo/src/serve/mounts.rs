@@ -196,8 +196,9 @@ impl Mounts {
         source: Source,
     ) -> Result<(Mount, Ticket), String> {
         let Source { files, under } = source;
-        let files = files.into_iter().map(|file| (file.path, file.bytes, file.mode));
-        let root = vfs.apply_files(vfs.empty(), files).map_err(|error| {
+        // Each file's ID was made where its bytes were read (or listed): none is hashed again.
+        let files = files.into_iter().map(|file| (file.path, file.id, file.bytes, file.mode));
+        let root = vfs.apply_known_files(vfs.empty(), files).map_err(|error| {
             format!("the files of the source for {at} don't make a tree: {}", op_error(&error))
         })?;
         let mount = Mount { at: at.to_owned(), origin: Origin::Root(root), under };
@@ -294,10 +295,12 @@ mod tests {
         Source {
             files: files
                 .iter()
-                .map(|(path, bytes)| SourceFile {
-                    path: (*path).to_owned(),
-                    bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes),
-                    mode: Mode::Regular,
+                .map(|(path, bytes)| {
+                    SourceFile::of(
+                        (*path).to_owned(),
+                        blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes),
+                        Mode::Regular,
+                    )
                 })
                 .collect(),
             under: under.to_owned(),

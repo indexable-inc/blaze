@@ -18,9 +18,12 @@
 //!   counts arenas committed whole and never touched, so no footprint), `blaze-mem resident bytes`
 //!   (blaze-mem's committed pages less the purged ones), `chunks warm bytes` and `chunks cold
 //!   bytes` (free chunks resident and purged), and `blocks live bytes`, `blocks warm bytes`
-//!   and `blocks cold bytes` (kept values' size classes), and the stores' buffer pools
-//!   ([`blaze_cas::pool_counts`]): `pool resident bytes`, `pool pinned bytes`, `pool loaded
-//!   bytes`, `pool prefetched bytes`, `pool evicted bytes` and `pool pinned bound waits`;
+//!   and `blocks cold bytes` (kept values' size classes), the stores' buffer pools
+//!   ([`blaze_cas::pool_counts`]): `pool resident bytes`, `store heap bytes`, `pool pinned
+//!   bytes`, `pool loaded bytes`, `pool prefetched bytes`, `pool evicted bytes` and `pool
+//!   pinned bound waits`, and the tasks' direct reads ([`blaze_cas::direct::counts`]):
+//!   `direct records read`, `direct bytes read`, `direct reads`, `direct runs`, `direct files
+//!   opened`, `direct maps`, `direct mapped bytes` and `direct leaked bytes`;
 //!   `stack bytes` (what the live fibers' stacks hold, [`blaze_graph::sched::stack::resident`])
 //!   and `threads` (the process's threads, each with a stack and heaps of its own).
 //!
@@ -65,6 +68,7 @@ macro_rules! per_tag {
             concat!($prefix, "other"),
             concat!($prefix, "solver"),
             concat!($prefix, "pool"),
+            concat!($prefix, "heap"),
         ]
     };
 }
@@ -122,9 +126,10 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     plot_named("blocks live bytes", blocks.live());
     plot_named("blocks warm bytes", blocks.warm);
     plot_named("blocks cold bytes", blocks.cold);
-    // The stores' buffer pools: what they hold resident is `Tag::Pool`'s live bytes above;
-    // these say how much of it readers pin (not the sweep's to take), the bound on that, the
-    // budget the sweep holds the pools to, and what moved through them.
+    // The stores' buffer pools, kept for the stores' own commits, opens and collections and
+    // the reads not yet on `direct` (`super::direct::pool`): what they hold resident is
+    // `Tag::Pool`'s live bytes above; these say how much of it readers pin, and what moved
+    // through them. A daemon whose tasks read through `direct` alone moves only the commits'.
     let pool = blaze_cas::pool_counts();
     plot_named("pool resident bytes", pool.resident);
     // Every store's global-heap bytes, as each last counted itself (blaze_cas::PoolCounts).
@@ -134,6 +139,19 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     plot_named("pool prefetched bytes", pool.prefetched);
     plot_named("pool evicted bytes", pool.evicted);
     plot_named("pool pinned bound waits", pool.bound_waits);
+    // The tasks' store reads through `blaze_cas::direct` (lane M3): what moved through them
+    // since the process began. Nothing they read is resident past its reader's task but what
+    // a mapping holds (`direct mapped bytes`, the kernel's page cache, shared) and what a
+    // reader keeps of its own (`direct leaked bytes`, which is a bug when not 0).
+    let direct = blaze_cas::direct::counts();
+    plot_named("direct records read", direct.records);
+    plot_named("direct bytes read", direct.bytes);
+    plot_named("direct reads", direct.reads);
+    plot_named("direct runs", direct.runs);
+    plot_named("direct files opened", direct.files_opened);
+    plot_named("direct maps", direct.maps);
+    plot_named("direct mapped bytes", direct.mapped_bytes);
+    plot_named("direct leaked bytes", direct.leaked_bytes);
     // The part of the footprint past the heaps that is not an allocator's: the fibers' stacks,
     // and the threads that each hold a stack and heaps of their own.
     blaze_profile::plot(Plot::StackBytes, blaze_graph::sched::stack::resident());

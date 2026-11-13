@@ -1461,6 +1461,11 @@ impl FlatTree {
 
     /// Pushes to `placed`, empty, where each of `splices` is in this tree and in the one they
     /// make.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a tree's ranges are u32 (TextSize), and a splice's token text is not checked \
+                  under 4 GiB before this: a larger token needs a typed refusal at the splice"
+    )]
     fn place(&self, splices: &[(u32, Splice<'_>)], placed: &mut Vec<Placed>) {
         placed.reserve(splices.len());
         for &(at, splice) in splices {

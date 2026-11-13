@@ -141,6 +141,10 @@ fn id<T: FromId>(bits: u64) -> T {
 /// `slots` (what a location macro expanded to, whose value the records fill from where the
 /// body is) is written as its kind and type, not its value. A named lifetime of `lifetimes`
 /// (the owner's lifetime parameters in scope, outermost first) is written as its index there.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the portable body writes its parameter count as a u32 word; a body with 2^32 parameters needs a typed refusal before hashing"
+)]
 pub fn portable_body(
     body: &Body,
     blank: &[u16],

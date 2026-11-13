@@ -86,6 +86,7 @@ impl Unhashable {
 
     /// The error a build stops with: the item by kind and path (or the crate), what could not
     /// be hashed, and for MIR that failed to lower, the error lowering it gave.
+    #[blaze::renders_positions]
     pub fn describe(&self, db: &Db) -> String {
         // alloc: the message a build stops with, written once at the edge.
         let mut said = match self.of {
@@ -788,6 +789,10 @@ fn deep_refs(db: &Db, id: ItemId) -> Box<[ItemId]> {
 
 /// Tarjan's algorithm from every item of `krate` not yet reached: linear in the items and refs
 /// of the crate, where a search per item is the sum of what each reaches.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a component's start is a u32 index into the crate's cycle members, at most the crate's items, and a crate's items are u32-numbered, so the count fits"
+)]
 pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> Components {
     frame::task(Tag::Other, |frame| {
         let mut tarjan = Tarjan::new(db, graph, krate, None, frame);

@@ -15,8 +15,10 @@
 //!
 //! Only what is a function of that key is kept:
 //!
-//! - an item written in a file and outside any body (one with a row in its file's index); one
-//!   a macro wrote is answered as before, until an expansion has a key of its inputs;
+//! - an item written outside any body in a file (a row in its file's index) or in an expansion
+//!   with a key of its inputs (`stored::expansion::key`; its index found by that key, with no
+//!   expansion); one an expansion with no key wrote (a proc macro's, an eager call's) is
+//!   answered as before;
 //! - of flags, every item but a module (whose attributes are of two files and the command
 //!   line);
 //! - of assoc items, an `impl` or `trait` that is `plain` (no macro call at assoc position
@@ -37,7 +39,7 @@
 //!
 //! The invariant: equal keys are equal bytes; an entry found is the answer the query makes.
 
-use base_db::{Crate, Db, EditionedFileId};
+use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use std::fmt::Write as _;
 
@@ -91,20 +93,23 @@ const TYPE: u8 = 2;
 
 /// Where an item is written and what it is made of: all a key takes.
 struct Place {
-    file: EditionedFileId,
+    /// A file, or an expansion with a key (`stored::expansion::key`).
+    file: HirFileId,
     /// Its ast id in `file`: what the file's index lists its assoc items under and an error
     /// names it by. Of the file, so never part of a key or a value.
     ast: ErasedFileAstId,
-    /// The set its entries are packed in: its file's.
+    /// The set its entries are packed in: its file's, or its expansion's key
+    /// (`stored::set_of`).
     set: ContentId,
-    /// How its file is read (`stored::read_as`).
+    /// How its text is read (`stored::set_of`).
     read_as: u8,
     krate: Crate,
     source: ItemSource,
 }
 
 /// The place of the item `lookup` names: `None` when this database keeps no entries, when a
-/// macro wrote the item, or when it has no row in its file's index (it is in a body).
+/// macro whose expansion has no key wrote the item, or when it has no row in its file's index
+/// (it is in a body).
 fn place<N: AstIdNode>(
     db: &Db,
     lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule> + Copy,
@@ -112,18 +117,12 @@ fn place<N: AstIdNode>(
     of(db)?;
     let loc = lookup.lookup(db);
     let id = loc.ast_id();
-    let HirFileId::FileId(file) = id.file_id else { return None };
+    let file = id.file_id;
     let krate = loc.krate(db);
     let ast = id.value.erase();
-    let source = stored::index::of(db, file, krate).get(ast)?;
-    Some(Place {
-        file,
-        ast,
-        set: stored::file_set(db, file),
-        read_as: stored::read_as(db, file),
-        krate,
-        source,
-    })
+    let source = stored::index::source(db, file, ast, krate)?;
+    let (set, read_as) = stored::set_of(db, file)?;
+    Some(Place { file, ast, set, read_as, krate, source })
 }
 
 /// Feeds the cfg of the place's crate where `names` says the hashed text names `cfg`; else
@@ -237,9 +236,19 @@ fn refuse(db: &Db, place: &Place, family: &'static str, why: String) -> ! {
 /// of its crate asked, its ast id, and whether its key took the crate's cfg (`cfg`). An
 /// error's path: it reads the file's text and its ast ids.
 fn says(db: &Db, place: &Place, cfg: bool) -> String {
-    let file = place.file.file_id(db);
+    let file = match place.file {
+        HirFileId::FileId(file) => file.file_id(db),
+        HirFileId::MacroFile(call) => {
+            let takes = if cfg { "takes" } else { "does not take" };
+            // alloc: error path
+            let mut out = format!("an item of the expansion {call:?} (ast id {:?}) of ", place.ast);
+            crate::span_names::write_crate_label(db, place.krate, &mut out);
+            _ = write!(out, " (its key {takes} the crate's cfg)");
+            return out;
+        }
+    };
     let text = db.file_text(file).text(db);
-    let node = HirFileId::FileId(place.file).ast_id_map(db).try_get_erased(place.ast);
+    let node = place.file.ast_id_map(db).try_get_erased(place.ast);
     let (line, first) = match node {
         Some(node) => {
             let range = node.text_range();
@@ -342,8 +351,10 @@ fn assoc(
     let Some(place) = place.filter(|it| it.source.plain) else { return make() };
     let key = assoc_key(db, whose, &place, mixed(&place));
     let file = place.file;
-    // The assoc items written in this one, by the ast ids they have in its own file.
-    let listed = stored::index::of(db, file, place.krate).assoc_items(place.ast);
+    // The assoc items written in this one, by the ast ids they have in its own file. The
+    // index is there: `place` found the impl's row in it.
+    let Some(index) = stored::index::of_any(db, file, place.krate) else { return make() };
+    let listed = index.assoc_items(place.ast);
     let read = |bytes: &[u8]| decode_assoc(db, file, listed, container, bytes);
     match entry(db, ASSOC, &place.set, key, read) {
         Ok(Some(items)) => {
@@ -380,7 +391,7 @@ fn assoc(
 /// disagreeing.
 fn encode_assoc(
     db: &Db,
-    file: EditionedFileId,
+    file: HirFileId,
     listed: AssocItems<'_>,
     items: &[(Name, AssocItemId)],
 ) -> R<Option<Vec<u8>>> {
@@ -394,7 +405,7 @@ fn encode_assoc(
             AssocItemId::ConstId(it) => (CONST, it.lookup(db).id.map(|it| it.erase())),
             AssocItemId::TypeAliasId(it) => (TYPE, it.lookup(db).id.map(|it| it.erase())),
         };
-        if id.file_id != HirFileId::FileId(file) || name.key().is_some() {
+        if id.file_id != file || name.key().is_some() {
             return Ok(None);
         }
         let text = name.symbol().as_str();
@@ -448,7 +459,7 @@ impl<'a> In<'a> {
 /// under a key that does not cover them.
 fn decode_assoc(
     db: &Db,
-    file: EditionedFileId,
+    file: HirFileId,
     listed: AssocItems<'_>,
     container: ItemContainerId,
     bytes: &[u8],
@@ -462,7 +473,6 @@ fn decode_assoc(
     let count = input.word()? as usize;
     // alloc: the query's value, one impl's items; a count the bytes cannot hold fails below
     let mut items = Vec::with_capacity(count.min(bytes.len() / 9));
-    let file = HirFileId::FileId(file);
     for _ in 0..count {
         let kind = input.take(1)?[0];
         let at = input.word()?;

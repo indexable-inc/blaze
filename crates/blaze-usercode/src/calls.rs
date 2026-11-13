@@ -434,6 +434,10 @@ const KEPT: usize = 256;
 
 /// The last run's calls of each program run in a sandbox, by the program's path, oldest
 /// first: a few dozen a build. In memory only: they explain a run of this daemon's.
+#[expect(
+    blaze::process_static,
+    reason = "capped at KEPT programs, the oldest going first; the daemon should own it"
+)]
 static LAST: blaze_core::lock::Lock<Vec<(PathBuf, Vec<Call>)>> =
     blaze_core::lock::Lock::new("usercode.calls.last", Vec::new());
 
@@ -462,8 +466,7 @@ pub fn of(program: &Path) -> Vec<Call> {
 mod tests {
     use super::*;
 
-    const MAPS: &str = "\
-55d0c8a00000-55d0c8a2c000 r--p 00000000 08:01 1311     /t/debug/build/x-1f/build-script-build
+    const MAPS: &str = r"55d0c8a00000-55d0c8a2c000 r--p 00000000 08:01 1311     /t/debug/build/x-1f/build-script-build
 55d0c8a2c000-55d0c8b10000 r-xp 0002c000 08:01 1311     /t/debug/build/x-1f/build-script-build
 55d0c9d31000-55d0c9d52000 rw-p 00000000 00:00 0        [heap]
 7f1c2a000000-7f1c2a028000 r--p 00000000 08:01 9177     /usr/lib/x86_64-linux-gnu/libc.so.6

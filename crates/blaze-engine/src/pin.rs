@@ -464,7 +464,7 @@ mod tests {
     fn the_variables_hold_only_for_the_manifest_they_name() {
         let here = Path::new("/w/a/Cargo.toml");
         assert!(names(Some(OsStr::new("/w/a/Cargo.toml")), here));
-        assert!(!names(Some(OsStr::new("/tmp/test-ws/Cargo.toml")), here));
+        assert!(!names(Some(OsStr::new("/srv/test-ws/Cargo.toml")), here));
         assert!(!names(None, here));
     }
 
@@ -484,7 +484,8 @@ mod tests {
     /// the very case [`SETTLED_NS`] keeps out of the file.
     #[test]
     fn a_kept_lookup_answers_as_the_manifests_do() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-kept-{}", std::process::id()));
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-kept-");
+        let root = tmp.path();
         let start = root.join("crates/a/src");
         std::fs::create_dir_all(&start).unwrap();
         let file = root.join("kept");
@@ -536,7 +537,6 @@ mod tests {
             "the kept lookup answers while every stamp stands"
         );
         assert_eq!(found_kept_in(&start, None).unwrap().pinned.as_deref(), Some("0.20261027.2"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The control: a manifest rewritten in place with its stamp put back is the one change
@@ -545,7 +545,8 @@ mod tests {
     /// keeps out of the file.
     #[test]
     fn the_oracle_catches_a_manifest_rewritten_under_its_stamp() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-control-{}", std::process::id()));
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-control-");
+        let root = tmp.path();
         let start = root.join("src");
         std::fs::create_dir_all(&start).unwrap();
         let file = root.join("kept");
@@ -570,12 +571,12 @@ mod tests {
             found_kept_in(&start, None).unwrap(),
             "kept and read disagree: the oracle sees it"
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn the_root_manifest_holds_the_pin() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-{}", std::process::id()));
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-");
+        let root = tmp.path();
         let member = root.join("crates/a");
         std::fs::create_dir_all(member.join("src")).unwrap();
         std::fs::write(
@@ -596,13 +597,12 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace\n").unwrap();
         assert!(matches!(pinned(&found), Err(PinError::NotToml { .. })));
         assert!(matches!(root_manifest(&member), Err(PinError::NotToml { .. })));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn a_pin_names_a_channel() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-channel-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-channel-");
+        let root = tmp.path();
         let manifest = root.join("Cargo.toml");
         for (pin, read) in
             [("stable", Ok(Some("stable"))), ("canary", Ok(Some("canary"))), ("nightly", Err(()))]
@@ -622,7 +622,6 @@ mod tests {
         assert_eq!(channel_known(&file), Some(("0.20261028.1".to_owned(), false)), "dated ahead");
         std::fs::write(&file, "../x\n").unwrap();
         assert_eq!(channel_known(&file), None);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A build of blaze's tree builds any checkout of that tree whatever it pins (the
@@ -630,8 +629,8 @@ mod tests {
     /// another pinned workspace it hands off to the pinned release as a release does.
     #[test]
     fn a_tree_build_runs_itself_in_blazes_tree_and_hands_off_elsewhere() {
-        let root = std::env::temp_dir().join(format!("blaze-pin-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-pin-tree-");
+        let root = tmp.path();
         let tree = |at: &str, name: &str| {
             let engine = root.join(at).join("crates/blaze-engine");
             std::fs::create_dir_all(&engine).unwrap();
@@ -677,7 +676,6 @@ mod tests {
         assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", false).unwrap(), Choice::Release);
         assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", true).unwrap(), Choice::Ignored);
         assert_eq!(choose("0.20261030.1", &own, "0.20261030.1", false).unwrap(), Choice::Pinned);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// `--ignore-pin` is blaze's only as the first word after `blaze`; anywhere else it is the

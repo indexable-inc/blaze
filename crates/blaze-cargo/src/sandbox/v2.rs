@@ -625,11 +625,11 @@ mod tests {
         trace::{self, Report, Seen},
     };
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-v2-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A test's directory, removed when the guard drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-v2-{name}-"));
+        let dir = made.path().to_owned();
+        (made, dir)
     }
 
     fn spec(dir: &Path, program: &str, args: &[&str], trace: bool) -> confine::Spec {
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn a_spec_with_a_field_it_does_not_know_is_refused() {
-        let dir = scratch("spec");
+        let (_made, dir) = scratch("spec");
         let file = dir.join("spec.json");
         let mut value = serde_json::to_value(spec(&dir, "/bin/true", &[], true)).unwrap();
         std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn a_report_is_written_whole_beside_and_moved_in() {
-        let dir = scratch("report");
+        let (_made, dir) = scratch("report");
         let file = dir.join("report");
         std::fs::write(&file, b"old").unwrap();
         let report = Report::NotMade("no".into());
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn a_traced_run_reads_the_whole_environment_from_the_start() {
-        let dir = scratch("begin");
+        let (_made, dir) = scratch("begin");
         let spec = spec(&dir, "/bin/true", &[], true);
         std::fs::write(&spec.live, "R\tearlier\t/x\n").unwrap();
         let live = super::begin(&spec).unwrap();
@@ -751,7 +751,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_run_that_names_what_its_key_has_is_lent_the_rest() {
-        let dir = scratch("lent");
+        let (_made, dir) = scratch("lent");
         let mut spec = spec(&dir, "/bin/true", &[], true);
         spec.env.push(("OLDPWD".into(), "/home/u".into()));
         spec.env.push(("CC".into(), "clang".into()));
@@ -828,7 +828,7 @@ mod tests {
             eprintln!("skipped: {why}");
             return;
         }
-        let dir = scratch("run");
+        let (_made, dir) = scratch("run");
         let data = dir.join("data.txt");
         std::fs::write(&data, "input\n").unwrap();
         let mut spec = spec(&dir, "/bin/sh", &["-c"], true);
@@ -857,8 +857,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "the run's TMPDIR is a path under the sandbox's own /tmp, which the sandbox makes \
+                  for it, and one that is no UTF-8 is what the sandbox cannot make"
+    )]
     fn a_sandbox_that_cannot_be_made_is_a_report_that_says_why() {
-        let dir = scratch("not-made");
+        let (_made, dir) = scratch("not-made");
         let mut spec = spec(&dir, "/bin/true", &[], true);
         spec.env.push((
             "TMPDIR".into(),

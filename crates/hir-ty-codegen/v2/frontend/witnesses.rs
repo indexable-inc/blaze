@@ -11,7 +11,7 @@
 //! (`blaze_query::db::witnessed`). The changed set is the engine's changed keys since a view
 //! (`blaze_query::db::changed_keys_since`) looked up in those postings. Reads at `HIGH` (a
 //! library's sources) need none: a write of one opens a new durable view, which no kept walk
-//! is patched across and under which this table is made anew ([`of`]).
+//! is patched across and under which this table is made anew ([`of_in`]).
 
 use std::{
     alloc::Global,
@@ -39,10 +39,10 @@ const DIGEST_DOMAIN: &str = "blaze v2 witnessed value 1";
 const SHARDS: usize = 64;
 
 /// What one database's describes and counts read below `HIGH`, for the life of its kept
-/// walks ([`super::let_go_kept_walks`] lets it go).
+/// walks, in its owner's [`super::Walks`].
 pub(super) struct Witnesses {
     /// The database's durable view (`Storage::durable_view`) when made: a write of an input
-    /// at `HIGH` makes the table anew ([`of`]).
+    /// at `HIGH` makes the table anew ([`of_in`]).
     durable: u64,
     /// The database's view (`Storage::view`) when made: no changed set is named from before
     /// it, as no describe run before it left its reads here.
@@ -342,6 +342,10 @@ pub(super) fn digest<T: std::fmt::Debug>(value: &T) -> [u8; 16] {
     out
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread read buffer taken out for each run, uncapped: it keeps the most reads one run made; the run should own it"
+)]
 thread_local! {
     /// The read keys of the witnessed run on this thread: taken out for the run and put back
     /// after, so no borrow of it is held across the run's waits, and a run nested in it (on
@@ -366,42 +370,22 @@ pub(super) fn witnessed<R>(
     made
 }
 
-/// Every database's witnesses, each with its nonce. No count bound: an entry goes only in
-/// [`let_go`], or is made anew when its database's durable view is another ([`of`]), as the
-/// records a database read are (`described::found_of`).
-static WITNESSES: Lock<Vec<(base_db::Nonce, Arc<Witnesses>)>> =
-    Lock::new("codegen.frontend.witnesses", Vec::new());
-
-/// The witnesses of `db`: its own while no input at `HIGH` was written since they were made,
-/// else made anew, empty, from its current view.
-pub(super) fn of(db: &Db) -> Arc<Witnesses> {
-    let (database, _) = db.nonce_and_revision();
+/// The witnesses of `db` kept in `slot` (its owner's, [`super::Walks`]; or none, for a front
+/// end whose builds keep nothing): the slot's while no input at `HIGH` was written since they
+/// were made, else made anew, empty, from its current view, and kept in the slot. No process
+/// static holds any: they go with the database's owner.
+pub(super) fn of_in(slot: &mut Option<Arc<Witnesses>>, db: &Db) -> Arc<Witnesses> {
     let storage = blaze_query::db::Database::storage(db);
     let durable = storage.durable_view().as_u64();
-    let mut all = WITNESSES.lock();
-    if let Some(at) = all.iter().position(|(of, _)| *of == database) {
-        if all[at].1.durable == durable {
-            return all[at].1.clone(); // clone: a reference count, once a build
-        }
-        all.remove(at);
+    if let Some(kept) = slot
+        && kept.durable == durable
+    {
+        return kept.clone(); // clone: a reference count, once a build
     }
-    // alloc: once per database and write of an input at `HIGH`, an empty table
+    // alloc: once per owner and write of an input at `HIGH`, an empty table
     let made = Arc::new(Witnesses::new(durable, storage.view().as_u64()));
-    all.push((database, made.clone())); // clone: a reference count
+    *slot = Some(made.clone()); // clone: a reference count
     made
-}
-
-/// Lets go of every database's witnesses; how many postings went.
-pub(super) fn let_go() -> u64 {
-    let mut all = WITNESSES.lock();
-    let postings = all.iter().map(|(_, it)| it.postings()).sum();
-    all.clear();
-    postings
-}
-
-/// How many databases' witnesses are held: each names interned ids, as a kept walk does.
-pub(super) fn held() -> usize {
-    WITNESSES.lock().len()
 }
 
 #[cfg(test)]

@@ -4,6 +4,9 @@
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 #![forbid(unsafe_code)]
@@ -109,6 +112,10 @@ impl Expansion<'_, '_> {
 
 static NO_FIXUPS: SyntaxFixupUndoInfo = SyntaxFixupUndoInfo::NONE;
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The scratch of the radix sorts of ranges, kept by the worker.
     static RANGE_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<TextRange>> =

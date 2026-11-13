@@ -23,24 +23,33 @@
 //! The hashes are of text and of nothing a parse decides (a lazy node or a parsed one, where
 //! the item is in its file), so an outline and a full parse of one text make the same bytes.
 //!
-//! The invariant: equal keys are equal bytes; a row is a function of its item's text alone.
+//! Last, the positions: a segment of its own, a range a row in the rows' order, where each
+//! item is written in the file ([`FileIndex::range`]). A position is of the file, as the
+//! index is (its key is the file's content), and in no row and no entry keyed by an item's
+//! text: a reader that needs where an item is (whether a mark of the file's text is inside
+//! it, its line) reads it here, with no parse and no ast id map, and an entry of the item is
+//! not moved by an edit that only moves it.
+//!
+//! The invariant: equal keys are equal bytes; a row is a function of its item's text alone,
+//! and a position of the file's text.
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
-use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID};
+use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, TextRange, TextSize};
 use syntax::{
     NodeOrToken, SyntaxKind, ast,
     view::{self, AstNode as _, HasModuleItem as _},
 };
 
-use crate::HirFileId;
+use crate::{HirFileId, MacroCallId};
 
 type R<T = ()> = Result<T, String>;
 
 /// The layout of a file's index: part of its key and its second word. It changes with the
 /// header, a row, which nodes have rows, what any of the three hashes covers, or the pairs.
-/// 2: the pairs of assoc items after the rows, and their count in the header.
-pub const LAYOUT: u32 = 2;
+/// 2: the pairs of assoc items after the rows, and their count in the header. 3: the
+/// positions after the pairs, a range a row.
+pub const LAYOUT: u32 = 3;
 
 /// The family of a file's index, as the entry store names it.
 pub const FAMILY: &str = "file index";
@@ -58,6 +67,8 @@ const HEAD: usize = 20;
 const ROW: usize = 56;
 /// Bytes of a pair: the ast id of an `impl` or a `trait`, then of one assoc item written in it.
 const PAIR: usize = 8;
+/// Bytes of a position: where a row's item starts in the file and where it ends.
+const SPAN: usize = 8;
 
 /// In a header's feed, where a body was cut: no piece is this long.
 const CUT: u32 = u32::MAX;
@@ -130,21 +141,40 @@ impl FileIndex {
         (u32_at(row, 0), source)
     }
 
-    /// The row of the item whose ast id is `ast`: a binary search of the rows.
-    pub fn get(&self, ast: ErasedFileAstId) -> Option<ItemSource> {
+    /// How many assoc items are listed.
+    fn pairs(&self) -> usize {
+        u32_at(&self.bytes, 16) as usize
+    }
+
+    /// Where the row of the item whose ast id is `ast` is: a binary search of the rows.
+    fn find(&self, ast: ErasedFileAstId) -> Option<usize> {
         let want = ast.into_raw();
         let (mut low, mut high) = (0, self.len());
         // The bound: the range halves each turn.
         while low < high {
             let mid = low + (high - low) / 2;
-            let (id, source) = self.row(mid);
-            match id.cmp(&want) {
-                std::cmp::Ordering::Equal => return Some(source),
+            match u32_at(&self.bytes, HEAD + mid * ROW).cmp(&want) {
+                std::cmp::Ordering::Equal => return Some(mid),
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
             }
         }
         None
+    }
+
+    /// The row of the item whose ast id is `ast`: a binary search of the rows.
+    pub fn get(&self, ast: ErasedFileAstId) -> Option<ItemSource> {
+        self.find(ast).map(|at| self.row(at).1)
+    }
+
+    /// Where the item whose ast id is `ast` is written in the file, as its node's range: the
+    /// positions segment, read with no parse. `None` for a node with no row (an item in a
+    /// body, which its body's syntax places).
+    pub fn range(&self, ast: ErasedFileAstId) -> Option<TextRange> {
+        let at = self.find(ast)?;
+        let base = HEAD + self.len() * ROW + self.pairs() * PAIR + at * SPAN;
+        let (start, end) = (u32_at(&self.bytes, base), u32_at(&self.bytes, base + 4));
+        Some(TextRange::new(TextSize::from(start), TextSize::from(end)))
     }
 
     /// Every row, by ast id.
@@ -160,8 +190,9 @@ impl FileIndex {
     /// search of the pairs.
     pub fn assoc_items(&self, owner: ErasedFileAstId) -> AssocItems<'_> {
         let want = owner.into_raw();
-        let pairs = &self.bytes[HEAD + self.len() * ROW..];
-        let count = pairs.len() / PAIR;
+        let count = self.pairs();
+        let start = HEAD + self.len() * ROW;
+        let pairs = &self.bytes[start..start + count * PAIR];
         // The first pair whose owner is not below `want`. The bound: the range halves each turn.
         let (mut low, mut high) = (0, count);
         while low < high {
@@ -251,13 +282,56 @@ pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
     FileIndex { bytes: bytes.into_boxed_slice() }
 }
 
-/// The source hashes of the item `ast` of `file`: `None` for an item a macro wrote (its file
-/// has no index: it is keyed by its expansion's inputs) and for a node with no row.
-pub fn source(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> Option<ItemSource> {
-    match file {
-        HirFileId::FileId(file) => of(db, file, krate).get(ast),
-        HirFileId::MacroFile(_) => None,
+/// The index of `call`'s expansion, read for `krate`, where the expansion has a key
+/// ([`super::expansion::key`]: its inputs, never its text): found by that key where this
+/// database keeps entries, with no expansion; made from the expansion's parse and kept where
+/// it is not found. `None` for an expansion with no key, whose items are made from it.
+///
+/// A row is a function of its item's text, as a file's is; the positions are of the
+/// expansion's text, which the key determines.
+#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+pub fn of_expansion(db: &Db, call: MacroCallId, krate: Crate) -> Option<FileIndex> {
+    let set = super::expansion::key(db, call)?;
+    let key = key(&set);
+    let kept = super::of(db);
+    if let Some(kept) = kept {
+        let mut found = None;
+        kept.get(db, krate, FAMILY, &set, key, &mut |bytes| {
+            found = Some(decode(bytes)?);
+            Ok(())
+        });
+        if let Some(found) = found {
+            return Some(found);
+        }
     }
+    let file = HirFileId::MacroFile(call);
+    let bytes = make(file.root(db), file.ast_id_map(db));
+    if let Some(kept) = kept {
+        kept.put(db, krate, FAMILY, &set, key, &bytes);
+    }
+    Some(FileIndex { bytes: bytes.into_boxed_slice() })
+}
+
+/// The index of `file`, a file's ([`of`]) or an expansion's ([`of_expansion`]): `None` for an
+/// expansion with no key.
+pub fn of_any(db: &Db, file: HirFileId, krate: Crate) -> Option<&FileIndex> {
+    match file {
+        HirFileId::FileId(file) => Some(of(db, file, krate)),
+        HirFileId::MacroFile(call) => of_expansion(db, call, krate).as_ref(),
+    }
+}
+
+/// The source hashes of the item `ast` of `file`: `None` for an item of an expansion with no
+/// key ([`super::expansion::key`]) and for a node with no row.
+pub fn source(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> Option<ItemSource> {
+    of_any(db, file, krate)?.get(ast)
+}
+
+/// Where the item `ast` of `file` is written ([`FileIndex::range`]): `None` for an item of an
+/// expansion with no key and for a node with no row. No parse or expansion where the index is
+/// kept.
+pub fn range(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> Option<TextRange> {
+    of_any(db, file, krate)?.range(ast)
 }
 
 /// The index of the file whose tree is `root` and whose ast ids are `map`, as its entry's
@@ -265,8 +339,8 @@ pub fn source(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> O
 pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
     // alloc: one file's pairs, while its index is made
     let mut assoc = Vec::new();
-    let mut rows = rows(root, map, &mut assoc);
-    rows.sort_unstable_by_key(|&(id, _)| id);
+    let mut rows = placed_rows(root, map, &mut assoc);
+    rows.sort_unstable_by_key(|&(id, _, _)| id);
     if let Some(pair) = rows.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         panic!("file index: two items of one file with ast id {:#x}", pair[0].0);
     }
@@ -274,12 +348,13 @@ pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
     // alloc: the sort's buffer, once per index made
     assoc.sort_by_key(|pair| pair[0]);
     // alloc: one file's index, kept as the query's value
-    let mut out = Vec::with_capacity(HEAD + rows.len() * ROW + assoc.len() * PAIR);
+    let mut out =
+        Vec::with_capacity(HEAD + rows.len() * (ROW + SPAN) + assoc.len() * PAIR);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&LAYOUT.to_le_bytes());
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     out.extend_from_slice(&(assoc.len() as u32).to_le_bytes());
-    for (id, source) in rows {
+    for &(id, source, _) in &rows {
         out.extend_from_slice(&id.to_le_bytes());
         let flags = if source.body.is_some() { HAS_BODY } else { 0 }
             | if source.attrs_cfg { ATTRS_CFG } else { 0 }
@@ -293,6 +368,10 @@ pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
     for [owner, item] in assoc {
         out.extend_from_slice(&owner.to_le_bytes());
         out.extend_from_slice(&item.to_le_bytes());
+    }
+    for &(_, _, range) in &rows {
+        out.extend_from_slice(&u32::from(range.start()).to_le_bytes());
+        out.extend_from_slice(&u32::from(range.end()).to_le_bytes());
     }
     out
 }
@@ -310,7 +389,8 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
         return Err(format!("file index layout {layout}, and this reads layout {LAYOUT}"));
     }
     let (count, pairs) = (u32_at(bytes, 12) as usize, u32_at(bytes, 16) as usize);
-    let size = HEAD as u64 + count as u64 * ROW as u64 + pairs as u64 * PAIR as u64;
+    let size =
+        HEAD as u64 + count as u64 * (ROW + SPAN) as u64 + pairs as u64 * PAIR as u64;
     if bytes.len() as u64 != size {
         // alloc: error path
         return Err(format!(
@@ -342,16 +422,35 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
         }
         last = owner;
     }
+    let placed = &index.bytes[HEAD + count * ROW + pairs * PAIR..];
+    for at in 0..count {
+        let (start, end) = (u32_at(placed, at * SPAN), u32_at(placed, at * SPAN + 4));
+        if start > end {
+            // alloc: error path
+            return Err(format!(
+                "a file index whose position {at} ends at {end}, before its start {start}"
+            ));
+        }
+    }
     Ok(index)
 }
 
 /// Every row of the file, in the file's order: the file itself first. Into `assoc`, a pair
 /// an assoc item (its `impl` or `trait`, then itself), in the file's order.
+#[cfg(test)]
 fn rows(
     root: view::Node<'_>,
     map: &AstIdMap,
     assoc: &mut Vec<[u32; 2]>,
 ) -> Vec<(u32, ItemSource)> {
+    placed_rows(root, map, assoc).into_iter().map(|(id, source, _)| (id, source)).collect()
+}
+
+/// A row as it is made: the ast id, the source hashes, and where the node is in its file.
+type Row = (u32, ItemSource, TextRange);
+
+/// [`rows`], each with where its node is written.
+fn placed_rows(root: view::Node<'_>, map: &AstIdMap, assoc: &mut Vec<[u32; 2]>) -> Vec<Row> {
     // alloc: one file's rows, while its index is made
     let mut out = Vec::new();
     let mut attrs = Feed::new(ATTRS_DOMAIN);
@@ -367,9 +466,14 @@ fn rows(
         header_cfg: cfg,
         plain: false,
     };
-    out.push((ROOT_ERASED_FILE_AST_ID.into_raw(), file));
+    out.push((ROOT_ERASED_FILE_AST_ID.into_raw(), file, root.text_range()));
     if let Some(file) = view::SourceFile::cast(root) {
         for item in file.items() {
+            item_rows(item, map, &mut out, assoc);
+        }
+    } else if let Some(expanded) = view::MacroItems::cast(root) {
+        // An expansion at item or assoc position ([`of_expansion`]): its items as a file's.
+        for item in expanded.items() {
             item_rows(item, map, &mut out, assoc);
         }
     }
@@ -379,11 +483,11 @@ fn rows(
 fn item_rows(
     item: view::Item<'_>,
     map: &AstIdMap,
-    out: &mut Vec<(u32, ItemSource)>,
+    out: &mut Vec<Row>,
     assoc: &mut Vec<[u32; 2]>,
 ) {
     let id = map.ast_id_of_view::<ast::Item>(item).erase().into_raw();
-    out.push((id, item_source(item)));
+    out.push((id, item_source(item), item.syntax().text_range()));
     match item {
         view::Item::Module(it) => {
             for child in it.item_list().into_iter().flat_map(|list| list.items()) {
@@ -407,7 +511,8 @@ fn item_rows(
             for variant in it.variant_list().into_iter().flat_map(|list| list.variants()) {
                 let id = map.ast_id_of_view::<ast::Variant>(variant).erase().into_raw();
                 let body = variant.const_arg().map(|it| it.syntax());
-                out.push((id, node_source(variant.syntax(), body.as_slice(), body, None, false)));
+                let source = node_source(variant.syntax(), body.as_slice(), body, None, false);
+                out.push((id, source, variant.syntax().text_range()));
             }
         }
         _ => {}
@@ -420,7 +525,7 @@ fn assoc_rows(
     owner: u32,
     list: Option<view::AssocItemList<'_>>,
     map: &AstIdMap,
-    out: &mut Vec<(u32, ItemSource)>,
+    out: &mut Vec<Row>,
     assoc: &mut Vec<[u32; 2]>,
 ) {
     for child in list.into_iter().flat_map(|list| list.assoc_items()) {
@@ -722,6 +827,41 @@ mod tests {
         for (id, source) in rows {
             assert_eq!(index.get(ErasedFileAstId::from_raw(id)), Some(source));
         }
+    }
+
+    /// The invariant of the positions: each row's range is its node's range in the file, as
+    /// the ast id map places it, read from the index alone; an outline places them as a full
+    /// parse does. The control: the text shifted by a comment moves every range but the
+    /// file's own start, and no row's hashes.
+    #[test]
+    fn an_index_places_each_item_where_its_file_has_it() {
+        let text = text("1", "", "#[derive(Clone)]");
+        for outline in [false, true] {
+            let parse = if outline {
+                SourceFile::parse_outline(text.as_str(), Edition::Edition2021)
+            } else {
+                SourceFile::parse(&text, Edition::Edition2021)
+            };
+            let map = AstIdMap::from_view(parse.root());
+            let index = decode(&make(parse.root(), &map)).expect("the index this wrote");
+            for (id, _) in rows_of(&text, outline) {
+                let ast = ErasedFileAstId::from_raw(id);
+                let want = map.get_erased(ast).text_range();
+                assert_eq!(index.range(ast), Some(want), "row {id:#x}, outline {outline}");
+            }
+        }
+        // alloc: a test's text
+        let shifted = format!("// a comment\n{text}");
+        let (a, b) = (index_of(&text, false), index_of(&shifted, false));
+        let (a, b) = (decode(&a).unwrap(), decode(&b).unwrap());
+        let mut moved = 0;
+        for ((id, source), (_, shifted_source)) in a.rows().zip(b.rows()) {
+            assert_eq!(source, shifted_source, "a row's hashes do not move");
+            if a.range(id) != b.range(id) {
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, N, "every range moves by the comment: the file's grows, the rest shift");
     }
 
     /// An inner attribute of a cut body is of the header (what collecting the item reads),

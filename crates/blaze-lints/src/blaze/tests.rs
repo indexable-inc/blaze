@@ -198,6 +198,10 @@ pub mod borrow {
         type Owned;
         fn to_owned(&self) -> Self::Owned;
     }
+    pub enum Cow<'a, B: ?Sized + ToOwned + 'a> {
+        Borrowed(&'a B),
+        Owned(<B as ToOwned>::Owned),
+    }
     impl ToOwned for str {
         type Owned = crate::string::String;
         fn to_owned(&self) -> crate::string::String {
@@ -541,11 +545,11 @@ fn cold() {
 
 #[deny(blaze::hot)]
 fn exempt(s: &str) {
-    let _ = String::from("x"); // alloc: once per build
+    // alloc: once per build, a comment that keeps nothing
+    let _ = String::from("x"); //~ hot_alloc
     // alloc: the error path
-    let _ = s.to_string();
-    let _ = format!("x"); // alloc:
-    //~^ hot_alloc
+    let _ = s.to_string(); //~ hot_alloc
+    let _ = format!("x"); //~ hot_alloc
     let _ = Box::new(1u32); // dyn: the wrong tag
     //~^ hot_alloc
 }
@@ -555,8 +559,8 @@ fn exempt(s: &str) {
 
 /// A crate that denies `hot_alloc` (`hot_alloc = "deny"` in `[workspace.metadata.blaze.lints]`
 /// gives the flag) fails on a fresh `Vec::new()`, `vec![]` or `String::new()`: each is an error,
-/// though none allocates until it grows. A `Vec` that names its allocator, and a line saying why
-/// it needs the global heap, pass.
+/// though none allocates until it grows. A `Vec` that names its allocator passes; a line saying
+/// why it needs the global heap does not, as no comment stands in for an allocator.
 #[test]
 fn a_fresh_global_vec_in_a_crate_denying_hot_alloc_is_an_error() {
     let main = r#"
@@ -573,7 +577,8 @@ pub fn task(frame: &Frame) -> usize {
     let empty: Vec<u32> = vec![]; //~ hot_alloc
     let text = String::new(); //~ hot_alloc
     let framed: Vec<u32, &Frame> = Vec::new_in(frame);
-    let kept: Vec<u32> = Vec::new(); // alloc: handed to the caller, who outlives the task
+    // alloc: handed to the caller, who outlives the task
+    let kept: Vec<u32> = Vec::new(); //~ hot_alloc
     let _ = (fresh, empty, text, framed, kept);
     0
 }
@@ -583,7 +588,7 @@ pub fn task(frame: &Frame) -> usize {
     let out = lint(&fixture, "-A clippy::all --deny=blaze::hot_alloc");
     assert_eq!(found(&out), expected(main), "the findings of:\n{main}\nwere:\n{out}");
     let errors = out.lines().filter(|it| it.starts_with("error: ")).count();
-    assert_eq!(errors, 3, "each finding is an error:\n{out}");
+    assert_eq!(errors, 4, "each finding is an error:\n{out}");
 }
 
 /// Under `hot_alloc` a function of the workspace's allocation is found once, in that function:
@@ -701,13 +706,14 @@ pub fn collects() {
     );
 }
 
-/// A `Vec` that names its allocator is fine; a line saying why it needs the global heap is
-/// kept, one with an empty reason is not, and neither is `#[expect]`'s.
+/// A `Vec` that names its allocator is fine, `Global` written out included; a line saying why
+/// it needs the global heap keeps nothing (no comment stands in for an allocator), and
+/// `#[expect]` keeps the item's.
 #[test]
 fn implicit_allocator_passes_a_named_allocator_and_an_exemption() {
     check_implicit(
         r#"
-use std::alloc::Allocator;
+use std::alloc::{Allocator, Global};
 pub struct Frame;
 impl Allocator for Frame {
     fn allocate(&self, _size: usize) -> *mut u8 {
@@ -717,10 +723,12 @@ impl Allocator for Frame {
 
 pub fn task(frame: &Frame) {
     let framed: Vec<u32, &Frame> = Vec::new_in(frame);
-    let empty: Vec<u32> = Vec::new(); // alloc:
-    //~^ implicit_allocator
-    let kept: Vec<u32> = Vec::new(); // alloc: handed to the caller, who outlives the task
-    let _ = (framed, empty, kept);
+    let global: Vec<u32> = Vec::new_in(Global);
+    let sized = Vec::<u32>::with_capacity_in(4, Global);
+    let empty: Vec<u32> = Vec::new(); //~ implicit_allocator
+    // alloc: handed to the caller, who outlives the task
+    let kept: Vec<u32> = Vec::new(); //~ implicit_allocator
+    let _ = (framed, global, sized, empty, kept);
 }
 
 #[expect(blaze::implicit_allocator, reason = "the test's own")]
@@ -760,7 +768,8 @@ impl Iterator for Count {
 }
 
 pub fn takes(_items: impl Iterator<Item = u32>) {}
-pub fn takes_rows(_rows: impl Iterator<Item = Vec<u32>>) {} //~ implicit_allocator
+pub fn takes_rows(_rows: impl Iterator<Item = String>) {} //~ implicit_allocator
+pub fn takes_vecs(_rows: impl Iterator<Item = Vec<u32>>) {}
 pub fn gives() -> impl Iterator<Item = u32> {
     Count(0)
 }
@@ -775,6 +784,158 @@ pub fn calls() {
 }
 "#,
     );
+}
+
+/// A dependency's crate of types that take no allocator: one holding a `Vec` in a field two
+/// types down, and one holding nothing on the heap.
+const BUFS: &str = r#"
+//- /bufs/lib.rs crate:bufs deps:std library
+pub struct Inner { bytes: std::vec::Vec<u8> }
+pub struct BufWriter { inner: Inner, at: usize }
+impl BufWriter {
+    pub fn new() -> BufWriter { loop {} }
+}
+pub struct Plain { at: usize, of: *const u8 }
+impl Plain {
+    pub fn new() -> Plain { loop {} }
+}
+"#;
+
+/// Runs `main`, which may use `bufs`, with `blaze::implicit_allocator` denied.
+fn check_implicit_with_bufs(main: &str) -> String {
+    let main = main.trim_start_matches('\n');
+    let fixture = format!(
+        "{MINICORE}{ALLOC_STD}{}\n//- /src/lib.rs crate:main deps:std,bufs\n{main}",
+        BUFS.trim()
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::implicit_allocator");
+    let found = found_of(&out, |it| it == "implicit_allocator");
+    assert_eq!(found, expected(main), "the findings of:\n{main}\nwere:\n{out}");
+    out
+}
+
+/// A dependency's type with no allocator parameter is judged by its fields, transitively: a
+/// `BufWriter` whose `Inner` holds a `Vec` is a finding where it is made and where it is
+/// written; a `Plain` that holds nothing on the heap is none. A `Cow` of `str` owns a
+/// `String`; a `&str` borrows.
+#[test]
+fn implicit_allocator_finds_a_dependency_type_by_what_its_fields_hold() {
+    let out = check_implicit_with_bufs(
+        r#"
+pub fn kept(_w: bufs::BufWriter) {} //~ implicit_allocator
+pub fn plain(_p: bufs::Plain) {}
+pub fn made() {
+    let _w = bufs::BufWriter::new(); //~ implicit_allocator
+    let _p = bufs::Plain::new();
+}
+pub fn cow(_c: std::borrow::Cow<'_, str>) {} //~ implicit_allocator
+pub fn borrowed(_c: &str) {}
+"#,
+    );
+    assert!(out.contains("`BufWriter` takes no allocator but holds a `Inner` (its field `inner`)"), "{out}");
+    assert!(out.contains("whose `Cow::Owned` is a `String` on the global heap"), "{out}");
+}
+
+/// A copying method makes its value at the call though the receiver holds its type: `clone`
+/// of a `Vec`, `to_vec` of a slice and `to_string` of a `String`'s `str` are findings, and
+/// the note leads with the borrow that allocates nothing. A clone of an `Arc` shares and is
+/// none; handing a `Vec` on (`take`) is none.
+#[test]
+fn implicit_allocator_finds_a_copy_and_leads_with_the_borrow() {
+    let main = r#"
+use std::sync::Arc;
+fn take<T>(v: T) -> T { v }
+pub fn copies(v: &Vec<u32>, s: &[u32], shared: &Arc<u32>, owned: Vec<u32>) {
+    let a = v.clone(); //~ implicit_allocator
+    let b = s.to_vec(); //~ implicit_allocator
+    let c = shared.clone();
+    let d = take(owned);
+    let _ = (a, b, c, d);
+}
+"#;
+    let main = main.trim_start_matches('\n');
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{main}");
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::implicit_allocator");
+    let found = found_of(&out, |it| it == "implicit_allocator");
+    assert_eq!(found, expected(main), "the findings of:\n{main}\nwere:\n{out}");
+    assert!(out.contains("first, do not allocate: borrow it"), "{out}");
+}
+
+/// A `format!` leads with `format_into!`, the caller's buffer; a `vec!` of elements with an
+/// array. Neither has a fix: std has no explicit form of either with the same type.
+#[test]
+fn implicit_allocator_leads_with_the_form_that_does_not_allocate() {
+    let main = r#"
+pub fn text(n: u32) {
+    let s = format!("{}", n); //~ implicit_allocator
+    let v = vec![1u32, 2]; //~ implicit_allocator
+    let _ = (s, v);
+}
+"#;
+    let main = main.trim_start_matches('\n');
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{main}");
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::implicit_allocator");
+    let found = found_of(&out, |it| it == "implicit_allocator");
+    assert_eq!(found, expected(main), "the findings of:\n{main}\nwere:\n{out}");
+    assert!(out.contains("first, do not allocate: write into the caller's buffer with `blaze_mem::format_into!"), "{out}");
+    assert!(out.contains("first, do not allocate: use an array"), "{out}");
+    assert!(!out.contains("name the global allocator where it is used"), "{out}");
+}
+
+/// The fix: in a crate that turns on `allocator_api`, `Vec::new()`, `Vec::with_capacity(n)`,
+/// `Box::new(x)` and an empty `vec![]` become their `_in` forms with `Global`, and `use
+/// std::alloc::Global;` is added where the name resolves to nothing. Where `Global` is in
+/// scope, no `use` is added. A crate without the feature gets the finding and no fix.
+#[test]
+fn implicit_allocator_fixes_a_constructor_to_its_explicit_global_form() {
+    let gated = r#"
+#![feature(allocator_api)]
+pub fn made(n: usize) {
+    let a: Vec<u32> = Vec::new(); //~ implicit_allocator
+    let _ = (a,);
+}
+"#;
+    let gated = gated.trim_start_matches('\n');
+    let out = lint(
+        &format!("{MINICORE}{ALLOC_STD}{MAIN}{gated}"),
+        "-A clippy::all --deny=blaze::implicit_allocator",
+    );
+    assert_eq!(found_of(&out, |it| it == "implicit_allocator"), expected(gated), "{out}");
+    assert!(out.contains("name the global allocator where it is used"), "{out}");
+    assert!(out.contains("Vec::new_in(Global)"), "{out}");
+    assert!(out.contains("use std::alloc::Global;"), "{out}");
+    assert!(out.contains("the better change and is made by hand"), "{out}");
+
+    let in_scope = r#"
+#![feature(allocator_api)]
+use std::alloc::Global;
+pub fn made(n: usize) {
+    let b = Vec::<u32>::with_capacity(n); //~ implicit_allocator
+    let c = Box::new(1u32); //~ implicit_allocator
+    let _ = (b, c, Global);
+}
+"#;
+    let in_scope = in_scope.trim_start_matches('\n');
+    let out = lint(
+        &format!("{MINICORE}{ALLOC_STD}{MAIN}{in_scope}"),
+        "-A clippy::all --deny=blaze::implicit_allocator",
+    );
+    assert_eq!(found_of(&out, |it| it == "implicit_allocator"), expected(in_scope), "{out}");
+    assert!(out.contains("Vec::<u32>::with_capacity_in(n, Global)"), "{out}");
+
+    let ungated = r#"
+pub fn made() {
+    let a: Vec<u32> = Vec::new(); //~ implicit_allocator
+    let _ = a;
+}
+"#;
+    let ungated = ungated.trim_start_matches('\n');
+    let out = lint(
+        &format!("{MINICORE}{ALLOC_STD}{MAIN}{ungated}"),
+        "-A clippy::all --deny=blaze::implicit_allocator",
+    );
+    assert_eq!(found_of(&out, |it| it == "implicit_allocator"), expected(ungated), "{out}");
+    assert!(!out.contains("name the global allocator where it is used"), "{out}");
 }
 
 #[test]

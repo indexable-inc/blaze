@@ -897,6 +897,10 @@ impl Queue {
         self.schedule(effects);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a tag's slot is u32 and freed slots are reused, so the table holds only the tags in flight, at most a few per running test, far below 2^32"
+    )]
     fn tag(&mut self, purpose: For) -> Tag {
         let at = match self.free_tags.pop() {
             Some(at) => {
@@ -944,6 +948,10 @@ impl Queue {
     }
 
     /// A new attempt of `unit`, by its id.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "an attempt's slot is the low u32 of its id and freed slots are reused, so the table holds only the attempts live at once, at most one per test running"
+    )]
     fn new_attempt(&mut self, unit: u32, number: u32) -> u64 {
         let at = match self.free_attempts.pop() {
             Some(at) => at,

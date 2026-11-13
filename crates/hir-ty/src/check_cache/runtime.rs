@@ -325,6 +325,10 @@ static RECORDING: AtomicUsize = AtomicUsize::new(0);
 /// The owners noted, each with its crate, by the database that made them, until its
 /// [`Recording`] is dropped. The crate is noted with the owner so that [`encode`] takes only
 /// its own crate's under the lock: two crates encoded at once each find theirs.
+#[expect(
+    blaze::process_static,
+    reason = "a database's rows are dropped with its Recording; the recording database should own them"
+)]
 static SEEN: Lock<Vec<(Nonce, Vec<(Crate, Seen)>)>> =
     Lock::new("ty.check_cache.runtime.seen", Vec::new());
 

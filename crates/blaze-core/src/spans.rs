@@ -355,6 +355,78 @@ impl Resolved {
     }
 }
 
+/// The spans of a run, at most [`crate::threads::RUN_MOST`], filled in order from `at` of
+/// `file` by one `preadv` (more only where the system cuts one short before the file's end, or
+/// `EINTR` interrupts it, at most [`crate::fs::INTERRUPTS`] times): how many bytes in all, fewer
+/// only at the file's end. Bypassing the cache, a read that ends off [`DIRECT_ALIGN`] is the
+/// file's end, as [`crate::fs::read_into`] takes it.
+#[cfg(unix)]
+pub(crate) fn read_run(
+    file: &std::fs::File,
+    at: u64,
+    spans: impl Iterator<Item = Resolved>,
+    cache: Cache,
+) -> std::io::Result<usize> {
+    use std::{io, os::fd::AsFd as _};
+    const MOST: usize = crate::threads::RUN_MOST;
+    let mut taken = [Resolved { at: NonNull::dangling(), len: 0 }; MOST];
+    let mut count = 0;
+    for span in spans {
+        assert!(count < MOST, "a run of at most {MOST} spans");
+        taken[count] = span;
+        count += 1;
+    }
+    // No two spans of the run overlap, or the slices below would alias: sorted by address, each
+    // ends at or before the next starts. 64 at most, so the sort is on the stack and short.
+    let mut sorted = taken;
+    let sorted = &mut sorted[..count];
+    sorted.sort_unstable_by_key(|span| span.addr());
+    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].addr() + pair[0].len as u64 > pair[1].addr()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!(
+                "two spans of one batched read overlap ({} bytes at {:#x} and {:#x}): a batch's \
+                 parts read into distinct memory",
+                pair[0].len,
+                pair[0].addr(),
+                pair[1].addr()
+            ),
+        ));
+    }
+    let mut slices: [io::IoSliceMut<'_>; MOST] = std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
+    let mut want = 0;
+    for (slice, span) in slices.iter_mut().zip(&taken[..count]) {
+        // SAFETY: as `Resolved::with_mut`: `Spans::register`'s contract makes the bytes the
+        // registrant's, alive while it is registered (checked as the span was resolved), and
+        // nothing else touches a read's span while it is in flight; no two spans of the run
+        // overlap (checked above), so no two slices alias. The slices live only for this call.
+        *slice = io::IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(span.at.as_ptr(), span.len) });
+        want += span.len;
+    }
+    let mut left: &mut [io::IoSliceMut<'_>] = &mut slices[..count];
+    let (mut read, mut interrupted) = (0, 0);
+    while read < want {
+        match crate::raw::preadv(file.as_fd(), left, at + read as u64) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if cache == Cache::Bypassed && read as u64 % DIRECT_ALIGN != 0 {
+                    break;
+                }
+                io::IoSliceMut::advance_slices(&mut left, n);
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && interrupted < crate::fs::INTERRUPTS =>
+            {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(read)
+}
+
 /// `span` of the effect `what` of `file` at `at`, through `cache`, as a driver reaches it, or
 /// why it is refused: its region not registered now, the span past the region's end, or, to
 /// bypass the page cache, an offset, address or length that is not a whole number of

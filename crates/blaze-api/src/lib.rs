@@ -27,7 +27,10 @@
 //! - [`units`]: the launchd agent and systemd units that socket-activate it.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// The field order promised above, held by `blaze::cbor_field_order`.
+#![blaze::canonical_cbor]
 
 pub mod activation;
 pub mod borrowed;
@@ -118,6 +121,10 @@ pub const SCHEMA: u32 = 55;
 pub const LONGEST_REQUEST: u32 = blaze_protocol::LONGEST_FRAME;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[expect(
+    blaze::cbor_field_order,
+    reason = "`schema` first in the JSON line (`json::request`, pinned by json/tests.rs), so a reader sees the schema before the body; the CBOR is written in key order by hand (`frames::item_into`)"
+)]
 pub struct Envelope<T> {
     pub schema: u32,
     /// Chosen by the client; a response carries the id of its request.

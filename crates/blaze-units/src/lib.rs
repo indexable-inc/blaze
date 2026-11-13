@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 #[cfg(test)]
 #[global_allocator]

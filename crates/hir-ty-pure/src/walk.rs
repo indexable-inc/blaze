@@ -1523,6 +1523,11 @@ impl<'a, 'db> Walk<'a, 'db> {
     /// defined `#[allow_internal_unsafe]` expands to (`thread_local!`'s), as rustc's
     /// `unsafe_code` lint says. Not scanned in a crate trusted for `unsafe` (the toolchain's), so
     /// its source map is never read there.
+    #[expect(
+        blaze::reads_positions,
+        reason = "whether an `unsafe` block was written, and under which macro's `#[allow_internal_unsafe]`, is \
+                  read off the source map: the lowered body must say both of each block"
+    )]
     fn unsafe_code(&mut self, func: FunctionId) {
         let db = self.cx.db;
         let unsafe_bit = effects::effect_index(&effect_attrs::UNSAFE).map_or(0, |it| 1 << it);

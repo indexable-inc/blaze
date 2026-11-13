@@ -79,15 +79,26 @@ pub struct Source {
 
 /// A file of a fetched or read source. Its bytes are [`Bytes::kept`] in [`blaze_mem::Tag::Vfs`]
 /// where they are read in (a `.crate`'s, a checkout's, the standard library's): they become the
-/// VFS tree's with no copy and live as long as it holds them.
+/// VFS tree's with no copy and live as long as it holds them. Its `id` is the bytes' content ID
+/// ([`blaze_vfs::FILE_DOMAIN`]), made once where the bytes are read ([`SourceFile::of`]) or
+/// carried by what listed them (a shipped tree's texts file): the mount
+/// ([`blaze_vfs::Vfs::apply_known_files`]) and the on-disk mark take it and hash nothing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceFile {
     pub path: String,
+    pub id: ContentId,
     pub bytes: Bytes,
     pub mode: Mode,
 }
 
 impl SourceFile {
+    /// The file of `bytes` at `path` with `mode`, its ID hashed from the bytes: the one hash
+    /// they get.
+    pub fn of(path: String, bytes: Bytes, mode: Mode) -> SourceFile {
+        let id = ContentId::of(blaze_vfs::FILE_DOMAIN, &bytes);
+        SourceFile { path, id, bytes, mode }
+    }
+
     /// The file at `at`, read whole into a [`Bytes::kept`] block of the size its metadata gives
     /// (`len`): an error naming it when it is shorter or longer by the time it is read.
     pub fn read(at: &std::path::Path, len: u64) -> std::io::Result<Bytes> {
@@ -198,6 +209,10 @@ pub struct JobInput {
     /// starts. A crate whose front end kept no session of its own opens and carries the one
     /// marked here, after a restart too.
     pub body_marks: Arc<std::collections::BTreeMap<String, blaze_cas::Key>>,
+    /// `store` and `std` as a task reads a value of them: one direct read into the task's
+    /// frame, or a map of a value kept as a file of its own, with no pool between
+    /// ([`super::direct`]). The daemon's one, lent to every job.
+    pub reads: Arc<super::direct::Stores>,
 }
 
 /// The result of a task that jobs share (one node of the plane by its key, single-flighted:
@@ -857,18 +872,6 @@ pub trait Steps: Sized + Send + Sync + 'static {
     fn give_caches(&self) -> u64 {
         0
     }
-    /// On the loop: the bytes of the process tables every front end's ids index (the type
-    /// interner's and the trait solver's), which no drop of a front end frees. 0 for steps
-    /// that keep none.
-    fn kept_tables(&self) -> u64 {
-        0
-    }
-    /// On the loop, only while no front end is kept or out, no link image is kept, and no
-    /// task runs or may walk (`job::giving` lists it only then): releases those tables, as a
-    /// fresh process has them; the bytes they fell by.
-    fn give_tables(&self) -> u64 {
-        0
-    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// after the build's answer: what the build's end lets go of its front end (every MIR it
     /// made, and the values no build read since the one before). The front end is the task's
@@ -1124,20 +1127,11 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn compiled(&mut self, unit: usize) {
         let _ = unit;
     }
-    /// On the loop, while the plane holds a task back for memory the process holds besides
-    /// its tasks (`blaze_graph::Plane::short`): let go of what the front end keeps for no
-    /// task to come, by a write [`Writer::waiting`] asks for, if that can help.
-    fn short(&mut self) {}
-    /// On the loop, as the system says memory is short (docs/memory-budget.md section 7,
-    /// "Pressure"): let go of what the front end keeps for no task to come, by a write
-    /// [`Writer::waiting`] asks for, now, whatever this daemon's own budget says.
+    /// On the loop, as the system says memory is short, or the core is past its line with
+    /// nothing cheaper left to give (`job::giving`, `blaze_graph::giveback::Rung::Values`):
+    /// let go of what the front end keeps for no task to come, by a write [`Writer::waiting`]
+    /// asks for, now.
     fn pressed(&mut self) {}
-    /// On the loop, as the last thing the daemon gives back before a task fails for memory
-    /// (`blaze_graph::giveback::Rung::Running`): a release is due now, as for
-    /// [`Writer::pressed`], and every reader of the front end is stopped for it: each task
-    /// under way gives way at its next query call and is posted again whole once the release
-    /// is applied. What those tasks had done is done again.
-    fn stop_for_memory(&mut self) {}
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
@@ -1360,9 +1354,10 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         None
     }
     /// On the loop: how many instances unit `unit`'s codegen walk reached in this build, once
-    /// it ended well; `None` before that, and for a front that walks nothing. What a unit
-    /// that depends on it is forecast by before its own walk starts
-    /// (`super::plane::Plane::forecast_instances`).
+    /// it ended well; `None` before that, and for a front that walks nothing. Read by no
+    /// forecast since the gate (2026-11-13: the plane's one predictor is its peak record);
+    /// `Job::reached` and this go together, with `codegen::generate`'s set, as a change of
+    /// `serve::unit::codegen`.
     fn reached(&self, unit: usize) -> Option<u64> {
         let _ = unit;
         None

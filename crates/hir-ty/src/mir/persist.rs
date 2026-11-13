@@ -494,6 +494,11 @@ impl<'db> Encode<'_, 'db> {
     }
 
     #[inline]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format holds a list's length as a u32 word, and a body's lists \
+                  are not checked under 2^32 before this: a larger list needs a typed refusal"
+    )]
     fn count(&mut self, len: usize) {
         self.word(u32::try_from(len).expect("a MIR list of fewer than 2^32 items"));
     }
@@ -519,6 +524,11 @@ impl<'db> Encode<'_, 'db> {
         self.word(place);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format numbers a body's allocations by u32, not checked under \
+                  2^32 before this: a larger body needs a typed refusal"
+    )]
     fn allocation(&mut self, allocation: &StoredAllocation) {
         let allocation = allocation.as_ref();
         let index = match self.alloc_places.get(&allocation) {
@@ -534,6 +544,11 @@ impl<'db> Encode<'_, 'db> {
         self.word(index);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format places a body's text by a u32 start, and the text is not \
+                  checked under 4 GiB before this: a larger body needs a typed refusal"
+    )]
     fn text(&mut self, text: &str) {
         let start = u32::try_from(self.text.len()).expect("a body's text under 4 GiB");
         self.word(start);

@@ -390,6 +390,10 @@ fn text_hash(text: &str) -> u64 {
 const SPARE_WORDS: usize = 4;
 const SPARE_WORDS_CAP: usize = 1 << 22;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool capped at SPARE_WORDS buffers, each freed above SPARE_WORDS_CAP words"
+)]
 thread_local! {
     // alloc: const-empty, once per thread.
     static SPARES: RefCell<Vec<WordsBuffers>> = const { RefCell::new(Vec::new()) };
@@ -451,6 +455,10 @@ impl Words {
     }
 
     /// The word the next one written will be.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the HIR record addresses its words by u32; a buffer past 2^32 words needs a typed refusal from the write"
+    )]
     pub(crate) fn at(&self) -> u32 {
         u32::try_from(self.words.len()).expect("more than 2^32 words of HIR in one buffer")
     }
@@ -474,6 +482,10 @@ impl Words {
     }
 
     /// A count of what follows.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the HIR record writes a list's count as one u32 word; a list of 2^32 values needs a typed refusal from the write"
+    )]
     pub(crate) fn len(&mut self, len: usize) {
         self.u32(u32::try_from(len).expect("more than 2^32 values in one HIR list"));
     }
@@ -516,6 +528,10 @@ impl Words {
         values.for_each(|it| it.put(self));
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the HIR record's name table holds u32 indices, starts and lengths; 4 GiB of names in one buffer needs a typed refusal from the write"
+    )]
     fn name(&mut self, text: &str) -> u32 {
         let hash = text_hash(text);
         let mut at = self.by_hash.get(&hash).copied().unwrap_or(NO_NAME);
@@ -564,6 +580,10 @@ pub(crate) struct Column {
 
 impl Column {
     /// Writes `values` as a column.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a column's length is a u32 in the record format; a column of 2^32 records needs a typed refusal from the write"
+    )]
     pub(crate) fn push<T: blaze_format::Record>(out: &mut Writer, values: &[T]) -> Column {
         let len = u32::try_from(values.len()).expect("a column of more than 2^32 records");
         Column { at: out.push_slice(values), len }
@@ -1584,7 +1604,7 @@ mod tests {
         let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
             let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
             pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
-            rx.recv().unwrap().unwrap();
+            rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
         };
         for round in 0..20u32 {
             let [first, second] = [2 * round, 2 * round + 1].map(|at| {
@@ -1653,7 +1673,7 @@ mod tests {
                 Ok(round)
             });
             assert_eq!(held, Ok(round));
-            let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+            let mut ended = [rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended"), rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended")];
             ended.sort();
             assert_eq!(ended, [Ok(0), Ok(1)]);
             assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");

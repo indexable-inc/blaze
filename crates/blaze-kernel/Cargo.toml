@@ -23,6 +23,7 @@ blaze-report.workspace = true
 blaze-store-check.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 hegeltest.workspace = true
 
 [lints]

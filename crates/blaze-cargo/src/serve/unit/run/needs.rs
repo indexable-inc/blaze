@@ -90,6 +90,7 @@ pub(crate) enum Served {
 /// A safeguard taken out, for the tests' controls: always `Plant::None` outside them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// A wanting wake is not heeded while needs are queued: the front end is held from the
@@ -222,6 +223,7 @@ pub(crate) enum Refuse {
 /// outside them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum FrontPlant {
     None,
     /// A want while a build is asked asks another.

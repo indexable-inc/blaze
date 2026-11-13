@@ -43,6 +43,7 @@ pub use crate::{
 /// planted-bug controls). Always [`Plant::None`] outside this crate's tests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), expect(dead_code, reason = "the planted bugs are made by the tests only"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// A directory's nodes end where they are full, not where a name says: an entry added

@@ -555,6 +555,10 @@ static PACKS: OnceLock<Option<Arc<Packs>>> = OnceLock::new();
 
 /// What a source's failure said, until the daemon's loop shows it in a build's own output
 /// ([`take_notices`]): once a failure, since a failed source is paused.
+#[expect(
+    blaze::process_static,
+    reason = "one notice per failed source, drained by the daemon's loop: the daemon should own the queue"
+)]
 static NOTICES: crossbeam_queue::SegQueue<String> = crossbeam_queue::SegQueue::new();
 
 /// The failures of sources since the last call, each a line for the build that ends next:
@@ -614,6 +618,10 @@ pub(crate) fn first_ask_of(job: usize) -> bool {
     ASKED_OF.swap(job, std::sync::atomic::Ordering::Relaxed) != job
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "set for one lookup's extent and cleared by its guard: one job's packs and one error at most"
+)]
 thread_local! {
     /// The lookup under way on this thread asks these packs (its job's, [`asked`]'s
     /// argument, for the lookup's extent alone), whether it is a sealed unit's (what it

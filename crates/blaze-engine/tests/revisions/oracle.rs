@@ -35,6 +35,10 @@ fn number(name: &str, otherwise: u64) -> u64 {
     }
 }
 
+#[expect(
+    blaze::tmp_path,
+    reason = "a failing case written here outlives the run on purpose, for a person to check in: it needs a kept default (under the blaze home) instead of the system's temporary directory"
+)]
 fn out() -> PathBuf {
     std::env::var_os("BLAZE_ORACLE_OUT").map_or_else(|| std::env::temp_dir().join("blaze-oracle"), PathBuf::from)
 }

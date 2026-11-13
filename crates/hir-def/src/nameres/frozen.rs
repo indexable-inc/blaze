@@ -72,7 +72,6 @@ use crate::{
 };
 
 pub mod entries;
-pub mod items;
 pub mod pages;
 pub mod segments;
 
@@ -1736,10 +1735,44 @@ impl Enc<'_> {
     }
 
     fn scope(&mut self, it: &ItemScope) -> R {
+        self.scope_names(it)?;
+        self.scope_rest(it, true)
+    }
+
+    /// The names of `it` in its three namespaces, each with its item, in their order: the
+    /// part of [`Self::scope`] a crate's pages write once, as name entries (`pages`).
+    fn scope_names(&mut self, it: &ItemScope) -> R {
+        self.usize(it.types.len())?;
+        for (name, Item { def, vis, import }) in it.types.iter() {
+            self.name(name)?;
+            self.def(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_extern_crate)?;
+        }
+        self.usize(it.values.len())?;
+        for (name, Item { def, vis, import }) in it.values.iter() {
+            self.name(name)?;
+            self.def(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_glob)?;
+        }
+        self.usize(it.macros.len())?;
+        for (name, Item { def, vis, import }) in it.macros.iter() {
+            self.name(name)?;
+            self.macro_id(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_extern_crate)?;
+        }
+        Ok(())
+    }
+
+    /// The rest of [`Self::scope`] after its names; with `legacy`, its textual macros too,
+    /// which a crate's pages write once, as entries of their own (`pages`).
+    fn scope_rest(&mut self, it: &ItemScope, legacy: bool) -> R {
         let ItemScope {
-            types,
-            values,
-            macros,
+            types: _,
+            values: _,
+            macros: _,
             unresolved,
             declarations,
             impls,
@@ -1765,27 +1798,6 @@ impl Enc<'_> {
             sorted: _,
             by_def: _,
         } = it;
-        self.usize(types.len())?;
-        for (name, Item { def, vis, import }) in types.iter() {
-            self.name(name)?;
-            self.def(def)?;
-            self.visibility(vis)?;
-            self.option(import, Self::import_or_extern_crate)?;
-        }
-        self.usize(values.len())?;
-        for (name, Item { def, vis, import }) in values.iter() {
-            self.name(name)?;
-            self.def(def)?;
-            self.visibility(vis)?;
-            self.option(import, Self::import_or_glob)?;
-        }
-        self.usize(macros.len())?;
-        for (name, Item { def, vis, import }) in macros.iter() {
-            self.name(name)?;
-            self.macro_id(def)?;
-            self.visibility(vis)?;
-            self.option(import, Self::import_or_extern_crate)?;
-        }
         // alloc: encoding, once per crate per image write (not on a build's path)
         let mut names: Vec<&str> = unresolved.iter().map(|it| it.symbol().as_str()).collect();
         names.sort_unstable();
@@ -1870,15 +1882,17 @@ impl Enc<'_> {
         for &it in extern_crate_decls {
             self.extern_crate(it)?;
         }
-        // alloc: encoding, once per crate per image write (not on a build's path)
-        let mut legacy: Vec<_> = legacy_macros.iter().collect();
-        legacy.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
-        self.usize(legacy.len())?;
-        for (name, ids) in legacy {
-            self.name(name)?;
-            self.usize(ids.len())?;
-            for &it in ids {
-                self.macro_id(it)?;
+        if legacy {
+            // alloc: encoding, once per crate per image write (not on a build's path)
+            let mut legacy: Vec<_> = legacy_macros.iter().collect();
+            legacy.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
+            self.usize(legacy.len())?;
+            for (name, ids) in legacy {
+                self.name(name)?;
+                self.usize(ids.len())?;
+                for &it in ids {
+                    self.macro_id(it)?;
+                }
             }
         }
         let attr = self.sorted(attr_macros.iter(), |enc, k| enc.ast_id(**k))?;
@@ -3293,6 +3307,14 @@ impl Dec<'_> {
     /// A scope read straight into its columns; the name index is built once, at the end.
     fn scope(&mut self) -> R<ItemScope> {
         let mut scope = ItemScope::default();
+        self.scope_names(&mut scope)?;
+        self.scope_rest(&mut scope, true)?;
+        scope.seal().map_err(str::to_owned)?;
+        Ok(scope)
+    }
+
+    /// What [`Enc::scope_names`] wrote, pushed unindexed into `scope`'s three namespaces.
+    fn scope_names(&mut self, scope: &mut ItemScope) -> R<()> {
         let (n, room) = self.len_and_room()?;
         scope.types.reserve(room);
         for _ in 0..n {
@@ -3320,6 +3342,11 @@ impl Dec<'_> {
             let import = self.option(Self::import_or_extern_crate)?;
             scope.macros.push_unindexed(name, Item { def, vis, import });
         }
+        Ok(())
+    }
+
+    /// What [`Enc::scope_rest`] wrote, with `legacy` as it was written; unsealed.
+    fn scope_rest(&mut self, scope: &mut ItemScope, legacy: bool) -> R<()> {
         self.fill(&mut scope.unresolved, ThinVec::reserve_exact, Self::name)?;
         self.fill(&mut scope.declarations, ThinVec::reserve_exact, Self::def)?;
         let (n, room) = self.len_and_room()?;
@@ -3389,12 +3416,14 @@ impl Dec<'_> {
         }
         self.fill(&mut scope.use_decls, ThinVec::reserve_exact, Self::use_id)?;
         self.fill(&mut scope.extern_crate_decls, ThinVec::reserve_exact, Self::extern_crate)?;
-        let (n, room) = self.len_and_room()?;
-        scope.legacy_macros.reserve(room);
-        for _ in 0..n {
-            let name = self.name()?;
-            let ids = self.small(Self::macro_id)?;
-            scope.legacy_macros.push_unindexed(name, ids);
+        if legacy {
+            let (n, room) = self.len_and_room()?;
+            scope.legacy_macros.reserve(room);
+            for _ in 0..n {
+                let name = self.name()?;
+                let ids = self.small(Self::macro_id)?;
+                scope.legacy_macros.push_unindexed(name, ids);
+            }
         }
         let (n, room) = self.len_and_room()?;
         scope.attr_macros.reserve(room);
@@ -3428,8 +3457,7 @@ impl Dec<'_> {
             })?;
             scope.derive_macros.push_unindexed(ast_id, invocations);
         }
-        scope.seal().map_err(str::to_owned)?;
-        Ok(scope)
+        Ok(())
     }
 
     fn tree_id(&mut self) -> R<TreeId> {
@@ -4256,29 +4284,29 @@ pub mod inside { pub fn f() {} }
     /// The control: told no port, each home writes its own path, so the bytes differ.
     #[test]
     fn a_file_outside_the_vfs_is_named_by_its_ported_path() {
-        let tmp = std::env::temp_dir().join(format!("blaze-frozen-outside-{}", std::process::id()));
+        let held = blaze_core::temp::TempDir::for_test("blaze-frozen-outside-");
+        let tmp = held.path();
         let lib = |db: &TestDB| crate_named(db, "lib");
         const TEXT: &str = "pub fn out() {}\n";
-        let a = including_outside(&tmp, "homeA", true, TEXT);
-        let b = including_outside(&tmp, "homeB", true, TEXT);
+        let a = including_outside(tmp, "homeA", true, TEXT);
+        let b = including_outside(tmp, "homeB", true, TEXT);
         let bytes = encode(&a, lib(&a)).unwrap();
         assert!(holds(&bytes, b"\0INCLUDED\0f/registry/lib/outside.rs"), "named by the port's mark");
         assert!(!holds(&bytes, b"homeA"), "the bytes name the home");
         assert_eq!(encode(&b, lib(&b)).as_ref(), Ok(&bytes));
-        let fresh = including_outside(&tmp, "homeB", true, TEXT);
+        let fresh = including_outside(tmp, "homeB", true, TEXT);
         assert_eq!(unreadable(&fresh, lib(&fresh), &bytes), None);
         // A database of home B that read the file with another text refuses the bytes
         // naming the file: its content is not the one they were made from.
-        let edited = including_outside(&tmp, "homeB", true, "pub fn other() {}\n");
+        let edited = including_outside(tmp, "homeB", true, "pub fn other() {}\n");
         let why = unreadable(&edited, lib(&edited), &bytes).expect("another content");
         assert!(why.contains("outside.rs") && why.contains("has content"), "{why}");
 
-        let a = including_outside(&tmp, "homeA", false, TEXT);
-        let b = including_outside(&tmp, "homeB", false, TEXT);
+        let a = including_outside(tmp, "homeA", false, TEXT);
+        let b = including_outside(tmp, "homeB", false, TEXT);
         let plain = encode(&a, lib(&a)).unwrap();
         assert!(holds(&plain, b"homeA/sources/registry/lib/outside.rs"));
         assert_ne!(encode(&b, lib(&b)).unwrap(), plain);
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

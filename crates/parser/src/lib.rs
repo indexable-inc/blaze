@@ -20,6 +20,9 @@
 
 #![allow(rustdoc::private_intra_doc_links)]
 #![deny(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 extern crate rustc_lexer;
 

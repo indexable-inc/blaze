@@ -76,12 +76,10 @@ mod tests {
             why.contains(&format!("format {}", FORMAT - 1)) && why.contains(&format!("reads format {FORMAT}")),
             "{why}"
         );
-        let dir = std::env::temp_dir().join(format!("blaze-gc-ledger-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-gc-ledger-");
         let path = dir.join(LEDGER);
         std::fs::write(&path, old.encode()).unwrap();
         let said = read(&path).expect_err("the format before this one");
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(said.starts_with(&path.display().to_string()), "{said}");
         assert!(said.contains(&format!("format {}", FORMAT - 1)), "{said}");
         let now = Ledger { format: FORMAT, ..old };

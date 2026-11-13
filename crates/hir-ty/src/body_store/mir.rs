@@ -61,19 +61,7 @@ type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
 #[blaze_query::tracked(returns(deref), mem_tag = Mir)]
 pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
     let body = Body::of(db, def);
-    let located = |kind: MacroDefKind| {
-        matches!(
-            kind,
-            MacroDefKind::BuiltIn(
-                _,
-                BuiltinFnLikeExpander::Line
-                    | BuiltinFnLikeExpander::Column
-                    | BuiltinFnLikeExpander::File
-                    | BuiltinFnLikeExpander::ModulePath
-            ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
-        )
-    };
-    if !body.macro_calls().iter().any(|call| located(call.loc(db).def.kind)) {
+    if !calls_location_macro(db, body) {
         return Box::default();
     }
     let source_map = Body::unmoved_source_map(db, def);
@@ -89,6 +77,27 @@ pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
         .map(|(id, _)| id)
         // alloc: the query's value, of a body that called a location macro
         .collect()
+}
+
+/// Whether a macro `kind` makes a literal of where it is called: `line!`, `column!`, `file!`,
+/// `module_path!`, or a `concat!` (which may hold one of them).
+fn located(kind: MacroDefKind) -> bool {
+    matches!(
+        kind,
+        MacroDefKind::BuiltIn(
+            _,
+            BuiltinFnLikeExpander::Line
+                | BuiltinFnLikeExpander::Column
+                | BuiltinFnLikeExpander::File
+                | BuiltinFnLikeExpander::ModulePath
+        ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
+    )
+}
+
+/// Whether `body` calls a macro that makes a literal of where it is called ([`located`]):
+/// whether [`location_literals`] reads the source map. Of the body's macro calls alone.
+pub(super) fn calls_location_macro(db: &Db, body: &Body) -> bool {
+    body.macro_calls().iter().any(|call| located(call.loc(db).def.kind))
 }
 
 /// The location literals of `def`, for its records, with the address width of its crate's

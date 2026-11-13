@@ -372,6 +372,10 @@ pub const MACHINE: &[&str] = &[
 /// of the two with `/private` taken off or put on (macOS's `/var` and `/tmp` are
 /// `/private/var` and `/private/tmp`), and each `%`-escaped as a `file://` URL has it. Doubled
 /// or turned separators and case are not spellings: [`spelled_in`] matches across them.
+#[expect(
+    blaze::tmp_path,
+    reason = "macOS's real `/tmp` is a link to `/private/tmp`: a root under it has both spellings, and this names the host's directory, not a place to write"
+)]
 fn spellings(root: &str, resolved: Option<&str>) -> Vec<String> {
     let add = |out: &mut Vec<String>, it: &str| {
         if it != root && !out.iter().any(|known| known == it) {

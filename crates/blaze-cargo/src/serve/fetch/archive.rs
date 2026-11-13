@@ -85,7 +85,7 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
         let bytes = Bytes::kept(Tag::Vfs, size, |place| entry.read_exact(place))
             .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
         let mode = if bits & 0o111 != 0 { Mode::Executable } else { Mode::Regular };
-        files.push(SourceFile { path: inside, bytes, mode });
+        files.push(SourceFile::of(inside, bytes, mode));
     }
     Ok(files)
 }

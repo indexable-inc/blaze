@@ -883,15 +883,13 @@ fn uplifted_on_windows() {
     );
 }
 
-/// A directory of the test's own under the system's temporary one, removed after.
-struct Scratch(PathBuf);
+/// A directory of the test's own, by its canonical path, removed with all it holds after.
+struct Scratch(PathBuf, blaze_core::temp::TempDir);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("blaze-plan-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir.canonicalize().unwrap())
+        let dir = blaze_core::temp::TempDir::for_test(&format!("blaze-plan-{name}-"));
+        Scratch(dir.path().canonicalize().unwrap(), dir)
     }
 
     fn write(&self, path: &str, contents: &str) -> PathBuf {
@@ -899,12 +897,6 @@ impl Scratch {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
         path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

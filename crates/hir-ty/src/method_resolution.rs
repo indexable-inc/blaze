@@ -1317,7 +1317,8 @@ impl MacroDefinitions {
 /// Whether the body of `id` may hold an impl (or, without `impls`, an item a macro or an
 /// attribute writes): its text has an `impl`, a call of a macro not proven to write none
 /// ([`macro_is_inert`]) or an attribute that is not inert. An item a macro writes has no text
-/// of its own and may. The file is parsed for the item's range only when lexing it found one.
+/// of its own and may. The item's range is read from its file's index (no parse where the
+/// index is kept); an item in a body, which has no row, is placed by the ast id map.
 pub(crate) fn may_hold<N: syntax::AstNode>(
     db: &Db,
     krate: Crate,
@@ -1329,7 +1330,7 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
     if marks.is_empty() {
         return false;
     }
-    let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+    let range = item_range(db, krate, id);
     marks.iter().any(|(at, mark)| {
         range.contains(*at)
             && match mark {
@@ -1338,6 +1339,21 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
                 BodyMark::Attribute(name) => !attribute_is_inert(name.as_str()),
             }
     })
+}
+
+/// Where `id` is written in its file: its row's position in the file's index
+/// (`hir_expand::declarative::stored::index::range`), read with no parse; an item with no row
+/// (one in a body) is placed by its file's ast id map, whose body is parsed to have it.
+pub(crate) fn item_range<N: syntax::AstNode>(
+    db: &Db,
+    krate: Crate,
+    id: hir_expand::AstId<N>,
+) -> syntax::TextRange {
+    let ast = id.value.erase();
+    match hir_expand::declarative::stored::index::range(db, id.file_id, ast, krate) {
+        Some(range) => range,
+        None => id.file_id.ast_id_map(db).get_erased(ast).text_range(),
+    }
 }
 
 /// Whether a macro called `name` in a body of `krate` writes no impl: some `macro_rules!` of
@@ -1668,6 +1684,11 @@ fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
 /// `unsafe`), an attribute that is not inert or one from a fragment, or call a macro passed in
 /// as `$name!`, and the names of the other macros they call.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[expect(
+    blaze::narrowed_len,
+    reason = "a macro's call list ends are u32 indexes into one file's calls, bounded by the file's \
+              text, which nothing checks is under 4 GiB: a larger file needs a typed refusal at read"
+)]
 fn macro_definitions(db: &Db, file: base_db::EditionedFileId) -> MacroDefinitions {
     let text = db.file_text(file.file_id(db)).text(db);
     if !text.contains("macro_rules") {
@@ -1863,6 +1884,11 @@ struct Runs<V> {
 impl<V: Copy> Runs<V> {
     /// The runs of `values`, each `(group, value)`: run `rank[group]` holds a group's values in
     /// the order they come. Counted first, so each column is allocated once at its size.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the runs' ends are u32 and a crate's impls are not bounded below 2^32 anywhere \
+                  before this: a larger crate needs a typed refusal where impls are collected"
+    )]
     fn from_groups(frame: &Frame, rank: &[u32], values: &[(u32, V)]) -> Self {
         u32::try_from(values.len()).expect("more than 2^32 impls in a crate");
         let ends = frame.alloc_slice_fill_with(rank.len() + 1, |_| 0u32);
@@ -1901,6 +1927,11 @@ fn ranks<'f>(frame: &'f Frame, order: &[u32]) -> &'f mut [u32] {
 }
 
 /// The number of `trait_`, numbered as first seen: a new one is pushed on `trait_ids`.
+#[expect(
+    blaze::narrowed_len,
+    reason = "trait numbers are u32 and nothing bounds a crate's traits below 2^32 before this: \
+              a larger crate needs a typed refusal where impls are collected"
+)]
 fn trait_number(
     traits: &mut FrameMap<'_, TraitId, u32>,
     trait_ids: &mut Vec<TraitId, &Frame>,
@@ -1963,6 +1994,11 @@ impl<'db> SelfTys<'db> {
 
 /// The group of `self_ty`, numbered as first seen: a new one is pushed on `self_tys` with its
 /// hash.
+#[expect(
+    blaze::narrowed_len,
+    reason = "self-type groups are numbered u32 and nothing bounds a crate's self types below \
+              2^32 before this: a larger crate needs a typed refusal where impls are collected"
+)]
 fn group_of<'db>(
     groups: &mut FrameMap<'_, SimplifiedType<'db>, u32>,
     self_tys: &mut Vec<(u64, SimplifiedType<'db>), &Frame>,
@@ -2256,6 +2292,11 @@ impl<'db, 'f> TraitImplsBuilder<'db, 'f> {
         trait_number(&mut self.traits, &mut self.trait_ids, trait_)
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "rows are numbered u32 and nothing bounds a crate's impl rows below 2^32 before \
+                  this: a larger crate needs a typed refusal where impls are collected"
+    )]
     fn row(&mut self, t: u32, self_ty: SimplifiedType<'db>) -> u32 {
         let row_keys = &mut self.row_keys;
         *self.rows.entry((t, self_ty)).or_insert_with(|| {
@@ -2509,6 +2550,38 @@ impl<'db> TraitImpls<'db> {
             .for_trait_and_self_ty(trait_, &self_ty.0)
             .0
             .into()
+    }
+
+    /// Every trait impl of `krate` alone for one type, built-in derives among them: per
+    /// trait, its impls and then its derives. What [`Self::for_self_ty`] gives of the crate's
+    /// whole table. A crate read from impl table pages reads the type's entry and its rows
+    /// (`frozen::pages::for_self_ty`: `k + 2` reads for `k` rows), never the whole table; a
+    /// type with no trait impl there is known from its slot alone.
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
+    pub fn in_crate_for_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        blaze_mem::frame::current(|frame| {
+            let mut found: Vec<AnyImplId, &Frame> = Vec::new_in(frame);
+            if frozen::served(db, krate) {
+                frozen::for_self_ty(db, krate, &self_ty.0, |it| {
+                    found.push(either::for_both!(it, it => it.into()))
+                });
+            } else {
+                Self::for_crate(db, krate).for_self_ty(&self_ty.0, |run| match run {
+                    Either::Left(impls) => {
+                        found.extend(impls.iter().map(|&it| AnyImplId::from(it)))
+                    }
+                    Either::Right(derives) => {
+                        found.extend(derives.iter().map(|&it| AnyImplId::from(it)))
+                    }
+                });
+            }
+            // alloc: the memo's value, once at its length (none when empty)
+            found.iter().copied().collect()
+        })
     }
 
     /// The impls of one trait for one type in `block` alone, without the built-in derives.

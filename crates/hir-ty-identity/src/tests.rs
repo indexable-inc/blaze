@@ -140,7 +140,7 @@ pub fn f(x: u32) -> usize {
 #[test]
 fn same_source_in_two_checkouts_has_one_identity() {
     let here = program("/home/a/checkout/src/lib.rs", PLAIN);
-    let there = program("/tmp/elsewhere/blaze/src/lib.rs", PLAIN);
+    let there = program("/srv/elsewhere/blaze/src/lib.rs", PLAIN);
     assert_eq!(all(&here, "f"), all(&there, "f"));
 }
 

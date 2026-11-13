@@ -1,8 +1,9 @@
 //! Model tests (docs/v2/plan/design/model-checker.md) of the tagged lock-free stack every pool
 //! and the chunk cache move batches through: 2 or 3 threads under every interleaving to the
 //! preemption bound and every value C11 lets a load read, against a sequential model (the
-//! multiset of indices on the stack or held). And the frame cap (`frame::Cap`): its waits and
-//! cancels under the model checker's lock and condition variable.
+//! multiset of indices on the stack or held). The memory gate's waits and gives-way are the
+//! budget's (`budget::tests`, every interleaving of its sans-IO steps) and the gate's own
+//! tests (`gate::tests`).
 
 use std::sync::Arc;
 
@@ -159,41 +160,3 @@ fn model_a_pop_sees_what_its_pusher_wrote() {
     });
 }
 
-/// Two threads each hold half of a full cap and ask for one byte more. Whatever the
-/// interleaving, nothing deadlocks: when both wait, exactly the newer wait is cancelled, its
-/// thread gives its half back, and the other goes on. Every byte comes back.
-#[test]
-fn model_a_full_cap_cancels_one_of_two_stuck_holders() {
-    model(|| {
-        let (cap, _spills) = crate::frame::Cap::new(4, 4);
-        let spawn = || {
-            thread::spawn(move || {
-                let half = cap.reserve(2).expect("a first half is waited for, never cancelled");
-                let more = cap.reserve(1);
-                let went_on = more.is_ok();
-                drop(more);
-                drop(half);
-                went_on
-            })
-        };
-        let (a, b) = (spawn(), spawn());
-        let (a, b) = (a.join().unwrap_or(false), b.join().unwrap_or(false));
-        assert!(a || b, "at most one of the two is cancelled");
-        assert_eq!(cap.held(), 0, "every byte is given back");
-        assert_eq!(cap.waiting(), 0);
-    });
-}
-
-/// A thread that holds nothing waits behind a full cap and is let in once the grant drops: it is
-/// never the one cancelled, whichever thread reserves first.
-#[test]
-fn model_a_thread_holding_nothing_waits_and_is_never_cancelled() {
-    model(|| {
-        let (cap, _spills) = crate::frame::Cap::new(4, 4);
-        let full = thread::spawn(move || cap.reserve(4).map(drop).is_ok());
-        let late = thread::spawn(move || cap.reserve(2).map(drop).is_ok());
-        assert!(full.join().unwrap_or(false), "the full reserve is let in");
-        assert!(late.join().unwrap_or(false), "the waiting reserve is let in, not cancelled");
-        assert_eq!(cap.held(), 0);
-    });
-}

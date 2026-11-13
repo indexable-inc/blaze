@@ -235,8 +235,7 @@ mod tests {
     #[test]
     fn a_bulk_listing_is_the_listing_by_readdir_and_lstat() {
         use std::os::unix::fs::PermissionsExt as _;
-        let root = std::env::temp_dir().join(format!("blaze-fs-bulk-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let root = crate::temp::TempDir::for_test("blaze-fs-bulk-");
         let dir = root.join("listed");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("empty"), b"").unwrap();
@@ -279,6 +278,5 @@ mod tests {
 
         // A directory that is not there fails, as the listing by `readdir` did.
         assert!(entries(&root.join("missing"), &name).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

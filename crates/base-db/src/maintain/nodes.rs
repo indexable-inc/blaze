@@ -114,6 +114,11 @@ pub struct Plan {
 impl Plan {
     /// The plan of nodes `0..costs.len()`, node `n` predicted to cost `costs[n]` (at least 1)
     /// and depending on `deps(n)`.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a plan's nodes are one maintenance pass's crates, far under 2^32; a larger graph \
+                  needs a PlanError variant that names no node"
+    )]
     pub fn new<D: IntoIterator<Item = u32>>(
         costs: &[u64],
         mut deps: impl FnMut(u32) -> D,

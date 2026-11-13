@@ -215,6 +215,9 @@ hot_alloc = "deny"
 implicit_allocator = "deny"
 default_hasher = "deny"
 cold_error = "deny"
+# The environment is read in the settings modules `.clippy.toml`'s `env-read-allowed` names
+# (rule keys-cover-every-input; was `disallowed-methods` at warn).
+env_read = "deny"
 # The parallel lints find loops that could run in parallel, a suggestion, not a fault; read in
 # their own lane (docs/lints.md).
 parallelizable = "allow"
@@ -841,7 +844,9 @@ multiple_unsafe_ops_per_block = "warn" # no baseline yet; back to deny at zero f
 
 ## warn at following lints
 # CI raises these to deny
-dbg_macro = "warn"
+# deny (int-1112): a `dbg!` left in prints to stderr on every run and is never what a change
+# means; the tree has none outside lint fixtures' strings.
+dbg_macro = "deny"
 todo = "warn"
 print_stdout = "warn"
 print_stderr = "warn"

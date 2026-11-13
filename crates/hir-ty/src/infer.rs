@@ -1238,7 +1238,6 @@ pub enum PointerCast {
     /// Go from a mut raw pointer to a const raw pointer.
     MutToConstPointer,
 
-    #[allow(dead_code)]
     /// Go from `*const [T; N]` to `*const T`
     ArrayToPointer,
 
@@ -2620,6 +2619,10 @@ impl<'db, 'f> TupleFieldTypes<'db, 'f> {
 
     /// The place of `tys`, which is added at the end if it is new: `IndexSet::insert_full`'s
     /// index.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "tuple-type places are u32 in the inference record; a body with 2^32 tuple types needs a typed refusal from inference"
+    )]
     pub(crate) fn insert(&mut self, tys: Tys<'db>) -> u32 {
         let TupleFieldTypes { tys: list, places } = self;
         *places.entry(tys).or_insert_with(|| {

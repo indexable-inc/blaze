@@ -118,7 +118,67 @@ fn agree(resolved: &Db, read: &Db, names: &[&str]) -> Result<(), String> {
             return Err(format!("{name}: {} modules, {} read", table_a.len(), table_b.len()));
         }
         let mut looked = 0;
-        for (index, ((id_a, data), (id_b, _))) in table_a.iter().zip(table_b.iter()).enumerate() {
+        for (index, ((id_a, data), (id_b, data_b))) in table_a.iter().zip(table_b.iter()).enumerate() {
+            // The traits in scope, from their segment.
+            let traits = |db: &Db, krate: Crate, it: &crate::nameres::ModuleData| {
+                let all: Vec<_> = it.traits_in_scope(db).collect();
+                let mut enc = Enc::new(db, krate);
+                enc.fingerprint(|enc| {
+                    all.iter().try_for_each(|&it| enc.def(crate::ModuleDefId::TraitId(it)))
+                })
+                .unwrap()
+            };
+            if traits(resolved, a, data) != traits(read, b, data_b) {
+                return Err(format!("{name}: the traits in scope in module {index} differ"));
+            }
+            // Each textual macro, from its table, and one no module has.
+            let mut textual: Vec<Name> =
+                data.scope(resolved).legacy_macros().map(|(it, _)| *it).collect();
+            textual.retain(|it| it.key().is_none());
+            textual.push(plain("no_textual_macro_has_this"));
+            for it in textual {
+                let ids = |db: &Db, krate: Crate, data: &crate::nameres::ModuleData| {
+                    let found = data.legacy_macro_in_scope(db, &it).map(<[_]>::to_vec);
+                    let mut enc = Enc::new(db, krate);
+                    enc.fingerprint(|enc| {
+                        enc.option(found, |enc, ids| ids.into_iter().try_for_each(|id| enc.macro_id(id)))
+                    })
+                    .unwrap()
+                };
+                if ids(resolved, a, data) != ids(read, b, data_b) {
+                    return Err(format!(
+                        "{name}: textual macro `{}` in module {index} differs",
+                        it.as_str()
+                    ));
+                }
+            }
+            // The items the impls maintainer is handed of a served crate, against its scope.
+            if crate::nameres::frozen::pages::is_paged(read, b) {
+                let got = super::module_items(read, b, index);
+                let scope = data.scope(resolved);
+                let print = |db: &Db, krate: Crate, impls: &[crate::ImplId], traits: &[crate::TraitId], derives: usize| {
+                    let mut enc = Enc::new(db, krate);
+                    enc.fingerprint(|enc| {
+                        impls.iter().try_for_each(|&it| enc.impl_id(it))?;
+                        enc.usize(derives)?;
+                        traits.iter().try_for_each(|&it| enc.def(crate::ModuleDefId::TraitId(it)))
+                    })
+                    .unwrap()
+                };
+                let impls: Vec<_> = scope.impls().collect();
+                let declared: Vec<crate::TraitId> = scope
+                    .declarations()
+                    .filter_map(|it| match it {
+                        crate::ModuleDefId::TraitId(it) => Some(it),
+                        _ => None,
+                    })
+                    .collect();
+                let was = print(resolved, a, &impls, &declared, scope.builtin_derive_impls().len());
+                let is = print(read, b, &got.impls, &got.traits, got.derive_impls.len());
+                if was != is {
+                    return Err(format!("{name}: the items of module {index} differ"));
+                }
+            }
             let mut asked = names_of(data.scope(resolved));
             // A keyed name holds a context of the database that made it.
             asked.retain(|it| it.key().is_none());
@@ -214,6 +274,14 @@ fn a_previous_or_foreign_layout_is_refused_by_name() {
     previous[8..12].copy_from_slice(&(LAYOUT + 1).to_le_bytes());
     let said = refused(previous).unwrap();
     assert!(said.contains(&format!("layout {}", LAYOUT + 1)), "{said}");
+
+    // Layout 2, whose names were written twice and whose rows had no runs: refused by name,
+    // never read with this layout's rows.
+    assert_eq!(LAYOUT, 3);
+    let mut twice = pages.clone();
+    twice[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let said = refused(twice).unwrap();
+    assert!(said.contains("def map pages of layout 2"), "{said}");
 
     let mut encoding = pages.clone();
     encoding[16] ^= 1;
@@ -448,4 +516,184 @@ fn the_oracle_catches_a_name_left_out_under_edits() {
         at - 1
     });
     assert!(said.is_err(), "pages without `Shown` answered as the resolved crate");
+}
+
+/// The control of the refinement under edits: with each lookup serving the entry of the
+/// module's first name in slot order (an entry of another name served, the planted bug), the
+/// same run is caught at its first comparison.
+#[test]
+fn the_oracle_catches_another_names_entry_served_under_edits() {
+    let apart = apart();
+    let pages = written(&apart, &["lib"]).remove(0).1;
+    super::SERVES_ANOTHER_NAMES_ENTRY.set(true);
+    let mut at = 0;
+    let said = agree_under_edits(&apart, pages, EDITS.len(), || {
+        at += 1;
+        at - 1
+    });
+    super::SERVES_ANOTHER_NAMES_ENTRY.set(false);
+    assert!(said.is_err(), "lookups served other names' entries and answered as resolved");
+}
+
+/// A crate `lib` of `count` traits, each with an impl, a textual macro and a dependent: the
+/// traits in scope, the textual macros and the items of its root grow with `count`.
+fn sized_traits(count: usize) -> String {
+    let mut text = String::from("//- /main.rs crate:main deps:lib\nfn main() {}\n");
+    text.push_str("//- /lib.rs crate:lib\nmacro_rules! m0 { () => {} }\n");
+    for at in 0..count {
+        text.push_str(&format!("pub trait T{at} {{}}\npub struct S{at};\nimpl T{at} for S{at} {{}}\n"));
+    }
+    text
+}
+
+/// A textual macro's lookup reads its table's window and its entry: the same few pages
+/// whether the module has 40 traits and impls or 4,000; and nothing a lookup or the traits'
+/// read asks decodes the module's whole scope.
+#[test]
+fn a_textual_macro_reads_a_bounded_number_of_pages_and_no_scope() {
+    use crate::test_db::TestDBExt;
+    for count in [40, 4000] {
+        let text = sized_traits(count);
+        let pages = written(&text, &["lib"]).remove(0).1;
+        let source = Counting::new(pages);
+        // clone: a count of the test's source
+        let db = paged(&text, &[("lib", source.clone())]);
+        let lib = crate_named(&db, "lib");
+        let def_map = crate_def_map(&db, lib);
+        source.take();
+        let root = def_map.module(&db, def_map.root);
+        let ran = db.executed_in_read_order(|| {
+            assert!(root.legacy_macro_in_scope(&db, &plain("m0")).is_some(), "{count}");
+            let touched = source.take();
+            assert!((1..=LOOKUP_PAGES).contains(&touched), "{count} items: {touched} pages read");
+            assert!(root.legacy_macro_in_scope(&db, &plain("no_such")).is_none(), "{count}");
+            let touched = source.take();
+            assert!((1..=LOOKUP_PAGES).contains(&touched), "{count} items: {touched} pages read");
+            assert_eq!(root.traits_in_scope(&db).count(), count);
+            for module in 0..super::modules(&db, lib) {
+                let items = super::module_items(&db, lib, module);
+                assert_eq!(items.impls.len(), if module == 0 { count } else { 0 });
+            }
+        });
+        assert!(!ran.iter().any(|it| it.contains("scope_memo")), "{count}: {ran:?}");
+    }
+}
+
+/// The sealed crates of [`sealed_many`].
+const SEALED: [&str; 8] = ["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"];
+
+/// Each crate of [`SEALED`] with a function, a struct and a textual macro, and `main`, from
+/// source, importing one function of each by name.
+fn sealed_many() -> String {
+    let deps = SEALED.join(",");
+    let mut text = format!("//- /main.rs crate:main deps:{deps}\n");
+    for (at, name) in SEALED.iter().enumerate() {
+        text.push_str(&format!("use {name}::f{at};\n"));
+    }
+    text.push_str("fn main() {}\n");
+    for (at, name) in SEALED.iter().enumerate() {
+        text.push_str(&format!(
+            "//- /{name}.rs crate:{name} new_source_root:local\n\
+             pub fn f{at}() {{}}\npub struct S{at};\nmacro_rules! m{at} {{ () => {{}} }}\n"
+        ));
+    }
+    text
+}
+
+/// What resolving `main` above every crate of [`SEALED`] read from pages runs, with the
+/// queries that hold a decoded part of a sealed crate's name resolution counted: `scope_memo`
+/// (a module's whole scope) and `tail` (its name records). With `whole`, the planted cause:
+/// `l3`'s root scope asked for whole.
+fn sealed_run(whole: bool) -> Vec<String> {
+    use crate::test_db::TestDBExt;
+    let text = sealed_many();
+    let pages = written(&text, &SEALED);
+    let db = paged(&text, &sources(&pages));
+    let ran = db.executed_in_read_order(|| {
+        let main = crate_named(&db, "main");
+        let def_map = crate_def_map(&db, main);
+        for at in 0..SEALED.len() {
+            let found = def_map.name_in_module(&db, def_map.root, &plain(&format!("f{at}")));
+            assert!(found.values.is_some(), "`f{at}` imported into `main`: {found:?}");
+        }
+        for (at, name) in SEALED.iter().enumerate() {
+            let krate = crate_named(&db, name);
+            assert!(super::is_paged(&db, krate), "{name} is read from its pages");
+            let map = crate_def_map(&db, krate);
+            let root = map.module(&db, map.root);
+            assert!(root.legacy_macro_in_scope(&db, &plain(&format!("m{at}"))).is_some());
+            let found = map.name_in_module(&db, map.root, &plain(&format!("S{at}")));
+            assert!(found.types.is_some(), "{name}: {found:?}");
+            if whole && at == 3 {
+                assert!(root.scope(&db).get(&plain("S3")).types.is_some());
+            }
+        }
+    });
+    // An ingredient's name is its function's: `tail` is the pages' tail, which only a crate
+    // read from pages runs.
+    ran.into_iter().filter(|it| it.ends_with("scope_memo") || it == "tail" || it.ends_with("::tail")).collect()
+}
+
+/// The invariant: name resolution holds no decoded state of a sealed crate. `main` resolved
+/// over eight crates read from pages, each crate's names and textual macros looked up, runs
+/// no query that decodes a scope or a tail of any of them: what is held of each is its
+/// lookups' answers and the head (its rows and module tree), never a scope.
+#[test]
+fn name_resolution_state_stays_zero_across_many_sealed_crates() {
+    let held = sealed_run(false);
+    assert_eq!(held, Vec::<String>::new());
+}
+
+/// The control: the cause put back. One sealed crate's whole scope asked for runs one
+/// `scope_memo`, which the check above sees.
+#[test]
+fn a_sealed_crates_whole_scope_is_seen_by_the_zero_state_check() {
+    let held = sealed_run(true);
+    assert_eq!(held.iter().filter(|it| it.contains("scope_memo")).count(), 1, "{held:?}");
+}
+
+/// Names written once: a module's scope segment names each of its names by its entry's
+/// position, so a long name's text is in its entry and not in the scope segment; the scope
+/// read whole from the two answers as the resolved crate. The control: the names part of the
+/// whole form ([`Enc::scope_names`], which layout 2 wrote into every scope segment) holds the
+/// name's text.
+#[test]
+fn a_modules_names_are_written_once() {
+    let long = "n".repeat(4000);
+    let text = format!("//- /main.rs crate:main deps:lib\nfn main() {{}}\n//- /lib.rs crate:lib\npub fn {long}() {{}}\n");
+    let pages = written(&text, &["lib"]).remove(0).1;
+    let source = Counting::new(pages);
+    // clone: a count of the test's source
+    let db = paged(&text, &[("lib", source.clone())]);
+    let lib = crate_named(&db, "lib");
+    let head = read_head(&db, lib, &*source).unwrap();
+    let root = head.rows[0];
+    assert!((root.scope.1 as usize) < long.len(), "the scope segment is {} bytes", root.scope.1);
+    assert!((root.entries.1 as usize) > long.len(), "the entries are {} bytes", root.entries.1);
+    let map = crate_def_map(&db, lib);
+    assert!(map.module(&db, map.root).scope(&db).get(&plain(&long)).values.is_some());
+    let resolved = fixture::db(&text).into_db();
+    assert_eq!(agree(&resolved, &db, &["lib"]), Ok(()));
+
+    let lib = crate_named(&resolved, "lib");
+    let map = crate_def_map(&resolved, lib);
+    let scope = map.module(&resolved, map.root).scope(&resolved);
+    let mut enc = Enc::new(&resolved, lib);
+    let names = enc.fingerprint(|enc| enc.scope_names(scope)).unwrap();
+    assert!(names.len() > long.len(), "the names part is {} bytes", names.len());
+}
+
+/// The control of the check above: the cause put back. The module's whole scope asked for
+/// runs `scope_memo`, which the check sees.
+#[test]
+fn a_whole_scope_asked_for_is_seen_by_the_check() {
+    use crate::test_db::TestDBExt;
+    let text = sized_traits(40);
+    let pages = written(&text, &["lib"]).remove(0).1;
+    let db = paged(&text, &[("lib", Counting::new(pages))]);
+    let lib = crate_named(&db, "lib");
+    let def_map = crate_def_map(&db, lib);
+    let root = def_map.module(&db, def_map.root);
+    let ran = db.executed_in_read_order(|| _ = root.scope(&db).legacy_macros().count());
+    assert!(ran.iter().any(|it| it.contains("scope_memo")), "{ran:?}");
 }

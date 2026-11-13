@@ -6,6 +6,10 @@
 //!     blaze run -q -p scripts --bin cross -- '{"command": "glibc-list", "abilists": "/tmp/glibc-abilists"}'
 //!     blaze run -q -p scripts --bin cross -- '{"command": "darwin-list", "sdk": "/path/to/MacOSX.sdk"}'
 
+// `#[expect(blaze::..)]` names a blaze lint; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 const DOC: &str = r#"cross: blaze cross-compiles a program of Rust alone with nothing of the host (ledger row X1;
 docs/v2/plan/design/toolchain-c.md, "Cross compilation").
 
@@ -373,8 +377,13 @@ fn darwin_list(root: &Path, it: &Args) {
         }
     }
     let mut text = String::from(
-        "--- !tapi-tbd\ntbd-version:     4\ntargets:         [ arm64-macos ]\n\
-         install-name:    '/usr/lib/libSystem.B.dylib'\nexports:\n  - targets:         [ arm64-macos ]\n",
+        r"--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+exports:
+  - targets:         [ arm64-macos ]
+",
     );
     for kind in ["symbols", "weak-symbols", "thread-local-symbols"] {
         let picked: Vec<String> =
@@ -416,6 +425,12 @@ fn words(value: &Value, triple: &str) -> Option<Vec<String>> {
     Some(list.iter().filter_map(|it| it.as_str().map(str::to_owned)).collect())
 }
 
+#[expect(
+    blaze::tmp_path,
+    reason = "the default `work` is the documented new directory under /tmp (DOC's `work`), kept after the run with \
+              the build's home in it for a look after a failure, and short enough for the daemon socket under it; \
+              a TempDir would remove it at exit, a change to the script's interface"
+)]
 fn check(root: &Path, it: &Args) -> ! {
     let Some(engine) = &it.engine else { fail(SCRIPT, "check needs `engine`, the blaze measured") };
     let mut report = Report::new(SCRIPT, engine, &it.out);

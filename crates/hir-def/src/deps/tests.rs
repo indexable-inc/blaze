@@ -166,7 +166,7 @@ fn the_oracle_catches_a_walk_that_makes_every_key_again() {
     assert_eq!(take_keyed(&edited).len(), 41, "with no memo every key is made again");
 }
 
-const BUILD: ContentId = ContentId([7; 32]);
+pub(super) const BUILD: ContentId = ContentId([7; 32]);
 
 fn crate_named(db: &TestDB, name: &str) -> Crate {
     *base_db::all_crates(db)
@@ -175,8 +175,9 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
         .unwrap()
 }
 
-/// A store in memory, which refuses a second put of a key with other bytes as the store does.
-struct Memory {
+/// A store in memory, which refuses a second put of a key with other bytes as the store does
+/// (also `facts::tests`' image store).
+pub(super) struct Memory {
     images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
     gets: Lock<usize>,
 }
@@ -213,7 +214,7 @@ impl ImageStore for Memory {
     }
 }
 
-fn all(db: &TestDB) -> Vec<Crate> {
+pub(super) fn all(db: &TestDB) -> Vec<Crate> {
     base_db::all_crates(db).iter().copied().collect()
 }
 
@@ -512,7 +513,7 @@ fn keys_outside_the_lists(memory: &Memory, served: &Served, stored: &Stored) -> 
 }
 
 /// Whether `memory` holds, for every crate `stored` filed, each record kind of
-/// [`front_keys`] the front end writes: its image, its def map pages and its item pages. The
+/// [`front_keys`] the front end writes: its image and its def map pages. The
 /// kept roots ([`kept_key`]) are codegen's record, written by its own store beside these.
 fn holds_every_front_record(memory: &Memory, stored: &Stored) -> bool {
     let images = memory.images.lock();
@@ -1351,7 +1352,7 @@ fn keys_hold_no_path_of_the_checkout() {
         )
     };
     let alice = checkout("/home/alice/work", "/home/alice/work/target/out", "pub struct A;");
-    let bob = checkout("/srv/build/bob/deps/x", "/tmp/target-77/out", "pub struct A;");
+    let bob = checkout("/srv/build/bob/deps/x", "/scratch/target-77/out", "pub struct A;");
     assert_eq!(key_of(&alice, "lib", BUILD), key_of(&bob, "lib", BUILD));
     assert_eq!(key_of(&alice, "core", BUILD), key_of(&bob, "core", BUILD));
     let other = checkout("/home/alice/work", "/home/alice/work/target/out", "pub struct B;");
@@ -1832,10 +1833,9 @@ fn outside_fixture(dir: &std::path::Path) -> String {
 fn an_include_of_a_file_outside_the_vfs_files_the_image_by_the_files_content() {
     let _turn = TURN.lock();
     base_db::LOOKS_EVERY_TIME.set(true);
-    let dir = std::env::temp_dir().join(format!("blaze-deps-outside-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-deps-outside-");
     let file = dir.join("outside.rs");
-    let fixture = outside_fixture(&dir);
+    let fixture = outside_fixture(dir.path());
     let hits = |memory: &Memory| {
         let mut db = fixture::db(&fixture).into_db();
         let crates = all(&db);
@@ -1873,7 +1873,6 @@ fn an_include_of_a_file_outside_the_vfs_files_the_image_by_the_files_content() {
     std::fs::write(&file, "pub fn one() {}\n").unwrap();
     assert_eq!(hits(&memory), (vec!["lib".to_owned()], 0), "put back: the first image again");
     base_db::LOOKS_EVERY_TIME.set(false);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A crate that includes what its build script wrote, through `concat!` and `env!`.

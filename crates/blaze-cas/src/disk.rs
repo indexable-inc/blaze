@@ -158,14 +158,49 @@ impl Form {
 pub(crate) const RECORD_HEADER: u64 = 96;
 /// [`RecordHeader::dictionary`] of a value compressed without one.
 pub(crate) const NO_DICTIONARY: u32 = u32::MAX;
-const RECORD_MAGIC: [u8; 4] = *b"BLZR";
-/// Where a record header keeps its CRC-32C, taken over the header with these bytes zero.
+/// A record of format 8 and before: its CRC-32C covers its header only, so its payload is
+/// checked against `content` (BLAKE3) when it is read. Read forward, never written.
+const RECORD_MAGIC_HEADER: [u8; 4] = *b"BLZR";
+/// A record of format 9 on: its CRC-32C covers its header and then its payload, so a read
+/// checks the whole record for the cost of a CRC (~0.03 ns a byte, hardware) instead of a
+/// BLAKE3 of the value (~1 ns a byte). BLAKE3 stays for bytes that crossed a trust boundary
+/// (a remote's, `remote.rs`) and for the scrub ([`crate::read::Use::Check`]).
+const RECORD_MAGIC_WHOLE: [u8; 4] = *b"BLZW";
+/// Where a record header keeps its CRC-32C, taken with these bytes zero.
 const RECORD_CHECK: std::ops::Range<usize> = 12..16;
 /// A chunk in a chunked value's payload: its key and its length.
 pub(crate) const CHUNK_REF: usize = 40;
 
-/// What a record starts with. Its CRC-32C finds a torn append without reading the payload;
-/// the payload is checked against `content` when it is read.
+#[cfg(test)]
+thread_local! {
+    /// A test's store writes its records as format 8 did while this is set: how a test makes
+    /// the store a blaze of format 8 left, for this one to read forward.
+    pub(crate) static WRITE_FORMAT_8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a record's CRC-32C covers, as its magic says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Seal {
+    /// Its header only (format 8 and before), checked by [`RecordHeader::decode`]: the payload
+    /// is the value only once its BLAKE3 matches `content`.
+    Header,
+    /// Its header and payload (format 9 on), checked by [`RecordHeader::check`] once the
+    /// payload is read: the CRC it must match.
+    Whole(u32),
+}
+
+/// What a record's check showed of it once its payload was read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sealed {
+    /// The header and payload are the bytes written: no BLAKE3 is needed for a read.
+    Whole,
+    /// The header is whole; the payload is the value only once its BLAKE3 matches `content`.
+    Header,
+}
+
+/// What a record starts with. Format 9's CRC-32C covers the header and the payload, checked
+/// on every read ([`RecordHeader::check`]); a format-8 record's covers the header only, and
+/// its payload is checked against `content` when it is read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RecordHeader {
     pub kind: Kind,
@@ -180,9 +215,33 @@ pub(crate) struct RecordHeader {
 }
 
 impl RecordHeader {
-    pub(crate) fn encode(&self) -> [u8; RECORD_HEADER as usize] {
+    /// The header of a record whose payload is `payload` (`stored` bytes), in format 9: its
+    /// CRC-32C over the header, check bytes zero, then the payload.
+    pub(crate) fn encode(&self, payload: &[u8]) -> [u8; RECORD_HEADER as usize] {
+        debug_assert_eq!(self.stored, payload.len() as u64, "a header is encoded with its own payload");
+        #[cfg(test)]
+        if WRITE_FORMAT_8.get() {
+            return self.encode_format8();
+        }
+        let mut out = self.fields(RECORD_MAGIC_WHOLE);
+        let check = crc::extend(crc::crc32c(&out), payload);
+        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
+        out
+    }
+
+    /// The header as format 8 wrote it, its CRC over the header only: what a test of a store
+    /// written before format 9 writes.
+    #[cfg(test)]
+    pub(crate) fn encode_format8(&self) -> [u8; RECORD_HEADER as usize] {
+        let mut out = self.fields(RECORD_MAGIC_HEADER);
+        let check = crc::crc32c(&out);
+        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
+        out
+    }
+
+    fn fields(&self, magic: [u8; 4]) -> [u8; RECORD_HEADER as usize] {
         let mut out = [0; RECORD_HEADER as usize];
-        out[..4].copy_from_slice(&RECORD_MAGIC);
+        out[..4].copy_from_slice(&magic);
         out[4] = self.kind.code();
         out[5] = self.form.code();
         out[8..12].copy_from_slice(&self.dictionary.to_le_bytes());
@@ -190,31 +249,41 @@ impl RecordHeader {
         out[24..32].copy_from_slice(&self.raw.to_le_bytes());
         out[32..64].copy_from_slice(&self.key.0.0);
         out[64..96].copy_from_slice(&self.content.0);
-        let check = crc::crc32c(&out);
-        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
         out
     }
 
+    /// What `bytes` (a record's header, at least) says, and what its CRC covers. A format-8
+    /// header's CRC is checked here; a format-9 header's covers its payload too, so it is
+    /// checked by [`RecordHeader::check`] once the payload is read: until then its fields are
+    /// only bounded (its length has a span), which is what a walk over a pack needs.
     pub(crate) fn decode(bytes: &[u8]) -> Result<RecordHeader, &'static str> {
+        RecordHeader::decode_sealed(bytes).map(|(header, _)| header)
+    }
+
+    /// [`RecordHeader::decode`], and what the header's CRC covers.
+    pub(crate) fn decode_sealed(bytes: &[u8]) -> Result<(RecordHeader, Seal), &'static str> {
         if bytes.len() < RECORD_HEADER as usize {
             return Err("its header is cut short");
         }
         let bytes = &bytes[..RECORD_HEADER as usize];
-        if bytes[..4] != RECORD_MAGIC {
-            return Err("its header has no record's magic");
-        }
-        let mut unchecked = [0; RECORD_HEADER as usize];
-        unchecked.copy_from_slice(bytes);
-        unchecked[RECORD_CHECK].fill(0);
-        if u32_at(bytes, RECORD_CHECK.start) != crc::crc32c(&unchecked) {
-            return Err("its header does not match its check");
-        }
+        let check = u32_at(bytes, RECORD_CHECK.start);
+        let magic: [u8; 4] = bytes[..4].try_into().expect("a header's first four bytes");
+        let seal = match magic {
+            RECORD_MAGIC_WHOLE => Seal::Whole(check),
+            RECORD_MAGIC_HEADER => {
+                if check != crc::crc32c(&unchecked(bytes)) {
+                    return Err("its header does not match its check");
+                }
+                Seal::Header
+            }
+            _ => return Err("its header has no record's magic"),
+        };
         let kind = Kind::from_code(bytes[4]).ok_or("its header names no kind")?;
         let form = Form::from_code(bytes[5]).ok_or("its header names no form")?;
         if span_of(u64_at(bytes, 16)).is_none() {
             return Err("its header says a length no record can have");
         }
-        Ok(RecordHeader {
+        let header = RecordHeader {
             kind,
             form,
             dictionary: u32_at(bytes, 8),
@@ -222,7 +291,31 @@ impl RecordHeader {
             raw: u64_at(bytes, 24),
             key: Key(id_at(bytes, 32)),
             content: id_at(bytes, 64),
-        })
+        };
+        Ok((header, seal))
+    }
+
+    /// The record whose header is `header` (its first [`RECORD_HEADER`] bytes) and whose
+    /// payload is `payload` checked whole: its header, and what the check covered. Every read
+    /// of a record's payload goes through this (the one place a record is checked): a format-9
+    /// record's CRC covers the payload, so a payload byte rotted under an intact header is
+    /// refused here; a format-8 record's leaves its payload to the BLAKE3 of the value
+    /// ([`Sealed::Header`]).
+    pub(crate) fn check(header: &[u8], payload: &[u8]) -> Result<(RecordHeader, Sealed), &'static str> {
+        let (decoded, seal) = RecordHeader::decode_sealed(header)?;
+        if payload.len() as u64 != decoded.stored {
+            return Err("its payload is not the length its header says");
+        }
+        match seal {
+            Seal::Header => Ok((decoded, Sealed::Header)),
+            Seal::Whole(want) => {
+                let found = crc::extend(crc::crc32c(&unchecked(&header[..RECORD_HEADER as usize])), payload);
+                if found != want {
+                    return Err("its header and payload do not match its check");
+                }
+                Ok((decoded, Sealed::Whole))
+            }
+        }
     }
 
     /// The bytes the record takes in its pack, padding included.
@@ -232,11 +325,19 @@ impl RecordHeader {
     }
 }
 
+/// A record header with its check bytes zero, as its CRC is taken over.
+fn unchecked(bytes: &[u8]) -> [u8; RECORD_HEADER as usize] {
+    let mut out = [0; RECORD_HEADER as usize];
+    out.copy_from_slice(&bytes[..RECORD_HEADER as usize]);
+    out[RECORD_CHECK].fill(0);
+    out
+}
+
 /// A whole record: header, payload, zeros to the next alignment.
 pub(crate) fn record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     debug_assert_eq!(header.stored, payload.len() as u64);
     let mut out = Vec::with_capacity(header.span() as usize);
-    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&header.encode(payload));
     out.extend_from_slice(payload);
     out.resize(header.span() as usize, 0);
     out

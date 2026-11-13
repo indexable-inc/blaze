@@ -68,6 +68,10 @@ pub(crate) fn filing_keys(key: blaze_ids::ContentId) -> impl Iterator<Item = bla
 /// The keys builds found that a pin keeps, until the daemon's loop takes them
 /// ([`Collects::pin`]). The process's one queue: only `blaze serve`'s daemon has a collector
 /// that drains it, and it is the process's one daemon with a store on disk.
+#[expect(
+    blaze::process_static,
+    reason = "drained by the daemon's loop, but unbounded where no collector runs: the daemon should own the queue"
+)]
 static KEPT: crossbeam_queue::SegQueue<Kept> = crossbeam_queue::SegQueue::new();
 
 /// Keys queued for a pin: its name, why it is kept, and the keys.
@@ -1203,8 +1207,8 @@ mod tests {
             dir: name("home/v2/store"),
             layers: Vec::new(),
             tags: 1 << 40,
-            load_tags: (1 << 40) + (1 << 32),
-            loader: blaze_cas::Loader::Pumped,
+            load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+            loader: crate::serve::direct::pool::pumped(),
         };
         let mut effects = Vec::new();
         let mut store = Store::open(config, &mut effects);
@@ -1250,7 +1254,8 @@ mod tests {
         // Past the 65,536 records after which the store writes its index table.
         let mut store = filled(&mut sim, 70_000);
         let std: Vec<blaze_cas::Key> = (100..140).map(key).collect();
-        let gone = std::env::temp_dir().join(format!("blaze-collect-none-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-collect-none-");
+        let gone = made.join("none");
         let pace = Pace { grace: Duration::ZERO, ..Pace::default() };
         let mut collects = Collects::new(&gone, Compress::Inline, pace);
         // The first scan reads the store's pins (it has none); then the build.
@@ -1327,7 +1332,8 @@ mod tests {
         drop(store);
         let mut store = opened(&mut sim);
         assert!(!store.pins_read() && store.pins().count() == 0, "a store just opened has read no pin");
-        let gone = std::env::temp_dir().join(format!("blaze-collect-none-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-collect-none-");
+        let gone = made.join("none");
         let mut collects = Collects::new(&gone, Compress::Inline, Pace::default());
         let start = sim.now();
         let mut said = PinsRead::Reading;
@@ -1361,8 +1367,8 @@ mod tests {
 
     #[test]
     fn the_bytes_of_the_state_leave_the_store_out() {
-        let dir = std::env::temp_dir().join(format!("blaze-collect-other-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
+        let made = blaze_core::temp::TempDir::for_test("blaze-collect-other-");
+        let dir = made.path().to_owned();
         std::fs::create_dir_all(dir.join("store")).unwrap();
         std::fs::create_dir_all(dir.join("db")).unwrap();
         std::fs::write(dir.join("store/pack-000000"), vec![1u8; 1 << 20]).unwrap();
@@ -1477,7 +1483,8 @@ mod tests {
     fn a_build_end_forgets_what_its_places_let_go_after_a_scan_and_keeps_a_pinned_key() {
         let mut sim = blaze_core::sim::Sim::new(7, blaze_core::sim::Faults::default());
         let mut store = queued(&mut sim, 2);
-        let gone = std::env::temp_dir().join(format!("blaze-collect-forget-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-collect-forget-");
+        let gone = made.join("none");
         let mut collects = Collects::new(&gone, Compress::Inline, Pace::default());
         collects.build_ended(&mut store);
         assert_eq!(collects.forgets, Forgets::Scan, "a build's end with keys queued asks a scan");
@@ -1556,7 +1563,8 @@ mod tests {
         let mut store = opened(&mut sim);
         let started = |store: &mut Store| text_pin_at_start(store, Some(ids.iter()), 4).unwrap().1;
         let start = if pinned { Some(started(&mut store)) } else { None };
-        let gone = std::env::temp_dir().join(format!("blaze-image-texts-none-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-image-texts-none-");
+        let gone = made.join("none");
         let pace = Pace { grace: Duration::ZERO, ..Pace::default() };
         let mut collects = Collects::new(&gone, Compress::Inline, pace);
         periods(&mut sim, &mut store, 4);

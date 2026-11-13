@@ -16,6 +16,8 @@
 //! `&str`s.
 
 #![feature(allocator_api, allocator_ext, variant_count)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 pub mod args;

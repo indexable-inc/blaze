@@ -188,6 +188,37 @@ mod unix {
         checked_size(unsafe { libc::read(fd.as_raw_fd(), into.as_mut_ptr().cast(), into.len()) })
     }
 
+    /// One `preadv` of `fd` at `at` into `into`, in order: how many bytes, fewer at the file's
+    /// end. A run of adjacent ranges of one file is one call.
+    pub(crate) fn preadv(
+        fd: BorrowedFd<'_>,
+        into: &mut [io::IoSliceMut<'_>],
+        at: u64,
+    ) -> io::Result<usize> {
+        let count = libc::c_int::try_from(into.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a preadv of more buffers than an int counts")
+        })?;
+        let at = libc::off_t::try_from(at).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a preadv at an offset past off_t")
+        })?;
+        // SAFETY: `IoSliceMut` is ABI-compatible with `iovec` on unix (std documents it), each
+        // a live, exclusive buffer the call writes at most its length of; `into` outlives the
+        // call, which keeps none of them, and `fd` is borrowed open for it.
+        checked_size(unsafe { libc::preadv(fd.as_raw_fd(), into.as_ptr().cast(), count, at) })
+    }
+
+    /// The process's soft limit of open descriptors (`RLIMIT_NOFILE`), `u64::MAX` where it
+    /// has none.
+    pub(crate) fn nofile() -> io::Result<u64> {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
+        checked(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) })?;
+        Ok(match limit.rlim_cur == libc::RLIM_INFINITY {
+            true => u64::MAX,
+            false => u64::try_from(limit.rlim_cur).unwrap_or(u64::MAX),
+        })
+    }
+
     /// One `write` of `bytes` to `fd`: how many it took.
     pub(crate) fn write(fd: BorrowedFd<'_>, bytes: &[u8]) -> io::Result<usize> {
         // SAFETY: `bytes` is a live buffer of `bytes.len()` bytes the call only reads, and `fd`

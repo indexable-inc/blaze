@@ -4387,7 +4387,7 @@ fn shapes_let_go(text: &str) -> Vec<Shape> {
     hir::evict::front_end_kept();
     hir::evict::front_end_dropped(&db);
     drop(db);
-    super::let_go_kept_walks();
+    // No front end here was given [`super::Walks`], so nothing of its walks outlives it.
     assert_eq!(super::kept_walks(), 0);
     shapes
 }
@@ -4472,4 +4472,54 @@ fn a_build_after_a_release_equals_a_fresh_build() {
         "the control: with `erase_regions`' map kept across the release the build is still \
          the fresh one's, so the test does not see a stale row"
     );
+}
+
+/// The invariant: what the builds over a database keep for the next walk (its kept walks,
+/// witnesses and records found) is held by the database's owner's [`super::Walks`] and by
+/// nothing else, so it goes when the owner drops it: two front ends given one `Walks` share
+/// one kept walk a configuration, a front end given none keeps nothing past itself, and
+/// once the owner is dropped no `Walks` is alive.
+///
+/// Control: the process static these were held in until 2026-11-13 (`KEPT`, by the
+/// database's nonce) gave the two front ends without `Walks` one kept walk, which the
+/// `ptr_eq` below refuses.
+#[test]
+fn what_the_walks_keep_goes_with_the_databases_owner() {
+    let db: TestDB = fixture::db("fn main() {}").into_db();
+    fn made(db: &TestDB) -> HirFrontend<'_> {
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(&policy(OptLevel::O0))
+    }
+    let walks = super::Walks::new(&db);
+    let (a, b) = (made(&db).with_walks(&walks), made(&db).with_walks(&walks));
+    let kept = a.kept();
+    assert!(std::sync::Arc::ptr_eq(&kept, &b.kept()), "one kept walk a configuration");
+    let (c, d) = (made(&db), made(&db));
+    let own = c.kept();
+    assert!(
+        !std::sync::Arc::ptr_eq(&own, &d.kept()),
+        "a front end with no `Walks` keeps its own, and nothing holds it past the front end"
+    );
+    let (kept, own) = {
+        let weak = (std::sync::Arc::downgrade(&kept), std::sync::Arc::downgrade(&own));
+        drop((kept, own));
+        weak
+    };
+    assert!(own.upgrade().is_none(), "nothing but its build held a walk with no owner");
+    assert!(kept.upgrade().is_some(), "the owner holds its kept walk between builds");
+    drop((a, b, c, d));
+    drop(walks);
+    assert!(kept.upgrade().is_none(), "the kept walk went with its owner");
+}
+
+/// A `Walks` names its database's ids: given to a front end of another database, it is
+/// refused, naming the rule.
+#[test]
+#[should_panic(expected = "keys-cover-every-input")]
+fn walks_of_another_database_are_refused() {
+    let (one, other): (TestDB, TestDB) =
+        (fixture::db("fn main() {}").into_db(), fixture::db("fn main() {}").into_db());
+    let walks = super::Walks::new(&one);
+    let _ = HirFrontend::new(Databases::new(&other), HashSource::ById(ById), BuildTime::default())
+        .with_walks(&walks);
 }

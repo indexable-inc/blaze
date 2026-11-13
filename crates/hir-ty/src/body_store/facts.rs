@@ -22,19 +22,36 @@ pub enum Step {
     /// `const_eval_query` of a `const` item with no generic arguments: its value
     /// (`super::konst`).
     Const = 3,
+    /// [`super::lowering`]: the small facts of the body's lowering (its node counts, its
+    /// closures with their kinds, whether it has lowering errors or location literals), what
+    /// the other steps' decoders and a closure's interning read of the body, so a hit of
+    /// another step lowers nothing. Its value as a fact is the digest of what the lowering
+    /// read ([`super::Lowered::value`]), not of its answer: two bodies with equal counts can
+    /// have read different things.
+    Lower = 4,
 }
 
 impl Step {
-    pub const ALL: [Step; 4] = [Step::Infer, Step::Mir, Step::Borrowck, Step::Const];
+    pub const ALL: [Step; 5] = [Step::Infer, Step::Mir, Step::Borrowck, Step::Const, Step::Lower];
     /// How many steps there are: the length of an array indexed by a step.
     pub const COUNT: usize = Step::ALL.len();
 
     /// Whether the step's answers come from the kernel's verified body entries
     /// ([`super::entries`], posted by [`super::entries::serve`]), not from the item store's
-    /// own records: every step but a constant's value, which has no entry yet
-    /// (`blaze_kernel::steps::BODY_CONST` is its number, owed).
+    /// own records: every step but a constant's value and the lowering, which have no entry
+    /// yet (`blaze_kernel::steps::BODY_CONST` is the first's number, owed).
     pub const fn served(self) -> bool {
-        !matches!(self, Step::Const)
+        !matches!(self, Step::Const | Step::Lower)
+    }
+
+    /// Whether `self` is a step that may read `earlier` of the same body as a fact: the
+    /// lowering is earlier than every other step; otherwise by number.
+    pub const fn reads(self, earlier: Step) -> bool {
+        match (self, earlier) {
+            (Step::Lower, _) => false,
+            (_, Step::Lower) => true,
+            _ => (earlier as u8) < (self as u8),
+        }
     }
 }
 
@@ -86,6 +103,22 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// The value of `fact` now as `def`'s crate sees it (a fact about impls covers only the
     /// crates it loads); `None` when it cannot be hashed now.
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId>;
+
+    /// What a read by a step of `def` of a row behind the seal of the library group `group`
+    /// stands for, the row having let go of its reads there (`blaze_query::db::RowRead::Sealed`,
+    /// a row the walk would have read through): the facts its value is a function of, pushed
+    /// onto `facts`; `false` when none stand for it, and the step is refused by the row's name.
+    /// The default stands for none.
+    fn sealed(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        group: blaze_query::db::SealGroup,
+        facts: &mut Vec<FactRef>,
+    ) -> bool {
+        let _ = (db, def, group, facts);
+        false
+    }
 
     /// The earlier step of the body itself that `fact` stands for, where it is one (a body's
     /// MIR reads its own inference): a kernel entry reads that step's entry for it

@@ -46,9 +46,8 @@ mod tests {
     /// read of `<pid>`.
     #[test]
     fn a_kept_record_is_one_whole_file_and_no_part() {
-        let state = std::env::temp_dir().join(format!("blaze-thin-kept-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).unwrap();
+        let held = blaze_core::temp::TempDir::for_test("blaze-thin-kept-");
+        let state = held.path();
         let record = Kept {
             pid: 41,
             started_ns: 10,
@@ -63,6 +62,5 @@ mod tests {
         assert_eq!(path, state.join(DIR).join("41"));
         assert_eq!(Kept::read(&std::fs::read(&path).unwrap()), Ok(record));
         assert!(!state.join(DIR).join("41.part").exists());
-        let _ = std::fs::remove_dir_all(&state);
     }
 }

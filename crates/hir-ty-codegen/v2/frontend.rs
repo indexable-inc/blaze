@@ -3,7 +3,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use base_db::{Crate, CrateOrigin, Db};
@@ -109,6 +109,10 @@ pub struct HirFrontend<'db> {
     /// ([`witnesses::Witnesses`]): what [`Frontend::changed_since`] names and
     /// [`Frontend::redescribe`] holds by. Set with `stage`.
     witnesses: Option<Arc<witnesses::Witnesses>>,
+    /// What the builds over the database keep between them ([`Walks`]), given by its owner
+    /// ([`Self::with_walks`]); `None` for a front end whose builds keep nothing: its kept
+    /// walk, witnesses, records found and link inputs are its own and go with it.
+    pub(super) walks: Option<&'db Walks>,
     // dyn: `reached` once a batch of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
@@ -339,6 +343,10 @@ fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
 /// two builds with the same units share what a key holds, and a build with others never
 /// reads it.
 /// Nothing is taken out, so a place names one content for the process's life.
+#[expect(
+    blaze::process_static,
+    reason = "a handful of units contents, never taken out so a place names one content for the process's life: the daemon should own the table"
+)]
 static UNITS: Lock<Vec<Arc<Units>>> = Lock::new("codegen.frontend.units", Vec::new());
 
 /// [`UNITS`] by place, as a describe that runs reads it ([`Facing::front`]): a lock-free look.
@@ -486,50 +494,105 @@ fn described_static_memo(db: &Db, value: HirStatic, facing: Facing) -> MemoedSta
     MemoedStatic::Described(front.described_static(db, &value))
 }
 
-/// How many kept walks ([`HirFrontend::kept`]) a process holds: the least recently asked for
-/// goes when one more is made. A walk is of one database and configuration, and a daemon
-/// builds a few checkouts in a few configurations (a program's, its build-time code's, a
-/// test's), so the few last used are the ones the next build asks for.
-const KEPT_WALKS: usize = 8;
+/// How many [`Walks`] are alive in the process: each names its database's interned ids, so a
+/// release of the process tables (`hir::evict::release_process_tables`) waits for none to be.
+static WALKS: AtomicUsize = AtomicUsize::new(0);
 
-/// The walks kept, each with the database and facts it is of, the last asked for last.
-static KEPT: Lock<Vec<(base_db::Nonce, Facing, Arc<Kept<HirInstance, HirStatic>>)>> =
-    Lock::new("codegen.frontend.kept", Vec::new());
-
-/// Lets go of every kept walk ([`HirFrontend::kept`]): each function's describe, each
-/// program's last walk and lists, of every database and configuration. How many describes
-/// went. They are kept only so the next build's walk asks the front end less; on the global
-/// heap, under no budget, they were what a cold build of blaze held most of codegen's heap
-/// for (13.11 GiB with one task running; the held samples' spans were `codegen reach`,
-/// `codegen resolve`, `codegen delta` and `codegen templates`, each as old as the build: lane
-/// mem-1111, 2026-11-11). A walk in flight keeps its own until it ends; the next walk over
-/// each database begins with nothing kept and describes everything again. With them go the
-/// witnesses of every database's describes and counts ([`witnesses::let_go`]), which are of
-/// those walks: the next build's front end makes them anew. No entry is left, not even an
-/// empty one: an entry holds its database's nonce and configuration, and what it holds is what
-/// a release of the process tables (`hir::evict::release_process_tables`) waits for no walk
-/// to hold ([`kept_walks`]).
-pub fn let_go_kept_walks() -> usize {
-    let mut kept = KEPT.lock();
-    let describes = kept.iter().map(|(_, _, walks)| walks.len()).sum();
-    kept.clear();
-    drop(kept);
-    let postings = witnesses::let_go();
-    tracing::info!(
-        target: "blaze",
-        describes,
-        postings,
-        "codegen: the kept walks and their describes' witnesses were let go"
-    );
-    describes
+/// What the builds over one database keep between them for the next build's walk, and
+/// nothing else does: each configuration's kept walks ([`HirFrontend::kept`]), what the
+/// database's describes and counts read ([`witnesses::Witnesses`]) and what it read from
+/// describe records ([`described::Found`]). Each names the database's interned ids, so it is
+/// owned beside the database (blaze-cargo's kept front end) and dropped with it.
+///
+/// The database's link inputs ([`super::linked::Links`]) are kept here too.
+///
+/// Until 2026-11-13 these were four process statics (`KEPT`, `WITNESSES`, `FOUND`, and
+/// linked.rs's `KEPT` of link inputs), each by
+/// the database's nonce: the kept walks of the last eight databases and configurations stayed
+/// past their databases, the records read of a database were never let go at all, and a
+/// release could only empty all of them at once (lane F6 of the memory wave, read from code).
+/// Owned here, they leave exactly when the database does, and no build asks a static.
+pub struct Walks {
+    /// The database they are of: a front end of another is refused ([`HirFrontend::with_walks`]).
+    database: base_db::Nonce,
+    /// Each configuration's kept walk: a database is built in a few (a program's, its
+    /// build-time code's, a test's), each one entry.
+    kept: Lock<Vec<(Facing, Arc<Kept<HirInstance, HirStatic>>)>>,
+    witnesses: Lock<Option<Arc<witnesses::Witnesses>>>,
+    found: Lock<Option<(u64, Arc<described::Found>)>>,
+    /// The link inputs of the last few programs linked of the database
+    /// ([`super::linked::Links`]): what the next link of each brings forward.
+    links: super::linked::Links,
 }
 
-/// How many walks are kept ([`HirFrontend::kept`]), and databases' witnesses of their
-/// describes ([`witnesses::Witnesses`]), each of which names interned ids: 0 after
-/// [`let_go_kept_walks`] until the next walk keeps one or a front end is made with a policy.
+impl Walks {
+    /// Nothing kept yet, for `db`.
+    pub fn new(db: &Db) -> Walks {
+        WALKS.fetch_add(1, Ordering::Relaxed);
+        Walks {
+            database: db.nonce_and_revision().0,
+            // alloc: none until a walk is kept
+            kept: Lock::new("codegen.frontend.walks.kept", Vec::new()),
+            witnesses: Lock::new("codegen.frontend.walks.witnesses", None),
+            found: Lock::new("codegen.frontend.walks.found", None),
+            links: super::linked::Links::new(),
+        }
+    }
+
+    /// What the database's links keep for the next ([`HirFrontend::link_inputs`]).
+    pub(super) fn links(&self) -> &super::linked::Links {
+        &self.links
+    }
+
+    /// Whether these are of `db`: a database made again in its place (another nonce) needs a
+    /// [`Walks`] of its own, as [`HirFrontend::with_walks`] refuses these for it.
+    pub fn is_of(&self, db: &Db) -> bool {
+        self.database == db.nonce_and_revision().0
+    }
+
+    /// Lets go of everything kept, as a drop would, and keeps the owner: the next build over
+    /// the database walks whole and describes or finds everything again. How many functions
+    /// the kept walks held. A walk in flight keeps its own until it ends.
+    pub fn let_go(&self) -> usize {
+        let kept = std::mem::take(&mut *self.kept.lock());
+        let functions = kept.iter().map(|(_, walks)| walks.functions()).sum();
+        let postings = self.witnesses.lock().take().map_or(0, |it| it.postings());
+        self.found.lock().take();
+        let programs = self.links.let_go();
+        // Freed outside the locks.
+        drop(kept);
+        tracing::info!(
+            target: "blaze",
+            functions,
+            postings,
+            programs,
+            "codegen: a database's kept walks, witnesses, records found and link inputs were let go"
+        );
+        functions
+    }
+
+    /// The witnesses of `db`, its own while no input at `HIGH` was written since they were
+    /// made, else made anew, empty, from its current view.
+    fn witnesses(&self, db: &Db) -> Arc<witnesses::Witnesses> {
+        witnesses::of_in(&mut self.witnesses.lock(), db)
+    }
+
+    /// What `db` read from describe records since the last write of an input at `HIGH`.
+    fn found(&self, db: &Db) -> Arc<described::Found> {
+        described::found_in(&mut self.found.lock(), db)
+    }
+}
+
+impl Drop for Walks {
+    fn drop(&mut self) {
+        WALKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How many [`Walks`] are alive, each of which names interned ids: what a release of the
+/// process tables waits to be 0. No process static holds a walk, a witness or a record read.
 pub fn kept_walks() -> usize {
-    let walks = KEPT.lock().len();
-    walks + witnesses::held()
+    WALKS.load(Ordering::Relaxed)
 }
 
 const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::with_policy`), so \
@@ -548,11 +611,36 @@ impl<'db> HirFrontend<'db> {
             stage: None,
             found: None,
             witnesses: None,
+            walks: None,
             checks: None,
             stop: None,
             give_way: None,
             devirt: Default::default(),
         }
+    }
+
+    /// The front end of a build whose database's owner keeps `walks` for the builds over it:
+    /// the build's walk is kept there for the next ([`Self::kept`]), and what its describes
+    /// read and found is noted there. In any order with [`Self::with_policy`].
+    ///
+    /// # Panics
+    ///
+    /// When `walks` is of another database: its ids would name other things in this one
+    /// (rule keys-cover-every-input). A caller's bug, never a build's input.
+    pub fn with_walks(mut self, walks: &'db Walks) -> Self {
+        let database = self.databases.db.nonce_and_revision().0;
+        assert!(
+            walks.database == database,
+            "the kept walks of database {:?} were given to a front end of database {database:?} \
+             (rule keys-cover-every-input: a kept walk names its own database's ids)",
+            walks.database
+        );
+        self.walks = Some(walks);
+        if self.stage.is_some() {
+            self.found = Some(walks.found(self.databases.db));
+            self.witnesses = Some(walks.witnesses(self.databases.db));
+        }
+        self
     }
 
     /// The front end of a build that stops before its next function once `stop` is set: its
@@ -584,8 +672,13 @@ impl<'db> HirFrontend<'db> {
     pub fn with_policy(mut self, policy: &Policy) -> Self {
         let (id, units) = give_units(Units::of(self.databases.db, policy));
         self.stage = Some(described::Stage::of(policy, &units));
-        self.found = Some(described::found_of(self.databases.db));
-        self.witnesses = Some(witnesses::of(self.databases.db));
+        let db = self.databases.db;
+        // Kept by the database's owner where it gave them ([`Self::with_walks`]); else this
+        // front end's own, which go with it.
+        (self.found, self.witnesses) = match self.walks {
+            Some(walks) => (Some(walks.found(db)), Some(walks.witnesses(db))),
+            None => (Some(described::found_in(&mut None, db)), Some(witnesses::of_in(&mut None, db))),
+        };
         (self.units, self.units_id) = (Some(units), Some(id));
         self
     }
@@ -798,31 +891,28 @@ impl<'db> HirFrontend<'db> {
         witnesses::witnessed(db, run, note).2
     }
 
-    /// The describes the walks over this front end's database and configuration kept
-    /// (`blaze_codegen::driver::Kept`), for a build to take from and keep its own in
-    /// (`Build::keeping`): of this process, in memory, as its instances are the database's
-    /// ids. A database made again (a restart, a checkout loaded anew) has another nonce and
-    /// so none kept: its first walk describes everything, which the walk's span says
-    /// (`fresh`). Every describe taken from it is checked against what its last run read
-    /// first ([`Frontend::redescribe`]), so which walk it is given decides only how much is
-    /// kept, never what is built.
+    /// What the walks over this front end's database and configuration kept
+    /// (`blaze_codegen::driver::Kept`), for a build to patch and keep its own in
+    /// (`Build::keeping`): in the database owner's [`Walks`], as its instances are the
+    /// database's ids. A database made again (a restart, a checkout loaded anew) has a new
+    /// owner and so none kept: its first walk is whole, which the walk's span says (`fresh`).
+    /// A front end given no [`Walks`] keeps nothing past its build: its kept walk is a new,
+    /// empty one, its own. Every function a kept walk holds is checked against what its last
+    /// run read first ([`Frontend::redescribe`]), so which walk it is given decides only how
+    /// much is asked, never what is built.
     pub fn kept(&self) -> Arc<Kept<HirInstance, HirStatic>> {
-        let (database, _) = self.databases.db.nonce_and_revision();
-        let facing = self.facing(None);
-        let mut kept = KEPT.lock();
-        let found = kept.iter().position(|(of, as_, _)| *of == database && *as_ == facing);
-        let entry = match found {
-            Some(at) => kept.remove(at),
-            None => {
-                if kept.len() >= KEPT_WALKS {
-                    kept.remove(0);
-                }
-                // alloc: once per database and configuration a process builds, a kept walk
-                (database, facing, Arc::new(Kept::new()))
-            }
+        let Some(walks) = self.walks else {
+            // alloc: once a build, an empty walk this build alone holds
+            return Arc::new(Kept::new());
         };
-        let walk = entry.2.clone(); // clone: a reference count, once a build
-        kept.push(entry);
+        let facing = self.facing(None);
+        let mut kept = walks.kept.lock();
+        if let Some((_, walk)) = kept.iter().find(|(as_, _)| *as_ == facing) {
+            return walk.clone(); // clone: a reference count, once a build
+        }
+        // alloc: once per configuration the database is built in, a kept walk
+        let walk = Arc::new(Kept::new());
+        kept.push((facing, walk.clone())); // clone: a reference count
         walk
     }
 

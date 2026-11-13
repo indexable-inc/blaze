@@ -757,6 +757,10 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::canonical_cbor)) => AttrFlags::CANONICAL_CBOR,
+                (Some(Word::blaze), Some(Word::renders_positions)) => {
+                    AttrFlags::RENDERS_POSITIONS
+                }
                 (Some(Word::blaze), Some(Word::capabilities)) => AttrFlags::CAPABILITIES,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
@@ -948,6 +952,7 @@ name_set! {
     bench,
     bits,
     blaze,
+    canonical_cbor,
     capabilities,
     checkfree,
     clippy,
@@ -1003,6 +1008,7 @@ name_set! {
     program_lifetime,
     pure,
     reflect,
+    renders_positions,
     repr,
     rust_analyzer,
     rustc_allocator,
@@ -1292,6 +1298,14 @@ bitflags::bitflags! {
         /// function has a derivative blaze can be asked for. It changes no code of a function
         /// that is not asked for its derivative: no codegen key reads it.
         const DIFFERENTIABLE = 1 << 103;
+        /// `#[blaze::renders_positions]`, a word, on a function: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`), read by blaze-lints' `blaze::reads_positions`.
+        /// The function words a diagnostic or produces debug info, so it may read positions
+        /// and the live parse (a body's source map, a file's parse, an `AstIdMap`), and so may
+        /// what it calls; a query crate's function without it may not, since a result that read
+        /// positions reruns on every edit above it. It changes diagnostics, never code: no
+        /// codegen key reads it.
+        const RENDERS_POSITIONS = 1 << 104;
         /// `#[blaze::drop(early)]` on a struct, enum or union with a `Drop` impl: a blaze
         /// extension (inert under rustc with `#![register_tool(blaze)]`). Under
         /// `#![blaze::early_drop]` a value of the type is dropped after its last use
@@ -1304,6 +1318,13 @@ bitflags::bitflags! {
         /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
         /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
         const DROP_TRUSTED = 1 << 107;
+        /// `#![blaze::canonical_cbor]`, a word, inner, on a module or a crate root: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::cbor_field_order`. Every struct and struct variant under it that derives
+        /// serde's `Serialize` is written in RFC 8949's core deterministic CBOR, so it declares
+        /// its fields in the order of their keys' encoding (shorter first, then bytewise) and
+        /// the encoder writes them as they come. It changes diagnostics, never code.
+        const CANONICAL_CBOR = 1 << 108;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1529,7 +1550,16 @@ fn collect_attrs_in<'db, BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
+///
+/// The owner's fact where one is kept (`deps::facts`): a value written as a literal is kept,
+/// one a macro writes reads which macro its path names and is made again each time.
 pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    crate::deps::facts::of_attrs(db, name, owner, || symbol_attr_made(db, owner, name))
+}
+
+/// [`symbol_attr`] off the owner's syntax, and whether the value read nothing but the
+/// attributes' text (no macro in it).
+fn symbol_attr_made(db: &Db, owner: AttrDefId, name: &str) -> (Option<Symbol>, bool) {
     let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
     let value =
         collect_attrs_in(
@@ -1545,8 +1575,17 @@ pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbo
                 },
                 _ => ControlFlow::Continue(()),
             },
-        )?;
-    attr_value(db, owner, krate, value)
+        );
+    let Some(value) = value else { return (None, true) };
+    let mut written = value.value;
+    while let ast::Expr::ParenExpr(paren) = written {
+        match paren.expr() {
+            Some(inner) => written = inner,
+            None => break,
+        }
+    }
+    let literal = !matches!(written, ast::Expr::MacroExpr(_));
+    (attr_value(db, owner, krate, value), literal)
 }
 
 /// The string a key-value attribute's value is, with the macros in it expanded by the
@@ -1719,6 +1758,27 @@ pub enum NativeLibKind {
     RawDylib,
     /// A `kind` other than these (`"link-arg"`, or one rustc refuses), as written.
     Other(Symbol),
+}
+
+/// Every library the `#[link(...)]`s of `owner` name, each with the `cfg(...)` it is linked
+/// under, in the order written: what [`AttrFlags::native_libs`] keeps, before the crate's cfg
+/// picks.
+fn written_libs(db: &Db, owner: ExternBlockId) -> Box<[(NativeLib, Option<CfgExpr>)]> {
+    blaze_mem::frame::current(|frame| {
+        let mut libs = Vec::new_in(frame);
+        collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = &attr
+                && path_is(attr.path(), "link")
+                && let Some(tt) = attr.token_tree()
+                && let Some(lib) = parse_link_tt(tt)
+            {
+                libs.push(lib);
+            }
+            ControlFlow::Continue(())
+        });
+        // alloc: the fact's libraries, exact, made once per extern block
+        libs.drain(..).collect()
+    })
 }
 
 /// The library of a `link(...)`, and the `cfg(...)` it is linked under. `None` for one with no
@@ -2135,10 +2195,6 @@ fn fields_docs_bytes(docs: &ArenaMap<LocalFieldId, Option<Box<Docs>>>) -> usize 
 impl AttrFlags {
     #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
-        // A crate whose items are read from pages: the record's, and no outline is made.
-        if let Some(served) = crate::nameres::frozen::items::attr_flags(db, owner) {
-            return served;
-        }
         // The item's own entry where one is kept (rule 65), else walked off its syntax and kept.
         crate::nameres::frozen::entries::items::attr_flags(db, owner, || {
             let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
@@ -2157,6 +2213,21 @@ impl AttrFlags {
         /// field, read by index.
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
+            // A fact of the variant's header, which holds every field and its attributes (a
+            // `cfg` among them puts the crate's cfg in the key).
+            use crate::deps::facts::{Part, at, fact};
+            let (kind, place) = match variant {
+                VariantId::StructId(it) => (1, at(db, it)),
+                VariantId::UnionId(it) => (2, at(db, it)),
+                VariantId::EnumVariantId(it) => (5, at(db, it)),
+            };
+            fact(db, "field flags", "", kind, Some(place), Part::Header, || {
+                (field_attr_flags_made(db, variant), true)
+            })
+        }
+
+        /// [`field_attr_flags`] off the variant's syntax.
+        fn field_attr_flags_made(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 for_each_field(db, variant, Tree::Outline, |_, cfg_options, field| {
@@ -2349,37 +2420,41 @@ impl AttrFlags {
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
         let krate = owner.lookup(db).container.krate(db);
-        blaze_mem::frame::current(|frame| {
-            let mut libs = Vec::new_in(frame);
-            collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = &attr
-                    && path_is(attr.path(), "link")
-                    && let Some(tt) = attr.token_tree()
-                    && let Some((lib, cfg)) = parse_link_tt(tt)
-                    && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
-                {
-                    libs.push(lib);
-                }
-                ControlFlow::Continue(())
-            });
+        // The fact is every `#[link]` with its `cfg(..)` as written, which reads no cfg (one in
+        // a `cfg_attr` is in its key): the crate's cfg picks among them here, on every read.
+        let written: Box<[(NativeLib, Option<CfgExpr>)]> = crate::deps::facts::of_attrs(
+            db,
+            "link",
+            AttrDefId::ExternBlockId(owner),
+            || (written_libs(db, owner), true),
+        );
+        written
+            .into_iter()
+            .filter(|(_, cfg)| {
+                cfg.as_ref().is_none_or(|it| krate.cfg_options(db).check(it) != Some(false))
+            })
+            .map(|(lib, _)| lib)
             // alloc: the memo's libraries, exact; nothing for an extern block without `#[link]`
-            libs.drain(..).collect()
-        })
+            .collect()
     }
 
     /// The module a wasm module imports the functions of an `extern` block from,
     /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
     #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
     pub fn wasm_import_module(db: &Db, owner: ExternBlockId) -> Option<Symbol> {
-        collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
-            if let ast::Meta::TokenTreeMeta(attr) = &attr
-                && path_is(attr.path(), "link")
-                && let Some(tt) = attr.token_tree()
-                && let Some(module) = link_symbol(tt, "wasm_import_module")
-            {
-                return ControlFlow::Break(module);
-            }
-            ControlFlow::Continue(())
+        let owner = AttrDefId::ExternBlockId(owner);
+        crate::deps::facts::of_attrs(db, "wasm_import_module", owner, || {
+            let found = collect_attrs(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = &attr
+                    && path_is(attr.path(), "link")
+                    && let Some(tt) = attr.token_tree()
+                    && let Some(module) = link_symbol(tt, "wasm_import_module")
+                {
+                    return ControlFlow::Break(module);
+                }
+                ControlFlow::Continue(())
+            });
+            (found, true)
         })
     }
 
@@ -2622,15 +2697,18 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
-            collect_attrs(db, owner, |attr| {
-                if let ast::Meta::KeyValueMeta(attr) = attr
-                    && path_is(attr.path(), "lang")
-                    && let Some(value) = string_value(attr)
-                {
-                    ControlFlow::Break(Symbol::intern(&value))
-                } else {
-                    ControlFlow::Continue(())
-                }
+            crate::deps::facts::of_attrs(db, "lang", owner, || {
+                let found = collect_attrs(db, owner, |attr| {
+                    if let ast::Meta::KeyValueMeta(attr) = attr
+                        && path_is(attr.path(), "lang")
+                        && let Some(value) = string_value(attr)
+                    {
+                        ControlFlow::Break(Symbol::intern(&value))
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                });
+                (found, true)
             })
         }
     }
@@ -2651,6 +2729,11 @@ impl AttrFlags {
     /// that the ADT has repr.
     #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn repr_assume_has(db: &Db, owner: AdtId) -> Option<ReprOptions> {
+        crate::deps::facts::of_attrs(db, "repr", owner.into(), || (Self::repr_made(db, owner), true))
+    }
+
+    /// [`Self::repr_assume_has`] off the type's syntax.
+    fn repr_made(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         let mut result = None;
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
             let mut current = None;
@@ -2697,19 +2780,23 @@ impl AttrFlags {
     /// Call this only if there are legacy const generics, to save memory.
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub(crate) fn legacy_const_generic_indices(db: &Db, owner: FunctionId) -> Option<Box<[u32]>> {
-        blaze_mem::frame::current(|frame| {
-            let result = collect_attrs(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && path_is(attr.path(), "rustc_legacy_const_generics")
-                    && let Some(tt) = attr.token_tree()
-                {
-                    let result = parse_rustc_legacy_const_generics(tt, frame);
-                    ControlFlow::Break(result)
-                } else {
-                    ControlFlow::Continue(())
-                }
+        let what = "rustc_legacy_const_generics";
+        crate::deps::facts::of_attrs(db, what, owner.into(), || {
+            let made = blaze_mem::frame::current(|frame| {
+                let result = collect_attrs(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && path_is(attr.path(), "rustc_legacy_const_generics")
+                        && let Some(tt) = attr.token_tree()
+                    {
+                        let result = parse_rustc_legacy_const_generics(tt, frame);
+                        ControlFlow::Break(result)
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                });
+                result.filter(|it| !it.is_empty())
             });
-            result.filter(|it| !it.is_empty())
+            (made, true)
         })
     }
 
@@ -2756,6 +2843,13 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
+            crate::deps::facts::of_attrs(db, "target_feature", owner.into(), || {
+                (made(db, owner), true)
+            })
+        }
+
+        /// [`target_features`] off the function's syntax.
+        fn made(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
             blaze_mem::frame::current(|frame| {
                 let mut found = Vec::new_in(frame);
                 collect_attrs::<Infallible>(db, owner.into(), |attr| {
@@ -3006,15 +3100,18 @@ impl AttrFlags {
         // We LRU this query because it is only used by IDE.
         #[blaze_query::tracked(returns(ref), lru, weigh = cfgs_bytes, mem_tag = Nameres)]
         fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
-            blaze_mem::frame::current(|frame| {
-                let mut result = Vec::new_in(frame);
-                collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
-                match result.len() {
-                    0 => None,
-                    1 => result.into_iter().next(),
-                    // alloc: the memo's value, exact, only for an item whose flag says `#[cfg]`
-                    _ => Some(CfgExpr::All(result.drain(..).collect())),
-                }
+            crate::deps::facts::of_attrs(db, "cfg", owner, || {
+                let made = blaze_mem::frame::current(|frame| {
+                    let mut result = Vec::new_in(frame);
+                    collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
+                    match result.len() {
+                        0 => None,
+                        1 => result.into_iter().next(),
+                        // alloc: the memo's value, exact, only for an item whose flag says `#[cfg]`
+                        _ => Some(CfgExpr::All(result.drain(..).collect())),
+                    }
+                });
+                (made, true)
             })
         }
 
@@ -3181,6 +3278,11 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
+            crate::deps::facts::of_attrs(db, "unstable", owner, || (made(db, owner), true))
+        }
+
+        /// [`unstable_feature`] off the owner's syntax.
+        fn made(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && path_is(attr.path(), "unstable")
@@ -3216,14 +3318,17 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
         fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Box<str>> {
-            collect_attrs(db, owner, |attr| {
-                if let ast::Meta::KeyValueMeta(attr) = attr
-                    && path_is(attr.path(), "must_use")
-                    && let Some(message) = string_value(attr)
-                {
-                    return ControlFlow::Break(Box::from(&*message));
-                }
-                ControlFlow::Continue(())
+            crate::deps::facts::of_attrs(db, "must_use", owner, || {
+                let found = collect_attrs(db, owner, |attr| {
+                    if let ast::Meta::KeyValueMeta(attr) = attr
+                        && path_is(attr.path(), "must_use")
+                        && let Some(message) = string_value(attr)
+                    {
+                        return ControlFlow::Break(Box::from(&*message));
+                    }
+                    ControlFlow::Continue(())
+                });
+                (found, true)
             })
         }
     }
@@ -3238,6 +3343,12 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(deref), mem_tag = Nameres)]
         fn define_opaque(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
+            let what = "define_opaque";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        /// [`define_opaque`] off the function's syntax.
+        fn made(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 let mut tokens = Vec::new_in(frame);
@@ -3292,6 +3403,12 @@ impl AttrFlags {
 
         #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
         pub fn must_implement_one_of(db: &Db, owner: TraitId) -> Option<Box<[Name]>> {
+            let what = "rustc_must_implement_one_of";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        /// [`must_implement_one_of`] off the trait's syntax.
+        fn made(db: &Db, owner: TraitId) -> Option<Box<[Name]>> {
             blaze_mem::frame::current(|frame| {
                 let mut names = Vec::new_in(frame);
                 collect_attrs(db, owner.into(), |attr| {
@@ -3455,7 +3572,12 @@ fn own_disabled_sanitizers(db: &Db, owner: AttrDefId, inherited: u8) -> u8 {
     if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_SANITIZE) {
         return inherited;
     }
-    collect_attrs(db, owner, sanitize_sets).map_or(inherited, |sets| sets.apply(inherited))
+    // The fact is the sets as written (rare: only an item with `#[sanitize]` asks), so what the
+    // item inherits is no input of it.
+    let written: Option<(u8, u8)> = crate::deps::facts::of_attrs(db, "sanitize", owner, || {
+        (collect_attrs(db, owner, sanitize_sets).map(|it| (it.on, it.off)), true)
+    });
+    written.map_or(inherited, |(on, off)| SanitizeSets { on, off }.apply(inherited))
 }
 
 /// One `#[sanitize(..)]`: the sanitizers it turns on and those it turns off.

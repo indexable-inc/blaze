@@ -831,6 +831,10 @@ struct Stacks {
 const STACK_SETS: usize = 4;
 const STACK_ELEMENTS: usize = 1 << 16;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool capped at STACK_SETS sets of at most STACK_ELEMENTS elements each"
+)]
 thread_local! {
     /// This thread's spare stacks: a collector can run a query that lowers another store on
     /// the same thread, which takes the next set (or a fresh one).

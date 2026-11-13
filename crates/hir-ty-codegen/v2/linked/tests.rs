@@ -18,10 +18,13 @@ use super::*;
 use crate::v2::{BuildTime, Databases, ItemHashes};
 use db::TestDB;
 
+/// A front end over `text`'s database, with the database's owner of what its links keep
+/// ([`crate::v2::Walks`]), as a daemon's kept front end gives it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
+    let walks: &'static crate::v2::Walks = Box::leak(Box::new(crate::v2::Walks::new(db)));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
-    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()))
+    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()).with_walks(walks))
 }
 
 #[track_caller]
@@ -166,6 +169,46 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let again = frontend.link_inputs(&built).unwrap();
     assert_eq!((again.serial, again.base), (inputs.serial, None));
     assert!(again.tables.is_empty() && again.removed.is_empty() && again.work.made == 0);
+}
+
+/// The invariant: a database's link inputs are kept by its owner ([`crate::v2::Walks`]) and by
+/// nothing else, so they leave with it. The control is the front end given no owner: were
+/// anything in the process (a static, as until 2026-11-13) keeping them, its second link
+/// would find them and make nothing.
+#[test]
+fn link_inputs_are_kept_by_the_databases_owner_alone() {
+    let (db, frontend) = frontend(SPANNED);
+    let func = function(db, "f");
+    let owner = DefWithBodyId::FunctionId(func);
+    let root = BodyStore::of(db, owner).root_expr();
+    let start = frontend.hashes.span(db, owner, MirSpan::ExprId(root)).unwrap();
+    let built = Built {
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: start }]))],
+        items: vec![item_key(db, ItemId::Function(func))],
+        debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
+        ..Built::default()
+    };
+    let first = frontend.link_inputs(&built).unwrap();
+    assert!(first.work.whole.is_some());
+    let again = frontend.link_inputs(&built).unwrap();
+    assert!(again.work.whole.is_none() && again.work.made == 0, "the owner kept the first link's");
+
+    // A front end with no owner, over the same database: nothing it links is kept anywhere.
+    let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
+    let unowned = HirFrontend::new(Databases::new(db), hashes, BuildTime::default());
+    for link in 0..2 {
+        let inputs = unowned.link_inputs(&built).unwrap();
+        assert_eq!(
+            inputs.work.whole,
+            Some(NOTHING_KEPT),
+            "link {link} of a front end with no owner found link inputs kept"
+        );
+    }
+
+    // Let go by the owner: the next link makes every table again.
+    let walks = frontend.walks.expect("given by `frontend`");
+    assert_eq!(walks.links().let_go(), 1, "one program's link inputs were kept");
+    assert_eq!(frontend.link_inputs(&built).unwrap().work.whole, Some(NOTHING_KEPT));
 }
 
 #[test]
@@ -423,6 +466,9 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
     let mut db = fx.into_db();
     let file = file.file_id(&db);
     let hashes = || HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
+    // What the database's links keep, owned beside it for every step, as a daemon's kept
+    // front end owns it.
+    let links = Links::new();
     let mut before: Option<(BuiltId, Vec<(InstanceKey, bool)>)> = None;
     // The tables a link that applies each change holds, and the snapshot they are.
     let mut held: std::collections::BTreeMap<ContentId, Vec<u8>> = Default::default();
@@ -438,7 +484,7 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
         // everything written since the database was made, a wide level that names every row.
         blaze_query::db::plumbing::walk_changed_set(&db);
         let built = program.built(&db, &frontend.hashes, before.as_ref());
-        let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant))?;
+        let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant, &links))?;
         if given.serial != serial {
             if given.base != Some(serial) {
                 if given.base.is_some() {

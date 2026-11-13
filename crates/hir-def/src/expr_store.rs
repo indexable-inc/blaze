@@ -812,6 +812,10 @@ fn exact_arena<T: Clone>(pooled: &Arena<T>) -> Arena<T> {
 const POOL_SETS: usize = 4;
 const POOL_ELEMENTS: usize = 1 << 20;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool capped at POOL_SETS sets of at most POOL_ELEMENTS elements each"
+)]
 thread_local! {
     /// This thread's spare scratch, a stack: lowering one store can run a query that lowers
     /// another on the same thread, which takes the next set (or a fresh one) and gives it back

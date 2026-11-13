@@ -301,6 +301,9 @@ mod tests {
 
     const SEC: u64 = 1_000_000_000;
 
+    /// How long a test's stuck job waits for the test to let it go before it fails.
+    const RELEASE_WAIT: Duration = Duration::from_secs(60);
+
     /// A job of the request: inside its span, it waits for the next job, which waits for the
     /// one after, around to itself, until the test lets them go.
     fn job(k: usize, ready: &Barrier, gate: &(Lock<bool>, Signal)) {
@@ -313,9 +316,10 @@ mod tests {
         ready.wait();
         let (released, cv) = gate;
         let mut released = released.lock();
-        while !*released {
-            cv.wait(&mut released);
-        }
+        assert!(
+            !cv.wait_while_for(&mut released, |released| !*released, RELEASE_WAIT),
+            "job {k}: the test did not let the jobs go within {RELEASE_WAIT:?}"
+        );
     }
 
     #[test]
@@ -621,9 +625,10 @@ mod tests {
                     ready.wait();
                     let (released, cv) = &gate;
                     let mut released = released.lock();
-                    while !*released {
-                        cv.wait(&mut released);
-                    }
+                    assert!(
+                        !cv.wait_while_for(&mut released, |released| !*released, RELEASE_WAIT),
+                        "the test did not let the worker go within {RELEASE_WAIT:?}"
+                    );
                 })
                 .unwrap();
             ready.wait();

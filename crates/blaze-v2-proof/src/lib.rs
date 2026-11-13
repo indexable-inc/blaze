@@ -41,6 +41,9 @@
 //! as one CSR array.
 
 #![deny(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod bytes;
 pub mod columns;
@@ -105,6 +108,10 @@ pub struct TraceBuilder {
 }
 
 impl TraceBuilder {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a trace's edges are indexed by u32 rows; a trace of a fixture build stays far below 2^32 edges, and one past it needs a typed refusal from insert"
+    )]
     pub fn insert(&mut self, key: QueryKey, fingerprint: Fingerprint, edges: &[Edge], ran: bool) {
         let from = u32::try_from(self.edges.len()).expect("a trace has fewer than 2^32 edges");
         self.edges.extend_from_slice(edges);
@@ -118,6 +125,10 @@ impl TraceBuilder {
 
     /// Every key named once through a table indexed by the key's own content hash (one probe
     /// per edge, not a binary search), then only the distinct keys sorted.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "edges_from holds u32 offsets: the reads copied here are the builder's edges, which insert already held under 2^32"
+    )]
     pub fn finish(self) -> Trace {
         const NONE: u32 = u32::MAX;
         let mut table = KeyTable::with_capacity(self.rows.len() + self.edges.len() / 4);
@@ -213,6 +224,10 @@ impl KeyTable {
     }
 
     /// The index of `key`, added if it is new.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a key's index is u32 and the table interns at most one key per trace row or edge, which the trace builder holds under 2^32"
+    )]
     fn intern(&mut self, key: &QueryKey) -> u32 {
         let mask = self.slots.len() - 1;
         let mut at = self.slot(key);

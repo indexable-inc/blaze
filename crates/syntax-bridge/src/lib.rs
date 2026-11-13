@@ -3,6 +3,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::{
     alloc::{Allocator, Global},
@@ -1142,6 +1145,10 @@ where
 #[derive(Default)]
 struct PendingLeaves(VecDeque<tt::Leaf>);
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread shelf (blaze_mem::scratch) emptied after each conversion, kept at the most leaves pending at once, about the tree's depth"
+)]
 thread_local! {
     static PENDING_LEAVES: Cell<VecDeque<tt::Leaf>> = const { Cell::new(VecDeque::new()) }; // alloc: none, empty
 }

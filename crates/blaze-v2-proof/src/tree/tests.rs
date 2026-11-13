@@ -58,12 +58,9 @@ fn model(root: &Path, skip: &[String]) -> [u8; 32] {
     hasher.finalize()
 }
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("blaze-v2-proof-tree-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory of this test's own, removed when it drops.
+fn scratch(name: &str) -> blaze_core::temp::TempDir {
+    blaze_core::temp::TempDir::for_test(&format!("blaze-v2-proof-tree-{name}-"))
 }
 
 fn skip() -> Vec<String> {
@@ -90,15 +87,16 @@ fn populate(root: &Path) {
 
 #[test]
 fn the_digest_is_the_model_s() {
-    let root = scratch("model");
+    let held = scratch("model");
+    let root = held.path();
     populate(&root);
     assert_eq!(digest(&root, &skip()).unwrap(), model(&root, &skip()));
-    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
 fn every_change_but_a_skipped_one_changes_the_digest() {
-    let root = scratch("changes");
+    let held = scratch("changes");
+    let root = held.path();
     populate(&root);
     let mut before = digest(&root, &skip()).unwrap();
     fs::write(root.join("target/debug/out"), "built again\n").unwrap();
@@ -125,20 +123,19 @@ fn every_change_but_a_skipped_one_changes_the_digest() {
         assert_ne!(after, before, "a link is missed");
         assert_eq!(after, model(&root, &skip()));
     }
-    fs::remove_dir_all(&root).unwrap();
 }
 
 #[cfg(unix)]
 #[test]
 fn a_name_that_is_not_utf8_is_an_error_naming_it() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
-    let root = scratch("utf8");
+    let held = scratch("utf8");
+    let root = held.path();
     let bad = root.join(OsStr::from_bytes(b"bad\xff"));
     if fs::write(&bad, "x").is_err() {
         // A file system that refuses such names (APFS) can't hold the case.
-        return fs::remove_dir_all(&root).unwrap();
+        return;
     }
     let error = digest(&root, &[]).unwrap_err();
     assert!(error.to_string().contains("not UTF-8"), "{error}");
-    fs::remove_dir_all(&root).unwrap();
 }

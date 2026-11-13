@@ -272,9 +272,11 @@ enum Provider {
         /// Kept for the idle and transfer timeouts of blaze-http's `Client` core, once
         /// `over` drives it; a request's bound today is its `Cx`'s deadline.
         #[expect(dead_code, reason = "held for the Client core's timeouts; see the module's doc")]
+        #[expect(blaze::unwired, reason = "unwired until `over` drives blaze-http's `Client` core")]
         clock: Clock,
         /// Kept for TLS; trusted for nothing until then.
         #[expect(dead_code, reason = "held for TLS, which over refuses today; see the module's doc")]
+        #[expect(blaze::unwired, reason = "unwired until `over` speaks TLS, which it refuses today")]
         roots: Roots,
         wire: Wire,
     },

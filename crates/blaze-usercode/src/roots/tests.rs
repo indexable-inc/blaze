@@ -335,6 +335,10 @@ fn another_layout_of_the_roots_misses() {
 /// A root spelled otherwise (`/private` on macOS, separators doubled or turned, case,
 /// `%`-escaped, UTF-16) is still found embedded, and only a root as it is is ported.
 #[test]
+#[expect(
+    blaze::tmp_path,
+    reason = "the root is under `/tmp` on purpose: its `/private/tmp` spelling is the macOS link this test proves is found; nothing is written there"
+)]
 fn a_root_in_another_spelling_is_embedded() {
     let map = RootMap::default().with(Role::Workspace, Path::new("/tmp/blaze roots/ws"), &Looks::none());
     let roots = map.view();
@@ -983,8 +987,7 @@ fn a_package_that_is_its_workspace_marks_nothing() {
 /// spellings its output was scanned for may not be the ones it saw.
 #[test]
 fn a_root_relinked_since_its_map_was_made_is_kept_against_where_it_is() {
-    let dir = std::env::temp_dir().join(format!("blaze-roots-relinked-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
+    let dir = blaze_core::temp::TempDir::for_test("blaze-roots-relinked-");
     std::fs::create_dir_all(dir.join("one")).unwrap();
     std::fs::create_dir_all(dir.join("two")).unwrap();
     std::os::unix::fs::symlink(dir.join("one"), dir.join("ws")).unwrap();
@@ -996,7 +999,6 @@ fn a_root_relinked_since_its_map_was_made_is_kept_against_where_it_is() {
     assert!(map.view().relinked());
     let (kept, _) = map.view().kept(&reading(&[]), &printed(b"")).unwrap();
     assert!(kept.relinked && kept.shared.is_none());
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A link a run left in its `OUT_DIR` into its own package is kept as the package's

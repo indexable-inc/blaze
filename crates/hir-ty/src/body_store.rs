@@ -37,6 +37,7 @@ pub mod entries;
 mod facts;
 mod infer;
 mod konst;
+mod lower;
 mod mir;
 mod pending;
 mod record;
@@ -62,6 +63,7 @@ use blaze_record::{AnswerKey, Bounds, Digest, Filing, Placed};
 use hir_def::{DefWithBodyId, deps::ImageStore};
 
 pub use facts::{BodyFacts, Classified, Step};
+pub use lower::{Closure, Lowered, lowering};
 pub(crate) use infer::inference;
 pub(crate) use konst::constant;
 #[cfg(test)]
@@ -71,6 +73,17 @@ pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::location_literals;
 pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
+
+/// The inherent impls' associated types of `adt` a path's lowering looks a name up in
+/// (`lower::path::inherent_assoc_types`), each by its binding name, alias and impl: what a
+/// step's read of that query gave, for lane item-hash's fact of it
+/// (`blaze_item_hash::values::inherent_assoc_types`), whose value is this list by item key.
+pub fn inherent_assoc_types_of(
+    db: &Db,
+    adt: hir_def::AdtId,
+) -> &[(hir_expand::name::Name, hir_def::TypeAliasId, hir_def::ImplId)] {
+    crate::lower::path::inherent_assoc_types(db, adt)
+}
 
 use crate::next_solver::goal_store::{FactRef, slots, solver_version};
 use crate::store_registry::{Linked, Registry};
@@ -117,6 +130,7 @@ fn what(step: Step) -> &'static str {
         Step::Mir => "MIR",
         Step::Borrowck => "borrow check",
         Step::Const => "constant value",
+        Step::Lower => "lowering",
     }
 }
 
@@ -223,8 +237,9 @@ impl Store {
         def: DefWithBodyId,
         step: Step,
         schema: SchemaHash,
-        // dyn: the store's facts, given to the step's decoder once per hit
-        decode: impl FnOnce(&dyn BodyFacts, &[u8]) -> Result<T, String>,
+        // dyn: the store's facts, given to the step's decoder once per hit, with the answer's
+        // key (of a served step's answer, the zero key: it has none)
+        decode: impl FnOnce(&dyn BodyFacts, &[u8], ContentId) -> Result<T, String>,
     ) -> Lookup<T> {
         let Some(identity) = self.facts.identity(db, def) else {
             self.pending.refused(step, Refusal::NoIdentity);
@@ -232,7 +247,8 @@ impl Store {
             return Lookup::Off;
         };
         // A served step's answer is the kernel's verified entry, posted at this revision
-        // (`entries::serve`); a constant's is the item store's own record until it has one.
+        // (`entries::serve`); a constant's and a lowering's is the item store's own record
+        // until it has one.
         let answer = match step.served() {
             true => self.served_answer(db, def, step, schema, identity).map(|served| {
                 // clone: a counted reference to the posted answer
@@ -241,7 +257,8 @@ impl Store {
             }),
             false => {
                 let base = record::base_key(&identity, step, &schema, &self.version);
-                self.find_constant(db, def, &base).map(|(found, key)| (Answer::Record(found), key))
+                self.find_record(db, def, step, &base)
+                    .map(|(found, key)| (Answer::Record(found), key))
             }
         };
         let found = match answer {
@@ -251,7 +268,7 @@ impl Store {
                     Answer::Served(bytes) => Ok(&bytes[..]),
                     Answer::Record(found) => record::open_answer(found.bytes(), &answer_key),
                 };
-                match opened.and_then(|body| decode(&*self.facts, body)) {
+                match opened.and_then(|body| decode(&*self.facts, body, answer_key)) {
                     Ok(value) => {
                         let verify = self.mode == Mode::Verify;
                         // The one hit site of the three steps. The running query's value is
@@ -323,15 +340,15 @@ impl Store {
     }
 
     /// The answer record of the first shape of `base` whose facts hash the same now, and its
-    /// answer key: of a constant's value, the one step with no kernel entry yet (not
-    /// [`Step::served`]). The served steps have no lookup of the item store's records.
-    fn find_constant(
+    /// answer key: of a step with no kernel entry yet (not [`Step::served`]: a constant's
+    /// value, a lowering). The served steps have no lookup of the item store's records.
+    fn find_record(
         &self,
         db: &Db,
         def: DefWithBodyId,
+        step: Step,
         base: &ContentId,
     ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
-        let step = Step::Const;
         // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
         // that is no fact. The shape is passed over, and the lookup is an error.
         let mut no_fact = None;
@@ -394,21 +411,22 @@ impl Store {
         reads: Option<blaze_query::db::Reads>,
         // dyn: the store's facts, given to the step's encoder once per offer
         write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
-    ) {
+    ) -> Option<ContentId> {
         let mut scratch = SCRATCH.take();
         scratch.facts.clear();
         scratch.values.clear();
         scratch.answer.clear();
         let offered = self.offered(db, def, step, schema, reads, write, &mut scratch);
-        let ran = match offered {
-            Ok(()) => Ok((&scratch.facts[..], &scratch.answer[..])),
+        let (ran, key) = match offered {
+            Ok(key) => (Ok((&scratch.facts[..], &scratch.answer[..])), key),
             Err(refusal) => {
                 self.pending.refused(step, refusal);
-                Err(refusal)
+                (Err(refusal), None)
             }
         };
         self.trace(def, step, schema, ran);
         SCRATCH.set(scratch);
+        key
     }
 
     fn offered(
@@ -421,7 +439,7 @@ impl Store {
         // dyn: as in `offer`
         write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
         scratch: &mut Scratch,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Option<ContentId>, Refusal> {
         let identity = self.facts.identity(db, def).ok_or(Refusal::NoIdentity)?;
         let reads = reads.ok_or(Refusal::Unshareable)?;
         let mut refused = None;
@@ -447,6 +465,17 @@ impl Store {
         let _ = reads.for_each_read_through(db, through, |row| {
             let blaze_query::db::Read { key: read, kind } = match row {
                 blaze_query::db::RowRead::Read(read) => read,
+                // A row to read through behind a library's seal, which let go of its reads:
+                // the facts of what the seal vouches for (`BodyFacts::sealed`), refused by the
+                // row's name where none stand for it.
+                blaze_query::db::RowRead::Sealed(read, group) => {
+                    asked.set(None);
+                    if !self.facts.sealed(db, def, group, facts) {
+                        refused = Some(storage.read_name(read.key, read.kind));
+                        return ControlFlow::Break(());
+                    }
+                    return ControlFlow::Continue(());
+                }
                 // A row to read through that a store answered (its kept reads are the
                 // lookup's, not what its value was made from), or that cannot be brought up
                 // to date here (a cycle through it): no fact stands for it.
@@ -497,10 +526,18 @@ impl Store {
         // A served step's record is the kernel's entry, made from this trace
         // ([`Store::trace`], read by `entries`' run of the step): nothing to flush.
         if step.served() {
-            return Ok(());
+            return Ok(None);
         }
         let base = record::base_key(&identity, step, &schema, &self.version);
         record::write_shape(&mut scratch.shape, &base, &scratch.facts);
+        // The key the flush files the answer under (`Store::write`) and a lookup finds it by
+        // (`blaze_record::Found::Hit`'s `key`): the shape, so the base key, then each fact's
+        // value. What a lowering's fact is valued by (`Lowered::value`).
+        let mut key = AnswerKey::new(&scratch.shape[..]);
+        for &value in &scratch.values {
+            key.value(Digest::Is(value));
+        }
+        let key = key.finish();
         self.pending.push(Offered {
             step,
             def,
@@ -509,7 +546,7 @@ impl Store {
             values: &scratch.values,
             answer: &scratch.answer,
         });
-        Ok(())
+        Ok(Some(key))
     }
 
     /// Keeps what the run of `step` of `def` under `schema` just made as its trace
@@ -691,6 +728,21 @@ pub(crate) fn lookup<T>(
     // dyn: as `Store::lookup`
     decode: impl FnOnce(&dyn BodyFacts, &[u8]) -> Result<T, String>,
 ) -> Lookup<T> {
+    lookup_keyed(db, def, step, schema, |facts, bytes, _| decode(facts, bytes))
+}
+
+/// [`lookup`], with the key the answer was found under given to `decode` too: the digest of
+/// the base key and of each fact's value the shape lists, which a lowering's fact is valued
+/// by ([`Lowered::value`]). A served step's answer has none: the zero key.
+#[inline]
+pub(crate) fn lookup_keyed<T>(
+    db: &Db,
+    def: DefWithBodyId,
+    step: Step,
+    schema: SchemaHash,
+    // dyn: as `Store::lookup`
+    decode: impl FnOnce(&dyn BodyFacts, &[u8], ContentId) -> Result<T, String>,
+) -> Lookup<T> {
     if REGISTRY.is_empty() {
         return Lookup::Off;
     }
@@ -699,7 +751,9 @@ pub(crate) fn lookup<T>(
 
 /// After a [`Lookup::Miss`]: `step` of `def` ran, reading `reads` (from [`capture`]), and
 /// `write` puts its result's bytes in the buffer it is given, or refuses with why. Nothing is
-/// written until the flush.
+/// written until the flush. The key the answer will be filed under, for a step the item
+/// store files itself (not [`Step::served`]) and kept; `None` for a served step's run, a
+/// refused one, or with no store.
 #[inline]
 pub(crate) fn offer(
     db: &Db,
@@ -709,11 +763,11 @@ pub(crate) fn offer(
     reads: Option<blaze_query::db::Reads>,
     // dyn: as `Store::offer`
     write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
-) {
+) -> Option<ContentId> {
     if REGISTRY.is_empty() {
-        return;
+        return None;
     }
-    with_store(db, |store| store.offer(db, def, step, schema, reads, write));
+    with_store(db, |store| store.offer(db, def, step, schema, reads, write)).flatten()
 }
 
 /// Records the build's error for `step` of `def`: `why` it could not be served, or how its

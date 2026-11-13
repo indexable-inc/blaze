@@ -1,0 +1,244 @@
+# Every SCHEMA, LAYOUT, FORMAT, MAGIC and VERSION constant of the .rs files under crates/ (not tests, benches,
+# build scripts, or a directory named `target` or `vendor`), each with what holds it to rule
+# persisted-state-round-trips: `test <fn>`, the crate's test that a file of the previous layout is handled;
+# `none`, persisted with no such test yet, so a change of its value is refused until one is written and named;
+# or `not persisted: <why>`. Checked by scripts/src/bin/layouts.rs in CI.
+# file	const	verdict
+crates/blaze-api/src/frames.rs	ENVELOPE_SCHEMA	not persisted: a frame's envelope on the socket, between a client and its daemon
+crates/blaze-api/src/lib.rs	SCHEMA	not persisted: the socket's schema, compared at hello
+crates/blaze-cargo/src/cli/args.rs	FORMATS	not persisted: the values `--message-format` takes
+crates/blaze-cargo/src/cli/doctor.rs	VERSION	not persisted: the version of a report's JSON, read by tools, never by blaze
+crates/blaze-cargo/src/cli/edits.rs	VERSION	not persisted: the version of a report's JSON, read by tools, never by blaze
+crates/blaze-cargo/src/cli/observe/script.rs	VERSION	not persisted: the version of a trace's JSON, read by tools, never by blaze
+crates/blaze-cargo/src/serve/flightrec.rs	FORMAT	none
+crates/blaze-cargo/src/serve/flightrec.rs	FORMAT_PLAIN	none
+crates/blaze-cargo/src/serve/flightrec.rs	MAGIC	none
+crates/blaze-cargo/src/serve/image.rs	PEAKS_SCHEMA	test an_image_of_the_previous_layout_gives_its_history_and_its_engine_sections_go_unread
+crates/blaze-cargo/src/serve/inspect.rs	SCHEMA	not persisted: the inspect socket's messages
+crates/blaze-cargo/src/serve/job.rs	LAYOUT	not persisted: a directory's name
+crates/blaze-cargo/src/serve/local.rs	LAYOUT	none
+crates/blaze-cargo/src/serve/observe.rs	DUCKDB_VERSION	not persisted: the DuckDB release pinned
+crates/blaze-cargo/src/serve/unit/compile/parts.rs	LAYOUT	none
+crates/blaze-cargo/src/serve/unit/layout.rs	MAGIC	none
+crates/blaze-cargo/src/serve/unit/reads.rs	VERSION	none
+crates/blaze-cargo/src/serve/why.rs	MAGIC	none
+crates/blaze-cargo/src/toolchain/library/texts.rs	LAYOUT	none
+crates/blaze-cargo/src/toolchain/library/texts.rs	MAGIC	none
+crates/blaze-cas/src/collect.rs	PIN_MAGIC	none
+crates/blaze-cas/src/derived.rs	MAGIC	none
+crates/blaze-cas/src/disk.rs	HEAD_MAGIC	none
+crates/blaze-cas/src/disk.rs	PACK_MAGIC	none
+crates/blaze-cas/src/disk.rs	RECORD_MAGIC_HEADER	none
+crates/blaze-cas/src/disk.rs	RECORD_MAGIC_WHOLE	none
+crates/blaze-cas/src/disk.rs	SCHEMA_PREFIX	none
+crates/blaze-cas/src/index.rs	INDEX_MAGIC	none
+crates/blaze-cas/src/lib.rs	FORMAT	test a_store_of_an_older_format_is_read_and_goes_on
+crates/blaze-cas/src/lib.rs	FORMAT_READ	test a_store_of_an_older_format_is_read_and_goes_on
+crates/blaze-cas/src/remote.rs	ANSWER_MAGIC	none
+crates/blaze-cas/src/remote.rs	ASK_MAGIC	none
+crates/blaze-cas/src/remote.rs	VERSION	none
+crates/blaze-cas/src/sealed.rs	MAGIC	none
+crates/blaze-cas/src/sets.rs	MAGIC	none
+crates/blaze-cas/src/whole.rs	NAMES_MAGIC	none
+crates/blaze-cas/src/whole.rs	NAMES_MAGIC_1	none
+crates/blaze-certify/src/certificate.rs	LAYOUT	test a_list_of_the_previous_layout_is_refused_by_name
+crates/blaze-certify/src/certificate.rs	MAGIC	test a_list_of_the_previous_layout_is_refused_by_name
+crates/blaze-certify/src/kept.rs	MAGIC	none
+crates/blaze-certify/src/slot.rs	MAGIC	none
+crates/blaze-certify/src/slot.rs	START_MAGIC	none
+crates/blaze-codegen/src/blob.rs	MASKED_MAGIC	none
+crates/blaze-codegen/src/blob.rs	STATIC_MAGIC	none
+crates/blaze-codegen/src/blob.rs	TEMPLATE_MAGIC	none
+crates/blaze-codegen/src/summary.rs	SUMMARY_MAGIC	none
+crates/blaze-diagnostics/src/cache.rs	MAGIC	none
+crates/blaze-diagnostics/src/checks/attrs/parsers/stability.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
+crates/blaze-diagnostics/src/checks/features/library.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
+crates/blaze-diagnostics/src/lints/syntax/attrs/diagnostic/directive.rs	FORMAT_LITERALS	not persisted: a lint's name
+crates/blaze-explore-core/src/wire.rs	SCHEMAS	not persisted: the explorer's messages
+crates/blaze-ext/src/lib.rs	VERSION	not persisted: the extension interface's version
+crates/blaze-fmt/src/cargo_fmt.rs	MESSAGE_FORMATS	not persisted: the values a flag takes
+crates/blaze-fmt/src/lib.rs	RUSTFMT_VERSION	not persisted: the rustfmt release followed
+crates/blaze-format/src/lib.rs	MAGIC	none
+crates/blaze-format/src/schema.rs	SCHEMA_DOMAIN	none
+crates/blaze-format/src/tiers.rs	COLD_VERSION	none
+crates/blaze-format/src/tiers/buffer.rs	FORM_VERSION	none
+crates/blaze-gc/src/ledger.rs	FORMAT	test a_file_of_the_previous_layout_is_refused_by_name
+crates/blaze-gc/src/record.rs	FORMAT	none
+crates/blaze-global/src/wire.rs	VERSION	not persisted: the remote protocol's version, said at hello
+crates/blaze-graph/src/admission.rs	ESTIMATES_MAGIC	none
+crates/blaze-graph/src/admission.rs	PEAKS_LAYOUT	test a_previous_layout_is_refused_naming_both
+crates/blaze-graph/src/admission.rs	PEAKS_MAGIC	test a_previous_layout_is_refused_naming_both
+crates/blaze-graph/src/ledger.rs	AT_LAYOUT	none
+crates/blaze-graph/src/ledger.rs	AT_MAGIC	none
+crates/blaze-graph/src/ledger.rs	LAYOUT	none
+crates/blaze-graph/src/ledger.rs	MAGIC	none
+crates/blaze-hashcons/src/persist.rs	PACK_SCHEMA	none
+crates/blaze-history/src/codec.rs	MAGIC	none
+crates/blaze-history/src/section.rs	SCHEMA	none
+crates/blaze-hub/src/wire.rs	SCHEMA	not persisted: the hub's messages
+crates/blaze-image/src/spine.rs	LAYOUT	none
+crates/blaze-image/src/spine.rs	MAGIC	none
+crates/blaze-items/src/facts.rs	LAYOUT	none
+crates/blaze-items/src/hash.rs	LAYOUT_DOMAIN	none
+crates/blaze-kernel/src/entry.rs	ENTRY_MAGIC	none
+crates/blaze-kernel/src/entry.rs	ENTRY_MAGIC_FAMILY	none
+crates/blaze-kernel/src/session.rs	ROOT_MAGIC	none
+crates/blaze-kernel/src/table.rs	MAGIC	none
+crates/blaze-kernel/src/table.rs	MAGIC_FAMILY	none
+crates/blaze-kernel/src/trie.rs	MAGIC	none
+crates/blaze-launch-host/src/bind.rs	MAGIC	none
+crates/blaze-launch-host/src/record.rs	SPANS_MAGIC	none
+crates/blaze-launch-host/src/start.rs	MAGIC	none
+crates/blaze-launch/src/image.rs	MAGIC	none
+crates/blaze-launch/src/image.rs	VERSION	none
+crates/blaze-launch/src/record.rs	LAYOUT	none
+crates/blaze-launch/src/wire.rs	SCHEMA	not persisted: the launcher's messages
+crates/blaze-link/src/beside.rs	MH_MAGIC_64	not persisted: Mach-O's, not blaze's
+crates/blaze-link/src/macho/chained.rs	POINTER_FORMAT	not persisted: Mach-O's, not blaze's
+crates/blaze-link/src/macho/sign.rs	VERSION	not persisted: Mach-O's code directory, not blaze's
+crates/blaze-link/src/macho/unwind.rs	VERSION	not persisted: Mach-O's unwind info, not blaze's
+crates/blaze-link/src/pe/image.rs	LINKER_VERSION	not persisted: PE's, not blaze's
+crates/blaze-link/src/pe/image.rs	WINDOWS_VERSION	not persisted: PE's, not blaze's
+crates/blaze-link/src/position.rs	MAGIC	none
+crates/blaze-link/src/wasm/object.rs	LINKING_VERSION	not persisted: wasm's linking section, not blaze's
+crates/blaze-link/src/wasm/reader.rs	MAGIC	not persisted: wasm's, not blaze's
+crates/blaze-lints/src/blaze/hash_twice.rs	CONVERSIONS	not persisted: a list of method names
+crates/blaze-lints/src/blaze/outline_generic_body.rs	CONVERSIONS	not persisted: a list of method names
+crates/blaze-lints/src/blaze/string_key.rs	CONVERSIONS	not persisted: a list of method names
+crates/blaze-lints/src/msrvs.rs	FORMAT_ARGS_CAPTURE	not persisted: a Rust release
+crates/blaze-lints/src/msrvs.rs	TUPLE_ARRAY_CONVERSIONS	not persisted: a Rust release
+crates/blaze-lints/src/profile/indexed.rs	MAGIC	not persisted: LLVM's indexed profile, not blaze's
+crates/blaze-lints/src/profile/indexed.rs	VERSIONS	not persisted: LLVM's indexed profile, not blaze's
+crates/blaze-lir/src/lib.rs	VERSION	none
+crates/blaze-lir/src/persist.rs	SCHEMA	none
+crates/blaze-live/src/patch.rs	ANSWER_MAGIC	not persisted: a running program's answer
+crates/blaze-live/src/patch.rs	MESSAGE_MAGIC	not persisted: a patch message to a running program
+crates/blaze-live/src/patch.rs	MESSAGE_VERSION	not persisted: a patch message to a running program
+crates/blaze-macro-eval/src/wasm/statics.rs	MAGIC	not persisted: wasm's, not blaze's
+crates/blaze-manifest/src/features.rs	CARGO_VERSION	not persisted: the cargo release followed
+crates/blaze-manifest/src/metadata.rs	VERSION	not persisted: cargo metadata's output, not blaze's
+crates/blaze-pack/src/head.rs	LAYOUT	none
+crates/blaze-pack/src/head.rs	MAGIC	none
+crates/blaze-pack/src/layout.rs	VERSION	none
+crates/blaze-pack/src/manifest.rs	LAYOUT	test a_previous_or_foreign_layout_is_refused_by_name
+crates/blaze-pack/src/manifest.rs	MAGIC	test a_previous_or_foreign_layout_is_refused_by_name
+crates/blaze-pack/src/peer.rs	LAYOUT	none
+crates/blaze-pack/src/peer.rs	LIST_MAGIC	none
+crates/blaze-pack/src/peer.rs	MAGIC	none
+crates/blaze-pack/src/spans.rs	LAYOUT	none
+crates/blaze-pack/src/spans.rs	MAGIC	none
+crates/blaze-profile/src/crash.rs	LAYOUT	none
+crates/blaze-profile/src/crash.rs	LAYOUT_AT	none
+crates/blaze-profile/src/crash.rs	MAGIC	none
+crates/blaze-profile/src/crash.rs	MAGIC_AT	none
+crates/blaze-profile/src/flight/postmortem.rs	H_LAYOUT	none
+crates/blaze-profile/src/flight/postmortem.rs	H_MAGIC	none
+crates/blaze-profile/src/flight/postmortem.rs	LAYOUT	none
+crates/blaze-profile/src/flight/postmortem.rs	MAGIC	none
+crates/blaze-profile/src/gate.rs	VERDICT_VERSION	not persisted: the version of a verdict's JSON, read by a script
+crates/blaze-profile/src/history/manifest.rs	FORMAT	none
+crates/blaze-profile/src/history/manifest.rs	FORMAT_OLDEST	none
+crates/blaze-profile/src/perf/map.rs	MAGIC	none
+crates/blaze-profile/src/perf/rows.rs	FORMAT	none
+crates/blaze-profile/src/schema.rs	VERSION	none
+crates/blaze-profile/src/slow.rs	VERSION	none
+crates/blaze-protocol/src/lib.rs	SCHEMA	not persisted: the protocol's messages
+crates/blaze-record/src/list.rs	LAYOUT	none
+crates/blaze-registry/src/auth/protocol.rs	VERSIONS	not persisted: the credential protocol's versions
+crates/blaze-registry/src/index.rs	CACHE_VERSION	not persisted: cargo's index cache, not blaze's
+crates/blaze-script/src/engine.rs	STATUS_FORMAT	not persisted: a status line's form
+crates/blaze-shader/src/device.rs	MSL_VERSION	not persisted: the Metal language version asked for
+crates/blaze-solo/src/root.rs	SLOT_MAGIC	none
+crates/blaze-solo/src/table.rs	LAYOUT	none
+crates/blaze-solo/src/table.rs	MAGIC	none
+crates/blaze-std/src/task.rs	LAYOUT	not persisted: an enum value of this build
+crates/blaze-stencil/src/shape.rs	VERSION	none
+crates/blaze-stencil/src/table/format.rs	FORMAT	none
+crates/blaze-stencil/src/table/format.rs	MAGIC	none
+crates/blaze-testsel/src/table.rs	SET_MAGIC	none
+crates/blaze-thin/src/handover.rs	MAGIC	none
+crates/blaze-thin/src/lib.rs	VERSION	not persisted: the release's name
+crates/blaze-thin/src/lib.rs	VERSION_LINE	not persisted: what `--version` prints
+crates/blaze-units/src/load/plan/hash.rs	METADATA_VERSION	not persisted: cargo's metadata hash version, not blaze's
+crates/blaze-units/src/lock.rs	FORMAT	none
+crates/blaze-units/src/schema.rs	VERSION	not persisted: cargo metadata's output, not blaze's
+crates/blaze-usercode/src/confine.rs	HAND_VERSION	not persisted: a frame handed to a child at start
+crates/blaze-usercode/src/index.rs	SHAPE_MAGIC	none
+crates/blaze-usercode/src/test/wire.rs	MAGIC	none
+crates/blaze-usercode/src/test/wire.rs	VERSION	not persisted: the test protocol's version, said at hello
+crates/blaze-usercode/src/trace.rs	MAGIC	none
+crates/blaze-v2-proof/src/wire.rs	VERSION	none
+crates/blaze-vfs/src/disk.rs	MAGIC	none
+crates/blaze-vfs/src/image.rs	DISKS_SCHEMA	none
+crates/blaze-vfs/src/image.rs	TREE_SCHEMA	none
+crates/blaze-vfs/src/journal.rs	MAGIC	none
+crates/blaze-vfs/src/texts.rs	TEXT_SCHEMA	none
+crates/blaze-wasi/src/seed.rs	VERSION	not persisted: the ABI's version
+crates/const-ast/src/kinds.rs	FORMAT_ARGS_ARG	not persisted: a syntax kind's number
+crates/const-ast/src/kinds.rs	FORMAT_ARGS_EXPR	not persisted: a syntax kind's number
+crates/harness/harness-native-render/src/gpu.rs	PIXEL_FORMAT	not persisted: a GPU pixel format
+crates/harness/harness-native-render/src/paint.rs	LAYOUTS_KEPT	not persisted: a cache's size
+crates/harness/harness-native/src/app/stats.rs	LAYOUT	not persisted: a stat's name
+crates/harness/harness-native/src/world_api.rs	SCHEMA	not persisted: the world socket's messages
+crates/harness/harness-proto/src/lib.rs	SCHEMA	none
+crates/harness/harness-proto/src/log.rs	MAGIC	none
+crates/harness/harness-vt/src/lib.rs	GHOSTTY_VERSION_FALLBACK	not persisted: a Ghostty release
+crates/harness/harness/src/archive.rs	SCHEMA	none
+crates/harness/harness/src/db.rs	SCHEMA	none
+crates/hir-def/src/deps/found.rs	LAYOUT	test a_previous_or_foreign_layout_is_refused_by_name
+crates/hir-def/src/deps/image.rs	IMAGE_SCHEMA	none
+crates/hir-def/src/deps/image.rs	LAYOUT_7_SCHEMA	none
+crates/hir-def/src/deps/reads.rs	VERSION	test reads_of_the_previous_layout_are_refused_by_name
+crates/hir-def/src/deps/signatures.rs	RECORD_SCHEMA	none
+crates/hir-def/src/deps/signatures.rs	SCHEMA	none
+crates/hir-def/src/nameres/frozen/entries/items.rs	LAYOUT	test a_previous_layout_of_assoc_items_is_refused_by_name
+crates/hir-def/src/nameres/frozen/pages.rs	LAYOUT	test a_previous_or_foreign_layout_is_refused_by_name
+crates/hir-def/src/nameres/frozen/pages.rs	MAGIC	test a_previous_or_foreign_layout_is_refused_by_name
+crates/hir-expand/src/declarative/stored.rs	LAYOUT	test a_previous_layout_of_macro_tokens_is_refused_by_name
+crates/hir-expand/src/declarative/stored/index.rs	LAYOUT	test a_previous_layout_of_a_file_index_is_refused_by_name
+crates/hir-expand/src/declarative/stored/index.rs	MAGIC	test a_previous_layout_of_a_file_index_is_refused_by_name
+crates/hir-ty-codegen/fncache.rs	FORMAT	none
+crates/hir-ty-codegen/llvm/pgo.rs	RAW_VERSION	not persisted: LLVM's symbol name, not blaze's
+crates/hir-ty-codegen/unwind/seh.rs	CXX_MAGIC	not persisted: MSVC's exception magic, not blaze's
+crates/hir-ty-codegen/v2/frontend/described.rs	ASK_MAGIC	none
+crates/hir-ty-codegen/v2/frontend/described.rs	LAYOUT	none
+crates/hir-ty-codegen/v2/frontend/described.rs	SCHEMA	none
+crates/hir-ty-codegen/v2/linked.rs	SPAN_TABLE_MAGIC	none
+crates/hir-ty-codegen/v2/report.rs	VERSION	none
+crates/hir-ty-codegen/v2/roots/kept/frozen.rs	MAGIC	none
+crates/hir-ty-codegen/v2/shape.rs	VERSION	none
+crates/hir-ty-codegen/v2/side.rs	VERSION	none
+crates/hir-ty-lean/src/driver.rs	LEAN_VERSION	not persisted: the Lean release pinned
+crates/hir-ty-mir/src/mir/eval/shim/thread.rs	ATTR_MAGIC	not persisted: a word in an interpreted program's memory
+crates/hir-ty-mir/src/mir/eval/shim/thread.rs	SEMAPHORE_MAGIC	not persisted: a word in an interpreted program's memory
+crates/hir-ty-ub/src/borrows/diagnostics.rs	DEFAULT_FORMATTER	not persisted: a display setting
+crates/hir-ty/src/body_store/infer.rs	SCHEMA	none
+crates/hir-ty/src/body_store/konst.rs	SCHEMA	none
+crates/hir-ty/src/body_store/mir.rs	SCHEMA	none
+crates/hir-ty/src/body_store/record.rs	ANSWER_SCHEMA	none
+crates/hir-ty/src/check_cache/ids.rs	VERSION	none
+crates/hir-ty/src/check_cache/pages.rs	LAYOUT	test a_previous_or_foreign_layout_is_refused_by_name
+crates/hir-ty/src/check_cache/pages.rs	MAGIC	test a_previous_or_foreign_layout_is_refused_by_name
+crates/hir-ty/src/check_cache/part.rs	BODY_SCHEMA	none
+crates/hir-ty/src/check_cache/part.rs	IDS_VERSION	none
+crates/hir-ty/src/check_cache/part.rs	SCHEMA	none
+crates/hir-ty/src/check_cache/port.rs	SCHEMA	none
+crates/hir-ty/src/check_cache/runtime.rs	ENTRY_SCHEMA	none
+crates/hir-ty/src/consteval/deps/codec.rs	VERSION	none
+crates/hir-ty/src/infer/persist.rs	TY_TABLE_SCHEMA	none
+crates/hir-ty/src/lower/persist.rs	TY_TABLE_SCHEMA	none
+crates/hir-ty/src/method_resolution/frozen/pages.rs	LAYOUT	test a_previous_or_foreign_impl_page_layout_is_refused_by_name
+crates/hir-ty/src/method_resolution/frozen/pages.rs	MAGIC	test a_previous_or_foreign_impl_page_layout_is_refused_by_name
+crates/hir-ty/src/mir/persist.rs	SCHEMA	none
+crates/hir-ty/src/mir/persist.rs	WORDS_VERSION	none
+crates/hir-ty/src/next_solver/goal_store/record.rs	ANSWER_MAGIC	none
+crates/hir-ty/src/next_solver/persist.rs	FORMAT_VERSION	none
+crates/hir-ty/src/next_solver/persist.rs	TABLE_SCHEMA	none
+crates/ix-prof/src/ixprof.rs	FORMAT_VERSION	none
+crates/ix-prof/src/ixprof.rs	MAGIC	none
+crates/ix-prof/src/ixprof.rs	ZSTD_MAGIC	not persisted: zstd's frame magic, not blaze's
+crates/syntax-tree/src/flat/image.rs	IMAGE_LAYOUT	none
+crates/syntax-tree/src/flat/image.rs	MAGIC	none
+crates/syntax/src/image.rs	MAGIC	none
+crates/syntax/src/image.rs	TREE_VERSION	none
+crates/tt/src/storage/wire.rs	MAGIC	none

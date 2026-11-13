@@ -77,6 +77,10 @@ impl PartialEq for Name {
 
 impl Eq for Name {}
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread memo of span names by their static text, bounded by the span sites compiled into the program"
+)]
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
     // alloc: once per thread, grown to the kept names it opens spans of

@@ -68,6 +68,10 @@ pub(crate) const DEDUP_FROM: u32 = (SPARE_BYTES / size_of::<u32>()) as u32;
 /// [`RUN_READS`] and [`PENDING_FLOOR`] are set against, in the memory report ([`high_water`]). `MOST_RUN` names the run that set `MOST_RUN_READS`
 /// ([`name_most_reads`]), written only as a new mark is set: the cold path.
 static MOST_RUN_READS: AtomicU64 = AtomicU64::new(0);
+#[expect(
+    blaze::process_static,
+    reason = "one name, replaced only when a new high-water mark is set: never more than the longest run name"
+)]
 static MOST_RUN: ShortLock<(u64, String)> = ShortLock::new("query.local.most_run", (0, String::new()));
 static MOST_PENDING: AtomicU64 = AtomicU64::new(0);
 
@@ -774,6 +778,10 @@ unsafe impl Send for Spare {}
 
 // alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once, at
 // most `SPARES_KEPT`.
+#[expect(
+    blaze::process_static,
+    reason = "a spare pool of empty stacks capped at SPARES_KEPT, each buffer trimmed as it is kept"
+)]
 static SPARES: ShortLock<Vec<Spare>> = ShortLock::new("query.local.spares", Vec::new());
 
 /// The most bytes one buffer of a spare stack keeps ([`Local::trim`]): past it the buffer is let

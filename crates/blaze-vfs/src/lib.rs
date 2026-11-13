@@ -23,6 +23,8 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 mod disk;
 mod image;
@@ -664,6 +666,23 @@ impl Vfs {
         Ok(self.tree.id(root))
     }
 
+    /// [`Vfs::apply_files`] of files whose IDs were made from their bytes when they were read
+    /// (`(path, id, bytes, mode)`; a shipped tree's texts listing carries them): no byte is
+    /// hashed, so mounting a tree costs its entries, not its bytes. The tree is the one
+    /// [`Vfs::apply_files`] makes of the same bytes; an ID that is not its bytes' hash breaks
+    /// the tree's contract (debug builds assert it), so only a reader that made the IDs from
+    /// the bytes passes them.
+    pub fn apply_known_files(
+        &mut self,
+        base: ContentId,
+        files: impl IntoIterator<Item = (String, ContentId, Bytes, Mode)>,
+    ) -> Result<ContentId, OpError> {
+        let base = self.root(base).ok_or(OpError::UnknownRoot(base))?;
+        let root = self.tree.apply_known_files(base, files)?;
+        self.tree.reclaim();
+        Ok(self.tree.id(root))
+    }
+
     /// Hashes a commit's new files on `jobs` once they are many bytes (a checkout, a large
     /// write): the daemon's pool, so a checkout hashes on every core. The IDs are the same
     /// either way.
@@ -672,6 +691,10 @@ impl Vfs {
     }
 
     /// Opens `view`, in constant time. Its root and what it reaches are kept until it closes.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a view id is u32 and closed slots are never reused, so a long-lived tree that opens 2^32 views panics: open needs slot reuse or a CommitError naming the count"
+    )]
     pub fn open(&mut self, view: View) -> Result<ViewId, CommitError> {
         let root = self.root(view.root).ok_or(CommitError::UnknownBase(view.root))?;
         let id = ViewId::from_raw(u32::try_from(self.views.len()).expect("fewer than 2^32 views"));

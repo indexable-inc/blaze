@@ -20,6 +20,7 @@ use blaze_units::{
 use blaze_usercode::run::Value;
 
 use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
+use super::deps::tests::stores_of;
 
 /// What a unit said, kept in its record and drawn for each client.
 mod drawn;
@@ -368,7 +369,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         ("SECRET_TOKEN".to_owned(), "hunter2".to_owned()),
         ("CARGO_PKG_NAME".to_owned(), "wrong".to_owned()),
         ("BLAZE_SCRIPT_CACHE".to_owned(), "check".to_owned()),
-        ("TMPDIR".to_owned(), "/tmp/nix-shell.dv7jx8".to_owned()),
+        ("TMPDIR".to_owned(), "/shell/nix-shell.dv7jx8".to_owned()),
     ];
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
@@ -379,7 +380,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     assert_eq!(get("TMPDIR"), None);
     let outside = script::inherited(&job, &units.plans[1], false);
     assert!(
-        outside.iter().any(|(name, value)| name == "TMPDIR" && value == "/tmp/nix-shell.dv7jx8"),
+        outside.iter().any(|(name, value)| name == "TMPDIR" && value == "/shell/nix-shell.dv7jx8"),
         "a run outside the sandbox has the shell's"
     );
     assert_eq!(
@@ -1785,7 +1786,7 @@ fn primary_package_keys_only_a_record_whose_code_read_it() {
 fn build_script_compile_is_reused_across_runs() {
     let first = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-profile-0101"),
+        ("BLAZE_PROFILE", "/p/blaze-profile-0101"),
         ("OLDPWD", "/w"),
         ("SHLVL", "1"),
         ("BLAZE_CLIENT_PID", "4242"),
@@ -1793,8 +1794,8 @@ fn build_script_compile_is_reused_across_runs() {
     ];
     let second = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
-        ("OLDPWD", "/tmp/elsewhere"),
+        ("BLAZE_PROFILE", "/p/blaze-profile-0242"),
+        ("OLDPWD", "/elsewhere"),
         ("SHLVL", "3"),
         ("BLAZE_CLIENT_PID", "977"),
         ("TMPDIR", "/var/folders/bb/T"),
@@ -1824,13 +1825,13 @@ fn build_script_compile_is_reused_across_runs() {
 /// value of a variable its code read (another value, or unset), its source, a dependency.
 #[test]
 fn a_real_input_of_a_build_script_makes_its_record_miss() {
-    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
+    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/p/blaze-profile-0101")];
     let (base, read) = script_run(SCRIPT, true, &run);
     let mut store = super::reads::tests::Store::default();
     let filed = store.keep(base, &read, &super::reads::tests::env(&run));
     let other_value: &[(&str, &str)] =
-        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
-    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
+        &[("FOO", "off"), ("BLAZE_PROFILE", "/p/blaze-profile-0101")];
+    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/p/blaze-profile-0101")];
     for env in [other_value, unset] {
         let (again, read_again) = script_run(SCRIPT, true, env);
         assert_eq!(again, base, "{env:?}: the base key holds no variable's value");
@@ -1869,7 +1870,7 @@ fn a_kept_front_end_outlives_a_variable_no_crate_read() {
         ("CC", "clang"),
         ("FOO", "on"),
         ("INVOCATION_ID", "77aa"),
-        ("OLDPWD", "/tmp/elsewhere"),
+        ("OLDPWD", "/elsewhere"),
         ("SHLVL", "3"),
         ("TERM_SESSION_ID", "w1t2p0"),
         ("_", "/usr/local/bin/blaze"),
@@ -2636,6 +2637,8 @@ fn root_values(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> Vec<Str
 fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     // A reader sees what is put after it is made.
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
@@ -2657,7 +2660,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mut first = script_cfg_front();
     first.ran(1, &d_ran(&[])).unwrap();
     let d = first.krate(2).unwrap();
-    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut first, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
@@ -2670,7 +2673,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mut kept = script_cfg_front();
     kept.ran(1, &d_ran(&[])).unwrap();
     let d = kept.krate(2).unwrap();
-    let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&kept, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
@@ -2718,7 +2721,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         let mut fresh = script_cfg_front();
         fresh.ran(1, &d_ran(cfgs)).unwrap();
         let d = fresh.krate(2).unwrap();
-        let mut session = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+        let mut session = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
         let served = super::deps::images(&mut fresh, &[d], build, &mut session, mode)
             .unwrap()
             .expect("`d` is keyed");
@@ -2726,6 +2729,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         assert_eq!(root_values(&fresh, d), values, "{cfgs:?}");
         drop((session, fresh));
     }
+    });
 }
 
 /// A serve at the view the last serve left walks no key: what that serve wrote is no input of
@@ -2737,6 +2741,8 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
 fn a_serve_at_the_view_the_last_serve_left_walks_no_key_and_a_write_brings_the_walk_back() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
     let store = super::deps::tests::opened(&mut sim);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
     let build =
@@ -2746,7 +2752,7 @@ fn a_serve_at_the_view_the_last_serve_left_walks_no_key_and_a_write_brings_the_w
     let mut front = script_cfg_front();
     front.ran(1, &d_ran(&[])).unwrap();
     let d = front.krate(2).unwrap();
-    let mut session = super::deps::session(&front, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&front, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     assert!(
         super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(),
         "`d` is keyed"
@@ -2778,6 +2784,7 @@ fn a_serve_at_the_view_the_last_serve_left_walks_no_key_and_a_write_brings_the_w
     assert_eq!(session.walks(), 3, "writes came between: walked once");
     assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none());
     assert_eq!(session.walks(), 3, "the walk that moved nothing stands at its view");
+    });
 }
 
 /// `d`'s library, whose items are a file its build script writes to `OUT_DIR`.
@@ -2807,6 +2814,8 @@ fn d_generated(generated: &str) -> blaze_lower::Ran {
 fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
     let build =
@@ -2817,7 +2826,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let mut first = script_lib_front(D_INCLUDES);
     first.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
     let d = first.krate(2).unwrap();
-    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut first, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
@@ -2834,7 +2843,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let mut kept = script_lib_front(D_INCLUDES);
     kept.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
     let d = kept.krate(2).unwrap();
-    let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&kept, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
@@ -2853,6 +2862,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
         "`d` lost the image of the old `gen.rs`"
     );
     assert_eq!(root_values(&kept, d), ["two"], "`d` resolves with the file its run left now");
+    });
 }
 
 /// A proc macro can read a file outside the source tree (a schema or a `.proto` beside the
@@ -2861,7 +2871,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
 /// and finds it again once the file is as it was.
 #[test]
 fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_changes() {
-    let run = [("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
+    let run = [("BLAZE_PROFILE", "/p/blaze-profile-0101")];
     let (lowered, base) = script_lowered(SCRIPT, true, &run);
     let krate = lowered.krate(1).unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -3378,9 +3388,11 @@ fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Sto
     let mut sim = blaze_core::sim::Sim::new(seed, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
     let reader = store.reader();
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     let macros = super::deps::tests::no_macros();
     let first = std::sync::Arc::new(core_front(lib));
-    let session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&first);
     let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new())
         .unwrap_or_else(|error| panic!("the first build's keep: {}", error.what));
@@ -3389,6 +3401,7 @@ fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Sto
         store.put(it.key, it.kind, &it.bytes).unwrap();
     }
     drop((session, first));
+    });
     (sim, store, reader)
 }
 
@@ -3411,13 +3424,15 @@ fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Sto
 fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_the_next() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
     let (infer, mir) = (BODY_STEPS[0], BODY_STEPS[1]);
 
     // The first build runs every step, and keeps each as a kernel entry.
     let first = std::sync::Arc::new(alike_front(ALIKE));
-    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let mut session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().expect("an item store is installed unless it is turned off");
     assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
@@ -3450,7 +3465,7 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     // The next build's front end, of a tree with `three` edited, is served the four unedited
     // bodies' steps and runs `three`'s alone.
     let next = std::sync::Arc::new(alike_front(&ALIKE.replace("{ 3 }", "{ 4 }")));
-    let session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
     assert_eq!((served.skipped, served.no_store), (false, false), "{served:?}");
@@ -3463,6 +3478,7 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     for step in BODY_STEPS {
         assert_eq!((read[step].hits, read[step].ran), (4, 1), "step {step}: {read:?}");
     }
+    });
 }
 
 /// A crate is served once per revision however many of its units reach it, and a step's run
@@ -3476,11 +3492,13 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
 fn a_crate_is_served_and_a_run_kept_once_per_build() {
     let mut sim = blaze_core::sim::Sim::new(2, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || {
     let reader = store.reader();
     let macros = super::deps::tests::no_macros();
 
     let first = std::sync::Arc::new(alike_front(ALIKE));
-    let session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().unwrap();
     let ran_steps: u64 = BODY_STEPS.iter().map(|&step| ran[step].ran).sum();
@@ -3495,12 +3513,13 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     drop((session, first));
 
     let next = std::sync::Arc::new(alike_front(ALIKE));
-    let _session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let _session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
     assert_eq!((served.skipped, served.served, served.missed), (false, did.kept, 0), "the control, the first serve: {served:?}");
     let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
     assert_eq!((served.skipped, served.served), (true, 0), "a crate is served once a revision: {served:?}");
+    });
 }
 
 /// An `impl`'s method holding a closure, a trait's default method, and a function that calls
@@ -3516,10 +3535,12 @@ const OWNERS: &str = "#![no_std]\n\
 /// [`OWNERS`] built and kept, then a new database of the same tree served and checked; an
 /// error says which part of the invariant did not hold.
 fn owners_served_whole(seed: u64) -> Result<(), String> {
-    let (_sim, _store, reader) = built_and_kept(seed, OWNERS);
+    let (mut sim, _store, reader) = built_and_kept(seed, OWNERS);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
     let macros = super::deps::tests::no_macros();
     let next = std::sync::Arc::new(core_front(OWNERS));
-    let session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader)
         .map_err(|error| format!("the serve: {}", error.what))?;
@@ -3536,6 +3557,7 @@ fn owners_served_whole(seed: u64) -> Result<(), String> {
         return Err(format!("a body the syntax keys was not mapped: {did:?}"));
     }
     Ok(())
+    })
 }
 
 /// A method, a closure and a borrow check are served to the next build: an `impl`'s method
@@ -3623,20 +3645,22 @@ fn steps_of(lowered: &blaze_lower::Lowered, name: &str) -> [Option<ContentId>; 2
 /// store must have found nothing to refuse. An error names each reader whose steps differ, or
 /// the item store's error.
 fn leaks_never_stale(seed: u64) -> Result<(), String> {
-    let (_sim, _store, reader) = built_and_kept(seed, LEAKS);
+    let (mut sim, _store, reader) = built_and_kept(seed, LEAKS);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
     let macros = super::deps::tests::no_macros();
     let edited = LEAK_EDITS.iter().fold(LEAKS.to_owned(), |lib, (from, to)| {
         assert_eq!(lib.matches(from).count(), 1, "the edit of `{from}` is of one place");
         lib.replace(from, to)
     });
     let next = std::sync::Arc::new(core_front(&edited));
-    let served = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader)
         .map_err(|error| format!("the serve: {}", error.what))?;
     ask_bodies_steps(&next);
     let fresh = std::sync::Arc::new(core_front(&edited));
-    let _fresh = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+    let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&fresh);
     // alloc: a test's findings
     let mut stale: Vec<String> = Vec::new();
@@ -3651,6 +3675,7 @@ fn leaks_never_stale(seed: u64) -> Result<(), String> {
         true => Ok(()),
         false => Err(stale.join("; ")),
     }
+    })
 }
 
 /// A body that reads an edited leak is never served stale: a hidden type, an auto trait's
@@ -3682,12 +3707,14 @@ fn the_oracle_catches_a_world_blind_to_a_leak() {
 /// the item store's error (a served answer that disagrees with its database), or a serve that
 /// failed.
 fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
-    let (_sim, mut store, reader) = built_and_kept(seed, OWNERS);
+    let (mut sim, mut store, reader) = built_and_kept(seed, OWNERS);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<bodies::Did, String> {
     let macros = super::deps::tests::no_macros();
     let sessions = BodySessions::default();
     let marks = no_marks();
     let mut next = std::sync::Arc::new(core_front(OWNERS));
-    let served = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let (puts, first) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
         .map_err(|error| format!("the first serve: {}", error.what))?;
@@ -3716,7 +3743,7 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     ask_bodies_steps(&next);
     super::deps::item_errors(&served).map_err(|error| format!("the served database's item store: {}", error.what))?;
     let fresh = std::sync::Arc::new(core_front(&edited));
-    let _fresh = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+    let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&fresh);
     for name in ["bump", "id", "uses"] {
         let (now, run) = (steps_of(&next, name), steps_of(&fresh, name));
@@ -3725,6 +3752,7 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
         }
     }
     Ok(second)
+    })
 }
 
 /// An unedited body's entries are carried to the next revision: the crate's kept session is
@@ -3752,12 +3780,14 @@ fn an_unedited_bodys_entries_are_carried_to_the_next_revision() {
 /// a serve that failed, a session dropped as naming an entry the store lacks, or a function's
 /// steps other than a database of the edited tree served nothing has.
 fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
-    let (_sim, _store, reader) = built_and_kept(seed, OWNERS);
+    let (mut sim, _store, reader) = built_and_kept(seed, OWNERS);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<bodies::Did, String> {
     let macros = super::deps::tests::no_macros();
     let sessions = BodySessions::default();
     let marks = no_marks();
     let mut next = std::sync::Arc::new(core_front(OWNERS));
-    let served = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let edit = |next: &mut std::sync::Arc<blaze_lower::Lowered>, text: &str, why: &'static str| -> Result<(), String> {
         let lowered = std::sync::Arc::get_mut(next).ok_or("the front end is held past its serve")?;
@@ -3787,7 +3817,7 @@ fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
     }
     super::deps::item_errors(&served).map_err(|error| format!("the served database's item store: {}", error.what))?;
     let fresh = std::sync::Arc::new(core_front(&edited));
-    let _fresh = super::deps::session(&fresh, &reader, &macros, &[]).unwrap();
+    let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&fresh);
     for name in ["bump", "id", "uses"] {
         let (now, run) = (steps_of(&next, name), steps_of(&fresh, name));
@@ -3796,6 +3826,7 @@ fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
         }
     }
     last.ok_or_else(|| "no serve ran".to_owned())
+    })
 }
 
 /// A body edit after comment edits whose serves' puts never reached the store is served: the

@@ -67,6 +67,10 @@ pub(crate) fn run(
 }
 
 impl Pins {
+    #[expect(
+        blaze::retry,
+        reason = "a pin asked on a cached connection that failed is asked once more on a fresh one: the dead connection must be found before it is used, so one ask is made"
+    )]
     fn open(&mut self, view: &ViewRef) -> Result<ContentId, String> {
         for attempt in 0..2 {
             let client = self.connect()?;

@@ -88,6 +88,11 @@ impl Names {
         ok
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "name starts are u32 offsets into one buffer of names: past 4 GiB of names this \
+                  needs a typed refusal like `push`'s"
+    )]
     fn push_unchecked(&mut self, name: &str) {
         let start = u32::try_from(self.bytes.len()).expect("names of under 4 GiB");
         self.bytes.extend_from_slice(name.as_bytes());

@@ -254,7 +254,7 @@ moved a row by 2 to 6 times until taken out, `agents.json` memstrat-h1):
 | c | the pool's give-back has callers: one lap of the sweep each 30 s of idleness, every unpinned page at the limit's line and on a pressure event | the pool's pages of an idle daemon go (66 MiB to 0 after 60 s); no row moves | built |
 | b0 | a library's rows not kept as readers (lane records-1111's shed, `2b173f8632`) | 100 MiB live less | measured here, left off: a comment edit 20.0 to 34.7 ms |
 | b1 | a sealed crate's tables (`Resolutions`, `ImplSlices`, the crate graph, source roots) as `HIGH` leaves apart from the workspace's; then its rows keep no edges | library rows at `HIGH` (181,865 of 2.1 million today); 320 MiB live less | not built |
-| b2 | def maps and impl tables read in place; name resolution's state dropped for a sealed crate | 470 MiB less; under 2 GB | def maps: written, behind `BLAZE_DEF_MAP_PAGES=1`, not yet compiled or measured ("Def maps read in place", below); impl tables not built |
+| b2 | def maps and impl tables read in place; name resolution's state dropped for a sealed crate | 470 MiB less; under 2 GB | written, not compiled or measured (F2, 2026-11-13): def map pages the one form of a served crate's def map, its names once; impl tables as pages read by trait, by self type and by name; neither record pinned or decoded whole ("Def maps read in place", "Impl tables read in place", below) |
 | b3 | syntax, item trees and expansions of a sealed crate not held; signatures not memoized | 660 MiB less; under 1 GB | not built |
 | b4 | link and codegen tables as records | 400 MiB less; under 500 MB | not built (the engine's edit path is another lane's) |
 | d | restart and cold start read records: F2 and R8, then R7 | first no-op after a restart under 300 ms; then an idle daemon may drop to the budget | not built |
@@ -299,21 +299,24 @@ no row faster); the flight recorder's read room by bytes (the `profile` holder 6
 ## Def maps read in place (2026-11-12, lane records-1112b; D21, D29)
 
 Step b2's first half. **Written, not compiled or run by this lane**: the round's results
-decide; every number below that is not quoted from another section is a prediction. Off unless
-a request sets `BLAZE_DEF_MAP_PAGES=1`; unset, the image's def map part is decoded whole and is
-the only path. A crate given pages is read from them alone (`frozen::served`), never both.
+decide; every number below that is not quoted from another section is a prediction. The one
+path: the image holds no def map part, and a served crate is read from its pages alone
+(`frozen::served`). Layout 3 (F2, 2026-11-13) writes a module's names once.
 
 **The record** (`crates/hir-def/src/nameres/frozen/pages.rs`): a crate's `DefMap` as one store
 value of segments found by offsets from its start, little-endian, nothing fixed up at a read.
 
 | Segment | Holds | Read when |
 |---|---|---|
-| header (56 bytes), a row a module (24) | the layout, the encoding, where each segment is | the crate is first asked for |
+| header (56 bytes), a row a module (64) | the layout, the encoding, where each segment and run is | the crate is first asked for |
 | files | each file the segments name: owning crate, path from its root, content ID | with the header |
 | head | crate data, the module tree (origin, visibility, parent, children), preludes, whether a scope shadows a primitive type | with the header |
 | a module's name table | open-addressed slots (16 bytes: the hash of a name's text, where its entry is), at most half full | a name is looked up in that module |
-| a name's entry | the name and its `PerNs` | that name is looked up |
-| a module's scope | the whole `ItemScope` | something lists the scope (a glob, the traits in scope, impls) |
+| a name's entry, in its module's run of entries | the name and its `PerNs`, written once | that name is looked up |
+| a module's textual macro table and run of entries | slots as a name table's; the name and its `macro_rules!` | a textual macro is looked up |
+| a module's traits | the traits in scope | method resolution asks for them |
+| a module's items | its impls, built-in derive impls, declared traits | the impls maintainer is handed a crate with no impl tables |
+| a module's scope | the rest of the `ItemScope` (`Enc::scope_rest`), each entry's length, each namespace's names by entry position | something lists the whole scope (a glob): with the two runs, three reads |
 | tail | name records, diagnostics, derive helpers | a lint or diagnostic asks |
 
 A lookup of a name (`Modules::name`, the one memo of a path segment) reads a window of four
@@ -322,14 +325,14 @@ most six pages, for a crate of any size. The whole scope is decoded only for a r
 of it, a module at a time (`ScopeSlot::Paged`); the records only when asked
 (`RecordsSlot::Paged`). The head is decoded once a crate and is the `DefMap` value.
 
-**Through the pool.** The bytes come through `PageSource::read(at, len)`, which holds them only
-while the read runs. The driver's is `blaze_cas::Reader::part` (new): a raw record of a pack
-that one whole read verified is read a part at a time, the part's pages pinned for the task and
-no longer; the pool checks each block as it loads it. Nothing is pinned between reads, so the
-idle give-back takes the pages back. A value the store keeps another way (compressed, a file of
-its own from 4 MiB, still in a segment) is read whole and the part is of that: the same bytes,
-without the bound. The key is `deps::pages_key`: the image's filed key (every input of the
-crate and what it read), the layout and the encoding.
+**Through `blaze_cas::direct`.** The bytes come through `PageSource::read(at, len)`. The
+driver's (`PagedRecord`, blaze-cargo `serve/unit/deps.rs`) maps a record of
+`direct::MAP_FROM` (16 KiB) or more once, verified, and a part is a slice of the mapping: the
+kernel's page cache is the one copy, only the pages a lookup touches are loaded, and nothing
+is pinned in a pool. A shorter record (or one still in a writer's segment) is read once,
+verified, and held: under 16 KiB a crate. A collector keep is taken before the map. The key is
+`deps::pages_key`: the image's filed key (every input of the crate and what it read), the
+layout and the encoding.
 
 **Ids.** Nothing in the record is a database's id; each kind is written as `nameres::frozen`
 writes it, and read by interning again:
@@ -345,11 +348,15 @@ writes it, and read by interning again:
 | name | its text; a keyed name with its context |
 | a name's slot | FNV-1a of its text (never a hash of an interned id) |
 
-**What it does not do yet.** (1) The image still holds the def map part and is held pinned
-whole for the session (`Reader::pinned`), so the saving is the decoded heap values, not the
-image's bytes: the image without that part is next, then lang items and signatures the same
-way. (2) A module's names are written twice (scope segment and entries). (3) Impl tables
-(`hir-ty`'s frozen impls) are as they were. (4) A workspace crate is never paged: only a
+**What it does not do yet.** (1)–(3) of 2026-11-12 are written (F2, 2026-11-13, not
+compiled or run): the image holds no def map part and is mapped through `blaze_cas::direct`
+(`InStore`, blaze-cargo `unit/deps.rs`), pages likewise (`PagedRecord`), nothing pinned in a
+pool; a module's names are written once; impl tables are pages ("Impl tables read in
+place"). Checks: `nameres::frozen::pages::tests::a_modules_names_are_written_once`,
+`name_resolution_state_stays_zero_across_many_sealed_crates` with its control
+`a_sealed_crates_whole_scope_is_seen_by_the_zero_state_check`, and the refinement under
+random edits with its plants (a name left out, another name's entry served). Still a crate
+record, not per item (rule 65): both are one store value a crate. (4) A workspace crate is never paged: only a
 crate with an image is. (5) b3 and d are not built. F2 is not built (below): a crate with records is resolved
 from source once, in the write that adds it, before the store is asked.
 (6) No new `blaze_cas::Kind`: pages are `Kind::Query` like the image; their keys are what a
@@ -417,13 +424,13 @@ count on hello-world, 80 to 0.
 **What is left, in order** (split 2026-11-12: 1's second half is lane records-impls', 4 is
 records-items', 5 and the end-to-end revision cases are records-restart's, bodies and MIR are
 records-bodies'; 2, 3, the many-crates count test, the refinement test under random edits and
-the double resolve of harnessed crates are records-1112d's, then records-1112e's, which
-built none of them: 3 (the image not pinned whole, the duplicate write of a module's names),
-the many-crates count test, the refinement test of def-map pages under random edits and the
-double resolve are all still to do, in that order. Lane records-1112f (2026-11-12) wrote the
-registry-image piece above and built none of these either; before them it owes the smoke
-fix, the component-size measurement for rule 65 (`/tmp/records-1112e/next.md` D) and the
-wiring lines other lanes send. The record keys a pin and a pack export
+the double resolve of harnessed crates are records-1112d's, then records-1112e's. F2
+(2026-11-13, written, not compiled or run) wrote 3 (the image and the pages mapped through
+`blaze_cas::direct`, nothing pinned whole; a module's names once), the many-crates test
+(`name_resolution_state_stays_zero_across_many_sealed_crates`) and the refinement of def-map
+pages under random edits with its two plants; still to do: the double resolve, the smoke
+fix, the component-size measurement for rule 65 (`/tmp/records-1112e/next.md` D), and the
+per-item form of both records (rule 65; "Impl tables read in place"). The record keys a pin and a pack export
 cover are one list now, storegc's `hir_def::deps::front_keys` / `filing_keys` and
 blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there).
 
@@ -440,16 +447,9 @@ blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there
    after hir-def's). Checks: hir-ty
    `method_resolution::delta::tests::tables::a_crate_given_its_impl_tables_is_not_maintained_and_answers_as_the_one_that_made_them`
    with `the_oracle_catches_tables_kept_past_their_image`; the codec's own are hir-ty-mir's
-   `tests::frozen`. **Second half, not built**: the table is still decoded whole a crate at
-   its first lookup (every impl id interned; an impl in a body lowers that body), and
-   `FrozenImpls` is one map of every crate, so a serve that changes it re-verifies every
-   reader. Make it the pages discipline: a table by trait and by simplified self type
-   (open-addressed slots over the FNV-1a of the key's portable bytes, as
-   `pages::Modules::name`), each entry the impl ids of that key, read through
-   `PageSource`; `TraitImpls::for_crate_and_trait` and `InherentImpls::in_crate_for_self_ty`
-   read one entry; the candidate names (`in_crate_trait_value_items`) the same by name.
-   Tests then: pages touched per lookup bounded at two sizes; round trip of an entry against
-   `TraitImpls::for_crate`; layout refused by name.
+   `tests::frozen`. **Second half: written** (records-impls, then F2; "Impl tables read in
+   place"): pages read a key at a time. Left: the per-item form (rule 65), and the whole-table
+   readers that section lists.
 2. *A slot a crate for what a crate is read from.* **Written 2026-11-12 (records-1112d, not
    compiled or run by it).** Five maps of every crate (`PagedDefMaps`, `FrozenDefMaps`,
    `FrozenLangItems`, `DepImages`, hir-ty's `FrozenImpls`) stay for what runs outside
@@ -678,8 +678,8 @@ Written, none of it compiled by this lane (lanes records-restart, then records-r
   (`crates/hir-def/src/deps/found.rs`): `found_key(plan key)`, `Found { filed, families,
   own_surface, files }`, `encode`/`decode`, `FoundError`. `families` (asked by records-items)
   says which record families the writer put under the filed key (`family::IMAGE`,
-  `DEF_MAP_PAGES`, `IMPL_TABLES`, `ITEM_PAGES`), so an image older than a family is a miss of
-  that family. `own_surface` is cutoff-1112's 101 bytes (`Lowered::own_surface`, given back
+  `DEF_MAP_PAGES`, `IMPL_TABLES`; `ITEM_PAGES` retired 2026-11-13, kept known so old records
+  decode), so an image older than a family is a miss of that family. `own_surface` is cutoff-1112's 101 bytes (`Lowered::own_surface`, given back
   by `Lowered::carry_own_surface`), not the folded digest, which dies with any change below
   the crate. Not written: the put in `serve/work.rs` `store_kept` (one put beside the image;
   noopkeep lists that file and wants the lines first; memgive too), which also queues the key
@@ -722,7 +722,7 @@ Not written: C's put and read; D (`Files::declare_view_root` in base-db `view.rs
 decision in `lower_writes`, dropping `set_view_root`'s second hash); E's switch (the two
 `is_local` terms in `key.rs`, `deps::store(.., write: &[Crate])`, the quiet-crate and
 stop/idle writes); F; G; the simulation of a restart at every point of a build; the measured
-bounds; turning `BLAZE_DEF_MAP_PAGES` on. One more for E, by reading: `crate_inputs` hashes
+bounds. One more for E, by reading: `crate_inputs` hashes
 `proc_macro_cwd` through the package's markers only, and a member's is its workspace root, so
 a member's image key holds this machine's path until that is written as a marker too
 (`a_copied_store_in_a_new_home_resolves_nothing` will show it once members are eligible).
@@ -744,8 +744,7 @@ What the next writer needs, agreed with the lanes named:
   put one for; `front_keys` does not cover found keys (they are not made from the filed key),
   so the writer owes a test that every found key put for a std/bstd crate is queued to its
   pin, or a record written and not pinned is collected. A found record without its image, or
-  the reverse, is a miss either way. The serve's check of item pages asks the store, never
-  the record.
+  the reverse, is a miss either way.
 - *Named roots (records-1112f; written, not compiled), owed by this lane, not written.*
   `base_db::Files::ported` now has its reverse `Files::placed(bytes)` and `Files::held(bytes)
   -> Option<&'static str>` (the named root a path is still under; identity and `None` while
@@ -796,9 +795,11 @@ What the next writer needs, agreed with the lanes named:
 
 ## Items read in place (b3; 2026-11-12, lane records-items; D21, D29)
 
-**Written, not compiled or run by this lane**: the round's results decide, and no count here is
-this lane's measurement. Inert until `deps/serve.rs` gives a crate item pages (lines sent to
-records-1112d; behind the def-map pages' switch): until then the old path is the only path.
+**Written, not compiled or run by the lanes**: the round's results decide, and no count here is
+a measurement. One path (2026-11-13, F3): the crate-keyed item pages (`frozen/items.rs`,
+`items_key`, `ITEM_PAGES`) are deleted; every row below is per-item entries through
+`nameres::frozen::entries`, which the driver installs over the store
+(`serve/unit.rs` → `deps::entries`, read through `serve::direct`).
 
 **What forces a served crate's syntax** (read from the code). No reader of a served crate asks
 for an item tree: `file_item_tree_query` is called by name resolution's collection alone, which
@@ -808,71 +809,40 @@ defining file):
 
 | | Queries | State |
 |---|---|---|
-| A | `ImplItems::of`, `TraitItems::query_with_diagnostics` (the impl's or trait's file, and each macro call at assoc position expanded) | from the record |
-| B | `AttrFlags::query` (`file_attr_flags`: the file's outline; a macro-written item: its expansion) | from the record |
-| B | `field_attr_flags`, `generic_params_attr_flags`; the 33 attribute value queries of `attrs.rs` (`link_name` .. `block_disabled_sanitizers`, `docs`, `cfgs`, `repr_assume_has`, `target_features`, ..); stability (`own_of_def`, `own_of_fields`, `default_body_of`, `deprecation_origin`, `stability_origin`) | not built: an entry kind each |
-| B | crate-wide walks (`crate_diagnostic_items`, `crate_notable_traits`, `UnstableFeatures::query`, `ImportMap::of`) | not built: one table a crate each |
-| C | `enum_has_unsafe_fields`, `written_self_view`, `extern_block_abi`, `get_constrained_lifetimes`, `written_visibility` under `assoc_visibility`, `ExternCrateId::alias_or_name`, macro names | not built |
+| A | `ImplItems::of`, `TraitItems::query_with_diagnostics` (the impl's or trait's file, and each macro call at assoc position expanded) | per-item entries (`entries/items.rs`) for a `plain` impl or trait; one with a macro call at assoc position is collected from syntax until the expansion key (D) is built |
+| B | `AttrFlags::query` (`file_attr_flags`: the file's outline; a macro-written item: its expansion) | per-item entries for a file-written item; a module's flags and a macro-written item's are made from syntax (not built) |
+| B | `field_attr_flags`, `generic_params_attr_flags`; the 33 attribute value queries of `attrs.rs` (`link_name` .. `block_disabled_sanitizers`, `docs`, `cfgs`, `repr_assume_has`, `target_features`, ..); stability (`own_of_def`, `own_of_fields`, `default_body_of`, `deprecation_origin`, `stability_origin`) | per-item facts (`deps/facts.rs`, family `attr value`, keyed by the item's `attrs`): `symbol_attr`'s five, `lang`, `target_feature`, `cfg`, `unstable`, `must_use`, `rustc_must_implement_one_of`, `rustc_legacy_const_generics`, `wasm_import_module`, `repr`, `define_opaque` (paths of root names), `sanitize` (the sets as written; what an item inherits is applied on read), `link` (every `#[link]` with its `cfg(..)` as written; the crate's cfg picks on read, so no cfg is in the key); field flags keyed by the variant's `header` (2026-11-13, F3, not compiled); not built: `docs` (its value holds file ids and a source map: an IDE read, no build reads a dependency's), stability, generic-param flags |
+| B | crate-wide walks (`crate_diagnostic_items`, `crate_notable_traits`, `UnstableFeatures::query`, `ImportMap::of`) | not built: no table a crate (rule 65); each walk reads the per-item facts above and the item flags, so a sealed crate's walk is syntax-free once every fact it reads is one; a crate root's own attributes (a module's) are not kept |
+| C | `enum_has_unsafe_fields`, `written_self_view`, `extern_block_abi`, `get_constrained_lifetimes`, `written_visibility` under `assoc_visibility`, `ExternCrateId::alias_or_name`, macro names | per-item facts keyed by the item's `header` (`deps/facts.rs`; 2026-11-13, F3, not compiled); `get_constrained_lifetimes` reads only the served signature |
 | C | `with_source_map`/`relative` of each signature | lowers again from syntax by design; whether only a diagnostic of that item reaches it is not checked (the callers are the dispatchers in `expr_store.rs`, `hir/generics.rs`, `lib.rs`) |
-| D | `decl_macro_expander` (the tokens of a `macro_rules!`/`macro` a dependent calls) | per-item entries (`hir_expand::declarative::stored`), written, not compiled or run; a definition a macro wrote, one with a `cfg_attr` and one whose spans have a wider anchor are made from source as before |
-| D | the hygiene keys of `nameres/def_site.rs` (`macro_def_module`, `expanded_item_key`, `use_tree_key`, `module_item_key`, `expanded_*_context`) | not built |
-| D | `include_macro_invoc` (decoded every scope) | from the record: one list a crate |
-| E | an item's range or line (`method_resolution::may_hold`, `opaques.rs`, hir-ty-mir `location.rs`, hir-ty-codegen `places.rs`, `const_check/stability.rs`), blaze-items' `item_key` and macro token forms (`key.rs`, `form.rs`), lint levels (hir-lint-levels) | not built: positions as a segment of their own, read only by units that need them (form to agree with cutoff-1112); the item key and the resolved level set as entries |
+| D | `decl_macro_expander` (the tokens of a `macro_rules!`/`macro` a dependent calls) | per-item entries (`hir_expand::declarative::stored`, layout 2), written, not compiled or run; a definition with a `cfg_attr` is kept with the crate's cfg in its tokens' key; one a macro wrote and one whose spans have a wider anchor are made from source as before. The expansion key (`stored::expansion::key`: the layout, depth, the definition's edition, flags and header or parent key, the call's kind, `expand_to`, its site's header and body or parent key, the calling crate's edition and cfg) is built (2026-11-13, F3, not compiled): an expansion's items have a file index under it and their facts are found with no expansion; no key (made from syntax) for an attribute macro, an eager call, a proc macro, or a builtin that reads its position (`column!`, `file!`, `line!`, `module_path!`) |
+| D | the hygiene keys of `nameres/def_site.rs` (`macro_def_module`, `expanded_item_key`, `use_tree_key`, `module_item_key`, `expanded_*_context`) | not built: their values are interned `SyntaxContext`s; keeping them needs a portable context (its marks named by expansion keys) and, in the reading database, a map from an expansion key back to its call |
+| D | `include_macro_invoc` (decoded every scope) | from syntax (the crate-keyed list went with the item pages); one entry a call under the expansion key, not built |
+| E | an item's range or line (`method_resolution::may_hold`, `opaques.rs`, hir-ty-mir `location.rs`, hir-ty-codegen `places.rs`, `const_check/stability.rs`), blaze-items' `item_key` and macro token forms (`key.rs`, `form.rs`), lint levels (hir-lint-levels) | positions are a segment of the file index (layout 3: an item's start and end after the assoc pairs, read by `FileIndex::range`); `may_hold` and `opaques.rs` read it (2026-11-13, F3, not compiled). Not ported: `location.rs`, `places.rs` and `const_check/stability.rs` place a body's node (records-bodies); `key.rs` and `form.rs` read no syntax; lint levels not built |
 | F | bodies: `Body::of`, `body_syntax`, `block_item_tree_query`, `block_def_map`, `nameres::demand`, MIR's `parse_macro_expansion(..).err` | lane records-bodies |
 
-**The record** (`crates/hir-def/src/nameres/frozen/items.rs`): one store value a crate, with the
-def-map pages' discipline (`PageSource`, little-endian, offsets from the record's start, a
-layout or encoding of another blaze refused by name).
-
-| Segment | Holds | Read when |
-|---|---|---|
-| header (56 bytes) | layout, encoding, where the rest is | the crate's items are first asked for |
-| slots (16 bytes each, at most half full) | FNV-1a of an entry's key, where the entry is | an entry is looked up: a window of four |
-| files | the files the segments name, with their content IDs | with the header |
-| an entry | its key, then one query's answer of one item | that query is asked of that item |
-| includes | the crate's `include!` calls and the file each reads | `include_macro_invoc` |
-
-An entry's key is the query (`What`) and the item as `deps::signatures::key::Key` writes it
-(module index, container, ast id, a macro file as its call): no parse, no database id. Values
-are `nameres::frozen`'s encoding, a segment reading without any other. Entries are laid out in
-key order, so two databases write the same bytes. A lookup is one window of slots and one
-entry, at most six pages. A served item with no entry, or an entry that does not read, is
-`frozen::Unreadable` naming the crate and the item; nothing is lowered in its place. Each
-answer calls `report_stored_read`. The per-crate slot is `items::ItemPagesSlot` (`give_changed`);
-the store key is `items_key(image key)`: the image's filed key, the layout, the encoding and
-the item key's domain, under `Kind::Query`.
-
 **Written when** the crate is first resolved from source, in `deps::store`'s task of that
-crate, from the answers that database has (its parse is in memory; the assoc items of impls no
-build asked are collected there, after the answer). Never for a crate read from an image: one
-whose image and def-map pages are found without item pages is a miss in the serve
-(`deps/serve.rs`), resolved once and written with every family; `Stored::families` says which
-families a store wrote, for the found record (`deps::found::family`).
+crate (`deps::facts::keep_all`, called by `serve.rs`'s `make` where the item pages were
+written): every module's items (blocks left to their bodies), their assoc items, variants,
+macros, extern crates and blocks, each fact a dependent asks, so the entries are kept while
+that database's parse is in memory. A database's own asks keep them too (`fact` puts on a
+miss). An entry the store dropped is a miss and made from syntax, never a wrong answer: the
+per-item entries are not among `front_keys`, so the collector's pins for them are storegc's
+(not built).
 
-**What cannot come from this record.** An item in a block (its module exists only once its
-body is lowered) and every body: for a body owner the record is to hold the body's key
-(`deps::body_key`) and its position as the file (owning crate and path) and the item's erased
-ast id, never a byte offset; records-bodies provides the body from that (agreed with the main
-agent; not yet written into the record). A proc macro's expansion of a dependent's own call
-is the dependent's.
-
-**Checks** (hir-def `nameres::frozen::items::tests`):
-`a_crate_read_from_item_pages_answers_as_the_one_lowered` (the refinement, every entry through
-its query) with `the_oracle_catches_an_assoc_item_left_out_of_its_entry`;
-`a_crate_read_from_item_pages_makes_no_syntax_tree_or_expansion` (no query named `parse*`,
-`*item_tree*`, `*macro_expand*`, `*outline*`, `*expander*` runs) with
-`without_item_pages_the_same_asks_parse_and_expand`; `the_same_item_pages_from_two_databases`
-with `the_item_pages_of_another_source_are_other_bytes`;
-`a_previous_or_foreign_item_layout_is_refused_by_name`;
-`an_items_lookup_reads_a_bounded_number_of_pages` (40 and 4,000 impls) with
-`every_impls_items_read_more_pages_than_one`. Not written: the refinement under random edits
-elsewhere, and a blaze-cargo test that a dependent's build of a crate with item pages runs
-none of those queries for it. The old path of the three ported queries is not deleted: it is
-still the path of workspace crates and of items in blocks.
+**Checks** (hir-def `deps::facts::tests`, end to end: `deps::store` writes `lib`'s image and
+facts from a source database, a second database is served the image by `deps::serve` with the
+same entries): `a_served_crate_answers_every_fact_with_no_syntax` (no query named `parse`,
+`item_tree`, `macro_expansion`, `outline`, `expander`, `macro_arg`, `ast_id_map` runs; a
+method's self view and an enum's unsafe fields among the facts, their signatures read from the
+image) with `with_facts_read_live_the_same_asks_make_syntax`;
+`one_item_of_n_edited_makes_its_fact_alone` with `keyed_by_file_one_edit_makes_every_fact_again`;
+`facts_of_a_previous_layout_are_made_again` with its same-layout control. Not written: the
+blaze-cargo test that a dependent's build runs none of those queries for a served crate.
 
 **State and what is left** (2026-11-12, lane records-items2; nothing below was compiled or run
-by this lane). The record above is keyed by the crate (`items_key`), against rule 65: it is to
-be replaced by per-item entries, not extended. The per-item form has three levels, none keyed by
+by this lane). The crate-keyed record (`items_key`, deleted 2026-11-13) was against rule 65 and
+is replaced by per-item entries. The per-item form has three levels, none keyed by
 a crate: a file index (ast id to `ItemSource { attrs, header, body }`) under the file's content
 and how it is read; entries under their own keys, all through
 `nameres::frozen::entries` (`entry`, `keep`; the driver's `Entries`); a per-crate table of item
@@ -888,7 +858,8 @@ or context: every span of a kept definition is of its file's root context and re
 definition's own ast id, and a definition that is not so is not kept. An unchanged file: two
 gets, no parse. An edited file: its parse, one row put a macro asked, and the tokens of every
 unchanged macro found. `stored::def_hash` is the definition's content hash for other keys (a
-body's macro-definition fact). Inert until the driver calls `entries::set`; nothing does yet.
+body's macro-definition fact). The driver calls `entries::set` (`serve/unit.rs`, a fresh
+unit's database, over the store through `serve::direct`).
 Checks: hir-expand `declarative::stored::tests` (round trip, a changed token, a span not its
 own is not kept, a layout refused by name, the key's parts); hir-def
 `nameres::frozen::entries::tests`: `a_kept_macro_definition_is_expanded_with_no_parse_of_its_file`
@@ -932,11 +903,10 @@ expansion key, so impls with macro calls, attribute macros or tool attributes, i
 wrote, and `include!` calls (one entry a call) are kept too: until then they run as before;
 the cfg part as the truth of the atoms named, not the crate's whole cfg; module flags (the
 declaration's row, the file's row, the command line's files); the per-crate index (item key to
-entry key: with entries found under their own keys it saves only the hashing); `items.rs` and
-`items_key` deleted with their uses in `deps/serve.rs` (lane records-1112g), which the two
-served branches in `assoc.rs`, `attrs.rs` and `lib.rs` wait on; the driver's `entries::set`
-over the store; the index moved to `hir_expand::file_index`; a no-parse check of an impl's
-entries end to end (needs the def-map record in the same test); then rows B, C, E of the table.
+entry key: with entries found under their own keys it saves only the hashing); the index
+moved to `hir_expand::file_index`. Done 2026-11-13 (F3, not compiled): `items.rs`, `items_key`
+and the served branches deleted; the driver's `entries::set`; the end-to-end no-parse check
+(`deps::facts::tests`); rows B, C, E as the table says.
 
 ## Impl tables read in place (2026-11-12, lane records-impls; D21, D29)
 
@@ -945,9 +915,10 @@ lane**: the round's results decide. No switch: the whole-decode record of the fi
 never built or run, so it is replaced, not kept beside. A crate with an image and no tables in
 the store is maintained from its def map as before (`frozen::serve` gives it nothing).
 
-**The record** (`crates/hir-ty/src/method_resolution/frozen/pages.rs`, layout 1, key
-`frozen::key`: the image's filed key, the layout and the two encodings, `Kind::Query`): a
-header of 88 bytes, the files table, then a body of segments
+**The record** (`crates/hir-ty/src/method_resolution/frozen/pages.rs`, layout 2 since F2
+2026-11-13, key `frozen::key`: the image's filed key, the layout and the two encodings,
+`Kind::Query`): a header of 100 bytes (five tables and a flags word: `DECLARES_SEALED`,
+whether the crate declares a `#[blaze::sealed]` trait), the files table, then a body of segments
 (`hir_def::nameres::frozen::segments`, new: `Writer`, `files`, `reader`, the generic half of
 the def-map pages' segment code) and four open-addressed tables of 16-byte slots, at most half
 full. Every place is from the body's start; nothing is fixed up.
@@ -958,6 +929,7 @@ full. Every place is from the body's start; nothing is fixed up.
 | traits | trait | its blanket impls; where its rows are (one run) and each one's length | `pages::blanket`, `pages::trait_into` |
 | inherent | simplified self type | the inherent impls | `pages::inherent` |
 | names | a name's text | each (name, trait, function or constant) of the crate's traits | `pages::value_items` |
+| selfs | simplified self type | where each row of that self type is (rows not copied) | `pages::for_self_ty`: k+2 reads for k rows |
 
 A slot's hash is of what the key is in every database: FNV-1a of the item's syntax id
 (`ErasedFileAstId`, its kind and name), of a simplified type's kind and number, of a name's
@@ -981,11 +953,15 @@ crate), hir-ty-suspend `root.rs` and hir's two walks of inherent impls for a typ
 (`InherentImpls::for_self_ty_in_crate_and_block`, new, over `in_crate_for_self_ty`),
 `hir/diagnostics.rs` and blaze-diagnostics' `has_impls` (the trait's table of the checked
 crate). hir-ty-pure's four sites in `models.rs` and `effect_attrs.rs`
-(`in_crate_for_self_ty`, `for_crate_and_trait`). Still a whole-table read of a served crate: hir's `Impl::all_for_type`
-(`TraitImpls::for_crate(seen).for_self_ty`: every trait's impls for one type, which needs a
-table from a self type to the traits with a row for it; in the per-item layout below),
-`for_crate_and_deps` and `for_each_crate_and_block*` for any caller left, and
-`traits.rs`'s sealed check and `in_crate_for_trait`, which read what they ask.
+(`in_crate_for_self_ty`, `for_crate_and_trait`). F2 (2026-11-13, not compiled): hir's
+`Impl::all_for_type` reads `TraitImpls::in_crate_for_self_ty` (the selfs table) and
+`traits.rs`'s `declares_sealed` reads the header's flag, for a served crate. Still a
+whole-table read of a served crate: `for_crate_and_deps` and `for_each_crate_and_block*` for
+any caller left, `in_crate_for_trait`, and blaze-items' `inherent_impls_in`
+(`index.rs:651`, `InherentImpls::for_crate` whole), whose callers have only blaze-items'
+one-way hash of the self type, not the type: a per-type read needs the pages' slots found by
+that hash (the per-item form below, keyed by blaze-items' key through a hook as `GoalFacts`
+is) or facts that carry the type.
 
 **The input** is the crate's slot (`ImplTablesSlot`, `Tables { pages, mode }`), given in
 `frozen::set`'s write; queries read only the slot.
@@ -1035,8 +1011,8 @@ marked stored; the readers listed above; the head reads the record's whole files
 checks the content of every file the crate's impls are in (one read a crate, not a lookup).
 
 **State and what is left (records-items, 2026-11-12, at the end of its context; rule 65).**
-The record above is read per item but KEYED per crate (`items_key(image key)`): any change of
-the crate misses every entry. It is to be rebuilt, not extended, on this form (approved):
+The item pages were read per item but KEYED per crate (`items_key(image key)`): any change of
+the crate missed every entry. Rebuilt on this form (approved; the pages deleted 2026-11-13):
 
 1. *A file index*, keyed by H(file content id, edition): ast id to `ItemSource` for each
    item, variant and assoc item, found without parsing an unchanged file and made by the one

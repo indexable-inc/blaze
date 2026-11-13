@@ -40,11 +40,8 @@ mod const_macros;
 mod crates;
 mod doctests;
 mod files;
-#[expect(
-    dead_code,
-    reason = "the plan key is called by the find-records decision of `lower_writes`, piece D of restore.md's \"Restart reads records (d)\", which is not switched on yet"
-)]
 mod found;
+pub use found::NoPlanKey;
 mod harness;
 pub mod places;
 #[cfg(test)]
@@ -244,6 +241,10 @@ pub struct Lowered {
     /// which [`slot_of`] takes in place of parsing the crate's files: let go for a crate in
     /// the write that changes a file of its source root, its settings or its root's text.
     carried: blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
+    /// What a found record said each crate's image is filed under ([`Lowered::take_found`]),
+    /// let go as `carried` is, and whole when any file of the front end moves (a crate's plan
+    /// key covers every crate below it).
+    found: blaze_hash::HashMap<Crate, ContentId, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -272,6 +273,26 @@ struct Load {
     built: Vec<AbsPathBuf>,
     /// Whether what it read came from the view, not only from mounts of fixed roots.
     view: bool,
+    /// Its key as [`found::dir_key`] makes it, as of the last read: what the plan key of each
+    /// crate of its source root is made with ([`Lowered::plan_keys`]). None when its walk
+    /// followed a symlink, whose target the directory's ID does not cover.
+    key: Result<ContentId, found::NoPlanKey>,
+}
+
+/// Read the directory `load` of a source root through `tree`, skipping `skipped`, into
+/// `loaded`; and its key ([`Load::key`]): asked of the tree's nodes, no file's bytes.
+fn read_load<T: blaze_query::Tree>(
+    tree: &files::Mounts<'_, T>,
+    load: &str,
+    skipped: &[String],
+    loaded: &mut Vec<files::Loaded>,
+) -> Result<Result<ContentId, found::NoPlanKey>, LowerError> {
+    let followed = tree.walk(load, skipped, loaded)?;
+    if followed {
+        // alloc: a reason, once per directory with no key
+        return Ok(Err(found::NoPlanKey::Symlink { path: load.to_owned() }));
+    }
+    found::dir_key(tree, load, skipped)
 }
 
 /// What every task of a build reads and nothing writes once [`lower`] made it: each unit's
@@ -307,6 +328,15 @@ impl Crates {
     /// index past the units.
     pub fn cfg(&self, unit: usize) -> Option<&CfgOptions> {
         self.units.get(unit).filter(|it| it.krate.is_some()).map(|it| &it.cfg)
+    }
+
+    /// Each crate a unit of the plan has, once, sorted.
+    pub fn named(&self) -> Vec<Crate> {
+        // alloc: once per caller, one per crate of the plan
+        let mut crates: Vec<Crate> = self.units.iter().filter_map(|it| it.krate).collect();
+        crates.sort_unstable();
+        crates.dedup();
+        crates
     }
 }
 
@@ -401,9 +431,104 @@ struct Graph {
     made: blaze_hash::HashMap<FileId, Vec<Made>, Global>,
     /// Each crate made with how cargo passes its root ([`Spellings::new`]).
     spelled: Vec<(Crate, Spelling)>,
+    /// Each crate a plan's unit made, with what its plan key is made from
+    /// ([`Lowered::plan_keys`]).
+    planned: blaze_hash::HashMap<Crate, Planned, Global>,
     /// Whether a plan lowered had const macros, whose crates are made by the first plan alone
     /// (`const_macros::make`): a later plan is then lowered anew ([`Relowered::Anew`]).
     const_macros: bool,
+}
+
+/// What a crate's plan key is made from ([`found::plan_key`]), kept from when the crate was
+/// made: the half that a write never moves, and where to find the half that it does.
+struct Planned {
+    /// [`found::own_key`] of what the plan said of it.
+    own: Result<ContentId, found::NoPlanKey>,
+    /// Its package's source root, whose loads' keys ([`Load::key`]) are its directories'.
+    set: usize,
+    /// Its package's directory, absolute: what a found record's paths are under
+    /// ([`Lowered::found_files`]).
+    dir: String,
+    /// Its dependencies, as its data holds them.
+    deps: Vec<base_db::BuiltDependency>,
+    /// Whether a build script's run is applied to it (`ExtraCrateData::build_script_runs`):
+    /// what the run gives is in no plan key.
+    runs: bool,
+}
+
+/// Whether a build script's run is applied to `krate` or to a crate below it, or one of
+/// them is no plan's (whose runs the lowering did not keep): each crate asked once into
+/// `seen`.
+fn runs_at_or_below(
+    graph: &Graph,
+    krate: Crate,
+    seen: &mut blaze_hash::HashMap<Crate, bool, Global>,
+) -> bool {
+    if let Some(&runs) = seen.get(&krate) {
+        return runs;
+    }
+    let runs = match graph.planned.get(&krate) {
+        None => true,
+        Some(planned) => {
+            planned.runs || planned.deps.iter().any(|dep| runs_at_or_below(graph, dep.crate_id, seen))
+        }
+    };
+    seen.insert(krate, runs);
+    runs
+}
+
+/// `krate`'s plan key ([`Lowered::plan_keys`]), each crate below it worked out once into
+/// `keys`.
+fn plan_key_of(
+    graph: &Graph,
+    loads: &[Load],
+    krate: Crate,
+    keys: &mut blaze_hash::HashMap<Crate, Result<ContentId, NoPlanKey>, Global>,
+) -> Result<ContentId, NoPlanKey> {
+    if let Some(known) = keys.get(&krate) {
+        return known.clone();
+    }
+    let key = match graph.planned.get(&krate) {
+        None => Err(NoPlanKey::Unplanned),
+        Some(planned) => joined_key(graph, loads, planned, keys),
+    };
+    keys.insert(krate, key.clone());
+    key
+}
+
+/// [`found::joined`] of `planned`'s own key, its dependencies' plan keys and its source
+/// root's directories' keys, sorted by the directory.
+fn joined_key(
+    graph: &Graph,
+    loads: &[Load],
+    planned: &Planned,
+    keys: &mut blaze_hash::HashMap<Crate, Result<ContentId, NoPlanKey>, Global>,
+) -> Result<ContentId, NoPlanKey> {
+    let own = planned.own.clone()?;
+    // alloc: once per crate keyed, its dependencies' keys
+    let mut below = Vec::with_capacity(planned.deps.len());
+    for dep in &planned.deps {
+        match plan_key_of(graph, loads, dep.crate_id, keys) {
+            Ok(key) => below.push(found::Dep {
+                key,
+                name: dep.name.symbol().as_str(),
+                prelude: dep.is_prelude(),
+                sysroot: dep.is_sysroot(),
+                private: dep.is_private(),
+            }),
+            // alloc: a reason, once per crate with no plan key
+            Err(_) => return Err(NoPlanKey::Dependency { name: dep.name.to_string() }),
+        }
+    }
+    // alloc: once per crate keyed, its source root's directories
+    let mut dirs: Vec<(&str, ContentId)> = Vec::new();
+    for load in loads.iter().filter(|it| it.set == planned.set) {
+        dirs.push((load.dir.as_str(), load.key.clone()?));
+    }
+    dirs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    // alloc: as `dirs`
+    let dirs: Vec<ContentId> = dirs.into_iter().map(|(_, key)| key).collect();
+    Ok(found::joined(own, &below, &dirs))
 }
 
 /// What a source root of the front end is of ([`Graph::roots`]).
@@ -428,6 +553,7 @@ impl Graph {
             workspaces: HashMap::new(),                  // alloc: none
             made: blaze_hash::HashMap::new_in(Global),   // alloc: none
             spelled: Vec::new(),                         // alloc: none
+            planned: blaze_hash::HashMap::new_in(Global), // alloc: none
             const_macros: false,
         }
     }
@@ -542,6 +668,7 @@ pub fn lower_into<T: blaze_query::Tree>(
         library: blaze_hash::HashMap::new_in(Global),
         library_made: Vec::new(), // alloc: none
         carried: blaze_hash::HashMap::new_in(Global),
+        found: blaze_hash::HashMap::new_in(Global),
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -919,10 +1046,10 @@ fn lower_writes<T: blaze_query::Tree>(
             .collect();
         loaded.clear();
         tree.read_view.set(false);
-        tree.walk(load, &skipped, &mut loaded)?;
+        let key = read_load(&tree, load, &skipped, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
         set_files(db, load, &built, set, root_count, other_set, &loaded)?;
-        read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get() });
+        read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get(), key });
     }
 
     let const_ast_dir = const_macros::const_ast_dir(&config.library);
@@ -1236,6 +1363,46 @@ fn lower_writes<T: blaze_query::Tree>(
                 );
                 // clone: once per crate made
                 graph.spelled.push((krate, spelling.clone()));
+                // What the plan says of it, for its plan key (`found`): a crate of no package
+                // has none, as a path outside every package would put this machine in it.
+                let own = match set == other {
+                    true => Err(found::NoPlanKey::NoPackage),
+                    false => found::own_key(&found::Said {
+                        package_dir: files::parent(&package.manifest_path),
+                        out_dir: plan_env
+                            .iter()
+                            .find(|(name, _)| name == "OUT_DIR")
+                            .map(|(_, value)| value.as_str()),
+                        root: &src,
+                        passed_dir: &spelling.passed,
+                        aliased,
+                        library: durability == Durability::HIGH,
+                        edition: data.edition,
+                        origin: &data.origin,
+                        crate_attrs: &data.crate_attrs,
+                        target_kind: data.target_kind,
+                        crate_types: data.crate_types,
+                        proc_macro_cwd: data.proc_macro_cwd.as_str(),
+                        extra: &extra,
+                        workspace: workspace.content(),
+                        cfg: &cfg,
+                        env: &plan_env,
+                        deps: &[],
+                        dirs: &[],
+                    }),
+                };
+                graph.planned.insert(
+                    krate,
+                    Planned {
+                        own,
+                        set: set.0 as usize,
+                        // alloc: once per crate made, its package's directory
+                        dir: files::parent(&package.manifest_path).to_owned(),
+                        // clone: once per crate made, its dependencies
+                        deps: data.dependencies.clone(),
+                        runs: !extra.build_script_runs.is_empty(),
+                    },
+                );
                 made_of_root.push(Made {
                     data,
                     aliased,
@@ -1343,6 +1510,72 @@ impl Lowered {
     /// [`Crates::krate`].
     pub fn krate(&self, unit: usize) -> Option<Crate> {
         self.crates.krate(unit)
+    }
+
+    /// The plan key ([`found::plan_key`]) of each of `crates` and of every crate below them,
+    /// as the front end's files are now, or why one has none: what a found record is filed
+    /// under and asked for by (`hir_def::deps::found::found_key`). Made from what each crate
+    /// was made with and the keys of its source root's directories as last read (the tree's
+    /// nodes, no file's bytes): asking it parses and resolves nothing.
+    pub fn plan_keys(
+        &self,
+        crates: &[Crate],
+    ) -> blaze_hash::HashMap<Crate, Result<ContentId, NoPlanKey>, Global> {
+        // alloc: once a store or a find, a key a crate of the closure
+        let mut keys = blaze_hash::HashMap::new_in(Global);
+        for krate in crates {
+            plan_key_of(&self.graph, &self.loads, *krate, &mut keys);
+        }
+        keys
+    }
+
+    /// Takes what the found record of `krate` (filed under its plan key, [`Lowered::plan_keys`])
+    /// says, before the crate is identified or served: the key its image is filed under
+    /// ([`Lowered::found_filed`]) and, unless a build script's run is applied to it or to a
+    /// crate below it (what a run gives is in no plan key), its own surface
+    /// ([`Lowered::carry_own_surface`]: none of its files is parsed for it). Call
+    /// [`Lowered::give_surfaces`] after the last one. Both are let go in the write that
+    /// moves a file of the front end or applies a run below the crate.
+    pub fn take_found(
+        &mut self,
+        krate: Crate,
+        filed: ContentId,
+        own_surface: Option<&[u8]>,
+    ) -> Result<(), LowerError> {
+        self.found.insert(krate, filed);
+        let Some(own) = own_surface else { return Ok(()) };
+        // alloc: once a find, a crate of the closure each
+        let mut seen = blaze_hash::HashMap::new_in(Global);
+        if runs_at_or_below(&self.graph, krate, &mut seen) {
+            return Ok(());
+        }
+        self.carry_own_surface(krate, own)
+    }
+
+    /// What a found record said `krate`'s image is filed under ([`Lowered::take_found`]), while
+    /// no write moved it.
+    pub fn found_filed(&self, krate: Crate) -> Option<ContentId> {
+        self.found.get(&krate).copied()
+    }
+
+    /// The files of `krate`'s source root under its package's directory, each by its path
+    /// under that directory and its content ID in the source root ([`Db::file_content`]):
+    /// what a found record lists (`hir_def::deps::found::Found::files`). None for a crate no
+    /// plan's unit made.
+    pub fn found_files(&self, krate: Crate) -> Option<Vec<(String, ContentId)>> {
+        let planned = self.graph.planned.get(&krate)?;
+        let root = self.db.source_root(SourceRootId(planned.set as u32)).source_root(&self.db);
+        // alloc: a record's field, once a crate stored
+        let mut listed = Vec::new();
+        for file in root.iter() {
+            let Some(path) = self.paths.get(&file) else { continue };
+            let Some(under) = files::rest(path, &planned.dir).filter(|it| !it.is_empty()) else {
+                continue;
+            };
+            // alloc: as `listed`
+            listed.push((under.to_owned(), self.db.file_content(file)));
+        }
+        Some(listed)
     }
 
     /// How cargo passes each crate's root, which the program's names of its files are made from
@@ -2071,6 +2304,11 @@ impl Lowered {
                 !written.contains(krate)
                     && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
             });
+            // And what a found record said its image is filed under: of the crate before.
+            self.found.retain(|krate, _| {
+                !written.contains(krate)
+                    && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
+            });
             // In this run's batch: the crates given the run have other settings or files.
             self.give_surfaces();
         }
@@ -2171,7 +2409,7 @@ impl Lowered {
             }
             loaded.clear();
             tree.read_view.set(false);
-            tree.walk(&load.dir, &load.skipped, &mut loaded)?;
+            load.key = read_load(tree, &load.dir, &load.skipped, &mut loaded)?;
             load.view = tree.read_view.get();
             let change = set_files(db, &load.dir, &load.built, load.set, sets, other, &loaded)?;
             removed |= !change.removed.is_empty();
@@ -2186,6 +2424,9 @@ impl Lowered {
                 self.carried.retain(|krate, _| {
                     db.file_source_root(krate.data(&*db).root_file_id).source_root_id(&*db) != root
                 });
+                // A crate below moved too: its plan key, and so every found record above it,
+                // is another. What was found is let go whole; the next find asks again.
+                self.found.clear();
             }
             note(paths, db, load.set, &change);
         }
@@ -3114,7 +3355,9 @@ fn set_files(
         view.push(ViewFile { path, id: file.id, bytes: &file.bytes });
     }
     let root = ViewRoot { base: &base_path, built, partition: &partition, other, files: &view };
-    db.set_view_root(root).map_err(|error| {
+    // Every caller's IDs are made from the bytes they hold, once (the tree's walk, a run's
+    // files, `CONST_AST`): the view takes them without hashing the bytes a second time.
+    db.set_view_root_from_tree(root).map_err(|error| {
         let at = match &error {
             base_db::ViewError::BadPath(path)
             | base_db::ViewError::Duplicate(path)

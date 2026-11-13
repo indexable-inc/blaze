@@ -25,6 +25,7 @@
 pub mod queue;
 pub mod select;
 #[allow(dead_code)]
+#[expect(blaze::unwired, reason = "wired: one file compiled here and into every test harness; each side uses its half")]
 pub mod wire;
 
 use std::{io::Write as _, time::Duration};

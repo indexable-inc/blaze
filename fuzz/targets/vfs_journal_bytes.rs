@@ -13,6 +13,8 @@
 //!   exactly its heads and sequences.
 
 #![forbid(unsafe_code)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::time::Duration;
 
@@ -149,6 +151,11 @@ fn moved_and_settled(mut vfs: Vfs, mut file: Vec<u8>, data: &[u8]) {
 
 /// Completes every effect the journal asks for, as a disk holding `file` would, until it asks
 /// for none; returns the tickets made durable.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a truncate's u64 length is at most this in-memory file's length, a usize: the \
+              journal only cuts back to bytes it appended"
+)]
 fn settle(vfs: &mut Vfs, file: &mut Vec<u8>) -> Vec<Ticket> {
     let mut effects = Vec::new();
     let mut durable = Vec::new();

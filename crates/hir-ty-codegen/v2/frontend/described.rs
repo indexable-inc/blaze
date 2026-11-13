@@ -167,41 +167,24 @@ pub(super) struct Found {
     counted: SharedMap<HirInstance, Counted>,
 }
 
-/// What each database read from records, each with the database's durable view it was read
-/// in, the last asked for last: as many as kept walks' databases ([`KEPT_WALKS`]), a daemon's
-/// few checkouts.
-static FOUND: Lock<Vec<(base_db::Nonce, u64, Arc<Found>)>> =
-    Lock::new("codegen.frontend.found", Vec::new());
-
 /// What `db` read from records since the last write of an input a library's describe may
-/// read (its durable view, as [`Frontend::durable_view`] gives it): after such a write
-/// nothing read before it is kept, as a kept walk is not patched across one. A count
-/// ([`Found::counted`]) is of a function by its id, and what an id names is the same only
-/// while no library's source was written.
-pub(super) fn found_of(db: &Db) -> Arc<Found> {
-    let (database, _) = db.nonce_and_revision();
+/// read (its durable view, as [`Frontend::durable_view`] gives it), kept in `slot` with that
+/// view (its owner's, [`super::Walks`]; or none, for a front end whose builds keep nothing):
+/// after such a write nothing read before it is kept, as a kept walk is not patched across
+/// one. A count ([`Found::counted`]) is of a function by its id, and what an id names is the
+/// same only while no library's source was written. No process static holds any: until
+/// 2026-11-13 one did, by the database's nonce, and nothing let it go.
+pub(super) fn found_in(slot: &mut Option<(u64, Arc<Found>)>, db: &Db) -> Arc<Found> {
     let durable = blaze_query::db::Database::storage(db).durable_view().as_u64();
-    let mut found = FOUND.lock();
-    let entry = match found.iter().position(|(of, _, _)| *of == database) {
-        Some(at) => {
-            let (_, was, of) = found.remove(at);
-            match was == durable {
-                true => (database, durable, of),
-                // alloc: once per write of a library's input, an empty table
-                false => (database, durable, Arc::new(Found::default())),
-            }
-        }
-        None => {
-            if found.len() >= KEPT_WALKS {
-                found.remove(0);
-            }
-            // alloc: once per database a process builds
-            (database, durable, Arc::new(Found::default()))
-        }
-    };
-    let of = entry.2.clone(); // clone: a reference count, once a build
-    found.push(entry);
-    of
+    if let Some((was, found)) = slot
+        && *was == durable
+    {
+        return found.clone(); // clone: a reference count, once a build
+    }
+    // alloc: once per owner and write of a library's input, an empty table
+    let made = Arc::new(Found::default());
+    *slot = Some((durable, made.clone())); // clone: a reference count
+    made
 }
 
 /// The crates an instance worked out in `home` may name: `home` and what it depends on,

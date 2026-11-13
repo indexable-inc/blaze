@@ -28,6 +28,9 @@
 //!   reads, by the field's name: one fact for the build. Only `borrowck_debug` is read by a
 //!   step: the borrow check prints its regions where it is set, so a verdict kept without it
 //!   is checked again, and printed, with it.
+//! - `InherentAssocTypes(adt)`: the associated types of an ADT's inherent impls a path's
+//!   lowering looks `Type::Name` up in, each by name, alias key and impl key: a list made by
+//!   iterating every module of the ADT's crate, which no lookup fact stands for.
 //!
 //! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
 //! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
@@ -89,6 +92,12 @@ pub mod kinds {
     pub const FIELD_ORDER: QueryKind = QueryKind(0x1809);
     /// A field of the build's front-end settings, which a step reads.
     pub const SETTING: QueryKind = QueryKind(0x180a);
+    /// The associated types of an ADT's inherent impls, by binding name, that a path's
+    /// lowering looks a name up in (`Type::Name` of an ADT).
+    pub const INHERENT_ASSOC_TYPES: QueryKind = QueryKind(0x180b);
+    /// A body's own lowering, as each other step of it reads it: valued by the digest of
+    /// what the lowering read (`hir_ty::body_store::Lowered::value`), not by its answer.
+    pub const STEP_LOWER: QueryKind = QueryKind(0x180c);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -101,6 +110,7 @@ const WHOLE_SCOPE_DOMAIN: &str = "blaze v2 item-hash whole scope 1";
 const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
 const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
+const INHERENT_ASSOC_TYPES_DOMAIN: &str = "blaze v2 item-hash inherent assoc types 1";
 
 /// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
 /// no key is. The settings are one for the build, so the fact names nothing else.
@@ -163,8 +173,14 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
             None => Some(absent(kind)),
             Some(krate) => Some(crate_root_of(db, krate)),
         }
-    } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR {
-        let step = if kind == kinds::STEP_INFER { Step::Infer } else { Step::Mir };
+    } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR || kind == kinds::STEP_LOWER {
+        let step = if kind == kinds::STEP_INFER {
+            Step::Infer
+        } else if kind == kinds::STEP_MIR {
+            Step::Mir
+        } else {
+            Step::Lower
+        };
         match body_of(db, fact.subject)? {
             None => Some(absent(kind)),
             Some(body) => step_value(db, body, step),
@@ -187,6 +203,12 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
         (fact.subject == FIELD_ORDER_SUBJECT).then(|| field_order_of(db))
     } else if kind == kinds::SETTING {
         (fact.subject == BORROWCK_DEBUG_SUBJECT).then(|| borrowck_debug_of(db))
+    } else if kind == kinds::INHERENT_ASSOC_TYPES {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Item(ItemId::Adt(adt))) => Some(inherent_assoc_types_of(db, adt)),
+            Some(_) => None,
+        }
     } else if kind == kinds::TRAITS_IN_SCOPE || kind == kinds::WHOLE_SCOPE {
         match key::resolve(db, ItemKey(fact.subject)) {
             None => Some(absent(kind)),
@@ -313,6 +335,38 @@ pub fn resolves(db: &Db, module: ModuleId, name: &Name) -> FactRef {
     }
 }
 
+/// The `InherentAssocTypes` fact of `adt`: what a step's read of
+/// `hir_ty::lower::path::inherent_assoc_types(adt)` stands for.
+pub fn inherent_assoc_types(db: &Db, adt: AdtId) -> FactRef {
+    FactRef {
+        kind: kinds::INHERENT_ASSOC_TYPES,
+        subject: key::item_key(db, ItemId::Adt(adt)).0,
+        object: FactObject::None,
+    }
+}
+
+/// The list `inherent_assoc_types(adt)` gives, in its order, each row by its binding name's
+/// text and whether a `macro`'s context keys it, the alias's key and the impl's key. Sound as a
+/// fact (keys-cover-every-input): the value is the query's whole result with each id written
+/// as its item key, the same in every database, so two values are equal exactly when the
+/// results are; what a reader does with a row (the impl's self type, the alias's type) is a
+/// read of its own, recorded by its own rule. Not read through: the query iterates every
+/// module of the ADT's crate (`Modules::table`, each scope's inherent impls), reads no single
+/// fact names.
+#[blaze_query::tracked(returns(copy))]
+fn inherent_assoc_types_of(db: &Db, adt: AdtId) -> ContentId {
+    let rows = hir_ty::body_store::inherent_assoc_types_of(db, adt);
+    let mut h = Hasher::new(INHERENT_ASSOC_TYPES_DOMAIN);
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for (name, alias, impl_) in rows {
+        h.part(name.as_str().as_bytes())
+            .update(&[u8::from(name.key().is_some())])
+            .id(&key::item_key(db, ItemId::Alias(*alias)).0)
+            .id(&key::item_key(db, ItemId::Impl(*impl_)).0);
+    }
+    h.finish()
+}
+
 /// The traits in scope in `module`, by key, sorted.
 #[blaze_query::tracked(returns(copy))]
 fn traits_in_scope_of(db: &Db, module: ModuleId) -> ContentId {
@@ -374,14 +428,25 @@ fn body_of(db: &Db, subject: ContentId) -> Option<Option<DefWithBodyId>> {
 }
 
 /// The fact of `step` of a body, as a later step of the same body reads it, the body named as
-/// [`OWN`]; `None` for the borrow check, which no step reads.
+/// [`OWN`]; `None` for the borrow check, which no step reads, and a constant's value, which is
+/// read as its `ConstValue` fact.
 pub fn step_fact(step: Step) -> Option<FactRef> {
     let kind = match step {
         Step::Infer => kinds::STEP_INFER,
         Step::Mir => kinds::STEP_MIR,
+        Step::Lower => kinds::STEP_LOWER,
         Step::Borrowck | Step::Const => return None,
     };
     Some(FactRef { kind, subject: OWN, object: FactObject::None })
+}
+
+/// The fact of `step` of another body `body`, by its key, as a step of some other body reads
+/// it (a `const fn` evaluated, a closure's signature, a coroutine's witnesses); `None` where
+/// [`step_fact`] has none. Its value is [`step_value`] of `body` ([`value`]'s arm for the
+/// step kinds, through [`body_of`]): the hash of its answer, so two of these facts are equal
+/// exactly when the answers are. A reader of `body` itself names it [`OWN`] ([`relative`]).
+pub fn step_fact_of(db: &Db, body: DefWithBodyId, step: Step) -> Option<FactRef> {
+    Some(FactRef { subject: body_key(db, body), ..step_fact(step)? })
 }
 
 /// The `MatchCheck` fact of a body, as its own borrow check reads it, the body named as

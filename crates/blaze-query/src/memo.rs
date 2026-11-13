@@ -326,6 +326,10 @@ impl Store {
     }
 
     /// The number of a schema and producer pair, the same for every memo of it.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a memo's code is u32 and there is one per schema and producer pair, a few thousand in any build; 2^32 pairs would need a typed refusal here"
+    )]
     pub(crate) fn code(&self, schema: SchemaHash, producer: ContentId) -> u32 {
         let mut codes = self.codes.lock();
         if let Some(code) = codes.by.get(&(schema, producer)) {
@@ -440,6 +444,10 @@ impl Store {
 
     /// The memo's word, from the row it names: `value` is 0, a row this thread just put, or a
     /// shared row it took a name on.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "MemoHot holds a memo's edge count in u32 and nothing caps the edges one query records: a query past 2^32 edges needs a typed refusal where its edges are pushed"
+    )]
     fn add(
         &self,
         key: QueryKey,
@@ -1005,6 +1013,10 @@ impl Store {
 
     /// A slot of `memos` (the newest last) and `key`: up to [`INLINE`] memos in the slot
     /// itself, more in a list copied into this thread's key segment.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a slot holds its memo count in u32 and the memos of one key are its revisions kept, far below 2^32; more would need a typed refusal here"
+    )]
     pub(crate) fn slot(&self, key: Option<Span>, memos: &[MemoId]) -> Slot {
         let len = u32::try_from(memos.len()).expect("2^32 memos of one key");
         if memos.len() <= INLINE {

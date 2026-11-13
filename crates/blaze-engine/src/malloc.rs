@@ -104,6 +104,10 @@ mod linux {
     /// A block of `size` bytes aligned to `align` (a power of two), counted to the running
     /// task's tag; null with `ENOMEM` where there is none.
     fn made(size: usize, align: usize, zeroed: bool) -> *mut c_void {
+        if align > crate::heaps::MAX_ALIGN {
+            crate::heaps::c_alignment_refused(size, align);
+            return failed(ENOMEM);
+        }
         // SAFETY: `align` is a power of two; Linux's thread-locals are static TLS, there from
         // the thread's first instruction.
         let block = unsafe { C.c_malloc(size, align, zeroed) };
@@ -202,7 +206,11 @@ mod linux {
         if !align.is_power_of_two() || align % size_of::<*mut c_void>() != 0 {
             return EINVAL;
         }
-        // SAFETY: a power of two.
+        if align > crate::heaps::MAX_ALIGN {
+            crate::heaps::c_alignment_refused(size, align);
+            return ENOMEM;
+        }
+        // SAFETY: a power of two, within the arena's alignment.
         let block = unsafe { C.c_malloc(size, align, false) };
         if block.is_null() {
             return ENOMEM;
@@ -576,6 +584,11 @@ mod macos {
     /// thread-locals are not there the first zone's before this one, uncounted.
     fn made(size: usize, align: usize, zeroed: bool) -> *mut c_void {
         match locals() {
+            // C frees by address alone, so a block past the arena's alignment cannot be made
+            // the way a Rust one is (`heaps::over_aligned`): refused, saying so.
+            Locals::Live if align > crate::heaps::MAX_ALIGN => {
+                crate::heaps::c_alignment_refused(size, align).cast()
+            }
             // SAFETY: `align` is a power of two; the thread-locals are there.
             Locals::Live => unsafe { C.c_malloc(size, align, zeroed) }.cast(),
             Locals::Gone => {

@@ -154,7 +154,7 @@ pub(super) fn opened() -> Result<blaze_cas::Driven, String> {
     let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     // Pages are loaded as they are read, within the pool's budget: a store is not read
     // whole into memory to export a pin of it.
-    blaze_cas::Driven::open_with(&state, blaze_cas::Loader::Thread { root: state.clone() })
+    blaze_cas::Driven::open_with(&state, crate::serve::direct::pool::thread(&state))
 }
 
 fn seed_at(path: &Path) -> Result<[u8; 32], String> {
@@ -618,8 +618,8 @@ impl Layer {
             root: blaze_core::FileName::new("store").expect("a relative name"),
             writer: sealed::writer(cover),
             tags: LAYER_TAGS,
-            load_tags: LAYER_TAGS + (1 << 32),
-            loader: blaze_cas::Loader::Thread { root: shared.to_owned() },
+            load_tags: crate::serve::direct::pool::loads_after(LAYER_TAGS),
+            loader: crate::serve::direct::pool::thread(shared),
         };
         let mut effects = Vec::new(); // alloc: once a layer opened
         let mut store = blaze_cas::Store::open_shared(config, &mut effects);

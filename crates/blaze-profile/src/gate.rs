@@ -1069,8 +1069,8 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     if files.is_empty() {
         return Ok(Check::unchecked(name, "the build has no file"));
     }
-    let scratch = Scratch::new()?;
-    let (empty, out) = (scratch.0.join("history"), scratch.0.join("merged"));
+    let scratch = scratch()?;
+    let (empty, out) = (scratch.join("history"), scratch.join("merged"));
     for dir in [&empty, &out] {
         fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
     }
@@ -1140,27 +1140,12 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     Ok(Check::new(name, outcome, said).with(wrong))
 }
 
-/// A scratch directory under the system's temporary one, deleted when dropped.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Result<Scratch, String> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        // alloc: a directory's path, once a check
-        let dir = std::env::temp_dir().join(format!("blaze-gate-{}-{n}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
-        Ok(Scratch(dir))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // A directory under the system's temporary one that is left behind is only space.
-        _ = fs::remove_dir_all(&self.0);
-    }
+/// A check's scratch directory under the system's temporary one, removed with all it holds when
+/// the guard drops.
+fn scratch() -> Result<blaze_core::temp::TempDir, String> {
+    // alloc: the error's text, once a failed check
+    blaze_core::temp::TempDir::new("blaze-gate-")
+        .map_err(|error| format!("making the gate check's scratch directory: {error}"))
 }
 
 /// `SELECT * FROM build_summary` of `build`, the per-build summary CI keeps (views.sql), as the
@@ -1398,15 +1383,15 @@ mod tests {
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
         for name in FIXTURED {
-            let scratch = Scratch::new().unwrap();
+            let scratch = scratch().unwrap();
             for entry in fs::read_dir(fixtures().join(name.name())).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|it| it == "parquet") {
-                    fs::copy(&path, scratch.0.join(path.file_name().unwrap())).unwrap();
+                    fs::copy(&path, scratch.join(path.file_name().unwrap())).unwrap();
                 }
             }
             let verdict =
-                check(&duckdb, &scratch.0, None).unwrap_or_else(|error| panic!("{name}: {error}"));
+                check(&duckdb, scratch.path(), None).unwrap_or_else(|error| panic!("{name}: {error}"));
             let it = verdict.check(name).unwrap();
             assert_eq!(
                 it.outcome,

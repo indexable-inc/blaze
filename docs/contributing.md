@@ -110,6 +110,16 @@ it: codegen does not compensate.
 There, a crate of its own is better than growing `hir-ty` or `hir-def`, which are already the
 longest builds in the workspace.
 
+A new crate allocates as little as it can and names every allocator from its first line
+(rule `bump-allocate`): it borrows or writes into the caller's buffer where that does, and a
+function that must allocate is handed the allocator (`Vec::new_in(frame)`,
+`Box::new_in(value, alloc)`, a `&Frame` or an `A: Allocator`). No comment keeps an implied
+allocator from `blaze::implicit_allocator`. The gate holds a new crate there: a crate with no row
+in `crates/blaze-lints/baselines/alloc-sites.txt` is held to no `// alloc:` line and no `expect`
+of the lint outside tests (and, once no `// alloc:` line is left anywhere, no line naming
+`Global`), and every other crate's row only shrinks
+(`scripts/src/bin/allocs.rs`, [lints.md](lints.md#implicit_allocator)).
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary

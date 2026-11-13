@@ -982,6 +982,8 @@ impl Inputs for ViewInputs<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_core::temp::TempDir;
+
     use super::*;
 
     /// The invariant: a stamp stands for a file's content only once no write can share it. A
@@ -1009,23 +1011,22 @@ mod tests {
     /// the same length under the same stamp is seen; nothing was kept for it to hide behind.
     #[test]
     fn a_file_rewritten_at_once_to_the_same_length_is_seen() {
-        let dir = std::env::temp_dir().join(format!("blaze-usercode-racy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::for_test("blaze-usercode-racy-");
         let path = dir.join("input");
         let files = Files::new();
         std::fs::write(&path, b"aaaa").unwrap();
         let (first, _) = files.look(&path).unwrap();
         std::fs::write(&path, b"bbbb").unwrap();
         let (second, _) = files.look(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        drop(dir);
         assert!(first.is_some() && second.is_some());
         assert_ne!(first, second, "the second write's bytes are what is hashed");
     }
 
     #[test]
     fn the_disk_hashes_files_lists_directories_and_refuses_nothing_quietly() {
-        let dir = std::env::temp_dir().join(format!("blaze-disk-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
+        let tmp = TempDir::for_test("blaze-disk-test-");
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a"), b"one").unwrap();
         let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())], &Looks::none());
@@ -1052,7 +1053,6 @@ mod tests {
             std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
         }
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1092,9 +1092,7 @@ mod tests {
 
     #[test]
     fn every_check_shares_one_table_and_an_edit_is_a_new_entry() {
-        let dir = std::env::temp_dir().join(format!("blaze-files-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::for_test("blaze-files-test-");
         let path = dir.join("a");
         std::fs::write(&path, b"one").unwrap();
         // A clock past the racy window of the writes here, so each hash is kept under its
@@ -1117,7 +1115,6 @@ mod tests {
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(files.stamped.len(), 2);
         assert_eq!(now.env(OsStr::new("X")), Some(OsStr::new("1")));
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The invariant: each look at the disk is pushed once to the build's [`Looks`], with its
@@ -1127,8 +1124,7 @@ mod tests {
     /// ask looks. The control: a handle that keeps nothing ([`Looks::none`]) holds no look.
     #[test]
     fn each_look_is_pushed_once_with_the_answer_a_second_ask_gives() {
-        let made = std::env::temp_dir().join(format!("blaze-files-looks-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&made);
+        let made = TempDir::for_test("blaze-files-looks-");
         std::fs::create_dir_all(made.join("sub")).unwrap();
         let dir = std::fs::canonicalize(&made).unwrap();
         let (file, gone) = (dir.join("a"), dir.join("gone"));
@@ -1180,13 +1176,11 @@ mod tests {
         let twice: Vec<_> = Looks::twice(&all).collect();
         assert_eq!(twice.len(), 1);
         assert_eq!((twice[0].0.path.as_path(), twice[0].0.kind), (file.as_path(), LookKind::File));
-        _ = std::fs::remove_dir_all(&made);
     }
 
     #[test]
     fn a_canonical_miss_wants_its_parent_and_nothing_is_vouched_before_the_watch_settles() {
-        let made = std::env::temp_dir().join(format!("blaze-files-vouch-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&made);
+        let made = TempDir::for_test("blaze-files-vouch-");
         std::fs::create_dir_all(made.join("sub")).unwrap();
         let dir = std::fs::canonicalize(&made).unwrap();
         let path = dir.join("a");
@@ -1206,7 +1200,6 @@ mod tests {
         let id = Files::path_id(&roundabout);
         assert!(files.vouched.get(files.vouched.find(&id).unwrap()).names.is_none());
         assert_eq!(dirs.len(), 1);
-        _ = std::fs::remove_dir_all(&made);
     }
 
     /// A path named through symlinks rests on each link and on the file they end at: every
@@ -1216,12 +1209,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_path_through_symlinks_rests_on_each_link_and_the_file_they_end_at() {
-        let made = std::env::temp_dir().join(format!("blaze-files-links-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&made);
-        let dir = {
-            std::fs::create_dir_all(&made).unwrap();
-            std::fs::canonicalize(&made).unwrap()
-        };
+        let made = TempDir::for_test("blaze-files-links-");
+        let dir = std::fs::canonicalize(&made).unwrap();
         for sub in ["sdks/real/lib", "other"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -1267,7 +1256,6 @@ mod tests {
         assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
         let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
         assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
-        _ = std::fs::remove_dir_all(&made);
     }
 
     /// A file asked again, its answer vouched for or its stamp known, allocates nothing: the
@@ -1275,9 +1263,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_warm_file_allocates_nothing() {
-        let made = std::env::temp_dir().join(format!("blaze-files-warm-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&made);
-        std::fs::create_dir_all(&made).unwrap();
+        let made = TempDir::for_test("blaze-files-warm-");
         let path = std::fs::canonicalize(&made).unwrap().join("a");
         std::fs::write(&path, b"one").unwrap();
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
@@ -1293,7 +1279,6 @@ mod tests {
             files.file(&missing, &Looks::none()).unwrap()
         });
         assert_eq!(warm, None);
-        _ = std::fs::remove_dir_all(&made);
     }
 
     #[test]
@@ -1388,8 +1373,8 @@ mod tests {
         db.register::<ViewTree>();
         let view = db.open(blaze_vfs::View { root: tree.root_with_modes(files) });
 
-        let dir = std::env::temp_dir().join(format!("blaze-tree-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
+        let tmp = TempDir::for_test("blaze-tree-test-");
+        let dir = tmp.path();
         for (path, mode, bytes) in files {
             let at = dir.join(path);
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
@@ -1418,6 +1403,5 @@ mod tests {
             .unwrap();
         assert_ne!(disk.tree(&dir, false).unwrap(), plain, "the executable bit is in the hash");
         assert_eq!(disk.tree(&dir.join("none"), false).unwrap(), None);
-        _ = std::fs::remove_dir_all(&dir);
     }
 }

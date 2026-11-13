@@ -126,6 +126,10 @@
 //! behaviour identity, `core::reflect::fn_info(<codegen entry>).code_id`, once const eval
 //! answers `fn_info` (docs/v2/plan/design/code-identity.md, "Toolchain::id").
 
+// `#[expect(blaze::tmp_path)]` on the fixture's workspace; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 pub mod coverage;
 pub mod fixture;
 #[cfg(test)]
@@ -825,6 +829,7 @@ pub const BLAZE_IDENTITY: &str = "blaze-identity: ";
     dead_code,
     reason = "`pinned_llvm_config` is llvm-sys's build script's; this crate uses the check alone"
 )]
+#[expect(blaze::unwired, reason = "wired: one file shared with llvm-sys's build script, which calls the rest")]
 mod pin {
     include!("../../../vendor/llvm-sys/pin.rs");
 }
@@ -840,6 +845,7 @@ const LLVM_PACKAGE: &str = "llvm-sys";
     dead_code,
     reason = "the pin's writer and hex are blaze-stencil's build script's; this crate reads the pin"
 )]
+#[expect(blaze::unwired, reason = "wired: one file shared with blaze-stencil's build script, which calls the rest")]
 mod stencil_pin {
     include!("../../blaze-stencil/pin.rs");
 }

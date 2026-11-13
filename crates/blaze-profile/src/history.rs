@@ -2343,11 +2343,12 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-history-{}-{name}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh directory for `name`: the guard, which removes it with all it holds when it
+    /// drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-history-{name}-"));
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     fn read_back(path: &Path) -> Vec<RecordBatch> {
@@ -2401,7 +2402,7 @@ mod tests {
     #[test]
     fn a_child_process_row_and_a_test_run_row_read_back_column_for_column() {
         use crate::facts::{ProcessRow, TestOutcome, TestRunRow};
-        let dir = scratch("processes-test-runs");
+        let (_tmp, dir) = scratch("processes-test-runs");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let child = ProcessRow {
             build_id: 71,
@@ -2459,9 +2460,7 @@ mod tests {
         assert!(!builds.is_null(0) && builds.is_null(1), "a child of no build has a null build_id");
 
         let again = history.flush(Some(72)).unwrap();
-        assert_eq!((again.processes, again.test_runs), (0, 0), "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!((again.processes, again.test_runs), (0, 0), "a flush writes each row once");    }
 
     /// A client's span of `build`, its columns otherwise none.
     fn client_span(build: u32) -> SpanRow {
@@ -2489,7 +2488,7 @@ mod tests {
 
     #[test]
     fn a_clients_rows_are_written_with_its_builds_row_given_its_times() {
-        let dir = scratch("client-rows");
+        let (_tmp, dir) = scratch("client-rows");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(BuildRow { daemon_cpu_ns: Some((7, 3)), ..row(81, Outcome::Ok) });
         history.flush(Some(81)).unwrap();
@@ -2535,9 +2534,7 @@ mod tests {
         assert!(
             matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })),
             "{refused:?}"
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// The invariant: a solo answer is one `builds` row of its own number, outcome ok, with
     /// the client's times as its start, length and client columns, `misses` 0 and its solo
@@ -2546,7 +2543,7 @@ mod tests {
     /// it, and nothing of it is noted.
     #[test]
     fn a_solo_answer_is_one_build_row_with_its_slot_and_its_clients_spans() {
-        let dir = scratch("solo-build");
+        let (_tmp, dir) = scratch("solo-build");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(90, Outcome::Ok));
         let mut bytes = Vec::new();
@@ -2587,13 +2584,11 @@ mod tests {
         crate::live::encode(&spans.unwrap(), &mut other).unwrap();
         let refused = history.solo_build(solo(92), &ClientRows { build: 92, spans: other, ..ClientRows::default() });
         assert!(matches!(refused, Err(HistoryError::Client { build: 92, table: "spans", .. })), "{refused:?}");
-        assert!(history.ended.is_empty() && history.solo.is_empty(), "nothing of a refused solo build is noted");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert!(history.ended.is_empty() && history.solo.is_empty(), "nothing of a refused solo build is noted");    }
 
     #[test]
     fn a_flushed_table_reads_back_as_the_same_rows() {
-        let dir = scratch("round-trip");
+        let (_tmp, dir) = scratch("round-trip");
         let span = |i: u64| SpanRow {
             build: (i % 3) as u32,
             thread: 7,
@@ -2671,7 +2666,7 @@ mod tests {
     /// naming the value kind, the site and how many more times.
     #[test]
     fn a_merge_says_the_rows_its_inputs_held_and_holds_them() {
-        let dir = scratch("merged-rows");
+        let (_tmp, dir) = scratch("merged-rows");
         let process = Process { pid: 9, name: "blaze test", commit: None };
         let counters = |n: u64| {
             let rows: Vec<CounterRow> = (0..n)
@@ -2712,14 +2707,12 @@ mod tests {
         // A merge of a merged file says its own count, once.
         let again = dir.join("1-00000001-00000002-2.counters.parquet");
         concat(&again, &[merged, a], writer.properties(table)).unwrap();
-        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));    }
 
     #[test]
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;
-        let dir = scratch("bugs");
+        let (_tmp, dir) = scratch("bugs");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let at = std::panic::Location::caller();
         let site = |count| Site {
@@ -2782,7 +2775,7 @@ mod tests {
 
     #[test]
     fn a_builds_row_names_the_tree_it_built_and_the_blaze_that_ran_it() {
-        let dir = scratch("identity");
+        let (_tmp, dir) = scratch("identity");
         let workspace = dir.join("work");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -2816,14 +2809,12 @@ mod tests {
         fs::write(workspace.join("src/main.rs"), "fn main() { }\n").unwrap();
         let (edited, same_blaze) = built(&mut history, 52);
         assert_ne!(edited, tree, "a build of an edited tree names another tree");
-        assert_eq!(same_blaze, blaze);
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(same_blaze, blaze);    }
 
     #[test]
     fn the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush() {
         use crate::facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow};
-        let dir = scratch("facts");
+        let (_tmp, dir) = scratch("facts");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.linked([LinkRow {
             build_id: 61,
@@ -2859,9 +2850,7 @@ mod tests {
         assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
         let again = history.flush(Some(62)).unwrap();
-        assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");    }
 
     /// A build's account is written by the next flush, once, each count in its
     /// own column, and a history with no account yet (one from before the table) reads as no
@@ -2871,7 +2860,7 @@ mod tests {
         use arrow_array::types::UInt64Type;
 
         use crate::account::{Account, End, Origin, STEP_UNIT, Seen, Step};
-        let dir = scratch("accounts");
+        let (_tmp, dir) = scratch("accounts");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let steps = [Step {
             step: STEP_UNIT.to_owned(),
@@ -2900,16 +2889,14 @@ mod tests {
         assert_eq!(first.value(0), "/w/src/lib.rs");
         assert!(batch.column(schema::ACCOUNTS.column("alarms").unwrap()).is_null(0));
         let again = history.flush(Some(72)).unwrap();
-        assert_eq!(again.accounts, 0, "a flush writes each account once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(again.accounts, 0, "a flush writes each account once");    }
 
     #[test]
     fn a_builds_query_counts_are_written_at_the_next_flush_column_for_column() {
         use arrow_array::types::{UInt32Type, UInt64Type};
 
         use crate::facts::QueryCountRow;
-        let dir = scratch("query-counts");
+        let (_tmp, dir) = scratch("query-counts");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let mir = QueryCountRow {
             build_id: 63,
@@ -2982,9 +2969,7 @@ mod tests {
         assert_eq!(count("executed", 1), 7566);
 
         let again = history.flush(Some(64)).unwrap();
-        assert_eq!(again.query_counts, 0, "a flush writes each row once");
-        _ = fs::remove_dir_all(&dir);
-    }
+        assert_eq!(again.query_counts, 0, "a flush writes each row once");    }
 
     #[test]
     fn a_flush_writes_the_recorders_new_rows_and_the_builds_that_ended() {
@@ -2995,7 +2980,7 @@ mod tests {
         })
         .join()
         .unwrap();
-        let dir = scratch("flush");
+        let (_tmp, dir) = scratch("flush");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         for table in schema::TABLES {
             let path = dir.join(format!("schema.{}.parquet", table.name));
@@ -3038,7 +3023,7 @@ mod tests {
     #[test]
     fn rows_written_between_flushes_past_a_rings_size_are_all_flushed() {
         crate::install();
-        let dir = scratch("drained");
+        let (_tmp, dir) = scratch("drained");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         let bursts = 24;
         let burst = flight::CAP / 8;
@@ -3090,7 +3075,7 @@ mod tests {
 
     #[test]
     fn a_history_opened_again_numbers_on_from_its_files() {
-        let dir = scratch("reopen");
+        let (_tmp, dir) = scratch("reopen");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(1, Outcome::Failed));
         let first = history.flush(Some(1)).unwrap();
@@ -3126,7 +3111,7 @@ mod tests {
         crate::install();
         // Past any build another test of this process writes rows of.
         const KILLED: u32 = 7_000_001;
-        let dir = scratch("killed-mid-build");
+        let (_tmp, dir) = scratch("killed-mid-build");
         let mut first = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
@@ -3146,9 +3131,7 @@ mod tests {
             second.next_build() > KILLED,
             "the next daemon's first build is {}, a number the stopped daemon's rows already hold",
             second.next_build()
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// A flush with no new CPU samples asks the symbolizer nothing. The history reads a ring of
     /// the test's own: until 2026-11-03 it read the process's ring, and a run of this test saw
@@ -3157,7 +3140,7 @@ mod tests {
     #[test]
     fn a_flush_with_no_new_samples_names_nothing() {
         static OWN: sampler::Ring = sampler::Ring::new();
-        let dir = scratch("idle");
+        let (_tmp, dir) = scratch("idle");
         let mut history = History::open(&dir, CAP_MOST, &OWN).unwrap();
         let asked = symbols::ASKED.with(std::cell::Cell::get);
         let first = history.flush(None).unwrap();
@@ -3184,9 +3167,7 @@ mod tests {
             history.flush(None).unwrap().samples,
             1,
             "the sample kept into the history's ring"
-        );
-        _ = fs::remove_dir_all(&dir);
-    }
+        );    }
 
     /// The oracle of the default cap `cap` (a store's bytes to the bytes kept): for stores of
     /// `small` and `large` bytes, `small <= large`, it never falls as the store grows and
@@ -3235,7 +3216,7 @@ mod tests {
 
     #[test]
     fn past_the_cap_the_oldest_files_go_first() {
-        let dir = scratch("cap");
+        let (_tmp, dir) = scratch("cap");
         let mut history = History::open(&dir, 1, sampler::unsampled()).unwrap();
         let mut flushes = Vec::new();
         for build in 1..=3 {
@@ -3285,7 +3266,7 @@ mod tests {
         // that took a row of a higher build would be named for it and left out of this
         // build's merge (with build 5, a run beside the other tests read 3 rows merged of 4).
         const BUILD: u64 = 8_000_005;
-        let dir = scratch("manifest-round-trip");
+        let (_tmp, dir) = scratch("manifest-round-trip");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
@@ -3322,7 +3303,7 @@ mod tests {
     /// reopen that deletes the inputs, which no pin holds.
     #[test]
     fn a_merge_committed_and_not_deleted_reads_each_row_once() {
-        let dir = scratch("merged-not-deleted");
+        let (_tmp, dir) = scratch("merged-not-deleted");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.flush(None).unwrap();
         history.build_ended(row(7, Outcome::Ok));
@@ -3376,7 +3357,7 @@ mod tests {
     /// merge) retires them; they go at the first flush after the pin drops.
     #[test]
     fn a_pinned_reader_keeps_retired_files_until_it_lets_go() {
-        let dir = scratch("pinned-merge");
+        let (_tmp, dir) = scratch("pinned-merge");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.flush(None).unwrap();
         history.build_ended(row(5, Outcome::Running));
@@ -3411,7 +3392,7 @@ mod tests {
     /// writer, listing the same files with entries read from their footers.
     #[test]
     fn a_history_with_no_manifest_is_adopted_from_its_files() {
-        let dir = scratch("adopted");
+        let (_tmp, dir) = scratch("adopted");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         history.build_ended(row(3, Outcome::Ok));
         history.flush(Some(3)).unwrap();
@@ -3439,7 +3420,7 @@ mod tests {
     /// or deleted.
     #[test]
     fn a_parquet_file_blaze_did_not_write_stops_the_open_naming_it() {
-        let dir = scratch("unclassified");
+        let (_tmp, dir) = scratch("unclassified");
         drop(History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap());
         fs::write(dir.join("notes.parquet"), b"not ours").unwrap();
         let Err(error) = History::open(&dir, CAP_MOST, sampler::unsampled()) else {
@@ -3455,7 +3436,7 @@ mod tests {
     /// The cap deletes a build whole: every table of it, every flush of it, at once.
     #[test]
     fn past_the_cap_a_build_goes_whole() {
-        let dir = scratch("cap-whole");
+        let (_tmp, dir) = scratch("cap-whole");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         history.flush(None).unwrap();
@@ -3511,7 +3492,7 @@ mod tests {
                 folded_ns: 0,
             })
             .collect();
-        let dir = scratch("cost");
+        let (_tmp, dir) = scratch("cost");
         let mut writer = Writer::new();
         let start = std::time::Instant::now();
         let batch = batches::spans(&rows, Process::this()).unwrap();

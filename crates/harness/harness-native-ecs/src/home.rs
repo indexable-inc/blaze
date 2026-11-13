@@ -210,7 +210,7 @@ mod tests {
         }
         let (open, gate) = mpsc::channel::<()>();
         let home = Home::spawn("dies", move || -> u32 {
-            let _ = gate.recv();
+            gate.recv_timeout(Duration::from_secs(60)).expect("the test opened the gate");
             panic!("the value could not be made");
         })
         .unwrap();

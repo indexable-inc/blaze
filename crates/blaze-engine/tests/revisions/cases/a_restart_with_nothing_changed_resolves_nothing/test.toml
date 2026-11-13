@@ -27,10 +27,9 @@ max_ms = 2000
 max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_local_def_map = 0 }
 
 [revision.known]
-max_executed = "a restart resolves every workspace crate from source, and a unit's record is found only by an identity that needs its crate resolved (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", steps 5 and 7; pieces E and F)"
-max_written = "a restart writes every file of every package of the plan as an input of a new database (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
+max_executed = "a unit's record is found only by an identity made from its crate's texts, which are read and parsed at each restart, not from the image's filed key the found record gives (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece F: waits for content-keys-1112's record key)"
+max_written = "a restart still writes every file of every package of the plan as an input: a source root is not yet declared from its found record (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece D)"
 max_ms = "as max_executed: hello-world's first no-op after a restart is 3.9 s (2026-11-11)"
-max_ran = "a workspace crate has no records: `eligible` refuses a local crate (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"
 
 [[revision]]
 steps = ["kill"]
@@ -47,4 +46,3 @@ max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_lo
 [revision.known]
 max_executed = "as rev3"
 max_written = "as rev3"
-max_ran = "as rev3"

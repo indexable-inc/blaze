@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(Files::relative("/wsx/lib.rs", "/ws"), "/wsx/lib.rs");
         assert_eq!(Files::relative("/std/lib.rs", "/ws"), "/std/lib.rs");
         assert_eq!(Files::relative("src/lib.rs", ""), "src/lib.rs");
-        assert_eq!(Files::relative("/tmp/probe.rs", ""), "/tmp/probe.rs");
+        assert_eq!(Files::relative("/srv/probe.rs", ""), "/srv/probe.rs");
         assert_eq!(Files::relative("/ws/src/lib.rs", "/"), "ws/src/lib.rs");
         assert_eq!(Files::relative("$DIR/a.rs", ""), "$DIR/a.rs");
 

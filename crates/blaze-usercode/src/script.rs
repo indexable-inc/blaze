@@ -576,7 +576,7 @@ mod tests {
         let mut traced = Traced {
             env: vec![
                 ("OUT_DIR".into(), Some("/t/build/p/0123456789abcdef/out".into())),
-                ("CARGO_MAKEFLAGS".into(), Some("-j --jobserver-auth=fifo:/tmp/x".into())),
+                ("CARGO_MAKEFLAGS".into(), Some("-j --jobserver-auth=fifo:/run/x".into())),
                 ("CC".into(), None),
             ],
             ..Traced::default()
@@ -616,7 +616,7 @@ mod tests {
         let kept = |value: &str| make_flags(OsStr::new(value)).map(|it| it.into_string().unwrap());
         assert_eq!(kept("-j8 --jobserver-auth=3,4"), None);
         assert_eq!(kept(" -j --jobserver-fds=3,4 -j"), None);
-        assert_eq!(kept("--jobs=4 --jobserver-auth=fifo:/tmp/GMfifo1"), None);
+        assert_eq!(kept("--jobs=4 --jobserver-auth=fifo:/run/GMfifo1"), None);
         assert_eq!(kept("k -j8 --jobserver-auth=3,4"), Some("k".into()));
         assert_eq!(
             kept("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3"),
@@ -730,7 +730,7 @@ mod tests {
             let mut env = inherited(path);
             env.push(("OLDPWD".into(), oldpwd.into()));
             env.push(("SHLVL".into(), shlvl.into()));
-            env.push(("NIX_BUILD_TOP".into(), format!("/tmp/nix-shell.{oldpwd}").into()));
+            env.push(("NIX_BUILD_TOP".into(), format!("/build/nix-shell.{oldpwd}").into()));
             prepare(&unit(), &env, &place(), &Looks::none()).unwrap()
         };
         let first = shell("/a", "x", "1");

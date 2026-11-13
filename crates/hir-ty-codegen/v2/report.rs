@@ -268,6 +268,7 @@ impl super::HirFrontend<'_> {
     /// span tables: only rows [`Heat::reported`] keeps (with a profile, the hot loops alone),
     /// sorted by position and message, the same finding of two instances once. A row whose
     /// statement no table of the build has is an error naming the function.
+    #[blaze::renders_positions]
     pub fn vecreport(
         &self,
         built: &blaze_codegen::driver::Built,
@@ -283,6 +284,7 @@ impl super::HirFrontend<'_> {
     }
 }
 
+#[blaze::renders_positions]
 fn reported(
     db: &base_db::Db,
     hashes: &super::HashSource,

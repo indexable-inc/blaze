@@ -46,6 +46,8 @@ pub(crate) mod slot;
 mod kept;
 mod noop;
 #[blaze::sans_io]
+mod paused;
+#[blaze::sans_io]
 mod plan_reads;
 #[blaze::sans_io]
 mod said;
@@ -267,6 +269,10 @@ pub struct World<'a, S: Steps> {
     pub steps: &'a Arc<S>,
     pub effects: &'a mut Vec<Effect>,
     pub said: &'a mut Vec<Said>,
+    /// The loop's driver, lent to a store read the loop makes itself ([`super::direct`]): a
+    /// unit's freshness asked as it is posted, the records of a build whose front end is not
+    /// kept, a certificate's record.
+    pub reads: super::direct::Lender<'a>,
 }
 
 /// What the jobs need of the daemon besides its parts.
@@ -299,6 +305,9 @@ pub struct Setup {
     pub slots: String,
     /// The premises of every slot ([`super::daemon::Premises`]).
     pub premises: super::daemon::Premises,
+    /// The daemon's two stores as its tasks read them, with no pool: each read is one direct
+    /// read into the reading task's frame ([`super::direct`]). Every job's input lends it.
+    pub stores: Arc<super::direct::Stores>,
 }
 
 /// Every fetch of a batch that failed (`failed`, places in `fetches`), as one error: each
@@ -2033,11 +2042,6 @@ struct Paths<S: Steps> {
     kept: u32,
     /// What each of `images` weighs and when it was linked, for the budget.
     weights: kept::KeptImages,
-    /// The memory the kept images' budget is a part of when the daemon was given no limit
-    /// ([`blaze_graph::admission::limit`] is `u64::MAX`): the machine's, read once as the
-    /// daemon reads its own ([`blaze_graph::arena::machine_budget`]); else the limit as the
-    /// jobs were made, which [`Paths::budget`] reads again at each keep.
-    machine: u64,
     /// The images a unit links beside its planned outputs (a library's doctests, each its own
     /// program, under its runner's `.doctests` directory), by the unit's first output: taken
     /// with that output's, so an edit relinks the one example it changed.
@@ -2048,7 +2052,7 @@ struct Paths<S: Steps> {
 }
 
 impl<S: Steps> Paths<S> {
-    fn new(machine: u64) -> Paths<S> {
+    fn new() -> Paths<S> {
         Paths {
             ids: HashMap::new_in(Global),
             names: Vec::new(),  // alloc: none until the first path
@@ -2057,21 +2061,16 @@ impl<S: Steps> Paths<S> {
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
             weights: kept::KeptImages::new(),
-            machine,
             extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
     }
 
-    /// What the kept images may hold together: [`kept::budget`] of the limit the daemon runs
-    /// under, or of the machine's memory when it was given no limit. Read at each keep, so it
-    /// follows the limit as [`blaze_graph::admission::set_budgets`] last set it.
+    /// What the kept images may hold together: [`kept::budget`] of the memory gate's ceiling
+    /// (`blaze_mem::gate`), the one limit the daemon runs under: the machine's, or the one it
+    /// was given. Read at each keep.
     fn budget(&self) -> u64 {
-        let limit = match blaze_graph::admission::limit() {
-            u64::MAX => self.machine,
-            limit => limit,
-        };
-        kept::budget(limit)
+        kept::budget(blaze_mem::gate::process().ceiling())
     }
 
     fn intern(&mut self, path: &str) -> u32 {
@@ -2957,21 +2956,6 @@ impl<S: Steps> Build<S> {
         self.units.get(node.0.wrapping_sub(self.first.0) as usize).map(|it| *it as usize)
     }
 
-    /// Unit `unit` is refused from now on for `why`: its task, posted again after it gave way,
-    /// fails with it ([`Jobs::post`]). What the ceiling's last step says of a task that alone
-    /// does not fit ([`Jobs::fail_too_big`]). A unit refused already keeps its first reason.
-    fn refuse_unit(&mut self, unit: usize, why: String) {
-        let units = self.input.units.graph.units.len();
-        let refused = self.refused.get_or_insert_with(|| Refused {
-            by: vec![u32::MAX; units], // alloc: once a unit is refused
-            whys: Vec::new(),          // alloc: once a unit is refused
-        });
-        if refused.by.get(unit).is_some_and(|it| *it == u32::MAX) {
-            refused.by[unit] = refused.whys.len() as u32;
-            refused.whys.push(why);
-        }
-    }
-
     /// The job's error for `broke`, a write that failed or panicked, naming the write and its
     /// unit, with every unit that depends on its unit refused from now on, each naming it. The
     /// unit itself was built, its write is what failed, unless the write was part of making
@@ -3174,11 +3158,13 @@ impl<S: Steps> Build<S> {
     /// and the plane learns a near-zero cost for its key, one bad sample of the last few its
     /// prediction is the median of. Rare, and it costs one prediction, never a built value; the
     /// answer cached here also survives a repost of the task.
-    fn is_fresh(&mut self, at: usize) -> bool {
+    fn is_fresh(&mut self, reads: &mut super::direct::Lender<'_>, at: usize) -> bool {
         if let Some(fresh) = self.fresh[at] {
             return fresh;
         }
-        let fresh = self.front.fresh(at);
+        // On the loop: its store reads run on its own driver, lent ([`super::direct::Lender`]).
+        let front = &self.front;
+        let fresh = reads.lend(|| front.fresh(at));
         self.fresh[at] = Some(fresh);
         fresh
     }
@@ -3338,7 +3324,7 @@ struct Job<S: Steps> {
     /// holds it (docs/gc.md, "Leases").
     leases: Arc<Lock<Leases>>,
     /// What its client is told of its wait for memory ([`Jobs::tell_paused`]).
-    paused: blaze_graph::pressure::Paused,
+    paused: paused::Paused,
     /// When it began, on the injected clock ([`World::now`]): what its [`Response::Doing`]
     /// and `blaze status` count its time from.
     began: Duration,
@@ -4008,7 +3994,7 @@ impl<S: Steps> Job<S> {
             opened_ns: 0,
             opened_unix_ns: None,
             leases: Arc::new(Lock::new("serve.job.leases", Leases::default())), // alloc: once per job, shared with its lowering
-            paused: blaze_graph::pressure::Paused::default(),
+            paused: paused::Paused::default(),
             began,
             doing_said: None,
             missed: 0,
@@ -4353,7 +4339,8 @@ struct Filing {
     records: Lock<Vec<Box<crate::serve::unit::PendingRecord>>>,
     config: Arc<BuildConfig>,
     units: Arc<Units>,
-    store: blaze_cas::Reader,
+    /// What the slots of each record's key are read through, in one direct read a key.
+    store: Arc<crate::serve::direct::Stores>,
 }
 
 /// A placement the store was asked for.
@@ -4604,9 +4591,6 @@ impl<S: Steps> Builder for Jobs<S> {
 pub enum JobsFailed {
     /// Reserving the tables of effects or runs.
     Tables(MemError),
-    /// Reading the machine's memory, which the kept link images' budget is a part of when the
-    /// daemon was given no limit.
-    Machine(std::io::Error),
 }
 
 impl From<MemError> for JobsFailed {
@@ -4620,34 +4604,18 @@ impl std::fmt::Display for JobsFailed {
         match self {
             // The daemon names the tables: "the jobs' tables: <error>".
             JobsFailed::Tables(error) => write!(f, "{error}"),
-            JobsFailed::Machine(error) => write!(
-                f,
-                "reading the machine's memory, which the kept link images' budget is a part of when the daemon \
-                 is given no limit: {error}"
-            ),
         }
     }
 }
 
 impl<S: Steps> Jobs<S> {
-    /// The jobs, their tables of effects and runs reserved, committing nothing. When the
-    /// daemon was given no limit ([`blaze_graph::admission::limit`]), the machine's memory is
-    /// read for the kept link images' budget ([`Paths::budget`]).
+    /// The jobs, their tables of effects and runs reserved, committing nothing.
     pub fn new(setup: Setup) -> Result<Jobs<S>, JobsFailed> {
         let numbers = setup.runs_end.saturating_sub(setup.runs) / RUN_TAGS;
         let bits = numbers.checked_ilog2().unwrap_or(0);
         let run_slots = bits.min(RUN_SLOT_BITS);
         let own = Tagged::new(OWN_SLOT_BITS, OWN_GENERATION_BITS, MemTag::Io)?;
         let runs = Tagged::new(run_slots, bits - run_slots, MemTag::Usercode)?;
-        let machine = match blaze_graph::admission::limit() {
-            // The margin the daemon leaves the machine when it reads its own budget.
-            u64::MAX => {
-                blaze_graph::arena::machine_budget(1 << 30, None)
-                    .map_err(JobsFailed::Machine)?
-                    .bytes
-            }
-            limit => limit,
-        };
         Ok(Jobs {
             setup,
             asked: Vec::new(), // alloc: none until the session asks
@@ -4664,7 +4632,7 @@ impl<S: Steps> Jobs<S> {
             queued: Vec::new(), // alloc: none until an output waits for its path
             patching: HashMap::new_in(Global),
             firsts: Vec::new_in(Global), // alloc: empty, allocates nothing
-            paths: Paths::new(machine),
+            paths: Paths::new(),
             own,
             runs,
             put: blaze_cas::Tickets::default(),
@@ -4721,12 +4689,12 @@ impl<S: Steps> Jobs<S> {
 
     /// Each build's client told of its wait for memory (docs/memory-budget.md section 7, "What
     /// the client is told"): a note once a task of its request has been held back for memory
-    /// alone for [`blaze_graph::pressure::PAUSED_AFTER_NS`], again as what it says changes, and
-    /// that it resumed once none is ([`blaze_graph::pressure::Paused`]). `machine` is the
+    /// alone for [`paused::PAUSED_AFTER_NS`], again as what it says changes, and
+    /// that it resumed once none is ([`paused::Paused`]). `machine` is the
     /// machine ledger's say of who holds the rest, once its driver gives one. A speculative
     /// job not promoted is told nothing: no client waits on it.
     pub fn tell_paused(&mut self, w: &mut World<'_, S>, machine: Option<&str>) {
-        use blaze_graph::pressure::{RESUMED, Tell, paused_line};
+        use paused::{RESUMED, Tell, paused_line};
         let mut held_back = std::mem::take(&mut self.held_back);
         held_back.clear();
         w.plane.held_back(&mut held_back);
@@ -5887,7 +5855,7 @@ impl<S: Steps> Jobs<S> {
                     false => Vec::new(), // alloc: none
                 };
                 // Said before it is posted, so it is in before the task can end.
-                if build.unit(task.id).is_some_and(|at| build.is_fresh(at)) {
+                if build.unit(task.id).is_some_and(|at| build.is_fresh(&mut w.reads, at)) {
                     w.plane.replays(task.id);
                 }
                 Some(Readers { this: Some(this), images, ..Readers::default() })
@@ -5984,11 +5952,10 @@ impl<S: Steps> Jobs<S> {
     /// ended, so the step that hears the last one applies the write. The daemon calls it
     /// once a turn as well, for a reader that outlives its task.
     pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
-        // What a task held back for memory waits for, and a limit under what the daemon
-        // holds, are answered by the give-back rule: the allocator's freed pages first, a
-        // kept front end last and never for a wait a cheaper give covers ([`Jobs::give_back`]).
-        let short = w.plane.short();
-        self.give_back(w, short);
+        // The core past its line is answered by the give-back rule: the allocator's freed
+        // pages first, a kept front end last and never while anything cheaper covers it
+        // ([`Jobs::give_back`]). A task's own memory is the gate's (`blaze_mem::gate`).
+        self.give_back(w);
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
         for &id in &order {
@@ -6275,9 +6242,6 @@ impl<S: Steps> Jobs<S> {
         // A front-end carry's pass, which is no job's: its value came before this
         // ([`Jobs::front_carried`]), or never will, and the carry fails saying so.
         self.front_carried(w, node, false);
-        // A unit's node: what its walk reached teaches the forecast, and a unit whose names
-        // settled is forecast by its dependencies' walks ([`Jobs::forecast_walk`]).
-        self.forecast_walk(w, node);
         // The store of a kept front end whose job answered already ([`Settling`]): no batch
         // names it any more.
         let settling = self
@@ -7090,6 +7054,7 @@ impl<S: Steps> Jobs<S> {
             looks: job.looks.clone(), // clone: a refcount, once per view
             packs: super::packs::of_request(cargo.is_none_or(|it| it.prebuilt)),
             body_marks,
+            reads: Arc::clone(&self.setup.stores), // clone: a refcount, once per view
         };
         // Asked as the view is lowered, so it is in by the time the units are built.
         job.look = w.std.look_again(w.effects);
@@ -7301,7 +7266,7 @@ impl<S: Steps> Jobs<S> {
                 records: Lock::new("serve.job.store_kept.records", std::mem::take(&mut job.records)),
                 config: Arc::clone(&input.config), // clone: a refcount, once per build
                 units: Arc::clone(&input.units),   // clone: a refcount, once per build
-                store: input.store.clone(),        // clone: a refcount, once per build
+                store: Arc::clone(&input.reads),   // clone: a refcount, once per build
             }),
         };
         let work = Step::of(&job.cancelled, does);
@@ -7418,7 +7383,9 @@ impl<S: Steps> Jobs<S> {
             records = records.len(),
         )
         .entered();
-        let filed = crate::serve::unit::file_records(records, &input.config, &input.units, &input.store);
+        // The slots are read on the loop's own driver, lent ([`super::direct::Lender`]).
+        let filed =
+            w.reads.lend(|| crate::serve::unit::file_records(records, &input.config, &input.units, &input.reads));
         let checkout = &input.config.invocation.root;
         let mut tickets = blaze_cas::Tickets::default();
         let mut layered = blaze_cas::Tickets::default();
@@ -8068,7 +8035,7 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         build.writer.began(at);
-        let fresh = build.is_fresh(at);
+        let fresh = build.is_fresh(&mut w.reads, at);
         if fresh {
             build.writer.found_kept(at);
         } else {
@@ -8188,7 +8155,7 @@ impl<S: Steps> Jobs<S> {
         }
         // A fresh unit's run replays what it kept: said before it can end.
         if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get_mut(key_of(id))
-            && build.unit(node).is_some_and(|at| build.is_fresh(at))
+            && build.unit(node).is_some_and(|at| build.is_fresh(&mut w.reads, at))
         {
             w.plane.replays(node);
         }
@@ -10501,6 +10468,7 @@ impl<S: Steps> Jobs<S> {
             vfs: &mut *w.vfs,
             store: &mut *w.store,
             predict: w.plane.predict(),
+            peaks: w.plane.peaks(),
             effects: &mut *w.effects,
         });
         // What it waits for, read before the flush: a put another thread makes between the

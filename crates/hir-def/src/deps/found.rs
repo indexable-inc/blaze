@@ -28,7 +28,7 @@ use blaze_ids::{ContentId, Hasher};
 use super::key::absolute;
 
 /// The domain of the key a crate's found record is kept under ([`found_key`]).
-pub const FOUND_DOMAIN: &str = "blaze v2 found record";
+pub const FOUND_DOMAIN: &str = "blaze v2 found record 2";
 
 /// The record's layout: its first word. A record of another layout is under another key
 /// ([`found_key`] covers it) and, were it read all the same, is refused by name
@@ -41,12 +41,14 @@ pub const FOUND_DOMAIN: &str = "blaze v2 found record";
 /// by path. Every integer little-endian.
 pub const LAYOUT: u32 = 1;
 
-/// Where the found record of the crate whose plan key is `plan` is: the plan key (which
-/// covers what the plan says of the crate, its package's directories and its dependencies'
-/// plan keys) and the record's layout, so a record of another layout is never asked for.
-pub fn found_key(plan: ContentId) -> ContentId {
+/// Where the found record of the crate whose plan key is `plan` is, as front end `front_end`
+/// (its code identity, the image key's `build`) wrote it: the plan key (which covers what the
+/// plan says of the crate, its package's directories and its dependencies' plan keys), the
+/// front end, and the record's layout, so a record another front end wrote, or of another
+/// layout, is never asked for.
+pub fn found_key(plan: ContentId, front_end: ContentId) -> ContentId {
     let mut hasher = Hasher::new(FOUND_DOMAIN);
-    hasher.id(&plan).update(&LAYOUT.to_le_bytes());
+    hasher.id(&plan).id(&front_end).update(&LAYOUT.to_le_bytes());
     hasher.finish()
 }
 
@@ -62,7 +64,9 @@ pub mod family {
     pub const DEF_MAP_PAGES: u32 = 1 << 1;
     /// The impl tables (`hir_ty::method_resolution::frozen`'s key of the filed key).
     pub const IMPL_TABLES: u32 = 1 << 2;
-    /// The item pages (`deps::items_key(filed)`).
+    /// Retired (2026-11-13): the crate-keyed item pages, replaced by per-item entries kept under
+    /// their own keys (`deps::facts::keep_all`). No writer sets it and no reader asks for it;
+    /// it stays a known bit so a found record written while it was set still decodes.
     pub const ITEM_PAGES: u32 = 1 << 3;
     /// Every family this layout knows.
     pub const ALL: u32 = IMAGE | DEF_MAP_PAGES | IMPL_TABLES | ITEM_PAGES;
@@ -432,11 +436,13 @@ mod tests {
         unknown[37] = 0x80;
         assert_eq!(Found::decode(&unknown), Err(FoundError::Families { found: 0x8003 }));
         // And a record of another layout is never asked for: its key is another.
-        let plan = id(7);
+        let (plan, front_end) = (id(7), id(70));
         let mut other = Hasher::new(FOUND_DOMAIN);
-        other.id(&plan).update(&2u32.to_le_bytes());
-        assert_ne!(found_key(plan), other.finish());
-        assert_ne!(found_key(plan), found_key(id(8)));
+        other.id(&plan).id(&front_end).update(&2u32.to_le_bytes());
+        assert_ne!(found_key(plan, front_end), other.finish());
+        assert_ne!(found_key(plan, front_end), found_key(id(8), front_end));
+        // Another front end's record is never asked for.
+        assert_ne!(found_key(plan, front_end), found_key(plan, id(71)));
     }
 
     /// No path of a machine gets into a record, written or read: each is refused naming it.

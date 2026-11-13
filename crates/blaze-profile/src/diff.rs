@@ -525,16 +525,16 @@ errors gone:
     fn a_side_is_a_build_or_a_log() {
         assert_eq!(Side::parse("12"), Side::Build(12));
         assert_eq!(
-            Side::parse("/tmp/self-0151.log"),
-            Side::Log(PathBuf::from("/tmp/self-0151.log"))
+            Side::parse("/logs/self-0151.log"),
+            Side::Log(PathBuf::from("/logs/self-0151.log"))
         );
     }
 
     /// A log's errors and the phases of the profile it names; it has no unit's time.
     #[test]
     fn a_log_is_read_with_the_profile_it_names() {
-        let dir = std::env::temp_dir().join(format!("blaze-diff-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-diff-");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("profile")).unwrap();
         fs::write(
             dir.join("profile/phases.tsv"),
@@ -571,7 +571,6 @@ errors gone:
             said.contains("errors added:\n  E0411 1\nerrors gone:\n  derive-panic 1\n"),
             "{said}"
         );
-        _ = fs::remove_dir_all(&dir);
     }
 
     /// Two builds flushed to a history, diffed through the pinned DuckDB: the unit phase and
@@ -584,8 +583,8 @@ errors gone:
             std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
         );
         crate::install();
-        let dir = std::env::temp_dir().join(format!("blaze-diff-duckdb-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-diff-duckdb-");
+        let dir = tmp.path().to_path_buf();
         let mut history = History::open(&dir, CAP_MOST, crate::sampler::unsampled()).unwrap();
         for (build, ms) in [(81u32, 1), (82, 30)] {
             std::thread::spawn(move || {
@@ -640,7 +639,6 @@ errors gone:
         assert!(said.ends_with("errors added:\n  derive-panic 1\nerrors gone: none\n"), "{said}");
         let missing = run(&Side::Build(81), &Side::Build(99), Some(&duckdb), &dir).unwrap_err();
         assert!(matches!(missing, DiffError::NoBuild { build: 99, .. }), "{missing}");
-        _ = fs::remove_dir_all(&dir);
     }
 
 }

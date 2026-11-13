@@ -53,7 +53,14 @@ impl Shop {
         Shop { db, flow: Vec::new(), inputs: Vec::new(), cells: Vec::new() }
     }
 
+    /// A group sealed by the first pass that finds rows of it, its rows' edges kept.
     fn group(&mut self, name: &str, deps: &[SealGroup]) -> SealGroup {
+        self.db.storage_mut().seal_group(name, SealKind::LocalAtOnce, deps)
+    }
+
+    /// A library's group: sealed by the first pass, its rows' edges let go as they go behind
+    /// the seal ([`SealKind::lets_go_edges`]).
+    fn library(&mut self, name: &str, deps: &[SealGroup]) -> SealGroup {
         self.db.storage_mut().seal_group(name, SealKind::Library, deps)
     }
 
@@ -649,6 +656,10 @@ enum Step {
     Pull(Vec<usize>),
     /// A build's end: fold, settle and, in the database that has groups, the seal pass.
     Seal,
+    /// In the database that has groups, the reverse index made again without the readers
+    /// behind seals, as a pass does once they are half of it: a row whose edges were let go
+    /// is then reached by no reverse edge at all.
+    Shed,
     /// Asks for the changed set since the last ask, then for every row made.
     Ask,
 }
@@ -657,6 +668,8 @@ enum Step {
 struct Program {
     /// Each group's dependencies, among the groups before it.
     groups: Vec<Vec<usize>>,
+    /// Whether each group is a library's, whose rows let go of their edges behind its seal.
+    libraries: Vec<bool>,
     /// Each input's group, if it has one.
     inputs: Vec<Option<usize>>,
     flow: Vec<FlowNode>,
@@ -668,6 +681,7 @@ fn program(tc: &TestCase) -> Program {
     let groups: Vec<Vec<usize>> = (0..int(1, 4))
         .map(|at| (0..at).filter(|_| tc.draw(gs::booleans())).collect())
         .collect();
+    let libraries: Vec<bool> = groups.iter().map(|_| tc.draw(gs::booleans())).collect();
     // One input in five is of no group.
     let inputs: Vec<Option<usize>> =
         (0..int(1, 6)).map(|_| (int(0, 4) != 0).then(|| int(0, groups.len() - 1))).collect();
@@ -689,18 +703,19 @@ fn program(tc: &TestCase) -> Program {
     }
     let mut steps = Vec::new();
     for _ in 0..int(1, 20) {
-        steps.push(match int(0, 12) {
+        steps.push(match int(0, 13) {
             0..=3 => Step::Write(int(0, inputs.len() - 1), tc.draw(gs::integers::<u64>().max_value(6))),
             4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
             5 => Step::Evict,
             6 | 7 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
             8 | 9 => Step::Seal,
             10 => Step::Unwind(int(1, 3) as u32),
+            11 => Step::Shed,
             _ => Step::Ask,
         });
     }
     steps.push(Step::Ask);
-    Program { groups, inputs, flow, steps }
+    Program { groups, libraries, inputs, flow, steps }
 }
 
 /// One of the simulation's two databases: `sealed` gives it the program's groups.
@@ -710,7 +725,11 @@ fn made(program: &Program, sealed: bool, plant: Plant) -> Shop {
     if sealed {
         for (at, deps) in program.groups.iter().enumerate() {
             let deps: Vec<SealGroup> = deps.iter().map(|&dep| groups[dep]).collect();
-            groups.push(shop.group(&format!("group {at}"), &deps));
+            let name = format!("group {at}");
+            groups.push(match program.libraries[at] {
+                true => shop.library(&name, &deps),
+                false => shop.group(&name, &deps),
+            });
         }
     }
     for (at, group) in program.inputs.iter().enumerate() {
@@ -761,6 +780,11 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
                         shop.db.storage_mut().settle_changed_set();
                     }
                 }
+                Step::Shed => {
+                    if which == 0 {
+                        shop.db.storage_mut().shed_sealed_readers();
+                    }
+                }
                 Step::Ask => {
                     let since = if which == 0 { asked.0 } else { shop.db.storage().view() };
                     let (named, work) = retried(|| shop.ask(since));
@@ -809,8 +833,13 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
 /// and as a run from scratch does, under random writes, world changes, evictions, pulls, seal
 /// passes and asks, over random group graphs with inputs of every group and of none, and rows
 /// that read across groups, so some are of no group; and the sealed database's changed set
-/// names every row whose value differs since its last ask.
-#[hegel::test]
+/// names every row whose value differs since its last ask. Groups are libraries (rows let go
+/// of their edges behind the seal) or not, drawn, and the reverse index is made again without
+/// the readers behind seals among the steps.
+///
+/// 10,000 cases, a hundred times Hegel's default: at 100 the three stale answers this test
+/// found took several runs each to meet.
+#[hegel::test(test_cases = 10000)]
 fn a_sealed_database_answers_as_an_unsealed_one_under_random_writes(tc: TestCase) {
     let program = program(&tc);
     if let Err(why) = simulate(&program, Plant::None) {
@@ -824,6 +853,7 @@ fn a_sealed_database_answers_as_an_unsealed_one_under_random_writes(tc: TestCase
 fn directed() -> Program {
     Program {
         groups: vec![vec![], vec![0]],
+        libraries: vec![false, false],
         inputs: vec![Some(0), Some(1)],
         flow: vec![sum(&[Dep::Input(0)]), sum(&[Dep::Input(1), Dep::Query(0)]), sum(&[Dep::Query(1)])],
         steps: vec![
@@ -998,6 +1028,7 @@ fn the_oracle_catches_a_result_stored_over_a_seal_the_walk_broke() {
 fn a_row_ran_again_by_a_pull_before_the_walk() -> Program {
     Program {
         groups: vec![vec![]],
+        libraries: vec![false],
         inputs: vec![None, Some(0), None],
         flow: vec![
             sum(&[Dep::Input(0), Dep::Input(1)]),
@@ -1018,8 +1049,9 @@ fn a_walk_into_a_broken_seal_reaches_the_readers_of_what_a_pull_changed_first() 
 }
 
 /// The control of [`a_walk_into_a_broken_seal_reaches_the_readers_of_what_a_pull_changed_first`]:
-/// handing out only the readers of the imports that moved leaves row 2 unreached, the walk's
-/// end proves it unchanged, and it answers its old value.
+/// a walk that gathers the readers of what changed before it checks the seals (rule 2 of the
+/// rebuild taken out) gathers row 1 while its group is sealed, never asks it again, leaves
+/// row 2 unreached, and the walk's end proves it unchanged with its old value.
 #[test]
 fn the_oracle_catches_a_walk_that_misses_what_changed_before_it_entered_the_group() {
     let why = simulate(
@@ -1038,6 +1070,7 @@ fn the_oracle_catches_a_walk_that_misses_what_changed_before_it_entered_the_grou
 fn a_settle_before_an_untracked_row_ran() -> Program {
     Program {
         groups: vec![vec![]],
+        libraries: vec![false],
         inputs: vec![None],
         flow: vec![
             FlowNode { op: FlowOp::World, deps: vec![Dep::Input(0)] },
@@ -1068,4 +1101,121 @@ fn the_oracle_catches_a_floor_made_over_an_untracked_row_that_has_not_run() {
     )
     .expect_err("the oracle missed a row proved from a floor made before its read ran");
     assert!(why.contains("from scratch") || why.contains("does not name it"), "{why}");
+}
+
+/// The refinement's third stale answer (2026-11-12), as a directed program: a library and a
+/// crate over it. Rows 0 (the library's input) and 1 (the crate's input and row 0) are made
+/// and sealed; then row 2 (row 1) and row 3 (row 2 and the library's input) are made, of the
+/// crate's group but after its seal; then the library's input is written, which opens the
+/// library and leaves the crate's group waiting for its check, and the changed set is asked.
+fn a_row_made_after_the_seal_of_a_group_that_breaks() -> Program {
+    Program {
+        groups: vec![vec![], vec![0]],
+        libraries: vec![false, false],
+        inputs: vec![Some(0), Some(1)],
+        flow: vec![
+            sum(&[Dep::Input(0)]),
+            sum(&[Dep::Input(1), Dep::Query(0)]),
+            sum(&[Dep::Query(1)]),
+            sum(&[Dep::Query(2), Dep::Input(0)]),
+        ],
+        steps: vec![Step::Pull(vec![1]), Step::Seal, Step::Pull(vec![3]), Step::Write(0, 5), Step::Ask],
+    }
+}
+
+/// The invariant (end-state.md, rules 2 and 3 of the rebuild): the walk checks every seal
+/// before it works out its reach or traverses a row, and a row made in a sealed group after
+/// its seal is no group's for the reach's proof. Row 2 is in neither the crate's seal nor,
+/// while the crate's group waits for its check, the reach; row 3, which the write reaches,
+/// verifies row 2 by its edges, row 1 runs again, and every row answers as from scratch.
+#[test]
+fn a_row_made_after_a_seal_is_no_rows_of_the_group_for_the_reach() {
+    assert_eq!(simulate(&a_row_made_after_the_seal_of_a_group_that_breaks(), Plant::None), Ok(()));
+}
+
+/// The control of [`a_row_made_after_a_seal_is_no_rows_of_the_group_for_the_reach`]: with the
+/// reach worked out before the seals are checked and row 2 proved as a row of its group, row 3
+/// is verified in the same level as row 1, finds row 2 proved by the reach with its old value,
+/// and runs again over it; the oracle sees the stale answer.
+#[test]
+fn the_oracle_catches_a_reach_made_before_the_seals_were_checked() {
+    let why = simulate(
+        &a_row_made_after_the_seal_of_a_group_that_breaks(),
+        Plant::ReachBeforeSealsChecked,
+    )
+    .expect_err("the oracle missed a row proved by a reach made before its group's seal broke");
+    assert!(
+        why.contains("from scratch") || why.contains("does not name it") || why.contains("without"),
+        "{why}"
+    );
+}
+
+/// What [`a_library_without_edges_written`] saw.
+#[derive(Debug)]
+struct LetGo {
+    /// The seal pass's own count: the edges its library's rows let go.
+    pass_let_go: u64,
+    /// The census after the pass: edges kept behind seals, edges let go.
+    kept: u64,
+    let_go: u64,
+    /// The rows the changed set named after the write.
+    named: BTreeSet<usize>,
+    /// What the oracle said of every row then.
+    said: Result<(), String>,
+}
+
+/// A library of two rows (its top reads its input, an inner row reads the top) and a crate
+/// beside it (not depending on it) of one row; a row of no group (it reads both, so no one
+/// group covers it) over the inner row and the crate's row. Built, sealed, and the reverse
+/// index made again without the readers behind seals; then the library's input is written and
+/// the changed set asked.
+fn a_library_without_edges_written(plant: Plant) -> LetGo {
+    let mut shop = Shop::new(plant);
+    let lib = shop.library("lib", &[]);
+    let beside = shop.group("beside", &[]);
+    let (of_lib, of_beside) = (shop.input(1, Some(lib)), shop.input(2, Some(beside)));
+    let top = shop.row(sum(&[Dep::Input(of_lib)]));
+    let inner = shop.row(sum(&[Dep::Query(top)]));
+    let theirs = shop.row(sum(&[Dep::Input(of_beside)]));
+    let across = shop.row(sum(&[Dep::Query(inner), Dep::Query(theirs)]));
+    shop.pull_all().unwrap();
+    let pass = shop.seal();
+    assert_eq!(pass.sealed, 2, "{pass:?}");
+    shop.db.storage_mut().shed_sealed_readers();
+    let census = shop.db.storage().seal_census();
+    let since = shop.db.storage().view();
+    shop.write(of_lib, 5);
+    let (named, _) = shop.ask(since);
+    let said = shop.pull(&[across]).and_then(|()| shop.pull_all());
+    LetGo {
+        pass_let_go: pass.let_go,
+        kept: census.edges_behind_seals(),
+        let_go: census.edges_let_go(),
+        named,
+        said,
+    }
+}
+
+/// The invariant (memory.md 4.4, a library row keeps no forward edges): the library's two
+/// rows let go of their two edges as they go behind its seal, the crate beside it keeps its
+/// one; after a write of the library's input, which no reverse edge connects to the rows
+/// without edges, the walk starts from each of them as changed, reaches the row of no group
+/// over them, names it, and every row answers as from scratch.
+#[test]
+fn a_librarys_rows_let_go_of_their_edges_and_run_again_when_it_opens() {
+    let left = a_library_without_edges_written(Plant::None);
+    assert_eq!((left.pass_let_go, left.let_go, left.kept), (2, 2, 1), "{left:?}");
+    assert_eq!(left.said, Ok(()), "{left:?}");
+    assert_eq!(left.named, BTreeSet::from([0, 1, 3]), "the library's rows and the row over them");
+}
+
+/// The control of [`a_librarys_rows_let_go_of_their_edges_and_run_again_when_it_opens`]: when
+/// a library's group opens and queues none of its rows without edges, the walk finds nothing
+/// from the write, the row of no group over them is proved by the walk's end with its old
+/// value, and the oracle sees it.
+#[test]
+fn the_oracle_catches_rows_without_edges_left_out_of_the_walk() {
+    let left = a_library_without_edges_written(Plant::LetGoRowsNotAssumed);
+    let why = left.said.expect_err("the oracle missed a row over a library's rows without edges");
+    assert!(why.contains("from scratch"), "{why}");
 }

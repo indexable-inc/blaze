@@ -78,9 +78,8 @@ pub struct Near<I, S> {
     pub callees: Vec<Callee<I>>,
     /// Every static those refer to, each once, in that order.
     pub statics: Vec<(S, StaticId)>,
-    /// Describes made, and kept describes found to hold without one.
+    /// Describes made: those no record held.
     pub described: usize,
-    pub verified: usize,
 }
 
 impl<I, S> Near<I, S> {
@@ -153,8 +152,8 @@ impl<B: Prepare> Build<'_, B> {
 
     /// `asked` (a function and whose code asks for it) ready to compile: described, each
     /// function and static it refers to described and no further, and each function it builds
-    /// in resolved as it is. Describes go through the walk kept of the program where the build
-    /// has one, so a describe that still holds is not made again.
+    /// in resolved as it is. Each describe is the store's record of it where the build reads
+    /// records ([`Build::recording`]), else the front end's: nothing in memory is asked.
     ///
     /// Only for a launched build ([`Mode::Launched`]), where every call is through a slot: any
     /// other build's places say which callees are direct, which only a whole walk knows.
@@ -166,7 +165,7 @@ impl<B: Prepare> Build<'_, B> {
         let what = blaze_report::say!(blaze_report::say::Code(&self.frontend.spell(&asked.0)));
         self.launched_only(&what.flat())?;
         let counts = kept::Counts::default();
-        let root = self.described(asked, 0, &counts).and_then(|it| self.node(&asked.0, asked.1, it))?;
+        let root = self.described(asked, &counts).and_then(|it| self.node(&asked.0, asked.1, it))?;
         self.near_from(root, &counts)
     }
 
@@ -238,15 +237,13 @@ impl<B: Prepare> Build<'_, B> {
             node.built_in = seen.iter().copied().collect();
             node.built_in.sort_unstable();
         }
-        let (described, verified) = counts.get();
         Ok(Near {
             key,
             identity,
             nodes: Sorted::of(whole),
             callees: resolved.callees,
             statics: resolved.named_statics,
-            described,
-            verified,
+            described: counts.described_so_far(),
         })
     }
 
@@ -264,7 +261,7 @@ impl<B: Prepare> Build<'_, B> {
         resolved: &mut Resolved<B>,
     ) -> Result<Places<B>, CodegenError> {
         let describe = |asked: &(FrontInstance<B>, Origin)| {
-            self.described(asked, 0, counts).and_then(|it| self.node(&asked.0, asked.1, it))
+            self.described(asked, counts).and_then(|it| self.node(&asked.0, asked.1, it))
         };
         // alloc (each): once a function or static resolved, sized by its references
         let mut targets = Vec::with_capacity(refs.len());

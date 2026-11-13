@@ -651,11 +651,10 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
     }
 }
 
-const USAGE: &str = "blaze update                     installs the newest release of the channel, which then runs \
-                     outside pinned workspaces\n\
-                     blaze update --check             reads latest.json now and says what is out; installs nothing\n\
-                     blaze update --mode warn|auto|off|offline   what blaze does about newer releases ([update] mode)\n\
-                     blaze update --channel stable|canary   which releases count ([update] channel)";
+const USAGE: &str = r"blaze update                     installs the newest release of the channel, which then runs outside pinned workspaces
+blaze update --check             reads latest.json now and says what is out; installs nothing
+blaze update --mode warn|auto|off|offline   what blaze does about newer releases ([update] mode)
+blaze update --channel stable|canary   which releases count ([update] channel)";
 
 /// `blaze update`: [`USAGE`].
 pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32> {
@@ -836,8 +835,7 @@ mod tests {
     /// to the same bytes; none there reads as no check yet.
     #[test]
     fn the_state_round_trips() {
-        let dir = std::env::temp_dir().join(format!("blaze-update-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = blaze_core::temp::TempDir::for_test("blaze-update-state-");
         let file = dir.join("update").join("state.json");
         let page = |version: &str| {
             format!("https://github.com/indexable-inc/blaze/releases/tag/v{version}")
@@ -866,6 +864,5 @@ mod tests {
         State::default().write(&file).unwrap();
         assert_eq!(State::read(&file).unwrap(), State::default());
         assert_eq!(State::read(&dir.join("none.json")).unwrap(), State::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

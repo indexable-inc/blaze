@@ -333,6 +333,11 @@ impl Path {
     }
 
     /// Which of `len` candidate stores a load reads.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a load's choice is recorded as a u16: a location with u16::MAX candidate stores \
+                  needs a `Stuck` variant naming the location and its history's length"
+    )]
     pub(crate) fn branch_load(&mut self, len: usize) -> Result<usize, Stuck> {
         if len <= 1 {
             return Ok(0);

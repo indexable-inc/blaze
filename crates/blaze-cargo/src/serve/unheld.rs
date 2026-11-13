@@ -52,6 +52,7 @@ pub(crate) fn told(value: Option<&str>) -> Result<Option<Duration>, String> {
 /// A safeguard taken out, for the tests' controls: always `Plant::None` outside them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// Stops at the first look with nothing held, with no grace.

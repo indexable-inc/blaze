@@ -129,7 +129,7 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
                 true => Mode::Executable,
                 false => Mode::Regular,
             };
-            let file = SourceFile { path: name.to_owned(), bytes, mode };
+            let file = SourceFile::of(name.to_owned(), bytes, mode);
             Ok(LocalRead { at: at.to_owned(), source: Source { files: vec![file], under: name.to_owned() }, watched: None, generation })
         }
         None => {

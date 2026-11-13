@@ -805,6 +805,11 @@ fn instantiate_unwind(
     })
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "a template stores its reference count as a u32: an instance with 2^32 references \
+              needs a typed refusal from the template builder"
+)]
 fn refs_len(refs: &Refs) -> u32 {
     u32::try_from(refs.len()).expect("an instance refers to fewer than 2^32 things")
 }

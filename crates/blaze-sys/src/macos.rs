@@ -102,6 +102,7 @@ pub const SYMBOLS: &[Symbol] = &[
 
 /// The declarations. Nothing calls them in slice 1 but the symbol test's `dlsym`.
 #[allow(dead_code, reason = "declared for the slices that build on them; each is looked up by the symbol test")]
+#[expect(blaze::unwired, reason = "unwired until the slices that build on these declarations call them")]
 #[allow(clashing_extern_declarations, reason = "this crate's own typed signatures, not the libc crate's")]
 pub(crate) mod ffi {
     use super::{c_char, c_int, c_uint, c_void};

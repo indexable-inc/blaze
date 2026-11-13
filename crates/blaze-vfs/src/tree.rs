@@ -113,17 +113,19 @@ const MAX_LINKS: usize = 40;
 
 /// A file a transaction puts at a path, with its mode: one the tree has (the base's, or one
 /// moved), kept as its node so it is never read or hashed again; or new bytes, which become
-/// the file's own (an owned op's, or an edit's, without a copy).
+/// the file's own (an owned op's, or an edit's, without a copy); or new bytes whose ID the
+/// caller made from them when it read them ([`Tree::apply_known_files`]), not hashed again.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Blob {
     Node(NodeId, Mode),
     New(Bytes, Mode),
+    Known(ContentId, Bytes, Mode),
 }
 
 impl Blob {
     fn mode(&self) -> Mode {
         match self {
-            Blob::Node(_, mode) | Blob::New(_, mode) => *mode,
+            Blob::Node(_, mode) | Blob::New(_, mode) | Blob::Known(_, _, mode) => *mode,
         }
     }
 }
@@ -475,7 +477,7 @@ impl Tree {
     fn staged_bytes<'a>(&'a self, blob: &'a Blob) -> Result<&'a [u8], Corrupt> {
         match blob {
             Blob::Node(node, _) => Ok(self.bytes(*node)?.expect("a staged node is a file")),
-            Blob::New(bytes, _) => Ok(&bytes[..]),
+            Blob::New(bytes, _) | Blob::Known(_, bytes, _) => Ok(&bytes[..]),
         }
     }
 
@@ -643,12 +645,33 @@ impl Tree {
         let mut pending = Pending::new();
         for (path, bytes, mode) in files {
             check(&path)?;
-            self.stage_write(base, &mut pending, Cow::Owned(path), bytes, mode)?;
+            self.stage_write(base, &mut pending, Cow::Owned(path), Blob::New(bytes, mode))?;
+        }
+        Ok(self.commit_pending(base, &pending))
+    }
+
+    /// [`Tree::apply_files`] of files whose IDs their caller made from their bytes when it read
+    /// them (a texts file's listing, written as the shipped tree was placed): the IDs are taken
+    /// as they are, so no byte is hashed here. The caller's contract is the tree's own: an ID
+    /// is [`FILE_DOMAIN`]'s hash of the bytes it is given with (asserted in debug builds).
+    pub(crate) fn apply_known_files(
+        &mut self,
+        base: NodeId,
+        files: impl IntoIterator<Item = (String, ContentId, Bytes, Mode)>,
+    ) -> Result<NodeId, OpError> {
+        let mut pending = Pending::new();
+        for (path, id, bytes, mode) in files {
+            check(&path)?;
+            self.stage_write(base, &mut pending, Cow::Owned(path), Blob::Known(id, bytes, mode))?;
         }
         Ok(self.commit_pending(base, &pending))
     }
 
     /// The root the staged changes make of `base`.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a staged change names its new file by a u32 place; a commit of 2^32 new files needs a typed refusal from staging"
+    )]
     fn commit_pending(&mut self, base: NodeId, pending: &Pending) -> NodeId {
         // By component, so each directory's changes are one run, in its entries' order: every
         // path's components in one column, and each change its run of them.
@@ -765,17 +788,20 @@ impl Tree {
         found
     }
 
-    /// A whole file of `bytes` with `mode` at `path` (checked), staged: refused under a file or
-    /// over a directory.
+    /// A whole new file `blob` ([`Blob::New`] or [`Blob::Known`]) at `path` (checked), staged:
+    /// refused under a file or over a directory.
     fn stage_write(
         &self,
         base: NodeId,
         pending: &mut Pending,
         path: Cow<'_, str>,
-        bytes: Bytes,
-        mode: Mode,
+        blob: Blob,
     ) -> Result<(), OpError> {
-        too_large(&path, bytes.len())?;
+        let len = match &blob {
+            Blob::New(bytes, _) | Blob::Known(_, bytes, _) => bytes.len(),
+            Blob::Node(..) => unreachable!("a write stages new bytes"),
+        };
+        too_large(&path, len)?;
         if ancestors(&path).any(|up| self.file_now(base, pending, up).is_some()) {
             // alloc: the error's path
             return Err(OpError::NotADirectory(path.into_owned()));
@@ -784,7 +810,7 @@ impl Tree {
             // alloc: the error's path
             return Err(OpError::IsADirectory(path.into_owned()));
         }
-        put_owned(pending, path, Some(Blob::New(bytes, mode)));
+        put_owned(pending, path, Some(blob));
         Ok(())
     }
 
@@ -823,7 +849,7 @@ impl Tree {
                 }
                 _ => unreachable!("a write, matched above"),
             };
-            return self.stage_write(base, pending, path, bytes, mode);
+            return self.stage_write(base, pending, path, Blob::New(bytes, mode));
         }
         match &*op {
             Op::Write { .. } => unreachable!("staged above"),
@@ -957,6 +983,10 @@ impl Tree {
                         Blob::New(bytes, mode) => {
                             // clone: the store keeps the new file's bytes, as one more count.
                             (self.file_with(hashed[at as usize], bytes.clone()), *mode)
+                        }
+                        Blob::Known(id, bytes, mode) => {
+                            // clone: the store keeps the new file's bytes, as one more count.
+                            (self.file_with(*id, bytes.clone()), *mode)
                         }
                     })
                 }

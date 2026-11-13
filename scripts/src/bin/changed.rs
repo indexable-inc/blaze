@@ -408,7 +408,7 @@ fn selftest() {
         ),
     ];
     let packages = {
-        let tmp = TempDir::new("bz-changed-").unwrap_or_else(|e| fail(SCRIPT, &e));
+        let tmp = TempDir::new("bz-changed-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
         let root = tmp.path();
         for (relative, text) in manifests {
             let path = root.join(relative);

@@ -84,6 +84,15 @@ impl Served {
     /// The socket is made in a directory of its own that only the user can enter and is
     /// moved to `socket` once only the user can connect to it: at no time is it somewhere
     /// others reach with the mode the umask gave it, whatever directory `socket` is in.
+    #[cfg_attr(
+        unix,
+        expect(
+            blaze::tmp_path,
+            reason = "an address too long to bind at is bound through a short alias, and the \
+                      real /tmp is the short directory every Unix host has; TMPDIR may itself be \
+                      long"
+        )
+    )]
     pub fn bind(socket: &Path) -> Result<Served, NotServed> {
         #[cfg(unix)]
         SocketAddr::from_pathname(socket).map_err(|error| too_long(socket, error))?;
@@ -417,8 +426,8 @@ mod windows_tests {
 
     #[test]
     fn the_directory_and_the_socket_are_the_users_alone() {
-        let dir = std::env::temp_dir().join(format!("blaze-socket-private-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let made = blaze_core::temp::TempDir::for_test("blaze-socket-private-");
+        let dir = made.join("d");
         private_dir(&dir).unwrap();
         private_dir(&dir).unwrap();
         let served = Served::bind(&dir.join("sock")).unwrap();
@@ -451,15 +460,16 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-socket-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// A test's directory, and in it a path not yet made: the test makes it as it means to.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-socket-{name}-"));
+        let dir = made.join("d");
+        (made, dir)
     }
 
     #[test]
     fn a_socket_can_use_the_full_unix_address_length() {
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = blaze_core::temp::TempDir::for_test_socket("blaze-socket-full-");
         let mut name = String::from("s");
         while SocketAddr::from_pathname(dir.path().join(&name)).is_ok() {
             name.push('s');
@@ -476,7 +486,7 @@ mod tests {
 
     #[test]
     fn the_directory_and_the_socket_are_the_users_alone() {
-        let dir = scratch("private");
+        let (_made, dir) = scratch("private");
         private_dir(&dir).unwrap();
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         let served = Served::bind(&dir.join("sock")).unwrap();
@@ -502,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_silent_or_endless_client_is_given_up_on() {
-        let dir = scratch("requests");
+        let (_made, dir) = scratch("requests");
         private_dir(&dir).unwrap();
         let served = Served::bind(&dir.join("sock")).unwrap();
         let connect = || {
@@ -539,7 +549,7 @@ mod tests {
     #[test]
     fn a_socket_in_a_shared_directory_is_never_open_to_others() {
         // What a `--socket` in a directory everyone can enter is given.
-        let dir = scratch("shared");
+        let (_made, dir) = scratch("shared");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let socket = dir.join("sock");
@@ -558,7 +568,7 @@ mod tests {
 
     #[test]
     fn a_log_that_was_there_becomes_the_users_alone() {
-        let dir = scratch("log");
+        let (_made, dir) = scratch("log");
         private_dir(&dir).unwrap();
         let log = dir.join("log");
         std::fs::write(&log, "before\n").unwrap();
@@ -572,7 +582,7 @@ mod tests {
 
     #[test]
     fn a_directory_others_can_swap_is_refused() {
-        let dir = scratch("parents");
+        let (_made, dir) = scratch("parents");
         let open = dir.join("open");
         std::fs::create_dir_all(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -587,7 +597,7 @@ mod tests {
 
     #[test]
     fn a_client_that_never_reads_is_given_up_on() {
-        let dir = scratch("replies");
+        let (_made, dir) = scratch("replies");
         private_dir(&dir).unwrap();
         let served = Served::bind(&dir.join("sock")).unwrap();
         let mut client = connect(&dir.join("sock")).unwrap();
@@ -609,7 +619,7 @@ mod tests {
 
     #[test]
     fn a_reply_has_a_time_limit_once_the_request_is_read() {
-        let dir = scratch("reply-limit");
+        let (_made, dir) = scratch("reply-limit");
         private_dir(&dir).unwrap();
         let served = Served::bind(&dir.join("sock")).unwrap();
         let mut client = connect(&dir.join("sock")).unwrap();
@@ -623,7 +633,7 @@ mod tests {
 
     #[test]
     fn one_connection_too_many_is_closed() {
-        let dir = scratch("most");
+        let (_made, dir) = scratch("most");
         private_dir(&dir).unwrap();
         let mut served = Served::bind(&dir.join("sock")).unwrap();
         served.most = 2;
@@ -651,7 +661,7 @@ mod tests {
 
     #[test]
     fn one_process_serves_a_socket() {
-        let dir = scratch("lock");
+        let (_made, dir) = scratch("lock");
         private_dir(&dir).unwrap();
         let socket = dir.join("sock");
         let first = Served::bind(&socket).unwrap();
@@ -671,7 +681,7 @@ mod tests {
     /// of which has every open file of this one until it runs its program.
     #[test]
     fn a_socket_let_go_of_is_free_while_processes_start() {
-        let dir = scratch("lock-forks");
+        let (_made, dir) = scratch("lock-forks");
         private_dir(&dir).unwrap();
         let socket = dir.join("sock");
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

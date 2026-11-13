@@ -274,6 +274,12 @@ static WATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// A directory of cookies for one watch, made empty: under the temporary directory, which
 /// is the process's to write wherever the watched directory is.
+#[expect(
+    blaze::tmp_path,
+    reason = "a watch's cookie directory lives as long as the watch, not a scope: made here, removed when the \
+              watch drops and on each failed start, and kept by its canonical (/private/var) path the events \
+              name; its owner holding a TempDir is the change that moves it"
+)]
 fn cookies() -> io::Result<PathBuf> {
     let number = WATCHES.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir()
@@ -1064,10 +1070,9 @@ mod tests {
 
     /// A root under the temporary directory, which is `/var/...` named and `/private/var/...`
     /// real, with `src` and `target` made in it.
-    fn root(what: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("blaze-fsevents-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+    /// The guard removes it when the test ends.
+    fn root(what: &str) -> crate::temp::TempDir {
+        let root = crate::temp::TempDir::for_test(&format!("blaze-fsevents-{what}-"));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         root

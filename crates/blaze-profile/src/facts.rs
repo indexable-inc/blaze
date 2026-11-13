@@ -278,6 +278,10 @@ pub struct TestRunRow {
 /// The children reaped since the last flush took them: pushed by whichever thread reaped one,
 /// taken by the history's flush. Unbounded as a queue, bounded in practice by the children a
 /// flush interval reaps; a process with no history never installs the observer that fills it.
+#[expect(
+    blaze::process_static,
+    reason = "drained by each history flush: bounded by the children one flush interval reaps"
+)]
 static CHILDREN: crossbeam_queue::SegQueue<ProcessRow> = crossbeam_queue::SegQueue::new();
 
 /// Has every child a driver reaps from now on queued as a `processes` row, each label naming

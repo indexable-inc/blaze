@@ -136,8 +136,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
 #[test]
 fn profiles_match_cargo() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/profile-fixtures");
-    let scratch =
-        std::env::temp_dir().join(format!("blaze-manifest-profiles-{}", std::process::id()));
+    let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-profiles-");
     let mut names: Vec<_> =
         std::fs::read_dir(&fixtures).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
@@ -148,7 +147,6 @@ fn profiles_match_cargo() {
         runs += n;
         failed.extend(f);
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(runs >= 40, "only {runs} runs in {}", fixtures.display());
     assert!(failed.is_empty(), "{} differences:\n{}", failed.len(), failed.join("\n\n"));
 }

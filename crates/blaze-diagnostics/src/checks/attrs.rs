@@ -173,6 +173,11 @@ impl<'f> Lowered<'f> {
     }
 
     /// Ends the current owner's run.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "run ends are u32: a crate with 2^32 parsed attributes needs a typed refusal from \
+                  the lowering"
+    )]
     fn close(&mut self) {
         let end =
             u32::try_from(self.attrs.len()).expect("a crate has fewer than 2^32 parsed attributes");

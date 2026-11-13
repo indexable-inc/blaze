@@ -412,6 +412,8 @@ fn old_match_attr_flags(
                         "program_lifetime" => {
                             attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
                         }
+                        "canonical_cbor" => attr_flags.insert(AttrFlags::CANONICAL_CBOR),
+                        "renders_positions" => attr_flags.insert(AttrFlags::RENDERS_POSITIONS),
                         _ => {}
                     },
                     _ => {}

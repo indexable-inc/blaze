@@ -45,30 +45,6 @@ impl Drop for NamedTempFile {
     }
 }
 
-pub struct NamedTempDir {
-    path: PathBuf,
-}
-
-impl NamedTempDir {
-    pub fn new(prefix: &str) -> io::Result<NamedTempDir> {
-        general_imp::create(prefix, |_options, path| std::fs::create_dir(path))
-            .map(|((), path)| NamedTempDir { path })
-    }
-
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for NamedTempDir {
-    fn drop(&mut self) {
-        if std::fs::remove_dir_all(&self.path).is_err() {
-            tracing::info!(target: "blaze", "cannot remove temporary directory {}", self.path.display());
-        }
-    }
-}
-
 mod general_imp {
     use std::{
         fs::OpenOptions,
@@ -83,7 +59,9 @@ mod general_imp {
         prefix: &str,
         mut create: impl FnMut(OpenOptions, &Path) -> io::Result<T>,
     ) -> io::Result<(T, PathBuf)> {
-        let temp_dir = std::env::temp_dir().canonicalize()?;
+        // A temporary file goes next to the system's temporary directory; a directory is
+        // `blaze_core::temp::TempDir` (rule `blaze::tmp_path`).
+        let temp_dir = blaze_core::temp::base().canonicalize()?;
         let pid = std::process::id();
         loop {
             let path = temp_dir.join(format!(

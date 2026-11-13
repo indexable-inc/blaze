@@ -23,6 +23,7 @@ mod bounds_check_in_loop;
 mod box_large_new;
 mod boxed_recursive_node;
 mod build_script_ambient;
+mod cbor_field_order;
 mod not_latest_edition;
 mod checkfree;
 mod clone;
@@ -50,6 +51,9 @@ mod expect;
 #[cfg(test)]
 mod expect_tests;
 mod enum_vec_padded;
+mod env_read;
+#[cfg(test)]
+mod env_read_tests;
 mod error_debug;
 #[cfg(test)]
 mod errors_tests;
@@ -61,6 +65,7 @@ mod fixed_key_lookup;
 mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
+mod gapped_literal;
 mod general_facts;
 mod global_state;
 mod goose_fields;
@@ -86,6 +91,7 @@ mod lossy_as;
 mod many_bools;
 mod missing_size_hint;
 mod mut_ref;
+mod narrowed_len;
 mod native_contracts;
 #[cfg(test)]
 mod opaque_tests;
@@ -103,6 +109,7 @@ mod perf_general_tests;
 mod perf_tests;
 mod pod_serialized_by_field;
 mod proc_macro;
+mod process_static;
 #[cfg(test)]
 mod profile_tests;
 mod profiled;
@@ -111,7 +118,9 @@ mod program_lifetime;
 mod program_lifetime_tests;
 mod push_without_reserve;
 mod query_in_loop;
+mod reads_positions;
 mod relaxed_publish;
+mod retry;
 mod sans_io_core;
 mod scratch_in_loop;
 mod seqcst_unexplained;
@@ -127,19 +136,24 @@ mod stdout_lock_in_loop;
 mod string_key;
 mod struct_update;
 mod syscall_in_loop;
+mod test_code;
 #[cfg(test)]
 mod tests;
 mod thread_local_in_waiting_fn;
 #[cfg(test)]
 mod thread_local_tests;
+mod tmp_path;
 mod unbounded_from_input;
+mod unbounded_test_wait;
 mod unbounded_wait;
 mod unbuffered_io;
 mod unmarked_effects;
 mod unnamed_wait;
 mod unrecorded_span;
+mod untied_child;
 mod untyped_error;
 mod unwind_across_ffi;
+mod unwired;
 #[cfg(test)]
 mod waits_tests;
 mod wide_index;
@@ -287,6 +301,17 @@ pub enum Lint {
     CouldBeProgramLifetime,
     CouldBeRef32,
     SpanFieldUnrecorded,
+    EnvRead,
+    UntiedChild,
+    UnboundedTestWait,
+    ReadsPositions,
+    CborFieldOrder,
+    GappedLiteral,
+    Retry,
+    Unwired,
+    TmpPath,
+    NarrowedLen,
+    ProcessStatic,
 }
 
 /// Which workspaces a lint is for.
@@ -425,6 +450,10 @@ pub(crate) const YIELDS_TO_INTERNAL: &[Lint] = &[Lint::DosHasherOnInput];
 /// registry has them as renamed too (`blaze_lint_defs`' `RENAMED`).
 pub(crate) const RENAMED: &[(&str, Lint)] = &[("std_hashmap", Lint::DefaultHasher)];
 
+/// The `clippy.toml` key of the modules `env_read` allows, which the configuration's load
+/// checks is a list of paths.
+pub(crate) const ENV_READ_ALLOWED_KEY: &str = env_read::ALLOWED_KEY;
+
 impl Lint {
     /// In discriminant order.
     pub(crate) const ALL: &[Lint] = &[
@@ -537,6 +566,17 @@ impl Lint {
         Lint::CouldBeProgramLifetime,
         Lint::CouldBeRef32,
         Lint::SpanFieldUnrecorded,
+        Lint::EnvRead,
+        Lint::UntiedChild,
+        Lint::UnboundedTestWait,
+        Lint::ReadsPositions,
+        Lint::CborFieldOrder,
+        Lint::GappedLiteral,
+        Lint::Retry,
+        Lint::Unwired,
+        Lint::TmpPath,
+        Lint::NarrowedLen,
+        Lint::ProcessStatic,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -676,7 +716,29 @@ impl Lint {
             | Lint::CombinedIdentity
             // Rule guard-the-cause for the profile: a span's field that reaches no column of
             // `spans` (`blaze_profile::span::ad_hoc_fields`) is refused where it is written.
-            | Lint::SpanFieldUnrecorded => Kind::Internal,
+            | Lint::SpanFieldUnrecorded
+            // Rule keys-cover-every-input: the environment is read in the settings modules
+            // `env-read-allowed` names, and nowhere else.
+            | Lint::EnvRead
+            // Rules bounded-progress and clean-up-lane for tests: a process a test starts ends
+            // with it, and every wait in a test has a deadline.
+            | Lint::UntiedChild
+            | Lint::UnboundedTestWait
+            // Rule keys-cover-every-input for the front end: a query reads positions only in a
+            // function marked `#[blaze::renders_positions]`.
+            | Lint::ReadsPositions
+            // blaze-api's deterministic CBOR: a `#![blaze::canonical_cbor]` type declares its
+            // fields in their keys' order.
+            | Lint::CborFieldOrder
+            // Faults seen in the tree, refused where written: a lost line continuation, a
+            // retry, a design silenced instead of wired, a home under `/tmp`, a length
+            // narrowed with a panic, and a static that grows for the process's life.
+            | Lint::GappedLiteral
+            | Lint::Retry
+            | Lint::Unwired
+            | Lint::TmpPath
+            | Lint::NarrowedLen
+            | Lint::ProcessStatic => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -817,6 +879,17 @@ impl Lint {
             Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
             Lint::CouldBeRef32 => "could_be_ref32",
             Lint::SpanFieldUnrecorded => "span_field_unrecorded",
+            Lint::EnvRead => "env_read",
+            Lint::UntiedChild => "untied_child",
+            Lint::UnboundedTestWait => "unbounded_test_wait",
+            Lint::ReadsPositions => "reads_positions",
+            Lint::CborFieldOrder => "cbor_field_order",
+            Lint::GappedLiteral => "gapped_literal",
+            Lint::Retry => "retry",
+            Lint::Unwired => "unwired",
+            Lint::TmpPath => "tmp_path",
+            Lint::NarrowedLen => "narrowed_len",
+            Lint::ProcessStatic => "process_static",
         }
     }
 
@@ -936,6 +1009,17 @@ impl Lint {
                 concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
             }
             Lint::SpanFieldUnrecorded => concat!(docs!(), "#span_field_unrecorded"),
+            Lint::EnvRead => concat!(docs!(), "#env_read"),
+            Lint::UntiedChild => concat!(docs!(), "#untied_child"),
+            Lint::UnboundedTestWait => concat!(docs!(), "#unbounded_test_wait"),
+            Lint::ReadsPositions => concat!(docs!(), "#reads_positions"),
+            Lint::CborFieldOrder => concat!(docs!(), "#cbor_field_order"),
+            Lint::GappedLiteral => concat!(docs!(), "#gapped_literal"),
+            Lint::Retry => concat!(docs!(), "#retry"),
+            Lint::Unwired => concat!(docs!(), "#unwired"),
+            Lint::TmpPath => concat!(docs!(), "#tmp_path"),
+            Lint::NarrowedLen => concat!(docs!(), "#narrowed_len"),
+            Lint::ProcessStatic => concat!(docs!(), "#process_static"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -950,7 +1034,7 @@ impl Lint {
                 "write into a buffer the caller keeps, an arena, or intern it; format only at the edge"
             }
             Lint::HotAllocCall => {
-                "keep the allocation out of what the hot path calls, or say why it is needed there with `// alloc: <why>`"
+                "keep the allocation out of what the hot path calls: don't allocate (a borrow, a fixed buffer, the caller's buffer), or allocate in the task's frame; where one must stay, say why with `#[expect(blaze::hot_alloc, reason = \"..\")]`"
             }
             Lint::HotDyn => "use a concrete type, a generic, or a `match` on a tag",
             Lint::DefaultHasher => {
@@ -1007,6 +1091,39 @@ impl Lint {
             Lint::CombinedIdentity => {
                 "keep the set in a `blaze_ids::keyed::Keyed` and take its root, or hash every entry with `blaze_ids::Hasher`; an XOR or a sum that makes no identity says so with `// identity: <why>` on its line or the line above"
             }
+            Lint::EnvRead => {
+                "read the setting in a settings module (a module `env-read-allowed` in clippy.toml names), typed, with no default for a missing value, and hand it to this code; a process that hands its whole environment on (a client to its daemon, a runner to a child) says so with `#[expect(blaze::env_read, reason = \"..\")]`"
+            }
+            Lint::UntiedChild => {
+                "own the child in `stdx::JodChild`, which kills and reaps it on drop (`stdx::JodChild::spawn(command)`, or `.spawn().map(stdx::JodChild)`; a struct's field holds a `JodChild`, not a `Child` with a hand-written `Drop`), and set `BLAZE_DAEMON_EXIT_UNHELD=on` on every command that runs `blaze`; or `#[expect(blaze::untied_child, reason = \"..\")]` naming what ends the process instead"
+            }
+            Lint::UnboundedTestWait => {
+                "in a test, wait to a deadline and fail naming what was awaited: `rx.recv_timeout(WAIT).expect(\"<what>\")`, `stdx::child::exit_within(&mut child, \"<what>\", WAIT)` (or `stdx::child::output_within`) for a child, `park_timeout` or `Condvar::wait_timeout`/`Signal::wait_for` in a loop that compares `elapsed()`, a `blaze_core::wait` call given `Some(deadline)`, and a `try_wait` loop that compares a deadline or a round count; where something the lint cannot see bounds the wait, `#[expect(blaze::unbounded_test_wait, reason = \"<what bounds it>\")]`"
+            }
+            Lint::ReadsPositions => {
+                "read the position-free fact instead (the body, `ExpressionStore::is_synthesized`, the outline, the item index), or mark the function `#[blaze::renders_positions]` when what it makes is about where code is written (a diagnostic's words, debug info, an IDE lookup); else `#[expect(blaze::reads_positions, reason = \"<what must change>\")]`"
+            }
+            Lint::CborFieldOrder => {
+                "declare the fields in their keys' order, shorter key first, then bytewise (`blaze check --fix` moves each field whole; review the reorder when the type derives `PartialOrd`, `Ord` or `Hash`, whose derived order follows the declaration); or say why the declaration order must stay with `#[expect(blaze::cbor_field_order, reason = \"..\")]`"
+            }
+            Lint::GappedLiteral => {
+                "put the `\\` line continuation back (the suggestion does), make an aligned table a raw literal, or keep alignment on purpose with `#[expect(blaze::gapped_literal, reason = \"<what is aligned>\")]` on the item"
+            }
+            Lint::Retry => {
+                "remove the retry: the first failure is the error, typed, naming what failed and where; a count that is not a retry says so with `#[expect(blaze::retry, reason = \"..\")]`"
+            }
+            Lint::Unwired => {
+                "wire the item where it was meant to be used, delete it, give an item used only on some targets their `cfg`, or keep it with `#[expect(blaze::unwired, reason = \"<what wires it, and when>\")]` beside the attribute"
+            }
+            Lint::TmpPath => {
+                "make the directory with `blaze_core::temp::TempDir::new(prefix)` (`TempDir::for_test(prefix)` in a test) and hold it as long as it is used; a file beside the system's temporary files takes its directory from `blaze_core::temp::base()`; a path that names the real `/tmp` as policy says so with `#[expect(blaze::tmp_path, reason = \"..\")]`"
+            }
+            Lint::NarrowedLen => {
+                "return a typed error naming the thing and its size (`map_err(|_| Error::TooLarge { what, len })?`), or, where a check just before bounds it, say where with `#[expect(blaze::narrowed_len, reason = \"<the bound and where it is checked>\")]`"
+            }
+            Lint::ProcessStatic => {
+                "give the state an owner with a lifetime (the daemon, a build, a task) that drops it, or say what bounds it with `#[expect(blaze::process_static, reason = \"..\")]`"
+            }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
             }
@@ -1026,7 +1143,7 @@ impl Lint {
                 "name `target: \"blaze\"` (`target = \"blaze\"` in `#[instrument]`), or make the span or event `debug` where it runs too often to record"
             }
             Lint::ImplicitAllocator => {
-                "name the allocator inside `blaze_mem::frame::current(|frame| ..)` or with the request's `ArenaLocal`, or say why it needs the global heap with `// alloc: <why>` or `#[expect(blaze::implicit_allocator, reason = \"..\")]`"
+                "first, don't allocate: borrow, use a fixed buffer, or write into the caller's buffer; where an allocation is needed, name the allocator: the frame from `blaze_mem::frame::current(|frame| ..)`, the request's `ArenaLocal`, or `Global` written out (`Vec::new_in(Global)`) where the global heap is the value's lifetime; no comment keeps a finding, `#[expect(blaze::implicit_allocator, reason = \"..\")]` does and is counted"
             }
             Lint::FixedKeyLookup => {
                 "put the keys in `const KEYS: &[&str]` and declare `blaze_phf::phf_table!(static TABLE = KEYS;)`; `TABLE.get(key)` (`TABLE.index(bytes)` for bytes) is the key's index into a const array of values. Or say why it stays with `#[expect(blaze::fixed_key_lookup, reason = \"..\")]`"
@@ -1341,6 +1458,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(adt) = ast::Adt::cast(node) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
+        cbor_field_order::check(cx, adt);
         program_lifetime::check(cx, adt);
         could_be_program_lifetime::check(cx, adt);
         default_policy::check_adt(cx, adt);
@@ -1375,9 +1493,11 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(item) = ast::Static::cast(node) {
         global_state::check(cx, item);
+        process_static::check_static(cx, item);
     }
     if let Some(call) = ast::MacroCall::cast(node) {
         global_state::check_thread_local(cx, call);
+        process_static::check_thread_local(cx, call);
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
@@ -1420,6 +1540,11 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     unrecorded_span::check(cx, node);
     std_use::check_declaration(cx, node);
     span_field_unrecorded::check(cx, node);
+    gapped_literal::check(cx, node);
+    tmp_path::check(cx, node);
+    unwired::check(cx, node);
+    retry::check(cx, node);
+    narrowed_len::check(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);
@@ -1476,6 +1601,11 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         build_script_ambient::check(cx);
         not_latest_edition::check(cx);
         std_use::check(cx);
+        env_read::check(cx);
+        untied_child::check(cx);
+        unbounded_test_wait::check(cx);
+        reads_positions::check(cx);
+        tmp_path::check_body(cx);
         check_body(cx);
     }
 }
@@ -1538,6 +1668,8 @@ fn check_body(cx: &mut Cx<'_, '_>) {
         return;
     }
     let mut found: Vec<Finding> = Vec::new();
+    // `implicit_allocator`'s machine-applicable rewrites, by the range of the call each is of.
+    let mut fixes: Vec<(TextRange, Vec<(TextRange, String)>)> = Vec::new();
     {
         let Some(analysis) = cx.analysis() else { return };
         let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return };
@@ -1616,9 +1748,8 @@ fn check_body(cx: &mut Cx<'_, '_>) {
                 let made = hir::Adt::from(made).name(db);
                 let message =
                     format!("{} makes a `{}` of the global allocator", call(), made.as_str());
-                let note = "it allocates from the global heap once it grows: name its allocator \
-                            (`Vec::new_in(alloc)`), grow a buffer the caller keeps, or say why it \
-                            needs the global heap with `// alloc: <why>`";
+                let note = "it allocates from the global heap once it grows: grow a buffer the \
+                            caller keeps, or name its allocator (`Vec::new_in(frame)`)";
                 push(Lint::HotAlloc, range, message, Some(note.to_owned()));
             }
             if on_map
@@ -1634,11 +1765,18 @@ fn check_body(cx: &mut Cx<'_, '_>) {
             }
         }
         if on_implicit {
-            implicit_allocator::check_body(cx, &k, analysis, &mut push);
+            implicit_allocator::check_body(cx, &k, analysis, &mut push, &mut fixes);
         }
     }
     let root = cx.root();
     for finding in found {
+        // A `let`'s finding carries the fix of the call it holds.
+        let fix = (finding.lint == Lint::ImplicitAllocator)
+            .then(|| fixes.iter().find(|(at, _)| finding.range.contains_range(*at)))
+            .flatten()
+            .map(|(_, parts)| {
+                parts.iter().map(|(at, text)| (cx.span(*at), text.clone())).collect::<Vec<_>>()
+            });
         let at = match root.text_range().contains_range(finding.range) {
             true => match root.covering_element(finding.range) {
                 NodeOrToken::Node(it) => it,
@@ -1650,6 +1788,13 @@ fn check_body(cx: &mut Cx<'_, '_>) {
         let diagnostic = cx.blaze(finding.lint, at, span, finding.message);
         if let Some(note) = finding.note {
             diagnostic.note(note);
+        }
+        if let Some(parts) = fix {
+            diagnostic.multipart_suggestion(
+                "name the global allocator where it is used",
+                parts,
+                Applicability::MachineApplicable,
+            );
         }
         diagnostic
             .help(finding.lint.help())

@@ -251,7 +251,7 @@ fn terminals() {
     let tmux = [
         ("TERM_PROGRAM", "ghostty"),
         ("TERM_PROGRAM_VERSION", "1.2.0"),
-        ("TMUX", "/tmp/tmux-1/default,1,0"),
+        ("TMUX", "/run/tmux-1/default,1,0"),
     ];
     let behind = terminal::detect(&config, env(&tmux), true, None);
     assert!(!behind.progress && behind.notifier.is_none() && !behind.caps.links);

@@ -941,6 +941,17 @@ impl CollectBatch {
                     why = Some(format!("the record at {offset} runs past the pack"));
                     break 'slices;
                 }
+                // What is judged dead is deleted: a format-9 header is trusted only once its
+                // record's CRC, which covers the payload too, matches.
+                let checked = bytes(offset, RECORD_HEADER).and_then(|head| {
+                    let payload = bytes(offset + RECORD_HEADER, header.stored)?;
+                    Ok(RecordHeader::check(head, payload))
+                });
+                if let Ok(Err(what)) | Err(what) = checked.map_err(|_| "it could not be read through the store's pool") {
+                    // alloc: a problem reported
+                    why = Some(format!("the record at {offset}: {what}"));
+                    break 'slices;
+                }
                 self.judge(look, offset, &header);
                 offset += span;
             }
@@ -1061,16 +1072,15 @@ impl CollectBatch {
         let view = look.view();
         while self.read < self.keep.len() && self.ready_bytes < self.fill_most {
             let offset = self.keep[self.read];
-            let record = look
-                .pool_bytes(0, view, self.pack, offset, RECORD_HEADER)
-                .ok()
-                .and_then(|it| RecordHeader::decode(it).ok())
-                .and_then(|header| {
-                    let payload =
-                        look.pool_bytes(0, view, self.pack, offset + RECORD_HEADER, header.stored);
-                    // alloc: a record copied on, held until the store has copied it
-                    Some((header, payload.ok()?.to_vec()))
-                });
+            // Checked whole before it is copied on: a record rotted in its pack is not carried
+            // into a new one under a fresh check.
+            let record = look.pool_bytes(0, view, self.pack, offset, RECORD_HEADER).ok().and_then(|head| {
+                let stored = RecordHeader::decode(head).ok()?.stored;
+                let payload = look.pool_bytes(0, view, self.pack, offset + RECORD_HEADER, stored).ok()?;
+                let (header, _) = RecordHeader::check(head, payload).ok()?;
+                // alloc: a record copied on, held until the store has copied it
+                Some((header, payload.to_vec()))
+            });
             let Some((header, payload)) = record else {
                 // alloc: a problem reported
                 self.problems.push(format!(
@@ -2313,6 +2323,10 @@ impl Collector {
         }
     }
 
+    #[expect(
+        blaze::retry,
+        reason = "a pack whose batch went stale is scanned again up to RETRIES_MOST times: a race with writers, not failed IO; a scan that cannot go stale must replace it"
+    )]
     fn passed(&mut self, pack: usize, pass: Pass) -> Step {
         match pass {
             Pass::Stale if self.retries < RETRIES_MOST => {

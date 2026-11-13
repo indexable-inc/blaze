@@ -357,6 +357,10 @@ impl<'db> SemanticsScope<'db> {
 
     /// Calls the passed closure `f` on all names in scope.
     pub fn process_all_names(&self, f: &mut impl FnMut(Name, ScopeDef<'db>)) {
+        #[expect(
+            blaze::process_static,
+            reason = "one emptied per-thread map, taken for each call and given back, uncapped in capacity"
+        )]
         thread_local! {
             static NAMES_IN_SCOPE: RefCell<resolver::NamesInScope> =
                 RefCell::new(resolver::NamesInScope::default());

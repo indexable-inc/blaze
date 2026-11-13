@@ -21,6 +21,7 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 blaze-protocol.workspace = true
+stdx.workspace = true
 
 [lints]
 workspace = true

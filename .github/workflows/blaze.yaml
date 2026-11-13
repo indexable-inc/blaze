@@ -196,6 +196,56 @@ jobs:
       # has its class there (scripts/src/bin/domains.rs).
       - run: |
           "$BLAZE_SCRIPTS/domains" '{"root": "."}'
+      # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
+      # outside tests, the `// alloc:` lines left to convert, the `expect`s of
+      # `blaze::implicit_allocator` and the lines naming `Global` equal their crate's row of
+      # crates/blaze-lints/baselines/alloc-sites.txt, a crate with no row is held to 0, and no
+      # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
+      # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
+      # checks the workspace. Against the base itself: the checkout is shallow.
+      - name: global-heap allocations only go down
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          "$BLAZE_SCRIPTS/allocs" selftest
+          if [ -n "$BASE" ]; then
+            git fetch -q --depth=1 origin "$BASE"
+            "$BLAZE_SCRIPTS/allocs" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+          else
+            echo "no base to compare with (a run by hand): each crate is held to its row only"
+            "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
+          fi
+      # No source file under crates/ grows past 1500 lines, and those past it (scripts/sizes.txt)
+      # only shrink; a row new since the base is refused (rule one-concept-one-home: job.rs passed
+      # 10,000 lines and eight lanes collided in it; scripts/src/bin/sizes.rs).
+      - name: source files stay under the size bound
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          "$BLAZE_SCRIPTS/sizes" selftest
+          if [ -n "$BASE" ]; then
+            git fetch -q --depth=1 origin "$BASE"
+            "$BLAZE_SCRIPTS/sizes" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+          else
+            echo "no base to compare with (a run by hand): each file is held to its row only"
+            "$BLAZE_SCRIPTS/sizes" '{"command": "check"}'
+          fi
+      # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
+      # scripts/layouts.txt, and a persisted one whose value changed against the base names its
+      # crate's test of the previous layout (rule persisted-state-round-trips;
+      # scripts/src/bin/layouts.rs).
+      - name: a changed persisted layout has a previous-layout test
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          "$BLAZE_SCRIPTS/layouts" selftest
+          if [ -n "$BASE" ]; then
+            git fetch -q --depth=1 origin "$BASE"
+            "$BLAZE_SCRIPTS/layouts" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+          else
+            echo "no base to compare with (a run by hand): the list is checked, no value is compared"
+            "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
+          fi
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
       # (.github/scripts/explore_page.py; release.yaml checks every release too).
       - name: ix.dev/explore reads a new profile schema
@@ -517,6 +567,17 @@ jobs:
   # baselines are also the ratchet's: each crate a lint's lists is held at `warn` on it, every
   # other crate at `deny` (docs/lints.md, "Workspace levels and the ratchet"). They start with
   # every crate `unmeasured`, so the job fails until a run with `--bless-baselines` records them.
+  #
+  # Before the counts, the lints are fixed rather than refused (scripts/src/bin/lint_fix.rs): on
+  # a pull request from a branch of this repository, `blaze check --fix` makes every
+  # machine-applicable suggestion, one commit `blaze check --fix: <N> fixes of <lints>` by
+  # github-actions[bot] goes to the pull request's branch (with the token fmt.yaml pushes with,
+  # so the push starts CI again on it), and the job fails only for the error-level findings no
+  # fix made. A fork's pull request is pushed nothing and holds no write token: its fixes are the
+  # `lint-fix.diff` artifact. A push to main, a merge group or a run by hand fixes nothing and only
+  # checks. The checkout is the pull request's head, not GitHub's merge of it, so the fix
+  # commit's parent is the branch's head; no step but the push holds a write token (the
+  # checkout's is the workflow's, `contents: read`).
   lint-baselines:
     name: lint baselines
     needs: changes
@@ -526,6 +587,8 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # The ratchet only tightens (harness/v2/guards.py, `ratchet`; docs/lints.md, "Workspace
       # levels and the ratchet"): no `blaze.<lint>.txt` holds a crate at `warn` that the base did
       # not, a count over the base's, or a count back at `unmeasured`. Against the base itself:
@@ -547,9 +610,58 @@ jobs:
       - name: blaze build --release (the build job's)
         run: |
           python3 harness/unittests.py '{"build": true}'
+      - uses: ./.github/actions/script
+        with:
+          job: build
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
       - run: blaze stop
-      - env:
+      # The tree's blaze fixes, not the release: a lint this tree adds or changes is fixed by
+      # the blaze that defines it, as the counts below are of its lints.
+      - name: blaze check --fix, then what no fix made refused
+        id: fix
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
+          INPUT: >-
+            {"blaze": "target/release/blaze",
+             "select": ["--workspace", "--target", "aarch64-unknown-linux-gnu"],
+             "event": ${{ toJSON(github.event_name) }},
+             "fork": ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }},
+             "head_ref": ${{ toJSON(github.head_ref || null) }},
+             "out": ${{ toJSON(format('{0}/lint-fix', runner.temp)) }}}
+        run: |
+          "$BLAZE_SCRIPTS/lint_fix" selftest
+          "$BLAZE_SCRIPTS/lint_fix" "$INPUT"
+      # The fix commit, when the step above made one, to the pull request's branch, never main:
+      # the script refuses a head_ref of main, and this pushes only to refs/heads/<head_ref> of
+      # this repository. Only this step holds the token. Pushed whether or not findings are
+      # left: what was fixable is fixed either way. A branch that moved meanwhile refuses the
+      # push, which fails the job (no retry).
+      - name: push the fix commit to the pull request's branch
+        if: >-
+          !cancelled() && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          TOKEN: ${{ secrets.BLAZE_BOT_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+          OUT: ${{ runner.temp }}/lint-fix
+        run: |
+          [ -f "$OUT/commit" ] || { echo "no fix commit to push"; exit 0; }
+          [ -n "$TOKEN" ] || { echo "::error::BLAZE_BOT_TOKEN is not set: the fix commit $(cat "$OUT/commit") cannot be pushed (the workflow's own token's push starts no CI)"; exit 1; }
+          [ -n "$HEAD_REF" ] && [ "$HEAD_REF" != main ] || { echo "::error::the branch to push to is '$HEAD_REF': fixes never go to main"; exit 1; }
+          # The checkout's read-only header goes first: two would both be sent.
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push "https://github.com/${{ github.repository }}" "$(cat "$OUT/commit"):refs/heads/$HEAD_REF"
+      - name: the fixes a fork's pull request needs
+        if: failure() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-fix.diff
+          path: ${{ runner.temp }}/lint-fix/lint-fix.diff
+          if-no-files-found: ignore
+      - if: ${{ !cancelled() }}
+        env:
           BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
         run: >-
           target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
@@ -560,7 +672,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, lean, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once `blaze check --workspace` finishes on blaze's tree (it crashes today) and the first baselines exist; its fix-then-refuse step (scripts/src/bin/lint_fix.rs) is otherwise complete
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5

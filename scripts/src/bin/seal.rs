@@ -151,10 +151,10 @@ fn main_with(it: &Args) {
     }
     made(&out);
     let out_text = out.to_string_lossy().into_owned();
-    let work = std::env::temp_dir().join(format!("blaze-seal-{}", std::process::id()));
-    if work.exists() {
-        fail(SCRIPT, &format!("{} is there already: the homes and the machine must be fresh", work.display()));
-    }
+    // A new empty directory of this run's own (a same-pid one a killed run left is cleared), so
+    // the homes and the machine are fresh; removed when the run ends.
+    let held = blaze_script::TempDir::new("blaze-seal-").unwrap_or_else(|error| fail(SCRIPT, &error.to_string()));
+    let work = held.path().to_path_buf();
     let cache = work.join("cache");
     made(&cache);
     let home_of = |at: usize| {
@@ -241,7 +241,7 @@ fn main_with(it: &Args) {
         first.ran(&aws, &["s3", "sync", out_text.as_str(), &to, "--endpoint-url", &upload.endpoint, "--only-show-errors"], &work);
         println!("uploaded {} to {to} at {}", out.display(), upload.endpoint);
     }
-    _ = std::fs::remove_dir_all(&work);
+    drop(held);
 }
 
 fn main() {

@@ -154,11 +154,11 @@ pub fn rotate(log: &Path, fd: RawFd, also: &[RawFd], cap: u64) -> Result<Option<
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-serve-log-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A test's directory, removed when the guard drops, and its path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-serve-log-{name}-"));
+        let dir = made.path().to_path_buf();
+        (made, dir)
     }
 
     fn open(log: &Path) -> fs::File {
@@ -194,7 +194,7 @@ mod tests {
     /// go; and each new log starts by saying where the lines before it are.
     #[test]
     fn the_log_and_the_one_before_it_stay_within_the_cap() {
-        let dir = scratch("bound");
+        let (_made, dir) = scratch("bound");
         let log = dir.join(LOG);
         let file = open(&log);
         let also = open(&log);
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn the_oracle_catches_a_log_that_is_never_rotated() {
-        let dir = scratch("plant");
+        let (_made, dir) = scratch("plant");
         let log = dir.join(LOG);
         let file = open(&log);
         for _ in 0..2_000 {
@@ -246,7 +246,7 @@ mod tests {
     /// service manager) is left alone, and so is a log not yet due.
     #[test]
     fn a_standard_error_that_is_not_the_log_is_left_alone() {
-        let dir = scratch("elsewhere");
+        let (_made, dir) = scratch("elsewhere");
         let log = dir.join(LOG);
         let file = open(&log);
         (&file).write_all(&[b'x'; 100]).unwrap();

@@ -384,6 +384,11 @@ impl EGraph {
 
     /// The class of `node` (its arguments are classes), made when the e-node is new. A new
     /// e-node that folds to a constant joins that constant's class.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "classes are u32 ids and `add` returns no Result: an e-graph past 2^32 e-nodes \
+                  needs a typed refusal here"
+    )]
     pub(crate) fn add(&mut self, node: Node) -> u32 {
         let node = self.canonical(node);
         if let Some(&class) = self.memo.get(&node) {

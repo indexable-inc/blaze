@@ -572,8 +572,8 @@ fn run_becomes_its_program() {
 
 #[test]
 fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
-    let dir = std::env::temp_dir().join(format!("blaze-cli-doc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let made = blaze_core::temp::TempDir::for_test("blaze-cli-doc-");
+    let dir = made.path().to_path_buf();
     std::fs::create_dir_all(dir.join("old")).unwrap();
     std::fs::write(dir.join("old/index.html"), "").unwrap();
     std::fs::write(dir.join("crates.js"), "window.BLAZE_CRATES = [\"gone\",\"old\"];\n").unwrap();

@@ -790,6 +790,10 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
         self.local_def_map
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a module's op log is indexed by u32; a module making 2^32 ops needs a typed refusal from collection"
+    )]
     fn apply(&mut self, op: DeclOp) {
         self.apply_state(&op);
         if let DeclOp::Import(it) = &op

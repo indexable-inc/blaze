@@ -28,7 +28,7 @@ use crate::sync::{
 use crate::{
     ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold,
     disk::{
-        self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of,
+        self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, Sealed, content_of,
     },
     encodings_of,
     flags::{Flag, FlagColumns, Row},
@@ -547,6 +547,14 @@ impl Spot {
 /// never changes a demotion: an index swap starts the periods over, demotion waits for two,
 /// and the two rotations by then have cleared every carried `Read`, `ReadBefore`, `New` and
 /// `NewBefore`. `Flag::Verified` is no delta table's: a spot keeps it itself.
+/// Whether a record's check covered every byte its value is made from, so a read needs no
+/// BLAKE3 of the value: a format-9 record ([`Sealed::Whole`]) whose value is its payload or
+/// decoded from it alone. A value in a file of its own lies outside its record, so it is
+/// hashed; a chunked value's chunks are records of their own, each checked as it is read.
+pub(crate) fn whole_by_crc(header: &RecordHeader, payload: &[u8], sealed: Sealed) -> bool {
+    sealed == Sealed::Whole && (header.form != Form::External || payload.len() as u64 == header.raw)
+}
+
 pub(crate) fn carry_flags(from: &Table<Spot>, row: u64, to: &Table<Spot>, at: u64) {
     for flag in [Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore] {
         if from.flag(row, flag as usize) {
@@ -1003,7 +1011,7 @@ impl<'a> Look<'a> {
     }
 
     /// The file a found record is named by when it is corrupt.
-    fn file_of(self, found: Found<'a>) -> FileName {
+    pub(crate) fn file_of(self, found: Found<'a>) -> FileName {
         let tier = &found.view.tiers[found.tier];
         match found.place {
             Place::Pack(loc) => match tier.packs.get(loc.pack as usize) {
@@ -1114,14 +1122,25 @@ impl<'a> Look<'a> {
         of(found.view).or_else(|| of(self.view()))
     }
 
-    /// The header of a found record, checked to be of `key`, and its payload.
+    /// The header of a found record, checked to be of `key`, and its payload, the two checked
+    /// whole by the record's CRC ([`RecordHeader::check`]).
     pub(crate) fn record(
         self,
         found: Found<'a>,
         key: &Key,
     ) -> Result<(RecordHeader, &'a [u8]), Corrupt> {
+        self.record_sealed(found, key).map(|(header, payload, _)| (header, payload))
+    }
+
+    /// [`Look::record`], and what its check covered: a format-8 record's payload is the value
+    /// only once its BLAKE3 matches.
+    pub(crate) fn record_sealed(
+        self,
+        found: Found<'a>,
+        key: &Key,
+    ) -> Result<(RecordHeader, &'a [u8], Sealed), Corrupt> {
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
-        let (at, header, payload) = match found.place {
+        let (at, header_bytes, payload) = match found.place {
             Place::Pack(loc) => {
                 let tier = &found.view.tiers[found.tier];
                 if loc.pack as usize >= tier.packs.len() {
@@ -1139,11 +1158,11 @@ impl<'a> Look<'a> {
                         Some(why) => format!("its record at {at} could not be read: {why}"),
                     })
                 })?;
-                let header =
+                let stored =
                     // alloc: the error's message
-                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
+                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?.stored;
                 let payload =
-                    self.pack_bytes(found, loc, at + RECORD_HEADER, header.stored).map_err(|why| {
+                    self.pack_bytes(found, loc, at + RECORD_HEADER, stored).map_err(|why| {
                         // alloc: the error's message
                         corrupt(match why {
                             None => format!("the record at {at} runs past the pack"),
@@ -1164,17 +1183,17 @@ impl<'a> Look<'a> {
                     // alloc: the error's message
                     .ok_or_else(|| corrupt(format!("its record at {at} is outside its segment")))?;
                 let (header, payload) = bytes.split_at(RECORD_HEADER as usize);
-                let header =
-                    // alloc: the error's message
-                    RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
                 (at, header, payload)
             }
         };
+        let (header, sealed) = RecordHeader::check(header_bytes, payload)
+            // alloc: the error's message
+            .map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
         if header.key != *key {
             // alloc: the error's message
             return Err(corrupt(format!("the record at {at} is of another key")));
         }
-        Ok((header, payload))
+        Ok((header, payload, sealed))
     }
 
     /// The bytes of a found record, checked against its content hash: once a record for reads
@@ -1185,7 +1204,7 @@ impl<'a> Look<'a> {
         key: &Key,
         why: Use,
     ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
-        let (header, payload) = self.record(found, key)?;
+        let (header, payload, sealed) = self.record_sealed(found, key)?;
         let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
         let at = match found.place {
             Place::Pack(loc) => loc.offset,
@@ -1311,13 +1330,17 @@ impl<'a> Look<'a> {
         }
         let memo = !matches!(why, Use::Check);
         if !(memo && found.at.verified()) {
-            let hashed = content_of(&bytes);
-            if hashed != header.content {
-                // alloc: the error's message
-                return Err(corrupt(format!(
-                    "its bytes hash to {hashed:x}, not the {:x} recorded",
-                    header.content
-                )));
+            // A format-9 record's CRC, checked above, covered the bytes its value is made of:
+            // the BLAKE3 is the scrub's (`Use::Check`), and a format-8 record's.
+            if !(memo && whole_by_crc(&header, payload, sealed)) {
+                let hashed = content_of(&bytes);
+                if hashed != header.content {
+                    // alloc: the error's message
+                    return Err(corrupt(format!(
+                        "its bytes hash to {hashed:x}, not the {:x} recorded",
+                        header.content
+                    )));
+                }
             }
             if memo {
                 found.at.set_verified();
@@ -1330,8 +1353,9 @@ impl<'a> Look<'a> {
     }
 
     /// A hit of the own tier: its record's flag of use, and its pack's time of use, each
-    /// written only when it changes, so reading a record again writes no shared line.
-    fn was_read(self, found: Found<'a>) {
+    /// written only when it changes, so reading a record again writes no shared line. The one
+    /// mark of a read: [`crate::direct`]'s reads mark through it too.
+    pub(crate) fn was_read(self, found: Found<'a>) {
         if found.tier == 0 {
             found.at.set(Flag::Read);
             if let Place::Pack(loc) = found.place

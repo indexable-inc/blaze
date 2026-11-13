@@ -132,7 +132,8 @@ struct Real {
 /// becomes or waits for the program), and what the program printed, each read of its
 /// standard output with when it arrived.
 struct Running {
-    child: std::process::Child,
+    /// Killed and reaped on drop, so a revision that fails with a program running leaves none.
+    child: stdx::JodChild,
     started: Instant,
     printed: std::sync::Arc<std::sync::Mutex<Vec<(Instant, Vec<u8>)>>>,
     said: thread::JoinHandle<String>,
@@ -250,7 +251,8 @@ fn nothing_built(seen: &mut Observed, why: &str) {
 
 /// A process started and not yet waited for ([`Real::finish`]).
 struct Started {
-    child: std::process::Child,
+    /// Killed and reaped on drop, so a test that fails before [`Real::finish`] leaves none.
+    child: stdx::JodChild,
     stdout: thread::JoinHandle<String>,
     stderr: thread::JoinHandle<String>,
     began: Instant,
@@ -262,6 +264,10 @@ fn alive(pid: &str) -> bool {
 }
 
 impl Real {
+    #[expect(
+        blaze::tmp_path,
+        reason = "`/private/tmp`, not the `/tmp` link, keeps the daemon socket short and off any link, and the root is kept when the test panics (`keep`), which a TempDir cannot do"
+    )]
     fn new(test: &Test) -> Real {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // The daemon's socket is `<home>/v2.sock`, at most 104 bytes on macOS; and
@@ -296,7 +302,8 @@ impl Real {
     /// A `build` started and interrupted `after` milliseconds in, and waited for: its
     /// outcome is not read (it may have finished first).
     fn cancel(&self, args: &[&str], env: &BTreeMap<String, String>, after: u64) {
-        let mut child = self.command(args, env).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut child =
+            self.command(args, env).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(stdx::JodChild).unwrap();
         thread::sleep(Duration::from_millis(after));
         let _ = Command::new("kill").args(["-INT", &child.id().to_string()]).stderr(Stdio::null()).status();
         let began = Instant::now();
@@ -372,7 +379,8 @@ impl Real {
     /// `command` started, its output drained as it comes ([`Self::finish`] waits for it).
     fn start(&self, mut command: Command, what: &str) -> Started {
         let began = Instant::now();
-        let mut child = command.spawn().unwrap_or_else(|error| panic!("starting `{what}`: {error}"));
+        let mut child =
+            command.spawn().map(stdx::JodChild).unwrap_or_else(|error| panic!("starting `{what}`: {error}"));
         let stdout = drain(child.stdout.take().unwrap());
         let stderr = drain(child.stderr.take().unwrap());
         Started { child, stdout, stderr, began, what: what.to_owned() }
@@ -954,6 +962,7 @@ impl Real {
                 let mut child = self
                     .command(&args, env)
                     .spawn()
+                    .map(stdx::JodChild)
                     .unwrap_or_else(|error| panic!("{label}: starting {}: {error}", self.blaze.display()));
                 let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let (mut out, into) = (child.stdout.take().unwrap(), std::sync::Arc::clone(&printed));

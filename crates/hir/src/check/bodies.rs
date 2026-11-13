@@ -292,6 +292,10 @@ const KEPT_CHECKS: usize = 4096;
 /// them and the other is whole. Why here and not in the database: base-db cannot name hir's
 /// IDs, and a table by the database's nonce is how the other hosts keep what is one
 /// database's (hir-ty-codegen's kept walks).
+#[expect(
+    blaze::process_static,
+    reason = "an LRU capped at KEPT_CHECKS kept checks; a dropped database's stay until pushed out, so the database should own them once base-db can name hir's ids"
+)]
 static KEPT: Lock<Vec<(Of, Kept)>> = Lock::new("hir.check.kept", Vec::new());
 
 /// Takes the kept check of `of` out, if there is one.
@@ -439,6 +443,11 @@ struct Tables {
 impl Tables {
     /// The tables of a plan from `kept`: the touched modules, each with its whole list, and a
     /// task for each module and body `patch` visits.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a plan's starts are u32 into its bodies, which are not bounded below 2^32 \
+                  before this: a larger check needs a typed refusal where the plan is made"
+    )]
     fn patched(kept: &Kept, patch: &Patch<'_>) -> Tables {
         let mut tables = Tables {
             modules: Vec::with_capacity(patch.touched.len()),
@@ -763,6 +772,12 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// accepts of them, each with a task. With `memo` (a plan of every body that keeps) the
     /// lists are the database's ([`crate_file_modules`], [`module_bodies`]), so the engine
     /// names the ones an edit changes to the next plan.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a plan's crate ends and starts are u32 into its modules and bodies; the modules' \
+                  2^31 bound is asserted only after the crate ends are pushed and the bodies have \
+                  none: a larger check needs a typed refusal where the plan is made"
+    )]
     fn whole(db: &Db, crates: &[Crate], asked: &F, memo: bool) -> Tables {
         let mut modules = Vec::new();
         let mut crate_ends = Vec::with_capacity(crates.len());

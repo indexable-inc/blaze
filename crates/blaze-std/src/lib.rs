@@ -467,6 +467,7 @@ pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 /// (`Io::planted`) sets another.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), expect(dead_code, reason = "the planted bugs are made by the tests only"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 pub(crate) enum Plant {
     None,
     /// `Dir::subdir` keeps its parent's base: a narrowed directory reaches its parent.

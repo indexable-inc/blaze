@@ -234,6 +234,7 @@ impl<'a, 'db> InspectCandidate<'a, 'db> {
     /// Visit all nested goals of this candidate, rolling back
     /// all inference constraints.
     #[expect(dead_code, reason = "used in rustc")]
+    #[expect(blaze::unwired, reason = "rustc's proof-tree visit, ported ahead of a caller here")]
     fn visit_nested_in_probe<V: ProofTreeVisitor<'db>>(&self, visitor: &mut V) -> V::Result {
         self.goal.infcx.probe(|_| self.visit_nested_no_probe(visitor))
     }

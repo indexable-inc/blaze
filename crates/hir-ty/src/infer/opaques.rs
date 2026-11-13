@@ -32,6 +32,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 }
 
 #[expect(unused, reason = "rustc has this")]
+#[expect(blaze::unwired, reason = "ported from rustc ahead of the opaque-type check that would use it")]
 #[derive(Copy, Clone, Debug)]
 enum UsageKind<'db> {
     None,

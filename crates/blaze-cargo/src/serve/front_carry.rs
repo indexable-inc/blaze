@@ -843,7 +843,11 @@ pub(crate) mod bodies {
     }
 
     /// The owners of `def` whose MIR [`serve`] tries, in order: every place `entries::places`
-    /// gives (the body, then each closure and `async` coroutine in expression order).
+    /// gives (the body, then each closure and `async` coroutine in expression order). Read
+    /// from the body's lowering step (`hir_ty::body_store::lowering`), found by its key: no
+    /// inference runs to find them, and with a stored lowering no lowering either.
+    /// `entries::places` states why its places are the inference's, and `entries::run_mir`
+    /// refuses a body whose two lists differ.
     fn owner_places(db: &Db, def: DefWithBodyId) -> Vec<Place> {
         #[cfg(test)]
         if BODY_ONLY.get() {
@@ -1229,7 +1233,7 @@ pub(crate) mod bodies {
     pub(crate) fn kind_name(kind: ReadKind) -> &'static str {
         use blaze_item_hash::values::kinds as hashed;
         use blaze_items::kinds as items;
-        const FACTS: [(blaze_query::QueryKind, &str); 37] = [
+        const FACTS: [(blaze_query::QueryKind, &str); 39] = [
             (items::SIGNATURE, "signature"),
             (items::LAYOUT, "layout"),
             (items::FIELD, "field"),
@@ -1261,6 +1265,8 @@ pub(crate) mod bodies {
             (hashed::CRATE_ROOT, "crate root"),
             (hashed::STEP_INFER, "step infer"),
             (hashed::STEP_MIR, "step mir"),
+            (hashed::STEP_LOWER, "step lower"),
+            (hashed::INHERENT_ASSOC_TYPES, "inherent assoc types"),
             (hashed::MATCH_CHECK, "match check"),
             (hashed::TRAITS_IN_SCOPE, "traits in scope"),
             (hashed::WHOLE_SCOPE, "whole scope"),
@@ -1816,8 +1822,9 @@ pub(crate) mod bodies {
                         }
                     },
                     Step::Borrowck => Of::Borrowck,
-                    // A constant's value is the item store's record: claimed, counted, not kept.
-                    Step::Const => {
+                    // A constant's value and a lowering are the item store's records: claimed,
+                    // counted, not kept.
+                    Step::Const | Step::Lower => {
                         did.missed += 1;
                         continue;
                     }

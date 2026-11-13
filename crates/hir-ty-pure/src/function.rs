@@ -409,6 +409,11 @@ fn reach(
 
 /// The refusal of `rule` for `def` (at `index` of [`EFFECTS`]) of `root`, whose summary is
 /// `summary`: its witnesses followed down to where it is done.
+#[expect(
+    blaze::reads_positions,
+    reason = "the effects query keeps its refusal with each step's file, line and column: it must keep the \
+              spans, placed where the refusal is shown"
+)]
 fn refusal(
     cx: &Cx<'_>,
     def: &EffectDef,
@@ -492,6 +497,7 @@ const CHAIN: usize = 64;
 
 /// Where `span` of `instance`'s body is written: the body's own source when the span is of a
 /// body inlined into it.
+#[blaze::renders_positions]
 fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     let db = cx.db;
     // Read once, for a refusal's text, and dropped with it.

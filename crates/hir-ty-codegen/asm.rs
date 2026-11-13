@@ -1510,6 +1510,10 @@ impl Named {
 /// write another core sees and no hash of the text but `blaze_hash`'s; one that has not looks in
 /// the shared [`Table`] by its BLAKE3 hash, with loads alone.
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
+    #[expect(
+        blaze::process_static,
+        reason = "a per-thread memo of every asm text assembled, never pruned: it grows with the texts a process builds and needs a cap or a build-owned table"
+    )]
     thread_local! {
         /// What this thread had assembled for the triple it names, by text.
         static SEEN: RefCell<(String, HashMap<Box<str>, &'static Assembled, Global>)> =

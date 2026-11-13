@@ -246,9 +246,11 @@ impl AstId<ast::Macro> {
             };
             if let (Some((kept, file, hash)), Some(mut written)) = (kept, written) {
                 written.transparency(transparency);
-                // The transparency read the crate's cfg (a `cfg_attr` on the definition), which
-                // the tokens' key does not cover: such a definition is made from its source.
-                if read_cfg.get() {
+                // The transparency read the crate's cfg (a `cfg_attr` on the definition): the
+                // tokens' key takes the cfg wherever the definition's text names `cfg`
+                // (`stored::cfg_part`). A read the key does not cover is not kept.
+                if read_cfg.get() && stored::cfg_part(db, file, id.value.erase(), def_crate).is_none()
+                {
                     written.disown();
                 }
                 stored::keep(db, kept, file, id.value.erase(), def_crate, hash, written);

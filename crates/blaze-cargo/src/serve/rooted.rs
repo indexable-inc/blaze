@@ -93,8 +93,8 @@ mod tests {
             dir: name("home/v2/store"),
             layers: Vec::new(),
             tags: 1 << 40,
-            load_tags: (1 << 40) + (1 << 32),
-            loader: blaze_cas::Loader::Pumped,
+            load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+            loader: crate::serve::direct::pool::pumped(),
         };
         let mut effects = Vec::new();
         let mut store = blaze_cas::Store::open(config, &mut effects);

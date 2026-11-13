@@ -39,7 +39,7 @@ const TARGET: Target = Target {
         b"__.SYMDEF       ",
         b"#1/",
         b"/0              ",
-        b"0           0     0     644     ",
+        br"0           0     0     644     ",
         b"\x7fELF\x02\x01\x01",
     ],
     max_len: 1 << 16,

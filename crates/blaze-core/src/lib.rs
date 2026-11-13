@@ -45,6 +45,7 @@ pub mod cgroup;
 pub mod cores;
 pub mod create_process;
 pub mod decimal;
+mod descriptors;
 pub mod exit;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
@@ -87,7 +88,7 @@ pub mod reaped;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     unsafe_code,
-    reason = "a file mapped shared as atomic words, and the cross-process address waits on them"
+    reason = "a file mapped shared as atomic words; its waits are blaze_core::wait::wait_shared's"
 )]
 pub mod shared;
 pub mod signal;
@@ -99,6 +100,7 @@ pub mod sim;
 pub mod spans;
 mod sync;
 mod tags;
+pub mod temp;
 pub mod threads;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the io_uring driver: its mapped rings, buffers and system calls")]
@@ -115,6 +117,7 @@ use std::{fmt, time::Duration};
 pub use crate::journal::{
     Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
 };
+pub use crate::descriptors::Opens;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
 
@@ -349,6 +352,27 @@ pub enum Effect {
         file: FileName,
         at: u64,
         into: Span,
+        cache: Cache,
+        priority: Priority,
+        tag: Tag,
+    },
+    /// Every part of `parts` read as [`Effect::ReadInto`] reads one, all through `cache` at
+    /// `priority`, asked as one submission and told as one completion: [`Done::ReadMany`], the
+    /// asker's `parts` handed back with each part's [`ReadPart::got`] set. A part that fails
+    /// fails alone, its error naming its file and offset; the others are read. The store's
+    /// direct reader asks a page's records this way (blaze_cas::direct).
+    ///
+    /// How each driver serves it, against the floor of one system call a batch: io_uring puts
+    /// every part on the ring in one submission (one `io_uring_enter`); the threads, kqueue and
+    /// IOCP drivers read it on one file thread, a run of parts of one file each adjacent to the
+    /// last (`at` where the last ended) as one `preadv` on Unix, on the file's kept descriptor
+    /// (no open after its first). The simulation reads each part as it reads a `ReadInto`.
+    ///
+    /// The asker's contract is [`Effect::ReadInto`]'s for every part's span, and no two parts'
+    /// spans overlap (the threads' `preadv` checks it, failing the run's parts, naming both
+    /// spans). `parts` is not empty, and its parts' `got` are [`Got::Asked`].
+    ReadMany {
+        parts: Vec<ReadPart>,
         cache: Cache,
         priority: Priority,
         tag: Tag,
@@ -685,15 +709,23 @@ pub enum Effect {
         after: Duration,
         tag: Tag,
     },
-    /// The whole file mapped read-only into memory, shared with every other mapping of it
-    /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
+    /// `extent` of the file mapped read-only into memory, shared with every other mapping of it
+    /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`], whose
+    /// [`Mapping::bytes`] are exactly the extent's. A range is mapped from its offset rounded
+    /// down to the system's mapping granularity (a page; 64 KiB on Windows), and
+    /// [`Mapping::slack`] says how many bytes before it that took; nothing past its end is
+    /// shown. A range that runs past the file's length fails, naming the file, the range and the
+    /// length.
     ///
-    /// The asker's contract: while any [`Mapping`] of the file lives, no effect writes,
-    /// appends to or truncates that file in place; it is replaced only by renaming another
-    /// file over it, as the store and the image do. An in-place write would change bytes under
-    /// a live `&[u8]`, and a truncate would fault on the next read of the pages cut.
+    /// The asker's contract: while any [`Mapping`] of the file lives, the file may be appended
+    /// to, but the bytes below the length it had when mapped are never written again, and it is
+    /// never truncated; it is replaced only by renaming another file over it, as the store and
+    /// the image do. A write below that length would change bytes under a live `&[u8]`, and a
+    /// truncate would fault on the next read of the pages cut. An append changes nothing a
+    /// mapping shows: its bytes are past every mapping made before it.
     Map {
         file: FileName,
+        extent: Extent,
         tag: Tag,
     },
     /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
@@ -886,6 +918,7 @@ impl Effect {
             Effect::ReadAll { tag, .. }
             | Effect::Read { tag, .. }
             | Effect::ReadInto { tag, .. }
+            | Effect::ReadMany { tag, .. }
             | Effect::WriteFrom { tag, .. }
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
@@ -967,6 +1000,46 @@ pub enum Priority {
     /// `IOPRIO_CLASS_IDLE` (honoured under `mq-deadline` and BFQ), macOS's `IOPOL_THROTTLE` on
     /// the thread that reads it. Windows has no per-read class: there it fails, naming why.
     Idle,
+}
+
+/// One part of an [`Effect::ReadMany`]: `into.len` bytes at `at` of `file` read into the
+/// registered span `into`, and how that went.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: as `Effect`'s, tests' logs
+pub struct ReadPart {
+    pub file: FileName,
+    pub at: u64,
+    pub into: Span,
+    /// [`Got::Asked`] as asked; set by the driver.
+    pub got: Got,
+}
+
+impl ReadPart {
+    /// A part asked: `into.len` bytes at `at` of `file`.
+    pub fn asked(file: FileName, at: u64, into: Span) -> ReadPart {
+        ReadPart { file, at, into, got: Got::Asked }
+    }
+}
+
+/// How one [`ReadPart`] went.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error's message, in tests' logs
+pub enum Got {
+    /// Not read yet: as the asker hands it in.
+    Asked,
+    /// How many bytes of its span were read, from its first: fewer than the span only at the
+    /// end of the file.
+    Read(u32),
+    /// Why it was not read, naming its file and offset (and [`ABANDONED_SPAN`] where its span
+    /// is the kernel's still). The batch's other parts are not failed by it.
+    Failed(IoError),
+}
+
+/// What of a file an [`Effect::Map`] maps.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Extent {
+    /// All of it, at the length it has as it is mapped.
+    Whole,
+    /// `len` bytes at `at`, which lie inside the file.
+    Range { at: u64, len: u64 },
 }
 
 /// How [`Effect::Lock`] takes a file's lock.
@@ -1090,9 +1163,9 @@ pub struct Exit {
     pub peak_memory: u64,
 }
 
-/// A file mapped read-only by [`Effect::Map`]: its bytes, which stay as they are for as long
-/// as any clone of it lives (the store and the image only ever replace a file by renaming
-/// another over it, never write one in place).
+/// A file, or a range of one, mapped read-only by [`Effect::Map`]: its bytes, which stay as
+/// they are for as long as any clone of it lives (the store and the image only append to a file
+/// or replace it by renaming another over it, never write its bytes in place or cut it).
 #[derive(Clone)]
 pub struct Mapping(std::sync::Arc<Held>);
 
@@ -1120,16 +1193,29 @@ impl Mapping {
     /// The file at `path` mapped read-only and shared, as [`Effect::Map`] maps one, for a
     /// driver that maps outside a state machine (a shipped tree's texts, mapped once at a
     /// daemon's first use of the tree). The contract is [`Effect::Map`]'s: while the mapping
-    /// lives no one writes, appends to or truncates the file in place; it is only ever
-    /// replaced by renaming another over it.
+    /// lives the file may be appended to, but the bytes below the length it had when mapped are
+    /// never written again and it is never truncated; it is otherwise only ever replaced by
+    /// renaming another over it.
     pub fn map_file(path: &std::path::Path) -> std::io::Result<Mapping> {
         fs::map(path)
     }
 
+    /// The bytes of the extent mapped, exactly: nothing before its offset, nothing past its
+    /// length.
     pub fn bytes(&self) -> &[u8] {
         match &*self.0 {
             Held::File(mapped) => mapped.bytes(),
             Held::Copied(copied) => copied.bytes(),
+        }
+    }
+
+    /// The bytes mapped before the first of [`Mapping::bytes`]: a range's offset past the
+    /// system's mapping granularity (`blaze_core::fs::granularity`), which the mapping holds in
+    /// memory too. 0 for a whole file and for bytes copied.
+    pub fn slack(&self) -> usize {
+        match &*self.0 {
+            Held::File(mapped) => mapped.slack(),
+            Held::Copied(_) => 0,
         }
     }
 
@@ -1225,6 +1311,8 @@ pub enum Done {
     ReadInto {
         len: u32,
     },
+    /// Of an [`Effect::ReadMany`]: its parts, each with how it went.
+    ReadMany(Vec<ReadPart>),
     Appended,
     Synced,
     /// Of an [`Effect::Barrier`]: what was written to the file is ordered before what is

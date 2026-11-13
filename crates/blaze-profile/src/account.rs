@@ -90,7 +90,7 @@ impl Writer {
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
             | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
-            | "PagedDefMaps" | "PagedItems" | "FrozenKept" | "ScopeInput" | "ServedBodies"
+            | "PagedDefMaps" | "FrozenKept" | "ScopeInput" | "ServedBodies"
             | "SliceDirectory" | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
             // `CrateSlot` (base-db: one input a thing given to one crate) is written by a
             // plan and by blaze's own publications alike: its writes are attributed by the
@@ -110,7 +110,7 @@ impl Writer {
             // What blaze publishes of the crate from its own results, and the slot a served or
             // withdrawn dependency's entry has beside each of its maps.
             "CrateResolution" | "DirectorySlot" | "ImageSlot" | "DefMapSlot" | "LangItemsSlot"
-            | "PagesSlot" | "ImplTablesSlot" | "ItemPagesSlot" | "SurfaceSlot" | "RuntimeSlot"
+            | "PagesSlot" | "ImplTablesSlot" | "SurfaceSlot" | "RuntimeSlot"
             | "KeptSlot" => Writer::Derived,
             _ => Writer::Unattributed,
         }

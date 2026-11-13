@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use blaze_ids::rng::SplitMix64;
 use hegel::TestCase;
@@ -6,11 +6,8 @@ use hegel::generators as gs;
 
 use super::{Advice, MapOptions, Mapped};
 
-fn dir(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-core-mapped-{what}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn dir(what: &str) -> crate::temp::TempDir {
+    crate::temp::TempDir::for_test(&format!("blaze-core-mapped-{what}-"))
 }
 
 /// The safe reference: the file read whole.
@@ -174,8 +171,7 @@ fn a_mapping_is_the_file_read(tc: TestCase) {
     let populate = tc.draw(gs::booleans());
     let huge = tc.draw(gs::booleans());
     let advice: usize = tc.draw(gs::integers().max_value(3));
-    let dir = std::env::temp_dir().join(format!("blaze-core-mapped-prop-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir("prop");
     let path = dir.join(format!("{:016x}", name_of(&bytes)));
     std::fs::write(&path, &bytes).unwrap();
     let options = MapOptions::new().populate(populate).huge_pages(huge).advise(ADVICE[advice]);
@@ -191,4 +187,32 @@ fn name_of(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// A range maps exactly its bytes: from an offset off the granularity, the slack is how far past
+/// it the offset is, the slice is the range's bytes and nothing past its length; a range past the
+/// file's end is refused, naming the range and the length.
+#[test]
+fn a_range_maps_its_bytes_and_nothing_past_its_length() {
+    let dir = dir("range");
+    let path = dir.join("pack");
+    let granule = super::granularity();
+    let len = 3 * granule + 123;
+    let bytes = pattern(len, 7);
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    for (at, take) in [(0, 1), (1, 10), (granule - 1, 2), (granule, granule), (granule + 77, 2 * granule), (len - 5, 5)] {
+        // SAFETY: the test's own file, never written again.
+        let mapped = unsafe { MapOptions::new().map_range(&file, at as u64, take as u64) }.unwrap();
+        assert_eq!(mapped.bytes(), &bytes[at..at + take], "{take} bytes at {at}");
+        assert_eq!(mapped.len(), take, "nothing past the range's length is shown");
+        assert_eq!(mapped.slack(), at % granule, "the slack is the offset past the granularity");
+    }
+    // SAFETY: as above; nothing is mapped.
+    let past = unsafe { MapOptions::new().map_range(&file, (len - 4) as u64, 5) }.unwrap_err();
+    let said = past.to_string();
+    assert!(said.contains(&format!("5 bytes at {}", len - 4)) && said.contains(&len.to_string()), "{said}");
+    // SAFETY: as above.
+    let whole = unsafe { Mapped::map(&file) }.unwrap();
+    assert_eq!((whole.bytes(), whole.slack()), (&bytes[..], 0));
 }

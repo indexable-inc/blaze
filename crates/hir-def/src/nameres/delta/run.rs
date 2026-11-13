@@ -319,6 +319,10 @@ fn reads_an_unnamed_file(op: &DeclOp) -> bool {
     matches!(op, DeclOp::ResolvedMacroPath { def, .. } if def.is_include_like() && !def.is_include())
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "a group's diagnostics are counted in u32; a group with 2^32 diagnostics needs a typed refusal where it collects them"
+)]
 fn diagnostic_count(out: &GroupOut) -> u32 {
     u32::try_from(out.diagnostics.len()).expect("a group has 2^32 diagnostics")
 }

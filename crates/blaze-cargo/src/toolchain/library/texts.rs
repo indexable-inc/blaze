@@ -63,9 +63,8 @@ pub(crate) struct Entry {
     /// `/`-separated, from the tree's directory, with no empty, `.` or `..` part.
     pub path: String,
     pub mode: Mode,
-    /// Its text's content id, as the VFS gives it: what a mount will take in place of hashing
-    /// each text again (`Tree::file_with`; track 6c's cut 2), checked by the tests today.
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by the tests until the mount takes it"))]
+    /// Its text's content id, as the VFS gives it: what the mount takes in place of hashing
+    /// each text again (`Vfs::apply_known_files`).
     pub id: ContentId,
     /// Where its text is, from the file's start.
     pub at: u64,

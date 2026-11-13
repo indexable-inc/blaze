@@ -17,6 +17,5 @@ max_written = 400
 max_ran = { item_tree = 0, parse_macro_expansion = 0, macro_expand = 0, crate_local_def_map = 0 }
 
 [revision.known]
-max_executed = "a new home resolves the project's crate from source, and a unit's record is found only by an identity that needs its crate resolved (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", steps 5 and 7; pieces E and F)"
-max_written = "a new database is written every file of every package of the plan (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 3; pieces A to D)"
-max_ran = "a workspace crate has no records: `eligible` refuses a local crate (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", step 5; piece E)"
+max_executed = "a unit's record is found only by an identity made from its crate's texts, read and parsed in the new home (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece F: waits for content-keys-1112's record key)"
+max_written = "a new database is still written every file of every package of the plan: a source root is not yet declared from its found record (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", piece D)"

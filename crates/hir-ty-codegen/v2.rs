@@ -60,7 +60,7 @@ pub(crate) mod wasm;
 pub use crate::llvm::pgo::Profile;
 pub use allocator::allocations_unobserved;
 pub use backend::Backends;
-pub use frontend::{BodyChecks, Databases, HirFrontend, kept_walks, let_go_kept_walks};
+pub use frontend::{BodyChecks, Databases, HirFrontend, Walks, kept_walks};
 pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
 pub use linked::{Assumed, InputsWork, LinkInputs, Table, span_table_id, span_tables_of};

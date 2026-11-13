@@ -21,7 +21,9 @@
 //!     superseded_by: path#anchor, relative to the doc as a link is, for a superseded doc alone
 //!
 //! `current` says how blaze is now and is kept true: its links and anchors resolve, the repository
-//! paths it names in backticks exist, and the BLAZE_* settings it names are in the code. A `plan`
+//! paths it names in backticks exist, and the BLAZE_* settings it names are in the code. The
+//! other way round, a BLAZE_* setting blaze's own code reads (`reads`: a `"BLAZE_X"` literal in a
+//! non-test source file under crates/ or harness/) is named by some doc under docs/. A `plan`
 //! is a design not (fully) built, dated: its links and anchors resolve, but it may name paths
 //! still to come. A `record` was true on its date and is never brought up to date: only the files
 //! it links have to exist. A `superseded` doc names what replaced it and is left out of the
@@ -672,6 +674,45 @@ fn allowed_now(root: &Path) -> Vec<String> {
     allowed(&read_text(&root.join("tools").join("python-allowed.txt")).unwrap_or_default())
 }
 
+/// Whether `path` is a source file of blaze itself whose settings a person sets: under crates/
+/// or harness/, and not a test, a bench, an example, a build script or a frontend case (a
+/// program blaze builds, whose variables are its own). demo/ is left out for the same reason.
+fn own_source(path: &str) -> bool {
+    const OUT: [&str; 4] = ["/tests/", "/benches/", "/examples/", "/cases/"];
+    path.ends_with(".rs")
+        && (path.starts_with("crates/") || path.starts_with("harness/"))
+        && !OUT.iter().any(|it| path.contains(it))
+        && !path.ends_with("_tests.rs")
+        && !path.ends_with("/tests.rs")
+        && !path.ends_with("/build.rs")
+}
+
+/// The BLAZE_* settings a source file reads: each name that is a whole string literal
+/// (`"BLAZE_X"`, what `std::env::var`, `option_env!` or a settings const is given), before the
+/// file's first `#[cfg(test)]` line, where its test module starts. A name inside a longer
+/// string is a message about a setting, not a read of one.
+fn reads<'t>(p: &Patterns, text: &'t str) -> Vec<&'t str> {
+    let code = match text.find("\n#[cfg(test)]") {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    p.settings(code)
+        .into_iter()
+        .filter(|name| {
+            let at = name.as_ptr() as usize - code.as_ptr() as usize;
+            code[..at].ends_with('"') && code[at + name.len()..].starts_with('"')
+        })
+        .collect()
+}
+
+/// Each setting read in code (with the first file that reads it) that no doc names.
+fn undocumented(read: &BTreeMap<String, String>, documented: &BTreeSet<&str>) -> Vec<String> {
+    read.iter()
+        .filter(|(name, _)| !documented.contains(name.as_str()))
+        .map(|(name, path)| format!("{path}: reads {name}, which no doc under docs/ names"))
+        .collect()
+}
+
 fn check(root: &Path, p: &Patterns) -> Vec<String> {
     let (docs, mut errors) = load(root, p);
     // A check of no doc holds nothing (agents.json A39, vacuous success): the wrong root, or a
@@ -681,6 +722,7 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
     }
     errors.extend(python_problems(&python_files(root), &allowed_now(root)));
     let mut settings: BTreeSet<String> = BTreeSet::new();
+    let mut read: BTreeMap<String, String> = BTreeMap::new();
     for path in tracked(root) {
         if NOT_OURS.iter().any(|ours| path.starts_with(ours)) {
             continue;
@@ -689,6 +731,11 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
         let markdown = path.ends_with(".md");
         if !markdown && text.contains("BLAZE_") {
             settings.extend(p.settings(&text).into_iter().map(str::to_owned));
+            if own_source(&path) {
+                for name in reads(p, &text) {
+                    read.entry(name.to_owned()).or_insert_with(|| path.clone());
+                }
+            }
         }
         // Most files name no doc: the substring search skips them, and every line but the
         // few that hold `docs/`, before any regex runs.
@@ -707,6 +754,11 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
             }
         }
     }
+    // Any doc, of any status, documents a setting, fenced examples too (`body` has its fences
+    // blanked, so each doc is read whole): a plan names the ones it adds.
+    let whole: Vec<String> = docs.iter().filter_map(|doc| read_text(&root.join(&doc.path))).collect();
+    let documented: BTreeSet<&str> = whole.iter().flat_map(|text| p.settings(text)).collect();
+    errors.extend(undocumented(&read, &documented));
     let mut cache = BTreeMap::new();
     for doc in &docs {
         let Some(front) = &doc.front else { continue };
@@ -835,6 +887,37 @@ fn selftest(p: &Patterns) {
         p.settings("BLAZE_HOME, BLAZE_X_ (BLAZE_A_B) BLAZE_*, BLAZE_FOO* xBLAZE_NO BLAZE_lower")
             == ["BLAZE_HOME", "BLAZE_A_B"],
         "a setting is a whole BLAZE_ name, not a prefix of one or a glob",
+    );
+    // Both directions of a setting: one read in code is named by a doc (a doc's setting that no
+    // code reads is refused in `check`, over the tree).
+    let source = "let a = var(\"BLAZE_READ\");\nlet m = \"set BLAZE_MESSAGE to 1\";\nx(\"BLAZE_TWO\")\n#[cfg(test)]\nmod tests { var(\"BLAZE_TEST_ONLY\") }\n";
+    expect(
+        reads(p, source) == ["BLAZE_READ", "BLAZE_TWO"],
+        "a read is a whole string literal before the test module, not a name in a message",
+    );
+    let read: BTreeMap<String, String> = [("BLAZE_READ", "crates/a/src/lib.rs"), ("BLAZE_TWO", "crates/a/src/lib.rs")]
+        .iter()
+        .map(|(name, path)| ((*name).to_owned(), (*path).to_owned()))
+        .collect();
+    expect(
+        undocumented(&read, &["BLAZE_READ", "BLAZE_TWO"].into_iter().collect()).is_empty(),
+        "settings that a doc names hold",
+    );
+    expect(
+        undocumented(&read, &["BLAZE_READ"].into_iter().collect())
+            == ["crates/a/src/lib.rs: reads BLAZE_TWO, which no doc under docs/ names"],
+        "a setting read in code that no doc names is refused, naming the file",
+    );
+    expect(
+        own_source("crates/a/src/lib.rs")
+            && own_source("harness/x/src/main.rs")
+            && !own_source("crates/a/src/lib_tests.rs")
+            && !own_source("crates/a/tests/t.rs")
+            && !own_source("crates/a/build.rs")
+            && !own_source("harness/v2/frontend/cases/c/main.rs")
+            && !own_source("demo/life/src/window.rs")
+            && !own_source("scripts/src/bin/docs.rs"),
+        "a setting is read by blaze's own non-test sources",
     );
     // Written with `{d}` so that this file names no doc that `check` would look for.
     let d = "docs";

@@ -539,6 +539,11 @@ fn hung(why: &str) -> ! {
 
 /// Says `why` on stderr itself (an abort ends nothing the harness keeps), with a sample of the
 /// process where `sample` exists, and aborts.
+#[expect(
+    blaze::tmp_path,
+    reason = "the sample is read by a person after the abort, so it must outlive the process that a \
+              TempDir would remove it with; it belongs in the run's own output directory once the oracle has one"
+)]
 fn sample_and_abort(why: &str) -> ! {
     let pid = std::process::id();
     let sampled = std::env::temp_dir().join(format!("blaze-oracle-hang-{pid}.txt"));

@@ -105,7 +105,8 @@ mod tests {
     /// the descriptor kept open) is let go at once, not when that copy closes.
     #[test]
     fn a_dropped_lock_is_let_go_while_a_copy_of_its_file_is_open() {
-        let path = std::env::temp_dir().join(format!("stdx-file-lock-{}", std::process::id()));
+        let dir = blaze_core::temp::TempDir::for_test("stdx-file-lock-");
+        let path = dir.join("lock");
         let open = || {
             OpenOptions::new()
                 .read(true)

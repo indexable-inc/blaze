@@ -1,4 +1,12 @@
-//! Native targets: corosensei's fibers, each on a machine stack with a guard page below it.
+//! Native targets: corosensei's fibers, each on a machine stack with a guard below it.
+//!
+//! On Unix a fiber's stack is a sparse [`Region`] of blaze-mem's ([`Stack`]), so what it holds
+//! is in the memory gate's count (`blaze_mem::gate`, tag [`Tag::Frames`]): its top
+//! [`STANDING`] bytes are counted as it is made, and each deeper 64 KiB as the fiber is seen to
+//! reach it, at its switches out ([`Touch::note`]), through [`Region::reuse`], which asks the
+//! gate first. What a fiber touches below what is counted between two suspends is the one
+//! window the count trails; it is counted at the next suspend. Windows keeps corosensei's
+//! `DefaultStack`, uncounted: its stacks need the thread block's fields corosensei keeps.
 
 use std::{
     cell::Cell,
@@ -7,10 +15,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use corosensei::{
-    Coroutine, CoroutineResult,
-    stack::{DefaultStack, Stack as _},
-};
+#[cfg(not(unix))]
+use corosensei::stack::{DefaultStack, Stack as _};
+use corosensei::{Coroutine, CoroutineResult};
 
 use super::{RESIDENT, Resumed};
 
@@ -18,15 +25,31 @@ use super::{RESIDENT, Resumed};
 /// on, so a depth is never under what the kernel committed for it.
 const TOUCH_PAGE: usize = 4 << 10;
 
+/// The unit a stack is reserved, guarded and counted to the gate in: blaze-mem's sparse
+/// granule, so each range is whole pages on every page size blaze runs on.
+#[cfg(unix)]
+const GRANULE: usize = 64 << 10;
+/// The guard below a stack: inaccessible, so an overflow past `stdx::ensure_sufficient_stack`
+/// faults rather than writes another mapping.
+#[cfg(unix)]
+const GUARD: usize = GRANULE;
+/// What a stack is counted at as it is made: the frames every fiber's first call touches.
+#[cfg(unix)]
+const STANDING: usize = GRANULE;
+
 /// How deep a fiber's stack was seen to go, at its switches out ([`Yielder::suspend`]): the
 /// bytes from its base to the page of the deepest frame that suspended, what its share of
 /// [`super::resident`] is. A lower bound of what the stack committed: a recursion that
-/// returned before any suspend is not seen.
+/// returned before any suspend is not seen. On Unix it owns the stack's mapping, whose count to
+/// the gate it grows to that depth.
 struct Touch {
     /// The stack's base, its highest address.
     base: usize,
     /// Bytes counted into [`RESIDENT`] for it.
     held: AtomicU64,
+    /// The stack's mapping: what the gate counts of it is its `held`, from the top down.
+    #[cfg(unix)]
+    region: blaze_mem::Region,
 }
 
 impl Touch {
@@ -38,6 +61,31 @@ impl Touch {
             // Written by the thread that runs the fiber alone, as it switches out.
             self.held.store(held, Ordering::Relaxed);
             RESIDENT.fetch_add(held - before, Ordering::Relaxed);
+        }
+        #[cfg(unix)]
+        self.count_to(held as usize);
+    }
+
+    /// Counts the stack to the gate down to `depth` bytes below its base, in whole granules:
+    /// the bytes past what it counted, through [`blaze_mem::Region::reuse`]. The fiber is
+    /// already on those pages, so a gate that refuses them fails the job that grew its stack
+    /// there, naming it (rule panics-fail-one-job): the pages leave the process with the
+    /// stack, and the gate never counts less than the job went on holding.
+    #[cfg(unix)]
+    fn count_to(&self, depth: usize) {
+        let reserved = self.region.reserved();
+        let counted = self.region.held();
+        let need = depth.next_multiple_of(GRANULE).min(reserved - GUARD);
+        if need <= counted {
+            return;
+        }
+        if let Err(error) = self.region.reuse(reserved - need, need - counted) {
+            panic!(
+                "a fiber's stack reached {depth} B deep, past the {counted} B the memory gate \
+                 counted for it, and the gate refused the {} B more: {error} (blaze-graph \
+                 sched/stack/native.rs, rule no-fallback)",
+                need - counted
+            );
         }
     }
 }
@@ -63,32 +111,92 @@ fn note_depth() {
     }
 }
 
-/// A fiber's stack: `bytes` reserved (committed as touched), with a guard page below.
+/// A fiber's stack: `bytes` reserved (committed as touched), with a guard below. On Unix a
+/// sparse region of blaze-mem's ([`Touch::count_to`]), on base pages only: a fiber touches its
+/// top few pages, and under the host setting `transparent_hugepage=always` each fiber would
+/// otherwise hold 2 MiB from its first call.
 pub struct Stack {
+    #[cfg(unix)]
+    region: blaze_mem::Region,
+    #[cfg(not(unix))]
     stack: DefaultStack,
     bytes: usize,
 }
 
 impl Stack {
-    /// The stack is kept on base pages: a fiber touches its top few pages, and under the host
-    /// setting `transparent_hugepage=always` each fiber would otherwise hold 2 MiB from its
-    /// first call.
+    /// A stack of at least `bytes` above its guard. On Unix its top [`STANDING`] bytes are
+    /// counted to the gate now: the floor of a fiber's start, one reservation, one `mprotect`
+    /// and the gate's one compare-and-swap.
+    ///
+    /// # Errors
+    ///
+    /// Where the address space cannot be reserved, the guard cannot be set, or the gate
+    /// refuses the standing bytes, each naming the stack.
+    #[cfg(unix)]
     pub fn new(bytes: usize) -> io::Result<Stack> {
-        let stack = Stack { stack: DefaultStack::new(bytes)?, bytes };
-        let limit = std::ptr::NonNull::new(std::ptr::without_provenance_mut::<u8>(stack.limit()))
-            .ok_or_else(|| io::Error::other("corosensei gave a stack at address 0"))?;
-        // SAFETY: `[limit, base)` is the stack's usable range, mapped by `DefaultStack` and
-        // owned by it, alive while `stack` is; advice changes no contents.
-        unsafe { blaze_mem::huge::keep_base_pages(limit, bytes) };
-        Ok(stack)
+        let bytes = bytes.max(STANDING).next_multiple_of(GRANULE);
+        let region = blaze_mem::Region::reserve_sparse(GUARD + bytes, blaze_mem::Tag::Frames)
+            .map_err(io::Error::other)?; // alloc: error path
+        let low = region.base().as_ptr();
+        // SAFETY: the reservation's lowest `GUARD` bytes, its own, which nothing has used.
+        if unsafe { libc::mprotect(low.cast(), GUARD, libc::PROT_NONE) } != 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                // alloc: error path
+                format!("mprotect of a fiber stack's guard at {low:p} ({GUARD} B): {error}"),
+            ));
+        }
+        let top = region.reserved();
+        region.reuse(top - STANDING, STANDING).map_err(io::Error::other)?; // alloc: error path
+        Ok(Stack { region, bytes: top - GUARD })
     }
 
-    /// The lowest usable address: the stack has at least `bytes` above its guard page, which
+    #[cfg(not(unix))]
+    pub fn new(bytes: usize) -> io::Result<Stack> {
+        Ok(Stack { stack: DefaultStack::new(bytes)?, bytes })
+    }
+
+    /// The stack's base, its highest address.
+    fn base(&self) -> usize {
+        #[cfg(unix)]
+        return self.region.base().as_ptr().addr() + self.region.reserved();
+        #[cfg(not(unix))]
+        return self.stack.base().get();
+    }
+
+    /// The lowest usable address: the stack has at least `bytes` above its guard, which
     /// corosensei's `Stack::limit` counts in.
     pub fn limit(&self) -> usize {
-        self.stack.base().get() - self.bytes
+        self.base() - self.bytes
     }
 }
+
+/// What corosensei switches to: a [`Stack`]'s bounds, the mapping itself kept by its fiber's
+/// [`Touch`], which outlives the coroutine.
+#[cfg(unix)]
+struct Machine {
+    base: corosensei::stack::StackPointer,
+    limit: corosensei::stack::StackPointer,
+}
+
+// SAFETY: `[limit, base)` is a mapping its fiber's `Touch` owns and drops only after the
+// coroutine (`Stackful`'s drop), or never (a coroutine leaked mid-job leaks both); `base` is a
+// whole granule's end and `limit` its start, aligned past `STACK_ALIGNMENT`; `limit` is the
+// guard's start, which the trait counts in.
+#[cfg(unix)]
+unsafe impl corosensei::stack::Stack for Machine {
+    fn base(&self) -> corosensei::stack::StackPointer {
+        self.base
+    }
+
+    fn limit(&self) -> corosensei::stack::StackPointer {
+        self.limit
+    }
+}
+
+#[cfg(not(unix))]
+type Machine = DefaultStack;
 
 /// A fiber's handle on itself, given to its body: [`Yielder::suspend`] switches it out. Its
 /// `suspend` is the root of the may-suspend check (hir-ty-suspend finds
@@ -114,7 +222,7 @@ impl<I, O> Yielder<I, O> {
 /// A coroutine that is never dropped suspended mid-job: such a one is leaked, stack and all.
 /// Dropping it would force-unwind the job, whose own `catch_unwind` swallows corosensei's
 /// unwind and goes on into code that panics, and corosensei aborts the process on that panic.
-pub struct Stackful<I, O>(ManuallyDrop<Coroutine<I, O, (), DefaultStack>>, Box<Touch>);
+pub struct Stackful<I, O>(ManuallyDrop<Coroutine<I, O, (), Machine>>, ManuallyDrop<Box<Touch>>);
 
 impl<I, O> Stackful<I, O> {
     /// `_fiber` is the fiber's number, which wasm's layer names in its panics; corosensei's
@@ -128,11 +236,22 @@ impl<I, O> Stackful<I, O> {
         I: 'static,
         O: 'static,
     {
+        let base = stack.base();
+        #[cfg(unix)]
+        let (machine, touch) = {
+            let at = |addr: usize| {
+                corosensei::stack::StackPointer::new(addr).expect("a mapped stack is not at 0")
+            };
+            let machine = Machine { base: at(base), limit: at(stack.region.base().as_ptr().addr()) };
+            (machine, Touch { base, held: AtomicU64::new(0), region: stack.region })
+        };
+        #[cfg(not(unix))]
+        let (machine, touch) = (stack.stack, Touch { base, held: AtomicU64::new(0) });
         // alloc: a fiber's own, made with its stack: boxed, so a resume can point at it
-        let touch = Box::new(Touch { base: stack.stack.base().get(), held: AtomicU64::new(0) });
+        let touch = ManuallyDrop::new(Box::new(touch));
         Stackful(
             ManuallyDrop::new(Coroutine::with_stack(
-                stack.stack,
+                machine,
                 move |yielder: &corosensei::Yielder<I, O>, first| body(Yielder::of(yielder), first),
             )),
             touch,
@@ -144,7 +263,7 @@ impl<I, O> Stackful<I, O> {
     #[inline]
     pub fn resume(&mut self, input: I) -> Resumed<O> {
         // A fiber may resume another: the outer one's is put back as this one switches back.
-        let outer = TOUCHING.replace(std::ptr::from_ref(&*self.1));
+        let outer = TOUCHING.replace(std::ptr::from_ref(&**self.1));
         let resumed = self.0.resume(input);
         TOUCHING.set(outer);
         match resumed {
@@ -161,6 +280,9 @@ impl<I, O> Drop for Stackful<I, O> {
             unsafe { ManuallyDrop::drop(&mut self.0) };
             // Its stack is unmapped: its pages are no longer the process's.
             RESIDENT.fetch_sub(self.1.held.load(Ordering::Relaxed), Ordering::Relaxed);
+            // SAFETY: dropped once, here, after the coroutine that ran on its mapping; on Unix
+            // the mapping goes with it, and its count leaves the gate.
+            unsafe { ManuallyDrop::drop(&mut self.1) };
         }
         // A coroutine leaked mid-job keeps its stack mapped, and counted.
     }
@@ -281,4 +403,56 @@ pub fn give_back_below_here() -> io::Result<usize> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn give_back_below_here() -> io::Result<usize> {
     Ok(0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Recurses `depth` frames of 16 KiB each, writing every one, then suspends from the
+    /// deepest.
+    #[inline(never)]
+    fn deep(yielder: &Yielder<(), ()>, depth: usize) -> u8 {
+        let mut frame = [0u8; 16 << 10];
+        std::hint::black_box(&mut frame).fill(depth as u8);
+        if depth == 0 {
+            yielder.suspend(());
+            return frame[0];
+        }
+        let below = deep(yielder, depth - 1);
+        std::hint::black_box(&frame)[100].wrapping_add(below)
+    }
+
+    /// The invariant: a fiber's stack is in the gate's count from its start, by its standing
+    /// bytes, and as deep as it is seen to reach at each suspend; its count leaves with it.
+    /// 2 MiB of frames suspended from leave the stack's region holding at least 2 MiB; a fresh
+    /// stack holds exactly [`STANDING`]. The control, by removing the cause: a fiber that
+    /// suspends at once holds no more than its standing bytes, so the 2 MiB is the recursion's.
+    #[test]
+    fn a_fiber_stack_is_counted_as_deep_as_it_reaches() {
+        const DEPTH: usize = 2 << 20;
+        let stack = Stack::new(16 << 20).expect("a fiber stack");
+        assert_eq!(stack.region.held(), STANDING, "counted at start");
+        assert_eq!(stack.limit() - stack.region.base().as_ptr().addr(), GUARD);
+        for (frames, at_least, at_most) in
+            [(DEPTH / (16 << 10), DEPTH, 16 << 20), (0, STANDING, STANDING)]
+        {
+            let stack = Stack::new(16 << 20).expect("a fiber stack");
+            let mut fiber: Stackful<(), ()> =
+                Stackful::new(stack, 0, move |yielder: &Yielder<(), ()>, ()| {
+                if frames == 0 {
+                    yielder.suspend(());
+                } else {
+                    std::hint::black_box(deep(yielder, frames));
+                }
+            });
+            assert!(matches!(fiber.resume(()), Resumed::Yield(())));
+            let held = fiber.1.region.held();
+            assert!(
+                (at_least..=at_most).contains(&held),
+                "{frames} frames deep, the stack's count is {held} B, not in {at_least}..={at_most}"
+            );
+            assert!(matches!(fiber.resume(()), Resumed::Return));
+        }
+    }
 }

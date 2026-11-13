@@ -111,11 +111,6 @@ pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str(frozen::ENCODING),
 ]);
 
-/// The domain of an item's key ([`key::Key`]): what a record whose entries are found by such
-/// keys names in its own key (`deps::items_key`).
-pub(crate) fn key_domain() -> &'static str {
-    key::KEY_DOMAIN
-}
 
 /// The schema of one record's buffer.
 const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[

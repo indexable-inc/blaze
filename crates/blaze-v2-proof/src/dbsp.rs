@@ -295,6 +295,10 @@ fn index<C: Columns>(c: &C, key: &QueryKey) -> Option<usize> {
 /// what they did before. Each counted kind's keys are read once, `after`'s sliced keys once, and
 /// `after`'s reruns are joined once against `before`, found a bitset word at a time. Owned traces
 /// and [`crate::wire::View`]s of mapped files are read alike, so a check copies no column.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the keys that reran are a subset of one trace's keys, which a trace indexes by u32, so their count fits a u32"
+)]
 pub fn check<A: Columns, B: Columns>(
     case: &Case,
     touched: Touched,

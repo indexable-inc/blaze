@@ -549,6 +549,10 @@ mod trees {
     /// The maps of an anchor of a file: the anchor as in [`Kept`], and the file it is of.
     type KeptMaps = (Weak<FlatTree>, view::NodeId, HirFileId, AnchorMaps);
 
+    #[expect(
+        blaze::process_static,
+        reason = "per-thread memo rings capped at KEPT trees and KEPT_MAPS maps, the oldest evicted"
+    )]
     thread_local! {
         static TREES: RefCell<VecDeque<Kept>> = const { RefCell::new(VecDeque::new()) };
         static MAPS: RefCell<VecDeque<KeptMaps>> = const { RefCell::new(VecDeque::new()) };
@@ -631,6 +635,24 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
         )
     };
     <ItemBodySyntax<'_> as blaze_query::db::FromId>::from_id(id).syntax(db)
+}
+
+/// Whether a read of the row named `name` ([`file_body_syntax`], or an [`ItemBodySyntax`]'s
+/// `syntax`) with key `key` is a read of `def`'s own syntax, for whoever records what a body's
+/// lowering read (the item store's lowering step, `blaze_item_hash::reads`): the rows are
+/// private to this module. The file's table is a handle (each item's id there names it for as
+/// long as it is in the file); an item's `syntax` is its own text, which the key the lowering
+/// is filed under hashes. `false` for any other row, another file's table or another item's
+/// syntax, and for a body that is not written in a file outside fn bodies (found by
+/// [`placed_body_syntax`], whose key is the body itself).
+pub fn own_syntax_read(db: &Db, def: DefWithBodyId, name: &str, key: blaze_query::db::Id) -> bool {
+    let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
+    let Some(file) = file_id.file_id() else { return false };
+    match name {
+        "file_body_syntax" => blaze_query::db::AsId::as_id(&file) == key,
+        "syntax" => !ast_id.in_body() && file_body_syntax(db, file).get(&ast_id) == Some(&key),
+        _ => false,
+    }
 }
 
 /// The [`BodySyntax`] of one item of a file with a body outside fn bodies, set by

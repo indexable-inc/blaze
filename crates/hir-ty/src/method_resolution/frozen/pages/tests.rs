@@ -18,7 +18,9 @@ use intern::Symbol;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
 use std::alloc::Global;
 
-use super::{HEADER, SCANS_FOR_ABSENT, WRITES_NO_ROW_SLOT, encode, read_head};
+use super::{
+    HEADER, SCANS_FOR_ABSENT, WRITES_NO_ROW_SLOT, WRITES_NO_SELF_SLOT, encode, read_head,
+};
 use crate::{
     method_resolution::{
         CandidateId, InherentImpls, SelfTyKey, TraitImpls,
@@ -234,6 +236,29 @@ fn answers(db: &Db, krate: Crate, narrow: bool) -> Vec<Vec<u8>> {
             out.push(print_impls(db, krate, "blanket", key, &blanket));
             let of_trait = TraitImpls::for_crate_and_trait(db, krate, trait_);
             for (self_ty, (impls, derives)) in table.rows_at(t) {
+                // Every trait impl for the row's type: from the type's entry and its rows, or
+                // from the whole table, as `hir`'s `Impl::all_for_type` asks.
+                let mut of_self = Vec::new();
+                let mut push = |it: Either<ImplId, BuiltinDeriveImplId>| {
+                    of_self.push(print(db, krate, |enc| {
+                        enc.str("for self")?;
+                        write_simplified(enc, self_ty)?;
+                        match it {
+                            Either::Left(it) => enc.impl_id(it),
+                            Either::Right(it) => enc.builtin_derive_impl(it),
+                        }
+                    }))
+                };
+                match narrow {
+                    true => super::for_self_ty(db, krate, self_ty, &mut push),
+                    false => table.for_self_ty(self_ty, |run| match run {
+                        Either::Left(impls) => impls.iter().for_each(|&it| push(Either::Left(it))),
+                        Either::Right(derives) => {
+                            derives.iter().for_each(|&it| push(Either::Right(it)))
+                        }
+                    }),
+                }
+                out.extend(of_self);
                 if !narrow {
                     out.push(print_row(db, krate, trait_, self_ty, impls, derives));
                     continue;
@@ -261,6 +286,10 @@ fn answers(db: &Db, krate: Crate, narrow: bool) -> Vec<Vec<u8>> {
                 let absent = SelfTyKey(S::Tuple(9));
                 let none = TraitImpls::in_crate_for_trait_and_self_ty(db, krate, trait_, absent);
                 assert!(none.is_empty(), "{trait_:?} for a tuple of nine: {none:?}");
+                // A type no trait has an impl for: nothing, from the type's slot.
+                super::for_self_ty(db, krate, &S::Tuple(9), |it| {
+                    panic!("a trait impl for a tuple of nine: {it:?}")
+                });
             }
         }
         let inherent = InherentImpls::for_crate(db, krate);
@@ -349,6 +378,55 @@ fn the_oracle_catches_rows_written_with_no_slot() {
     assert!(!matches!(caught, Ok(Ok(()))), "the oracle passed rows no reader can find");
 }
 
+/// A crate that declares a `#[blaze::sealed]` trait, and a member.
+const SEALED: &str = r#"
+//- minicore: sized, copy, clone
+//- /main.rs crate:main deps:lib
+fn main() {}
+//- /lib.rs crate:lib
+#[blaze::sealed]
+pub trait Closed {}
+pub struct Mine;
+impl Closed for Mine {}
+"#;
+
+/// Whether a served crate declares a sealed trait is its pages' header: what the walk of the
+/// crate resolved from source says, read with no module scope and no table.
+#[test]
+fn a_served_crate_says_from_its_header_whether_it_declares_a_sealed_trait() {
+    for (text, declares) in [(SEALED, true), (FIXTURE, false)] {
+        let found = fixture::db(text).into_db();
+        let walked = within(&found, || crate::traits::declares_sealed(&found, named(&found, "lib")));
+        assert_eq!(walked, declares);
+        let read = paged(text, "lib", Counting::new(written(text, "lib")));
+        let lib = named(&read, "lib");
+        assert!(frozen::served(&read, lib));
+        assert_eq!(within(&read, || crate::traits::declares_sealed(&read, lib)), declares);
+    }
+}
+
+/// The control: the cause removed. Pages written of the crate without the sealed trait,
+/// given to a database whose source has it, answer as the pages say, not as the source:
+/// the answer is the header's, and no walk of the source stands in.
+#[test]
+fn a_served_crates_sealed_answer_is_its_pages_not_its_source() {
+    let read = paged(SEALED, "lib", Counting::new(written(FIXTURE, "lib")));
+    let lib = named(&read, "lib");
+    assert!(!within(&read, || crate::traits::declares_sealed(&read, lib)));
+}
+
+/// The control of the self types' table: with every self type written and none given a
+/// slot (the planted bug), the reader of one type's trait impls finds none where the whole
+/// table has them, which the oracle says.
+#[test]
+fn the_oracle_catches_self_types_written_with_no_slot() {
+    WRITES_NO_SELF_SLOT.set(true);
+    let pages = written(FIXTURE, "lib");
+    WRITES_NO_SELF_SLOT.set(false);
+    let caught = std::panic::catch_unwind(|| agree(FIXTURE, &pages));
+    assert!(!matches!(caught, Ok(Ok(()))), "the oracle passed self types no reader can find");
+}
+
 /// The refinement under edits elsewhere: after each of a run of edits to the member (an
 /// impl for a type of the dependency added, a local type and its impls added, text only),
 /// a database that reads `lib` from the pages written before the edits answers as one that
@@ -415,7 +493,21 @@ fn a_previous_or_foreign_impl_page_layout_is_refused_by_name() {
     let mut previous = pages.clone();
     previous[8..12].copy_from_slice(&0u32.to_le_bytes());
     let why = refused(previous.clone());
-    assert!(why.contains("impl table pages of layout 0, where this blaze reads layout 1"), "{why}");
+    assert!(why.contains("impl table pages of layout 0, where this blaze reads layout 2"), "{why}");
+
+    // The previous layout, which had no table of self types.
+    // clone: as above
+    let mut one = pages.clone();
+    one[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let why = refused(one);
+    assert!(why.contains("impl table pages of layout 1, where this blaze reads layout 2"), "{why}");
+
+    // A flag of the crate this blaze does not know.
+    // clone: as above
+    let mut flagged = pages.clone();
+    flagged[HEADER - 1] |= 0x80;
+    let why = refused(flagged);
+    assert!(why.contains("impl table pages with flags"), "{why}");
 
     // clone: as above
     let mut foreign = pages.clone();
@@ -528,7 +620,8 @@ fn an_impl_lookup_reads_a_bounded_number_of_pages() {
         let lib = named(&db, "lib");
         within(&db, || {
             let Asked { trait_, self_ty, name } = asked(&db, &source);
-            assert_eq!(super::counts(&db, lib), [count as u32, 1, count as u32, count as u32 + 1]);
+            let counted = [count as u32, 1, count as u32, count as u32 + 1, count as u32];
+            assert_eq!(super::counts(&db, lib), counted);
             let bounded = |what: &str| {
                 let touched = source.take();
                 assert!(
@@ -553,6 +646,18 @@ fn an_impl_lookup_reads_a_bounded_number_of_pages() {
             bounded("a name no trait binds");
             assert!(TraitImpls::served_blanket(&db, lib, trait_).blanket_impls(trait_).is_empty());
             bounded("a trait's blanket impls");
+            // A type's trait impls: its window and entry, then its one row (two pages more
+            // where the row crosses one).
+            let mut impls = 0;
+            super::for_self_ty(&db, lib, &self_ty, |_| impls += 1);
+            assert_eq!(impls, 1, "{count}");
+            let touched = source.take();
+            assert!(
+                (1..=LOOKUP_PAGES + 2).contains(&touched),
+                "{count} types, a type's trait impls: {touched} pages read"
+            );
+            super::for_self_ty(&db, lib, &S::Tuple(9), |it| panic!("{it:?}"));
+            bounded("the trait impls of a type with none");
         });
         records.push(record_pages);
     }

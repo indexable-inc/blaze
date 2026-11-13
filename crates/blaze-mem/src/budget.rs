@@ -216,6 +216,8 @@ pub enum Misuse {
     ReleaseOverHeld { task: TaskId, quanta: u64, held: u64 },
     /// `wounded_at_safe_point` for a task not told to give way.
     NotGivingWay { task: TaskId },
+    /// A call for a parked task (`call`) named one still running.
+    Running { task: TaskId, call: &'static str },
 }
 
 impl fmt::Display for Misuse {
@@ -253,6 +255,11 @@ impl fmt::Display for Misuse {
             Misuse::NotGivingWay { task } => write!(
                 f,
                 "memory budget: task {} unwound at a safe point without being told to give way",
+                task.0
+            ),
+            Misuse::Running { task, call } => write!(
+                f,
+                "memory budget: {call} of task {}, which is running, not parked",
                 task.0
             ),
         }
@@ -324,6 +331,9 @@ pub struct Budget {
     over: u64,
     /// `over` of unmarked tasks: owed from the room before any other grant.
     debt: u64,
+    /// Quanta of `reserved` lent to the gate's lock-free front ([`Budget::lend`]): counted as
+    /// held, by no task yet, so a grant from the front can never pass what the room allows.
+    lent: u64,
     #[cfg(test)]
     pub(crate) plant: Plant,
 }
@@ -380,9 +390,104 @@ impl Budget {
             reserved: 0,
             over: 0,
             debt: 0,
+            lent: 0,
             #[cfg(test)]
             plant: Plant::None,
         })
+    }
+
+    /// The config it was made with.
+    pub fn config(&self) -> Config {
+        self.config
+    }
+
+    /// How many tasks are started and not ended.
+    pub fn running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Whether any task is parked (held at its start, or unwound and not started again): a
+    /// start may then be held.
+    pub fn any_parked(&self) -> bool {
+        !self.parked.is_empty()
+    }
+
+    /// The quanta `task` holds as the Budget counts them (granted and overdrawn), if running.
+    pub fn held_by(&self, task: TaskId) -> Option<u64> {
+        self.at(task).map(|at| self.running[at].held())
+    }
+
+    /// Whether `task` is parked: held at its start, or unwound and not started again.
+    pub fn is_parked(&self, task: TaskId) -> bool {
+        self.parked.iter().any(|it| it.rank.task == task)
+    }
+
+    /// Quanta lent to the front and not taken back.
+    pub fn lent(&self) -> u64 {
+        self.lent
+    }
+
+    /// Lends up to `most` quanta of free room to a lock-free front, counted as reserved by no
+    /// task: only while nothing is owed or waited for (no debt, no marked task, no task the
+    /// room holds back), so the front never takes room an elder is waiting for. Says how many.
+    pub fn lend(&mut self, most: u64) -> u64 {
+        let waited_for = self.debt > 0
+            || self.running.iter().any(|it| it.mark != Mark::No)
+            || self.parked.iter().any(|it| matches!(it.hold, Some(Hold::Room { .. } | Hold::Behind(_))));
+        if waited_for {
+            return 0;
+        }
+        let free = self.limit_q().saturating_sub(self.reserved + self.debt);
+        let lent = free.min(most);
+        self.reserved += lent;
+        self.lent += lent;
+        lent
+    }
+
+    /// The front gives back `quanta` it was lent and handed to no task.
+    pub fn unlend(&mut self, quanta: u64) -> Freed {
+        debug_assert!(quanta <= self.lent, "unlent {quanta} quanta of {} lent", self.lent);
+        let quanta = quanta.min(self.lent);
+        self.lent -= quanta;
+        self.reserved -= quanta;
+        let mut freed = Freed::default();
+        self.settle(&mut freed.unheld);
+        freed
+    }
+
+    /// What `task` took from the front (`delta > 0`) or gave back to it (`delta < 0`) since
+    /// it was last absorbed: moved between the lent count and the task's.
+    pub fn absorb(&mut self, task: TaskId, delta: i64) -> Result<(), Misuse> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let at = self.at(task).ok_or(Misuse::Unknown { task, call: "absorb" })?;
+        let quanta = delta.unsigned_abs();
+        if delta > 0 {
+            if quanta > self.lent {
+                return Err(Misuse::ReleaseOverHeld { task, quanta, held: self.lent });
+            }
+            self.lent -= quanta;
+            let it = &mut self.running[at];
+            it.reserved += quanta;
+            it.peak = it.peak.max(it.held());
+            return Ok(());
+        }
+        let it = &mut self.running[at];
+        if quanta > it.held() {
+            return Err(Misuse::ReleaseOverHeld { task, quanta, held: it.held() });
+        }
+        // Given back to the front: out of the task (its overdraft first), into what is lent.
+        let from_over = quanta.min(it.over);
+        it.over -= from_over;
+        it.reserved -= quanta - from_over;
+        if it.mark == Mark::No {
+            self.debt -= from_over;
+        }
+        self.over -= from_over;
+        self.reserved += from_over;
+        self.lent += quanta;
+        Ok(())
     }
 
     /// Bytes committed by what the Budget answers for: core, the ungated reserve, every task's

@@ -352,6 +352,11 @@ impl Heads {
     }
 
     /// Starts watching `head`'s checkout in a new slot.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "slots are bounded far below 2^32 by the watcher tag range, asserted just after \
+                  the slot is taken (`tags < self.watcher_end`)"
+    )]
     fn watch(
         &mut self,
         vfs: &Vfs,

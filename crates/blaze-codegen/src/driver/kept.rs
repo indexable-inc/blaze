@@ -1,19 +1,25 @@
-//! What a walk keeps for the next walk over the same front end
-//! (docs/v2/plan/design/incremental-walk.md): each function's describe, by the instance and
-//! whose code asked for it, so the next walk asks the front end only whether it still holds
-//! ([`crate::backend::Frontend::redescribe`]) and describes again what changed and what is new.
+//! What a program's walk keeps for the next build of the same program over the same front end
+//! (docs/v2/plan/design/incremental-walk.md): its last walk ([`Walked`]), to be patched by
+//! what the front end names as changed, and its last `Built` by row or by its entries, for
+//! the next build's delta.
+//!
+//! No describe is kept here apart from a kept walk's own nodes. Until 2026-11-13 every
+//! describe of every walk was kept a second time in a table a round (`rounds`), by the
+//! instance and who asked, for a whole walk to verify in place of a describe: a describe was
+//! then held three times (that table, the kept walk's nodes, the build's own), and an entry
+//! no root reached any more was never removed (lane F6 of the memory wave, read from code).
+//! A function a whole walk reaches is now the store's record of it or the front end's
+//! describe ([`super::records`], `Build::found_or_described`): the record is its one holder
+//! between builds (docs/v2/plan/design/end-state/memory.md 4.4).
 //!
 //! Nothing here decides what a build holds. The walk reaches what it reaches from its roots
-//! every time, through each describe's references, kept or new: a kept describe no root
-//! reaches any more is never looked at, and one the front end says changed is never used. So
-//! the walk over kept describes equals the walk over none whenever the front end's answer is
-//! exact, which `driver/tests/kept.rs` holds it to.
+//! every time, patched or whole, so the walk over a kept walk equals the walk over none
+//! whenever the front end's changed set is exact, which `driver/tests/kept.rs` holds it to.
 //!
-//! A kept describe names the front end's instances, which are ids of its database: it lives
-//! in memory beside that database and is never written to the store. Whoever makes a [`Kept`]
-//! keeps it for one database and one configuration of the front end (`hir-ty-codegen`'s
-//! `HirFrontend::kept`); a restart begins with none and the first walk describes everything,
-//! which [`Walk::fresh`] says ([`Fresh::Restart`]).
+//! A kept walk names the front end's instances, which are ids of its database: it lives in
+//! memory beside that database, owned by whoever owns the database (`hir-ty-codegen`'s
+//! `Walks`, dropped with it), and is never written to the store. A restart begins with none
+//! and the first walk is whole, which [`Walk::fresh`] says ([`Fresh::Restart`]).
 
 use std::{
     hash::Hash,
@@ -32,21 +38,12 @@ use super::{
     lists::Lists,
     patch::Walked,
 };
-use crate::{backend::Described, plan::Origin};
 
-/// The rounds of a walk whose describes are kept apart: the first, and the one over the facts
-/// of the whole program the first closed ([`crate::backend::Frontend::closed`]). A body built
-/// against those facts is another describe than the one before them, so one table would hold
-/// whichever round ran last and each build would describe such a body twice.
-const ROUNDS: usize = 2;
-
-/// The describes of the walks over one database and configuration of a front end, of every
-/// program walked over it: two programs that reach one instance share its describe. Shared by
-/// the builds of a job, which walk at once: a describe is lent by one lookup and kept by one
-/// insert, with nothing held between.
+/// What the builds of the programs walked over one database and configuration of a front end
+/// keep for their next builds: each program's last walk and its last `Built`. Shared by the
+/// builds of a job, which walk at once: a walk or lists are taken by the one build that
+/// patches them and kept again as it ends.
 pub struct Kept<I, S> {
-    /// Each round's describes, by the instance and whose code asked for it.
-    rounds: [SharedMap<(I, Origin), Arc<Described<I, S>>>; ROUNDS],
     /// Each program's last walk whole ([`Walked`]), by [`program`] of its inputs, which the
     /// walk itself holds and a build compares: taken by the build that patches it, so a
     /// locked map.
@@ -64,7 +61,6 @@ pub struct Kept<I, S> {
 impl<I: Eq + Hash, S> Default for Kept<I, S> {
     fn default() -> Self {
         Kept {
-            rounds: std::array::from_fn(|_| SharedMap::default()),
             // alloc: none until a walk is kept
             walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
             built: SharedMap::default(),
@@ -80,30 +76,22 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
         Kept::default()
     }
 
-    /// How many describes are kept, over every round.
+    /// How many programs have something kept: a walk, lists or what a build gave.
     pub fn len(&self) -> usize {
-        self.rounds.iter().map(|it| it.pin().len()).sum()
+        let walks = self.walks.lock().len();
+        let lists = self.lists.lock().len();
+        walks.max(lists).max(self.built.pin().len())
     }
 
+    /// Nothing kept of any program: what [`Fresh::Restart`] says of a walk over it.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// The describe of `asked` the walk's round `round` (from 0) kept. The count is shared, so
-    /// the table's guard is let go before the caller asks the front end anything.
-    pub(super) fn function(
-        &self,
-        round: usize,
-        asked: &(I, Origin),
-    ) -> Option<Arc<Described<I, S>>> {
-        // clone: a reference count, once per function a walk reaches
-        self.rounds[round.min(ROUNDS - 1)].pin().get(asked).cloned()
-    }
-
-    /// Keeps `described` as the describe of `asked` in `round`, in place of any before.
-    pub(super) fn keep(&self, round: usize, asked: &(I, Origin), described: Arc<Described<I, S>>) {
-        // clone: the walk's handle of the function and who asks for it, once per describe
-        self.rounds[round.min(ROUNDS - 1)].pin().insert(asked.clone(), described);
+    /// How many functions the kept walks hold, each walk's own: what a [`Kept`] keeps of the
+    /// front end's describes, and nothing beside them.
+    pub fn functions(&self) -> usize {
+        self.walks.lock().values().map(Walked::functions).sum()
     }
 
     /// What `program`'s last build gave, if one was kept.
@@ -180,10 +168,12 @@ pub(super) fn program<T: Hash>(roots: &T) -> u64 {
 /// What a walk did: the fields of the `codegen walk` span, and [`super::Built::walk`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Walk {
-    /// Describes the front end was asked for: functions new to the kept walk, and kept ones
-    /// the front end said changed. Over every round.
+    /// Describes the front end was asked for: every function of a whole walk no record
+    /// holds, and of a patched walk the functions new to it and those the front end said
+    /// changed. Over every round.
     pub described: usize,
-    /// Kept describes the front end said still hold: each cost its answer, never a describe.
+    /// Functions of a patched walk the front end said still hold: each cost its answer, never
+    /// a describe. 0 for a whole walk, which takes no describe from memory.
     pub verified: usize,
     /// Describes read from the store's records ([`super::records`]): each cost a lookup and
     /// its record's decode, never a describe. Over every round.
@@ -264,17 +254,12 @@ pub struct Work {
 #[derive(Default)]
 pub(super) struct Counts {
     pub(super) described: AtomicUsize,
-    pub(super) verified: AtomicUsize,
     pub(super) found: AtomicUsize,
 }
 
 impl Counts {
     pub(super) fn described(&self) {
         self.described.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn verified(&self) {
-        self.verified.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn found(&self) {
@@ -285,7 +270,7 @@ impl Counts {
         self.found.load(Ordering::Relaxed)
     }
 
-    pub(super) fn get(&self) -> (usize, usize) {
-        (self.described.load(Ordering::Relaxed), self.verified.load(Ordering::Relaxed))
+    pub(super) fn described_so_far(&self) -> usize {
+        self.described.load(Ordering::Relaxed)
     }
 }

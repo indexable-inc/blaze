@@ -7,7 +7,7 @@ use std::{
 };
 
 use blaze_graph::{
-    Budget, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId,
+    Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId,
     admission::{Predict, TaskKind},
     machine::{NodeId, Outcome, Pool, Spec},
 };
@@ -35,7 +35,7 @@ fn same_bucket(n: u64) -> Key {
 }
 
 fn config(slots: usize) -> Config {
-    Config { slots, unseen_ns: 5_000, unseen_bytes: 1 << 20 }
+    Config { slots, unseen_ns: 5_000 }
 }
 
 const KIND: TaskKind = TaskKind(0x2001);
@@ -95,18 +95,18 @@ fn a_key_is_predicted_by_its_record_and_an_unseen_one_by_its_kind() {
     let mut history = History::new(config(16));
     let (seen, unseen) = (same_bucket(1), same_bucket(2));
     let p = history.predict(KIND, Some(&seen));
-    assert_eq!((p.cost, p.peak), (Some(5_000), 1 << 20), "a kind never seen");
+    assert_eq!((p.cost, p.peak), (Some(5_000), 0), "a kind never seen");
     history.observe(KIND, Some(&seen), 400_000, 300);
     history.observe(KIND, None, 800_000, 900);
     let p = history.predict(KIND, Some(&seen));
     assert_eq!((p.cost, p.peak), (Some(400_000), 300));
-    // The kind's mean moved an eighth of the way to the second run, its peak to the most.
+    // The kind's mean moved an eighth of the way to the second run; a kind keeps no peak.
     let p = history.predict(KIND, Some(&unseen));
-    assert_eq!((p.cost, p.peak), (Some(450_000), 900));
+    assert_eq!((p.cost, p.peak), (Some(450_000), 0));
     assert_eq!(history.predict(KIND, None), p);
     // Another kind with the same key has no record of it.
     let other = history.predict(TaskKind(9), Some(&seen));
-    assert_eq!((other.cost, other.peak), (Some(5_000), 1 << 20));
+    assert_eq!((other.cost, other.peak), (Some(5_000), 0));
 }
 
 #[test]
@@ -229,7 +229,6 @@ fn a_history_comes_back_from_its_bytes() {
         let bytes = history.encode();
         let back = History::decode(&bytes, config(64)).unwrap();
         assert_eq!(back.encode(), bytes, "seed {seed}");
-        assert_eq!(back.estimates(), history.estimates(), "seed {seed}");
         assert_eq!(back.times(), history.times(), "seed {seed}");
         let records: Vec<_> = history.keys().records().collect();
         assert_eq!(back.keys().records().collect::<Vec<_>>(), records, "seed {seed}");
@@ -286,6 +285,11 @@ fn bad_bytes_are_refused_naming_what_is_wrong() {
     let mut older = bytes.clone();
     older[..8].copy_from_slice(b"blzhis02");
     assert_eq!(decode(&older), Err(DecodeError::Version));
+    // The previous layout, which held the kinds' peaks (`Estimates`) after the clock: of
+    // another blaze, refused as another version, never read as this one's.
+    let mut with_estimates = bytes.clone();
+    with_estimates[..8].copy_from_slice(b"blzhis03");
+    assert_eq!(decode(&with_estimates), Err(DecodeError::Version));
     assert_eq!(decode(&bytes[..12]), Err(DecodeError::Short { at: 8 }));
     assert!(matches!(decode(&bytes[..bytes.len() - 1]), Err(DecodeError::Length { .. })));
     let mut longer = bytes.clone();
@@ -295,8 +299,7 @@ fn bad_bytes_are_refused_naming_what_is_wrong() {
     slots[8..16].copy_from_slice(&48u64.to_le_bytes());
     assert_eq!(decode(&slots), Err(DecodeError::Slots(48)));
 
-    let estimates = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
-    let kinds_at = 40 + estimates + 8;
+    let kinds_at = 40;
     let kinds = u64::from_le_bytes(bytes[kinds_at - 8..kinds_at].try_into().unwrap()) as usize;
     assert!(kinds >= 2);
     let mut order = bytes.clone();
@@ -320,10 +323,6 @@ fn bad_bytes_are_refused_naming_what_is_wrong() {
     let slot = twice[records_at..records_at + 4].to_vec();
     twice[records_at + RECORD_BYTES..records_at + RECORD_BYTES + 4].copy_from_slice(&slot);
     assert!(matches!(decode(&twice), Err(DecodeError::SlotOrder { .. })));
-    // The first record's estimates are not the plane's bytes.
-    let mut estimates_bad = bytes.clone();
-    estimates_bad[40..48].copy_from_slice(b"blzest00");
-    assert!(matches!(decode(&estimates_bad), Err(DecodeError::Estimates(_))));
     assert_eq!(&bytes[..8], MAGIC);
 }
 
@@ -397,8 +396,7 @@ fn runs(out: &[PlaneOutput]) -> Vec<NodeId> {
 
 /// The order a plane of one core runs `specs` in, each task done before the next starts.
 fn order(specs: Vec<Spec>) -> Vec<NodeId> {
-    let mut plane =
-        Plane::new(PlaneConfig { io: 1, work: 1, budget: None, starve_after: 8 }).unwrap();
+    let mut plane = Plane::new(PlaneConfig { io: 1, work: 1 }).unwrap();
     let mut out = open(&mut plane, specs);
     let mut ran = Vec::new();
     for at in 1.. {
@@ -483,27 +481,18 @@ fn the_plane_orders_random_graphs_by_the_history_critical_path() {
     }
 }
 
+/// A key's record keeps its last peak for a reader of that key; a kind has no peak here
+/// (admission forecasts from `blaze_graph::admission::Peaks`, never from this history).
 #[test]
-fn admission_takes_each_key_peak_not_its_kind() {
-    let (a, b, c, d) = (same_bucket(1), same_bucket(2), same_bucket(3), same_bucket(4));
+fn a_key_keeps_its_peak_and_a_kind_has_none() {
+    let (a, c) = (same_bucket(1), same_bucket(3));
     let mut history = History::new(config(64));
     history.observe(KIND, Some(&a), 1000, 80);
-    history.observe(KIND, Some(&b), 1000, 80);
     history.observe(KIND, Some(&c), 1000, 30);
-    history.observe(KIND, Some(&d), 1000, 30);
-    assert_eq!(history.estimates().predict(KIND), 80);
-    let plane = || {
-        let budget = Some(Budget { bytes: 100, from: "the test".to_owned(), kept_back: 0 });
-        Plane::new(PlaneConfig { io: 1, work: 2, budget, starve_after: 8 }).unwrap()
-    };
-    // Two of 80 do not fit 100 at once; two of 30 do, which the kind's 80 would not let.
-    let heavy = vec![predicted(&history, 0, &[], a), predicted(&history, 1, &[], b)];
-    assert_eq!(runs(&open(&mut plane(), heavy)).len(), 1);
-    let light = vec![predicted(&history, 0, &[], c), predicted(&history, 1, &[], d)];
-    assert_eq!(runs(&open(&mut plane(), light)).len(), 2);
-    let by_kind = history.estimates().predict(KIND);
-    let light_by_kind = vec![spec(0, &[], Some(c), 1, by_kind), spec(1, &[], Some(d), 1, by_kind)];
-    assert_eq!(runs(&open(&mut plane(), light_by_kind)).len(), 1);
+    assert_eq!(history.predict(KIND, Some(&a)).peak, 80);
+    assert_eq!(history.predict(KIND, Some(&c)).peak, 30);
+    assert_eq!(history.predict(KIND, None).peak, 0);
+    assert_eq!(history.predict(KIND, Some(&same_bucket(2))).peak, 0);
 }
 
 #[test]
@@ -557,8 +546,7 @@ fn a_record_after_an_empty_way_is_refused() {
     history.observe(KIND, Some(&same_bucket(1)), 1000, 1);
     history.observe(KIND, Some(&same_bucket(2)), 1000, 1);
     let bytes = history.encode();
-    let estimates = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
-    let kinds_at = 40 + estimates + 8;
+    let kinds_at = 40;
     let kinds = u64::from_le_bytes(bytes[kinds_at - 8..kinds_at].try_into().unwrap()) as usize;
     let records_at = kinds_at + kinds * KIND_BYTES + 8;
     assert_eq!(bytes.len(), records_at + 2 * RECORD_BYTES);

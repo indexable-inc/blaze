@@ -139,6 +139,7 @@ impl Lowered {
             made.insert(file);
             // Its root's text is another: what a record carried of its texts is let go.
             self.carried.remove(&krate);
+            self.found.remove(&krate);
             self.appended.insert(file, (unit, asked));
             if self.db.file_text(file).content(&self.db) != before {
                 written += 1;

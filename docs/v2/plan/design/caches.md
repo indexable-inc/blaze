@@ -33,7 +33,7 @@ or overwritten: a changed input makes another key.
 | `kept-front-end` | checkout | `Roots::fronts`: the database of a checkout's last build | by the variables it read (`EnvReads`) and its subject | no; from records | footprint (`job/giving.rs`) | one a checkout; a second checkout of the same sources lowers again: records-restart2 |
 | `found-record` | crate | a crate's filed image key and its package's file manifest, under its plan key (plan fields, directory Merkle IDs, dependencies' plan keys, front end code) | by key; the filed key is used only when the serve's own image key equals it | yes | store | a crate's key is its entry's key: records-restart2 |
 | `dep-image` | crate | a dependency's def map, lang items and signatures, under its image key (crate inputs, every file of its source root, dependencies' surfaces, front end code) and the values of what it read (`reads` slots) | by key | yes | store | crate-keyed; refused whole for a path under the daemon's home (records-1112e) and for every local crate (`eligible`, records-restart2); a crate whose `include!` reads outside its source root is refused whole (`serve::include_refusal`) where `unit-records` files the same read by value: Unowned 3 |
-| `def-map-pages` | crate | a dependency's def map as pages read a name at a time, under the image's key | by key | yes | store | crate-keyed; two forms beside the image's part (`BLAZE_DEF_MAP_PAGES`): records-1112e |
+| `def-map-pages` | crate | a dependency's def map as pages read a name at a time, under the image's key | by key | yes | store | crate-keyed, the one form of a served def map (the image holds no def map part); a module's names written once (layout 3): F2 |
 | `item-pages` | crate | a dependency's items, impl and trait items, attribute flags as pages | by key | yes | store | crate-keyed: records-items |
 | `macro-defs` | item | a declarative macro's tokens, under the position-free hash of its definition, and a file's index of its items (`hir-expand/src/declarative/stored.rs`, `stored/index.rs`) | by key | yes | store | †new this round, doc read only; its lane is not in `/tmp/round2/ready` |
 | `impl-tables` | crate | a dependency's impl tables, frozen and paged (`hir-ty/src/method_resolution/frozen*`) | by key | yes | store | crate-keyed: records-impls |
@@ -95,7 +95,6 @@ or overwritten: a changed input makes another key.
 
 | variable | what it selects | who removes it, when |
 |---|---|---|
-| `BLAZE_DEF_MAP_PAGES=1` | def maps from pages, not the image's part | records-1112e, when the round's measurements say on; the image's part goes with it |
 | `BLAZE_ITEM_STORE=off` | no item store | records-bodies, once bodies are records; `verify` stays as the differential |
 | `BLAZE_UNIT_KEY_DEEP=1` | the old deep unit key, as a planted bug in shipped code | cutoff-1112, when revision cases have their in-process driver (`tests/revisions/main.rs` names `sim`; there is no `sim.rs`): a plant is then a value the test gives the job, and no binary reads it |
 | `BLAZE_FRONT_END_PER_PLAN=1` | the plan as the kept front end's identity, a planted bug as above | onefront, as above |

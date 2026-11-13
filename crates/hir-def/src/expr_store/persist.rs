@@ -755,6 +755,10 @@ impl FieldNames {
         self.by_symbol.clear();
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the field-name table holds u32 starts and lengths in the record; 4 GiB of field names in one buffer needs a typed refusal from the write"
+    )]
     fn add(&mut self, name: &Name) {
         let symbol = name.symbol();
         if self.by_symbol.contains_key(symbol) {

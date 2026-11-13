@@ -552,6 +552,10 @@ mod tests {
     /// (in ms), the loop turning with its progress never moving, and a worker inside a span it
     /// never leaves, as the macro sessions' deadlock held 18 workers (selfbuild4 group 1); it
     /// says it is ready on stdout and waits to be signalled.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's deadlocked worker, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after its signal"
+    )]
     fn deadlocked(bound_ms: u64) -> ! {
         blaze_profile::install();
         signals::catch();
@@ -595,6 +599,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
@@ -666,6 +671,10 @@ mod tests {
     /// spawn effect tagged 0x5ca1ab1e, as a build script or sandbox launcher is) and is never
     /// polled again, as the daemon's loop parked inside a write's maintain was (lane reaphang,
     /// 2026-11-03), so the child exits and stays a zombie; the loop's turns never move.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's turn that never ends, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after it is ready"
+    )]
     fn stuck(bound_ms: u64) -> ! {
         use blaze_core::Driver as _;
         blaze_profile::install();
@@ -711,6 +720,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();

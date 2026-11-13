@@ -381,7 +381,13 @@ fn ids_name_their_sections() {
     assert_eq!(SectionId::vfs(3).name(), "the VFS tree");
     assert_eq!(SectionId(7).name(), "a section this blaze does not know");
     assert!(SectionId::PLANE_HISTORY.to_string().contains("0x400"));
-    let live = [SectionId::PLANE_HISTORY, SectionId::VFS_TREE, SectionId::VFS_DISKS];
+    assert_eq!(SectionId::ADMISSION_PEAKS.name(), "admission's peaks");
+    let live = [
+        SectionId::PLANE_HISTORY,
+        SectionId::ADMISSION_PEAKS,
+        SectionId::VFS_TREE,
+        SectionId::VFS_DISKS,
+    ];
     for (at, retired) in SectionId::RETIRED.into_iter().enumerate() {
         assert!(retired.name().ends_with("a section no blaze writes now"), "{retired}");
         assert!(!live.contains(&retired), "{retired} is retired, so never taken again");

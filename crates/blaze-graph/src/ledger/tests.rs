@@ -1,99 +1,98 @@
-//! The ledger's DST (docs/memory-budget.md, section 7, "Proof"; `testing` skill, dst-not-review).
+//! The shared ledger's DST (docs/v2/plan/design/end-state/memory.md, sections 4.5 and 9.8;
+//! `testing` skill, dst-not-review).
 //!
-//! Two to five daemons share one simulated ledger file. Each daemon is a real [`Plane`] that
-//! admits against the real core ([`Ledger::turn`]), and its tasks' grants and real use are
-//! drawn. Their acts interleave with crashes (a daemon gone without leaving), restarts, pids the
-//! system gives again (to a new daemon, or to a process that is no daemon), and clean exits. A
-//! turn is one atomic read-modify-write of the file, as the driver's `flock` makes it; under
-//! [`Plant::UnlockedRmw`] it is a read, then other acts, then a write of what was read.
+//! Two to six blaze processes, or one past [`SLOTS`], share one simulated ledger: real atomic
+//! words, stepped one access at a time through the real operations ([`Op`]), so the processes
+//! interleave at every atomic. Their acts are drawn: reserves that sleep until they fit
+//! ([`Acquire`]), tries ([`Reserve`]), releases, core takes and gives, censuses, clean exits,
+//! deaths at any step, restarts, pids the system gives again (to a restarted blaze or to a
+//! process that is no blaze), a process that stops (it never steps again, its charge held), the
+//! end of a driver's wait (a tick: every sleeper wakes), and beats.
 //!
-//! Every daemon has a request open, so each takes a lease at its turns ([`Plane::lease`]) and
-//! starts the tasks that fit it at their `Add`, with no turn between.
+//! The oracles, each stated where it is checked:
+//! - [`World::check`]: the live processes' grants sum to at most the budget; their cores to at
+//!   most the cores and the floors given past them;
+//! - [`World::saw`]: a sum counts no more than the live slots held while it ran, and a slot of a
+//!   process dead before it began is freed by its end;
+//! - [`World::quiet`]: no wake is lost.
 //!
-//! After every act the oracle checks:
-//! - the live daemons' grants sum to at most the machine budget;
-//! - so do their rooms, what each may grant with no turn, its lease in it;
-//! - no live daemon is granted more than the ledger records of it, nor has more room (so what
-//!   it grants between turns is room no other daemon is told is free), and every live daemon
-//!   has its record;
-//! - a turn admits nothing while the other live daemons' charges sum to the machine budget.
-//!
-//! At the end every daemon's tasks end, round by round (each finishes what runs, says what it
-//! holds, and takes a turn): every task, each of which fits alone, starts within a bounded
-//! number of rounds; then a probe as large as one daemon may be allowed with every other idle
-//! starts at its next turn (bounded-progress).
-//!
-//! Four plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! Four plants ([`Plant`]) prove the oracles catch what they claim to, each in a control.
 //! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
 //! its plan.
 
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, sync::atomic::AtomicU64};
 
-use blaze_protocol::events::NodeKind;
 use blaze_rng::SplitMix64;
 use hegel::{TestCase, generators as gs};
 
 use super::*;
-use crate::{
-    machine::{NodeId, Outcome, Pool, Spec},
-    plane::{Budget, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
-};
 
 /// The simulated ledger's path, which every error names.
-const PATH: &str = "/tmp/blaze-501/machine";
-
-/// Pids the simulated system has: few, so they are given again often. Five daemons and
-/// [`MOST_SQUATTERS`] other processes leave one free for a restart.
-const PIDS: u32 = 9;
-const MOST_SQUATTERS: usize = 3;
+const PATH: &str = "/run/blaze-501/machine.1";
 
 /// Most acts a plan draws: a case runs in milliseconds.
-const MOST_ACTS: u64 = 160;
+const MOST_ACTS: u64 = 200;
+
+/// Processes that are no blaze at once, each holding a pid.
+const MOST_SQUATTERS: usize = 3;
 
 /// Seeds of [`plan_of`] a control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
+const CONTROL_SEEDS: u64 = 512;
 
 /// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
 const REPLAY: (u64, Plant) = (0, Plant::None);
 
-/// The one request each daemon's plane has open.
-const REQUEST: RequestId = RequestId(1);
+/// Every process's core floor, as the driver asks it.
+const FLOOR: u64 = 1;
+
+/// The most steps one settling of every process may take: past it, something spins.
+const SETTLE: u64 = 4_000_000;
 
 // --- The plan ------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
-struct Daemon {
-    ceiling: u64,
-    /// What the daemon holds with nothing running (a front end, caches).
-    baseline: u64,
-    work: usize,
+enum What {
+    /// Reserve these bytes, sleeping until they fit.
+    Acquire(u64),
+    /// Try once.
+    Try(u64),
+    /// Release `1 + pick % holds` bytes.
+    Release(u64),
+    /// Take these cores past what it holds.
+    Take(u64),
+    /// Give back `1 + pick % cores` cores.
+    Give(u64),
+    Census,
+    Leave,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Act {
-    /// A task asking `memory` that holds `real` once it runs: more or less than it asked.
-    Submit { daemon: usize, memory: u64, real: u64 },
-    /// The running task `pick` (modulo how many run) ends.
-    Finish { daemon: usize, pick: usize },
-    /// The daemon measures what it holds.
-    Held { daemon: usize },
-    /// A turn of the ledger.
-    Turn { daemon: usize },
-    Crash { daemon: usize },
-    /// A dead daemon starts again, with the free pid `pick` (modulo how many are free).
-    Restart { daemon: usize, pick: usize },
-    /// A clean exit.
-    Leave { daemon: usize },
-    /// A process that is no daemon takes the free pid `pick`.
+    /// Up to `burst` steps of the process's operation.
+    Step { actor: usize, burst: u32 },
+    /// An idle, joined process starts an operation.
+    Begin { actor: usize, what: What },
+    /// The process dies, whatever step it is at.
+    Kill { actor: usize },
+    /// A dead or gone process starts again, with the free pid `pick` (modulo how many are free).
+    Restart { actor: usize, pick: usize },
+    /// An idle process stops, holding what it holds, and never steps again.
+    Stall { actor: usize },
+    /// A process that is no blaze takes the free pid `pick`.
     Squat { pick: usize },
     /// The oldest such process exits.
     Unsquat,
+    /// Every driver's wait ends at its deadline: every sleeper wakes.
+    Tick,
+    /// An idle process beats.
+    Beat { actor: usize },
 }
 
 #[derive(Debug)]
 struct Plan {
     budget: u64,
-    daemons: Vec<Daemon>,
+    cores: u64,
+    actors: usize,
     acts: Vec<Act>,
 }
 
@@ -101,10 +100,6 @@ struct Plan {
 trait Draw {
     /// In `lo..=hi`.
     fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
 
     fn one_in(&mut self, n: u64) -> bool {
         self.int(0, n - 1) == 0
@@ -129,41 +124,45 @@ impl Draw for SplitMix64 {
 }
 
 fn plan(d: &mut impl Draw) -> Plan {
-    let budget = d.int(256, 1 << 20);
-    let count = d.int(2, 5) as usize;
+    let budget = d.int(64, 1 << 20);
+    let cores = d.int(1, 32);
+    // One plan in 16 has a process past the bound: it is refused, naming it.
+    let actors = if d.one_in(16) { SLOTS + 1 } else { d.int(2, 6) as usize };
+    // Two such amounts can pass the budget together, and each fits alone.
+    let most = (budget * 2 / 3).max(1);
+    let count = d.int(1, MOST_ACTS);
     // alloc: a plan, once a case
-    let daemons = (0..count)
-        .map(|_| Daemon {
-            // Half the daemons may be allowed the whole machine: the probe at the end then
-            // sees every byte another daemon's record keeps.
-            ceiling: if d.coin() { budget } else { d.int(budget / 2, budget) },
-            baseline: d.int(1, budget / 16),
-            work: d.int(1, 4) as usize,
-        })
-        .collect();
-    let n = d.int(1, MOST_ACTS);
-    // alloc: a plan, once a case
-    let acts = (0..n).map(|_| act(d, budget, count)).collect();
-    Plan { budget, daemons, acts }
+    let acts = (0..count).map(|_| act(d, actors, most, cores)).collect();
+    Plan { budget, cores, actors, acts }
 }
 
-/// Every task fits alone: at most 3/16 of the budget, and five baselines take at most 5/16 of
-/// it, under any ceiling (at least half the budget).
-fn act(d: &mut impl Draw, budget: u64, count: usize) -> Act {
-    let daemon = d.int(0, count as u64 - 1) as usize;
+fn act(d: &mut impl Draw, actors: usize, most: u64, cores: u64) -> Act {
+    let actor = d.int(0, actors as u64 - 1) as usize;
     match d.int(0, 99) {
-        0..=29 => {
-            let memory = d.int(1, budget * 3 / 16);
-            Act::Submit { daemon, memory, real: d.int(0, 2 * memory) }
+        0..=59 => {
+            let long = if actors > SLOTS { 40 } else { 400 };
+            let burst = if d.one_in(4) { d.int(1, long) } else { d.int(1, 4) };
+            Act::Step { actor, burst: burst as u32 }
         }
-        30..=49 => Act::Finish { daemon, pick: d.int(0, 7) as usize },
-        50..=63 => Act::Held { daemon },
-        64..=85 => Act::Turn { daemon },
-        86..=89 => Act::Crash { daemon },
-        90..=94 => Act::Restart { daemon, pick: d.int(0, 7) as usize },
-        95 | 96 => Act::Leave { daemon },
-        97 | 98 => Act::Squat { pick: d.int(0, 7) as usize },
-        _ => Act::Unsquat,
+        60..=81 => {
+            let what = match d.int(0, 11) {
+                0..=2 => What::Acquire(d.int(1, most)),
+                3 => What::Try(d.int(1, most)),
+                4..=6 => What::Release(d.int(0, 1 << 20)),
+                7 => What::Take(d.int(1, cores)),
+                8 => What::Give(d.int(0, 64)),
+                9 | 10 => What::Census,
+                _ => What::Leave,
+            };
+            Act::Begin { actor, what }
+        }
+        82..=85 => Act::Kill { actor },
+        86..=89 => Act::Restart { actor, pick: d.int(0, 15) as usize },
+        90 => Act::Stall { actor },
+        91..=93 => Act::Squat { pick: d.int(0, 15) as usize },
+        94 | 95 => Act::Unsquat,
+        96..=98 => Act::Tick,
+        _ => Act::Beat { actor },
     }
 }
 
@@ -174,7 +173,7 @@ fn plan_of(seed: u64) -> Plan {
 
 // --- The simulated machine ----------------------------------------------------------------
 
-/// What broke a run: the oracle (a bug of the core or the plane, or a plant), or the test.
+/// What broke a run: the oracle (a bug of the core, or a plant), or the test.
 enum Broke {
     Oracle(String),
     Harness(String),
@@ -189,8 +188,9 @@ impl fmt::Display for Broke {
     }
 }
 
-fn oracle(why: String) -> Broke {
-    Broke::Oracle(why)
+fn oracle(why: impl fmt::Display) -> Broke {
+    // alloc: a failure's message
+    Broke::Oracle(why.to_string())
 }
 
 fn harness(why: impl fmt::Display) -> Broke {
@@ -198,555 +198,608 @@ fn harness(why: impl fmt::Display) -> Broke {
     Broke::Harness(why.to_string())
 }
 
-struct Task {
-    id: NodeId,
-    memory: u64,
-    real: u64,
-    running: bool,
+/// A fresh ledger's words: the header a first process stamps, then zeros.
+fn words(budget: u64, cores: u64) -> Vec<AtomicU64> {
+    let header = Machine::header(budget, cores);
+    // alloc: the simulated mapping, once a case
+    (0..WORDS).map(|i| AtomicU64::new(if i < HEADER { header[i] } else { 0 })).collect()
 }
 
-/// A daemon that runs.
-struct Live {
-    process: Process,
-    plane: Plane,
-    tasks: Vec<Task>,
-    /// Under [`Plant::UnlockedRmw`]: the file as its turn read it, not yet written back.
-    read: Option<Vec<u8>>,
+fn machine(words: &[AtomicU64], plant: Plant) -> Machine<'_> {
+    let Ok(mut machine) = Machine::new(Path::new(PATH), words) else {
+        panic!("a ledger the test stamped reads");
+    };
+    machine.plant = plant;
+    machine
 }
 
-impl Live {
-    fn held(&self, daemon: &Daemon) -> u64 {
-        daemon.baseline + self.tasks.iter().filter(|it| it.running).map(|it| it.real).sum::<u64>()
-    }
+/// The simulated system's processes: the start of the one each pid runs, if any.
+struct Table(Vec<Option<u64>>);
 
-    fn running(&self) -> usize {
-        self.tasks.iter().filter(|it| it.running).count()
+impl Alive for Table {
+    fn started(&self, pid: u32) -> Result<Option<u64>, Unseen> {
+        Ok(self.0.get(pid as usize).copied().flatten())
     }
+}
 
-    /// Steps the plane, marking the tasks it starts as running.
-    fn step(&mut self, input: PlaneInput) -> Result<(), Broke> {
-        let outputs = self.plane.step(input).map_err(harness)?;
-        self.started(&outputs)
-    }
+/// An operation in flight.
+enum Running {
+    Join(Join),
+    Acquire(Acquire),
+    Try(Reserve),
+    Release(Release),
+    Take(TakeCores),
+    Give(GiveCores),
+    Census(Census),
+    Leave(Leave),
+}
 
-    fn started(&mut self, outputs: &[PlaneOutput]) -> Result<(), Broke> {
-        for output in outputs {
-            if let PlaneOutput::Run { id, .. } = output {
-                let Some(task) = self.tasks.iter_mut().find(|it| it.id == *id && !it.running)
-                else {
-                    return Err(harness(format_args!("the plane ran {id}, which waits for no run")));
-                };
-                task.running = true;
-            }
+enum Out {
+    Joined(Slot),
+    Acquired(Acquired),
+    Reserved(Reserved),
+    Lowered,
+    Took(Cores),
+    Counted(Counted),
+    Left,
+}
+
+fn step_op(op: &mut Running, m: &Machine<'_>, alive: &Table) -> Result<Step<Out>, MachineError> {
+    Ok(match op {
+        Running::Join(o) => o.step(m, alive)?.map(Out::Joined),
+        Running::Acquire(o) => o.step(m, alive)?.map(Out::Acquired),
+        Running::Try(o) => o.step(m, alive)?.map(Out::Reserved),
+        Running::Release(o) => o.step(m, alive)?.map(|_| Out::Lowered),
+        Running::Take(o) => o.step(m, alive)?.map(Out::Took),
+        Running::Give(o) => o.step(m, alive)?.map(|_| Out::Lowered),
+        Running::Census(o) => o.step(m, alive)?.map(Out::Counted),
+        Running::Leave(o) => o.step(m, alive)?.map(|()| Out::Left),
+    })
+}
+
+/// What the live slots held, at most, while a summing operation ran: per slot, the largest
+/// value any live process wrote there since it began.
+struct Watch {
+    began: u64,
+    bytes: [u64; SLOTS],
+    cores: [u64; SLOTS],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Life {
+    Running,
+    /// Dead, exited, or refused a slot.
+    Gone,
+}
+
+struct Actor {
+    pid: u32,
+    start: u64,
+    life: Life,
+    /// Stopped: it holds its charge and never steps again.
+    stalled: bool,
+    slot: Option<Slot>,
+    op: Option<Running>,
+    /// Asleep on the epoch while it holds this.
+    blocked: Option<u32>,
+    /// How many processes had died when it fell asleep.
+    deaths_seen: u64,
+    /// What its operation asks: bytes of an acquire or a try, cores of a take.
+    pending: u64,
+    /// The bytes granted and not released: what it uses.
+    holds: u64,
+    cores: u64,
+    /// Of its cores, those given as its floor past what fit.
+    credit: u64,
+    watch: Option<Watch>,
+}
+
+impl Actor {
+    fn new(pid: u32, start: u64) -> Actor {
+        Actor {
+            pid,
+            start,
+            life: Life::Running,
+            stalled: false,
+            slot: None,
+            op: Some(Running::Join(Join::new(Process { pid, start }))),
+            blocked: None,
+            deaths_seen: 0,
+            pending: 0,
+            holds: 0,
+            cores: 0,
+            credit: 0,
+            watch: None,
         }
-        Ok(())
     }
 }
 
-/// The processes of the simulated system: what [`Alive`] asks.
-struct Procs<'a>(&'a [Process]);
-
-impl Alive for Procs<'_> {
-    fn started(&self, pid: u32) -> Option<u64> {
-        self.0.iter().find(|it| it.pid == pid).map(|it| it.start)
-    }
+/// A process that died holding `slot` with the owner word `owner`, at `died_at`.
+struct Dead {
+    slot: usize,
+    owner: u64,
+    died_at: u64,
 }
 
-/// A plane taking a turn: what it starts is kept for the daemon to mark.
-struct Admitting<'a> {
-    plane: &'a mut Plane,
-    at_ns: u64,
-    outputs: Result<Vec<PlaneOutput>, crate::Error>,
-}
-
-impl Admits for Admitting<'_> {
-    fn allow(&mut self, allowance: &Allowance) {
-        self.outputs =
-            self.plane.step(PlaneInput::Allowance { at_ns: self.at_ns, bytes: allowance.bytes });
-    }
-
-    fn held(&self) -> u64 {
-        self.plane.held()
-    }
-
-    fn granted(&self) -> u64 {
-        self.plane.granted()
-    }
-
-    fn lease(&self) -> u64 {
-        self.plane.lease()
-    }
-}
-
-struct World<'p> {
+struct World {
     plant: Plant,
     budget: u64,
-    daemons: &'p [Daemon],
-    live: Vec<Option<Live>>,
-    /// Every process that runs: daemons and squatters.
-    procs: Vec<Process>,
-    squatters: Vec<Process>,
-    /// The ledger file's bytes.
-    file: Vec<u8>,
-    /// Process start times, node ids and the writers' clock: one count.
+    cores: u64,
+    planned: usize,
+    words: Vec<AtomicU64>,
+    table: Table,
+    actors: Vec<Actor>,
+    dead: Vec<Dead>,
+    squatters: Vec<u32>,
     clock: u64,
-    submitted: usize,
+    starts: u64,
+    deaths: u64,
 }
 
-impl<'p> World<'p> {
-    fn new(plan: &'p Plan, plant: Plant) -> World<'p> {
+/// A wake of every sleeper: what a futex wake of all does.
+fn wake_all(actors: &mut [Actor]) {
+    for actor in actors {
+        actor.blocked = None;
+    }
+}
+
+impl World {
+    fn new(plan: &Plan, plant: Plant) -> World {
+        // Pids: few past the processes, so they are given again often.
+        let pids = plan.actors + MOST_SQUATTERS;
+        // alloc: the simulated system, once a case
+        let mut table = Table(vec![None; pids + 1]);
+        let mut starts = 0;
+        // alloc: the simulated processes, once a case
+        let mut actors = Vec::with_capacity(plan.actors);
+        for i in 0..plan.actors {
+            starts += 1;
+            let pid = i as u32 + 1;
+            table.0[pid as usize] = Some(starts);
+            actors.push(Actor::new(pid, starts));
+        }
         World {
             plant,
             budget: plan.budget,
-            daemons: &plan.daemons,
-            live: plan.daemons.iter().map(|_| None).collect(), // alloc: a case's daemons
-            procs: Vec::new(),                                 // alloc: a case's processes
-            squatters: Vec::new(),                             // alloc: a case's squatters
-            file: Vec::new(),                                  // alloc: the simulated file
+            cores: plan.cores,
+            planned: plan.actors,
+            words: words(plan.budget, plan.cores),
+            table,
+            actors,
+            // alloc: the dead, once a case
+            dead: Vec::new(),
+            // alloc: the squatters, once a case
+            squatters: Vec::new(),
             clock: 0,
-            submitted: 0,
+            starts,
+            deaths: 0,
         }
     }
 
-    fn path() -> &'static Path {
-        Path::new(PATH)
+    fn load(&self, word: usize) -> u64 {
+        self.words[word].load(SeqCst)
     }
 
-    fn tick(&mut self) -> u64 {
-        self.clock += 1;
-        self.clock
+    fn runnable(&self, a: usize) -> bool {
+        let actor = &self.actors[a];
+        actor.life == Life::Running && !actor.stalled && actor.blocked.is_none() && actor.op.is_some()
     }
 
-    /// The file as it is, decoded with the plant in place.
-    fn ledger(&self, bytes: &[u8]) -> Result<Ledger<'static>, Broke> {
-        let mut ledger = Ledger::decode(World::path(), bytes).map_err(harness)?;
-        ledger.plant = self.plant;
-        Ok(ledger)
-    }
-
-    fn write(&mut self, ledger: &Ledger<'_>) {
-        let mut bytes = [0; LEN];
-        ledger.encode(&mut bytes);
-        self.file.clear();
-        self.file.extend_from_slice(&bytes);
+    fn idle(&self, a: usize) -> Option<Slot> {
+        let actor = &self.actors[a];
+        let idle = actor.life == Life::Running && !actor.stalled && actor.op.is_none();
+        if idle { actor.slot } else { None }
     }
 
     fn free_pids(&self) -> Vec<u32> {
-        // alloc: a short list, once an act
-        (1..=PIDS).filter(|pid| self.procs.iter().all(|it| it.pid != *pid)).collect()
+        // alloc: a pick among the free pids
+        (1..self.table.0.len() as u32).filter(|&pid| self.table.0[pid as usize].is_none()).collect()
+    }
+
+    /// What the live slots hold now: the start of a watch.
+    fn watch(&self) -> Watch {
+        let mut watch = Watch { began: self.clock, bytes: [0; SLOTS], cores: [0; SLOTS] };
+        for actor in &self.actors {
+            if let (Life::Running, Some(slot)) = (actor.life, actor.slot) {
+                watch.bytes[slot.index] = self.load(at(slot.index, RESERVED));
+                watch.cores[slot.index] = self.load(at(slot.index, CORES));
+            }
+        }
+        watch
     }
 
     fn act(&mut self, act: Act) -> Result<(), Broke> {
-        let at_ns = self.tick();
+        self.clock += 1;
         match act {
-            Act::Submit { daemon, memory, real } => self.submit(daemon, memory, real)?,
-            Act::Finish { daemon, pick } => {
-                if let Some(live) = &mut self.live[daemon] {
-                    finish(live, pick, at_ns)?;
-                }
-            }
-            Act::Held { daemon } => {
-                let config = self.daemons[daemon];
-                if let Some(live) = &mut self.live[daemon] {
-                    let bytes = live.held(&config);
-                    live.step(PlaneInput::Held { at_ns, bytes })?;
-                }
-            }
-            Act::Turn { daemon } => self.turn(daemon)?,
-            Act::Crash { daemon } => {
-                if let Some(live) = self.live[daemon].take() {
-                    self.procs.retain(|it| *it != live.process);
-                }
-            }
-            Act::Restart { daemon, pick } => self.start(daemon, pick)?,
-            Act::Leave { daemon } => {
-                if let Some(live) = self.live[daemon].take() {
-                    let mut ledger = self.ledger(&self.file)?;
-                    if let Err(why) = ledger.leave(live.process) {
-                        return Err(oracle(format!("a clean exit found no record: {why}")));
+            Act::Step { actor, burst } => {
+                for _ in 0..burst {
+                    if !self.runnable(actor) {
+                        break;
                     }
-                    self.write(&ledger);
-                    self.procs.retain(|it| *it != live.process);
+                    self.step(actor)?;
+                }
+            }
+            Act::Begin { actor, what } => self.begin(actor, what)?,
+            Act::Kill { actor } => self.kill(actor),
+            Act::Restart { actor, pick } => {
+                let free = self.free_pids();
+                if self.actors[actor].life == Life::Gone && !free.is_empty() {
+                    let pid = free[pick % free.len()];
+                    self.starts += 1;
+                    self.table.0[pid as usize] = Some(self.starts);
+                    self.actors[actor] = Actor::new(pid, self.starts);
+                }
+            }
+            Act::Stall { actor } => {
+                if self.idle(actor).is_some() {
+                    self.actors[actor].stalled = true;
                 }
             }
             Act::Squat { pick } => {
                 let free = self.free_pids();
                 if self.squatters.len() < MOST_SQUATTERS && !free.is_empty() {
-                    let process = Process { pid: free[pick % free.len()], start: self.tick() };
-                    self.procs.push(process);
-                    self.squatters.push(process);
+                    let pid = free[pick % free.len()];
+                    self.starts += 1;
+                    self.table.0[pid as usize] = Some(self.starts);
+                    self.squatters.push(pid);
                 }
             }
             Act::Unsquat => {
                 if !self.squatters.is_empty() {
-                    let gone = self.squatters.remove(0);
-                    self.procs.retain(|it| *it != gone);
+                    let pid = self.squatters.remove(0);
+                    self.table.0[pid as usize] = None;
+                }
+            }
+            Act::Tick => wake_all(&mut self.actors),
+            Act::Beat { actor } => {
+                if let Some(slot) = self.idle(actor) {
+                    let m = machine(&self.words, self.plant);
+                    m.beat(slot, self.clock)
+                        .map_err(|e| oracle(format_args!("process {actor} beats: {e}")))?;
                 }
             }
         }
+        self.check()?;
+        self.quiet()
+    }
+
+    fn begin(&mut self, a: usize, what: What) -> Result<(), Broke> {
+        let Some(slot) = self.idle(a) else { return Ok(()) };
+        let watch = self.watch();
+        let actor = &mut self.actors[a];
+        let op = match what {
+            What::Acquire(bytes) => {
+                actor.pending = bytes;
+                actor.watch = Some(watch);
+                Running::Acquire(Acquire::new(slot, bytes))
+            }
+            What::Try(bytes) => {
+                actor.pending = bytes;
+                actor.watch = Some(watch);
+                Running::Try(Reserve::new(slot, bytes))
+            }
+            What::Release(pick) => {
+                if actor.holds == 0 {
+                    return Ok(());
+                }
+                let bytes = 1 + pick % actor.holds;
+                // It stops using them before it gives them back.
+                actor.holds -= bytes;
+                Running::Release(Release::new(slot, bytes))
+            }
+            What::Take(cores) => {
+                actor.pending = cores;
+                actor.watch = Some(watch);
+                Running::Take(TakeCores::new(slot, cores, FLOOR))
+            }
+            What::Give(pick) => {
+                if actor.cores == 0 {
+                    return Ok(());
+                }
+                let cores = 1 + pick % actor.cores;
+                actor.cores -= cores;
+                actor.credit -= actor.credit.min(cores);
+                Running::Give(GiveCores::new(slot, cores))
+            }
+            What::Census => {
+                actor.watch = Some(watch);
+                Running::Census(Census::new())
+            }
+            What::Leave => {
+                actor.holds = 0;
+                actor.cores = 0;
+                actor.credit = 0;
+                Running::Leave(Leave::new(slot))
+            }
+        };
+        actor.op = Some(op);
+        Ok(())
+    }
+
+    fn kill(&mut self, a: usize) {
+        let actor = &mut self.actors[a];
+        if actor.life != Life::Running {
+            return;
+        }
+        // A claim in flight is not recorded: its slot counts nothing (the window the core's doc
+        // names), and a slot it holds is known only once its join ends.
+        if let Some(slot) = actor.slot {
+            self.dead.push(Dead { slot: slot.index, owner: slot.owner, died_at: self.clock });
+        }
+        self.table.0[actor.pid as usize] = None;
+        self.deaths += 1;
+        let (pid, start) = (actor.pid, actor.start);
+        *actor = Actor::new(pid, start);
+        actor.life = Life::Gone;
+        actor.op = None;
+    }
+
+    /// One step of process `a`'s operation: one access of a shared word at most.
+    fn step(&mut self, a: usize) -> Result<(), Broke> {
+        self.clock += 1;
+        let stepped = {
+            let World { words, table, actors, plant, .. } = &mut *self;
+            let m = machine(words, *plant);
+            let Some(op) = actors[a].op.as_mut() else {
+                return Err(harness(format_args!("process {a} stepped with no operation")));
+            };
+            step_op(op, &m, table)
+        };
+        match stepped {
+            Err(error) => self.failed(a, error)?,
+            Ok(Step::Next) => {}
+            Ok(Step::Wake) => wake_all(&mut self.actors),
+            Ok(Step::Block { expected }) => {
+                // The kernel compares the word as it blocks.
+                if self.load(EPOCH) as u32 == expected {
+                    let deaths = self.deaths;
+                    let actor = &mut self.actors[a];
+                    actor.blocked = Some(expected);
+                    actor.deaths_seen = deaths;
+                }
+            }
+            Ok(Step::Done(out)) => {
+                self.actors[a].op = None;
+                self.done(a, out)?;
+            }
+        }
+        self.watched(a);
         self.check()
     }
 
-    fn submit(&mut self, daemon: usize, memory: u64, real: u64) -> Result<(), Broke> {
-        let id = NodeId(u32::try_from(self.tick()).map_err(harness)?);
-        let at_ns = self.clock;
-        let Some(live) = &mut self.live[daemon] else { return Ok(()) };
-        live.tasks.push(Task { id, memory, real, running: false });
-        self.submitted += 1;
-        let spec = Spec {
-            id,
-            kind: NodeKind::Codegen,
-            name: format!("task {}", id.0), // alloc: a node's name, once a task
-            deps: Vec::new(),
-            pool: Pool::Work,
-            cost: 1,
-            key: None,
-            memory,
-        };
-        // alloc: one node a step
-        live.step(PlaneInput::Add { at_ns, request: REQUEST, nodes: vec![spec] })
-    }
-
-    /// A daemon starts: a new process, its plane, its record joined, and its first turn (the
-    /// driver's: no request comes before it), all before any other act.
-    fn start(&mut self, daemon: usize, pick: usize) -> Result<(), Broke> {
-        if self.live[daemon].is_some() {
-            return Ok(());
-        }
-        let free = self.free_pids();
-        let Some(&pid) = free.get(pick % free.len().max(1)) else {
-            return Err(harness("no pid is free for a restart"));
-        };
-        let process = Process { pid, start: self.tick() };
-        self.procs.push(process);
-        let config = self.daemons[daemon];
-        let budget = Budget {
-            bytes: config.ceiling,
-            from: "the simulated daemon's ceiling".to_owned(), // alloc: a daemon's budget
-            kept_back: 0,
-        };
-        let plane = Plane::new(PlaneConfig {
-            io: 1,
-            work: config.work,
-            budget: Some(budget),
-            starve_after: 8,
-        })
-        .map_err(harness)?;
-        let mut live = Live { process, plane, tasks: Vec::new(), read: None }; // alloc: a daemon's tasks
-        let at_ns = self.clock;
-        live.step(PlaneInput::Open {
-            at_ns,
-            request: REQUEST,
-            weight: 1,
-            keep_going: true,
-            idle: false,
-        })?;
-        live.step(PlaneInput::Held { at_ns, bytes: config.baseline })?;
-        let mut ledger = self.ledger(&self.file)?;
-        ledger.prune(&Procs(&self.procs));
-        let record = Record {
-            process,
-            budget: self.budget,
-            ceiling: config.ceiling,
-            held: config.baseline,
-            granted: 0,
-            lease: 0,
-            wants: 0,
-            gives: 0,
-            at_ns,
-            version: Label::head(b"blaze 0.0.0-sim", 1),
-            home: Label::tail(b"/sim/home/.blaze", fnv1a(b"/sim/home/.blaze")),
-        };
-        match ledger.join(record) {
-            Ok(()) => {}
-            Err(LedgerError { why: Why::Full, .. }) => {
-                return Err(oracle(format!(
-                    "the ledger filled with {MOST} records while at most {} daemons ran: dead \
-                     daemons' records were kept",
-                    self.daemons.len()
-                )));
+    /// Every watch takes in what process `a`'s step wrote in its slot.
+    fn watched(&mut self, a: usize) {
+        let actor = &self.actors[a];
+        let (Life::Running, Some(slot)) = (actor.life, actor.slot) else { return };
+        let bytes = self.load(at(slot.index, RESERVED));
+        let cores = self.load(at(slot.index, CORES));
+        for actor in &mut self.actors {
+            if let Some(watch) = &mut actor.watch {
+                watch.bytes[slot.index] = watch.bytes[slot.index].max(bytes);
+                watch.cores[slot.index] = watch.cores[slot.index].max(cores);
             }
-            Err(why) => return Err(harness(why)),
         }
-        self.write(&ledger);
-        let bytes = self.file.clone(); // alloc: the file a turn reads
-        self.live[daemon] = Some(live);
-        self.commit(daemon, &bytes)
     }
 
-    /// A turn of `daemon`: one atomic read-modify-write of the file, or under
-    /// [`Plant::UnlockedRmw`] its read now and its write at its next turn.
-    fn turn(&mut self, daemon: usize) -> Result<(), Broke> {
-        let Some(live) = &mut self.live[daemon] else { return Ok(()) };
-        if self.plant == Plant::UnlockedRmw {
-            match live.read.take() {
-                None => {
-                    live.read = Some(self.file.clone()); // alloc: the file a turn read
-                    return Ok(());
+    fn failed(&mut self, a: usize, error: MachineError) -> Result<(), Broke> {
+        match error.why {
+            // One past the bound: refused, naming it, and it exits.
+            Why::Full if self.planned > SLOTS => {
+                let actor = &mut self.actors[a];
+                self.table.0[actor.pid as usize] = None;
+                actor.life = Life::Gone;
+                actor.op = None;
+                Ok(())
+            }
+            Why::Full | Why::Lost { .. } | Why::Over { .. } | Why::Churn { .. } | Why::Stuck { .. } => {
+                Err(oracle(format_args!("process {a} (pid {}): {error}", self.actors[a].pid)))
+            }
+            _ => Err(harness(format_args!("process {a} (pid {}): {error}", self.actors[a].pid))),
+        }
+    }
+
+    fn done(&mut self, a: usize, out: Out) -> Result<(), Broke> {
+        match out {
+            Out::Joined(slot) => self.actors[a].slot = Some(slot),
+            Out::Acquired(got) => {
+                self.saw(a, Some(got.counted), None)?;
+                let actor = &mut self.actors[a];
+                actor.holds += actor.pending;
+            }
+            Out::Reserved(reserved) => {
+                let counted = match reserved {
+                    Reserved::Granted { counted, .. } | Reserved::Refused { counted, .. } => counted,
+                };
+                self.saw(a, Some(counted), None)?;
+                if let Reserved::Granted { .. } = reserved {
+                    let actor = &mut self.actors[a];
+                    actor.holds += actor.pending;
                 }
-                Some(read) => return self.commit(daemon, &read),
+            }
+            Out::Lowered => {}
+            Out::Took(took) => {
+                self.saw(a, None, Some(took.counted))?;
+                let actor = &mut self.actors[a];
+                let fit = actor.pending.saturating_sub(took.over);
+                actor.cores += took.granted;
+                actor.credit += took.granted - took.granted.min(fit);
+            }
+            Out::Counted(counted) => self.saw(a, Some(counted.reserved), Some(counted.cores_held))?,
+            Out::Left => {
+                let actor = &mut self.actors[a];
+                self.table.0[actor.pid as usize] = None;
+                actor.slot = None;
+                actor.life = Life::Gone;
             }
         }
-        let bytes = self.file.clone(); // alloc: the file a turn reads
-        self.commit(daemon, &bytes)
-    }
-
-    /// The rest of a turn, on the file's `bytes` as the turn read them.
-    fn commit(&mut self, daemon: usize, bytes: &[u8]) -> Result<(), Broke> {
-        let mut ledger = self.ledger(bytes)?;
-        let at_ns = self.tick();
-        let budget = self.budget;
-        let procs = &self.procs;
-        let Some(live) = &mut self.live[daemon] else { return Ok(()) };
-        let me = live.process;
-        // What the other daemons that truly run are charged, as the turn reads it.
-        let others: u64 = ledger
-            .records()
-            .filter(|it| it.process != me && procs.contains(&it.process))
-            .map(Record::charge)
-            .sum();
-        let before = live.plane.granted();
-        let mut admitting =
-            Admitting { plane: &mut live.plane, at_ns, outputs: Ok(Vec::new()) }; // alloc: an empty list
-        let turn = match ledger.turn(me, at_ns, &Procs(procs), &mut admitting) {
-            Ok(turn) => turn,
-            Err(LedgerError { why: Why::NotJoined { .. }, .. }) => {
-                return Err(oracle(format!(
-                    "pid {} took a turn with no record of it in the ledger: another daemon's \
-                     write dropped it",
-                    me.pid
-                )));
-            }
-            Err(why) => return Err(harness(why)),
-        };
-        let outputs = std::mem::replace(&mut admitting.outputs, Ok(Vec::new())).map_err(harness)?; // alloc: an empty list
-        live.started(&outputs)?;
-        let after = live.plane.granted();
-        if others >= budget && after > before {
-            return Err(oracle(format!(
-                "pid {} admitted {} bytes while the other daemons' charges sum to {others}, the \
-                 machine budget {budget} or more (its allowance: {:?})",
-                me.pid,
-                after - before,
-                turn.allowance
-            )));
-        }
-        self.write(&ledger);
+        self.actors[a].watch = None;
         Ok(())
     }
 
-    /// The invariants every act keeps.
+    /// The oracles of a sum, at the end of process `a`'s summing operation.
+    fn saw(&mut self, a: usize, bytes: Option<u64>, cores: Option<u64>) -> Result<(), Broke> {
+        let Some(watch) = &self.actors[a].watch else {
+            return Err(harness(format_args!("process {a} summed with no watch")));
+        };
+        // The invariant: a sum counts only the slots of live processes, each at most what it
+        // held while the sum ran: a freed slot of the dead is never counted.
+        let held: u64 = watch.bytes.iter().sum();
+        if let Some(counted) = bytes
+            && counted > held
+        {
+            return Err(oracle(format_args!(
+                "process {a}'s sum counted {counted} bytes, and the live slots held at most {held} \
+                 while it ran: it counted the slot of a dead process"
+            )));
+        }
+        let held: u64 = watch.cores.iter().sum();
+        if let Some(counted) = cores
+            && counted > held
+        {
+            return Err(oracle(format_args!(
+                "process {a}'s sum counted {counted} cores, and the live slots held at most {held} \
+                 while it ran: it counted the slot of a dead process"
+            )));
+        }
+        // The invariant: a dead process's charge is gone after one sum by any other: a sum that
+        // began after the death freed its slot.
+        for dead in &self.dead {
+            if dead.died_at < watch.began && self.load(at(dead.slot, OWNER)) == dead.owner {
+                return Err(oracle(format_args!(
+                    "slot {} still holds the process that died at {}, after process {a}'s sum, \
+                     begun at {}, passed it",
+                    dead.slot, dead.died_at, watch.began
+                )));
+            }
+        }
+        let words = &self.words;
+        self.dead.retain(|dead| words[at(dead.slot, OWNER)].load(SeqCst) == dead.owner);
+        Ok(())
+    }
+
+    /// The oracles of every instant.
     fn check(&self) -> Result<(), Broke> {
-        let granted: u64 = self.live.iter().flatten().map(|it| it.plane.granted()).sum();
-        if granted > self.budget {
-            return Err(oracle(format!(
-                "the live daemons' grants sum to {granted}, over the machine budget {}: {}",
-                self.budget,
-                self.grants()
+        let live = || self.actors.iter().filter(|actor| actor.life == Life::Running);
+        // The invariant: the sum of live reservations never exceeds the budget.
+        let held: u64 = live().map(|actor| actor.holds).sum();
+        if held > self.budget {
+            return Err(oracle(format_args!(
+                "the live processes hold {held} bytes granted, past the budget of {}",
+                self.budget
             )));
         }
-        // A daemon is live only once its first turn is done ([`World::start`]), so each has a
-        // room: none is the `u64::MAX` of a plane never told an allowance.
-        let mut rooms = 0u64;
-        for live in self.live.iter().flatten() {
-            rooms = rooms.saturating_add(live.plane.room());
-        }
-        if rooms > self.budget {
-            return Err(oracle(format!(
-                "the live daemons' rooms, what each may grant with no turn, sum to {rooms}, over \
-                 the machine budget {}: {}",
-                self.budget,
-                self.grants()
+        // The invariant: cores held never exceed the cores and the floors of the processes
+        // given them past what fit (at most one each).
+        let cores: u64 = live().map(|actor| actor.cores).sum();
+        let credit: u64 = live().map(|actor| actor.credit).sum();
+        if let Some(actor) = live().find(|actor| actor.credit > FLOOR) {
+            return Err(oracle(format_args!(
+                "pid {} holds {} cores past what fit, more than its floor of {FLOOR}",
+                actor.pid, actor.credit
             )));
         }
-        let ledger = self.ledger(&self.file)?;
-        for live in self.live.iter().flatten() {
-            let Some(record) = ledger.record(live.process) else {
-                return Err(oracle(format!(
-                    "pid {} runs and the ledger has no record of it: {}",
-                    live.process.pid,
-                    self.grants()
-                )));
-            };
-            if live.plane.granted() > record.charge() {
-                return Err(oracle(format!(
-                    "pid {} is granted {}, more than the {} the ledger records of it, room \
-                     another daemon may be told is free: {}",
-                    live.process.pid,
-                    live.plane.granted(),
-                    record.charge(),
-                    self.grants()
-                )));
-            }
-            if live.plane.room() > record.charge() {
-                return Err(oracle(format!(
-                    "pid {} has room to grant up to {} with no turn, more than the {} the ledger \
-                     records of it (its lease {}): the rest is room another daemon is told is \
-                     free: {}",
-                    live.process.pid,
-                    live.plane.room(),
-                    record.charge(),
-                    record.lease,
-                    self.grants()
-                )));
-            }
+        if cores > self.cores + credit {
+            return Err(oracle(format_args!(
+                "the live processes hold {cores} cores, past the machine's {} and their {credit} \
+                 floors given past it",
+                self.cores
+            )));
         }
         Ok(())
     }
 
-    /// Each live daemon's grant beside what the ledger records of it, for a failure's message.
-    fn grants(&self) -> String {
-        // alloc: a failure's message
-        let mut text = String::new();
-        let ledger = Ledger::decode(World::path(), &self.file).ok();
-        for live in self.live.iter().flatten() {
-            let charge = ledger.as_ref().and_then(|it| it.record(live.process)).map(Record::charge);
-            text.push_str(&format!(
-                "[pid {} granted {} room {} recorded {charge:?}] ",
-                live.process.pid,
-                live.plane.granted(),
-                live.plane.room()
-            ));
-        }
-        if let Some(ledger) = &ledger {
-            for record in ledger.records() {
-                text.push_str(&format!(
-                    "(record pid {} start {} charge {}) ",
-                    record.process.pid,
-                    record.process.start,
-                    record.charge()
-                ));
-            }
-        }
-        text
-    }
-
-    /// Every daemon's tasks end, round by round; then the probe (bounded-progress).
-    fn drain(&mut self) -> Result<(), Broke> {
-        for daemon in 0..self.live.len() {
-            if let Some(read) = self.live[daemon].as_mut().and_then(|it| it.read.take()) {
-                self.commit(daemon, &read)?;
-                self.check()?;
-            }
-        }
-        if self.live.iter().all(Option::is_none) {
-            self.start(0, 0)?;
-            self.check()?;
-        }
-        // Each task fits alone, and in a round in which tasks wait at least one starts at the
-        // latest by the next round's turns. The leases do not change that: from the second
-        // round on no task was started since a daemon's last turn but at that turn, so a
-        // daemon that starts none leases 1/16 of its ceiling at most, and five baselines and
-        // four such leases leave any daemon its largest task. The first round's records may
-        // still hold the leases of the acts, which is the two rounds more.
-        let bound = 2 * self.submitted + 6;
-        let mut rounds = 0;
-        while self.waiting() > 0 {
-            if rounds == bound {
-                return Err(oracle(format!(
-                    "{} tasks, each of which fits alone, still wait after {bound} rounds in which \
-                     every running task ended and every daemon took a turn: {}",
-                    self.waiting(),
-                    self.grants()
-                )));
-            }
-            self.round()?;
-            rounds += 1;
-        }
-        self.round()?;
-        self.probe()
-    }
-
-    /// The tasks not yet ended, of every live daemon: waiting or running.
-    fn waiting(&self) -> usize {
-        self.live.iter().flatten().map(|it| it.tasks.len()).sum()
-    }
-
-    /// Every running task ends and every daemon says what it holds, then each takes a turn.
-    fn round(&mut self) -> Result<(), Broke> {
-        for daemon in 0..self.live.len() {
-            let config = self.daemons[daemon];
-            let at_ns = self.tick();
-            let Some(live) = &mut self.live[daemon] else { continue };
-            while live.running() > 0 {
-                finish(live, 0, at_ns)?;
-            }
-            live.step(PlaneInput::Held { at_ns, bytes: live.held(&config) })?;
-            self.check()?;
-        }
-        for daemon in 0..self.live.len() {
-            if self.live[daemon].is_some() {
-                let bytes = self.file.clone(); // alloc: the file a turn reads
-                self.commit(daemon, &bytes)?;
-                self.check()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// With every daemon idle, a task as large as the ledger should let the daemon with the
-    /// largest ceiling grant starts at its next turn: no dead daemon's charge is kept.
-    fn probe(&mut self) -> Result<(), Broke> {
-        let Some(daemon) = (0..self.live.len())
-            .filter(|&it| self.live[it].is_some())
-            .max_by_key(|&it| self.daemons[it].ceiling)
-        else {
-            return Err(harness("no daemon runs for the probe"));
-        };
-        let me = self.live[daemon].as_ref().expect("a live daemon").process;
-        let ledger = self.ledger(&self.file)?;
-        let others: u64 = ledger
-            .records()
-            .filter(|it| it.process != me && self.procs.contains(&it.process))
-            .map(Record::charge)
-            .sum();
-        let fits = self.daemons[daemon].ceiling.min(self.budget.saturating_sub(others));
-        if fits == 0 {
+    /// The invariant: no wake is lost. Once nothing runs, a sleeper sleeps only on the epoch
+    /// now, and only while it would not fit beside what the live slots hold; a death since it
+    /// fell asleep excuses it until its driver's wait ends (a tick), as the dead process may
+    /// have lowered without bumping.
+    fn quiet(&self) -> Result<(), Broke> {
+        if (0..self.actors.len()).any(|a| self.runnable(a)) {
             return Ok(());
         }
-        self.submit(daemon, fits, fits)?;
-        let bytes = self.file.clone(); // alloc: the file a turn reads
-        self.commit(daemon, &bytes)?;
-        self.check()?;
-        let live = self.live[daemon].as_ref().expect("a live daemon");
-        // Granted all of it too: a task as large as the ceiling may start alone with less.
-        if live.tasks.iter().any(|it| !it.running) || live.plane.granted() < fits {
-            return Err(oracle(format!(
-                "pid {} did not start a task of {fits} bytes, all its ceiling and the machine \
-                 budget less the {others} the other live daemons hold allow, with every daemon \
-                 idle: {}",
-                me.pid,
-                self.grants()
-            )));
+        let epoch = self.load(EPOCH) as u32;
+        let held: u64 = (0..SLOTS)
+            .filter(|&slot| state_of(self.load(at(slot, OWNER))) == LIVE)
+            .map(|slot| self.load(at(slot, RESERVED)))
+            .sum();
+        for (a, actor) in self.actors.iter().enumerate() {
+            let Some(expected) = actor.blocked else { continue };
+            if actor.life != Life::Running || actor.deaths_seen != self.deaths {
+                continue;
+            }
+            if epoch != expected {
+                return Err(oracle(format_args!(
+                    "process {a} sleeps on epoch {expected}, which moved to {epoch} with no wake"
+                )));
+            }
+            let Some(Running::Acquire(acquire)) = &actor.op else {
+                return Err(harness(format_args!("process {a} sleeps outside an acquire")));
+            };
+            let bytes = acquire.bytes();
+            if held + bytes <= self.budget {
+                return Err(oracle(format_args!(
+                    "process {a} sleeps for {bytes} bytes, which fit beside the {held} the live \
+                     slots hold in the budget of {}: a lost wake",
+                    self.budget
+                )));
+            }
         }
         Ok(())
     }
-}
 
-/// The running task `pick` (modulo how many run) of `live` ends.
-fn finish(live: &mut Live, pick: usize, at_ns: u64) -> Result<(), Broke> {
-    // alloc: a short list, once an act
-    let running: Vec<usize> = (0..live.tasks.len()).filter(|&it| live.tasks[it].running).collect();
-    if running.is_empty() {
-        return Ok(());
+    /// Runs every process that can run, each alone to the end of its operation or its sleep.
+    fn settle(&mut self) -> Result<(), Broke> {
+        let mut steps = 0;
+        loop {
+            let mut moved = false;
+            for a in 0..self.actors.len() {
+                while self.runnable(a) {
+                    self.step(a)?;
+                    moved = true;
+                    steps += 1;
+                    if steps > SETTLE {
+                        return Err(oracle(format_args!(
+                            "the processes did not settle in {SETTLE} steps"
+                        )));
+                    }
+                }
+            }
+            if !moved {
+                return Ok(());
+            }
+        }
     }
-    let task = live.tasks.remove(running[pick % running.len()]);
-    live.step(PlaneInput::Done {
-        at_ns,
-        id: task.id,
-        outcome: Outcome::Built,
-        added: Vec::new(), // alloc: none added
-        group: None,
-        peak: task.memory.max(task.real),
-    })
+
+    /// The end: every process gives back what it holds, round by round, and every wait ends
+    /// (bounded-progress): what is still asleep at the end does not fit beside what the live
+    /// slots hold (a stalled process's charge, a dead one's whose pid runs again).
+    fn drain(&mut self) -> Result<(), Broke> {
+        for _ in 0..self.actors.len() + 4 {
+            self.settle()?;
+            self.quiet()?;
+            // `1 + pick % n` with `pick = n - 1` is all `n`.
+            for a in 0..self.actors.len() {
+                if let Some(pick) = self.actors[a].holds.checked_sub(1) {
+                    self.begin(a, What::Release(pick))?;
+                }
+            }
+            self.settle()?;
+            self.quiet()?;
+            for a in 0..self.actors.len() {
+                if let Some(pick) = self.actors[a].cores.checked_sub(1) {
+                    self.begin(a, What::Give(pick))?;
+                }
+            }
+            self.settle()?;
+            self.quiet()?;
+            wake_all(&mut self.actors);
+        }
+        self.settle()?;
+        self.quiet()
+    }
 }
 
 fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
     let mut world = World::new(plan, plant);
-    for daemon in 0..plan.daemons.len() {
-        world.start(daemon, 0)?;
-        world.check()?;
-    }
     for &act in &plan.acts {
         world.act(act)?;
     }
@@ -755,12 +808,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 
 // --- The tests ------------------------------------------------------------------------------
 
-/// The invariant: whatever crashes, restarts and pid reuse, the live daemons' grants never sum
-/// past the machine budget, nor does what they may grant with no turn (each one's room: its
-/// charge and its lease), none grants or has room the ledger does not hold for it, none admits
-/// while the others' charges fill the machine, and every task that fits starts.
-#[hegel::test(test_cases = 300)]
-fn live_grants_fit_the_machine_budget_after_any_crash(tc: TestCase) {
+/// The invariant: whatever the interleaving at every atomic, deaths, pid reuse and stopped
+/// processes, the live reservations never sum past the budget, the cores held pass the cores by
+/// at most the floors given past them, a sum counts no dead slot and frees every slot of a
+/// process dead before it began, and no wake is lost.
+#[hegel::test(test_cases = 200)]
+fn live_reservations_fit_the_budget_and_no_wake_is_lost(tc: TestCase) {
     let plan = plan(&mut Drawn(&tc));
     if let Err(broke) = run(&plan, Plant::None) {
         panic!("{broke}\nplan {plan:?}");
@@ -788,23 +841,23 @@ fn control(plant: Plant) {
 }
 
 #[test]
-fn the_oracle_catches_a_read_modify_write_without_the_lock() {
-    control(Plant::UnlockedRmw);
+fn the_oracle_catches_a_sum_before_the_add() {
+    control(Plant::SumThenAdd);
 }
 
 #[test]
-fn the_oracle_catches_a_prune_that_ignores_start_time() {
-    control(Plant::PruneIgnoresStart);
+fn the_oracle_catches_a_wake_before_the_slot_is_lowered() {
+    control(Plant::WakeBeforeLower);
 }
 
 #[test]
-fn the_oracle_catches_an_allowance_that_leaves_out_a_daemon() {
-    control(Plant::AllowanceSkipsOne);
+fn the_oracle_catches_a_pruned_slot_still_counted() {
+    control(Plant::PrunedStillCounted);
 }
 
 #[test]
-fn the_oracle_catches_a_lease_the_ledger_does_not_record() {
-    control(Plant::LeaseUnrecorded);
+fn the_oracle_catches_a_pid_matched_without_its_start() {
+    control(Plant::PidWithoutStart);
 }
 
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
@@ -816,330 +869,112 @@ fn replay_one_seed() {
     }
 }
 
-// --- The file ---------------------------------------------------------------------------------
+// --- Single cases -----------------------------------------------------------------------------
 
-/// A record of `pid` with every other field drawn, labels longer and shorter than they keep.
-fn record(d: &mut impl Draw, pid: u32) -> Record {
-    let version_len = d.int(0, 40) as usize;
-    let version: Vec<u8> = (0..version_len).map(|_| d.int(1, 255) as u8).collect(); // alloc: a drawn label
-    let home_len = d.int(0, 60) as usize;
-    let home: Vec<u8> = (0..home_len).map(|_| d.int(1, 255) as u8).collect(); // alloc: a drawn label
-    Record {
-        process: Process { pid, start: d.int(0, u64::MAX) },
-        budget: d.int(0, u64::MAX),
-        ceiling: d.int(0, u64::MAX),
-        held: d.int(0, u64::MAX),
-        granted: d.int(0, u64::MAX),
-        lease: d.int(0, u64::MAX),
-        wants: d.int(0, u64::MAX),
-        gives: d.int(0, u64::MAX),
-        at_ns: d.int(0, u64::MAX),
-        version: Label::head(&version, d.int(0, u64::MAX)),
-        home: Label::tail(&home, d.int(0, u64::MAX)),
-    }
+fn join(m: &Machine<'_>, table: &Table, pid: u32, start: u64) -> Result<Slot, MachineError> {
+    finish(&mut Join::new(Process { pid, start }), m, table, || {})
 }
 
-/// What is written reads back as the same ledger, and writes again to the same bytes
-/// (persisted-state-round-trips); one byte changed anywhere is an error naming the file, never
-/// a ledger read.
-#[hegel::test(test_cases = 200)]
-fn a_ledger_round_trips_byte_for_byte_and_refuses_a_changed_byte(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    for pid in 1..=d.int(0, MOST as u64) as u32 {
-        ledger.join(record(&mut d, pid)).expect("a free slot");
+/// The invariant: a process past [`SLOTS`] is refused, naming the bound and the file, and joins
+/// once a slot's process has died.
+#[test]
+fn the_sixty_fifth_process_is_refused_naming_the_bound() {
+    let words = words(1 << 20, 8);
+    let m = machine(&words, Plant::None);
+    // alloc: the simulated system
+    let mut table = Table(vec![None; SLOTS + 2]);
+    for pid in 1..=SLOTS as u32 {
+        table.0[pid as usize] = Some(u64::from(pid) * 10);
+        let slot = join(&m, &table, pid, u64::from(pid) * 10).expect("a slot is free");
+        assert_eq!(slot.index(), pid as usize - 1);
     }
-    for _ in 0..d.int(0, 4) {
-        let pid = d.int(1, MOST as u64) as u32;
-        let start = ledger.records().find(|it| it.process.pid == pid).map(|it| it.process);
-        if let Some(process) = start {
-            ledger.leave(process).expect("a joined record");
+    let last = SLOTS as u32 + 1;
+    table.0[last as usize] = Some(7);
+    let refused = join(&m, &table, last, 7).expect_err("every slot holds a live process");
+    assert_eq!(refused.why, Why::Full);
+    let said = refused.to_string();
+    assert!(said.contains("64") && said.contains(PATH), "{said}");
+    // Pid 3 dies: the join's sum frees its slot, and takes it.
+    table.0[3] = None;
+    let slot = join(&m, &table, last, 7).expect("the dead process's slot is freed");
+    assert_eq!(slot.index(), 2);
+}
+
+/// Two reservers stepped in lockstep, so each one's add and sum fall between the other's.
+fn race(plant: Plant) -> [Reserved; 2] {
+    let words = words(100, 4);
+    let m = machine(&words, plant);
+    // alloc: the simulated system
+    let table = Table(vec![None, Some(1), Some(2)]);
+    let a = join(&m, &table, 1, 1).expect("a slot is free");
+    let b = join(&m, &table, 2, 2).expect("a slot is free");
+    let mut ops = [Reserve::new(a, 60), Reserve::new(b, 60)];
+    let mut outs = [None, None];
+    for _ in 0..2 * MOST_STEPS {
+        for (op, out) in ops.iter_mut().zip(&mut outs) {
+            if out.is_some() {
+                continue;
+            }
+            match op.step(&m, &table).expect("a reserve steps") {
+                Step::Done(reserved) => *out = Some(reserved),
+                Step::Next | Step::Wake => {}
+                Step::Block { .. } => panic!("a reserve never sleeps"),
+            }
+        }
+        if let [Some(a), Some(b)] = outs {
+            return [a, b];
         }
     }
-    let mut bytes = [0; LEN];
-    ledger.encode(&mut bytes);
-    let read = Ledger::decode(path, &bytes).expect("what was written reads");
-    assert_eq!(read, ledger);
-    let mut again = [0; LEN];
-    read.encode(&mut again);
-    assert_eq!(again, bytes, "a ledger read back writes the same bytes");
-
-    let at = d.int(0, LEN as u64 - 1) as usize;
-    let flip = d.int(1, 255) as u8;
-    bytes[at] ^= flip;
-    match Ledger::decode(path, &bytes) {
-        Ok(_) => panic!("byte {at} changed by {flip:#04x} and the ledger still read"),
-        Err(error) => {
-            assert!(error.why.corrupt(), "{error}");
-            let said = error.to_string();
-            assert!(said.contains(PATH), "the error names the file: {said}");
-        }
-    }
+    panic!("two reserves did not end in {} steps", 2 * MOST_STEPS);
 }
 
+/// The invariant: of two reservers whose bytes together pass the budget, cut between add and
+/// sum, at most one passes; summing before the add lets both.
 #[test]
-fn an_empty_file_is_an_empty_ledger_and_a_short_one_is_corrupt() {
-    let path = Path::new(PATH);
-    assert_eq!(Ledger::decode(path, &[]).expect("empty reads").records().count(), 0);
-    let error = Ledger::decode(path, &[0; 100]).expect_err("a short file");
-    assert_eq!(error.why, Why::Length { len: 100 });
-    assert!(error.to_string().contains(PATH));
+fn two_reservers_cut_between_add_and_sum_never_both_pass() {
+    let granted = |reserved: &Reserved| matches!(reserved, Reserved::Granted { .. });
+    let outs = race(Plant::None);
+    assert!(!outs.iter().all(granted), "both passed: {outs:?}");
+    let planted = race(Plant::SumThenAdd);
+    assert!(planted.iter().all(granted), "the planted sum-then-add did not race: {planted:?}");
 }
 
-/// A file of the layout before the lease is refused by its layout, naming the file and both
-/// layouts, never read as a ledger whose daemons lease nothing: a daemon of that layout would
-/// not count this one's lease.
+/// The invariant: a file of another layout, or another length, is refused naming the file.
 #[test]
-fn a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts() {
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    ledger.join(record(&mut SplitMix64::new(3), 1)).expect("a free slot");
-    let mut bytes = [0; LEN];
-    ledger.encode(&mut bytes);
-    assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
-    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-    let error = Ledger::decode(path, &bytes).expect_err("layout 1");
-    assert_eq!(error.why, Why::Format { found: 1 });
-    assert!(error.why.corrupt());
-    let said = error.to_string();
+fn a_ledger_of_another_layout_is_refused_naming_its_file() {
+    let words = words(100, 4);
+    words[AT_LAYOUT].store(LAYOUT + 1, SeqCst);
+    let Err(error) = Machine::new(Path::new(PATH), &words) else {
+        panic!("a ledger of layout {} read as layout {LAYOUT}", LAYOUT + 1);
+    };
+    assert_eq!(error.why, Why::Layout { found: LAYOUT + 1 });
+    assert!(error.to_string().contains(PATH), "{error}");
+    words[AT_LAYOUT].store(LAYOUT, SeqCst);
+    let Err(error) = Machine::new(Path::new(PATH), &words[..WORDS - 1]) else {
+        panic!("a ledger one word short read");
+    };
+    assert_eq!(error.why, Why::Length { words: WORDS - 1 });
+    assert!(error.to_string().contains(PATH), "{error}");
+}
+
+/// The invariant: a live process that stops beating keeps its charge: no sum frees it, and
+/// another's reserve is refused by it.
+#[test]
+fn a_live_process_that_stops_beating_keeps_its_charge() {
+    let words = words(100, 4);
+    let m = machine(&words, Plant::None);
+    // alloc: the simulated system
+    let table = Table(vec![None, Some(1), Some(2)]);
+    let a = join(&m, &table, 1, 1).expect("a slot is free");
+    let granted = finish(&mut Reserve::new(a, 80), &m, &table, || {}).expect("a reserve ends");
+    assert_eq!(granted, Reserved::Granted { counted: 80, budget: 100 });
+    m.beat(a, 1).expect("its slot is its");
+    let b = join(&m, &table, 2, 2).expect("a slot is free");
+    let counted = finish(&mut Census::new(), &m, &table, || {}).expect("a census ends");
+    assert_eq!((counted.processes, counted.pruned, counted.reserved), (2, 0, 80));
+    let refused = finish(&mut Reserve::new(b, 30), &m, &table, || {}).expect("a reserve ends");
     assert!(
-        said.contains(PATH)
-            && said.contains("layout 1")
-            && said.contains(&format!("layout {FORMAT}")),
-        "{said}"
+        matches!(refused, Reserved::Refused { over_by: 10, counted: 110, budget: 100, .. }),
+        "{refused:?}"
     );
-}
-
-/// A file of the layout before what a daemon wants and gives (layout 2) is refused the same
-/// way, never read as a ledger whose daemons want nothing: its version and home labels sit
-/// where layout 3 keeps those two numbers.
-#[test]
-fn a_file_of_the_layout_before_wants_and_gives_is_refused_naming_both_layouts() {
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    ledger.join(record(&mut SplitMix64::new(4), 1)).expect("a free slot");
-    let mut bytes = [0; LEN];
-    ledger.encode(&mut bytes);
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
-    let error = Ledger::decode(path, &bytes).expect_err("layout 2");
-    assert_eq!(error.why, Why::Format { found: 2 });
-    let said = error.to_string();
-    assert!(said.contains("layout 2") && said.contains("layout 3"), "{said}");
-}
-
-/// A record's lease is part of its charge, so another daemon's allowance is less by it.
-#[test]
-fn a_lease_counts_against_every_other_daemons_allowance() {
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    let of = |pid: u32, held: u64, lease: u64| Record {
-        process: Process { pid, start: 1 },
-        budget: 100,
-        ceiling: 100,
-        held,
-        granted: 0,
-        lease,
-        wants: 0,
-        gives: 0,
-        at_ns: 0,
-        version: Label::EMPTY,
-        home: Label::EMPTY,
-    };
-    ledger.join(of(1, 10, 20)).expect("a free slot");
-    ledger.join(of(2, 5, 0)).expect("a free slot");
-    assert_eq!(ledger.record(Process { pid: 1, start: 1 }).expect("joined").charge(), 30);
-    let allowance = ledger.allowance(Process { pid: 2, start: 1 }).expect("joined");
-    assert_eq!((allowance.bytes, allowance.others), (70, 30));
-}
-
-/// A daemon past the [`MOST`]th is refused, naming the file and the bound.
-#[test]
-fn joining_past_the_most_is_refused() {
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    let mut rng = SplitMix64::new(7);
-    for pid in 1..=MOST as u32 {
-        ledger.join(record(&mut rng, pid)).expect("a free slot");
-    }
-    let error = ledger.join(record(&mut rng, MOST as u32 + 1)).expect_err("the ledger is full");
-    assert_eq!(error.why, Why::Full);
-    let said = error.to_string();
-    assert!(said.contains(PATH) && said.contains("64"), "{said}");
-}
-
-// --- Sharing by need --------------------------------------------------------------------------
-
-/// One daemon of the sharing simulation: what it holds, the floor it keeps when idle, and for
-/// one that builds what its build needs to hold in all.
-#[derive(Clone, Copy, Debug)]
-struct Peer {
-    process: Process,
-    held: u64,
-    floor: u64,
-    need: Option<u64>,
-}
-
-/// Daemons that build and daemons that idle take turns at one ledger, each as the driver does:
-/// a building one grows into its allowance and says what it is still short of; an idle one
-/// says what it could give, is told what to hold at most ([`Ledger::yielded`]) and gives down
-/// to it, never under its floor. Checked at every turn: what the daemons hold fits the machine
-/// budget; an idle daemon never goes under its floor, and gives only while another wants. At
-/// the end: no daemon that builds is short of its need while an idle one could still give.
-fn share(seed: u64, plant: Plant) -> Result<(), String> {
-    let mut random = SplitMix64::new(seed);
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    ledger.plant = plant;
-    let count = 2 + random.below(5) as usize;
-    // alloc: a case's daemons
-    let mut peers: Vec<Peer> = (0..count)
-        .map(|at| {
-            let floor = 1 + random.below(8);
-            let held = floor + random.below(33);
-            // The first builds and the second idles, so every case has both; the rest by coin.
-            let builds = at == 0 || (at != 1 && random.below(2) == 0);
-            let need = builds.then(|| held + 1 + random.below(40));
-            Peer { process: Process { pid: at as u32 + 1, start: 1 }, held, floor, need }
-        })
-        .collect();
-    let machine = peers.iter().map(|it| it.held).sum::<u64>() + random.below(9);
-    for peer in &peers {
-        let record = Record {
-            process: peer.process,
-            budget: machine,
-            ceiling: machine,
-            held: peer.held,
-            granted: 0,
-            lease: 0,
-            wants: 0,
-            gives: 0,
-            at_ns: 0,
-            version: Label::EMPTY,
-            home: Label::EMPTY,
-        };
-        ledger.join(record).map_err(|error| format!("seed {seed}: {error}"))?;
-    }
-    let failed = |error: LedgerError| format!("seed {seed}: {error}");
-    for round in 0..8 {
-        for at in 0..peers.len() {
-            let peer = peers[at];
-            match peer.need {
-                Some(need) => {
-                    let allowance = ledger.allowance(peer.process).map_err(failed)?.bytes;
-                    let held = need.min(allowance).max(peer.held);
-                    peers[at].held = held;
-                    ledger.charge(peer.process, held, 0, 0, round).map_err(failed)?;
-                    ledger.need(peer.process, need - held, 0).map_err(failed)?;
-                }
-                None => {
-                    ledger.charge(peer.process, peer.held, 0, 0, round).map_err(failed)?;
-                    ledger.need(peer.process, 0, peer.held - peer.floor).map_err(failed)?;
-                    let wanted: u64 = ledger
-                        .records()
-                        .filter(|it| it.process != peer.process)
-                        .map(|it| it.wants)
-                        .sum();
-                    let target = ledger.yielded(peer.process).map_err(failed)?;
-                    if target < peer.held {
-                        if wanted == 0 {
-                            return Err(format!(
-                                "seed {seed}, round {round}: daemon {at} was told to hold {target} of {} while no daemon wants anything",
-                                peer.held
-                            ));
-                        }
-                        if target < peer.floor {
-                            return Err(format!(
-                                "seed {seed}, round {round}: daemon {at} was told to hold {target}, under its floor of {}",
-                                peer.floor
-                            ));
-                        }
-                        peers[at].held = target;
-                        ledger.charge(peer.process, target, 0, 0, round).map_err(failed)?;
-                        ledger.need(peer.process, 0, target - peer.floor).map_err(failed)?;
-                    }
-                }
-            }
-            let held: u64 = peers.iter().map(|it| it.held).sum();
-            if held > machine {
-                return Err(format!(
-                    "seed {seed}, round {round}: the daemons hold {held} of a machine budget of {machine}: {peers:?}"
-                ));
-            }
-        }
-    }
-    let givable: u64 = peers.iter().filter(|it| it.need.is_none()).map(|it| it.held - it.floor).sum();
-    for (at, peer) in peers.iter().enumerate() {
-        if let Some(need) = peer.need
-            && peer.held < need
-            && givable > 0
-        {
-            return Err(format!(
-                "seed {seed}: daemon {at} builds and holds {} of the {need} it needs while idle daemons could still give {givable}: {peers:?}",
-                peer.held
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The invariant: daemons sharing one machine budget by need never hold more than it
-/// together; a daemon that builds is not left short of what it needs while an idle one holds
-/// more than its floor; an idle daemon gives only while another wants, and never under its
-/// floor.
-#[test]
-fn a_building_daemon_is_not_short_while_an_idle_one_holds_more_than_its_floor() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(broke) = share(seed, Plant::None) {
-            panic!("{broke}");
-        }
-    }
-}
-
-/// The control: with no yield (the rule before layout 3) a building daemon stays short beside
-/// idle daemons that hold what it needs.
-#[test]
-fn the_oracle_catches_idle_daemons_that_yield_nothing() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(why) = share(seed, Plant::NoYield) {
-            eprintln!("Plant::NoYield caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!("the oracle caught Plant::NoYield at none of seeds 0..{CONTROL_SEEDS}");
-}
-
-/// The Mac of 2026-11-12 in GiB: a hello-world's daemon that builds and wants 30 more, beside
-/// daemons idle at 22.6, 9.7 and 6.1 (here 23, 10 and 6, each with a floor of 1). Each idle
-/// daemon is told its part in proportion to what it can give, the parts cover what is wanted,
-/// and the daemon that builds yields nothing.
-#[test]
-fn idle_daemons_give_in_proportion_to_what_each_can() {
-    let path = Path::new(PATH);
-    let mut ledger = Ledger::empty(path);
-    let of = |pid: u32, held: u64, wants: u64, gives: u64| Record {
-        process: Process { pid, start: 1 },
-        budget: 96,
-        ceiling: 96,
-        held,
-        granted: 0,
-        lease: 0,
-        wants,
-        gives,
-        at_ns: 0,
-        version: Label::EMPTY,
-        home: Label::EMPTY,
-    };
-    ledger.join(of(1, 20, 30, 0)).expect("a free slot");
-    ledger.join(of(2, 23, 0, 22)).expect("a free slot");
-    ledger.join(of(3, 10, 0, 9)).expect("a free slot");
-    ledger.join(of(4, 6, 0, 5)).expect("a free slot");
-    let told = |pid: u32| ledger.yielded(Process { pid, start: 1 }).expect("joined");
-    assert_eq!(told(1), u64::MAX, "the daemon that builds yields nothing");
-    // 30 wanted of 36 givable: 22 x 30/36 = 18.3 -> 19; 9 x 30/36 = 7.5 -> 8; 5 x 30/36 = 4.2 -> 5.
-    assert_eq!((told(2), told(3), told(4)), (23 - 19, 10 - 8, 6 - 5));
-    // Nobody wants: nobody yields.
-    ledger.need(Process { pid: 1, start: 1 }, 0, 0).expect("joined");
-    let told = |pid: u32| ledger.yielded(Process { pid, start: 1 }).expect("joined");
-    assert_eq!((told(2), told(3), told(4)), (u64::MAX, u64::MAX, u64::MAX));
 }

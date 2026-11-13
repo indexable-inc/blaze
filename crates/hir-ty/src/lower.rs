@@ -3553,6 +3553,12 @@ impl SupertraitsInfo {
         &self.supertraits[self.direct_start as usize..]
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "direct_start is a u32 into a trait's supertraits, which are bounded by the \
+                  crate graph's traits but not checked below 2^32: making the field a usize or \
+                  refusing at collection would remove it"
+    )]
     fn new(
         all: &[TraitId],
         direct: &[TraitId],

@@ -134,8 +134,7 @@ fn workspace_ids(text: &str) -> String {
 #[test]
 fn fixtures_read_as_cargo_reads_them() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let scratch =
-        std::env::temp_dir().join(format!("blaze-manifest-fixtures-{}", std::process::id()));
+    let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-fixtures-");
     let mut names: Vec<_> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
@@ -143,7 +142,7 @@ fn fixtures_read_as_cargo_reads_them() {
     for name in &names {
         let fixture = dir.join(name);
         let expected = std::fs::read_to_string(fixture.join("expected.json")).unwrap();
-        let got = read(&fixture, &scratch);
+        let got = read(&fixture, scratch.path());
         if got != expected {
             let line = got.lines().zip(expected.lines()).position(|(a, b)| a != b).unwrap_or(0);
             failed.push(format!(
@@ -155,7 +154,6 @@ fn fixtures_read_as_cargo_reads_them() {
             ));
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert!(names.len() >= 4);
 }

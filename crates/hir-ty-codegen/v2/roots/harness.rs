@@ -116,6 +116,12 @@ fn listing(frontend: &HirFrontend<'_>, db: &Db, krate: Crate) -> Result<Vec<Test
     Ok(tests)
 }
 
+#[expect(
+    blaze::reads_positions,
+    reason = "a test's description is read off the live tree with its file, line and column, which go into the \
+              harness's source text and its digest: an edit above a test changes the harness; the positions \
+              must come from the link's span tables, the harness naming each test by path"
+)]
 fn test(
     frontend: &HirFrontend<'_>,
     db: &Db,

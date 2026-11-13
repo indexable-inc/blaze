@@ -340,6 +340,7 @@ const _: () = assert!(size_of::<ProvidedBuf>() == 16);
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct StatxTime {
     sec: i64,
     nsec: u32,
@@ -351,6 +352,7 @@ struct StatxTime {
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct Statx {
     mask: u32,
     /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
@@ -1189,6 +1191,13 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
     out
 }
 
+/// An [`Effect::ReadMany`] in flight: the asker's parts, handed back with each `got` set, and
+/// how many of its requests have not ended.
+struct Batch {
+    parts: Vec<crate::ReadPart>,
+    left: usize,
+}
+
 /// A watch's read and what it reads for, in [`Uring::watchings`], which is not freed while the
 /// kernel may still write into `buffer` (see `Drop`).
 struct Watching {
@@ -1729,6 +1738,13 @@ pub struct Uring {
     /// Each file opened for reads into and writes from memory ([`Effect::ReadInto`],
     /// [`Effect::WriteFrom`]), by its name: the store's pool's packs, opened once and kept.
     positional: HashMap<FileName, Handle<Kept>, Global>,
+    /// Each [`Effect::ReadMany`] in flight, by its tag: its parts, each read by a request of
+    /// its own on the ring (`ops::PART`), and how many of them are not in yet.
+    batches: HashMap<Tag, Batch, Global>,
+    /// The table [`crate::threads::run`] is handed for the work done off the ring, which reads
+    /// nothing into memory (this driver's reads are on the ring, `positional`'s): it stays
+    /// empty, allocating nothing.
+    descriptors: Arc<crate::descriptors::Descriptors>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1832,6 +1848,9 @@ impl Uring {
             kept: slab(KEPT)?,
             names: HashMap::new_in(Global),
             positional: HashMap::new_in(Global),
+            batches: HashMap::new_in(Global),
+            // alloc: setup, once per driver: an empty table, which nothing reads through.
+            descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1988,9 +2007,11 @@ impl Uring {
         span: &crate::Span,
         cache: crate::Cache,
         idle: bool,
+        part: Option<u32>,
     ) -> io::Result<()> {
-        let what = match kind {
-            Kind::ReadInto => "a read into memory of",
+        let what = match (kind, part) {
+            (Kind::ReadInto, None) => "a read into memory of",
+            (Kind::ReadInto, Some(_)) => "a batched read into memory of",
             _ => "a write from memory to",
         };
         let span = crate::spans::resolve(span, name, at, cache, what)
@@ -2006,11 +2027,84 @@ impl Uring {
         if idle {
             hot.flags |= ops::IDLE;
         }
+        if part.is_some() {
+            hot.flags |= ops::PART;
+        }
         let addr = span.addr();
-        let len = u32::try_from(span.len()).expect("a span's length is a u32");
-        let cold = Cold { at, names: [addr as u32, (addr >> 32) as u32, len, 0, 0], ..Cold::EMPTY };
+        let len = u32::try_from(span.len()).map_err(|_| {
+            // alloc: an error path.
+            io::Error::other(format!(
+                "{what} {name}: a span of {} bytes, past the u32 length one io_uring op carries",
+                span.len()
+            ))
+        })?;
+        let index = part.unwrap_or(0);
+        let cold =
+            Cold { at, names: [addr as u32, (addr >> 32) as u32, len, index, 0], ..Cold::EMPTY };
         self.start(hot, ops::NO_BYTES, cold);
         Ok(())
+    }
+
+    /// Starts [`Effect::ReadMany`] `tag`: each part a [`Kind::ReadInto`] of its own on its
+    /// file's kept positional descriptor, all written to the ring before the next submit, so
+    /// the batch is one `io_uring_enter` where the ring has room. A part refused before it is
+    /// asked (its span, its file's open) fails alone, at once; the batch is told when its last
+    /// part is in ([`Uring::part_ended`]).
+    fn read_many(
+        &mut self,
+        tag: Tag,
+        parts: Vec<crate::ReadPart>,
+        cache: crate::Cache,
+        idle: bool,
+    ) -> io::Result<()> {
+        let count = parts.len();
+        if count == 0 {
+            self.ready.push(Completion { tag, done: Done::ReadMany(parts) });
+            return Ok(());
+        }
+        if self.batches.contains_key(&tag) {
+            // alloc: an error path.
+            return Err(io::Error::other(format!("a batched read is in flight as {tag:?} already")));
+        }
+        // alloc: a slot of the table of batches, grown once to the most at once.
+        self.batches.insert(tag, Batch { parts, left: count });
+        for index in 0..count {
+            let (file, at, into) = {
+                let part = &self.batches[&tag].parts[index];
+                (part.file.clone(), part.at, part.into) // clone: a refcount
+            };
+            let index32 = u32::try_from(index).expect("a batch of at most u32::MAX parts");
+            if let Err(error) =
+                self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, Some(index32))
+            {
+                // alloc: an error path.
+                let why = IoError(format!("{file} at {at} ({} bytes): {error}", into.len));
+                self.part_ended(tag, index32, Done::Failed(why));
+            }
+        }
+        Ok(())
+    }
+
+    /// The part `index` of the batch `tag` ended as `done`; the batch is told once its last
+    /// part has.
+    pub(super) fn part_ended(&mut self, tag: Tag, index: u32, done: Done) {
+        let batch = self.batches.get_mut(&tag).expect("a part's batch in flight");
+        let part = &mut batch.parts[index as usize];
+        part.got = match done {
+            Done::ReadInto { len } => crate::Got::Read(len),
+            // alloc: an error path, its file and offset named.
+            Done::Failed(why) if why.0.starts_with(part.file.as_str()) => crate::Got::Failed(why),
+            Done::Failed(why) => crate::Got::Failed(IoError(format!(
+                "{} at {} ({} bytes): {}",
+                part.file, part.at, part.into.len, why.0
+            ))),
+            other => unreachable!("a part of a batched read ends as a read: {other:?}"),
+        };
+        batch.left -= 1;
+        if batch.left == 0 {
+            let batch = self.batches.remove(&tag).expect("just seen");
+            self.ready.push(Completion { tag, done: Done::ReadMany(batch.parts) });
+        }
     }
 
     /// A kept file's sync, done: [`Done::Synced`], unless the file kept under its name has no
@@ -2067,6 +2161,7 @@ impl Uring {
     /// in at a poll once the thread wakes the ring.
     fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
         let tag = effect.tag();
+        let descriptors = Arc::clone(&self.descriptors); // clone: a count, for the thread.
         self.off_ring_with(tag, move |root| {
             // What the thread waits in is said by file (every-wait-says-what): a write-back
             // of 162 MB is a second of this thread, and was in no span.
@@ -2080,7 +2175,7 @@ impl Uring {
             };
             // alloc: clone: the file's name for the span, once a call off the ring
             let file = file.to_owned();
-            crate::lock::io_wait(op, &file, move || crate::threads::run(root, effect))
+            crate::lock::io_wait(op, &file, move || crate::threads::run(root, &descriptors, effect))
         })
     }
 
@@ -2513,7 +2608,7 @@ impl Driver for Uring {
                 // One `mkdir` or `rmdir` here on the driver's thread, as a mode is set: the
                 // ring's `IORING_OP_MKDIRAT` and `IORING_OP_UNLINKAT` are not used for them yet.
                 effect @ (Effect::MakeDir { .. } | Effect::RemoveDir { .. }) => {
-                    crate::threads::run(&self.root, effect).map(Some)
+                    crate::threads::run(&self.root, &self.descriptors, effect).map(Some)
                 }
                 // No io_uring op takes a lock, and `flock` without waiting is one call: here on
                 // the driver's thread, as a mode is set.
@@ -2576,11 +2671,15 @@ impl Driver for Uring {
                 },
                 Effect::ReadInto { file, at, into, cache, priority, .. } => {
                     let idle = priority == crate::Priority::Idle;
-                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle)
+                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, None)
                         .map(|()| None)
                 }
+                Effect::ReadMany { parts, cache, priority, .. } => {
+                    let idle = priority == crate::Priority::Idle;
+                    self.read_many(tag, parts, cache, idle).map(|()| None)
+                }
                 Effect::WriteFrom { file, at, from, cache, .. } => self
-                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false)
+                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false, None)
                     .map(|()| None),
                 // An empty one too, so it answers once the file it makes is there.
                 Effect::Append { file, bytes, .. } => self.file(&file, Wants::Append).map(|file| {
@@ -2622,7 +2721,7 @@ impl Driver for Uring {
                     self.timers.insert(due, tag);
                     Ok(None)
                 }
-                Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
+                Effect::Map { file, extent, .. } => self.map(tag, &file, extent).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
                     .and_then(|listener| {
@@ -2774,6 +2873,12 @@ mod tests {
         run_until_idle, threads::Threads,
     };
 
+    #[expect(
+        blaze::tmp_path,
+        reason = "the ring's tests take a root not made yet (one sweeps a root that is not there) and clone it as a \
+                  PathBuf; moving them onto TempDir means each of some fifty callers holds a guard and a child path \
+                  under it, to be done and run on Linux, where these tests compile"
+    )]
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3321,10 +3426,22 @@ mod tests {
         std::fs::write(root.join("store/pack"), b"packed").unwrap();
         std::fs::write(root.join("store/empty"), b"").unwrap();
         let name = |it: &str| FileName::new(it).unwrap();
+        let whole = crate::Extent::Whole;
         let mut effects = vec![
-            Effect::Map { file: name("store/pack"), tag: Tag(1) },
-            Effect::Map { file: name("store/empty"), tag: Tag(2) },
-            Effect::Map { file: name("store/missing"), tag: Tag(3) },
+            Effect::Map { file: name("store/pack"), extent: whole, tag: Tag(1) },
+            Effect::Map { file: name("store/empty"), extent: whole, tag: Tag(2) },
+            Effect::Map { file: name("store/missing"), extent: whole, tag: Tag(3) },
+            // A range sees its bytes and nothing past its length; one past the end fails.
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 2, len: 3 },
+                tag: Tag(4),
+            },
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 4, len: 3 },
+                tag: Tag(5),
+            },
         ];
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| {
@@ -3343,6 +3460,8 @@ mod tests {
                 (1, "mapped \"packed\"".to_owned()),
                 (2, "mapped \"\"".to_owned()),
                 (3, "failed".to_owned()),
+                (4, "mapped \"cke\"".to_owned()),
+                (5, "failed".to_owned()),
             ])
         );
         let root = dir("uring-map-threads");

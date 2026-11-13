@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod ahead;
 pub mod edit;
@@ -223,6 +225,10 @@ impl<F: Files> Edits<'_, F> {
         self.load(file, path)
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a working file's number is u32 and there is one per file of the view an edit reaches, far below 2^32; load's error is a String, so a typed refusal needs a typed error first"
+    )]
     fn load(&mut self, file: FileId, path: &str) -> Result<u32, String> {
         let (_, bytes) =
             self.files.file(path).ok_or_else(|| format!("{path} is not in the view"))?;
