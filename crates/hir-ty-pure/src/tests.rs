@@ -9,5 +9,6 @@ mod facts;
 mod fixture;
 mod fns;
 mod models;
+mod reach_oracle;
 mod scripts;
 mod share;

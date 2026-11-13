@@ -81,14 +81,34 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
      array or `Vec` by `usize` unless `i < len`.
 
    A site is discharged when the state before it entails its condition (an `Assert`'s, a
-   model's panic condition) or when no feasible edge reaches its block. Entailment is small and
-   decidable: syntactic equality of terms, constant bounds from the facts and the types (one
-   step through a relation: `i < n` and `n <= MAX` give `i <= MAX - 1`), one step of
-   transitivity, and implications whose premise holds. An overflow check (`i += 1` in a crate
-   that keeps them) is discharged when the exact result fits the type for every value within
-   the operands' bounds; `usize` is the target's width, never a guess. A `bool` two paths
-   write (`a && b` is lowered to one) keeps, as implications, what each of its values meant
-   on the paths that gave it.
+   model's panic condition) or when no feasible edge reaches its block. A model that states
+   no panic condition (`len`) discharges nothing.
+
+   **Linear arithmetic.** `a + b`, `a - b`, a multiple or a shift by a constant are a linear
+   form, `sum of coefficient * term + constant` (`Term::Lin`: exact integers, hash-consed, the
+   terms in order). `x / d` and `x >> c` of a value known not negative, `d` a positive
+   constant, are a quotient `q` with `0 <= q`, `d*q <= x <= d*q + d - 1`, `q <= x`, and
+   `q < x` when `d >= 2` and `x >= 1` (which gives `lo + (hi - lo) / 2 < hi`). A form is the
+   value of a local **only where no wraparound is shown**: the state's facts (not the type's
+   range) put the exact result inside the type, or the operation is checked and the path is
+   past its overflow `Assert` (the flag being false implies the value is the form). A wrapping
+   operation not shown to fit is the form wrapped into its type (`Term::Wrap`), an unknown
+   the same operands give again, so `if i + 1 < n { v[i + 1] }` agrees with itself and
+   `v[v.len() - 1]` with no guard is not discharged without overflow checks. A product of two
+   unknowns is an unknown.
+
+   **Entailment** is small and decidable: syntactic equality of terms; constant bounds from
+   the facts and the types; implications whose premise holds; and for `<`, `<=`, `==` adding
+   facts up: every `a < b`, `a <= b`, `a == b` of the state is a bound `form <= c`, and
+   `goal <= c` holds when the bounds of the goal's own terms give it, or some fact that
+   cancels one of its terms leaves a remainder shown the same way. On two-term facts
+   (`x - y <= c`) this is the shortest path of a difference-constraint graph, as ABCD
+   (Bodik, Gupta, Sarkar, PLDI 2000) and the octagon domain use, without the closure: it is
+   goal-directed. **The budget:** at most 4 facts added up per proof and 256 tried per
+   question (`LINEAR_DEPTH`, `LINEAR_FUEL`); a proof that needs more is not found and the
+   site stays reported. A `bool` two paths write (`a && b` is lowered to one) keeps, as
+   implications, what each of its values meant on the paths that gave it; an implication
+   whose premise holds is written down as a fact, since the linear proofs read facts.
 
    **Soundness of the memory model.** A term is a value, not a place. A shared borrow `&p`
    is a reference *to the value `p` has then* (`RefTo(v)`): safe code cannot change `p` while
@@ -102,8 +122,7 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
    one unknown per (block, local) (per field for aggregates of one shape, so a range's end
    survives its loop) and only the facts both paths hold survive, so a loop is iterated to a
    fixed point; a joined value's constant bounds are widened after one turn. A coroutine body,
-   inline assembly and a `for const` loop are not analysed (refused). Arithmetic is not
-   followed in this slice (`i + 1` is an unknown).
+   inline assembly and a `for const` loop are not analysed (refused).
 3. **Contracts** (spec only). `#[blaze::requires(i < self.len())]` on a function is a
    precondition every caller must prove at the call with tier 2's entailment (a refusal names
    the call and the clause), and a fact the callee's body starts with; `ensures` is a fact at
@@ -193,14 +212,27 @@ what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`;
 and near misses that are still reported (the check is on another index, slice or option, the
 guard does not dominate, the value is reassigned between guard and use, the vector is cleared
 between, the loop's bound is another length), for `nopanic`, for `panic_in_drop` and for
-`blaze::unreachable!()` itself; a crate's own `blaze::unreachable!` keeps its meaning. The
-invariant: *a site the prover discharges is not reached, or its condition holds, in every run
-of the MIR*. Next level of evidence (not built): a Hegel test that runs random small bodies in
-the MIR evaluator and checks no discharged site fails, with a planted bug (a fact kept across a
-write).
+`blaze::unreachable!()` itself; a crate's own `blaze::unreachable!` keeps its meaning; a
+waiver by attribute or by flag is refused. Linear arithmetic is tested in both overflow
+profiles: `v[len - 1]` under a non-empty check, `v[i + 1]` under `i + 1 < len`, a pair under
+`i < len - 1`, the middle of `lo < hi <= len`, `v[len - k]` under `1 <= k <= len`; and still
+reported: `v[len - 1]` unguarded (the wrap, with overflow checks off), `v[i + 2]` under
+`i + 1 < len`, `v[i * j]`.
+
+The invariant: *a site the prover discharges is not reached, or its condition holds, in every
+run of the MIR*. It is held by a Hegel test against the MIR evaluator
+(`crates/hir-ty-pure/src/tests/reach_oracle.rs`): random guards (variants, bounds, lengths,
+linear expressions with `+`, `-`, `/ 2`, `&&`) around a random site, random arguments with
+the ends of `usize` among them, both overflow profiles; a body all of whose panic sites are
+discharged must not panic when run. Controls: a guarded site is proved and runs while the
+bare one is not proved and panics; and a planted model entry (`first` is always `Some`) is
+caught.
 
 ## Not done
 
-Arithmetic (`v[len - 1]`, `i + 1 < len`), `while let Some(x) = it.next()` over anything but a
-`Range`, facts through user functions (tier 3), the Lean check of certificates, the optimizer's
-use of a proved site, the run-time `Todo` error and `blaze status`.
+A loop's relational invariants (binary search written as a loop needs `hi <= len` at the head;
+a joined value keeps only constant bounds), products and other non-linear arithmetic, division
+by a non-constant or of a value that may be negative, proofs past the linear budget,
+`while let Some(x) = it.next()` over anything but a `Range`, facts through user functions
+(tier 3), the Lean check of certificates, the optimizer's use of a proved site, the run-time
+`Todo` error and `blaze status`.

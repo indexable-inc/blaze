@@ -2309,6 +2309,10 @@ impl<'a, 'db> Solver<'a, 'db> {
                 applied.implies.push((filled, some));
                 applied.implies.push((some, filled));
                 applied.implies.push((Atom::new(Rel::Eq, len, zero), none));
+                #[cfg(test)]
+                if models::PLANT_FIRST_ALWAYS_SOME.get() {
+                    applied.facts.push(some);
+                }
             }
             Model::Get => {
                 let of = pointee(self)?;
