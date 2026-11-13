@@ -360,6 +360,12 @@ pub(crate) fn decide(
             false => levels.set_of(&mut lcx, &mut said, at),
         };
         let spec = levels.spec(&lcx, lint, set);
+        if it.fulfills_only {
+            if let Some(expect) = spec.expect {
+                said.fulfill(expect);
+            }
+            continue;
+        }
         out.extend(said.finish(&lcx, lint, spec, it.diag));
     }
     out.extend(pre);

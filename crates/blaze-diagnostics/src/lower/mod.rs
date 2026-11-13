@@ -191,16 +191,26 @@ pub struct Found {
     /// For a lint of rustc's pre-expansion lint pass: its level is of `lint_at`'s file alone
     /// ([`hir_lint_levels::Levels::set_of_in_file`]).
     pub pre_expansion: bool,
+    /// Never written: it only fulfills the `#[expect]` its lint has at `lint_at`, if any
+    /// (rustc's `struct_expect` of a dummy diagnostic).
+    pub fulfills_only: bool,
 }
 
 impl Found {
     pub fn new(diag: Diag, phase: Phase) -> Found {
-        Found { diag, phase, lint_at: None, pre_expansion: false }
+        Found { diag, phase, lint_at: None, pre_expansion: false, fulfills_only: false }
     }
 
     /// A lint's diagnostic, its level decided at `at`.
     pub fn lint(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
-        Found { diag, phase, lint_at: Some(at), pre_expansion: false }
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: false }
+    }
+
+    /// What a lint would say at `at` and does not, because what it says there is already said
+    /// of something around it: `diag` is never written, and an `#[expect]` of the lint at `at`
+    /// is fulfilled as if it were.
+    pub fn fulfilling(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false, fulfills_only: true }
     }
 }
 
