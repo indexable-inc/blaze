@@ -1,4 +1,4 @@
-// /learn: the course map. Lesson 1 is the home page (site.flecs); the rest are under site.learn (learn/*.flecs, at
+// /learn: the course map. Lesson 1 is /start (site.flecs); the rest are under site.learn (learn/*.flecs, at
 // /learn/<slug>), each with Lesson {order, line, glyph}, made of Steps, one idea per screen, with questions woven in.
 // client/learn.ts plays a lesson one step at a time and keeps the reader's progress in localStorage.
 //
@@ -24,7 +24,7 @@ themes {
 
 site {
   // Opened here so the course map and the lessons can name them; site.flecs and updates.flecs run later.
-  index {}
+  start {}
   updates {}
 
   learn : Page {

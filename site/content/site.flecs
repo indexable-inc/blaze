@@ -1,6 +1,7 @@
 // The site's pages. Each page is an entity under `site`; its path is its URL (site.index is /).
-// The whole site is one course: the home page is its first lesson (what blaze is, installing it, the first build),
-// the course map is /learn (learn.flecs), the other lessons are in learn/, the updates in updates.flecs and updates/.
+// The whole site is one course. Its front door, /, is the intro: the wordmark dropping in and catching fire, one line
+// and the way in. Lesson 1 is /start (what blaze is, installing it, the first build), the course map is /learn
+// (learn.flecs), the other lessons are in learn/, the updates in updates.flecs and updates/.
 // Reference pages (install details, benchmarks, the charter, RFCs) sit beside it in the sidebar (nav.flecs).
 site {
   OrderedChildren
@@ -13,14 +14,26 @@ site {
   learn {}
   updates {}
 
-  // Lesson 1, and the front door: what blaze is, installing it, the first build and the commands you will type.
+  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line and the way into the course.
+  // No sidebar here, so the last line is the way to the course map and the reference pages.
   index : Page {
+    Hero
+    Title: {"blaze"}
+    Tab: {"blaze: Rust that rebuilds in milliseconds"}
+    Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
+
+    Lede is("Builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+    Go start(label: "Start the course", href: "/start")
+    Dim more("[Course map](/learn) · [Install](/install) · [Benchmarks](/bench) · [GitHub](https://github.com/indexable-inc/blaze)")
+  }
+
+  // Lesson 1: what blaze is, installing it, the first build and the commands you will type.
+  start : Page {
     Narrow
     Lesson: {0, "What blaze is, installing it, and your first build.", "start"}
     (InTheme, themes.basics)
     Title: {"Start here"}
-    Tab: {"blaze: Rust that rebuilds in milliseconds"}
-    Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
+    Description: {"What blaze is, how to install it, and your first build: the first lesson of the course, a few minutes long."}
 
     Step what("Rust, rebuilt in milliseconds") {
       Lede is("**blaze** builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
@@ -84,6 +97,6 @@ site {
 
   "404" : Page {
     Title: {"Not found"}
-    P gone("Nothing here. [Start the course](/) or open [the course map](/learn).")
+    P gone("Nothing here. [Start the course](/start) or open [the course map](/learn).")
   }
 }

@@ -10,7 +10,7 @@ site {
       Narrow
       Lesson: {1, "Compile, then link, and why a one-line edit can still take a while.", "pipeline"}
       (InTheme, themes.basics)
-      (Requires, site.index)
+      (Requires, site.start)
       Title: {"What a build does"}
       Description: {"What happens when you build Rust, and why a small edit can take seconds."}
 

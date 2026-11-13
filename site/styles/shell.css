@@ -94,12 +94,6 @@ main.wide { max-width: none; }
 .head h1 { margin: 0; font-size: clamp(30px, 3.4vw, 38px); line-height: 1.12; font-weight: 600; letter-spacing: -0.03em; color: var(--ink-1); overflow-wrap: anywhere; }
 .head + .lede, .head + p.lede { margin-top: 0; }
 
-/* The home page: the logo, large, then the lede in the reading colour. */
-.hero { padding: 56px 0 8px; }
-.hero-logo { margin: 0 0 8px; line-height: 0; }
-.hero-logo .logo img { width: min(100%, 344px); height: auto; margin: 0 0 0 -8px; border-radius: 0; box-shadow: none; background: none; }
-.hero ~ .lede { max-width: 34em; font-size: clamp(19px, 2.1vw, 22px); line-height: 1.45; color: var(--ink-1); letter-spacing: -0.015em; }
-
 /* A goal: a row with its title and one line, folded; open, its few paragraphs. */
 .goal { border-top: 1px solid var(--line); }
 .goal:last-of-type { border-bottom: 1px solid var(--line); }
@@ -172,7 +166,6 @@ main.wide { max-width: none; }
 	.mbrand .logo img { width: 60px; height: auto; }
 	.grid { padding: 0 12px; }
 	.head { padding-top: 24px; }
-	.hero { padding-top: 28px; }
 	.pager { flex-direction: column; }
 	.doc .pager a { max-width: none; }
 	.pager .next { margin-left: 0; }

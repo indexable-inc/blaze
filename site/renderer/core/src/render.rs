@@ -242,7 +242,7 @@ fn highlighted(e: &Entity) -> Option<String> {
 /// `Art daemon(...)` beside `P daemon(...)` is one node carrying both; it is refused rather than half rendered.
 const ELEMENTS: &[&str] = &[
     "Lede", "P", "Dim", "H3", "Li", "Code", "Command", "Img", "Art", "Section", "Issue", "Goal", "Step", "Quiz",
-    "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table",
+    "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table", "Go",
 ];
 
 fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
@@ -437,6 +437,9 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
             "<figure class=\"diagram\" data-figure=\"{piece}\"><figcaption>{l}</figcaption></figure>"
         ));
     }
+    if e.has("Go") {
+        return go(n, ctx);
+    }
     if e.has_tag("Ul") || e.has_tag("Ol") {
         let t = if e.has_tag("Ul") { "ul" } else { "ol" };
         return Ok(format!("<{t}>\n{}\n</{t}>", children(n, ctx)?));
@@ -451,6 +454,42 @@ fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
         e.values.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")
     };
     Err(format!("{}: no element type (tags {tags}; components {comps})", e.path))
+}
+
+/// The page's one big button: a link to another page of the site. When that page is a lesson, the link carries the
+/// lesson's key in the reader's progress and where its course map is, so client/intro.ts can send a reader who has
+/// finished it on to the map instead.
+fn go(n: Id, ctx: &Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let (label, href) = (field(e.value("Go"), "label"), field(e.value("Go"), "href"));
+    let path = &e.path;
+    if label.is_empty() {
+        return Err(format!("{path}: a Go needs a label"));
+    }
+    let to = ctx
+        .s
+        .pages
+        .iter()
+        .find(|p| p.url == href)
+        .ok_or_else(|| format!("{path}: Go {href:?} is not a page of the site (/start)"))?;
+    let target = ctx.e(to.node);
+    let mut lesson = String::new();
+    if target.has("Lesson") {
+        let parent = target.parent.ok_or("a lesson has no parent")?;
+        if let Some((at, c)) = ctx.s.world.course_of(ctx.s.pages, parent)? {
+            let node = c.nodes.iter().find(|x| x.id == to.node).expect("the lesson is on its course");
+            lesson = format!(
+                " data-lesson=\"{}\" data-course=\"{}\"",
+                esc(&node.key),
+                esc(&ctx.s.served.href(&ctx.s.pages[at].url))
+            );
+        }
+    }
+    Ok(format!(
+        "<p class=\"go\"><a href=\"{}\"{lesson}>{}</a></p>",
+        esc(&ctx.s.served.href(&to.url)),
+        esc(&label)
+    ))
 }
 
 /// A multiple-choice question: the prompt, the choices (each with its one-line why, which client/learn.ts shows once
@@ -842,7 +881,7 @@ fn lesson_attrs(ctx: &mut Ctx) -> Result<(&'static str, String), String> {
     let line = prose(&field(Some(v), "line"));
     let path = e.path.clone();
     let parent = e.parent.ok_or("a lesson has no parent")?;
-    // The course path is on the page whose Course widget lists this page's parent (the home page).
+    // The course path is on the page whose Course widget lists this page's parent (the course map).
     let (course_at, c) = ctx
         .s
         .world
@@ -942,10 +981,16 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
     } else {
         ""
     };
-    // Every page has the client router (moving between pages without a load) and the sidebar's script (folds, the
-    // phone drawer, search, the outline's scroll spy).
-    ctx.script("nav");
-    ctx.script("side");
+    // The front door (`Hero`) is a page of its own, with no sidebar: only the script that runs it (client/intro.ts).
+    // Every other page has the client router (moving between pages without a load) and the sidebar's script (folds,
+    // the phone drawer, search, the outline's scroll spy).
+    let hero = n.has_tag("Hero");
+    if hero {
+        ctx.script("intro");
+    } else {
+        ctx.script("nav");
+        ctx.script("side");
+    }
     let scripts = ctx
         .scripts
         .iter()
@@ -957,13 +1002,14 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // The home page's title is the logo, large; every other page has the docs' header: where it sits, the title,
-    // the RFC line.
-    let head = if n.has_tag("Hero") {
+    // The front door's title is the wordmark: the brand's still picture, which is what shows without JS, and the
+    // canvas client/intro.ts draws it live on. Every other page has the docs' header: where it sits, the title, the
+    // RFC line.
+    let head = if hero {
         format!(
-            "<header class=\"hero\"><h1 class=\"hero-logo\"><span class=\"sr\">{}</span>{}</h1></header>",
+            "<h1 class=\"wordmark\"><span class=\"sr\">{}</span>{}<canvas aria-hidden=\"true\"></canvas></h1>",
             esc(&title),
-            crate::side::picture(s.world, s.site, s.served, "logo", "")
+            crate::side::still_picture(s.world, s.site, s.served)
         )
     } else {
         // A lesson's glyph above its title, as on its node on the course path (client/learn.ts moves it to the
@@ -997,7 +1043,14 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
     let icon = esc(&s.served.href("/brand/blaze-icon-dark.svg"));
     let ico = esc(&s.served.href("/brand/favicon.ico"));
     let touch = esc(&s.served.href("/brand/blaze-icon-dark-180.png"));
-    let html = format!(
+    // In <head>, classic and synchronous: the sidebar's shut state and width are set before anything paints. The
+    // front door has no sidebar.
+    let early = if hero {
+        String::new()
+    } else {
+        format!("<script src=\"{}\"></script>\n", esc(&s.served.href("/js/early.js")))
+    };
+    let top = format!(
         "<!doctype html>
 <html lang=\"en\">
 <head>
@@ -1011,10 +1064,29 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
 {description}
 {canonical}
 <link rel=\"stylesheet\" href=\"{css}\" />
-<script src=\"{early}\"></script>
-{scripts}
+{early}{scripts}
 </head>
-<body>
+",
+        esc(&tab),
+        css = esc(&s.served.href("/site.css")),
+    );
+    if hero {
+        // No frame, no sidebar, no pager: the wordmark in the middle of the window and the page's blocks under it.
+        return Ok(format!(
+            "{top}<body class=\"front\">
+<main class=\"doc intro\">
+{head}
+<div class=\"intro-after\">
+{body}
+</div>
+</main>
+</body>
+</html>
+"
+        ));
+    }
+    let html = format!(
+        "{top}<body>
 <div class=\"frame\">
 {}
 <script src=\"{keep}\"></script>
@@ -1034,16 +1106,12 @@ pub fn render(s: &Site, page: &Page) -> Result<String, String> {
 </body>
 </html>
 ",
-        esc(&tab),
         crate::side::sidebar(s.nav, page, s.served, s.world, s.site),
         crate::side::mobile_bar(s.served, s.world, s.site),
         crate::side::topline(),
         crate::side::pager(s.nav, page, s.served),
-        css = esc(&s.served.href("/site.css")),
         // Classic and synchronous on purpose: it runs as soon as the sidebar is parsed, before the first paint.
         keep = esc(&s.served.href("/js/keep.js")),
-        // In <head>, classic and synchronous: the sidebar's shut state and width are set before anything paints.
-        early = esc(&s.served.href("/js/early.js")),
     );
     Ok(html)
 }

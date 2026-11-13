@@ -44,6 +44,7 @@ struct Code(lang: string, text: string) // a code block; lang is rust, toml, bas
 struct Command(text: string)            // one shell command with a copy button
 struct Art(piece: string, label: string) // an animated drawing (client/art.ts draws `piece`); label is its alt text, never read out
 struct Img(src: string, alt: string, width: i32, height: i32)
+struct Go(label: string, href: string)  // the page's one big button: a link to another page of the site (/start)
 
 // Containers: their children are their content, in order.
 struct Section(title: string)           // <section> with an <h2>
@@ -61,9 +62,9 @@ Ol { (With, flecs.core.OrderedChildren) }
 Table { (With, flecs.core.OrderedChildren) }
 Tr { (With, flecs.core.OrderedChildren) }
 
-// The course (the home page's path; renderer core render.rs and course.rs, client/learn.ts). A lesson is a page under
-// site.learn (/learn/<slug>) with Lesson; an update is a page under site.updates (/updates/<slug>) with Update. Both are
-// made of Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a fold;
+// The course (the course map's path; renderer core render.rs and course.rs, client/learn.ts). A lesson is a page with
+// Lesson, under site.learn (/learn/<slug>) or, the first one, site.start (/start); an update is a page under
+// site.updates (/updates/<slug>) with Update. Both are made of Steps, one idea per screen. Without JS the steps are stacked and each question shows its answer in a fold;
 // client/learn.ts turns the page into one step at a time and keeps the reader's progress in localStorage.
 // The path is a graph, not a line: a lesson or update names what to learn first with (Requires, page), and belongs to
 // one Theme, a band of the path under its own heading, with (InTheme, themes.<name>).
@@ -157,7 +158,9 @@ InTheme { Exclusive }                   // (InTheme, themes.<name>): the band of
 // Page kinds.
 Narrow {}                               // a 560px column instead of 820px
 Wide {}                                 // a wide column, no outline beside it
-Hero {}                                 // the page's title is the logo, large (the home page)
+// The front door (/): no sidebar; the page's title is the wordmark, big in the middle of the window, which
+// client/intro.ts drops in and sets on fire (the brand's still picture without JS), then the page's blocks under it.
+Hero {}
 
 prefab Page {
   OrderedChildren

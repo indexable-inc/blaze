@@ -3,8 +3,8 @@
  * (wrangler.jsonc `run_worker_first: true`): an old host or the bare base is redirected, the base is taken off the
  * path, and then, by site path:
  *
- *   /          the home page (lesson 1), or install.sh for a client that doesn't ask for HTML (curl, wget)
- *   /usage     a 301 to /: its content moved into the home lesson
+ *   /          the home page (the intro), or install.sh for a client that doesn't ask for HTML (curl, wget)
+ *   /usage     a 301 to /start: its content moved into lesson 1
  *   /latest.json   blaze's newest releases and its yanked ones, from the RELEASES bucket (docs/release.md), which
  *              every blaze daemon reads every few minutes with If-None-Match
  *
@@ -18,7 +18,7 @@ import { assetHeaders, plain } from './http';
 async function route(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url);
 	const p = url.pathname;
-	if (p === '/usage' || p === '/usage/') return new Response(null, { status: 301, headers: { location: `${outer('/')}${url.search}`, 'cache-control': 'public, max-age=3600' } });
+	if (p === '/usage' || p === '/usage/') return new Response(null, { status: 301, headers: { location: `${outer('/start')}${url.search}`, 'cache-control': 'public, max-age=3600' } });
 	if (p === '/' && !acceptsHtml(request)) return installer(request, env, url);
 	if (p === '/latest.json') return latest(request, env);
 	const res = assetHeaders(await env.ASSETS.fetch(request), p);

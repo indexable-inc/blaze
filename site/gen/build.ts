@@ -65,7 +65,7 @@ function generated(all: Map<string, Node>): { name: string; code: string }[] {
 	return out;
 }
 
-const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css'];
+const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css', 'intro.css'];
 
 type Baked = SnapshotInput['bakes'];
 

@@ -1,5 +1,5 @@
 /**
- * The course (the home page is lesson 1, the other lessons are at /learn/<slug>, the updates at /updates/<slug>, the
+ * The course (lesson 1 is /start, the other lessons are at /learn/<slug>, the updates at /updates/<slug>, the
  * course map at /learn and What's new at /updates; Lesson, Update, Step, Quiz, Tap and Figure in content/schema.flecs,
  * rendered by the renderer's render.rs). Without JS a lesson or update is one page of steps under each other, each
  * question with its answer in a fold. This script turns it into the lesson player, one step at a time, in the page's
@@ -26,6 +26,7 @@
  */
 
 import { mount, type Diagram } from './lib/diagrams';
+import { icon } from './lib/icon';
 import { onPage } from './lib/page';
 import { CHANGED, KEY, type Saved, clearFresh, firstTime, fresh as freshOf, load, progress, roll, stateOf, stateWords, store } from './lib/progress';
 import { enabled as soundOn, setEnabled as setSound, sound } from './lib/sound';
@@ -39,17 +40,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
 	return e;
 }
 
-const ICON = {
-	back: '<path d="M15 5l-7 7 7 7"/>',
-	sound: '<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>',
-	muted: '<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>',
-};
-
-function icon(name: keyof typeof ICON): string {
-	return `<svg class="icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name]}</svg>`;
-}
-
-/** A check mark in pixel cells on a faint 9 by 7 grid, as the home page's drawings are made. */
+/** A check mark in pixel cells on a faint 9 by 7 grid, as the lessons' drawings are made. */
 function seal(): string {
 	const on = new Set(['1,3', '2,4', '3,5', '4,4', '5,3', '6,2', '7,1']);
 	let cells = '';
@@ -514,7 +505,7 @@ function markNew(li: HTMLElement, on: boolean) {
 }
 
 /**
- * The course path (on the home page; render.rs `course`, laid out by course.rs): each node lit with the reader's
+ * The course path (on the course map; render.rs `course`, laid out by course.rs): each node lit with the reader's
  * progress (its state, the ring for how far in, its mastery cells), the updates new since their last visit marked
  * New, the next node marked with its Start or Continue, the edges stroked between the pins (render.rs gives them in
  * `data-edges`; this only measures where the pins landed), the counts and Reset progress under the big button, which

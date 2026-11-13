@@ -1,8 +1,9 @@
 /**
  * The lessons' diagrams (Figure and Tap in content/schema.flecs; render.rs writes `<figure class="diagram"
  * data-figure="...">` and `<div class="diagram" data-figure="..." data-pick>`). Each is a few named parts (crates,
- * functions, a store) on a coarse grid, joined by wires drawn as rows of square cells, the home page's pixel language
- * (client/art.ts, styles/art.css): the page's inks, one accent (the fire orange) for the part that changed.
+ * functions, a store) on a coarse grid, joined by wires drawn as rows of square cells, the pixel language of the
+ * lessons' drawings (client/art.ts, styles/art.css): the page's inks, one accent (the fire orange) for the part that
+ * changed.
  *
  * - Explore (a Figure): tapping a part, or a button under the diagram, plays what happens, such as an edit lighting
  *   up everything that is compiled again; a line under the diagram says it in words, for screen readers too.

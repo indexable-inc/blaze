@@ -136,6 +136,9 @@ Symmetric, Target and Trait need the `FLECS_CONSTRAINT_TRAITS` addon.
   Every container type gets `(With, flecs.core.OrderedChildren)`, and a new container type needs the same line.
 - Links are pairs: `(Cites, refs.koka)`, `(DependsOn, site.charter)`. Inline `[[name]]` references are checked by the
   renderer instead.
+- **The front door** is `site.index` (`/`): a `Hero` page, rendered with no sidebar, whose title is the wordmark
+  (client/intro.ts draws it live) over its few blocks, one of them a `Go` (the big button, a link to a page). Lesson 1
+  is `site.start` (`/start`); link to the first lesson there, never to `/`.
 - **Name every block** after its content, not its position: its path under the page is its link target and search
   anchor (`motivation.why`).
 - **Sort by data across files.** Child order is creation order, and across files that depends on file names and

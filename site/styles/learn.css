@@ -2,7 +2,7 @@
    lesson is a page of steps under each other and each question shows its answer in a fold. With it
    (`main.lesson[data-on]`), one step shows at a time in the page's column, between the lesson's segments at the top
    and the big button at the bottom, within thumb reach on a phone. The diagrams are pixel cells in the page's inks, as the
-   home page's drawings are (art.css), with the fire orange for the one part that changed. */
+   lessons' drawings are (art.css), with the fire orange for the one part that changed. */
 
 /* ---------- Without JS, and before learn.ts starts ---------- */
 
@@ -276,7 +276,7 @@ code.dg-ref.hl { background: var(--bg-4); color: var(--ink-1); box-shadow: 0 0 0
 	.diagram[data-drawn] { padding: 14px 10px 12px; }
 }
 
-/* ---------- The course path (the home page) ---------- */
+/* ---------- The course path (the course map) ---------- */
 
 /* The course is a graph (renderer core course.rs lays it out): bands (.theme, one per Theme, under a divider with its
    name), each a list of nodes, one per row, a node's disc in its column (--col) of a narrow graph on the left and its

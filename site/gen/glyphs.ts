@@ -1,13 +1,13 @@
 /**
  * The course's glyphs: one small line drawing per lesson and per update, the picture on its node on the course path
- * (the home page), on What's new, and above its title on its page. A lesson or update names its glyph
+ * (the course map), on What's new, and above its title on its page. A lesson or update names its glyph
  * (`Lesson: {1, "...", "pipeline"}` in content/learn/*.flecs, `Update: {..., "fetch"}` in content/updates/*.flecs);
  * gen/build.ts bakes the drawing onto the page as its `Baked {html}`, and the renderer (render.rs `glyph`) inlines it.
  * An unknown name fails the build.
  *
  * Drawn as the site's icons are (Phosphor light, renderer/core/src/icons.rs): thin round-capped strokes in
  * `currentColor`, here on a 32x32 canvas. Each glyph also has one filled pixel cell, `.g-cell`: the one part that
- * matters (the function that changed, the kept output), as the home page's drawings mark it. styles/learn.css colours
+ * matters (the function that changed, the kept output), as the lessons' drawings mark it. styles/learn.css colours
  * it: the ink of its node, and the fire orange once the lesson is mastered. Inline rather than a `<use>` sprite, so
  * the page's CSS reaches inside, and no fetch.
  */
