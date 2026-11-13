@@ -735,6 +735,37 @@ keeps a frame small or a symbol visible to a profiler.
 **Allowing it.** `#[expect(blaze::hot_marked_cold, reason = "..")]`, when the profile's workload
 is not the one the function is cold in.
 
+## `implicit_overflow`
+
+In `blaze::edition`, allowed by default (docs/v2/plan/design/explicit-overflow.md).
+
+**What it catches.** Integer arithmetic whose meaning depends on the profile, wherever blaze
+can't show it fits: `+`, `-`, `*`, `<<`, `>>`, their compound forms, unary `-`, and an `as`
+that can lose an integer's value (to a narrower integer, between signed and unsigned, a float
+to an integer; `usize` and `isize` count as 32 bits on the target side). Also calls whose
+overflow follows the profile (`pow`, `abs`, `next_power_of_two`, integer `Iterator::sum` and
+`product`) or always panics (`strict_*`). The reach prover judges each operation from the
+checks around it (`i < v.len()`, `b <= a`, a mask, a remainder). The message names the fact
+that is missing: `can't show `a + b` fits in `u32` here: nothing bounds `b``.
+
+**Why it matters.** With overflow checks an overflowing `a + b` panics; without them it wraps.
+Plain arithmetic says neither, so the profile decides what the code means. The verdict is the
+same in both profiles.
+
+**How to fix it.** Say what overflow means: `checked_*` with `?` (or a typed error), `wrapping_*`
+or `Wrapping<T>`, `saturating_*`, `overflowing_*`, `T::try_from(x)`. Or add a check blaze can
+see that bounds the operands. `blaze check --fix` does the rewrite where it is clear: in a
+function returning `Option`, `a + b` becomes `a.checked_add(b)?` and `x as u8` becomes
+`u8::try_from(x).ok()?`. In a function returning a `Result` whose error takes a
+`TryFromIntError`, a cast becomes `u8::try_from(x)?`.
+
+**Not found.** `/` and `%`, whose panics are the same in every profile. Floats, except a float
+cast to an integer. Constants, statics and `const { .. }` blocks, where overflow is a
+compile-time error. Test code. Arithmetic that a macro makes up (arithmetic written in a macro
+call's arguments is still found).
+
+**Allowing it.** `#[expect(blaze::implicit_overflow, reason = "..")]`.
+
 ## `intern_candidate`
 
 **What it catches.** A non-generic type of the crate that is `Clone`, `PartialEq` and `Hash`
