@@ -7,6 +7,9 @@
  *   Once it is alight the rest of the page shows. A key or a press shows it at once.
  * - Every cell is a whole number of device pixels, and the canvas sits on a device pixel, so the pixels stay sharp
  *   at any zoom. The pointer's breath parts the flames and its sweep drags them.
+ * - The command (the `Lede`, `cargo build` → `blaze build` as written): once the page lit it reads `cargo build`,
+ *   then `cargo` burns off letter by letter and `blaze` catches in its place, then the subcommand cycles through
+ *   blaze's own (build, check, test, run), each typed over the last. Same commands, another tool.
  * - The race (a `Race` block: blaze and cargo building the same edit, the two times a measurement from the benchmark
  *   history) runs in real time, over and over: both lanes start together, each fills at the pace it was measured at
  *   and stops on its time, so blaze is done before the eye has moved and cargo is still going.
@@ -46,6 +49,23 @@ const WARM = 48;
 const KNOCK_WAIT = 120;
 /** A page that is still here this long after it burnt (the load was stopped, or failed) is put back, in ms. */
 const STRANDED = 5000;
+/** The command: when `cargo` starts to burn and each letter's lag, how long a letter burns, when `blaze` catches and
+ * each letter's lag, how long a caught letter takes to cool, in seconds after the page lit. */
+const CMD_BURN = 0.9;
+const CMD_BURN_LAG = 0.09;
+const CMD_BURN_FOR = 0.4;
+const CMD_CATCH = 1.55;
+const CMD_CATCH_LAG = 0.07;
+const CMD_COOL = 0.5;
+/** Then the subcommands, from this moment, each held this long, typed and untyped this fast a letter (seconds). */
+const CMD_CYCLE_AT = 3.2;
+const CMD_HOLD = 1.7;
+const CMD_KEY = 0.055;
+/** blaze's commands, as blaze-thin and blaze-client route them (route.rs, ask.rs). */
+const SUBCOMMANDS = ['build', 'check', 'test', 'run'];
+/** The fire's ramp, hottest first: a letter burning goes down it; one catching comes up it and cools to the ink. */
+const RAMP = ['#fff4c4', '#ffd23f', '#ff9a26', '#e0461a', '#9a2c10'];
+
 /** The race: a beat with both lanes empty, the run, then the result held, in seconds. */
 const RACE_READY = 0.4;
 const RACE_HOLD = 2.6;
@@ -84,6 +104,62 @@ function racer(fig: HTMLElement): (t: number) => void {
 			const text = show(at, l.ms);
 			if (text !== l.text) l.took.textContent = l.text = text;
 		}
+	};
+}
+
+/**
+ * The command, run in real time (see the top). It takes over the `Lede`'s first `code` and paints the moment `t`
+ * seconds after the page lit. `null` when the lede is not the command it expects, which leaves it as written.
+ */
+function typer(lede: HTMLElement): ((t: number) => void) | null {
+	const codes = lede.querySelectorAll('code');
+	if (codes.length !== 2 || codes[0].textContent !== 'cargo build') return null;
+	const code = document.createElement('code');
+	code.className = 'cmd';
+	const old = [...'cargo'].map((c) => Object.assign(document.createElement('span'), { textContent: c }));
+	const now = [...'blaze'].map((c) => Object.assign(document.createElement('span'), { textContent: c, className: 'cmd-new' }));
+	const tool = document.createElement('span');
+	tool.className = 'tool';
+	tool.append(...old, ...now);
+	const sub = document.createElement('span');
+	sub.className = 'sub';
+	const caret = document.createElement('span');
+	caret.className = 'caret';
+	code.append(tool, ' ', sub, caret);
+	lede.replaceChildren(code);
+	const ramp = (u: number) => RAMP[Math.min(RAMP.length - 1, Math.max(0, Math.floor(u * RAMP.length)))];
+	const cycle = SUBCOMMANDS.length * CMD_HOLD;
+	let shown = '';
+	return (t) => {
+		old.forEach((el, i) => {
+			const u = (t - CMD_BURN - i * CMD_BURN_LAG) / CMD_BURN_FOR;
+			el.style.display = u >= 1 ? 'none' : '';
+			el.style.color = u <= 0 ? '' : ramp(u);
+			el.style.transform = u <= 0 ? '' : `translateY(${-u * 0.35}em)`;
+			el.style.opacity = u <= 0 ? '' : String(1 - u * u);
+		});
+		now.forEach((el, i) => {
+			const u = (t - CMD_CATCH - i * CMD_CATCH_LAG) / CMD_COOL;
+			el.style.display = u < 0 ? 'none' : '';
+			el.style.color = u >= 1 ? '' : ramp(1 - u);
+		});
+		// The subcommand: `build` until the cycle starts, then each typed over the last.
+		let word = 'build';
+		let typing = false;
+		if (t >= CMD_CYCLE_AT) {
+			const at = (t - CMD_CYCLE_AT) % cycle;
+			const k = Math.floor(at / CMD_HOLD);
+			const into = at - k * CMD_HOLD;
+			const from = SUBCOMMANDS[k];
+			const to = SUBCOMMANDS[(k + 1) % SUBCOMMANDS.length];
+			const out = from.length * CMD_KEY;
+			const back = CMD_HOLD - out - to.length * CMD_KEY;
+			if (into < back) word = from;
+			else if (into < back + out) ((word = from.slice(0, from.length - Math.ceil((into - back) / CMD_KEY))), (typing = true));
+			else ((word = to.slice(0, Math.ceil((into - back - out) / CMD_KEY))), (typing = true));
+		}
+		if (word !== shown) sub.textContent = shown = word;
+		caret.classList.toggle('on', typing || (t >= CMD_BURN && t < CMD_CYCLE_AT));
 	};
 }
 
@@ -139,6 +215,8 @@ onPage((signal) => {
 	};
 	const fig = main.querySelector<HTMLElement>('.race');
 	const race = fig && racer(fig);
+	const lede = main.querySelector<HTMLElement>('.lede');
+	const command = lede && !still.matches ? typer(lede) : null;
 
 	const tick = (now: number) => {
 		frame = requestAnimationFrame(tick);
@@ -151,7 +229,10 @@ onPage((signal) => {
 			while (fire.steps < Math.floor(burnt * FPS)) fire.step();
 		}
 		if (t >= LIT) reveal();
-		if (!Number.isNaN(lit)) race?.((now - lit) / 1000);
+		if (!Number.isNaN(lit)) {
+			race?.((now - lit) / 1000);
+			command?.((now - lit) / 1000);
+		}
 		// Every frame while a letter is falling or the word still shakes; after that only when the fire has stepped.
 		const moving = t < LANDED + 0.3;
 		if (!moving && fire.steps === drawn) return;

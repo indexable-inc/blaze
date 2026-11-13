@@ -23,7 +23,7 @@ site {
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
     Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
 
-    Lede is("A faster `cargo build`. Same projects, same commands.")
+    Lede is("`cargo build` → `blaze build`")
 
     // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
     // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
