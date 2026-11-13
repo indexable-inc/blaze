@@ -467,8 +467,10 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     fn term(&mut self, term: Term, range: (i128, i128)) -> TermId {
         if let Some(&id) = self.ids.get(&term) {
+            // The same term asked for with another range keeps what both allow at least: the
+            // wider of the two, which is true whichever asked.
             let had = self.ranges[id as usize];
-            self.ranges[id as usize] = (had.0.max(range.0), had.1.min(range.1));
+            self.ranges[id as usize] = (had.0.min(range.0), had.1.max(range.1));
             return id;
         }
         let id = self.terms.len() as TermId;
@@ -1114,11 +1116,15 @@ impl<'a, 'db> Solver<'a, 'db> {
                 self.discr(value, Some(ty))
             }
             Rvalue::Cast(CastKind::IntToInt, operand, ty) => {
-                // A cast that cannot change the value is the value.
+                // A cast to a type that holds every value of the operand's type is the value.
+                // Decided by the two types, never by what this state knows of the value: a
+                // term's range is its type's in every state it appears in.
                 let value = self.operand(state, operand);
-                let (low, high) = self.bounds(state, value);
-                match int_range(ty.as_ref(), self.word) {
-                    Some((least, most)) if least <= low && high <= most => value,
+                let from = self.operand_ty(operand).and_then(|it| int_range(it, self.word));
+                match (from, int_range(ty.as_ref(), self.word)) {
+                    (Some((low, high)), Some((least, most))) if least <= low && high <= most => {
+                        value
+                    }
                     _ => self.fresh(Some(ty.as_ref())),
                 }
             }

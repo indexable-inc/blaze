@@ -165,7 +165,9 @@ fn todo() {
 
 "
     );
-    assert_eq!(lint(&fixture, &only("todo")), expected);
+    // blaze's own lint of the same call (`blaze::todo`, on by default) says the hole's type;
+    // it has its tests in `blaze/reach_tests.rs`.
+    assert_eq!(lint(&fixture, &format!("{} -A blaze::todo", only("todo"))), expected);
 }
 
 #[test]
