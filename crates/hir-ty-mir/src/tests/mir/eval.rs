@@ -420,6 +420,37 @@ fn main() {
     );
 }
 
+/// A field whose declared type is an alias holds an enum: matching the field in place reads
+/// its discriminant through the alias. The variant is the second, so a discriminant read as 0
+/// takes the wrong arm.
+#[test]
+fn match_in_place_on_a_field_of_an_alias_type() {
+    check_pass(
+        r#"
+//- minicore: sized
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+enum E<T0, T1> { M0(T0), M1(T1) }
+trait Members { type Repr; }
+impl<T0, T1> Members for (T0, T1) { type Repr = E<T0, T1>; }
+struct W<M: Members>(M::Repr);
+
+fn main() {
+    let w: W<(u8, u32)> = W(E::M1(3));
+    match w.0 {
+        E::M0(_) => should_not_reach(),
+        E::M1(x) => if x != 3 { should_not_reach() },
+    }
+    if let E::M0(_) = &w.0 {
+        should_not_reach();
+    }
+}
+    "#,
+    );
+}
+
 #[test]
 fn drop_struct_field() {
     check_pass(

@@ -1144,15 +1144,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.cached_ptr_size
     }
 
-    fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> PlaceTy<'db> {
+    /// The type of the place `ty` projected by `proj`, normalized: a field's declared type may
+    /// be an alias (`<M as Members>::Repr`), and every reader of a place's type (its
+    /// discriminant, its layout, a deref) asks what it is, not what it was written as. rustc
+    /// normalizes there too (codegen's `monomorphize` of each place type); read as written, the
+    /// discriminant of `w.0: <(B, A) as Mem>::Repr` was 0 whatever variant `w.0` held, since an
+    /// alias is no enum.
+    fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> Result<'db, PlaceTy<'db>> {
         let pair = (ty, proj);
         if let Some(r) = self.projected_ty_cache.borrow().get(&pair) {
-            return *r;
+            return Ok(*r);
         }
         let (ty, proj) = pair;
-        let r = ty.projection_ty(&self.infcx, &proj, self.param_env.param_env);
+        let mut r = ty.projection_ty(&self.infcx, &proj, self.param_env.param_env);
+        r.ty = self.normalized(r.ty, "the type of a place")?;
         self.projected_ty_cache.borrow_mut().insert((ty, proj), r);
-        r
+        Ok(r)
     }
 
     fn place_addr_and_ty_and_metadata<'b>(
@@ -1167,7 +1174,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mut behind_deref = false;
         for proj in p.projection.as_slice() {
             let prev_ty = ty;
-            ty = self.projected_ty(ty, *proj);
+            ty = self.projected_ty(ty, *proj)?;
             match proj {
                 ProjectionElem::Deref => {
                     let size = self.ptr_size();
@@ -1335,7 +1342,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn place_ty<'b>(&'b self, p: &StoredPlace, locals: &'b Locals<'db>) -> Result<'db, Ty<'db>> {
         let mut ty = PlaceTy::from_ty(locals.body.locals[p.local].ty.as_ref());
         for proj in p.projection.as_slice() {
-            ty = self.projected_ty(ty, *proj);
+            ty = self.projected_ty(ty, *proj)?;
         }
         Ok(ty.ty)
     }
@@ -3079,6 +3086,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn compute_discriminant(&self, ty: Ty<'db>, bytes: &[u8]) -> Result<'db, i128> {
+        // Only a type that is no enum has the discriminant 0; an alias may be one.
+        let ty = self.normalized(ty, "the type whose discriminant is read")?;
         let layout = self.layout(ty)?;
         let TyKind::Adt(adt_def, _) = ty.kind() else {
             return Ok(0);
