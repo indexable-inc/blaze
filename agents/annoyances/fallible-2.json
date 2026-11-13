@@ -1,0 +1,19 @@
+{
+ "id": "fallible-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-fallible-alloc",
+ "where": "cargo clippy, blaze-mem",
+ "what": "An impl placed between a '// SAFETY:' comment and its 'unsafe impl' (three files in blaze-mem, one in bstd) compiled and passed 'cargo check' and 'cargo test'; only 'cargo clippy' refused it (undocumented_unsafe_blocks, deny). And 'cargo clippy -p blaze-std-shim' stops in a dependency: blaze-ids fails clippy::manual_memcpy at crates/blaze-ids/src/many.rs:253 on origin/main, so a crate above it is linted only with --no-deps.",
+ "cost": "twenty minutes",
+ "cause": "the dev loop's check and test do not run clippy; a deny-level clippy error sits on main in blaze-ids",
+ "whys": [
+  "a broken safety comment got past check and test",
+  "they do not run clippy's deny lints",
+  "the dev loop under cargo has no single command that is the gate's lint set",
+  "blaze check is the gate and lanes use cargo"
+ ],
+ "class": "a deny lint that only the gate runs is found late",
+ "prevention": "the how-to for the cargo dev loop names 'cargo clippy -p <crate> --no-deps' beside check; state: not written",
+ "workaround": "cargo +nightly-2026-10-27 clippy -p <crate> --lib --no-deps",
+ "state": "open"
+}

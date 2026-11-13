@@ -1,0 +1,20 @@
+{
+ "id": "fallible-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-fallible-alloc",
+ "where": "blaze: bstd, cargo",
+ "what": "The lane's check was 'cargo check -p blaze-std --all-targets passes'. On origin/main (136432aa02) 'cargo +nightly-2026-10-27 check -p blaze-std' ends with 10 errors (contract clauses '-> (r: T) ensures', 'where const { .. }', core::reflect, three blaze features), so no change to bstd can be checked, linted or tested with cargo as it is.",
+ "cost": "about an hour to build a stand-in; every bstd result of the lane is from the stand-in, not from blaze",
+ "cause": "bstd uses blaze-only syntax (A10, D25) while cargo is the dev-loop builder and lanes may not start blaze on the Mac",
+ "whys": [
+  "a bstd change could not be compiled by the lane",
+  "cargo rejects bstd's blaze-only syntax and the lane may not run blaze",
+  "rule blaze-builds-blaze makes cargo the dev-loop builder but bstd is written for blaze only",
+  "no tool gives a cargo-checkable view of bstd",
+  "the tree has two builders and one crate only one of them accepts, with nothing bridging them"
+ ],
+ "class": "a crate only blaze accepts cannot be verified in the cargo dev loop",
+ "prevention": "a committed script that writes a cargo-checkable copy of bstd (contracts and where-const stripped, reflection stubbed) so check, clippy and the tests that need no reflection run under cargo; state: written in the lane's scratchpad (shim.py), not yet in the tree",
+ "workaround": "copy crates/blaze-std to a git-excluded crates/zz-bstd-shim with the blaze-only syntax taken out and run cargo check/clippy/test -p blaze-std-shim; three tests fail there on the base commit too (tests::explicit::a_worlds_limits_are_the_ones_its_maker_said, tests::paths::a_path_never_escapes_its_directory, video::videotoolbox's encode test)",
+ "state": "open"
+}
