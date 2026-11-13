@@ -1897,7 +1897,13 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
     ) -> Result<PlaceWithOrigin<'f>> {
         let interner = self.cx.interner();
         let members = crate::error_union::members(interner, union).ok_or(ErrorGuaranteed)?;
-        let pat_ty = self.node_ty(pat.into())?;
+        // The member is the type of the constructor pattern, which under `x @` is the
+        // pattern after it: a binding by reference has the reference's type.
+        let mut of_member = pat;
+        while let Pat::Bind { subpat: Some(inner), .. } = self.cx.store.pat(of_member) {
+            of_member = inner;
+        }
+        let pat_ty = self.node_ty(of_member.into())?;
         let pat_ty = self.cx.structurally_resolve_type(pat.into(), pat_ty);
         let at = crate::error_union::member_index(members, pat_ty).ok_or(ErrorGuaranteed)?;
         let repr =

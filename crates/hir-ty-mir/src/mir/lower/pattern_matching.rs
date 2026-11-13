@@ -972,6 +972,17 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         crate::error_union::repr_variant(self.db, repr, at)
     }
 
+    /// blaze: the pattern whose type is the member that `pattern`, one with
+    /// `PatAdjust::UnionMember`, matches: `pattern` itself, a constructor pattern, or the
+    /// constructor pattern after its `x @`s (a binding by reference has the reference's type,
+    /// not the member's).
+    pub(super) fn union_member_pat(&self, mut pattern: PatId) -> PatId {
+        while let Pat::Bind { subpat: Some(inner), .. } = self.store.pat(pattern) {
+            pattern = inner;
+        }
+        pattern
+    }
+
     /// blaze: the place of the member that `pattern`, a pattern of a member of the error
     /// union `union` at `union_place`, matches: the one field of the variant of the union's
     /// `Repr` enum that holds that member. When `mode` checks, control goes on (the block
@@ -988,7 +999,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     ) -> Result<'db, (Place<'db>, BasicBlockId)> {
         const NOT_A_MEMBER: MirLowerError<'static> =
             MirLowerError::TypeError("a pattern of no member of the error union it matches");
-        let member = self.infer.pat_ty(pattern);
+        let member = self.infer.pat_ty(self.union_member_pat(pattern));
         let variant = self.union_member_variant(union, member).ok_or(NOT_A_MEMBER)?;
         if !matches!(union.as_adt(), Some((AdtId::StructId(_), _))) {
             return Err(NOT_A_MEMBER);

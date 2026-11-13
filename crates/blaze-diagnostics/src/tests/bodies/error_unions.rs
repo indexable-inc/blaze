@@ -26,6 +26,22 @@ fn stderr(main: &str) -> String {
     checked(&fixture).stderr()
 }
 
+/// A crate that does not turn error unions on is told what rustc tells it: the unmet
+/// `From` bound, with nothing of sets (the extension changes no program that does not ask).
+#[test]
+fn a_crate_without_error_unions_keeps_rustcs_words() {
+    let fixture = "//- minicore: sized, result, try, from\n//- /main.rs crate:main\n\
+        pub struct Missing;\npub struct FsError;\n\
+        pub fn open_dir() -> Result<u8, FsError> { loop {} }\n\
+        pub fn run() -> Result<u8, Missing> {\n    let dir = open_dir()?;\n    Ok(dir)\n}\n";
+    let out = checked(fixture).stderr();
+    assert!(
+        out.starts_with("error[E0277]: the trait bound `Missing: From<FsError>` is not satisfied"),
+        "{out}"
+    );
+    assert!(!out.contains("error set"), "{out}");
+}
+
 /// (b) of the feature's check: `fs.open_dir()?` fails with `FsError`, which `run`'s error
 /// type, `Missing`, does not hold. The error names the call that adds the failure, the
 /// member, the set as the signature writes it and whose it is, and its fix is the set with

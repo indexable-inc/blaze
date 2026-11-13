@@ -447,7 +447,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 // member in it. The member is the pattern's own type, so this is the last
                 // adjustment.
                 PatAdjust::UnionMember => {
-                    let member = self.infer.pat_ty(pattern);
+                    let member = self.infer.pat_ty(self.union_member_pat(pattern));
                     let variant = self.union_member_variant(adjustment.source.as_ref(), member)?;
                     let variant = VariantId::EnumVariantId(variant);
                     place.push(Step::Field(0));

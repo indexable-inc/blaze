@@ -732,7 +732,7 @@ fn base(c: Conn) -> u32 {
 fn a_match_on_an_error_union_is_exhaustive_over_its_members() {
     check(
         r#"
-//- minicore: sized, error_union, result
+//- minicore: sized, error_union, result, str, slice
 #![blaze::error_unions]
 pub struct Missing { pub capability: &'static str }
 pub enum FsKind { NotFound, NotADirectory }
@@ -786,6 +786,12 @@ fn a_member_covered_twice(e: Missing | FsError) -> u8 {
 fn a_let_of_one_member(e: Missing | FsError) {
     let FsError { op: _, .. } = e;
 }
+
+fn a_member_bound_whole_through_a_reference(e: &(Missing | FsError)) -> usize {
+    match e {
+        m @ Missing { .. } => m.capability.as_bytes().len(),
+    }
+}
 "#,
         &[
             ("e", "E0004: FsError { .. }"),
@@ -794,6 +800,7 @@ fn a_let_of_one_member(e: Missing | FsError) {
             ("e", "E0004: FsError { kind: FsKind::NotADirectory, .. }"),
             ("Missing { capability: _ }", "unreachable_patterns"),
             ("FsError { op: _, .. }", "E0005 local binding: Missing { .. }"),
+            ("e", "E0004: &FsError { .. }"),
         ],
     );
 }
