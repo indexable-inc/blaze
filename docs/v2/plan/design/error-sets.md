@@ -81,13 +81,13 @@ A struct, tuple-struct or path pattern whose type is one member of the set it is
 against matches when the set holds that member, against the member's value: `FsError { kind, ..
 }`, `Stopped::Cancelled`, `Wrap(x)`. An enum member is matched by its variants. References are
 peeled first, as for any constructor pattern (`&(A | B)` binds by reference). `x @ FsError { ..
-}` binds the member, not the set, when the pattern after `@` names the member's struct or
-variant by path. Only in a crate with the attribute; a pattern of no member is the type
-mismatch it was.
+}` binds the member, not the set (a `&FsError` through a reference), when the pattern after
+`@` names the member's struct or variant by path. Only in a crate with the attribute; a
+pattern of no member is the type mismatch it was.
 
 Inference records one adjustment on the pattern, `PatAdjust::UnionMember`, whose source is the
-set; which member is the pattern's own type, so nothing else is stored (InferenceRecord schema
-31). Every reader of pattern adjustments turns it into the pattern it stands for, core's
+set; which member is the pattern's own type (under `x @`, the type of the pattern after it),
+so nothing else is stored (InferenceRecord schema 31). Every reader of pattern adjustments turns it into the pattern it stands for, core's
 `ErrorUnion` struct around the variant of its `Repr` enum that holds the member
 (`hir_ty::error_union`): match checking (so a match is exhaustive exactly when every member is
 covered, a member left out is the witness, written `FsError { .. }` or `Stopped::_`, and a member
@@ -178,7 +178,7 @@ handles every area's cancellation.
   optimization level, on errors shaped as bstd's: `?` widens `Missing` and `FsError` into one
   set and each failure comes out as its member with its fields; a smaller set widens; an enum
   member is matched by its variants; members match through a reference, under `@`, in `let`-
-  `else` and `if let`.
+  `else` and `if let`, and in a closure that captures the set.
 - `crates/blaze-diagnostics/src/tests/bodies/error_unions.rs`: the missing member's error, word
   for word, with its control (the member added, no error); E0004 naming the member.
 - `crates/hir-ty/src/tests/error_unions.rs`: the invariant that a set's members have one order
