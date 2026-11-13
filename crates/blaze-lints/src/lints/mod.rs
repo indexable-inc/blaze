@@ -962,6 +962,7 @@ mod tests {
         let (macros, _) = named_in("#[allow(blaze::proc_macro)]");
         assert!(
             edition.intersects(blaze::Lint::LossyAs.bit())
+                && edition.intersects(blaze::Lint::ImplicitOverflow.bit())
                 && edition.intersects(blaze::Lint::GlobalState.bit())
                 && edition.intersects(blaze::Lint::AsyncFn.bit())
                 && edition.intersects(blaze::Lint::UnmarkedPure.bit())

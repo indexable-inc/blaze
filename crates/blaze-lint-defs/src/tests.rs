@@ -76,6 +76,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
         ("blaze::lossy_as", false),
+        ("blaze::implicit_overflow", false),
         ("blaze::global_state", false),
         ("blaze::async_fn", false),
         ("blaze::unmarked_pure", false),

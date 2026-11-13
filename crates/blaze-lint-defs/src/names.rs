@@ -96,6 +96,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
     ),
     // What the blaze edition removes or respells (docs/v2/plan/design/edition.md): the code blaze
     // cannot analyse, what blaze's standard library replaces (`std_use`), `lossy_as`,
+    // `implicit_overflow`,
     // `global_state`, `async_fn`, `mut_ref`, and the marks it writes at a crate's border
     // (`unmarked_*`). Allowed until a workspace turns the group on, but for the members whose
     // advice this blaze already has (`ready`), which warn.
@@ -108,6 +109,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::build_script_ambient",
             "blaze::std_use",
             "blaze::lossy_as",
+            "blaze::implicit_overflow",
             "blaze::global_state",
             "blaze::async_fn",
             "blaze::unmarked_pure",
