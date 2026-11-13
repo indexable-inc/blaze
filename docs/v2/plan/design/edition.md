@@ -36,7 +36,7 @@ it.
 | # | change | deletes | spec | size |
 |---|---|---|---|---|
 | 1 | **Handles copy themselves.** `Handle` marks types whose clone is a second reference to the same thing (`Arc`, `Rc`, channel senders, interned ids). Where a handle would be moved and is used again, it is copied; the last use moves. | `.clone()` on handles, clone-then-move blocks | here | small |
-| 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | here | medium |
+| 2 | **Error unions.** `A \| B` in type position is an anonymous enum, order-free; `?` widens a smaller set into a larger one; `match` on it is exhaustive. | error enums, `From` impls, `anyhow`, `thiserror` | [error-sets](error-sets.md), here | medium |
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
 | 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | [records](records.md) | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
@@ -72,7 +72,7 @@ features some of them are written with):
 - Observable difference: a value lives until its last copy drops, and `Arc::strong_count`,
   `get_mut` and `try_unwrap` can see copies. So it is edition-only, never on ordinary Rust.
 
-**2. Error unions.**
+**2. Error unions.** (What is built, its cost and bstd's port: [error-sets](error-sets.md).)
 - Members are concrete named types at first; a type parameter in a union is refused (with two
   parameters equal, `T | U` would be ambiguous).
 - Layout is an enum with one variant per member, sorted by the member's type identity, so the

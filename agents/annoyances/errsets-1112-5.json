@@ -1,0 +1,19 @@
+{
+ "id": "errsets-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "my own method",
+ "what": "An annoyance row was added with its JSON in an unquoted shell heredoc: the backticks in its text ran as a command (a grep, read-only) and the row was refused as bad JSON. The same nesting rev-9 describes.",
+ "cost": "5 minutes",
+ "cause": "an unquoted heredoc substitutes backticks",
+ "whys": [
+  "the row's text was inside shell text",
+  "agents.py takes its row as one shell argument, so every row passes through a shell's quoting",
+  "there is no form of the command that reads the row from a file or stdin"
+ ],
+ "class": "text that passes through a shell on its way to a tool",
+ "prevention": "agents.py reads its JSON from stdin or a file when given none as an argument; not built",
+ "workaround": "build the JSON in Python under a quoted heredoc and pass it with subprocess",
+ "fix": "",
+ "state": "open"
+}

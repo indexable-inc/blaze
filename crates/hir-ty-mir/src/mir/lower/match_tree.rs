@@ -439,12 +439,41 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // test of its own that is not followed here.
         let adjustments = self.infer.pat_adjustments.get(&pattern).unwrap_or_default();
         for adjustment in adjustments {
-            if adjustment.kind == PatAdjust::OverloadedDeref && !adjustment.source.as_ref().is_box()
-            {
-                return None;
+            match adjustment.kind {
+                PatAdjust::OverloadedDeref if !adjustment.source.as_ref().is_box() => return None,
+                PatAdjust::BuiltinDeref | PatAdjust::OverloadedDeref => place.push(Step::Deref),
+                // blaze: a pattern of a member of an error union asks which variant of the
+                // union's `Repr` enum (its one field) the union holds, and the rest of the
+                // member in it. The member is the pattern's own type, so this is the last
+                // adjustment.
+                PatAdjust::UnionMember => {
+                    let member = self.infer.pat_ty(self.union_member_pat(pattern));
+                    let variant = self.union_member_variant(adjustment.source.as_ref(), member)?;
+                    let variant = VariantId::EnumVariantId(variant);
+                    place.push(Step::Field(0));
+                    let mut within = variant_place(variant, &place, frame);
+                    within.push(Step::Field(0));
+                    let mut inside = Vec::new_in(frame);
+                    self.pairs_of_unadjusted(pattern, within, &mut inside)?;
+                    self.pairs_of_variant(variant, inside, place, pairs);
+                    return Some(());
+                }
             }
-            place.push(Step::Deref);
         }
+        self.pairs_of_unadjusted(pattern, place, pairs)
+    }
+
+    /// [`Self::pairs_of`] of `pattern` itself, at the place its adjustments came to.
+    fn pairs_of_unadjusted<'t>(
+        &self,
+        pattern: PatId,
+        mut place: Vec<Step, &'t Frame>,
+        pairs: &mut Vec<Pair<'t>, &'t Frame>,
+    ) -> Option<()>
+    where
+        'a: 't,
+    {
+        let frame = *place.allocator();
         let ty = self.infer.pat_ty(pattern);
         match self.store.pat(pattern) {
             Pat::Wild | Pat::Bind { subpat: None, .. } => (),
