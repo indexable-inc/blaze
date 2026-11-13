@@ -13,18 +13,16 @@ site {
       Description: {"blaze's opt-in extensions: linear types that can't be forgotten, effects a signature lists, and pure functions."}
 
       Step idea("A signature that tells the truth") {
-        P sig("A Rust signature says what goes in and what comes out. It doesn't say whether the function can panic, allocate, block, or touch the world. blaze lets you write those down, and then checks them through every call.")
+        P sig("A Rust signature doesn't say whether a function can panic, allocate or block. blaze lets you say it, and checks it.")
         Code opt(lang: "rust", text: `#![feature(register_tool)]
         #![register_tool(blaze)]`)
-        Dim same("Code without these attributes means exactly what it means under rustc.")
       }
 
       Step effects("Effects") {
-        P may("`#[blaze::may(...)]` lists what a function is allowed to do. Anything the list leaves out is refused, in it **and in everything it calls**.")
+        Art tree(piece: "effects", label: "A call tree. A call far below blocks; the effect climbs the wires to the top function, whose promise breaks.")
         Code parse(lang: "rust", text: `#[blaze::may(alloc)]
-        pub fn parse(text: &str) -> Tree \{
-            // a call that can panic or block in here is a compile error
-        }`)
+        pub fn parse(text: &str) -> Tree \{ ... }`)
+        P may("Anything not listed is refused, **in every function it calls** too.")
       }
 
       Step effects_q("Check: effects") {
@@ -38,24 +36,21 @@ site {
       }
 
       Step linear("Linear types") {
-        P must("Some values must not be quietly dropped: a transaction that has to be committed or rolled back. Mark the type `#[blaze::linear]`, and letting one go out of scope is an error.")
         Code txn(lang: "rust", text: `#[blaze::linear]
         pub struct Txn \{ id: u32 }
 
         impl Txn \{
             #[blaze::consumes] pub fn commit(self) \{}
-            #[blaze::consumes] pub fn rollback(self) \{}
         }`)
-        Dim mir("blaze checks this on the compiled code of each function, so every path out of it, early returns and `?` included, has to use the value up.")
+        P must("A linear value can't be quietly dropped: every path out, `?` included, must use it up.")
       }
 
       Step pure("Pure functions") {
-        P pure("`#[blaze::pure]` says a function reads the world only through its arguments: no globals, no files, no clock. blaze checks it through every call, and can then reuse its result whenever the arguments are the same.")
+        P pure("`#[blaze::pure]`: reads the world only through its arguments. Checked through every call, so its result can be reused.")
       }
 
       Step status("Where it stands") {
-        P now("Experimental: these are written and checked inside blaze's own code, and their designs are still open. blaze's own crates are their first users.")
-        Dim rfcs("The designs, and the open questions: [the RFCs](/rfcs).")
+        P now("Experimental: written and used by blaze's own crates first. Designs: [the RFCs](/rfcs).")
       }
     }
   }

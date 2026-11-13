@@ -238,7 +238,28 @@ fn highlighted(e: &Entity) -> Option<String> {
     }
 }
 
+/// Every element type a block can be. Two blocks in one scope with the same name are one entity in Flecs, so
+/// `Art daemon(...)` beside `P daemon(...)` is one node carrying both; it is refused rather than half rendered.
+const ELEMENTS: &[&str] = &[
+    "Lede", "P", "Dim", "H3", "Li", "Code", "Command", "Img", "Art", "Section", "Issue", "Goal", "Step", "Quiz",
+    "RowChart", "LineChart", "Charts", "Picker", "BenchHistory", "Tap", "Figure", "Ul", "Ol", "Table",
+];
+
 fn block(n: Id, ctx: &mut Ctx) -> Result<String, String> {
+    let e = ctx.e(n);
+    let kinds: Vec<&str> = ELEMENTS
+        .iter()
+        .chain(WIDGETS.iter())
+        .copied()
+        .filter(|k| e.has(k) || e.has_tag(k))
+        .collect();
+    if kinds.len() > 1 {
+        return Err(format!(
+            "{}: one block is two elements ({}); two blocks in one scope share this name, so rename one",
+            e.path,
+            kinds.join(", ")
+        ));
+    }
     if let Some(tag) = WIDGETS.iter().find(|t| ctx.e(n).has_tag(t)) {
         return widget(tag, n, ctx);
     }

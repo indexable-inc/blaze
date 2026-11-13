@@ -13,7 +13,8 @@
 .frame { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); gap: 4px; min-height: 100svh; padding: 6px clamp(8px, 1vw, 14px) 10px 0; }
 
 /* The sidebar. */
-.side { position: sticky; top: 0; display: flex; flex-direction: column; height: 100svh; margin-top: -6px; padding: 14px 0 0 clamp(8px, 1vw, 14px); }
+.side { position: sticky; top: 0; display: flex; flex-direction: column; height: 100svh; margin-block: -6px -10px; padding: 14px 0 0 clamp(8px, 1vw, 14px); }
+/* The negative margins match .frame's top and bottom padding, so a sidebar the height of the screen never makes the page scroll. */
 .sidetop { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 8px 12px 0; }
 .brand { display: block; padding: 2px 6px; border-radius: 8px; line-height: 0; }
 .brand:hover { background: var(--s-tint); }

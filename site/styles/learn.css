@@ -63,7 +63,7 @@ main.lesson[data-on] > section.step > .lede { font-size: 21px; line-height: 1.55
 main.lesson[data-on] > section.step strong { color: var(--ink-1); font-weight: 600; }
 main.lesson[data-on] > section.step > p.dim { font-size: 15px; line-height: 1.55; color: var(--ink-3); }
 main.lesson[data-on] > section.step .art { margin: 22px 0; }
-main.lesson[data-on] > section.step :is(pre, .cmd, .table-wrap, table) { margin-block: 18px; }
+main.lesson[data-on] > section.step > :is(.codeblock, .cmd, .table-wrap, table) { margin-block: 18px; }
 
 /* A step slides in from the side it comes from. */
 main.lesson[data-on] > section.step.in-fwd { animation: lp-in 240ms cubic-bezier(0.2, 0.7, 0.3, 1); }
@@ -194,6 +194,14 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 .dg-wires { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; shape-rendering: crispEdges; }
 .dg-wires rect { fill: var(--ink-4); transition: fill 0.25s; }
 .dg-wire.lit rect { fill: var(--ink-1); }
+.dg-tip { fill: var(--ink-4); shape-rendering: geometricPrecision; transition: fill 0.25s; }
+.dg-wire.hl rect, .dg-wire.hl .dg-tip { fill: var(--ink-2); }
+.dg-wire.lit .dg-tip { fill: var(--ink-1); }
+.dg-part.hl { background: var(--bg-4); color: var(--ink-1); box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+/* A part's name in the step's text, linked to the part (client/lib/diagrams.ts). */
+code.dg-ref { cursor: pointer; transition: background-color 0.15s, color 0.15s, box-shadow 0.15s; }
+code.dg-ref.still { cursor: default; }
+code.dg-ref.hl { background: var(--bg-4); color: var(--ink-1); box-shadow: 0 0 0 1px var(--ink-3); }
 .dg-wire.quiet:not(.lit) { display: none; }
 .dg-part {
 	position: absolute;
@@ -546,5 +554,5 @@ main.lesson[data-on] .quiz .choice { margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
 	main.lesson[data-on] > section.step.in-fwd, main.lesson[data-on] > section.step.in-back, .pick[data-mark='wrong'] { animation: none; }
-	.lp-bar i, .pick, .dg-part, .dg-wires rect, .course .qs i, .course .pin, :is(.course, .ulog) .disc, .doc .course-go, .trail .line { transition: none; }
+	.lp-bar i, .pick, .dg-part, .dg-wires rect, .dg-tip, code.dg-ref, .course .qs i, .course .pin, :is(.course, .ulog) .disc, .doc .course-go, .trail .line { transition: none; }
 }

@@ -40,6 +40,8 @@ type Piece = {
 	wires: Wire[];
 	/** Labels are code (crate and function names). */
 	code?: boolean;
+	/** Each wire ends in an arrowhead at its `to` part: the wires say which way they go (uses, calls, becomes). */
+	arrows?: boolean;
 	/** The line under the diagram until it is touched. */
 	idle?: string;
 	/** Two ways to tap (a body edit, a signature change), as a segmented switch above the diagram. */
@@ -88,6 +90,7 @@ const STEP = 380;
 
 // Lesson 1: source to program, compile then link.
 const pipeline: Piece = {
+	arrows: true,
 	cols: 26,
 	rows: 10,
 	parts: [
@@ -131,6 +134,7 @@ const CRATE_WIRES: Wire[] = [
 	{ from: 'app', to: 'program' },
 ];
 const crates: Piece = {
+	arrows: true,
 	cols: 26,
 	rows: 15,
 	code: true,
@@ -142,7 +146,7 @@ const crates: Piece = {
 		{ id: 'program', label: 'program', x: 25, y: 1, at: 'r', fixed: true },
 	],
 	wires: CRATE_WIRES,
-	idle: 'Tap a crate to edit it.',
+	idle: 'Arrows point from a crate to the crates it uses. Tap a crate to edit it.',
 	tap(v, id) {
 		if (id === 'program') return;
 		v.reset();
@@ -168,6 +172,7 @@ const FN_WIRES: Wire[] = [
 	{ from: 'parse', to: 'lex' },
 ];
 const fns: Piece = {
+	arrows: true,
 	cols: 26,
 	rows: 15,
 	code: true,
@@ -178,7 +183,7 @@ const fns: Piece = {
 		{ id: 'lex', label: 'lex', x: 5, y: 13 },
 	],
 	wires: FN_WIRES,
-	idle: 'Tap a function to edit it.',
+	idle: 'Arrows point from a function to the functions it calls. Tap one to edit it.',
 	modes: [
 		{ id: 'body', label: 'Body edit' },
 		{ id: 'sig', label: 'Signature change' },
@@ -368,6 +373,8 @@ export function mount(el: HTMLElement, pickMode: boolean, onPick?: () => void): 
 	// Every wire cell, with its column and row: the ones a part covers are hidden (clip below), so a wire stops at the
 	// part's edge instead of running under it and showing past its far side.
 	const drawn: [SVGRectElement, number, number][] = [];
+	// Per wire, its cells from start to end and its arrowhead, placed on the last cell left showing (clip below).
+	const runs: { cells: [SVGRectElement, number, number][]; tip: SVGPolygonElement | null }[] = [];
 	for (const w of piece.wires) {
 		const a = at.get(w.from)!;
 		const b = at.get(w.to)!;
@@ -376,11 +383,20 @@ export function mount(el: HTMLElement, pickMode: boolean, onPick?: () => void): 
 		const g = document.createElementNS(SVG, 'g');
 		g.classList.add('dg-wire');
 		if (w.quiet) g.classList.add('quiet');
+		const run: [SVGRectElement, number, number][] = [];
 		for (const [i, j] of cells(corners)) {
 			const r = rect(i, j);
 			g.append(r);
 			drawn.push([r, i, j]);
+			run.push([r, i, j]);
 		}
+		let tip: SVGPolygonElement | null = null;
+		if (piece.arrows) {
+			tip = document.createElementNS(SVG, 'polygon');
+			tip.classList.add('dg-tip');
+			g.append(tip);
+		}
+		runs.push({ cells: run, tip });
 		svg.append(g);
 		wires.set(`${w.from}>${w.to}`, g);
 	}
@@ -508,7 +524,54 @@ export function mount(el: HTMLElement, pickMode: boolean, onPick?: () => void): 
 			const under = rects.some((p) => x1 > p.left - 1 && x0 < p.right + 1 && y1 > p.top - 1 && y0 < p.bottom + 1);
 			r.style.display = under ? 'none' : '';
 		}
+		// The arrowhead takes the place of the last cell showing, pointing on into the part the wire ends at.
+		for (const { cells: run, tip } of runs) {
+			if (!tip) continue;
+			let k = run.length - 1;
+			while (k > 0 && run[k]![0].style.display === 'none') k--;
+			const next = run[k + 1] ?? run[k]!;
+			const prev = run[k - 1] ?? run[k]!;
+			const [, i, j] = run[k]!;
+			const [dx, dy] = k + 1 < run.length ? [next[1] - i, next[2] - j] : [i - prev[1], j - prev[2]];
+			run[k]![0].style.display = 'none';
+			const [cx, cy] = [i + 0.5, j + 0.5];
+			const pts: Pt[] = [
+				[cx + dx * 0.45, cy + dy * 0.45],
+				[cx - dx * 0.3 - dy * 0.45, cy - dy * 0.3 + dx * 0.45],
+				[cx - dx * 0.3 + dy * 0.45, cy - dy * 0.3 - dx * 0.45],
+			];
+			tip.setAttribute('points', pts.map((q) => q.join(',')).join(' '));
+		}
 	};
+	// The step's own words name the parts (`app` in "Here `app` uses `net`"): pointing at either lights the other,
+	// with the wires leaving that part, and clicking the word taps the part.
+	const step = el.closest('section.step') ?? el.parentElement;
+	const refs = new Map<string, HTMLElement[]>();
+	for (const c of step?.querySelectorAll<HTMLElement>(':not(pre) > code') ?? []) {
+		if (el.contains(c)) continue;
+		const p = piece.parts.find((q) => q.label === c.textContent?.trim());
+		if (!p) continue;
+		c.classList.add('dg-ref');
+		refs.set(p.id, [...(refs.get(p.id) ?? []), c]);
+	}
+	const hover = (id: string, on: boolean) => {
+		buttons.get(id)?.classList.toggle('hl', on);
+		for (const c of refs.get(id) ?? []) c.classList.toggle('hl', on);
+		for (const w of piece.wires) if (w.from === id) wires.get(`${w.from}>${w.to}`)?.classList.toggle('hl', on);
+	};
+	for (const [id, b] of buttons) {
+		b.addEventListener('pointerenter', () => hover(id, true));
+		b.addEventListener('pointerleave', () => hover(id, false));
+	}
+	for (const [id, cs] of refs)
+		for (const c of cs) {
+			c.addEventListener('pointerenter', () => hover(id, true));
+			c.addEventListener('pointerleave', () => hover(id, false));
+			const b = buttons.get(id)!;
+			if (!pickMode && piece.tap && !b.disabled) c.addEventListener('click', () => piece.tap!(view, id));
+			else c.classList.add('still');
+		}
+
 	const ro = new ResizeObserver(clip);
 	ro.observe(box);
 	void document.fonts?.ready.then(clip);

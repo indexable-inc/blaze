@@ -14,26 +14,21 @@ site {
       Description: {"How blaze is becoming a formally verified compiler: an executable Lean semantics of MIR, and passes proved against it."}
 
       Step trust("Who checks the compiler?") {
-        P bugs("Compilers have bugs, and a compiler bug is the worst kind: your code is right, and the program is still wrong. Tests catch many, but only the cases someone thought to write.")
-        P goal("blaze's goal is a **formally verified** compiler: a proof, checked by a machine, that each step keeps your program's meaning.")
+        P bugs("A compiler bug: your code is right, the program is wrong. Tests catch the cases someone thought of.")
+        P goal("blaze aims for a **formally verified** compiler: each step proved, by a machine, to keep your program's meaning.")
       }
 
       Step mir("One definition of meaning") {
-        P mir("Before machine code, blaze turns each function into **MIR**, Rust's mid-level form: blocks of simple statements joined by jumps.")
-        P lean("blaze writes down what MIR *means* once, as a program in [Lean](https://lean-lang.org), a proof assistant. It can run: give it a function and its inputs, and it computes the result.")
+        P mir("blaze writes down what **MIR** (Rust's mid-level form) means once, as a program in [Lean](https://lean-lang.org). You can run it.")
       }
 
       Step passes("Passes, proved") {
-        P pass("Between building MIR and emitting code, blaze rewrites it in **passes**: folding constants, removing dead blocks, merging jumps. Each one is proved in Lean to keep the meaning, for every program, not just the ones in a test.")
-        Ul proved {
-          Li fold("constant folding, and simplifying conditions known at compile time")
-          Li dead("removing dead blocks and dead stores")
-          Li jumps("threading, merging and simplifying jumps")
-        }
+        Art art(piece: "proof", label: "A function's blocks before a pass, and after it with the dead block gone. An equals sign joins them and a check lights up.")
+        P pass("Folding constants, removing dead code, merging jumps: each pass is proved in Lean to keep the meaning, for **every** program.")
       }
 
-      Step validate("When a proof is too hard: check the result") {
-        P tv("For a pass that is hard to prove once and for all, blaze uses **translation validation**: after the pass runs, a checker compares the MIR before and after. The checker itself is proved, so when it says yes, the two mean the same.")
+      Step validate("Or check each run") {
+        P tv("Where a proof is too hard, a **proved checker** compares the code before and after each run of the pass.")
       }
 
       Step validate_q("Check: which is which?") {
@@ -47,8 +42,7 @@ site {
       }
 
       Step trusted("What is still trusted") {
-        P axioms("Every proof rests on Lean's three standard axioms and nothing more, and blaze lists what is still trusted rather than hiding it: today, the passes not yet proved, the code after MIR, and the semantics for unsafe code and atomics, which comes next.")
-        Dim more("How it works and what is proved: [formal-verification.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/formal-verification.md).")
+        P axioms("Only Lean's three standard axioms, and a public list of what isn't proved yet: unsafe code, atomics, the code after MIR. More: [formal-verification.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/formal-verification.md).")
       }
     }
   }

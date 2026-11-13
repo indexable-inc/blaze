@@ -23,76 +23,65 @@ site {
     Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
 
     Step what("Rust, rebuilt in milliseconds") {
-      Lede is("**blaze** is a Rust compiler and build tool that stays running. You type the commands you know from cargo; it rebuilds an edit in milliseconds instead of seconds.")
-      Art art(piece: "incremental", label: "A lattice of dots. One dot changes, and only it and the few dots that depend on it light up and settle; the rest never move.")
-      Dim course("This is the first lesson of a short course, one idea per screen. Press **Continue** or the right arrow.")
+      Lede is("**blaze** builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+      Art art(piece: "incremental", label: "A lattice of functions. One changes, and only it and the few that depend on it light up and settle.")
+      Dim course("A short course, one idea per screen. Press **Continue** or →.")
     }
 
     Step why("Why it is fast") {
-      P cargo("`rustc` is incremental too: it saves its work on disk and recompiles only the **codegen units** (groups of functions) that changed. But cargo starts a new `rustc` for the crate you edited and for every crate that depends on it, each one reloads its saved state and rechecks its crate, and then the whole program is linked again.")
-      P blaze("blaze is one **daemon** that stays running with your whole workspace in memory, already parsed and type-checked. When you save, it redoes the work for **the functions you changed** and what really reads them, across crates, with nothing to reload.")
-      Table numbers {
-        Tr head { Th a("Edit one function in a 200-crate workspace"); Th b("cargo"); Th c("blaze") }
-        Tr main_crate { Td a("in the main crate"); Td b("1.76 s"); Td c("0.42 s") }
-        Tr deep_crate { Td a("in a crate everything depends on"); Td b("6.33 s"); Td c("0.60 s") }
-      }
-      Dim measured("Linux x86-64, 8 CPUs, median of three. Every run since: [benchmarks](/bench).")
+      Art race(piece: "race", label: "Two lanes over time. cargo: a rustc for each affected crate, each starting by reloading its saved state, then the whole program linked. blaze: one function, then done.")
+      P cargo("`rustc` is incremental, but cargo still starts one per affected crate, each reloading its saved state, then links everything again.")
+      P blaze("blaze keeps your workspace in memory and redoes only **the functions you changed**.")
     }
 
     Step install("Install it") {
-      P one("One line, on macOS on Apple silicon or Linux (x86-64 or ARM64). You don't need Rust or rustup installed: blaze brings its own.")
       Command curl("curl -fsSL https://ix.dev/blaze | sh")
-      Dim what("It downloads the build for your machine, checks it against the published checksums and puts `blaze` in `~/.cargo/bin`. Run it again to upgrade. Requirements and other channels: [Install](/install).")
+      Dim what("macOS on Apple silicon or Linux. No Rust needed: blaze brings its own. Details: [Install](/install).")
     }
 
     Step first("Your first build") {
-      P go("In any Rust project, type `blaze` where you would type `cargo`:")
-      Code run(lang: "bash", text: `cd my-project
-        blaze run`)
-      P daemon("The first build starts a background process, the **daemon**, which loads your project and compiles all of it from source. That one takes about as long as cargo.")
-      P edit("Now change a function and run it again. The daemon still holds everything, so only your edit is rebuilt:")
-      Code finished(lang: "", text: `\$ blaze run
-            Finished \`dev\` profile [blaze] target(s) in 0.02s`)
+      Code run(lang: "bash", text: "blaze run")
+      Art held(piece: "daemon", label: "Your workspace as a block of cells. The first build fills every cell; after that each save changes a single cell.")
+      P daemon("The first build loads everything into a background **daemon**. After that, each save rebuilds one piece:")
+      Code finished(lang: "", text: `Finished \`dev\` profile [blaze] target(s) in 0.02s`)
     }
 
-    Step daemon_q("Check: the second build") {
-      Quiz q(prompt: "Why is the second `blaze run` so much faster than the first?") {
-        Choice cache("blaze downloaded a prebuilt copy of your project.", "Nothing of yours is downloaded. Your code is compiled on your machine.")
-        Choice held("The daemon kept the program in memory and recompiled only what the edit changed.", "Right: the first build loads and compiles everything once, and the daemon keeps it for every build after.") {
+    Step daemon_q("Check") {
+      Quiz q(prompt: "Why is the second `blaze run` so much faster?") {
+        Choice cache("It downloaded a prebuilt copy.", "Nothing is downloaded: your code is compiled on your machine.")
+        Choice held("The daemon kept everything in memory and redid only the edit.", "Right: load once, then only what changed.") {
           Right
         }
-        Choice skip("It skipped type checking to save time.", "blaze checks types on every build; an edit with a type error fails, as under cargo.")
+        Choice skip("It skipped type checking.", "Types are checked on every build.")
       }
     }
 
     Step commands("The commands") {
-      Ul list {
-        Li build("`blaze build`, `blaze run`, `blaze test`, `blaze check`, `blaze bench`: cargo's commands, with cargo's flags. `b`, `r`, `t` and `c` for short.")
-        Li status("`blaze status`: what the daemon holds, and the memory it uses.")
-        Li stop("`blaze stop`: save the daemon's state and stop it. It keeps running until you do.")
+      Table cmds {
+        Tr build { Td a("`blaze build` `run` `test` `check` `bench`"); Td b("cargo's commands and flags") }
+        Tr status { Td a("`blaze status`"); Td b("what the daemon holds") }
+        Tr stop { Td a("`blaze stop`"); Td b("save its state and stop") }
       }
-      P watch("blaze has no watch mode of its own; any file watcher can run it:")
-      Code watchexec(lang: "bash", text: "watchexec -e rs -- blaze build")
+      Dim watch("Rebuild on save with any watcher: `watchexec -e rs -- blaze build`.")
     }
 
-    Step own("Its own toolchain") {
-      P nightly("blaze builds every project with the one Rust nightly it pins, whatever `rust-toolchain.toml` says. Stable code and `#![feature(...)]` code both build.")
-      P never("And `blaze` never hands your build to cargo or `rustc`. When it can't build something yet, it stops and says what and where. Each of those is a bug, and [an issue](https://github.com/indexable-inc/blaze/issues) is welcome.")
+    Step own("No fallback") {
+      P never("`blaze` never hands your build to cargo or `rustc`. If it can't build something yet, it stops and names what and where.")
     }
 
-    Step fallback_q("Check: when it can't") {
+    Step fallback_q("Check") {
       Quiz q(prompt: "blaze meets code it can't compile yet. What happens?") {
-        Choice cargo("It quietly runs cargo instead, so the build still works.", "blaze never falls back. A build that quietly took another route would hide the bug.")
-        Choice stop("The build stops with an error that names the code and the reason.", "Right. A loud failure is better than a build that quietly did something else.") {
+        Choice cargo("It quietly runs cargo instead.", "Never: a quiet fallback would hide the bug.")
+        Choice stop("It stops with an error naming the code.", "Right. Loud beats quietly different.") {
           Right
         }
-        Choice skip("It skips that crate and builds the rest.", "Skipping would give you a program that isn't what you wrote. blaze stops instead.")
+        Choice skip("It skips that crate.", "That would build a program you didn't write.")
       }
     }
 
-    Step next("Where next") {
-      P path("The next lessons show how blaze gets its speed: what a build really does, why only what changed is redone, and how macros and build scripts are kept. Then what blaze adds to Rust: const generic expressions, its own standard library, and a compiler being proved correct in Lean.")
-      Dim map("Every lesson is on [the course map](/learn). Your progress stays in this browser.")
+    Step next("Next") {
+      P path("Next: how blaze gets its speed, then what it adds to Rust: const generic math, effects, its own std, and proofs in Lean.")
+      Dim map("All lessons: [the course map](/learn).")
     }
   }
 

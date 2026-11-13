@@ -13,17 +13,16 @@ site {
       Description: {"bstd: blaze's own standard library, built on core and alloc, where IO is a capability you pass and every task runs under simulation too."}
 
       Step ambient("Anything can touch anything") {
-        P std("In Rust's `std`, any function can open a file, read the clock or spawn a thread, and its signature won't tell you. That makes code hard to test and hard to trust.")
+        P std("In `std`, any function can open a file or read the clock, and its signature won't tell you.")
       }
 
       Step handed("Handed, not taken") {
-        P io("**bstd** is blaze's own standard library, written from scratch on `core` and `alloc`. In it, IO is a value: `main` receives an `Io`, and a function can only do what it was handed.")
+        Art cap(piece: "capability", label: "main hands one box to a function. The function reaches that box; its tries at the others stop at a wall.")
         Code main(lang: "rust", text: `fn main(cx: &Cx, io: Io) -> Result<(), Error> \{
-            let data: Dir<ReadWrite> = io.fs().open_dir(cx, path!("data"))?;
-            // a function given only \`data\` can touch that directory and nothing else
-            Ok(())
+            let data = io.fs().open_dir(cx, path!("data"))?;
+            save(&data, &doc) // save can touch data, and only data
         }`)
-        Dim cx("`Cx` is the task's context: its deadline, its cancellation, its trace span and the memory it allocates from.")
+        P io("**bstd**, blaze's own std on `core` and `alloc`: IO is a value you pass.")
       }
 
       Step handed_q("Check: what can it touch?") {
@@ -37,13 +36,12 @@ site {
       }
 
       Step sim("The same code, simulated") {
-        P one("Underneath, one `Io` runs over io_uring on Linux, kqueue on macOS, IOCP on Windows, or a **deterministic simulation**: a fake clock, fake disks and reordered events, all from one seed.")
-        P why("So a test can crash a program halfway through a write, a thousand different ways, and replay the exact one that broke. blaze tests its own store and daemon this way.")
+        Art sim(piece: "remote", label: "One block hands work to several; each finishes in its own time and the results come back in an order a seed decides.")
+        P one("One `Io` runs on io_uring, kqueue, IOCP, or a **deterministic simulation** from one seed: crash a write a thousand ways, replay the one that broke.")
       }
 
       Step status("Where it stands") {
-        P now("Experimental: bstd's drivers and interfaces are written, and blaze's own new crates are moving onto it. Next: a `fn main(io: Io)` edition, so a program can say it uses bstd alone.")
-        Dim design("The design: [std.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/std.md).")
+        P now("Experimental: drivers and interfaces written; blaze's new crates are moving onto it. Design: [std.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/std.md).")
       }
     }
   }
