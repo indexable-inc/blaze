@@ -68,6 +68,7 @@ mod host;
 mod journal;
 #[cfg(test)]
 mod pages;
+pub mod seeds;
 
 use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
@@ -474,6 +475,8 @@ pub struct Sim {
     host: host::Host,
     /// Bytes clones forced out of their sources ([`Sim::bytes_forced`]).
     bytes_forced: u64,
+    /// What a test under seeds armed it with ([`Sim::arm`]): its power cuts, trace and counts.
+    armed: Option<Box<seeds::Armed>>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -560,6 +563,7 @@ impl Sim {
             bytes_read: 0,
             host: host::Host::new(seed),
             bytes_forced: 0,
+            armed: None,
         }
     }
 
@@ -680,6 +684,7 @@ impl Sim {
     /// Every lock goes with the processes that held them, another process's too
     /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
+        seeds::crashed(self);
         // A write from memory in flight may have landed any of its sectors, unsynced: the cut
         // below keeps or tears them as it does every change since the last sync.
         // alloc: a crash, not an op.
@@ -1509,6 +1514,7 @@ impl Sim {
     }
 
     fn fail(&mut self, tag: Tag) -> Completion {
+        seeds::injected(self);
         // alloc: an injected failure's message.
         Completion { tag, done: Done::Failed(IoError("injected by the simulation".into())) }
     }
@@ -1995,6 +2001,10 @@ impl Sim {
 
 impl Driver for Sim {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
+        // An armed simulation traces them, and takes none while its power is cut.
+        if seeds::submitted(self, effects) {
+            return;
+        }
         for effect in effects.drain(..) {
             match effect {
                 Effect::Watch { dir, tag } => {
@@ -2336,6 +2346,9 @@ impl Driver for Sim {
     /// [`wait::until`], interrupted at [`Faults::interrupt_one_in`]'s rate as a kernel's is.
     /// With nothing in flight that will complete, it returns at once.
     fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
+        if seeds::off(self) {
+            return 0;
+        }
         let first = self.pending.next_deadline().map(Duration::from_nanos);
         let Some(first) = first
             .into_iter()
@@ -2391,6 +2404,7 @@ impl Driver for Sim {
         }
         self.told = later;
         self.later = told;
+        seeds::polled(self, &out[before..]);
         out.len() - before
     }
 
