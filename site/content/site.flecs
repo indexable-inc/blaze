@@ -24,7 +24,7 @@ site {
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
     Description: {"blaze builds Rust with cargo's commands and rebuilds an edit in milliseconds. Learn it in short lessons: what it is, how to install it, and how it works."}
 
-    Lede is("Builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+    Lede is("`blaze build`. Edits rebuild in milliseconds.")
 
     // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
     // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
@@ -73,7 +73,7 @@ site {
     Description: {"What blaze is, how to install it, and your first build: the first lesson of the course, a few minutes long."}
 
     Step what("Rust, rebuilt in milliseconds") {
-      Lede is("**blaze** builds Rust with the commands you know from cargo, and rebuilds an edit in milliseconds.")
+      Lede is("`blaze build` builds Rust. Edits rebuild in milliseconds.")
       Art art(piece: "incremental", label: "A lattice of functions. One changes, and only it and the few that depend on it light up and settle.")
       Dim course("A short course, one idea per screen. Press **Continue** or →.")
     }
