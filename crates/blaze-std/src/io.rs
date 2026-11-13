@@ -989,11 +989,19 @@ impl Io {
         }
         change(&mut world.changed, &effect, tag.0 + 1);
         let World { driver, effects, disk, .. } = &mut *world;
-        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
+        // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
+        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {
             disk.submitted(sim, &effect);
         }
         effects.push(effect);
         driver.submit(effects);
+        // Under `bstd::test` the armed simulation cuts the power at an effect of its seed's: the
+        // world crashes and the program's start ends here, unwound, with the lock let go first.
+        let cut = driver.sim().is_some_and(Sim::cut_due);
+        drop(world);
+        if cut {
+            crate::simtest::power_lost(self);
+        }
         tag
     }
 
