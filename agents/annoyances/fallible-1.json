@@ -14,7 +14,7 @@
   "the tree has two builders and one crate only one of them accepts, with nothing bridging them"
  ],
  "class": "a crate only blaze accepts cannot be verified in the cargo dev loop",
- "prevention": "a committed script that writes a cargo-checkable copy of bstd (contracts and where-const stripped, reflection stubbed) so check, clippy and the tests that need no reflection run under cargo; state: written in the lane's scratchpad (shim.py), not yet in the tree",
+ "prevention": "harness/v2/bstd_cargo.py writes a cargo-checkable copy of bstd (contracts and where-const stripped, reflection stubbed) and runs check, clippy or test on it; how-to row bstd-under-cargo. State: in the tree on branch bstd-fallible-alloc. It is a stand-in, not the fix: the class goes when blaze builds blaze in the dev loop again.",
  "workaround": "copy crates/blaze-std to a git-excluded crates/zz-bstd-shim with the blaze-only syntax taken out and run cargo check/clippy/test -p blaze-std-shim; three tests fail there on the base commit too (tests::explicit::a_worlds_limits_are_the_ones_its_maker_said, tests::paths::a_path_never_escapes_its_directory, video::videotoolbox's encode test)",
- "state": "open"
+ "state": "open: worked around by harness/v2/bstd_cargo.py (how-to bstd-under-cargo)"
 }

@@ -1,0 +1,9 @@
+{
+ "id": "bstd-under-cargo",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-fallible-alloc",
+ "task": "Check, lint or test a change to bstd (crates/blaze-std) in the cargo dev loop",
+ "do": "uv run --frozen python harness/v2/bstd_cargo.py '{\"command\": \"check\"}' (also \"clippy\", \"test\", \"write\"; \"filter\" narrows test). It writes crates/zz-bstd-shim, a copy with bstd's blaze-only syntax taken out, and runs cargo on the package blaze-std-shim with the pinned nightly. Set CARGO_TARGET_DIR. Edit crates/blaze-std, never the copy; keep crates/zz-bstd-shim in .git/info/exclude and never commit the Cargo.lock line cargo adds. Three tests fail in the copy on main too (tests::explicit::a_worlds_limits_are_the_ones_its_maker_said, tests::paths::a_path_never_escapes_its_directory, video::videotoolbox's encode test), and tests::own and tests::cell are left out: compare with that baseline. A green run is about bstd under rustc; blaze check and blaze test of bstd are still the proof.",
+ "why": "cargo +nightly check -p blaze-std ends in 10 errors on main (contract clauses, where const, core::reflect), so a bstd change could not be compiled at all in the dev loop (annoyances A10, fallible-1).",
+ "state": "current"
+}
