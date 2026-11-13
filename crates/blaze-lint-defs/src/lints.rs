@@ -539,15 +539,13 @@ pub(super) const BUILTIN: &[Lint] = &[
         "linker_info",
         Allow,
         "linker warnings known to be informational-only and not indicative of a problem",
-    )
-    .crate_level(),
+    ),
     l(
         "linker_messages",
         Warn,
         "warnings emitted at runtime by the target-specific linker program",
     )
-    .ignore_deny_warnings()
-    .crate_level(),
+    .ignore_deny_warnings(),
     l("long_running_const_eval", Deny, "detects long const eval operations").external(),
     l(
         "macro_expanded_macro_exports_accessed_by_absolute_paths",
@@ -717,7 +715,7 @@ pub(super) const BUILTIN: &[Lint] = &[
         Allow,
         "identifiers that will be parsed as a prefix in Rust 2021",
     )
-    .fcw(EditionSemanticsChange(Edition2021, "reserving-syntax"))
+    .fcw(EditionError(Edition2021, "reserving-syntax"))
     .crate_level(),
     l(
         "rust_2021_prelude_collisions",
@@ -761,7 +759,7 @@ pub(super) const BUILTIN: &[Lint] = &[
         Warn,
         "trailing semicolon in macro body used as expression",
     )
-    .fcw(FutureReleaseError(79813)),
+    .fcw_deps(FutureReleaseError(79813)),
     l(
         "shadowing_supertrait_items",
         Allow,
