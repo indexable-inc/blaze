@@ -491,7 +491,8 @@ pub mod convert {
     }
     // endregion:as_mut
     // region:infallible
-    pub enum Infallible {}
+    // An alias of `!`, as in core since Rust 1.100.
+    pub type Infallible = !;
     // endregion:infallible
 }
 
@@ -3282,6 +3283,7 @@ pub mod prelude {
 
     pub mod rust_2024 {
         pub use super::v1::*;
+        pub use crate::future::{Future, IntoFuture};    // :future
     }
 }
 
