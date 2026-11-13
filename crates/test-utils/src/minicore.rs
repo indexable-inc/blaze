@@ -75,6 +75,8 @@
 //!     pin:
 //!     pointee: copy, send, sync, ord, hash, unpin, phantom_data
 //!     range:
+//!     reach: slice, option, result
+//!     blaze_unreachable: panic
 //!     new_range:
 //!     receiver: deref
 //!     record: clone, copy
@@ -1724,6 +1726,16 @@ pub mod slice {
             loop {}
         }
 
+        // region:reach
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        pub fn first(&self) -> Option<&T> {
+            if let [first, ..] = self { Some(first) } else { None }
+        }
+        // endregion:reach
+
         // region:iterator
         pub fn iter(&self) -> crate::iter::Iter<'_, T> {
             loop {}
@@ -1847,6 +1859,14 @@ pub mod result {
         Err(E),
     }
     impl<T, E> Result<T, E> {
+        // region:reach
+        pub const fn is_ok(&self) -> bool {
+            match self {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
+        // endregion:reach
         pub const fn or<F>(self, res: Result<T, F>) -> Result<T, F> {
             match self {
                 Ok(v) => Ok(v),
@@ -2809,6 +2829,16 @@ pub mod pat {
 }
 // endregion:pat
 
+// region:blaze_unreachable
+pub mod blaze {
+    /// `blaze::unreachable!()` (docs/v2/plan/design/proved-unreachable.md).
+    #[rustc_builtin_macro(blaze_unreachable)]
+    pub macro unreachable() {
+        /* compiler built-in */
+    }
+}
+// endregion:blaze_unreachable
+
 // region:non_zero
 pub mod num {
     #[repr(transparent)]
@@ -2838,6 +2868,14 @@ pub mod num {
     #[rustc_diagnostic_item = "NonZero"]
     #[repr(transparent)]
     pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);
+
+    // region:reach
+    impl NonZero<u32> {
+        pub const fn get(self) -> u32 {
+            unsafe { crate::mem::transmute(self) }
+        }
+    }
+    // endregion:reach
 }
 // endregion:non_zero
 

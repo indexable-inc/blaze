@@ -107,6 +107,8 @@ mod profile_tests;
 mod profiled;
 mod program_lifetime;
 #[cfg(test)]
+mod reach_tests;
+#[cfg(test)]
 mod program_lifetime_tests;
 mod push_without_reserve;
 mod query_in_loop;
