@@ -68,6 +68,7 @@ since the release before and the title of each change merged since.
 
 ### Fixed
 
+- Linux executables link when crt objects carry an allocated `SHT_GNU_SFRAME` section: blaze-link drops it, and unwind stays `.eh_frame` (#1888).
 - Two crates whose build scripts each make a native library of one name in their own `OUT_DIR` (two copies of one `-sys` crate, or blake3 and a vendored copy of it) link both libraries: each crate's `-l` is found first in the directories its own compile searches, as rustc finds it. The name was resolved once for the whole program, so every crate got the first directory's library and the others' symbols were undefined at the link (`blake3_hash_many_avx512` on x86-64 Linux).
 - A `#![no_std]` proc-macro crate builds as a wasm module again (multiversion_no_op, a dependency of encoding_rs): the glue blaze appends to its root named `std`, `Vec`, `String` and `Box`, which such a crate has no name for, so it failed with dozens of unresolved paths in code it does not have. The glue now reaches std through an `extern crate std` of its own module (#1780).
 - A function-like proc macro called as an expression whose output is one block, `{ a; b; }` (quote!'s `{ #(#statements)* }`), expands to that block. The block's last `;` was taken for one the expansion ends in, dropped, and reported as "macro expansion ignores `;` and any tokens following", and the statements were parsed without their braces.

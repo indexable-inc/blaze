@@ -14,11 +14,11 @@ use blaze_ids::ContentId;
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_items::ItemKey;
 use blaze_live::patch::{Descriptor, Message, MessageView, Patch, hash};
-use object::read::elf::ElfFile64;
+use object::read::elf::{ElfFile64, ProgramHeader as _};
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, ObjectSymbol as _,
-    RelocationFlags, SymbolFlags, SymbolKind, SymbolScope, elf,
+    RelocationFlags, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
 };
 
 use crate::{
@@ -1965,6 +1965,111 @@ fn a_c_object_and_rust_code_call_each_other_by_name() {
         error.what.contains("undefined symbol `rust_fn`") && error.what.contains("helper.o"),
         "{error}"
     );
+}
+
+/// `_start` calls `crt_start`, defined in a native object whose allocated `.sframe`
+/// (`SHT_GNU_SFRAME`, `SHF_LINK_ORDER` to `.text`) the link drops. A second object carries
+/// only an allocated `.sframe` with `sh_link` 0, which is no tie.
+#[test]
+fn an_allocated_sframe_section_links_and_the_call_reaches_crt_start() {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = b.section_id(StandardSection::Text);
+    let at = b.append_section_data(text, &returns(1), 16);
+    let crt = b.add_symbol(Def {
+        name: "crt_start".into(),
+        value: at,
+        size: 6,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let sframe = b.add_section(Vec::new(), b".sframe".to_vec(), SectionKind::ReadOnlyData);
+    b.section_mut(sframe).flags = SectionFlags::Elf {
+        sh_type: elf::SHT_GNU_SFRAME,
+        sh_flags: elf::SHF_ALLOC | elf::SHF_LINK_ORDER,
+    };
+    let frame = b.append_section_data(sframe, &[0; 8], 8);
+    b.add_relocation(
+        sframe,
+        Relocation {
+            offset: frame,
+            symbol: crt,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_PC32 },
+        },
+    )
+    .unwrap();
+    let mut bytes = b.write().unwrap();
+    // `sh_link` of `.sframe` to `.text`, as `link` in tests/ties.rs writes a section header.
+    let (sframe_at, text_index) = {
+        let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+        let (table, size, count, names) = (u64_at(0x28), u16_at(0x3a), u16_at(0x3c), u16_at(0x3e));
+        let strings = u64_at(table + names * size + 24);
+        let mut text_index = None;
+        let mut sframe_at = None;
+        for index in 0..count {
+            let header = table + index * size;
+            let start = strings + u32_at(header);
+            let end = start + bytes[start..].iter().position(|it| *it == 0).unwrap();
+            match &bytes[start..end] {
+                b".text" => text_index = Some(index as u32),
+                b".sframe" => sframe_at = Some(header),
+                _ => {}
+            }
+        }
+        (sframe_at.expect(".sframe"), text_index.expect(".text"))
+    };
+    bytes[sframe_at + 40..sframe_at + 44].copy_from_slice(&text_index.to_le_bytes());
+    let crt_object: std::sync::Arc<[u8]> = bytes.into();
+
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let sframe = b.add_section(Vec::new(), b".sframe".to_vec(), SectionKind::ReadOnlyData);
+    b.section_mut(sframe).flags = SectionFlags::Elf {
+        sh_type: elf::SHT_GNU_SFRAME,
+        sh_flags: elf::SHF_ALLOC | elf::SHF_LINK_ORDER,
+    };
+    b.append_section_data(sframe, &[0; 8], 8);
+    let loose: std::sync::Arc<[u8]> = b.write().unwrap().into();
+
+    let start = function(1, &CALLER, vec![rel32(1, Target::Extern("crt_start".into()))]);
+    // `.symtab` names a native global when the executable exports it.
+    let mut out = output(false);
+    out.link.export_dynamic.push("crt_start".to_owned());
+    let mut image = Image::new(name(TO), out).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: vec![&start],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        natives: vec![
+            Native {
+                id: id(61),
+                name: "crt.o",
+                bytes: &crt_object,
+                kind: NativeKind::Object,
+                order: 0,
+            },
+            Native {
+                id: id(62),
+                name: "loose.o",
+                bytes: &loose,
+                kind: NativeKind::Object,
+                order: 1,
+            },
+        ],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    assert_eq!(linked.rel32(linked.symbol("start") + 1), linked.symbol("crt_start"));
+    let elf = linked.elf();
+    assert!(elf.section_by_name(".sframe").is_none());
+    let endian = elf.endian();
+    assert!(elf.elf_program_headers().iter().all(|it| it.p_type(endian) != elf::PT_GNU_SFRAME));
 }
 
 #[test]

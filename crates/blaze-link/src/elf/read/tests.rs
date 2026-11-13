@@ -704,6 +704,48 @@ fn a_loaded_section_of_a_type_blaze_does_not_lay_out_is_an_error() {
     }
 }
 
+/// An x86-64 object with `.text` and eight bytes of `.sframe` (`sh_type`, `SHF_ALLOC`) and an
+/// `R_X86_64_PC32` against the text section's symbol.
+fn sframe_object(sh_type: elf::SectionType) -> Vec<u8> {
+    let mut b = builder(Architecture::X86_64);
+    let text = b.section_id(StandardSection::Text);
+    b.append_section_data(text, &[0xc3], 1);
+    let text_symbol = b.section_symbol(text);
+    let sframe = b.add_section(Vec::new(), b".sframe".to_vec(), Kind::ReadOnlyData);
+    b.append_section_data(sframe, &[0; 8], 8);
+    b.section_mut(sframe).flags = SectionFlags::Elf { sh_type, sh_flags: elf::SHF_ALLOC };
+    relocate(&mut b, sframe, 0, text_symbol, 0, elf::R_X86_64_PC32);
+    let mut bytes = b.write().unwrap();
+    if sh_type == elf::SHT_GNU_SFRAME {
+        let kept = {
+            let header = Header::parse(&*bytes).unwrap();
+            let sections = header.sections(ENDIAN, &*bytes).unwrap();
+            sections.iter().any(|it| {
+                sections.section_name(ENDIAN, it).unwrap() == b".sframe"
+                    && it.sh_type(ENDIAN) == elf::SHT_GNU_SFRAME
+            })
+        };
+        if !kept {
+            set_sh_type(&mut bytes, ".sframe", elf::SHT_GNU_SFRAME.0);
+        }
+    }
+    bytes
+}
+
+#[test]
+fn an_allocated_sframe_section_is_dropped() {
+    let bytes = sframe_object(elf::SHT_GNU_SFRAME);
+    let gnu = object(read(Arch::X86_64, "t.o", &bytes, &NativeKind::Object));
+    let sframe = section(&gnu, ".sframe").1;
+    assert_eq!(sframe.what, SectionKind::Dropped);
+    assert_eq!(sframe.data, Data::Zero(0));
+    assert!(gnu.section_fixups(sframe).is_empty());
+
+    let bytes = sframe_object(elf::SHT_PROGBITS);
+    let progbits = object(read(Arch::X86_64, "t.o", &bytes, &NativeKind::Object));
+    assert_eq!(section(&progbits, ".sframe").1.what, alloc(".sframe", false, false, false));
+}
+
 #[test]
 fn a_compressed_loaded_section_is_an_error() {
     let mut b = builder(Architecture::X86_64);
