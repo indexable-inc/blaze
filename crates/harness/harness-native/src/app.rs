@@ -150,7 +150,9 @@ struct Pick {
 
 struct Palette {
     mode: Mode,
-    query: String,
+    query: chat::Draft,
+    query_since: f32,
+    query_drag: Option<(crate::pane::Unit, (usize, usize))>,
     at: usize,
     /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
     /// once typing has paused for [`PALETTE_DEBOUNCE`].
@@ -159,10 +161,12 @@ struct Palette {
 }
 
 impl Palette {
-    fn new() -> Self {
+    fn new(now: f32) -> Self {
         Self {
             mode: Mode::Commands,
-            query: String::new(),
+            query: chat::Draft::default(),
+            query_since: now,
+            query_drag: None,
             at: 0,
             searched: String::new(),
             changed: 0.0,
@@ -1101,14 +1105,16 @@ impl App {
                 // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let (profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
+                let sid = o.try_cloned::<&model::Object>().map(|ob| ob.id);
+                let (mut profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
                     let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
                     let chats = me.chats.borrow();
                     let transcript = o.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
-                    chat::sidebar_model(transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()))
+                    me.sidebar_profile(sid.expect("chat row has no session identity"), transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()), status != "running")
                 } else {
                     (String::new(), String::new(), None)
                 };
+                if profile.is_empty() && edit.is_none() && o.has(model::ChatMode::id()) { profile = "Model".to_owned(); }
                 let (name, meta, hint) = match &edit {
                     Some((shown, _)) => (shown.clone(), String::new(), String::new()),
                     None => (name, meta, hint),
@@ -1131,6 +1137,21 @@ impl App {
                     ]
                     .concat(),
                 );
+                if let Some(controls) = row.part("profile") {
+                    let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
+                    for (part, page, tip) in [("label", "model", "Choose model · ⌘/"), ("effort", "effort", "Thinking effort · click or swipe to change")] {
+                        if let Some(control) = controls.part(part) {
+                            let active = editable && (part != "effort" || profile_effort.is_some());
+                            if active {
+                                control.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:pick:{}:{page}", sid.unwrap()));
+                            } else {
+                                control.entity().remove(harness_native_ui_input_api::Pressable::id());
+                                control.action("");
+                            }
+                            control.set(harness_native_ui_input_api::Tooltip { text: if active { format!("{profile_tip}\n{tip}") } else { format!("{profile_tip}\nRead-only transcript") }.as_str().into() });
+                        }
+                    }
+                }
                 if let Some(slot) = row.part("profile").and_then(|p| p.part("effort")) {
                     view::for_each_of(slot, profile_effort.map(|level| ("meter", "hn.ChatEffort", level)), |meter, level, _| {
                         chat::effort_meter(meter, Some(level), tone(w, "ink_muted"), tone(w, "ink_faint"));
@@ -1514,7 +1535,7 @@ impl App {
         }
         // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
         // the daemon's search), newest first.
-        let q = self.palette.as_ref().map(|p| p.query.trim().to_lowercase()).unwrap_or_default();
+        let q = self.palette.as_ref().map(|p| p.query.text.trim().to_lowercase()).unwrap_or_default();
         if !q.is_empty() {
             let mut runs: Vec<(u64, u64)> = Vec::new();
             self.world.new_query::<&model::Run>().each_entity(|e, r| {
@@ -1576,7 +1597,7 @@ impl App {
             self.hint("ZoomOut"),
             Do::Zoom(-1),
         ));
-        let q = self.palette.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
+        let q = self.palette.as_ref().map(|p| p.query.text.to_lowercase()).unwrap_or_default();
         out.retain(|(_, _, name, _, _)| fuzzy(&name.to_lowercase(), &q));
         out
     }
@@ -1586,7 +1607,7 @@ impl App {
         // world (as a page would) and so the palette's entries.
         let (time, mut wait) = (self.time, false);
         if let Some(p) = self.palette.as_mut() {
-            let q = p.query.trim().to_owned();
+            let q = p.query.text.trim().to_owned();
             if q != p.searched {
                 if (p.mode == Mode::Chats || q.chars().count() >= 2) && time - p.changed >= PALETTE_DEBOUNCE {
                     if p.mode == Mode::Chats {
@@ -1604,7 +1625,7 @@ impl App {
             self.poke();
         }
         let w = self.world.world_ref();
-        let want = self.palette.as_ref().map(|p| (p.mode, p.at, p.query.clone()));
+        let want = self.palette.as_ref().map(|p| (p.mode, p.at, p.query.text.clone()));
         // The overlay on screen is no longer wanted (closed, or the other mode opened): it goes out on its springs.
         if let Some((id, mode)) = self.ids.palette
             && want.as_ref().is_none_or(|(m, ..)| *m != mode)
@@ -1637,11 +1658,7 @@ impl App {
             self.sync_chat_library(card, at, &query);
             return;
         }
-        let shown =
-            if query.is_empty() { "Search objects and commands\u{2026}".to_owned() } else { query };
-        if let Some(t) = card.and_then(|c| c.part("query")).and_then(|q| q.part("text")) {
-            t.text(&shown);
-        }
+        if let Some(card) = card { self.sync_palette_field(card, "Search objects and commands…"); }
         let entries = self.entries();
         let at = at.min(entries.len().saturating_sub(1));
         let (clear, chosen) = (tone(w, "clear"), tone(w, "selection"));
@@ -1747,7 +1764,7 @@ impl App {
         if let Some(m) = self.world.world_ref().try_lookup("ui_matched::hn_picker") {
             m.destruct();
         }
-        self.palette = Some(Palette { mode: Mode::New, at, ..Palette::new() });
+        self.palette = Some(Palette { mode: Mode::New, at, ..Palette::new(self.time) });
         self.poke();
     }
 
@@ -2528,17 +2545,8 @@ impl App {
 
     /// Text typed into the open palette (a key no binding takes): its query.
     fn palette_type(&mut self, chars: &str) {
-        let time = self.time;
-        let Some(p) = self.palette.as_mut().filter(|p| p.mode != Mode::New) else { return };
-        let typed: String = chars
-            .chars()
-            .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
-            .collect();
-        if !typed.is_empty() {
-            p.query.push_str(&typed);
-            p.at = 0;
-            p.changed = time;
-        }
+        let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+        self.palette_draft(|d| { d.marked = None; if !typed.is_empty() { d.insert(&typed); } });
     }
 
     /// The sidebar node (the device row's parent).
@@ -2713,7 +2721,7 @@ impl App {
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
         crate::audio::cue("open");
-        self.palette = Some(Palette::new());
+        self.palette = Some(Palette::new(self.time));
         self.poke();
     }
 
@@ -2721,8 +2729,9 @@ impl App {
     pub fn palette_query(&mut self, q: &str) {
         let time = self.time;
         if let Some(p) = self.palette.as_mut() {
-            p.query = q.to_owned();
+            p.query = chat::Draft { text: q.to_owned(), caret: q.len(), anchor: q.len(), ..chat::Draft::default() };
             p.changed = time;
+            p.query_since = time;
         }
         self.poke();
     }
@@ -3255,8 +3264,7 @@ mod tests {
             "hn.StepFail", "hn.StepNote", "hn.StepGrid",
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
-            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
-            "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
+            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.PaletteField", "hn.tree.ProfileControl", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
             "hn.ChatContext", "hn.ChatPlan", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",

@@ -35,11 +35,12 @@ mod peek;
 mod pick;
 pub(super) mod plan;
 mod rename;
+mod palette;
 mod steps;
 
 pub(super) use rename::Rename;
 pub(super) use steps::live_face;
-pub(super) use pick::{sidebar_model, effort_meter};
+pub(super) use pick::effort_meter;
 
 pub(super) use genui::Live as GenLive;
 pub(super) use peek::Live as PeekLive;
@@ -1875,7 +1876,7 @@ impl App {
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
         let focused =
             self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing()
-                && !self.renaming();
+                && !self.renaming() && st.pick.is_none();
         // Its chips: the one under the pointer, its card, and the live state of the pull requests, issues and places it
         // names (relative places from the session's directory, as a press opens them: chat_open_at).
         let cwd = self
@@ -2505,6 +2506,7 @@ impl App {
 
     /// Run `f` on the focused chat's draft; true when there is one.
     fn with_draft(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
+        if self.palette_editing() { return self.palette_draft(f); }
         // A name being renamed takes them first (chat/rename.rs), then a cell's field that has the keys, then the input.
         if self.renaming() {
             return self.rename_draft(f);
@@ -2610,6 +2612,7 @@ impl App {
 
     /// An `act.Edit` on the focused chat's input (scene/20-keys.flecs ctx.Chat).
     pub(super) fn chat_edit(&mut self, op: &str) {
+        if self.palette_editing() { return self.palette_edit(op); }
         // A name being renamed has the keys before anything in the pane (chat/rename.rs).
         if self.renaming() {
             return self.rename_edit(op);
@@ -2782,6 +2785,7 @@ impl App {
     /// Text typed (a key no binding took), committed by an input method or pasted, into the focused chat's input.
     /// Whether a chat took it.
     pub(super) fn chat_type(&mut self, text: &str) -> bool {
+        if self.palette_editing() { self.palette_type(text); return true; }
         if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
             return true;
         }
@@ -2826,6 +2830,7 @@ impl App {
     }
 
     pub(super) fn chat_marked(&self) -> Option<Option<String>> {
+        if self.palette_editing() { return Some(self.palette.as_ref().and_then(|p| p.query.marked.clone())); }
         if let Some(r) = &self.rename {
             return Some(r.marked());
         }
@@ -2845,6 +2850,7 @@ impl App {
     /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
     /// else its input's.
     pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
+        if self.palette_editing() { return self.palette_copy(); }
         if let Some(c) = self.rename_copy() {
             return Some(c);
         }
@@ -2967,6 +2973,7 @@ impl App {
     /// Command-A in the focused chat: the whole transcript after a press in it, else the input's draft. Whether a chat
     /// took it.
     pub(super) fn chat_select_all(&mut self) -> bool {
+        if self.palette_editing() { return self.palette_draft(|d| (d.anchor, d.caret) = (0, d.text.len())); }
         if self.renaming() {
             return self.with_draft(|d| (d.anchor, d.caret) = (0, d.text.len()));
         }
@@ -3014,6 +3021,11 @@ impl App {
     /// Where the focused chat's caret is (window points, zoomed), for the input method's candidate window: the start of
     /// the marked text, else the caret ([`words_caret`]): a cell's field's while it has the keys, else the input's.
     pub(super) fn chat_caret_rect(&mut self) -> Option<Option<[f32; 4]>> {
+        if self.palette_editing() {
+            let z = self.zoom();
+            let caret = self.palette_text().and_then(|t| words_caret(&mut self.paint.borrow_mut(), t.entity()));
+            return Some(caret.map(|r| r.map(|v| v * z)));
+        }
         let z = self.zoom();
         let zoomed = |r: Option<[f32; 4]>| r.map(|r| r.map(|v| v * z));
         if let Some(node) = self.rename.as_ref().and_then(|r| self.rename_node(r.obj)) {

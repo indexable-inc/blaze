@@ -78,25 +78,20 @@ hn {
         }
       }
     }
-    // The actual model family, then the same quiet effort bars as the composer.
+    // Separate hit targets for the model and effort, always available even while this row is hovered.
     profile : ui.Row {
-      Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: End, wrap: false}
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
       Tooltip: {text: $profile_tip}
-      label : hn.tree.Trail { Text: {s: $profile} }
-      effort : ui.Row {
-        Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      label : hn.tree.ProfileControl {
+        text : hn.tree.Trail { Text: {s: $profile} }
       }
+      effort : hn.tree.ProfileControl {}
       if $profile != "" {
         Size: {w: {kind: Fit, value: 0, min: 0, max: $tree_trail_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
       } else {
         Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 0, r: 0, t: 0, b: 0}
-      }
-      if $hint == "" {
-        HoverShow: {row: 0, keep: true, away: false}
-      } else {
-        HoverShow: {row: 0, keep: false, away: true}
       }
     }
     meta : hn.tree.Trail {
@@ -116,7 +111,7 @@ hn {
       Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
       Padding: {l: 0, r: $tree_pad_r, t: 0, b: 0}
       hint : hn.tree.Trail {
-        Text: {s: $hint}
+        if $profile == "" { Text: {s: $hint} } else { Text: {s: ""} }
         HoverShow: {row: 0, keep: false, away: false}
       }
     }

@@ -127,57 +127,10 @@ hn {
     Shape: {radius: $chat_effort_bar_radius, n: 4, border: 0, feather: 0}
     Size: {w: {kind: Fixed, value: $chat_effort_bar_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_effort_h, min: $chat_effort_h * $chat_effort_floor, max: 0}}
   }
-  // Den's model and effort picker, in the chat's status bar (src/app/chat/pick.rs): one quiet control, the model's name, its
-  // effort as a level meter (hn.ChatEffort) and a small chevron, muted, on a soft wash under the pointer, its words and
-  // lit bars easing to the ink (pick.rs mixes hn.ChatControlInk's by the hover spring). The effort's name is the
-  // control's tooltip and the menu's; an effort its model does not list (so no level to light) shows as words after the
-  // name instead ("Opus · Medium"). No maker's mark here: the marks lead the menu's groups. A press opens the models and
-  // the efforts in one searchable menu above it; Command-/ opens the models and Shift-Command-/ steps the effort
-  // (scene/20-keys.flecs).
-  prefab ChatPick : ui.Row {
-    Pressable
-    Action: {name: ""}
-    Cursor: {shape: Arrow}
-    Tooltip: {text: "Model and effort  ⌘/"}
-    Fill: $tone_clear
-    Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
-    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
-    Padding: {l: $chat_pick_pad_x, r: $chat_pick_pad_x, t: 0, b: 0}
-    label : ui.Line {
-      Fill: $tone_ink_muted
-      Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
-      TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
-    }
-    effort : hn.ChatEffort {}
-    // While the effort moves (a swipe, a drag, a key), its name after the meter (hn.ChatPickWord), until a moment after.
-    word : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    }
-    chevron : ui.Symbol {
-      Icon: {glyph: ""}
-      Fill: $tone_ink_faint
-      Size: {w: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_chevron, min: 0, max: 0}}
-    }
-  }
-  // The bar's quiet controls' inks (the picker's words and lit bars, the stop's ring and square): at rest, under the
-  // pointer (eased between by each control's hover spring), and a level's unlit bars.
-  prefab ChatControlInk {
-    rest { Fill: $tone_ink_muted }
-    hot { Fill: $tone_ink }
-    off { Fill: $tone_ink_faint }
-  }
-  prefab ChatPickWord : ui.Line {
-    Fill: $tone_ink_muted
-    Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
-    TextStyle: {size: $size_chrome, line: $line_chrome, role: 0, bold: 0}
-  }
   // Its menu (pick.rs), a ui.Menu above it chat_pick_menu_w wide: the models (hn.ChatPickModels, unless it opened on the
   // effort alone), then the effort (hn.ChatPickEffort, unless it opened on the models alone), a hairline between.
   prefab ChatPickMenu : ui.Menu {
+    Side: {edge: Right, dx: $menu_gap, dy: 0}
     Size: {w: {kind: Fixed, value: $chat_pick_menu_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     models : ui.Column {
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
