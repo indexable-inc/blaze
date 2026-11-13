@@ -39,6 +39,7 @@ const HANDLERS: &[(&str, Handler)] = &[
     }),
     // cmd+N: a chat of the last-used agent kind, at once.
     ("NewChat", |a, _, _| a.new_chat()),
+    ("OpenChat", |a, _, _| a.open_chat_library()),
     // File > New…: the new-object picker, or closed again.
     ("Picker", |a, _, _| {
         if a.picking() {
@@ -103,6 +104,10 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("PaletteUp", |a, _, _| a.palette_step(-1)),
     ("PaletteDown", |a, _, _| a.palette_step(1)),
     ("PaletteRun", |a, _, _| {
+        if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Chats) {
+            a.choose_library_highlight();
+            return;
+        }
         let at = a.palette.as_ref().map_or(0, |p| p.at);
         if let Some((.., d)) = a.entries().into_iter().nth(at) {
             a.choose(d);

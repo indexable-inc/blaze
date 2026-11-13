@@ -367,11 +367,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
             toned(v, &words(node, "text"), &tone);
         }
         "Markdown" => {
-            let mut rows = Vec::new();
-            super::blocks(&words(node, "text"), false, &mut rows);
-            view::for_each_of(v, rows.iter().enumerate().map(|(i, r)| (format!("m{i}"), r.prefab(), r)), |row, r, _| {
-                super::fill_row(row, r, &RowCtx::NOWHERE, &mut *b.measure);
-            });
+            super::fill_markdown(v, &words(node, "text"), &mut *b.measure);
         }
         "Code" => {
             let code = Row::Code { lang: words(node, "lang"), text: words(node, "text") };

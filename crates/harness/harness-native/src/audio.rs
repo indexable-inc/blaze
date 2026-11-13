@@ -1,12 +1,11 @@
-//! The app's sound: a short cue as an agent's step changes and music that follows what is going on, mixed live to the
-//! default output.
+//! The app's sound: a short cue when work ends, with optional music and rain, mixed live to the default output.
 //!
 //! - **Cues** are the scene's (scene/widgets/sound.flecs, `hn.sound.cue`): each a few `Sound`s in the voices
 //!   harness-native-blaze synthesises, rendered once on a thread of their own through its room.
 //! - **Music** is the band's ([`crate::music`]): composed and synthesised live in the callback, in the mood the scene
 //!   names (`hn.sound.mood`: calm, flow, drive, battle). [`scene`], called each frame, picks the mood from what the
 //!   agents are doing and how many are at it; the band glides there.
-//! - **Rain** ([`music::Rain`]) plays when nothing else does, and quieter under the music, so the app is never silent.
+//! - **Rain** ([`music::Rain`]) is opt-in, and plays quieter under the optional music.
 //! - [`start`] opens the output (an AudioQueue: AudioToolbox's, linked here, no crate). With nothing sounding for a few
 //!   seconds the queue pauses, and the output device rests.
 //!
@@ -18,6 +17,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+mod completion;
+pub use completion::Tracker as CompletionTracker;
 
 /// The numbers in `s`, a list in words (`"0 2 4 7 9"`), as `what` of `at`.
 fn numbers<T: std::str::FromStr>(s: &ScriptString, what: &str, at: &str) -> Result<Vec<T>, String>
@@ -241,8 +243,8 @@ static MIXER: OnceLock<Mutex<Mixer>> = OnceLock::new();
 static CUES: OnceLock<Mutex<HashMap<String, Buf>>> = OnceLock::new();
 static MOODS: OnceLock<HashMap<String, music::Mood>> = OnceLock::new();
 static QUEUE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-/// The step the running turn is on, and whether the chat in front was working last frame.
-static NOW: Mutex<(String, bool)> = Mutex::new((String::new(), false));
+/// The step the running turn is on, used only by the optional music.
+static NOW: Mutex<String> = Mutex::new(String::new());
 
 #[repr(C)]
 struct Format {
@@ -328,7 +330,7 @@ pub fn start(level: f32, music: f32, ambient: f32, rain: &[music::RainSource], c
         return Ok(());
     }
     let _ = CUES.set(Mutex::new(HashMap::new()));
-    let rest = moods.get("rest").cloned();
+    let rest = if music > 0.0 { moods.get("rest").cloned() } else { None };
     let _ = MOODS.set(moods);
     // The first song differs by launch: the band's seed is the time.
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
@@ -357,7 +359,7 @@ pub fn start(level: f32, music: f32, ambient: f32, rain: &[music::RainSource], c
     }
     QUEUE.store(queue, Ordering::Release);
     // Paused until something plays; with rain, something always does.
-    if (ambient > 0.0 && !rain.is_empty()) || MOODS.get().is_some_and(|m| m.contains_key("rest")) {
+    if (ambient > 0.0 && !rain.is_empty()) || (music > 0.0 && MOODS.get().is_some_and(|m| m.contains_key("rest"))) {
         // SAFETY: the queue just made.
         unsafe { AudioQueueStart(queue, std::ptr::null()) };
     } else if let Some(m) = MIXER.get() {
@@ -372,8 +374,6 @@ pub fn start(level: f32, music: f32, ambient: f32, rain: &[music::RainSource], c
                     l.lock().unwrap_or_else(PoisonError::into_inner).insert(name, buf); // alloc: the library, kept for the process
                 }
             }
-            // Everything is rendered: one bell says the sound is ready.
-            cue("ready");
         })
         .map_err(|e| format!("the sound thread: {e}"))?;
     Ok(())
@@ -400,23 +400,25 @@ fn with_mixer(f: impl FnOnce(&mut Mixer)) {
     }
 }
 
-/// Play cue `name` (nothing before [`start`], or while it is still being rendered).
+/// Play a completion cue (nothing before [`start`], or while it is still being rendered).
+/// Routine steps, navigation and startup are silent, including calls from other views.
 pub fn cue(name: &str) {
+    if !matches!(name, "done" | "fail") {
+        return;
+    }
     let Some(buf) = CUES.get().and_then(|l| l.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()) else { return };
     with_mixer(|m| m.playing.push(Playing { buf, at: 0 })); // alloc: a handful sounding at once
 }
 
-/// The running turn is on a step of kind `kind` (steps.rs's, as its block shows it): a new one plays its cue.
+/// The running turn is on a step of kind `kind` (steps.rs's, as its block shows it), for the optional music's mood.
 pub fn step(kind: &str) {
     if MIXER.get().is_none() {
         return;
     }
     let item = harness_native_render::block::item(kind);
     let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
-    if now.0 != item {
-        item.clone_into(&mut now.0);
-        drop(now);
-        cue(item);
+    if now.as_str() != item {
+        item.clone_into(&mut now);
     }
 }
 
@@ -432,26 +434,24 @@ fn rung(item: &str, agents: usize) -> usize {
     (by_step + usize::from(agents >= 3) + usize::from(agents >= 6)).min(LADDER.len() - 1)
 }
 
-/// Each frame: how many agents are at work, whether the chat in front is one of them, and whether it is night. While
-/// any works the music plays in the mood that fits ([`rung`]); when the chat in front stops, `done` rings (`fail` when it ended
-/// on an error); with none at
-/// work the band goes back to its `rest` mood.
-pub fn scene(agents: usize, front: bool, failed: bool, night: bool) {
+/// Each frame: how many agents are at work and whether it is night. Optional music follows the work's mood; with no
+/// work it returns to its rest mood. Completion cues are driven separately by [`CompletionTracker`].
+pub fn scene(agents: usize, night: bool) {
     if MIXER.get().is_none() {
         return;
     }
     let mut now = NOW.lock().unwrap_or_else(PoisonError::into_inner);
-    let (was, item) = (now.1, now.0.clone());
-    now.1 = front;
-    if !front {
-        now.0.clear();
+    let item = now.clone();
+    if agents == 0 {
+        now.clear();
     }
     drop(now);
-    if was && !front {
-        cue(if failed { "fail" } else { "done" });
-    }
     let mood = (agents > 0).then(|| MOODS.get().and_then(|m| m.get(LADDER[rung(&item, agents)]))).flatten();
     with_mixer(|m| {
+        // Muted music must never activate a silent band that keeps the output queue awake.
+        if m.music <= 0.0 {
+            return;
+        }
         m.night = night;
         match mood {
             Some(mood) => {
@@ -492,7 +492,7 @@ mod live {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         cue("done");
         for _ in 0..80 {
-            scene(1, true, false, false);
+            scene(1, false);
             step("edit");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

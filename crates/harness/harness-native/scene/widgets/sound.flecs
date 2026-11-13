@@ -1,12 +1,12 @@
 // The app's sound (src/audio.rs, src/music.rs). Data only.
-// - cue: a soft sound as an agent's step changes, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
+// - cue: completion sounds, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
 //   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
 //   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
 //   sql think), and what the person does or what happens: `ready`, `fresh`, `send`, `copy`, `select`, `open`,
 //   `archive`, `done`, `fail`.
 // - song, mood: the music, below.
-// `hn.sound`'s Gain is the master. native.json `sound: false` turns it all off, `music: false` the music, `ambient: false`
-// the rain.
+// `hn.sound`'s Gain is the master. Only done/fail cues play; routine activity stays silent.
+// native.json `sound: false` turns it all off. Music and rain are opt-in (`music: true`, `ambient: true`).
 
 @tree ChildOf
 hn {
@@ -139,13 +139,11 @@ hn {
         Gain: {amp: 0.25}
         a { Sound: {voice: Bell}; Onset: {at: 0}; Lasts: {dur: 3}; Pitch: {hz: 440}; Gain: {amp: 0.03} }
       }
-      // The turn ended: the chord, climbing home.
+      // The turn ended: a soft, short pair of notes.
       done {
-        Gain: {amp: 0.39}
-        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 1}; Pitch: {hz: 440}; Gain: {amp: 0.05}; Pan: {pos: -0.3, sweep: 0} }
-        b { Sound: {voice: Mallet}; Onset: {at: 0.1}; Lasts: {dur: 1}; Pitch: {hz: 554.37}; Gain: {amp: 0.05} }
-        c { Sound: {voice: Mallet}; Onset: {at: 0.2}; Lasts: {dur: 1.2}; Pitch: {hz: 659.25}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
-        d { Sound: {voice: Bell}; Onset: {at: 0.32}; Lasts: {dur: 2.2}; Pitch: {hz: 880}; Gain: {amp: 0.035} }
+        Gain: {amp: 0.25}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.5}; Pitch: {hz: 440}; Gain: {amp: 0.05} }
+        b { Sound: {voice: Mallet}; Onset: {at: 0.1}; Lasts: {dur: 0.6}; Pitch: {hz: 659.25}; Gain: {amp: 0.04} }
       }
     }
 

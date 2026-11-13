@@ -165,6 +165,64 @@ fn effort_word(e: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// Broad, curated capability families, not benchmark scores. Unknown models remain unranked.
+/// The menu and sidebar use this one policy so their ordering and labels agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Capability {
+    Light,
+    Balanced,
+    Frontier,
+}
+
+impl Capability {
+    fn of(model: &ModelChoice) -> Option<Self> {
+        Self::named([&model.id, &model.model, &model.name])
+    }
+
+    fn named(names: [&str; 3]) -> Option<Self> {
+        let mut words = names.into_iter().flat_map(|s| s.split(['-', ' ', '_']));
+        words.find_map(|word| match word.to_ascii_lowercase().as_str() {
+            "opus" | "fable" | "astra" => Some(Self::Frontier),
+            "sol" | "terra" | "sonnet" => Some(Self::Balanced),
+            "haiku" | "luna" => Some(Self::Light),
+            _ => None,
+        })
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Balanced => "Balanced",
+            Self::Frontier => "Frontier",
+        }
+    }
+}
+
+/// A sidebar's quiet model profile and its full explanation. The transcript and daemon listing resolve exactly as
+/// the model picker does; no effort or capability is invented for a model the agent has not described.
+pub(in crate::app) fn sidebar_model(
+    transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>, listed: (&str, &str),
+) -> (String, String, Option<(usize, usize)>) {
+    let empty = Transcript::default();
+    let label = Label::of(transcript.unwrap_or(&empty), kind, kept, listed);
+    if label.name.is_empty() {
+        return (String::new(), String::new(), None);
+    }
+    let capability = label.cur.and_then(Capability::of).or_else(|| Capability::named([label.name, "", ""]));
+    let (family, version, _) = label.cur.map(row_words).unwrap_or_else(|| {
+        let (family, version) = family_version(label.name);
+        (family, version, String::new())
+    });
+    let mut tip = if label.cur.is_some() && !version.is_empty() { format!("{family} {version}") } else { label.name.to_owned() };
+    if let Some(c) = capability {
+        tip.push_str(&format!("\n{} capability tier (curated)", c.word()));
+    }
+    if !label.effort.is_empty() {
+        tip.push_str(&format!("\n{} thinking effort", effort_word(label.effort)));
+    }
+    (family, tip, level(label.cur, label.effort))
+}
+
 /// A token count as the meter's popover says it: 950, 46.2k, 258k, 1M.
 pub(super) fn tokens(n: u64) -> String {
     let (v, unit) = match n {
@@ -381,6 +439,9 @@ impl App {
     /// Open chat `sid`'s menu `page`, or close it when that one is open (a press on its control again); any other chat's
     /// closes.
     pub(in crate::app) fn chat_pick_toggle(&mut self, sid: u64, page: Pick) {
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let mut states = self.chat.borrow_mut();
         for (s, st) in states.iter_mut() {
             if *s != sid {
@@ -420,6 +481,9 @@ impl App {
     pub(in crate::app) fn chat_pick_set(&mut self, rest: &str) {
         let Some((sid, rest)) = rest.split_once(':') else { return };
         let Ok(sid) = sid.parse::<u64>() else { return };
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let (model, effort) = match rest.split_once(':') {
             Some(("model", m)) => (Some(m.to_owned()), None),
             Some(("effort", e)) => (None, Some(e.to_owned())),
@@ -438,6 +502,9 @@ impl App {
     pub(in crate::app) fn chat_pick_spawn(&mut self, rest: &str) {
         let mut it = rest.splitn(3, ':');
         let (Some(sid), Some(kind), Some(m)) = (it.next().and_then(|s| s.parse::<u64>().ok()), it.next(), it.next()) else { return };
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let (kind, m) = (kind.to_owned(), m.to_owned());
         self.chat_pick_close();
         let e = self.entity_of(sid);
@@ -570,6 +637,11 @@ impl App {
         let mut due = Vec::new(); // alloc: the wishes due this frame, rarely more than one
         let mut waiting = false;
         for (sid, st) in self.chat.borrow_mut().iter_mut() {
+            if self.external_session(*sid).is_some() {
+                st.effort.wish = None;
+                st.effort.moved = None;
+                continue;
+            }
             if let Some(w) = st.effort.wish.as_mut().filter(|w| !w.sent) {
                 if !w.held && now - w.at >= feel.commit {
                     w.sent = true;
@@ -581,6 +653,9 @@ impl App {
             waiting |= st.effort.wish.is_some() || st.effort.moved.is_some_and(|m| now - m < feel.word + 0.1);
         }
         for (sid, e) in due {
+            if self.external_session(sid).is_some() {
+                continue;
+            }
             self.link.chat_choose(sid, None, Some(e.clone()));
             self.remember_chat_choice(sid, None, Some(e));
         }
@@ -592,6 +667,9 @@ impl App {
     /// Chat `sid`'s effort moved to `effort` here (shown at once, sent once let go and rested): `held` while a drag or a
     /// swipe goes on, `pulse` for a trackpad tick when it changes. Whether it changed.
     fn chat_effort_to(&mut self, sid: u64, effort: &str, held: bool, pulse: bool) -> bool {
+        if self.external_session(sid).is_some() {
+            return false;
+        }
         let now = self.time;
         let changed = {
             let mut states = self.chat.borrow_mut();
@@ -616,6 +694,9 @@ impl App {
     /// Chat `sid`'s effort `by` stops along its model's efforts from the one shown (held at the ends, or `round` past
     /// them). The efforts are its model's; None when it has none (or is not in the list), else whether it moved.
     fn chat_effort_step(&mut self, sid: u64, by: i32, round: bool, held: bool, pulse: bool) -> Option<bool> {
+        if self.external_session(sid).is_some() {
+            return None;
+        }
         let (efforts, shown) = {
             let chats = self.chats.borrow();
             let t = chats.get(&sid)?;
@@ -808,7 +889,7 @@ fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usi
 
 /// The effort's level meter (hn.ChatEffort): a bar (hn.ChatEffortBar) per effort of `n`, their heights rising evenly
 /// from the bar's least to its height, those up to `at` in `lit`, the rest in `off`; with no level, no bars and no room.
-fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill) {
+pub(in crate::app) fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill) {
     let w = m.entity().world();
     let bar = view::prefab(w, "hn.ChatEffortBar")
         .and_then(|b| b.try_cloned::<&Size>())
@@ -972,6 +1053,10 @@ fn family_version(name: &str) -> (String, String) {
             _ if version.is_empty() && t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || c == '.') => {
                 t.clone_into(&mut version);
             }
+            _ if !version.is_empty() && t.chars().all(|c| c.is_ascii_digit()) => {
+                version.push('.');
+                version.push_str(t);
+            }
             _ if t.chars().any(|c| c.is_ascii_digit()) => words.push(t.to_owned()),
             _ => {
                 let mut c = t.chars();
@@ -987,6 +1072,15 @@ fn family_version(name: &str) -> (String, String) {
 fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
     !a.is_empty() && parts(a) > parts(b)
+}
+
+/// Visible generations first, then older ones. Within each, strongest known capability tier first; equal and
+/// unranked models retain the provider's order. The running older model stays among visible generations.
+fn model_order(models: &[ModelChoice], words: &[(String, String, String)], running: Option<&str>) -> Vec<usize> {
+    let older = |i: usize| words.iter().any(|(f, v, _)| *f == words[i].0 && newer(v, &words[i].1));
+    let mut order: Vec<usize> = (0..models.len()).collect(); // alloc: indices of one open menu's models
+    order.sort_by_cached_key(|&i| (older(i) && running != Some(models[i].id.as_str()), std::cmp::Reverse(Capability::of(&models[i]))));
+    order
 }
 
 /// The menu's models (hn.ChatPickModels `list`): every kind's under its head led by its maker's mark, the chat's own
@@ -1018,12 +1112,18 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         let fold = !searching && !nav.older.iter().any(|k| k == kind);
         let folded: Vec<bool> = (0..models.len()).map(|i| fold && older(i) && !runs(&models[i])).collect(); // alloc: per model
         let hidden = folded.iter().filter(|f| **f).count();
-        // The newest first, then (opened) the older ones, each kept in the order the agent lists them.
-        let order: Vec<usize> = (0..models.len()).filter(|&i| !older(i) || runs(&models[i])).chain((0..models.len()).filter(|&i| older(i) && !runs(&models[i]))).collect(); // alloc: per model
+        // Newest generations first, strongest tier first; provider order breaks ties. The fold and selected tick
+        // still follow model identity, so sorting never changes which model the chat runs.
+        let order = model_order(models, &words, c.cur.filter(|_| own).map(|m| m.id.as_str()));
         let shown: Vec<(&ModelChoice, &(String, String, String))> = order.iter().filter(|&&i| !folded[i]).map(|&i| (&models[i], &words[i])).collect(); // alloc: per model
         rows.extend(shown.into_iter().map(|(m, (label, meta, about))| {
             let (label, meta, about) = (label.clone(), meta.clone(), about.clone());
             let on = runs(m);
+            let about = match Capability::of(m) {
+                Some(tier) if about.is_empty() => format!("{} capability tier", tier.word()),
+                Some(tier) => format!("{} \u{b7} {about}", tier.word()),
+                None => about,
+            };
             let detail = if own { about } else { format!("Starts a new {title} chat. {about}").trim_end().to_owned() };
             if on {
                 own_detail.clone_from(&detail);
@@ -1205,6 +1305,7 @@ mod tests {
         assert_eq!(family_version("GPT-6.1-Sol"), ("Sol".into(), "6.1".into()));
         assert_eq!(family_version("GPT-6.1 Terra"), ("Terra".into(), "6.1".into()));
         assert_eq!(family_version("GPT-6-Astra"), ("Astra".into(), "6".into()));
+        assert_eq!(family_version("claude-fable-5-2"), ("Fable".into(), "5.2".into()));
         assert_eq!(family_version("gpt-5.6"), ("GPT".into(), "5.6".into()));
         assert_eq!(family_version("o4-mini"), ("o4 Mini".into(), String::new()));
         let m = |name: &str, about: &str| ModelChoice { id: name.to_ascii_lowercase(), name: name.into(), about: about.into(), ..ModelChoice::default() };
@@ -1214,12 +1315,40 @@ mod tests {
         assert!(newer("6.1", "6") && newer("6", "5.6") && !newer("5.6", "6") && !newer("", "6") && !newer("6", "6"));
     }
 
+    /// Sorting by capability keeps provider ties and the older-generation fold; the running old model stays visible.
+    #[test]
+    fn capable_models_lead_without_losing_old_or_unknown_models() {
+        let models: Vec<ModelChoice> = ["GPT-6.1-Sol", "GPT-6-Luna", "GPT-6-Astra", "GPT-6.1-Terra", "Unknown-A", "GPT-6-Sol", "Unknown-B"]
+            .into_iter().map(|name| ModelChoice { id: name.to_owned(), name: name.to_owned(), ..ModelChoice::default() }).collect();
+        let words: Vec<_> = models.iter().map(row_words).collect();
+        assert_eq!(model_order(&models, &words, None), [2, 0, 3, 1, 4, 6, 5]);
+        assert_eq!(model_order(&models, &words, Some("GPT-6-Sol")), [2, 0, 3, 5, 1, 4, 6]);
+        assert_eq!(Capability::of(&models[4]), None, "an unfamiliar family has no guessed capability");
+    }
+
     use harness_proto::event::{Body, Event};
 
     fn kept() -> BTreeMap<String, Vec<ModelChoice>> {
         let efforts = ["low", "medium", "high", "xhigh"].map(str::to_owned).to_vec();
         let opus = ModelChoice { id: "opus".into(), model: "claude-opus-5-5".into(), name: "Opus 5.5".into(), efforts, ..ModelChoice::default() };
         BTreeMap::from([("claude".to_owned(), vec![opus])])
+    }
+
+    /// A sidebar's profile follows the same transcript/daemon choice as its picker, including a new chat's seed.
+    #[test]
+    fn sidebar_model_profile_uses_the_chats_actual_choice() {
+        let kept = kept();
+        let mut t = Transcript::default();
+        t.start_on(Some("opus"), Some("high"));
+        let (words, tip, meter) = sidebar_model(Some(&t), "claude", &kept, ("", ""));
+        assert_eq!(words, "Opus");
+        assert_eq!(meter, Some((2, 4)));
+        assert!(tip.starts_with("Opus 5.5\n") && tip.contains("High thinking effort"));
+        assert_eq!(sidebar_model(None, "claude", &kept, ("", "")), (String::new(), String::new(), None));
+        let (words, tip, meter) = sidebar_model(None, "codex", &kept, ("unknown-model", ""));
+        assert_eq!(meter, None);
+        assert_eq!(words, "Unknown Model");
+        assert_eq!(tip, "unknown-model", "unknown capability and effort are left absent");
     }
 
     /// A cmd+N chat's control says the remembered model and effort from its first frame (its transcript seeded, before
