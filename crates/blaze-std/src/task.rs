@@ -226,7 +226,7 @@ impl<'p> Scope<'p> {
     ) -> Task<'_, T> {
         let live = &self.live;
         live.last.set(name);
-        let frame = match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
+        let frame = match Frame::named(name, scratch, blaze_mem::Tag::Frames) {
             Ok(frame) => frame,
             Err(_) => {
                 let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };

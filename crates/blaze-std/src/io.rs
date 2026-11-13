@@ -572,7 +572,7 @@ impl Io {
     /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
     /// assumed). Every wait under it ends by `budget`.
     pub fn cx(&self, budget: Duration, scratch: usize) -> Result<Cx, Stopped> {
-        let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
+        let frame = Frame::named("main's frame", scratch, blaze_mem::Tag::Frames)
             .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: scratch })?;
         Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
     }

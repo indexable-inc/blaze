@@ -1380,7 +1380,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
         let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::ReadAll { file, tag })?;
         match done {
             Done::Read(bytes) => {
-                into.try_extend(&bytes)
+                into.extend(&bytes)
                     .map_err(|stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped)))?;
                 Ok(bytes.len())
             }
@@ -1597,7 +1597,7 @@ impl File<ReadWrite> {
         capacity: NonZero<usize>,
     ) -> Result<Buffered<'f, 'a>, FsError> {
         let mut held = Bytes::new_in(frame, "bstd::fs buffered");
-        held.try_reserve(capacity.get())
+        held.reserve(capacity.get())
             .map_err(|stopped| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(stopped)))?;
         Ok(Buffered { file: self, held, capacity: capacity.get() })
     }
@@ -1634,7 +1634,7 @@ impl Buffered<'_, '_> {
     /// `bytes`, which fit, kept in the buffer.
     fn keep(&mut self, bytes: &[u8]) -> Result<(), FsError> {
         self.held
-            .try_extend(bytes)
+            .extend(bytes)
             .map_err(|stopped| FsError::new(FsOp::Append, &self.file.name, FsKind::Stopped(stopped)))
     }
 

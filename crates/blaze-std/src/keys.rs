@@ -132,7 +132,7 @@ impl Keys {
     pub fn sign(&self, cx: &Cx, key: &KeyName, message: &[u8], into: &mut Bytes<'_>) -> Result<(), KeysError> {
         let signature = self.with_key(cx, KeysOp::Sign, key, |found| Ok(simulated_signature(&found.material, message)))?;
         // clone: an error's name of its key, a refcount.
-        into.try_extend(&signature).map_err(|stopped| KeysError { op: KeysOp::Sign, key: key.clone(), kind: stopped.into() })
+        into.extend(&signature).map_err(|stopped| KeysError { op: KeysOp::Sign, key: key.clone(), kind: stopped.into() })
     }
 
     /// Whether `signature` is `key`'s of `message`.

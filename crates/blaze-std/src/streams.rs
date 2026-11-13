@@ -195,7 +195,7 @@ impl Stream {
             Provider::Host(io) => hosted::wait(io, cx, "bstd::streams recv", |host| {
                 let reply = host.streams.replies.front_mut()?;
                 let take = most.min(reply.len());
-                let taken = into.try_extend(&reply[..take]).map(|()| take).map_err(Refused::Stopped);
+                let taken = into.extend(&reply[..take]).map(|()| take).map_err(Refused::Stopped);
                 if taken.is_ok() {
                     reply.drain(..take);
                     if reply.is_empty() {
@@ -208,7 +208,7 @@ impl Stream {
                 let take = most.min(self.inbox.len());
                 let (front, _) = self.inbox.as_slices();
                 let take = take.min(front.len());
-                match into.try_extend(&front[..take]) {
+                match into.extend(&front[..take]) {
                     Ok(()) => {
                         self.inbox.drain(..take);
                         Ok(take)

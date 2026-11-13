@@ -95,7 +95,7 @@ fn device<'a>(host: &'a mut SimHost, kind: DeviceKind, name: &DeviceName) -> Res
 
 /// `bytes` added to `into`, or the stop that it has no room.
 fn extend(into: &mut Bytes<'_>, bytes: &[u8]) -> Result<usize, Refused> {
-    into.try_extend(bytes)?;
+    into.extend(bytes)?;
     Ok(bytes.len())
 }
 

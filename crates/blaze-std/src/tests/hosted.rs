@@ -408,7 +408,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     let url = Url::parse("https://relay.example/session").expect("a URL");
     let origin = url.origin().expect("an origin");
     let shout = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
-        reply.try_extend(&sent.to_ascii_uppercase())
+        reply.extend(&sent.to_ascii_uppercase())
     });
     let mut heard = cx.bytes();
     // A stream is linear: finished whatever it carried, and checked after.

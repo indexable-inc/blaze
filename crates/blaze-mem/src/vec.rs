@@ -291,6 +291,22 @@ impl<T, A: Allocator + Named> Vec<T, A> {
         Ok(())
     }
 
+    /// Appends `more` clones of `value` and lends them back to be filled: the new elements
+    /// themselves, from where they were made, so a caller never looks them up by range.
+    pub fn extend_filled(&mut self, more: usize, value: T) -> Result<&mut [T], OutOfMemory>
+    where
+        T: Clone,
+    {
+        self.reserve(more)?;
+        let before = self.inner.len();
+        for _ in 0..more {
+            self.push(value.clone())?;
+        }
+        // SAFETY: the `more` pushes above put initialized elements at `before..before + more`
+        // of the vector's block; the slice borrows the vector mutably for as long as it lives.
+        Ok(unsafe { slice::from_raw_parts_mut(self.inner.as_mut_ptr().add(before), more) })
+    }
+
     /// A copy of it in the same allocator.
     pub fn clone_in_place(&self) -> Result<Vec<T, A>, OutOfMemory>
     where

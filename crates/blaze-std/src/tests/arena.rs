@@ -31,7 +31,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let mut model: Vec<u8> = Vec::new();
     for (at, &len) in plan.appends.iter().enumerate() {
         let chunk = vec![at as u8; len];
-        match bytes.try_extend(&chunk) {
+        match bytes.extend(&chunk) {
             Ok(()) => model.extend_from_slice(&chunk),
             Err(Stopped::OutOfMemory { arena: "test arena", asked }) if asked >= len => {}
             Err(other) => return Err(format!("append {at} of {len} bytes stopped with {other}")),

@@ -371,8 +371,8 @@ fn a_task_gets_the_scratch_its_spawn_names() {
     let io = world(14, Plant::None);
     let cx = root(&io);
     let scope = cx.scope();
-    let small = scope.spawn("small", 64 << 10, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 8 << 20]) });
-    let roomy = scope.spawn("roomy", TASK_FRAME, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 1 << 20]) });
+    let small = scope.spawn("small", 64 << 10, |cx| -> Result<(), Stopped> { cx.bytes().extend(&vec![0; 8 << 20]) });
+    let roomy = scope.spawn("roomy", TASK_FRAME, |cx| -> Result<(), Stopped> { cx.bytes().extend(&vec![0; 1 << 20]) });
     let (small, roomy) = (small.join(&cx), roomy.join(&cx));
     let joined = scope.join(&cx);
     assert!(roomy.is_ok(), "{roomy:?}");
@@ -381,7 +381,7 @@ fn a_task_gets_the_scratch_its_spawn_names() {
     assert!(joined.is_err(), "the scope fails with its task");
     // The root's frame is said too.
     let tight = io.cx(Duration::from_secs(1), 64 << 10).expect("a root context");
-    assert!(matches!(tight.bytes().try_extend(&vec![0; 8 << 20]), Err(Stopped::OutOfMemory { .. })));
+    assert!(matches!(tight.bytes().extend(&vec![0; 8 << 20]), Err(Stopped::OutOfMemory { .. })));
 }
 
 #[test]
@@ -468,7 +468,7 @@ fn a_streams_inbox_is_bounded_by_what_its_opener_said() {
     let origin = Url::parse("https://relay.example/session").expect("a URL");
     let origin = origin.origin().expect("an origin");
     let echo = Streams::handler(|_: &crate::Cx, _: &crate::url::Origin, sent: &[u8], reply: &mut crate::mem::Bytes<'_>| {
-        reply.try_extend(sent)
+        reply.extend(sent)
     });
     let mut heard = cx.bytes();
     // A stream is linear: finished whatever it carried, and checked after.

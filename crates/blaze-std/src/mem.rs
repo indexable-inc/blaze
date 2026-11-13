@@ -7,28 +7,36 @@
 //! | [`Arena`] | `mem.arena("name", limit)` | until dropped |
 //!
 //! Both are blaze-mem's [`Frame`], the bump allocator of blaze's tasks, which already keeps a
-//! limit (`Frame::with_reserve`): an arena is a named frame whose reserve is its limit, so
-//! nothing here is a new allocator and nothing needs `unsafe`. Running out is an outcome:
-//! [`Bytes::try_extend`] returns [`Stopped::OutOfMemory`] naming the arena. A collection the
-//! caller makes in an arena itself (`Vec::new_in(arena.alloc())`) must grow through its
-//! `try_` forms (`try_reserve`): an infallible growth past the limit is `alloc`'s allocation
-//! failure, until bstd's own collections (S4) turn it into the task's failure.
+//! limit and a name (`Frame::named`): an arena is a named frame whose reserve is its limit, so
+//! nothing here is a new allocator and nothing needs `unsafe`.
+//!
+//! Running out is an outcome, and the only form (docs/v2/plan/design/fallible-bstd.md,
+//! decision D29): every growth of a collection in an allocator returns an error naming the
+//! arena, [`OutOfMemory`] from the collections ([`Vec`], [`String`], [`crate::map::Map`],
+//! [`format_in!`]) and [`Stopped::OutOfMemory`] from bstd's own calls ([`Bytes::extend`]);
+//! the first converts into the second with `?`. There is no infallible push and no `try_`
+//! prefix. `alloc`'s own `Vec<T, A>` is not used in bstd: its `push` over a full arena ends
+//! the process, and `crates/blaze-std/clippy.toml` bans it.
+//!
+//! Sizes and offsets are types: a count of bytes is a [`ByteLen`] and a position an
+//! [`Offset`], with checked arithmetic that returns [`Overflow`].
 //!
 //! The rest of blaze-mem's allocators by lifetime are re-exported here as they are: a
 //! request's arena ([`RequestArena`], blaze-mem's `Arena`, named so beside bstd's own
 //! [`Arena`]), pools and their caches, slabs with generational handles, revisions, regions and
 //! the vectors over them, kept blocks, the subsystem [`Tag`]s, and owned text in an allocator
-//! ([`String`], [`format_in!`]). The functions of blaze-mem that reach a frame through the
-//! thread (`frame::current`, `frame::task`) are left out: in bstd the frame is `cx.frame()`.
+//! ([`String`], [`format_in!`], and [`format_into!`] for text in a buffer the caller lends).
+//! The functions of blaze-mem that reach a frame through the thread (`frame::current`,
+//! `frame::task`) are left out: in bstd the frame is `cx.frame()`.
 
 pub use blaze_mem::{
-    AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
-    Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
-    format_in, page_size,
+    AppendVec, ArenaLocal, Block, Built, ByteLen, Cache, Column, FormatError, Frame,
+    FromUtf8Error, HUGE_PAGE, Handle, InsertError, InsideChar, Kept, Marker, MemError, Named,
+    Offset, OutOfMemory, Overflow, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
+    TooSmall, Vec, format_in, format_into, page_size,
 };
 pub use blaze_mem::Arena as RequestArena;
 
-use alloc::vec::Vec;
 use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.
@@ -46,28 +54,29 @@ impl<'a> Bytes<'a> {
         Bytes { bytes: Vec::new_in(frame), arena }
     }
 
+    /// What a growth of these bytes that found no room says: their own name, not the frame's.
+    fn stopped(&self, error: OutOfMemory) -> Stopped {
+        Stopped::OutOfMemory { arena: self.arena, asked: error.asked }
+    }
+
     /// `more` added at the end, or [`Stopped::OutOfMemory`] with the bytes as they were.
-    pub fn try_extend(&mut self, more: &[u8]) -> Result<(), Stopped> {
-        self.try_reserve(more.len())?;
-        self.bytes.extend_from_slice(more);
-        Ok(())
+    pub fn extend(&mut self, more: &[u8]) -> Result<(), Stopped> {
+        self.bytes.extend_from_slice(more).map_err(|error| self.stopped(error))
     }
 
     /// Room for `more` bytes past the end, or [`Stopped::OutOfMemory`].
-    pub fn try_reserve(&mut self, more: usize) -> Result<(), Stopped> {
-        self.bytes
-            .try_reserve(more)
-            .map_err(|_| Stopped::OutOfMemory { arena: self.arena, asked: more })
+    pub fn reserve(&mut self, more: usize) -> Result<(), Stopped> {
+        self.bytes.reserve(more).map_err(|error| self.stopped(error))
     }
 
     /// `more` zero bytes added at the end, lent back to be filled (by a
     /// [`crate::pending::Pending`] read), or [`Stopped::OutOfMemory`] with the bytes as they
     /// were.
     pub fn grow_zeroed(&mut self, more: usize) -> Result<&mut [u8], Stopped> {
-        self.try_reserve(more)?;
-        let at = self.bytes.len();
-        self.bytes.resize(at + more, 0);
-        Ok(&mut self.bytes[at..])
+        let arena = self.arena;
+        self.bytes
+            .extend_filled(more, 0)
+            .map_err(|error| Stopped::OutOfMemory { arena, asked: error.asked })
     }
 
     /// Only the first `len` bytes kept; nothing changes if it holds no more.
@@ -120,7 +129,7 @@ impl Mem {
             Plant::ArenaUnlimited => TASK_FRAME,
             _ => limit,
         };
-        let frame = Frame::with_reserve(reserve, Tag::Other)
+        let frame = Frame::named(name, reserve, Tag::Other)
             .map_err(|_| Stopped::OutOfMemory { arena: name, asked: limit })?;
         Ok(Arena { name, limit, frame })
     }
@@ -160,8 +169,8 @@ impl Arena {
         self.frame
     }
 
-    /// The allocator, for a collection of the caller's (`Vec::new_in(arena.alloc())`), grown
-    /// through its `try_` forms.
+    /// The allocator, for a collection of the caller's (`Vec::new_in(arena.alloc())`), whose
+    /// growth names this arena when it has no room.
     pub fn alloc(&self) -> &Frame {
         &self.frame
     }

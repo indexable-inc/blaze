@@ -443,7 +443,7 @@ fn hosted(io: &Io, cx: &Cx, request: &Request<'_>, into: &mut Bytes<'_>) -> Resu
         // clone: the simulated host's record, refcounts.
         host.http.asked.push((request.method, request.url.clone()));
         match host.http.routes.iter().find(|route| &route.url == request.url) {
-            Some(route) => into.try_extend(&route.body).map(|()| route.status),
+            Some(route) => into.extend(&route.body).map(|()| route.status),
             None => Ok(404),
         }
     });
@@ -487,7 +487,7 @@ fn read_answer(
         if let Some(head) = &mut head {
             let (took, ended) = head.body.decode(&unread, &mut decoded).map_err(HttpKind::Protocol)?;
             unread.drain(..took);
-            into.try_extend(&decoded)?;
+            into.extend(&decoded)?;
             decoded.clear();
             if into.len() - start > wire.body_most {
                 return Err(HttpKind::TooBig { most: wire.body_most });

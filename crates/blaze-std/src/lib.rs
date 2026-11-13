@@ -178,6 +178,8 @@ pub mod kv;
 pub mod local;
 /// The locale: time zone, language and formats, as plain data.
 pub mod locale;
+/// The one hash map, in the allocator its type names, with fallible growth: `Map`.
+pub mod map;
 pub mod mem;
 /// Typed names: a key's, a device's, a module's, an application's.
 pub mod name;
@@ -241,17 +243,10 @@ pub mod text {
     pub use blaze_bytes::{Text, text_of};
 }
 
-/// The one hash map: hashbrown's, on foldhash with one fixed seed, in the allocator its type
-/// names; shared between threads, papaya's lock-free map (blaze-hash).
-pub mod map {
-    pub use blaze_hash::{
-        ByHash, Equivalent, HashMap as Map, Operation, SharedByHash, SharedMap, hash_map::Entry,
-    };
-}
-
-/// The one hash set, as [`map`] (blaze-hash).
+/// The one hash set, as [`map`]: its `insert` is fallible too.
 pub mod set {
-    pub use blaze_hash::{ByHashSet, HashSet as Set, SharedSet};
+    pub use crate::map::Set;
+    pub use blaze_hash::SharedSet;
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
@@ -402,6 +397,22 @@ impl fmt::Display for Stopped {
 }
 
 impl core::error::Error for Stopped {}
+
+/// A collection's growth that found no room is the task's [`Stopped::OutOfMemory`]: `?`
+/// carries one into the other.
+impl From<mem::OutOfMemory> for Stopped {
+    fn from(error: mem::OutOfMemory) -> Stopped {
+        Stopped::OutOfMemory { arena: error.arena, asked: error.asked }
+    }
+}
+
+/// blaze-mem's own refusal (a frame's limit, a region used up, the system out of memory),
+/// named by its tag.
+impl From<mem::MemError> for Stopped {
+    fn from(error: mem::MemError) -> Stopped {
+        Stopped::from(error.out_of_memory())
+    }
+}
 
 /// Consumes a linear value that has no fields left to move out (a fieldless marker such as
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.

@@ -158,6 +158,13 @@ macro_rules! shared {
 
         // SAFETY: each call is the held allocator's own, on the same handle that made the
         // block: a handle and its copies are one allocator, as `Allocator` asks of clones.
+        /// The handle names the arena its allocator does.
+        impl<A: crate::mem::Named + ?Sized> crate::mem::Named for $name<A> {
+            fn name(&self) -> &'static str {
+                (**self).name()
+            }
+        }
+
         unsafe impl<A: Allocator + ?Sized> Allocator for $name<A> {
             fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
                 (**self).allocate(layout)

@@ -76,20 +76,20 @@ fn plan(d: &mut impl Draw) -> Plan {
 fn application(request: &Request<'_>, into: &mut Bytes<'_>) -> Result<u16, Stopped> {
     let target = request.url.target();
     if target == "/ok" {
-        into.try_extend(b"fine")?;
+        into.extend(b"fine")?;
         Ok(200)
     } else if target.starts_with("/big") {
         // More than one receive's worth.
         for at in 0..40_000u32 {
-            into.try_extend(&[(at % 251) as u8])?;
+            into.extend(&[(at % 251) as u8])?;
         }
         Ok(200)
     } else if target == "/echo" {
-        into.try_extend(format!("{:?} of {} bytes:", request.method, request.body.len()).as_bytes())?;
-        into.try_extend(request.body)?;
+        into.extend(format!("{:?} of {} bytes:", request.method, request.body.len()).as_bytes())?;
+        into.extend(request.body)?;
         Ok(201)
     } else {
-        into.try_extend(b"no such thing")?;
+        into.extend(b"no such thing")?;
         Ok(404)
     }
 }

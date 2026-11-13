@@ -93,7 +93,7 @@
 //! - A point that calls itself, directly or through others: its body would hold its own
 //!   [`Point`] as a constant, which code identity refuses (`hir_ty_identity::SELF_READ`).
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
 use core::{alloc::AllocError, any::Any, cell::Cell, fmt};
 
 use blaze_mem::Frame;
@@ -103,7 +103,7 @@ use crate::{
     cx::Cx,
     id::{ContentHasher, ContentId},
     map::Map,
-    mem::{Arena, Mem},
+    mem::{Arena, Mem, Vec},
     sync::{LocalLock, LocalShared},
 };
 
@@ -875,14 +875,12 @@ impl Generation {
     /// Keeps a clone of `call`'s value under `slot`, if the arena has room for it.
     fn keep(&mut self, slot: Called, call: &dyn Call) -> bool {
         let Some(entries) = self.entries.as_mut() else { return false };
-        if entries.try_reserve(1).is_err() {
+        // Room for the entry before its value is cloned: a value is not made to be dropped.
+        if entries.reserve(1).is_err() {
             return false;
         }
         match call.keep(&self.alloc) {
-            Some(Ok(kept)) => {
-                entries.insert(slot, kept);
-                true
-            }
+            Some(Ok(kept)) => entries.insert(slot, kept).is_ok(),
             Some(Err(AllocError)) | None => false,
         }
     }
@@ -1041,28 +1039,24 @@ impl<'m> Graph<'m> {
 
     fn try_record(&self, parent: Option<Called>, made: Called) -> Result<(), Stopped> {
         let frame = self.arena.alloc();
-        let full = |asked: usize| Stopped::OutOfMemory { arena: self.arena.name(), asked };
         let mut edges = self.edges.borrow_mut();
         // Every call is a node, with inputs or without.
         for node in [Some(made), parent].into_iter().flatten() {
             if !edges.contains_key(&node) {
-                edges.try_reserve(1).map_err(|_| full(size_of::<Called>()))?;
-                edges.insert(node, Vec::new_in(frame));
+                edges.insert(node, Vec::new_in(frame))?;
             }
         }
         match parent {
             Some(parent) => {
                 let Some(inputs) = edges.get_mut(&parent) else { return Ok(()) };
                 if !inputs.contains(&made) {
-                    inputs.try_reserve(1).map_err(|_| full(size_of::<Called>()))?;
-                    inputs.push(made);
+                    inputs.push(made)?;
                 }
             }
             None => {
                 let mut roots = self.roots.borrow_mut();
                 if !roots.contains(&made) {
-                    roots.try_reserve(1).map_err(|_| full(size_of::<Called>()))?;
-                    roots.push(made);
+                    roots.push(made)?;
                 }
             }
         }

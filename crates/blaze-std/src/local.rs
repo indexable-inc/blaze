@@ -209,7 +209,7 @@ impl End {
             return Ok(0);
         }
         // Room is made before the pipe's lock is taken: nothing allocates under it.
-        into.try_reserve(most).map_err(refuse)?;
+        into.reserve(most).map_err(refuse)?;
         let cx = cx.span("bstd::local read: bytes in the pipe");
         let waited = cx.wait_for(io, || {
             let mut pipe = self.half.inward().lock();
