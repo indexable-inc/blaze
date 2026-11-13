@@ -1204,9 +1204,9 @@ code after an expression that never returns. It forgets what it knew of a value 
 is reassigned, and of what a `&mut` leads to at every call and write through a pointer. It
 follows linear arithmetic where the sum is shown not to wrap (`v[v.len() - 1]` under
 `!v.is_empty()`, `v[i + 1]` under `i + 1 < v.len()`, `lo + (hi - lo) / 2` under
-`lo < hi && hi <= v.len()`), within a small budget of facts added up. It does not follow
-products, a loop's own invariants (`hi <= len` in a binary search loop) or what a function of
-your own returns.
+`lo < hi && hi <= v.len()`, and a binary search written as a loop), within a small budget of
+facts added up. It does not follow products, a relation between two values that both change
+round a loop, or what a function of your own returns.
 
 **How to fix it.** Add the check that rules the path out so that it dominates the site. Where
 blaze cannot prove it, return a `Result`, or write core's `unreachable!()`, the promise blaze

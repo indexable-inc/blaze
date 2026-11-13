@@ -121,8 +121,11 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
    mentions it) when the point runs again; where two paths meet, a local with two values gets
    one unknown per (block, local) (per field for aggregates of one shape, so a range's end
    survives its loop) and only the facts both paths hold survive, so a loop is iterated to a
-   fixed point; a joined value's constant bounds are widened after one turn. A coroutine body,
-   inline assembly and a `for const` loop are not analysed (refused).
+   fixed point; a joined value's constant bounds are widened after one turn. A joined integer
+   also keeps `j <= y` and `y <= j` for each value `y` a path brings for it, when every path's
+   own value satisfies it in that path's state: a binary search loop's `hi <= len` holds on
+   the way in and on every way round, so it holds at the head. A coroutine body, inline
+   assembly and a `for const` loop are not analysed (refused).
 3. **Contracts** (spec only). `#[blaze::requires(i < self.len())]` on a function is a
    precondition every caller must prove at the call with tier 2's entailment (a refusal names
    the call and the clause), and a fact the callee's body starts with; `ensures` is a fact at
@@ -217,7 +220,8 @@ waiver by attribute or by flag is refused. Linear arithmetic is tested in both o
 profiles: `v[len - 1]` under a non-empty check, `v[i + 1]` under `i + 1 < len`, a pair under
 `i < len - 1`, the middle of `lo < hi <= len`, `v[len - k]` under `1 <= k <= len`; and still
 reported: `v[len - 1]` unguarded (the wrap, with overflow checks off), `v[i + 2]` under
-`i + 1 < len`, `v[i * j]`.
+`i + 1 < len`, `v[i * j]`. A binary search loop passes in both profiles and the same loop
+started one past the length is reported.
 
 The invariant: *a site the prover discharges is not reached, or its condition holds, in every
 run of the MIR*. It is held by a Hegel test against the MIR evaluator
@@ -225,13 +229,15 @@ run of the MIR*. It is held by a Hegel test against the MIR evaluator
 linear expressions with `+`, `-`, `/ 2`, `&&`) around a random site, random arguments with
 the ends of `usize` among them, both overflow profiles; a body all of whose panic sites are
 discharged must not panic when run. Controls: a guarded site is proved and runs while the
-bare one is not proved and panics; and a planted model entry (`first` is always `Some`) is
-caught.
+bare one is not proved and panics; a binary search loop is proved and runs while the one
+started past the length is not proved and panics; and a planted model entry (`first` is
+always `Some`) is caught.
 
 ## Not done
 
-A loop's relational invariants (binary search written as a loop needs `hi <= len` at the head;
-a joined value keeps only constant bounds), products and other non-linear arithmetic, division
+A loop's invariants beyond a joined integer against the values its paths bring (a relation
+between two values that both change round the loop, such as `i + j == n`), products and
+other non-linear arithmetic, division
 by a non-constant or of a value that may be negative, proofs past the linear budget,
 `while let Some(x) = it.next()` over anything but a `Range`, facts through user functions
 (tier 3), the Lean check of certificates, the optimizer's use of a proved site, the run-time

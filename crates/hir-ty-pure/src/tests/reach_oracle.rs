@@ -223,6 +223,27 @@ fn the_oracle_tells_a_guarded_site_from_a_bare_one() {
     assert_eq!(check(&middle), Ok(Verdict { proved: true, panicked: false }));
 }
 
+/// A loop's invariant is held to the evaluator too: a binary search over `0..len` is proved
+/// and runs to its end for a key above every element; the same loop started one past the
+/// length is not proved, and that run panics.
+#[test]
+fn the_oracle_runs_a_binary_search_loop() {
+    let search = |hi: &str| {
+        // alloc: a test's text
+        let site = format!(
+            "{{ let mut lo = 0; let mut hi = {hi}; while lo < hi {{ let mid = lo + (hi - lo) / 2; \
+             if v[mid] < d {{ lo = mid + 1; }} else {{ hi = mid; }} }} lo as u32 }}"
+        );
+        Program { divisor: 100, ..program(&[], &site, &[1, 2, 3, 4, 5], 0, 0) }
+    };
+    for overflow_checks in [false, true] {
+        let inside = Program { overflow_checks, ..search("v.len()") };
+        assert_eq!(check(&inside), Ok(Verdict { proved: true, panicked: false }));
+        let past = Program { overflow_checks, ..search("v.len() + 1") };
+        assert_eq!(check(&past), Ok(Verdict { proved: false, panicked: true }));
+    }
+}
+
 /// The control: with a model entry planted that says `first` is always `Some`, the prover
 /// discharges `v.first().unwrap()` on a slice that may be empty, and the oracle refuses it.
 #[test]

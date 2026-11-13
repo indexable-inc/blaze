@@ -1797,9 +1797,45 @@ impl<'a, 'db> Solver<'a, 'db> {
                 break;
             }
         }
-        // What this join makes again is forgotten in each state first.
         let joined = self.joined[block as usize].clone(); // clone: read while states change
         let made = |key: Key| matches!(key, Key::Join(at, of) if at == block && joined.contains(&of));
+        // What every path holds of a joined integer against the values the paths bring for
+        // it (a loop's `hi <= len`: `len` on the way in, `mid` on the way round): `j <= y`
+        // and `y <= j` for each such value `y` that this join does not make again, kept when
+        // every path's own value satisfies it in that path's state. Asked before the states
+        // forget what this join makes again: a path round a loop proves it from what held of
+        // the last turn's values.
+        let mut invariants = Vec::new(); // alloc: the joined slots' relations, few
+        for slot in 0..slots {
+            let whole = slot as u32;
+            let integer = self
+                .local_ty(slot)
+                .is_some_and(|ty| !ty.is_bool() && int_range(ty, self.word).is_some());
+            if !integer || !joined.contains(&whole) {
+                continue;
+            }
+            for at in 0..incoming.len().min(4) {
+                let anchor = incoming[at].vals[slot];
+                let repeated = incoming[..at].iter().any(|it| it.vals[slot] == anchor);
+                if repeated || self.mentions(anchor, &made) || self.const_of(anchor).is_some() {
+                    continue;
+                }
+                for below in [true, false] {
+                    let holds = incoming.iter().all(|it| {
+                        let value = it.vals[slot];
+                        let atom = match below {
+                            true => Atom::new(Rel::Le, value, anchor),
+                            false => Atom::new(Rel::Le, anchor, value),
+                        };
+                        self.entails(it, atom)
+                    });
+                    if holds {
+                        invariants.push((whole, anchor, below));
+                    }
+                }
+            }
+        }
+        // What this join makes again is forgotten in each state first.
         for state in incoming.iter_mut() {
             state.facts.retain(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
             state.imps.retain(|(premise, then)| {
@@ -1852,6 +1888,13 @@ impl<'a, 'db> Solver<'a, 'db> {
             if changed {
                 state.vals[slot] = self.term(Term::Agg(variant, fields), ANY);
             }
+        }
+        for (slot, anchor, below) in invariants {
+            let value = state.vals[slot as usize];
+            state.put(match below {
+                true => Atom::new(Rel::Le, value, anchor),
+                false => Atom::new(Rel::Le, anchor, value),
+            });
         }
         // Widening: once the joined slots stop growing, a bound is kept only if the entry
         // state had it the last time, so bounds that move each turn (a counter's) are dropped
