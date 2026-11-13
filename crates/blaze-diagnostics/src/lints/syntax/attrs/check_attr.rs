@@ -96,6 +96,9 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>]) -> V
         if let Some(diag) = parsed {
             emit(diag);
         }
+        if let Some(diag) = repeated_reprs(cx, &node) {
+            emit(diag);
+        }
         if let Some(diag) = repr(cx, walk, &node) {
             emit(diag);
         }
@@ -504,6 +507,70 @@ fn repr(cx: &Cx<'_, '_>, walk: &Walk<'_>, node: &Node<'_>) -> Option<Diag> {
         diag.primary(span);
     }
     Some(diag)
+}
+
+/// rustc's `repeated_reprs` (Rust 1.100, rust-lang/rust#157036): a representation the
+/// node's `#[repr]`s give more than once, every place it is given, in the order rustc sorts
+/// them (by the representation, as `ReprAttr` orders, then by place).
+fn repeated_reprs(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
+    let mut reprs: SmallVec<[((u8, u64), InFile<TextRange>); 4]> = SmallVec::new();
+    for attr in node.named("repr") {
+        let Args::List(tt) = attr.args() else { continue };
+        let Some(list) = meta::list(tt) else { continue };
+        for inner in &list {
+            if let Some(item) = inner.item()
+                && let Some(key) = repr_order(item)
+            {
+                reprs.push((key, attr.in_file(inner.range())));
+            }
+        }
+    }
+    reprs.sort_unstable_by_key(|(key, at)| (*key, at.value.start(), at.value.end()));
+    let mut spans = reprs
+        .chunk_by(|(a, _), (b, _)| a == b)
+        .filter(|same| same.len() != 1)
+        .flatten()
+        .map(|(_, at)| cx.span(*at));
+    let mut diag = Diag::lint(
+        "repeated_reprs",
+        "`#[repr(..)]` attribute is specified more than once",
+        spans.next()?,
+    );
+    for span in spans {
+        diag.primary(span);
+    }
+    diag.note("for consistency, only specify the representation once");
+    Some(diag)
+}
+
+/// Where rustc's `ReprAttr` of the hint `item` sorts (its derived `Ord`): the variant
+/// (`ReprInt`, `ReprRust`, `ReprC`, `ReprPacked`, `ReprSimd`, `ReprTransparent`, `ReprAlign`),
+/// then the integer type (`IntType`: the signed ones, then the unsigned, each from the
+/// pointer-sized up) or the alignment. `None` for a hint `parse_repr` rejects.
+fn repr_order(item: &meta::Item<'_>) -> Option<(u8, u64)> {
+    hint(item)?;
+    let word = item.word()?;
+    let align = |tt: ast::TokenTree<'_>| {
+        let list = meta::list(tt)?;
+        let [Inner::Lit(lit)] = list.as_slice() else { return None };
+        ast::IntNumber::cast(*lit)?.value().ok().and_then(|it| u64::try_from(it).ok())
+    };
+    Some(match (word, item.args) {
+        ("Rust", _) => (1, 0),
+        ("C", _) => (2, 0),
+        ("packed", ItemArgs::List(tt)) => (3, align(tt)?),
+        ("packed", _) => (3, 1),
+        ("simd", _) => (4, 0),
+        ("transparent", _) => (5, 0),
+        ("align", ItemArgs::List(tt)) => (6, align(tt)?),
+        (int, _) => {
+            const INTS: [&str; 12] = [
+                "isize", "i8", "i16", "i32", "i64", "i128", "usize", "u8", "u16", "u32", "u64",
+                "u128",
+            ];
+            (0, INTS.iter().position(|it| *it == int)? as u64)
+        }
+    })
 }
 
 /// rustc's `parse_repr` of one hint: what it counts as, or `None` for one it rejects.
