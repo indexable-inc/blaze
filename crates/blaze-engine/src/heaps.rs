@@ -561,17 +561,38 @@ mod boot {
         BUFFER.0.get().addr()
     }
 
-    /// A block for `layout` from the buffer, zero (`.bss`, never reused). Only the thread in
-    /// `start` calls it (every other waits on its `Once`), so the bump is a load and a store.
+    /// The word before each block, holding its size: C's `realloc` and `malloc_usable_size`
+    /// are given a block's address alone.
+    const HEADER: usize = size_of::<usize>();
+
+    /// A block for `layout` from the buffer, zero (`.bss`, never reused), its size in the word
+    /// before it ([`size`]). Only the thread in `start` calls it (every other waits on its
+    /// `Once`), so the bump is a load and a store.
     pub(super) fn alloc(layout: Layout) -> *mut u8 {
         let at = USED.load(Ordering::Relaxed);
-        let from = (start() + at).next_multiple_of(layout.align()) - start();
+        let align = layout.align().max(HEADER);
+        let from = (start() + at + HEADER).next_multiple_of(align) - start();
         let Some(end) = from.checked_add(layout.size()).filter(|end| *end <= BYTES) else {
             super::say(b"blaze: the global heap's start allocated past its 1 MiB boot buffer (crates/blaze-engine/src/heaps.rs boot); blaze stops\n");
             std::process::abort()
         };
         USED.store(end, Ordering::Relaxed);
-        BUFFER.0.get().cast::<u8>().wrapping_add(from)
+        let block = BUFFER.0.get().cast::<u8>().wrapping_add(from);
+        // SAFETY: the word before the block is inside the buffer (`from >= HEADER`), aligned
+        // for a `usize` (`from` is a multiple of `HEADER`), and no other block's.
+        unsafe { block.sub(HEADER).cast::<usize>().write(layout.size()) };
+        block
+    }
+
+    /// The size the boot block at `ptr` was made with.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is a block [`alloc`] returned.
+    #[inline]
+    pub(super) unsafe fn size(ptr: *const u8) -> usize {
+        // SAFETY: the caller says `ptr` is a boot block, whose header `alloc` wrote.
+        unsafe { ptr.sub(HEADER).cast::<usize>().read() }
     }
 
     /// Whether `ptr` is a boot block.
@@ -579,6 +600,16 @@ mod boot {
     pub(super) fn contains(ptr: *const u8) -> bool {
         ptr.addr().wrapping_sub(start()) < BYTES
     }
+}
+
+/// The size of `ptr` if it is a block made while the arena was being set up ([`boot`]): no
+/// tag's, never freed, and unknown to mimalloc and to every other allocator, so C's `free`,
+/// `realloc` and `malloc_usable_size` ask this before either.
+#[inline]
+pub(crate) fn boot_block(ptr: *const u8) -> Option<usize> {
+    // SAFETY: inside the boot buffer every address C or Rust holds is a block `boot::alloc`
+    // returned.
+    boot::contains(ptr).then(|| unsafe { boot::size(ptr) })
 }
 
 /// An allocation the arena could not serve: its holder, size and alignment, the arena then,
@@ -1628,6 +1659,11 @@ impl Malloc for Heaps {
 
     #[inline]
     unsafe fn usable(&self, ptr: *mut u8) -> usize {
+        // A block C asked for while the arena was being set up is a boot block, which
+        // mimalloc's page map has no page for.
+        if let Some(bytes) = boot_block(ptr) {
+            return bytes;
+        }
         // SAFETY: the caller says `ptr` is a live block of mimalloc's (C's, never over-aligned).
         unsafe { mi_usable_size(ptr.cast()) }
     }
