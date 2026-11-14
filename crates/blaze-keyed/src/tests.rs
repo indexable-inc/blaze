@@ -1,7 +1,8 @@
 //! The driver under deterministic simulation (rule 43, 64): a model of three crates whose items
 //! call each other by name, edited at random; every request runs the real driver, the real key
 //! functions, the real text graph, the real outside machine and the real record formats, with the
-//! host's answers delivered in a seeded random order and the process killed at random points.
+//! host's answers delivered in an order drawn from the case's tape and the process killed at
+//! drawn points.
 //!
 //! The oracle:
 //! - Keys: every key the model computes maps to one meaning for the whole run (two meanings
@@ -27,8 +28,7 @@ use std::{
 
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
-use blaze_rng::SplitMix64;
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config, Flight, Nanos, Tape};
 
 use crate::{
     PLANT, Plant,
@@ -100,6 +100,16 @@ enum Op {
 }
 
 const REQUEST: Op = Op::Request { kill: None };
+
+/// What the oracle above saw broken.
+fn oracle(why: impl Into<String>) -> Broke {
+    Broke::Oracle(why.into())
+}
+
+/// The model's own trouble: its from-scratch build could not be made.
+fn harness(why: impl Into<String>) -> Broke {
+    Broke::Harness(why.into())
+}
 
 fn digest(bytes: &[u8]) -> ContentId {
     record::digest(bytes)
@@ -309,7 +319,7 @@ impl Model {
     }
 
     /// Every key and record a from-scratch build makes now.
-    fn fresh(&self) -> Result<Vec<FreshUnit>, String> {
+    fn fresh(&self) -> Result<Vec<FreshUnit>, Broke> {
         let present = |c: usize| (0..3).filter(move |&i| self.items[c][i].present);
         let pieces: Vec<Vec<Vec<u8>>> = (0..3).map(|c| present(c).map(|i| self.piece(c, i)).collect()).collect();
         let names: Vec<Vec<Vec<NameHash>>> = (0..3)
@@ -334,7 +344,7 @@ impl Model {
         let crates: Vec<CrateNodes<'_>> = (0..3)
             .map(|c| CrateNodes { identity: ContentId([10 + c as u8; 32]), nodes: &nodes[c], deps: DEPS[c] })
             .collect();
-        let graph = Graph::build(&crates, Global).map_err(|error| error.to_string())?;
+        let graph = Graph::build(&crates, Global).map_err(|error| harness(error.to_string()))?;
         let mut scratch = Vec::new_in(Global);
         let mut units: Vec<FreshUnit> = Vec::new();
         for c in 0..3 {
@@ -355,7 +365,7 @@ impl Model {
                 })
                 .collect();
             let surface_bytes = record::write_traced(&surface, &[own], &exports, &[]);
-            let always = graph.always(c as u32).map_err(|error| error.to_string())?;
+            let always = graph.always(c as u32).map_err(|error| harness(error.to_string()))?;
             let mut bodies = Vec::new();
             let mut late_all = Vec::new();
             for i in present(c) {
@@ -366,7 +376,8 @@ impl Model {
                 let mut reads = Vec::new();
                 for n in calls {
                     let name = name_of(NAMES[n].as_bytes());
-                    let closure = graph.name_closure(c as u32, name, &mut scratch).map_err(|error| error.to_string())?;
+                    let closure =
+                        graph.name_closure(c as u32, name, &mut scratch).map_err(|error| harness(error.to_string()))?;
                     reads.push(NameRead { name, closure });
                 }
                 let late: Vec<LateRead<'_>> = spec
@@ -413,12 +424,13 @@ impl Model {
 
     /// Files every key a fresh build makes under its meaning; a second meaning is a key that
     /// misses an input.
-    fn register(&mut self, fresh: &[FreshUnit]) -> Result<(), String> {
-        let mut file = |tag: Tag, key: ContentId, bytes: &[u8]| -> Result<(), String> {
-            let means = meaning(tag, &aligned(bytes.to_vec()))?;
+    fn register(&mut self, fresh: &[FreshUnit]) -> Result<(), Broke> {
+        let mut file = |tag: Tag, key: ContentId, bytes: &[u8]| -> Result<(), Broke> {
+            // A record of the model's own fresh build that does not read is the model's fault.
+            let means = meaning(tag, &aligned(bytes.to_vec())).map_err(harness)?;
             match self.meanings.insert((tag.0, key.0), means) {
                 Some(before) if before != means => {
-                    Err(format!("two values under one key of kind {}: a key that misses an input", tag.0))
+                    Err(oracle(format!("two values under one key of kind {}: a key that misses an input", tag.0)))
                 }
                 _ => Ok(()),
             }
@@ -433,36 +445,37 @@ impl Model {
         Ok(())
     }
 
-    fn check_meaning(&self, tag: Tag, key: ContentId, bytes: &[u8], what: &str) -> Result<(), String> {
-        let means = meaning(tag, bytes)?;
+    fn check_meaning(&self, tag: Tag, key: ContentId, bytes: &[u8], what: &str) -> Result<(), Broke> {
+        // These bytes are the driver's (a hit or a put): one that does not read is a finding.
+        let means = meaning(tag, bytes).map_err(oracle)?;
         match self.meanings.get(&(tag.0, key.0)) {
             Some(fresh) if *fresh == means => Ok(()),
-            Some(_) => Err(format!("{what} of kind {} is not what a fresh build files under its key", tag.0)),
-            None => Err(format!("{what} of kind {} under a key no fresh build made", tag.0)),
+            Some(_) => Err(oracle(format!("{what} of kind {} is not what a fresh build files under its key", tag.0))),
+            None => Err(oracle(format!("{what} of kind {} under a key no fresh build made", tag.0))),
         }
     }
 
     /// The verify-once oracle for a look at item `item` of unit `unit`.
-    fn examine(&self, unit: u32, item: StableId) -> Result<(), String> {
+    fn examine(&self, unit: u32, item: StableId) -> Result<(), Broke> {
         if self.seen.settled.contains(&unit) {
-            return Err(format!("a lookup under a held manifest: unit {unit}"));
+            return Err(oracle(format!("a lookup under a held manifest: unit {unit}")));
         }
         if self.seen.unchanged.get(unit as usize) == Some(&true) {
-            return Err(format!("a dependent of an unchanged surface was examined: unit {unit}"));
+            return Err(oracle(format!("a dependent of an unchanged surface was examined: unit {unit}")));
         }
         if self.seen.proved.contains(&(unit, item.0.0)) {
-            return Err(format!("a check after a hit: unit {unit}"));
+            return Err(oracle(format!("a check after a hit: unit {unit}")));
         }
         Ok(())
     }
 
-    fn perform(&mut self, effect: &Effect<'_>, fresh: &[FreshUnit]) -> Result<Answer, String> {
+    fn perform(&mut self, effect: &Effect<'_>, fresh: &[FreshUnit]) -> Result<Answer, Broke> {
         Ok(match *effect {
             Effect::Get { ticket, unit, item, tag, key, .. } => {
                 let record = self.disk.records.get(&(tag.0, key.0)).cloned();
                 if unit != NO_UNIT {
                     if !self.seen.gets.insert((unit, tag.0, item.0.0, key.0)) {
-                        return Err(format!("an item looked up twice in one snapshot: unit {unit}, kind {}", tag.0));
+                        return Err(oracle(format!("an item looked up twice in one snapshot: unit {unit}, kind {}", tag.0)));
                     }
                     let fresh_unit = &fresh[unit as usize];
                     if tag == UnitManifest::TAG {
@@ -479,10 +492,11 @@ impl Model {
                 if let Some(bytes) = record.as_ref().filter(|_| tag != Certificate::TAG) {
                     self.check_meaning(tag, key, bytes, "a hit")?;
                     if tag == UnitManifest::TAG {
-                        let root = record::open::<UnitManifest>(bytes, &Key::from_id(key)).map_err(|e| e.to_string())?;
-                        for entry in root.entries.follow(bytes).map_err(|e| e.to_string())? {
+                        let root =
+                            record::open::<UnitManifest>(bytes, &Key::from_id(key)).map_err(|e| oracle(e.to_string()))?;
+                        for entry in root.entries.follow(bytes).map_err(|e| oracle(e.to_string()))? {
                             if !self.disk.records.contains_key(&(entry.tag, entry.key.0)) {
-                                return Err("a manifest hit names a record the store lacks".into());
+                                return Err(oracle("a manifest hit names a record the store lacks"));
                             }
                         }
                     }
@@ -491,13 +505,13 @@ impl Model {
             }
             Effect::Answer { ticket, tag, shape, .. } => {
                 if tag != Certificate::TAG || shape != SHAPE {
-                    return Err("an answer asked of a shape the model never filed".into());
+                    return Err(oracle("an answer asked of a shape the model never filed"));
                 }
                 Answer::Answers(ticket, vec![self.world()])
             }
             Effect::Verify { ticket, unit, item, reads } => {
                 if !self.seen.verifies.insert((unit, item.0.0)) {
-                    return Err(format!("an item verified twice in one snapshot: unit {unit}"));
+                    return Err(oracle(format!("an item verified twice in one snapshot: unit {unit}")));
                 }
                 self.examine(unit, item)?;
                 let facts = self.facts_now(unit as usize);
@@ -511,7 +525,7 @@ impl Model {
             Effect::Run { ticket, task, .. } => {
                 self.in_flight += 1;
                 if self.in_flight > WORKERS.max(1) {
-                    return Err(format!("{} tasks run at once on {WORKERS} workers", self.in_flight));
+                    return Err(oracle(format!("{} tasks run at once on {WORKERS} workers", self.in_flight)));
                 }
                 match task {
                     Task::Key { unit } => {
@@ -521,17 +535,17 @@ impl Model {
                     }
                     Task::Surface { unit, key } => {
                         if self.disk.records.contains_key(&(Surface::TAG.0, key.id().0)) {
-                            return Err("a surface task ran for a record the store holds".into());
+                            return Err(oracle("a surface task ran for a record the store holds"));
                         }
                         Answer::Wrote(ticket, aligned(fresh[unit as usize].surface_bytes.clone()))
                     }
                     Task::Body { unit, item, key } => {
                         if self.disk.records.contains_key(&(Body::TAG.0, key.id().0)) {
-                            return Err("a body task ran for a record the store holds".into());
+                            return Err(oracle("a body task ran for a record the store holds"));
                         }
                         let c = unit as usize;
                         let Some(&(i, ..)) = fresh[c].bodies.iter().find(|(_, id, ..)| *id == item) else {
-                            return Err("a body task for an item the unit lacks".into());
+                            return Err(oracle("a body task for an item the unit lacks"));
                         };
                         Answer::Wrote(ticket, aligned(self.body_record(c, i, &key, planted(Plant::ReadDropped))))
                     }
@@ -541,7 +555,10 @@ impl Model {
                 // The simulated machine is no trusted writer: everything is filed in its own
                 // namespace, as the plan named it.
                 if namespace != Namespace::LOCAL {
-                    return Err(format!("a put of kind {} key {key:?} in namespace {:016x}, on a machine that is no trusted writer", tag.0, namespace.0));
+                    return Err(oracle(format!(
+                        "a put of kind {} key {key:?} in namespace {:016x}, on a machine that is no trusted writer",
+                        tag.0, namespace.0
+                    )));
                 }
                 if tag != Certificate::TAG {
                     self.check_meaning(tag, key, bytes, "a put")?;
@@ -582,14 +599,14 @@ impl Model {
     }
 
     /// One request, to its outcome; `None` when it was killed.
-    fn request<M: Memo>(&mut self, memo: &mut M, rng: &mut SplitMix64, kill: Option<u32>) -> Result<Option<Outcome>, String> {
+    fn request<M: Memo>(&mut self, memo: &mut M, tape: &Tape, kill: Option<u32>) -> Result<Option<Outcome>, Broke> {
         let fresh = self.fresh()?;
         self.register(&fresh)?;
         self.in_flight = 0;
         self.seen = Seen { unchanged: (0..3).map(|c| self.unchanged(c, &fresh)).collect(), ..Seen::default() };
         let plans: Vec<UnitPlan<'static>> =
             (0..3).map(|c| UnitPlan { deps: DEPS[c], last: self.disk.last.get(c).copied(), namespace: Namespace::LOCAL }).collect();
-        let outcome = proof::scope(|snap| self.drive(snap, memo, rng, kill, &fresh, &plans))?;
+        let outcome = proof::scope(|snap| self.drive(snap, memo, tape, kill, &fresh, &plans))?;
         if let Some(outcome) = &outcome {
             self.check_end(outcome, &fresh)?;
             self.disk.last = fresh.iter().map(|unit| unit.manifest).collect();
@@ -603,18 +620,23 @@ impl Model {
         &mut self,
         snap: Snapshot<'_>,
         memo: &mut M,
-        rng: &mut SplitMix64,
+        tape: &Tape,
         kill: Option<u32>,
         fresh: &[FreshUnit],
         plans: &[UnitPlan<'_>],
-    ) -> Result<Option<Outcome>, String> {
+    ) -> Result<Option<Outcome>, Broke> {
         let plan = Plan { certificate: certificate(), namespace: Namespace::LOCAL, units: plans };
-        let mut driver = Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| format!("{error:?}"))?;
-        let mut queue: Vec<Answer> = Vec::new();
+        let mut driver =
+            Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| oracle(format!("{error:?}")))?;
+        // The host's answers, each due at once: which comes next is the tape's choice.
+        let mut flight: Flight<Answer> = Flight::new();
         let mut performed = 0u32;
         for _ in 0..20_000 {
-            if !queue.is_empty() && rng.coin() {
-                let answer = queue.swap_remove(rng.index(queue.len()));
+            if !flight.is_empty() && tape.coin("deliver early") {
+                // Every answer is asked due at once, so one is due whenever any is in flight.
+                let Some(answer) = flight.deliver(tape, Nanos(0)) else {
+                    return Err(harness("answers in flight and none due at time 0"));
+                };
                 self.deliver(&mut driver, answer);
                 continue;
             }
@@ -628,6 +650,7 @@ impl Model {
                 Step::Do(effect) => {
                     performed += 1;
                     if kill == Some(performed) {
+                        flight.kill();
                         return Ok(None);
                     }
                     Act::Asked(self.perform(&effect, fresh)?)
@@ -639,56 +662,62 @@ impl Model {
                     if let Outcome::Certified { .. } = outcome
                         && driver.certified().is_none()
                     {
-                        return Err("a certified outcome with no certificate proof".into());
+                        return Err(oracle("a certified outcome with no certificate proof"));
                     }
                     return Ok(Some(outcome));
                 }
-                Act::Asked(answer) => queue.push(answer),
-                Act::Wait if queue.is_empty() => return Err("the driver waits with nothing asked".into()),
-                Act::Wait => {
-                    let answer = queue.swap_remove(rng.index(queue.len()));
-                    self.deliver(&mut driver, answer);
-                }
+                Act::Asked(answer) => flight.ask(answer),
+                Act::Wait => match flight.deliver(tape, Nanos(0)) {
+                    Some(answer) => self.deliver(&mut driver, answer),
+                    // A stall: the oracle's "nothing stalls".
+                    None => return Err(oracle("the driver waits with nothing asked")),
+                },
             }
         }
-        Err("no outcome in 20000 steps".into())
+        // A stall too; the bound is far above any request of the model.
+        Err(oracle("no outcome in 20000 steps"))
     }
 
-    fn check_end(&self, outcome: &Outcome, fresh: &[FreshUnit]) -> Result<(), String> {
+    fn check_end(&self, outcome: &Outcome, fresh: &[FreshUnit]) -> Result<(), Broke> {
         let checks: Checks = match outcome {
             Outcome::Built { ran } => ran.checks,
             Outcome::Certified { checks } => *checks,
-            other => return Err(format!("the request ended {other:?}")),
+            other => return Err(oracle(format!("the request ended {other:?}"))),
         };
         if checks.rechecks != 0 {
-            return Err(format!("{} checks of an item already proved in this snapshot", checks.rechecks));
+            return Err(oracle(format!("{} checks of an item already proved in this snapshot", checks.rechecks)));
         }
         let address = outside::address(certificate(), SHAPE, &[self.world()]);
         let Some(bytes) = self.disk.records.get(&(Certificate::TAG.0, address.id().0)) else {
-            return Err("an answer with no certificate of the tree".into());
+            return Err(oracle("an answer with no certificate of the tree"));
         };
-        let root = record::open::<Certificate>(bytes, &address).map_err(|e| e.to_string())?;
-        let payload = root.payload.follow(bytes).map_err(|e| e.to_string())?;
+        let root = record::open::<Certificate>(bytes, &address).map_err(|e| oracle(e.to_string()))?;
+        let payload = root.payload.follow(bytes).map_err(|e| oracle(e.to_string()))?;
         let manifests: Vec<u8> = fresh.iter().flat_map(|unit| unit.manifest.id().0).collect();
         if payload != &manifests[..] {
-            return Err("the certificate names other manifests than a fresh build's".into());
+            return Err(oracle("the certificate names other manifests than a fresh build's"));
         }
         for (c, unit) in fresh.iter().enumerate() {
             if !self.disk.records.contains_key(&(UnitManifest::TAG.0, unit.manifest.id().0)) {
-                return Err(format!("unit {c}'s manifest is not in the store"));
+                return Err(oracle(format!("unit {c}'s manifest is not in the store")));
             }
         }
         Ok(())
     }
 }
 
-/// Runs `ops` from an empty store, each process with a memo from `make`; the outcomes of the
-/// requests that finished.
-fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn() -> M) -> Result<(Vec<Outcome>, Model), String> {
+/// Runs `ops` from an empty store, each process with a memo from `make`, the host's answers
+/// delivered in the order `tape` chooses; the outcomes of the requests that finished.
+fn run<M: Memo>(
+    ops: &[Op],
+    tape: &Tape,
+    plant: Plant,
+    kills: bool,
+    make: impl Fn() -> M,
+) -> Result<(Vec<Outcome>, Model), Broke> {
     PLANT.set(plant);
     let result = (|| {
         let mut model = Model::new();
-        let mut rng = SplitMix64::new(seed);
         let mut memo = make();
         let mut outcomes = Vec::new();
         let mut last_built = false;
@@ -696,10 +725,10 @@ fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn(
             match op {
                 Op::Request { kill } => {
                     let kill = kill.filter(|_| kills);
-                    match model.request(&mut memo, &mut rng, kill)? {
+                    match model.request(&mut memo, tape, kill)? {
                         Some(outcome) => {
                             if last_built && !matches!(outcome, Outcome::Certified { .. }) {
-                                return Err(format!("a request with no edit after an answer ended {outcome:?}"));
+                                return Err(oracle(format!("a request with no edit after an answer ended {outcome:?}")));
                             }
                             last_built = true;
                             outcomes.push(outcome);
@@ -723,21 +752,26 @@ fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn(
     result
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let c = tc.draw(gs::integers::<u8>().max_value(2)) as usize;
-    let i = tc.draw(gs::integers::<u8>().max_value(2)) as usize;
-    let v = tc.draw(gs::integers::<u8>().max_value(2));
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
-        0 => Op::Body(c, i, v),
-        1 => Op::Sig(c, i, v),
-        2 => Op::Param(c, i, v),
-        3 => Op::Toggle(c, i),
-        4 => Op::Env(i % 2, (v > 0).then_some(v)),
-        5 => Op::Restart,
-        6 => Op::Request { kill: Some(u32::from(tc.draw(gs::integers::<u8>().max_value(60))) + 1) },
-        _ => REQUEST,
+/// One edit, restart or request. Calm (every draw 0) is a request that is not killed.
+fn op(tape: &Tape) -> Op {
+    let c = tape.int_in(0..=2u8, "unit") as usize;
+    let i = tape.int_in(0..=2u8, "item") as usize;
+    let v = tape.int_in(0..=2u8, "value");
+    // Ten kinds, a plain request three of them, as before; it is at 0 so the calm op is quiet.
+    match tape.int_in(0..=9u8, "op") {
+        0..=2 => REQUEST,
+        3 => Op::Body(c, i, v),
+        4 => Op::Sig(c, i, v),
+        5 => Op::Param(c, i, v),
+        6 => Op::Toggle(c, i),
+        7 => Op::Env(i % 2, (v > 0).then_some(v)),
+        8 => Op::Restart,
+        _ => Op::Request { kill: Some(u32::from(tape.int_in(0..=60u8, "kill at")) + 1) },
     }
+}
+
+fn ops(tape: &Tape) -> Vec<Op> {
+    tape.vec(0..=30, "ops", op)
 }
 
 const CAP: u64 = 1 << 20;
@@ -746,34 +780,36 @@ const CAP: u64 = 1 << 20;
 /// host's answers, every hit and every reuse is what a fresh build files, every check is made
 /// once per request and none after a proof, no task runs for a record the store holds, at most
 /// `max(workers, 1)` run, and a request after an answer with no edit is certified.
-#[hegel::test(test_cases = 200)]
-fn a_hit_is_only_what_a_fresh_build_files(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None, true, || RecordsOnly) {
-        panic!("{why}");
-    }
+#[test]
+fn a_hit_is_only_what_a_fresh_build_files() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || RecordsOnly).map(|_| ())
+    });
 }
 
 /// The invariant: the same under `Resident`, a memo kept across requests of one process.
-#[hegel::test(test_cases = 200)]
-fn a_resident_hit_is_only_what_a_fresh_build_files(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None, true, || Resident::new(CAP)) {
-        panic!("{why}");
-    }
+#[test]
+fn a_resident_hit_is_only_what_a_fresh_build_files() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || Resident::new(CAP)).map(|_| ())
+    });
 }
 
-fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    let (plain, plain_model) = run(ops, seed, plant, false, || RecordsOnly)?;
-    let (resident, resident_model) = run(ops, seed, plant, false, || Resident::new(CAP))?;
+/// The two memos run `ops` under one schedule. The schedule stays one seed drawn from the case's
+/// tape: the two runs must make the same choices in the same order, and a tape hands each choice
+/// out once, so each run reads its own `Tape::seeded` of that seed.
+fn refines(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let seed = tape.next_u64("schedule seed");
+    let (plain, plain_model) = run(ops, &Tape::seeded(seed), plant, false, || RecordsOnly)?;
+    let (resident, resident_model) = run(ops, &Tape::seeded(seed), plant, false, || Resident::new(CAP))?;
     if plain != resident {
-        return Err(format!("outcomes differ: records-only {plain:?}, resident {resident:?}"));
+        return Err(oracle(format!("outcomes differ: records-only {plain:?}, resident {resident:?}")));
     }
     let bytes = |model: &Model| model.disk.records.iter().map(|(key, bytes)| (*key, bytes.to_vec())).collect::<Vec<_>>();
     if bytes(&plain_model) != bytes(&resident_model) {
-        return Err("the stores differ between records-only and resident".into());
+        return Err(oracle("the stores differ between records-only and resident"));
     }
     Ok(())
 }
@@ -781,75 +817,66 @@ fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
 /// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes (the
 /// check counters included), the same tasks run and the same records written, for any edits and
 /// restarts.
-#[hegel::test(test_cases = 200)]
-fn resident_refines_records_only(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = refines(&ops, seed, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn resident_refines_records_only() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        refines(&ops, tape, Plant::None)
+    });
 }
 
-/// `ops` pass as the code is, and with `plant` some seed's run is refused saying `says`.
-fn caught(ops: &[Op], plant: Plant, says: &str, check: impl Fn(&[Op], u64, Plant) -> Result<(), String>) {
-    let mut caught = false;
-    for seed in 0..16 {
-        check(ops, seed, Plant::None).unwrap();
-        if let Err(why) = check(ops, seed, plant) {
-            assert!(why.contains(says), "{plant:?}: {why}");
-            caught = true;
-        }
-    }
-    assert!(caught, "the oracle missed {plant:?}");
-}
+/// A control's cases: the 16 seeds each control looped by hand before, now schedules on the tape.
+const CONTROL: Config = Config::cases(16);
 
-fn plain(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    run(ops, seed, plant, true, || RecordsOnly).map(|_| ())
+fn plain(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || RecordsOnly).map(|_| ())
 }
 
 #[test]
 fn the_oracle_catches_a_key_that_leaves_out_a_name() {
     let ops = [REQUEST, Op::Sig(1, 2, 1), REQUEST];
-    caught(&ops, Plant::KeyLeavesOutNames, "a key that misses an input", plain);
+    blaze_sim::control(CONTROL, Plant::None, Plant::KeyLeavesOutNames, "a key that misses an input", |tape, plant| {
+        plain(&ops, tape, plant)
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_manifest_key_that_leaves_out_late_inputs() {
     let ops = [REQUEST, Op::Env(0, Some(1)), REQUEST];
-    caught(&ops, Plant::KeyLeavesOutLateInputs, "a key that misses an input", plain);
+    blaze_sim::control(CONTROL, Plant::None, Plant::KeyLeavesOutLateInputs, "a key that misses an input", |tape, plant| {
+        plain(&ops, tape, plant)
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_dropped_read() {
     let ops = [REQUEST, Op::Sig(1, 2, 1), REQUEST];
-    caught(&ops, Plant::ReadDropped, "not what a fresh build files", plain);
+    blaze_sim::control(CONTROL, Plant::None, Plant::ReadDropped, "not what a fresh build files", |tape, plant| {
+        plain(&ops, tape, plant)
+    });
 }
 
 #[test]
 fn the_oracle_catches_an_overcommitted_pool() {
-    caught(&[REQUEST], Plant::OverCommitsPool, "tasks run at once", plain);
+    blaze_sim::control(CONTROL, Plant::None, Plant::OverCommitsPool, "tasks run at once", |tape, plant| {
+        plain(&[REQUEST], tape, plant)
+    });
 }
 
+/// The kill points of before (after effect 1 to 79 of the first request), drawn from the tape;
+/// its 316 cases are the 79 kill points times the 4 seeds each was run under by hand.
 #[test]
 fn the_oracle_catches_a_manifest_filed_before_its_records() {
-    let mut caught = false;
-    for kill in 1..80 {
-        let ops = [Op::Request { kill: Some(kill) }, REQUEST];
-        for seed in 0..4 {
-            plain(&ops, seed, Plant::None).unwrap();
-            if let Err(why) = plain(&ops, seed, Plant::ManifestBeforeRecords) {
-                assert!(why.contains("lacks"), "{why}");
-                caught = true;
-            }
-        }
-    }
-    assert!(caught, "the oracle missed a manifest filed before its records");
+    blaze_sim::control(Config::cases(79 * 4), Plant::None, Plant::ManifestBeforeRecords, "lacks", |tape, plant| {
+        let kill = tape.int_in(1..=79u32, "kill at");
+        plain(&[Op::Request { kill: Some(kill) }, REQUEST], tape, plant)
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_stale_resident_entry() {
     let ops = [REQUEST, Op::Env(0, Some(1)), REQUEST];
-    caught(&ops, Plant::StaleResident, "", refines);
+    blaze_sim::control(CONTROL, Plant::None, Plant::StaleResident, "", |tape, plant| refines(&ops, tape, plant));
 }
 
 /// Body 1 of unit 2 is edited away and back while body 0 moves: its key hits the record of the
@@ -858,13 +885,21 @@ fn the_oracle_catches_a_stale_resident_entry() {
 #[test]
 fn the_oracle_catches_a_check_after_a_hit() {
     let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), Op::Body(2, 0, 1), REQUEST];
-    caught(&ops, Plant::ChecksAfterHit, "a check after a hit", plain);
+    blaze_sim::control(CONTROL, Plant::None, Plant::ChecksAfterHit, "a check after a hit", |tape, plant| {
+        plain(&ops, tape, plant)
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_lookup_under_a_held_manifest() {
     let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST];
-    caught(&ops, Plant::LooksUpUnderHeldManifest, "a lookup under a held manifest", plain);
+    blaze_sim::control(
+        CONTROL,
+        Plant::None,
+        Plant::LooksUpUnderHeldManifest,
+        "a lookup under a held manifest",
+        |tape, plant| plain(&ops, tape, plant),
+    );
 }
 
 /// A private body edit in unit 0 leaves its surface equal; keyed by unit 0's manifest, its
@@ -872,11 +907,17 @@ fn the_oracle_catches_a_lookup_under_a_held_manifest() {
 #[test]
 fn the_oracle_catches_a_dependent_examined_under_an_unchanged_surface() {
     let ops = [REQUEST, Op::Body(0, 1, 5), REQUEST];
-    caught(&ops, Plant::UnitKeyedByDepManifests, "a dependent of an unchanged surface was examined", plain);
+    blaze_sim::control(
+        CONTROL,
+        Plant::None,
+        Plant::UnitKeyedByDepManifests,
+        "a dependent of an unchanged surface was examined",
+        |tape, plant| plain(&ops, tape, plant),
+    );
 }
 
 fn ran_of(ops: &[Op]) -> Ran {
-    let (outcomes, _) = run(ops, 7, Plant::None, false, || RecordsOnly).unwrap();
+    let (outcomes, _) = run(ops, &Tape::seeded(7), Plant::None, false, || RecordsOnly).unwrap();
     match outcomes.last() {
         Some(Outcome::Built { ran }) => *ran,
         other => panic!("the last request ended {other:?}"),
@@ -885,9 +926,10 @@ fn ran_of(ops: &[Op]) -> Ran {
 
 #[test]
 fn a_no_op_runs_no_task() {
-    let (outcomes, _) = run(&[REQUEST, REQUEST], 1, Plant::None, false, || RecordsOnly).unwrap();
+    let (outcomes, _) = run(&[REQUEST, REQUEST], &Tape::seeded(1), Plant::None, false, || RecordsOnly).unwrap();
     assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
-    let (outcomes, _) = run(&[REQUEST, Op::Restart, REQUEST], 1, Plant::None, false, || RecordsOnly).unwrap();
+    let (outcomes, _) =
+        run(&[REQUEST, Op::Restart, REQUEST], &Tape::seeded(1), Plant::None, false, || RecordsOnly).unwrap();
     assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
 }
 
@@ -895,7 +937,7 @@ fn a_no_op_runs_no_task() {
 #[test]
 fn an_undone_edit_is_certified() {
     let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), REQUEST];
-    let (outcomes, _) = run(&ops, 3, Plant::None, false, || RecordsOnly).unwrap();
+    let (outcomes, _) = run(&ops, &Tape::seeded(3), Plant::None, false, || RecordsOnly).unwrap();
     assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
 }
 
@@ -988,10 +1030,10 @@ fn a_cycle_is_one_component() {
     assert_ne!(a1, a2);
 }
 
-fn drawn_id(tc: &hegel::TestCase) -> ContentId {
+fn drawn_id(tape: &Tape) -> ContentId {
     let mut id = [0u8; 32];
     for chunk in id.chunks_mut(8) {
-        chunk.copy_from_slice(&tc.draw(gs::integers::<u64>()).to_le_bytes());
+        chunk.copy_from_slice(&tape.int::<u64>("id").to_le_bytes());
     }
     ContentId(id)
 }
@@ -999,25 +1041,27 @@ fn drawn_id(tc: &hegel::TestCase) -> ContentId {
 /// The invariant: a segment reference [`crate::store::SegmentRef::new`] made decodes from its
 /// row to itself; a row of another length, with its padding not zero, or naming an index off
 /// [`crate::store::ALIGN`], is refused.
-#[hegel::test(test_cases = 200)]
-fn a_segment_ref_round_trips(tc: hegel::TestCase) {
+#[test]
+fn a_segment_ref_round_trips() {
     use crate::store::{ALIGN, ENTRY, FOOTER, HEADER, SegmentId, SegmentRef, WireError};
 
-    let digest = SegmentId(drawn_id(&tc));
-    let index_at = tc.draw(gs::integers::<u64>().min_value(HEADER as u64 / ALIGN).max_value(1 << 24)) * ALIGN;
-    let count = tc.draw(gs::integers::<u32>().max_value(1 << 20));
-    let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
-    let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
-    let row = made.encode();
-    assert_eq!(SegmentRef::decode(&row), Ok(made));
-    assert_eq!((made.digest(), made.size(), made.index_at(), made.count()), (digest, len, index_at, count));
-    assert!(matches!(SegmentRef::decode(&row[..SegmentRef::ROW - 1]), Err(WireError::Length { .. })));
-    let mut padded = row;
-    padded[SegmentRef::ROW - 1] = 1;
-    assert_eq!(SegmentRef::decode(&padded), Err(WireError::Padding { at: 52 }));
-    assert!(matches!(SegmentRef::new(digest, len + 1, index_at + 1, count), Err(WireError::Index { .. })));
-    assert!(matches!(SegmentRef::new(digest, len + 1, index_at, count), Err(WireError::Index { .. })));
-    assert!(SegmentRef::new(digest, len, HEADER as u64 - ALIGN, count).is_err(), "an index inside the header");
+    blaze_sim::check(Config::cases(200), |tape| {
+        let digest = SegmentId(drawn_id(tape));
+        let index_at = tape.int_in(HEADER as u64 / ALIGN..=1 << 24, "index at") * ALIGN;
+        let count = tape.int_in(0..=1u32 << 20, "count");
+        let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+        let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
+        let row = made.encode();
+        assert_eq!(SegmentRef::decode(&row), Ok(made));
+        assert_eq!((made.digest(), made.size(), made.index_at(), made.count()), (digest, len, index_at, count));
+        assert!(matches!(SegmentRef::decode(&row[..SegmentRef::ROW - 1]), Err(WireError::Length { .. })));
+        let mut padded = row;
+        padded[SegmentRef::ROW - 1] = 1;
+        assert_eq!(SegmentRef::decode(&padded), Err(WireError::Padding { at: 52 }));
+        assert!(matches!(SegmentRef::new(digest, len + 1, index_at + 1, count), Err(WireError::Index { .. })));
+        assert!(matches!(SegmentRef::new(digest, len + 1, index_at, count), Err(WireError::Index { .. })));
+        assert!(SegmentRef::new(digest, len, HEADER as u64 - ALIGN, count).is_err(), "an index inside the header");
+    });
 }
 
 /// A segment length is taken at both ends of its range and refused one past each.
@@ -1033,63 +1077,70 @@ fn a_segment_len_is_bounded_at_both_ends() {
 
 /// The invariant: a statement decodes from its 200 bytes to itself; bytes cut short or
 /// extended, a tier byte that names no tier, or padding not zero, are refused.
-#[hegel::test(test_cases = 200)]
-fn a_statement_round_trips(tc: hegel::TestCase) {
+#[test]
+fn a_statement_round_trips() {
     use crate::kind::Tier;
     use crate::store::{SegmentId, SegmentLen, Statement, WireError};
 
-    let len = tc.draw(gs::integers::<u64>().min_value(SegmentLen::LEAST).max_value(SegmentLen::MOST));
-    let mut signature = [0u8; 64];
-    signature[..32].copy_from_slice(&drawn_id(&tc).0);
-    signature[32..].copy_from_slice(&drawn_id(&tc).0);
-    let statement = Statement {
-        namespace: Namespace(tc.draw(gs::integers::<u64>())),
-        segment: SegmentId(drawn_id(&tc)),
-        len: SegmentLen::new(len).unwrap_or_else(|why| panic!("{why}")),
-        toolchain: drawn_id(&tc),
-        records: tc.draw(gs::integers::<u32>()),
-        tier: if tc.draw(gs::integers::<u8>().max_value(1)) == 1 { Tier::Fast } else { Tier::Top },
-        issued: tc.draw(gs::integers::<u64>()),
-        signer: drawn_id(&tc).0,
-        signature,
-    };
-    let bytes = statement.encode();
-    assert_eq!(&bytes[..Statement::BODY], &statement.body()[..]);
-    assert_eq!(Statement::decode(&bytes), Ok(statement));
-    let cut = usize::from(tc.draw(gs::integers::<u16>().max_value(Statement::LEN as u16 - 1)));
-    assert_eq!(Statement::decode(&bytes[..cut]), Err(WireError::Length { len: cut, wanted: Statement::LEN }));
-    let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
-    extended.extend_from_slice(&bytes);
-    extended.push(0);
-    assert_eq!(Statement::decode(&extended), Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN }));
-    let mut tier = bytes;
-    tier[92] = 2;
-    assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
-    let mut padded = bytes;
-    padded[94] = 1;
-    assert_eq!(Statement::decode(&padded), Err(WireError::Padding { at: 94 }));
+    blaze_sim::check(Config::cases(200), |tape| {
+        let len = tape.int_in(SegmentLen::LEAST..=SegmentLen::MOST, "len");
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&drawn_id(tape).0);
+        signature[32..].copy_from_slice(&drawn_id(tape).0);
+        let statement = Statement {
+            namespace: Namespace(tape.int::<u64>("namespace")),
+            segment: SegmentId(drawn_id(tape)),
+            len: SegmentLen::new(len).unwrap_or_else(|why| panic!("{why}")),
+            toolchain: drawn_id(tape),
+            records: tape.int::<u32>("records"),
+            tier: if tape.int_in(0..=1u8, "tier") == 1 { Tier::Fast } else { Tier::Top },
+            issued: tape.int::<u64>("issued"),
+            signer: drawn_id(tape).0,
+            signature,
+        };
+        let bytes = statement.encode();
+        assert_eq!(&bytes[..Statement::BODY], &statement.body()[..]);
+        assert_eq!(Statement::decode(&bytes), Ok(statement));
+        let cut = usize::from(tape.int_in(0..=Statement::LEN as u16 - 1, "cut"));
+        assert_eq!(Statement::decode(&bytes[..cut]), Err(WireError::Length { len: cut, wanted: Statement::LEN }));
+        let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
+        extended.extend_from_slice(&bytes);
+        extended.push(0);
+        assert_eq!(
+            Statement::decode(&extended),
+            Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN })
+        );
+        let mut tier = bytes;
+        tier[92] = 2;
+        assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
+        let mut padded = bytes;
+        padded[94] = 1;
+        assert_eq!(Statement::decode(&padded), Err(WireError::Padding { at: 94 }));
+    });
 }
 
 /// The invariant: on a machine that is no trusted writer every package is filed in the
 /// machine's own namespace, whatever its origin: a fully local private build names no shared
 /// namespace. On a trusted writer, registry and toolchain packages are public and the rest the
 /// organisation's.
-#[hegel::test(test_cases = 200)]
-fn an_untrusted_machine_files_everything_locally(tc: hegel::TestCase) {
+#[test]
+fn an_untrusted_machine_files_everything_locally() {
     use crate::kind::{Origin, namespace_of};
 
-    let origin = match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => Origin::Registry { checksum: drawn_id(&tc) },
-        1 => Origin::Toolchain,
-        _ => Origin::Private,
-    };
-    let org = Namespace(tc.draw(gs::integers::<u64>()));
-    assert_eq!(namespace_of(origin, org, false), Namespace::LOCAL);
-    let trusted = namespace_of(origin, org, true);
-    match origin {
-        Origin::Registry { .. } | Origin::Toolchain => assert_eq!(trusted, Namespace::PUBLIC),
-        Origin::Private => assert_eq!(trusted, org),
-    }
+    blaze_sim::check(Config::cases(200), |tape| {
+        let origin = match tape.int_in(0..=2u8, "origin") {
+            0 => Origin::Registry { checksum: drawn_id(tape) },
+            1 => Origin::Toolchain,
+            _ => Origin::Private,
+        };
+        let org = Namespace(tape.int::<u64>("org"));
+        assert_eq!(namespace_of(origin, org, false), Namespace::LOCAL);
+        let trusted = namespace_of(origin, org, true);
+        match origin {
+            Origin::Registry { .. } | Origin::Toolchain => assert_eq!(trusted, Namespace::PUBLIC),
+            Origin::Private => assert_eq!(trusted, org),
+        }
+    });
 }
 
 /// `TAGS` names every kind once: no tag twice, no name twice, each kind at its own tag.

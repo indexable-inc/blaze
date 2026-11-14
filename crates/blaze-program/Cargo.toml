@@ -24,7 +24,7 @@ blaze-keyed.workspace = true
 [dev-dependencies]
 # `Aligned`: core records are opened 16-aligned.
 blaze-format.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

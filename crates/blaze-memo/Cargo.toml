@@ -30,9 +30,8 @@ blaze-mem.workspace = true
 blaze-memo-macros.workspace = true
 
 [dev-dependencies]
-# The simulation's seeded draws.
-blaze-rng.workspace = true
-hegeltest.workspace = true
+# Every test's choices, the simulation's schedule among them, drawn from one tape.
+blaze-sim.workspace = true
 
 [lints]
 workspace = true
