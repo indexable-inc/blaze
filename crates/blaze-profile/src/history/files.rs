@@ -1328,7 +1328,7 @@ impl CapRule {
 /// The builds the rule keeps whole: every one in `running`, and the `keep` highest-numbered of
 /// the others any file of `kept` holds rows of, sorted. A file whose rows span `lo..=hi` says
 /// builds `lo` and `hi` had rows; one between them is in the same unit whatever it is.
-fn kept_builds<'a, R: Allocator + Clone, A: Allocator + Clone>(
+fn kept_builds<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Clone>(
     kept: impl Iterator<Item = &'a Kept>,
     running: &BTreeSet<u64, R>,
     keep: usize,
@@ -1364,7 +1364,7 @@ fn past_cap<'a>(
 
 /// [`past_cap_in`] once the history is past its cap: the units, the kept builds set aside, then
 /// the rest retired oldest first into `gone`, the caller's set, of the caller's allocator.
-fn units_past_cap<'a, R: Allocator + Clone, A: Allocator + Clone>(
+fn units_past_cap<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Clone + std::alloc::AllocatorClone>(
     kept: impl Iterator<Item = &'a Kept> + Clone,
     total: u64,
     cap: u64,
