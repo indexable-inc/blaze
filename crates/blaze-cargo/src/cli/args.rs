@@ -622,15 +622,37 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
                 && !flags.selection.is_empty() =>
         {
-            let what = match (&flags.query, &flags.rules) {
-                (Some(_), _) => "`--query`",
-                (None, Some(_)) => "`--rules`",
-                (None, None) => "`--replace`",
-            };
             let given: Vec<String> = flags.selection.iter().map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
             Some(format!(
-                "{what} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
+                "{} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
                  so {} would change nothing: run it without",
+                rules_mode(flags),
+                given.join(", ")
+            ))
+        }
+        // `replaced` writes a diff or a status line, never JSON.
+        Command::Check
+            if flags.query.is_none()
+                && (flags.rules.is_some() || !flags.replace.is_empty())
+                && flags.message_format.iter().flat_map(|it| it.split(',')).any(|it| it.to_ascii_lowercase().starts_with("json")) =>
+        {
+            Some(format!(
+                "{} writes a diff or a status line and no JSON messages yet, so `--message-format` json \
+                 would change nothing: run it without",
+                rules_mode(flags)
+            ))
+        }
+        // No build runs, no lock file is read and nothing is fetched or configured: these
+        // would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.build_only.is_empty() =>
+        {
+            let given: Vec<String> = flags.build_only.iter().map(|it| format!("`{it}`")).collect(); // alloc: a refusal's few flags
+            Some(format!(
+                "{} runs no build, reads no lock file, fetches nothing and sends no cargo config, \
+                 so {} would change nothing: run it without",
+                rules_mode(flags),
                 given.join(", ")
             ))
         }
@@ -669,6 +691,15 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             )
         }
         _ => None,
+    }
+}
+
+/// Which of `--query`, `--rules` and `--replace` a refusal names, the first given.
+fn rules_mode(flags: &Flags) -> &'static str {
+    match (&flags.query, &flags.rules) {
+        (Some(_), _) => "`--query`",
+        (None, Some(_)) => "`--rules`",
+        (None, None) => "`--replace`",
     }
 }
 
@@ -745,7 +776,17 @@ pub struct Flags {
     pub lint_levels: Vec<String>,
     /// Each flag of [`SELECTS_A_BUILD`] given, by its long name, in order.
     pub selection: Vec<&'static str>,
+    /// Each flag of [`STEERS_A_BUILD`] given, and each `-Z` but `unstable-options`, as typed
+    /// in short: what a build reads and `--query`, `--rules` and `--replace` would not.
+    pub build_only: Vec<String>,
 }
+
+/// The flags that steer how a build runs: its jobs, what it does past a failure, the lock
+/// file and the network, cargo's config. `--query`, `--rules` and `--replace` run no build,
+/// read no lock file, fetch nothing, and send none of the config, so they refuse each by name
+/// ([`refused`]). `-Z unstable-options` is read: it allows `-C`, which they honour.
+const STEERS_A_BUILD: &[&str] =
+    &["jobs", "keep-going", "fail-fast", "no-fail-fast", "locked", "frozen", "offline", "no-locked", "config"];
 
 /// The flags that choose what a build compiles and reports: packages, features, profile,
 /// target and targets. `--query`, `--rules` and `--replace` read the checkout as the daemon's
@@ -779,6 +820,12 @@ impl Flags {
     fn read(&mut self, flag: &Flag, value: Option<&str>) {
         if let Some(name) = flag.long.filter(|it| SELECTS_A_BUILD.contains(it)) {
             self.selection.push(name);
+        }
+        if let Some(name) = flag.long.filter(|it| STEERS_A_BUILD.contains(it)) {
+            self.build_only.push(format!("--{name}"));
+        }
+        if flag.long.is_none() && flag.short == Some('Z') && value != Some("unstable-options") {
+            self.build_only.push(format!("-Z {}", value.unwrap_or_default()));
         }
         let owned = || value.map(str::to_owned);
         match flag.long.unwrap_or("") {
