@@ -11,6 +11,7 @@
 #![blaze::sans_io]
 
 use std::alloc::Global;
+use std::ops::Range;
 use std::sync::{Arc, TryLockError};
 
 use blaze_rng::SplitMix64;
@@ -25,16 +26,28 @@ pub struct Choice {
 }
 
 /// A stretch of a tape drawn for one thing (an element of a list, an operation):
-/// `choices[start..end]`, which the shrinker deletes whole.
+/// `choices[span.range()]`, which the shrinker deletes whole.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub label: &'static str,
-    #[expect(
-        blaze::untyped_index,
-        reason = "a span's ends are counts of choices drawn, which the shrinker deletes by and other crates' tests read as numbers: a public field's type stays"
-    )]
     pub start: u32,
     pub end: u32,
+}
+
+impl Span {
+    /// The positions of a record's `choices` the span covers: `choices[span.range()]` is
+    /// what was drawn for it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    #[expect(
+        blaze::as_cast,
+        reason = "a span's ends are `u32` counts of choices, and a `usize` holds every `u32` on every target blaze builds for"
+    )]
+    pub fn range(&self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
 }
 
 /// What a tape hands out past its prefix.

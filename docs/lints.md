@@ -96,6 +96,16 @@ hash_twice = "deny"
 A group applies before the single lints the table names, so `hash_twice = "deny"` wins over
 `general = "allow"`. A rustc-style flag (`--allow=blaze::general`) does the same.
 
+An `#[expect]` that no finding fulfils is itself reported (`unfulfilled_lint_expectations`).
+`blaze check --all-targets` lints a library twice, plain and built with `--test`, and many lints
+judge a test build's production code differently (or not at all), so every expectation has one
+judge: the plain build judges each one it has, and the test build of a library, binary or example
+judges only the ones it alone has (in `#[cfg(test)]` code, on or in a `#[test]` function, or
+written under `cfg_attr(test, ..)`). A stale expectation on production code is therefore reported
+by a run that lints the plain build, not by `--tests` alone; and a lint that fires on production
+code only in the test build cannot be expected on the production item (change what the test
+does, or give the code the typed form the lint asks for).
+
 ## Workspace levels and the ratchet
 
 blaze's own workspace denies every lint of blaze's in every crate, and lets a crate that
