@@ -39,6 +39,12 @@ pub struct Conf {
     /// lint query keyed by the configuration is keyed by the profile's bytes.
     #[serde(skip)]
     pub profile: Option<crate::profile::Loaded>,
+    /// The measured items' held values the complexity lints read
+    /// ([`crate::baseline::items::load`], from the workspace ratchet's baselines directory):
+    /// hashed by the file's bytes, as the profile is. None when nothing loaded one: every item
+    /// over its bound is a finding then, which is what a bless runs under.
+    #[serde(skip)]
+    pub items: Option<crate::baseline::items::Loaded>,
 }
 
 /// A `clippy.toml` holds no NaN that two equal configurations could differ by in practice; a
@@ -51,6 +57,7 @@ impl std::hash::Hash for Conf {
         self.msrv.hash(state);
         state.write_u64(table_hash(&self.table));
         self.profile.hash(state);
+        self.items.hash(state);
     }
 }
 
@@ -83,7 +90,7 @@ fn value_hash(value: &toml::Value) -> u64 {
 }
 
 /// The counts the lints read ([`Conf::int`]): `u64` in clippy's `Conf`, and blaze's own.
-const COUNTS: [&str; 19] = [
+const COUNTS: [&str; 33] = [
     "array-size-threshold",
     "stack-size-threshold",
     "enum-variant-size-threshold",
@@ -104,6 +111,21 @@ const COUNTS: [&str; 19] = [
     "bounded-heap-field-string-bytes",
     "bounded-heap-field-vec-len",
     "large-box-threshold",
+    // The complexity lints' bounds (docs/lints.md, "Complexity"; `blaze::complexity::Measure`).
+    "function-weight-threshold",
+    "path-count-threshold",
+    "live-state-threshold",
+    "effect-breadth-threshold",
+    "exits-threshold",
+    "function-lines-threshold",
+    "function-statements-threshold",
+    "file-lines-threshold",
+    "params-threshold",
+    "struct-fields-threshold",
+    "enum-variants-threshold",
+    "nesting-threshold",
+    "fan-out-threshold",
+    "module-cycle-threshold",
 ];
 
 /// The flags the lints read ([`Conf::bool`]).
@@ -384,7 +406,7 @@ impl Conf {
             }
             None => rust_version.and_then(Version::parse),
         };
-        Ok(Conf { path, table, msrv, profile: None })
+        Ok(Conf { path, table, msrv, profile: None, items: None })
     }
 
     /// The profile the lints are to read: `profile` and its percents from this file, each key

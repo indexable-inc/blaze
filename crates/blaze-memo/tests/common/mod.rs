@@ -49,7 +49,7 @@ pub struct Crate {
 #[blaze_memo::tracked(returns(copy))]
 pub fn value(db: &dyn Db, leaf: Leaf) -> u64 {
     db.pause();
-    let n = leaf.n(db);
+    let n = *leaf.n(db);
     db.ran(VALUE, leaf.gid(), 0);
     n
 }

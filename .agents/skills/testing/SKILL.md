@@ -57,7 +57,11 @@ them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants
 collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
 gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
 or regenerating code, read the invariants its crate states: they are what the new code is judged
-against.
+against. A promise in a doc comment is either derived (an effect attribute the build checks) or a `#
+Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``, ``Evidence: Lean `Name` `` or
+`Unverified: why`; never prose alone. The `claims` lints refuse a doc the effect walk refutes, a
+promise held by nothing and a stale pointer; the ledger refuses a crate's count of open claims
+growing or any claim's level dropping (docs/v2/plan/design/claims.md).
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 

@@ -194,6 +194,42 @@ twice cannot be written and skipping it cannot either.
 - Counters: checks per kind per request; a second check of one thing in one snapshot is a bug the
   simulation's oracle catches.
 
+## Findings (`crates/blaze-findings`)
+
+A lint finding is a record keyed like the check it comes from, never a side effect of one.
+
+- **Records.** Per (body, pass): `BodyFindings` (tag 20, key = toolchain, body key, pass id and
+  version, and the ids of what the pass read beyond the body). Per item for a workspace fold:
+  `ItemRows` (21, same key). The fold's leaves: `FoldFindings` (22, key = pass, scope, leaf,
+  rows digest). An analysis that reads beyond its item: `DeferredFindings` (23, key = pass,
+  item, the ids it read). A finding holds the lint, its item, a range relative to the item, a
+  message id with typed arguments and a fix of item-relative edits; no level and no file
+  position, so a level change or a moved item re-keys nothing. Its id hashes the lint, item,
+  message, arguments and ordinal: `new` and `fixed` are a diff of ids.
+- **Classes** (the class rule). *Answer*: computed before the reply; every pass with a lint at
+  deny anywhere is this class whatever it declares, so a gate never passes unchecked. *Cheap*:
+  advisory per-body passes and the delta of each workspace fold, right after the answer at
+  interactive QoS on the performance cores. *Deferred*: expensive analyses (value ranges,
+  near-duplicate search, mutation testing), after the cheap class drains, at utility QoS on a
+  quarter of the cores, remote-eligible. A pass declares its expected cost; one over its class's
+  bound (100 µs answer, 1 ms cheap per subject) is reported by name with both numbers.
+- **Cancellation.** All classes run on the command's snapshot. A newer command cancels work
+  that read something that moved or is no longer asked for, and what depends on it; it adopts
+  in-flight work of the same (pass, subject, key). A file change alone starts nothing (rule 80);
+  nothing is computed twice.
+- **Waits.** `Wait::Answer` replies with the answer class; `Wait::Cheap` (the default) also
+  waits for cheap work up to 500 ms; `Wait::All { budget }` waits for everything up to the
+  budget. Every reply lists what is pending (lint, item, class, estimate) and which passes were
+  slow; a superseded command's reply says so.
+- **Adoption ladder.** `step` in `[workspace.metadata.blaze.lints]`: `rust` (general at warn),
+  `suggest` (and `blaze::suggest`: where a blaze feature or a tighter type would pay), `edition`,
+  `strict` (blaze's own table). Moving up baselines the new step's findings per lint and crate.
+- **Cost against the floor.** A body edit re-runs only that body's passes (the floor) plus, per
+  fold, one leaf of ~64 rows and the root of 32 bytes per leaf: at 2^20 rows ~0.5 MB rewritten
+  and ~1 ms per edit (estimates), the root far over the floor of one leaf; a middle level of the
+  tree brings it to the floor and is not built yet. Not wired into `blaze check` yet; the
+  scheduler is sans-IO and its simulation is the proof.
+
 ## Deleted and reused
 
 - **Deleted** (the audit's list), each after its replacement passes: blaze-query's validity,

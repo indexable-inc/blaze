@@ -45,13 +45,34 @@
 //! - the rest: a number anywhere, a string where the program branches or looks up by it (a
 //!   compare, a map key, an environment variable's name, a path component): name it. A literal
 //!   passed to a `Duration` constructor is asked to name the duration.
+//!
+//! A string has its home already when a `const` of the crate, or of a local dependency, holds
+//! it ([`named_index`]): the literal is told that `const`'s path, with a machine-applicable fix
+//! where the path names it from here. `const BLAZE_HOME: &str = "BLAZE_HOME"` is the home; the
+//! second `"BLAZE_HOME"` is the finding. A string that spells an item's name (the variant of
+//! its `match` arm, a field beside it, its function, the type its method is of, its crate) is
+//! told the convention that maps the name to the text (`DepInfo` in snake_case is
+//! `"dep_info"`); a `match` or an array that spells every variant of an enum is one finding,
+//! whose fix is the reflection form (`for const` over the variants) where the crate has blaze's
+//! compile-time reflection on, else one `const` table beside the enum. What sibling crates
+//! share is [`shared`]'s.
+//!
+//! `repeated_format`: a format template (the string of a `format_args!` a formatting or error
+//! macro wrote: `format!`, `write!`, `panic!`, `anyhow!`, `bail!`, blaze's own) of
+//! [`template::TEMPLATE_WORDS_FLOOR`] words or more, its placeholders made one, written in two
+//! or more places of the crate. A template that is not a string literal (`concat!(..)`, a
+//! `const`) is not read; a macro that formats without `format_args!` (one that takes its
+//! template apart itself, as `tracing`'s field syntax does) is a gap.
+
+mod shared;
+mod template;
 
 use std::alloc::Global;
 
 use base_db::Db;
 use blaze_hash::HashMap;
 use hir_def::{
-    ConstId, DefWithBodyId, EnumId, EnumVariantId, FieldId, FunctionId, StaticId, VariantId,
+    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FieldId, FunctionId, StaticId, VariantId,
     expr_store::Body,
     hir::{
         ArithOp, Array, BinaryOp, BindingId, CmpOp, Expr, ExprId, Literal, Pat, PatId, Statement,
@@ -68,7 +89,8 @@ use syntax::{
     view::{self as ast, AstNode as _},
 };
 
-use super::{Finding, Lint, facts, frozen_collection, general_facts, test_code};
+use self::shared::{Access, UseClass};
+use super::{Finding, Lint, dup, facts, frozen_collection, general_facts, test_code};
 use crate::{check::Cx, diag::Applicability};
 
 /// How many `as` casts, borrows and string conversions a literal's use is followed up through.
@@ -105,6 +127,20 @@ const ENV_FNS: &[&str] = &["var", "var_os", "set_var", "remove_var"];
 /// The methods of `Path` and `PathBuf` whose argument is a path or one of its components.
 const PATH_METHODS: &[&str] =
     &["new", "join", "push", "with_extension", "with_file_name", "set_extension", "set_file_name"];
+/// The calls that fill or set what a name names: the writer's side of a key, a variable or a
+/// file ([`Access::Writes`]).
+const WRITES: &[&str] = &[
+    "insert", "entry", "set_var", "remove_var", "write", "create", "create_new", "create_dir",
+    "create_dir_all", "rename", "copy", "hard_link",
+];
+/// The calls that look a name up: the reader's side ([`Access::Reads`]).
+const READS: &[&str] = &[
+    "get", "get_mut", "contains_key", "contains", "remove", "var", "var_os", "read", "read_to_string",
+    "read_dir", "open", "metadata", "exists", "try_exists",
+];
+/// How many parents a formatted value is followed up to the `Err(..)` it is the error of:
+/// `Err(format!(..))` is two, `bail!`'s `return Err(anyhow!(..).into())` five.
+const ERR_DEPTH: usize = 6;
 
 /// A literal's value: what two sites must share to be the same fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -239,6 +275,12 @@ pub(crate) enum Ask {
     Spellings(Role),
     /// The enums whose discriminant indexes the array in this field.
     EnumIndex(FieldId),
+    /// The string `const`s whose value is this string ([`named_index`]).
+    Named(Symbol),
+    /// The bodies that write this format template, normalised ([`template::normalise`]).
+    Template(Symbol),
+    /// The fieldless enums whose variants' names are this set ([`variant_set_key`]).
+    VariantSet(Symbol),
 }
 
 /// The crate's answer to an [`Ask`].
@@ -249,6 +291,12 @@ pub(crate) struct Answer {
     consts: Vec<(ConstId, Value, Prim)>,
     spellings: Vec<(Symbol, DefWithBodyId)>,
     enums: Vec<EnumId>,
+    /// The `const`s that hold a string, in the crate's walk order.
+    named: Vec<ConstId>,
+    /// How many sites of a template are not the error of an `Err(..)`.
+    outside_err: u32,
+    /// The error types of the `Err(..)`s a template's sites are in, distinct.
+    errors: Vec<AdtId>,
 }
 
 /// A place compared against strings in one body: a [`Place`] or a local.
@@ -258,21 +306,63 @@ enum SetPlace {
     Local(BindingId),
 }
 
-/// What a string is used for where the program branches or looks up by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lookup {
-    Compared,
-    Key,
-    Env,
-    Path,
-}
-
 /// The item a string spells the name of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ItemName {
     Variant(EnumVariantId),
     Field(FieldId),
     Function(FunctionId),
+    /// The type the method it is in is of.
+    Type(AdtId),
+    /// The crate it is in.
+    Crate,
+}
+
+/// The convention that maps an item's name to the string spelling it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Case {
+    AsWritten,
+    Lower,
+    Snake,
+    Kebab,
+    ScreamingSnake,
+    Camel,
+    Pascal,
+    /// The same letters in another case, with no word boundary to say which.
+    OtherCase,
+}
+
+impl Case {
+    /// How a message says it: "in snake_case".
+    fn said(self) -> &'static str {
+        match self {
+            Case::AsWritten => "as written",
+            Case::Lower => "in lower case",
+            Case::Snake => "in snake_case",
+            Case::Kebab => "in kebab-case",
+            Case::ScreamingSnake => "in SCREAMING_SNAKE_CASE",
+            Case::Camel => "in camelCase",
+            Case::Pascal => "in PascalCase",
+            Case::OtherCase => "in another letter case",
+        }
+    }
+
+    /// The convention `text` is written in.
+    fn of(text: &str) -> Case {
+        let lower = text.chars().any(|c| c.is_ascii_lowercase());
+        let upper = text.chars().any(|c| c.is_ascii_uppercase());
+        if text.contains('-') {
+            Case::Kebab
+        } else if text.contains('_') || !lower {
+            if lower { Case::Snake } else { Case::ScreamingSnake }
+        } else if !upper {
+            Case::Lower
+        } else if text.starts_with(|c: char| c.is_ascii_uppercase()) {
+            Case::Pascal
+        } else {
+            Case::Camel
+        }
+    }
 }
 
 /// What is known of a literal beyond its use, the strongest first.
@@ -293,7 +383,7 @@ enum Known {
     VariantsDisagree(EnumId),
     /// An array repeat count of the field: what indexes it is asked of the crate.
     FieldLen(FieldId),
-    ItemName(ItemName),
+    ItemName(ItemName, Case),
 }
 
 /// One literal of a body that is not exempt.
@@ -301,11 +391,16 @@ enum Known {
 pub(crate) struct Lit {
     /// The literal, or the `-` before it.
     at: ExprId,
+    /// Where `at` is in the body's tree ([`hir::BodyAnalysis::expr_range`]).
+    range: TextRange,
     value: Value,
     prim: Prim,
     role: Option<Role>,
     known: Known,
-    lookup: Option<Lookup>,
+    /// What the program looks up or branches by it as (never [`UseClass::Const`] or
+    /// [`UseClass::Matched`], which are not literals of a body).
+    lookup: Option<UseClass>,
+    access: Access,
     /// What a compared literal is compared with.
     other: Option<ExprId>,
     /// The place a compared string is compared with, for a closed set.
@@ -316,8 +411,36 @@ pub(crate) struct Lit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Matched {
     scrutinee: ExprId,
+    /// Where the scrutinee is in the body's tree.
+    range: TextRange,
     role: Option<Role>,
     values: Vec<Symbol>,
+}
+
+/// A format template a macro wrote in the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Template {
+    /// The `format_args!` expression.
+    at: ExprId,
+    /// Normalised ([`template::normalise`]).
+    text: Symbol,
+    /// The error type of the `Err(..)` the formatted value is the error of: `Some(None)` where
+    /// the type is not an ADT.
+    error: Option<Option<AdtId>>,
+}
+
+/// A `match` or an array of strings that spells the name of every variant of an enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WholeSet {
+    /// The `match` or the array.
+    at: ExprId,
+    /// The enum, known for a `match`; an array asks the crate by [`Ask::VariantSet`].
+    of: Option<EnumId>,
+    /// The array's key for [`Ask::VariantSet`].
+    key: Option<Symbol>,
+    /// The string literals, each of one variant.
+    names: Vec<ExprId>,
+    case: Case,
 }
 
 /// An index of an array by an enum's discriminant, the array not of the enum's variant count.
@@ -337,6 +460,8 @@ pub(crate) struct Literals {
     indexed: Vec<Indexed>,
     consts: Vec<(Role, ConstId, Value, Prim)>,
     enum_fields: Vec<(FieldId, EnumId)>,
+    templates: Vec<Template>,
+    whole_sets: Vec<WholeSet>,
 }
 
 /// The literals of the body of `def` that are not exempt, once per body and edit.
@@ -351,15 +476,99 @@ pub(crate) fn literals(db: &Db, def: DefWithBodyId) -> Literals {
         return out;
     }
     let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
+    let krate = hir::DefWithBody::from(def).module(db).krate(db);
     let walk = Walk {
         db,
         def,
         body: analysis.body(),
         analysis: &analysis,
         parents: facts::Parents::of(analysis.body()),
+        crate_name: krate.display_name(db).map(|it| it.crate_name().symbol().clone()),
     };
     walk.gather(&mut out);
     out
+}
+
+/// The string `const`s of `krate` (not test code), by value, in the crate's walk order: what a
+/// literal of the crate, or of a crate that depends on it, is told already names it. Its own
+/// query, apart from [`magic_index`], so a dependent crate reads its dependencies' `const`s
+/// and never their bodies' literals.
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn named_index(db: &Db, krate: base_db::Crate) -> Index {
+    let mut index = Index::default();
+    if dup::index::is_test_target(db, krate) {
+        return index;
+    }
+    for def in frozen_collection::crate_bodies(db, krate) {
+        let DefWithBodyId::ConstId(konst) = def else { continue };
+        if test_code::is_test_def(db, def) {
+            continue;
+        }
+        let Some(Value::Str(text)) = const_value(db, konst) else { continue };
+        if shared::is_prose(text.as_str()) {
+            continue;
+        }
+        if let Some(answer) = index.answer(Ask::Named(text)) {
+            answer.named.push(konst);
+        }
+    }
+    index
+}
+
+/// The fieldless enums of `krate` with [`SET_MIN`] variants or more, by the key of their
+/// variants' names ([`variant_set_key`]): what an array of strings is asked spells.
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn variant_sets(db: &Db, krate: base_db::Crate) -> Index {
+    let mut index = Index::default();
+    for module in hir::Crate::from(krate).modules(db) {
+        for item in module.declarations(db) {
+            let hir::ModuleDef::Adt(hir::Adt::Enum(of)) = item else { continue };
+            if of.is_data_carrying(db) {
+                continue;
+            }
+            let variants = of.variants(db);
+            if variants.len() < SET_MIN {
+                continue;
+            }
+            let Some(key) = variant_set_key(variants.iter().map(|it| it.name(db).symbol().clone())) else {
+                continue;
+            };
+            if let Some(answer) = index.answer(Ask::VariantSet(key))
+                && !answer.enums.contains(&EnumId::from(of))
+            {
+                answer.enums.push(EnumId::from(of));
+            }
+        }
+    }
+    index
+}
+
+/// The key of a set of names that every spelling of them shares: each name's words in lower
+/// case joined by `_`, sorted, joined by `,`. `None` for a set with a name of no words.
+fn variant_set_key(names: impl Iterator<Item = Symbol>) -> Option<Symbol> {
+    let mut keys: Vec<Vec<u8, Global>, Global> = Vec::new_in(Global);
+    for name in names {
+        let mut key = Vec::new_in(Global);
+        for word in words(name.as_str()) {
+            if !key.is_empty() {
+                key.push(b'_');
+            }
+            key.extend(word.bytes().map(|it| it.to_ascii_lowercase()));
+        }
+        if key.is_empty() {
+            return None;
+        }
+        keys.push(key);
+    }
+    keys.sort_unstable();
+    let mut out: Vec<u8, Global> = Vec::new_in(Global);
+    for (at, key) in keys.iter().enumerate() {
+        if at > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(key);
+    }
+    Some(Symbol::intern(core::str::from_utf8(&out).ok()?))
 }
 
 /// Every [`Ask`] of a crate and its [`Answer`].
@@ -422,6 +631,15 @@ pub(crate) fn magic_index(db: &Db, krate: base_db::Crate) -> Index {
                 answer.enums.push(of);
             }
         }
+        for template in &found.templates {
+            index.body(Ask::Template(template.text), def);
+            let Some(answer) = index.answer(Ask::Template(template.text)) else { continue };
+            match template.error {
+                None => answer.outside_err += 1,
+                Some(Some(error)) if !answer.errors.contains(&error) => answer.errors.push(error),
+                Some(_) => {}
+            }
+        }
     }
     index
 }
@@ -439,7 +657,13 @@ pub(crate) struct MagicKey {
 /// leaves this answer as it was leaves the body's lint as it was.
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn magic_answer(db: &Db, key: MagicKey) -> Answer {
-    magic_index(db, key.krate(db)).0.get(&key.ask(db)).cloned().unwrap_or_default()
+    let (krate, ask) = (key.krate(db), key.ask(db));
+    let index = match ask {
+        Ask::Named(_) => named_index(db, krate),
+        Ask::VariantSet(_) => variant_sets(db, krate),
+        _ => magic_index(db, krate),
+    };
+    index.0.get(&ask).cloned().unwrap_or_default()
 }
 
 /// Where a literal is used: the expression it is used as (through casts, borrows and
@@ -457,10 +681,14 @@ struct Walk<'a, 'db> {
     body: &'db Body,
     analysis: &'a hir::BodyAnalysis<'db>,
     parents: facts::Parents,
+    /// The name of the crate the body is in, which a string can spell.
+    crate_name: Option<Symbol>,
 }
 
 impl<'db> Walk<'_, 'db> {
     fn gather(&self, out: &mut Literals) {
+        self.templates(out);
+        self.name_arrays(out);
         let mut in_pattern = Vec::new_in(Global);
         for (_, pat) in self.body.pats() {
             match pat {
@@ -472,7 +700,7 @@ impl<'db> Walk<'_, 'db> {
         let indexed = self.enum_indexes(out);
         for (id, expr) in self.body.exprs() {
             match expr {
-                Expr::Literal(literal) if !in_pattern.contains(&id) && self.written(id) => {
+                Expr::Literal(literal) if !in_pattern.contains(&id) => {
                     if let Some(lit) = self.literal(id, literal, &indexed) {
                         out.lits.push(lit);
                     }
@@ -483,9 +711,16 @@ impl<'db> Walk<'_, 'db> {
                     for arm in arms {
                         self.string_pats(arm.pat, &mut values);
                     }
-                    if values.len() >= SET_MIN && self.written(id) && !self.in_const(id) {
+                    if values.len() >= SET_MIN
+                        && self.written(id)
+                        && !self.in_const(id)
+                        && let Some(range) = self.analysis.expr_range(scrutinee)
+                    {
                         let role = self.place(scrutinee).map(Role::Compare);
-                        out.matched.push(Matched { scrutinee, role, values });
+                        out.matched.push(Matched { scrutinee, range, role, values });
+                    }
+                    if let Some(whole) = self.match_spells_every_variant(id) {
+                        out.whole_sets.push(whole);
                     }
                 }
                 _ => {}
@@ -497,6 +732,131 @@ impl<'db> Walk<'_, 'db> {
     fn written(&self, id: ExprId) -> bool {
         let file = self.analysis.tree().1;
         self.analysis.source_map().expr_syntax(id).is_ok_and(|it| it.file_id == file)
+    }
+
+    /// The format templates of the body: each `format_args!` a macro wrote whose template is a
+    /// string literal of [`template::TEMPLATE_WORDS_FLOOR`] words or more, normalised, with the
+    /// error type of the `Err(..)` it is the error of.
+    fn templates(&self, out: &mut Literals) {
+        let map = self.analysis.source_map();
+        // Lowering one `format_args!` makes several expressions (the `Arguments` call, its
+        // pieces, its arguments) that all map back to its syntax: the template is read once,
+        // at the outermost of them, so one written template is one site.
+        let mut seen: Vec<_, Global> = Vec::new_in(Global);
+        for (id, _) in self.body.exprs() {
+            let Ok(source) = map.expr_syntax(id) else { continue };
+            if source.value.kind() != SyntaxKind::FORMAT_ARGS_EXPR {
+                continue;
+            }
+            if self.parents.up(id, usize::MAX).any(|it| map.expr_syntax(it).is_ok_and(|it| it == source)) {
+                continue;
+            }
+            if seen.contains(&source) {
+                continue;
+            }
+            let root = source.file_id.root(self.db);
+            let at = source.value.syntax_node_ptr().text_range();
+            let covering = match root.covering_element(at) {
+                NodeOrToken::Node(it) => it,
+                NodeOrToken::Token(it) => match it.parent() {
+                    Some(it) => it,
+                    None => continue,
+                },
+            };
+            let Some(node) = covering
+                .ancestors()
+                .find(|it| it.kind() == SyntaxKind::FORMAT_ARGS_EXPR && it.text_range() == at)
+            else {
+                continue;
+            };
+            let Some(written) = ast::FormatArgsExpr::cast(node).and_then(|it| it.template()) else { continue };
+            // A template that is not one string token (`concat!(..)`, a `const`) is not read.
+            let Some(token) = written.syntax().first_token() else { continue };
+            if token.kind() != SyntaxKind::STRING || written.syntax().text_range() != token.text_range() {
+                continue;
+            }
+            let Some(text) = template::normalise(token.text()) else { continue };
+            if template::words(text.as_str()) < template::TEMPLATE_WORDS_FLOOR {
+                continue;
+            }
+            seen.push(source);
+            out.templates.push(Template { at: id, text, error: self.err_of(id) });
+        }
+    }
+
+    /// The error type of the `Err(..)` whose error `id` is part of, through [`ERR_DEPTH`]
+    /// parents (`Err(format!(..))`, `bail!`'s `return Err(anyhow!(..))`): `Some(None)` where
+    /// the error is not an ADT, `None` outside an `Err`.
+    fn err_of(&self, id: ExprId) -> Option<Option<AdtId>> {
+        for it in self.parents.up(id, ERR_DEPTH) {
+            let Expr::Call { callee, .. } = self.body.expr(it) else { continue };
+            let Some(ValueNs::EnumVariantId(variant)) =
+                general_facts::value_of(self.db, self.def, self.body, callee)
+            else {
+                continue;
+            };
+            let variant = hir::EnumVariant::from(variant);
+            let result = hir::Adt::Enum(variant.parent_enum(self.db));
+            if variant.name(self.db).as_str() != "Err" || !general_facts::std_adt(self.db, result, "result", &["Result"]) {
+                continue;
+            }
+            let error = self.ty(it).type_arguments().nth(1).and_then(|it| it.as_adt()).map(AdtId::from);
+            return Some(error);
+        }
+        None
+    }
+
+    /// The `match` `id` when each arm's value is a string literal that spells its pattern's
+    /// variant, one arm per variant of the enum: the whole set of names, written by hand.
+    fn match_spells_every_variant(&self, id: ExprId) -> Option<WholeSet> {
+        let Expr::Match { arms, .. } = self.body.expr(id) else { return None };
+        if !self.written(id) || self.in_const(id) {
+            return None;
+        }
+        let mut of = None;
+        let mut seen: Vec<EnumVariantId, Global> = Vec::new_in(Global);
+        let mut names = Vec::new();
+        let mut case = None;
+        for arm in arms.iter() {
+            let Expr::Literal(Literal::String(text)) = self.body.expr(arm.expr) else { return None };
+            let Some(VariantId::EnumVariantId(variant)) = self.analysis.infer().variant_resolution_for_pat(arm.pat) else {
+                return None;
+            };
+            let variant_ = hir::EnumVariant::from(variant);
+            let parent = EnumId::from(variant_.parent_enum(self.db));
+            if *of.get_or_insert(parent) != parent || seen.contains(&variant) {
+                return None;
+            }
+            let spelled = spelling(variant_.name(self.db).as_str(), text.as_str().trim())?;
+            case.get_or_insert(spelled);
+            seen.push(variant);
+            names.push(arm.expr);
+        }
+        let of = of?;
+        let count = hir::Enum::from(of).variants(self.db).len();
+        (count >= SET_MIN && seen.len() == count).then(|| WholeSet { at: id, of: Some(of), key: None, names, case: case.unwrap_or(Case::AsWritten) })
+    }
+
+    /// The arrays of [`SET_MIN`] or more string literals the body writes, with the key of the
+    /// set their texts spell ([`variant_set_key`]), which the crate is asked the enum of.
+    fn name_arrays(&self, out: &mut Literals) {
+        for (id, expr) in self.body.exprs() {
+            let Expr::Array(Array::ElementList { elements, .. }) = expr else { continue };
+            if elements.len() < SET_MIN || !self.written(id) || self.in_const(id) {
+                continue;
+            }
+            let mut texts: Vec<Symbol, Global> = Vec::new_in(Global);
+            for &it in elements.iter() {
+                let Expr::Literal(Literal::String(text)) = self.body.expr(it) else { break };
+                texts.push(Symbol::intern(text.as_str().trim()));
+            }
+            if texts.len() != elements.len() || texts.iter().any(|it| shared::is_prose(it.as_str())) {
+                continue;
+            }
+            let Some(key) = variant_set_key(texts.iter().cloned()) else { continue };
+            let case = Case::of(texts[0].as_str());
+            out.whole_sets.push(WholeSet { at: id, of: None, key: Some(key), names: elements.to_vec(), case });
+        }
     }
 
     /// Whether `id` is inside an inline `const { .. }` block.
@@ -668,9 +1028,31 @@ impl<'db> Walk<'_, 'db> {
         }
     }
 
-    /// The literal `id` when it is not exempt.
+    /// The kind of the token the literal `id` is written as (`INT_NUMBER`, `STRING`, `BYTE`,
+    /// ..), when the body's own file writes it.
+    fn token_kind(&self, id: ExprId) -> Option<SyntaxKind> {
+        let (root, file) = self.analysis.tree();
+        let source = self.analysis.source_map().expr_syntax(id).ok()?;
+        if source.file_id != file {
+            return None;
+        }
+        match root.covering_element(source.value.syntax_node_ptr().text_range()) {
+            NodeOrToken::Node(it) => Some(it.first_token()?.kind()),
+            NodeOrToken::Token(it) => Some(it.kind()),
+        }
+    }
+
+    /// The literal `id` when it is not exempt. A byte (`b'0'`) is a number to the front end and
+    /// a character to the reader: only a number written as one is a number here.
     fn literal(&self, id: ExprId, literal: &Literal, indexed: &[(BindingId, EnumId)]) -> Option<Lit> {
-        let value = Value::of(literal)?;
+        let value = match (self.token_kind(id)?, Value::of(literal)?) {
+            (
+                SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER,
+                it @ (Value::Int(_) | Value::Big(_) | Value::Float(_)),
+            ) => it,
+            (SyntaxKind::STRING, it @ Value::Str(_)) => it,
+            _ => return None,
+        };
         if self.in_const(id) {
             return None;
         }
@@ -685,11 +1067,13 @@ impl<'db> Walk<'_, 'db> {
         };
         let lit = Lit {
             at,
+            range: self.analysis.expr_range(at)?,
             value,
             prim,
             role: parent.and_then(|it| self.role(used, it)),
             known: Known::Nothing,
             lookup: None,
+            access: Access::Names,
             other: None,
             set: None,
         };
@@ -910,10 +1294,7 @@ impl<'db> Walk<'_, 'db> {
     fn string(&self, mut lit: Lit, text: Symbol, use_: Use) -> Option<Lit> {
         let Use { used, parent } = use_;
         let s = text.as_str();
-        let prose = s.is_empty()
-            || !s.chars().any(char::is_alphanumeric)
-            || s.chars().any(char::is_whitespace);
-        if prose {
+        if shared::is_prose(s) {
             return None;
         }
         let callee = parent.and_then(|it| self.callee(it));
@@ -921,36 +1302,66 @@ impl<'db> Walk<'_, 'db> {
             return None;
         }
         let role = lit.role;
-        lit.known = self.item_name(used, s, parent).map_or(Known::Nothing, Known::ItemName);
-        if let Some(parent) = parent
-            && let Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(CmpOp::Eq { .. })) } =
-                self.body.expr(parent)
-        {
-            let other = if lhs == used { rhs } else { lhs };
-            lit.lookup = Some(Lookup::Compared);
-            lit.other = Some(other);
-            lit.set = self.set_place(other);
-            return Some(lit);
+        lit.known = self.item_name(used, s, parent).map_or(Known::Nothing, |(item, case)| Known::ItemName(item, case));
+        if let Some(parent) = parent {
+            match self.body.expr(parent) {
+                Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(CmpOp::Eq { .. })) } => {
+                    let other = if lhs == used { rhs } else { lhs };
+                    lit.lookup = Some(UseClass::Compared);
+                    lit.access = Access::Reads;
+                    lit.other = Some(other);
+                    lit.set = self.set_place(other);
+                    return Some(lit);
+                }
+                // `value["name"]`: a JSON or config object, or any map indexed by a name.
+                Expr::Index { index, .. } if index == used => {
+                    lit.lookup = Some(UseClass::Key);
+                    lit.access = Access::Reads;
+                    return Some(lit);
+                }
+                _ => {}
+            }
         }
         let (Some(callee), Some(Role::Arg { index, .. })) = (callee, role) else { return Some(lit) };
         let top = general_facts::std_top(self.db, hir::Function::from(callee.f).module(self.db));
         let top = top.as_ref().map(|it| it.as_str());
         let of = |names: &[&str]| callee.self_adt.is_some_and(|adt| names.contains(&adt.name(self.db).as_str()));
-        lit.lookup = if top == Some("collections") && of(MAPS) && index == 1 && KEY_METHODS.contains(&callee.name) {
-            Some(Lookup::Key)
+        // A key method of std's maps, or of any type but a string (`str::contains` searches
+        // text): blaze_hash's and papaya's maps, a JSON object, a config table.
+        let std_map = top == Some("collections") && of(MAPS);
+        let other_map = callee.name != "contains"
+            && callee.self_adt.is_some_and(|adt| !general_facts::std_adt(self.db, adt, "string", &["String"]));
+        lit.lookup = if index == 1 && KEY_METHODS.contains(&callee.name) && (std_map || other_map) {
+            Some(UseClass::Key)
         } else if top == Some("env") && callee.self_adt.is_none() && ENV_FNS.contains(&callee.name) {
-            Some(Lookup::Env)
+            Some(UseClass::Env)
         } else if top == Some("fs") || (top == Some("path") && of(&["Path", "PathBuf"]) && PATH_METHODS.contains(&callee.name)) {
-            Some(Lookup::Path)
+            Some(UseClass::Path)
         } else {
             None
         };
+        lit.access = if WRITES.contains(&callee.name) {
+            Access::Writes
+        } else if READS.contains(&callee.name) {
+            Access::Reads
+        } else {
+            Access::Names
+        };
+        // An environment variable's or a path's name is fixed outside the program: the function,
+        // type or crate around it is named after it, not the other way, so a rename of them must
+        // not follow it (`fn home() { env::var("HOME") }`). Its finding is the lookup.
+        if matches!(lit.lookup, Some(UseClass::Env | UseClass::Path))
+            && matches!(lit.known, Known::ItemName(ItemName::Function(_) | ItemName::Type(_) | ItemName::Crate, _))
+        {
+            lit.known = Known::Nothing;
+        }
         Some(lit)
     }
 
-    /// The item `text` spells the name of at `used`: the variant of the `match` arm it is the
-    /// value of, a field passed beside it in the same call or tuple, or the function it is in.
-    fn item_name(&self, used: ExprId, text: &str, parent: Option<ExprId>) -> Option<ItemName> {
+    /// The item `text` spells the name of at `used`, and in what convention: the variant of the
+    /// `match` arm it is the value of, a field passed beside it in the same call or tuple, the
+    /// function it is in, the type that function is a method of, or the crate.
+    fn item_name(&self, used: ExprId, text: &str, parent: Option<ExprId>) -> Option<(ItemName, Case)> {
         let db = self.db;
         if let Some(parent) = parent {
             match self.body.expr(parent) {
@@ -962,7 +1373,7 @@ impl<'db> Walk<'_, 'db> {
                         return None;
                     };
                     let name = hir::EnumVariant::from(variant).name(db);
-                    return spells(name.as_str(), text).then_some(ItemName::Variant(variant));
+                    return spelling(name.as_str(), text).map(|case| (ItemName::Variant(variant), case));
                 }
                 Expr::Tuple { exprs: beside } | Expr::Call { args: beside, .. } | Expr::MethodCall { args: beside, .. } => {
                     for &it in beside {
@@ -971,23 +1382,31 @@ impl<'db> Walk<'_, 'db> {
                             at = expr;
                         }
                         if let Expr::Field { name, .. } = self.body.expr(at)
-                            && spells(name.as_str(), text)
+                            && let Some(case) = spelling(name.as_str(), text)
                             && let Some(either::Either::Left(field)) =
                                 self.analysis.infer().field_resolution(at)
                         {
-                            return Some(ItemName::Field(field));
+                            return Some((ItemName::Field(field), case));
                         }
                     }
                 }
                 _ => {}
             }
         }
-        match self.def {
-            DefWithBodyId::FunctionId(f) => {
-                spells(FunctionSignature::of(db, f).name.as_str(), text).then_some(ItemName::Function(f))
+        if let DefWithBodyId::FunctionId(f) = self.def {
+            if let Some(case) = spelling(FunctionSignature::of(db, f).name.as_str(), text) {
+                return Some((ItemName::Function(f), case));
             }
-            _ => None,
+            if let Some(assoc) = hir::AsAssocItem::as_assoc_item(hir::Function::from(f), db)
+                && let hir::AssocItemContainer::Impl(it) = assoc.container(db)
+                && let Some(adt) = it.self_ty(db).as_adt()
+                && let Some(case) = spelling(adt.name(db).as_str(), text)
+            {
+                return Some((ItemName::Type(AdtId::from(adt)), case));
+            }
         }
+        let krate = self.crate_name.as_ref()?;
+        spelling(krate.as_str(), text).map(|case| (ItemName::Crate, case))
     }
 
     /// A `const` passed as an argument: what [`Ask::Consts`] answers.
@@ -1016,37 +1435,64 @@ fn const_value(db: &Db, konst: ConstId) -> Option<Value> {
     }
 }
 
-/// Whether `text` spells `name`: as it is, in lower case, or with `-` for `_` (`DepInfo` is
-/// spelled `"DepInfo"`, `"depinfo"`; `dep_info` `"dep_info"`, `"dep-info"`), or as `name` in
-/// snake case (`"dep_info"`, `"dep-info"` for `DepInfo`).
-fn spells(name: &str, text: &str) -> bool {
+/// The convention in which `text` spells `name`, if it does: as written, in another letter
+/// case, or the same words joined another way (`DepInfo` is `"dep_info"` in snake_case,
+/// `"dep-info"` in kebab-case, `"DEP_INFO"` in SCREAMING_SNAKE_CASE, `"depInfo"` in camelCase;
+/// `dep_info` is `"DepInfo"` in PascalCase).
+fn spelling(name: &str, text: &str) -> Option<Case> {
     let name = name.strip_prefix("r#").unwrap_or(name);
-    if text == name || text.eq_ignore_ascii_case(name) {
-        return true;
+    if text == name {
+        return Some(Case::AsWritten);
     }
-    let snake = snake_case(name);
-    text == snake || text == snake.replace('_', "-")
+    if same_words(name, text) {
+        return Some(Case::of(text));
+    }
+    text.eq_ignore_ascii_case(name).then_some(Case::OtherCase)
 }
 
-fn snake_case(name: &str) -> String {
-    // alloc: one name in snake case
-    let mut out = String::new();
-    for (at, c) in name.char_indices() {
-        if c.is_ascii_uppercase() {
-            if at > 0 && !out.ends_with('_') {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
+/// Whether `a` and `b` are the same words, letter case and the way they are joined aside.
+fn same_words(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (words(a), words(b));
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => {}
+            _ => return false,
         }
     }
-    out
+}
+
+/// The words of a name or a key: split at `-`, `_` and the start of a capital that follows a
+/// lower-case letter or a digit (`"buildId"`, `"build_id"` and `"Build-Id"` are `build`, `id`).
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < bytes.len() && matches!(bytes[at], b'-' | b'_') {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return None;
+        }
+        let start = at;
+        at += 1;
+        while at < bytes.len() {
+            let (before, here) = (bytes[at - 1], bytes[at]);
+            if matches!(here, b'-' | b'_')
+                || (here.is_ascii_uppercase() && (before.is_ascii_lowercase() || before.is_ascii_digit()))
+            {
+                break;
+            }
+            at += 1;
+        }
+        // Splits are at ASCII bytes, so both ends are on character boundaries.
+        text.get(start..at)
+    })
 }
 
 /// How `a` and `b` differ when they are likely one name spelled twice: only by case, only by
-/// `-`, `_` and case, by a plural `s`, or by one character that is not a digit, both
-/// [`NEAR_LEN`] long or more.
+/// `-`, `_` and case, by the convention the words are joined in (`"build_id"`, `"buildId"`), by a
+/// plural `s`, or by one character that is not a digit, both [`NEAR_LEN`] long or more.
 fn near(a: &str, b: &str) -> Option<&'static str> {
     if a == b {
         return None;
@@ -1061,6 +1507,9 @@ fn near(a: &str, b: &str) -> Option<&'static str> {
     let (fa, fb) = (fold(a), fold(b));
     if fa == fb {
         return Some("`-` and `_`");
+    }
+    if same_words(a, b) {
+        return Some("the case convention (`_`, `-` or capitals between words)");
     }
     if fa.strip_suffix('s') == Some(fb.as_str()) || fb.strip_suffix('s') == Some(fa.as_str()) {
         return Some("a plural `s`");
@@ -1097,7 +1546,7 @@ struct Fix {
 }
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {
-    if !cx.on_blaze(Lint::MagicNumber) && !cx.on_blaze(Lint::MagicString) {
+    if ![Lint::MagicNumber, Lint::MagicString, Lint::RepeatedFormat].iter().any(|&it| cx.on_blaze(it)) {
         return;
     }
     let found = find(cx);
@@ -1122,6 +1571,7 @@ struct Report<'a, 'c, 't> {
     analysis: &'a hir::BodyAnalysis<'c>,
     numbers: bool,
     strings: bool,
+    formats: bool,
 }
 
 fn find(cx: &Cx<'_, '_>) -> Vec<(Finding, Option<Fix>)> {
@@ -1141,9 +1591,20 @@ fn find(cx: &Cx<'_, '_>) -> Vec<(Finding, Option<Fix>)> {
         analysis,
         numbers: cx.on_blaze(Lint::MagicNumber),
         strings: cx.on_blaze(Lint::MagicString),
+        formats: cx.on_blaze(Lint::RepeatedFormat),
     };
     let found = literals(db, def);
     report.sets(found, &mut out);
+    if report.strings {
+        for whole in &found.whole_sets {
+            out.extend(report.whole_set(whole));
+        }
+    }
+    if report.formats {
+        for template in &found.templates {
+            out.extend(report.template(template));
+        }
+    }
     for lit in &found.lits {
         let one = match lit.value {
             Value::Str(text) if report.strings => report.string(lit, text, found),
@@ -1246,7 +1707,7 @@ impl<'c> Report<'_, 'c, '_> {
                 let message = format!("`{text}` is the size of `{name}`: derive it, `size_of::<{name}>()`");
                 return derived(message, format!("size_of::<{name}>()"), Applicability::MaybeIncorrect);
             }
-            Known::Nothing | Known::Duration | Known::ItemName(_) => {}
+            Known::Nothing | Known::Duration | Known::ItemName(..) => {}
         }
         if let Some(role) = lit.role {
             if let Some((resolves, name)) = self.one_const(lit, role, range) {
@@ -1391,16 +1852,42 @@ impl<'c> Report<'_, 'c, '_> {
         const NOTE: &str = "a string the program branches or looks up by names a thing: its home is one `const`, or a type (an enum where the set is closed, a newtype over an interned name) the compiler checks every use of";
         let s = text.as_str();
         let db = self.db;
-        if let Known::ItemName(item) = lit.known {
-            let (what, how) = match item {
+        if found.whole_sets.iter().any(|it| it.names.contains(&lit.at) && self.whole_enum(it).is_some()) {
+            // The `match` or array is the finding, once.
+            return None;
+        }
+        if let Some(named) = self.named(lit, text) {
+            return Some(named);
+        }
+        if let Known::ItemName(item, case) = lit.known {
+            let (what, name, how) = match item {
                 ItemName::Variant(it) => {
                     let variant = hir::EnumVariant::from(it);
-                    (format!("the variant `{}::{}`", variant.parent_enum(db).name(db).as_str(), variant.name(db).as_str()), "reflection over the enum's variants")
+                    let name = variant.name(db).as_str().to_owned(); // alloc: a finding's message part
+                    (format!("the variant `{}::{name}`", variant.parent_enum(db).name(db).as_str()), name, "reflection over the enum's variants")
                 }
-                ItemName::Field(it) => (format!("the field `{}` beside it", hir::Field::from(it).name(db).as_str()), "reflection over the type's fields"),
-                ItemName::Function(it) => (format!("the function it is in, `{}`", FunctionSignature::of(db, it).name.as_str()), "`core::any::type_name` or reflection"),
+                ItemName::Field(it) => {
+                    let name = hir::Field::from(it).name(db).as_str().to_owned(); // alloc: a finding's message part
+                    (format!("the field `{name}` beside it"), name, "reflection over the type's fields")
+                }
+                ItemName::Function(it) => {
+                    let name = FunctionSignature::of(db, it).name.as_str().to_owned(); // alloc: a finding's message part
+                    (format!("the function it is in, `{name}`"), name, "`core::any::type_name` or reflection")
+                }
+                ItemName::Type(it) => {
+                    let name = hir::Adt::from(it).name(db).as_str().to_owned(); // alloc: a finding's message part
+                    (format!("the type its method is of, `{name}`"), name, "`core::any::type_name::<Self>()` or reflection")
+                }
+                ItemName::Crate => {
+                    let name = self.cx.krate().display_name(db).map(|it| it.to_string()).unwrap_or_default();
+                    (format!("its crate, `{name}`"), name, "`env!(\"CARGO_PKG_NAME\")`")
+                }
             };
-            let message = format!("`\"{s}\"` spells the name of {what}: derive it ({how}), so a rename follows it");
+            let convention = match case {
+                Case::AsWritten => String::new(),
+                other => format!(" {} (`{name}` is `\"{s}\"`)", other.said()),
+            };
+            let message = format!("`\"{s}\"` spells the name of {what}{convention}: derive it ({how}), so a rename follows it");
             return Some((self.finding(LINT, lit.at, message, NOTE)?, None));
         }
         if let Some(role) = lit.role {
@@ -1429,16 +1916,132 @@ impl<'c> Report<'_, 'c, '_> {
         }
         let in_set = lit.set.is_some_and(|place| self.set_values(found, place).len() >= SET_MIN);
         let message = match lit.lookup? {
-            Lookup::Compared if in_set => return None,
-            Lookup::Compared => format!(
+            UseClass::Compared if in_set => return None,
+            UseClass::Compared => format!(
                 "`\"{s}\"` is compared with `{}`: name it, a `const`; where that value is one of a closed set, make it an enum",
                 lit.other.map_or("", |it| self.text(it))
             ),
-            Lookup::Key => format!("`\"{s}\"` is a map key: name it, a `const`; a fixed set of keys is a struct's fields or an enum"),
-            Lookup::Env => format!("`\"{s}\"` names an environment variable: name it, a `const` beside the code that owns the setting, or read it once into a field of the typed settings"),
-            Lookup::Path => format!("`\"{s}\"` is a file name or path component: name it, a `const` beside the code that owns the layout"),
+            UseClass::Key => format!("`\"{s}\"` is a map key: name it, a `const`; a fixed set of keys is a struct's fields or an enum"),
+            UseClass::Env => format!("`\"{s}\"` names an environment variable: name it, a `const` beside the code that owns the setting, or read it once into a field of the typed settings"),
+            UseClass::Path => format!("`\"{s}\"` is a file name or path component: name it, a `const` beside the code that owns the layout"),
+            // Not a literal of a body: a `const`'s value and a `match`'s patterns are rows of
+            // the crate's, never here.
+            UseClass::Const | UseClass::Matched => return None,
         };
         Some((self.finding(LINT, lit.at, message, NOTE)?, None))
+    }
+
+    /// The `const` of the crate, or else of a local dependency (in the order a walk from the
+    /// crate reaches them), that already holds `text`: the literal is a second copy of it. A
+    /// dependency's is asked of only for a string the program looks up or branches by, or one
+    /// that spells the `const`'s own name (`"BLAZE_HOME"` for `BLAZE_HOME`): a short word two
+    /// unrelated crates both happen to hold is not one fact. The fix writes the path that
+    /// names it from here, machine-applicable, where there is one.
+    fn named(&self, lit: &Lit, text: Symbol) -> Option<(Finding, Option<Fix>)> {
+        const NOTE: &str = "a string a `const` already holds has its home there: a second literal is a copy that a change to the `const` leaves behind";
+        let db = self.db;
+        let own = self.ask(Ask::Named(text)).named.first().copied();
+        let konst = match own {
+            Some(it) => it,
+            None => dup::index::local_deps(db, self.krate).iter().find_map(|&dep| {
+                let answer = magic_answer(db, MagicKey::new(db, dep, Ask::Named(text)));
+                answer.named.iter().copied().find(|&it| {
+                    lit.lookup.is_some()
+                        || hir::Const::from(it).name(db).is_some_and(|name| spelling(name.as_str(), text.as_str()).is_some())
+                })
+            })?,
+        };
+        let konst = hir::Const::from(konst);
+        let module = self.analysis.def().module(db);
+        let config = hir::FindPathConfig {
+            prefer_no_std: false,
+            prefer_prelude: false,
+            prefer_absolute: false,
+            allow_unstable: true,
+        };
+        let item = hir::ItemInNs::Values(hir::ModuleDef::Const(konst));
+        let path = module.find_path(db, item, config).map(|it| it.display(db, self.cx.edition()).to_string());
+        let shown = match &path {
+            Some(it) => it.clone(), // clone: the message's copy of the fix's text
+            None => hir::ModuleDef::Const(konst).canonical_path(db, self.cx.edition())?,
+        };
+        let message = match path {
+            Some(_) => format!("`{shown}` already names this; use it"),
+            None => format!("`{shown}` already names this, but is not visible here: make it `pub` (or move it where both can see it) and use it"),
+        };
+        let range = self.range(lit.at)?;
+        let fix = path.map(|with| Fix {
+            message: "use the `const`",
+            parts: vec![(range, with)], // alloc: one part
+            applicability: Applicability::MachineApplicable,
+        });
+        Some((self.finding(Lint::MagicString, lit.at, message, NOTE)?, fix))
+    }
+
+    /// The enum a whole set of names spells: a `match`'s own, or the one enum of the crate
+    /// whose variants an array's strings are.
+    fn whole_enum(&self, whole: &WholeSet) -> Option<EnumId> {
+        if let Some(of) = whole.of {
+            return Some(of);
+        }
+        match self.ask(Ask::VariantSet(whole.key?)).enums.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        }
+    }
+
+    /// A `match` or an array that spells every variant's name: one finding, whose fix is the
+    /// reflection form where the crate has blaze's compile-time reflection on, else one `const`
+    /// table beside the enum.
+    fn whole_set(&self, whole: &WholeSet) -> Option<(Finding, Option<Fix>)> {
+        const NOTE: &str = "names written once per variant by hand are a second list of the variants: a variant added or renamed leaves the list behind, and nothing but a reader checks they agree";
+        let of = hir::Enum::from(self.whole_enum(whole)?);
+        let name = of.name(self.db);
+        let name = name.as_str();
+        let what = match whole.of {
+            Some(_) => "this `match`",
+            None => "this array",
+        };
+        let case = match whole.case {
+            Case::AsWritten => String::new(),
+            other => format!(" {}", other.said()),
+        };
+        let message = match self.cx.features().blaze_comptime {
+            true => format!(
+                "{what} spells the name of every variant of `{name}`{case}: derive the names, `for const` over `{name}`'s variants, so a variant added or renamed is named with it"
+            ),
+            false => format!(
+                "{what} spells the name of every variant of `{name}`{case}: keep the names in one `const` table beside `{name}`, indexed by its discriminant, so a variant added or renamed is named in the same place"
+            ),
+        };
+        Some((self.finding(Lint::MagicString, whole.at, message, NOTE)?, None))
+    }
+
+    /// A format template written in two or more places of the crate.
+    fn template(&self, template: &Template) -> Option<(Finding, Option<Fix>)> {
+        const NOTE: &str = "one sentence written in several places is one message kept in several copies: a change to one leaves the others saying the old thing, and nothing finds every place that reports this case";
+        let answer = self.ask(Ask::Template(template.text));
+        let (others, total) = self.others(answer);
+        if total < 2 {
+            return None;
+        }
+        let owner = match (answer.outside_err, answer.errors.as_slice()) {
+            (0, [one]) => format!(
+                "a variant of `{}`, the error every place returns, whose `Display` writes it",
+                hir::Adt::from(*one).name(self.db).as_str()
+            ),
+            (0, _) => "a variant of a typed error whose `Display` writes it".to_owned(),
+            _ => "one function that formats it (or a variant of a typed error, where it reports a failure)".to_owned(),
+        };
+        let places = match others.is_empty() {
+            true => format!("{total} times here"),
+            false => format!("here and in {others} ({total} places)"),
+        };
+        let message = format!(
+            "the message `\"{}\"` is written {places}: give the sentence one owner, {owner}",
+            template.text.as_str()
+        );
+        Some((self.finding(Lint::RepeatedFormat, template.at, message, NOTE)?, None))
     }
 
     /// The strings compared with `place` in the body, distinct, in order.

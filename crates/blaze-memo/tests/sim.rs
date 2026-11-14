@@ -52,7 +52,19 @@ const GIVE_WAYS: u32 = 256;
 
 thread_local! {
     static ME: Cell<usize> = const { Cell::new(NONE) };
+    /// How many times this worker paused inside a query body.
+    static PAUSES: Cell<u32> = const { Cell::new(0) };
 }
+
+/// A panic to inject in an ordinary run: worker `worker` panics at its `pause`-th pause. The
+/// control that a worker's panic is the run's verdict, never a hang or a give-way bound.
+#[derive(Clone, Copy, Debug)]
+struct PanicAt {
+    worker: usize,
+    pause: u32,
+}
+
+const INJECTED: &str = "an injected panic in a query body";
 
 struct State {
     running: usize,
@@ -61,6 +73,8 @@ struct State {
     held: Vec<(FlightKey, usize)>,
     rng: SplitMix64,
     stuck: Option<String>,
+    /// The first panic of a worker this round: the round's verdict.
+    panicked: Option<String>,
 }
 
 /// The baton: one worker runs at a time; who runs next is the seeded draw's.
@@ -81,6 +95,7 @@ impl Sim {
                     held: Vec::new(),
                     rng: SplitMix64::new(seed),
                     stuck: None,
+                    panicked: None,
                 },
             ),
             turn: Signal::new("blaze-memo sim turn"),
@@ -131,11 +146,31 @@ impl Sim {
         state.blocked_on = vec![None; WORKERS];
         state.rng = SplitMix64::new(seed);
         state.stuck = None;
+        state.panicked = None;
     }
 
     fn start(&self) {
         let mut state = self.state.lock();
         self.pass(&mut state);
+    }
+
+    /// A worker panicked with `why`: the simulation ends with it as the verdict (the first
+    /// panic stands, and outranks any hang or give-way bound another worker reports, before or
+    /// after). Every worker waiting for its turn wakes and stops.
+    fn panicked(&self, why: String) {
+        let mut state = self.state.lock();
+        if state.panicked.is_none() {
+            state.panicked = Some(why.clone());
+        }
+        if state.stuck.is_none() {
+            state.stuck = Some(format!("stopped: {why}"));
+        }
+        self.turn.notify_all();
+    }
+
+    /// The first worker's panic of this round, if any.
+    fn panic_verdict(&self) -> Option<String> {
+        self.state.lock().panicked.clone()
     }
 
     fn finish(&self, me: usize) {
@@ -219,6 +254,7 @@ struct SimDb<'a> {
     memo: &'a Memo,
     sim: &'a Sim,
     runs: &'a Runs,
+    panic_at: Option<PanicAt>,
 }
 
 impl Database for SimDb<'_> {
@@ -229,6 +265,16 @@ impl Database for SimDb<'_> {
 
 impl Db for SimDb<'_> {
     fn pause(&self) {
+        let pauses = PAUSES.with(|it| {
+            it.set(it.get() + 1);
+            it.get()
+        });
+        if let Some(at) = self.panic_at
+            && at.worker == ME.with(Cell::get)
+            && at.pause == pauses
+        {
+            panic!("{INJECTED}");
+        }
         self.sim.yield_now();
     }
 
@@ -302,6 +348,11 @@ fn worker(me: usize, sim: &Sim, db: &SimDb<'_>, world: &World, model: &Model<'_>
                     break;
                 }
                 Err(Cancelled::GaveWay) => {
+                    // A peer's panic can leave this ask nothing to wait for but a run that
+                    // never comes: that panic is the verdict, not this ask's bound.
+                    if let Some(why) = sim.panic_verdict() {
+                        return Err(format!("stopped: {why}"));
+                    }
                     gave_way += 1;
                     if gave_way >= GIVE_WAYS {
                         return Err(format!("{it:?} gave way {GIVE_WAYS} times"));
@@ -315,6 +366,10 @@ fn worker(me: usize, sim: &Sim, db: &SimDb<'_>, world: &World, model: &Model<'_>
 }
 
 fn run(seed: u64, plant: Plant) -> Result<(), String> {
+    run_with(seed, plant, None)
+}
+
+fn run_with(seed: u64, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), String> {
     let mut rng = SplitMix64::new(seed);
     let values: Vec<Vec<u64>> = (0..=CRATES)
         .map(|_| (0..LEAVES).map(|_| rng.below(8)).collect())
@@ -375,16 +430,21 @@ fn run(seed: u64, plant: Plant) -> Result<(), String> {
                     let (sim, world, model, runs, current, asks) =
                         (&*sim, &world, &model, &runs, &current, &asks[me]);
                     scope.spawn(move || {
-                        let db = SimDb { memo: current, sim, runs };
+                        let db = SimDb { memo: current, sim, runs, panic_at };
+                        PAUSES.with(|it| it.set(0));
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             worker(me, sim, &db, world, model, asks)
                         }))
                         .unwrap_or_else(|payload| {
-                            Err(payload
+                            let why = payload
                                 .downcast_ref::<String>()
                                 .cloned()
                                 .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
-                                .unwrap_or_else(|| "a panic".to_owned()))
+                                .unwrap_or_else(|| "a panic with no message".to_owned());
+                            // Set while this worker still holds the baton: no peer runs between
+                            // the panic and its verdict.
+                            sim.panicked(format!("worker {me} panicked: {why}"));
+                            Err(why)
                         });
                         sim.finish(me);
                         result
@@ -394,6 +454,11 @@ fn run(seed: u64, plant: Plant) -> Result<(), String> {
             sim.start();
             handles.into_iter().map(|it| it.join().expect("a worker's panic is caught")).collect()
         });
+        // A worker's panic is the round's verdict, whatever the others reported after it
+        // (a give-way bound, a stop, a hang).
+        if let Some(why) = sim.panic_verdict() {
+            return Err(format!("snapshot {snapshot}: {why}"));
+        }
         let mut counts = Counts::default();
         for result in results {
             counts.add(&result.map_err(|why| format!("snapshot {snapshot}: {why}"))?);
@@ -453,8 +518,33 @@ fn the_oracle_catches_a_check_on_a_hit() {
 }
 
 /// A fixpoint member whose flight is let go when its run returns is run again by another task
-/// while its head iterates; the memo refuses the second entry, naming it.
+/// while its head iterates; the memo refuses the second entry, naming it, and that worker's
+/// panic is the verdict.
 #[test]
 fn the_oracle_catches_a_member_run_twice() {
-    caught(Plant::MemberLetGo, "ran twice");
+    caught(Plant::MemberLetGo, "ran twice in one snapshot");
+}
+
+/// Without a plant, a panic in a query body on one worker fails the run with its own message,
+/// never as a peer that gave way until its bound or a hang: the propagation the planted
+/// controls rely on holds for real failures too.
+#[test]
+fn a_worker_panic_is_the_verdict() {
+    let mut seen = 0;
+    for seed in 0..16 {
+        for worker in 0..WORKERS {
+            let at = PanicAt { worker, pause: 1 + (seed as u32 % 3) };
+            match run_with(seed, Plant::None, Some(at)) {
+                Ok(()) => {}
+                Err(why) => {
+                    assert!(
+                        why.contains(&format!("worker {worker} panicked: {INJECTED}")),
+                        "seed {seed}, {at:?}: the verdict is not the injected panic: {why}"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no injected panic was reached");
 }

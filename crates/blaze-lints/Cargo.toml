@@ -17,6 +17,9 @@ doctest = false
 blaze-core.workspace = true
 base-db.workspace = true
 blaze-diagnostics.workspace = true
+# The one join of `blaze::could_be_narrower` (`blaze_findings::fold::Narrow`), the rule its
+# workspace fold applies too.
+blaze-findings.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-intent.workspace = true

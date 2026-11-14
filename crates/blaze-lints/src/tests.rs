@@ -134,7 +134,10 @@ pub(crate) fn try_lint_once(
                 let root = db.source_root(root).source_root(&db);
                 let Some(path) = root.path_for_file(&file) else { continue };
                 let name = path.to_string().trim_start_matches('/').to_owned();
-                if module == crate_root && name == "src/lib.rs" {
+                // A library's root, else a binary's: a fixture that writes both lints the library.
+                if module == crate_root
+                    && (name == "src/lib.rs" || (name == "src/main.rs" && linted.is_none()))
+                {
                     linted = Some(krate);
                 }
                 if names.insert(file, name.clone()).is_none() {
@@ -142,7 +145,7 @@ pub(crate) fn try_lint_once(
                 }
             }
         }
-        let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs`");
+        let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs` or `/src/main.rs`");
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup =
             Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };

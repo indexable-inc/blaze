@@ -30,7 +30,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     kind::{Certificate, Key, Kind, Tag, UnitManifest},
-    record::{self, Entry, Fact, RecordError, StableId},
+    record::{self, Entry, Fact, HasPayload, Headed, RecordError, StableId},
 };
 
 /// Invariant in `'s`: two snapshots' brands never unify.
@@ -174,6 +174,38 @@ impl<'s, 'b, K: Kind> Hit<'s, 'b, K> {
     pub fn bytes(&self) -> &'b [u8] {
         self.bytes
     }
+}
+
+impl<'s, 'b, K: Kind> Hit<'s, 'b, K>
+where
+    K::Root: HasPayload,
+{
+    /// The payload of the record the hit opened: nothing is opened or checked again.
+    pub fn payload(&self) -> Result<&'b [u8], RecordError> {
+        self.root.payload().follow(self.bytes).map_err(RecordError::Format)
+    }
+}
+
+/// The payload of `record`, the bytes the store holds under `holds`'s key, by the proof: the one
+/// reader of an [`Opaque`](crate::record::Opaque) or [`Traced`](crate::record::Traced) record's
+/// payload for code that holds a proof but not the [`Hit`] that made it (a manifest's named
+/// record, an outside value found by address, an action's input).
+///
+/// No head is compared and nothing is verified: the proof was made by the record's one check,
+/// and a key's bytes never change in the store. What runs is the format's bounds on the buffer,
+/// which reading any byte of it needs (the root's place and the payload's range), and in debug
+/// builds an assertion that the head is the proof's key.
+pub fn payload<'b, K: Kind>(holds: &Holds<'_, K>, record: &'b [u8]) -> Result<&'b [u8], RecordError>
+where
+    K::Root: HasPayload,
+{
+    let root = blaze_format::open::<K::Root>(record).map_err(RecordError::Format)?;
+    debug_assert!(
+        root.head().key == holds.key().id() && root.head().tag == K::TAG.0,
+        "a proof of {:?} given another record",
+        holds.key().id()
+    );
+    root.payload().follow(record).map_err(RecordError::Format)
 }
 
 impl<'s, 'b> Hit<'s, 'b, UnitManifest> {

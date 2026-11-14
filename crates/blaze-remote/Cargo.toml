@@ -16,7 +16,9 @@ doctest = false
 [dependencies]
 # The plain store: its segment is the wire format; its `Source` and `Verifier` are the seam.
 blaze-cas.workspace = true
-# The core's vocabulary: `Origin`, `namespace_of` (privacy), `RecordRef` (actions).
+# The one vocabulary: the store's (`SegmentRef`, `SegmentLen`, `Statement`, `Source`,
+# `Verifier`, `StoreError`), `Origin` and `namespace_of` (privacy), `RecordRef` and
+# `ActionResult` (actions).
 blaze-keyed.workspace = true
 # `ContentId` (BLAKE3 digests), CRC-32C.
 blaze-ids.workspace = true
@@ -34,6 +36,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 blaze-rng.workspace = true
+# An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).
+blaze-sha256.workspace = true
 hegeltest.workspace = true
 
 [lints]

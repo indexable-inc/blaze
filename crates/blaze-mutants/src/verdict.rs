@@ -23,60 +23,18 @@ use std::alloc::Global;
 use std::fmt;
 
 use blaze_ids::ContentId;
-use blaze_keyed::kind::{Grain, Keep, Key, KeyHasher, Kind, Layout, Tag, Trace};
-use blaze_keyed::record::Opaque;
-use blaze_program::key::BodyKey;
+use blaze_keyed::kind::{Key, Kind};
 use blaze_program::record::TestKey;
 
-use crate::Plant;
 use crate::arid::EquivRule;
 
-/// The version of what the operators do and of the record's layout: a change to either bumps it,
-/// and every verdict is made again.
-pub const MUTANTS_VERSION: u16 = 1;
+/// The core record kind of a final verdict and what its key is made of: declared in the core's
+/// `kind.rs` with its key rule (its tag listed in `TAGS`), never here.
+pub use blaze_keyed::kind::{MutantVerdict, VerdictInputs};
 
-/// The core record kind of a final verdict. Its tag is the next free one after
-/// `blaze_keyed::kind::TAGS` (11 kinds); it is to be listed there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MutantVerdict;
-
-/// What a verdict's key is made of.
-pub struct VerdictInputs<'a> {
-    pub body: BodyKey,
-    pub site: u32,
-    /// [`crate::operator::Mutation::encode`]'s bytes.
-    pub mutation: &'a [u8],
-    /// The keys of every test whose reach includes the function, sorted, each once.
-    pub tests: &'a [TestKey],
-    pub plant: Plant,
-}
-
-impl Kind for MutantVerdict {
-    const TAG: Tag = Tag(12);
-    const NAME: &'static str = "MutantVerdict";
-    const DOMAIN: &'static str = "blaze-keyed MutantVerdict key";
-    const VERSION: u16 = MUTANTS_VERSION;
-    const LAYOUT: Layout = Layout::Flat;
-    const GRAIN: Grain = Grain::Run;
-    const TRACE: Trace = Trace::Key;
-    const KEEP: Keep = Keep::Disk;
-    type Root = Opaque;
-    type Inputs<'a> = VerdictInputs<'a>;
-
-    fn key(inputs: &VerdictInputs<'_>) -> Key<MutantVerdict> {
-        let mut hasher = KeyHasher::of::<MutantVerdict>();
-        hasher.id(&inputs.body.0).u64(u64::from(inputs.site)).bytes(inputs.mutation);
-        let tests: &[TestKey] = match inputs.plant {
-            Plant::VerdictKeyWithoutTests => &[],
-            _ => inputs.tests,
-        };
-        hasher.u64(tests.len() as u64);
-        for test in tests {
-            hasher.id(&test.0);
-        }
-        hasher.finish()
-    }
-}
+/// The version of what the operators do and of the record's layout: the core kind's version. A
+/// change to either bumps it there, and every verdict is made again.
+pub const MUTANTS_VERSION: u16 = MutantVerdict::VERSION;
 
 /// A verdict's key.
 pub type VerdictKey = Key<MutantVerdict>;

@@ -248,8 +248,8 @@ fn indent_of(text: &str, at: TextSize, end: TextSize) -> Option<&str> {
 
 /// The edit that writes `#[blaze::<word>]` before what starts at `at`: on a line of its own at
 /// that line's indentation when `at` starts its line, before it on its line otherwise. `end`
-/// is where the function ends.
-fn before(text: &str, at: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
+/// is where the function ends. `claims` writes the attribute a doc's claim is with it.
+pub(super) fn before(text: &str, at: TextSize, end: TextSize, word: &str) -> (TextSize, String) {
     match indent_of(text, at, end) {
         Some(indent) => (at, format!("#[blaze::{word}]\n{indent}")), // alloc: the fix's text
         None => (at, format!("#[blaze::{word}] ")),                  // alloc: the fix's text
@@ -288,7 +288,7 @@ fn written_effects(f: ast::Fn<'_>) -> Vec<(usize, TextRange)> {
 
 /// Where `f`'s signature starts in its tree: past its doc comments and attributes, at its
 /// visibility, qualifiers or `fn`.
-fn signature_start(f: ast::Fn<'_>) -> Option<TextSize> {
+pub(super) fn signature_start(f: ast::Fn<'_>) -> Option<TextSize> {
     f.syntax().children_with_tokens().find_map(|child| match child {
         NodeOrToken::Node(node)
             if matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT) =>

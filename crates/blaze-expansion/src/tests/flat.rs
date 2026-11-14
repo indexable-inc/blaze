@@ -94,7 +94,7 @@ fn another_layout_or_kind_is_refused() {
     let record = Aligned::copy_from(&outside::write_value(&key, &[], &bytes));
     proof::scope(|snap| {
         let holds: Holds<'_, Expansion> = proof::hit(snap, key, &record).expect("its own key").holds();
-        assert_eq!(outside::payload_of(&record, &holds).expect("opens"), &bytes[..]);
+        assert_eq!(proof::payload(&holds, &record).expect("opens"), &bytes[..]);
         let other = Key::<Expansion>::from_id(Digest::of("test", b"other"));
         assert!(matches!(proof::hit(snap, other, &record), Err(RecordError::Key { .. })));
         let as_script = Key::<ScriptRun>::from_id(key.id());

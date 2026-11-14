@@ -10,17 +10,17 @@
 #![deny(blaze::sans_io_core)]
 
 use blaze_cas::plain::Namespace;
-use blaze_ids::ContentId;
 
 use crate::{
     name::{self, Toolchain},
+    segment::SegmentRef,
     trust::{PublicKey, Refusal, Signer, Why, verify_sig},
-    wire::{id_at, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
+    wire::{Bounded, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
 };
 
 const DOMAIN: &str = "blaze-remote bundle 1";
+const ROW: usize = SegmentRef::ROW;
 const HEADER: usize = 232;
-const ROW: usize = 56;
 /// The most segments a bundle names.
 pub const SEGMENTS_MOST: usize = 4096;
 /// The most bytes a manifest may be.
@@ -46,22 +46,13 @@ impl BundleId {
     }
 }
 
-/// One segment of a bundle.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SegmentRef {
-    pub digest: ContentId,
-    pub len: u64,
-    pub index_at: u64,
-    pub count: u32,
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Bundle {
     pub namespace: Namespace,
     pub id: BundleId,
     pub issued: u64,
     pub keys_serial: u64,
-    pub segments: Vec<SegmentRef>,
+    pub segments: Bounded<SegmentRef, SEGMENTS_MOST>,
 }
 
 fn padded(out: &mut Vec<u8>, text: &str) {
@@ -89,11 +80,7 @@ impl Bundle {
         padded(&mut out, &self.id.target);
         padded(&mut out, &self.id.cfg);
         for segment in &self.segments {
-            out.extend_from_slice(&segment.digest.0);
-            put_u64(&mut out, segment.len);
-            put_u64(&mut out, segment.index_at);
-            put_u32(&mut out, segment.count);
-            put_u32(&mut out, 0);
+            out.extend_from_slice(&segment.encode());
         }
         out.extend_from_slice(&signer.public().0);
         let signature = signer.sign(DOMAIN, &out);
@@ -130,12 +117,9 @@ impl Bundle {
         let mut segments = Vec::with_capacity(count);
         for i in 0..count {
             let at = HEADER + i * ROW;
-            let segment = SegmentRef { digest: id_at(bytes, at), len: u64_at(bytes, at + 32), index_at: u64_at(bytes, at + 40), count: u32_at(bytes, at + 48) };
-            if segment.len > blaze_cas::plain::SEGMENT_MOST {
-                return Err(refuse(Why::TooLarge { len: segment.len, most: blaze_cas::plain::SEGMENT_MOST }));
-            }
-            segments.push(segment);
+            segments.push(SegmentRef::decode(&bytes[at..at + ROW]).map_err(|why| refuse(Why::Wire(why)))?);
         }
+        let segments = Bounded::new(segments).map_err(refuse)?;
         Ok((Bundle { namespace, id: id.clone(), issued: u64_at(bytes, 16), keys_serial: u64_at(bytes, 24), segments }, signer))
     }
 }

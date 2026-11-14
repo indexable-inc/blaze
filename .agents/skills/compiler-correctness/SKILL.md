@@ -259,4 +259,19 @@ if the answer is "it might have changed", find the key, stamp or proof that says
 skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
 in one snapshot is an invariant the simulation's oracle checks.
 
+## findings-are-records (rule 81)
+
+A lint finding is a record keyed like the check it comes from (the body's key, the pass and its
+version, and what the pass read beyond the body), so a finding is computed once and found again by
+key. It holds no level and no file position: its range is relative to its item
+(`item-relative-positions`), so changing a level or moving an item changes no key. Passes run in
+three classes: a pass with any lint at deny or above runs before the answer, so a gate never passes
+unchecked; advice runs right after the answer; expensive analyses (workspace folds, test strength,
+duplicates across crates) run in the background on the command's snapshot, are cancelled by a newer
+command and are never started by a file change (`act-on-snapshots`). Every reply says what is still
+pending. A project that is plain Rust adopts blaze's checks one step at a time (`step = "rust" |
+"suggest" | "edition" | "strict"` in `[workspace.metadata.blaze.lints]`), and `blaze::suggest` says
+where a blaze feature or a tighter type would pay. The crate is crates/blaze-findings; the design is
+docs/v2/plan/design/target.md, Findings.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

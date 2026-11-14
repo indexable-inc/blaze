@@ -34,12 +34,13 @@ use blaze_ids::ContentId;
 
 use crate::{
     bucket::{Asked, Cond, Failure, Machine, Op, Pending, Reply, Step, Ticket, failed},
-    bundle::{Bundle, BundleId, SegmentRef},
+    bundle::{Bundle, BundleId},
     find::{Answer, Cache, Find, RootSeen},
     name::{self, Toolchain},
-    segment,
+    segment::{self, SegmentId, SegmentRef},
     shard::{self, Entry, Root, Run, SHARD_MOST, ShardRef},
     trust::{KeyList, Refusal, Roles, Signer, Statement, Tier, Trusted, Why},
+    wire::Bounded,
 };
 
 /// Attempts at the root before [`Failure::Contended`].
@@ -55,7 +56,7 @@ pub const IN_FLIGHT: usize = 16;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BundleOut {
     pub id: BundleId,
-    pub segments: Vec<ContentId>,
+    pub segments: Vec<SegmentId>,
 }
 
 /// Everything a push needs.
@@ -162,6 +163,10 @@ pub struct Push<'a> {
     pending: Pending<Doing>,
     queue: VecDeque<Doing>,
     uploads: BTreeMap<usize, (String, Vec<Option<String>>)>,
+    /// A segment past this goes up in parts of `part` bytes: [`MULTIPART_OVER`] and [`PART`],
+    /// lowered only by a test ([`Push::with_parts`]) so the simulation's bucket exercises parts.
+    multipart_over: u64,
+    part: usize,
     seen: Option<RootSeen>,
     generation: u64,
     new_run: Option<Run>,
@@ -198,18 +203,18 @@ impl<'a> Push<'a> {
         let mut entries = Vec::new();
         for (i, bytes) in segments.into_iter().enumerate() {
             let object = format!("segment {i} of this push");
-            let read = segment::read(bytes).map_err(|why| refused(&object, None, Why::Malformed(why)))?;
+            let read = segment::read(bytes).map_err(|why| refused(&object, None, Why::Segment(why)))?;
             if read.namespace != namespace && !crate::planted(crate::Plant::SkipPrivacy) {
-                let object = name::segment(namespace, &toolchain, &read.digest).map_err(bad)?;
+                let object = name::segment(namespace, &toolchain, &read.segment.digest().0).map_err(bad)?;
                 return Err(refused(&object, None, Why::Private { segment: read.namespace.0, wanted: namespace.0 }));
             }
-            let at = SegmentRef { digest: read.digest, len: read.len, index_at: read.index_at, count: read.records.len() as u32 };
+            let at = read.segment;
             for rec in &read.records {
-                entries.push(Entry { key: rec.key, value: rec.value, segment: read.digest, segment_len: read.len, index_at: read.index_at, at: rec.at, len: rec.len, count: at.count });
+                entries.push(Entry::new(rec.key, rec.value, at, rec.at, rec.len).map_err(|why| refused(&object, Some(key_hex(&rec.key)), why))?);
             }
-            segs.push(Seg { bytes, at, records: at.count });
+            segs.push(Seg { bytes, at, records: at.count() });
         }
-        entries.sort_by(|a, b| a.key.cmp(&b.key).then(a.segment.cmp(&b.segment)));
+        entries.sort_by(|a, b| a.key.cmp(&b.key).then(a.segment().digest().cmp(&b.segment().digest())));
         let mut kept: Vec<Entry> = Vec::with_capacity(entries.len());
         for entry in entries {
             match kept.last() {
@@ -239,15 +244,13 @@ impl<'a> Push<'a> {
             }
             let mut refs = Vec::with_capacity(out.segments.len());
             for digest in &out.segments {
-                let Some(seg) = segs.iter().find(|it| it.at.digest == *digest) else {
-                    return Err(refused(&object, Some(blaze_format::hex::encode(&digest.0)), Why::Malformed("a bundle names a segment this push does not hold")));
+                let Some(seg) = segs.iter().find(|it| it.at.digest() == *digest) else {
+                    return Err(refused(&object, Some(blaze_format::hex::encode(&digest.0.0)), Why::Malformed("a bundle names a segment this push does not hold")));
                 };
                 refs.push(seg.at);
             }
-            if refs.len() > crate::bundle::SEGMENTS_MOST {
-                return Err(refused(&object, None, Why::TooLarge { len: refs.len() as u64, most: crate::bundle::SEGMENTS_MOST as u64 }));
-            }
-            outs.push(Bundle { namespace, id: out.id, issued: now_s, keys_serial: list.serial, segments: refs });
+            let segments = Bounded::new(refs).map_err(|why| refused(&object, None, why))?;
+            outs.push(Bundle { namespace, id: out.id, issued: now_s, keys_serial: list.serial, segments });
         }
 
         let report = Report { records: entries.len() as u64, sampled: sample.len() as u64, ..Report::default() };
@@ -274,6 +277,8 @@ impl<'a> Push<'a> {
             pending: Pending::new(),
             queue: VecDeque::new(),
             uploads: BTreeMap::new(),
+            multipart_over: MULTIPART_OVER,
+            part: PART,
             seen: None,
             generation: 0,
             new_run: None,
@@ -288,12 +293,22 @@ impl<'a> Push<'a> {
         self.report
     }
 
+    /// The machine with segments past `over` bytes sent in parts of `part`: a test's, so a
+    /// multipart upload runs against the simulation's bucket without 64 MiB segments.
+    #[cfg(test)]
+    pub(crate) fn with_parts(mut self, over: u64, part: usize) -> Push<'a> {
+        assert!(part > 0, "a part of no bytes");
+        self.multipart_over = over;
+        self.part = part;
+        self
+    }
+
     fn seg_object(&self, i: usize) -> String {
-        name::segment(self.namespace, &self.toolchain, &self.segs[i].at.digest).expect("named in new")
+        name::segment(self.namespace, &self.toolchain, &self.segs[i].at.digest().0).expect("named in new")
     }
 
     fn statement_object(&self, i: usize) -> String {
-        name::statement(self.namespace, &self.toolchain, &self.segs[i].at.digest).expect("named in new")
+        name::statement(self.namespace, &self.toolchain, &self.segs[i].at.digest().0).expect("named in new")
     }
 
     fn shard_object(&self, generation: u64, digest: &ContentId) -> String {
@@ -301,7 +316,7 @@ impl<'a> Push<'a> {
     }
 
     fn parts_of(&self, i: usize) -> u32 {
-        self.segs[i].bytes.len().div_ceil(PART) as u32
+        self.segs[i].bytes.len().div_ceil(self.part) as u32
     }
 
     /// The op for a queued `doing`, its bytes copied only now.
@@ -313,9 +328,9 @@ impl<'a> Push<'a> {
             Doing::Begin(i) => Op::Begin { name: self.seg_object(i) },
             Doing::Part(i, n) => {
                 let bytes = self.segs[i].bytes;
-                let at = (n as usize - 1) * PART;
+                let at = (n as usize - 1) * self.part;
                 let upload = self.uploads[&i].0.clone();
-                Op::Part { name: self.seg_object(i), upload, number: n, bytes: bytes[at..(at + PART).min(bytes.len())].to_vec() }
+                Op::Part { name: self.seg_object(i), upload, number: n, bytes: bytes[at..(at + self.part).min(bytes.len())].to_vec() }
             }
             Doing::Finish(i) => {
                 let (upload, etags) = &self.uploads[&i];
@@ -324,8 +339,19 @@ impl<'a> Push<'a> {
             }
             Doing::PutStatement(i) => {
                 let seg = &self.segs[i];
-                let statement = Statement { namespace: self.namespace, segment: seg.at.digest, len: seg.at.len, toolchain: self.toolchain.digest(), records: seg.records, tier: self.tier, issued: self.now_s, builder: self.signer.public() };
-                Op::Put { name: self.statement_object(i), bytes: statement.encode(self.signer), cond: Cond::Absent }
+                let mut statement = Statement {
+                    namespace: self.namespace,
+                    segment: seg.at.digest(),
+                    len: seg.at.segment_len(),
+                    toolchain: self.toolchain.digest(),
+                    records: seg.records,
+                    tier: self.tier,
+                    issued: self.now_s,
+                    signer: [0; 32],
+                    signature: [0; 64],
+                };
+                self.signer.sign_statement(&mut statement);
+                Op::Put { name: self.statement_object(i), bytes: statement.encode().to_vec(), cond: Cond::Absent }
             }
             Doing::PutShard | Doing::PutBundle | Doing::Load(..) | Doing::PutRoot | Doing::ReadBack => unreachable!("asked directly, never queued"),
         }
@@ -353,15 +379,15 @@ impl<'a> Push<'a> {
             },
             Doing::HeadSeg(i) => match reply {
                 Reply::Missing => {
-                    self.queue.push_back(if self.segs[i].at.len > MULTIPART_OVER { Doing::Begin(i) } else { Doing::PutSeg(i) });
+                    self.queue.push_back(if self.segs[i].at.size() > self.multipart_over { Doing::Begin(i) } else { Doing::PutSeg(i) });
                     Ok(())
                 }
-                Reply::Exists { len } if len == self.segs[i].at.len => {
+                Reply::Exists { len } if len == self.segs[i].at.size() => {
                     self.report.segments_present += 1;
                     self.queue.push_back(Doing::PutStatement(i));
                     Ok(())
                 }
-                Reply::Exists { len } => Err(refused(&self.seg_object(i), None, Why::Length { len, wanted: self.segs[i].at.len })),
+                Reply::Exists { len } => Err(refused(&self.seg_object(i), None, Why::Length { len, wanted: self.segs[i].at.size() })),
                 other => Err(failed(&self.seg_object(i), other)),
             },
             Doing::PutSeg(i) | Doing::Finish(i) => match reply {
@@ -417,8 +443,7 @@ impl<'a> Push<'a> {
                 let object = name::shard(self.namespace, &self.toolchain, generation, &shard.digest).expect("named");
                 match reply {
                     Reply::Got { bytes, .. } => {
-                        let empty = Cache::default();
-                        let known = self.cache.as_ref().unwrap_or(&empty);
+                        let known = self.cache.as_mut().ok_or_else(|| Failure::Misused("a shard loaded during a find".to_owned()))?;
                         let entries = shard::decode_whole(&object, &bytes, &shard, self.namespace, known)?;
                         merging.loaded.insert(shard.digest, entries);
                         Ok(())
@@ -498,7 +523,10 @@ impl<'a> Push<'a> {
         ShardRef { first: entries[0].key, digest, count: entries.len() as u32 }
     }
 
-    fn put_root(&mut self, now: u64, out: &mut Vec<Asked>) {
+    /// Puts the root over `self.runs`, or refuses when they are more than a root holds
+    /// ([`shard::RUNS_MOST`]): the merge keeps them under it, so this names a broken merge.
+    fn put_root(&mut self, now: u64, out: &mut Vec<Asked>) -> Result<(), Failure> {
+        let runs = Bounded::new(self.runs.clone()).map_err(|why| refused(&self.root_object, None, why))?;
         self.report.tries += 1;
         self.report.generation = self.generation;
         let root = Root {
@@ -507,7 +535,7 @@ impl<'a> Push<'a> {
             keys_serial: self.key_serial,
             issued: self.now_s,
             previous: self.seen.as_ref().map_or(ContentId([0; 32]), |it| it.digest),
-            runs: self.runs.clone(),
+            runs,
         };
         let bytes = root.encode(self.signer);
         self.root_digest = Some(shard::root_digest(&bytes));
@@ -518,6 +546,7 @@ impl<'a> Push<'a> {
         };
         self.ask(now, out, Op::Put { name: self.root_object.clone(), bytes, cond }, Doing::PutRoot);
         self.phase = Phase::Root;
+        Ok(())
     }
 
     /// One merge step with nothing pending: the loads the next chunk needs, or the chunk
@@ -525,25 +554,37 @@ impl<'a> Push<'a> {
     fn merge_step(&mut self, now: u64, out: &mut Vec<Asked>) -> Result<(), Failure> {
         let generation = self.generation;
         let m = self.merging.as_mut().expect("merging");
-        if m.i == m.older.shards.len() {
+        if m.i == m.older.shards().len() {
             let carry = std::mem::take(&mut m.carry);
             let mut shards = std::mem::take(&mut m.out);
             if !carry.is_empty() {
                 shards.push(self.put_shard(now, out, generation, &carry));
             }
-            let merged = Run { generation, shards };
+            let merged = Run::new(generation, shards).map_err(|why| refused(&self.root_object, None, why))?;
             self.runs.splice(0..2, [merged]);
             self.merging = None;
             self.report.merges += 1;
             return Ok(());
         }
-        let (lo, hi) = (if m.i == 0 { None } else { Some(m.older.shards[m.i].first) }, m.older.covers(m.i).1);
+        let (lo, hi) = (if m.i == 0 { None } else { Some(m.older.shards()[m.i].first) }, m.older.covers(m.i).1);
         let mut wanted: Vec<(ShardRef, bool)> = Vec::new();
-        let older = m.older.shards[m.i];
-        if !m.loaded.contains_key(&older.digest) {
-            wanted.push((older, true));
-        }
-        let overlapping: Vec<usize> = (0..m.newer.shards.len())
+        let older = m.older.shards()[m.i];
+        // A shard this client already checked (a merge before its root lost) is taken from the
+        // cache, its check carried, never fetched and checked again (decision 18).
+        let cache = self.cache.as_ref();
+        let mut want = |shard: ShardRef, is_older: bool, loaded: &mut BTreeMap<ContentId, Vec<Entry>>| {
+            if loaded.contains_key(&shard.digest) {
+                return;
+            }
+            match cache.and_then(|it| it.whole(&shard)) {
+                Some(entries) => {
+                    loaded.insert(shard.digest, entries);
+                }
+                None => wanted.push((shard, is_older)),
+            }
+        };
+        want(older, true, &mut m.loaded);
+        let overlapping: Vec<usize> = (0..m.newer.shards().len())
             .filter(|&j| {
                 let (first, next) = m.newer.covers(j);
                 hi.is_none_or(|hi| first < hi) && match (next, lo) {
@@ -553,10 +594,7 @@ impl<'a> Push<'a> {
             })
             .collect();
         for &j in &overlapping {
-            let shard = m.newer.shards[j];
-            if !m.loaded.contains_key(&shard.digest) {
-                wanted.push((shard, false));
-            }
+            want(m.newer.shards()[j], false, &mut m.loaded);
         }
         if !wanted.is_empty() {
             let (older_gen, newer_gen) = (m.older.generation, m.newer.generation);
@@ -570,14 +608,14 @@ impl<'a> Push<'a> {
         let in_range = |key: &[u8; 32]| lo.is_none_or(|lo| *key >= lo) && hi.is_none_or(|hi| *key < hi);
         let mut newer_entries: Vec<Entry> = Vec::new();
         for &j in &overlapping {
-            newer_entries.extend(m.loaded[&m.newer.shards[j].digest].iter().filter(|it| in_range(&it.key)).copied());
+            newer_entries.extend(m.loaded[&m.newer.shards()[j].digest].iter().filter(|it| in_range(&it.key)).copied());
         }
         // Newer shards whose range ends inside this chunk are not needed again.
         for &j in &overlapping {
             if let (Some(next), Some(hi)) = (m.newer.covers(j).1, hi)
                 && next <= hi
             {
-                m.loaded.remove(&m.newer.shards[j].digest);
+                m.loaded.remove(&m.newer.shards()[j].digest);
             }
         }
         let (mut a, mut b) = (0, 0);
@@ -635,7 +673,7 @@ impl<'a> Push<'a> {
                             shards.push(self.put_shard(now, out, self.generation, part));
                         }
                         self.entries = entries;
-                        self.new_run = Some(Run { generation: self.generation, shards });
+                        self.new_run = Some(Run::new(self.generation, shards).map_err(|why| refused(&self.root_object, None, why))?);
                     }
                     for i in 0..self.bundles.len() {
                         let bundle = &self.bundles[i];
@@ -646,7 +684,7 @@ impl<'a> Push<'a> {
                     if crate::planted(crate::Plant::RootBeforeShards) {
                         self.phase = Phase::Merge;
                         self.runs = self.new_run.iter().cloned().chain(self.seen.iter().flat_map(|it| it.root.runs.iter().cloned())).collect();
-                        self.put_root(now, out);
+                        self.put_root(now, out)?;
                         return Ok(false);
                     }
                 }
@@ -667,7 +705,7 @@ impl<'a> Push<'a> {
                         self.merging = Some(Merging { newer: self.runs[0].clone(), older: self.runs[1].clone(), i: 0, loaded: BTreeMap::new(), carry: Vec::new(), out: Vec::new() });
                         continue;
                     }
-                    self.put_root(now, out);
+                    self.put_root(now, out)?;
                 }
                 Phase::Root => return Err(Failure::Misused("the root's answer did not move the push on".to_owned())),
                 Phase::ReadBack => {

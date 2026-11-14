@@ -16,6 +16,33 @@
 //! - [`reach`] and [`record::TestRecord`]: tests are programs; a result is keyed by what the
 //!   test reaches (calls and statics' values), its outside reads and its arguments.
 //!
+//! **The row rule** (one definition; every path derives from it). Each function has a tier: a
+//! dependency's is the top tier; a workspace function's is the fast tier unless it was tiered
+//! up and is unchanged since. The *rows* of a program are the least set of nodes that holds the
+//! roots and is closed under the edges of the code at those tiers: a function's calls that its
+//! code does not take in (an inline edge is not an edge), its statics, and a static's fields
+//! (what takes a function's address). A node has a row exactly when it is in that set, never
+//! because it had one before. A build's makes are the set's keys the store does not hold.
+//!
+//! - A whole build ([`walk::Fresh`]) walks the set from the roots.
+//! - A delta keeps every row whose node it did not touch and that is still in the set. It walks
+//!   the *stale* nodes (edited, revisited, tiered up, changed statics, roots not yet placed)
+//!   only when they are in the set. A stale node is walked for its own sake
+//!   ([`walk::Seed::Walk`]) when it is a root, or when an unstale root reaches it through
+//!   unstale rows only ([`program::Program::seeds`]): then it is in the set whatever the walk
+//!   does. Every other stale node ([`walk::Seed::IfReached`]) is walked when the walk reaches it:
+//!   through a walked node's code, or through the kept calls of a row the walk passed over as
+//!   held ([`walk::Seed::Through`]). A stale node the walk never reaches is not in the set; its
+//!   row is retired ([`walk::Ended::unreached`] makes [`program::Program::place`] run the mark).
+//! - [`program::Program::tier_ups`] picks which rows to tier up (a policy); a tier-up is a stale
+//!   node like any other. A node new to the set in a delta that only tiers up is made at the
+//!   top tier ([`program::Delta::new_at`]), so a tier-up leaves no row at the fast tier.
+//!   [`program::Program::top_tier`] is the rows held at the top tier: a whole build seeded
+//!   with it as `Delta::tier_up` (new nodes at the fast tier) has the same tiers, so the same
+//!   rows.
+//! - A tier changes no behaviour, so a test's key is over the tier-free plan keys of what it
+//!   can run ([`reach`]); a tier-up never runs a test again.
+//!
 //! Nothing here does IO, reads a clock, or reacts to a file change: a build happens when asked,
 //! and every state machine is driven by its caller.
 //!

@@ -16,12 +16,19 @@
 //!
 //! **Tiers.** An instance outside the workspace (a dependency, anything from the shared bucket)
 //! is made at [`Tier::Release`] always. A workspace instance is made at [`Tier::Edit`] unless it
-//! was seeded as a tier-up ([`Seed::TierUp`]), when it is made at `Release` from the same plan
-//! and body key; the callees it reaches that the program does not hold yet stay at `Edit`. A
-//! tier-up whose every referrer tiers up too is only promoted ([`Seed::Promote`]): it is made
-//! when a walked referrer still calls it, and never when every one takes it in, so a tier-up
-//! makes no record the program will not hold (work once: an equal key is never made again,
-//! and nothing is made to be thrown away).
+//! is stale as a tier-up ([`Stale::TierUp`]), when it is made at `Release` from the same plan
+//! and body key. A node new to the program (no row before, not stale) is made at the walk's
+//! [`WalkConfig::new_at`]: `Edit` in an edit walk, so nothing an edit needs waits on the top
+//! tier, and `Release` in a walk that only tiers up ([`crate::program::Delta::new_at`]), which
+//! runs in the background, so a node first reached there is made once at the tier the program
+//! is moving to, not at `Edit` now and again at the next tier-up. Either way the tier is a
+//! function of the delta, never of which caller reached the node first.
+//!
+//! **Which nodes are walked** is the crate's row rule (see the crate docs): a stale node is
+//! walked when it is in the program's new set of rows, never because it had a row. One that
+//! only walked nodes can reach ([`Seed::IfReached`]) is walked when one of them still calls it,
+//! and never when every one takes it in or stops calling it, so no delta (an edit, a tier-up)
+//! makes a record the program will not hold (work once: nothing is made to be thrown away).
 //!
 //! **What it holds.** The frontier, the set of nodes seen (with each one's phase), the plans it
 //! read (the calls only of instances some caller may inline, so the plan cache is the inline
@@ -43,7 +50,8 @@
 //! instance inlined nowhere makes exactly 1 code record; one inlined into `K - 1` callers makes
 //! `K` (every key that moved and no other). An edit walk is seeded by
 //! [`crate::program::Program::seeds`] and stops at every node the prior program holds and the
-//! edit did not touch ([`Prior`]), so it reads the edit's neighbourhood, not the program.
+//! edit did not touch ([`Prior`]), reaching only the stale ones among that node's kept targets
+//! ([`Seed::Through`]), so it reads the edit's neighbourhood, not the program.
 //!
 //! **128 cores.** A walk is one shard of `shards`: it owns the symbols whose shard is its own
 //! ([`shard_of`]), and hands every other node it reaches to its owner ([`Ask::Route`]). Each
@@ -102,6 +110,9 @@ pub trait Prior {
     fn tier(&self, _symbol: &Symbol) -> Option<Tier> {
         None
     }
+    /// What the prior program's row of `node` refers to (its calls, then its statics); empty
+    /// when it holds no row of it.
+    fn targets(&self, node: &Node) -> Vec<Node, Global>;
 }
 
 /// No prior program: a whole walk.
@@ -111,26 +122,52 @@ impl Prior for Fresh {
     fn holds(&self, _: &Node) -> bool {
         false
     }
+
+    fn targets(&self, _: &Node) -> Vec<Node, Global> {
+        Vec::new_in(Global)
+    }
 }
 
-/// How a node comes into a walk.
+/// Why a node is stale in a delta: how it is walked when it is (the crate's row rule).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub enum Seed {
-    /// Reached from a node walked: not walked when the prior program holds it.
-    Reached,
-    /// A root or an instance of an edited item: walked whatever the prior holds, at the fast
+pub enum Stale {
+    /// An instance of an edited item, a changed static, or a root not placed yet: at the fast
     /// tier if it is the workspace's.
     Edited,
     /// A function whose body is unchanged but whose key may have moved (a callee's or an
-    /// inlinee's did): walked whatever the prior holds, at the tier the prior holds it at.
+    /// inlinee's did): at the tier the prior holds it at.
     Revisit,
-    /// A workspace instance to make again at the top tier, its body unchanged.
+    /// A workspace instance at the top tier, its body unchanged.
     TierUp,
-    /// A workspace instance to make at the top tier only if this walk reaches it: every node
-    /// referring to it tiers up too, and may take it in rather than call it, so it is not
-    /// walked for its own sake (an instance taken into all its callers is never coded alone).
-    /// Given to its owning shard before any answer, like every seed.
-    Promote,
+}
+
+/// How a node comes into a walk. Every seed is given to its owning shard before any answer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Seed {
+    /// Reached through a walked node's code: walked unless the prior program holds it and it is
+    /// not stale. A held one passed over reaches its own kept targets as [`Seed::Through`].
+    Reached,
+    /// Reached through the kept calls of a row passed over as held: walked when it is stale;
+    /// passed over in turn, forwarding to its own targets, when it is a gate; any other such
+    /// node is a kept row, and nothing is done.
+    Through,
+    /// An unstale row on a path from a walked node to an [`Seed::IfReached`] one: when the walk
+    /// passes it, it forwards to its kept targets ([`Seed::Through`]).
+    Gate,
+    /// A stale node walked for its own sake: a root, or reached from an unstale root through
+    /// unstale rows only, so it has a row whatever the walk does.
+    Walk(Stale),
+    /// A stale node walked only when the walk reaches it: every path to it from a root passes a
+    /// node this walk walks, which may take it in or stop calling it. One never reached has no
+    /// row ([`Ended::unreached`]).
+    IfReached(Stale),
+}
+
+/// What an ended walk gives: what it walked, and the stale nodes it never reached (no row).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ended {
+    pub walked: Vec<Walked, Global>,
+    pub unreached: Vec<Node, Global>,
 }
 
 /// A walk's settings.
@@ -145,6 +182,9 @@ pub struct WalkConfig {
     /// walk that does not end is a bug named, never a spin.
     pub fuel: u64,
     pub plant: Plant,
+    /// The tier a workspace node new to the program is made at (see the module's tiers):
+    /// [`crate::program::Delta::new_at`] of the delta walked, `Edit` for a whole build.
+    pub new_at: Tier,
 }
 
 /// The shard of `symbol` among `shards`: a function of the symbol alone.
@@ -188,15 +228,19 @@ pub enum Answer {
 
 /// What the program holds of one node: its key (an instance key, or a static's value key), its
 /// tier (a static's is `Release`), the functions and statics it refers to, and (for a function)
-/// every instance it took in.
+/// its plan key and every instance it took in, by plan key: the tier-free identity of the code
+/// a test runs through it ([`crate::reach`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Walked {
     pub node: Node,
     pub key: Digest,
     pub tier: Tier,
+    /// A function's plan key; a static has none (the default).
+    pub plan: PlanKey,
     pub calls: Vec<Symbol, Global>,
     pub statics: Vec<Symbol, Global>,
-    pub inlined: Vec<Symbol, Global>,
+    /// Every instance taken in at any depth, sorted by symbol, each once, with its plan key.
+    pub inlined: Vec<(Symbol, PlanKey), Global>,
 }
 
 /// Why a walk stopped.
@@ -218,6 +262,8 @@ pub enum WalkError {
     Fuel { steps: u64 },
     /// The walk was ended with `symbol` still waiting.
     Unfinished { symbol: Symbol },
+    /// `symbol` was keyed into `instance` without its plan in hand.
+    NoPlan { symbol: Symbol, instance: Symbol },
 }
 
 impl fmt::Display for WalkError {
@@ -247,6 +293,9 @@ impl fmt::Display for WalkError {
             }
             WalkError::Unfinished { symbol } => {
                 write!(f, "the walk was ended with {symbol} still waiting for a record")
+            }
+            WalkError::NoPlan { symbol, instance } => {
+                write!(f, "instance {instance} was keyed with {symbol} in it, whose plan the walk does not hold")
             }
         }
     }
@@ -289,10 +338,14 @@ pub struct Walk {
     /// Plans asked for and not yet answered.
     asked: blaze_hash::HashSet<Symbol, Global>,
     seen: blaze_hash::HashMap<Node, Phase, Global>,
-    /// Workspace instances seeded to tier up ([`Seed::TierUp`] and [`Seed::Promote`]).
+    /// Workspace instances walked to tier up ([`Stale::TierUp`]).
     promoted: blaze_hash::HashSet<Symbol, Global>,
-    /// Functions reached and passed over because the prior program holds them.
-    passed: blaze_hash::HashSet<Symbol, Global>,
+    /// Stale nodes walked only when reached ([`Seed::IfReached`]), not reached yet.
+    deferred: blaze_hash::HashMap<Node, Stale, Global>,
+    /// Nodes reached and passed over because the prior program holds them.
+    passed: blaze_hash::HashSet<Node, Global>,
+    /// Kept rows that forward when passed ([`Seed::Gate`]).
+    gates: blaze_hash::HashSet<Node, Global>,
     /// Revisited workspace instances, at the tier the prior program holds them at.
     kept: blaze_hash::HashMap<Symbol, Tier, Global>,
     /// The nodes to start on.
@@ -323,7 +376,9 @@ impl Walk {
             asked: blaze_hash::HashSet::new_in(Global),
             seen: blaze_hash::HashMap::new_in(Global),
             promoted: blaze_hash::HashSet::new_in(Global),
+            deferred: blaze_hash::HashMap::new_in(Global),
             passed: blaze_hash::HashSet::new_in(Global),
+            gates: blaze_hash::HashSet::new_in(Global),
             kept: blaze_hash::HashMap::new_in(Global),
             frontier: VecDeque::new_in(Global),
             waiting: blaze_hash::HashMap::new_in(Global),
@@ -349,44 +404,80 @@ impl Walk {
             self.asks.push_back(Ask::Route { node, shard, seed });
             return;
         }
-        if seed == Seed::Promote {
-            if let Node::Function(symbol) = node {
-                self.promoted.insert(symbol);
-                // Reached before the promotion came: it was passed over as held; walk it now.
-                if self.passed.remove(&symbol) {
+        match seed {
+            Seed::Walk(stale) => {
+                self.deferred.remove(&node);
+                // Passed over as held before its seed came: walk it now.
+                if self.passed.remove(&node) {
                     self.seen.remove(&node);
-                    self.reach(node, Seed::Reached, prior);
+                }
+                self.start(node, Some(stale), prior);
+            }
+            Seed::IfReached(stale) => {
+                if self.passed.remove(&node) {
+                    self.seen.remove(&node);
+                    self.start(node, Some(stale), prior);
+                } else if !self.seen.contains_key(&node) {
+                    self.deferred.insert(node, stale);
                 }
             }
-            return;
-        }
-        // A seed for a node passed over as held (reached before its seed came): walk it.
-        if let (true, Node::Function(symbol)) = (seed != Seed::Reached, node) {
-            if self.passed.remove(&symbol) {
-                self.seen.remove(&node);
+            Seed::Gate => {
+                self.gates.insert(node);
+            }
+            Seed::Through => {
+                if let Some(stale) = self.deferred.remove(&node) {
+                    self.start(node, Some(stale), prior);
+                } else if self.gates.contains(&node) && !self.seen.contains_key(&node) && prior.holds(&node) {
+                    self.pass(node, prior);
+                }
+            }
+            Seed::Reached => {
+                if let Some(stale) = self.deferred.remove(&node) {
+                    self.start(node, Some(stale), prior);
+                    return;
+                }
+                if self.seen.contains_key(&node) {
+                    return;
+                }
+                if prior.holds(&node) {
+                    self.pass(node, prior);
+                    return;
+                }
+                self.start(node, None, prior);
             }
         }
+    }
+
+    /// Passes over a kept row: not walked, but what it still refers to is reached through it.
+    fn pass(&mut self, node: Node, prior: &impl Prior) {
+        self.passed.insert(node);
+        self.seen.insert(node, Phase::Done);
+        for target in prior.targets(&node) {
+            self.reach(target, Seed::Through, prior);
+        }
+    }
+
+    /// Puts `node` on the frontier, at the tier its staleness says (a node new to the program
+    /// at its own tier).
+    fn start(&mut self, node: Node, stale: Option<Stale>, prior: &impl Prior) {
         if self.seen.contains_key(&node) {
             return;
         }
-        let promoted = matches!(node, Node::Function(symbol) if self.promoted.contains(&symbol));
-        if seed == Seed::Reached && prior.holds(&node) && !promoted {
-            if let Node::Function(symbol) = node {
-                self.passed.insert(symbol);
-            }
-            self.seen.insert(node, Phase::Done);
-            return;
-        }
-        match (seed, node) {
-            (Seed::TierUp, Node::Function(symbol)) => {
-                self.promoted.insert(symbol);
-            }
-            (Seed::Revisit, Node::Function(symbol)) => {
-                if let Some(tier) = prior.tier(&symbol) {
-                    self.kept.insert(symbol, tier);
+        if let Node::Function(symbol) = node {
+            match stale {
+                Some(Stale::TierUp) => {
+                    self.promoted.insert(symbol);
                 }
+                Some(Stale::Revisit) => {
+                    if let Some(tier) = prior.tier(&symbol) {
+                        self.kept.insert(symbol, tier);
+                    }
+                }
+                None if self.config.new_at == Tier::Release => {
+                    self.promoted.insert(symbol);
+                }
+                Some(Stale::Edited) | None => {}
             }
-            _ => {}
         }
         self.seen.insert(node, Phase::Resolving);
         self.frontier.push_back(node);
@@ -468,7 +559,17 @@ impl Walk {
                     self.asks.push_back(Ask::MakeCode { symbol, key, tier, plan: plan.key, inline });
                     return Ok(());
                 };
-                let inlined = keys.took_in_closure(&symbol);
+                let Some(plan) = self.plans.0.get(&symbol).map(|entry| entry.key) else {
+                    return Err(WalkError::NoPlan { symbol, instance: symbol });
+                };
+                let closure = keys.took_in_closure(&symbol);
+                let mut inlined = Vec::with_capacity_in(closure.len(), Global);
+                for callee in closure {
+                    let Some(entry) = self.plans.0.get(&callee) else {
+                        return Err(WalkError::NoPlan { symbol: callee, instance: symbol });
+                    };
+                    inlined.push((callee, entry.key));
+                }
                 self.finish(node);
                 if let Some(entry) = self.plans.0.get_mut(&symbol) {
                     // `Release` inlines everything `Edit` does and more.
@@ -486,6 +587,7 @@ impl Walk {
                     node,
                     key: key.0,
                     tier,
+                    plan,
                     calls: head.calls,
                     statics: head.statics,
                     inlined,
@@ -505,9 +607,9 @@ impl Walk {
         std::mem::replace(&mut self.walked, Vec::new_in(Global))
     }
 
-    /// Ends the walk, giving what is done and not taken; an error names an instance still
-    /// waiting.
-    pub fn end(self) -> Result<Vec<Walked, Global>, WalkError> {
+    /// Ends the walk, giving what is done and not taken, and the stale nodes it never reached
+    /// (in node order); an error names an instance still waiting.
+    pub fn end(self) -> Result<Ended, WalkError> {
         let mut waiting = Vec::new_in(Global);
         for (node, phase) in &self.seen {
             if *phase != Phase::Done {
@@ -518,7 +620,10 @@ impl Walk {
         if let Some(symbol) = waiting.first() {
             return Err(WalkError::Unfinished { symbol: *symbol });
         }
-        Ok(self.walked)
+        let mut unreached = Vec::with_capacity_in(self.deferred.len(), Global);
+        unreached.extend(self.deferred.keys().copied());
+        unreached.sort_unstable();
+        Ok(Ended { walked: self.walked, unreached })
     }
 
     /// The instance keys this walk made at `tier`.
@@ -606,6 +711,7 @@ impl Walk {
             node,
             key: value.key().0,
             tier: Tier::Release,
+            plan: PlanKey::default(),
             calls: head.calls,
             statics: head.statics,
             inlined: Vec::new_in(Global),

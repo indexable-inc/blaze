@@ -58,7 +58,8 @@ impl Store for MemStore {
         panic!("MemStore::map: no kind of this crate is Plain")
     }
 
-    fn put<K: Kind>(&self, key: &Key<K>, bytes: &[u8]) -> Result<Filing, StoreError> {
+    /// Every namespace in one table: the simulations file under one namespace ([`NAMESPACE`]).
+    fn put<K: Kind>(&self, key: &Key<K>, _namespace: Namespace, bytes: &[u8]) -> Result<Filing, StoreError> {
         let mut records = self.records.borrow_mut();
         if let Some(filed) = records.get(&(K::TAG.0, key.id().0)) {
             return Ok(if &**filed == bytes { Filing::Same } else { Filing::Other });
@@ -76,6 +77,9 @@ impl Store for MemStore {
         panic!("MemStore::compact: not used by these tests")
     }
 }
+
+/// The namespace every simulated record is filed in: a machine's own.
+pub(crate) const NAMESPACE: Namespace = Namespace::LOCAL;
 
 /// The toolchain every simulated call and run is keyed with.
 pub(crate) fn tool() -> ToolId {

@@ -30,7 +30,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::fmt;
+use std::{alloc::Global, fmt, marker::PhantomData};
+
+use blaze_keyed::kind::{Inlinee, Instance, InstanceInputs, InstancePlan, Key, Kind, PlanInputs, Tier as CoreTier};
 
 use crate::codec::{CodecError, Digest, Hasher, In, Out};
 
@@ -38,10 +40,6 @@ use crate::codec::{CodecError, Digest, Hasher, In, Out};
 pub const ARGS_DOMAIN: &str = "blaze program args 1";
 /// The domain of the settings' key.
 pub const SETTINGS_DOMAIN: &str = "blaze program settings 1";
-/// The domain of a plan key.
-pub const PLAN_DOMAIN: &str = "blaze program plan 1";
-/// The domain of an instance key.
-pub const INSTANCE_DOMAIN: &str = "blaze program instance 1";
 
 /// An item (or a shim's subject) by the front end's stable identity: a hash of its path and
 /// kind, with no position in it.
@@ -293,28 +291,39 @@ impl fmt::Display for InstanceKey {
     }
 }
 
-/// The plan key of `symbol` while its body's key is `body`, under `settings`.
+/// The plan key of `symbol` while its body's key is `body`, under `settings`: the core's
+/// [`InstancePlan`] key, its one rule.
 pub fn plan_key(symbol: &Symbol, body: &BodyKey, settings: &SettingsKey) -> PlanKey {
-    let mut hasher = Hasher::new(PLAN_DOMAIN);
-    hasher.id(&symbol.item.0).id(&body.0).id(&symbol.args.0).id(&settings.0);
-    PlanKey(hasher.finish())
+    let inputs = PlanInputs { item: symbol.item.0, args: symbol.args.0, body: body.0, settings: settings.0, of: PhantomData };
+    PlanKey(InstancePlan::key(&inputs).id())
+}
+
+impl Tier {
+    /// The core's tier: [`Tier::Edit`] is the fast backend's, [`Tier::Release`] the top one.
+    pub fn core(self) -> CoreTier {
+        match self {
+            Tier::Edit => CoreTier::Fast,
+            Tier::Release => CoreTier::Top,
+        }
+    }
 }
 
 /// The instance key of the instance planned under `plan`, made at `tier`, that takes in
 /// `took_in` (its direct inlinees with their instance keys at the same tier, sorted by symbol,
 /// each once). The caller keeps the order ([`crate::inline::Keys::resolve`] does): two lists
-/// of one set give one key.
+/// of one set give one key. The core's [`Instance`] key, its one rule.
 pub fn instance_key(plan: &PlanKey, tier: Tier, took_in: &[(Symbol, InstanceKey)]) -> InstanceKey {
     debug_assert!(
         took_in.windows(2).all(|pair| pair[0].0 < pair[1].0),
         "an instance's inlinees are sorted by symbol, each once"
     );
-    let mut hasher = Hasher::new(INSTANCE_DOMAIN);
-    hasher.id(&plan.0);
-    hasher.update(&[tier as u8]);
-    hasher.update(&(took_in.len() as u64).to_le_bytes());
-    for (symbol, key) in took_in {
-        hasher.id(&symbol.item.0).id(&symbol.args.0).id(&key.0);
-    }
-    InstanceKey(hasher.finish())
+    // The core's inputs name each inlinee in its own row: one list per key, freed on return.
+    let mut inlinees = Vec::with_capacity_in(took_in.len(), Global);
+    inlinees.extend(took_in.iter().map(|(symbol, key)| Inlinee {
+        item: symbol.item.0,
+        args: symbol.args.0,
+        code: Key::from_id(key.0),
+    }));
+    let inputs = InstanceInputs { plan: Key::from_id(plan.0), tier: tier.core(), inlinees: &inlinees };
+    InstanceKey(Instance::key(&inputs).id())
 }

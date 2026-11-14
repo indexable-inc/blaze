@@ -1,0 +1,9 @@
+{
+ "id": "H-add-a-lint-pass-to-findings",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-findings",
+ "task": "Give a lint (or a set of lints sharing one walk) its place in the findings scheduler (crates/blaze-findings)",
+ "do": "Declare one `PassDecl` next to the lints: `id: PassId::of(name)` written out (a `const` table; `misnamed()` checks it), a `version` bumped whenever what the pass computes changes, `lints` as `LintId::of(\"blaze::<name>\")`, `over` (Body for a per-body walk; Rows plus a `Fold { rows }` for a workspace rule, the join written as a `fold::Join`; Analysis for something that reads beyond its item, listing the ids it read), its `class` (Cheap unless it is an expensive analysis, then Deferred; never declare Answer: a lint at deny is promoted by `class_of`) and an honest `expected_ns` within the class's bound (`misdeclared()` refuses one over). A finding is item-relative: range from the item's start, `message` an id with typed `Arg`s, never a formatted string with positions or levels in it. For a fold, write the join's reference implementation first (as `fold::Narrow` is for `could_be_narrower`) and add it to the fold property test so the delta equals the fold from scratch.",
+ "why": "Records keyed by body and pass version are reused across edits and level changes; the class decides whether a finding holds the reply, so a pass in the wrong class either slows every answer or hides a gate; the sans-IO scheduler's simulation (crates/blaze-findings/src/tests.rs) checks every pass's work is computed once and that pending lists exactly what is missing.",
+ "state": "current"
+}

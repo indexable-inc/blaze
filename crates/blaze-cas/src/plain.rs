@@ -10,7 +10,7 @@
 //!
 //! - `head`, 4160 bytes: two 64-byte slots at 0 and 4096 (a sector apart, so a torn write of
 //!   one never touches the other; nothing assumes a page size). Generation `g` lives in slot
-//!   `g % 2`. A slot: 0..4 `BLPH`, 4..8 format (1), 8..16 generation, 16..24 the manifest
+//!   `g % 2`. A slot: 0..4 `BLPH`, 4..8 format (2), 8..16 generation, 16..24 the manifest
 //!   log's id, 24..32 the manifest's offset in it, 32..36 its length, 36..40 its CRC-32C,
 //!   40..60 zero, 60..64 CRC-32C of 0..60. The newest whole slot whose manifest is whole is
 //!   the committed generation. The file is made at its full length (zeros) and synced at the
@@ -30,9 +30,13 @@
 //!   it lies (nothing of the machine in it): a 128-byte header (`BLPS`, format u32, namespace
 //!   u64, count u32, zero u32, index offset u64, lowest key, highest key, 32 zero); payloads
 //!   from 128 at 16-aligned offsets; `count` sorted 48-byte entries (32 key; 8 place:
-//!   offset/16 in bits 0..40, kind in 56..64; 4 length; 4 CRC-32C of key, kind byte and
-//!   payload); a 48-byte footer (`BLPE`, count u32, index offset u64, the BLAKE3 digest of
-//!   every byte before the digest). A segment never mixes namespaces; one no manifest names
+//!   offset/16 in bits 0..40, blaze-keyed's `Tag` (u16) in 40..56, zero in 56..64; 4 length;
+//!   4 CRC-32C of key, tag and payload); a 48-byte footer (`BLPE`, count u32, index offset
+//!   u64, the BLAKE3 digest of every byte before the digest). Format 1 (a kind's byte in bits
+//!   56..64) is refused by name, every file of it, never read as empty. Zero records is a valid
+//!   segment (176 bytes). The geometry is blaze-keyed's (`store::{HEADER, FOOTER, ENTRY,
+//!   ALIGN}`); [`seal_segment`] and the commit write it through one function, [`check_segment`]
+//!   reads it. A segment never mixes namespaces; one no manifest names
 //!   still says what it held; its index is an immutable object a remote source serves by range
 //!   (`format::find_ranged`: about one 64 KiB read per lookup in a shard of a million).
 //! - `flip`: the lock file. `CACHEDIR.TAG`: the cache directory tag; on macOS the directory
@@ -40,11 +44,12 @@
 //!
 //! # A commit, in order
 //!
-//! 1. The store's batch and the workers' [`Batch`]es (each filled by one worker, no shared
-//!    word) are laid end to end as one segment: no copy of a worker's bytes, which move into
-//!    their writes. The index is sorted once (n log n on the commit's entries).
-//! 2. `seg-<id>` is made at its length and every piece written at its offset, in parallel. No
-//!    lock is held. No sync (durable mode: one sync of the segment here).
+//! 1. The store's batches and the workers' [`Batch`]es (each filled by one worker for one
+//!    namespace, no shared word) are laid end to end as one segment per namespace that holds
+//!    records: no copy of a worker's bytes, which move into their writes. Each index is sorted
+//!    once (n log n on its entries).
+//! 2. Each `seg-<id>` in turn is made at its length and every piece written at its offset, in
+//!    parallel. No lock is held. No sync (durable mode: one sync of each segment here).
 //! 3. The flip lock is taken (`flock`, never waiting in the kernel: a 2 ms timer between
 //!    asks, stopped by name after 60 s). Under it: the head is read again, and the manifest
 //!    when another process flipped since (so no update is lost); the new manifest is built
@@ -80,8 +85,10 @@
 //! # Reads
 //!
 //! Each segment is mapped once per process, never unmapped during a run, and its index
-//! touched a page at a time once mapped. A lookup probes the index of each segment of the
-//! generation, newest first, with no lock and no write to anything shared: up to three
+//! touched a page at a time once mapped. A lookup names the namespaces it asks, in order
+//! (this machine's, the organisation's, the public one: [`Settings::reads`]), and searches no
+//! other; within each it probes the index of each segment, newest first, with no lock and no
+//! write to anything shared ([`PlainStore`], blaze-keyed's `Store`): up to three
 //! interpolation steps on the key's first 8 bytes, then bisection. [`Driven::get`] returns
 //! the payload in place (the mapping); [`Driven::get_into`] reads it with one `pread` into
 //! the caller's buffer. Per lookup: 0 syscalls and 0 faults for the index (touched), plus
@@ -117,16 +124,23 @@ pub mod settings;
 mod core;
 mod driven;
 mod format;
+mod handle;
 mod verified;
 
 #[cfg(test)]
 mod tests;
 
 pub use self::core::{
-    Batch, Committed, GRACE_NS, Got, Located, Lost, Plain, PlainConfig, PutError, Report,
+    Batch, Committed, GRACE_NS, Got, Lost, Placed, Plain, PlainConfig, PutError, ROOT_TAG, Report,
     SEGMENTS_MOST, SLICE_BYTES, Sliced, TAGS, WINDOW,
 };
-pub use self::driven::{Driven, Found, LocalDir, Opened, Source, Verifier, lower_this_thread};
-pub use self::format::{Namespace, SEGMENT_MOST, Segment};
+pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
+pub use self::format::{Described, Entry, FORMAT, Segment, check_segment, describe, record_crc, seal_segment};
+pub use self::handle::PlainStore;
 pub use self::settings::{Form, Settings};
-pub use self::verified::Checks;
+pub use self::verified::{Checks, Proof};
+// The vocabulary is blaze-keyed's (rule 30): re-exported where the remote lane looks for it.
+pub use blaze_keyed::{
+    kind::{Namespace, Tag},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, SEGMENT_MOST, Source, Verifier},
+};

@@ -56,10 +56,13 @@ pub(super) fn is_test_def(db: &base_db::Db, def: hir_def::DefWithBodyId) -> bool
 }
 
 /// The module `node` is in: its innermost item's, or, for the file's own inner attributes, the
-/// module of the file's first item.
+/// module of the file's first item. A macro call is an `Item` to the grammar but defines
+/// nothing, so it is passed over: a `println!` in a body is in its function's module.
 pub(super) fn module_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<hir::Module> {
     let db = cx.db();
-    let is_item = |it: &ast::Node<'t>| ast::Item::cast(*it).is_some();
+    let is_item = |it: &ast::Node<'t>| {
+        ast::Item::cast(*it).is_some_and(|it| !matches!(it, ast::Item::MacroCall(_)))
+    };
     let item = node
         .ancestors()
         .find(is_item)
@@ -71,8 +74,8 @@ pub(super) fn module_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<hir:
 }
 
 /// clippy's `is_cfg_test`, as [`Cx::is_in_test`] reads a module's `cfg`: the `cfg`'s list has
-/// the word `test`.
-fn names_test(cfg: &CfgExpr) -> bool {
+/// the word `test`. The one home of the rule: `test_misses_its_subject` asks it too.
+pub(super) fn names_test(cfg: &CfgExpr) -> bool {
     let is_test =
         |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
     match cfg {

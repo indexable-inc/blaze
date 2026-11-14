@@ -1,0 +1,9 @@
+{
+ "id": "H-smoke-before-merge",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane proof-before-merge tool (rule 68)",
+ "task": "Make the smoke quote a merge to main needs, and land with it",
+ "do": "On the branch: `git merge origin/main` and commit (the head must contain main: the quote names the head's tree, which a --no-ff merge keeps). Build that commit's release blaze on blaze-vm and, in that checkout, run `blaze run -q -p scripts --bin smoke -- '{\"blaze\": \"/root/inst/blaze\", \"work\": \"/root/wt/<lane>/smoke\"}' > smoke.txt` inside the same `/root/loop.sh` call (work must be absent or empty; add `\"projects\": [\"hello\", \"six\"]` for the six-crate fixture). Exit 0 only for `verdict ok`; on a failure, standard error has the failed step's output tail, `<work>/<project>-home/v2/serve.log`'s tail and the slowest spans of the last build, and every step's logs are in `<work>/logs/`. Copy smoke.txt to the Mac and run `python3 .github/scripts/land.py '{\"what\": \"what the branch does\", \"smoke\": \"smoke.txt\"}'`: it checks the quote against `git rev-parse HEAD^{tree}` with `smoke '{\"verify\": {\"quote\": ..., \"tree\": ...}}'`, puts it in the pull request's body, and its waiting checks it again before it merges. When main moves past the head before the merge, merge main again and make a new quote: the old one names a tree that will not be main.",
+ "why": "Rule proof-before-merge: on 2026-11-13 three pull requests were admin-merged on compile checks and the merged blaze segfaulted at start, then could not finish a cold hello-world. land.py now refuses without the quote, and there is no flag around it.",
+ "state": "current"
+}

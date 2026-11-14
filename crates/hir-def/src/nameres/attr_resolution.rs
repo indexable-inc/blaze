@@ -135,6 +135,9 @@ impl DefMap {
                         // (docs/v2/plan/design/effect-summary.md).
                         | "bounded_turn"
                         | "answers_request"
+                        // `#[blaze::lock_checked]`, from `AttrFlags::LOCK_CHECKED`
+                        // (blaze-lints' `blaze::lock_order`).
+                        | "lock_checked"
                         | "expect"
                         // `#[blaze::may(..)]`, the deleted spelling of `expect`: inert here so
                         // that it is refused by name, with the fix that respells it
@@ -210,6 +213,10 @@ impl DefMap {
                         // (blaze-lints' `blaze::cbor_field_order` and `blaze::reads_positions`).
                         | "canonical_cbor"
                         | "renders_positions"
+                        // `#[blaze::invariant(..)]` on a struct, from
+                        // `AttrFlags::blaze_invariants` (`hir_ty_pure::refined`,
+                        // docs/v2/plan/design/refined-values.md).
+                        | "invariant"
                 )
             {
                 return true;

@@ -21,9 +21,11 @@ pub fn closure(x: u32) -> u32 {
 pub fn or_else(x: u32) -> Result<u32, E> {
     fast(x).or_else(|_| slow_r(x))
 }
+// minicore's `Result` has `is_ok` (under its `reach` flag) and no `is_err`: the negated test
+// is the shape here, read by the same rule (`Shapes::failed`) as `is_err`.
 pub fn is_err(x: u32) -> u32 {
     let mut v = fast(x);
-    if v.is_err() {
+    if !v.is_ok() {
         v = slow_r(x);
     }
     match v {

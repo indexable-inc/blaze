@@ -386,9 +386,7 @@ pub fn inside(x: u32) -> u32 {
 /// are listed passes, one of a trait with no list may do anything and is refused.
 #[test]
 fn a_call_through_dyn_takes_the_traits_marks() {
-    let out = expect_of(
-        "",
-        r#"
+    let main = r#"
 pub trait Job {
     #[blaze::expect()]
     fn run(&self) -> u32;
@@ -400,8 +398,14 @@ pub trait Loose {
 pub fn bounded(job: &dyn Job) -> u32 { job.run() }
 #[blaze::expect()]
 pub fn loose(job: &dyn Loose) -> u32 { job.run() }
-"#,
+"#;
+    // A `core` with the lang items a call through `dyn` needs (`minicore_with_dyn`).
+    let fixture = format!(
+        "{}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{}",
+        super::effects_tests::minicore_with_dyn(),
+        main.trim_start_matches('\n')
     );
+    let out = lint(&fixture, FLAGS);
     let found = saying(&out, UNDECLARED);
     assert_eq!(found.len(), 1, "{out}");
     assert!(found[0].contains("`fn loose`") && found[0].contains("takes `dyn Loose"), "{out}");

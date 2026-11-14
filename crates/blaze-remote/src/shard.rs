@@ -25,8 +25,9 @@ use blaze_cas::plain::Namespace;
 use blaze_ids::ContentId;
 
 use crate::{
+    segment::{SegmentId, SegmentRef},
     trust::{PublicKey, Refusal, Signer, Why, verify_sig},
-    wire::{id_at, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
+    wire::{Bounded, id_at, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
 };
 
 pub const ENTRY: usize = 128;
@@ -37,10 +38,14 @@ pub const BLOCKS_MOST: usize = 256;
 pub const SHARD_MOST: usize = BLOCK_ENTRIES * BLOCKS_MOST;
 const HEAD: usize = 32;
 const HEAD_BLOCK: usize = 64;
-/// The most bytes a root may be.
-pub const ROOT_MOST: u64 = 8 << 20;
-/// The most runs a root may hold: a reader refuses more.
+/// The most runs a root may hold.
 pub const RUNS_MOST: usize = 64;
+/// The most shards a run may hold: 1,820 shards of up to [`SHARD_MOST`] entries, 119 million
+/// keys a run.
+pub const SHARDS_MOST: usize = 1820;
+/// The most bytes a root may be: what [`RUNS_MOST`] runs of [`SHARDS_MOST`] shards encode to
+/// (8,387,760 bytes, under 8 MiB), so every root that can be built can be read.
+pub const ROOT_MOST: u64 = (80 + RUNS_MOST * (16 + SHARDS_MOST * 72) + 96) as u64;
 /// Runs kept before the newest two are merged whatever their sizes.
 pub const RUNS_KEPT: usize = 8;
 
@@ -48,47 +53,57 @@ const SHARD_DOMAIN: &str = "blaze-remote shard head 1";
 const BLOCK_DOMAIN: &str = "blaze-remote shard block 1";
 const ROOT_DOMAIN: &str = "blaze-remote root 1";
 
-/// One index entry.
+/// One index entry: a record's key, its value's digest, the segment holding it and where in
+/// that segment its payload is. Made only by [`Entry::new`], which checks the payload lies
+/// inside the segment's payloads, so every entry that exists encodes to one a reader takes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry {
     pub key: [u8; 32],
     pub value: ContentId,
-    pub segment: ContentId,
-    pub segment_len: u64,
-    pub index_at: u64,
-    pub at: u64,
-    pub len: u32,
-    pub count: u32,
+    segment: SegmentRef,
+    at: u64,
+    len: u32,
 }
 
 impl Entry {
+    /// The entry, or [`Why::OutsideSegment`] when `at..at + len` is not inside `segment`'s
+    /// payloads (from its header to its index).
+    pub fn new(key: [u8; 32], value: ContentId, segment: SegmentRef, at: u64, len: u32) -> Result<Entry, Why> {
+        let fits = at >= blaze_cas::plain::HEADER as u64 && at.checked_add(u64::from(len)).is_some_and(|end| end <= segment.index_at());
+        if !fits {
+            return Err(Why::OutsideSegment);
+        }
+        Ok(Entry { key, value, segment, at, len })
+    }
+
+    pub fn segment(&self) -> &SegmentRef {
+        &self.segment
+    }
+
+    /// Where its payload starts in its segment.
+    pub fn at(&self) -> u64 {
+        self.at
+    }
+
+    /// Its payload's length.
+    pub fn payload_len(&self) -> u32 {
+        self.len
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.key);
         out.extend_from_slice(&self.value.0);
-        out.extend_from_slice(&self.segment.0);
-        put_u64(out, self.segment_len);
-        put_u64(out, self.index_at);
+        out.extend_from_slice(&self.segment.digest().0.0);
+        put_u64(out, self.segment.size());
+        put_u64(out, self.segment.index_at());
         put_u64(out, self.at);
         put_u32(out, self.len);
-        put_u32(out, self.count);
+        put_u32(out, self.segment.count());
     }
 
     fn decode(bytes: &[u8]) -> Result<Entry, Why> {
-        let entry = Entry {
-            key: key_at(bytes, 0),
-            value: id_at(bytes, 32),
-            segment: id_at(bytes, 64),
-            segment_len: u64_at(bytes, 96),
-            index_at: u64_at(bytes, 104),
-            at: u64_at(bytes, 112),
-            len: u32_at(bytes, 120),
-            count: u32_at(bytes, 124),
-        };
-        let fits = entry.at >= 128 && entry.at.checked_add(u64::from(entry.len)).is_some_and(|end| end <= entry.index_at) && entry.index_at.checked_add(u64::from(entry.count) * 48 + 48) == Some(entry.segment_len);
-        if !fits || entry.segment_len > blaze_cas::plain::SEGMENT_MOST {
-            return Err(Why::OutsideSegment);
-        }
-        Ok(entry)
+        let segment = SegmentRef::new(SegmentId(id_at(bytes, 64)), u64_at(bytes, 96), u64_at(bytes, 104), u32_at(bytes, 124)).map_err(Why::Wire)?;
+        Entry::new(key_at(bytes, 0), id_at(bytes, 32), segment, u64_at(bytes, 112), u32_at(bytes, 120))
     }
 }
 
@@ -205,7 +220,10 @@ pub fn decode_block(object: &str, head: &Head, i: usize, bytes: &[u8]) -> Result
 
 /// Every entry of a whole shard object, checked; a head or block already checked by this
 /// client (`known`) is taken as it was and not checked again.
-pub fn decode_whole(object: &str, bytes: &[u8], shard: &ShardRef, namespace: Namespace, known: &crate::find::Cache) -> Result<Vec<Entry>, Refusal> {
+/// The head and every block checked here are kept in `known` (blocks up to its bound), so this
+/// client does not check them again (decision 18): a push whose root lost re-merges from what
+/// it already holds.
+pub fn decode_whole(object: &str, bytes: &[u8], shard: &ShardRef, namespace: Namespace, known: &mut crate::find::Cache) -> Result<Vec<Entry>, Refusal> {
     let len = shard_len(shard.count);
     if bytes.len() != len {
         return Err(Refusal::new(object, None, Why::Length { len: bytes.len() as u64, wanted: len as u64 }));
@@ -213,7 +231,11 @@ pub fn decode_whole(object: &str, bytes: &[u8], shard: &ShardRef, namespace: Nam
     let hl = head_len(shard.count);
     let head = match known.head(&shard.digest) {
         Some(head) => head.clone(),
-        None => Head::decode(object, &bytes[..hl], shard, namespace)?,
+        None => {
+            let head = Head::decode(object, &bytes[..hl], shard, namespace)?;
+            known.keep_head(shard.digest, head.clone());
+            head
+        }
     };
     let mut out = Vec::with_capacity(shard.count as usize);
     for i in 0..head.blocks.len() {
@@ -222,7 +244,9 @@ pub fn decode_whole(object: &str, bytes: &[u8], shard: &ShardRef, namespace: Nam
             continue;
         }
         let (at, n) = head.block_range(i);
-        out.extend(decode_block(object, &head, i, &bytes[at as usize..(at + n) as usize])?);
+        let entries = decode_block(object, &head, i, &bytes[at as usize..(at + n) as usize])?;
+        out.extend_from_slice(&entries);
+        known.keep_merged_block(shard.digest, i, entries);
     }
     if out.first().map(|it| it.key) != Some(shard.first) {
         return Err(Refusal::new(object, None, Why::Malformed("a shard whose first key is not its root's")));
@@ -238,14 +262,34 @@ pub struct ShardRef {
     pub count: u32,
 }
 
-/// One run: shards disjoint and sorted by first key.
+/// One run: shards disjoint and sorted by first key. Made only by [`Run::new`], which checks
+/// what a root's reader checks, so every run that exists can be read back.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Run {
     pub generation: u64,
-    pub shards: Vec<ShardRef>,
+    shards: Bounded<ShardRef, SHARDS_MOST>,
 }
 
 impl Run {
+    /// The run, or why not: no shards or more than [`SHARDS_MOST`], a shard of no entries or of
+    /// more than [`SHARD_MOST`], or shards not sorted by their first keys.
+    pub fn new(generation: u64, shards: Vec<ShardRef>) -> Result<Run, Why> {
+        if shards.is_empty() {
+            return Err(Why::Malformed("a run of no shards"));
+        }
+        if shards.iter().any(|it| it.count == 0 || it.count as usize > SHARD_MOST) {
+            return Err(Why::Malformed("a shard of no entries or too many"));
+        }
+        if shards.windows(2).any(|pair| pair[0].first >= pair[1].first) {
+            return Err(Why::Malformed("a run whose shards are not sorted"));
+        }
+        Ok(Run { generation, shards: Bounded::new(shards)? })
+    }
+
+    pub fn shards(&self) -> &[ShardRef] {
+        &self.shards
+    }
+
     pub fn entries(&self) -> u64 {
         self.shards.iter().map(|it| u64::from(it.count)).sum()
     }
@@ -270,8 +314,9 @@ pub struct Root {
     pub keys_serial: u64,
     pub issued: u64,
     pub previous: ContentId,
-    /// Newest first.
-    pub runs: Vec<Run>,
+    /// Newest first. At most [`RUNS_MOST`] runs of at most [`SHARDS_MOST`] shards: within
+    /// [`ROOT_MOST`] by construction.
+    pub runs: Bounded<Run, RUNS_MOST>,
 }
 
 impl Root {
@@ -290,7 +335,7 @@ impl Root {
             put_u64(&mut out, run.generation);
             put_u32(&mut out, run.shards.len() as u32);
             put_u32(&mut out, 0);
-            for shard in &run.shards {
+            for shard in run.shards() {
                 out.extend_from_slice(&shard.first);
                 out.extend_from_slice(&shard.digest.0);
                 put_u32(&mut out, shard.count);
@@ -335,26 +380,23 @@ impl Root {
             let generation = u64_at(bytes, at);
             let n = u32_at(bytes, at + 8) as usize;
             at += 16;
-            if n == 0 || n > (end - at) / 72 {
-                return Err(refuse(Why::Malformed("a run of no shards, or more than the root holds")));
+            if n > (end - at) / 72 {
+                return Err(refuse(Why::Malformed("a run of more shards than the root holds")));
             }
             let mut shards: Vec<ShardRef> = Vec::with_capacity(n);
             for _ in 0..n {
-                let shard = ShardRef { first: key_at(bytes, at), digest: id_at(bytes, at + 32), count: u32_at(bytes, at + 64) };
-                if shard.count == 0 || shard.count as usize > SHARD_MOST || u32_at(bytes, at + 68) != 0 {
-                    return Err(refuse(Why::Malformed("a shard of no entries or too many")));
+                if u32_at(bytes, at + 68) != 0 {
+                    return Err(refuse(Why::Malformed("a shard reference whose last four bytes are not zero")));
                 }
-                if shards.last().is_some_and(|it| it.first >= shard.first) {
-                    return Err(refuse(Why::Malformed("a run whose shards are not sorted")));
-                }
-                shards.push(shard);
+                shards.push(ShardRef { first: key_at(bytes, at), digest: id_at(bytes, at + 32), count: u32_at(bytes, at + 64) });
                 at += 72;
             }
-            runs.push(Run { generation, shards });
+            runs.push(Run::new(generation, shards).map_err(refuse)?);
         }
         if at != end {
             return Err(refuse(Why::Length { len: bytes.len() as u64, wanted: (at + 96) as u64 }));
         }
+        let runs = Bounded::new(runs).map_err(refuse)?;
         let root = Root { namespace, generation: u64_at(bytes, 16), keys_serial: u64_at(bytes, 24), issued: u64_at(bytes, 32), previous: id_at(bytes, 48), runs };
         Ok((root, signer))
     }

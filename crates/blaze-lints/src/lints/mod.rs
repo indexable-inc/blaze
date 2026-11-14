@@ -1000,8 +1000,21 @@ mod tests {
                 || pedantic.intersects(edition)),
             "the kinds are disjoint"
         );
+        let (suggest, _) = named_in("#[warn(blaze::suggest)]");
+        assert!(
+            suggest.intersects(blaze::Lint::CouldBeNarrower.bit())
+                && suggest.intersects(blaze::Lint::CouldBeRef32.bit())
+                && !suggest.intersects(blaze::Lint::UnmarkedPure.bit())
+        );
+        assert!(
+            !(general.intersects(suggest)
+                || internal.intersects(suggest)
+                || pedantic.intersects(suggest)
+                || edition.intersects(suggest)),
+            "the kinds are disjoint"
+        );
         assert_eq!(
-            general | internal | pedantic | edition,
+            general | internal | pedantic | edition | suggest,
             On::BLAZE,
             "every blaze lint is of one kind"
         );
@@ -1045,18 +1058,13 @@ mod tests {
             "{} -A blaze::general -A blaze::edition -W clippy::dbg_macro -D blaze::hot_alloc",
             crate::tests::CLIPPY_OFF
         )));
-        // Beside what the flags turn on: the lints outside `blaze::general` that are on by
-        // default (an edition lint whose advice this blaze has, a `deny` where the code
-        // declared something), and `blaze::unreachable`, which no flag turns off.
+        // Beside what the flags turn on: only the two no flag turns off, `blaze::refinement`
+        // and `blaze::unreachable`. The edition lints that are on by default
+        // (`proc_macro_fn_like`, `program_lifetime`) are of `blaze::edition`, which the flags
+        // allow, so they are off here.
         assert_eq!(
             named(on),
-            [
-                "dbg_macro",
-                "blaze::hot_alloc",
-                "blaze::proc_macro_fn_like",
-                "blaze::program_lifetime",
-                "blaze::unreachable"
-            ]
+            ["dbg_macro", "blaze::hot_alloc", "blaze::refinement", "blaze::unreachable"]
         );
     }
 }

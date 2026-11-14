@@ -168,20 +168,23 @@ An agent costs its whole context, and its report loses detail both ways, so the 
 small pieces, reads and deletions itself and never starts a fleet to read or summarise. But work
 that splits into independent, large pieces is done in parallel (`sota-first`): one lane per piece,
 with a brief that states its outcome, its check and its paths (`worktree-per-lane` says how lanes
-share one directory). At most four lanes write in one tree at once: that is what the main agent can
-compile within minutes of each report and admit onto the green head (`fan-out-write-only`); more
-pieces wait for a slot, and a fifth piece that is truly independent and needs no compile of this
-tree (a tool in Python, a doc) may run beside them. A rewrite of a part is not split across lanes
-editing the old code in place: it gets a fresh core in new crates beside the old code, each lane
-owning new files of it, and the old code is switched off and deleted when the new core passes. Do
-not give one lane a numbered list of pieces that do not depend on each other: it will do the first
-and the rest wait unstarted for hours. When you write such a list, ask of each item whether it needs
-another item's result; each one that does not is its own lane, started in the same message or in the
-next free slot, with its own files and its own check. The same holds for you: when you say a piece
-is "queued", "next" or "when a lane frees up", and nothing it needs is missing and a slot is free,
-start it instead; when you hold something back, say which limit holds it (the four slots, a file
-that would collide, a tree that does not compile). Review the lanes' lists when they report: a "not
-started" item that could have run beside the others is moved to a lane of its own.
+share one directory). At most four lanes write in shared files of one tree at once (existing crates,
+a registry every lane appends to): that is what the main agent can compile within minutes of each
+report and admit onto the green head (`fan-out-write-only`); more such pieces wait for a slot. A
+lane whose whole piece is a new crate or a new directory of its own does not take a slot, nor does
+one that needs no compile of this tree (a tool in Python, a doc); the main agent still compiles each
+as it reports. A lane that finds itself appending to a list every other lane appends to has found a
+duplicated fact: say so, and the list becomes one declaration. A rewrite of a part is not split
+across lanes editing the old code in place: it gets a fresh core in new crates beside the old code,
+each lane owning new files of it, and the old code is switched off and deleted when the new core
+passes. Do not give one lane a numbered list of pieces that do not depend on each other: it will do
+the first and the rest wait unstarted for hours. When you write such a list, ask of each item
+whether it needs another item's result; each one that does not is its own lane, started in the same
+message or in the next free slot, with its own files and its own check. The same holds for you: when
+you say a piece is "queued", "next" or "when a lane frees up", and nothing it needs is missing and a
+slot is free, start it instead; when you hold something back, say which limit holds it (the four
+slots, a file that would collide, a tree that does not compile). Review the lanes' lists when they
+report: a "not started" item that could have run beside the others is moved to a lane of its own.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 

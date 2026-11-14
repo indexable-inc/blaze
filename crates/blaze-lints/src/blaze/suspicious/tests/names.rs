@@ -51,7 +51,10 @@ pub fn twin(n: u32) -> u32 { 0 }
 extern "C" fn foreign(n: u32) -> u32 { 0 }
 "#,
     );
-    assert!(!out.contains("never reads"), "{out}");
+    // A callback is reported: that it is one is a fact of a use in another body, which a body's
+    // lint does not read; its signature says so with an `#[expect(.., reason)]`.
+    assert!(out.contains("`fn callback` never reads its parameter `n`"), "{out}");
+    assert_eq!(out.matches("never reads").count(), 1, "{out}");
 }
 
 #[test]

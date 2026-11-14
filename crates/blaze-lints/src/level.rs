@@ -98,6 +98,9 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
+/// The group `blaze::suggest`, the adoption ladder's second step: where a plain Rust project
+/// gains from a blaze feature or a tighter type, every lint of [`blaze::Kind::Suggest`].
+pub(crate) const BLAZE_SUGGEST: On = blaze_kind(blaze::Kind::Suggest);
 /// The group `blaze::edition`: what the blaze edition removes or respells (`as_cast`,
 /// `implicit_overflow`, `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border
 /// (`unmarked_*`),
@@ -163,6 +166,7 @@ impl Target {
             "pedantic_perf" => return Some(BLAZE_PEDANTIC_PERF),
             "edition" => return Some(BLAZE_EDITION),
             "proc_macro" => return Some(BLAZE_PROC_MACRO),
+            "suggest" => return Some(BLAZE_SUGGEST),
             _ => {}
         }
         blaze::Lint::named(name).map(blaze::Lint::bit)
@@ -214,9 +218,10 @@ impl Lint<'_> {
             Lint::Blaze(lint) => match lint.kind() {
                 blaze::Kind::General => Level::Warn,
                 blaze::Kind::Edition if lint.warns_by_default() => Level::Warn,
-                blaze::Kind::Internal | blaze::Kind::PedanticPerf | blaze::Kind::Edition => {
-                    Level::Allow
-                }
+                blaze::Kind::Internal
+                | blaze::Kind::PedanticPerf
+                | blaze::Kind::Edition
+                | blaze::Kind::Suggest => Level::Allow,
             },
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }

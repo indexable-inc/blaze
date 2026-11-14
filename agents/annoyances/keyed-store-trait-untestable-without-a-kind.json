@@ -1,0 +1,14 @@
+{
+ "id": "keyed-store-trait-untestable-without-a-kind",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), plain-store lane round 5, blaze-merge-1113",
+ "where": "crates/blaze-keyed/src/kind.rs Kind; crates/blaze-cas/src/plain/handle.rs PlainStore's impl of blaze_keyed::store::Store",
+ "what": "Store's read, map and put take a Key<K: Kind>, and Kind needs a Layout, Grain, Trace, Keep and a Root: Headed, with no impl anywhere in the tree to borrow, so the plain store's Store impl (lock-free reads, own proofs for uncommitted puts, Uncommitted from map) got no test: a test kind would mean guessing all of these without a compiler.",
+ "cost": "the trait impl lands untested; its behaviour is tested only through Plain and Driven underneath it",
+ "cause": "the trait is written against the full record-kind machinery, and nothing gives a store test a minimal kind",
+ "class": "an interface whose only argument types are expensive to make, so every implementer's test needs the whole stack",
+ "prevention": "blaze-keyed ships a #[cfg(any(test, feature = \"test-kinds\"))] kind (bytes in, bytes out) that every Store implementer's tests use",
+ "workaround": "none; the impl is reviewed against Plain's tested reads and puts",
+ "fix": "not yet",
+ "state": "open"
+}

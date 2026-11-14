@@ -30,9 +30,9 @@ use std::{
 };
 
 use blaze_keyed::{
-    kind::{CodeKey, ExpanderModule, Key, Kind, ModuleInputs, ProcKind, ToolId},
+    kind::{CodeKey, ExpanderModule, Key, Kind, ModuleInputs, Namespace, ProcKind, ToolId},
     proof::{self, Holds, Snapshot},
-    record::{self, RecordError},
+    record,
     store::{Put as Filing, Store},
 };
 
@@ -213,35 +213,31 @@ impl<W: Copy + Eq + Hash + fmt::Debug> Default for Modules<W> {
     }
 }
 
-/// The value of a module's record `record`, by its proof, read in place.
-///
-/// The core has no payload reader for an `Opaque` record by its proof (its `outside::payload_of`
-/// is for `Traced` records), so this opens the record under the proof's key the way
-/// `payload_of` does: the open the core's own reader makes, not a check of this crate's.
+/// The value of a module's record `record`, by its proof, read in place through the core's one
+/// payload reader ([`proof::payload`]): nothing is checked again.
 pub fn open_module<'r>(
     subject: &Subject,
     holds: &Holds<'_, ExpanderModule>,
     record: &'r [u8],
 ) -> Result<ModuleValueRef<'r>, Refusal> {
     let key = holds.key();
-    let payload = record::open::<ExpanderModule>(record, &key)
-        .and_then(|root| root.payload.follow(record).map_err(RecordError::Format))
-        .map_err(record_error(subject, key))?;
+    let payload = proof::payload(holds, record).map_err(record_error(subject, key))?;
     ModuleValueRef::read(payload)
         .map_err(|corrupt| Refusal::Corrupt { subject: subject.clone(), key: key.id(), corrupt })
 }
 
 /// Files a compiled module's value under its key: what the compiling task does before
 /// [`Modules::end`]. Other bytes under the key are [`Refusal::TwoValues`]: the unit key misses
-/// an input of the compile.
+/// an input of the compile. `namespace` is the macro package's ([`blaze_keyed::kind::namespace_of`]).
 pub fn file_module<S: Store>(
     store: &S,
     subject: &Subject,
     key: Key<ExpanderModule>,
+    namespace: Namespace,
     value: &ModuleValue<'_>,
 ) -> Result<(), Refusal> {
     let record = record::write_opaque(&key, &value.encode());
-    match store.put::<ExpanderModule>(&key, &record).map_err(store_error(subject, key))? {
+    match store.put::<ExpanderModule>(&key, namespace, &record).map_err(store_error(subject, key))? {
         Filing::Written | Filing::Same => Ok(()),
         Filing::Other => Err(Refusal::TwoValues { subject: subject.clone(), key: key.id() }),
     }

@@ -16,7 +16,7 @@ use blaze_keyed::{
 use blaze_rng::SplitMix64;
 use hegel::TestCase;
 
-use super::support::{Broke, Draw, Drawn, MemStore, control, filing, tool};
+use super::support::{Broke, Draw, Drawn, MemStore, NAMESPACE, control, filing, tool};
 use crate::{
     Digest, Subject, What,
     machine::Ticket,
@@ -107,7 +107,7 @@ fn run_in(snap: Snapshot<'_>, plan: &Plan, plant: Plant) -> Result<(), Broke> {
                 let helpers = ["helper"];
                 let exports = [Export { name: "Model", kind: ProcKind::Derive, index: 0, helpers: &helpers }];
                 let value = ModuleValue { module: module_digest(&bytes), len: bytes.len() as u64, exports: &exports };
-                file_module(&store, &subject(module), key(module), &value).map_err(filing)?;
+                file_module(&store, &subject(module), key(module), NAMESPACE, &value).map_err(filing)?;
                 compiled[module] += 1;
                 if plant == Plant::GlobalWrite {
                     // The write waits on every reader in flight, and cancels it.

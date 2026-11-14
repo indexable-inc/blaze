@@ -9,7 +9,8 @@
 //! it finds, what it leaves alone and the right form; docs/lints.md says the same for people.
 //! Findings are reported through `std_mistakes::report`, the one home of a finding with its fix.
 
-mod doc_names_nothing;
+// `claims` reads a doc's owner and resolves its paths through this one's helpers.
+pub(super) mod doc_names_nothing;
 mod fallback;
 mod glob_import;
 mod half_done;

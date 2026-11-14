@@ -1,0 +1,14 @@
+{
+ "id": "no-shared-workspace-use-facts",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane weight lints (write_only_field .. swappable_parameters), fix-hello-1113",
+ "where": "crates/blaze-lints/src/blaze/weight/rows.rs; crates/blaze-diagnostics/src/lints/names/dead/ (store_marks, pub(crate) there); crates/blaze-lints/src/query.rs lint_plan",
+ "what": "A lint that asks how an item is used across the workspace (is this field read, this variant constructed, this trait implemented elsewhere) has no query to ask: the dead kernel's per-store marks are private to blaze-diagnostics and per crate, lint_plan leaves out the bodies derives made, and definition ids differ between a crate's lib and test configurations.",
+ "cost": "the weight lane wrote its own use-row walk and per-crate fold (rows.rs) beside the dead kernel's marks: two walks of every body for the same facts, and the join across configurations by where an item is written had to be invented again",
+ "cause": "use facts are computed inside each consumer (dead's liveness, test_only, the weight lints) instead of once as rows every lint reads",
+ "class": "whole-workspace facts derived ad hoc inside one lint family, so the next family re-derives them",
+ "prevention": "one front-end query of use rows per body (subject by where it is written, way, role) with folds per crate, in a crate both blaze-diagnostics and blaze-lints depend on, as docs/v2/plan/design/end-state/check-test.md describes; dead, test_only and the weight lints all read it",
+ "workaround": "weight/rows.rs is that shape already (body_uses per body, crate_uses per crate, readers per crate); move it down and port dead's marks onto it",
+ "fix": "not yet",
+ "state": "open"
+}

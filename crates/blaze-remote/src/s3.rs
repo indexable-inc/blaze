@@ -3,9 +3,11 @@
 //! Pure functions: the time is given.
 //!
 //! Signed headers are `host`, `x-amz-content-sha256`, `x-amz-date`, and any `if-match` or
-//! `if-none-match`. No test vector checks the signing here: AWS's published vectors use an
-//! example secret, which is never written into this tree. Correctness against R2 is not
-//! measured.
+//! `if-none-match`. AWS's published vectors use an example secret, which is never written into
+//! this tree; instead the test `sigv4_signs_as_the_algorithm_defines` recomputes a signature
+//! from the algorithm's definition on an independent HMAC-SHA256 (blaze-sha256, held to RFC
+//! 4231), under a secret derived from a constant label. That R2 accepts it is not measured until
+//! the owner's bucket exists.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]

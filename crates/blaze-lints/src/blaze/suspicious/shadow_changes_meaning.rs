@@ -48,14 +48,14 @@ pub(super) fn check_body(cx: &mut Cx<'_, '_>) {
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
             let Statement::Let { pat, initializer: Some(init), .. } = statement else { continue };
-            let Pat::Bind { id: new, .. } = body[*pat] else { continue };
+            let Pat::Bind { id: new, .. } = body.pat(pat) else { continue };
             let binding = &body[new];
             if binding.name.as_str().starts_with('_') || binding.hygiene != HygieneId::ROOT {
                 continue;
             }
             // The binding the initializer's scope names by the new one's name: the shadowed.
             let path = ModPath::from_segments(PathKind::Plain, std::iter::once(binding.name.clone()));
-            let Some(scope) = scopes.scope_for(*init) else { continue };
+            let Some(scope) = scopes.scope_for(init) else { continue };
             let resolver = resolver_for_scope(db, def, Some(scope));
             let Some(ValueNs::LocalBinding(old)) =
                 resolver.resolve_path_in_value_ns_fully(db, Path::BarePath(&path), HygieneId::ROOT)
@@ -65,10 +65,10 @@ pub(super) fn check_body(cx: &mut Cx<'_, '_>) {
             if old == new || body[old].hygiene != HygieneId::ROOT {
                 continue;
             }
-            if reads(db, def, body, *init, old) {
+            if reads(db, def, body, init, old) {
                 continue;
             }
-            let Some(range) = analysis.expr_range(*init) else { continue };
+            let Some(range) = analysis.expr_range(init) else { continue };
             let name = binding.name.as_str();
             facts::push(
                 &mut found,

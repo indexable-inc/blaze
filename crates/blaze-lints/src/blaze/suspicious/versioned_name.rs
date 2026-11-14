@@ -22,7 +22,7 @@ use std::alloc::Global;
 
 use syntax::{
     SyntaxKind,
-    view::{self as ast, AstNode as _, HasAttrs as _},
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use super::super::{Lint, std_mistakes::report};

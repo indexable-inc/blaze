@@ -42,7 +42,7 @@ use rustc_type_ir::{
 use crate::{
     effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index, trusted_trait},
     memory::MemoryEffects,
-    walk::{Cx, Def, How, Instance, Summary, body_once, never_returns, summary},
+    walk::{CallRow, Cx, Def, How, Instance, Summary, body_once, call_row, never_returns, summary},
 };
 
 /// What a check found of an instance.
@@ -234,6 +234,20 @@ pub fn derived_pure(db: &Db, func: FunctionId) -> bool {
 pub fn instance_effects(db: &Db, krate: Crate, body: Body, args: StoredGenericArgs) -> EffectSet {
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
     summary(db, env, Instance { def: Def::Body(body), args }).kinds
+}
+
+/// Every kind of effect a call of `func<args>` from a body of `krate` brings, `krate`'s impls in
+/// scope, no trust applied: what the call adds at its site ([`call_row`], the lookup the walk
+/// itself makes at each call) with what the body does. An allocator's method is its kind
+/// alone: its body is not walked.
+pub fn call_effects(db: &Db, krate: Crate, func: FunctionId, args: StoredGenericArgs) -> EffectSet {
+    let row = call_row(db, func, args.as_ref(), effects::workspace(db, krate));
+    let added = match row {
+        Some(CallRow::Allocator(rule)) => return EffectSet::one(rule),
+        Some(CallRow::Row { kinds, .. }) => kinds,
+        None => EffectSet::EMPTY,
+    };
+    added.union(instance_effects(db, krate, Body::Fn(func), args))
 }
 
 /// What the instance `body<args>` touches (level 1 of the inferred facts), `krate`'s impls in

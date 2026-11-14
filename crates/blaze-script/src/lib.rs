@@ -8,6 +8,9 @@
 //!   byte for byte as the Python script wrote it.
 //! - [`run`], [`git`], [`run_shown`], [`run_within`]: a program run, its output captured or
 //!   shown, or captured with a deadline.
+//! - [`child`]: a program run with its whole environment given and its outputs to files, under
+//!   a deadline that kills its process group, the kernel's peak memory and CPU time with its
+//!   status (`in_process` times with it, `smoke` checks with it).
 //! - [`pyfmt`]: `{x:g}`, `{x!r}` and `{x}` of a value, as an f-string writes them.
 //! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
 //! - [`pypath`]: `os.path`'s `normpath`, `relpath` and the rest, `glob.glob` and `fnmatch`.
@@ -26,6 +29,7 @@
 #![feature(register_tool)]
 #![register_tool(blaze)]
 
+pub mod child;
 pub mod engine;
 pub mod input;
 pub mod pyfmt;
