@@ -199,19 +199,19 @@ impl<'a, F: Files> Sema<'a, F> {
         Some(self.types.borrow()[at as usize])
     }
 
-    /// The trees the patterns search: each view file holding `literal` (or every one), then
-    /// the macro expansions in it, depth first.
+    /// The trees the patterns search: each view file and the macro expansions in it, depth
+    /// first, each that holds `literal` (or every one). A file without the literal is still
+    /// expanded: a macro defined elsewhere can write it.
     fn searched(&self, literal: Option<&str>) -> Vec<u32> {
         let finder = literal.map(|it| Finder::new(it.as_bytes()));
         let mut out = Vec::new(); // alloc: the trees one atom searches
         for &tree in &self.targets {
-            let root = self.tree_at(tree).root;
-            if finder.as_ref().is_some_and(|it| it.find(root.text().as_bytes()).is_none()) {
-                continue;
-            }
             let mut stack = vec![tree];
             while let Some(tree) = stack.pop() {
-                out.push(tree);
+                let root = self.tree_at(tree).root;
+                if finder.as_ref().is_none_or(|it| it.find(root.text().as_bytes()).is_some()) {
+                    out.push(tree);
+                }
                 let inner = self.expansions_of(tree);
                 stack.extend(inner.iter().rev());
             }

@@ -157,6 +157,21 @@ fn in_macro_input_holds_for_an_expansions_nodes_from_the_input_only() {
 }
 
 #[test]
+fn a_pattern_finds_a_match_whose_literal_only_a_macro_expansion_holds() {
+    let fixture = "//- /dep.rs crate:dep edition:2021\n\
+                   #[macro_export]\n\
+                   macro_rules! answer { () => { 40 + 2 }; }\n\
+                   //- /lib.rs crate:lib deps:dep edition:2021\n\
+                   pub fn asked() -> u32 { dep::answer!() }\n";
+    let (db, files) = view(fixture, 1, &["lib.rs"]);
+    let outcome = query(&db, &files, r#"(rule (sum e) (expr e "40 + 2"))"#).unwrap();
+    let found = texts(&outcome, "sum");
+    // lib.rs never spells `40`: only the expansion of `answer!()` does.
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0][0].replace(' ', ""), "40+2", "{found:?}");
+}
+
+#[test]
 fn visibility_names_each_fns_own() {
     let (db, files) = lib();
     let rules = r#"(rule (vis d v) (syntax n "FN") (defines n d) (visibility d v))"#;
