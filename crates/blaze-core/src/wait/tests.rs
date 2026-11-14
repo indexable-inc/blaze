@@ -12,17 +12,22 @@
 //! under its own interruptions
 //! ([`a_sim_under_interruption_delivers_everything_by_each_deadline`]).
 //!
-//! The park ([`parking`], a pool worker's idle wait, a futex on its thread's ring on Linux):
-//! a simulated futex on the virtual clock runs a drawn unpark between any two of the park's
-//! atomics ([`Futex::switch`]) or while it waits, with interruptions, spurious returns and
-//! latency; the oracle is that no unpark is lost (a park an unpark came to ends `Ready`,
-//! promptly; one with a token waiting takes it at once; `Deadline` only with no unpark) and
-//! every park ends by its deadline. The plant ([`ParkPlant::CheckThenStore`]) looks for a token
-//! and then stores `PARKED` over it, the lost wakeup [`the_oracle_catches_a_lost_wakeup`] must
-//! find. That no unpark is lost is also proved, of every interleaving of the two threads' atomics
-//! (`parking::no_unpark_is_lost`, `crates/blaze-core/lean/BlazeCore/Wait/Parking.lean`), which
-//! this test's whole unparks never tried; this test stays for the clock: that a park ends by
-//! its deadline and promptly after its wake, which that theorem does not state.
+//! The park ([`parking`], a pool worker's idle wait, a futex on its thread's ring on Linux) has
+//! no simulation test of its own: what the test said is proved in Lean of the real `park` and
+//! `unpark` as two threads, one atomic operation at a time, on every schedule, with every
+//! return for nothing and timeout the kernel may make and every script of the clock's readings
+//! (`crates/blaze-core/lean/BlazeCore/Wait/Parking*.lean`): no unpark is lost
+//! (`parking::no_unpark_is_lost`), a park says its deadline passed only at or after it and is
+//! not asleep past it (`parking::a_park_keeps_its_deadline`), a park left alone returns or
+//! sleeps within eight of its own steps (`parking::a_park_left_alone_returns_or_sleeps`), and
+//! it says `Ready` exactly for a token (`parking::a_park_is_ready_exactly_for_a_token`). The
+//! test ran each unpark whole between two of the park's atomics; the theorems are of every
+//! interleaving. Their controls, the planted lost wakeup among them
+//! ([`ParkPlant::CheckThenStore`]), are beside them in `parking.rs`. What stays here is the
+//! direct driver's park against a simulated futex (below, on Linux): a drawn unpark runs
+//! between any two of the park's atomics or while it waits, with interruptions, spurious
+//! returns and latency, and the oracle is that no unpark is lost and every park ends by its
+//! deadline, promptly.
 //!
 //! The reap ([`reaping`]) has no simulation test of its own: that every child reaped is
 //! reported once with its status, that a reap that ends at its deadline leaves the child for
@@ -38,15 +43,14 @@
 //! is left a zombie.
 //!
 //! The direct driver (`wait/direct.rs`, the waits of a process where io_uring is refused) runs
-//! the park's plans too ([`Through::Direct`]) and the reap's, on Linux: simulated kernels
+//! the park's plans and the reap's, on Linux: simulated kernels
 //! answer its calls ([`FutexCalls`], [`ChildCalls`]), their `CLOCK_MONOTONIC` on another
 //! origin than the wait's clock ([`KERNEL_AHEAD`]) so each call's absolute time is made from
 //! the kernel's, and each fault comes back as the error the kernel returns (`EINTR`,
 //! `ETIMEDOUT`). The same oracles hold, and the same plants are caught through it.
 
 use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
+    cell::Cell,
     convert::Infallible,
     fmt::Write as _,
     io,
@@ -54,42 +58,37 @@ use std::{
     time::Duration,
 };
 
-use blaze_sim::{Broke, Config, Tape};
+#[cfg(target_os = "linux")]
+use blaze_sim::Broke;
+use blaze_sim::{Config, Tape};
 
 #[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+};
 
 #[cfg(target_os = "linux")]
 use super::direct::{ChildCalls, Direct, FutexCalls};
 #[cfg(target_os = "linux")]
+use super::parking::{self, ParkPlant};
+#[cfg(target_os = "linux")]
 use super::reaping::{self, ReapPlant};
-use super::{
-    Clock, Deadline, Once, WaitError, Waited,
-    parking::{self, Futex, ParkPlant},
-    retry::FUEL,
-    until,
-};
+use super::{Clock, Deadline, Once, WaitError, Waited, retry::FUEL, until};
+#[cfg(target_os = "linux")]
+use crate::atomic::AtomicU32;
 use crate::{
     Completion, Done, Driver, Effect, FileName, Tag,
-    atomic::AtomicU32,
     sim::{Faults, Sim},
 };
 
 /// Cases a control searches for one its plant breaks.
+#[cfg(target_os = "linux")]
 const CONTROL_SEEDS: u32 = 256;
 
 /// Most waits a plan draws.
+#[cfg(target_os = "linux")]
 const MOST_WAITS: u64 = 24;
-
-/// How a park or a reap reaches its simulated kernel.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Through {
-    /// The core on the kernel's own wait, each call retried by [`until`]: the ring's shape.
-    Core,
-    /// The core on the direct driver, which makes the kernel's calls itself.
-    #[cfg(target_os = "linux")]
-    Direct,
-}
 
 /// How far the simulated kernel's `CLOCK_MONOTONIC` is ahead of the wait's clock: the direct
 /// driver gives a futex wait an absolute time on the kernel's, never the wait's.
@@ -112,6 +111,7 @@ fn us(n: u64) -> Duration {
 }
 
 /// A fault's rate: off, or once in 1 to 8 calls.
+#[cfg(target_os = "linux")]
 fn sometimes(tape: &Tape, label: &'static str) -> u64 {
     match tape.coin(label) {
         false => 0,
@@ -215,6 +215,7 @@ fn a_sim_under_interruption(tape: &Tape) {
 // --- The park: a futex wait and the unparks that come to it -----------------------------
 
 /// The faults of the park's and the reap's simulated kernel.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct FutexFaults {
     /// A call is interrupted within 100 µs of its start once in this many (0: never).
@@ -227,6 +228,7 @@ struct FutexFaults {
     max_step: Duration,
 }
 
+#[cfg(target_os = "linux")]
 impl FutexFaults {
     /// How late after its cause a park or a reap may end: a few calls and steps.
     fn bound(&self) -> Duration {
@@ -234,6 +236,7 @@ impl FutexFaults {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn futex_faults(tape: &Tape) -> FutexFaults {
     FutexFaults {
         eintr_one_in: sometimes(tape, "eintr one in"),
@@ -245,6 +248,7 @@ fn futex_faults(tape: &Tape) -> FutexFaults {
 
 /// One park: its deadline, when an unpark comes after it begins, and whether a stray unpark
 /// comes after it ends (a token the next park must take at once).
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Round {
     deadline: Option<Duration>,
@@ -254,12 +258,14 @@ struct Round {
 
 /// The futex's choices (which call a fault hits, where, each latency and step) are drawn from
 /// the case's tape as the run goes.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ParkPlan {
     faults: FutexFaults,
     rounds: Vec<Round>,
 }
 
+#[cfg(target_os = "linux")]
 fn park_plan(tape: &Tape) -> ParkPlan {
     let faults = futex_faults(tape);
     let n = tape.int_in(1..=MOST_WAITS, "parks");
@@ -283,7 +289,9 @@ fn park_plan(tape: &Tape) -> ParkPlan {
 }
 
 /// A futex on the virtual clock, with the unparks of a plan to run at their times: at a
-/// switch point of the park once their time has come, or while the park waits in it.
+/// switch point of the park once their time has come, or while the park waits in it. The park
+/// and the unpark reach it through the direct driver ([`Direct`]), which makes its calls.
+#[cfg(target_os = "linux")]
 struct FutexSim<'a> {
     now: &'a Cell<Duration>,
     tape: &'a Tape,
@@ -297,11 +305,12 @@ struct FutexSim<'a> {
     woken: Cell<bool>,
 }
 
+#[cfg(target_os = "linux")]
 impl FutexSim<'_> {
     /// The real unpark, at `at`.
     fn fire(&self, at: Duration) {
         self.in_unpark.set(true);
-        parking::unpark(self.word, self);
+        parking::unpark(self.word, &Direct(self));
         self.in_unpark.set(false);
         self.fired.borrow_mut().push(at);
     }
@@ -367,40 +376,6 @@ impl FutexSim<'_> {
     }
 }
 
-impl Futex for FutexSim<'_> {
-    fn wait<C: Clock>(
-        &self,
-        what: &'static str,
-        word: &AtomicU32,
-        expected: u32,
-        deadline: Option<Deadline>,
-        clock: &C,
-    ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| self.call(word, expected, left))
-    }
-
-    fn wake(&self, _: &AtomicU32) {
-        if self.waiting.get() {
-            self.woken.set(true);
-        }
-    }
-
-    fn switch(&self) {
-        if self.in_unpark.get() {
-            return;
-        }
-        let step = Duration::from_nanos(1 + self.tape.below(self.faults.max_step.as_nanos() as u64, "step ns"));
-        self.now.set(self.now.get() + step);
-        while let Some(at) = self.next_unpark() {
-            if at > self.now.get() {
-                break;
-            }
-            self.unparks.borrow_mut().pop_front();
-            self.fire(at);
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 impl FutexCalls for FutexSim<'_> {
     fn monotonic(&self) -> io::Result<Duration> {
@@ -418,26 +393,43 @@ impl FutexCalls for FutexSim<'_> {
         }
     }
 
-    fn futex_wake(&self, word: &AtomicU32) {
-        Futex::wake(self, word);
+    fn futex_wake(&self, _: &AtomicU32) {
+        if self.waiting.get() {
+            self.woken.set(true);
+        }
     }
 
+    /// A point between two atomics of the park: a step of time, then the unparks whose time
+    /// has come. Nothing inside an unpark, which runs whole.
     fn between(&self) {
-        Futex::switch(self);
+        if self.in_unpark.get() {
+            return;
+        }
+        let step = Duration::from_nanos(1 + self.tape.below(self.faults.max_step.as_nanos() as u64, "step ns"));
+        self.now.set(self.now.get() + step);
+        while let Some(at) = self.next_unpark() {
+            if at > self.now.get() {
+                break;
+            }
+            self.unparks.borrow_mut().pop_front();
+            self.fire(at);
+        }
     }
 }
 
-/// A drawn [`ParkPlan`] run with `plant`, the park reaching the simulated futex as `through`
-/// says: the first broken rule, the oracle's.
-fn drawn_parks(tape: &Tape, plant: ParkPlant, through: Through) -> Result<(), Broke> {
+/// A drawn [`ParkPlan`] run with `plant`, the park reaching the simulated futex through the
+/// direct driver: the first broken rule, the oracle's.
+#[cfg(target_os = "linux")]
+fn drawn_parks(tape: &Tape, plant: ParkPlant) -> Result<(), Broke> {
     let plan = park_plan(tape);
     tape.note(format_args!("plan {plan:?}"));
-    run_parks_through(tape, &plan, plant, through).map_err(Broke::Oracle)
+    run_parks(tape, &plan, plant).map_err(Broke::Oracle)
 }
 
 /// `plan`'s parks one after another on one word and clock, with `plant`, the futex drawing
-/// from `tape`, the park reaching it as `through` says: the first broken rule.
-fn run_parks_through(tape: &Tape, plan: &ParkPlan, plant: ParkPlant, through: Through) -> Result<(), String> {
+/// from `tape`, the park reaching it through the direct driver: the first broken rule.
+#[cfg(target_os = "linux")]
+fn run_parks(tape: &Tape, plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let word = AtomicU32::new(parking::EMPTY);
@@ -461,11 +453,7 @@ fn run_parks_through(tape: &Tape, plan: &ParkPlan, plant: ParkPlant, through: Th
         sim.fired.borrow_mut().clear();
         let deadline = round.deadline.map(|it| Deadline::after(start, it));
         let what = "a simulated park";
-        let parked = match through {
-            Through::Core => parking::park(&word, &sim, what, deadline, &clock, plant),
-            #[cfg(target_os = "linux")]
-            Through::Direct => parking::park(&word, &Direct(&sim), what, deadline, &clock, plant),
-        };
+        let parked = parking::park(&word, &Direct(&sim), what, deadline, &clock, plant);
         let end = now.get();
         let fired = sim.fired.borrow().first().copied();
         // The token as the park began: `token` itself is set again below, for the next park,
@@ -530,29 +518,10 @@ fn run_parks_through(tape: &Tape, plan: &ParkPlan, plant: ParkPlant, through: Th
     Ok(())
 }
 
-/// The invariant: whatever interrupts it and whenever its unpark comes, no wakeup is lost and
-/// every park ends by its deadline.
-#[test]
-fn no_unpark_is_lost_under_interruption() {
-    blaze_sim::check(Config::cases(300), |tape| drawn_parks(tape, ParkPlant::None, Through::Core));
-}
-
 /// What the park's oracle says of an unpark or a token lost, whichever way the loss shows: a
 /// park that ends at its deadline after one, a token gone, or a futex wait nothing will wake.
+#[cfg(target_os = "linux")]
 const LOST: &str = "lost";
-
-/// The lost wakeup the oracle must catch in one of [`CONTROL_SEEDS`] cases: a park that looks
-/// for a token and then stores over one that came between.
-#[test]
-fn the_oracle_catches_a_lost_wakeup() {
-    blaze_sim::control(
-        Config::cases(CONTROL_SEEDS),
-        ParkPlant::None,
-        ParkPlant::CheckThenStore,
-        LOST,
-        |tape, plant| drawn_parks(tape, plant, Through::Core),
-    );
-}
 
 // --- The reap: a child's exit waited for, then reaped ------------------------------------
 
@@ -856,7 +825,7 @@ const NEVER_REPORTED: &str = "never reported";
 #[cfg(target_os = "linux")]
 #[test]
 fn no_unpark_is_lost_through_the_direct_driver() {
-    blaze_sim::check(Config::cases(300), |tape| drawn_parks(tape, ParkPlant::None, Through::Direct));
+    blaze_sim::check(Config::cases(300), |tape| drawn_parks(tape, ParkPlant::None));
 }
 
 /// The lost wakeup, planted in the park the direct driver waits for: caught through it in one
@@ -869,7 +838,7 @@ fn the_oracle_catches_a_lost_wakeup_through_the_direct_driver() {
         ParkPlant::None,
         ParkPlant::CheckThenStore,
         LOST,
-        |tape, plant| drawn_parks(tape, plant, Through::Direct),
+        drawn_parks,
     );
 }
 

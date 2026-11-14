@@ -134,6 +134,24 @@ fn a_rewrite_that_leaves_a_file_unparsable_fails_the_request() {
 }
 
 #[test]
+fn a_text_rewrite_of_a_file_that_already_has_a_syntax_error_is_refused_naming_it() {
+    let fixture = format!("{LIB}pub fn broken() -> u32 {{ let y = ; 2 }}\npub fn other() -> u32 {{ new(5) }}\n");
+    let (db, files) = view(&fixture, 0, &["lib.rs"]);
+    // One rewrite mends the file's own error and another makes a new one: as many errors as
+    // before, and still a broken file.
+    let rules = r#"
+        (rule (bad s) (syntax s "LET_STMT") (enclosing-fn s f) (def-path f "lib::broken"))
+        (rule (new-path p) (path p "lib::new"))
+        (rewrite mended (bad s) (replace s "let y = 1;"))
+        (rewrite broke (new-path p) (replace p "new("))
+    "#;
+    let error = refused(edit(&db, &files, rules, &[]));
+    let line = fixture.lines().position(|it| it.contains("pub fn broken")).unwrap() - 1;
+    assert!(error.starts_with(&format!("lib.rs:{line}:")), "{error}");
+    assert!(error.contains("already has a syntax error"), "{error}");
+}
+
+#[test]
 fn a_template_that_is_no_expression_where_it_replaces_one_is_refused_naming_its_rule() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);
     let rules = r#"
@@ -143,6 +161,19 @@ fn a_template_that_is_no_expression_where_it_replaces_one_is_refused_naming_its_
     let error = refused(edit(&db, &files, rules, &[]));
     assert!(error.contains("`broken` (rules:3)") && error.contains("not an expression"), "{error}");
     assert!(error.starts_with("lib.rs:"), "{error}");
+}
+
+#[test]
+fn a_template_past_the_token_cap_is_refused_naming_its_rule() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `old($x, ` and 1023 more arguments: 2050 tokens.
+    let rules = format!(
+        "(rule (call e x) (expr e \"lib::old($x)\"))\n\
+         (rewrite big (call e x) (not (in-macro-expansion e)) (replace e \"old($x, {}1)\"))",
+        "1, ".repeat(1022)
+    );
+    let error = refused(edit(&db, &files, &rules, &[]));
+    assert!(error.contains("`big` (rules:2)") && error.contains("has 2050 tokens"), "{error}");
 }
 
 #[test]
@@ -157,6 +188,21 @@ fn a_template_path_from_a_crate_that_names_nothing_is_an_error() {
 }
 
 #[test]
+fn a_template_path_inside_a_string_or_a_comment_is_left_as_written() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `::lib::nwe` names nothing: as code it would be refused, as text it is only text.
+    let rules = r#"
+        (rule (call e x) (expr e "lib::old($x)"))
+        (rewrite to-new (call e x) (not (in-macro-expansion e))
+          (replace e "{ let _ = \"::lib::nwe\"; ::lib::new($x) /* was ::lib::new */ }"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(r#"{ { let _ = "::lib::nwe"; new(1) /* was ::lib::new */ } }"#), "{text}");
+    assert!(text.contains(r#"{ { let _ = "::lib::nwe"; crate::new(2) /* was ::lib::new */ } }"#), "{text}");
+}
+
+#[test]
 fn rename_goes_through_the_front_ends_references() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);
     let rules = r#"
@@ -168,6 +214,23 @@ fn rename_goes_through_the_front_ends_references() {
     assert!(text.contains("pub fn older(x: u32)"), "{text}");
     assert!(text.contains("{ older(1) }") && text.contains("crate::older(2)"), "{text}");
     assert!(text.contains("id!(older(3))"), "{text}");
+}
+
+#[test]
+fn a_rename_reached_through_several_references_is_one_rename() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `old` has three references, so three rows ask for the same rename.
+    let through = r#"
+        (rule (uses n) (def-path d "lib::old") (references d n))
+        (rewrite renamed (uses n) (rename n "older"))
+    "#;
+    let direct = r#"
+        (rule (target d) (def-path d "lib::old"))
+        (rewrite renamed (target d) (rename d "older"))
+    "#;
+    let through = edit(&db, &files, through, &[]).unwrap();
+    let direct = edit(&db, &files, direct, &[]).unwrap();
+    assert_eq!(through.edited.ops, direct.edited.ops);
 }
 
 const PREC: &str = r#"

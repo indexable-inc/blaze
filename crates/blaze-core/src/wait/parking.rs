@@ -236,13 +236,12 @@ fn parks(plant: ParkPlant, schedule: &[Step], now: Duration, deadline: Option<De
 /// unpark has returned the park is never asleep with no wake coming; where both returned, the
 /// token was taken once and the word is empty, or the park had left before the token came and
 /// it is there for the next; and a park with no deadline never says one passed ([`parks`]).
-/// The simulation test beside it (`wait/tests.rs`, `no_unpark_is_lost_under_interruption`)
-/// runs each unpark whole between two of the park's atomics; here a park's step may come
-/// between the unpark's swap and its wake, and the proof is of every such run: the park's
-/// eight kinds of program point and the unpark's three, 26 reachable states, each thread's
-/// step with any choice of the kernel's keeps them. That test stays for what this does not
-/// state: that a park ends by its deadline and promptly after its wake, on a clock that moves.
-/// Its control is `the_oracle_catches_a_lost_wakeup_in_a_schedule`.
+/// The simulation test this replaced ran each unpark whole between two of the park's atomics;
+/// here a park's step may come between the unpark's swap and its wake, and the proof is of
+/// every such run: the park's eight kinds of program point and the unpark's three, 26
+/// reachable states, each thread's step with any choice of the kernel's keeps them. What that
+/// test said of a clock that moves is the three theorems below. Its control is
+/// `the_oracle_catches_a_lost_wakeup_in_a_schedule`.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
 pub(crate) fn no_unpark_is_lost(schedule: Vec<Step>, now: Duration, deadline: Option<Duration>) -> bool {
@@ -408,6 +407,76 @@ pub(crate) fn a_park_left_alone_returns_or_sleeps(
         None => None,
     };
     settles(&Timed, schedule, &readings, deadline, token)
+}
+
+/// Whether a park and an unpark of one word, run by `schedule` on `kernel` and the world's
+/// clock reading `readings`, say `Ready` exactly for a token. `token` is the claim that a
+/// token waits as the park begins, and `held` whether the word holds one (a theorem's are the
+/// same; a control's differ):
+///
+/// - with a token waiting, the park is never asleep, and where it returned it said `Ready`:
+///   the token is not lost to a deadline or an error;
+/// - with no token and no step of the unpark's in the schedule, the park never says `Ready`:
+///   it does not wake for nothing.
+///
+/// A schedule in which the unpark runs with no token waiting says nothing here: what the park
+/// says then is [`parks`]'s.
+fn answers<K: Futex + Sync>(
+    kernel: &K,
+    schedule: &[Step],
+    readings: &[Duration],
+    deadline: Option<Deadline>,
+    token: bool,
+    held: bool,
+) -> bool {
+    let mut unparks = false;
+    let mut at = 0;
+    while at < schedule.len() {
+        if schedule[at].second {
+            unparks = true;
+        }
+        at += 1;
+    }
+    let word = AtomicU32::new(match held {
+        true => NOTIFIED,
+        false => EMPTY,
+    });
+    threads::clock(readings);
+    let (parked, _) = threads::two(
+        schedule,
+        || park(&word, kernel, "a park", deadline, &Shown, ParkPlant::None),
+        || unpark(&word, kernel),
+    );
+    match parked {
+        Ended::Done(Ok(Waited::Ready(()))) => token || unparks,
+        Ended::Running => true,
+        Ended::Done(Ok(Waited::Deadline)) | Ended::Done(Err(_)) | Ended::Asleep => !token,
+    }
+}
+
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/ParkingToken.lean): a park says
+/// `Ready` exactly for a token. For every schedule of a park and an unpark of one word, every
+/// script of the clock's readings, every choice of the kernel's and every deadline or none: a
+/// token waiting as the park begins is taken (the park is never asleep and never says its
+/// deadline passed or fails), and a park with no token and no unpark never says `Ready`,
+/// whatever returns for nothing the kernel makes ([`answers`]). With [`no_unpark_is_lost`],
+/// that is what the simulation test called "no token is lost" and "it woke with no unpark".
+/// Run on drawn schedules below too. Its controls are
+/// `the_oracle_catches_a_token_that_is_not_there` and
+/// `the_oracle_catches_a_park_ready_with_no_token`.
+#[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
+pub(crate) fn a_park_is_ready_exactly_for_a_token(
+    schedule: Vec<Step>,
+    readings: Vec<Duration>,
+    deadline: Option<Duration>,
+    token: bool,
+) -> bool {
+    let deadline = match deadline {
+        Some(at) => Some(Deadline::at(at)),
+        None => None,
+    };
+    answers(&Timed, &schedule, &readings, deadline, token, token)
 }
 
 #[cfg(test)]
@@ -671,6 +740,9 @@ mod theorems {
             if !a_park_left_alone_returns_or_sleeps(schedule.clone(), readings.clone(), deadline, token) {
                 return said("a park left alone was still running");
             }
+            if !a_park_is_ready_exactly_for_a_token(schedule.clone(), readings.clone(), deadline, token) {
+                return said("a park was not ready exactly for a token");
+            }
             Ok(())
         });
     }
@@ -694,6 +766,27 @@ mod theorems {
         let readings = [ns(12)];
         assert!(!keeps(&Untimed, &schedule, &readings, deadline));
         assert!(keeps(&Timed, &schedule, &readings, deadline));
+    }
+
+    /// The planted start with the token claimed and not there: the park sleeps, and the oracle
+    /// says a token waiting was not taken.
+    #[test]
+    fn the_oracle_catches_a_token_that_is_not_there() {
+        let schedule = steps(&[p(0), p(0), p(0), p(0)]);
+        assert!(!answers(&Timed, &schedule, &[], None, true, false));
+        assert!(answers(&Timed, &schedule, &[], None, true, true));
+    }
+
+    /// The planted start with a token nobody gave: the park says `Ready` with no token claimed
+    /// and no unpark in the schedule, which the oracle refuses.
+    #[test]
+    fn the_oracle_catches_a_park_ready_with_no_token() {
+        let schedule = steps(&[p(0), p(0), p(0), p(0)]);
+        assert!(!answers(&Timed, &schedule, &[], None, false, true));
+        assert!(answers(&Timed, &schedule, &[], None, false, false));
+        // A return for nothing sends the park back to wait: it is asleep, not ready.
+        let spurious = steps(&[p(0), p(0), p(0), p(0), p(1), p(0), p(0), p(0)]);
+        assert!(answers(&Timed, &spurious, &[], None, false, false));
     }
 
     /// The planted kernel that never blocks: the park compares, reads the clock and waits

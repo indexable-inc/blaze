@@ -321,6 +321,17 @@ field_wise_conversion = "allow"
 hand_written_visitor = "allow"
 repeated_field_list = "allow"
 registry_spread = "allow"
+# Faults seen in the tree (2026-11-14, docs/lints.md#default_refuses, #one_at_a_time,
+# #unwritten_allocator), in `internal` above: at `warn` until each has a baseline, since
+# `deny` with none fails the first run and the ratchet refuses a crate a baseline did not list at
+# the base. Each goes to `deny` when its findings reach none: `default_refuses` (a trait default
+# that answers nothing, about 45 in the tree), `one_at_a_time` (a configured single-record read
+# per item of a loop, one: blaze-cargo's `serve::unit::codegen`) and `unwritten_allocator` (a
+# collection type at an item's interface that leaves its allocator to the default, or
+# `Global` in a function's signature; many), which then folds into `implicit_allocator`.
+default_refuses = "warn"
+one_at_a_time = "warn"
+unwritten_allocator = "warn"
 # `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
 # hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
 # code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own

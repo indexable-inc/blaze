@@ -8,6 +8,15 @@
 # hot crates' own clippy.toml has none, so they read none.
 env-read-allowed = ["base_db::settings", "blaze_core::home", "blaze_std::rt"]
 
+# The single-record reads with a batched form (`blaze::one_at_a_time`, docs/lints.md#one_at_a_time):
+# a call of one once per item of a `for` loop or an iterator adaptor's closure names `batched`.
+# A read with no batched form is not listed (`blaze_cas::Store::get`, `ImageStore::get`,
+# `Entries::entry` have none yet). Kept equal in the hot crates' clippy.toml.
+one-at-a-time = [
+    { path = "blaze_cas::direct::Direct::read", batched = "read_many" },
+    { path = "blaze_cargo::serve::direct::read", batched = "read_many" },
+]
+
 disallowed-types = [
     # The watch table of directories outside a checkout, removed 2026-11-14 (outside-verdict-1114 Lane 1).
     { path = "blaze_vfs::outside::Dirs", reason = "nothing outside a checkout is watched (2026-11-14, agents/annoyances/outside-watch-gone.json): an outside read is a leaf with its lstat stamp, checked by `blaze_vfs::outside::holds`", allow-invalid = true },
