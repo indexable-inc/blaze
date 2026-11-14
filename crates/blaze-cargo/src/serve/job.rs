@@ -213,6 +213,8 @@ pub enum Value<S: Steps> {
     Answer(Result<Response, ApiError>),
     /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
     Answers(Result<Vec<Response>, ApiError>),
+    /// [`Work::Prove`]: what its worker found ([`Front::prove`]), for the loop's run of Lean.
+    Proving(Result<S::Proving, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
     Selected(Result<Vec<String>, ApiError>),
     Evaluated(Result<TestResult, ApiError>),
@@ -521,6 +523,14 @@ pub(super) enum Does<S: Steps> {
         front: Arc<S::Front>,
         filter: Vec<String>,
     },
+    /// `blaze prove` ([`Work::Prove`]): the theorem functions of the job's library crates
+    /// translated to Lean and the check of their proofs planned ([`Front::prove`]); the
+    /// check itself is a run of the loop ([`Jobs::check_proofs`]).
+    Prove {
+        front: Arc<S::Front>,
+        emit: bool,
+        subset: bool,
+    },
     /// Posted with the job's writer, once its check is built and nothing reads its front end:
     /// the documentation sets `cfg(doc)` on the crates it documents.
     Doc {
@@ -644,6 +654,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Verify { .. } => tracing::info_span!("verify"),
             Does::Edit { .. } => tracing::info_span!("edit"),
             Does::Ahead { .. } => tracing::info_span!("ahead"),
+            Does::Prove { emit, .. } => tracing::info_span!(target: "blaze", "prove", emit = *emit),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
             Does::Write { asked, .. } => tracing::info_span!(
@@ -884,6 +895,9 @@ impl<S: Steps> plane::Work for Step<S> {
             }),
             Does::Ahead { front, filter } => {
                 self.settle(front.ahead(this(readers), filter), Value::Ahead)
+            }
+            Does::Prove { front, emit, subset } => {
+                self.settle(front.prove(this(readers), *emit, *subset), Value::Proving)
             }
             Does::Doc { front, no_deps, private } => {
                 let writer = readers
@@ -1226,6 +1240,7 @@ fn command_of(work: &Work) -> Command {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
+        | Work::Prove { .. }
         | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
@@ -1239,6 +1254,7 @@ fn kind_of(work: &Work) -> JobKind {
         Work::Run { .. } => JobKind::Run,
         // A reach builds only the units its views' front ends apply, each as a check builds
         // it, and so shares a check's records ([`reads_front_unbuilt`]).
+        // A proof reads the front end as a reach does, and shares a check's records too.
         Work::Reach { .. }
         | Work::Check(_)
         | Work::Verify(_)
@@ -1247,13 +1263,14 @@ fn kind_of(work: &Work) -> JobKind {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Doc { .. }
+        | Work::Prove { .. }
         | Work::Lock(_) => JobKind::Check,
     }
 }
 
 /// Whether `work` answers from its views' front ends without building their units first: a
 /// reach (item hashes), an edit (name resolution) and a build ahead's choice (the tests each
-/// test unit holds) read def maps, which a crate whose proc macros are not built, or whose
+/// test unit holds) read def maps, and a proof (`blaze prove`) reads bodies' MIR, which a crate whose proc macros are not built, or whose
 /// build scripts' cfgs, env and `OUT_DIR` are not applied, gives only half expanded. Each view
 /// of such a job, once lowered, first builds the units its front end applies
 /// ([`applied_units`]) in the job's own plane request, and only then is read ([`Jobs::next`]):
@@ -1263,7 +1280,7 @@ fn kind_of(work: &Work) -> JobKind {
 /// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
 fn reads_front_unbuilt(work: &Work) -> bool {
     match work {
-        Work::Reach { .. } | Work::Edit(_) | Work::Ahead { .. } => true,
+        Work::Reach { .. } | Work::Edit(_) | Work::Ahead { .. } | Work::Prove { .. } => true,
         Work::Check(_)
         | Work::Build(_)
         | Work::Test { .. }
@@ -1295,6 +1312,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Edit(_) => "edit",
         Work::Ahead { .. } => "ahead",
         Work::Lock(_) => "lock",
+        Work::Prove { .. } => "prove",
     }
 }
 
@@ -1331,6 +1349,7 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
         | Work::Doc { targets, .. }
+        | Work::Prove { targets, .. }
         | Work::Lock(targets) => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
@@ -6724,6 +6743,8 @@ impl<S: Steps> Jobs<S> {
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answers(Err(error))) => self.end(w, id, false, Some(error)),
+                Some(Value::Proving(Ok(proving))) => self.check_proofs(w, id, proving),
+                Some(Value::Proving(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
             Stage::Ahead(at) if at == node => match job.take_value(node) {
@@ -9648,6 +9669,33 @@ impl<S: Steps> Jobs<S> {
         self.release_runs(w);
     }
 
+    /// A `blaze prove`'s worker has answered: its check, Lean over what the worker found, is
+    /// a run of the loop as a build's tests are, in the sandbox, and the job's answer is the
+    /// run's ([`Steps::check_proofs`]).
+    fn check_proofs(&mut self, w: &mut World<'_, S>, id: JobId, proving: S::Proving) {
+        let (run, tags) = match self.run_tags(id, None) {
+            Ok(it) => it,
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else {
+            self.run_over(run);
+            return;
+        };
+        let runs = match &job.work {
+            Work::Prove { lean, .. } => S::check_proofs(proving, lean.as_deref(), tags),
+            _ => S::check_proofs(proving, None, tags),
+        };
+        job.stage = Stage::Runs(run);
+        if let Some(it) = self.runs.get_mut(run) {
+            it.runs = Some(Box::new(runs)); // alloc: once per check of a job
+            it.held = true;
+        }
+        self.release_runs(w);
+    }
+
     /// Each job's tests or run [`Jobs::plane_finished`] held, asked again: one whose job has no
     /// placement in flight starts, everything the build placed all there; the rest wait on. One
     /// whose job ended meanwhile (a placement failed, or it was cancelled) ends unstarted, not
@@ -10808,6 +10856,9 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
         Work::Doc { no_deps, private, .. } => {
             Does::Doc { front: lowered()?, no_deps: *no_deps, private: *private }
+        }
+        Work::Prove { emit, subset, .. } => {
+            Does::Prove { front: lowered()?, emit: *emit, subset: *subset }
         }
         Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
             return Err(ApiError::new(
