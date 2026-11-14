@@ -228,8 +228,21 @@ fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emi
         shapes.insert(callee_name.clone(), callee.shape.clone());
         // What the callee imports comes first; a module two callees share is listed once.
         for import in callee.imports.iter().chain([&callee]) {
-            if !imports.iter().any(|it| it.module == import.module) {
-                imports.push(import.clone());
+            match imports.iter().find(|it| it.module == import.module) {
+                None => imports.push(import.clone()),
+                // One module, two texts: two items with one Lean name (methods of two traits
+                // of one name from two modules, on one type). Neither may stand for the other.
+                Some(it) if it.text != import.text => {
+                    return Err(NotTranslated {
+                        function: body.display.clone(),
+                        what: format!(
+                            "two functions with one Lean name, `{}` (`{}` and `{}`)",
+                            import.name, it.function, import.function
+                        ),
+                        at: format!("fn {}", body.display),
+                    });
+                }
+                Some(_) => {}
             }
         }
     }

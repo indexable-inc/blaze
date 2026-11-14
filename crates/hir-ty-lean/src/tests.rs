@@ -630,8 +630,8 @@ pub fn twice(limit: u32) -> u32 {
 fn a_method_of_a_trait_impl_or_a_generic_type_is_refused_by_name() {
     let cases = [
         (
-            "pub trait T { fn g(&self) -> u32; }\npub struct S;\nimpl T for S { fn g(&self) -> u32 { 0 } }\npub fn f(s: S) -> u32 { S::h(&s) }\nimpl S { pub fn h(&self) -> u32 { <S as T>::g(self) } }\n",
-            "generic function",
+            "pub trait T<X> { fn g(&self) -> u32; }\npub struct S;\nimpl T<u32> for S { fn g(&self) -> u32 { 0 } }\npub fn f(s: S) -> u32 { S::h(&s) }\nimpl S { pub fn h(&self) -> u32 { <S as T<u32>>::g(self) } }\n",
+            "generic trait `T`",
         ),
         (
             "pub struct W<T> { pub x: T }\nimpl<T> W<T> { pub fn get(&self) -> u32 { 0 } }\npub fn f(w: W<u32>) -> u32 { w.get() }\n",
@@ -2035,4 +2035,162 @@ fn the_worlds_constructs_become_their_models() {
             assert!(!text.contains("| _ =>"), "`{name}`:\n{text}");
         }
     }
+}
+
+// ---- Methods of trait impls (docs/v2/plan/design/proofs-for-sans-io.md, section 3 step b). ----
+
+const TRAIT_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, default";
+
+/// A trait with two methods implemented for a struct and an enum, `Default`, `PartialEq` and
+/// `Add` implemented for the crate's types, each call syntax in a function of its own, and a
+/// theorem function over them, whose statement `lean/BlazeModel/traits/proved.lean` proves.
+const TRAITS: &str = "use core::ops::Add;
+pub trait Shape {
+    fn size(&self) -> u64;
+    fn corners(&self) -> u32;
+}
+pub struct Square { pub side: u64 }
+pub enum Tile { Empty, Rect(u64, u64) }
+impl Shape for Square {
+    fn size(&self) -> u64 { self.side * 4 }
+    fn corners(&self) -> u32 { 4 }
+}
+impl Shape for Tile {
+    fn size(&self) -> u64 {
+        match self { Tile::Empty => 0, Tile::Rect(w, h) => (*w + *h) * 2 }
+    }
+    fn corners(&self) -> u32 { match self { Tile::Empty => 0, Tile::Rect(_, _) => 4 } }
+}
+pub struct Clock { pub ticks: u64 }
+impl Default for Clock { fn default() -> Clock { Clock { ticks: 0 } } }
+impl PartialEq for Square { fn eq(&self, other: &Square) -> bool { self.side == other.side } }
+impl Add for Square {
+    type Output = Square;
+    fn add(self, other: Square) -> Square { Square { side: self.side + other.side } }
+}
+pub fn by_method(s: &Square) -> u64 { s.size() }
+pub fn by_trait_path(t: &Tile) -> u64 { Shape::size(t) }
+pub fn by_qualified(t: &Tile) -> u32 { <Tile as Shape>::corners(t) }
+pub fn by_type_path(s: &Square) -> u32 { Square::corners(s) }
+pub fn by_default() -> Clock { Clock::default() }
+pub fn by_eq(a: &Square, b: &Square) -> bool { *a == *b }
+pub fn by_add(a: Square, b: Square) -> Square { a + b }
+#[blaze::theorem]
+pub fn shapes_agree(side: u32) -> bool {
+    let wide = side as u64;
+    let square = Square { side: wide };
+    let tile = Tile::Rect(wide, wide);
+    let doubled = by_add(Square { side: wide }, Square { side: wide });
+    by_method(&square) == by_trait_path(&tile)
+        && by_type_path(&square) == by_qualified(&tile)
+        && by_default().ticks == 0
+        && by_eq(&doubled, &Square { side: wide * 2 })
+        && Tile::Empty.size() == 0
+}
+";
+
+/// Each call syntax static dispatch resolves to a method of a trait impl calls that method's
+/// model, a function named `<type>.<trait>.<method>` in a module of its own: a method call,
+/// the trait's path, the qualified path, the type's path, `Default::default`, and `==` and `+`,
+/// which MIR calls as `PartialEq::eq` and `Add::add`.
+#[test]
+fn a_method_of_a_trait_impl_is_a_function_named_by_its_type_and_trait() {
+    let cases: [(&str, &str, &str); 7] = [
+        ("by_method", "traits.Square.Shape.size s", "BlazeModel.traits.Square.Shape.size"),
+        ("by_trait_path", "traits.Tile.Shape.size t", "BlazeModel.traits.Tile.Shape.size"),
+        ("by_qualified", "traits.Tile.Shape.corners t", "BlazeModel.traits.Tile.Shape.corners"),
+        ("by_type_path", "traits.Square.Shape.corners s", "BlazeModel.traits.Square.Shape.corners"),
+        ("by_default", "traits.Clock.Default.default", "BlazeModel.traits.Clock.Default.default"),
+        ("by_eq", "traits.Square.PartialEq.eq", "BlazeModel.traits.Square.PartialEq.eq"),
+        ("by_add", "traits.Square.Add.add a b", "BlazeModel.traits.Square.Add.add"),
+    ];
+    for (name, call, module) in cases {
+        let out = golden(TRAIT_FLAGS, "traits", name, TRAITS);
+        assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        assert!(
+            out.imports.iter().any(|it| it.module == module),
+            "`{name}` imports `{module}`: {:?}",
+            out.imports.iter().map(|it| &it.module).collect::<Vec<_>>()
+        );
+    }
+    let out = golden(TRAIT_FLAGS, "traits", "shapes_agree", TRAITS);
+    assert_eq!(out.statement.as_deref(), Some("traits.shapes_agree.spec.statement"));
+    let square_size = out.imports.iter().find(|it| it.name == "traits.Square.Shape.size");
+    assert_eq!(square_size.map(|it| it.function.as_str()), Some("traits::Square::Shape::size"));
+}
+
+/// What a trait impl's method needs beyond a non-generic impl of a non-generic trait for a
+/// non-generic type is refused by name: a call through a generic bound, through a trait
+/// object, of a trait's default method, a method of an impl of a generic trait, of a generic
+/// impl, of an impl for a generic type, and two traits of one name on one type.
+#[test]
+fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
+    let shape = "pub trait Shape { fn size(&self) -> u64; }\npub struct S { pub x: u64 }\n\
+                 impl Shape for S { fn size(&self) -> u64 { self.x } }\n";
+    let cases = [
+        (format!("{shape}pub fn f<T: Shape>(t: &T) -> u64 {{ t.size() }}\n"), "a generic function"),
+        (format!("{shape}pub fn f(s: &dyn Shape) -> u64 {{ s.size() }}\n"), "a trait object"),
+        (
+            "pub trait Shape { fn size(&self) -> u64; fn twice(&self) -> u64 { self.size() * 2 } }\n\
+             pub struct S { pub x: u64 }\nimpl Shape for S { fn size(&self) -> u64 { self.x } }\n\
+             pub fn f(s: &S) -> u64 { s.twice() }\n"
+                .to_owned(),
+            "a call of `Shape::twice`, the trait's default method, whose body is generic over `Self`",
+        ),
+        (
+            "pub trait Conv<X> { fn conv(&self) -> u32; }\npub struct S;\n\
+             impl Conv<u64> for S { fn conv(&self) -> u32 { 1 } }\npub fn f(s: &S) -> u32 { s.conv() }\n"
+                .to_owned(),
+            "a method of an impl of the generic trait `Conv` with an argument other than `Self`",
+        ),
+        (
+            "pub trait Shape { fn size(&self) -> u64; }\n\
+             impl<const N: usize> Shape for [u32; N] { fn size(&self) -> u64 { 0 } }\n\
+             pub fn f(a: &[u32; 2]) -> u64 { a.size() }\n"
+                .to_owned(),
+            "a method of a trait impl of `Shape` with type or const parameters",
+        ),
+        (
+            "mod a { pub trait Shape { fn size(&self) -> u64; } }\n\
+             mod b { pub trait Shape { fn size(&self) -> u64; } }\npub struct S;\n\
+             impl a::Shape for S { fn size(&self) -> u64 { 1 } }\n\
+             impl b::Shape for S { fn size(&self) -> u64 { 2 } }\n\
+             pub fn f(s: &S) -> u64 { a::Shape::size(s) + b::Shape::size(s) }\n"
+                .to_owned(),
+            "two functions with one Lean name, `main.S.Shape.size`",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(TRAIT_FLAGS, "f", &source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
+    }
+    // An impl for a generic type is reached by no call the subset has (a value of the type is
+    // refused first), but `blaze prove` asks for every function: the method itself, alone.
+    let source = "pub trait Shape { fn size(&self) -> u64; }\npub struct W<T> { pub x: T }\n\
+                  impl Shape for W<u32> { fn size(&self) -> u64 { 0 } }\n";
+    let db = db(&fixture_of(TRAIT_FLAGS, "main", source));
+    let krate = all_crates(&db)
+        .iter()
+        .copied()
+        .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "main"))
+        .expect("the fixture has the crate");
+    let imp = crate_def_map(&db, krate)
+        .modules(&db)
+        .find_map(|(_, data)| data.scope(&db).impls().next())
+        .expect("the fixture's impl");
+    let size = imp
+        .impl_items(&db)
+        .items
+        .iter()
+        .find_map(|(_, item)| match item {
+            hir_def::AssocItemId::FunctionId(it) => Some(*it),
+            _ => None,
+        })
+        .expect("the impl's `size`");
+    let err = emit(&db, size).expect_err("a method of an impl for a generic type is refused");
+    assert!(
+        err.what.contains("a method of a trait impl of `Shape` for a generic type"),
+        "{err}"
+    );
 }

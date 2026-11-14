@@ -5,19 +5,26 @@
 
 use std::{
     alloc::Global,
+    cell::RefCell,
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
 use blaze_core::{
-    Address, Completion as Finished, Conn, Done, Driver as _, Effect, Tag,
+    Address, Completion as Finished, Conn, Done, Driver, Effect, Tag, Waker,
     sim::{Faults, Sim},
     wait::Deadline,
 };
+use blaze_sim::{Broke, Config as SimConfig, Tape};
 
-use super::{IN_FLIGHT_MOST, Loop, Plant, Told};
-use crate::{Client, Config, Event, Kind, Request, RequestId, Step};
+use super::{Asker, Fetched, IN_FLIGHT_MOST, Inbox, Loop, Message, Plant, Told, serve};
+use crate::{
+    Client, Config, Event, Kind, Request, RequestId, Step,
+    mailbox::{self, Rx},
+};
 
 /// Every request's timeout: the client's deadline for an answer that does not come.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -416,4 +423,219 @@ fn requests_past_the_bound_wait_and_an_askers_deadline_ends_one() {
     assert!(second > first, "the second started before the first ended: the bound was not held");
     assert!(told.iter().any(|(_, it)| matches!(it, Told::Event(Event::Done { request: RequestId(1) }))));
     assert_eq!(told.iter().filter(|(_, it)| matches!(it, Told::TimedOut(_))).count(), 1);
+}
+
+// --- `serve`, the driver thread's loop, under the simulation's waker -----------------------
+
+/// A port nothing listens on in the simulation: a connect there is refused.
+const REFUSED: u16 = 9;
+/// The longest idle the requests are posted after: past [`TIMEOUT`], so a request timed from a
+/// clock set before the wait starts with its timeout spent.
+const GAP_MOST: Duration = Duration::from_secs(15);
+/// What the oracle says of a request that ended past its timeout.
+const LATE: &str = "past its timeout";
+/// What the oracle says of a request that ended in something other than what it asked.
+const WRONG: &str = "not its answer";
+/// The cases a control may spend to catch its plant.
+const CONTROL_CASES: u32 = 64;
+
+/// A fault the serve test can be run with: a safeguard removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    /// [`Sim::lose_wakes_while_parked`]: the io_uring driver's lost wake.
+    LoseParkedWakes,
+    /// [`Plant::StaleClock`]: the request started on the clock the last step left.
+    StaleClock,
+}
+
+/// What one asked request is.
+#[derive(Clone, Copy, Debug)]
+enum Asked {
+    /// The scripted server answers `len` bytes.
+    Answered { len: usize },
+    /// Nothing listens: the connect is refused.
+    Refused,
+}
+
+/// The simulation, as `serve` drives it, stamping each request's end with the virtual time it
+/// was told at: `serve` tells its askers, then submits, at one time.
+struct Timed<'a> {
+    sim: &'a mut Sim,
+    from: &'a Rx<(u64, Fetched)>,
+    ended: BTreeMap<u64, (Duration, Fetched)>,
+    /// A request told an end twice: the first such.
+    twice: Option<u64>,
+}
+
+impl Timed<'_> {
+    fn stamp(&mut self) {
+        while let Ok(Some((key, fetched))) = self.from.try_recv() {
+            let now = self.sim.now();
+            if self.ended.insert(key, (now, fetched)).is_some() {
+                self.twice.get_or_insert(key);
+            }
+        }
+    }
+}
+
+impl Driver for Timed<'_> {
+    fn submit(&mut self, effects: &mut Vec<Effect>) {
+        self.stamp();
+        self.sim.submit(effects);
+    }
+
+    fn poll(&mut self, out: &mut Vec<Finished>, until: Deadline) -> usize {
+        self.sim.poll(out, until)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.sim.in_flight()
+    }
+
+    fn now(&self) -> Duration {
+        self.sim.now()
+    }
+
+    fn wall_ns(&self) -> u64 {
+        Driver::wall_ns(&*self.sim)
+    }
+
+    fn waker(&self) -> Option<Waker> {
+        self.sim.waker()
+    }
+}
+
+/// One case: `serve` itself, on the simulation with its waker handed out, a scripted HTTP/1.1
+/// server as another process on the same machine; requests posted to its inbox by other
+/// threads' wakes at drawn times, after drawn idles, then `Stop`; then the oracle.
+fn served_run(tape: &Tape, fault: Fault) -> Result<(), Broke> {
+    let faults = Faults { max_latency: Duration::from_micros(tape.int_in(0..=2_000u64, "max latency us")), ..Faults::default() };
+    let mut sim = Sim::new(tape.next_u64("the simulation's seed"), faults);
+    sim.give_wakers();
+    if fault == Fault::LoseParkedWakes {
+        sim.lose_wakes_while_parked();
+    }
+    let Some(waker) = sim.waker() else {
+        return Err(Broke::Harness("Sim::give_wakers gave no waker".to_owned()));
+    };
+    let server = Rc::new_in(RefCell::new(Server::default()), Global);
+    // clone: the server, for the process that runs it
+    let running = Rc::clone(&server);
+    sim.other_process(SERVER..u64::MAX, move |_, completion, effects| running.borrow_mut().complete(completion, effects));
+    let mut effects = Vec::new_in(Global);
+    server.borrow_mut().listen(&mut effects);
+    sim.submit(&mut effects);
+    let inbox: Arc<Inbox, Global> = Arc::new_in(Inbox::new(waker), Global);
+    let (to, from) = mailbox::channel::<(u64, Fetched)>(None);
+    let asked = tape.vec(1..=8, "requests", |tape| {
+        let gap = Duration::from_micros(tape.int_in(0..=GAP_MOST.as_micros() as u64, "idle before it, us"));
+        let asked = match tape.index(3, "what it asks") {
+            0 => Asked::Answered { len: 10 },
+            1 => Asked::Answered { len: 70_000 },
+            _ => Asked::Refused,
+        };
+        (gap, asked)
+    });
+    let mut posted = Vec::new_in(Global);
+    let mut at = Duration::ZERO;
+    for (i, (gap, what)) in asked.iter().enumerate() {
+        at += *gap;
+        if *gap > TIMEOUT {
+            tape.reached("a request was posted after an idle past its timeout");
+        }
+        let url = match what {
+            Asked::Answered { len } => format!("http://127.0.0.1:8080/n/{len}/{i}"),
+            Asked::Refused => format!("http://127.0.0.1:{REFUSED}/r/{i}"),
+        };
+        // clone: the inbox, the answer's sender and the address, for the other thread's act
+        let (inbox, to, asking) = (Arc::clone(&inbox), to.clone(), url.clone());
+        let key = i as u64;
+        sim.wake_at(at, move || {
+            let asker = Asker::Collect { key, to, head: None, body: Vec::new_in(Global) };
+            inbox.post(Message::Ask { id: RequestId(key), request: Request::get(asking), within: None, asker });
+        });
+        posted.push((at, *what, url));
+    }
+    drop(to);
+    // Every request has ended by then, its timeout and the simulation's latency past its post.
+    let stop_at = at + TIMEOUT + SLACK * 2;
+    // clone: the inbox, for the act that stops the loop
+    let stopping = Arc::clone(&inbox);
+    sim.wake_at(stop_at, move || stopping.post(Message::Stop));
+    // A sleep of the loop's own past the stop: with every wake lost, the loop still turns, reads
+    // the stop and returns, so a lost wake is a late request the oracle names, never a hang.
+    let (woke, _sleeping) = mailbox::channel(Some(1));
+    inbox.post(Message::Sleep { after: stop_at + TIMEOUT * 3, woke });
+    let mut core = Loop::new(client(), 0, IN_FLIGHT_MOST);
+    if fault == Fault::StaleClock {
+        core.plant(Plant::StaleClock);
+    }
+    let mut timed = Timed { sim: &mut sim, from: &from, ended: BTreeMap::new_in(Global), twice: None };
+    serve(&mut timed, core, &inbox);
+    timed.stamp();
+    let Timed { ended, twice, .. } = timed;
+    if let Some(key) = twice {
+        return Err(Broke::Oracle(format!("request {key} told two ends")));
+    }
+    if sim.wakes_landed().parked > 0 {
+        tape.reached("a wake landed while the loop was parked");
+    }
+    let server = server.borrow();
+    for (i, (at, what, url)) in posted.iter().enumerate() {
+        let Some((when, fetched)) = ended.get(&(i as u64)) else {
+            return Err(Broke::Oracle(format!("{url}, posted at {at:?}, never ended: {LATE}")));
+        };
+        if *when > *at + TIMEOUT + SLACK {
+            return Err(Broke::Oracle(format!("{url}, posted at {at:?}, ended at {when:?}: {LATE}")));
+        }
+        match (what, fetched) {
+            (Asked::Answered { len }, Fetched::Answered { status: 200, body, .. })
+                if server.sent.get(&format!("/n/{len}/{i}")) == Some(body) =>
+            {
+                tape.reached("a request was answered");
+            }
+            (Asked::Refused, Fetched::Failed(error))
+                if matches!(&error.kind, Kind::Io { step: Step::Connect, port: REFUSED, why, .. } if why.contains("refused")) =>
+            {
+                tape.reached("a request was refused");
+            }
+            (_, fetched) => {
+                return Err(Broke::Oracle(format!("{url}, posted at {at:?}, ended at {when:?} in {fetched:?}: {WRONG}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: every request posted to `serve`'s inbox at virtual time t, with a wake of its
+/// driver, ends by t plus its timeout, with the server's bytes or the refusal of its connect,
+/// whatever the seed places each wake at (before the poll looks, between its look and its
+/// park, or while it is parked) and however long the loop was idle before it. `serve` runs as
+/// on its thread, on the simulation's waker (`blaze_core::sim::Sim::give_wakers`), the server
+/// a second process on the machine.
+#[test]
+fn every_request_posted_to_serve_ends_by_its_timeout_wherever_its_wake_lands() {
+    let config = SimConfig::cases(128).must_reach(&[
+        "a request was answered",
+        "a request was refused",
+        "a wake landed while the loop was parked",
+        "a request was posted after an idle past its timeout",
+    ]);
+    blaze_sim::check(config, |tape| served_run(tape, Fault::None));
+}
+
+/// Control: a wake that lands while the driver is parked is lost (the io_uring driver before
+/// its fix); a request posted then waits for the loop's next timer, and ends past its timeout.
+#[test]
+fn the_oracle_catches_a_wake_lost_while_the_driver_is_parked() {
+    blaze_sim::control(SimConfig::cases(CONTROL_CASES), Fault::None, Fault::LoseParkedWakes, LATE, served_run);
+}
+
+/// Control: the order before the fix (the request started in `Loop::ask` on the client's clock
+/// as the last step left it, and `serve` not advancing the loop as a wait ends); a request
+/// posted after an idle past its timeout ends at once in "no answer", not its answer.
+#[test]
+fn the_oracle_catches_a_request_timed_from_a_clock_set_before_the_wait() {
+    blaze_sim::control(SimConfig::cases(CONTROL_CASES), Fault::None, Fault::StaleClock, WRONG, served_run);
 }

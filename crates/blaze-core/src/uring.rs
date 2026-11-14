@@ -3440,12 +3440,40 @@ mod tests {
         assert_ne!(at.port(), 0);
         assert_eq!(round_trip(&mut ring, &Address::Tcp(at)), round_tripped());
         assert_eq!(ring.local_addr(Tag(1)), None);
-        // Nothing listens there now.
-        let mut effects = vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(1) }];
+        // A connect to a port held and refusing, not to the port just let go of, which another
+        // test or process may bind before the connect (it failed 2 runs in 24 that way, told
+        // `[Connected { .. }]`).
+        let (refusing, _held) = held_refusing_port();
+        let mut effects = vec![Effect::Connect { at: Address::Tcp(refusing), tag: Tag(1) }];
         let mut seen = Vec::new();
         run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
         assert!(matches!(&seen[..], [Done::Failed(_)]), "{seen:?}");
+    }
+
+    /// A loopback address that refuses every connect for as long as the second value lives,
+    /// and that no other socket is handed meanwhile: the local port of a connection held open
+    /// (its client end, its listener). Closing a listener and connecting to its port instead
+    /// races whoever binds next; a port held this way cannot be taken by a bind to port 0.
+    ///
+    /// Why it refuses and is held, as each kernel's source reads:
+    /// - Linux: a SYN is matched against established sockets by their four-tuple, then against
+    ///   listening ones (`__inet_lookup_listener`); none listens on the port, so the kernel
+    ///   answers with a reset (`ECONNREFUSED`). The port is in the bind table with a socket that
+    ///   has no `SO_REUSEADDR`, so every other bind of it conflicts (`inet_csk_bind_conflict`),
+    ///   and port 0's search skips it.
+    /// - macOS (xnu, `tcp_input`): the wildcard lookup (`in_pcblookup_hash`) walks only sockets
+    ///   with no foreign address, so a connected one is not found, and a segment to no socket
+    ///   is dropped with a reset (`dropwithresetnosock`). A bind to port 0 searches with the
+    ///   wildcard (`in_pcbbind`, `wild = 1`), which counts the connected socket, so its port is
+    ///   never handed out. A socket bound and never listening would not do here: xnu finds it,
+    ///   sees `TCPS_CLOSED` and drops the SYN with no reset, so the connect hangs to its timeout.
+    fn held_refusing_port() -> (std::net::SocketAddr, (std::net::TcpListener, std::net::TcpStream)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = listener.local_addr().unwrap();
+        // A loopback connect to a listener completes in the kernel at once; the bound says so.
+        let client = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(10)).unwrap();
+        (client.local_addr().unwrap(), (listener, client))
     }
 
     fn maps(driver: &mut impl Driver, root: &Path) -> BTreeMap<u64, String> {

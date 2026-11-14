@@ -885,9 +885,9 @@ mod tests {
             "three requests should have shared one connection"
         );
 
-        let refusing = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed = refusing.local_addr().unwrap().port();
-        drop(refusing);
+        // A port held and refusing, not one let go of, which another test or process may bind
+        // before the connect.
+        let (closed, _held) = held_refusing_port();
         let got = http.get(&format!("http://127.0.0.1:{closed}/a"), &[]).unwrap_err();
         let said = format!("{got:#}");
         assert!(got.downcast_ref::<Transport>().is_some(), "{said}");
@@ -897,6 +897,22 @@ mod tests {
             )),
             "{said}"
         );
+    }
+
+    /// A loopback port that refuses every connect for as long as the second value lives, and
+    /// that no other socket is handed meanwhile: the local port of a connection held open (its
+    /// client end, its listener). Why, on each kernel, is said once, on blaze-core's io_uring
+    /// test of the same (`uring::tests::held_refusing_port`): Linux resets a SYN to a port with
+    /// no listener and keeps the port in its bind table; xnu's wildcard lookup skips connected
+    /// sockets, so the SYN is reset, and its port-0 search counts them, so the port is not
+    /// handed out. A socket bound and never listening refuses on Linux but not on macOS, where
+    /// xnu drops the SYN to its `TCPS_CLOSED` socket and the connect hangs to its timeout.
+    fn held_refusing_port() -> (u16, (std::net::TcpListener, std::net::TcpStream)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = listener.local_addr().unwrap();
+        // A loopback connect to a listener completes in the kernel at once; the bound says so.
+        let client = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(10)).unwrap();
+        (client.local_addr().unwrap().port(), (listener, client))
     }
 
     /// A redirect off HTTPS (blaze-http's tests follow one there) is [`Refused::Downgraded`],
