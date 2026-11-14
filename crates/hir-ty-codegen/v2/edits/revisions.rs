@@ -356,7 +356,7 @@ fn run(name: &str) {
 }
 
 /// The oracle's case of `turns` under this driver (seed 0: every draw is the sequence's
-/// own, which Hegel shrinks). A failure is written as a case under `BLAZE_ORACLE_OUT` (the
+/// own, which blaze-sim shrinks). A failure is written as a case under `BLAZE_ORACLE_OUT` (the
 /// system's temporary directory otherwise) before it is reported.
 #[expect(
     blaze::tmp_path,
@@ -380,19 +380,18 @@ fn oracle(turns: &[generate::Turn]) {
 /// The oracle (docs/harness.md): after any drawn sequence of edits of the library, saves,
 /// restarts, second databases and dropped builds, the incremental build's records are a
 /// clean build's, nothing panics, and a turn makes no function its edit does not reach.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn any_turn_sequence_builds_as_clean() {
-    // `BLAZE_ORACLE_MINUTES=<n>` with a large `HEGEL_TEST_CASES`: a run of that long; the
+    // `BLAZE_ORACLE_MINUTES=<n>` with a large `BLAZE_SIM_SEEDS`: a run of that long; the
     // sequences after it are not run.
     let minutes: Option<u64> = std::env::var("BLAZE_ORACLE_MINUTES").ok().map(|it| it.parse().expect("BLAZE_ORACLE_MINUTES is a number"));
     let began = Instant::now();
-    super::run_cases(40, |tc| {
+    blaze_sim::check(blaze_sim::Config::cases(40), |tape| {
         if minutes.is_some_and(|it| began.elapsed().as_secs() >= it * 60) {
             return;
         }
-        let mut draw = |n: u64| tc.draw(hegel::generators::integers::<u64>().max_value(n - 1));
-        let turns = generate::turns(&mut draw, generate::Parts::LIBRARY, true, 6);
+        let turns = generate::turns(tape, generate::Parts::LIBRARY, true, 6);
         oracle(&turns);
     });
 }

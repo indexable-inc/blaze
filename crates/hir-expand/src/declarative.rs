@@ -119,9 +119,10 @@ impl AstId<ast::Macro> {
         }
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let map = id.file_id.span_map(db);
-            // What is kept of the definition, written as its trees are made.
-            let mut written = kept.map(|(_, file, _)| {
-                stored::Writer::new(stored::Place::of(db, file, id.value.erase()))
+            // What is kept of the definition, written as its trees are made: none of one with
+            // no row, whose text its spans could not be read back to (`stored::Place::of`).
+            let mut written = kept.and_then(|(_, file, _)| {
+                stored::Place::of(db, file, id.value.erase(), def_crate).map(stored::Writer::new)
             });
             let read_cfg = std::cell::Cell::new(false);
 

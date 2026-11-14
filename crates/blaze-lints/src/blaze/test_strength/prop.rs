@@ -1,10 +1,9 @@
-//! Hegel properties of [`super::flow`], the core of the analysis, over generated bodies: an
+//! Properties of [`super::flow`], the core of the analysis, over generated bodies: an
 //! assertion added never takes an observation away, and a body with every check taken out
 //! observes nothing of the code under test (so its subject is pseudo-tested). The oracle is
 //! [`keeps`]; [`a_lost_observation_is_caught`] plants the bug it is there to catch.
 
-use hegel::TestCase;
-use hegel::generators::{self as gs, Generator as _};
+use blaze_sim::{Config, Tape};
 
 use super::flow::{self, Block, Body, Call, Effect, Outcome, Place, Src, Step, Stmt, Subject, Term};
 
@@ -15,39 +14,40 @@ const LOCALS: u32 = 6;
 /// The most blocks before the failing one.
 const BLOCKS: u32 = 6;
 
-fn place(tc: &TestCase) -> Place {
-    let local: u32 = tc.draw(gs::integers().max_value(LOCALS - 1));
-    let len: usize = tc.draw(gs::integers().max_value(2));
-    let mut path = Vec::new(); 
+fn place(tape: &Tape) -> Place {
+    let local: u32 = tape.int_in(0..=LOCALS - 1, "local");
+    let len: usize = tape.int_in(0..=2, "path length");
+    let mut path = Vec::new();
     for _ in 0..len {
-        let index: u32 = tc.draw(gs::integers().max_value(1));
-        path.push(if tc.draw(gs::booleans()) { Step::Field(index) } else { Step::Variant(index) });
+        let index: u32 = tape.int_in(0..=1, "step index");
+        path.push(if tape.bool("a field, not a variant") { Step::Field(index) } else { Step::Variant(index) });
     }
     Place { local, path }
 }
 
-fn stmt(tc: &TestCase) -> Stmt {
-    let kind: u32 = tc.draw(gs::integers().max_value(4));
-    let to = place(tc);
+fn stmt(tape: &Tape) -> Stmt {
+    let kind: u32 = tape.int_in(0..=4, "statement");
+    let to = place(tape);
     match kind {
-        0 => Stmt::Copy { to, from: place(tc) },
-        1 => Stmt::Borrow { to, of: place(tc) },
-        2 => Stmt::Derive { to, from: vec![place(tc), place(tc)], mark: None }, 
+        0 => Stmt::Copy { to, from: place(tape) },
+        1 => Stmt::Borrow { to, of: place(tape) },
+        2 => Stmt::Derive { to, from: vec![place(tape), place(tape)], mark: None },
         3 => {
-            let step = if tc.draw(gs::booleans()) { Step::Discr } else { Step::Len };
-            Stmt::Read { to, from: place(tc), step }
+            let step = if tape.bool("a discriminant, not a length") { Step::Discr } else { Step::Len };
+            Stmt::Read { to, from: place(tape), step }
         }
         _ => Stmt::Aggregate {
             to,
-            
-            fields: vec![(vec![Step::Field(0)], place(tc)), (vec![Step::Field(1)], place(tc))],
+
+            fields: vec![(vec![Step::Field(0)], place(tape)), (vec![Step::Field(1)], place(tape))],
         },
     }
 }
 
 /// An effect of a call; with `checks`, one that may check what it is handed.
-fn effect(tc: &TestCase, checks: bool) -> Effect {
-    let kind: u32 = tc.draw(gs::integers().max_value(if checks { 6 } else { 4 }));
+fn effect(tape: &Tape, checks: bool) -> Effect {
+    let most: u32 = if checks { 6 } else { 4 };
+    let kind: u32 = tape.int_in(0..=most, "effect");
     match kind {
         0 => Effect::Identity,
         1 => Effect::Element { wrap: Some(1) },
@@ -61,8 +61,8 @@ fn effect(tc: &TestCase, checks: bool) -> Effect {
 
 /// A body whose block 0 calls the code under test; with `checks`, its branches may go to a
 /// failing block (the last), and it may assert.
-fn draw_body(tc: &TestCase, checks: bool) -> Body {
-    let n: u32 = tc.draw(gs::integers().min_value(2).max_value(BLOCKS));
+fn draw_body(tape: &Tape, checks: bool) -> Body {
+    let n: u32 = tape.int_in(2..=BLOCKS, "blocks");
     let fail = n;
     
     let mut blocks = vec![Block {
@@ -76,25 +76,26 @@ fn draw_body(tc: &TestCase, checks: bool) -> Body {
         }),
     }];
     for at in 1..n {
-        let count: usize = tc.draw(gs::integers().max_value(4));
-        let stmts = (0..count).map(|_| stmt(tc)).collect(); 
+        let count: usize = tape.int_in(0..=4, "statements");
+        let stmts = (0..count).map(|_| stmt(tape)).collect();
         let next = at + 1;
-        let kind: u32 = tc.draw(gs::integers().max_value(if checks { 4 } else { 2 }));
+        let most: u32 = if checks { 4 } else { 2 };
+        let kind: u32 = tape.int_in(0..=most, "terminator");
         let term = if next == n {
             Term::Return
         } else {
             match kind {
-                0 => Term::Goto(vec![next]), 
-                1 => Term::Switch { on: Some(place(tc)), targets: vec![next, n - 1] }, 
+                0 => Term::Goto(vec![next]),
+                1 => Term::Switch { on: Some(place(tape)), targets: vec![next, n - 1] },
                 2 => Term::Call(Call {
-                    effect: effect(tc, checks),
-                    args: vec![Some(place(tc)), Some(place(tc))], 
-                    dest: place(tc),
+                    effect: effect(tape, checks),
+                    args: vec![Some(place(tape)), Some(place(tape))],
+                    dest: place(tape),
                     target: Some(next),
                     subject: None,
                 }),
-                3 => Term::Switch { on: Some(place(tc)), targets: vec![next, fail] }, 
-                _ => Term::Assert { cond: Some(place(tc)), target: next },
+                3 => Term::Switch { on: Some(place(tape)), targets: vec![next, fail] },
+                _ => Term::Assert { cond: Some(place(tape)), target: next },
             }
         };
         blocks.push(Block { stmts, term });
@@ -162,23 +163,27 @@ fn with_assert(body: &Body, cond: Place) -> Body {
 
 /// The invariant: adding an assertion to a test never takes an observation away; the
 /// analysis is monotone in the checks a body makes.
-#[hegel::test(test_cases = 256)]
-fn an_added_assertion_never_removes_an_observation(tc: TestCase) {
-    let body = draw_body(&tc, true);
-    let cond = place(&tc);
-    let before = flow::run(&body);
-    let after = flow::run(&with_assert(&body, cond));
-    assert!(keeps(&before, &after), "{body:?}\nbefore {:?}\nafter {:?}", before.obs, after.obs);
+#[test]
+fn an_added_assertion_never_removes_an_observation() {
+    blaze_sim::check(Config::cases(256), |tape| {
+        let body = draw_body(tape, true);
+        let cond = place(tape);
+        let before = flow::run(&body);
+        let after = flow::run(&with_assert(&body, cond));
+        assert!(keeps(&before, &after), "{body:?}\nbefore {:?}\nafter {:?}", before.obs, after.obs);
+    });
 }
 
 /// The invariant: a test with every check taken out observes nothing of the code it calls;
 /// whatever that code returns, the test passes, so the code is pseudo-tested.
-#[hegel::test(test_cases = 256)]
-fn without_checks_nothing_of_the_subject_is_observed(tc: TestCase) {
-    let body = unchecked(&draw_body(&tc, true));
-    let outcome = flow::run(&body);
-    let observed = outcome.obs.iter().any(|it| matches!(it.src, Src::Call { .. }));
-    assert!(outcome.saturated || !observed, "{body:?}\n{:?}", outcome.obs);
+#[test]
+fn without_checks_nothing_of_the_subject_is_observed() {
+    blaze_sim::check(Config::cases(256), |tape| {
+        let body = unchecked(&draw_body(tape, true));
+        let outcome = flow::run(&body);
+        let observed = outcome.obs.iter().any(|it| matches!(it.src, Src::Call { .. }));
+        assert!(outcome.saturated || !observed, "{body:?}\n{:?}", outcome.obs);
+    });
 }
 
 /// The planted-bug control: an analysis that loses one observation when an assertion is added
@@ -229,7 +234,7 @@ fn a_lost_observation_is_caught() {
 
 /// The invariant: a value nested in itself round after round (`acc = (acc, x)`) is cut at
 /// [`flow::DEPTH`] and kept, not observed: unchecked, it observes nothing; asserted, all of it.
-/// Hegel's first counterexample of [`without_checks_nothing_of_the_subject_is_observed`],
+/// The property search's first counterexample of [`without_checks_nothing_of_the_subject_is_observed`],
 /// when a position past the depth was observed outright.
 #[test]
 fn a_value_nested_in_itself_is_kept_not_observed() {

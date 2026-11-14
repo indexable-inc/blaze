@@ -159,7 +159,7 @@ impl Model {
             match decl.over {
                 Over::Body | Over::Rows => {
                     for i in 0..ITEMS {
-                        let key = self.sched.key_of(decl.id, self.body_key(i), &[], &self.view).map_err(|e| e.to_string())?;
+                        let key = self.sched.key_of(decl.id, self.body_key(i).id(), &[], &self.view).map_err(|e| e.to_string())?;
                         let wanted = Wanted { pass: decl.id, subject: Subject::Item(item(i)), key, reads: vec![item(i)] };
                         out.push((wanted, vec![self.versions[i]]));
                     }

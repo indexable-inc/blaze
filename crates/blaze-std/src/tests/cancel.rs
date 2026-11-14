@@ -7,9 +7,9 @@
 
 use std::time::Duration;
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
+use super::{check, control, path, root, world, write_synced};
 use crate::{
     Plant, Stopped,
     clock::SleepError,
@@ -35,18 +35,18 @@ struct Plan {
     sleep_ms: u64,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let n = d.int(1, NAMES.len() as u64);
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let n = tape.int_in(1..=NAMES.len() as u64, "tasks");
     let tasks = (0..n)
-        .map(|_| match d.int(0, 5) {
+        .map(|_| match tape.int_in(0..=5u64, "kind") {
             0 => Kind::Fails,
-            1 if d.one_in(3) => Kind::Panics,
+            1 if tape.one_in(3, "panics") => Kind::Panics,
             _ => Kind::Waits,
         })
         .collect();
-    let cancel_at = d.one_in(3).then(|| d.int(0, n - 1));
-    Plan { seed, tasks, cancel_at, sleep_ms: d.int(0, 50) }
+    let cancel_at = tape.one_in(3, "cancel").then(|| tape.int_in(0..=n - 1, "cancel at"));
+    Plan { seed, tasks, cancel_at, sleep_ms: tape.int_in(0..=50u64, "sleep ms") }
 }
 
 /// How one waiting task's two waits ended.
@@ -132,12 +132,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// a scope fails or panics, or the scope is cancelled, every wait of its later tasks ends
 /// with `Cancelled`, the ones before it ended as they would have, and the scope returns its
 /// first failure, naming the task.
-#[hegel::test(test_cases = 150)]
-fn cancelling_a_scope_ends_its_waits_with_cancelled(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn cancelling_a_scope_ends_its_waits_with_cancelled() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_wait_that_ignores_cancellation() {
-    control(Plant::WaitIgnoresCancel, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::WaitIgnoresCancel, plan, run);
 }

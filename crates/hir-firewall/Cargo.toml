@@ -32,9 +32,9 @@ syntax.workspace = true
 blaze-macro-eval.workspace = true
 blaze-query.workspace = true
 blaze-serde.workspace = true
+blaze-sim.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
-hegeltest.workspace = true
 blaze-lower.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

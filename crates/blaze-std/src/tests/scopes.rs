@@ -10,9 +10,9 @@
 
 use std::{cell::RefCell, time::Duration};
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{check, control, path, root, world};
 use crate::{
     Cx, Plant,
     clock::Clock,
@@ -43,19 +43,19 @@ struct Plan {
     cancel_at: Option<u64>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let n = d.int(1, NAMES.len() as u64);
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let n = tape.int_in(1..=NAMES.len() as u64, "tasks");
     let tasks = (0..n)
-        .map(|_| match d.int(0, 7) {
+        .map(|_| match tape.int_in(0..=7u64, "kind") {
             0 => Kind::Fails,
-            1 if d.one_in(2) => Kind::Panics,
-            2 | 3 => Kind::Writes { cancel: d.coin() },
-            4 | 5 => Kind::Reads { cancel: d.coin() },
-            _ => Kind::Sleeps(d.int(0, 20)),
+            1 if tape.one_in(2, "panics") => Kind::Panics,
+            2 | 3 => Kind::Writes { cancel: tape.coin("cancel write") },
+            4 | 5 => Kind::Reads { cancel: tape.coin("cancel read") },
+            _ => Kind::Sleeps(tape.int_in(0..=20u64, "sleep ms")),
         })
         .collect();
-    let cancel_at = d.one_in(3).then(|| d.int(0, n - 1));
+    let cancel_at = tape.one_in(3, "cancel").then(|| tape.int_in(0..=n - 1, "cancel at"));
     Plan { seed, tasks, cancel_at }
 }
 
@@ -186,12 +186,12 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
 /// The invariant: when `Scope::join` returns its tasks have all ended. Nothing a task started
 /// is still in flight in the driver, each `Task::join` gives exactly what its closure did, and
 /// the scope's own join gives the first failure, naming the task.
-#[hegel::test(test_cases = 150)]
-fn a_scopes_tasks_have_all_ended_when_it_joins(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_scopes_tasks_have_all_ended_when_it_joins() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_join_that_drops_a_failure() {
-    control(Plant::JoinDropsFailure, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::JoinDropsFailure, plan, run);
 }

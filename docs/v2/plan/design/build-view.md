@@ -142,7 +142,7 @@ ratatui) was replaced on 2026-11-12 and is deleted.
 
 - The fold's blocker ranking is hard to check by eye and its interface is stable: a few unit tests
   on small graphs (a chain, a diamond, Andrew's shape: one running codegen with 82 waiting behind
-  it) and a Hegel property: every unfinished task waits on at least one blocker, and `holds` sums
+  it) and a blaze-sim property: every unfinished task waits on at least one blocker, and `holds` sums
   to at least the unfinished count minus the frontier.
 - `blaze check -p blaze-protocol --target wasm32-unknown-unknown` passes: the model the page
   runs is the one the terminal runs.

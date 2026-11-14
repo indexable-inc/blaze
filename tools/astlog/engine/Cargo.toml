@@ -16,7 +16,7 @@ regex.workspace = true
 snafu.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

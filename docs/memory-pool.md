@@ -148,7 +148,7 @@ section 7).
 
 ## Proof
 
-A Hegel deterministic simulation test of admission and eviction together (the `testing`
+A blaze-sim deterministic simulation test of admission and eviction together (the `testing`
 skill):
 
 - **What it draws:** tasks with random kinds, input sizes and real peaks (some above their

@@ -1,0 +1,13 @@
+{
+ "id": "dst-1113-10",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "cargo test of blaze's own crates on main (fae038aef, which is main's code for these crates), blaze-vm, RUST_TEST_THREADS=6",
+ "what": "Tests that fail on main under cargo, each also failing by the same name on the branch that moved tests to blaze-sim: blaze-cas 6 (tests::a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename, a_damaged_value_in_another_writers_store_is_never_served, a_flipped_byte_of_a_value_is_never_served, home::a_head_of_format_7_reads_with_no_homes_and_one_of_format_8_round_trips_them, layers::the_oracle_catches_a_record_visible_before_its_outputs, place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it); blaze-lints 1 (blaze::refinement_tests::a_requires_is_shown_at_each_call); hir-expand 4 (declarative::stored::index::tests::an_index_places_each_item_where_its_file_has_it, view_tests::calls_and_expansions, roots_and_pointers, walks_and_ranges_up); blaze-graph 1 (arena::sampled::tests::a_full_bucket_loses_the_sample_and_counts_it); blaze-profile 1 (history::tests::past_the_cap_the_oldest_files_go_first); blaze-query 4 (db::tests::sealed::*); blaze-codegen 2 (driver::tests::kept::the_oracle_catches_a_dyn_fact_change_that_invalidates_nothing, walk::the_oracle_catches_a_walk_that_counts_only_its_roots); 54 in the group's 1,438-test target with blaze-diagnostics (tests::lints, tests::bodies, tests::items); 19 in hir-def and its group; 40 in hir-ty-codegen, hir-ty-mir and hir-ty-lean; 38 in blaze-cargo; ix-prof's test binary ends with signal 11; blaze-item-hash 13 and blaze-lower 3 (seen at 128 threads). Lists by name: blaze-vm:/root/wt/dst-1113/v/dst-1113-<group>.failed.",
+ "cost": "every change to these crates has to be judged against a base run, about two hours of VM time for this branch",
+ "cause": "not looked into here; the merge gate's test job did not run tonight (runs queued on main since 04:49 UTC never started) and pull requests were admin-merged on the smoke alone",
+ "class": "a red test on main that nobody is told about",
+ "prevention": "a nightly job that runs cargo test at six threads and writes the failing names where harness/known-failures.toml can be held to them; not built",
+ "workaround": "run the same groups on the base tree and compare names",
+ "state": "open"
+}

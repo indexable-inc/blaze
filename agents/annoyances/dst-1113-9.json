@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-9",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "blaze-vm, cargo test of blaze's own crates",
+ "what": "I ran `cargo test -p <crates>` on the 128-core VM with cargo's default test threads, several such jobs at once. blaze-cargo's daemon tests each reserve about 4 TiB of address space in one test process, and 92 failed with `the store's pool of 4096 windows of 1073741824 bytes could not reserve its pages ... Cannot allocate memory (os error 12)` (`reserved 244678 GiB in 4376 regions`); base-tree runs hit their 570 s limit while still compiling; the VM's load reached 184. How-to H6 already says RUST_TEST_THREADS=6.",
+ "cost": "about an hour of runs whose failures said nothing about the change, and a wrong first report of 92 failures in blaze-cargo",
+ "cause": "I had read H6 at the start of the session and did not apply it three hours later; nothing on the VM applies it",
+ "whys": "the right thread count is a how-to row and not a property of the queue; /root/loop.sh sets the toolchain and LLVM but not the test threads; a test process on 128 cores runs 128 daemons at once and the address space is 256 TiB",
+ "class": "a setting every caller must remember, where one place could set it",
+ "prevention": "loop.sh exports RUST_TEST_THREADS=6 unless the caller sets one, and blaze-cargo's tests reserve a pool sized for a test; not done: loop.sh is shared and I did not change it",
+ "workaround": "one sequential systemd unit with RUST_TEST_THREADS=6 (/root/wt/dst-1113/verify.sh)",
+ "state": "open"
+}
