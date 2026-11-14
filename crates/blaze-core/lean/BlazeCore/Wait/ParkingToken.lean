@@ -1,4 +1,5 @@
 import BlazeCore.Wait.ParkingDeadline
+import BlazeModel.blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token
 
 /-!
 A park says `Ready` exactly for a token (`blaze_core::wait::parking::a_park_is_ready_exactly_for_a_token`,
@@ -257,4 +258,148 @@ theorem alone_run (d : Option Deadline) (schedule : List Step) (readings : List 
   obtain ⟨ea, eb, w'', he', hne⟩ := alone_last d a' b' w' hI
   exact ⟨ea, eb, w'', he.trans he', hne⟩
 
+/-! `answers`. -/
+
+/-- `answers`'s first loop, from `at` with `i` steps of the schedule left and fuel above that:
+`unparks`, or whether a step from `at` on is the second thread's. -/
+theorem loop_eq : ∀ (i fuel : Nat) (sch : Slice Step) (u : Bool) (at' : Usize),
+    at'.val + i = sch.val.length → i < fuel →
+    answers.Timed.loop_0 fuel sch u at' =
+      .ok (u || (sch.val.drop at'.val.toNat).any (fun s => s.second))
+  | _, 0, _, _, _, _, hf => absurd hf (Nat.not_lt_zero _)
+  | 0, fuel + 1, sch, u, at', ha, _ => by
+    have hlt : Scalar.lt at' (Slice.len sch) = false := by
+      have h : ¬ at'.val < (Slice.len sch).val := by rw [Slice.len_val]; omega
+      exact decide_eq_false h
+    have hd : sch.val.drop at'.val.toNat = [] := List.drop_eq_nil_of_le (by omega)
+    simp only [answers.Timed.loop_0, hlt, Bool.false_eq_true, ↓reduceIte, hd, List.any_nil,
+      Bool.or_false]
+  | i + 1, fuel + 1, sch, u, at', ha, hf => by
+    have hlt : Scalar.lt at' (Slice.len sch) = true := by
+      have h : at'.val < (Slice.len sch).val := by rw [Slice.len_val]; omega
+      exact decide_eq_true h
+    have h0 := at'.hmin
+    simp only [ScalarTy.min] at h0
+    have hl := sch.hlen
+    have hix : at'.val.toNat < sch.val.length := by omega
+    have hn1 : ScalarTy.min .Usize ≤ at'.val + 1 := by simp only [ScalarTy.min]; omega
+    have hn2 : at'.val + 1 ≤ ScalarTy.max .Usize := by simp only [ScalarTy.max]; omega
+    have hadd : Scalar.add at' (1 : Usize) = .ok ⟨at'.val + 1, hn1, hn2⟩ := by
+      unfold Scalar.add
+      rw [usize_1]
+      exact Scalar.checked_ok _ _ ⟨hn1, hn2⟩
+    have ih := loop_eq i fuel sch (if (sch.val.get ⟨_, hix⟩).second then true else u)
+      ⟨at'.val + 1, hn1, hn2⟩ (by simp only; omega) (by omega)
+    simp only [answers.Timed.loop_0, hlt, ↓reduceIte, Slice.index_ok _ _ hix, hadd,
+      Result.bind_ok, ih]
+    have h1 : (at'.val + 1).toNat = at'.val.toNat + 1 := by omega
+    rw [h1, List.drop_eq_getElem_cons hix, List.any_cons]
+    simp only [List.get_eq_getElem]
+    cases (sch.val[at'.val.toNat]'hix).second <;> simp
+
+/-- `answers`'s first loop from the start, with fuel one more than the schedule's steps:
+whether some step of the schedule is the second thread's. -/
+theorem loop_unparks (sch : Slice Step) :
+    ∃ b, answers.Timed.loop_0 (sch.val.length + 1) sch false 0 = .ok b ∧
+      (b = true ↔ ∃ s ∈ sch.val, s.second = true) := by
+  refine ⟨_, loop_eq sch.val.length (sch.val.length + 1) sch false 0
+    (by rw [usize_0]; simp) (by omega), ?_⟩
+  rw [usize_0]
+  simp
+
+/-- `answers` from its run: the loop's answer `u`, the word made from `token`, the run of the
+park and the unpark, and `at_3`'s answer on how the park stood. -/
+theorem answers_eq (d : Option Deadline) (sch : Slice Step) (readings : Slice core.time.Duration)
+    (token u : Bool) (x : Int) (hx : (token = true ∧ x = 1) ∨ (token = false ∧ x = 0))
+    (hloop : answers.Timed.loop_0 (sch.val.length + 1) sch false 0 = .ok u)
+    (ea : Ended Res) (eb : Ended Unit) (w' : World)
+    (he : (two sch.val
+          (keeps.Timed.closure0.call (sch.val.length + 1) { c0 := W, c1 := KT, c2 := d })
+          (keeps.Timed.closure1.call { c0 := W, c1 := KT })).exec
+        ⟨[x], [], [], [], false, 0, readings.val.map core.time.Duration.toNanos⟩ =
+          .ok ((ea, eb), w'))
+    (hat : (answers.Timed.at_3 token u (ea, eb)).exec w' = .ok (true, w')) :
+    (answers.Timed (sch.val.length + 1) KT sch readings d token token).value = .ok true := by
+  apply Prog.value_of_exec (w := w')
+  have he' : (two sch.val
+          (answers.Timed.closure0.call (sch.val.length + 1) { c0 := W, c1 := KT, c2 := d })
+          (answers.Timed.closure1.call { c0 := W, c1 := KT })).exec
+        ⟨[x], [], [], [], false, 0, readings.val.map core.time.Duration.toNanos⟩ =
+          .ok ((ea, eb), w') := he
+  have hcl : (Threads.clock readings).exec ⟨[x], [], [], [], false, 0, []⟩ =
+      .ok ((), ⟨[x], [], [], [], false, 0, readings.val.map core.time.Duration.toNanos⟩) := rfl
+  rcases hx with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+  · have hnew : (Atomic.new (1 : U32)).exec World.new =
+        .ok (W, ⟨[1], [], [], [], false, 0, []⟩) := by rw [new_exec, u32_1]
+    simp only [answers.Timed, answers.Timed.at_1, answers.Timed.at_2, Prog.lift_done, hloop,
+      Prog.bind_done_ok, Bool.true_beq, ↓reduceIte, Prog.exec_bind, Threads.two_of]
+    rw [hnew]
+    simp only []
+    rw [hcl]
+    simp only []
+    rw [he']
+    exact hat
+  · have hnew : (Atomic.new (0 : U32)).exec World.new =
+        .ok (W, ⟨[0], [], [], [], false, 0, []⟩) := by rw [new_exec, u32_0]
+    simp only [answers.Timed, answers.Timed.at_1, answers.Timed.at_2, Prog.lift_done, hloop,
+      Prog.bind_done_ok, Bool.true_beq, Bool.false_beq, Bool.not_false, Bool.false_eq_true,
+      ↓reduceIte, Prog.exec_bind, Threads.two_of]
+    rw [hnew]
+    simp only []
+    rw [hcl]
+    simp only []
+    rw [he']
+    exact hat
+
+/-- `answers` on the timed kernel, with fuel one more than the schedule's steps and
+`held = token`, returns `true`. -/
+theorem answers_true (d : Option Deadline) (sch : Slice Step)
+    (readings : Slice core.time.Duration) (token : Bool) :
+    (answers.Timed (sch.val.length + 1) KT sch readings d token token).value = .ok true := by
+  obtain ⟨u, hloop, hu⟩ := loop_unparks sch
+  cases token
+  · cases u
+    · have hall : ∀ s ∈ sch.val, s.second = false := by
+        intro s hs
+        cases h : s.second
+        · rfl
+        · exact absurd (hu.2 ⟨s, hs, h⟩) (by simp)
+      obtain ⟨ea, eb, w', he, hne⟩ :=
+        alone_run d sch.val (readings.val.map core.time.Duration.toNanos) hall
+      refine answers_eq d sch readings false false 0 (Or.inr ⟨rfl, rfl⟩) hloop ea eb w' he ?_
+      cases ea with
+      | Done r =>
+        cases r with
+        | Ok v =>
+          cases v with
+          | Ready _ => exact absurd rfl hne
+          | Deadline => rfl
+        | Err _ => rfl
+      | Running => rfl
+      | Asleep => rfl
+    · obtain ⟨ea, eb, w', he, -⟩ :=
+        keeps_run d sch.val (readings.val.map core.time.Duration.toNanos)
+      refine answers_eq d sch readings false true 0 (Or.inr ⟨rfl, rfl⟩) hloop ea eb w' he ?_
+      cases ea with
+      | Done r =>
+        cases r with
+        | Ok v => cases v <;> rfl
+        | Err _ => rfl
+      | Running => rfl
+      | Asleep => rfl
+  · obtain ⟨ea, eb, w', he, h1, h2⟩ :=
+      token_run d sch.val (readings.val.map core.time.Duration.toNanos)
+    refine answers_eq d sch readings true u 1 (Or.inl ⟨rfl, rfl⟩) hloop ea eb w' he ?_
+    cases ea with
+    | Done r => obtain rfl := h2 r rfl; rfl
+    | Running => rfl
+    | Asleep => exact absurd rfl h1
+
 end BlazeCore.Wait.ParkingTokenProof
+
+open BlazeCore.Wait.ParkingTokenProof in
+/-- Fuel: the schedule's steps and one more, for `answers`'s first loop and the park's loop. -/
+theorem blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof :
+    blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.statement := by
+  intro schedule readings deadline token
+  exact ⟨schedule.val.length + 1, answers_true _ schedule readings token⟩
