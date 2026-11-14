@@ -263,6 +263,22 @@ theorem step_now_move : ∃ c, w.step who pick (.now true) =
     rfl
   | cons r rest => exact ⟨if w.clock < r then r else w.clock, step_now_cons hr⟩
 
+/-- `step_now_move` with what it keeps: the reading the clock becomes is at or after the clock,
+so no `now` moves the clock back. -/
+theorem step_now_up : ∃ c, w.clock ≤ c ∧ w.step who pick (.now true) =
+    some (⟨c, true⟩, { w with clock := c, readings := w.readings.tail }) := by
+  cases hr : w.readings with
+  | nil =>
+    refine ⟨w.clock, Int.le_refl _, ?_⟩
+    rw [step_now_nil hr]
+    cases w
+    simp only at hr
+    subst hr
+    rfl
+  | cons r rest =>
+    refine ⟨if w.clock < r then r else w.clock, ?_, step_now_cons hr⟩
+    split <;> omega
+
 /-! A wait with a deadline. -/
 
 theorem step_wait_until_woken {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
