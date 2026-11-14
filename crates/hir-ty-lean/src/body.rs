@@ -2815,6 +2815,13 @@ impl<'db> Cx<'db> {
                     (2, true) => (Elem::Field("exhausted".to_owned()), Ty::Bool),
                     _ => return Err(self.refuse("a field a range does not have", at)),
                 },
+                // The world's `Step`: its fields in the order of the Lean structure
+                // `Threads.Step` (`lean/Blaze/Threads.lean`), which is the Rust struct's.
+                (m::ProjectionElem::Field(field), Ty::Shared(Shared::Step)) => match field.0 {
+                    0 => (Elem::Field("second".to_owned()), Ty::Bool),
+                    1 => (Elem::Field("pick".to_owned()), Ty::Int(IntTy::U8)),
+                    _ => return Err(self.refuse("a field a `Step` does not have", at)),
+                },
                 (m::ProjectionElem::Downcast(VariantId::EnumVariantId(variant)), _) => {
                     let Some(Proj::Mir(m::ProjectionElem::Field(field))) = elems.get(at_elem).copied()
                     else {
