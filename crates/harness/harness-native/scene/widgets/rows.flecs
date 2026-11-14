@@ -35,6 +35,8 @@ hn {
     prop profile: string = ""
     prop profile_tip: string = ""
     (IsA, hn.TreeRowLook)
+    // Optional slots own their spacing; empty mood/status text must not leave phantom gaps.
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
     Action: {name: "select:{obj}"}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
     Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
@@ -47,6 +49,7 @@ hn {
     emotion : ui.Row {}
     name : hn.tree.Head {
       Text: {s: $name}
+      Padding: {l: 0, r: $tree_gap, t: 0, b: 0}
       // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
       // (the trailing words carry only what is new: what it works on, how it failed).
       Tooltip: {text: $why}
@@ -67,6 +70,7 @@ hn {
     // (or Right) opens it. Gone when nothing works under it, or once it is open and they show.
     if $under != "" {
       under : ui.Row {
+        Padding: {l: 0, r: $tree_gap, t: 0, b: 0}
         Flex: {axis: Row, gap: $tree_under_gap, align: Center, justify: End, wrap: false}
         FixedSize: {h: true, v: false}
         Tooltip: {text: "$under at work under it"}
@@ -80,7 +84,18 @@ hn {
         }
       }
     }
-    // One line: compact controls leave the task title the main element; full values live in tooltips and popovers.
+    meta : hn.tree.Trail {
+      Text: {s: $meta}
+      Tooltip: {text: $why}
+      if $meta != "" { Padding: {l: 0, r: $tree_gap, t: 0, b: 0} }
+      else { Padding: {l: 0, r: 0, t: 0, b: 0} }
+      if $hint == "" {
+        HoverShow: {row: 0, keep: true, away: false}
+      } else {
+        HoverShow: {row: 0, keep: false, away: true}
+      }
+    }
+    // Controls stay at the trailing edge, including while the agent's activity text changes.
     profile : ui.Row {
       Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
       Tooltip: {text: $profile_tip}
@@ -88,7 +103,10 @@ hn {
         icon : hn.ModelIconSlot {}
         text : hn.tree.Trail { Text: {s: $profile} }
       }
-      effort : hn.tree.ProfileControl {}
+      effort : hn.tree.ProfileControl {
+        Size: {w: {kind: Fixed, value: $tree_effort_w, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+        Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      }
       context : ui.Row {}
       context_pop : ui.Node { Overlay }
       if $profile != "" {
@@ -97,16 +115,6 @@ hn {
       } else {
         Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 0, r: 0, t: 0, b: 0}
-      }
-    }
-    meta : hn.tree.Trail {
-      Text: {s: $meta}
-      Tooltip: {text: $why}
-      // Gone while hovered when the shortcut shows in its place.
-      if $hint == "" {
-        HoverShow: {row: 0, keep: true, away: false}
-      } else {
-        HoverShow: {row: 0, keep: false, away: true}
       }
     }
     // The shortcut (cmd+1 to 9), on hover only, where the trailing words were: a layer over the row (out of its flow),

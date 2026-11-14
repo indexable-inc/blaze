@@ -283,8 +283,9 @@ pub(super) fn tokens(n: u64) -> String {
 }
 
 /// The ring's arc for share `f` of the window: clockwise from the top of a 12-unit box, radius 5 (a hair at the least, the
-/// whole circle at the most).
+/// whole circle at the most). Zero usage draws no arc, leaving only the empty track.
 fn arc(f: f64) -> String {
+    if f <= 0.0 { return String::new(); }
     let f = f.clamp(0.01, 1.0);
     if f >= 0.999 {
         return "M6 1 A5 5 0 1 1 6 11 A5 5 0 1 1 6 1".to_owned();
@@ -363,10 +364,26 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
     current(t, models_of(t, kind, kept), shown(t, ("", "")).0).map(|m| m.efforts.clone()).unwrap_or_default()
 }
 
+/// Every chat reserves the same context column. Unknown usage is an empty, non-actionable ring, never a reported zero.
+fn sidebar_meter(slot: View<'_>, sid: u64, context: Option<&harness_proto::event::ContextUse>, working: bool) {
+    let w = slot.entity().world();
+    view::for_each_of(slot, [("meter", "hn.SidebarContext", ())], |v, (), _| {
+        meter(v, context.map_or((0, 1), |c| (c.used, c.window)), tone(w, "ink"));
+        breathe(v, working);
+        if context.is_some() {
+            v.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:ctx:{sid}"));
+        } else {
+            v.entity().remove(harness_native_ui_input_api::Pressable::id());
+            v.action("");
+        }
+        let tip = context.map_or_else(|| "Context\nUsage has not arrived yet".to_owned(), |c| format!("Context · {:.0}% used\n{} of {} tokens\nClick for breakdown", c.used as f64 * 100.0 / c.window as f64, tokens(c.used), tokens(c.window)));
+        v.set(Tooltip { text: tip.as_str().into() });
+    });
+}
+
 impl App {
     /// Every visible agent owns its context meter and popover, so inspecting one never depends on pane focus.
     pub(in crate::app) fn fill_sidebar_context(&self, row: View<'_>, sid: u64, t: &Transcript, kind: &str, working: bool, summary: Option<model::AgentContext>) {
-        let w = self.world.world_ref();
         let summary = summary.filter(|c| c.window > 0).map(|c| harness_proto::event::ContextUse { used: c.used, window: c.window, ..Default::default() });
         let rich = t.context.as_ref().filter(|c| c.window > 0);
         // An unselected chat needs only its current summary. A loaded transcript supplies the breakdown when current.
@@ -375,14 +392,7 @@ impl App {
             (rich, summary) => rich.or(summary),
         };
         let Some(slot) = row.part("context") else { return };
-        let shown = (context.is_some() || working).then_some(("meter", "hn.SidebarContext", ()));
-        view::for_each_of(slot, shown, |v, (), _| {
-            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), tone(w, "ink"));
-            breathe(v, working);
-            v.action(&format!("chat:ctx:{sid}"));
-            let tip = context.map_or_else(|| "Context\nUsage has not arrived yet".to_owned(), |c| format!("Context · {:.0}% used\n{} of {} tokens\nClick for breakdown", c.used as f64 * 100.0 / c.window as f64, tokens(c.used), tokens(c.window)));
-            v.set(Tooltip { text: tip.as_str().into() });
-        });
+        sidebar_meter(slot, sid, context, working);
         let (open, menu) = self.chat.borrow().get(&sid).map_or((false, false), |s| (s.ctx_open, s.pick.is_some()));
         if let Some(pop) = row.part("context_pop") {
             super::context::fill_context_pop(pop, slot.part("meter"), context, if t.agent.is_empty() { kind } else { &t.agent }, menu || !self.side_open || self.palette.is_some(), open, (self.pointer.x, self.pointer.y));
@@ -1279,6 +1289,57 @@ fn effort_section(slot: View<'_>, c: &MenuCtx<'_>, page: Pick, nav: &mut PickNav
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: missing, zero and reported context occupy identical columns; zero never paints a usage arc.
+    /// Activity and optional effort must not push the model controls away from the row's trailing edge.
+    #[test]
+    fn sidebar_columns_stay_aligned_before_and_after_usage_arrives() {
+        use harness_native_ui_layout_api::{Padding, Viewport};
+        let world = super::super::scene_world().unwrap();
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        world.set(Viewport { w: 360.0, h: 200.0 });
+        let list = View::root(w, "ui.Column");
+        let zero = harness_proto::event::ContextUse { used: 0, window: 200000, ..Default::default() };
+        let used = harness_proto::event::ContextUse { used: 24000, window: 200000, ..Default::default() };
+        let rows: Vec<_> = [None, Some(&zero), Some(&used)].into_iter().enumerate().map(|(i, context)| {
+            let row = list.child("hn.ObjRow");
+            row.props("hn.ObjRow", &[("name", Prop::Str("New chat")), ("profile", Prop::Str("Fable")), ("meta", Prop::Str(if i == 2 { "Editing code" } else { "" }))]);
+            let profile = row.part("profile").unwrap();
+            sidebar_meter(profile.part("context").unwrap(), i as u64, context, i == 2);
+            let meter = profile.part("context").unwrap().part("meter").unwrap();
+            let path = meter.part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap();
+            assert_eq!(path.d.as_str().is_empty(), i != 2);
+            assert_eq!(meter.entity().has(harness_native_ui_input_api::Pressable::id()), context.is_some());
+            let tip = meter.entity().try_cloned::<&Tooltip>().unwrap();
+            assert!(tip.text.as_str().contains(match i { 0 => "not arrived", 1 => "0% used", _ => "12% used" }));
+            let effort = profile.part("effort").unwrap();
+            view::for_each_of(effort, (i != 0).then_some(("meter", "hn.ChatEffort", ())), |v, (), _| {
+                effort_meter(v, Some((i, if i == 1 { 4 } else { 7 })), tone(w, "ink"), tone(w, "ink_faint"));
+            });
+            row
+        }).collect(); // alloc: the three cases in this headless layout check
+        for _ in 0..4 { world.progress_time(1.0 / 60.0); }
+        let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().unwrap();
+        let parts = |row: View<'_>| {
+            let profile = row.part("profile").unwrap();
+            [laid(profile.part("label").unwrap()).x, laid(profile.part("effort").unwrap()).x, laid(profile.part("context").unwrap()).x]
+        };
+        assert_eq!(parts(rows[0]), parts(rows[1]));
+        assert_eq!(parts(rows[1]), parts(rows[2]));
+        let row = rows[0];
+        let pad = row.entity().try_cloned::<&Padding>().unwrap();
+        let kind = row.part("kind_icon").unwrap();
+        assert_eq!(laid(row.part("name").unwrap()).x, laid(row).x + pad.l + laid(kind).w, "empty optional slots add no spacing");
+        assert_eq!(laid(row).h, 28.0, "tabs remain one line");
+        // In-place data updates preserve the same target and clear a previous nonzero arc.
+        let profile = rows[2].part("profile").unwrap();
+        let slot = profile.part("context").unwrap();
+        let id = slot.part("meter").unwrap().id();
+        sidebar_meter(slot, 2, Some(&zero), false);
+        assert_eq!(slot.part("meter").unwrap().id(), id);
+        assert!(slot.part("meter").unwrap().part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap().d.as_str().is_empty());
+    }
 
     #[test]
     fn a_models_line_splits_into_its_version_and_the_rest() {

@@ -1,0 +1,15 @@
+{
+  "id": "harness-ui-1113-8",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Harness sidebar row layout and context meter",
+  "what": "Andrew showed model controls shifting between new and existing chats, a filled dot at zero usage, and excessive left indentation.",
+  "cost": "Rows were harder to scan and used title space for empty optional slots.",
+  "cause": "Context presence controlled whether its layout column existed; arc geometry clamped zero to a visible minimum; the parent flex gap inserted spacing around empty mood and metadata slots.",
+  "whys": ["Missing usage deleted the meter, shrinking the trailing control group.", "The geometric minimum was applied before distinguishing empty from positive usage.", "Spacing belonged to the parent rather than the optional content, so absent content still occupied gaps.", "The view had no invariant for its empty and populated column geometry."],
+  "class": "Optional content changes structural geometry instead of only its visible content.",
+  "prevention": "Every chat keeps its context ring and fixed effort column; unknown usage has distinct help and no action. Zero has no arc. Optional content owns its spacing and activity precedes the trailing controls. A headless native layout check compares missing, zero and populated usage, different effort counts, and in-place usage updates.",
+  "workaround": "None",
+  "fix": "Stable trailing columns, truly empty context rings, and compact one-line title spacing.",
+  "state": "fixed in this change"
+}
