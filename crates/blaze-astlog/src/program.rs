@@ -66,6 +66,10 @@ pub enum Atom {
     Child,
     /// `(descendant p c)`: each node below `p`, in order.
     Descendant,
+    /// `(int-value n i)`: the integer an integer literal, or a negated one, means.
+    IntValue,
+    /// `(str-value n s)`: the text a string literal means, unescaped.
+    StrValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +128,8 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "match-arm" => (Atom::MatchArm, 4, Needs::Nothing),
         "child" => (Atom::Child, 2, all0),
         "descendant" => (Atom::Descendant, 2, all0),
+        "int-value" => (Atom::IntValue, 2, all0),
+        "str-value" => (Atom::StrValue, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

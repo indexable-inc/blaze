@@ -450,3 +450,31 @@ fn child_and_descendant_walk_down_from_a_bound_node() {
     assert_eq!(texts(&outcome, "lits"), [["7"], ["1"], ["2"]]);
     assert!(texts(&outcome, "self-below").is_empty());
 }
+
+/// `int-value` reads an integer literal in any radix, with `_`s and a suffix, and a negated one
+/// in an expression or a pattern; one past `i64` has no row. `str-value` unescapes a string,
+/// raw ones too.
+#[test]
+fn int_value_and_str_value_read_what_a_literal_means() {
+    let fixture = r##"
+//- /lib.rs crate:lib edition:2021
+pub const A: i64 = 0x1F;
+pub const B: u32 = 1_000u32;
+pub const C: i64 = -7;
+pub fn f(n: i64) -> &'static str { match n { -2 => "neg\ttab", 3 => r#"raw "q""#, _ => "x" } }
+pub const BIG: u64 = 18446744073709551615;
+"##;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (ints n i) (syntax n "LITERAL") (int-value n i))
+        (rule (negated n i) (syntax n "PREFIX_EXPR") (int-value n i))
+        (rule (pats n i) (syntax n "LITERAL_PAT") (int-value n i))
+        (rule (strs s) (syntax n "LITERAL") (str-value n s))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let ints = [["0x1F", "31"], ["1_000u32", "1000"], ["7", "7"], ["2", "2"], ["3", "3"]];
+    assert_eq!(texts(&outcome, "ints"), ints);
+    assert_eq!(texts(&outcome, "negated"), [["-7", "-7"]]);
+    assert_eq!(texts(&outcome, "pats"), [["-2", "-2"], ["3", "3"]]);
+    assert_eq!(texts(&outcome, "strs"), [["neg\ttab"], ["raw \"q\""], ["x"]]);
+}

@@ -1220,6 +1220,27 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                 };
                 out.extend(below.into_iter().map(|it| vec![p.clone(), node(self.syn(it))]));
             }
+            Atom::IntValue => {
+                let at = self.need_syn(&inputs[0], "int-value", line)?;
+                if let Some(value) = int_value(at) {
+                    out.push(vec![node(self.syn(at)), Value::Int(value)]);
+                }
+            }
+            Atom::StrValue => {
+                let at = self.need_syn(&inputs[0], "str-value", line)?;
+                let value = ast::Literal::cast(at).and_then(|it| match it.kind() {
+                    ast::LiteralKind::String(it) => match it.value() {
+                        Ok(value) => Some(value),
+                        // A bad escape is the file's own parse error, which the front end
+                        // reports; the literal means no text.
+                        Err(_) => None,
+                    },
+                    _ => None,
+                });
+                if let Some(value) = value {
+                    out.push(vec![node(self.syn(at)), text(&value)]);
+                }
+            }
         }
         Ok(())
     }
@@ -1264,4 +1285,30 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
             (None, _) => Cow::Borrowed("(outside the view)"),
         }
     }
+}
+
+/// The integer `node` means: an integer literal, or one negated in an expression (`-7`) or a
+/// pattern (`-2 =>`). `None` for any other node and for a value past `i64`, which no rule's
+/// integer can equal.
+fn int_value(node: ast::Node<'_>) -> Option<i64> {
+    let (negated, literal) = match node.kind() {
+        SyntaxKind::LITERAL => (false, node),
+        SyntaxKind::PREFIX_EXPR | SyntaxKind::LITERAL_PAT => {
+            let minus = node.children_with_tokens().any(|it| it.kind() == SyntaxKind::MINUS);
+            let literal = node.children().find(|it| it.kind() == SyntaxKind::LITERAL)?;
+            // `!7` and `*7` are no integer; a pattern's literal has no other prefix.
+            if node.kind() == SyntaxKind::PREFIX_EXPR && !minus {
+                return None;
+            }
+            (minus, literal)
+        }
+        _ => return None,
+    };
+    let ast::LiteralKind::IntNumber(number) = ast::Literal::cast(literal)?.kind() else { return None };
+    // Each failure below is a value past `i64` (the digits past `u128`, then past `i128`, then
+    // the signed value): the doc's `None`.
+    let Ok(magnitude) = number.value() else { return None };
+    let Ok(magnitude) = i128::try_from(magnitude) else { return None };
+    let Ok(value) = i64::try_from(if negated { -magnitude } else { magnitude }) else { return None };
+    Some(value)
 }

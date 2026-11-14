@@ -128,6 +128,8 @@ argument.
 | `(syntax n "KIND")` | nothing | every node of that `SyntaxKind` |
 | `(match-arm m a p b)` | nothing | a `match`, each of its arms, the arm's pattern and its expression; from `m`, from `a`, or every arm of the view. A guard is no part of `p` |
 | `(child p c)`, `(descendant p c)` | `p` | each child node of `p`, or each node below it (never `p`), in order; `parent` and `ancestor` are their inverses |
+| `(int-value n i)` | `n` | the integer an integer literal means, in any radix, with `_`s and a suffix (`0x1F` is 31), or a negated one in an expression or a pattern (`-2`); a value past `i64` has no row |
+| `(str-value n s)` | `n` | the text a string literal means, escapes and raw strings read (`"a\tb"` is `a`, a tab, `b`); a byte or C string has no row |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
 | `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`) |
 | `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field); an impl has none, so no row |
