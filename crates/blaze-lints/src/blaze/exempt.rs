@@ -310,7 +310,9 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::RepeatedFieldList
         | Lint::RegistrySpread
         // Held by `#[expect(blaze::same_behaviour, reason = ..)]` and the ratchet baseline.
-        | Lint::SameBehaviour => None,
+        | Lint::SameBehaviour
+        // Off by default; held by `#[expect(blaze::loop_match_candidate, reason = ..)]`.
+        | Lint::LoopMatchCandidate => None,
     }
 }
 

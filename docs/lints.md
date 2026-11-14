@@ -12,8 +12,8 @@ hashbrown, tokio, the common fixed-seed hashers, `core::fmt`, iterators, slices'
 The other `blaze::` lints (the group `blaze::internal`) check conventions of blaze's own code
 base; they are allowed unless a workspace turns them on.
 
-The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `packable`, `pod_serialized_by_field`,
-`soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
+The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `loop_match_candidate`, `packable`,
+`pod_serialized_by_field`, `soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
 allowed unless a workspace or crate turns it on (`pedantic_perf = "warn"`; `vecreport`, which
 the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc`, `nonblocking`, `undeclared_effect` and `unfulfilled_effect` are in
@@ -1130,6 +1130,53 @@ it refuses: the check cannot show the absence of a cycle through it.
 **How to fix it.** Take the locks in one order everywhere; drop the guard before the call.
 
 **Allowing it.** `#[expect(blaze::lock_order, reason = "..")]` on the function.
+
+## `loop_match_candidate`
+
+In `blaze::pedantic_perf`, allowed by default.
+
+**What it catches.** A hand-written state machine: a `loop` whose whole body is one of
+
+- `state = match state { .. };`, each arm's value the next state;
+- `match state { A => { ..; state = B; } .. }`, each arm ending in an assignment to `state`.
+
+`state` is a local (not a field, not a closure's capture) of a type rustc's `loop_match` takes:
+an integer, a float, `bool`, `char`, or an enum whose variants have no fields. No arm has a
+guard, nothing else writes `state`, and at least one transition goes to a constant: a literal, a
+fieldless variant or a module's `const`. The finding counts the transitions and how many are
+constant. A loop that has `#[loop_match]` already is left alone, as is any shape it can't tell.
+
+**Why it matters.** Each step goes back to the top of the loop and through the `match` again, an
+indirect jump or a chain of compares the branch predictor has to guess. With `#[loop_match]`,
+rustc compiles a constant transition into a direct jump to its arm, the way a C `goto` or a
+computed-goto interpreter does.
+
+**How to fix it.** On nightly, with `#![feature(loop_match)]` on the crate:
+
+```rust
+#[loop_match]
+'machine: loop {
+    state = 'blk: {
+        match state {
+            State::A => {
+                work();
+                #[const_continue]
+                break 'blk State::B;
+            }
+            State::B => break 'machine,
+        }
+    };
+}
+```
+
+A `break` out of the loop needs the loop's label, since Rust refuses an unlabeled `break` inside
+the labeled block (E0695).
+
+**Why it is off.** `loop_match` is an incomplete nightly feature: rustc warns
+`incomplete_features`, and stable Rust rejects the attributes. The lint also can't see whether
+the loop is hot.
+
+**Allowing it.** `#[expect(blaze::loop_match_candidate, reason = "..")]` on the function.
 
 ## `undeclared_effect`, `unfulfilled_effect`, `negative_effect`
 

@@ -63,9 +63,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     // (`blaze::result_part_unobserved` .. `blaze::property_over_examples`), and the 4 suggestion
     // lints (`blaze::could_be_narrower` .. `blaze::could_have_invariant`), and the 10 structural
     // lints (`blaze::hand_written_derivable` .. `blaze::registry_spread`), and
-    // `blaze::same_behaviour`.
+    // `blaze::same_behaviour`, and `blaze::loop_match_candidate`.
     // (The refinement gate, `blaze::refinement`, is the one more.)
-    assert_eq!(blaze_lints().len(), 245);
+    assert_eq!(blaze_lints().len(), 246);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
