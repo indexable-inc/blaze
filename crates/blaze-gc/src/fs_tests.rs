@@ -336,3 +336,57 @@ fn a_target_dir_inside_cargo_home_or_the_daemons_state_is_never_removed_or_marke
     assert_eq!(refused(&root.join("build/ws-1")), None);
     assert_eq!(refused(&home.join("src/project/target")), None);
 }
+
+/// A touch of `dir`'s existing record, a use [`crate::record::TOUCH_EVERY_NS`] after the last:
+/// whether `dir`'s stamp moved.
+fn touch_moves_dir_stamp(name: &str) -> bool {
+    use crate::record;
+    let held = scratch(name);
+    let dir = held.path();
+    let first = 1_000 * record::TOUCH_EVERY_NS;
+    record::touch(&dir, Some("/ws"), &["debug"], first).unwrap_or_else(|why| panic!("{why}"));
+    // Back in time, so a move of the stamp shows on any file system's tick.
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::open(&dir).and_then(|it| it.set_modified(old)).unwrap();
+    let later = first + record::TOUCH_EVERY_NS;
+    record::touch(&dir, Some("/ws"), &["debug"], later).unwrap_or_else(|why| panic!("{why}"));
+    let stamp = std::fs::metadata(&dir).and_then(|it| it.modified()).unwrap();
+    let used = record::read(&dir).unwrap_or_else(|why| panic!("{why}")).map(|it| it.used_ns);
+    assert_eq!(used, Some(later), "the touch wrote the new time");
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name()).collect();
+    assert_eq!(entries, [std::ffi::OsString::from(record::RECORD)], "no temporary left beside it");
+    stamp != old
+}
+
+/// The build dir's stamp is an ancestor of every build script's program and output, and a run
+/// that begins within the racy window of a change to it is kept under no key and run again by
+/// the next query (2026-11-14, "<build dir> above ... changed after the run began").
+#[test]
+fn touching_a_record_leaves_its_directory_stamp_as_it_was() {
+    let moved = touch_moves_dir_stamp("touch-in-place");
+    assert!(!moved, "the touch moved the build dir's stamp");
+}
+
+/// Control: with the rename back, the same check sees the stamp move.
+#[test]
+fn touching_a_record_leaves_its_directory_stamp_as_it_was_catches_a_rename() {
+    crate::record::PLANT_TOUCH_RENAMES.set(true);
+    let moved = touch_moves_dir_stamp("touch-renames");
+    crate::record::PLANT_TOUCH_RENAMES.set(false);
+    assert!(moved, "the planted rename went unseen");
+}
+
+/// A shorter record over a longer one reads whole: the overwrite cuts the file to its length.
+#[test]
+fn a_touch_in_place_that_shrinks_the_record_reads_whole() {
+    use crate::record;
+    let held = scratch("touch-shrinks");
+    let dir = held.path();
+    let first = 1_000 * record::TOUCH_EVERY_NS;
+    record::touch(&dir, Some("/a/long/checkout/path"), &["debug", "release"], first)
+        .unwrap_or_else(|why| panic!("{why}"));
+    let later = first + record::TOUCH_EVERY_NS;
+    record::touch(&dir, Some("/ws"), &["debug"], later).unwrap_or_else(|why| panic!("{why}"));
+    let read = record::read(&dir).unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(read.and_then(|it| it.checkout), Some("/ws".to_owned()));
+}

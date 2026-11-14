@@ -3,8 +3,15 @@
 //! dir's lease ([`touch`]); the collector reads it to find a dir whose checkout is gone or that
 //! has not been used for its TTL, and `blaze clean --list` shows it.
 //!
-//! Written whole: a temporary beside it (`.blaze-record.<pid>.<count>.tmp`), synced, then renamed over
-//! it, so a reader sees the old record or the new one, never a part.
+//! Made whole: a temporary beside it (`.blaze-record.<pid>.<count>.tmp`), synced, then renamed
+//! into place. Touched in place ([`touch`]): an existing record is overwritten and cut to its new
+//! length, so its directory's entries and stamp stay as they were. A rename into a build dir
+//! changed the build dir's stamp, and a build script's run that began within the racy window of
+//! it was kept under no key (`blaze_usercode::inputs`, "above ... changed after the run began"),
+//! so the next query ran it again. A reader that races a touch can see a part of the record: one
+//! that does not read is refused and its directory kept ([`crate::plan::Keep::Refused`]), and one
+//! that reads with a part of a time is of a directory the toucher holds a lease on, which no
+//! collector removes.
 
 use std::{
     io::Write as _,
@@ -174,16 +181,57 @@ pub fn touch(
     kept.retain(|(it, _)| !profiles.contains(&it.as_str()));
     kept.extend(profiles.iter().map(|name| ((*name).to_owned(), now_ns)));
     kept.sort();
-    write(
-        dir,
-        &Record {
-            format: FORMAT,
-            checkout: checkout.map(str::to_owned),
-            used_ns: now_ns,
-            profiles: kept,
-        },
-    )?;
+    let record = Record {
+        format: FORMAT,
+        checkout: checkout.map(str::to_owned),
+        used_ns: now_ns,
+        profiles: kept,
+    };
+    match overwrite(dir, &record)? {
+        Overwritten::Yes => {}
+        Overwritten::NoRecord => write(dir, &record)?,
+    }
     Ok(unread)
+}
+
+enum Overwritten {
+    Yes,
+    NoRecord,
+}
+
+/// Writes `record` over `dir`'s existing record file, in place: written from its start, cut to
+/// its length, synced. No entry of `dir` is made, renamed or removed, so `dir`'s stamp does not
+/// move (see the module's doc for why that matters and what a racing reader sees).
+fn overwrite(dir: &Path, record: &Record) -> Result<Overwritten, String> {
+    #[cfg(test)]
+    if PLANT_TOUCH_RENAMES.get() {
+        return Ok(Overwritten::NoRecord);
+    }
+    let path = path_of(dir);
+    let bytes = encode(record);
+    let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Overwritten::NoRecord);
+        }
+        Err(error) => return Err(format!("opening {}: {error}", path.display())),
+    };
+    let written = (|| -> std::io::Result<()> {
+        let mut file = &file;
+        file.write_all(&bytes)?;
+        file.set_len(bytes.len() as u64)?;
+        // durable: review: the collector decides what to delete from these files; a torn one must not be read
+        file.sync_all()
+    })();
+    written.map_err(|error| format!("writing {} in place: {error}", path.display()))?;
+    Ok(Overwritten::Yes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Planted bug: [`touch`] renames a whole record over an existing one, as it did before
+    /// 2026-11-14, so the directory's stamp moves on each touch.
+    pub static PLANT_TOUCH_RENAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// When `record` says its directory `name` was last used.
